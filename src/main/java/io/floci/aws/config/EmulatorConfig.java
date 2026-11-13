@@ -2583,6 +2583,18 @@ public interface EmulatorConfig {
          */
         Optional<List<String>> additionalDockerNetworks();
 
+        /**
+         * Extra /etc/hosts entries added to every ECS task container, as "hostname:ip" pairs; the
+         * ip may be the literal "host-gateway", as in {@code docker run --add-host}. Unset by
+         * default: like the ECS agent, Floci gives a task container only the {@code extraHosts}
+         * its container definition declares. {@code host.docker.internal:host-gateway} restores
+         * the entry Floci used to add to every task container on Linux. For an awsvpc task with
+         * security-group enforcement the entries go on the task's network namespace.
+         *
+         * Env var: FLOCI_SERVICES_ECS_EXTRA_HOSTS (comma-separated)
+         */
+        Optional<List<String>> extraHosts();
+
         @WithDefault("512")
         int defaultMemoryMb();
 

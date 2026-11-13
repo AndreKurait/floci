@@ -276,7 +276,7 @@ public class BridgeGatewayRelay {
     }
 
     /** The default bridge's IPv4 gateway, or {@code null} when it has none. */
-    static String gatewayOf(Network bridge) {
+    public static String gatewayOf(Network bridge) {
         if (bridge == null || bridge.getIpam() == null || bridge.getIpam().getConfig() == null) {
             return null;
         }

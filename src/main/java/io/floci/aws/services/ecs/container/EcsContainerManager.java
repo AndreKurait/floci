@@ -84,6 +84,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
 import java.io.IOException;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
@@ -93,6 +94,7 @@ import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -157,6 +159,7 @@ public class EcsContainerManager {
     private final EcsCredentialsProxy credentialsProxy;
     private final EcsTaskLinkLocalAddresses linkLocalAddresses;
     private final EfsService efsService;
+    private EcsHostAlias hostAlias;
     // Stamped as RUN_LABEL on every container this process creates, so a sweep can tell its own apart.
     private final String runId = UUID.randomUUID().toString();
     private final ContainerReconciler containerReconciler;
@@ -201,6 +204,18 @@ public class EcsContainerManager {
         this.linkLocalAddresses = linkLocalAddresses;
         this.efsService = efsService;
         this.containerReconciler = new ContainerReconciler(lifecycleManager, LOG);
+        this.hostAlias = new EcsHostAlias(lifecycleManager::getDockerClient, EcsContainerManager::linuxJvm);
+    }
+
+    /** Replaces how a task's containers reach a Floci URL naming host.docker.internal. */
+    void useHostAlias(EcsHostAlias hostAlias) {
+        this.hostAlias = hostAlias;
+    }
+
+    /** The same test as {@code DockerHostResolver.isLinuxHost()}: the Floci JVM runs on Linux. */
+    private static boolean linuxJvm() {
+        String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
+        return os.contains("linux") || os.contains("nix") || os.contains("nux");
     }
 
     public EcsContainerManager(ContainerBuilder containerBuilder,
@@ -267,6 +282,7 @@ public class EcsContainerManager {
         // Parsed before anything is prepared, so a bad operator setting fails the launch with
         // nothing to clean up.
         DockerFlags dockerFlags = configuredDockerFlags();
+        TaskFlociAccess flociAccess = taskFlociAccess(dockerFlags);
         List<String> additionalNetworks = AdditionalDockerNetworks.validated(
                 config.services().ecs().additionalDockerNetworks(), "ECS");
         String taskId = extractTaskId(task.getTaskArn());
@@ -314,7 +330,7 @@ public class EcsContainerManager {
         // Both resolved before any environment is built: whether the task gets role credentials
         // decides whether its containers may also carry Floci's baseline static credentials,
         // which would otherwise win over the role in the SDK credential chain.
-        PreparedNetwork protectedNetwork = prepareNetwork(task, taskDef, region, taskId);
+        PreparedNetwork protectedNetwork = prepareNetwork(task, taskDef, region, taskId, flociAccess);
         TaskRoleCredentialEndpoint taskRoleEndpoint = prepareTaskRoleCredentials(task, taskDef, protectedNetwork);
         Map<ContainerDefinition, List<String>> envVarsByContainer = new LinkedHashMap<>();
         // Resolved before any container is created, so a registry-startup failure can't leak one already started.
@@ -332,8 +348,8 @@ public class EcsContainerManager {
                 String metadataId = UUID.randomUUID().toString().replace("-", "");
                 metadataIdsByContainer.put(def.getName(), metadataId);
                 List<String> containerEnv = new ArrayList<>(buildEnvVars(def, overridesByName.get(def.getName()), region,
-                        metadataId, taskRoleEndpoint.vending() || usesInstanceRole(task, taskDef), dockerFlags));
-                String imdsEndpoint = instanceMetadataEndpoint(task, dockerFlags);
+                        metadataId, taskRoleEndpoint.vending() || usesInstanceRole(task, taskDef), flociAccess));
+                String imdsEndpoint = instanceMetadataEndpoint(task, flociAccess);
                 if (imdsEndpoint != null && containerEnv.stream()
                         .noneMatch(kv -> kv.startsWith(INSTANCE_METADATA_ENDPOINT_ENV + "="))) {
                     containerEnv.add(INSTANCE_METADATA_ENDPOINT_ENV + "=" + imdsEndpoint);
@@ -356,7 +372,7 @@ public class EcsContainerManager {
             }
 
             if (firelensRouter != null) {
-                firelensConfig = firelensConfig(task, taskDef, firelensRouter, firelensLogOptions);
+                firelensConfig = firelensConfig(task, taskDef, firelensRouter, firelensLogOptions, flociAccess);
                 firelensExternalConfig = s3ExternalConfig(firelensRouter);
                 firelensVolumeName = firelensVolumeName(config, task.getTaskArn());
                 Map<String, String> labels = new LinkedHashMap<>(ownerLabels());
@@ -419,12 +435,19 @@ public class EcsContainerManager {
                 ContainerBuilder.Builder specBuilder = containerBuilder.newContainer(imagesByContainer.get(def))
                         .withName(containerName)
                         .withEnv(env)
-                        .withDockerNetwork(config.services().ecs().dockerNetwork())
-                        // Resolve Floci's endpoint from inside the task container the same way Lambda
-                        // containers do: host.docker.internal on Linux, plus Floci's embedded DNS so the
-                        // reachable AWS_ENDPOINT_URL hostname resolves to Floci instead of the container's
-                        // own loopback.
-                        .withHostDockerInternalOnLinux();
+                        .withDockerNetwork(config.services().ecs().dockerNetwork());
+                // Hosts entries: only the extraHosts the definition declares, as the ECS agent
+                // applies them, then the operator's configured extra-hosts. Floci adds no
+                // host.docker.internal entry of its own unless it cannot tell how else this
+                // container reaches it (see EcsHostAlias), and not over a definition that maps
+                // that name itself. ECS does not support extraHosts on awsvpc tasks.
+                List<String> declaredHosts = taskDef.getNetworkMode() == NetworkMode.awsvpc
+                        ? List.of() : declaredExtraHosts(def);
+                declaredHosts.forEach(entry -> addExtraHost(specBuilder, entry));
+                boolean declaresAlias = declaredHosts.stream().anyMatch(EcsHostAlias::isHostAliasEntry);
+                flociAccess.implicitHosts().stream()
+                        .filter(entry -> !(declaresAlias && EcsHostAlias.isHostAliasEntry(entry)))
+                        .forEach(entry -> addExtraHost(specBuilder, entry));
                 // The operator's flags first: a --dns there replaces Floci's embedded DNS, which
                 // withEmbeddedDns() only adds when no server is set yet.
                 dockerFlags.applyTo(specBuilder, "ECS");
@@ -1365,7 +1388,8 @@ public class EcsContainerManager {
         }
     }
 
-    private PreparedNetwork prepareNetwork(EcsTask task, TaskDefinition definition, String region, String taskId) {
+    private PreparedNetwork prepareNetwork(EcsTask task, TaskDefinition definition, String region, String taskId,
+                                           TaskFlociAccess flociAccess) {
         if (definition.getNetworkMode() != NetworkMode.awsvpc
                 || firewallManager == null || !firewallManager.enabled()) {
             return null;
@@ -1392,7 +1416,7 @@ public class EcsContainerManager {
                     config.services().ecs().dynamicAwsvpcHostPorts());
             namespace = firewallManager.createNamespace("ecs", taskId, regionResolver.getAccountId(),
                     region, config.services().ecs().dockerNetwork(), bindings, Map.of(RUN_LABEL, runId),
-                    hostPortBindAddress());
+                    hostPortBindAddress(), namespaceHosts(flociAccess));
             List<String> groupIds = eni.getGroups().stream().map(g -> g.getGroupId()).toList();
             List<SecurityGroup> groups = ec2Service.describeSecurityGroups(region, groupIds, List.of(), Map.of());
             if (groups.size() != groupIds.size()) {
@@ -1736,7 +1760,7 @@ public class EcsContainerManager {
 
     private FirelensConfigGenerator.Context firelensContext(
             EcsTask task, TaskDefinition taskDef, ContainerDefinition router,
-            Map<String, Map<String, String>> logOptions) {
+            Map<String, Map<String, String>> logOptions, TaskFlociAccess flociAccess) {
         FirelensConfiguration firelens = router.getFirelensConfiguration();
         Map<String, String> options = firelens.options() != null ? firelens.options() : Map.of();
         boolean metadata = !"false".equalsIgnoreCase(options.get("enable-ecs-log-metadata"));
@@ -1764,13 +1788,13 @@ public class EcsContainerManager {
                 : NetworkMode.bridge.name();
         return new FirelensConfigGenerator.Context(
                 networkMode, metadata, cluster, task.getTaskArn(), familyRevision,
-                memoryMb, external, awsEnv.flociEndpoint(), logOptions);
+                memoryMb, external, flociAccess.resolution().rewrite(awsEnv.flociEndpoint()), logOptions);
     }
 
     private String firelensConfig(
             EcsTask task, TaskDefinition taskDef, ContainerDefinition router,
-            Map<String, Map<String, String>> logOptions) {
-        FirelensConfigGenerator.Context ctx = firelensContext(task, taskDef, router, logOptions);
+            Map<String, Map<String, String>> logOptions, TaskFlociAccess flociAccess) {
+        FirelensConfigGenerator.Context ctx = firelensContext(task, taskDef, router, logOptions, flociAccess);
         return isFluentdRouter(router)
                 ? FirelensConfigGenerator.fluentdConfig(ctx)
                 : FirelensConfigGenerator.fluentBitConfig(ctx);
@@ -2055,11 +2079,11 @@ public class EcsContainerManager {
     }
 
     /** Floci's IMDS server as a task container reaches it, or null when the task is not on an EC2 instance. */
-    String instanceMetadataEndpoint(EcsTask task, DockerFlags dockerFlags) {
+    String instanceMetadataEndpoint(EcsTask task, TaskFlociAccess flociAccess) {
         if (instanceMetadataServer == null || task.getEc2InstanceId() == null) {
             return null;
         }
-        String base = flociEndpointFor(dockerFlags);
+        String base = flociEndpointFor(flociAccess);
         if (base == null) {
             return null;
         }
@@ -2227,8 +2251,124 @@ public class EcsContainerManager {
      * container cannot resolve Floci's embedded-DNS name, so it is given an address instead, as
      * Lambda containers with their own DNS are.
      */
-    private String flociEndpointFor(DockerFlags dockerFlags) {
+    private String flociEndpointFor(TaskFlociAccess flociAccess) {
+        return flociAccess.resolution().rewrite(rawFlociEndpointFor(flociAccess.dockerFlags()));
+    }
+
+    private String rawFlociEndpointFor(DockerFlags dockerFlags) {
         return dockerFlags.setsDns() ? awsEnv.flociEndpoint(false) : awsEnv.flociEndpoint();
+    }
+
+    /**
+     * How one task's containers reach Floci: the rewrite of a host.docker.internal endpoint, and
+     * the hosts entries Floci adds to every container of the task (the configured extra-hosts,
+     * plus host.docker.internal only where nothing else reaches it).
+     */
+    record TaskFlociAccess(DockerFlags dockerFlags, EcsHostAlias.Resolution resolution, List<String> implicitHosts) {
+    }
+
+    TaskFlociAccess taskFlociAccess(DockerFlags dockerFlags) {
+        List<String> configured = configuredExtraHosts();
+        // An operator who maps host.docker.internal themselves has chosen where it points.
+        boolean mappedByOperator = Stream.concat(dockerFlags.extraHosts().stream(), configured.stream())
+                .anyMatch(EcsHostAlias::isHostAliasEntry);
+        EcsHostAlias.Resolution resolution = EcsHostAlias.Resolution.KEEP_NAME;
+        if (!mappedByOperator && (namesHostAlias(awsEnv.flociEndpoint())
+                || namesHostAlias(rawFlociEndpointFor(dockerFlags)))) {
+            resolution = hostAlias.resolve();
+        }
+        List<String> implicit = new ArrayList<>(configured);
+        if (resolution.addHostEntry()) {
+            implicit.add(EcsHostAlias.HOST_GATEWAY_ENTRY);
+        }
+        return new TaskFlociAccess(dockerFlags, resolution, List.copyOf(implicit));
+    }
+
+    private static boolean namesHostAlias(String url) {
+        if (url == null) {
+            return false;
+        }
+        try {
+            return EcsHostAlias.namesHostAlias(new URI(url));
+        } catch (URISyntaxException e) {
+            return false;
+        }
+    }
+
+    /** floci.services.ecs.extra-hosts, each "hostname:ip"; a malformed entry fails the launch. */
+    private List<String> configuredExtraHosts() {
+        Optional<List<String>> configured = config.services().ecs().extraHosts();
+        List<String> entries = configured == null ? null : configured.orElse(null);
+        if (entries == null) {
+            return List.of();
+        }
+        List<String> valid = new ArrayList<>();
+        for (String raw : entries) {
+            String entry = raw == null ? "" : raw.strip();
+            if (entry.isEmpty()) {
+                continue;
+            }
+            int separator = entry.indexOf(':');
+            if (separator <= 0 || separator == entry.length() - 1) {
+                throw new IllegalArgumentException(
+                        "floci.services.ecs.extra-hosts entry must be hostname:ip, got: " + entry);
+            }
+            valid.add(entry);
+        }
+        return valid;
+    }
+
+    /**
+     * The hosts file an awsvpc task's protected namespace gives its containers. They run in
+     * container network mode, where Docker takes no hosts entries of their own, so the operator's
+     * docker-flags --add-host entries go here with the task's implicit ones.
+     */
+    private static List<String> namespaceHosts(TaskFlociAccess flociAccess) {
+        List<String> hosts = new ArrayList<>(flociAccess.dockerFlags().extraHosts());
+        flociAccess.implicitHosts().stream().filter(entry -> !hosts.contains(entry)).forEach(hosts::add);
+        return List.copyOf(hosts);
+    }
+
+    /**
+     * True when a hosts entry cannot write more than its own hosts-file line: a hostname with no
+     * whitespace, colon (the separator Docker splits on) or control character, and an address with
+     * no whitespace or control character.
+     */
+    public static boolean isHostsFileSafe(String hostname, String ipAddress) {
+        return hostname != null && ipAddress != null && !hostname.isEmpty() && !ipAddress.isEmpty()
+                && hostname.chars().allMatch(c -> c > 0x20 && c < 0x7f && c != ':')
+                && ipAddress.chars().allMatch(c -> c > 0x20 && c < 0x7f);
+    }
+
+    /**
+     * The definition's extraHosts as "hostname:ip" entries, in declared order. Registration
+     * checks their shape; an entry stored before that check that could write another hosts-file
+     * line is dropped here.
+     */
+    static List<String> declaredExtraHosts(ContainerDefinition def) {
+        Object declared = def.getUnparsed() == null ? null : def.getUnparsed().get("extraHosts");
+        if (!(declared instanceof List<?> list)) {
+            return List.of();
+        }
+        List<String> entries = new ArrayList<>();
+        for (Object item : list) {
+            if (item instanceof Map<?, ?> host
+                    && host.get("hostname") instanceof String hostname && !hostname.isBlank()
+                    && host.get("ipAddress") instanceof String ipAddress
+                    && isHostsFileSafe(hostname.strip(), ipAddress.strip())) {
+                entries.add(hostname.strip() + ":" + ipAddress.strip());
+            } else {
+                LOG.warnv("Ignoring an extraHosts entry of container {0} that is not a single hosts line: {1}",
+                        def.getName(), item);
+            }
+        }
+        return entries;
+    }
+
+    /** Split on the first colon, as docker --add-host does: an IPv6 address has colons of its own. */
+    private static void addExtraHost(ContainerBuilder.Builder specBuilder, String entry) {
+        int separator = entry.indexOf(':');
+        specBuilder.withExtraHost(entry.substring(0, separator), entry.substring(separator + 1));
     }
 
     /**
@@ -2239,7 +2379,7 @@ public class EcsContainerManager {
 
     private List<String> buildEnvVars(ContainerDefinition def, ContainerOverride override, String region,
                                       String metadataId, boolean vendingTaskRoleCredentials,
-                                      DockerFlags dockerFlags) {
+                                      TaskFlociAccess flociAccess) {
         // AWS SDK baseline (endpoint + region + credentials) first so the task can reach the
         // emulator, then the task-def environment, then task-def secrets, then the override
         // environment. Later entries win on key conflict, so an explicit task-def value or
@@ -2262,10 +2402,17 @@ public class EcsContainerManager {
         }
         if (sealed()) {
             SDK_ENDPOINT_KEYS.forEach(envMap::remove);
+        } else {
+            // Without a hosts entry the task cannot resolve host.docker.internal; hand it the
+            // address that name stood for.
+            EcsHostAlias.Resolution resolution = flociAccess.resolution();
+            envMap.computeIfPresent("AWS_ENDPOINT_URL", (key, value) -> resolution.rewrite(value));
+            envMap.computeIfPresent("FLOCI_ENDPOINT", (key, value) -> resolution.rewrite(value));
+            envMap.computeIfPresent("FLOCI_HOSTNAME", (key, value) -> resolution.rewriteHost(value));
         }
         // The task metadata endpoint, which an application, the ECS SDK integrations and the
         // aws-for-fluent-bit init process all read from this variable.
-        String flociEndpoint = flociEndpointFor(dockerFlags);
+        String flociEndpoint = flociEndpointFor(flociAccess);
         if (metadataId != null && flociEndpoint != null) {
             envMap.put("ECS_CONTAINER_METADATA_URI_V4", flociEndpoint + "/v4/" + metadataId);
         }

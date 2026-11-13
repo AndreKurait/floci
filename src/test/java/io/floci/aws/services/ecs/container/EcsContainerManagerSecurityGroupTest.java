@@ -36,6 +36,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
@@ -65,6 +66,7 @@ class EcsContainerManagerSecurityGroupTest {
     private RegionResolver regionResolver;
     private Ec2Service ec2Service;
     private SecurityGroupFirewallManager firewallManager;
+    private EmulatorConfig config;
     private EcsContainerManager manager;
 
     @BeforeEach
@@ -82,7 +84,7 @@ class EcsContainerManagerSecurityGroupTest {
         when(lifecycleManager.getDockerClient()).thenReturn(dockerClient);
 
         containerDetector = mock(ContainerDetector.class);
-        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         regionResolver = mock(RegionResolver.class);
         when(regionResolver.getAccountId()).thenReturn("000000000000");
         LaunchedContainerAwsEnv awsEnv = mock(LaunchedContainerAwsEnv.class);
@@ -104,10 +106,36 @@ class EcsContainerManagerSecurityGroupTest {
     }
 
     @Test
+    void operatorHostsEntriesGoOnTheNamespaceItsContainersRead() {
+        // In container network mode Docker takes no hosts entries on the workload itself.
+        when(config.services().ecs().dockerFlags())
+                .thenReturn(Optional.of("--add-host host.docker.internal:10.9.0.2"));
+        when(containerDetector.isRunningInContainer()).thenReturn(false);
+        when(firewallManager.enabled()).thenReturn(true);
+        when(firewallManager.createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(new SecurityGroupFirewallManager.Namespace("helper-id", "10.0.0.5"));
+        NetworkInterface eni = new NetworkInterface();
+        eni.setNetworkInterfaceId("eni-1");
+        eni.setVpcId("vpc-1");
+        eni.setPrivateIpAddress("10.0.0.10");
+        eni.setGroups(List.of(new GroupIdentifier("sg-1", "default")));
+        when(ec2Service.createNetworkInterface(any(), eq("subnet-1"), any(), any(), any(), any(), any()))
+                .thenReturn(eni);
+        SecurityGroup sg = new SecurityGroup();
+        sg.setGroupId("sg-1");
+        when(ec2Service.describeSecurityGroups(any(), eq(List.of("sg-1")), any(), any())).thenReturn(List.of(sg));
+
+        manager.startTask(awsvpcTask(), awsvpcTaskDef(List.of()), List.of(), "us-east-1");
+
+        verify(firewallManager).createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(),
+                eq(List.of("host.docker.internal:10.9.0.2")));
+    }
+
+    @Test
     void awsvpcTaskWithFirewallJoinsHelperNamespaceAndSkipsHostPorts() {
         when(containerDetector.isRunningInContainer()).thenReturn(false);
         when(firewallManager.enabled()).thenReturn(true);
-        when(firewallManager.createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any()))
+        when(firewallManager.createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(new SecurityGroupFirewallManager.Namespace("helper-id", "10.0.0.5"));
 
         NetworkInterface eni = new NetworkInterface();
@@ -136,6 +164,9 @@ class EcsContainerManagerSecurityGroupTest {
         verify(dockerClient).inspectContainerCmd("helper-id");
         verify(dockerClient, times(1)).inspectContainerCmd("docker-id");
         verify(firewallManager).register(any(), eq("helper-id"), any());
+        // The task's containers read the helper's hosts file: no entry ECS would not add.
+        verify(firewallManager).createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(),
+                eq(List.of()));
         assertEquals("eni-1", handle.getNetworkInterfaceId());
         assertEquals("us-east-1", handle.getRegion());
     }
@@ -158,7 +189,7 @@ class EcsContainerManagerSecurityGroupTest {
     void stopTaskUnregistersEniAndReleasingTheTaskNetworkDeletesIt() {
         when(containerDetector.isRunningInContainer()).thenReturn(false);
         when(firewallManager.enabled()).thenReturn(true);
-        when(firewallManager.createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any()))
+        when(firewallManager.createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(new SecurityGroupFirewallManager.Namespace("helper-id", "10.0.0.5"));
 
         NetworkInterface eni = new NetworkInterface();
@@ -194,7 +225,7 @@ class EcsContainerManagerSecurityGroupTest {
     void firelensRouterAndAppBothJoinTheHelperNamespace() {
         when(containerDetector.isRunningInContainer()).thenReturn(false);
         when(firewallManager.enabled()).thenReturn(true);
-        when(firewallManager.createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any()))
+        when(firewallManager.createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(new SecurityGroupFirewallManager.Namespace("helper-id", "10.0.0.5"));
 
         NetworkInterface eni = new NetworkInterface();
@@ -242,7 +273,7 @@ class EcsContainerManagerSecurityGroupTest {
         verify(builder, times(2)).withNetworkMode("container:helper-id");
         verify(builder, times(2)).withLabels(Map.of("io.floci.security-group.workload", "true"));
 
-        verify(firewallManager).createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any());
+        verify(firewallManager).createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(), any());
         verify(lifecycleManager).create(any(), any());
         verify(lifecycleManager).startCreated(eq("router-id"), any());
         verify(lifecycleManager).createAndStartEphemeral(any(), any());
