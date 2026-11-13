@@ -688,6 +688,20 @@ class PartitionCrossServiceSmokeIntegrationTest {
 
     @ParameterizedTest
     @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
+    void memoryDbParameterGroupArn(PartitionCase partitionCase) {
+        String region = offered(partitionCase, "memorydb");
+        String name = unique("smoke-group", partitionCase);
+        String arn = json11(region, "memorydb", "AmazonMemoryDB.CreateParameterGroup",
+                "{\"ParameterGroupName\":\"" + name + "\",\"Family\":\"memorydb_redis6\"}")
+        .when().post("/").then().statusCode(200)
+            .extract().jsonPath().getString("ParameterGroup.ARN");
+        cleanup.register(() -> json11(region, "memorydb", "AmazonMemoryDB.DeleteParameterGroup",
+                "{\"ParameterGroupName\":\"" + name + "\"}").when().post("/"));
+        PartitionMatrix.assertArnIn(partitionCase, arn);
+    }
+
+    @ParameterizedTest
+    @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
     void memoryDbAclArn(PartitionCase partitionCase) {
         String region = offered(partitionCase, "memorydb");
         String name = unique("smoke-acl", partitionCase);
