@@ -75,13 +75,20 @@ public final class CfnCreateOnlyProperties {
 
     /**
      * True when the value at any create-only pointer of the type differs between the old and the new
-     * properties. A top-level name compares the whole value (a value added where none existed is not a
-     * change, as before). A nested pointer {@code A/B/C} compares the values at that path: present on
+     * properties. A top-level name compares the whole value. Additions preserve the prior behavior,
+     * except hosted VersionLabel and LatestVersionNumber additions replace their immutable version. A nested pointer {@code A/B/C} compares the values at that path: present on
      * one side only is a change, absent on both is not. A {@code *} segment compares every array
      * element's subtree.
      */
     public static boolean createOnlyValueChanged(String resourceType, JsonNode oldProps, JsonNode newProps) {
         for (String pointer : getCreateOnlyProperties(resourceType)) {
+            // Hosted label/token additions create a new immutable version, including an empty CFN label.
+            if ("AWS::AppConfig::HostedConfigurationVersion".equals(resourceType)
+                    && Set.of("VersionLabel", "LatestVersionNumber").contains(pointer)
+                    && (oldProps == null || !oldProps.has(pointer))
+                    && newProps != null && newProps.has(pointer)) {
+                return true;
+            }
             String[] segments = pointer.split("/");
             if (pointerChanged(oldProps, newProps, segments, 0, segments.length == 1)) {
                 return true;
