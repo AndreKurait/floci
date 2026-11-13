@@ -1,4 +1,4 @@
-package io.floci.aws.services.dynamodb;
+package io.github.hectorvent.floci.services.dynamodb;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.json.JsonWriteFeature;
@@ -10,41 +10,40 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
-import io.floci.aws.config.EmulatorConfig;
-import io.floci.aws.core.common.AwsArnUtils;
-import io.floci.aws.core.common.AwsException;
-import io.floci.aws.core.common.AwsRegions;
-import io.floci.aws.core.common.Digests;
-import io.floci.aws.core.common.RegionResolver;
-import io.floci.aws.core.common.RequestScopes;
-import io.floci.aws.core.common.SmithyValidationErrors;
-import io.floci.aws.core.common.Totp;
-import io.floci.aws.core.resource.ExplorerResource;
-import io.floci.aws.core.storage.AccountAwareStorageBackend;
-import io.floci.aws.core.storage.InMemoryStorage;
-import io.floci.aws.core.storage.StorageBackend;
-import io.floci.aws.core.storage.StorageFactory;
-import io.floci.aws.services.dynamodb.DynamoDbCapacityQuotas.Capacity;
-import io.floci.aws.services.dynamodb.NativeDynamoDbTableService.GsiThroughputUpdate;
-import io.floci.aws.services.dynamodb.model.AttributeDefinition;
-import io.floci.aws.services.dynamodb.model.ConditionalCheckFailedException;
-import io.floci.aws.services.dynamodb.model.ContributorInsights;
-import io.floci.aws.services.dynamodb.model.ExportDescription;
-import io.floci.aws.services.dynamodb.model.ExportSummary;
-import io.floci.aws.services.dynamodb.model.GlobalSecondaryIndex;
-import io.floci.aws.services.dynamodb.model.ImportSummary;
-import io.floci.aws.services.dynamodb.model.ImportTableDescription;
-import io.floci.aws.services.dynamodb.model.IncrementalExportSpecification;
-import io.floci.aws.services.dynamodb.model.KeySchemaElement;
-import io.floci.aws.services.dynamodb.model.LocalSecondaryIndex;
-import io.floci.aws.services.dynamodb.model.PointInTimeChange;
-import io.floci.aws.services.dynamodb.model.ProvisionedThroughput;
-import io.floci.aws.services.dynamodb.model.StreamDescription;
-import io.floci.aws.services.dynamodb.model.TableBackup;
-import io.floci.aws.services.dynamodb.model.TableDefinition;
-import io.floci.aws.services.dynamodb.model.VectorIndex;
-import io.floci.aws.services.s3.S3Service;
-import io.floci.aws.services.s3.model.S3Object;
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.AwsRegions;
+import io.github.hectorvent.floci.core.common.Digests;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.RequestScopes;
+import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
+import io.github.hectorvent.floci.core.common.StripedLocks;
+import io.github.hectorvent.floci.core.common.Totp;
+import io.github.hectorvent.floci.core.resource.ExplorerResource;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.InMemoryStorage;
+import io.github.hectorvent.floci.core.storage.StorageBackend;
+import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.dynamodb.model.AttributeDefinition;
+import io.github.hectorvent.floci.services.dynamodb.model.ConditionalCheckFailedException;
+import io.github.hectorvent.floci.services.dynamodb.model.ContributorInsights;
+import io.github.hectorvent.floci.services.dynamodb.model.ExportDescription;
+import io.github.hectorvent.floci.services.dynamodb.model.ExportSummary;
+import io.github.hectorvent.floci.services.dynamodb.model.GlobalSecondaryIndex;
+import io.github.hectorvent.floci.services.dynamodb.model.ImportSummary;
+import io.github.hectorvent.floci.services.dynamodb.model.ImportTableDescription;
+import io.github.hectorvent.floci.services.dynamodb.model.IncrementalExportSpecification;
+import io.github.hectorvent.floci.services.dynamodb.model.KeySchemaElement;
+import io.github.hectorvent.floci.services.dynamodb.model.LocalSecondaryIndex;
+import io.github.hectorvent.floci.services.dynamodb.model.PointInTimeChange;
+import io.github.hectorvent.floci.services.dynamodb.model.ReplicaAutoScalingState;
+import io.github.hectorvent.floci.services.dynamodb.model.StreamDescription;
+import io.github.hectorvent.floci.services.dynamodb.model.TableBackup;
+import io.github.hectorvent.floci.services.dynamodb.model.TableDefinition;
+import io.github.hectorvent.floci.services.dynamodb.model.VectorIndex;
+import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.services.s3.model.S3Object;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -94,8 +93,8 @@ import java.util.stream.Collectors;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
 
-import static io.floci.aws.services.dynamodb.DynamoDbTimestamps.epochSeconds;
-import static io.floci.aws.services.dynamodb.DynamoDbTimestamps.instantOf;
+import static io.github.hectorvent.floci.services.dynamodb.DynamoDbTimestamps.epochSeconds;
+import static io.github.hectorvent.floci.services.dynamodb.DynamoDbTimestamps.instantOf;
 
 @ApplicationScoped
 public class DynamoDbService {
@@ -118,6 +117,8 @@ public class DynamoDbService {
     static final String DEFAULT_STREAM_VIEW_TYPE = "NEW_AND_OLD_IMAGES";
 
     private final StorageBackend<String, TableDefinition> tableStore;
+    private final StorageBackend<String, ReplicaAutoScalingState> replicaAutoScalingStore;
+    private final StripedLocks tableControlLocks = new StripedLocks(256);
     private final StorageBackend<String, Map<String, JsonNode>> itemStore;
     private final StorageBackend<String, ExportDescription> exportStore;
     private final StorageBackend<String, ImportTableDescription> importStore;
@@ -134,8 +135,6 @@ public class DynamoDbService {
     // relies on ReentrantLock's re-entrancy so the inner put/update/delete calls do
     // not deadlock after the outer transaction already took each participant's lock.
     private final ConcurrentHashMap<String, ConcurrentHashMap<String, ReentrantLock>> itemLocks = new ConcurrentHashMap<>();
-    // Held from an account quota check until the capacity it allowed is stored.
-    private final Object capacityLock = new Object();
     // ClientRequestToken idempotency for TransactWriteItems. AWS retains tokens for
     // ~10 minutes; floci uses the same window. The cache entry stores a hash of the
     // request body so a replay with the same token but different parameters can be
@@ -148,10 +147,9 @@ public class DynamoDbService {
     private static final int MAX_VECTOR_INDEXES_PER_TABLE = 5;
     private static final int MAX_VECTOR_DIMENSIONS = 4096;
     private static final int MIN_VECTOR_INDEX_NAME_LENGTH = 3;
-    // The order AWS prints the enum constraint in.
-    static final List<String> BILLING_MODES = List.of("PROVISIONED", "PAY_PER_REQUEST");
     // The order AWS prints the enum constraint in, which is neither alphabetical nor the order
     // the API reference lists.
+    private static final Set<String> VALID_BILLING_MODES = Set.of("PROVISIONED", "PAY_PER_REQUEST");
     private static final List<String> VECTOR_DISTANCE_FUNCTIONS = List.of(
             DynamoDbVectorScoring.DOT_PRODUCT,
             DynamoDbVectorScoring.COSINE,
@@ -199,7 +197,10 @@ public class DynamoDbService {
              regionResolver, streamService, kinesisForwarder, s3Service, objectMapper,
              config.services().dynamodb().vectorIndexAllocationSeconds(),
              config.services().dynamodb().vectorIndexBackfillSeconds(),
-             config.services().dynamodb().latestRestorableLagSeconds(), Clock.systemUTC());
+             config.services().dynamodb().latestRestorableLagSeconds(), Clock.systemUTC(),
+             command -> Thread.ofVirtual().start(command),
+             storageFactory.create("dynamodb", "dynamodb-replica-autoscaling.json",
+                     new TypeReference<Map<String, ReplicaAutoScalingState>>() {}));
     }
 
     /** The item store the configured {@code item-layout} selects; package-private for tests. */
@@ -223,6 +224,25 @@ public class DynamoDbService {
 
     DynamoDbService(StorageBackend<String, TableDefinition> tableStore, RegionResolver regionResolver) {
         this(tableStore, null, null, null, regionResolver, null, null, null, null);
+    }
+
+    /** Explicit stores and collaborators for replica-settings deletion failure tests. */
+    DynamoDbService(StorageBackend<String, TableDefinition> tableStore,
+                    StorageBackend<String, Map<String, JsonNode>> itemStore,
+                    RegionResolver regionResolver, DynamoDbStreamService streamService,
+                    KinesisStreamingForwarder kinesisForwarder,
+                    StorageBackend<String, ReplicaAutoScalingState> replicaAutoScalingStore) {
+        this(tableStore, itemStore, null, null, new InMemoryStorage<>(), new InMemoryStorage<>(),
+                regionResolver, streamService, kinesisForwarder, null, null, 0, 0, 0, Clock.systemUTC(),
+                Runnable::run, replicaAutoScalingStore);
+    }
+
+    /** Explicit stores for replica-settings persistence and refused-write tests. */
+    DynamoDbService(StorageBackend<String, TableDefinition> tableStore, RegionResolver regionResolver,
+                    StorageBackend<String, ReplicaAutoScalingState> replicaAutoScalingStore) {
+        this(tableStore, null, null, null, new InMemoryStorage<>(), new InMemoryStorage<>(),
+                regionResolver, null, null, null, null, 0, 0, 0, Clock.systemUTC(),
+                Runnable::run, replicaAutoScalingStore);
     }
 
     DynamoDbService(StorageBackend<String, TableDefinition> tableStore,
@@ -321,7 +341,30 @@ public class DynamoDbService {
                     int latestRestorableLagSeconds,
                     Clock clock,
                     Executor exportExecutor) {
+        this(tableStore, itemStore, exportStore, importStore, backupStore, pointInTimeStore, regionResolver,
+                streamService, kinesisForwarder, s3Service, objectMapper, vectorIndexAllocationSeconds,
+                vectorIndexBackfillSeconds, latestRestorableLagSeconds, clock, exportExecutor, new InMemoryStorage<>());
+    }
+
+    private DynamoDbService(StorageBackend<String, TableDefinition> tableStore,
+                            StorageBackend<String, Map<String, JsonNode>> itemStore,
+                            StorageBackend<String, ExportDescription> exportStore,
+                            StorageBackend<String, ImportTableDescription> importStore,
+                            StorageBackend<String, TableBackup> backupStore,
+                            StorageBackend<String, PointInTimeChange> pointInTimeStore,
+                            RegionResolver regionResolver,
+                            DynamoDbStreamService streamService,
+                            KinesisStreamingForwarder kinesisForwarder,
+                            S3Service s3Service,
+                            ObjectMapper objectMapper,
+                            int vectorIndexAllocationSeconds,
+                            int vectorIndexBackfillSeconds,
+                            int latestRestorableLagSeconds,
+                            Clock clock,
+                            Executor exportExecutor,
+                            StorageBackend<String, ReplicaAutoScalingState> replicaAutoScalingStore) {
         this.tableStore = tableStore;
+        this.replicaAutoScalingStore = replicaAutoScalingStore;
         this.itemStore = itemStore;
         this.exportStore = exportStore;
         this.importStore = importStore;
@@ -641,19 +684,11 @@ public class DynamoDbService {
 
         TableDefinition table = new TableDefinition(tableName, keySchema, attributeDefinitions,
                 region, regionResolver.getAccountId());
-        if ("PAY_PER_REQUEST".equals(billingMode)) {
-            table.setBillingMode(billingMode);
-            table.getProvisionedThroughput().setReadCapacityUnits(0L);
-            table.getProvisionedThroughput().setWriteCapacityUnits(0L);
-        } else if (readCapacity != null && writeCapacity != null) {
+        table.setCreationDateTime(clock.instant());
+        if (readCapacity != null && writeCapacity != null) {
             table.getProvisionedThroughput().setReadCapacityUnits(readCapacity);
             table.getProvisionedThroughput().setWriteCapacityUnits(writeCapacity);
         }
-        // Track warm throughput: on-demand uses fixed values, provisioned uses the capacity.
-        ProvisionedThroughput tp = readCapacity != null && writeCapacity != null
-                ? new ProvisionedThroughput(readCapacity, writeCapacity) : null;
-        table.setWarmReadUnitsPerSecond(TableDefinition.defaultWarmReadUnits(billingMode, tp));
-        table.setWarmWriteUnitsPerSecond(TableDefinition.defaultWarmWriteUnits(billingMode, tp));
 
         if (gsis != null && !gsis.isEmpty()) {
             for (GlobalSecondaryIndex gsi : gsis) {
@@ -695,12 +730,7 @@ public class DynamoDbService {
             table.setVectorIndexes(created);
         }
 
-        synchronized (capacityLock) {
-            if (!"PAY_PER_REQUEST".equals(billingMode)) {
-                DynamoDbCapacityQuotas.requireNewTableWithinQuotas(table, reservedCapacity(region), region);
-            }
-            tableStore.put(storageKey, table);
-        }
+        tableStore.put(storageKey, table);
         itemsByTable.put(scopedItemsKey(storageKey), new ConcurrentSkipListMap<>());
         LOG.infov("Created table: {0} in region {1}", tableName, region);
         return table;
@@ -868,7 +898,7 @@ public class DynamoDbService {
         if (indexes.isEmpty()) {
             return;
         }
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         boolean changed = false;
         boolean anySettling = false;
         boolean anyAllocating = false;
@@ -903,7 +933,7 @@ public class DynamoDbService {
      * where AWS reports {@code Backfilling} at all. A settle must have run first.
      */
     public boolean isVectorIndexBackfilling(VectorIndex index) {
-        return reportsVectorIndexBackfilling(index) && !Instant.now().isBefore(
+        return reportsVectorIndexBackfilling(index) && !clock.instant().isBefore(
                 index.getCreationStartedAt().plusSeconds(vectorIndexAllocationSeconds));
     }
 
@@ -961,6 +991,15 @@ public class DynamoDbService {
         tableStore.put(regionKey(region, canonicalTableName), table);
     }
 
+    Optional<ReplicaAutoScalingState> replicaAutoScalingState(TableDefinition table) {
+        return replicaAutoScalingStore.get(table.getTableArn())
+                .filter(state -> table.getTableId().equals(state.tableId()));
+    }
+
+    void persistReplicaAutoScalingState(TableDefinition table, ReplicaAutoScalingState state) {
+        replicaAutoScalingStore.putAllAtomically(Map.of(table.getTableArn(), state));
+    }
+
     /**
      * Turns on the table's stream and persists the result, so DescribeTable reports
      * StreamSpecification / LatestStreamArn and event source mappings can find the stream.
@@ -1011,7 +1050,17 @@ public class DynamoDbService {
         return table;
     }
 
+    Object tableControlLock(String tableName, String region) {
+        return tableControlLocks.lockFor(scopedItemsKey(regionKey(region, canonicalTableName(region, tableName))));
+    }
+
     public void deleteTable(String tableName, String region) {
+        synchronized (tableControlLock(tableName, region)) {
+            deleteTableLocked(tableName, region);
+        }
+    }
+
+    private void deleteTableLocked(String tableName, String region) {
         String canonicalTableName = canonicalTableName(region, tableName);
         String storageKey = regionKey(region, canonicalTableName);
         TableDefinition table = tableStore.get(storageKey)
@@ -1042,6 +1091,11 @@ public class DynamoDbService {
             // Discard any buffered CDC records and stop draining: the destination stream is gone.
             kinesisForwarder.onTableDeleted(regionResolver.getAccountId(), region, canonicalTableName);
         }
+        // Preserve the existing item/stream teardown even if the new settings file cannot be committed.
+        // A retained record belongs to the deleted TableId and cannot attach to a recreated table.
+        if (replicaAutoScalingStore.get(table.getTableArn()).isPresent()) {
+            replicaAutoScalingStore.deleteAllAtomically(Set.of(table.getTableArn()));
+        }
         LOG.infov("Deleted table: {0}", canonicalTableName);
     }
 
@@ -1054,19 +1108,6 @@ public class DynamoDbService {
         if (kinesisForwarder != null) {
             kinesisForwarder.onDestinationDisabled(regionResolver.getAccountId(), region, tableName, streamArn);
         }
-    }
-
-    Object capacityLock() {
-        return capacityLock;
-    }
-
-    private Capacity reservedCapacity(String region) {
-        String prefix = region + "::";
-        Capacity reserved = Capacity.NONE;
-        for (TableDefinition table : tableStore.scan(k -> k.startsWith(prefix))) {
-            reserved = reserved.plus(Capacity.of(table));
-        }
-        return reserved;
     }
 
     public List<String> listTables(String region) {
@@ -1422,12 +1463,6 @@ public class DynamoDbService {
 
         String itemKey = buildItemKey(table, key, true);
 
-        // AWS refuses an over-limit statement before it evaluates the condition.
-        if (sizeRule == UpdateSizeRule.UPDATE_ITEM && updateExpression != null) {
-            DynamoDbItemSize.updateStatementSize(updateExpression, path -> parsePath(path, expressionAttrNames),
-                    expressionAttrValues).ifPresent(DynamoDbService::requireUpdateStatementWithinSizeLimit);
-        }
-
         return withItemLock(storageKey, itemKey, () -> {
             ConcurrentSkipListMap<String, JsonNode> items = itemsFor(storageKey, stagedItems, true);
 
@@ -1537,7 +1572,12 @@ public class DynamoDbService {
             // AWS validates index key values against the item the update produces.
             validateIndexKeyTypes(table, item, true);
 
-            requireUpdatedItemWithinSizeLimit(item);
+            if (sizeRule == UpdateSizeRule.UPDATE_ITEM && updateExpression != null) {
+                requireUpdateItemWithinSizeLimit(item, DynamoDbItemSize.updateStatementSize(updateExpression,
+                        path -> parsePath(path, expressionAttrNames), expressionAttrValues));
+            } else {
+                requireUpdatedItemWithinSizeLimit(item);
+            }
 
             if (stagedItems == null) {
                 pointInTimeRecovery.recordItem(regionResolver.getAccountId(), storageKey, table, itemKey, existing);
@@ -1643,29 +1683,69 @@ public class DynamoDbService {
                     .toList();
         }
 
-        // Order by the full (possibly composite) sort key, comparing each attribute in key-schema
-        // order (floci-io/floci#1675), then, on an index, by the table key, which is what
-        // tells apart items whose index keys tie.
-        List<String> orderKeyNames = new ArrayList<>(sortKeyNames);
-        if (accessPath.isIndex()) {
-            orderKeyNames.add(table.getPartitionKeyName());
-            if (table.getSortKeyName() != null) {
-                orderKeyNames.add(table.getSortKeyName());
+        // Sort by the full (possibly composite) sort key, comparing each attribute in key-schema
+        // order. Using only the first sort-key attribute would ignore the remaining components
+        // (e.g. a "requestStateQuery RANGE, createdAt RANGE" index would never order by createdAt),
+        // which in turn breaks ScanIndexForward=false. See floci-io/floci#1675.
+        if (!sortKeyNames.isEmpty()) {
+            List<String> finalSortKeyNames = sortKeyNames;
+            results = new ArrayList<>(results);
+            results.sort((a, b) -> {
+                for (String name : finalSortKeyNames) {
+                    JsonNode aAttr = a.get(name);
+                    JsonNode bAttr = b.get(name);
+                    int cmp;
+                    if (aAttr == null && bAttr == null) cmp = 0;
+                    else if (aAttr == null) cmp = -1;
+                    else if (bAttr == null) cmp = 1;
+                    else cmp = ExpressionEvaluator.compareAttributeValues(aAttr, bAttr);
+                    if (cmp != 0) return cmp;
+                }
+                return 0;
+            });
+            if (Boolean.FALSE.equals(scanIndexForward)) {
+                Collections.reverse(results);
             }
         }
-        Comparator<JsonNode> keyOrder = (a, b) -> compareKeyAttributes(a, b, orderKeyNames);
-        int direction = Boolean.FALSE.equals(scanIndexForward) ? -1 : 1;
-        if (!orderKeyNames.isEmpty()) {
-            results = new ArrayList<>(results);
-            results.sort((a, b) -> direction * keyOrder.compare(a, b));
-        }
 
-        // ExclusiveStartKey is a position in key order, not a pointer to an item, so the
-        // query resumes after it even when no item has that key any more.
+        // Apply ExclusiveStartKey offset
         if (exclusiveStartKey != null) {
-            results = results.stream()
-                    .filter(item -> direction * keyOrder.compare(item, exclusiveStartKey) > 0)
-                    .toList();
+            String tablePkName = table.getPartitionKeyName();
+            String tableSkName = table.getSortKeyName();
+            boolean hasTableKeys = exclusiveStartKey.has(tablePkName);
+
+            String startItemKey = hasTableKeys
+                    ? buildItemKeyFromNode(exclusiveStartKey, tablePkName, tableSkName)
+                    : buildItemKeyFromNode(exclusiveStartKey, pkName, sortKeyNames);
+
+            int startIdx = -1;
+            for (int i = 0; i < results.size(); i++) {
+                String thisKey = hasTableKeys
+                        ? buildItemKeyFromNode(results.get(i), tablePkName, tableSkName)
+                        : buildItemKeyFromNode(results.get(i), pkName, sortKeyNames);
+                if (thisKey.equals(startItemKey)) {
+                    startIdx = i;
+                    break;
+                }
+            }
+            if (startIdx >= 0) {
+                results = new ArrayList<>(results.subList(startIdx + 1, results.size()));
+            } else if (!accessPath.isIndex() && tableSkName != null && exclusiveStartKey.has(tableSkName)) {
+                // The item the last page ended on is gone: resume after the place its sort key
+                // holds in the order of this query. A table's sort key is unique in a partition.
+                JsonNode startSortKey = exclusiveStartKey.get(tableSkName);
+                int direction = Boolean.FALSE.equals(scanIndexForward) ? -1 : 1;
+                int resumeIdx = results.size();
+                for (int i = 0; i < results.size(); i++) {
+                    JsonNode sortKey = results.get(i).get(tableSkName);
+                    if (sortKey != null
+                            && direction * ExpressionEvaluator.compareAttributeValues(sortKey, startSortKey) > 0) {
+                        resumeIdx = i;
+                        break;
+                    }
+                }
+                results = new ArrayList<>(results.subList(resumeIdx, results.size()));
+            }
         }
 
         List<JsonNode> evaluatedItems = results;
@@ -1736,15 +1816,6 @@ public class DynamoDbService {
                             JsonNode expressionAttrNames, JsonNode expressionAttrValues,
                             JsonNode scanFilter, Integer limit, JsonNode exclusiveStartKey,
                             String indexName, Integer segment, Integer totalSegments, String region) {
-        return scan(tableName, filterExpression, expressionAttrNames, expressionAttrValues,
-                scanFilter, limit, exclusiveStartKey, indexName, segment, totalSegments, "AND", region);
-    }
-
-    public ScanResult scan(String tableName, String filterExpression,
-                            JsonNode expressionAttrNames, JsonNode expressionAttrValues,
-                            JsonNode scanFilter, Integer limit, JsonNode exclusiveStartKey,
-                            String indexName, Integer segment, Integer totalSegments,
-                            String conditionalOperator, String region) {
         DynamoDbReservedWords.check(filterExpression, "FilterExpression");
         String canonicalTableName = canonicalTableName(region, tableName);
         String storageKey = regionKey(region, canonicalTableName);
@@ -1805,9 +1876,7 @@ public class DynamoDbService {
             // is not read, does not count toward ScannedCount, and the cursor
             // anchors to the previous scanned item (which, with a filter, may well
             // be an item that was not returned).
-            // Scan reads and filters only what the index holds, so non-projected attributes never match.
-            JsonNode filtered = indexItem(item, accessPath, table);
-            int sz = DynamoDbItemSize.calculateItemSize(filtered);
+            int sz = readItemSize(item, accessPath, table);
             if (accSize > 0 && accSize + sz > MAX_RESPONSE_BYTES) {
                 lastEvaluatedKey = buildKeyNode(table, lastScanned, lekPkName, lekSkName, indexScan);
                 break;
@@ -1818,8 +1887,8 @@ public class DynamoDbService {
             scannedItems.add(item);
             lastScanned = item;
             boolean matched = (filterExpression == null
-                    || matchesFilterExpression(filtered, filterExpression, expressionAttrNames, expressionAttrValues))
-                    && (scanFilter == null || matchesScanFilterPublic(filtered, scanFilter, conditionalOperator));
+                    || matchesFilterExpression(item, filterExpression, expressionAttrNames, expressionAttrValues))
+                    && (scanFilter == null || matchesScanFilter(item, scanFilter));
             if (matched) {
                 results.add(item);
             }
@@ -1843,15 +1912,11 @@ public class DynamoDbService {
     // index stores, not on the full base item. Characterised on real AWS (us-east-1,
     // 2026-09-05): querying a 20KB item through a KEYS_ONLY GSI costs 0.5 units.
     private int readItemSize(JsonNode item, DynamoDbAccessPath accessPath, TableDefinition table) {
-        return DynamoDbItemSize.calculateItemSize(indexItem(item, accessPath, table));
-    }
-
-    private static JsonNode indexItem(JsonNode item, DynamoDbAccessPath accessPath, TableDefinition table) {
         if (!accessPath.isIndex() || "ALL".equals(accessPath.projectionType())) {
-            return item;
+            return DynamoDbItemSize.calculateItemSize(item);
         }
-        return ProjectionEvaluator.trimToAttributes(
-                (ObjectNode) item, accessPath.projectedAttributeNames(table));
+        return DynamoDbItemSize.calculateItemSize(ProjectionEvaluator.trimToAttributes(
+                (ObjectNode) item, accessPath.projectedAttributeNames(table)));
     }
 
     // The 1 MB page counts the size above. The bill of a base table read counts a vector
@@ -1862,27 +1927,25 @@ public class DynamoDbService {
     }
 
     public boolean matchesScanFilterPublic(JsonNode item, JsonNode scanFilter) {
-        return matchesScanFilterPublic(item, scanFilter, "AND");
+        return matchesScanFilter(item, scanFilter);
     }
 
     public boolean matchesKeyConditionPublic(JsonNode attrValue, JsonNode condition) {
         return matchesKeyCondition(attrValue, condition);
     }
 
-    public boolean matchesScanFilterPublic(JsonNode item, JsonNode scanFilter, String conditionalOperator) {
-        boolean useOr = "OR".equals(conditionalOperator);
+    private boolean matchesScanFilter(JsonNode item, JsonNode scanFilter) {
         Iterator<Map.Entry<String, JsonNode>> fields = scanFilter.fields();
         while (fields.hasNext()) {
             Map.Entry<String, JsonNode> entry = fields.next();
             String attrName = entry.getKey();
             JsonNode condition = entry.getValue();
             JsonNode attrValue = item.get(attrName);
-            boolean matched = matchesKeyCondition(attrValue, condition);
-            if (matched == useOr) {
-                return useOr;
+            if (!matchesKeyCondition(attrValue, condition)) {
+                return false;
             }
         }
-        return !useOr;
+        return true;
     }
 
     // --- Batch Operations ---
@@ -2456,8 +2519,8 @@ public class DynamoDbService {
         }
     }
 
-    private static void requireUpdateStatementWithinSizeLimit(int statementSize) {
-        if (!DynamoDbItemSize.updateStatementWithinLimit(statementSize)) {
+    private static void requireUpdateItemWithinSizeLimit(JsonNode item, int statementSize) {
+        if (!DynamoDbItemSize.updateItemWithinLimit(item, statementSize)) {
             throw new UpdatedItemTooLargeException();
         }
     }
@@ -2534,17 +2597,6 @@ public class DynamoDbService {
                                         List<AttributeDefinition> newAttrDefs,
                                         List<VectorIndexCreate> vectorCreates, List<String> vectorDeletes,
                                         String billingMode, String region) {
-        return updateTable(tableName, readCapacity, writeCapacity, gsiCreates, gsiDeletes, List.of(),
-                           newAttrDefs, vectorCreates, vectorDeletes, billingMode, region);
-    }
-
-    /** @param gsiUpdates the index throughput changes, which the caller applies after this returns */
-    public TableDefinition updateTable(String tableName, Long readCapacity, Long writeCapacity,
-                                        List<GlobalSecondaryIndex> gsiCreates, List<String> gsiDeletes,
-                                        List<GsiThroughputUpdate> gsiUpdates,
-                                        List<AttributeDefinition> newAttrDefs,
-                                        List<VectorIndexCreate> vectorCreates, List<String> vectorDeletes,
-                                        String billingMode, String region) {
         String canonicalTableName = canonicalTableName(region, tableName);
         String storageKey = regionKey(region, canonicalTableName);
         TableDefinition table = tableStore.get(storageKey)
@@ -2560,7 +2612,6 @@ public class DynamoDbService {
             throw new AwsException("ValidationException",
                     "The parameter 'ProvisionedThroughput.WriteCapacityUnits' must be greater than 0", 400);
         }
-        DynamoDbCapacityQuotas.requireWithinTableQuota(readCapacity, writeCapacity, region);
         if (readCapacity != null && writeCapacity != null
                 && "PROVISIONED".equals(table.getBillingMode())
                 && readCapacity.equals(table.getProvisionedThroughput().getReadCapacityUnits())
@@ -2606,42 +2657,15 @@ public class DynamoDbService {
         if (newAttrDefs != null) {
             knownAttrDefs.addAll(newAttrDefs);
         }
-        String newBillingMode = billingMode != null ? billingMode : table.getBillingMode();
         validateVectorIndexUpdates(table, vectorIndexCreates, vectorIndexDeletes,
-                gsiCreates.size() + gsiDeletes.size(), knownAttrDefs, newBillingMode);
-        if (!"PAY_PER_REQUEST".equals(newBillingMode)) {
-            DynamoDbCapacityQuotas.requireUpdateWithinQuotas(table, readCapacity, writeCapacity, gsiCreates,
-                    gsiDeletes, gsiUpdates, reservedCapacity(region), region);
-        }
+                gsiCreates.size() + gsiDeletes.size(), knownAttrDefs,
+                billingMode != null ? billingMode : table.getBillingMode());
 
         if (readCapacity != null) {
             table.getProvisionedThroughput().setReadCapacityUnits(readCapacity);
-            if (readCapacity > table.getWarmReadUnitsPerSecond()) {
-                table.setWarmReadUnitsPerSecond(readCapacity);
-            }
         }
         if (writeCapacity != null) {
             table.getProvisionedThroughput().setWriteCapacityUnits(writeCapacity);
-            if (writeCapacity > table.getWarmWriteUnitsPerSecond()) {
-                table.setWarmWriteUnitsPerSecond(writeCapacity);
-            }
-        }
-
-        // Handle billing mode switch.
-        if (billingMode != null && !billingMode.equals(table.getBillingMode())) {
-            table.setBillingMode(billingMode);
-            if ("PAY_PER_REQUEST".equals(billingMode)) {
-                table.getProvisionedThroughput().setReadCapacityUnits(0L);
-                table.getProvisionedThroughput().setWriteCapacityUnits(0L);
-                long wru = TableDefinition.defaultWarmReadUnits("PAY_PER_REQUEST", null);
-                long wwu = TableDefinition.defaultWarmWriteUnits("PAY_PER_REQUEST", null);
-                if (wru > table.getWarmReadUnitsPerSecond()) {
-                    table.setWarmReadUnitsPerSecond(wru);
-                }
-                if (wwu > table.getWarmWriteUnitsPerSecond()) {
-                    table.setWarmWriteUnitsPerSecond(wwu);
-                }
-            }
         }
 
         for (String indexName : gsiDeletes) {
@@ -2661,7 +2685,7 @@ public class DynamoDbService {
             VectorIndex vectorIndex = create.index();
             vectorIndex.setIndexArn(table.getTableArn() + "/index/" + vectorIndex.getIndexName());
             vectorIndex.setIndexStatus("CREATING");
-            vectorIndex.setCreationStartedAt(Instant.now());
+            vectorIndex.setCreationStartedAt(clock.instant());
             table.getVectorIndexes().add(vectorIndex);
         }
         if (!vectorIndexCreates.isEmpty()) {
@@ -3273,12 +3297,12 @@ public class DynamoDbService {
                 .orElseThrow(() -> new AwsException("TableNotFoundException", "Table not found: " + tableName, 400));
     }
 
-    static boolean isExpired(JsonNode item, TableDefinition table) {
+    boolean isExpired(JsonNode item, TableDefinition table) {
         if (!table.isTtlEnabled() || table.getTtlAttributeName() == null) return false;
         JsonNode attr = item.get(table.getTtlAttributeName());
         if (attr == null || !attr.has("N")) return false;
         try {
-            return Long.parseLong(attr.get("N").asText()) < Instant.now().getEpochSecond();
+            return Long.parseLong(attr.get("N").asText()) < clock.instant().getEpochSecond();
         } catch (NumberFormatException e) {
             return false;
         }
@@ -3531,7 +3555,6 @@ public class DynamoDbService {
             throw new AwsException("ValidationException",
                     "Invalid UpdateExpression: The expression can not be empty;", 400);
         }
-        requireAssignmentAfterSetTarget(expression);
         requireClosedParentheses(expression, "");
         // AWS tokenizes UpdateExpression whitespace-insensitively, so collapse runs of
         // whitespace (newlines, tabs, multiple spaces) so clause-keyword dispatch and the
@@ -3541,7 +3564,6 @@ public class DynamoDbService {
         // name as a bare identifier instead.
         String remaining = expression.trim().replaceAll("\\s+", " ");
         DynamoDbReservedWords.check(remaining, "UpdateExpression");
-        requireSectionsUsedOnce(remaining);
 
         while (!remaining.isEmpty()) {
             String upper = remaining.toUpperCase();
@@ -3778,7 +3800,6 @@ public class DynamoDbService {
 
     private String applyRemoveClause(ObjectNode item, String clause, JsonNode exprAttrNames,
                                      List<String> touched) {
-        List<String> paths = new ArrayList<>();
         while (!clause.isEmpty()) {
             String upper = clause.toUpperCase();
             if (upper.startsWith("SET ") || upper.startsWith("ADD ") || upper.startsWith("DELETE ")) {
@@ -3804,35 +3825,9 @@ public class DynamoDbService {
             }
 
             touched.add(attrPart);
-            paths.add(attrPart);
-        }
-        // Every action addresses the item as it was before the update, so a list loses its later
-        // indexes first and an earlier removal never shifts the element a later one names.
-        paths.sort(Comparator.comparing((String path) -> parsePath(path, exprAttrNames), DynamoDbService::removalOrder));
-        for (String path : paths) {
-            removeValueAtPath(item, path, exprAttrNames);
+            removeValueAtPath(item, attrPart, exprAttrNames);
         }
         return clause;
-    }
-
-    /** Orders parsed paths so that, within one list, a higher index sorts first. */
-    private static int removalOrder(List<Object> left, List<Object> right) {
-        for (int i = 0; i < Math.min(left.size(), right.size()); i++) {
-            Object a = left.get(i);
-            Object b = right.get(i);
-            int order;
-            if (a instanceof Long x && b instanceof Long y) {
-                order = Long.compare(y, x);
-            } else if (a instanceof String x && b instanceof String y) {
-                order = x.compareTo(y);
-            } else {
-                order = a instanceof Long ? -1 : 1;
-            }
-            if (order != 0) {
-                return order;
-            }
-        }
-        return Integer.compare(right.size(), left.size());
     }
 
     private String applyAddClause(ObjectNode item, String clause,
@@ -4171,7 +4166,7 @@ public class DynamoDbService {
             arr.add(value);
         }
     }
-
+    
     private void setValueAtPath(ObjectNode item, String path, JsonNode value, JsonNode exprAttrNames) {
         List<Object> tokens = parsePath(path, exprAttrNames);
         if (tokens.isEmpty()) return;
@@ -4455,70 +4450,8 @@ public class DynamoDbService {
         }
     }
 
-    static void requireSectionsUsedOnce(String expression) {
-        Set<String> seen = new HashSet<>();
-        for (ExpressionEvaluator.Token token : ExpressionEvaluator.tokenize(expression)) {
-            String word = token.value().toUpperCase(Locale.ROOT);
-            if (token.type() == ExpressionEvaluator.TokenType.IDENTIFIER && UPDATE_SECTIONS.contains(word)
-                    && !seen.add(word)) {
-                throw new AwsException("ValidationException", "Invalid UpdateExpression: The \"" + word
-                        + "\" section can only be used once in an update expression;", 400);
-            }
-        }
-    }
-
     private static boolean isUpdatePunctuation(char c) {
         return "()[],.=+-".indexOf(c) >= 0;
-    }
-
-    private static final Set<String> UPDATE_SECTIONS = Set.of("SET", "REMOVE", "ADD", "DELETE");
-
-    // DynamoDB reads a SET target path up to "=", so a comma before it fails on the comma.
-    static void requireAssignmentAfterSetTarget(String expression) {
-        List<ExpressionEvaluator.Token> tokens = ExpressionEvaluator.tokenize(expression);
-        boolean inSet = false;
-        int target = -1;
-        int depth = 0;
-        for (int i = 0; i < tokens.size(); i++) {
-            ExpressionEvaluator.Token token = tokens.get(i);
-            if (target >= 0) {
-                switch (token.type()) {
-                    case COMMA -> throw new AwsException("ValidationException",
-                            "Invalid UpdateExpression: Syntax error; token: \",\", near: \""
-                                    + expression.substring(tokens.get(i - 1).pos(), tokens.get(i + 1).end()) + "\"",
-                            400);
-                    case EQ -> {
-                        if (i == target) {
-                            return;
-                        }
-                        target = -1;
-                    }
-                    case IDENTIFIER, NAME_REF, DOT, LBRACKET, NUMBER, RBRACKET -> { }
-                    default -> {
-                        return;
-                    }
-                }
-                continue;
-            }
-            switch (token.type()) {
-                case LPAREN -> depth++;
-                case RPAREN -> depth--;
-                case COMMA -> target = inSet && depth == 0 ? i + 1 : -1;
-                case IDENTIFIER -> {
-                    String word = token.value().toUpperCase(Locale.ROOT);
-                    if (depth == 0 && UPDATE_SECTIONS.contains(word)) {
-                        inSet = word.equals("SET");
-                        target = inSet ? i + 1 : -1;
-                    }
-                }
-                case UNKNOWN -> {
-                    if (!isUpdatePunctuation(token.value().charAt(0))) {
-                        return;
-                    }
-                }
-                default -> { }
-            }
-        }
     }
 
     static int findNextComma(String s) {
@@ -5128,27 +5061,6 @@ public class DynamoDbService {
         };
     }
 
-    private static int compareKeyAttributes(JsonNode a, JsonNode b, List<String> keyNames) {
-        for (String name : keyNames) {
-            JsonNode aAttr = a.get(name);
-            JsonNode bAttr = b.get(name);
-            int cmp;
-            if (aAttr == null && bAttr == null) {
-                cmp = 0;
-            } else if (aAttr == null) {
-                cmp = -1;
-            } else if (bAttr == null) {
-                cmp = 1;
-            } else {
-                cmp = ExpressionEvaluator.compareAttributeValues(aAttr, bAttr);
-            }
-            if (cmp != 0) {
-                return cmp;
-            }
-        }
-        return 0;
-    }
-
     private void validateExclusiveStartKeyWithinQuery(JsonNode exclusiveStartKey, TableDefinition table,
                                                       DynamoDbAccessPath accessPath, JsonNode keyConditions,
                                                       String keyConditionExpression, JsonNode expressionAttrValues,
@@ -5664,8 +5576,8 @@ public class DynamoDbService {
         return new Page<>(sorted.subList(startIdx, end), newNextToken);
     }
 
-    private static String newJobId() {
-        return System.currentTimeMillis() + "-" + UUID.randomUUID().toString().replace("-", "");
+    private String newJobId() {
+        return clock.millis() + "-" + UUID.randomUUID().toString().replace("-", "");
     }
 
     // --- Backup Operations ---
@@ -5880,9 +5792,11 @@ public class DynamoDbService {
      */
     static void validateBillingMode(JsonNode request, String memberPrefix) {
         JsonNode billingMode = request.path("BillingMode");
-        if (billingMode.isTextual() && !BILLING_MODES.contains(billingMode.asText())) {
-            throw SmithyValidationErrors.validationException(SmithyValidationErrors.notInEnum(
-                    billingMode.asText(), memberPrefix + "billingMode", BILLING_MODES));
+        if (billingMode.isTextual() && !VALID_BILLING_MODES.contains(billingMode.asText())) {
+            throw SmithyValidationErrors.validationException(
+                    "Value '" + billingMode.asText() + "' at '" + memberPrefix
+                    + "billingMode' failed to satisfy constraint: "
+                    + "Member must satisfy enum value set: [PROVISIONED, PAY_PER_REQUEST]");
         }
     }
 
@@ -5967,7 +5881,7 @@ public class DynamoDbService {
         desc.setTableCreationParameters(request.get("TableCreationParameters"));
         desc.setCloudWatchLogGroupArn(AwsArnUtils.Arn.of("logs", region, accountId,
                 "log-group:/aws-dynamodb/imports:*").toString());
-        desc.setStartTime(Instant.now().getEpochSecond());
+        desc.setStartTime(clock.instant().getEpochSecond());
         if (importStore != null) {
             importStore.put(importArn, desc);
         }
@@ -6018,7 +5932,7 @@ public class DynamoDbService {
             failImport(desc, "UNKNOWN", e.getMessage());
         }
         persistItems(regionKey(region, tableName));
-        desc.setEndTime(Instant.now().getEpochSecond());
+        desc.setEndTime(clock.instant().getEpochSecond());
         activateTable(tableName, region);
         if (importStore != null) {
             importStore.put(desc.getImportArn(), desc);
@@ -6087,7 +6001,7 @@ public class DynamoDbService {
      * worker survives the process. An import also leaves its table stuck in CREATING.
      */
     private void recoverInterruptedJobs() {
-        long now = Instant.now().getEpochSecond();
+        long now = clock.instant().getEpochSecond();
         if (exportStore instanceof AccountAwareStorageBackend<ExportDescription> exports) {
             for (AccountAwareStorageBackend.AccountEntry<ExportDescription> entry : exports.scanAllAccountEntries(k -> true)) {
                 ExportDescription desc = entry.value();
@@ -6156,7 +6070,7 @@ public class DynamoDbService {
             resources.add(new ExplorerResource(
                     table.getTableArn(), "dynamodb:table", "dynamodb",
                     parsed.region(), parsed.accountId(),
-                    table.getCreationDateTime() != null ? table.getCreationDateTime() : Instant.now(),
+                    table.getCreationDateTime() != null ? table.getCreationDateTime() : clock.instant(),
                     table.getTags() != null ? table.getTags() : Map.of()));
         }
         return resources;

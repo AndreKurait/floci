@@ -1,9 +1,9 @@
-package io.floci.aws.core.common;
+package io.github.hectorvent.floci.core.common;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.cbor.CBORFactory;
-import io.floci.aws.core.common.TagOnCreate.TagSet;
-import io.floci.aws.core.common.TagOnCreate.Tagging;
+import io.github.hectorvent.floci.core.common.TagOnCreate.TagSet;
+import io.github.hectorvent.floci.core.common.TagOnCreate.Tagging;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.MediaType;
 import org.junit.jupiter.api.Test;
@@ -41,18 +41,16 @@ class TagOnCreateTest {
     }
 
     @Test
-    void controlTowerUsesModeledTagMapsAndChecksTheCreateActionWithTheirTags() {
-        for (String operation : List.of("CreateLandingZone", "EnableControl", "EnableBaseline")) {
-            Tagging tagging = TagOnCreate.of("controltower:" + operation, json(
-                    "{\"tags\":{\"team\":\"blue\"}}")).orElseThrow();
-            assertEquals("controltower:TagResource", tagging.action());
-            assertEquals(List.of(set(Map.of("team", "blue"))), tagging.sets());
-            assertTrue(tagging.requestTags());
-            assertFalse(tagging.createAction());
-            assertEquals(List.of(Map.of("aws:RequestTag/team", List.of("blue"), "aws:TagKeys", List.of("team"))),
-                    TagOnCreate.requestTagContexts(tagging));
-            assertFalse(TagOnCreate.of("controltower:" + operation, json("{\"tags\":{}}")).isPresent());
-        }
+    void assumeRoleUsesOnlyConsumedSessionTagsAndRetainsGeneratedAuthorization() {
+        Tagging tags = TagOnCreate.of("sts:AssumeRole", form("Action=AssumeRole"
+                + "&Tags.member.3.Key=Project&Tags.member.3.Value=session"
+                + "&tags.member.1.Key=Other&tags.member.1.Value=unused")).orElseThrow();
+        assertEquals("sts:TagSession", tags.action());
+        assertEquals(List.of(set(Map.of("Project", "session"))), tags.checked());
+        assertEquals(List.of(Map.of("aws:RequestTag/Project", List.of("session"),
+                "aws:TagKeys", List.of("Project"))), TagOnCreate.requestTagContexts(tags));
+        assertEquals(Optional.empty(), TagOnCreate.of("sts:AssumeRole", form("Action=AssumeRole"
+                + "&tags.member.1.Key=Project&tags.member.1.Value=unused")));
     }
 
     @Test
@@ -90,34 +88,38 @@ class TagOnCreateTest {
                         + "&TagSpecification.item.1.Tag.1.Key=team")).orElseThrow().otherSpellings());
     }
 
-    /** CodeDeploy reads its modeled {@code Key}/{@code Value} tags; other spellings stay on the tagging check. */
+    /**
+     * CodeDeploy's handler reads a tag as {@code Key} and {@code Value}, or as {@code key} and {@code value}, so both
+     * are the tags it applies; under any other case a tag is checked on the tagging action only.
+     */
     @Test
-    void aBodysTagsAreReadInTheModeledCaseAndCheckedOnTheTaggingActionInAnyOther() {
-        for (String operation : List.of("CreateApplication", "CreateDeploymentGroup")) {
-            Tagging tagging = TagOnCreate.of("codedeploy:" + operation, json(
-                    "{\"applicationName\":\"demo\",\"tags\":[{\"Key\":\"team\",\"Value\":\"red\"}]}")).orElseThrow();
-            assertEquals(List.of(set(Map.of("team", "red"))), tagging.sets(), operation);
-            assertEquals(List.of(), tagging.otherSpellings(), operation);
+    void aBodysTagsAreReadInTheCasesTheirHandlerReadsAndCheckedOnTheTaggingActionInAnyOther() {
+        for (String tag : List.of("{\"key\":\"team\",\"value\":\"red\"}", "{\"Key\":\"team\",\"Value\":\"red\"}")) {
+            Tagging tagging = TagOnCreate.of("codedeploy:CreateApplication", json(
+                    "{\"applicationName\":\"demo\",\"tags\":[" + tag + "]}")).orElseThrow();
+            assertEquals(List.of(set(Map.of("team", "red"))), tagging.sets(), tag);
+            assertEquals(List.of(), tagging.otherSpellings(), tag);
         }
-        Tagging lower = TagOnCreate.of("codedeploy:CreateApplication", json(
-                "{\"applicationName\":\"demo\",\"tags\":[{\"key\":\"team\",\"value\":\"red\"}]}")).orElseThrow();
-        assertEquals(List.of(), lower.sets());
-        assertEquals(List.of(set(Map.of("team", "red"))), lower.otherSpellings());
+        // Under any other case the handler reads neither, and keeps an empty tag; the tagging action is checked for both.
         Tagging upper = TagOnCreate.of("codedeploy:CreateApplication", json(
                 "{\"applicationName\":\"demo\",\"tags\":[{\"KEY\":\"team\",\"VALUE\":\"red\"}]}")).orElseThrow();
-        assertEquals(List.of(), upper.sets());
-        assertEquals(List.of(set(Map.of("team", "red"))), upper.otherSpellings());
+        assertEquals(List.of(set(Map.of("", ""))), upper.sets());
+        assertEquals(List.of(set(Map.of("", "")), set(Map.of("team", "red"))), upper.checked());
+        // Only CodeDeploy's handler reads a lowercase key where the SDK sends Key.
         assertEquals(List.of(), sets("dynamodb:CreateTable", json(
                 "{\"TableName\":\"t\",\"Tags\":[{\"key\":\"team\",\"value\":\"red\"}]}")));
     }
 
-    /** A non-list CodeDeploy tags member is not applied, though its contents remain visible to the safety check. */
+    /**
+     * CodeDeploy's handler iterates its tags member whatever it holds, so an object's values are tags too; a deny on
+     * one holds on the own action and the tagging action alike.
+     */
     @Test
-    void anObjectsValuesAreOnlyOtherSpellingsForCodeDeploy() {
+    void anObjectsValuesAreTagsWhereTheHandlerIteratesIt() {
         Tagging object = TagOnCreate.of("codedeploy:CreateApplication", json("{\"applicationName\":\"demo\","
                 + "\"tags\":{\"0\":{\"key\":\"team\",\"value\":\"red\"}}}")).orElseThrow();
-        assertEquals(List.of(), object.sets());
-        assertTrue(object.otherSpellings().contains(set(Map.of("team", "red"))));
+        assertEquals(List.of(set(Map.of("team", "red"))), object.sets());
+        assertEquals(List.of("red"), TagOnCreate.requestTagContexts(object).getFirst().get("aws:RequestTag/team"));
         // Elsewhere it is checked on the tagging action and with the own action, beside no tags.
         Tagging elsewhere = TagOnCreate.of("dynamodb:CreateTable", json("{\"TableName\":\"t\","
                 + "\"Tags\":{\"0\":{\"Key\":\"team\",\"Value\":\"red\"}}}")).orElseThrow();
@@ -130,25 +132,15 @@ class TagOnCreateTest {
     }
 
     /**
-     * An object read as a list of tags and as a map gives two sets, so a member named as its structure's key does not
-     * replace the tag a handler iterating the object applies.
+     * CodeDeploy's handler reads a tag's key and value as text whatever they hold, a missing key as an empty one,
+     * and so does the check; other handlers' keys are read as text when they are a number or a flag too.
      */
     @Test
-    void anObjectReadAsTagsAndAsAMapGivesASetForEach() {
-        Tagging collision = TagOnCreate.of("kms:CreateKey", json(
-                "{\"Tags\":{\"team\":{\"TagKey\":\"team\",\"TagValue\":\"red\"}}}")).orElseThrow();
-        assertEquals(List.of(), collision.sets());
-        assertEquals(List.of(set(Map.of("team", "red")), set(Map.of("team", ""))), collision.otherSpellings());
-        assertEquals(List.of(List.of(), List.of("red"), List.of("")), TagOnCreate.requestTagContexts(collision).stream()
-                .map(context -> context.getOrDefault("aws:RequestTag/team", List.of())).toList());
-        // A map holding only strings is read as a map alone.
-        assertEquals(List.of(set(Map.of("team", "red"))), TagOnCreate.of("kms:CreateKey", json(
-                "{\"Tags\":{\"team\":\"red\"}}")).orElseThrow().otherSpellings());
-    }
-
-    /** Some handlers read non-string tag fields as text, and the check follows their current behavior. */
-    @Test
     void aTagKeyThatIsNoStringIsReadAsText() {
+        assertEquals(List.of(set(Map.of("123", "red"))), sets("codedeploy:CreateApplication", json(
+                "{\"applicationName\":\"demo\",\"tags\":[{\"key\":123,\"value\":\"red\"}]}")));
+        assertEquals(List.of(set(Map.of("", "red"))), sets("codedeploy:CreateApplication", json(
+                "{\"applicationName\":\"demo\",\"tags\":[{\"value\":\"red\"}]}")));
         assertEquals(List.of(set(Map.of("true", "1"))), sets("dynamodb:CreateTable", json(
                 "{\"TableName\":\"t\",\"Tags\":[{\"Key\":true,\"Value\":1}]}")));
         // Under any other spelling, every element of a tag list is checked on the tagging action.

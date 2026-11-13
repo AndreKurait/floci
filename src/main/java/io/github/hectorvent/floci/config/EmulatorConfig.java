@@ -1,4 +1,4 @@
-package io.floci.aws.config;
+package io.github.hectorvent.floci.config;
 
 import io.smallrye.config.ConfigMapping;
 import io.smallrye.config.WithDefault;
@@ -99,7 +99,7 @@ public interface EmulatorConfig {
     /**
      * Path to a shared mock-response configuration file used by the fixed-stub AI services
      * (Textract, Comprehend, Rekognition) to return a caller-configured response instead of
-     * their default canned stub. See {@link io.floci.aws.core.common.AiMockConfigLoader}.
+     * their default canned stub. See {@link io.github.hectorvent.floci.core.common.AiMockConfigLoader}.
      * Equivalent to Step Functions' {@code SFN_MOCK_CONFIG}, but shared across services since
      * mocking here is opt-in on top of an always-available default, not the only way to invoke
      * an action.
@@ -128,6 +128,34 @@ public interface EmulatorConfig {
 
     interface NetworkConfig {
         SecurityGroupEnforcementConfig securityGroupEnforcement();
+        VpcRoutingConfig vpcRouting();
+    }
+
+    interface VpcRoutingConfig {
+        String PUBLIC_AWS_API_ADDRESS = "192.0.2.1";
+
+        @WithDefault("false")
+        boolean enabled();
+
+        /** Routes spoofed AWS API names from known VPC clients through their public NAT gateways. */
+        @WithDefault("false")
+        boolean publicAwsApi();
+
+        /** Explicit IPv4 front door for the public TCP bridge and matching recursive VPC DNS answers. */
+        Optional<String> publicAwsApiUpstreamHost();
+
+        @WithDefault("80")
+        int publicAwsApiUpstreamHttpPort();
+
+        @WithDefault("443")
+        int publicAwsApiUpstreamHttpsPort();
+
+        /** Sends public HTTPS through Floci's SNI listener, retaining the selected HTTP upstream. */
+        @WithDefault("false")
+        boolean publicAwsApiNativeHttps();
+
+        /** Exact additional peer names served by the selected public endpoint front door. */
+        Optional<List<String>> publicAwsApiHosts();
     }
 
     interface SecurityGroupEnforcementConfig {
@@ -177,6 +205,15 @@ public interface EmulatorConfig {
     }
 
     interface DnsConfig {
+        /**
+         * A local IPv4 address to bind and advertise for UDP/TCP DNS on port 53.
+         * Enables the resolver for a host process as well as a container. When unset,
+         * DNS starts automatically only inside a container, on its selected network.
+         * Workload containers must be able to reach this address.
+         * Env: {@code FLOCI_DNS_LISTEN_ADDRESS}.
+         */
+        Optional<String> listenAddress();
+
         /**
          * Additional hostname suffixes the embedded DNS server will resolve to Floci's
          * container IP, alongside the primary {@code floci.hostname}.
@@ -357,7 +394,6 @@ public interface EmulatorConfig {
     }
 
     interface ServiceStorageOverrides {
-        RekognitionStorageConfig rekognition();
         SsmStorageConfig ssm();
         SqsStorageConfig sqs();
         S3StorageConfig s3();
@@ -408,13 +444,6 @@ public interface EmulatorConfig {
         LakeFormationStorageConfig lakeformation();
         EfsStorageConfig efs();
         SageMakerStorageConfig sagemaker();
-    }
-
-    interface RekognitionStorageConfig {
-        Optional<String> mode();
-
-        @WithDefault("5000")
-        long flushIntervalMs();
     }
 
     interface ApsStorageConfig {
@@ -469,6 +498,7 @@ public interface EmulatorConfig {
     }
 
     interface LambdaStorageConfig {
+        // Function runtime-management settings share the Lambda storage mode and flush interval.
         Optional<String> mode();
 
         @WithDefault("5000")
@@ -476,7 +506,6 @@ public interface EmulatorConfig {
     }
 
     interface CloudWatchLogsStorageConfig {
-        // Saved query definitions share the Logs storage mode and flush interval.
         Optional<String> mode();
 
         // Log events are the largest and most write-heavy store, so they flush less often than the rest.
@@ -883,8 +912,6 @@ public interface EmulatorConfig {
         ConnectServiceConfig connect();
         AppIntegrationsServiceConfig appintegrations();
         DlmServiceConfig dlm();
-        SignerServiceConfig signer();
-        XrayServiceConfig xray();
         CognitoIdentityServiceConfig cognitoidentity();
         GlobalAcceleratorServiceConfig globalaccelerator();
         DataSyncServiceConfig datasync();
@@ -893,10 +920,8 @@ public interface EmulatorConfig {
 
         LakeFormationServiceConfig lakeformation();
         EfsServiceConfig efs();
-        Ec2InstanceConnectServiceConfig ec2instanceconnect();
         CodeGuruReviewerServiceConfig codegurureviewer();
         CodeArtifactServiceConfig codeartifact();
-        QuickSightServiceConfig quicksight();
         MarketplaceServiceConfig marketplace();
         DmsServiceConfig dms();
     }
@@ -962,24 +987,6 @@ public interface EmulatorConfig {
         boolean enabled();
     }
 
-    interface SignerServiceConfig {
-        @WithDefault("true")
-        boolean enabled();
-
-        /**
-         * Records signing jobs as succeeded without producing an artifact, for callers that only
-         * read job metadata. Off by default: a job that reports success must have something to
-         * download, and Floci does not sign code.
-         */
-        @WithDefault("false")
-        boolean mockSigningJobs();
-    }
-
-    interface XrayServiceConfig {
-        @WithDefault("true")
-        boolean enabled();
-    }
-
     interface CognitoIdentityServiceConfig {
         @WithDefault("true")
         boolean enabled();
@@ -998,6 +1005,13 @@ public interface EmulatorConfig {
     interface SsoAdminServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        /**
+         * AWS-managed application provider ids ({@code applicationProvider/<id>}) that CreateApplication
+         * admits besides {@code custom}, for a deployment that emulates a service creating its own
+         * IAM Identity Center application. Empty by default.
+         */
+        Optional<List<String>> additionalApplicationProviders();
     }
 
     interface SsoOidcServiceConfig {
@@ -1058,14 +1072,6 @@ public interface EmulatorConfig {
     interface CodeGuruReviewerServiceConfig {
         @WithDefault("true")
         boolean enabled();
-    }
-
-    interface QuickSightServiceConfig {
-        @WithDefault("true")
-        boolean enabled();
-
-        /** Public origin used by browser embedding clients. */
-        Optional<String> embedBaseUrl();
     }
 
     interface MarketplaceServiceConfig {
@@ -1157,7 +1163,9 @@ public interface EmulatorConfig {
         /**
          * {@code immediate} follows the job run states without running anything; {@code docker} runs
          * each Spark job run's {@code spark-submit}, and each Hive job run's {@code hive}, in a container of the
-         * application's custom image, or else of the release's EMR Serverless image.
+         * application's custom image, or else of the release's EMR Serverless image; {@code refuse} admits each
+         * job run and ends it FAILED at once, saying that job execution is not available, for deployments that
+         * must not report a run that did not execute.
          */
         @WithDefault("immediate")
         String runnerMode();
@@ -1179,16 +1187,6 @@ public interface EmulatorConfig {
          * Hive image on Amazon ECR Public.
          */
         Optional<String> hiveImageTemplate();
-
-        /**
-         * How many executors a {@code docker} Spark job run may have at once, each in a container of its own, as each
-         * has a worker of its own on EMR Serverless; 0, the default, runs a job's executors in its driver's container, in
-         * Spark's local mode. The application's maximum capacity limits them too.
-         *
-         * Env var: FLOCI_SERVICES_EMRSERVERLESS_EXECUTOR_CONTAINERS
-         */
-        @WithDefault("0")
-        int executorContainers();
 
         /**
          * When true, Floci removes, in the {@code docker} runner mode, every EMR Serverless driver a
@@ -1243,11 +1241,6 @@ public interface EmulatorConfig {
     }
 
     interface LakeFormationServiceConfig {
-        @WithDefault("true")
-        boolean enabled();
-    }
-
-    interface Ec2InstanceConnectServiceConfig {
         @WithDefault("true")
         boolean enabled();
     }
@@ -1353,14 +1346,17 @@ public interface EmulatorConfig {
     interface AutoScalingServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        /** Maximum number of direct reservation IDs accepted in an ASG capacity target. */
+        @WithDefault("1")
+        int maxCapacityReservationIds();
+
+        Optional<List<String>> multipleCapacityReservationScopes();
     }
 
     interface ApplicationAutoScalingServiceConfig {
         @WithDefault("true")
         boolean enabled();
-
-        @WithDefault("1")
-        long scheduledActionIntervalSeconds();
     }
 
     interface ElasticBeanstalkServiceConfig {
@@ -1465,8 +1461,14 @@ public interface EmulatorConfig {
         @WithDefault("true")
         boolean enabled();
 
+        @WithDefault("false")
+        boolean directCommandExecutionEnabled();
+
         @WithDefault("5")
         int maxParameterHistory();
+
+        @WithDefault("1000")
+        long resourceDataSyncIntervalMs();
     }
 
     interface SqsServiceConfig {
@@ -1649,6 +1651,20 @@ public interface EmulatorConfig {
         @WithDefault("false")
         boolean enforcementEnabled();
 
+        /** Enables bounded metadata lookup and proof verification for current AssumeRole sessions. */
+        @WithDefault("false")
+        boolean issuedSessionVerificationEnabled();
+
+        /** Enables issuer-owned current Lambda execution identity observations and proof verification. */
+        @WithDefault("false")
+        boolean lambdaIdentityVerificationEnabled();
+
+        /**
+         * Opt-in endpoint that returns SigV4 derived signing keys (never secrets) for sessions this
+         * Floci issued, to one configured caller. See {@code DerivedSigningKeyController}.
+         */
+        DerivedSigningKeysConfig derivedSigningKeys();
+
         @WithDefault("false")
         boolean seedDeployerPrincipal();
 
@@ -1658,6 +1674,31 @@ public interface EmulatorConfig {
          * is the AWS default.
          */
         Optional<String> accountAlias();
+
+        /** Optional local account-root ARN to service-principal membership JSON file, read at startup. */
+        Optional<String> servicePrincipalMembershipsPath();
+    }
+
+    /** {@code floci.services.iam.derived-signing-keys.*}; nothing but {@code enabled} is read while it is false. */
+    interface DerivedSigningKeysConfig {
+        @WithDefault("false")
+        boolean enabled();
+
+        /** The one access key ID allowed to call the endpoint; never an IAM-store key. */
+        Optional<String> callerAccessKeyId();
+
+        /** File holding that caller's secret access key (owner-only permissions). */
+        Optional<String> callerSecretAccessKeyFile();
+
+        /** Exact regions a key may be derived for. */
+        Optional<List<String>> allowedRegions();
+
+        /** Exact SigV4 signing names a key may be derived for; names Floci serves are refused. */
+        Optional<List<String>> allowedServices();
+
+        /** {@code signing} (kSigning) and/or {@code service} (kService). */
+        @WithDefault("signing")
+        List<String> allowedLevels();
     }
 
     interface MskServiceConfig {
@@ -2022,6 +2063,10 @@ public interface EmulatorConfig {
         @WithDefault("true")
         boolean enabled();
 
+        /** Metadata-only clusters and snapshots, explicitly without a graph backend. */
+        @WithDefault("false")
+        boolean mock();
+
         /** Base port of the proxy port range. First cluster gets this port. */
         @WithDefault("8182")
         int proxyBasePort();
@@ -2130,33 +2175,6 @@ public interface EmulatorConfig {
          * clusters run their HDFS in emr-7.5.0's.
          */
         Optional<String> hiveImageTemplate();
-
-        /**
-         * The memory, in MB, a {@code docker} cluster's NodeManager offers the YARN containers its steps' Spark
-         * executors run in. EMR sizes it by the instance type; Floci's node shares the machine it runs on.
-         *
-         * Env var: FLOCI_SERVICES_EMR_YARN_NODE_MEMORY_MB
-         */
-        @WithDefault("4096")
-        int yarnNodeMemoryMb();
-
-        /**
-         * The virtual cores a {@code docker} cluster's NodeManager offers YARN's containers.
-         *
-         * Env var: FLOCI_SERVICES_EMR_YARN_NODE_VCORES
-         */
-        @WithDefault("4")
-        int yarnNodeVcores();
-
-        /**
-         * The most core and task nodes a {@code docker} cluster runs as containers of their own, core nodes first; each
-         * costs 300 to 800 MB while idle. With 0 the primary node holds its DataNode and NodeManager, as a cluster of one
-         * node does.
-         *
-         * Env var: FLOCI_SERVICES_EMR_YARN_MAX_WORKER_NODES
-         */
-        @WithDefault("4")
-        int yarnMaxWorkerNodes();
 
         /**
          * When true, Floci removes, in the {@code docker} runner mode, every EMR step driver and bootstrap
@@ -2297,6 +2315,14 @@ public interface EmulatorConfig {
     interface KmsServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        /**
+         * {@code <account-id>=<service principal>} entries: ListGrants and ListRetirableGrants list a grant's
+         * grantee or retiring principal in that account as that AWS service principal, as KMS lists an AWS
+         * service's grantees (GrantListEntry). Grants and the list filters keep the stored principal.
+         * Empty by default.
+         */
+        Optional<List<String>> listedGranteeServicePrincipals();
     }
 
     interface CognitoServiceConfig {
@@ -2344,6 +2370,14 @@ public interface EmulatorConfig {
          */
         @WithDefault("30")
         int maxWaitSeconds();
+
+        /**
+         * Positive millisecond ceiling for Wait states and Retry backoffs. Overrides
+         * {@code max-wait-seconds}; non-positive values keep the seconds setting.
+         * Execution, task and heartbeat deadlines are not shortened.
+         */
+        @WithDefault("0")
+        long maxWaitMillis();
     }
 
     interface SwfServiceConfig {
@@ -2364,6 +2398,13 @@ public interface EmulatorConfig {
          */
         @WithDefault("1")
         long timeoutSweepIntervalSeconds();
+
+        /**
+         * Positive millisecond sweep interval, overriding {@code timeout-sweep-interval-seconds}.
+         * Changes when expired timeouts are observed, not the recorded timeout deadlines.
+         */
+        @WithDefault("0")
+        long timeoutSweepIntervalMillis();
     }
 
     interface CloudFormationServiceConfig {
@@ -2553,6 +2594,39 @@ public interface EmulatorConfig {
         String hostPortBindAddress();
 
         Optional<String> dockerNetwork();
+
+        /**
+         * Additional Docker create flags applied to every ECS task container, with the grammar of
+         * {@code floci.services.lambda.docker-flags} ({@code --dns}, {@code --add-host},
+         * {@code -v}, {@code --env}, {@code --label}, ...). A {@code --dns} server replaces Floci's
+         * embedded DNS. When set, task containers are not given Floci's SDK endpoint variables
+         * ({@code AWS_ENDPOINT_URL}, {@code FLOCI_ENDPOINT}, {@code FLOCI_HOSTNAME}): they reach
+         * AWS by its real names through the configured DNS, as on ECS.
+         *
+         * Env var: FLOCI_SERVICES_ECS_DOCKER_FLAGS
+         */
+        Optional<String> dockerFlags();
+
+        /**
+         * Additional existing Docker networks an ECS task container joins before it starts. The
+         * primary network remains selected by docker-network or docker-flags. Not applied to
+         * awsvpc tasks, whose containers share their task's network namespace.
+         *
+         * Env var: FLOCI_SERVICES_ECS_ADDITIONAL_DOCKER_NETWORKS (comma-separated)
+         */
+        Optional<List<String>> additionalDockerNetworks();
+
+        /**
+         * Extra /etc/hosts entries added to every ECS task container, as "hostname:ip" pairs; the
+         * ip may be the literal "host-gateway", as in {@code docker run --add-host}. Unset by
+         * default: like the ECS agent, Floci gives a task container only the {@code extraHosts}
+         * its container definition declares. {@code host.docker.internal:host-gateway} restores
+         * the entry Floci used to add to every task container on Linux. For an awsvpc task with
+         * security-group enforcement the entries go on the task's network namespace.
+         *
+         * Env var: FLOCI_SERVICES_ECS_EXTRA_HOSTS (comma-separated)
+         */
+        Optional<List<String>> extraHosts();
 
         @WithDefault("512")
         int defaultMemoryMb();
@@ -2814,6 +2888,10 @@ public interface EmulatorConfig {
     }
 
     interface CloudFrontServiceConfig {
+        /** Image used for a fresh, isolated Node process on each TestFunction call. */
+        @WithDefault("node:22-alpine")
+        String functionRuntimeImage();
+
         @WithDefault("true")
         boolean enabled();
 
@@ -3119,6 +3197,7 @@ public interface EmulatorConfig {
         boolean insecureSkipTlsVerify();
     }
 
+    /** Repository previews use the existing ECR repository store; hybrid durability remains asynchronous. */
     interface EcrServiceConfig {
         @WithDefault("true")
         boolean enabled();
@@ -3165,15 +3244,6 @@ public interface EmulatorConfig {
     interface LambdaServiceConfig {
         @WithDefault("true")
         boolean enabled();
-
-        /**
-         * Remove previous-run Docker Lambda containers at startup and retry incomplete cleanup
-         * on cold starts. Disable when deployments share a daemon and the same owner identity.
-         *
-         * Env var: FLOCI_SERVICES_LAMBDA_RECONCILE_CONTAINERS_ON_STARTUP
-         */
-        @WithDefault("true")
-        boolean reconcileContainersOnStartup();
 
         /**
          * Registry host (optionally with a path prefix) that Lambda runtime images are pulled
@@ -3316,8 +3386,27 @@ public interface EmulatorConfig {
         /** Docker network to attach Lambda containers to. Empty = default bridge. */
         Optional<String> dockerNetwork();
 
+        /**
+         * Additional existing Docker networks joined before a Lambda container starts.
+         * The primary network remains selected by docker-network or docker-flags.
+         *
+         * Env var: FLOCI_SERVICES_LAMBDA_ADDITIONAL_DOCKER_NETWORKS (comma-separated)
+         */
+        Optional<List<String>> additionalDockerNetworks();
+
         /** Additional Docker create flags applied to every Lambda execution container. */
         Optional<String> dockerFlags();
+
+        /**
+         * Optional command executed inside each new Lambda container before it can receive invocations.
+         * Exit zero admits the container; nonzero retries within container-readiness-timeout-seconds.
+         * Arguments use Docker flag quoting rules; no shell is implicitly invoked.
+         */
+        Optional<String> containerReadinessCommand();
+
+        /** Overall budget for the optional container readiness command, in seconds. */
+        @WithDefault("60")
+        int containerReadinessTimeoutSeconds();
 
         /**
          * Base name prefix for the containers and code volumes Lambda spawns, replacing the
@@ -3507,11 +3596,74 @@ public interface EmulatorConfig {
     }
 
     interface Ec2ServiceConfig {
-        /** Optional full EC2 catalog file for locally built guest images. */
+        /** Trusted network helper that prepares IMDS before the guest image starts. */
+        @WithDefault("floci/network-helper:local")
+        String metadataHelperImage();
+
+        /**
+         * Docker AppArmor profile for systemd-v1 guests and their init helpers.
+         * Unset uses unconfined because docker-default denies the required mounts.
+         * A custom profile must already be loaded on the workload Docker host.
+         */
+        Optional<String> nativeInitApparmorProfile();
+
+        /** Optional EC2 catalog file; includeDefaultImages in that file retains the bundled catalog. */
         Optional<String> imageCatalogPath();
 
         /** Optional JSON file of additional regional AWS-managed prefix lists. */
         Optional<String> managedPrefixListCatalogPath();
+
+        /**
+         * Explicit guest environment entries, each {@code KEY=VALUE}. Duplicate keys and
+         * Floci-owned identity, credential, region, endpoint and IMDS settings are rejected.
+         * Env: {@code FLOCI_SERVICES_EC2_EXTRA_ENV}, comma-separated; escape a comma as {@code \,}.
+         */
+        Optional<List<String>> extraEnv();
+
+        /**
+         * Guest process limits, each {@code name=soft[:hard]}; omitted hard equals soft and
+         * {@code -1} means unlimited. Unset keeps Docker's defaults.
+         * Env: {@code FLOCI_SERVICES_EC2_ULIMITS}, comma-separated.
+         */
+        Optional<List<String>> ulimits();
+
+        /**
+         * Docker privileged mode for guest containers. Security-group enforcement always
+         * disables it. Network and volume helpers retain their own privilege settings.
+         * Env: {@code FLOCI_SERVICES_EC2_PRIVILEGED}.
+         */
+        @WithDefault("true")
+        boolean privileged();
+
+        /**
+         * Linux capabilities to drop from guest containers, in addition to mandatory
+         * security-group restrictions. Set privileged=false for capability restrictions.
+         * Env: {@code FLOCI_SERVICES_EC2_CAP_DROP}, comma-separated.
+         */
+        Optional<List<String>> capDrop();
+
+        /**
+         * Linux capabilities to add to guest containers, for images whose own startup grants
+         * file capabilities (for example {@code setcap cap_syslog+ep}) outside Docker's default
+         * set. Security-group enforcement still removes NET_ADMIN and NET_RAW from these. A
+         * capability may not be both added and dropped. Set privileged=false for this to matter.
+         * Env: {@code FLOCI_SERVICES_EC2_CAP_ADD}, comma-separated.
+         */
+        Optional<List<String>> capAdd();
+
+        /**
+         * Read-only bind mounts supplied by the deployment before the guest starts.
+         * Sources are absolute Linux paths on the Docker daemon host, not the Floci process host.
+         * Indexed environment entries use {@code FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__SOURCE}
+         * and {@code FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__TARGET}.
+         */
+        @WithDefault("")
+        List<GuestReadOnlyBind> readOnlyBinds();
+
+        interface GuestReadOnlyBind {
+            String source();
+            String target();
+        }
 
         @WithDefault("true")
         boolean enabled();
@@ -3584,6 +3736,10 @@ public interface EmulatorConfig {
         @WithDefault("2299")
         int sshPortRangeEnd();
 
+        /** Host interface for SSH published by either EC2 network helper. */
+        @WithDefault("127.0.0.1")
+        String sshHostBindAddress();
+
         /**
          * When true, TCP ports opened by an instance's security-group ingress rules are
          * published on the host via a socat sidecar container, both at launch and on later
@@ -3620,7 +3776,7 @@ public interface EmulatorConfig {
         boolean volumeBlockDevices();
 
         /** Image used for the helper container that manages volume loop devices and storage. */
-        @WithDefault("alpine:3.21")
+        @WithDefault("debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3")
         String volumeHelperImage();
 
         /** When true, instances go straight to RUNNING without launching Docker containers. */
@@ -3636,6 +3792,8 @@ public interface EmulatorConfig {
          * {@link #mockPublicAddress()}, which an Elastic IP on its primary private address then
          * shows too. Elastic IPs are allocated from 203.0.113.0/24 whatever this says, and
          * instances with containers always report the container's reachable address.
+         * {@code pool} allocates model identities from {@link #mockPublicAddressPool()};
+         * the caller must provide their local routing.
          *
          * Env var: FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESSES
          */
@@ -3651,13 +3809,24 @@ public interface EmulatorConfig {
          */
         Optional<String> mockPublicAddress();
 
+        /**
+         * Network-aligned IPv4 CIDR of at most 256 model identities, required when
+         * {@link #mockPublicAddresses()} is {@code pool}. This does not allocate Internet
+         * addresses or install routing: the caller owns delivery to each modeled instance.
+         *
+         * Env var: FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESS_POOL
+         */
+        Optional<String> mockPublicAddressPool();
+
         enum MockPublicAddresses {
             /** No automatic public address. */
             NONE,
             /** An address from 203.0.113.0/24, distinct from other live instances while one is free. */
             DOCUMENTATION,
             /** The configured {@code mock-public-address}. */
-            FIXED
+            FIXED,
+            /** Distinct identities from the configured pool, with caller-owned local delivery. */
+            POOL
         }
 
         /**
@@ -3679,6 +3848,15 @@ public interface EmulatorConfig {
     interface VpcNetworksConfig {
         @WithDefault("true")
         boolean enabled();
+
+        /**
+         * Preserve native IPv4 ranges in independent protected VPC namespaces, including
+         * overlapping ranges. Requires Docker Engine 28+, native private IPs and security-group
+         * enforcement, with non-internal Docker transport bridges.
+         * Env: {@code FLOCI_SERVICES_EC2_VPC_NETWORKS_ISOLATE_ADDRESS_SPACES}.
+         */
+        @WithDefault("false")
+        boolean isolateAddressSpaces();
 
         /**
          * Private range that substituted CIDRs are allocated from, used when a declared VPC CIDR
@@ -3704,6 +3882,14 @@ public interface EmulatorConfig {
         /** Docker network driver for VPC networks. */
         @WithDefault("bridge")
         String driver();
+
+        /**
+         * Create internal Docker VPC networks without external connectivity through that network.
+         * Other guest attachments retain their own connectivity.
+         * Env: {@code FLOCI_SERVICES_EC2_VPC_NETWORKS_INTERNAL}.
+         */
+        @WithDefault("false")
+        boolean internal();
     }
 
     interface AppConfigServiceConfig {
@@ -3776,6 +3962,13 @@ public interface EmulatorConfig {
         /** When true, no health check is ever probed and a registered instance is InService at once. */
         @WithDefault("false")
         boolean mock();
+
+        /** Serve supported Classic frontends inside their own protected VPC namespaces. */
+        @WithDefault("false")
+        boolean vpcFrontends();
+
+        @WithDefault("haproxy:3.2-alpine@sha256:5893840576071e6217cd52ebdcc14f454c6f7a631056fa6f4e0f40d3cac4215b")
+        String proxyImage();
     }
 
     interface ElbV2ServiceConfig {
@@ -3785,13 +3978,29 @@ public interface EmulatorConfig {
         @WithDefault("false")
         boolean mock();
 
-        /** Reuse backend HTTP/1.x connections between ordinary forwarded requests. */
-        @WithDefault("true")
-        boolean backendKeepAlive();
+        /** Optional local probe interval ceiling; zero preserves each target group's interval. */
+        @WithDefault("0")
+        long maxHealthCheckIntervalMillis();
 
-        /** Default idle-pool timeout in seconds; zero disables expiry. Target Keep-Alive may override it. */
-        @WithDefault("60")
-        int backendKeepAliveTimeoutSeconds();
+        /**
+         * Accounts (12-digit ids) whose Application Load Balancers may be in a single Availability
+         * Zone, for local setups that model single-zone deployments. AWS refuses an ALB in fewer than
+         * two zones. Unset (the default) keeps the two-zone rule for every account.
+         */
+        Optional<List<String>> singleZoneAlbAccounts();
+
+        /** AWS defaults unless explicitly overridden for local deployments. */
+        @WithDefault("aws")
+        AlbZoneRule albZoneRule();
+
+        /** A region entry takes precedence over the global rule, including an explicit AWS reset. */
+        Map<String, AlbZoneRule> albZoneRuleByRegion();
+    }
+
+    enum AlbZoneRule {
+        AWS,
+        ALLOW_SINGLE_ZONE,
+        REQUIRE_TWO_ZONES
     }
 
     interface EksServiceConfig {
@@ -3809,14 +4018,6 @@ public interface EmulatorConfig {
         /** Optional vCPU ceiling for the single k3s node container. Zero uses its instance type. */
         @WithDefault("0")
         int maxVcpus();
-
-        /**
-         * Optional EC2 catalog instance type the k3s node container is sized from, in place of its
-         * first node group's type. The node group, the node's {@code node.kubernetes.io/instance-type}
-         * label and the synthesized EC2 instance keep the requested type. A type absent from the
-         * catalog is ignored with a warning; {@link #maxMemoryMib()} and {@link #maxVcpus()} still apply.
-         */
-        Optional<String> nodeInstanceType();
 
         @WithDefault("k3s")
         String provider();
@@ -4049,12 +4250,8 @@ public interface EmulatorConfig {
         /** Path to PEM private key file. Env: FLOCI_TLS_KEY_PATH */
         Optional<String> keyPath();
 
-        /**
-         * PEM file of extra CA certificates that Floci's own outbound HTTPS clients trust, on top of
-         * the JVM's default roots (and Floci's CA when TLS is on). Applies whether or not TLS is enabled.
-         * Containers Floci launches are not affected. Env: FLOCI_TLS_EXTRA_CA_PATH
-         */
-        Optional<String> extraCaPath();
+        /** PEM certificates appended to workload trust bundles. Env: FLOCI_TLS_EXTRA_CA_CERTS */
+        Optional<String> extraCaCerts();
 
         /**
          * Auto-generate a server certificate when no cert-path/key-path is provided. The leaf is
@@ -4081,6 +4278,19 @@ public interface EmulatorConfig {
          */
         @WithDefault("443")
         int awsHttpsPort();
+
+        /** Optional local TLS destination for names without an owned listener on the AWS HTTPS port. */
+        @WithDefault("0")
+        int awsHttpsFallbackPort();
+
+        /** Explicit local IPv4 destination; defaults to loopback. */
+        Optional<String> awsHttpsFallbackHost();
+
+        @WithDefault("false")
+        boolean awsHttpsFallbackProxyProtocol();
+
+        /** Exact names selecting the configured TLS destination before owned listener lookup. */
+        Optional<List<String>> awsHttpsFallbackHosts();
     }
 
     /**

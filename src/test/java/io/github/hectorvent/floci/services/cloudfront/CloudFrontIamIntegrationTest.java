@@ -1,8 +1,8 @@
-package io.floci.aws.services.cloudfront;
+package io.github.hectorvent.floci.services.cloudfront;
 
-import io.floci.aws.testing.SignedIamEnforcementProfile;
-import io.floci.aws.testing.SignedIamUsers;
-import io.floci.aws.testutil.AwsRequestSigner;
+import io.github.hectorvent.floci.testing.SignedIamEnforcementProfile;
+import io.github.hectorvent.floci.testing.SignedIamUsers;
+import io.github.hectorvent.floci.testutil.AwsRequestSigner;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
