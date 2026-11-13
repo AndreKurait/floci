@@ -71,6 +71,14 @@ final class VpcRoutingCommands {
                            List<String> deniedDestinations, List<String> resolvers, List<ControlConnection> controls,
                            boolean instanceMetadataAllowed, String publicDevice, List<String> inboundPublicSources,
                            List<ControlListener> listeners) {
+        return endpoint(privateAddress, privateDevice, localRoutes, hops, deniedDestinations, resolvers, controls,
+                instanceMetadataAllowed, publicDevice, inboundPublicSources, listeners, null);
+    }
+
+    static String endpoint(String privateAddress, String privateDevice, List<LocalRoute> localRoutes, List<Hop> hops,
+                           List<String> deniedDestinations, List<String> resolvers, List<ControlConnection> controls,
+                           boolean instanceMetadataAllowed, String publicDevice, List<String> inboundPublicSources,
+                           List<ControlListener> listeners, VpcFrontendIngress frontend) {
         String source = VpcRouteSelection.ipv4(privateAddress);
         StringBuilder script = new StringBuilder("set -eu\nip -4 route flush proto 186\n");
         for (Hop hop : hops) {
@@ -87,6 +95,10 @@ final class VpcRoutingCommands {
         StringBuilder rules = new StringBuilder("flush chain inet floci_vpc_routes ingress\n")
                 .append("flush chain inet floci_vpc_routes egress\n")
                 .append("add rule inet floci_vpc_routes egress oifname lo counter accept\n");
+        if (frontend != null) {
+            frontend.appendIngress(rules);
+            frontend.appendReply(rules);
+        }
         if (publicDevice != null) {
             String device = device(publicDevice);
             for (String address : inboundPublicSources) {

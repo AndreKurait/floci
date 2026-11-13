@@ -374,6 +374,37 @@ class VpcPublicPeerRoutingTest {
         assertTrue(manager.publicAddress(ACCOUNT, REGION, "frontend").isEmpty());
     }
 
+    @Test
+    void frontendPortsRequireExactOwnershipAndFollowRouteWithdrawal() {
+        prepareNamespace("frontend", 2, true);
+        manager.register(identity("frontend", 2), "frontend", List.of());
+        manager.attachPublicFrontend(ACCOUNT, REGION, interfaceFor("frontend", 2), "frontend");
+        assertEquals(Optional.of("240.0.0.2"), manager.publicFrontendTransport(ACCOUNT, REGION, "frontend"));
+        assertThrows(IllegalStateException.class,
+                () -> manager.publishFrontendListeners(ACCOUNT, REGION, "frontend", "foreign", Set.of(443)));
+        assertThrows(IllegalStateException.class,
+                () -> manager.publishFrontendListeners("222222222222", REGION, "frontend", "frontend", Set.of(443)));
+        manager.publishFrontendListeners(ACCOUNT, REGION, "frontend", "frontend", Set.of(443));
+        assertTrue(latest("frontend").contains("ip daddr 240.0.0.2 tcp dport { 443 }"
+                + " ip saddr 0.0.0.0/0 counter accept"));
+        routes.add(route("192.0.2.0/24", "missing-gateway", "blackhole"));
+        manager.reconcile();
+        String applied = latest("frontend");
+        assertTrue(applied.indexOf("ip saddr 192.0.2.0/24 counter drop")
+                < applied.indexOf("ip saddr 0.0.0.0/0 counter accept"));
+        gateway.setAttachments(List.of());
+        manager.reconcile();
+        assertFalse(latest("frontend").contains("ip saddr 0.0.0.0/0 counter accept"));
+        manager.publishFrontendListeners(ACCOUNT, REGION, "frontend", "frontend", Set.of());
+        assertFalse(latest("frontend").contains("tcp dport { 443 }"));
+        assertTrue(latest("frontend").contains("ip daddr 240.0.0.2 counter drop"));
+        missing("frontend");
+        manager.reconcile();
+        assertTrue(manager.publicFrontendTransport(ACCOUNT, REGION, "frontend").isEmpty());
+        assertThrows(IllegalStateException.class,
+                () -> manager.publishFrontendListeners(ACCOUNT, REGION, "frontend", "frontend", Set.of(443)));
+    }
+
     private void missing(String helper) {
         InspectContainerCmd inspect = docker.inspectContainerCmd(helper);
         when(inspect.exec()).thenThrow(new NotFoundException("namespace absent"));

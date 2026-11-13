@@ -32,6 +32,17 @@ association or the VPC's main table, then longest prefix match. Unsupported
 targets and absent routes drop traffic instead of falling back to Docker's
 default internet route.
 
+An external client on the public transport can reach a protected frontend only
+on ports its owning service explicitly publishes. Publication checks the
+account, region, ENI and live namespace owner. Traffic still requires the
+frontend's security group and an active internet-gateway route to the caller;
+a more-specific NAT, blackhole or unsupported route denies it. Unpublished
+ports remain closed even if a process is listening and the security group
+allows them. Withdrawing all ports closes external admission. This routing
+contract does not itself start listeners or attach external client containers.
+`VpcExternalFrontendPacketIntegrationTest` verifies these checks with real
+packets, including denial and recovery without delivering denied requests.
+
 With `FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API=true`, the transport also has an
 owned TCP bridge for the public AWS APIs. Spoofed AWS API DNS names resolve to
 `192.0.2.1` for known VPC clients; queries outside a VPC retain the usual emulator
