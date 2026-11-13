@@ -2,6 +2,9 @@ package io.github.hectorvent.floci.services.s3;
 
 import org.junit.jupiter.api.Test;
 
+import java.util.List;
+import java.util.Map;
+
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
 class S3ResourceArnsTest {
@@ -27,4 +30,9 @@ class S3ResourceArnsTest {
         assertEquals("arn:aws:s3:::b/folder/", S3ResourceArns.object("aws", "b", "folder/"));
     }
 
+    @Test
+    void aListingOffersItsPrefixAndTheEmptyStringForNone() {
+        assertEquals(Map.of("s3:prefix", List.of("logs/")), S3ConditionKeys.listing("logs/"));
+        assertEquals(Map.of("s3:prefix", List.of("")), S3ConditionKeys.listing(null));
+    }
 }

@@ -21,6 +21,7 @@ import io.github.hectorvent.floci.services.cloudtrail.model.Trail;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.model.AccessKey;
 import io.github.hectorvent.floci.services.iam.model.IamUser;
+import io.github.hectorvent.floci.services.s3.S3ResourceArns;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -999,13 +1000,12 @@ public class CloudTrailService {
             ObjectNode bucketRes = mapper.createObjectNode();
             bucketRes.put("accountId", regionResolver.getAccountId());
             bucketRes.put("type", "AWS::S3::Bucket");
-            bucketRes.put("ARN", AwsArnUtils.Arn.global(partition, "s3", "", in.bucketName()).toString());
+            bucketRes.put("ARN", S3ResourceArns.bucket(partition, in.bucketName()));
             resources.add(bucketRes);
             if (in.key() != null) {
                 ObjectNode objRes = mapper.createObjectNode();
                 objRes.put("type", "AWS::S3::Object");
-                objRes.put("ARN",
-                        AwsArnUtils.Arn.global(partition, "s3", "", in.bucketName() + "/" + in.key()).toString());
+                objRes.put("ARN", S3ResourceArns.object(partition, in.bucketName(), in.key()));
                 resources.add(objRes);
             }
             record.set("resources", resources);

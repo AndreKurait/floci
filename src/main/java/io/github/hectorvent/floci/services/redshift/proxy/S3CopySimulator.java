@@ -4,6 +4,8 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.s3.S3ConditionKeys;
+import io.github.hectorvent.floci.services.s3.S3ResourceArns;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.s3.model.PutObjectOptions;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
@@ -143,7 +145,7 @@ public final class S3CopySimulator {
                 } else {
                     if (roleSession != null) {
                         RedshiftRoleAccess.authorizeSessionAction(s3, iamService, roleSession, spec.iamRoleArn(),
-                                "s3:ListBucket", copyBucketArn(spec, s3), Map.of("s3:prefix", List.of(spec.keyOrPrefix())));
+                                "s3:ListBucket", copyBucketArn(spec, s3), S3ConditionKeys.listing(spec.keyOrPrefix()));
                         s3.authorizeSignedListBucket(roleSession.accessKeyId(), roleSession.sessionToken(), spec.bucket(),
                                 spec.keyOrPrefix());
                     } else {
@@ -211,8 +213,7 @@ public final class S3CopySimulator {
         if (spec.iamRoleArn() != null) {
             return RedshiftRoleAccess.bucketArn(spec.iamRoleArn(), spec.bucket());
         }
-        return AwsArnUtils.Arn.global(s3.bucketPartition(spec.bucket()), "s3", "",
-                spec.bucket()).toString();
+        return S3ResourceArns.bucket(s3.bucketPartition(spec.bucket()), spec.bucket());
     }
 
     private static String copyObjectArn(CopyStatementParser.S3CopyFrom spec, S3Service s3, String key) {

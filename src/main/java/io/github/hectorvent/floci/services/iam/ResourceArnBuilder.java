@@ -31,6 +31,7 @@ import io.github.hectorvent.floci.services.lambda.durable.DurableTokens;
 import io.github.hectorvent.floci.services.lambdamicrovms.LambdaMicrovmsService;
 import io.github.hectorvent.floci.services.neptune.NeptuneSnapshotResources;
 import io.github.hectorvent.floci.services.s3.S3ControlArnUtils;
+import io.github.hectorvent.floci.services.s3.S3ResourceArns;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
 import io.github.hectorvent.floci.services.sqs.SqsService;
 import io.github.hectorvent.floci.services.ssm.SsmService;
@@ -1068,7 +1069,7 @@ public class ResourceArnBuilder {
         String partition = AwsRegions.partitionFor(region);
         String stripped = path.startsWith("/") ? path.substring(1) : path;
         if (stripped.isEmpty()) {
-            return AwsArnUtils.Arn.global(partition, "s3", "", "*").toString();
+            return S3ResourceArns.bucket(partition, "*");
         }
         // S3VirtualHostFilter rewrites a bucket-level virtual-hosted request (GET /) to
         // /bucket/, and the empty key after that separator is not part of the resource.
@@ -1076,10 +1077,10 @@ public class ResourceArnBuilder {
         // go or a bucket-level ARN never matches. A key that itself ends in a slash
         // (a folder marker such as folder/) keeps it, because there the slash is key data.
         int firstSlash = stripped.indexOf('/');
-        if (firstSlash == stripped.length() - 1) {
-            stripped = stripped.substring(0, firstSlash);
+        if (firstSlash < 0 || firstSlash == stripped.length() - 1) {
+            return S3ResourceArns.bucket(partition, firstSlash < 0 ? stripped : stripped.substring(0, firstSlash));
         }
-        return AwsArnUtils.Arn.global(partition, "s3", "", stripped).toString();
+        return S3ResourceArns.object(partition, stripped.substring(0, firstSlash), stripped.substring(firstSlash + 1));
     }
 
     /**

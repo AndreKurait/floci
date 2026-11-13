@@ -1989,7 +1989,7 @@ public class S3Controller {
     /** Evaluates one action on one DeleteObjects entry's object, answering a denial as S3 does per key. */
     private void authorizeEntryIdentity(String iamCredential, String action, String bucket, String key,
                                         Map<String, List<String>> signatureConditions) {
-        String resource = S3PublicAccessEvaluator.objectArn(s3Service.bucketPartition(bucket), bucket, key);
+        String resource = S3ResourceArns.object(s3Service.bucketPartition(bucket), bucket, key);
         try {
             iamEnforcementFilter.authorizeAdditionalResource(
                     iamCredential, action, resource, null, null, signatureConditions);
@@ -4130,7 +4130,7 @@ public class S3Controller {
         rejectUnknownPostRegion(credential);
         if (credential != null && !credential.isEmpty()) {
             iamEnforcementFilter.authorizePostObject(AccountResolver.SIGV4_SCHEME + " Credential=" + credential,
-                    S3PublicAccessEvaluator.objectArn(s3Service.bucketPartition(bucket), bucket, key),
+                    S3ResourceArns.object(s3Service.bucketPartition(bucket), bucket, key),
                     regionResolver.resolveRegionFromPresignedCredential(credential),
                     S3SignatureConditions.post(lcFields));
         }
@@ -4664,7 +4664,7 @@ public class S3Controller {
     private void authorizeCopySourceRead(HttpHeaders httpHeaders, UriInfo uriInfo, CopySourceRef source,
                                          S3Service.RequestAuthorization authorization) {
         String action = source.versionId() == null ? "s3:GetObject" : "s3:GetObjectVersion";
-        String resource = S3PublicAccessEvaluator.objectArn(
+        String resource = S3ResourceArns.object(
                 s3Service.bucketPartition(source.bucket()), source.bucket(), source.objectKey());
         iamEnforcementFilter.authorizeAdditionalResource(iamCredential(httpHeaders, uriInfo), action, resource,
                 null, null, S3SignatureConditions.request(
@@ -4706,7 +4706,7 @@ public class S3Controller {
         }
         String action = "s3:PutObjectTagging";
         if (checksIdentity) {
-            String resource = S3PublicAccessEvaluator.objectArn(
+            String resource = S3ResourceArns.object(
                     s3Service.bucketPartition(destBucket), destBucket, destKey);
             iamEnforcementFilter.authorizeAdditionalResource(credential, action, resource,
                     null, null, S3SignatureConditions.request(
@@ -4727,7 +4727,7 @@ public class S3Controller {
             return;
         }
         String credential = iamCredential(httpHeaders, uriInfo);
-        String resource = S3PublicAccessEvaluator.bucketArn(AwsRegions.partitionFor(region), bucket);
+        String resource = S3ResourceArns.bucket(AwsRegions.partitionFor(region), bucket);
         ResourcePolicyDecision policyDecision = s3Service.ownsBucket(bucket) ? null : ResourcePolicyDecision.NEUTRAL;
         for (String action : actions) {
             iamEnforcementFilter.authorizeAdditionalResource(

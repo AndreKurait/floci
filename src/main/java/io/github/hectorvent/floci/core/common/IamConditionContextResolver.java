@@ -37,6 +37,7 @@ import io.github.hectorvent.floci.services.kinesis.KinesisService;
 import io.github.hectorvent.floci.services.lambda.LambdaRuntimeManagementService;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambdaweb.LambdaWebService;
+import io.github.hectorvent.floci.services.s3.S3ConditionKeys;
 import io.github.hectorvent.floci.services.s3.S3ControlTagConditionKeys;
 import io.github.hectorvent.floci.services.s3.S3ObjectActions;
 import io.github.hectorvent.floci.services.s3.S3ObjectKeys;
@@ -1050,7 +1051,7 @@ public class IamConditionContextResolver {
 
     Map<String, List<String>> s3BucketListConditionContext(MultivaluedMap<String, String> queryParameters) {
         Map<String, List<String>> conditions = new LinkedHashMap<>();
-        addQueryCondition(conditions, "s3:prefix", queryParameters, "prefix");
+        addQueryCondition(conditions, S3ConditionKeys.PREFIX, queryParameters, "prefix");
         addQueryCondition(conditions, "s3:delimiter", queryParameters, "delimiter");
         addQueryCondition(conditions, "s3:max-keys", queryParameters, "max-keys");
         return conditions.isEmpty() ? null : conditions;

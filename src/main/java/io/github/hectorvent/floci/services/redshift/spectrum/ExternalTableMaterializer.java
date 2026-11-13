@@ -3,7 +3,6 @@ package io.github.hectorvent.floci.services.redshift.spectrum;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
-import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.Digests;
@@ -18,6 +17,7 @@ import io.github.hectorvent.floci.services.glue.model.Table;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.redshift.proxy.RedshiftRoleAccess;
 import io.github.hectorvent.floci.services.redshift.proxy.S3CopySimulator;
+import io.github.hectorvent.floci.services.s3.S3ResourceArns;
 import io.github.hectorvent.floci.services.s3.S3ScratchSpace;
 import io.github.hectorvent.floci.services.s3.S3Service;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
@@ -786,8 +786,7 @@ public class ExternalTableMaterializer {
                 scratchKey = SCRATCH_KEY_PREFIX + UUID.randomUUID() + ".csv";
                 if (roleSession != null && roleSession.accessKeyId() != null) {
                     String partition = AwsRegions.partitionFor(config.defaultRegion());
-                    String scratchArn = AwsArnUtils.Arn.global(partition, "s3", "",
-                            SCRATCH_BUCKET + "/" + scratchKey).toString();
+                    String scratchArn = S3ResourceArns.object(partition, SCRATCH_BUCKET, scratchKey);
                     iamService.registerScratchResource(roleSession.accessKeyId(), scratchArn);
                 }
                 readWithDuckDb(session.accountId(), roleSession, table, sources,
