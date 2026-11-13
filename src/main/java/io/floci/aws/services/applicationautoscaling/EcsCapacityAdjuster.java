@@ -9,8 +9,7 @@ import jakarta.inject.Inject;
 import java.util.List;
 
 /**
- * {@link CapacityAdjuster} for {@code ecs:service:DesiredCount} — the only scalable
- * dimension this control loop drives today.
+ * {@link CapacityAdjuster} for {@code ecs:service:DesiredCount}.
  */
 @ApplicationScoped
 public class EcsCapacityAdjuster implements CapacityAdjuster {
