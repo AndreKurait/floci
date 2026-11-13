@@ -67,11 +67,18 @@ public class AutoScalingService implements PassedRoleLookup {
         this(groupChanges, null);
     }
 
-    @Inject
     AutoScalingService(Event<AutoScalingGroupChanged> groupChanges, ElbV2Service elbV2Service,
                        EmulatorConfig config, ElbClassicService elbClassicService) {
+        this(groupChanges, elbV2Service, config, elbClassicService, null);
+    }
+
+    @Inject
+    AutoScalingService(Event<AutoScalingGroupChanged> groupChanges, ElbV2Service elbV2Service,
+                       EmulatorConfig config, ElbClassicService elbClassicService,
+                       AutoScalingEventPublisher eventPublisher) {
         this(groupChanges, elbV2Service, config.services().autoscaling().maxCapacityReservationIds(),
-                config.services().autoscaling().multipleCapacityReservationScopes().orElse(List.of()), elbClassicService);
+                config.services().autoscaling().multipleCapacityReservationScopes().orElse(List.of()),
+                elbClassicService, Clock.systemUTC(), eventPublisher);
     }
 
     AutoScalingService(Event<AutoScalingGroupChanged> groupChanges, ElbV2Service elbV2Service) {
@@ -98,6 +105,15 @@ public class AutoScalingService implements PassedRoleLookup {
     private AutoScalingService(Event<AutoScalingGroupChanged> groupChanges, ElbV2Service elbV2Service,
                                int maxCapacityReservationIds, List<String> multipleCapacityReservationScopes,
                                ElbClassicService elbClassicService, Clock clock) {
+        this(groupChanges, elbV2Service, maxCapacityReservationIds, multipleCapacityReservationScopes,
+                elbClassicService, clock, null);
+    }
+
+    private AutoScalingService(Event<AutoScalingGroupChanged> groupChanges, ElbV2Service elbV2Service,
+                               int maxCapacityReservationIds, List<String> multipleCapacityReservationScopes,
+                               ElbClassicService elbClassicService, Clock clock,
+                               AutoScalingEventPublisher eventPublisher) {
+        this.eventPublisher = eventPublisher;
         if (maxCapacityReservationIds < 1) {
             throw new IllegalArgumentException("floci.services.autoscaling.max-capacity-reservation-ids must be positive");
         }
@@ -211,6 +227,7 @@ public class AutoScalingService implements PassedRoleLookup {
     Ec2Service ec2Service;
 
     private final ElbClassicService elbClassicService;
+    private final AutoScalingEventPublisher eventPublisher;
 
     public AutoScalingService(ElbV2Service elbV2Service, ElbClassicService elbClassicService) {
         this(null, elbV2Service, 1, List.of(), elbClassicService);
@@ -684,7 +701,18 @@ public class AutoScalingService implements PassedRoleLookup {
                         .filter(Objects::nonNull)
                         .forEach(instanceId -> {
                             try {
-                                ec2Service.terminateInstances(region, List.of(instanceId));
+                                AutoScalingEventPublisher.Termination termination =
+                                        terminateEc2Instances(asg, ec2Service, List.of(instanceId));
+                                if (termination != null) {
+                                    try {
+                                        ScalingActivity activity = recordActivity(region, name,
+                                                "Terminating EC2 instance: " + instanceId,
+                                                "The Auto Scaling group was deleted.", "Successful");
+                                        termination.activity(List.of(instanceId), activity);
+                                    } catch (RuntimeException failure) {
+                                        LOG.warnv(failure, "Could not record termination event activity for {0}", instanceId);
+                                    }
+                                }
                             }
                             catch (AwsException e) {
                                 if (!"InvalidInstanceID.NotFound".equals(e.getErrorCode())) {
@@ -709,6 +737,27 @@ public class AutoScalingService implements PassedRoleLookup {
             warmPools.remove(warmPoolKey(region, name));
             groups.remove(key);
         }
+    }
+
+    void instanceLaunched(AutoScalingGroup group, Instance instance, ScalingActivity activity) {
+        if (eventPublisher != null) {
+            eventPublisher.launched(group, instance, activity);
+        }
+    }
+
+    AutoScalingEventPublisher.Termination terminateEc2Instances(AutoScalingGroup group, Ec2Service ec2,
+                                                                List<String> instanceIds) {
+        AutoScalingEventPublisher.Termination observer = terminationObserver(group, instanceIds);
+        if (observer == null) {
+            ec2.terminateInstances(group.getRegion(), instanceIds);
+        } else {
+            ec2.terminateInstancesWithCompletion(group.getRegion(), instanceIds, observer);
+        }
+        return observer;
+    }
+
+    AutoScalingEventPublisher.Termination terminationObserver(AutoScalingGroup group, List<String> instanceIds) {
+        return eventPublisher == null ? null : eventPublisher.termination(group, instanceIds);
     }
 
     public List<AutoScalingGroup> describeAutoScalingGroups(String region, List<String> names) {
@@ -1035,6 +1084,10 @@ public class AutoScalingService implements PassedRoleLookup {
             completeActivity(instance.getStandbyActivityId(), status, message);
             instance.setStandbyActivityId(null);
         }
+    }
+
+    ScalingActivity activityForEvent(String activityId) {
+        return activityId == null ? null : activities.get(activityId);
     }
 
     void completeTerminationActivity(AsgInstance instance, String status, String message) {
