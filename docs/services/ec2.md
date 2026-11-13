@@ -203,6 +203,13 @@ has an exact IP and TCP-port exception, while their application traffic remains 
 See [Lambda VPC configuration](lambda.md#vpcconfig-snapstart-loggingconfig-and-durableconfig)
 for execution and lifecycle limits.
 
+An observer detects externally stopped, removed, or disconnected namespace helpers.
+It retires their DNS identity and removes their addresses from peer security-group rules,
+so an unrelated container reusing an address does not inherit the former ENI's membership.
+Detection is asynchronous; failed policy updates quarantine peers and are retried.
+The owning workload retains responsibility for removing its retired helper; failed
+Docker removal is reported and remains retryable.
+
 Security-group permissions on a host-published port use the source visible inside Docker. Docker Desktop may replace the original external-client address. The legacy socat application publisher is disabled while enforcement is enabled because it obscures that source. SSH is published directly by the protected namespace. Application host ports remain available through the legacy publisher only when enforcement is explicitly disabled. Direct managed container traffic uses the logical ENI identity.
 
 When enforcement is disabled, an instance's security groups can open a TCP port to a CIDR source and Floci publishes that port on the host so you can reach the app from `localhost`. For each opened port Floci starts a small `alpine/socat` sidecar container that binds an allocated host port (default range 30000–30999) and forwards it to the instance container's IP, with `TCP_NODELAY` on both sockets so a request the client sends as two small writes is not held for the first write's delayed ACK (about 40 ms per round trip otherwise). The listen socket also takes a `backlog` of 4096 (socat's default is 5), so a burst of connections is queued rather than silently dropped from a full accept queue; the kernel caps the backlog at `net.core.somaxconn`. This works both for rules present at launch and for rules added later with `authorize-security-group-ingress`; revoking the rule removes the forward. The mapping (`app port -> host port`) is written to the logs:
