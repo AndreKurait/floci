@@ -86,6 +86,20 @@ until the update commits; a failed stack update restores the previous stream. `U
 Retain` keeps a displaced stream. Stack deletion removes the current stream and its events, and
 tolerates a stream that was already deleted.
 
+## CloudWatch Logs subscription filters
+
+`AWS::Logs::SubscriptionFilter` manages the native filter in `LogGroupName`. `Ref` and
+`PhysicalResourceId` return its name; an omitted `FilterName` is generated and remains stable on
+mutable updates. Changing either name or group deletes the old filter before creating the new
+one, including with `UpdateReplacePolicy: Retain`, as observed for this resource on AWS. A failed
+update keeps the complete prior definition for rollback, including its original creation time.
+
+The initial native scope accepts same-account Lambda and logical Logs destination ARNs in the
+log group's region. Direct role-backed Kinesis/Firehose destinations, `RoleArn`,
+`ApplyOnTransformedLogs`, `FieldSelectionCriteria`, and `EmitSystemFields` are explicitly rejected.
+Logical destination delivery, IAM role checks, and creation-time control messages remain separate
+from this CloudFormation lifecycle support; see [subscription filters](cloudwatch.md#subscription-filters).
+
 ## CloudWatch Logs metric filters
 
 `AWS::Logs::MetricFilter` returns the filter name alone for both `Ref` and
@@ -238,7 +252,7 @@ cross-resource references.
 | IoT Core | `Authorizer`, `DomainConfiguration` (`ServerCertificates` resolves to a JSON string), `Policy` (deleted after detaching it from its principals; on AWS the delete fails with `DeleteConflictException` while the policy is attached), `Thing`, `TopicRule` |
 | CloudFront | `CachePolicy`, `Distribution`, `Function` (`KeyValueStoreAssociations` is ignored), `KeyGroup`, `OriginAccessControl`, `OriginRequestPolicy`, `PublicKey`, `ResponseHeadersPolicy` |
 | CloudWatch | `Alarm`, `CompositeAlarm`, `Dashboard`. Composite alarms have backing definitions with name Ref and Arn GetAtt, rollback, and replacement cleanup. Composite actions are stored only; suppression properties are rejected. |
-| CloudWatch Logs | `LogGroup`, `LogStream`, `MetricFilter` |
+| CloudWatch Logs | `LogGroup`, `LogStream`, `MetricFilter`, `SubscriptionFilter` |
 | WAFv2 | `IPSet`, `LoggingConfiguration`, `WebACL`, `WebACLAssociation` |
 | Config | `ConfigRule` |
 | Bedrock AgentCore | `Runtime` (Ref returns the AgentRuntimeId; CapacityProviderConfiguration, FilesystemConfigurations, LifecycleConfiguration, PlatformVersion and RequestHeaderConfiguration are accepted and not stored), `RuntimeEndpoint` (Ref returns the endpoint ARN; Tags are accepted and not stored), `Memory` (Ref returns the memory ARN; MemoryStrategies, IndexedKeys, NamespaceKeys and StreamDeliveryResources are accepted and not stored) |

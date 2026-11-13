@@ -432,6 +432,10 @@ AWS::Logs::LogGroup	FieldIndexPolicies	accepted and ignored
 AWS::Logs::LogGroup	KmsKeyId	accepted and ignored
 AWS::Logs::LogGroup	LogGroupClass	accepted and ignored
 AWS::Logs::LogGroup	ResourcePolicyDocument	accepted and ignored
+AWS::Logs::SubscriptionFilter	ApplyOnTransformedLogs	explicitly rejected; native subscription filters do not support this property
+AWS::Logs::SubscriptionFilter	EmitSystemFields	explicitly rejected; native subscription filters do not support this property
+AWS::Logs::SubscriptionFilter	FieldSelectionCriteria	explicitly rejected; native subscription filters do not support this property
+AWS::Logs::SubscriptionFilter	RoleArn	explicitly rejected; native subscription filters do not support this property
 AWS::Organizations::Account	RoleName	accepted and ignored
 AWS::Pipes::Pipe	KmsKeyIdentifier	accepted and ignored
 AWS::Pipes::Pipe	LogConfiguration	accepted and ignored

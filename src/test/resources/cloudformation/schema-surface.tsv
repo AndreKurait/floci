@@ -152,6 +152,7 @@ AWS::Lambda::WebFunctionRevision	CreatedAt,FunctionArn,RevisionArn,RevisionId,St
 AWS::Logs::LogGroup	Arn	BearerTokenAuthenticationEnabled,DataProtectionPolicy,DeletionProtectionEnabled,FieldIndexPolicies,KmsKeyId,LogGroupClass,LogGroupName,ResourcePolicyDocument,RetentionInDays,Tags
 AWS::Logs::LogStream		LogGroupName,LogStreamName
 AWS::Logs::MetricFilter		ApplyOnTransformedLogs,EmitSystemFieldDimensions,FieldSelectionCriteria,FilterName,FilterPattern,LogGroupName,MetricTransformations
+AWS::Logs::SubscriptionFilter		ApplyOnTransformedLogs,DestinationArn,Distribution,EmitSystemFields,FieldSelectionCriteria,FilterName,FilterPattern,LogGroupName,RoleArn
 AWS::Organizations::Account	AccountId,Arn,JoinedMethod,JoinedTimestamp,Paths,State,Status	AccountName,Email,ParentIds,RoleName,Tags
 AWS::Organizations::Organization	Arn,Id,ManagementAccountArn,ManagementAccountEmail,ManagementAccountId,RootId	FeatureSet
 AWS::Organizations::OrganizationalUnit	Arn,Id,Path	Name,ParentId,Tags

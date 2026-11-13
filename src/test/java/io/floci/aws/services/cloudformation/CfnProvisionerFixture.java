@@ -99,6 +99,7 @@ import io.floci.aws.services.cloudformation.provisioners.LambdaWebCfnProvisioner
 import io.floci.aws.services.cloudformation.provisioners.LogsCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.LogsLogStreamCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.LogsMetricFilterCfnProvisioner;
+import io.floci.aws.services.cloudformation.provisioners.LogsSubscriptionFilterCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.OrganizationsCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.PipesCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.RdsCfnProvisioner;
@@ -127,6 +128,8 @@ import io.floci.aws.services.cloudtrail.CloudTrailService;
 import io.floci.aws.services.cloudwatch.dashboards.CloudWatchDashboardsService;
 import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsMetricFilterService;
 import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsService;
+import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsSubscriptionAdmissionService;
+import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsSubscriptionFilterService;
 import io.floci.aws.services.cloudwatch.metrics.CloudWatchMetricsService;
 import io.floci.aws.services.cognito.CognitoService;
 import io.floci.aws.services.configservice.AwsConfigService;
@@ -185,6 +188,8 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
+
+import static org.mockito.Mockito.mock;
 
 /**
  * Builds {@link CfnResourceDispatcher} for tests without a wall of positional nulls.
@@ -392,6 +397,9 @@ final class CfnProvisionerFixture {
             if (logsService != null) {
                 discovered.add(new LogsCfnProvisioner(logsService));
                 discovered.add(new LogsLogStreamCfnProvisioner(logsService));
+                discovered.add(new LogsSubscriptionFilterCfnProvisioner(
+                        new CloudWatchLogsSubscriptionFilterService(logsService,
+                                mock(CloudWatchLogsSubscriptionAdmissionService.class))));
             }
             if (logsMetricFilterService != null) {
                 discovered.add(new LogsMetricFilterCfnProvisioner(logsMetricFilterService));
