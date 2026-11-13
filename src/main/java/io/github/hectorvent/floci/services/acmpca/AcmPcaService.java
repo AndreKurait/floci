@@ -7,7 +7,6 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
-import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
@@ -121,15 +120,15 @@ public class AcmPcaService implements Resettable {
             parent = PrivateCaCertificates.certificate(authority.certificatePem());
         }
         Instant now = now();
-        Instant notBefore = PrivateCaRequests.validity(request, now, true);
-        Instant notAfter = PrivateCaRequests.validity(request, now, false);
-        if (!notBefore.isBefore(notAfter) || parent != null && notAfter.isAfter(parent.getNotAfter().toInstant())) {
-            throw new AwsException("InvalidArgsException", "The requested validity exceeds the CA validity", 400);
-        }
         String token = PrivateCaRequests.token(request);
         IssueToken previous = token == null ? null : authority.issueTokens().get(token);
         if (previous != null && previous.createdAt().plusSeconds(300).isAfter(now)) {
             return mapper.createObjectNode().put("CertificateArn", previous.certificateArn());
+        }
+        Instant notBefore = PrivateCaRequests.validity(request, now, true);
+        Instant notAfter = PrivateCaRequests.validity(request, now, false);
+        if (!notBefore.isBefore(notAfter) || parent != null && notAfter.isAfter(parent.getNotAfter().toInstant())) {
+            throw new AwsException("InvalidArgsException", "The requested validity exceeds the CA validity", 400);
         }
         X509Certificate certificate = PrivateCaCertificates.issue(
                 csr, authority.privateKeyPem(), parent, notBefore, notAfter);
@@ -252,7 +251,7 @@ public class AcmPcaService implements Resettable {
         String arn = text(request, "CertificateAuthorityArn");
         AwsArnUtils.Arn parsed = validateArn(arn, false);
         if (!region.equals(parsed.region()) || !regionResolver.getAccountId().equals(parsed.accountId())
-                || !AwsRegions.partitionFor(region).equals(parsed.partition())) {
+                || !regionResolver.partitionForRegion(region).equals(parsed.partition())) {
             throw missing();
         }
         // scan never migrates unprefixed legacy data into another account.
@@ -265,7 +264,8 @@ public class AcmPcaService implements Resettable {
     }
 
     private boolean owned(CertificateAuthority authority, String region) {
-        return authority.ownerAccount().equals(regionResolver.getAccountId()) && authority.region().equals(region);
+        return authority.ownerAccount().equals(regionResolver.getAccountId()) && authority.region().equals(region)
+                && AwsArnUtils.parse(authority.arn()).partition().equals(regionResolver.partitionForRegion(region));
     }
 
     private boolean retained(CertificateAuthority authority) {
@@ -341,7 +341,7 @@ public class AcmPcaService implements Resettable {
             }
             AwsArnUtils.Arn arn = validateArn(parts[2], false);
             if (!arn.accountId().equals(parts[0]) || !arn.region().equals(region)
-                    || !arn.partition().equals(AwsRegions.partitionFor(region))) {
+                    || !arn.partition().equals(regionResolver.partitionForRegion(region))) {
                 throw new IllegalArgumentException("Token contains an invalid authority");
             }
             return parts[2];
@@ -350,7 +350,7 @@ public class AcmPcaService implements Resettable {
         }
     }
 
-    private static AwsArnUtils.Arn validateArn(String value, boolean certificate) {
+    private AwsArnUtils.Arn validateArn(String value, boolean certificate) {
         try {
             if (value.length() > 200 || !AwsArnUtils.isArnFor(value, "acm-pca")) {
                 throw new IllegalArgumentException("Not a Private CA ARN");
@@ -358,7 +358,7 @@ public class AcmPcaService implements Resettable {
             AwsArnUtils.Arn arn = AwsArnUtils.parse(value);
             String suffix = certificate ? "/certificate/[0-9a-fA-F]+" : "";
             if (!arn.accountId().matches("[0-9]{12}") || arn.region().isEmpty()
-                    || !arn.partition().equals(AwsRegions.partitionFor(arn.region()))
+                    || !arn.partition().equals(regionResolver.partitionForRegion(arn.region()))
                     || !arn.resource().matches("certificate-authority/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}"
                     + "-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}" + suffix)) {
                 throw new IllegalArgumentException("Invalid Private CA ARN");
@@ -369,8 +369,8 @@ public class AcmPcaService implements Resettable {
         }
     }
 
-    private static String templateArn(String region, String template) {
-        return AwsArnUtils.Arn.global(AwsRegions.partitionFor(region), "acm-pca", "", "template/" + template).toString();
+    private String templateArn(String region, String template) {
+        return AwsArnUtils.Arn.global(regionResolver.partitionForRegion(region), "acm-pca", "", "template/" + template).toString();
     }
 
     private static void requireUsable(CertificateAuthority authority) {
