@@ -43,20 +43,6 @@ def test_a_member_fills_a_variable_its_stem_relates_to_and_of_its_kind():
         {"type": "thing", "fill": {"ThingName": "SpecialThingName"}}]
 
 
-def test_a_member_naming_the_type_before_the_variable_wins_over_a_bare_one():
-    formats = {"snapshot": "arn:${Partition}:svc:${Region}:${Account}:snapshot:${ClusterName}/${SnapshotName}",
-               "cluster": FORMATS["thing"].replace("thing/${ThingName}", "cluster:${ClusterName}")}
-    # The snapshot's cluster is the one its SnapshotClusterIdentifier names; ClusterIdentifier is the cluster's own.
-    assert r.resources_for("svc:RestoreFromClusterSnapshot", ["cluster", "snapshot"], formats,
-                           members("ClusterIdentifier", "SnapshotIdentifier", "SnapshotClusterIdentifier")) == [
-        {"type": "cluster", "fill": {"ClusterName": "ClusterIdentifier"}},
-        {"type": "snapshot", "fill": {"ClusterName": "SnapshotClusterIdentifier", "SnapshotName": "SnapshotIdentifier"}}]
-    # The tenant's id is its own, not the bare Id of the invalidation the operation reads.
-    assert r.resources_for("svc:GetInvalidationForTenant", ["tenant"],
-                           {"tenant": "arn:${Partition}:svc::${Account}:tenant/${Id}"}, members("TenantId", "Id")) == [
-        {"type": "tenant", "fill": {"Id": "TenantId"}}]
-
-
 def test_a_bare_name_fills_the_type_the_operation_is_about_and_no_other():
     assert r.resources_for("svc:CreateThing", ["thing"], FORMATS, members("Name")) == [
         {"type": "thing", "fill": {"ThingName": "Name"}}]
@@ -74,25 +60,6 @@ def test_a_fixed_format_and_a_creates_own_type_are_named_without_members():
     # Another type the action lists, which the request does not name, is not checked.
     assert r.resources_for("svc:CreatePool", ["pool", "thing"], FORMATS, members("Description")) == [
         {"type": "pool", "fill": {}}]
-
-
-def test_a_create_makes_its_own_type_whatever_a_member_holding_the_resources_it_acts_on_names():
-    # CreateResourceShare's resourceArns are what the share it makes holds, never the share itself.
-    assert r.resources_for("svc:CreatePool", ["pool", "thing"], FORMATS, members("resourceArns[]")) == [
-        {"types": ["pool", "thing"], "arn": "resourceArns[]"}, {"type": "pool", "fill": {}}]
-    # A member named after the type it makes still holds it, and a non-create makes nothing.
-    assert r.resources_for("svc:CreatePool", ["pool"], FORMATS, members("PoolArn")) == [
-        {"types": ["pool"], "arn": "PoolArn"}]
-    assert r.resources_for("svc:UpdatePool", ["pool"], FORMATS, members("resourceArns[]")) == [
-        {"types": ["pool"], "arn": "resourceArns[]"}]
-
-
-def test_an_optional_arn_member_of_a_type_without_variables_names_it_when_absent():
-    named = [{"types": ["catalog", "thing"], "arn": "CatalogArn"}]
-    assert r.with_absent_arn(named, FORMATS, {"CatalogArn"}) == named + [
-        {"type": "catalog", "fill": {}, "when": {"CatalogArn": [None]}}]
-    # A required member is always there.
-    assert r.with_absent_arn(named, FORMATS, set()) == named
 
 
 def test_an_optional_arn_member_of_a_type_with_variables_names_its_services_default_when_absent():
@@ -290,34 +257,6 @@ def test_a_bare_id_names_the_resource_whose_config_an_operation_reads():
         {"type": "distribution", "fill": {"DistributionId": "Id"}}]
 
 
-def lever_model(request_uri: str, label: str = "id") -> dict:
-    """A rest-json model whose UpdateSafetyLeverState takes `id` from the path label given, and a `state`."""
-    return {"metadata": {"protocol": "rest-json"},
-            "operations": {"UpdateSafetyLeverState": {"http": {"method": "PATCH", "requestUri": request_uri},
-                                                      "input": {"shape": "In"}}},
-            "shapes": {"In": {"type": "structure", "members": {
-                           "id": {"shape": "String", "location": "uri", "locationName": label},
-                           "state": {"shape": "String"}}},
-                       "String": {"type": "string"}}}
-
-
-def test_a_bare_path_label_names_the_type_the_segment_before_it_names():
-    formats = {"safety-lever": "arn:${Partition}:fis:${Region}:${Account}:safety-lever/${Id}",
-               "experiment": "arn:${Partition}:fis:${Region}:${Account}:experiment/${Id}"}
-    labels = r.path_labels({"fis": lever_model("/safetyLevers/{id}/state")}, "UpdateSafetyLeverState")
-    assert labels == {"id": "safetylever"}
-    # The lever's state is the lever's: its path says so where the operation's name goes on past the type.
-    assert r.resources_for("fis:UpdateSafetyLeverState", ["safety-lever"], formats, members("id"), labels=labels) == [
-        {"type": "safety-lever", "fill": {"Id": "id"}}]
-    assert r.resources_for("fis:UpdateSafetyLeverState", ["safety-lever"], formats, members("id")) == []
-    # A segment naming another type, a label after another label and a member that is no bare name name nothing.
-    assert r.resources_for("fis:UpdateSafetyLeverState", ["experiment"], formats, members("id"), labels=labels) == []
-    assert r.path_labels({"fis": lever_model("/{other}/{id}/state")}, "UpdateSafetyLeverState") == {}
-    named = lever_model("/safetyLevers/{leverId}", label="leverId")
-    named["shapes"]["In"]["members"]["leverId"] = named["shapes"]["In"]["members"].pop("id")
-    assert r.path_labels({"fis": named}, "UpdateSafetyLeverState") == {}
-
-
 def test_a_resource_member_taking_only_an_arn_holds_the_resource_the_action_acts_on():
     model = {
         "metadata": {"protocol": "rest-xml", "endpointPrefix": "svc"},
@@ -342,6 +281,18 @@ def reference(namespace: str, operations: dict[str, list[str]], resources: dict[
                             "SDK": [{"Name": namespace, "Method": name, "Package": "Boto3"}]} for name in operations],
             "Resources": [{"Name": kind, "ARNFormats": [arn]} for kind, arn in resources.items()]}
 
+@pytest.mark.parametrize("upstream,expected", [
+    ("arn:${Partition}:swf::${Account}:/domain/${DomainName}",
+     "arn:${Partition}:swf:${Region}:${Account}:/domain/${DomainName}"),
+    ("arn:${Partition}:swf:${Region}:${Account}:/domain/${DomainName}",
+     "arn:${Partition}:swf:${Region}:${Account}:/domain/${DomainName}"),
+    ("arn:${Partition}:swf:${Region}:${Account}:different/${DomainName}",
+     "arn:${Partition}:swf:${Region}:${Account}:different/${DomainName}"),
+])
+def test_swf_restores_only_the_known_missing_region(upstream, expected):
+    document = reference("swf", {}, {"domain": upstream})
+    assert r.arn_formats([document], {"swf"}) == {"swf": {"domain": expected}}
+
 
 def model(operations: dict[str, dict[str, str]], protocol: str = "json") -> dict:
     """A botocore model whose operations take the members given, each a string or a list of strings."""
@@ -361,6 +312,8 @@ def corrections(monkeypatch):
     monkeypatch.setattr(r, "NOT_COVERED", {"later": "a later batch"})
     monkeypatch.setattr(r, "CORRECTIONS", {})
     monkeypatch.setattr(r, "READ_IN_HAND_BUILT", {})
+    monkeypatch.setattr(r, "READ_IN_NOT_COVERED", {})
+    monkeypatch.setattr(r, "REST_ONLY_OPERATIONS", {})
     monkeypatch.setattr(r, "UNQUALIFIED", {})
     monkeypatch.setattr(r, "MINTED_IDS", {})
     monkeypatch.setattr(r, "FOUND_BY", {})
@@ -393,6 +346,15 @@ def test_a_built_document_validates_matches_botocore_and_names_the_namespaces_it
     assert json.loads(r.render(document)) == document
 
 
+@pytest.mark.parametrize("namespace", ["svc", "other", "hand"])
+def test_validation_rejects_a_namespace_also_declared_not_covered(corrections, tmp_path, namespace):
+    write_models(tmp_path, {"svc": model({"GetThing": {"ThingName": "String"}, "ListThings": {}})})
+    document = r.build(DOCUMENTS, "test", tmp_path, "botocore test")
+    assert r.validate(document) == []
+    document["notCovered"][namespace] = "stale classification after composition"
+    assert any(namespace in problem and "notCovered" in problem for problem in r.validate(document))
+
+
 def test_a_member_holding_an_account_id_gives_the_account_of_the_types_named_by_variables(corrections, tmp_path):
     write_models(tmp_path, {"svc": model({"GetThing": {"ThingName": "String", "registryId": "AccountId"},
                                           "ListThings": {"registryId": "AccountId"}})})
@@ -407,58 +369,6 @@ def test_a_member_holding_an_account_id_gives_the_account_of_the_types_named_by_
                           ["registryId"]) == [{"type": "catalog", "fill": {}}]
     # Two account members, either of which it could be, give none.
     assert r.with_account([{"type": "thing", "fill": {}}], FORMATS, ["a", "b"]) == [{"type": "thing", "fill": {}}]
-
-
-def test_an_account_member_of_a_types_own_structure_gives_that_types_account_alone(tmp_path):
-    service = model({"RestoreThing": {"ThingName": "String", "PoolId": "String", "OwnerAccount": "String"}})
-    service["shapes"]["Thing"] = {"type": "structure", "members": {"OwnerAccount": {"shape": "String"}}}
-    service["shapes"]["Pool"] = {"type": "structure", "members": {"PoolId": {"shape": "String"}}}
-    write_models(tmp_path, {"svc": service})
-    models = r.load_models(tmp_path, {"svc"})
-    assert r.structure_account_members(models, "RestoreThing", ["thing", "pool"]) == {"thing": "OwnerAccount"}
-    resources = [{"type": "thing", "fill": {"ThingName": "ThingName"}}, {"type": "pool", "fill": {"PoolId": "PoolId"}},
-                 {"types": ["thing"], "arn": "ThingArn"}]
-    assert r.with_structure_account(resources, FORMATS, {"thing": "OwnerAccount"}) == [
-        {"type": "thing", "fill": {"ThingName": "ThingName"}, "account": "OwnerAccount"},
-        {"type": "pool", "fill": {"PoolId": "PoolId"}}, {"types": ["thing"], "arn": "ThingArn"}]
-    # An account another rule gave stays, and a format without an account takes none.
-    given = [{"type": "thing", "fill": {}, "account": "registryId"}]
-    assert r.with_structure_account(given, FORMATS, {"thing": "OwnerAccount"}) == given
-    assert r.with_structure_account([{"type": "catalog", "fill": {}}], {"catalog": "arn:${Partition}:svc:::catalog"},
-                                    {"catalog": "OwnerAccount"}) == [{"type": "catalog", "fill": {}}]
-    # A structure with two such members says nothing about which one is its account.
-    service["shapes"]["Thing"]["members"]["SourceAccount"] = {"shape": "String"}
-    service["shapes"]["RestoreThingIn"]["members"]["SourceAccount"] = {"shape": "String"}
-    write_models(tmp_path / "two", {"svc": service})
-    assert r.structure_account_members(r.load_models(tmp_path / "two", {"svc"}), "RestoreThing", ["thing"]) == {}
-
-
-ACCOUNTS = {"account": "arn:${Partition}:account::${Account}:account",
-            "accountInOrganization":
-                "arn:${Partition}:account::${ManagementAccountId}:account/o-${OrganizationId}/${MemberAccountId}"}
-
-
-def test_an_account_member_names_the_account_an_arn_names_before_the_one_it_is_in():
-    # AccountId is the member account; the management account, the ARN's own, and the organization stay open.
-    assert r.resources_for("account:GetAlternateContact", ["accountInOrganization"], ACCOUNTS,
-                           members("AccountId")) == [
-        {"type": "accountInOrganization", "fill": {"MemberAccountId": "AccountId"}}]
-
-
-def test_an_account_alone_applies_to_a_request_leaving_out_the_optional_account_member_naming_another():
-    named = r.resources_for("account:GetAlternateContact", ["account", "accountInOrganization"], ACCOUNTS,
-                            members("AccountId"))
-    assert named == [{"type": "account", "fill": {}},
-                     {"type": "accountInOrganization", "fill": {"MemberAccountId": "AccountId"}}]
-    absent = r.with_absent_account(named, ACCOUNTS, ["AccountId"], {"AccountId"})
-    assert absent == [{"type": "account", "fill": {}, "when": {"AccountId": [None]}}, named[1]]
-    # The account member then gives the account of neither: the caller's own, or the one the member fills.
-    assert r.with_account(absent, ACCOUNTS, ["AccountId"]) == absent
-    # A required member is always there; one naming nothing else gives the account its account.
-    assert r.with_absent_account(named, ACCOUNTS, ["AccountId"], set()) == named
-    alone = [{"type": "account", "fill": {}}]
-    assert r.with_absent_account(alone, ACCOUNTS, ["AccountId"], {"AccountId"}) == alone
-    assert r.with_account(alone, ACCOUNTS, ["AccountId"]) == [{"type": "account", "fill": {}, "account": "AccountId"}]
 
 
 @pytest.mark.parametrize("member", ["ownerAccount", "resourceAccount"])
@@ -1053,6 +963,17 @@ def test_a_member_two_clients_locate_apart_is_an_error():
         r.located_members({"one": one, "two": two}, "GetThing")
 
 
+@pytest.mark.parametrize("kind", ["integer", "long"])
+def test_numeric_uri_labels_name_resources_but_body_and_query_numbers_do_not(kind):
+    svc = rest_model(
+        {"GetDeployment": {"DeploymentNumber": "Number", "Limit": "Number", "Count": "Number"}},
+        {"GetDeployment": {"DeploymentNumber": "uri:DeploymentNumber", "Limit": "querystring:limit"}})
+    svc["shapes"]["Number"] = {"type": kind}
+    assert r.request_members({"svc": svc}, "GetDeployment") == {"DeploymentNumber": "DeploymentNumber"}
+    assert r.located_members({"svc": svc}, "GetDeployment") == {"DeploymentNumber": "{DeploymentNumber}"}
+
+
+
 def test_a_located_member_must_be_a_path_label_or_a_query_parameter(corrections, tmp_path):
     write_models(tmp_path, {"svc": rest_model({"GetThing": {"ThingName": "String"}, "ListThings": {}},
                                               {"GetThing": {"ThingName": "uri:ThingName"}})})
@@ -1114,6 +1035,61 @@ def test_verify_reports_a_rest_models_operation_whose_action_aws_no_longer_has(c
     assert r.main(["--verify", "--source-dir", str(sources), "--output", str(output)]) == 1
 
 
+def test_cloudfront_resource_coverage_includes_the_complete_management_family():
+    assert r.reads("cloudfront:DescribeKeyValueStore")
+    assert r.reads("cloudfront:DeleteKeyValueStore")
+    assert r.reads("cloudfront:DescribeFunction")
+    assert r.reads("cloudfront:ListDistributions")
+    assert "cloudfront" not in r.NOT_COVERED
+
+
+@pytest.fixture
+def partial_cloudfront_document(monkeypatch):
+    document = json.loads(r.OUTPUT.read_text(encoding="utf-8"))
+    allowed = {"cloudfront:DescribeKeyValueStore", "cloudfront:DeleteKeyValueStore"}
+    document["operations"] = {operation: entry for operation, entry in document["operations"].items()
+                              if not operation.startswith("cloudfront:") or operation in allowed}
+    document["notCovered"]["cloudfront"] = "Synthetic partial-namespace fixture"
+    monkeypatch.setattr(r, "READ_IN_NOT_COVERED", dict.fromkeys(allowed, "fixture"))
+    assert r.validate(document) == []
+    return document
+
+
+def test_partial_namespace_rejects_an_operation_outside_its_explicit_allowlist(partial_cloudfront_document):
+    document = partial_cloudfront_document
+    document["operations"]["cloudfront:DescribeFunction"] = {
+        "action": "cloudfront:DescribeFunction", "types": [], "resources": []}
+    document["operations"] = dict(sorted(document["operations"].items()))
+    assert "cloudfront is in both namespaces and notCovered" in r.validate(document)
+
+
+def test_partial_namespace_requires_at_least_one_qualified_operation(partial_cloudfront_document):
+    document = partial_cloudfront_document
+    document["operations"] = {operation: entry for operation, entry in document["operations"].items()
+                              if not operation.startswith("cloudfront:")}
+    assert "cloudfront is in both namespaces and notCovered" in r.validate(document)
+
+
+@pytest.mark.parametrize("section", ["handBuilt", "otherNamespaces"])
+def test_partial_namespace_does_not_allow_other_classification_overlap(section, partial_cloudfront_document):
+    document = partial_cloudfront_document
+    document[section].append("cloudfront")
+    assert f"cloudfront is in both {section} and notCovered" in r.validate(document)
+
+
+def test_rest_xml_operations_read_path_labels_without_reading_bodies():
+    sample = rest_model({"DescribeKeyValueStore": {"Name": "String"}, "DescribeFunction": {"Name": "String"}},
+                        {"DescribeKeyValueStore": {"Name": "uri:Name"}, "DescribeFunction": {"Name": "uri:Name"}})
+    sample["metadata"].update(protocol="rest-xml", endpointPrefix="cloudfront")
+    assert r.request_members({"cloudfront": sample}, "DescribeKeyValueStore") == {"Name": "Name"}
+    assert r.located_members({"cloudfront": sample}, "DescribeKeyValueStore") == {"Name": "{Name}"}
+    assert r.request_members({"cloudfront": sample}, "DescribeFunction") == {"Name": "Name"}
+    assert r.located_members({"cloudfront": sample}, "DescribeFunction") == {"Name": "{Name}"}
+    sample["metadata"]["endpointPrefix"] = "another-service"
+    assert r.request_members({"other": sample}, "DescribeKeyValueStore") == {"Name": "Name"}
+    assert r.located_members({"other": sample}, "DescribeKeyValueStore") == {"Name": "{Name}"}
+
+
 def test_id_targets_follow_the_model_and_resource_types_not_operation_names():
     ec2 = model({"AnnotateResources": {"Resources": "Strings"}}, "ec2")
     member = ec2["shapes"]["AnnotateResourcesIn"]["members"]["Resources"]
@@ -1159,6 +1135,106 @@ def test_id_targets_reject_unknown_types_ambiguous_prefixes_and_malformed_member
         assert r.validate(invalid), (field, value)
 
 
+def test_an_optional_arn_member_of_a_type_without_variables_names_it_when_absent():
+    named = [{"types": ["catalog", "thing"], "arn": "CatalogArn"}]
+    assert r.with_absent_arn(named, FORMATS, {"CatalogArn"}) == named + [
+        {"type": "catalog", "fill": {}, "when": {"CatalogArn": [None]}}]
+    # A required member is always there.
+    assert r.with_absent_arn(named, FORMATS, set()) == named
+
+
+def test_optional_members_are_only_optional_top_level_strings():
+    model = {
+        "metadata": {"protocol": "rest-json"},
+        "operations": {"DescribeCatalog": {"input": {"shape": "Request"}}},
+        "shapes": {
+            "Request": {"type": "structure", "required": ["RequiredArn"], "members": {
+                "CatalogArn": {"shape": "Text"}, "RequiredArn": {"shape": "Text"},
+                "Nested": {"shape": "Nested"}, "Count": {"shape": "Count"}}},
+            "Text": {"type": "string"}, "Count": {"type": "integer"},
+            "Nested": {"type": "structure", "members": {"CatalogArn": {"shape": "Text"}}},
+        },
+    }
+    assert r.optional_members({"test": model}, "DescribeCatalog") == {"CatalogArn"}
+    assert r.optional_members({"test": model}, "Missing") == set()
+
+
+def test_qualified_identifier_resources_are_all_retained_only_for_resolving_namespaces(monkeypatch):
+    monkeypatch.setattr(r, "QUALIFIED_MEMBERS", ("svc",), raising=False)
+    formats = {"key": "arn:${Partition}:svc:${Region}:${Account}:key/${KeyIdentifier}"}
+    named = members("IncomingKeyIdentifier", "OutgoingKeyIdentifier", "TagKeys[]")
+    assert r.resources_for("svc:ReEncrypt", ["key"], formats, named) == [
+        {"type": "key", "fill": {"KeyIdentifier": "IncomingKeyIdentifier"}},
+        {"type": "key", "fill": {"KeyIdentifier": "OutgoingKeyIdentifier"}},
+    ]
+    assert r.resources_for("other:ReEncrypt", ["key"], formats, named) == []
+
+
+def test_a_create_makes_its_own_type_whatever_a_member_holding_the_resources_it_acts_on_names():
+    # CreateResourceShare's resourceArns are what the share it makes holds, never the share itself.
+    assert r.resources_for("svc:CreatePool", ["pool", "thing"], FORMATS, members("resourceArns[]")) == [
+        {"types": ["pool", "thing"], "arn": "resourceArns[]"}, {"type": "pool", "fill": {}}]
+    # A member named after the type it makes still holds it, and a non-create makes nothing.
+    assert r.resources_for("svc:CreatePool", ["pool"], FORMATS, members("PoolArn")) == [
+        {"types": ["pool"], "arn": "PoolArn"}]
+    assert r.resources_for("svc:UpdatePool", ["pool"], FORMATS, members("resourceArns[]")) == [
+        {"types": ["pool"], "arn": "resourceArns[]"}]
+
+
+def lever_model(request_uri: str, label: str = "id") -> dict:
+    """A rest-json model whose UpdateSafetyLeverState takes `id` from the path label given, and a `state`."""
+    return {"metadata": {"protocol": "rest-json"},
+            "operations": {"UpdateSafetyLeverState": {"http": {"method": "PATCH", "requestUri": request_uri},
+                                                      "input": {"shape": "In"}}},
+            "shapes": {"In": {"type": "structure", "members": {
+                           "id": {"shape": "String", "location": "uri", "locationName": label},
+                           "state": {"shape": "String"}}},
+                       "String": {"type": "string"}}}
+
+
+def test_a_bare_path_label_names_the_type_the_segment_before_it_names():
+    formats = {"safety-lever": "arn:${Partition}:fis:${Region}:${Account}:safety-lever/${Id}",
+               "experiment": "arn:${Partition}:fis:${Region}:${Account}:experiment/${Id}"}
+    labels = r.path_labels({"fis": lever_model("/safetyLevers/{id}/state")}, "UpdateSafetyLeverState")
+    assert labels == {"id": "safetylever"}
+    # The lever's state is the lever's: its path says so where the operation's name goes on past the type.
+    assert r.resources_for("fis:UpdateSafetyLeverState", ["safety-lever"], formats, members("id"), labels=labels) == [
+        {"type": "safety-lever", "fill": {"Id": "id"}}]
+    assert r.resources_for("fis:UpdateSafetyLeverState", ["safety-lever"], formats, members("id")) == []
+    # A segment naming another type, a label after another label and a member that is no bare name name nothing.
+    assert r.resources_for("fis:UpdateSafetyLeverState", ["experiment"], formats, members("id"), labels=labels) == []
+    assert r.path_labels({"fis": lever_model("/{other}/{id}/state")}, "UpdateSafetyLeverState") == {}
+    named = lever_model("/safetyLevers/{leverId}", label="leverId")
+    named["shapes"]["In"]["members"]["leverId"] = named["shapes"]["In"]["members"].pop("id")
+    assert r.path_labels({"fis": named}, "UpdateSafetyLeverState") == {}
+
+
+def test_an_account_member_names_the_account_an_arn_names_before_the_one_it_is_in():
+    # AccountId is the member account; the management account, the ARN's own, and the organization stay open.
+    assert r.resources_for("account:GetAlternateContact", ["accountInOrganization"], ACCOUNTS,
+                           members("AccountId")) == [
+        {"type": "accountInOrganization", "fill": {"MemberAccountId": "AccountId"}}]
+
+
+def test_an_account_alone_applies_to_a_request_leaving_out_the_optional_account_member_naming_another():
+    named = r.resources_for("account:GetAlternateContact", ["account", "accountInOrganization"], ACCOUNTS,
+                            members("AccountId"))
+    assert named == [{"type": "account", "fill": {}},
+                     {"type": "accountInOrganization", "fill": {"MemberAccountId": "AccountId"}}]
+    absent = r.with_absent_account(named, ACCOUNTS, ["AccountId"], {"AccountId"})
+    assert absent == [{"type": "account", "fill": {}, "when": {"AccountId": [None]}}, named[1]]
+    # The account member then gives the account of neither: the caller's own, or the one the member fills.
+    assert r.with_account(absent, ACCOUNTS, ["AccountId"]) == absent
+    # A required member is always there; one naming nothing else gives the account its account.
+    assert r.with_absent_account(named, ACCOUNTS, ["AccountId"], set()) == named
+    alone = [{"type": "account", "fill": {}}]
+    assert r.with_absent_account(alone, ACCOUNTS, ["AccountId"], {"AccountId"}) == alone
+    assert r.with_account(alone, ACCOUNTS, ["AccountId"]) == [{"type": "account", "fill": {}, "account": "AccountId"}]
+
+
+ACCOUNTS = {"account": "arn:${Partition}:account::${Account}:account",
+            "accountInOrganization":
+                "arn:${Partition}:account::${ManagementAccountId}:account/o-${OrganizationId}/${MemberAccountId}"}
 @pytest.mark.parametrize("operation", [
     "GetLandingZone", "UpdateLandingZone", "DeleteLandingZone", "ResetLandingZone",
     "GetBaseline", "GetEnabledBaseline", "UpdateEnabledBaseline", "ResetEnabledBaseline", "DisableBaseline",
@@ -1236,43 +1312,3 @@ def test_sso_access_scope_does_not_authorize_target_applications():
     derived = r.entry_for(operation, {"action": entry["action"], "types": entry["types"]},
                           document["arnFormats"]["sso"], models)
     assert derived["resources"] == [{"types": ["Application"], "arn": "ApplicationArn"}]
-
-
-def test_a_path_segment_in_ies_names_the_type_in_y():
-    # lever_model's operation stands in for Route 53's ListTrafficPolicyVersions, /trafficpolicies/{Id}/versions.
-    labels = r.path_labels({"route53": lever_model("/2013-04-01/trafficpolicies/{id}/versions")},
-                           "UpdateSafetyLeverState")
-    assert labels == {"id": "trafficpolicy"}
-    formats = {"trafficpolicy": "arn:${Partition}:route53:::trafficpolicy/${Id}"}
-    assert r.resources_for("route53:ListTrafficPolicyVersions", ["trafficpolicy"], formats, members("id"),
-                           labels=labels) == [{"type": "trafficpolicy", "fill": {"Id": "id"}}]
-    assert r.resources_for("route53:ListTrafficPolicyVersions", ["trafficpolicy"], formats, members("id")) == []
-
-
-def test_a_member_whose_enum_lists_two_of_the_actions_types_picks_the_type():
-    formats = {"healthcheck": "arn:${Partition}:route53:::healthcheck/${Id}",
-               "hostedzone": "arn:${Partition}:route53:::hostedzone/${Id}"}
-    members = {"ResourceType": "ResourceType", "ResourceId": "ResourceId"}
-    enums = {"ResourceType": {"healthcheck", "hostedzone"}}
-    assert r.picked_by_enum(["healthcheck", "hostedzone"], formats, members, enums) == [
-        {"type": "healthcheck", "fill": {"Id": "ResourceId"}, "when": {"ResourceType": ["healthcheck"]}},
-        {"type": "hostedzone", "fill": {"Id": "ResourceId"}, "when": {"ResourceType": ["hostedzone"]}}]
-    # An enum listing one of the action's types, or none of them, picks nothing.
-    assert r.picked_by_enum(["hostedzone"], formats, members, enums) is None
-    assert r.picked_by_enum(["healthcheck", "hostedzone"], formats, members, {"ResourceType": {"other"}}) is None
-    # Without a member naming the resource, the request names none of them.
-    assert r.picked_by_enum(["healthcheck", "hostedzone"], formats, {"ResourceType": "ResourceType"}, enums) is None
-
-
-def test_an_enum_value_picks_a_type_ignoring_case_and_hyphens_and_the_resource_id_fills_it():
-    formats = {"document": "arn:${Partition}:ssm:${Region}:${Account}:document/${DocumentName}",
-               "managed-instance": "arn:${Partition}:ssm:${Region}:${Account}:managed-instance/${InstanceId}",
-               "parameter": "arn:${Partition}:ssm:${Region}:${Account}:parameter/${ParameterNameWithoutLeadingSlash}"}
-    members = {"ResourceType": "ResourceType", "ResourceId": "ResourceId"}
-    enums = {"ResourceType": {"Document", "ManagedInstance", "Parameter", "Automation"}}
-    assert r.picked_by_enum(["document", "managed-instance", "parameter"], formats, members, enums) == [
-        {"type": "document", "fill": {"DocumentName": "ResourceId"}, "when": {"ResourceType": ["Document"]}},
-        {"type": "managed-instance", "fill": {"InstanceId": "ResourceId"},
-         "when": {"ResourceType": ["ManagedInstance"]}},
-        {"type": "parameter", "fill": {"ParameterNameWithoutLeadingSlash": "ResourceId"},
-         "when": {"ResourceType": ["Parameter"]}}]

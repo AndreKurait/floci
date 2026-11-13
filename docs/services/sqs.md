@@ -84,6 +84,17 @@ curl -X DELETE "http://localhost:4566/_aws/sqs/messages?QueueUrl=$QUEUE_URL"
 
 `ReceiveMessage` waits up to `WaitTimeSeconds` (0 to 20) for a message to arrive and returns as soon as one is available. Values outside that range are rejected with `InvalidParameterValue`. When the request omits `WaitTimeSeconds`, the queue's `ReceiveMessageWaitTimeSeconds` attribute applies (default `0`, short polling), matching AWS.
 
+Empty long polls wait on a versioned notification owned by that queue incarnation,
+without repeating a storage scan every second. Successful message mutations wake
+receivers, including internal redrive delivery and visibility changes. A notification
+between an empty scan and parking is retained. Nonempty queues retain periodic
+checks for visibility and retention expiry. Deletion, reset and shutdown wake old
+receivers; they cannot claim messages from a replacement queue.
+Reset also fences message-store writes across queue generations. An old write
+that finishes after reset cannot overwrite a replacement queue's persisted messages.
+Queue creation retains the message queue already opened by a concurrent receive or send
+after metadata becomes visible, preserving waiting receivers and their messages.
+
 `MaxNumberOfMessages` defaults to 1 and must be an integer from 1 to 10.
 Out-of-range, malformed, and overflowing values return `InvalidParameterValue`
 without receiving a message or changing its receive count or visibility. Both
@@ -105,9 +116,13 @@ aws sqs set-queue-attributes \
 
 `DelaySeconds` must be 0 to 900, both on a message and as a queue attribute: `SendMessage` rejects other values with `InvalidParameterValue` (in `SendMessageBatch` only that entry fails), and `CreateQueue` and `SetQueueAttributes` reject them with `InvalidAttributeValue`.
 
-A message attribute with no `DataType`, with a `DataType` whose base type (the part before the first `.`) is not `String`, `Number` or `Binary`, with no value, with an empty `StringValue` or `BinaryValue`, or with a `BinaryValue` that is not base64 is rejected by `SendMessage` with `InvalidParameterValue` on both the JSON and query protocols. The base type match is case-sensitive, so `Number.int` is accepted while `number` is not, and a `DataType` such as `.` that starts with a period is rejected because its base type is empty. In `SendMessageBatch` only the entry carrying that attribute fails; the other entries are sent. The entry still counts toward the batch payload total, so a batch over the batch payload limit fails whole with `BatchRequestTooLong` even when the excess comes from that entry.
-
 `SqsManagedSseEnabled` is `true` for a queue with no `KmsMasterKeyId`, matching AWS, and `false` once a KMS key is set. It is derived on read rather than stored, so clearing `KmsMasterKeyId` returns the queue to `true`, unless you set `SqsManagedSseEnabled` yourself, in which case your value stands. AWS does not document the cleared-key case crisply, so that behaviour is Floci's choice rather than a copied one. `CreateQueue` on an existing name compares requested attributes against these reported values, so asking for `SqsManagedSseEnabled=false` on a queue that reports `true` fails with `QueueAlreadyExists` (`QueueNameExists` over JSON).
+
+`AWS::SQS::QueuePolicy` installs its resolved `PolicyDocument` on every URL in `Queues`.
+Updates keep the resource's `Ref` and `Fn::GetAtt Id`, apply the new document, and remove the policy
+from targets dropped from the list. A failed write or later stack-update failure restores the
+previous policies and target list. Deleting the policy resource detaches its policies without
+deleting the queues; an already-deleted queue is tolerated, while other cleanup errors fail deletion.
 
 ## Message Retention
 
@@ -214,6 +229,8 @@ The region is the one the request was signed for, and the host carries that regi
 
 Under either setting every form is accepted as input. That covers the AWS URL, the Floci URL, any other host whose path ends in `/<account>/<queue-name>`, and the bare queue name. A queue is stored by account and name, so a base URL with a path of its own, such as `http://localhost:4566/sqs`, keeps the same queues under either setting. Existing queues, persisted ones included, are reported in the form the current setting and base URL give.
 
+Query clients such as Boto 2 can send signed `GET` requests to `/<account>/<queue-name>` (with an optional trailing slash), with `Action` and its parameters in the query string. The path supplies the queue URL for both authorization and dispatch. Header signatures and presigned requests are verified against the original URI. A Query request on `/queue/<region>/<account>/<queue-name>` returns `InvalidAddress` after signature verification. S3-signed object requests keep their S3 routing.
+
 ## Queue policies under IAM enforcement
 
 With `floci.services.iam.enforcement-enabled` on, a queue's `Policy` attribute, written by
@@ -221,6 +238,12 @@ With `floci.services.iam.enforcement-enabled` on, a queue's `Policy` attribute, 
 describes. Within one account either the policy or the caller's identity policies can allow a call,
 and an explicit `Deny` in either refuses it. A `QueueUrl` whose path names another account is a
 cross-account call: the queue's policy and the caller's identity policies both have to allow it.
+
+`GetQueueUrl` and `CreateQueue` authorize the queue named by `QueueName`, including
+legacy Query GET and POST requests and SDK JSON requests. An unrelated `QueueUrl`
+does not select their authorization resource. Other queue operations continue to
+authorize their `QueueUrl`. `GetQueueUrl` currently selects the caller's account;
+the optional `QueueOwnerAWSAccountId` is not implemented.
 
 ## Storage write failures
 
