@@ -132,6 +132,12 @@ class CfnCreateOnlyPropertiesTest {
         assertEquals(Set.of("Name", "ReplicateTo"),
                 CfnCreateOnlyProperties.getCreateOnlyProperties("AWS::AppConfig::DeploymentStrategy"));
         assertFalse(CfnCreateOnlyProperties.isCreateOnly("AWS::AppConfig::DeploymentStrategy", "GrowthFactor"));
+        assertEquals(Set.of("ApplicationId", "ConfigurationProfileId", "Content", "ContentType", "Description",
+                        "LatestVersionNumber", "VersionLabel"),
+                CfnCreateOnlyProperties.getCreateOnlyProperties("AWS::AppConfig::HostedConfigurationVersion"));
+        assertEquals(Set.of("ApplicationId", "ConfigurationProfileId", "ConfigurationVersion", "DeploymentStrategyId",
+                        "Description", "DynamicExtensionParameters", "EnvironmentId", "KmsKeyIdentifier", "Tags"),
+                CfnCreateOnlyProperties.getCreateOnlyProperties("AWS::AppConfig::Deployment"));
     }
 
     @Test
@@ -216,5 +222,48 @@ class CfnCreateOnlyPropertiesTest {
         assertTrue(CfnCreateOnlyProperties.isCreateOnly("AWS::Events::Archive", "SourceArn"));
         assertTrue(CfnCreateOnlyProperties.isCreateOnly("AWS::Events::Archive", "ArchiveName"));
         assertFalse(CfnCreateOnlyProperties.isCreateOnly("AWS::Events::Archive", "RetentionDays"));
+    }
+
+    @Test
+    void hostedLabelAndTokenAdditionsRequireReplacementIncludingAnEmptyLabel() throws IOException {
+        ObjectMapper mapper = new ObjectMapper();
+        for (String added : List.of("{\"VersionLabel\":\"release\"}", "{\"VersionLabel\":\"\"}",
+                "{\"LatestVersionNumber\":0}")) {
+            assertTrue(CfnCreateOnlyProperties.createOnlyValueChanged("AWS::AppConfig::HostedConfigurationVersion",
+                    mapper.readTree("{}"), mapper.readTree(added)));
+        }
+    }
+
+    @Test
+    void hostedUnchangedOptionalPropertiesRemainStableAndRemovalStillReplaces() throws IOException {
+        ObjectMapper mapper = new ObjectMapper();
+        for (String properties : List.of("{\"VersionLabel\":\"\"}", "{\"LatestVersionNumber\":0}")) {
+            assertFalse(CfnCreateOnlyProperties.createOnlyValueChanged("AWS::AppConfig::HostedConfigurationVersion",
+                    mapper.readTree(properties), mapper.readTree(properties)));
+            assertTrue(CfnCreateOnlyProperties.createOnlyValueChanged("AWS::AppConfig::HostedConfigurationVersion",
+                    mapper.readTree(properties), mapper.readTree("{}")));
+        }
+    }
+
+    @Test
+    void unrelatedTopLevelAdditionBehaviorRemainsUnchanged() throws IOException {
+        ObjectMapper mapper = new ObjectMapper();
+        assertFalse(CfnCreateOnlyProperties.createOnlyValueChanged("AWS::S3::Bucket",
+                mapper.readTree("{}"), mapper.readTree("{\"BucketName\":\"owned\"}")));
+        assertFalse(CfnCreateOnlyProperties.createOnlyValueChanged("AWS::AppConfig::HostedConfigurationVersion",
+                mapper.readTree("{}"), mapper.readTree("{\"Description\":\"unchanged-scope\"}")));
+        assertTrue(CfnCreateOnlyProperties.createOnlyValueChanged("AWS::S3::Bucket",
+                mapper.readTree("{\"BucketName\":\"owned\"}"), mapper.readTree("{}")));
+    }
+
+    @Test
+    void nestedCreateOnlyAdditionsStillCompareTheirExactRegistryPointer() throws IOException {
+        ObjectMapper mapper = new ObjectMapper();
+        assertTrue(CfnCreateOnlyProperties.createOnlyValueChanged("AWS::Route53::HealthCheck",
+                mapper.readTree("{\"HealthCheckConfig\":{}}"),
+                mapper.readTree("{\"HealthCheckConfig\":{\"Type\":\"HTTP\"}}")));
+        assertFalse(CfnCreateOnlyProperties.createOnlyValueChanged("AWS::Route53::HealthCheck",
+                mapper.readTree("{\"HealthCheckConfig\":{}}"),
+                mapper.readTree("{\"HealthCheckConfig\":{\"Port\":80}}")));
     }
 }

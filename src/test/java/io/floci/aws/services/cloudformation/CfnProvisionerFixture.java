@@ -3,6 +3,7 @@ package io.floci.aws.services.cloudformation;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.ServiceConfigAccess;
 import io.floci.aws.core.common.docker.ContainerReachableEndpoint;
 import io.floci.aws.services.acm.AcmService;
 import io.floci.aws.services.apigateway.ApiGatewayService;
@@ -25,6 +26,8 @@ import io.floci.aws.services.cloudformation.provisioners.ApiGatewayUsagePlanCfnP
 import io.floci.aws.services.cloudformation.provisioners.ApiGatewayV2CfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.ApiGatewayV2DomainCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.AppConfigCfnProvisioner;
+import io.floci.aws.services.cloudformation.provisioners.AppConfigDeploymentCfnProvisioner;
+import io.floci.aws.services.cloudformation.provisioners.AppConfigHostedVersionCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.AppSyncCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.ApplicationAutoScalingCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.AutoScalingGroupCfnProvisioner;
@@ -185,6 +188,9 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
+
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * Builds {@link CfnResourceDispatcher} for tests without a wall of positional nulls.
@@ -452,6 +458,10 @@ final class CfnProvisionerFixture {
             }
             if (appConfigService != null) {
                 discovered.add(new AppConfigCfnProvisioner(appConfigService));
+                ServiceConfigAccess serviceConfig = mock(ServiceConfigAccess.class);
+                when(serviceConfig.isEnabled("appconfig")).thenReturn(true);
+                discovered.add(new AppConfigDeploymentCfnProvisioner(appConfigService, serviceConfig));
+                discovered.add(new AppConfigHostedVersionCfnProvisioner(appConfigService, serviceConfig));
             }
             if (lambdaService != null) {
                 discovered.add(new LambdaAddressingCfnProvisioner(lambdaService));
