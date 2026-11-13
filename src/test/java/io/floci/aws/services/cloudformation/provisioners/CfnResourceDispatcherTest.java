@@ -19,6 +19,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -44,6 +45,61 @@ class CfnResourceDispatcherTest {
     private final CfnDynamicReferences dynamicReferences = mock(CfnDynamicReferences.class);
     private final CfnResourceDispatcher dispatcher =
             new CfnResourceDispatcher(mapper, registry, dynamicReferences, null);
+
+    @Test
+    void publicIdProjectionIsIndependentOfRefAndPreservesLifecycleIdentity() {
+        AtomicReference<String> deleted = new AtomicReference<>();
+        CfnResourceProvisioner owner = new CfnResourceProvisioner() {
+            @Override
+            public Set<String> resourceTypes() {
+                return Set.of(TYPE);
+            }
+
+            @Override
+            public void provision(StackResource resource, JsonNode properties, ProvisionContext ctx) {
+            }
+
+            @Override
+            public String referenceValue(String physicalId) {
+                return "reference:" + physicalId;
+            }
+
+            @Override
+            public String publicPhysicalId(String physicalId) {
+                return "public:" + physicalId;
+            }
+
+            @Override
+            public void delete(String resourceType, String physicalId, String region) {
+                deleted.set(physicalId);
+            }
+        };
+        CfnResourceDispatcher routed = new CfnResourceDispatcher(mapper,
+                new CloudFormationResourceRegistry(List.of(owner)), dynamicReferences, null);
+        StackResource resource = new StackResource();
+        resource.setResourceType(TYPE);
+        resource.setPhysicalId("application|profile|7");
+
+        assertEquals("public:application|profile|7", routed.publicPhysicalId(TYPE, resource.getPhysicalId()));
+        assertEquals("reference:application|profile|7", routed.referenceValue(TYPE, resource.getPhysicalId()));
+        assertNull(routed.publicPhysicalId(TYPE, null));
+        routed.delete(resource, "us-east-1");
+        assertEquals("application|profile|7", deleted.get());
+        assertEquals("application|profile|7", resource.getPhysicalId());
+    }
+
+    @Test
+    void publicIdsKeepDefaultCustomUnownedAndDisabledRepresentations() {
+        CfnResourceDispatcher routed = new CfnResourceDispatcher(mapper,
+                new CloudFormationResourceRegistry(List.of(serving(TYPE),
+                        serving("AWS::CloudFormation::CustomResource"))), dynamicReferences, null);
+        for (String type : Arrays.asList(TYPE, "AWS::Unknown::Thing", "Custom::Namer", null)) {
+            assertEquals("owner|resource", routed.publicPhysicalId(type, "owner|resource"));
+            assertNull(routed.publicPhysicalId(type, null));
+        }
+        DisabledServiceProvisioner disabled = new DisabledServiceProvisioner(TYPE);
+        assertEquals("owner|resource", disabledDispatcher(disabled).publicPhysicalId(TYPE, "owner|resource"));
+    }
 
     /**
      * A type the registry routes to the generic custom-resource handler is a custom resource: the
@@ -396,6 +452,11 @@ class CfnResourceDispatcherTest {
         @Override
         public String serviceEnabledFlag() {
             return "floci.services.thing.enabled";
+        }
+
+        @Override
+        public String publicPhysicalId(String physicalId) {
+            throw new AssertionError("A disabled owner must not project response IDs");
         }
 
         @Override

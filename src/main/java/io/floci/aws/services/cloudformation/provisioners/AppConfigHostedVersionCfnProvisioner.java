@@ -50,6 +50,11 @@ public class AppConfigHostedVersionCfnProvisioner implements CfnResourceProvisio
     }
 
     @Override
+    public String publicPhysicalId(String physicalId) {
+        return physicalId == null ? null : referenceValue(physicalId);
+    }
+
+    @Override
     public void provision(StackResource resource, JsonNode properties, ProvisionContext ctx) {
         if (ctx.isUpdate()) {
             ReplacementCleanup.endRollbackRetry(resource);
