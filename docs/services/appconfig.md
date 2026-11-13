@@ -49,6 +49,7 @@ Hosted deployment and validation requests still select configurations by numeric
 - `GetConfigurationProfile`
 - `ListConfigurationProfiles`
 - `DeleteConfigurationProfile`
+- `ValidateConfiguration`
 - `CreateHostedConfigurationVersion`
 - `GetHostedConfigurationVersion`
 - `ListHostedConfigurationVersions`
@@ -76,6 +77,22 @@ A missing or undeployed environment returns `BadRequestException`; an unknown ap
 returns `ResourceNotFoundException`.
 Only hosted configurations are served: a deployed version with no hosted configuration version behind it,
 such as one from an S3 or SSM source, returns `ResourceNotFoundException`.
+
+`CreateConfigurationProfile` stores up to two `Validators`, each with a `Type` and `Content`
+of at most 32,768 characters. Hosted freeform profiles support inline `JSON_SCHEMA` validators
+using draft-04, including references within the schema. `ValidateConfiguration` checks the
+selected hosted version and returns HTTP 204 when it passes; invalid content or an invalid
+schema returns `BadRequestException`. Validation leaves the stored profile and versions unchanged.
+`StartDeployment` applies the same validators before creating a deployment or changing the active
+configuration, so a refusal preserves the previous deployment and content. With IAM enforcement
+enabled, validation requires `appconfig:ValidateConfiguration` on both the application and
+configuration-profile ARNs.
+
+Other schema drafts and external schema references are not supported. JSON Schema validators
+are refused for feature-flag profiles. Lambda validator declarations are retained, but validation
+and deployment refuse them because Lambda invocation is not implemented. Validation of S3 and
+other external configuration sources is not implemented. The CloudFormation provisioner still
+ignores the template's `Validators`; these validators are configured through the management API.
 
 `CreateEnvironment` keeps up to five `Monitors`, each a CloudWatch `AlarmArn` with an optional IAM role
 `AlarmRoleArn`, and environment reads return them; an environment created without monitors returns none.
