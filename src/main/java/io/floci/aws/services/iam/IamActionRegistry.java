@@ -9,6 +9,7 @@ import io.floci.aws.core.common.RequestResources;
 import io.floci.aws.core.common.ResteasyRequests;
 import io.floci.aws.core.common.SignedServiceRoute;
 import io.floci.aws.core.common.WireProtocol;
+import io.floci.aws.services.appconfig.AppConfigDataController;
 import io.floci.aws.services.dynamodb.DynamoDbPartiQLParser;
 import io.floci.aws.services.eks.EksController;
 import io.floci.aws.services.s3.S3BucketSubresources;
@@ -651,6 +652,16 @@ public class IamActionRegistry {
     public String resolveMatchedRoute(String credentialScope, ResourceInfo resourceInfo) {
         if (resourceInfo == null || resourceInfo.getResourceClass() == null) {
             return null;
+        }
+        if ("appconfig".equals(credentialScope)
+                && AppConfigDataController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            // GetLatestConfiguration uses an internal route to avoid an S3 bucket-name collision.
+            return switch (resourceInfo.getResourceMethod().getName()) {
+                case "startConfigurationSession" -> "appconfig:StartConfigurationSession";
+                case "getLatestConfiguration" -> "appconfig:GetLatestConfiguration";
+                default -> null;
+            };
         }
         IamOperation iamOperation = resourceInfo.getResourceClass().getAnnotation(IamOperation.class);
         if (iamOperation == null || !credentialScope.equals(iamOperation.namespace())) {
