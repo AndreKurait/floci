@@ -1,0 +1,143 @@
+package io.github.hectorvent.floci.services.lambda.launcher;
+
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.iam.model.IamRole;
+import io.github.hectorvent.floci.services.iam.model.LambdaExecutionBinding;
+import io.github.hectorvent.floci.services.iam.model.SessionCreds;
+import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+
+import java.security.SecureRandom;
+import java.util.Optional;
+
+/** Mints and revokes the IAM sessions used by Lambda execution environments. */
+@ApplicationScoped
+public class LambdaExecutionRoleCredentials {
+
+    private static final String UPPER_ALPHANUMERIC = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    private static final String SECRET_CHARACTERS =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    /**
+     * These values are what {@code IamEnforcementFilter} authorizes a caller against, so they are
+     * minted from a CSPRNG rather than a predictable generator.
+     */
+    private static final SecureRandom SECURE_RANDOM = new SecureRandom();
+
+    private final IamService iamService;
+
+    @Inject
+    public LambdaExecutionRoleCredentials(IamService iamService) {
+        this.iamService = iamService;
+    }
+
+    /**
+     * Account that owns a function's execution-role session. Falls back to the function ARN because
+     * a published version carries no {@code accountId}: {@code publishVersion} builds the snapshot
+     * field by field and leaves it null, so keying off the field alone would hand every
+     * version-qualified invoke the placeholder credentials and silently skip IAM enforcement while
+     * {@code $LATEST} enforced it. Callers must resolve the account through here so the session is
+     * unregistered under the account it was registered with.
+     */
+    public static String sessionAccountId(LambdaFunction function) {
+        String accountId = function.getAccountId();
+        if (accountId != null && !accountId.isBlank()) {
+            return accountId;
+        }
+        return AwsArnUtils.accountOrDefault(function.getFunctionArn(), null);
+    }
+
+    /**
+     * Mints a non-expiring session for a known execution role. Unknown or malformed roles retain
+     * the existing container credential fallback rather than becoming an implicit deny-all caller.
+     */
+    public Optional<SessionCreds> forFunction(LambdaFunction function) {
+        Optional<SessionCreds> credentials = forRole(
+                function.getRole(), sessionAccountId(function), function.getFunctionName());
+        if (credentials.isPresent()) {
+            LambdaExecutionBinding binding = binding(function);
+            if (binding != null) {
+                iamService.bindLambdaExecution(sessionAccountId(function), credentials.get().accessKeyId(), binding);
+            }
+        }
+        return credentials;
+    }
+
+    /** A session for {@code roleArn} assumed on behalf of {@code functionName} in {@code functionAccountId}. */
+    public Optional<SessionCreds> forRole(String roleArn, String functionAccountId, String functionName) {
+        if (roleArn == null || roleArn.isBlank()
+                || functionAccountId == null || functionAccountId.isBlank()) {
+            return Optional.empty();
+        }
+
+        String roleName;
+        try {
+            AwsArnUtils.Arn parsed = AwsArnUtils.parse(roleArn);
+            if (!"iam".equals(parsed.service()) || !parsed.resource().startsWith("role/")) {
+                return Optional.empty();
+            }
+            roleName = parsed.resource().substring(parsed.resource().lastIndexOf('/') + 1);
+        } catch (IllegalArgumentException e) {
+            return Optional.empty();
+        }
+        if (roleName.isBlank()) {
+            return Optional.empty();
+        }
+
+        String roleAccountId = AwsArnUtils.accountOrDefault(roleArn, functionAccountId);
+        Optional<IamRole> role = iamService.findRole(roleAccountId, roleName);
+        if (role.isEmpty()) {
+            return Optional.empty();
+        }
+
+        SessionCreds credentials = new SessionCreds(
+                "ASIA" + random(UPPER_ALPHANUMERIC, 16),
+                random(SECRET_CHARACTERS, 40),
+                random(SECRET_CHARACTERS, 200));
+        String assumedRoleId = role.get().getRoleId() != null ? role.get().getRoleId() + ":" + functionName : null;
+        iamService.registerLambdaExecutionRoleSession(
+                functionAccountId, credentials.accessKeyId(), credentials.secretAccessKey(),
+                credentials.sessionToken(), roleArn, functionName, assumedRoleId);
+        return Optional.of(credentials);
+    }
+
+    /** Bind before start so init-time AssumeRole can retain provenance; verification still requires running. */
+    public void bindContainer(LambdaFunction function, String accessKey, String containerId) {
+        LambdaExecutionBinding binding = binding(function);
+        if (binding != null) {
+            iamService.bindLambdaExecution(sessionAccountId(function), accessKey, binding.withContainer(containerId));
+        }
+    }
+
+    public void bindStartedContainer(LambdaFunction function, String accessKey, String containerId, String startedAt) {
+        LambdaExecutionBinding binding = binding(function);
+        if (binding != null) {
+            iamService.bindLambdaExecution(sessionAccountId(function), accessKey,
+                    binding.withContainer(containerId).withStartedAt(startedAt));
+        }
+    }
+
+    private static LambdaExecutionBinding binding(LambdaFunction function) {
+        if (function.isHotReload() || function.getFunctionArn() == null || function.getCodeSha256() == null) {
+            return null;
+        }
+        AwsArnUtils.Arn arn = AwsArnUtils.parse(function.getFunctionArn());
+        return new LambdaExecutionBinding(sessionAccountId(function), arn.region(), function.getFunctionName(),
+                function.getFunctionArn(), function.getVersion() == null ? "$LATEST" : function.getVersion(),
+                function.getRole(), function.getCodeSha256(), function.getRevisionId(), null, null);
+    }
+
+    public void unregister(String accountId, String accessKeyId) {
+        iamService.unregisterSession(accountId, accessKeyId);
+    }
+
+    private static String random(String characters, int length) {
+        StringBuilder value = new StringBuilder(length);
+        for (int i = 0; i < length; i++) {
+            value.append(characters.charAt(SECURE_RANDOM.nextInt(characters.length())));
+        }
+        return value.toString();
+    }
+}
