@@ -13,6 +13,10 @@
 # tools/java_sources.py, so they do not change when the package moves.
 
 services:
+  - service: quicksight
+    doc: docs/services/quicksight.md
+    sources:
+      - { path: services/quicksight/QuickSightController.java, mode: rest }
   - service: account
     doc: docs/services/account.md
     sources:
@@ -37,6 +41,7 @@ services:
     doc: docs/services/athena.md
     sources:
       - { path: services/athena/AthenaJsonHandler.java, mode: switch }
+      - { path: services/athena/AthenaPreparedStatementHandler.java, mode: switch }
   - service: bedrock
     doc: docs/services/bedrock.md
     sources:
@@ -80,6 +85,7 @@ services:
     doc: docs/services/cloudformation.md
     sources:
       - { path: services/cloudformation/CloudFormationQueryHandler.java, mode: switch }
+      - { path: services/cloudformation/CloudFormationDriftHandler.java, mode: switch }
   - service: cloudhsmv2
     doc: docs/services/cloudhsmv2.md
     sources:
@@ -165,6 +171,19 @@ services:
     doc: docs/services/appintegrations.md
     sources:
       - { path: services/appintegrations/AppIntegrationsController.java, mode: rest }
+      - { path: core/common/SharedTagsController.java, mode: rest }
+    rename_actions:
+      ListTags: ListTagsForResource
+      TagResourcePost: TagResource
+    exclude_actions:
+      - ListTagsByQuery
+      - TagResourceByBody
+      - TagResourcePut
+      - UntagResourceByQuery
+  - service: signer
+    doc: docs/services/signer.md
+    sources:
+      - { path: services/signer/SignerController.java, mode: rest }
       - { path: core/common/SharedTagsController.java, mode: rest }
     rename_actions:
       ListTags: ListTagsForResource
@@ -373,6 +392,7 @@ services:
       ListVpcAssociationAuthorizations: ListVPCAssociationAuthorizations
       ListHostedZonesByVpc: ListHostedZonesByVPC
       GetDnssec: GetDNSSEC
+      TestDnsAnswer: TestDNSAnswer
   - service: route53resolver
     doc: docs/services/route53resolver.md
     sources:
@@ -455,8 +475,10 @@ deferred_handlers:
   - { path: services/cloudcontrol/CloudControlJsonHandler.java }  # no standalone action table yet
   - { path: services/cloudmap/CloudMapHandler.java }  # non-tabular doc (grouped/inline)
   - { path: services/cloudwatch/logs/CloudWatchLogsHandler.java }  # multi-table doc (nested handler)
+  - { path: services/cloudwatch/logs/CloudWatchLogsTransformerHandler.java }  # multi-table doc (nested handler, reached through CloudWatchLogsHandler)
   - { path: services/cloudwatch/logs/CloudWatchLogsMetricFilterHandler.java }  # multi-table doc (nested handler, reached through CloudWatchLogsHandler)
   - { path: services/cloudwatch/logs/CloudWatchLogsDeliveryHandler.java }  # multi-table doc (nested handler, reached through CloudWatchLogsHandler)
+  - { path: services/cloudwatch/logs/CloudWatchLogsExportHandler.java }  # multi-table doc (nested handler, reached through CloudWatchLogsHandler)
   - { path: services/cloudwatch/metrics/CloudWatchMetricsJsonHandler.java }  # multi-table doc (nested handler)
   - { path: services/cloudwatch/metrics/CloudWatchMetricsQueryHandler.java }  # multi-table doc (nested handler)
   - { path: services/codebuild/CodeBuildJsonHandler.java }  # non-tabular doc (grouped/inline)
