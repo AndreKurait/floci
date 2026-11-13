@@ -88,6 +88,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
     private final ResourceGroupsTaggingService resourceGroupsTaggingService;
     private final ReplayDispatcher replayDispatcher;
     private final AppSyncTargetValidator appSyncTargetValidator;
+    private final EventBridgeTargetLookup targetLookup;
 
     @Inject
     public EventBridgeService(StorageFactory storageFactory,
@@ -151,6 +152,7 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
         this.replayDispatcher = replayDispatcher;
         this.resourceGroupsTaggingService = resourceGroupsTaggingService;
         this.appSyncTargetValidator = appSyncTargetValidator;
+        this.targetLookup = new EventBridgeTargetLookup(busStore, ruleStore, targetStore, regionResolver);
     }
 
     @PostConstruct
@@ -728,6 +730,11 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
         targetStore.put(key, existing);
         ruleStore.get(key).ifPresent(rule -> dispatcher.dropPendingRetries(rule.getArn(), ids));
         return new RemoveTargetsResult(removed, ids.size() - removed);
+    }
+
+    public PaginatedResult<String> listRuleNamesByTarget(String targetArn, String busName, Integer limit,
+                                                        String nextToken, String region) {
+        return targetLookup.list(targetArn, busName, limit, nextToken, region);
     }
 
     public List<Target> listTargetsByRule(String ruleName, String busName, String region) {
