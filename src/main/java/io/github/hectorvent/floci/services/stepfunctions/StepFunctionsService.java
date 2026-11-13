@@ -2373,6 +2373,24 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         }
     }
 
+    public ObjectNode testState(JsonNode request) {
+        TestStateDefinition.Prepared prepared = TestStateDefinition.prepare(request, objectMapper);
+        if (prepared.stateName() != null) {
+            validateDefinition(prepared.definitionText());
+        }
+        TestStateDefinition.validateSupported(prepared);
+        if (prepared.stateName() == null) {
+            List<String> errors = new ArrayList<>();
+            validateState("/", prepared.state(), false,
+                    new HashSet<>(transitionTargets(prepared.state())), errors);
+            if (!errors.isEmpty()) {
+                throw new AwsException("InvalidDefinition", "Invalid state definition: " + errors.getFirst(), 400);
+            }
+        }
+        validateRoleArn(prepared.roleArn());
+        return aslExecutor.testPureState(prepared, regionResolver.getAccountId(), regionResolver.getPartition());
+    }
+
     private void validateDefinition(String definition) {
         if (definition == null || definition.isBlank()) {
             throw new AwsException("InvalidDefinition",
