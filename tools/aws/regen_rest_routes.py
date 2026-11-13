@@ -69,25 +69,75 @@ MODELS: dict[str, str] = {
 }
 
 
+# Shared-controller and ARN-spanning operations are activated with their qualified tables.
+SHARED_ROUTES: dict[str, frozenset[str]] = {}
+ARN_SPANNING_ROUTES: dict[str, frozenset[str]] = {}
+
+
 ONLY_OPERATIONS: dict[str, tuple[str, ...]] = {}
+
+
+def access_denied_status(model: dict) -> int | None:
+    """The HTTP status explicitly modelled for a declared AccessDenied or AccessDeniedException error."""
+    statuses = set()
+    for operation in model["operations"].values():
+        for reference in operation.get("errors", []):
+            name = reference["shape"]
+            error = model.get("shapes", {}).get(name, {}).get("error", {})
+            if error.get("code", name) in ("AccessDenied", "AccessDeniedException") and "httpStatusCode" in error:
+                status = error["httpStatusCode"]
+                if type(status) is not int or not 400 <= status <= 599:
+                    raise SystemExit(f"error: invalid access-denied HTTP status {status!r}")
+                statuses.add(status)
+    if len(statuses) > 1:
+        raise SystemExit(f"error: a REST model has conflicting access-denied HTTP statuses {sorted(statuses)}")
+    return next(iter(statuses), None)
+
+
+def bare_tags_route(method: str) -> dict:
+    """The bare `/tags` route SharedTagsController also serves for a shared tags route of the method, with where it
+    reads the ARN: a tagging request is a POST whose body names it, whether the service tags with POST or with
+    PUT, and a GET or DELETE names it in its query. A route of another method than the operation's says so."""
+    bare = "POST" if method in ("POST", "PUT") else method
+    route = {"requestUri": "/tags", "located": {"resourceArn": "body" if bare == "POST" else "?resourceArn"}}
+    return route if bare == method else {"method": bare, **route}
 
 
 def build(models: dict[str, dict], provenance: str) -> dict:
     """The vendored document from each loaded model."""
     routes = {}
+    denial_statuses = {}
     for name in sorted(models):
         model = models[name]
         if model["metadata"].get("protocol") not in ("rest-json", "rest-xml"):
             raise SystemExit(f"error: {name} is not a REST model")
+        shared = SHARED_ROUTES.get(name, frozenset())
+        spanning = ARN_SPANNING_ROUTES.get(name, frozenset())
         operations = {}
         for operation in sorted(ONLY_OPERATIONS.get(name, model["operations"])):
             http = model["operations"][operation]["http"]
-            operations[operation] = {"method": http["method"], "requestUri": http["requestUri"]}
+            request_uri = http["requestUri"]
+            if operation in shared or operation in spanning:
+                # A tags route names its resource as an ARN, which holds slashes: the label has to
+                # span them or the route matches no tag request at all.
+                request_uri = re.sub(r"\{([^}]*[Aa]rn[^}]*)}", r"{\1+}", request_uri)
+            route = {"method": http["method"], "requestUri": request_uri}
+            if operation in shared:
+                route["alternatives"] = [bare_tags_route(http["method"])]
+            operations[operation] = route
         routes[name] = {
             "credentialScope": MODELS[name],
             "apiVersion": model["metadata"]["apiVersion"],
             "operations": operations,
         }
+        status = access_denied_status(model)
+        if status is not None:
+            scope = MODELS[name]
+            if scope in denial_statuses and denial_statuses[scope] != status:
+                raise SystemExit(f"error: REST models of {scope} have conflicting access-denied HTTP statuses")
+            denial_statuses[scope] = status
+            routes[name]["accessDeniedStatus"] = status
+    routes = dict(sorted(routes.items()))
     shared = shared_routes(routes)
     if shared:
         raise SystemExit("error: one route names more than one operation in a scope the rules do not route alone: "
@@ -117,8 +167,10 @@ def shared_routes(routes: dict[str, dict]) -> list[str]:
         if model["credentialScope"] in HAND_ROUTED:
             continue
         for operation, route in model["operations"].items():
-            key = (model["credentialScope"],) + route_key(route["method"], route["requestUri"])
-            named.setdefault(key, set()).add(operation)
+            for variant in [route, *route.get("alternatives", [])]:
+                key = (model["credentialScope"],) + route_key(variant.get("method", route["method"]),
+                                                              variant["requestUri"])
+                named.setdefault(key, set()).add(operation)
     return [f"{key[0]} {key[1]} {'/'.join(key[2])}: {', '.join(sorted(operations))}"
             for key, operations in sorted(named.items()) if len(operations) > 1]
 
@@ -139,6 +191,8 @@ def render(doc: dict) -> str:
         lines.append(f"    {json.dumps(name)}: {{")
         lines.append(f'      "credentialScope": {json.dumps(model["credentialScope"])},')
         lines.append(f'      "apiVersion": {json.dumps(model["apiVersion"])},')
+        if "accessDeniedStatus" in model:
+            lines.append(f'      "accessDeniedStatus": {model["accessDeniedStatus"]},')
         lines.append('      "operations": {')
         operations = list(model["operations"].items())
         for position, (operation, route) in enumerate(operations):

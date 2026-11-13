@@ -103,3 +103,109 @@ def test_cloudfront_reads_key_value_stores_and_other_management_operations():
     result = r.build({"cloudfront": model("rest-xml", "2020-05-31", **operations)}, "test")
     assert set(result["models"]["cloudfront"]["operations"]) == set(operations)
     assert "ListDistributions" in result["models"]["cloudfront"]["operations"]
+
+
+@pytest.fixture
+def route_settings(monkeypatch):
+    monkeypatch.setattr(r, "SHARED_ROUTES", {
+        name: frozenset({"TagResource", "UntagResource", "ListTagsForResource", "GetTags"})
+        for name in ("lambda", "pipes", "apigateway")
+    })
+    monkeypatch.setattr(r, "ARN_SPANNING_ROUTES", {
+        "apigatewayv2": frozenset({"TagResource", "UntagResource", "GetTags"})
+    })
+    monkeypatch.setattr(r, "HAND_ROUTED", {"s3": r.HAND_ROUTED["s3"]})
+
+
+@pytest.mark.parametrize("status", [400, 401, 402, 403])
+def test_denial_status_comes_from_the_declared_error_shape(status):
+    service = model("rest-json", "2020-01-01", GetThing=("GET", "/things/{Name}"))
+    service["operations"]["GetThing"]["errors"] = [{"shape": "Denied"}]
+    service["shapes"] = {
+        "Denied": {"type": "structure", "exception": True,
+                   "error": {"code": "AccessDeniedException", "httpStatusCode": status}},
+        "Unused": {"type": "structure", "exception": True,
+                   "error": {"code": "AccessDeniedException", "httpStatusCode": 499}},
+    }
+    doc = r.build({"lambda": service}, "botocore test")
+    assert doc["models"]["lambda"]["accessDeniedStatus"] == status
+    assert json.loads(r.render(doc))["models"]["lambda"]["accessDeniedStatus"] == status
+
+
+def test_a_non_denial_error_does_not_supply_the_denial_status():
+    service = model("rest-json", "2020-01-01", GetThing=("GET", "/things/{Name}"))
+    service["operations"]["GetThing"]["errors"] = [{"shape": "ValidationException"}]
+    service["shapes"] = {"ValidationException": {"error": {"httpStatusCode": 400}}}
+    doc = r.build({"lambda": service}, "botocore test")
+    assert "accessDeniedStatus" not in doc["models"]["lambda"]
+
+
+def test_models_sharing_a_scope_must_agree_on_the_denial_status():
+    first = model("rest-json", "2020-01-01", GetThing=("GET", "/things/{Name}"))
+    second = model("rest-json", "2020-01-01", GetThing=("GET", "/things/{Name}"))
+    for service, status in ((first, 401), (second, 403)):
+        service["operations"]["GetThing"]["errors"] = [{"shape": "AccessDeniedException"}]
+        service["shapes"] = {"AccessDeniedException": {"error": {"httpStatusCode": status}}}
+    with pytest.raises(SystemExit, match="conflicting access-denied HTTP statuses"):
+        r.build({"lambda": first, "lambda-microvms": second}, "botocore test")
+
+
+@pytest.mark.parametrize("name", ["lambda", "pipes"])
+@pytest.mark.parametrize("operation,method,source", [
+    ("TagResource", "POST", "body"),
+    ("UntagResource", "DELETE", "?resourceArn"),
+    ("ListTagsForResource", "GET", "?resourceArn"),
+])
+def test_shared_tag_alternative_keeps_actual_member_source(name, operation, method, source, route_settings):
+    doc = r.build({name: model("rest-json", "2020-01-01", **{operation: (method, "/tags/{resourceArn}")})}, "test")
+    route = doc["models"][name]["operations"][operation]
+    assert route["requestUri"] == "/tags/{resourceArn+}"
+    assert route["alternatives"] == [{"requestUri": "/tags", "located": {"resourceArn": source}}]
+    assert json.loads(r.render(doc)) == doc
+
+
+def test_shared_tag_alternative_collision_is_rejected(route_settings):
+    with pytest.raises(SystemExit, match="one route names more than one operation"):
+        r.build({"pipes": model("rest-json", "2020-01-01",
+            TagResource=("POST", "/tags/{resourceArn}"), OtherOperation=("POST", "/tags"))}, "test")
+
+
+@pytest.mark.parametrize("name", ["lambda", "pipes", "eks", "dsql"])
+def test_a_model_a_route_filter_moves_under_a_prefix_keeps_its_own_paths(name):
+    # IAM matches a moved request on its path without the prefix its filter records, so the routes are the model's.
+    doc = r.build({name: model("rest-json", "2020-01-01", GetThing=("GET", "/things/{ThingId}"))}, "test")
+    assert doc["models"][name]["operations"]["GetThing"]["requestUri"] == "/things/{ThingId}"
+
+
+def test_a_service_tagging_with_put_keeps_the_bare_post_the_shared_controller_serves(route_settings):
+    # API Gateway v1 tags with PUT on /tags/{resource_arn}, and SharedTagsController's bare /tags tags with a POST
+    # naming the ARN in its body whatever the service's method, so that alternative says it is a POST.
+    doc = r.build({"apigateway": model("rest-json", "2015-07-09", TagResource=("PUT", "/tags/{resource_arn}"),
+                                       UntagResource=("DELETE", "/tags/{resource_arn}"),
+                                       GetTags=("GET", "/tags/{resource_arn}"))}, "test")
+    operations = doc["models"]["apigateway"]["operations"]
+    assert operations["TagResource"] == {"method": "PUT", "requestUri": "/tags/{resource_arn+}", "alternatives": [
+        {"method": "POST", "requestUri": "/tags", "located": {"resourceArn": "body"}}]}
+    assert operations["UntagResource"]["alternatives"] == [
+        {"requestUri": "/tags", "located": {"resourceArn": "?resourceArn"}}]
+    assert operations["GetTags"]["alternatives"] == [{"requestUri": "/tags", "located": {"resourceArn": "?resourceArn"}}]
+    assert json.loads(r.render(doc)) == doc
+
+
+def test_an_alternative_is_keyed_by_its_own_method(route_settings):
+    # The bare POST of a PUT tags route collides with another operation's POST /tags, never with a PUT /tags.
+    with pytest.raises(SystemExit, match="one route names more than one operation"):
+        r.build({"apigateway": model("rest-json", "2015-07-09", TagResource=("PUT", "/tags/{resource_arn}"),
+                                     CreateTag=("POST", "/tags"))}, "test")
+    r.build({"apigateway": model("rest-json", "2015-07-09", TagResource=("PUT", "/tags/{resource_arn}"),
+                                 PutTags=("PUT", "/tags"))}, "test")
+
+
+def test_an_arn_label_the_controller_lets_span_slashes_is_greedy(route_settings):
+    # API Gateway v2's controller serves /v2/tags/{resourceArn: .+}, so an ARN sent unencoded reaches it; its other
+    # routes and labels keep the model's one segment, and it has no bare route.
+    doc = r.build({"apigatewayv2": model("rest-json", "2018-11-29", TagResource=("POST", "/v2/tags/{resource-arn}"),
+                                         GetApi=("GET", "/v2/apis/{apiId}"))}, "test")
+    operations = doc["models"]["apigatewayv2"]["operations"]
+    assert operations["TagResource"] == {"method": "POST", "requestUri": "/v2/tags/{resource-arn+}"}
+    assert operations["GetApi"] == {"method": "GET", "requestUri": "/v2/apis/{apiId}"}
