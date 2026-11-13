@@ -443,6 +443,7 @@ public class CloudFormationQueryHandler {
                    .elem("EventId", e.getEventId())
                    .elem("StackId", e.getStackId())
                    .elem("StackName", e.getStackName())
+                    .elem("ClientRequestToken", e.getClientRequestToken())
                    .elem("LogicalResourceId", e.getLogicalResourceId())
                    .elem("PhysicalResourceId", e.getPhysicalResourceId())
                    .elem("ResourceType", e.getResourceType())

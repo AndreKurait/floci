@@ -11,11 +11,13 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -106,6 +108,78 @@ class CloudFormationStackPersistenceTest {
         assertTrue(loaded.getChangeSets().containsKey("initial-create"));
         assertEquals("CREATE_COMPLETE", loaded.getChangeSets().get("initial-create").getStatus());
         assertEquals(PENDING_POLICY, loaded.getChangeSets().get("initial-create").getStackPolicyBody());
+    }
+
+    @Test
+    void historicalEventTokensSurviveLaterOperationsAndStorageReloads() {
+        Path filePath = tempDir.resolve("event-tokens.json");
+        Stack stack = new Stack();
+        stack.setStackName("my-stack");
+        stack.setClientRequestToken("Create-Aa-123");
+        StackEvent created = new StackEvent();
+        created.setResourceStatus("CREATE_COMPLETE");
+        created.setClientRequestToken("Create-Aa-123");
+        stack.getEvents().add(created);
+
+        PersistentStorage<String, Stack> writer = new PersistentStorage<>(
+                filePath, new TypeReference<Map<String, Stack>>() {});
+        writer.put(KEY, stack);
+        PersistentStorage<String, Stack> updater = new PersistentStorage<>(
+                filePath, new TypeReference<Map<String, Stack>>() {});
+        updater.load();
+        Stack restored = updater.get(KEY).orElseThrow();
+        assertNull(restored.getClientRequestToken(), "The active operation token remains transient");
+        assertEquals("Create-Aa-123", restored.getEvents().getFirst().getClientRequestToken());
+        assertEquals(created.getEventId(), restored.getEvents().getFirst().getEventId());
+        assertEquals(created.getTimestamp(), restored.getEvents().getFirst().getTimestamp());
+
+        restored.setClientRequestToken("Update-Bb-456");
+        StackEvent updated = new StackEvent();
+        updated.setResourceStatus("UPDATE_COMPLETE");
+        updated.setClientRequestToken("Update-Bb-456");
+        restored.getEvents().add(updated);
+        updater.put(KEY, restored);
+        restored.setClientRequestToken("Delete-Cc-789");
+
+        PersistentStorage<String, Stack> reader = new PersistentStorage<>(
+                filePath, new TypeReference<Map<String, Stack>>() {});
+        reader.load();
+        Stack loaded = reader.get(KEY).orElseThrow();
+        assertNull(loaded.getClientRequestToken());
+        assertEquals(List.of("Create-Aa-123", "Update-Bb-456"),
+                loaded.eventsSnapshot().stream().map(StackEvent::getClientRequestToken).toList());
+        assertEquals(List.of(created.getEventId(), updated.getEventId()),
+                loaded.eventsSnapshot().stream().map(StackEvent::getEventId).toList());
+        assertEquals(List.of("CREATE_COMPLETE", "UPDATE_COMPLETE"),
+                loaded.eventsSnapshot().stream().map(StackEvent::getResourceStatus).toList());
+    }
+
+    @Test
+    void legacyEventWithoutATokenRemainsAbsentAfterStorageReload() throws Exception {
+        Path filePath = tempDir.resolve("legacy-event-token.json");
+        Files.writeString(filePath, """
+                {"%s":{"stackName":"my-stack","events":[
+                  {"eventId":"legacy-event","resourceStatus":"CREATE_COMPLETE"}
+                ]}}
+                """.formatted(KEY));
+        PersistentStorage<String, Stack> updater = new PersistentStorage<>(
+                filePath, new TypeReference<Map<String, Stack>>() {});
+        updater.load();
+        Stack restored = updater.get(KEY).orElseThrow();
+        assertEquals(1, restored.eventsSnapshot().size());
+        assertNull(restored.getEvents().getFirst().getClientRequestToken());
+        restored.setClientRequestToken("Later-Operation");
+        updater.put(KEY, restored);
+
+        PersistentStorage<String, Stack> reader = new PersistentStorage<>(
+                filePath, new TypeReference<Map<String, Stack>>() {});
+        reader.load();
+        Stack loaded = reader.get(KEY).orElseThrow();
+        assertEquals(1, loaded.eventsSnapshot().size());
+        assertEquals("legacy-event", loaded.getEvents().getFirst().getEventId());
+        assertEquals("CREATE_COMPLETE", loaded.getEvents().getFirst().getResourceStatus());
+        assertNull(loaded.getEvents().getFirst().getClientRequestToken());
+        assertNull(loaded.getClientRequestToken());
     }
 
     @Test
