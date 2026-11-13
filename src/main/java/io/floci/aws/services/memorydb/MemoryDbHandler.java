@@ -32,16 +32,26 @@ public class MemoryDbHandler {
 
     private final MemoryDbService service;
     private final ObjectMapper objectMapper;
+    private final MemoryDbParameterGroupHandler parameterGroups;
 
     @Inject
-    public MemoryDbHandler(MemoryDbService service, ObjectMapper objectMapper) {
+    public MemoryDbHandler(MemoryDbService service, ObjectMapper objectMapper,
+                           MemoryDbParameterGroupHandler parameterGroups) {
         this.service = service;
         this.objectMapper = objectMapper;
+        this.parameterGroups = parameterGroups;
+    }
+
+    public MemoryDbHandler(MemoryDbService service, ObjectMapper objectMapper) {
+        this(service, objectMapper, null);
     }
 
     public Response handle(String action, JsonNode request, String region) {
         LOG.debugv("MemoryDB action: {0}", action);
         try {
+            if (parameterGroups != null && MemoryDbParameterGroupTarget.claims("memorydb:" + action, request)) {
+                return parameterGroups.handle(action, request, region);
+            }
             return switch (action) {
                 case "CreateCluster" -> handleCreateCluster(request, region);
                 case "DescribeClusters" -> handleDescribeClusters(request, region);

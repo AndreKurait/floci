@@ -19,6 +19,8 @@ import io.floci.aws.services.iam.ResourceArnBuilder;
 import io.floci.aws.services.iam.model.IamRole;
 import io.floci.aws.services.iam.model.IamUser;
 import io.floci.aws.services.lambdaweb.LambdaWebService;
+import io.floci.aws.services.memorydb.MemoryDbParameterGroupService;
+import io.floci.aws.services.memorydb.MemoryDbParameterGroupTarget;
 import io.floci.aws.services.s3.S3ConditionKeys;
 import io.floci.aws.services.s3.S3ControlTagConditionKeys;
 import io.floci.aws.services.s3.S3ObjectActions;
@@ -110,11 +112,30 @@ public class IamConditionContextResolver {
     private final Clock clock;
     private final ResolvedServiceCatalog serviceCatalog;
 
+    private Instance<MemoryDbParameterGroupService> memoryDbParameterGroups;
+
     /**
      * The system clock, not the CDI one: Object Lock's remaining retention days has to count from the
      * same now as S3Service, which checks retention against {@code Instant.now()}.
      */
     @Inject
+    public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                       Instance<Ec2Service> ec2Service,
+                                       Instance<S3Service> s3Service,
+                                       Instance<CloudWatchLogsService> logsService,
+                                       Instance<CloudWatchLogsCrossAccountService> crossAccountService,
+                                       Instance<IamService> iamService,
+                                       Instance<LambdaWebService> lambdaWebService,
+                                       RequestContext requestContext,
+                                       EmulatorConfig config,
+                                       CurrentVertxRequest currentVertxRequest,
+                                       ResolvedServiceCatalog serviceCatalog,
+                                       Instance<MemoryDbParameterGroupService> memoryDbParameterGroups) {
+        this(dynamoDbFacade, ec2Service, s3Service, logsService, crossAccountService,
+                iamService, lambdaWebService, requestContext, config, currentVertxRequest, serviceCatalog);
+        this.memoryDbParameterGroups = memoryDbParameterGroups;
+    }
+
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
                                        Instance<Ec2Service> ec2Service,
                                        Instance<S3Service> s3Service,
@@ -165,10 +186,56 @@ public class IamConditionContextResolver {
             case "iam" -> iamConditionContext(action, ctx);
             case "logs" -> logsConditionContext(action, ctx);
             case "lambda" -> lambdaConditionContext(action, ctx);
+            case "memorydb" -> memoryDbParameterGroupConditions(action, ctx);
             case "redshift" -> RequestConditionKeys.requestKeys(action).isEmpty() ? null
                     : requestConditions(action, formParameters(ctx)::get);
             default -> null;
         };
+    }
+
+    private Map<String, List<String>> memoryDbParameterGroupConditions(String action, ContainerRequestContext ctx) {
+        JsonNode body = bufferedJsonBody(ctx);
+        if (body == null || !body.isObject() || !MemoryDbParameterGroupTarget.claims(action, body)) {
+            return null;
+        }
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        if (("memorydb:CreateParameterGroup".equals(action) || "memorydb:TagResource".equals(action))
+                && body.path("Tags").isArray()) {
+            Set<String> keys = new LinkedHashSet<>();
+            for (JsonNode tag : body.path("Tags")) {
+                if (tag.path("Key").isTextual()
+                        && (tag.path("Value").isTextual() || tag.path("Value").isNull() || !tag.has("Value"))) {
+                    String key = tag.path("Key").textValue();
+                    keys.add(key);
+                    conditions.put(REQUEST_TAG_PREFIX + key, List.of(tag.path("Value").isTextual()
+                            ? tag.path("Value").textValue() : ""));
+                }
+            }
+            if (!keys.isEmpty()) {
+                conditions.put("aws:TagKeys", List.copyOf(keys));
+            }
+        } else if ("memorydb:UntagResource".equals(action) && body.path("TagKeys").isArray()) {
+            List<String> keys = new ArrayList<>();
+            body.path("TagKeys").forEach(key -> {
+                if (key.isTextual()) {
+                    keys.add(key.textValue());
+                }
+            });
+            if (!keys.isEmpty()) {
+                conditions.put("aws:TagKeys", keys);
+            }
+        }
+        if (!"memorydb:CreateParameterGroup".equals(action)
+                && memoryDbParameterGroups != null && memoryDbParameterGroups.isResolvable()) {
+            String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+            String account = requestContext.getAccountId() == null ? config.defaultAccountId() : requestContext.getAccountId();
+            String partition = requestContext.getPartition() == null
+                    ? AwsRegions.partitionFor(region) : requestContext.getPartition();
+            String arn = MemoryDbParameterGroupTarget.resourceArn(action, body, partition, region, account);
+            memoryDbParameterGroups.get().iamTags(arn, partition, region, account).forEach((key, value) ->
+                    conditions.put(RESOURCE_TAG_PREFIX + key, List.of(value)));
+        }
+        return conditions.isEmpty() ? null : conditions;
     }
 
     /** Logs tag operations and group mutations use the handler's resource and request scope. */

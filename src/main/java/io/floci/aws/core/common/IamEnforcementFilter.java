@@ -23,6 +23,7 @@ import io.floci.aws.services.iam.ResourcePolicyProviders;
 import io.floci.aws.services.iam.ScpProvider;
 import io.floci.aws.services.iam.model.CallerContext;
 import io.floci.aws.services.iam.model.IamRole;
+import io.floci.aws.services.memorydb.MemoryDbParameterGroupTarget;
 import io.floci.aws.services.s3.S3ObjectActions;
 import io.floci.aws.services.s3.S3ScratchSpace;
 import io.floci.aws.services.s3.S3Service;
@@ -94,6 +95,8 @@ import java.util.regex.Pattern;
 public class IamEnforcementFilter implements ContainerRequestFilter {
 
     private static final Logger LOG = Logger.getLogger(IamEnforcementFilter.class);
+    private static final String MEMORYDB_PARAMETER_GROUP_REQUEST =
+            IamEnforcementFilter.class.getName() + ".memorydbParameterGroupRequest";
 
     /** AWS's wording for a credential it does not recognise. */
     private static final String INVALID_SECURITY_TOKEN = "The security token included in the request is invalid.";
@@ -1125,8 +1128,10 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                                              String credentialScope, List<String> resources,
                                              String region, String accountId, String akid) {
         // A create tags the resource it makes, not the parent it makes it in (see RequestResources.created).
-        List<String> created = RequestResources.created(operation, tagging.action(), ctx,
-                AwsRegions.partitionFor(region), region, accountId, IamActionRegistry.pathLabels(credentialScope, ctx));
+        String createdPartition = "memorydb:CreateParameterGroup".equals(operation)
+                ? requestPartition() : AwsRegions.partitionFor(region);
+        List<String> created = RequestResources.created(operation, tagging.action(), ctx, createdPartition, region,
+                accountId, IamActionRegistry.pathLabels(credentialScope, ctx));
         List<String> made = created.isEmpty() ? resources : created;
         for (TagOnCreate.TagSet set : tagging.checked()) {
             Map<String, List<String>> context = TagOnCreate.conditionContext(tagging, set, operation);
@@ -1804,6 +1809,13 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 || "apigateway".equals(credentialScope)) {
             return arnBuilder.buildResources(credentialScope, ctx, region, accountId, requestPartition());
         }
+        if ("memorydb".equals(credentialScope)
+                && MemoryDbParameterGroupTarget.claims(operation, PassedRoles.jsonBody(ctx))) {
+            if (claimedProtocol(ctx) == WireProtocol.AWS_JSON_1_1) {
+                ctx.setProperty(MEMORYDB_PARAMETER_GROUP_REQUEST, Boolean.TRUE);
+            }
+            return arnBuilder.buildResources(credentialScope, operation, ctx, region, accountId, requestPartition());
+        }
         String partition = "route53".equals(credentialScope) ? requestPartition() : AwsRegions.partitionFor(region);
         return arnBuilder.buildResources(credentialScope, operation, ctx, region, accountId, partition);
     }
@@ -1934,6 +1946,9 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         // reaches the s3control SDK deserializers (issue #557).
         if (IamActionRegistry.isS3ControlRequest(credentialScope, ctx)) {
             return s3ControlXmlAccessDenied(accessDeniedMessage(action));
+        }
+        if (Boolean.TRUE.equals(ctx.getProperty(MEMORYDB_PARAMETER_GROUP_REQUEST))) {
+            return jsonAccessDenied(accessDeniedMessage(action), 403);
         }
         boolean restXml = catalog.byCredentialScope(credentialScope)
                 .filter(descriptor -> descriptor.supportsProtocol(ServiceProtocol.REST_XML)).isPresent();
