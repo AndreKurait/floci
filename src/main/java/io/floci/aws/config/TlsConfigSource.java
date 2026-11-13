@@ -265,7 +265,7 @@ public class TlsConfigSource implements ConfigSource {
 
     /** Service infixes that AWS virtual-hosts with an extra resource-id label before the region. */
     private static final List<String> MULTI_LABEL_REGIONAL_SERVICE_INFIXES = List.of(
-            "execute-api", "dkr.ecr", "s3-control", "s3.dualstack", "s3-website",
+            "ddb", "execute-api", "dkr.ecr", "s3-control", "s3.dualstack", "s3-website",
             "s3-fips", "s3-fips.dualstack");
 
     /**
