@@ -164,6 +164,14 @@ resources = tagging.get_resources(
 print(resources["ResourceTagMappingList"])
 ```
 
+## IAM authorization
+
+Resource Groups Tagging SDK requests sign with `tagging`, while their IAM
+permissions use `tag`, such as `tag:GetResources`. Floci resolves permissions
+from the serving service without changing the SDK's signature or routing.
+An explicit `tag:GetResources` deny overrides a wildcard allow; a policy
+naming `tagging:GetResources` does not grant the operation.
+
 ## Out of Scope
 
 - Validation that a `TagResources` ARN names an existing resource: an ARN that

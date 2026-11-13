@@ -226,6 +226,16 @@ class TestRecorderChannelLifecycle:
         )
 
         try:
+            with pytest.raises(ClientError) as exc:
+                config_client.start_configuration_recorder(ConfigurationRecorderName="default")
+            assert exc.value.response["Error"]["Code"] == "NoAvailableDeliveryChannelException"
+            assert exc.value.response["ResponseMetadata"]["HTTPStatusCode"] == 400
+            status = config_client.describe_configuration_recorder_status()[
+                "ConfigurationRecordersStatus"
+            ][0]
+            assert status["recording"] is False
+            assert status.get("lastStartTime") is None
+
             config_client.put_delivery_channel(
                 DeliveryChannel={"name": "default", "s3BucketName": "config-bucket"}
             )
@@ -237,6 +247,16 @@ class TestRecorderChannelLifecycle:
 
             config_client.stop_configuration_recorder(ConfigurationRecorderName="default")
             config_client.delete_delivery_channel(DeliveryChannelName="default")
+
+            stopped = config_client.describe_configuration_recorder_status()[
+                "ConfigurationRecordersStatus"
+            ][0]
+            with pytest.raises(ClientError) as exc:
+                config_client.start_configuration_recorder(ConfigurationRecorderName="default")
+            assert exc.value.response["Error"]["Code"] == "NoAvailableDeliveryChannelException"
+            assert config_client.describe_configuration_recorder_status()[
+                "ConfigurationRecordersStatus"
+            ][0] == stopped
 
             with pytest.raises(ClientError) as exc:
                 config_client.delete_delivery_channel(DeliveryChannelName="default")

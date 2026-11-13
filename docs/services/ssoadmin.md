@@ -91,6 +91,10 @@ Floci supports the SSO Admin operations used to manage IAM Identity Center permi
 | `ListAccountAssignmentDeletionStatus` | Lists account-assignment deletion request metadata with optional operation-status filtering and AWS-compatible pagination. |
 <!-- floci:actions:end -->
 
+## Application providers
+
+`CreateApplication` admits the customer-managed provider `arn:<partition>:sso::aws:applicationProvider/custom`. An AWS service that creates its own IAM Identity Center application in a customer's instance names an AWS-managed provider instead. To emulate such a service, list its provider ids in `floci.services.ssoadmin.additional-application-providers` (`FLOCI_SERVICES_SSOADMIN_ADDITIONAL_APPLICATION_PROVIDERS`, comma-separated). `CreateApplication` then admits `arn:<partition>:sso::aws:applicationProvider/<id>` for each listed id in the request Region's partition. Any other well-formed provider is still `ResourceNotFoundException`. `DescribeApplicationProvider` and `ListApplicationProviders` describe only the custom provider. AWS admits an AWS-managed provider only through its owning service; Floci does not model that distinction, so any caller may use a listed provider.
+
 State is isolated by caller account through Floci storage.
 
 ## AWS-compatible failures and state
