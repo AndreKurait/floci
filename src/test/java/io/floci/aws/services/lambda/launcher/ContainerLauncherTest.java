@@ -12,6 +12,7 @@ import com.github.dockerjava.api.command.ExecStartCmd;
 import com.github.dockerjava.api.command.InspectContainerCmd;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.InspectNetworkCmd;
+import com.github.dockerjava.api.command.InspectVolumeCmd;
 import com.github.dockerjava.api.command.ListContainersCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.AccessMode;
@@ -33,6 +34,7 @@ import io.floci.aws.core.common.docker.ContainerLifecycleManager;
 import io.floci.aws.core.common.docker.ContainerLogStreamer;
 import io.floci.aws.core.common.docker.ContainerReachableEndpoint;
 import io.floci.aws.core.common.docker.ContainerSpec;
+import io.floci.aws.core.common.docker.ContainerStorageHelper;
 import io.floci.aws.core.common.docker.CurrentContainerNetworkResolver;
 import io.floci.aws.core.common.docker.DockerHostResolver;
 import io.floci.aws.core.common.docker.LaunchedContainerAwsEnv;
@@ -122,6 +124,7 @@ class ContainerLauncherTest {
     @Mock LambdaExecutionRoleCredentials executionRoleCredentials;
     @Mock LambdaLayerService layerService;
     @Mock Ec2Service ec2Service;
+    @Mock LambdaVpcNetworkManager vpcNetworkManager;
 
     @TempDir
     Path tempDir;
@@ -181,6 +184,8 @@ class ContainerLauncherTest {
         lenient().when(runtimeApiServer.close()).thenReturn(CompletableFuture.completedFuture(null));
         when(dockerHostResolver.resolve()).thenReturn("127.0.0.1");
         lenient().when(executionRoleCredentials.forFunction(any())).thenReturn(Optional.empty());
+        lenient().when(vpcNetworkManager.prepare(any(), anyString(), anyString(), anyInt(), any()))
+                .thenReturn(Optional.empty());
 
         // lenient: the failure-path test (populate fails before any container is created) never
         // reaches these, but every success-path test does — they must not trip strict-stubs.
@@ -522,7 +527,7 @@ class ContainerLauncherTest {
         return new ContainerLauncher(builder, lifecycleManager, logStreamer, selectedResolver,
                 runtimeApiServerFactory, dockerHostResolver, config, ecrRegistryManager,
                 layerService, new LaunchedContainerAwsEnv(endpoint),
-                executionRoleCredentials, ec2Service);
+                executionRoleCredentials, ec2Service, vpcNetworkManager);
     }
 
     @Test
@@ -546,6 +551,108 @@ class ContainerLauncherTest {
         verify(runtimeApiServer, times(1)).close();
         verify(lifecycleManager, times(2)).removeVolumeStrict("owned-resolver");
         assertNull(handle.getDnsResolverVolume());
+    }
+
+    @Test
+    void protectedNetworkDoesNotAlsoJoinTheOrdinaryVpcNetwork() throws Exception {
+        protectedNetwork();
+        LambdaFunction function = protectedFunction();
+        function.setVpcId("vpc-protected");
+        function.setVpcConfig(Map.of("SubnetIds", List.of("subnet-protected"),
+                "SecurityGroupIds", List.of("sg-protected")));
+
+        launcher.launch(function);
+
+        assertEquals("container:sg-helper", captureRealContainerSpec().networkMode());
+        verify(ec2Service, never()).allocateVpcPrivateIp(anyString(), anyString());
+        verify(ec2Service, never()).attachContainerToVpc(anyString(), anyString(), anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void protectedNetworkIsReleasedAfterItsWorkload() throws Exception {
+        LambdaVpcNetworkManager.Attachment attachment = protectedNetwork();
+        ContainerHandle handle = launcher.launch(protectedFunction());
+        ContainerSpec spec = captureRealContainerSpec();
+        assertEquals("container:sg-helper", spec.networkMode());
+        assertEquals("true", spec.labels().get(ContainerStorageHelper.SECURITY_GROUP_WORKLOAD_LABEL));
+
+        launcher.stop(handle);
+
+        InOrder order = inOrder(lifecycleManager, vpcNetworkManager, runtimeApiServer);
+        order.verify(lifecycleManager).stopAndRemoveStrict(eq("container-123"), any(), eq(1));
+        order.verify(vpcNetworkManager).release(attachment);
+        order.verify(runtimeApiServer).close();
+    }
+
+    @Test
+    void failedProtectedContainerRemovalKeepsNetworkAndRuntimeLease() throws Exception {
+        protectedNetwork();
+        ContainerHandle handle = launcher.launch(protectedFunction());
+        doThrow(new IllegalStateException("Docker removal failed"))
+                .when(lifecycleManager).stopAndRemoveStrict(eq("container-123"), any(), eq(1));
+
+        assertThrows(IllegalStateException.class, () -> launcher.stop(handle));
+
+        verify(vpcNetworkManager, never()).release(any());
+        verify(runtimeApiServer, never()).close();
+        verify(runtimeApiServerFactory, never()).release(any());
+    }
+
+    @Test
+    void failedDnsOnlyLaunchKeepsExistingRemovalBudget() throws Exception {
+        when(config.services().lambda().dockerNetwork()).thenReturn(Optional.of("dns-isolated"));
+        when(config.dns()).thenReturn(mock(EmulatorConfig.DnsConfig.class));
+        when(embeddedDnsServer.getServerIp()).thenReturn(Optional.of("192.0.2.53"));
+        Network network = mock(Network.class);
+        when(network.getInternal()).thenReturn(true);
+        InspectNetworkCmd inspectNetwork = mock(InspectNetworkCmd.class, RETURNS_SELF);
+        when(dockerClient.inspectNetworkCmd()).thenReturn(inspectNetwork);
+        when(inspectNetwork.exec()).thenReturn(network);
+        InspectVolumeCmd inspectVolume = mock(InspectVolumeCmd.class, RETURNS_DEEP_STUBS);
+        when(dockerClient.inspectVolumeCmd(anyString())).thenReturn(inspectVolume);
+        when(inspectVolume.exec().getMountpoint()).thenReturn("/daemon/volumes/resolver");
+        doThrow(new IllegalStateException("Docker start failed"))
+                .when(lifecycleManager).startCreated(eq("container-123"), any());
+        LambdaFunction function = protectedFunction();
+
+        assertThrows(IllegalStateException.class, () -> launcher.launch(function));
+
+        InOrder order = inOrder(lifecycleManager);
+        order.verify(lifecycleManager).stopAndRemoveStrict(eq("container-123"), any());
+        order.verify(lifecycleManager).removeIfExistsStrict("container-123", true);
+        order.verify(lifecycleManager).removeVolumeStrict(anyString());
+        verify(lifecycleManager, never()).stopAndRemoveStrict(anyString(), any(), eq(1));
+        verify(runtimeApiServerFactory).release(runtimeApiServer);
+    }
+
+    @Test
+    void failedLaunchReleasesItsPreparedNetwork() throws Exception {
+        LambdaVpcNetworkManager.Attachment attachment = protectedNetwork();
+        when(lifecycleManager.create(any())).thenThrow(new IllegalStateException("Docker create failed"));
+        LambdaFunction function = protectedFunction();
+
+        assertThrows(IllegalStateException.class, () -> launcher.launch(function));
+
+        verify(vpcNetworkManager).release(attachment);
+        verify(runtimeApiServerFactory).release(runtimeApiServer);
+    }
+
+    private LambdaVpcNetworkManager.Attachment protectedNetwork() {
+        LambdaVpcNetworkManager.Attachment attachment = new LambdaVpcNetworkManager.Attachment(
+                "111111111111", "us-east-1", "eni-protected", "sg-helper");
+        when(vpcNetworkManager.prepare(any(), anyString(), anyString(), anyInt(), any()))
+                .thenReturn(Optional.of(attachment));
+        return attachment;
+    }
+
+    private LambdaFunction protectedFunction() throws IOException {
+        LambdaFunction function = new LambdaFunction();
+        function.setFunctionName("protected-function");
+        function.setFunctionArn("arn:aws:lambda:us-east-1:111111111111:function:protected-function");
+        function.setRuntime("nodejs20.x");
+        function.setHandler("index.handler");
+        function.setCodeLocalPath(Files.createDirectory(tempDir.resolve("protected-code")).toString());
+        return function;
     }
 
     @ParameterizedTest
