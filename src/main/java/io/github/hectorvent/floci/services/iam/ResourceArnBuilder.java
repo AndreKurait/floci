@@ -313,6 +313,17 @@ public class ResourceArnBuilder {
             return List.of(eksService.get().findAccessEntryUpdateTarget(pathSegment(updatePath[1]), pathSegment(updatePath[3]))
                     .map(entry -> entry.accessEntryArn()).orElse("*"));
         }
+        if ("ec2".equals(credentialScope)) {
+            if ("ec2:DescribePlacementGroups".equals(operation)) {
+                return List.of("*");
+            }
+            if ("ec2:CreatePlacementGroup".equals(operation) || "ec2:DeletePlacementGroup".equals(operation)) {
+                String name = firstFormParam(ctx, "GroupName");
+                return name == null || name.isBlank() ? List.of("*")
+                        : List.of(new AwsArnUtils.Arn(partition, "ec2", region, accountId,
+                                "placement-group/" + name).toString());
+            }
+        }
         if (operation != null && operation.startsWith(credentialScope + ":") && RequestResources.reads(operation)) {
             return namedResources(credentialScope, operation, ctx, region, accountId, partition);
         }
