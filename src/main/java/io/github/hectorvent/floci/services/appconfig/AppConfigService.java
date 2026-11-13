@@ -830,6 +830,9 @@ public class AppConfigService implements Resettable {
     public synchronized Deployment startDeployment(String applicationIdentifier,
                                                     String environmentIdentifier,
                                                     Map<String, Object> request) {
+        if (validationPaused) {
+            throw new AwsException("BadRequestException", "Deployments are unavailable while a reset is in progress.", 400);
+        }
         String appId = resolveApplication(applicationIdentifier).getId();
         Environment environment = resolveEnvironment(appId, environmentIdentifier);
         String envId = environment.getId();
@@ -977,7 +980,15 @@ public class AppConfigService implements Resettable {
         }
         deployment.setState(completed ? "REVERTED" : "ROLLED_BACK");
         deployment.setPercentageComplete(0.0f);
-        deployment.setCompletedAt(clock.instant().toString());
+        if (completed) {
+            List<DeploymentEvent> events = new ArrayList<>();
+            events.add(new DeploymentEvent("REVERT_COMPLETED", "Deployment reverted by user request",
+                    clock.instant().toString(), "USER"));
+            events.addAll(deployment.getEventLog());
+            deployment.setEventLog(events);
+        } else {
+            deployment.setCompletedAt(clock.instant().toString());
+        }
         if (alarmCause != null) {
             List<DeploymentEvent> events = new ArrayList<>(deployment.getEventLog());
             events.add(new DeploymentEvent("ROLLBACK_STARTED", alarmCause,
@@ -1027,6 +1038,9 @@ public class AppConfigService implements Resettable {
             try {
                 RequestScopes.runAs(owner.accountId(), owner.region(), () -> {
                     synchronized (this) {
+                        if (validationPaused) {
+                            return;
+                        }
                         deploymentStore.get(owner.key()).filter(AppConfigService::active)
                                 .ifPresent(deployment -> {
                                     String key = deployment.getApplicationId() + "::" + deployment.getEnvironmentId()

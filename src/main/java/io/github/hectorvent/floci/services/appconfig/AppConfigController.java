@@ -348,7 +348,7 @@ public class AppConfigController {
         String clientVersion = uriInfo.getQueryParameters().getFirst("client_configuration_version");
         LegacyConfiguration data = dataService.getConfiguration(
                 appId, envId, configuration, clientId, clientVersion, accept);
-        if (data.configurationVersion().equals(clientVersion)) {
+        if (data.configurationVersion().equals(clientVersion) && !data.s3Source()) {
             return Response.noContent()
                     .header("Configuration-Version", data.configurationVersion())
                     .build();

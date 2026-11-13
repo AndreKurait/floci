@@ -88,8 +88,11 @@ feature flags are resolved as on the [data plane](#data-plane), including Ion fo
 An exact resource ID takes precedence over another resource's name. If multiple resources in the
 selected scope share a name, name lookup returns `BadRequestException`; use the intended resource's ID.
 This also applies to the management operations and `StartConfigurationSession` that use these lookups.
-A `client_configuration_version` equal to the deployed version returns HTTP 204 with an empty body
-and `Configuration-Version`, without `Content-Type` or `Content-Length`. An empty configuration
+For hosted configurations, a `client_configuration_version` equal to the deployed version returns HTTP 204 with an empty body
+and `Configuration-Version`, without `Content-Type` or `Content-Length`.
+An unchanged retained S3 version returns HTTP 200 with an empty body and its stored content type,
+matching the observed S3 response. The AWS API reference documents HTTP 204 for matching versions generally.
+An empty configuration
 that the caller has not received still returns HTTP 200 and its stored content type.
 A missing or undeployed environment returns `BadRequestException`; an unknown application or configuration profile
 returns `ResourceNotFoundException`.
@@ -192,6 +195,14 @@ If the previous hosted configuration version has been deleted, the stop is rejec
 with `BadRequestException` before changing the active version or stopping the deployment.
 Older persisted deployments without completion timestamps cannot be reverted because
 that window cannot be verified.
+
+Completed reverts preserve `StartedAt` and `CompletedAt`. They prepend a
+`REVERT_COMPLETED` event with `TriggeredBy: USER` and the revert time, retaining all
+recorded event history. Environment state aggregation, ordinary deployment start
+and completion events, and event `ActionInvocations` fields remain unimplemented.
+
+S3 configuration responses do not use a hosted `VersionLabel`; their opaque VersionId remains
+the deployment and legacy configuration version.
 
 ## Data Plane (AppConfigData) {#data-plane}
 
