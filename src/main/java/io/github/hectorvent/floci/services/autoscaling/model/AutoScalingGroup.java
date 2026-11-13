@@ -17,6 +17,8 @@ public class AutoScalingGroup {
 
     private String autoScalingGroupName;
     private String autoScalingGroupArn;
+    // Internal publication ownership; absent on groups stored before metrics publication was supported.
+    private String metricsIncarnation;
     private String launchConfigurationName;
     private String launchTemplateId;
     private String launchTemplateName;
@@ -67,6 +69,9 @@ public class AutoScalingGroup {
 
     public String getAutoScalingGroupArn() { return autoScalingGroupArn; }
     public void setAutoScalingGroupArn(String v) { this.autoScalingGroupArn = v; }
+
+    public String getMetricsIncarnation() { return metricsIncarnation; }
+    public void setMetricsIncarnation(String v) { metricsIncarnation = v; }
 
     public String getLaunchConfigurationName() { return launchConfigurationName; }
     public void setLaunchConfigurationName(String v) { this.launchConfigurationName = v; }

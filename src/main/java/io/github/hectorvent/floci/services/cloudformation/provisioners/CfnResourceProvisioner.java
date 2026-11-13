@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.LongNode;
 import com.fasterxml.jackson.databind.node.TextNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.services.cloudformation.CloudFormationDriftSnapshot;
 import io.github.hectorvent.floci.services.cloudformation.model.StackEvent;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 
@@ -26,6 +27,12 @@ import java.util.function.Consumer;
 public interface CfnResourceProvisioner {
 
     Set<String> resourceTypes();
+
+    /** Only a real provider read can qualify drift; unimplemented readers must not report IN_SYNC. */
+    default CfnDriftProjection readDrift(CloudFormationDriftSnapshot.Resource resource, JsonNode properties,
+                                        String account, String region) {
+        throw new AwsException("ValidationError", "Drift detection is not implemented for " + resource.type(), 400);
+    }
 
     /** Ref can expose one part of a resource's compound physical identity. */
     default String referenceValue(String physicalId) {
