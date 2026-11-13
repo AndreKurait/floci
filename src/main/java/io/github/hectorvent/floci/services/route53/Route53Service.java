@@ -1,0 +1,1554 @@
+package io.github.hectorvent.floci.services.route53;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.DomainNames;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.core.common.dns.DnsClientVpcSource.ClientVpc;
+import io.github.hectorvent.floci.core.common.dns.DnsLookupHelper;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.StorageBackend;
+import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.route53.model.AliasTarget;
+import io.github.hectorvent.floci.services.route53.model.ChangeInfo;
+import io.github.hectorvent.floci.services.route53.model.DelegationSet;
+import io.github.hectorvent.floci.services.route53.model.HealthCheck;
+import io.github.hectorvent.floci.services.route53.model.HealthCheckConfig;
+import io.github.hectorvent.floci.services.route53.model.HostedZone;
+import io.github.hectorvent.floci.services.route53.model.ResourceRecord;
+import io.github.hectorvent.floci.services.route53.model.ResourceRecordSet;
+import io.github.hectorvent.floci.services.route53.model.VpcAssociation;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+
+import java.math.BigInteger;
+import java.security.SecureRandom;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
+import java.util.stream.Collectors;
+
+@ApplicationScoped
+public class Route53Service implements Resettable {
+
+    private static final String CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    private static final SecureRandom RANDOM = new SecureRandom();
+    private static final List<String> DEFAULT_NAME_SERVERS = List.of("ns-1.awsdns-01.org", "ns-2.awsdns-02.net",
+            "ns-3.awsdns-03.com", "ns-4.awsdns-04.co.uk");
+    private static final List<String> NAME_SERVER_TLDS = List.of("org", "net", "com", "co.uk");
+    private static final int MAX_VPC_ASSOCIATIONS_PER_ZONE = 300;
+    private static final int MAX_VPC_ASSOCIATION_AUTHORIZATIONS = 1000;
+
+    public record CreateZoneResult(HostedZone zone, ChangeInfo change) {}
+    public record TestDnsAnswerResult(String nameserver, String protocol, String recordName, String recordType,
+                                      String responseCode, List<String> recordData) {}
+    private record OwnedZone(String accountId, HostedZone zone) {}
+
+    private final StorageBackend<String, HostedZone> zoneStore;
+    private final StorageBackend<String, DelegationSet> delegationSetStore;
+    private final StorageBackend<String, List<ResourceRecordSet>> recordStore;
+    private final StorageBackend<String, HealthCheck> healthCheckStore;
+    private final StorageBackend<String, ChangeInfo> changeStore;
+    private final StorageBackend<String, Map<String, String>> tagStore;
+    private final StorageBackend<String, List<VpcAssociation>> vpcAuthorizationStore;
+    private final List<String> nameServers;
+    private final List<Boolean> configuredNameServerSlots;
+    private final String defaultAccountId;
+    private final RegionResolver regionResolver;
+    private final Ec2Service ec2Service;
+    private final long vpcAssociationControlPlaneDelayMs;
+    private final Map<String, Long> hostedZoneMutationBusyUntilNanos = new ConcurrentHashMap<>();
+    private final Map<String, Long> authorizationMutationBusyUntilNanos = new ConcurrentHashMap<>();
+    private final Map<String, Integer> privateZoneNameCounts = new ConcurrentHashMap<>();
+    private final Map<String, Integer> publicZoneNameCounts = new ConcurrentHashMap<>();
+    private final Map<String, List<PublicAliasZone>> publicAliasZones = new ConcurrentHashMap<>();
+
+    @Inject
+    public Route53Service(StorageFactory factory, EmulatorConfig config, RegionResolver regionResolver,
+                          Ec2Service ec2Service) {
+        this.zoneStore = factory.create("route53", "route53-zones.json",
+                new TypeReference<Map<String, HostedZone>>() {});
+        this.delegationSetStore = factory.create("route53", "route53-delegation-sets.json",
+                new TypeReference<Map<String, DelegationSet>>() {});
+        this.recordStore = factory.create("route53", "route53-records.json",
+                new TypeReference<Map<String, List<ResourceRecordSet>>>() {});
+        this.healthCheckStore = factory.create("route53", "route53-health-checks.json",
+                new TypeReference<Map<String, HealthCheck>>() {});
+        this.changeStore = factory.create("route53", "route53-changes.json",
+                new TypeReference<Map<String, ChangeInfo>>() {});
+        this.tagStore = factory.create("route53", "route53-tags.json",
+                new TypeReference<Map<String, Map<String, String>>>() {});
+        this.vpcAuthorizationStore = factory.create("route53", "route53-vpc-association-authorizations.json",
+                new TypeReference<Map<String, List<VpcAssociation>>>() {});
+
+        EmulatorConfig.Route53ServiceConfig r53 = config.services().route53();
+        List<Optional<String>> configuredNames = List.of(
+                r53.defaultNameserver1(),
+                r53.defaultNameserver2(),
+                r53.defaultNameserver3(),
+                r53.defaultNameserver4()
+        );
+        List<String> effectiveNames = new ArrayList<>(4);
+        List<Boolean> configuredSlots = new ArrayList<>(4);
+        for (int i = 0; i < 4; i++) {
+            configuredSlots.add(configuredNames.get(i).isPresent());
+            effectiveNames.add(delegationName(configuredNames.get(i).orElse(DEFAULT_NAME_SERVERS.get(i))));
+        }
+        this.configuredNameServerSlots = List.copyOf(configuredSlots);
+        this.nameServers = List.copyOf(effectiveNames);
+        this.defaultAccountId = config.defaultAccountId();
+        this.regionResolver = regionResolver;
+        this.ec2Service = ec2Service;
+        this.vpcAssociationControlPlaneDelayMs = Math.max(0, r53.vpcAssociationControlPlaneDelayMs());
+        for (OwnedZone owned : allHostedZonesAcrossAccounts()) {
+            zoneNameCounts(owned.zone().isPrivateZone()).merge(
+                    normalizeName(owned.zone().getName()).toLowerCase(), 1, Integer::sum);
+            indexPublicAliases(owned.zone(), owned.accountId(),
+                    getRecordsForZoneAcrossAccounts(owned.accountId(), owned.zone().getId()));
+        }
+    }
+
+    public TestDnsAnswerResult testDnsAnswer(String hostedZoneId, String recordName, String recordType,
+                                             String resolverIp, String subnetIp, String subnetMask) {
+        String id = Route53TestDnsAnswer.validate(hostedZoneId, recordName, recordType, resolverIp, subnetIp, subnetMask);
+        HostedZone zone = getHostedZoneOwnedByCaller(id);
+        if (zone.isPrivateZone()) {
+            throw new AwsException("InvalidInput", "TestDNSAnswer supports public hosted zones only.", 400);
+        }
+        return Route53TestDnsAnswer.answer(zone, recordStore.get(id).orElse(List.of()),
+                assignedNameServers(zone), recordName, recordType);
+    }
+
+    public synchronized DelegationSet createReusableDelegationSet(String callerReference, String hostedZoneId) {
+        if (callerReference == null || callerReference.isEmpty() || callerReference.length() > 128) {
+            throw new AwsException("InvalidInput", "CallerReference must contain between 1 and 128 characters.", 400);
+        }
+        for (DelegationSet existing : delegationSetStore.scan(k -> true)) {
+            if (existing.callerReference().equals(callerReference)) {
+                throw new AwsException("DelegationSetAlreadyCreated",
+                        "A reusable delegation set with this caller reference already exists.", 400);
+            }
+        }
+        if (delegationSetStore.keys().size() >= 100) {
+            throw new AwsException("LimitsExceeded", "The reusable delegation set limit has been reached.", 400);
+        }
+        HostedZone source = null;
+        if (hostedZoneId != null) {
+            String zoneId = hostedZoneId.startsWith("/hostedzone/") ? hostedZoneId.substring(12) : hostedZoneId;
+            if (zoneId.isEmpty() || zoneId.length() > 32) {
+                throw new AwsException("InvalidInput", "HostedZoneId must contain between 1 and 32 characters.", 400);
+            }
+            try {
+                source = getHostedZoneOwnedByCaller(zoneId);
+            } catch (AwsException e) {
+                if (!"NoSuchHostedZone".equals(e.getErrorCode())) {
+                    throw e;
+                }
+                throw new AwsException("HostedZoneNotFound", "The specified hosted zone cannot be found.", 400);
+            }
+            if (source.isPrivateZone()) {
+                throw new AwsException("InvalidArgument", "A private hosted zone cannot have a reusable delegation set.", 400);
+            }
+            if (source.getDelegationSetId() != null) {
+                throw new AwsException("DelegationSetAlreadyReusable", "The hosted zone's delegation set is already reusable.", 400);
+            }
+        }
+        String id = "N" + generateZoneId().substring(1);
+        DelegationSet set = new DelegationSet(id, callerReference,
+                source == null ? newNameServers(id) : assignedNameServers(source));
+        delegationSetStore.put(id, set);
+        if (source != null) {
+            source.setDelegationSetId(id);
+            source.setDelegationNameServers(set.nameServers());
+            zoneStore.put(source.getId(), source);
+        }
+        return set;
+    }
+
+    public DelegationSet getReusableDelegationSet(String id) {
+        String cleanId = delegationSetId(id);
+        return delegationSetStore.get(cleanId).orElseThrow(() ->
+                new AwsException("NoSuchDelegationSet", "No reusable delegation set found with ID: " + cleanId, 400));
+    }
+
+    public synchronized void deleteReusableDelegationSet(String id) {
+        DelegationSet set = getReusableDelegationSet(id);
+        if (zoneStore.scan(k -> true).stream().anyMatch(zone -> set.id().equals(zone.getDelegationSetId()))) {
+            throw new AwsException("DelegationSetInUse", "The reusable delegation set is associated with a hosted zone.", 400);
+        }
+        delegationSetStore.delete(set.id());
+    }
+
+    public DelegationSet getDelegationSet(HostedZone zone) {
+        return zone.getDelegationSetId() == null ? new DelegationSet(null, null, assignedNameServers(zone))
+                : getReusableDelegationSet(zone.getDelegationSetId());
+    }
+
+    private List<String> newNameServers(String id) {
+        BigInteger value = new BigInteger(id, 36);
+        List<String> assigned = new ArrayList<>(4);
+        for (int i = 0; i < 4; i++) {
+            if (configuredNameServerSlots.get(i)) {
+                assigned.add(nameServers.get(i));
+            } else {
+                int slot = value.shiftRight(i * 18).intValue() & 0x3ffff;
+                assigned.add(String.format(Locale.ROOT, "ns-%d.awsdns-%02d.%s",
+                        (slot & 0x7ff) + 1, (slot >>> 11) % 100, NAME_SERVER_TLDS.get(i)));
+            }
+        }
+        return List.copyOf(assigned);
+    }
+
+    public long getReusableDelegationSetCount() {
+        return delegationSetStore.keys().size();
+    }
+
+    Route53Pagination.Page<DelegationSet> pageReusableDelegationSets(String marker, String maxItems) {
+        if (marker != null && marker.length() > 64) {
+            throw new AwsException("InvalidInput", "Marker must contain at most 64 characters.", 400);
+        }
+        int pageSize;
+        try {
+            BigInteger requested = new BigInteger(maxItems);
+            if (requested.signum() <= 0) {
+                throw new NumberFormatException("Nonpositive page size");
+            }
+            pageSize = requested.min(BigInteger.valueOf(100)).intValueExact();
+        } catch (NumberFormatException e) {
+            throw new AwsException("InvalidInput", "MaxItems must be a positive integer.", 400);
+        }
+        List<DelegationSet> sets = delegationSetStore.scan(k -> true).stream()
+                .filter(set -> marker == null || set.id().compareTo(marker) >= 0)
+                .sorted(Comparator.comparing(DelegationSet::id)).toList();
+        return Route53Pagination.page(sets, null, pageSize, DelegationSet::id);
+    }
+
+    private List<String> assignedNameServers(HostedZone zone) {
+        if (zone.getDelegationSetId() != null) {
+            return getReusableDelegationSet(zone.getDelegationSetId()).nameServers();
+        }
+        if (!zone.getDelegationNameServers().isEmpty()) {
+            return zone.getDelegationNameServers();
+        }
+        // Older zones did not store their assignment separately from the apex NS records.
+        List<String> stored = recordStore.get(zone.getId()).orElse(List.of()).stream()
+                .filter(record -> "NS".equals(record.getType()) && isApexSoaOrNs(record, zone.getName()))
+                .flatMap(record -> record.getRecords().stream()).map(ResourceRecord::getValue)
+                .map(Route53Service::delegationName).toList();
+        return stored.size() == 4 ? stored : nameServers;
+    }
+
+    private static String delegationSetId(String id) {
+        String cleanId = id == null ? "" : id.startsWith("/delegationset/") ? id.substring(15) : id;
+        if (cleanId.isEmpty() || cleanId.length() > 32) {
+            throw new AwsException("InvalidInput", "DelegationSetId must contain between 1 and 32 characters.", 400);
+        }
+        return cleanId;
+    }
+
+    // ── Hosted Zones ──────────────────────────────────────────────────────────
+
+    public synchronized CreateZoneResult createHostedZone(String name, String callerReference,
+                                                           String comment, VpcAssociation vpcAssociation) {
+        return createHostedZone(name, callerReference, comment, vpcAssociation, null);
+    }
+
+    public synchronized CreateZoneResult createHostedZone(String name, String callerReference, String comment,
+                                                           VpcAssociation vpcAssociation, String delegationSetId) {
+        String normalizedName = normalizeName(name);
+
+        for (HostedZone existing : zoneStore.scan(k -> true)) {
+            if (existing.getCallerReference().equals(callerReference)) {
+                throw new AwsException("HostedZoneAlreadyExists",
+                        "A hosted zone with caller reference " + callerReference + " already exists.", 409);
+            }
+        }
+
+        DelegationSet set = null;
+        if (delegationSetId != null) {
+            if (vpcAssociation != null) {
+                throw new AwsException("InvalidInput", "A private hosted zone cannot use a reusable delegation set.", 400);
+            }
+            set = getReusableDelegationSet(delegationSetId);
+            validateDelegationSetForZone(set, normalizedName);
+        }
+        String id = generateZoneId();
+        String callerAccountId = callerAccountId();
+        validateVpcOwnershipIfKnown(vpcAssociation, callerAccountId);
+        HostedZone zone = new HostedZone(id, normalizedName, callerReference, comment, vpcAssociation);
+        zone.setOwnerAccountId(callerAccountId);
+        zone.setDelegationSetId(set == null ? null : set.id());
+        zone.setDelegationNameServers(set != null ? set.nameServers()
+                : vpcAssociation != null ? nameServers : newNameServers(id));
+        if (vpcAssociation != null) {
+            vpcAssociation.setOwnerAccountId(callerAccountId);
+        }
+        zoneNameCounts(zone.isPrivateZone()).merge(normalizedName.toLowerCase(), 1, Integer::sum);
+        zoneStore.put(id, zone);
+        List<ResourceRecordSet> records = buildDefaultRecords(normalizedName, zone.getDelegationNameServers());
+        recordStore.put(id, records);
+        indexPublicAliases(zone, callerAccountId, records);
+        ChangeInfo change = newChange(null);
+        return new CreateZoneResult(zone, change);
+    }
+
+    private void validateDelegationSetForZone(DelegationSet set, String name) {
+        String accountId = callerAccountId();
+        List<HostedZone> zones = allHostedZonesAcrossAccounts().stream()
+                .filter(owned -> accountId.equals(owned.accountId()) && accountId.equals(ownerAccountId(owned.zone())))
+                .map(OwnedZone::zone).toList();
+        if (zones.stream().filter(zone -> set.id().equals(zone.getDelegationSetId())).count() >= 100) {
+            throw new AwsException("TooManyHostedZones", "The hosted zone limit for this reusable delegation set has been reached.", 400);
+        }
+        String normalizedName = normalizeRecordName(name);
+        for (HostedZone existing : zones) {
+            if (existing.isPrivateZone()) {
+                continue;
+            }
+            String existingName = normalizeRecordName(existing.getName());
+            boolean related = DomainNames.isWithin(normalizedName, existingName)
+                    || DomainNames.isWithin(existingName, normalizedName);
+            if (related && assignedNameServers(existing).stream().anyMatch(ns ->
+                    set.nameServers().stream().anyMatch(candidate -> ns.equalsIgnoreCase(candidate)))) {
+                throw new AwsException("ConflictingDomainExists",
+                        "The domain overlaps a public hosted zone that uses the same name servers.", 400);
+            }
+        }
+    }
+
+    public HostedZone getHostedZone(String id) {
+        HostedZone zone = getHostedZoneOwnedByCaller(id);
+        zone.setResourceRecordSetCount(recordCount(id));
+        return zone;
+    }
+
+    public synchronized ChangeInfo deleteHostedZone(String id) {
+        HostedZone zone = getHostedZone(id);
+        List<ResourceRecordSet> records = recordStore.get(id).orElse(List.of());
+        long nonDefault = records.stream()
+                .filter(r -> !isApexSoaOrNs(r, zone.getName()))
+                .count();
+        if (nonDefault > 0) {
+            throw new AwsException("HostedZoneNotEmpty",
+                    "The hosted zone contains resource record sets in addition to the default NS and SOA records.", 400);
+        }
+        zoneStore.delete(id);
+        recordStore.delete(id);
+        tagStore.delete("hostedzone/" + id);
+        vpcAuthorizationStore.delete(id);
+        zoneNameCounts(zone.isPrivateZone()).computeIfPresent(normalizeName(zone.getName()).toLowerCase(),
+                (k, v) -> v > 1 ? v - 1 : null);
+        publicAliasZones.computeIfPresent(normalizeRecordName(zone.getName()), (name, zones) -> {
+            List<PublicAliasZone> remaining = zones.stream()
+                    .filter(candidate -> !candidate.ownedBy(ownerAccountId(zone), zone.getId())).toList();
+            return remaining.isEmpty() ? null : remaining;
+        });
+        return newChange(null);
+    }
+
+    /**
+     * The comment is cleared when the request carries none, which is what AWS does rather than
+     * leaving the previous comment in place.
+     */
+    public synchronized HostedZone updateHostedZoneComment(String id, String comment) {
+        HostedZone zone = getHostedZoneOwnedByCaller(id);
+        zone.setComment(comment);
+        zoneStore.put(id, zone);
+        return zone;
+    }
+
+    public List<HostedZone> listHostedZones(String marker, int maxItems) {
+        return pageHostedZones(marker, maxItems).items();
+    }
+
+    Route53Pagination.Page<HostedZone> pageHostedZones(String marker, int maxItems) {
+        return pageHostedZones(marker, maxItems, null);
+    }
+
+    Route53Pagination.Page<HostedZone> pageHostedZones(String marker, int maxItems, String delegationSetId) {
+        String selected = delegationSetId == null ? null : getReusableDelegationSet(delegationSetId).id();
+        List<HostedZone> all = new ArrayList<>(zoneStore.scan(k -> true));
+        if (selected != null) {
+            all.removeIf(zone -> !selected.equals(zone.getDelegationSetId()));
+        }
+        all.sort(Comparator.comparing(HostedZone::getName).thenComparing(HostedZone::getId));
+        for (HostedZone zone : all) {
+            zone.setResourceRecordSetCount(recordCount(zone.getId()));
+        }
+        return Route53Pagination.page(all, marker, maxItems, HostedZone::getId);
+    }
+
+    public List<HostedZone> listHostedZonesByName(String dnsName, int maxItems) {
+        return pageHostedZonesByName(dnsName, null, maxItems).items();
+    }
+
+    Route53Pagination.Page<HostedZone> pageHostedZonesByName(String dnsName, String hostedZoneId, int maxItems) {
+        List<HostedZone> all = new ArrayList<>(zoneStore.scan(k -> true));
+        all.sort(Comparator.comparing((HostedZone zone) -> reversedDnsName(zone.getName()))
+                .thenComparing(HostedZone::getId));
+        for (HostedZone zone : all) {
+            zone.setResourceRecordSetCount(recordCount(zone.getId()));
+        }
+        if (dnsName != null && !dnsName.isEmpty()) {
+            String startName = reversedDnsName(normalizeName(dnsName));
+            all.removeIf(zone -> {
+                int comparison = reversedDnsName(zone.getName()).compareTo(startName);
+                return comparison < 0 || (comparison == 0 && hostedZoneId != null && !hostedZoneId.isEmpty()
+                        && zone.getId().compareTo(hostedZoneId) < 0);
+            });
+        }
+        int pageSize = maxItems <= 0 ? maxItems : Math.min(maxItems, 100);
+        return Route53Pagination.page(all, null, pageSize, HostedZone::getId);
+    }
+
+    static String reversedDnsName(String name) {
+        String normalized = normalizeName(name);
+        List<String> labels = new ArrayList<>();
+        int labelStart = 0;
+        boolean escaped = false;
+        for (int i = 0; i < normalized.length(); i++) {
+            char character = normalized.charAt(i);
+            if (character == '.' && !escaped) {
+                if (i > labelStart) {
+                    labels.add(normalized.substring(labelStart, i));
+                }
+                labelStart = i + 1;
+            }
+            if (character == '\\' && !escaped) {
+                escaped = true;
+            } else {
+                escaped = false;
+            }
+        }
+        StringBuilder reversed = new StringBuilder(normalized.length());
+        for (int i = labels.size() - 1; i >= 0; i--) {
+            reversed.append(labels.get(i)).append('.');
+        }
+        return reversed.toString();
+    }
+
+    public long getHostedZoneCount() {
+        return zoneStore.keys().size();
+    }
+
+    // ── VPC Associations ──────────────────────────────────────────────────────
+
+    public synchronized VpcAssociation createVpcAssociationAuthorization(String zoneId, VpcAssociation vpc) {
+        getHostedZoneOwnedByCaller(zoneId);
+        rejectAuthorizationMutationOverlap(zoneId);
+        resolveVpcOwnerAccount(vpc).ifPresent(vpc::setOwnerAccountId);
+        List<VpcAssociation> authorizations = new ArrayList<>(vpcAuthorizationStore.get(zoneId).orElse(List.of()));
+        if (findAssociation(authorizations, vpc) == null) {
+            if (authorizations.size() >= MAX_VPC_ASSOCIATION_AUTHORIZATIONS) {
+                throw new AwsException("TooManyVPCAssociationAuthorizations",
+                        "The maximum number of VPC association authorizations has been reached for hosted zone " + zoneId + ".", 400);
+            }
+            authorizations.add(vpc);
+            vpcAuthorizationStore.put(zoneId, authorizations);
+            markMutationBusy(authorizationMutationBusyUntilNanos, zoneId);
+        }
+        return vpc;
+    }
+
+    public synchronized void deleteVpcAssociationAuthorization(String zoneId, VpcAssociation vpc) {
+        getHostedZoneOwnedByCaller(zoneId);
+        rejectAuthorizationMutationOverlap(zoneId);
+        List<VpcAssociation> authorizations = new ArrayList<>(vpcAuthorizationStore.get(zoneId).orElse(List.of()));
+        VpcAssociation existing = findAssociation(authorizations, vpc);
+        if (existing == null) {
+            throw new AwsException("VPCAssociationAuthorizationNotFound",
+                    "The VPC that you specified is not authorized to be associated with the hosted zone.", 404);
+        }
+        authorizations.remove(existing);
+        if (authorizations.isEmpty()) {
+            vpcAuthorizationStore.delete(zoneId);
+        } else {
+            vpcAuthorizationStore.put(zoneId, authorizations);
+        }
+        markMutationBusy(authorizationMutationBusyUntilNanos, zoneId);
+    }
+
+    public List<VpcAssociation> listVpcAssociationAuthorizations(String zoneId) {
+        getHostedZoneOwnedByCaller(zoneId);
+        List<VpcAssociation> authorizations = new ArrayList<>(vpcAuthorizationStore.get(zoneId).orElse(List.of()));
+        authorizations.sort((a, b) -> {
+            int id = a.getVpcId().compareTo(b.getVpcId());
+            return id != 0 ? id : a.getVpcRegion().compareTo(b.getVpcRegion());
+        });
+        return authorizations;
+    }
+
+    /** Associates a VPC with a private hosted zone. */
+    public synchronized ChangeInfo associateVpcWithHostedZone(String zoneId, VpcAssociation vpc,
+                                                              String comment) {
+        OwnedZone ownedZone = getHostedZoneAcrossAccounts(zoneId);
+        HostedZone zone = ownedZone.zone();
+        if (!zone.isPrivateZone()) {
+            throw new AwsException("PublicZoneVPCAssociation",
+                    "You're trying to associate a VPC with a public hosted zone. "
+                            + "Public hosted zones can't be associated with a VPC.", 400);
+        }
+        rejectHostedZoneMutationOverlap(zoneId);
+        if (findAssociation(zone, vpc) == null) {
+            String callerAccountId = callerAccountId();
+            validateVpcOwnershipIfKnown(vpc, callerAccountId);
+            List<VpcAssociation> authorizations = new ArrayList<>(
+                    getVpcAuthorizationsForAccount(ownedZone.accountId(), zoneId));
+            VpcAssociation authorization = findAssociation(authorizations, vpc);
+            boolean crossAccount = !callerAccountId.equals(ownerAccountId(zone));
+            if (crossAccount && authorization == null) {
+                throw new AwsException("NotAuthorizedException",
+                        "Associating the specified VPC with the specified hosted zone has not been authorized.", 401);
+            }
+            if (crossAccount && authorization.getOwnerAccountId() == null) {
+                String resolvedOwner = resolveVpcOwnerAccount(vpc).orElseThrow(() ->
+                        new AwsException("InvalidVPCId",
+                                "The VPC ID that you specified either isn't a valid ID or the current account is not authorized to access this VPC.",
+                                400));
+                authorization.setOwnerAccountId(resolvedOwner);
+                putVpcAuthorizationsForAccount(ownedZone.accountId(), zoneId, authorizations);
+            }
+            if (authorization != null && authorization.getOwnerAccountId() != null
+                    && !authorization.getOwnerAccountId().equals(callerAccountId)) {
+                throw new AwsException("NotAuthorizedException",
+                        "Associating the specified VPC with the specified hosted zone has not been authorized.", 401);
+            }
+            if (zone.getVpcAssociations().size() >= MAX_VPC_ASSOCIATIONS_PER_ZONE) {
+                throw new AwsException("LimitsExceeded",
+                        "The maximum number of VPCs that can be associated with this hosted zone has been reached.", 400);
+            }
+            for (HostedZone other : listHostedZonesByVpc(vpc.getVpcId(), vpc.getVpcRegion())) {
+                if (!other.getId().equals(zoneId) && other.getName().equals(zone.getName())) {
+                    throw new AwsException("ConflictingDomainExists",
+                            "The VPC that you chose, " + vpc.getVpcId() + " in region " + vpc.getVpcRegion()
+                                    + ", is already associated with another hosted zone that has the same name.",
+                            400);
+                }
+            }
+            vpc.setOwnerAccountId(resolveVpcOwnerAccount(vpc).orElse(callerAccountId));
+            zone.getVpcAssociations().add(vpc);
+            putZoneForAccount(ownedZone.accountId(), zoneId, zone);
+            markMutationBusy(hostedZoneMutationBusyUntilNanos, zoneId);
+        }
+        return newChange(comment);
+    }
+
+    /**
+     * Disassociates a VPC from a private hosted zone. AWS refuses to remove the
+     * only remaining association — the zone would become unresolvable.
+     */
+    public synchronized ChangeInfo disassociateVpcFromHostedZone(String zoneId, VpcAssociation vpc,
+                                                                 String comment) {
+        OwnedZone ownedZone = getHostedZoneAcrossAccounts(zoneId);
+        HostedZone zone = ownedZone.zone();
+        VpcAssociation existing = findAssociation(zone, vpc);
+        if (existing == null) {
+            throw new AwsException("VPCAssociationNotFound",
+                    "The VPC " + vpc.getVpcId() + " in region " + vpc.getVpcRegion()
+                            + " is not associated with hosted zone " + zoneId + ".", 404);
+        }
+        String associationOwner = existing.getOwnerAccountId();
+        String callerAccountId = callerAccountId();
+        String zoneOwner = ownerAccountId(zone);
+        if (associationOwner == null && !zoneOwner.equals(callerAccountId)) {
+            associationOwner = resolveVpcOwnerAccount(existing).orElseThrow(() ->
+                    new AwsException("InvalidVPCId",
+                            "The VPC ID that you specified either isn't a valid ID or the current account is not authorized to access this VPC.",
+                            400));
+            if (!associationOwner.equals(callerAccountId)) {
+                throw new AwsException("InvalidVPCId",
+                        "The VPC ID that you specified either isn't a valid ID or the current account is not authorized to access this VPC.",
+                        400);
+            }
+            existing.setOwnerAccountId(associationOwner);
+            putZoneForAccount(ownedZone.accountId(), zoneId, zone);
+        }
+        if (associationOwner != null
+                && !associationOwner.equals(callerAccountId)
+                && !zoneOwner.equals(callerAccountId)) {
+            throw new AwsException("InvalidVPCId",
+                    "The VPC ID that you specified either isn't a valid ID or the current account is not authorized to access this VPC.",
+                    400);
+        }
+        if (zone.getVpcAssociations().size() == 1) {
+            throw new AwsException("LastVPCAssociation",
+                    "The VPC that you chose, " + vpc.getVpcId() + " in region " + vpc.getVpcRegion()
+                            + ", is the last VPC that is associated with the hosted zone.", 400);
+        }
+        zone.getVpcAssociations().remove(existing);
+        putZoneForAccount(ownedZone.accountId(), zoneId, zone);
+        markMutationBusy(hostedZoneMutationBusyUntilNanos, zoneId);
+        return newChange(comment);
+    }
+
+    /**
+     * Returns every hosted zone associated with the given VPC, regardless of the
+     * account that created the zone.
+     */
+    public List<HostedZone> listHostedZonesByVpc(String vpcId, String vpcRegion) {
+        List<HostedZone> matches = new ArrayList<>();
+        for (OwnedZone owned : allHostedZonesAcrossAccounts()) {
+            HostedZone zone = owned.zone();
+            if (findAssociation(zone, new VpcAssociation(vpcId, vpcRegion)) != null) {
+                if (zone.getOwnerAccountId() == null) {
+                    zone.setOwnerAccountId(owned.accountId());
+                }
+                matches.add(zone);
+            }
+        }
+        // Tie-break by id: name alone leaves equal-named zones ordered by the backing store's
+        // own iteration, which can differ between the page-1 and page-2 scans and desync the
+        // id-based NextToken continuation point (skipping or repeating an entry).
+        matches.sort((a, b) -> {
+            int cmp = a.getName().compareTo(b.getName());
+            return cmp != 0 ? cmp : a.getId().compareTo(b.getId());
+        });
+        return matches;
+    }
+
+    /**
+     * {@link VpcAssociation} has no value equality, so associations are matched on
+     * their ID and region rather than by object identity.
+     */
+    private static VpcAssociation findAssociation(HostedZone zone, VpcAssociation vpc) {
+        if (zone.getVpcAssociations() == null) {
+            return null;
+        }
+        return findAssociation(zone.getVpcAssociations(), vpc);
+    }
+
+    private static VpcAssociation findAssociation(List<VpcAssociation> associations, VpcAssociation vpc) {
+        for (VpcAssociation candidate : associations) {
+            if (vpc.getVpcId().equals(candidate.getVpcId())
+                    && vpc.getVpcRegion().equals(candidate.getVpcRegion())) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    // ── Resource Record Sets ──────────────────────────────────────────────────
+
+    public synchronized ChangeInfo changeResourceRecordSets(String zoneId,
+                                                             List<Map<String, Object>> changes,
+                                                             String comment) {
+        HostedZone zone = getHostedZone(zoneId);
+        List<ResourceRecordSet> current = new ArrayList<>(
+                recordStore.get(zoneId).orElse(new ArrayList<>()));
+
+        for (Map<String, Object> change : changes) {
+            String action = (String) change.get("action");
+            ResourceRecordSet rrs = (ResourceRecordSet) change.get("rrs");
+            validateChange(action, rrs, current, zone.getName());
+            applyChange(action, rrs, current);
+        }
+
+        zone.setResourceRecordSetCount(current.size());
+        zoneStore.put(zoneId, zone);
+        recordStore.put(zoneId, current);
+        indexPublicAliases(zone, ownerAccountId(zone), current);
+        return newChange(comment);
+    }
+
+    public List<ResourceRecordSet> listResourceRecordSets(String zoneId, String startName,
+                                                           String startType, int maxItems) {
+        getHostedZone(zoneId);
+        List<ResourceRecordSet> records = new ArrayList<>(
+                recordStore.get(zoneId).orElse(List.of()));
+
+        records.sort((a, b) -> {
+            int cmp = normalizeRecordName(a.getName()).compareTo(normalizeRecordName(b.getName()));
+            if (cmp != 0) return cmp;
+            return a.getType().compareTo(b.getType());
+        });
+
+        if (startName != null && !startName.isEmpty()) {
+            String normalizedStart = normalizeRecordName(startName);
+            final String finalStartType = startType;
+            records = records.stream()
+                    .filter(r -> {
+                        int cmp = normalizeRecordName(r.getName()).compareTo(normalizedStart);
+                        if (cmp > 0) return true;
+                        if (cmp == 0 && finalStartType != null && !finalStartType.isEmpty()) {
+                            return r.getType().compareTo(finalStartType) >= 0;
+                        }
+                        return cmp == 0;
+                    })
+                    .toList();
+            records = new ArrayList<>(records);
+        }
+
+        if (maxItems > 0 && records.size() > maxItems) {
+            return records.subList(0, maxItems);
+        }
+        return records;
+    }
+
+    // ── Changes ───────────────────────────────────────────────────────────────
+
+    public ChangeInfo getChange(String changeId) {
+        return changeStore.get(changeId).orElseThrow(() ->
+                new AwsException("NoSuchChange",
+                        "No change found with ID: " + changeId, 404));
+    }
+
+    // ── Health Checks ─────────────────────────────────────────────────────────
+
+    /**
+     * A caller reference makes the create safe to retry: the same reference with the same settings
+     * (the request's canonical {@code requestSettings}) returns the health check it already created,
+     * and different settings are refused.
+     */
+    public synchronized HealthCheck createHealthCheck(String callerReference, HealthCheckConfig cfg,
+                                                      String requestSettings) {
+        for (HealthCheck existing : healthCheckStore.scan(k -> true)) {
+            if (existing.getCallerReference().equals(callerReference)) {
+                if (requestSettings.equals(existing.getRequestSettings())) {
+                    return existing;
+                }
+                throw new AwsException("HealthCheckAlreadyExists",
+                        "A health check with caller reference " + callerReference + " already exists.", 409);
+            }
+        }
+        String id = UUID.randomUUID().toString();
+        HealthCheck hc = new HealthCheck(id, callerReference, cfg, requestSettings);
+        healthCheckStore.put(id, hc);
+        return hc;
+    }
+
+    public HealthCheck getHealthCheck(String id) {
+        return healthCheckStore.get(id).orElseThrow(() ->
+                new AwsException("NoSuchHealthCheck",
+                        "No health check found with ID: " + id, 404));
+    }
+
+    public void deleteHealthCheck(String id) {
+        getHealthCheck(id);
+        healthCheckStore.delete(id);
+        tagStore.delete("healthcheck/" + id);
+    }
+
+    public List<HealthCheck> listHealthChecks(String marker, int maxItems) {
+        return pageHealthChecks(marker, maxItems).items();
+    }
+
+    Route53Pagination.Page<HealthCheck> pageHealthChecks(String marker, int maxItems) {
+        List<HealthCheck> all = new ArrayList<>(healthCheckStore.scan(k -> true));
+        all.sort(Comparator.comparing(HealthCheck::getId));
+        return Route53Pagination.page(all, marker, maxItems, HealthCheck::getId);
+    }
+
+    public HealthCheck updateHealthCheck(String id, HealthCheckConfig cfg) {
+        HealthCheck hc = getHealthCheck(id);
+        hc.setConfig(cfg);
+        hc.setHealthCheckVersion(hc.getHealthCheckVersion() + 1);
+        healthCheckStore.put(id, hc);
+        return hc;
+    }
+
+    // ── Tags ──────────────────────────────────────────────────────────────────
+
+    public Map<String, String> listTagsForResource(String resourceType, String resourceId) {
+        return tagStore.get(resourceType + "/" + resourceId).orElse(Collections.emptyMap());
+    }
+
+    public void changeTagsForResource(String resourceType, String resourceId,
+                                      List<Map<String, String>> addTags, List<String> removeTagKeys) {
+        String key = resourceType + "/" + resourceId;
+        Map<String, String> tags = new LinkedHashMap<>(tagStore.get(key).orElse(new LinkedHashMap<>()));
+        if (removeTagKeys != null) {
+            removeTagKeys.forEach(tags::remove);
+        }
+        if (addTags != null) {
+            addTags.forEach(t -> {
+                if (t.get("Key") != null) {
+                    tags.put(t.get("Key"), t.getOrDefault("Value", ""));
+                }
+            });
+        }
+        tagStore.put(key, tags);
+    }
+
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
+    public List<String> getNameServers() {
+        return nameServers;
+    }
+
+    public List<String> getAssignedNameServers(String hostedZoneId) {
+        return getDelegationSet(getHostedZone(hostedZoneId)).nameServers();
+    }
+
+    public String getDefaultAccountId() {
+        return defaultAccountId;
+    }
+
+    public String ownerAccountId(HostedZone zone) {
+        return zone.getOwnerAccountId() != null ? zone.getOwnerAccountId() : defaultAccountId;
+    }
+
+    private OwnedZone getHostedZoneAcrossAccounts(String zoneId) {
+        if (zoneStore instanceof AccountAwareStorageBackend<?> rawAccountAware) {
+            @SuppressWarnings("unchecked")
+            AccountAwareStorageBackend<HostedZone> accountAware =
+                    (AccountAwareStorageBackend<HostedZone>) rawAccountAware;
+            AccountAwareStorageBackend.OwnedEntry<HostedZone> entry = accountAware.findAnyAccountEntry(zoneId)
+                    .orElseThrow(() -> new AwsException("NoSuchHostedZone",
+                            "No hosted zone found with ID: " + zoneId, 404));
+            if (entry.value().getOwnerAccountId() == null) {
+                entry.value().setOwnerAccountId(entry.account());
+            }
+            return new OwnedZone(entry.account(), entry.value());
+        }
+        HostedZone zone = getHostedZone(zoneId);
+        return new OwnedZone(ownerAccountId(zone), zone);
+    }
+
+    private List<OwnedZone> allHostedZonesAcrossAccounts() {
+        if (zoneStore instanceof AccountAwareStorageBackend<?> rawAccountAware) {
+            @SuppressWarnings("unchecked")
+            AccountAwareStorageBackend<HostedZone> accountAware =
+                    (AccountAwareStorageBackend<HostedZone>) rawAccountAware;
+            return accountAware.scanAllAccountEntries(k -> true).stream()
+                    .map(entry -> new OwnedZone(entry.accountId(), entry.value()))
+                    .toList();
+        }
+        return zoneStore.scan(k -> true).stream()
+                .map(zone -> new OwnedZone(ownerAccountId(zone), zone))
+                .toList();
+    }
+
+    public boolean isCoveredByPrivateZone(String qname) {
+        if (qname == null || qname.isBlank()) {
+            return false;
+        }
+        String normalizedQname = normalizeName(qname).toLowerCase();
+        if (privateZoneNameCounts.isEmpty()
+                || privateZoneNameCounts.keySet().stream().noneMatch(z -> DomainNames.isWithin(normalizedQname, z))) {
+            return false;
+        }
+        for (OwnedZone owned : allHostedZonesAcrossAccounts()) {
+            HostedZone zone = owned.zone();
+            if (!zone.isPrivateZone()) {
+                continue;
+            }
+            String zoneName = normalizeName(zone.getName()).toLowerCase();
+            if (DomainNames.isWithin(normalizedQname, zoneName)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public List<ResourceRecordSet> findPrivateRecordsForName(String qname) {
+        if (qname == null || qname.isBlank()) {
+            return List.of();
+        }
+        return findRecordsForName(normalizeName(qname).toLowerCase(),
+                mostSpecificZones(normalizeName(qname).toLowerCase(), true).stream()
+                        .map(owned -> getRecordsForZoneAcrossAccounts(owned.accountId(), owned.zone().getId()))
+                        .toList());
+    }
+
+    public boolean isCoveredByPrivateZone(String qname, ClientVpc origin) {
+        return !privateDnsZones(qname, origin).isEmpty();
+    }
+
+    /** Includes only the most specific private zones associated with the querying VPC. */
+    public Set<String> privateDnsZoneIds(String qname, ClientVpc origin) {
+        return privateDnsZones(qname, origin).stream()
+                .map(owned -> owned.zone().getId()).collect(Collectors.toSet());
+    }
+
+    public List<ResourceRecordSet> findPrivateRecordsForName(String qname, ClientVpc origin) {
+        List<OwnedZone> zones = privateDnsZones(qname, origin);
+        return zones.isEmpty() ? List.of() : findRecordsForName(normalizeName(qname).toLowerCase(),
+                zones.stream().map(owned -> getRecordsForZoneAcrossAccounts(
+                        owned.accountId(), owned.zone().getId())).toList());
+    }
+
+    public boolean hasPrivateRecordsBeneath(String qname, ClientVpc origin) {
+        List<OwnedZone> zones = privateDnsZones(qname, origin);
+        if (zones.isEmpty()) {
+            return false;
+        }
+        String suffix = "." + normalizeName(qname).toLowerCase();
+        return zones.stream().flatMap(owned -> getRecordsForZoneAcrossAccounts(
+                        owned.accountId(), owned.zone().getId()).stream())
+                .anyMatch(record -> normalizeName(record.getName()).toLowerCase().endsWith(suffix));
+    }
+
+    private List<OwnedZone> privateDnsZones(String qname, ClientVpc origin) {
+        if (origin == null || qname == null || qname.isBlank()) {
+            return List.of();
+        }
+        return mostSpecificZones(normalizeName(qname).toLowerCase(), true, owned ->
+                owned.zone().getVpcAssociations().stream().anyMatch(association ->
+                        origin.vpcId().equals(association.getVpcId())
+                                && origin.region().equals(association.getVpcRegion())
+                                && origin.accountId().equals(association.getOwnerAccountId() != null
+                                ? association.getOwnerAccountId()
+                                : resolveVpcOwnerAccount(association).orElse(owned.accountId()))));
+    }
+
+    static List<ResourceRecordSet> findRecordsForName(String normalizedQname,
+                                                              List<List<ResourceRecordSet>> zoneRecords) {
+        List<ResourceRecordSet> nameMatches = new ArrayList<>();
+        List<ResourceRecordSet> wildcardMatches = new ArrayList<>();
+
+        for (List<ResourceRecordSet> records : zoneRecords) {
+            List<ResourceRecordSet> zoneWildcards = new ArrayList<>();
+            for (ResourceRecordSet rrs : records) {
+                String rName = normalizeName(rrs.getName()).toLowerCase();
+                if (rName.equals(normalizedQname)) {
+                    nameMatches.add(rrs);
+                } else if (rName.startsWith("*.")) {
+                    zoneWildcards.add(rrs);
+                }
+            }
+            if (nameMatches.isEmpty()) {
+                for (ResourceRecordSet rrs : zoneWildcards) {
+                    String rName = normalizeName(rrs.getName()).toLowerCase();
+                    String wildcardSuffix = rName.substring(2); // e.g. "corp.internal."
+                    if (normalizedQname.endsWith("." + wildcardSuffix)) {
+                        // A wildcard cannot match when the name or an ancestor closer than the wildcard's
+                        // parent exists, and a name with records only beneath it exists too (RFC 4592 2.2)
+                        boolean closerNameExists = records.stream()
+                                .map(r -> normalizeName(r.getName()).toLowerCase())
+                                .anyMatch(n -> sharedSuffixLength(n, normalizedQname) > wildcardSuffix.length());
+                        if (!closerNameExists) {
+                            wildcardMatches.add(rrs);
+                        }
+                    }
+                }
+            }
+        }
+        return !nameMatches.isEmpty() ? nameMatches : wildcardMatches;
+    }
+
+    /** Length of the longest whole-label suffix two normalized names share, trailing dot included. */
+    private static int sharedSuffixLength(String a, String b) {
+        int i = a.length();
+        int j = b.length();
+        int shared = 0;
+        while (i > 0 && j > 0 && a.charAt(i - 1) == b.charAt(j - 1)) {
+            i--;
+            j--;
+            boolean labelStart = (i == 0 || a.charAt(i - 1) == '.') && (j == 0 || b.charAt(j - 1) == '.');
+            if (labelStart) {
+                shared = a.length() - i;
+            }
+        }
+        return shared;
+    }
+
+    /**
+     * Whether a private zone holds records beneath {@code qname} although none at it: an empty
+     * non-terminal, which exists in DNS and so answers NOERROR rather than NXDOMAIN.
+     */
+    public boolean hasPrivateRecordsBeneath(String qname) {
+        if (qname == null || qname.isBlank()) {
+            return false;
+        }
+        String normalizedQname = normalizeName(qname).toLowerCase();
+        String suffix = "." + normalizedQname;
+        for (OwnedZone owned : mostSpecificZones(normalizedQname, true)) {
+            for (ResourceRecordSet rrs : getRecordsForZoneAcrossAccounts(owned.accountId(), owned.zone().getId())) {
+                if (normalizeName(rrs.getName()).toLowerCase().endsWith(suffix)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    record PublicDnsZone(String name, List<ResourceRecordSet> matchingRecords, List<ResourceRecordSet> records) {}
+
+    /** A service registration can fill a missing record only inside one undelegated public zone. */
+    public Optional<String> publicDnsRegistrationZoneId(String qname, String recordType) {
+        if (qname == null || qname.isBlank()) {
+            return Optional.empty();
+        }
+        String normalized = normalizeName(qname).toLowerCase(Locale.ROOT);
+        List<OwnedZone> zones = mostSpecificZones(normalized, false);
+        if (zones.size() != 1) {
+            return Optional.empty();
+        }
+        OwnedZone owned = zones.getFirst();
+        String apex = normalizeName(owned.zone().getName()).toLowerCase(Locale.ROOT);
+        List<ResourceRecordSet> records = getRecordsForZoneAcrossAccounts(
+                owned.accountId(), owned.zone().getId());
+        boolean delegated = records.stream().anyMatch(record -> "NS".equals(record.getType())
+                && !normalizeName(record.getName()).equalsIgnoreCase(apex)
+                && DomainNames.isWithin(normalized, normalizeName(record.getName())));
+        boolean stored = findRecordsForName(normalized, List.of(records)).stream()
+                .anyMatch(record -> "CNAME".equals(record.getType()) || record.getType().equals(recordType));
+        return delegated || stored ? Optional.empty() : Optional.of(owned.zone().getId());
+    }
+
+    List<PublicDnsZone> publicDnsZones(String qname) {
+        String normalized = normalizeName(qname).toLowerCase();
+        return mostSpecificZones(normalized, false).stream()
+                .map(owned -> {
+                    List<ResourceRecordSet> records = getRecordsForZoneAcrossAccounts(
+                            owned.accountId(), owned.zone().getId());
+                    return new PublicDnsZone(owned.zone().getName(),
+                            findRecordsForName(normalized, List.of(records)), records);
+                })
+                .toList();
+    }
+
+    /**
+     * A configured public DNS answer. A null target means that DNS claims the name but its
+     * answer cannot select a service, so consumers must not fall back to an unrelated listener.
+     */
+    public record PublicAlias(String dnsName, String hostedZoneId) {}
+
+    private static final PublicAlias UNRESOLVED_PUBLIC_ALIAS = new PublicAlias(null, null);
+
+    private record PublicAliasZone(String accountId, String id, String name,
+                                   Map<String, PublicAlias> targets, Set<String> names, Set<String> delegations) {
+        boolean ownedBy(String account, String zoneId) {
+            return accountId.equals(account) && id.equals(zoneId);
+        }
+
+        PublicAlias lookup(String qname) {
+            for (String ancestor = qname; !ancestor.equals(name); ancestor = parentName(ancestor)) {
+                if (delegations.contains(ancestor)) {
+                    return UNRESOLVED_PUBLIC_ALIAS;
+                }
+            }
+            if (names.contains(qname)) {
+                return targets.getOrDefault(qname, UNRESOLVED_PUBLIC_ALIAS);
+            }
+            for (String ancestor = parentName(qname); !ancestor.isEmpty(); ancestor = parentName(ancestor)) {
+                if (names.contains(ancestor)) {
+                    String wildcard = "*." + ancestor;
+                    return names.contains(wildcard) ? targets.getOrDefault(wildcard, UNRESOLVED_PUBLIC_ALIAS) : null;
+                }
+            }
+            return null;
+        }
+    }
+
+    /** Derived, immutable DNS indexes are published on writes, never built on the HTTP event loop. */
+    private void indexPublicAliases(HostedZone zone, String accountId, List<ResourceRecordSet> records) {
+        if (zone.isPrivateZone()) {
+            return;
+        }
+        String zoneName = normalizeRecordName(zone.getName());
+        Map<String, PublicAlias> targets = new LinkedHashMap<>();
+        Set<String> names = new HashSet<>();
+        Set<String> delegations = new HashSet<>();
+        for (ResourceRecordSet record : records) {
+            String name = normalizeRecordName(record.getName());
+            for (String ancestor = name; DomainNames.isWithin(ancestor, zoneName); ancestor = parentName(ancestor)) {
+                names.add(ancestor);
+                if (ancestor.equals(zoneName)) {
+                    break;
+                }
+            }
+            if ("NS".equals(record.getType()) && !name.equals(zoneName)) {
+                delegations.add(name);
+            }
+            if ("A".equals(record.getType()) || "AAAA".equals(record.getType()) || "CNAME".equals(record.getType())) {
+                PublicAlias target = publicAliasTarget(record);
+                targets.merge(name, target, (left, right) -> left.equals(right) ? left : UNRESOLVED_PUBLIC_ALIAS);
+            }
+        }
+        PublicAliasZone indexed = new PublicAliasZone(accountId, zone.getId(), zoneName,
+                Map.copyOf(targets), Set.copyOf(names), Set.copyOf(delegations));
+        publicAliasZones.compute(zoneName, (name, previous) -> {
+            List<PublicAliasZone> updated = new ArrayList<>();
+            if (previous != null) {
+                previous.stream().filter(candidate -> !candidate.ownedBy(accountId, zone.getId())).forEach(updated::add);
+            }
+            updated.add(indexed);
+            return List.copyOf(updated);
+        });
+    }
+
+    private static PublicAlias publicAliasTarget(ResourceRecordSet record) {
+        if (record.getRegion() != null || record.getFailover() != null || record.getHealthCheckId() != null) {
+            return UNRESOLVED_PUBLIC_ALIAS;
+        }
+        AliasTarget alias = record.getAliasTarget();
+        if (("A".equals(record.getType()) || "AAAA".equals(record.getType())) && alias != null
+                && alias.getDnsName() != null && !alias.getDnsName().isBlank()) {
+            String zoneId = alias.getHostedZoneId();
+            if (zoneId != null && zoneId.startsWith("/hostedzone/")) {
+                zoneId = zoneId.substring("/hostedzone/".length());
+            }
+            return new PublicAlias(normalizeRecordName(alias.getDnsName()), zoneId);
+        }
+        if ("CNAME".equals(record.getType()) && record.getRecords() != null && record.getRecords().size() == 1) {
+            String target = record.getRecords().getFirst().getValue();
+            if (target != null && !target.isBlank()) {
+                return new PublicAlias(normalizeRecordName(target), null);
+            }
+        }
+        return UNRESOLVED_PUBLIC_ALIAS;
+    }
+
+    private static String parentName(String name) {
+        int dot = name.indexOf('.');
+        return dot < 0 ? "" : name.substring(dot + 1);
+    }
+
+    private List<PublicAliasZone> publicAliasZonesFor(String name) {
+        for (String ancestor = name; !ancestor.isEmpty(); ancestor = parentName(ancestor)) {
+            List<PublicAliasZone> zones = publicAliasZones.get(ancestor);
+            if (zones != null) {
+                return zones;
+            }
+        }
+        return List.of();
+    }
+
+    /**
+     * Follows unambiguous public A/AAAA aliases and CNAMEs without upstream DNS or storage scans.
+     * Null means no configured answer claims the name. An unresolved configured answer has a
+     * null DNS target. Consumers must match a resolved target to their own resource before routing.
+     */
+    public PublicAlias lookupPublicAlias(String name) {
+        String current = normalizeRecordName(name);
+        Set<String> visited = new HashSet<>();
+        String targetZoneId = null;
+        boolean followed = false;
+        for (int depth = 0; depth < 8; depth++) {
+            if (!visited.add(current)) {
+                break;
+            }
+            List<PublicAliasZone> zones = publicAliasZonesFor(current);
+            if (zones.isEmpty()) {
+                return followed ? new PublicAlias(current, targetZoneId) : null;
+            }
+            if (zones.size() != 1) {
+                break;
+            }
+            PublicAliasZone zone = zones.getFirst();
+            if (targetZoneId != null && !zone.id().equals(targetZoneId)) {
+                break;
+            }
+            PublicAlias next = zone.lookup(current);
+            if (next == null) {
+                return followed ? UNRESOLVED_PUBLIC_ALIAS : null;
+            }
+            if (next.dnsName() == null) {
+                break;
+            }
+            followed = true;
+            current = next.dnsName();
+            targetZoneId = next.hostedZoneId();
+        }
+        return UNRESOLVED_PUBLIC_ALIAS;
+    }
+
+    private Map<String, Integer> zoneNameCounts(boolean privateZone) {
+        return privateZone ? privateZoneNameCounts : publicZoneNameCounts;
+    }
+
+    /** The longest containing zones, so a parent never answers for a more specific child. */
+    private List<OwnedZone> mostSpecificZones(String normalizedQname, boolean privateZone) {
+        return mostSpecificZones(normalizedQname, privateZone, owned -> true);
+    }
+
+    private List<OwnedZone> mostSpecificZones(String normalizedQname, boolean privateZone,
+                                             Predicate<OwnedZone> visible) {
+        Map<String, Integer> names = zoneNameCounts(privateZone);
+        if (names.isEmpty() || names.keySet().stream().noneMatch(z -> DomainNames.isWithin(normalizedQname, z))) {
+            return List.of();
+        }
+        List<OwnedZone> matchingZones = new ArrayList<>();
+        int maxZoneLength = -1;
+        for (OwnedZone owned : allHostedZonesAcrossAccounts()) {
+            HostedZone zone = owned.zone();
+            if (zone.isPrivateZone() != privateZone || !visible.test(owned)) {
+                continue;
+            }
+            String zoneName = normalizeName(zone.getName()).toLowerCase();
+            if (!DomainNames.isWithin(normalizedQname, zoneName)) {
+                continue;
+            }
+            if (zoneName.length() > maxZoneLength) {
+                matchingZones.clear();
+                maxZoneLength = zoneName.length();
+            }
+            if (zoneName.length() == maxZoneLength) {
+                matchingZones.add(owned);
+            }
+        }
+        return matchingZones;
+    }
+
+    private List<ResourceRecordSet> getRecordsForZoneAcrossAccounts(String accountId, String zoneId) {
+        if (recordStore instanceof AccountAwareStorageBackend<?> rawAccountAware) {
+            @SuppressWarnings("unchecked")
+            AccountAwareStorageBackend<List<ResourceRecordSet>> accountAware =
+                    (AccountAwareStorageBackend<List<ResourceRecordSet>>) rawAccountAware;
+            return accountAware.getForAccount(accountId, zoneId)
+                    .or(() -> accountAware.findAnyAccount(zoneId))
+                    .orElse(List.of());
+        }
+        return recordStore.get(zoneId).orElse(List.of());
+    }
+
+    private void putZoneForAccount(String accountId, String zoneId, HostedZone zone) {
+        if (zoneStore instanceof AccountAwareStorageBackend<?> rawAccountAware) {
+            @SuppressWarnings("unchecked")
+            AccountAwareStorageBackend<HostedZone> accountAware =
+                    (AccountAwareStorageBackend<HostedZone>) rawAccountAware;
+            accountAware.putForAccount(accountId, zoneId, zone);
+            return;
+        }
+        zoneStore.put(zoneId, zone);
+    }
+
+    private List<VpcAssociation> getVpcAuthorizationsForAccount(String accountId, String zoneId) {
+        if (vpcAuthorizationStore instanceof AccountAwareStorageBackend<?> rawAccountAware) {
+            @SuppressWarnings("unchecked")
+            AccountAwareStorageBackend<List<VpcAssociation>> accountAware =
+                    (AccountAwareStorageBackend<List<VpcAssociation>>) rawAccountAware;
+            return accountAware.getForAccount(accountId, zoneId).orElse(List.of());
+        }
+        return vpcAuthorizationStore.get(zoneId).orElse(List.of());
+    }
+
+    private void putVpcAuthorizationsForAccount(String accountId, String zoneId,
+                                                        List<VpcAssociation> authorizations) {
+        if (vpcAuthorizationStore instanceof AccountAwareStorageBackend<?> rawAccountAware) {
+            @SuppressWarnings("unchecked")
+            AccountAwareStorageBackend<List<VpcAssociation>> accountAware =
+                    (AccountAwareStorageBackend<List<VpcAssociation>>) rawAccountAware;
+            accountAware.putForAccount(accountId, zoneId, authorizations);
+            return;
+        }
+        vpcAuthorizationStore.put(zoneId, authorizations);
+    }
+
+    private HostedZone getHostedZoneOwnedByCaller(String zoneId) {
+        String callerAccountId = callerAccountId();
+        if (zoneStore instanceof AccountAwareStorageBackend<?> rawAccountAware) {
+            @SuppressWarnings("unchecked")
+            AccountAwareStorageBackend<HostedZone> accountAware =
+                    (AccountAwareStorageBackend<HostedZone>) rawAccountAware;
+            HostedZone zone = accountAware.getForAccount(callerAccountId, zoneId).orElse(null);
+            if (zone == null && callerAccountId.equals(defaultAccountId)) {
+                // Only the configured default account can claim pre-account-isolation unscoped data.
+                // AccountAwareStorageBackend#get migrates that legacy shape into the caller partition.
+                zone = accountAware.get(zoneId).orElse(null);
+            }
+            if (zone == null) {
+                throw new AwsException("NoSuchHostedZone",
+                        "No hosted zone found with ID: " + zoneId, 404);
+            }
+            if (zone.getOwnerAccountId() == null) {
+                zone.setOwnerAccountId(callerAccountId);
+                accountAware.putForAccount(callerAccountId, zoneId, zone);
+            }
+            if (!callerAccountId.equals(zone.getOwnerAccountId())) {
+                throw new AwsException("NoSuchHostedZone",
+                        "No hosted zone found with ID: " + zoneId, 404);
+            }
+            return zone;
+        }
+
+        HostedZone zone = zoneStore.get(zoneId).orElseThrow(() ->
+                new AwsException("NoSuchHostedZone", "No hosted zone found with ID: " + zoneId, 404));
+        if (!ownerAccountId(zone).equals(callerAccountId)) {
+            throw new AwsException("NoSuchHostedZone",
+                    "No hosted zone found with ID: " + zoneId, 404);
+        }
+        return zone;
+    }
+
+    private String callerAccountId() {
+        return regionResolver != null ? regionResolver.getAccountId() : defaultAccountId;
+    }
+
+    private Optional<String> resolveVpcOwnerAccount(VpcAssociation vpc) {
+        if (vpc == null || ec2Service == null) {
+            return Optional.empty();
+        }
+        return ec2Service.findVpcOwnerAccount(vpc.getVpcRegion(), vpc.getVpcId());
+    }
+
+    private void validateVpcOwnershipIfKnown(VpcAssociation vpc, String callerAccountId) {
+        if (vpc == null) {
+            return;
+        }
+        Optional<String> owner = resolveVpcOwnerAccount(vpc);
+        if (owner.isPresent() && !owner.get().equals(callerAccountId)) {
+            throw new AwsException("InvalidVPCId",
+                    "The VPC ID that you specified either isn't a valid ID or the current account is not authorized to access this VPC.",
+                    400);
+        }
+    }
+
+    private void rejectHostedZoneMutationOverlap(String zoneId) {
+        if (isMutationBusy(hostedZoneMutationBusyUntilNanos, zoneId)) {
+            throw new AwsException("PriorRequestNotComplete",
+                    "A previous request for this hosted zone is still being processed.", 400);
+        }
+    }
+
+    private void rejectAuthorizationMutationOverlap(String zoneId) {
+        if (isMutationBusy(authorizationMutationBusyUntilNanos, zoneId)) {
+            throw new AwsException("ConcurrentModification",
+                    "Another VPC association authorization mutation is still being processed.", 400);
+        }
+    }
+
+    private boolean isMutationBusy(Map<String, Long> busyUntilNanos, String zoneId) {
+        if (vpcAssociationControlPlaneDelayMs <= 0) {
+            return false;
+        }
+        Long deadline = busyUntilNanos.get(zoneId);
+        if (deadline == null) {
+            return false;
+        }
+        if (mutationTimeNanos() >= deadline) {
+            busyUntilNanos.remove(zoneId, deadline);
+            return false;
+        }
+        return true;
+    }
+
+    private void markMutationBusy(Map<String, Long> busyUntilNanos, String zoneId) {
+        if (vpcAssociationControlPlaneDelayMs <= 0) {
+            return;
+        }
+        busyUntilNanos.put(zoneId, mutationTimeNanos()
+                + TimeUnit.MILLISECONDS.toNanos(vpcAssociationControlPlaneDelayMs));
+    }
+
+    long mutationTimeNanos() {
+        return System.nanoTime();
+    }
+
+    public static String normalizeName(String name) {
+        if (name == null || name.isEmpty()) return name;
+        return name.endsWith(".") ? name : name + ".";
+    }
+
+    /**
+     * A configured nameserver as the delegation set lists it: without surrounding whitespace, which
+     * the config does not trim, and without the final dot, as Route 53 lists it. {@code strip()}
+     * also removes the Unicode spaces that {@code trim()} keeps.
+     */
+    private static String delegationName(String configured) {
+        return DnsLookupHelper.normalizeTarget(configured.strip());
+    }
+
+    public static String normalizeRecordName(String name) {
+        String normalized = normalizeName(name);
+        if (normalized == null) {
+            return null;
+        }
+        StringBuilder result = new StringBuilder(normalized.length());
+        for (int i = 0; i < normalized.length(); i++) {
+            result.append(asciiLower(normalized.charAt(i)));
+        }
+        return result.toString();
+    }
+
+    private static String generateZoneId() {
+        StringBuilder sb = new StringBuilder("Z");
+        for (int i = 0; i < 14; i++) {
+            sb.append(CHARS.charAt(RANDOM.nextInt(CHARS.length())));
+        }
+        return sb.toString();
+    }
+
+    private static String generateChangeId() {
+        StringBuilder sb = new StringBuilder("C");
+        for (int i = 0; i < 13; i++) {
+            sb.append(CHARS.charAt(RANDOM.nextInt(CHARS.length())));
+        }
+        return sb.toString();
+    }
+
+    private ChangeInfo newChange(String comment) {
+        String id = generateChangeId();
+        ChangeInfo change = new ChangeInfo(id, Instant.now().toString(), comment);
+        changeStore.put(id, change);
+        return change;
+    }
+
+    private List<ResourceRecordSet> buildDefaultRecords(String zoneName, List<String> zoneNameServers) {
+        List<ResourceRecordSet> records = new ArrayList<>();
+
+        ResourceRecordSet soa = new ResourceRecordSet();
+        soa.setName(zoneName);
+        soa.setType("SOA");
+        soa.setTtl(900L);
+        soa.setRecords(List.of(new ResourceRecord(
+                normalizeName(zoneNameServers.get(0)) + " awsdns-hostmaster.amazon.com. 1 7200 900 1209600 86400")));
+        records.add(soa);
+
+        ResourceRecordSet ns = new ResourceRecordSet();
+        ns.setName(zoneName);
+        ns.setType("NS");
+        ns.setTtl(172800L);
+        ns.setRecords(zoneNameServers.stream()
+                .map(n -> new ResourceRecord(normalizeName(n)))
+                .toList());
+        records.add(ns);
+
+        return records;
+    }
+
+    private boolean isApexSoaOrNs(ResourceRecordSet rrs, String zoneName) {
+        return normalizeRecordName(rrs.getName()).equals(normalizeRecordName(zoneName)) &&
+                ("SOA".equals(rrs.getType()) || "NS".equals(rrs.getType()));
+    }
+
+    private int recordCount(String zoneId) {
+        return recordStore.get(zoneId).map(List::size).orElse(0);
+    }
+
+    private void validateChange(String action, ResourceRecordSet rrs,
+                                List<ResourceRecordSet> current, String zoneName) {
+        String recordName = normalizeRecordName(rrs.getName());
+        String zone = normalizeRecordName(zoneName);
+        if (!".".equals(zone) && !DomainNames.isWithin(recordName, zone)) {
+            throw new AwsException("InvalidChangeBatch",
+                    "RRSet with DNS name " + normalizeName(rrs.getName()) + " is not permitted in zone "
+                            + normalizeName(zoneName), 400);
+        }
+        if ("DELETE".equals(action) && isApexSoaOrNs(rrs, zoneName)) {
+            throw new AwsException("InvalidChangeBatch",
+                    "Invalid resource record set: Deleting the SOA or NS record at the zone apex is not permitted.", 400);
+        }
+        if ("CREATE".equals(action)) {
+            boolean exists = current.stream().anyMatch(r -> sameRecord(r, rrs));
+            if (exists) {
+                throw new AwsException("InvalidChangeBatch",
+                        "Tried to create resource record set [name='" + rrs.getName() +
+                        "', type='" + rrs.getType() + "'] but it already exists.", 400);
+            }
+        }
+        if ("DELETE".equals(action)) {
+            List<ResourceRecordSet> existing = current.stream().filter(r -> sameRecord(r, rrs)).toList();
+            if (existing.isEmpty()) {
+                throw new AwsException("InvalidChangeBatch",
+                        "Tried to delete resource record set " + deleteTargetDescription(rrs)
+                                + " but it was not found", 400);
+            }
+            if (existing.stream().noneMatch(r -> recordSetsMatch(r, rrs))) {
+                throw new AwsException("InvalidChangeBatch",
+                        "Tried to delete resource record set " + deleteTargetDescription(rrs)
+                                + " but the values provided do not match the current values", 400);
+            }
+        }
+    }
+
+    private void applyChange(String action, ResourceRecordSet rrs, List<ResourceRecordSet> current) {
+        switch (action) {
+            case "CREATE" -> {
+                ResourceRecordSet normalized = new ResourceRecordSet(rrs);
+                normalized.setName(normalizeRecordName(rrs.getName()));
+                current.add(normalized);
+            }
+            case "DELETE" -> current.remove(deleteTarget(current, rrs));
+            case "UPSERT" -> {
+                current.removeIf(r -> sameRecord(r, rrs));
+                ResourceRecordSet normalized = new ResourceRecordSet(rrs);
+                normalized.setName(normalizeRecordName(rrs.getName()));
+                current.add(normalized);
+            }
+        }
+    }
+
+    /**
+     * Whether two record sets share an identity: name, type and set identifier. Route 53 treats a
+     * name with ASCII case differences or without the trailing dot as the same, and requires a set identifier of at least one
+     * character, so a blank one is none. That also matches a record an earlier CloudFormation
+     * provisioner stored with the template's undotted Name or empty SetIdentifier.
+     */
+    public static boolean sameRecord(ResourceRecordSet a, ResourceRecordSet b) {
+        return normalizeRecordName(a.getName()).equals(normalizeRecordName(b.getName()))
+                && a.getType().equals(b.getType())
+                && Objects.equals(blankToNull(a.getSetIdentifier()), blankToNull(b.getSetIdentifier()));
+    }
+
+    private static String blankToNull(String value) {
+        return value == null || value.isBlank() ? null : value;
+    }
+
+    /**
+     * One DELETE removes one record. An earlier version could store the same record both undotted and
+     * dotted, possibly for two owners, so prefer the copy named exactly as the request names it.
+     */
+    private static ResourceRecordSet deleteTarget(List<ResourceRecordSet> current, ResourceRecordSet rrs) {
+        List<ResourceRecordSet> matches = current.stream().filter(r -> recordSetsMatch(r, rrs)).toList();
+        return matches.stream().filter(r -> r.getName().equals(rrs.getName())).findFirst().orElse(matches.get(0));
+    }
+
+    private static String deleteTargetDescription(ResourceRecordSet rrs) {
+        String description = "[name='" + rrs.getName() + "', type='" + rrs.getType() + "'";
+        if (rrs.getSetIdentifier() != null) {
+            description += ", set-identifier='" + rrs.getSetIdentifier() + "'";
+        }
+        return description + "]";
+    }
+
+    private static boolean recordSetsMatch(ResourceRecordSet a, ResourceRecordSet b) {
+        return sameRecord(a, b)
+                && Objects.equals(a.getTtl(), b.getTtl())
+                && Objects.equals(a.getWeight(), b.getWeight())
+                && Objects.equals(a.getRegion(), b.getRegion())
+                && Objects.equals(a.getFailover(), b.getFailover())
+                && Objects.equals(a.getHealthCheckId(), b.getHealthCheckId())
+                && aliasTargetsMatch(a.getAliasTarget(), b.getAliasTarget())
+                && recordValuesMatch(a.getRecords(), b.getRecords());
+    }
+
+    private static boolean aliasTargetsMatch(AliasTarget a, AliasTarget b) {
+        if (a == null || b == null) {
+            return a == b;
+        }
+        return Objects.equals(a.getHostedZoneId(), b.getHostedZoneId())
+                && aliasDnsNamesMatch(a.getDnsName(), b.getDnsName())
+                && a.isEvaluateTargetHealth() == b.isEvaluateTargetHealth();
+    }
+
+    private static boolean aliasDnsNamesMatch(String a, String b) {
+        return Objects.equals(normalizeRecordName(a), normalizeRecordName(b));
+    }
+
+    private static char asciiLower(char c) {
+        return c >= 'A' && c <= 'Z' ? (char) (c + ('a' - 'A')) : c;
+    }
+
+    private static boolean recordValuesMatch(List<ResourceRecord> a, List<ResourceRecord> b) {
+        List<String> av = a == null ? List.of() : a.stream().map(ResourceRecord::getValue).sorted().toList();
+        List<String> bv = b == null ? List.of() : b.stream().map(ResourceRecord::getValue).sorted().toList();
+        return av.equals(bv);
+    }
+
+    @Override
+    public void clear() {
+        hostedZoneMutationBusyUntilNanos.clear();
+        authorizationMutationBusyUntilNanos.clear();
+        privateZoneNameCounts.clear();
+        publicZoneNameCounts.clear();
+        publicAliasZones.clear();
+    }
+}
