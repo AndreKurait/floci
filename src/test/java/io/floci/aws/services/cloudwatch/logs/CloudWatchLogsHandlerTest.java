@@ -12,6 +12,7 @@ import io.floci.aws.services.cloudwatch.metrics.CloudWatchMetricsService;
 import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 
 import java.util.List;
 import java.util.Map;
@@ -64,10 +65,11 @@ class CloudWatchLogsHandlerTest {
                 service,
                 new CloudWatchLogsCrossAccountService(
                         new InMemoryStorage<>(), new InMemoryStorage<>(),
-                        new RegionResolver(REGION, ACCOUNT), MAPPER),
+                        new RegionResolver(REGION, ACCOUNT), MAPPER,
+                        Mockito.mock(CloudWatchLogsDestinationTargetService.class)),
                 new CloudWatchLogsMetricFilterService(service,
                         mock(CloudWatchMetricsService.class), new RegionResolver(REGION, ACCOUNT)),
-                MAPPER);
+                MAPPER, Mockito.mock(CloudWatchLogsSubscriptionAdmissionService.class));
 
         service.createLogGroup(GROUP, null, null, REGION);
         service.createLogStream(GROUP, STREAM, REGION);
