@@ -630,6 +630,10 @@ Known differences from AWS:
 
 #### Restarts
 
+Before shared container teardown, Floci pauses ECS reconciliation and waits for its current
+pass to finish. Replacement tasks cannot start while another service retires their credentials
+or networking. A state reset starts a fresh reconciler after the old tasks have been drained.
+
 Task state is memory-only, so a restarted Floci knows no task and the service scheduler starts
 new ones to reach each service's desired count. Floci therefore clears what the previous run's
 tasks left behind before it starts their replacements, so a service is never served by a task

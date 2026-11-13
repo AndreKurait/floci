@@ -449,15 +449,11 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         stopManagedContainers();
     }
 
-    /** Stop replacement tasks before shutdown starts retiring their credentials and network. */
+    /** Waits for the current pass before any owner drains shared containers or networking. */
     @Override
     public void beginTeardown() {
-        ScheduledExecutorService current = reconciler;
-        current.shutdownNow();
-        try {
-            current.awaitTermination(2, TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
+        synchronized (reconciliationPassLock) {
+            reconciler.shutdownNow();
         }
     }
 
@@ -5352,6 +5348,9 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
 
     void reconcile() {
         synchronized (reconciliationPassLock) {
+            if (reconciler.isShutdown()) {
+                return;
+            }
             try {
                 retryPreviousRunTaskVolumes();
             } catch (Exception e) {
@@ -5816,6 +5815,9 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
 
     void reconcileServices() {
         synchronized (reconciliationPassLock) {
+            if (reconciler.isShutdown()) {
+                return;
+            }
             for (Map.Entry<String, EcsServiceModel> entry : services.entrySet()) {
                 try {
                     reconcileService(entry.getKey(), entry.getValue());
