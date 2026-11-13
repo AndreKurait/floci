@@ -130,6 +130,43 @@ class IamConditionContextResolverTest {
     }
 
     @Test
+    void mqCreateReadsUncachedWireTagsAndRestoresTheBody() throws Exception {
+        byte[] wire = "{\"name\":\"owned\",\"tags\":{\"owner\":\"one\"}}".getBytes(StandardCharsets.UTF_8);
+        ContainerRequestContext ctx = mock(ContainerRequestContext.class);
+        when(ctx.getEntityStream()).thenReturn(new ByteArrayInputStream(wire));
+        when(ctx.getMediaType()).thenReturn(MediaType.APPLICATION_JSON_TYPE);
+        assertNull(ctx.getProperty(IamConditionContextResolver.BUFFERED_JSON_BODY));
+
+        Map<String, List<String>> actual = resolver.resolve("mq", "mq:CreateConfiguration", ctx);
+        assertEquals(Map.of("aws:RequestTag/owner", List.of("one"), "aws:TagKeys", List.of("owner")), actual);
+        ArgumentCaptor<InputStream> restored = ArgumentCaptor.forClass(InputStream.class);
+        verify(ctx).setEntityStream(restored.capture());
+        assertArrayEquals(wire, restored.getValue().readAllBytes());
+        ArgumentCaptor<JsonNode> cached = ArgumentCaptor.forClass(JsonNode.class);
+        verify(ctx).setProperty(eq(IamConditionContextResolver.BUFFERED_JSON_BODY), cached.capture());
+        assertEquals(mapper.readTree(wire), cached.getValue());
+
+        when(ctx.getProperty(IamConditionContextResolver.BUFFERED_JSON_BODY)).thenReturn(cached.getValue());
+        doThrow(new AssertionError("A cached body must not be consumed again")).when(ctx).getEntityStream();
+        assertEquals(actual, resolver.resolve("mq", "mq:CreateConfiguration", ctx));
+    }
+
+    @Test
+    void mqCreateRejectsNonStringTagsFromAnUncachedBodyBeforeAuthorization() throws Exception {
+        byte[] wire = "{\"name\":\"owned\",\"tags\":{\"owner\":1}}".getBytes(StandardCharsets.UTF_8);
+        ContainerRequestContext ctx = mock(ContainerRequestContext.class);
+        when(ctx.getEntityStream()).thenReturn(new ByteArrayInputStream(wire));
+        when(ctx.getMediaType()).thenReturn(MediaType.APPLICATION_JSON_TYPE);
+        AwsException refused = assertThrows(AwsException.class,
+                () -> resolver.resolve("mq", "mq:CreateConfiguration", ctx));
+        assertEquals("BadRequestException", refused.getErrorCode());
+        assertEquals(400, refused.getHttpStatus());
+        ArgumentCaptor<InputStream> restored = ArgumentCaptor.forClass(InputStream.class);
+        verify(ctx).setEntityStream(restored.capture());
+        assertArrayEquals(wire, restored.getValue().readAllBytes());
+    }
+
+    @Test
     void aWebFunctionEndpointRequestCarriesTheAuthTypeItNamesAndTheOneItHas() throws Exception {
         String function = "arn:aws:lambda:us-east-1:123456789012:web-function/app";
         WebFunctionEndpoint stored = new WebFunctionEndpoint();

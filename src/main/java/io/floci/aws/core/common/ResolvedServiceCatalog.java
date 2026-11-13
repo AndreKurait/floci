@@ -3,6 +3,7 @@ package io.floci.aws.core.common;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.services.accessanalyzer.AccessAnalyzerController;
 import io.floci.aws.services.account.AccountController;
+import io.floci.aws.services.amazonmq.AmazonMqConfigurationController;
 import io.floci.aws.services.amazonmq.AmazonMqController;
 import io.floci.aws.services.apigateway.ApiGatewayController;
 import io.floci.aws.services.appconfig.AppConfigController;
@@ -203,7 +204,7 @@ public class ResolvedServiceCatalog {
                 descriptor("mq", "amazonmq", config.services().amazonmq().enabled(), true,
                         "amazonmq", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("mq"), Set.of(), Set.of(AmazonMqController.class)),
+                        Set.of(), Set.of("mq"), Set.of(), Set.of(AmazonMqController.class, AmazonMqConfigurationController.class)),
                 descriptor("sts", "iam", config.services().iam().enabled(), false,
                         null, null, 5000L, AwsNamespaces.STS, ServiceProtocol.QUERY,
                         protocols(ServiceProtocol.QUERY),

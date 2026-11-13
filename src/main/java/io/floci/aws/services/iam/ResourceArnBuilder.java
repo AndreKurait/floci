@@ -12,6 +12,8 @@ import io.floci.aws.core.common.ServicePrincipals;
 import io.floci.aws.core.common.SigV4CredentialScope;
 import io.floci.aws.core.common.StoredResourceArns;
 import io.floci.aws.core.common.auth.SigV4Canonicalization;
+import io.floci.aws.services.amazonmq.AmazonMqConfigurationService;
+import io.floci.aws.services.amazonmq.model.ConfigurationState.Scope;
 import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsCrossAccountService;
 import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
 import io.floci.aws.services.cloudwatch.logs.LogGroupTagTarget;
@@ -218,6 +220,17 @@ public class ResourceArnBuilder {
     public List<String> buildResources(String credentialScope, String operation, ContainerRequestContext ctx,
                                        String region, String accountId, String partition) {
         if (credentialScope == null) {
+            return List.of("*");
+        }
+        if ("mq".equals(credentialScope) && operation != null && switch (operation) {
+            case "mq:DescribeConfiguration", "mq:UpdateConfiguration", "mq:DeleteConfiguration",
+                    "mq:DescribeConfigurationRevision", "mq:ListConfigurationRevisions" -> true;
+            default -> false;
+        }) {
+            String id = ctx.getUriInfo().getPathParameters().getFirst("configurationId");
+            return List.of(AmazonMqConfigurationService.configurationArn(new Scope(partition, accountId, region), id));
+        }
+        if ("mq:CreateConfiguration".equals(operation) || "mq:ListConfigurations".equals(operation)) {
             return List.of("*");
         }
         if (operation != null && operation.startsWith(credentialScope + ":") && RequestResources.reads(operation)) {

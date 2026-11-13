@@ -21,6 +21,47 @@ Only the **RabbitMQ** engine and the `SINGLE_INSTANCE` deployment mode are suppo
 | `RebootBroker` | Reboots the broker |
 | `DescribeSharedResources` | Returns an empty `sharedResources` list for an existing broker (always empty, since Floci has no `UpdateBroker` to associate a resource share with the broker) |
 
+### Standalone configurations
+
+The configuration API stores RabbitMQ configuration revisions without starting a broker:
+
+| Action | Description |
+|---|---|
+| `CreateConfiguration` | Creates a separate identity and revision 1, whose data is absent |
+| `DescribeConfiguration` | Returns typed engine/authentication metadata, creation tags, and the latest revision |
+| `UpdateConfiguration` | Appends an immutable base64 document and description |
+| `DeleteConfiguration` | Removes the configuration and all its revisions |
+| `DescribeConfigurationRevision` | Reads one retained revision |
+| `ListConfigurationRevisions` | Pages through revision metadata in numeric order |
+| `ListConfigurations` | Pages through configuration metadata in identity order |
+
+Configuration names may repeat. Requests and responses use `RABBITMQ` and `SIMPLE`.
+The default engine version is `3.13`; a supplied version is stored as metadata. Documents
+are stored after base64 validation and are not sanitized, interpreted, or applied to brokers.
+Existing broker configuration fields remain pass-through metadata; attachment validation
+and protection against deleting an attached configuration are not implemented.
+
+Configuration state is isolated by partition, account, and Region. Each scope mutation is
+published atomically through the configured storage backend. Hybrid storage retains its
+usual asynchronous flush durability. Reset closes admission during storage clearing and
+invalidates paging tokens; an aborted reset reopens admission. Tokens also expire on restart.
+
+Lists default to 20 results and accept 5 through 100. Tokens bind the operation, scope,
+parent, and page size. They resume after the last returned identity or revision, and do not
+provide a snapshot across mutations.
+
+IAM checks the dispatched configuration action. Create and list use `*`; the remaining
+five actions use the exact configuration ARN and its immutable creation tags. Tagged creates
+also require `mq:CreateTags` on the newly allocated ARN before publishing state. Request tag
+conditions apply to the tags that will be stored. Tag mutation/list endpoints are not provided.
+
+The revision limit is 300. Additional local limits are 50 active configurations per scope,
+64 KiB decoded per revision, 8 MiB decoded documents per scope, 50 tags (128-byte keys and
+256-byte values), 1,024-byte descriptions, and 64-byte engine version labels. The most recent
+1,000 deleted identities are retained so update returns `ConflictException` (409); older
+retired identities may return `NotFoundException` (404). This bounded retirement behavior is
+a compatibility choice, not a promise of indefinite AWS tombstone retention.
+
 ### User management
 
 Amazon MQ's user API (`CreateUser`, `DescribeUser`, `ListUsers`, `UpdateUser`,
