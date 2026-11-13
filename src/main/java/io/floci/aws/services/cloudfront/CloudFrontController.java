@@ -1006,6 +1006,7 @@ public class CloudFrontController {
     @Path("/key-value-store")
     public Response createKeyValueStore(String body) {
         try {
+            validateRequestXml(body, "CreateKeyValueStoreRequest");
             String name = XmlParser.extractFirst(body, "Name", null);
             String comment = XmlParser.extractFirst(body, "Comment", null);
             boolean hasImportSource = XmlParser.extractElementTree(body, "ImportSource") != null;
@@ -1068,6 +1069,7 @@ public class CloudFrontController {
                                         @HeaderParam("If-Match") String ifMatch,
                                         String body) {
         try {
+            validateRequestXml(body, "UpdateKeyValueStoreRequest");
             KeyValueStore kvs = service.updateKeyValueStore(name, ifMatch, XmlParser.extractFirst(body, "Comment", null));
             return Response.ok(xmlKeyValueStore(kvs), XML)
                     .header("ETag", kvs.getEtag())
@@ -3711,13 +3713,28 @@ public class CloudFrontController {
         return oai;
     }
 
+    private static void validateRequestXml(String body, String root) {
+        if (!root.equals(XmlParser.rootElementName(body))) {
+            throw new AwsException("InvalidArgument", "The request XML is malformed or has an invalid root element.", 400);
+        }
+    }
+
     private CloudFrontFunction parseFunction(String body) {
         CloudFrontFunction fn = new CloudFrontFunction();
         fn.setName(XmlParser.extractFirst(body, "Name", null));
         fn.setComment(XmlParser.extractFirst(body, "Comment", null));
         fn.setRuntime(XmlParser.extractFirst(body, "Runtime", "cloudfront-js-2.0"));
         fn.setFunctionCode(XmlParser.extractFirst(body, "FunctionCode", null));
-        fn.setKeyValueStoreArns(new ArrayList<>(XmlParser.extractAll(body, "KeyValueStoreARN")));
+        List<String> storeArns = XmlParser.extractAll(body, "KeyValueStoreARN");
+        XmlParser.XmlElement associations = XmlParser.extractElementTree(body, "KeyValueStoreAssociations");
+        if (associations != null) {
+            XmlParser.XmlElement quantity = associations.child("Quantity");
+            if (quantity == null) {
+                throw new AwsException("InvalidArgument", "KeyValueStoreAssociations must include Quantity.", 400);
+            }
+            validateAssociationsQuantity(parseAssociationsQuantity(quantity.text()), storeArns.size());
+        }
+        fn.setKeyValueStoreArns(new ArrayList<>(storeArns));
         return fn;
     }
 
