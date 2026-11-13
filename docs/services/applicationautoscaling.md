@@ -31,7 +31,7 @@ Auto Scaling groups over the Query protocol under the `autoscaling` signing name
 ## Pagination
 
 `DescribeScalableTargets` accepts `MaxResults` from 1 to 50 and defaults to 50.
-`DescribeScalingPolicies` accepts `MaxResults` from 1 to 10 and defaults to 10.
+`DescribeScalingPolicies` accepts positive integer `MaxResults` values and defaults to 10.
 When more results remain, pass the returned `NextToken` with the same operation,
 region, and filters to retrieve the next page. An invalid token returns
 `InvalidNextTokenException`; an out-of-range page size returns `ValidationException`.
