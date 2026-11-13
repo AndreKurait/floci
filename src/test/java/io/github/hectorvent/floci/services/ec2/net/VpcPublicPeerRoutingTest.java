@@ -39,6 +39,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -51,9 +52,11 @@ class VpcPublicPeerRoutingTest {
     private final Ec2Service ec2 = mock(Ec2Service.class);
     private final VpcNetworkManager vpcs = mock(VpcNetworkManager.class);
     private final DockerClient docker = mock(DockerClient.class, RETURNS_DEEP_STUBS);
+    private final ContainerBuilder containers = mock(ContainerBuilder.class);
+    private final ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
+    private final ContainerReachableEndpoint endpoint = mock(ContainerReachableEndpoint.class);
     private final VpcRoutingManager manager = new VpcRoutingManager(
-            config, ec2, vpcs, docker, mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class),
-            JSON, mock(ContainerReachableEndpoint.class));
+            config, ec2, vpcs, docker, containers, lifecycle, JSON, endpoint);
     private final Map<String, List<String>> scripts = new LinkedHashMap<>();
     private final List<Route> routes = new ArrayList<>();
     private final InternetGateway gateway = new InternetGateway();
@@ -115,6 +118,51 @@ class VpcPublicPeerRoutingTest {
                 "ip saddr 10.0.2.10 ip daddr 172.18.0.3 snat to 172.18.0.2"));
         assertFalse(latest("first").contains("floci_sg"),
                 "Native route admission must leave security-group enforcement to its existing owner");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void publicApiUsesTheNativeSourceNetworkUnlessItIsInternal(boolean internalControlNetwork) {
+        enablePublicApi();
+        admit("first", 2, internalControlNetwork);
+        admit("second", 3, internalControlNetwork);
+
+        String callerDevice = internalControlNetwork ? "eth2" : "eth0";
+        String apiNextHop = internalControlNetwork ? "240.0.0.1" : "172.18.0.254";
+        String bridgeDevice = internalControlNetwork ? "eth1" : "eth0";
+        String returnGateway = internalControlNetwork ? "240.0.0.2" : "172.18.0.2";
+        String installed = latest("first");
+        assertTrue(installed.contains("ip -4 route replace 192.0.2.1/32 via " + apiNextHop
+                + " dev " + callerDevice + " src 10.0.2.10"));
+        assertTrue(installed.contains("egress ip daddr 192.0.2.1 oifname \"" + callerDevice + "\" counter accept"));
+        assertTrue(installed.contains("outgoing oifname \"" + callerDevice
+                + "\" ip saddr 10.0.2.10 ip daddr 192.0.2.1 snat to 172.18.0.2"));
+        assertTrue(latest("aws-api").contains("ip -4 route replace 172.18.0.2/32 via "
+                + returnGateway + " dev " + bridgeDevice + " src 192.0.2.1 proto 186"));
+        assertTrue(latest("aws-api").contains("ingress iifname \"" + bridgeDevice
+                + "\" ip saddr 172.18.0.2 ip daddr 192.0.2.1 tcp dport { 80, 443 } counter accept"));
+        assertTrue(installed.contains("ip -4 route replace 172.18.0.3/32 via 240.0.0.3 dev eth2"));
+        assertTrue(installed.contains("outgoing oifname \"eth2\" ip saddr 10.0.2.10"
+                + " ip daddr 172.18.0.3 snat to 172.18.0.2"));
+        assertFalse(installed.contains("floci_sg"));
+        assertFalse(installed.contains("snat to 240.0.0.2"));
+        assertEquals(Set.of("172.18.0.2", "172.18.0.3"), manager.publicInstanceAddresses());
+    }
+
+    @Test
+    void publicApiBlackholeWithdrawsItsSourceTranslationAndBridgeCaller() {
+        enablePublicApi();
+        admit("first", 2, false);
+        assertTrue(latest("aws-api").contains("ip saddr 172.18.0.2 ip daddr 192.0.2.1"));
+        routes.add(0, route("192.0.2.1/32", "igw", "blackhole"));
+
+        manager.reconcile();
+
+        assertFalse(latest("aws-api").contains("ip saddr 172.18.0.2"));
+        assertFalse(latest("aws-api").contains("route replace 172.18.0.2/32"));
+        assertTrue(latest("first").contains("egress ip daddr 192.0.2.1 counter drop"));
+        assertFalse(latest("first").contains("ip daddr 192.0.2.1 snat"));
+        assertFalse(latest("first").contains("via 172.18.0.254"));
     }
 
     @Test
@@ -330,6 +378,52 @@ class VpcPublicPeerRoutingTest {
         InspectContainerCmd inspect = docker.inspectContainerCmd(helper);
         when(inspect.exec()).thenThrow(new NotFoundException("namespace absent"));
         when(docker.execCreateCmd(helper)).thenThrow(new NotFoundException("namespace absent"));
+    }
+
+    private void enablePublicApi() {
+        when(config.network().vpcRouting().publicAwsApi()).thenReturn(true);
+        when(config.network().securityGroupEnforcement().helperImage()).thenReturn("helper-image");
+        when(endpoint.baseUrl(false)).thenReturn("http://172.18.0.1:4566");
+        ContainerBuilder.Builder builder = mock(ContainerBuilder.Builder.class, RETURNS_SELF);
+        when(containers.newContainer("helper-image")).thenReturn(builder);
+        when(lifecycle.createAndStart(any()))
+                .thenReturn(new ContainerLifecycleManager.ContainerInfo("aws-api", Map.of()));
+        when(docker.listContainersCmd().withShowAll(true).exec()).thenReturn(List.of());
+        when(docker.inspectContainerCmd("aws-api").exec().getState().getRunning()).thenReturn(true);
+        when(docker.inspectContainerCmd("aws-api").exec().getName()).thenReturn("/aws-api");
+        when(docker.inspectContainerCmd("aws-api").exec().getNetworkSettings().getNetworks()).thenReturn(Map.of(
+                "control", attachment("control-network", "172.18.0.254"),
+                "public", attachment("public-network", "240.0.0.1")));
+        ExecCreateCmd create = mock(ExecCreateCmd.class, RETURNS_SELF);
+        ExecCreateCmdResponse created = mock(ExecCreateCmdResponse.class);
+        when(created.getId()).thenReturn("api-exec");
+        when(create.exec()).thenReturn(created);
+        when(docker.execCreateCmd("aws-api")).thenReturn(create);
+        AtomicReference<String[]> command = new AtomicReference<>();
+        scripts.put("aws-api", new ArrayList<>());
+        doAnswer(invocation -> {
+            String[] argv = (String[]) invocation.getRawArguments()[0];
+            command.set(argv);
+            if (argv.length == 3 && "sh".equals(argv[0])) {
+                scripts.get("aws-api").add(argv[2]);
+            }
+            return create;
+        }).when(create).withCmd(any(String[].class));
+        when(docker.inspectExecCmd("api-exec").exec().getExitCodeLong()).thenReturn(0L);
+        when(docker.execStartCmd("api-exec").exec(any())).thenAnswer(invocation -> {
+            ResultCallback.Adapter<Frame> callback = invocation.getArgument(0);
+            String output = switch (command.get()[0]) {
+                case "getent" -> "172.18.0.1 STREAM backend";
+                case "ip" -> JSON.writeValueAsString(List.of(
+                        Map.of("ifname", "eth0", "addr_info", List.of(Map.of("local", "172.18.0.254"))),
+                        Map.of("ifname", "eth1", "addr_info", List.of(Map.of("local", "240.0.0.1")))));
+                case "ss" -> "LISTEN 0 128 192.0.2.1:80 *:*\nLISTEN 0 128 192.0.2.1:443 *:*";
+                default -> "";
+            };
+            callback.onNext(new Frame(StreamType.STDOUT, output.getBytes(StandardCharsets.UTF_8)));
+            callback.onComplete();
+            return callback;
+        });
     }
 
     private static NetworkInterface interfaceFor(String helper, int host) {
