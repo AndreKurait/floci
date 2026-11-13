@@ -82,10 +82,6 @@ public class NativeDynamoDbJsonHandler {
             List.of("OLD_IMAGE", "KEYS_ONLY", "NEW_AND_OLD_IMAGES", "NEW_IMAGE");
     private static final List<String> ATTRIBUTE_TYPES = List.of("B", "N", "S");
     private static final List<String> PROJECTION_TYPES = List.of("ALL", "INCLUDE", "KEYS_ONLY");
-    // The warm throughput a new on-demand table or index starts with.
-    private static final long ON_DEMAND_WARM_READ_UNITS = 12000;
-    private static final long ON_DEMAND_WARM_WRITE_UNITS = 4000;
-
     private final DynamoDbService dynamoDbService;
     private final NativeDynamoDbTableService tableService;
     private final ObjectMapper objectMapper;
@@ -150,6 +146,7 @@ public class NativeDynamoDbJsonHandler {
             case "GetResourcePolicy" -> handleGetResourcePolicy(request, region);
             case "DeleteResourcePolicy" -> handleDeleteResourcePolicy(request, region);
             case "EnableKinesisStreamingDestination" -> handleEnableKinesisStreamingDestination(request, region);
+            case "UpdateKinesisStreamingDestination" -> handleUpdateKinesisStreamingDestination(request, region);
             case "DisableKinesisStreamingDestination" -> handleDisableKinesisStreamingDestination(request, region);
             case "DescribeKinesisStreamingDestination" -> handleDescribeKinesisStreamingDestination(request, region);
             case "ExportTableToPointInTime" -> handleExportTable(request, region);
@@ -3499,6 +3496,52 @@ public class NativeDynamoDbJsonHandler {
                 tableService.disableKinesisStreamingDestination(tableName, streamArn, region))).build();
     }
 
+    private Response handleUpdateKinesisStreamingDestination(JsonNode request, String region) {
+        String tableName = kinesisUpdateString(request, "TableName", "tableName", 1);
+        String streamArn = kinesisUpdateString(request, "StreamArn", "streamArn", 37);
+        JsonNode configuration = request.path("UpdateKinesisStreamingConfiguration");
+        if (!configuration.isMissingNode() && !configuration.isNull() && !configuration.isObject()) {
+            throw new AwsException("SerializationException",
+                    "UpdateKinesisStreamingConfiguration must be an object", 400);
+        }
+        JsonNode precisionNode = configuration.path("ApproximateCreationDateTimePrecision");
+        if (!precisionNode.isMissingNode() && !precisionNode.isNull() && !precisionNode.isTextual()) {
+            throw new AwsException("SerializationException", "ApproximateCreationDateTimePrecision must be a string", 400);
+        }
+        String precision = precisionNode.isMissingNode() || precisionNode.isNull() ? null : precisionNode.asText();
+        if (precision != null && !KinesisStreamingDestination.PRECISION_MILLISECOND.equals(precision)
+                && !KinesisStreamingDestination.PRECISION_MICROSECOND.equals(precision)) {
+            throw SmithyValidationErrors.validationException(
+                    "Value '" + precision
+                            + "' at 'updateKinesisStreamingConfiguration.approximateCreationDateTimePrecision' "
+                            + "failed to satisfy constraint: Member must satisfy enum value set: [MILLISECOND, MICROSECOND]");
+        }
+        KinesisDestination result = tableService.updateKinesisStreamingDestination(
+                tableName, streamArn, precision, region);
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("TableName", result.tableName());
+        response.put("StreamArn", result.streamArn());
+        response.put("DestinationStatus", result.destinationStatus());
+        response.putObject("UpdateKinesisStreamingConfiguration")
+                .put("ApproximateCreationDateTimePrecision", result.approximateCreationDateTimePrecision());
+        return Response.ok(response).build();
+    }
+
+    private static String kinesisUpdateString(JsonNode request, String member, String path, int minimumLength) {
+        JsonNode value = request.path(member);
+        if (value.isMissingNode() || value.isNull()) {
+            throw SmithyValidationErrors.validationException(SmithyValidationErrors.notNull(path));
+        }
+        if (!value.isTextual()) {
+            throw new AwsException("SerializationException", member + " must be a string", 400);
+        }
+        String violation = SmithyValidationErrors.lengthOutOfRange(path, value.asText(), minimumLength, 1024);
+        if (violation != null) {
+            throw SmithyValidationErrors.validationException(violation);
+        }
+        return value.asText();
+    }
+
     /**
      * The shape Enable and Disable both answer with: TableName, StreamArn, DestinationStatus and
      * EnableKinesisStreamingConfiguration. DestinationStatusDescription belongs to Describe only.
@@ -4065,16 +4108,12 @@ public class NativeDynamoDbJsonHandler {
     }
 
     /**
-     * AWS reports a provisioned index's warm throughput as its provisioned capacity, and an on-demand
-     * one's as the values a new on-demand index starts with. An index is ACTIVE as soon as it exists here.
+     * Reports retained warm peaks with the current capacity floor. An index is ACTIVE as soon as it exists here.
      */
     private ObjectNode gsiWarmThroughput(TableDefinition table, GlobalSecondaryIndex gsi) {
-        boolean onDemand = "PAY_PER_REQUEST".equals(table.getBillingMode());
         ObjectNode warmThroughput = objectMapper.createObjectNode();
-        warmThroughput.put("ReadUnitsPerSecond",
-                onDemand ? ON_DEMAND_WARM_READ_UNITS : gsi.getProvisionedThroughput().getReadCapacityUnits());
-        warmThroughput.put("WriteUnitsPerSecond",
-                onDemand ? ON_DEMAND_WARM_WRITE_UNITS : gsi.getProvisionedThroughput().getWriteCapacityUnits());
+        warmThroughput.put("ReadUnitsPerSecond", gsi.getWarmReadUnitsPerSecond(table.getBillingMode()));
+        warmThroughput.put("WriteUnitsPerSecond", gsi.getWarmWriteUnitsPerSecond(table.getBillingMode()));
         warmThroughput.put("Status", "ACTIVE");
         return warmThroughput;
     }
