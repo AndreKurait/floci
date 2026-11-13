@@ -13,11 +13,21 @@ quarkus:
 floci:
   base-url: "http://localhost:4566"
   network:
+    vpc-routing:
+      enabled: false
+      public-aws-api: false
+      public-aws-api-upstream-http-port: 80
+      public-aws-api-upstream-https-port: 443
+      public-aws-api-native-https: false
     security-group-enforcement:
       enabled: true
       helper-image: floci/network-helper:local
   default-region: us-east-1
   default-account-id: "000000000000"
+  dns:
+    # Host DNS remains opt-in; listener tests use their own addresses and ephemeral ports.
+    # listen-address: 127.0.0.1                    # FLOCI_DNS_LISTEN_ADDRESS
+    container-fallback-enabled: true
   partitions:
     strict: false
     allow-unknown-regions: false
@@ -36,6 +46,7 @@ floci:
       sns:
         flush-interval-ms: 60000
       lambda:
+        # Includes per-version runtime-management settings.
         flush-interval-ms: 60000
       cloudwatchlogs:
         flush-interval-ms: 60000
@@ -116,8 +127,13 @@ floci:
     shutdown-grace-period-seconds: 2
 
   tls:
+    # extra-ca-certs: ""               # FLOCI_TLS_EXTRA_CA_CERTS (optional public PEM trust anchors)
     enabled: false
     self-signed: true
+    aws-https-fallback-port: 0
+    # aws-https-fallback-host: 127.0.0.1
+    aws-https-fallback-proxy-protocol: false
+    aws-https-fallback-hosts:
 
   protocols:
     strict-claiming: false
@@ -131,7 +147,9 @@ floci:
   services:
     ssm:
       enabled: true
+      direct-command-execution-enabled: false
       max-parameter-history: 5
+      resource-data-sync-interval-ms: 100
     sqs:
       enabled: true
       default-visibility-timeout: 30
@@ -155,9 +173,11 @@ floci:
       enabled: true
     lambda:
       enabled: true
-      reconcile-containers-on-startup: true
       container-drain-timeout-seconds: 15
       docker-flags: ""
+      # additional-docker-networks: []
+      container-readiness-command: ""
+      container-readiness-timeout-seconds: 60
       honour-architectures: false
       zip-max-entries: 100000
       async-retry-delay-seconds: 1
@@ -179,7 +199,10 @@ floci:
     iam:
       enabled: true
       enforcement-enabled: false
+      issued-session-verification-enabled: false
+      lambda-identity-verification-enabled: false
       seed-deployer-principal: false
+      # service-principal-memberships-path: unset; tests explicitly select their local fixture.
     msk:
       enabled: true
       mock: true
@@ -259,6 +282,7 @@ floci:
       scheduled-action-sweep-interval-seconds: 60
     neptune:
       enabled: true
+      mock: false
       proxy-base-port: 8182
       proxy-max-port: 8282
       default-image: "tinkerpop/gremlin-server:3.7.3"
@@ -303,10 +327,12 @@ floci:
       allow-plaintext-http: true
       mock-config-file: ${SFN_MOCK_CONFIG:src/test/resources/fixtures/sfn-mock-config.json}
       max-wait-seconds: 30
+      max-wait-millis: 0
     swf:
       enabled: true
       timeout-sweep-enabled: true
       timeout-sweep-interval-seconds: 1
+      timeout-sweep-interval-millis: 0
     cloudformation:
       enabled: true
       # Pinned to the shipped default: the retention tests advance the test clock past this
@@ -336,22 +362,30 @@ floci:
     ec2:
       # Opt-in Standard On-Demand vCPU admission. FLOCI_SERVICES_EC2_ENFORCE_VCPU_QUOTAS
       enforce-vcpu-quotas: false
-      # Optional complete catalog override for locally built guest images.
+      # Optional external catalog; includeDefaultImages in the file retains bundled images.
       image-catalog-path: ${FLOCI_SERVICES_EC2_IMAGE_CATALOG_PATH:}
       managed-prefix-list-catalog-path: ${FLOCI_SERVICES_EC2_MANAGED_PREFIX_LIST_CATALOG_PATH:}
+      extra-env: ${FLOCI_SERVICES_EC2_EXTRA_ENV:}
+      ulimits: ${FLOCI_SERVICES_EC2_ULIMITS:}
+      privileged: true
+      cap-drop: ${FLOCI_SERVICES_EC2_CAP_DROP:}
+      cap-add: ${FLOCI_SERVICES_EC2_CAP_ADD:}
       enabled: true
       imds-port: 9169
+      metadata-helper-image: floci/network-helper:local
       ssh-port-range-start: 2200
       ssh-port-range-end: 2299
+      ssh-host-bind-address: "127.0.0.1"
       publish-security-group-ports: true
       app-port-range-start: 30000
       app-port-range-end: 30999
       max-published-ports-per-instance: 20
       socat-image: alpine/socat
       volume-block-devices: false
-      volume-helper-image: alpine:3.21
+      volume-helper-image: debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
       mock: true
       mock-public-addresses: none
+      mock-public-address-pool:
       instance-resource-limits: true
       aws-faithful-private-ip: false
       # container-ips-routable: true  # see src/main/resources/application.yml
@@ -359,6 +393,7 @@ floci:
       # reconcile Docker networks on whatever daemon CI happens to have.
       vpc-networks:
         enabled: false
+        isolate-address-spaces: false
     ecs:
       enabled: true
       mock: true
@@ -371,6 +406,8 @@ floci:
       enabled: true
     appconfigdata:
       enabled: true
+    # Immutable lifecycle preview snapshots share the ECR repository metadata store.
+    # Their durability follows the configured storage mode, including asynchronous hybrid flushes.
     ecr:
       enabled: true
       tls-uri: false
@@ -398,12 +435,12 @@ floci:
     elb:
       enabled: true
       mock: true
+      vpc-frontends: false
+      proxy-image: haproxy:3.2-alpine@sha256:5893840576071e6217cd52ebdcc14f454c6f7a631056fa6f4e0f40d3cac4215b
     elbv2:
       enabled: true
       mock: true
-      backend-keep-alive: true
-      backend-keep-alive-timeout-seconds: 60
-
+      max-health-check-interval-millis: 0
       alb-zone-rule: aws
       # single-zone-alb-accounts: 111111111111,222222222222
     codebuild:
@@ -435,6 +472,8 @@ floci:
       worker-poll-interval-ms: 1
     autoscaling:
       enabled: true
+      multiple-capacity-reservation-scopes: ""
+      max-capacity-reservation-ids: 1
     applicationautoscaling:
       enabled: true
     elasticbeanstalk:
@@ -511,8 +550,6 @@ floci:
       enabled: true
     efs:
       enabled: true
-    ec2instanceconnect:
-      enabled: true
     organizations:
       enabled: true
     rum:
@@ -562,8 +599,6 @@ floci:
       enabled: true
     dlm:
       enabled: true
-    signer:
-      enabled: true
     cognitoidentity:
       enabled: true
     globalaccelerator:
@@ -601,9 +636,6 @@ floci:
       enabled: true
     codeartifact:
       enabled: true
-    quicksight:
-      enabled: true
-      embed-base-url: ${floci.base-url}
     marketplace:
       enabled: true
     dms:

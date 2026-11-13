@@ -13,10 +13,6 @@
 # tools/java_sources.py, so they do not change when the package moves.
 
 services:
-  - service: quicksight
-    doc: docs/services/quicksight.md
-    sources:
-      - { path: services/quicksight/QuickSightController.java, mode: rest }
   - service: account
     doc: docs/services/account.md
     sources:
@@ -25,10 +21,6 @@ services:
     doc: docs/services/access-analyzer.md
     sources:
       - { path: services/accessanalyzer/AccessAnalyzerController.java, mode: rest }
-  - service: ec2-instance-connect
-    doc: docs/services/ec2-instance-connect.md
-    sources:
-      - { path: services/ec2instanceconnect/InstanceConnectJsonHandler.java, mode: switch }
   - service: acm
     doc: docs/services/acm.md
     sources:
@@ -37,14 +29,6 @@ services:
     doc: docs/services/payment-cryptography.md
     sources:
       - { path: services/paymentcryptography/PaymentCryptographyJsonHandler.java, mode: switch }
-  - service: paymentcryptographydata
-    doc: docs/services/payment-cryptography-data.md
-    sources:
-      - { path: services/paymentcryptography/PaymentCryptographyCryptoController.java, mode: rest }
-      - { path: services/paymentcryptography/PaymentCryptographyPinController.java, mode: rest }
-      - { path: services/paymentcryptography/PaymentCryptographyCardController.java, mode: rest }
-    exclude_actions:
-      - GenerateMacEmvPinChange
   - service: applicationautoscaling
     doc: docs/services/applicationautoscaling.md
     sources:
@@ -53,6 +37,7 @@ services:
     doc: docs/services/athena.md
     sources:
       - { path: services/athena/AthenaJsonHandler.java, mode: switch }
+      - { path: services/athena/AthenaPreparedStatementHandler.java, mode: switch }
   - service: bedrock
     doc: docs/services/bedrock.md
     sources:
@@ -88,10 +73,15 @@ services:
     doc: docs/services/ce.md
     sources:
       - { path: services/ce/CostExplorerJsonHandler.java, mode: switch }
+  - service: codedeploy-agent
+    doc: docs/design/codedeploy-agent-runtime.md
+    sources:
+      - { path: services/codedeploy/CodeDeployAgentJsonHandler.java, mode: switch }
   - service: cloudformation
     doc: docs/services/cloudformation.md
     sources:
       - { path: services/cloudformation/CloudFormationQueryHandler.java, mode: switch }
+      - { path: services/cloudformation/CloudFormationDriftHandler.java, mode: switch }
   - service: cloudhsmv2
     doc: docs/services/cloudhsmv2.md
     sources:
@@ -177,19 +167,6 @@ services:
     doc: docs/services/appintegrations.md
     sources:
       - { path: services/appintegrations/AppIntegrationsController.java, mode: rest }
-      - { path: core/common/SharedTagsController.java, mode: rest }
-    rename_actions:
-      ListTags: ListTagsForResource
-      TagResourcePost: TagResource
-    exclude_actions:
-      - ListTagsByQuery
-      - TagResourceByBody
-      - TagResourcePut
-      - UntagResourceByQuery
-  - service: signer
-    doc: docs/services/signer.md
-    sources:
-      - { path: services/signer/SignerController.java, mode: rest }
       - { path: core/common/SharedTagsController.java, mode: rest }
     rename_actions:
       ListTags: ListTagsForResource
@@ -328,7 +305,6 @@ services:
       - { path: services/securityadmin/SecurityAdminController.java, mode: rest }
     rename_actions:
       ListAdmin: ListOrganizationAdminAccounts
-      CreateMembers: CreateMember
   - service: resource-groups
     doc: docs/services/resource-groups.md
     sources:
@@ -399,6 +375,7 @@ services:
       ListVpcAssociationAuthorizations: ListVPCAssociationAuthorizations
       ListHostedZonesByVpc: ListHostedZonesByVPC
       GetDnssec: GetDNSSEC
+      TestDnsAnswer: TestDNSAnswer
   - service: route53resolver
     doc: docs/services/route53resolver.md
     sources:
@@ -411,14 +388,12 @@ services:
     doc: docs/services/securityhub.md
     sources:
       - { path: services/securityhub/SecurityHubController.java, mode: rest }
-      - { path: services/securityadmin/SecurityAdminController.java, mode: rest }
       - { path: core/common/SharedTagsController.java, mode: rest }
     rename_actions:
       ListTags: ListTagsForResource
       TagResourcePost: TagResource
     exclude_actions:
       - ListTagsByQuery
-      - ListAdmin
       - TagResourceByBody
       - TagResourcePut
       - UntagResourceByQuery
@@ -483,8 +458,10 @@ deferred_handlers:
   - { path: services/cloudcontrol/CloudControlJsonHandler.java }  # no standalone action table yet
   - { path: services/cloudmap/CloudMapHandler.java }  # non-tabular doc (grouped/inline)
   - { path: services/cloudwatch/logs/CloudWatchLogsHandler.java }  # multi-table doc (nested handler)
+  - { path: services/cloudwatch/logs/CloudWatchLogsTransformerHandler.java }  # multi-table doc (nested handler, reached through CloudWatchLogsHandler)
   - { path: services/cloudwatch/logs/CloudWatchLogsMetricFilterHandler.java }  # multi-table doc (nested handler, reached through CloudWatchLogsHandler)
   - { path: services/cloudwatch/logs/CloudWatchLogsDeliveryHandler.java }  # multi-table doc (nested handler, reached through CloudWatchLogsHandler)
+  - { path: services/cloudwatch/logs/CloudWatchLogsExportHandler.java }  # multi-table doc (nested handler, reached through CloudWatchLogsHandler)
   - { path: services/cloudwatch/metrics/CloudWatchMetricsJsonHandler.java }  # multi-table doc (nested handler)
   - { path: services/cloudwatch/metrics/CloudWatchMetricsQueryHandler.java }  # multi-table doc (nested handler)
   - { path: services/codebuild/CodeBuildJsonHandler.java }  # non-tabular doc (grouped/inline)
@@ -511,6 +488,7 @@ deferred_handlers:
   - { path: services/sns/SnsJsonHandler.java }  # multi-table doc
   - { path: services/sns/SnsQueryHandler.java }  # multi-table doc
   - { path: services/ssm/Ec2MessagesJsonHandler.java }  # multi-table doc
+  - { path: services/ssm/SsmMessagesController.java }  # control channel documented in the SSM multi-table doc
   - { path: services/ssm/SsmJsonHandler.java }  # multi-table doc
   - { path: services/textract/TextractJsonHandler.java }  # no standalone action table yet
   - { path: services/transcribe/TranscribeJsonHandler.java }  # no standalone action table yet

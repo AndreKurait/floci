@@ -107,6 +107,22 @@ def test_a_create_of_a_child_of_a_type_its_action_acts_on_names_it_from_the_pare
     assert r.creates_for("svc:CreateListener", ["loadbalancer/app/"], LISTENERS, members("RoleArn")) == []
 
 
+def test_a_rest_xml_request_is_read_for_its_path_and_query_members_alone():
+    # RequestResources reads a path label or a query parameter whatever the protocol, but not a REST-XML body.
+    shapes = {"String": {"type": "string"},
+              "In": {"type": "structure", "members": {
+                  "Id": {"shape": "String", "location": "uri", "locationName": "Id"},
+                  "Marker": {"shape": "String", "location": "querystring", "locationName": "Marker"},
+                  "Comment": {"shape": "String"}}}}
+    for protocol, read in (("rest-xml", {"Id": "Id", "Marker": "Marker"}),
+                           ("rest-json", {"Id": "Id", "Marker": "Marker", "Comment": "Comment"})):
+        models = {"svc": {"metadata": {"protocol": protocol}, "operations": {"GetThing": {"input": {"shape": "In"}}},
+                          "shapes": shapes}}
+        assert r.request_members(models, "GetThing") == read, protocol
+        assert set(r.string_patterns(models, "GetThing")) == set(read), protocol
+        assert r.located_members(models, "GetThing") == {"Id": "{Id}", "Marker": "?Marker"}, protocol
+
+
 def test_an_arn_inside_a_structure_or_a_lists_structures_is_read_by_its_path():
     shapes = {"String": {"type": "string"}, "Strings": {"type": "list", "member": {"shape": "String"}},
               "Priority": {"type": "structure", "members": {"RuleArn": {"shape": "String"}, "Priority": {"shape": "String"},
@@ -172,6 +188,31 @@ def test_stems_drop_the_suffixes_names_carry():
     # A plural's s goes, from a type's name and a member's alike, so they still meet.
     assert r.related(r.stem("EventBusName"), r.stem("event-bus"))
     assert r.related("autoscalinggroup", "group") and not r.related("ab", "b")
+    # A read of a resource's config is a read of the resource, and a type may carry the config in its name.
+    assert r.stem("DistributionConfig") == "distribution"
+    assert r.related(r.stem("FieldLevelEncryption"), r.stem("field-level-encryption-config"))
+
+
+def test_a_bare_id_names_the_resource_whose_config_an_operation_reads():
+    formats = {"distribution": "arn:${Partition}:cloudfront::${Account}:distribution/${DistributionId}"}
+    assert r.resources_for("cloudfront:GetDistributionConfig", ["distribution"], formats, {"Id": "Id"}) == [
+        {"type": "distribution", "fill": {"DistributionId": "Id"}}]
+
+
+def test_a_resource_member_taking_only_an_arn_holds_the_resource_the_action_acts_on():
+    model = {
+        "metadata": {"protocol": "rest-xml", "endpointPrefix": "svc"},
+        "operations": {"TagResource": {"input": {"shape": "Input"}}},
+        "shapes": {"Input": {"type": "structure", "members": {
+                       "Resource": {"shape": "Value", "location": "querystring", "locationName": "Resource"}}},
+                   "Value": {"type": "string", "pattern": "arn:aws(-cn)?:svc::[0-9]+:.*"}},
+    }
+    formats = {"distribution": "arn:${Partition}:svc::${Account}:distribution/${DistributionId}",
+               "function": "arn:${Partition}:svc::${Account}:function/${Name}"}
+    entry = r.entry_for("svc:TagResource", {"action": "svc:TagResource", "types": ["distribution", "function"]},
+                        formats, {"svc": model})
+    assert entry["resources"] == [{"types": ["distribution", "function"], "arn": "Resource"}]
+    assert entry["located"] == {"Resource": "?Resource"}
 
 
 def reference(namespace: str, operations: dict[str, list[str]], resources: dict[str, str]) -> dict:
@@ -181,6 +222,18 @@ def reference(namespace: str, operations: dict[str, list[str]], resources: dict[
             "Operations": [{"Name": name, "AuthorizedActions": [{"Service": namespace, "Name": name}],
                             "SDK": [{"Name": namespace, "Method": name, "Package": "Boto3"}]} for name in operations],
             "Resources": [{"Name": kind, "ARNFormats": [arn]} for kind, arn in resources.items()]}
+
+@pytest.mark.parametrize("upstream,expected", [
+    ("arn:${Partition}:swf::${Account}:/domain/${DomainName}",
+     "arn:${Partition}:swf:${Region}:${Account}:/domain/${DomainName}"),
+    ("arn:${Partition}:swf:${Region}:${Account}:/domain/${DomainName}",
+     "arn:${Partition}:swf:${Region}:${Account}:/domain/${DomainName}"),
+    ("arn:${Partition}:swf:${Region}:${Account}:different/${DomainName}",
+     "arn:${Partition}:swf:${Region}:${Account}:different/${DomainName}"),
+])
+def test_swf_restores_only_the_known_missing_region(upstream, expected):
+    document = reference("swf", {}, {"domain": upstream})
+    assert r.arn_formats([document], {"swf"}) == {"swf": {"domain": expected}}
 
 
 def model(operations: dict[str, dict[str, str]], protocol: str = "json") -> dict:
@@ -201,6 +254,8 @@ def corrections(monkeypatch):
     monkeypatch.setattr(r, "NOT_COVERED", {"later": "a later batch"})
     monkeypatch.setattr(r, "CORRECTIONS", {})
     monkeypatch.setattr(r, "READ_IN_HAND_BUILT", {})
+    monkeypatch.setattr(r, "READ_IN_NOT_COVERED", {})
+    monkeypatch.setattr(r, "REST_ONLY_OPERATIONS", {})
     monkeypatch.setattr(r, "UNQUALIFIED", {})
     monkeypatch.setattr(r, "MINTED_IDS", {})
     monkeypatch.setattr(r, "FOUND_BY", {})
@@ -231,6 +286,15 @@ def test_a_built_document_validates_matches_botocore_and_names_the_namespaces_it
     assert document["operations"]["svc:ListThings"]["resources"] == []
     assert document["otherNamespaces"] == ["other"]
     assert json.loads(r.render(document)) == document
+
+
+@pytest.mark.parametrize("namespace", ["svc", "other", "hand"])
+def test_validation_rejects_a_namespace_also_declared_not_covered(corrections, tmp_path, namespace):
+    write_models(tmp_path, {"svc": model({"GetThing": {"ThingName": "String"}, "ListThings": {}})})
+    document = r.build(DOCUMENTS, "test", tmp_path, "botocore test")
+    assert r.validate(document) == []
+    document["notCovered"][namespace] = "stale classification after composition"
+    assert any(namespace in problem and "notCovered" in problem for problem in r.validate(document))
 
 
 def test_a_member_holding_an_account_id_gives_the_account_of_the_types_named_by_variables(corrections, tmp_path):
@@ -798,6 +862,17 @@ def test_a_member_two_clients_locate_apart_is_an_error():
         r.located_members({"one": one, "two": two}, "GetThing")
 
 
+@pytest.mark.parametrize("kind", ["integer", "long"])
+def test_numeric_uri_labels_name_resources_but_body_and_query_numbers_do_not(kind):
+    svc = rest_model(
+        {"GetDeployment": {"DeploymentNumber": "Number", "Limit": "Number", "Count": "Number"}},
+        {"GetDeployment": {"DeploymentNumber": "uri:DeploymentNumber", "Limit": "querystring:limit"}})
+    svc["shapes"]["Number"] = {"type": kind}
+    assert r.request_members({"svc": svc}, "GetDeployment") == {"DeploymentNumber": "DeploymentNumber"}
+    assert r.located_members({"svc": svc}, "GetDeployment") == {"DeploymentNumber": "{DeploymentNumber}"}
+
+
+
 def test_a_located_member_must_be_a_path_label_or_a_query_parameter(corrections, tmp_path):
     write_models(tmp_path, {"svc": rest_model({"GetThing": {"ThingName": "String"}, "ListThings": {}},
                                               {"GetThing": {"ThingName": "uri:ThingName"}})})
@@ -859,6 +934,61 @@ def test_verify_reports_a_rest_models_operation_whose_action_aws_no_longer_has(c
     assert r.main(["--verify", "--source-dir", str(sources), "--output", str(output)]) == 1
 
 
+def test_cloudfront_resource_coverage_includes_the_complete_management_family():
+    assert r.reads("cloudfront:DescribeKeyValueStore")
+    assert r.reads("cloudfront:DeleteKeyValueStore")
+    assert r.reads("cloudfront:DescribeFunction")
+    assert r.reads("cloudfront:ListDistributions")
+    assert "cloudfront" not in r.NOT_COVERED
+
+
+@pytest.fixture
+def partial_cloudfront_document(monkeypatch):
+    document = json.loads(r.OUTPUT.read_text(encoding="utf-8"))
+    allowed = {"cloudfront:DescribeKeyValueStore", "cloudfront:DeleteKeyValueStore"}
+    document["operations"] = {operation: entry for operation, entry in document["operations"].items()
+                              if not operation.startswith("cloudfront:") or operation in allowed}
+    document["notCovered"]["cloudfront"] = "Synthetic partial-namespace fixture"
+    monkeypatch.setattr(r, "READ_IN_NOT_COVERED", dict.fromkeys(allowed, "fixture"))
+    assert r.validate(document) == []
+    return document
+
+
+def test_partial_namespace_rejects_an_operation_outside_its_explicit_allowlist(partial_cloudfront_document):
+    document = partial_cloudfront_document
+    document["operations"]["cloudfront:DescribeFunction"] = {
+        "action": "cloudfront:DescribeFunction", "types": [], "resources": []}
+    document["operations"] = dict(sorted(document["operations"].items()))
+    assert "cloudfront is in both namespaces and notCovered" in r.validate(document)
+
+
+def test_partial_namespace_requires_at_least_one_qualified_operation(partial_cloudfront_document):
+    document = partial_cloudfront_document
+    document["operations"] = {operation: entry for operation, entry in document["operations"].items()
+                              if not operation.startswith("cloudfront:")}
+    assert "cloudfront is in both namespaces and notCovered" in r.validate(document)
+
+
+@pytest.mark.parametrize("section", ["handBuilt", "otherNamespaces"])
+def test_partial_namespace_does_not_allow_other_classification_overlap(section, partial_cloudfront_document):
+    document = partial_cloudfront_document
+    document[section].append("cloudfront")
+    assert f"cloudfront is in both {section} and notCovered" in r.validate(document)
+
+
+def test_rest_xml_operations_read_path_labels_without_reading_bodies():
+    sample = rest_model({"DescribeKeyValueStore": {"Name": "String"}, "DescribeFunction": {"Name": "String"}},
+                        {"DescribeKeyValueStore": {"Name": "uri:Name"}, "DescribeFunction": {"Name": "uri:Name"}})
+    sample["metadata"].update(protocol="rest-xml", endpointPrefix="cloudfront")
+    assert r.request_members({"cloudfront": sample}, "DescribeKeyValueStore") == {"Name": "Name"}
+    assert r.located_members({"cloudfront": sample}, "DescribeKeyValueStore") == {"Name": "{Name}"}
+    assert r.request_members({"cloudfront": sample}, "DescribeFunction") == {"Name": "Name"}
+    assert r.located_members({"cloudfront": sample}, "DescribeFunction") == {"Name": "{Name}"}
+    sample["metadata"]["endpointPrefix"] = "another-service"
+    assert r.request_members({"other": sample}, "DescribeKeyValueStore") == {"Name": "Name"}
+    assert r.located_members({"other": sample}, "DescribeKeyValueStore") == {"Name": "{Name}"}
+
+
 def test_id_targets_follow_the_model_and_resource_types_not_operation_names():
     ec2 = model({"AnnotateResources": {"Resources": "Strings"}}, "ec2")
     member = ec2["shapes"]["AnnotateResourcesIn"]["members"]["Resources"]
@@ -902,3 +1032,39 @@ def test_id_targets_reject_unknown_types_ambiguous_prefixes_and_malformed_member
         invalid = copy.deepcopy(document)
         invalid["operations"]["ec2:CreateTags"]["targets"][field] = value
         assert r.validate(invalid), (field, value)
+
+
+def test_an_optional_arn_member_of_a_type_without_variables_names_it_when_absent():
+    named = [{"types": ["catalog", "thing"], "arn": "CatalogArn"}]
+    assert r.with_absent_arn(named, FORMATS, {"CatalogArn"}) == named + [
+        {"type": "catalog", "fill": {}, "when": {"CatalogArn": [None]}}]
+    assert r.with_absent_arn(named, FORMATS, set()) == named
+    assert r.with_absent_arn([{"types": ["thing"], "arn": "ThingArn"}], FORMATS, {"ThingArn"}) == [
+        {"types": ["thing"], "arn": "ThingArn"}]
+
+
+def test_optional_members_are_only_optional_top_level_strings():
+    model = {
+        "metadata": {"protocol": "rest-json"},
+        "operations": {"DescribeCatalog": {"input": {"shape": "Request"}}},
+        "shapes": {
+            "Request": {"type": "structure", "required": ["RequiredArn"], "members": {
+                "CatalogArn": {"shape": "Text"}, "RequiredArn": {"shape": "Text"},
+                "Nested": {"shape": "Nested"}, "Count": {"shape": "Count"}}},
+            "Text": {"type": "string"}, "Count": {"type": "integer"},
+            "Nested": {"type": "structure", "members": {"CatalogArn": {"shape": "Text"}}},
+        },
+    }
+    assert r.optional_members({"test": model}, "DescribeCatalog") == {"CatalogArn"}
+    assert r.optional_members({"test": model}, "Missing") == set()
+
+
+def test_qualified_identifier_resources_are_all_retained_only_for_resolving_namespaces(monkeypatch):
+    monkeypatch.setattr(r, "QUALIFIED_MEMBERS", ("svc",), raising=False)
+    formats = {"key": "arn:${Partition}:svc:${Region}:${Account}:key/${KeyIdentifier}"}
+    named = members("IncomingKeyIdentifier", "OutgoingKeyIdentifier", "TagKeys[]")
+    assert r.resources_for("svc:ReEncrypt", ["key"], formats, named) == [
+        {"type": "key", "fill": {"KeyIdentifier": "IncomingKeyIdentifier"}},
+        {"type": "key", "fill": {"KeyIdentifier": "OutgoingKeyIdentifier"}},
+    ]
+    assert r.resources_for("other:ReEncrypt", ["key"], formats, named) == []

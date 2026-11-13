@@ -1,0 +1,237 @@
+package io.github.hectorvent.floci.services.stepfunctions;
+
+import io.github.hectorvent.floci.testing.TestTime;
+import org.junit.jupiter.api.Assertions;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+
+import java.time.Duration;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.IntStream;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
+
+class MapIterationSchedulerTest {
+
+    private static final Duration WAIT_BUDGET = Duration.ofMillis(200);
+    private static final Duration ONE_NANO = Duration.ofNanos(1);
+
+    @Test
+    void appliesAwsConcurrencyCeilingsForInlineAndDistributedMaps() {
+        assertEquals(40, AslExecutor.effectiveMapConcurrency(50_000, 0, false));
+        assertEquals(40, AslExecutor.effectiveMapConcurrency(50_000, 500, false));
+        assertEquals(7, AslExecutor.effectiveMapConcurrency(7, 0, false));
+        assertEquals(10_000, AslExecutor.effectiveMapConcurrency(50_000, 0, true));
+        assertEquals(250, AslExecutor.effectiveMapConcurrency(50_000, 250, true));
+    }
+
+    @Test
+    void maxConcurrencyOneStartsEachItemStrictlyInInputOrder() throws Exception {
+        List<Integer> starts = new CopyOnWriteArrayList<>();
+
+        List<Integer> results = MapIterationScheduler.execute(5, 1, index -> () -> {
+            starts.add(index);
+            return index;
+        }, Long.MAX_VALUE);
+
+        assertEquals(List.of(0, 1, 2, 3, 4), starts);
+        assertEquals(starts, results);
+    }
+
+    @Test
+    void keepsOnlyMaxConcurrencyIterationsInFlight() throws Exception {
+        int itemCount = 50;
+        int maxConcurrency = 3;
+        AtomicInteger active = new AtomicInteger();
+        AtomicInteger maxObserved = new AtomicInteger();
+        AtomicInteger started = new AtomicInteger();
+        CountDownLatch firstWaveStarted = new CountDownLatch(maxConcurrency);
+        CountDownLatch release = new CountDownLatch(1);
+
+        try (ExecutorService driver = Executors.newSingleThreadExecutor()) {
+            Future<List<Integer>> execution = driver.submit(() -> MapIterationScheduler.execute(
+                    itemCount, maxConcurrency, index -> () -> {
+                        int nowActive = active.incrementAndGet();
+                        maxObserved.accumulateAndGet(nowActive, Math::max);
+                        started.incrementAndGet();
+                        firstWaveStarted.countDown();
+                        try {
+                            release.await();
+                            return index;
+                        } finally {
+                            active.decrementAndGet();
+                        }
+                    }, Long.MAX_VALUE));
+
+            assertTrue(firstWaveStarted.await(2, TimeUnit.SECONDS), "initial worker window did not start");
+            assertEquals(maxConcurrency, started.get(), "queued items must not be submitted early");
+            release.countDown();
+
+            assertEquals(IntStream.range(0, itemCount).boxed().toList(),
+                    execution.get(5, TimeUnit.SECONDS));
+            assertEquals(maxConcurrency, maxObserved.get());
+        }
+    }
+
+    @Test
+    void reportsLaterFailureWithoutWaitingForAnEarlierBlockedItem() throws Exception {
+        CountDownLatch slowStarted = new CountDownLatch(1);
+        CountDownLatch slowInterrupted = new CountDownLatch(1);
+        CountDownLatch neverRelease = new CountDownLatch(1);
+
+        try (ExecutorService driver = Executors.newSingleThreadExecutor()) {
+            Future<List<Integer>> execution = driver.submit(() -> MapIterationScheduler.execute(
+                    2, 2, index -> () -> {
+                        if (index == 0) {
+                            slowStarted.countDown();
+                            try {
+                                neverRelease.await();
+                                return index;
+                            } catch (InterruptedException e) {
+                                slowInterrupted.countDown();
+                                throw e;
+                            }
+                        }
+                        if (!slowStarted.await(2, TimeUnit.SECONDS)) {
+                            fail("slow iteration did not start");
+                        }
+                        throw new IllegalStateException("later iteration failed");
+                    }, Long.MAX_VALUE));
+
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> execution.get(2, TimeUnit.SECONDS));
+            assertEquals(IllegalStateException.class, failure.getCause().getClass());
+            assertEquals("later iteration failed", failure.getCause().getMessage());
+            assertTrue(slowInterrupted.await(2, TimeUnit.SECONDS),
+                    "the blocked sibling should be interrupted after failure");
+        }
+    }
+
+    @Test
+    void preservesInputOrderWhenItemsCompleteOutOfOrder() throws Exception {
+        CountDownLatch laterItemsCompleted = new CountDownLatch(2);
+
+        List<Integer> results = Assertions.assertTimeoutPreemptively(
+                Duration.ofSeconds(2),
+                () -> MapIterationScheduler.execute(3, 3, index -> () -> {
+                    if (index == 0) {
+                        laterItemsCompleted.await();
+                    } else {
+                        laterItemsCompleted.countDown();
+                    }
+                    return index;
+                }, Long.MAX_VALUE));
+
+        assertEquals(List.of(0, 1, 2), results);
+    }
+
+    @Test
+    void stopsStartingSerialIterationsOncePastTheDeadline() {
+        AtomicInteger started = new AtomicInteger();
+
+        assertThrows(TimeoutException.class, () -> MapIterationScheduler.execute(3, 1, index -> () -> {
+            started.incrementAndGet();
+            return index;
+        }, System.nanoTime() - 1));
+
+        assertEquals(0, started.get());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"1, 3", "2, 1", "2, 2"})
+    void interruptsBlockedIterationsWhenTheWaitBudgetExpires(int itemCount, int maxConcurrency) throws Exception {
+        int inFlight = Math.min(itemCount, maxConcurrency);
+        CountDownLatch started = new CountDownLatch(inFlight);
+        CountDownLatch neverRelease = new CountDownLatch(1);
+        CountDownLatch blockedInterrupted = new CountDownLatch(inFlight);
+        List<Integer> cut = new CopyOnWriteArrayList<>();
+        TestTime time = TestTime.create();
+        TimelineWaits waits = new TimelineWaits(time);
+        long deadlineNanos = time.nanoTime() + WAIT_BUDGET.toNanos();
+
+        try {
+            CompletableFuture<TimeoutException> run = AslExecutorFixture.start(() ->
+                    assertThrows(TimeoutException.class, () -> MapIterationScheduler.execute(
+                            itemCount, maxConcurrency, index -> () -> {
+                                started.countDown();
+                                try {
+                                    neverRelease.await();
+                                    return index;
+                                } catch (InterruptedException e) {
+                                    blockedInterrupted.countDown();
+                                    throw e;
+                                }
+                            }, deadlineNanos, cut::add, time::nanoTime, waits)));
+            assertTrue(started.await(10, TimeUnit.SECONDS), "the worker window did not start");
+            waits.awaitWaiting(1);
+
+            time.advance(WAIT_BUDGET.minus(ONE_NANO));
+            assertEquals(1, waits.waiting(), "the wait for an iteration lasts until the budget is spent");
+            assertFalse(run.isDone());
+            assertEquals(inFlight, blockedInterrupted.getCount(), "no iteration is interrupted before that");
+
+            time.advance(ONE_NANO);
+            AslExecutorFixture.finished(run);
+            assertTrue(blockedInterrupted.await(10, TimeUnit.SECONDS),
+                    "every blocked iteration should be interrupted after the timed wait expires");
+            assertEquals(List.of(), cut, "deadline expiry must not name an iteration as failed");
+        } finally {
+            neverRelease.countDown();
+        }
+    }
+
+    @Test
+    void namesEachInFlightIterationBeforeCancellingItOnFailure() throws Exception {
+        CountDownLatch othersStarted = new CountDownLatch(2);
+        CountDownLatch neverRelease = new CountDownLatch(1);
+        CountDownLatch othersInterrupted = new CountDownLatch(2);
+        List<Integer> cut = new CopyOnWriteArrayList<>();
+        List<Integer> namedWhenInterrupted = new CopyOnWriteArrayList<>();
+
+        try (ExecutorService driver = Executors.newSingleThreadExecutor()) {
+            Future<List<Integer>> execution = driver.submit(() -> MapIterationScheduler.execute(
+                    3, 3, index -> () -> {
+                        if (index == 1) {
+                            if (!othersStarted.await(2, TimeUnit.SECONDS)) {
+                                fail("the other iterations did not start");
+                            }
+                            throw new IllegalStateException("middle iteration failed");
+                        }
+                        othersStarted.countDown();
+                        try {
+                            neverRelease.await();
+                            return index;
+                        } catch (InterruptedException e) {
+                            if (cut.contains(index)) {
+                                namedWhenInterrupted.add(index);
+                            }
+                            othersInterrupted.countDown();
+                            throw e;
+                        }
+                    }, Long.MAX_VALUE, cut::add));
+
+            assertThrows(ExecutionException.class, () -> execution.get(2, TimeUnit.SECONDS));
+        }
+
+        assertEquals(List.of(0, 2), cut, "every in-flight iteration, in start order, never the failed one");
+        assertTrue(othersInterrupted.await(2, TimeUnit.SECONDS));
+        assertEquals(List.of(0, 2), namedWhenInterrupted.stream().sorted().toList(),
+                "each was named before it was cancelled");
+    }
+
+}

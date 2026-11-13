@@ -4,8 +4,7 @@
 A REST request is authorized by its route: `IamActionRegistry` maps the HTTP method and path to the
 IAM action, by its rules first and then by these routes, and a route neither maps is left unchecked.
 This vendors, for each operation of the models below, its HTTP method and request URI exactly as the
-SDKs send them, plus the explicit access-denied HTTP status of each model when it declares one.
-A request no rule maps is the operation whose route it matches, checked as the action
+SDKs send them. A request no rule maps is the operation whose route it matches, checked as the action
 `iam-authorized-actions.json` names for it, or as its own; `IamRestRouteCoverageTest` builds a
 request on each route and compares the action the registry gives with that one.
 
@@ -52,6 +51,10 @@ MODELS: dict[str, str] = {
     "accessanalyzer": "access-analyzer",
     "apigateway": "apigateway",
     "apigatewayv2": "apigateway",
+    "appconfig": "appconfig",
+    "appconfigdata": "appconfig",
+    "cloudfront": "cloudfront",
+    "cloudfront-keyvaluestore": "cloudfront-keyvaluestore",
     "dsql": "dsql",
     "eks": "eks",
     "es": "es",
@@ -59,38 +62,19 @@ MODELS: dict[str, str] = {
     "lambda-core": "lambda",
     "lambda-microvms": "lambda",
     "opensearch": "es",
-    # The data plane is signed for the service, which is one scope for both of its planes.
-    "payment-cryptography-data": "payment-cryptography",
     "pipes": "pipes",
-    "quicksight": "quicksight",
     "s3": "s3",
     "s3control": "s3",
     "scheduler": "scheduler",
-    "signer": "signer",
-}
-
-# The models whose routes are rewritten onto an internal prefix, and the prefix they are rewritten
-# onto, with whether the labels in their paths hold an ARN. A service whose routes sit under such a
-# prefix has them there, and the prefix names them.
-INTERNAL_ROUTES: dict[str, tuple[str, bool]] = {
-    # The Payment Cryptography data plane's routes sit under the prefix its route filter rewrites
-    # them onto, and the key they name is an ARN, whose slashes the rewritten path holds: the label
-    # spans them, as the controller's own path does.
-    "payment-cryptography-data": ("/_paymentcryptography", True),
-    # Signer's routes collide with S3's path-style ones and are rewritten onto the prefix its route
-    # filter owns, so its routes are vendored as the rewritten path: the action and the request's
-    # resource labels both resolve from it.
-    "signer": ("/_signer", False),
 }
 
 
-# Operations a model does not serve itself, so their path is not rewritten onto its internal prefix.
-# The shared tags controller serves /tags/{resourceArn} for every service that is a TagHandler, and
-# the service's route filter leaves that path alone; prefixing it here would advertise a route no
-# request ever arrives on, and the IAM check would find no rule for it.
-SHARED_ROUTES: dict[str, frozenset[str]] = {
-    "signer": frozenset({"TagResource", "UntagResource", "ListTagsForResource"}),
-}
+# Shared-controller and ARN-spanning operations are activated with their qualified tables.
+SHARED_ROUTES: dict[str, frozenset[str]] = {}
+ARN_SPANNING_ROUTES: dict[str, frozenset[str]] = {}
+
+
+ONLY_OPERATIONS: dict[str, tuple[str, ...]] = {}
 
 
 def access_denied_status(model: dict) -> int | None:
@@ -110,6 +94,15 @@ def access_denied_status(model: dict) -> int | None:
     return next(iter(statuses), None)
 
 
+def bare_tags_route(method: str) -> dict:
+    """The bare `/tags` route SharedTagsController also serves for a shared tags route of the method, with where it
+    reads the ARN: a tagging request is a POST whose body names it, whether the service tags with POST or with
+    PUT, and a GET or DELETE names it in its query. A route of another method than the operation's says so."""
+    bare = "POST" if method in ("POST", "PUT") else method
+    route = {"requestUri": "/tags", "located": {"resourceArn": "body" if bare == "POST" else "?resourceArn"}}
+    return route if bare == method else {"method": bare, **route}
+
+
 def build(models: dict[str, dict], provenance: str) -> dict:
     """The vendored document from each loaded model."""
     routes = {}
@@ -118,23 +111,20 @@ def build(models: dict[str, dict], provenance: str) -> dict:
         model = models[name]
         if model["metadata"].get("protocol") not in ("rest-json", "rest-xml"):
             raise SystemExit(f"error: {name} is not a REST model")
-        prefix, arn_labels = INTERNAL_ROUTES.get(name, ("", False))
         shared = SHARED_ROUTES.get(name, frozenset())
+        spanning = ARN_SPANNING_ROUTES.get(name, frozenset())
         operations = {}
-        for operation in sorted(model["operations"]):
+        for operation in sorted(ONLY_OPERATIONS.get(name, model["operations"])):
             http = model["operations"][operation]["http"]
-            if operation in shared:
-                request_uri = http["requestUri"]
-                # A shared tags route names its resource as an ARN, which holds slashes: the label
-                # has to span them or the route matches no tag request at all.
+            request_uri = http["requestUri"]
+            if operation in shared or operation in spanning:
+                # A tags route names its resource as an ARN, which holds slashes: the label has to
+                # span them or the route matches no tag request at all.
                 request_uri = re.sub(r"\{([^}]*[Aa]rn[^}]*)}", r"{\1+}", request_uri)
-            else:
-                request_uri = prefix + http["requestUri"]
-            if arn_labels:
-                # A label holding an ARN spans the slashes the ARN holds, which the rewritten path
-                # holds as they are.
-                request_uri = re.sub(r"\{([^}]+)\}", r"{\1+}", request_uri)
-            operations[operation] = {"method": http["method"], "requestUri": request_uri}
+            route = {"method": http["method"], "requestUri": request_uri}
+            if operation in shared:
+                route["alternatives"] = [bare_tags_route(http["method"])]
+            operations[operation] = route
         routes[name] = {
             "credentialScope": MODELS[name],
             "apiVersion": model["metadata"]["apiVersion"],
@@ -147,6 +137,7 @@ def build(models: dict[str, dict], provenance: str) -> dict:
                 raise SystemExit(f"error: REST models of {scope} have conflicting access-denied HTTP statuses")
             denial_statuses[scope] = status
             routes[name]["accessDeniedStatus"] = status
+    routes = dict(sorted(routes.items()))
     shared = shared_routes(routes)
     if shared:
         raise SystemExit("error: one route names more than one operation in a scope the rules do not route alone: "
@@ -176,8 +167,10 @@ def shared_routes(routes: dict[str, dict]) -> list[str]:
         if model["credentialScope"] in HAND_ROUTED:
             continue
         for operation, route in model["operations"].items():
-            key = (model["credentialScope"],) + route_key(route["method"], route["requestUri"])
-            named.setdefault(key, set()).add(operation)
+            for variant in [route, *route.get("alternatives", [])]:
+                key = (model["credentialScope"],) + route_key(variant.get("method", route["method"]),
+                                                              variant["requestUri"])
+                named.setdefault(key, set()).add(operation)
     return [f"{key[0]} {key[1]} {'/'.join(key[2])}: {', '.join(sorted(operations))}"
             for key, operations in sorted(named.items()) if len(operations) > 1]
 
