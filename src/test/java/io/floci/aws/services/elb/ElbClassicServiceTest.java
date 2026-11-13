@@ -267,11 +267,13 @@ class ElbClassicServiceTest {
 
         ExecutorService pool = Executors.newFixedThreadPool(2);
         CountDownLatch start = new CountDownLatch(1);
+        CountDownLatch firstScan = new CountDownLatch(1);
         AtomicBoolean writing = new AtomicBoolean(true);
         try {
             Future<?> writer = pool.submit(() -> {
                 start.await();
                 try {
+                    assertTrue(firstScan.await(10, TimeUnit.SECONDS), "the scanner did not start");
                     for (int i = 0; i < 400; i++) {
                         service.createLoadBalancerListeners(REGION, "scanned-elb", List.of(https));
                         service.deleteLoadBalancerListeners(REGION, "scanned-elb", List.of(443));
@@ -287,6 +289,7 @@ class ElbClassicServiceTest {
                 while (writing.get()) {
                     service.serverCertificateReferences();
                     scans++;
+                    firstScan.countDown();
                 }
                 return scans;
             });
