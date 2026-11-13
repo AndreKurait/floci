@@ -92,6 +92,9 @@ public class IotService {
     private static final Pattern THING_NAME_PATTERN = Pattern.compile("[a-zA-Z0-9:_-]{1,128}");
     private static final Pattern THING_TYPE_NAME_PATTERN = Pattern.compile("[a-zA-Z0-9:_-]+");
     private static final Pattern SHADOW_NAME_PATTERN = Pattern.compile("[$a-zA-Z0-9:_-]{1,64}");
+    private static final Pattern JOB_ID_PATTERN = Pattern.compile("[a-zA-Z0-9_-]{1,64}");
+    private static final Set<String> TERMINAL_JOB_EXECUTION_STATES =
+            Set.of("SUCCEEDED", "FAILED", "TIMED_OUT", "REJECTED", "REMOVED", "CANCELED");
     /** The {@code FirehoseSeparator} shape of the IoT API model. */
     private static final Pattern FIREHOSE_SEPARATOR = Pattern.compile("([\\n\\t])|(\\r\\n)|(,)");
     public static final int MAX_POLICY_VERSIONS = 5;
@@ -105,6 +108,8 @@ public class IotService {
     private final Object shadowWriteLock = new Object();
     /** One lock for every UpdateThing and DeleteThing, so a merge, a version check and the write are one step. */
     private final Object thingWriteLock = new Object();
+    /** Serializes job creation, execution writes and deletion across their two stores. */
+    private final Object jobWriteLock = new Object();
 
     /** certificateId to the partition and key it was last found under; see {@link #findRegisteredCertificate}. */
     private final Map<String, CertificateLocation> certificateLocations = new ConcurrentHashMap<>();
@@ -1384,58 +1389,126 @@ public class IotService {
     }
 
     public IotJob createJob(String jobId, JsonNode request, String region) {
-        startMqttIfEnabled();
-        if (jobStore.get(jobKey(region, jobId)).isPresent()) {
-            throw new AwsException("ResourceAlreadyExistsException", "Job already exists: " + jobId, 409);
-        }
-        JsonNode targetsNode = request.path("targets");
-        if (!targetsNode.isArray() || targetsNode.isEmpty()) {
-            throw new AwsException("InvalidRequestException", "targets is required", 400);
-        }
-
-        Instant now = Instant.now();
-        IotJob job = new IotJob();
-        job.setJobId(jobId);
-        job.setJobArn(regionResolver.buildArn("iot", region, "job/" + jobId));
-        job.setDocument(request.path("document").asText(null));
-        job.setDocumentSource(request.path("documentSource").asText(null));
-        job.setDescription(request.path("description").asText(null));
-        job.setTargetSelection(request.path("targetSelection").asText("SNAPSHOT"));
-        job.setCreatedAt(now);
-        job.setLastUpdatedAt(now);
-
-        List<String> targets = new ArrayList<>();
-        Set<String> thingNames = new TreeSet<>();
-        targetsNode.forEach(target -> {
-            String value = target.asText();
-            if (value != null && !value.isBlank()) {
-                targets.add(value);
-                thingNames.addAll(thingNamesForJobTarget(value, region));
+        synchronized (jobWriteLock) {
+            startMqttIfEnabled();
+            if (findJob(jobId, region).isPresent()) {
+                throw new AwsException("ResourceAlreadyExistsException", "Job already exists: " + jobId, 409);
             }
-        });
-        if (thingNames.isEmpty()) {
-            throw new AwsException("ResourceNotFoundException", "No job targets found", 404);
-        }
-        job.setTargets(targets);
-        jobStore.put(jobKey(region, jobId), job);
+            JsonNode targetsNode = request.path("targets");
+            if (!targetsNode.isArray() || targetsNode.isEmpty()) {
+                throw new AwsException("InvalidRequestException", "targets is required", 400);
+            }
 
-        for (String thingName : thingNames) {
-            Thing thing = describeThing(thingName, region);
-            IotJobExecution execution = new IotJobExecution();
-            execution.setJobId(jobId);
-            execution.setThingName(thingName);
-            execution.setThingArn(thing.getThingArn());
-            execution.setStatus("QUEUED");
-            execution.setQueuedAt(now);
-            execution.setLastUpdatedAt(now);
-            jobExecutionStore.put(jobExecutionKey(region, thingName, jobId), execution);
+            Instant now = Instant.now();
+            IotJob job = new IotJob();
+            job.setJobId(jobId);
+            job.setJobArn(regionResolver.buildArn("iot", region, "job/" + jobId));
+            job.setDocument(request.path("document").asText(null));
+            job.setDocumentSource(request.path("documentSource").asText(null));
+            job.setDescription(request.path("description").asText(null));
+            job.setTargetSelection(request.path("targetSelection").asText("SNAPSHOT"));
+            job.setCreatedAt(now);
+            job.setLastUpdatedAt(now);
+
+            List<String> targets = new ArrayList<>();
+            Set<String> thingNames = new TreeSet<>();
+            targetsNode.forEach(target -> {
+                String value = target.asText();
+                if (value != null && !value.isBlank()) {
+                    targets.add(value);
+                    thingNames.addAll(thingNamesForJobTarget(value, region));
+                }
+            });
+            if (thingNames.isEmpty()) {
+                throw new AwsException("ResourceNotFoundException", "No job targets found", 404);
+            }
+            job.setTargets(targets);
+            jobStore.put(jobKey(region, jobId), job);
+
+            for (String thingName : thingNames) {
+                Thing thing = describeThing(thingName, region);
+                IotJobExecution execution = new IotJobExecution();
+                execution.setJobId(jobId);
+                execution.setThingName(thingName);
+                execution.setThingArn(thing.getThingArn());
+                execution.setStatus("QUEUED");
+                execution.setQueuedAt(now);
+                execution.setLastUpdatedAt(now);
+                jobExecutionStore.put(jobExecutionKey(region, thingName, jobId), execution);
+            }
+            return job;
         }
-        return job;
     }
 
     public IotJob describeJob(String jobId, String region) {
-        return jobStore.get(jobKey(region, jobId))
+        return findJob(jobId, region)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Job not found: " + jobId, 404));
+    }
+
+    private Optional<IotJob> findJob(String jobId, String region) {
+        String key = jobKey(region, jobId);
+        if (jobStore instanceof AccountAwareStorageBackend<IotJob> aware) {
+            aware.migrateLegacyEntries(regionResolver.getDefaultAccountId(), key::equals,
+                    job -> key, job -> true);
+            return aware.getForAccount(aware.accountId(), key);
+        }
+        return jobStore.get(key);
+    }
+
+    private void migrateJobExecutions(String jobId, String region) {
+        if (jobExecutionStore instanceof AccountAwareStorageBackend<IotJobExecution> aware) {
+            String prefix = "job-execution:" + region + ":";
+            String suffix = ":" + jobId;
+            String defaultAccount = regionResolver.getDefaultAccountId();
+            for (AccountAwareStorageBackend.AccountEntry<IotJobExecution> entry : aware.scanAllAccountEntries(
+                    key -> key.startsWith(prefix) && key.endsWith(suffix))) {
+                if (defaultAccount.equals(entry.accountId())
+                        && matchesJobExecution(entry.key(), entry.value(), jobId, region)) {
+                    aware.getForAccountMigratingLegacyKeys(defaultAccount, entry.key(), List.of(),
+                            execution -> matchesJobExecution(entry.key(), execution, jobId, region), true);
+                }
+            }
+        }
+    }
+
+    private boolean matchesJobExecution(String key, IotJobExecution execution, String jobId, String region) {
+        return jobId.equals(execution.getJobId()) && execution.getThingName() != null
+                && key.equals(jobExecutionKey(region, execution.getThingName(), jobId));
+    }
+
+    private Optional<IotJobExecution> findJobExecution(String key) {
+        return jobExecutionStore instanceof AccountAwareStorageBackend<IotJobExecution> aware
+                ? aware.getForAccount(aware.accountId(), key) : jobExecutionStore.get(key);
+    }
+
+    private Map<String, IotJobExecution> executionsForJob(String jobId, String region) {
+        migrateJobExecutions(jobId, region);
+        String prefix = "job-execution:" + region + ":";
+        String suffix = ":" + jobId;
+        Map<String, IotJobExecution> executions = new LinkedHashMap<>();
+        for (String key : jobExecutionStore.keys()) {
+            if (key.startsWith(prefix) && key.endsWith(suffix)) {
+                findJobExecution(key).filter(execution -> matchesJobExecution(key, execution, jobId, region))
+                        .ifPresent(execution -> executions.put(key, execution));
+            }
+        }
+        return executions;
+    }
+
+    public void deleteJob(String jobId, boolean force, String region) {
+        if (jobId == null || !JOB_ID_PATTERN.matcher(jobId).matches()) {
+            throw new AwsException("InvalidRequestException", "Invalid job ID", 400);
+        }
+        synchronized (jobWriteLock) {
+            IotJob job = describeJob(jobId, region);
+            boolean terminal = "COMPLETED".equals(job.getStatus()) || "CANCELED".equals(job.getStatus());
+            if (!terminal && !(force && "IN_PROGRESS".equals(job.getStatus()))) {
+                throw new AwsException("InvalidStateTransitionException",
+                        "The job must be terminal, or IN_PROGRESS with force enabled, before deletion.", 409);
+            }
+            executionsForJob(jobId, region).keySet().forEach(jobExecutionStore::delete);
+            jobStore.delete(jobKey(region, jobId));
+        }
     }
 
     public Page<IotJob> listJobs(String region, Integer maxResults, String nextToken) {
@@ -1456,49 +1529,79 @@ public class IotService {
     public IotJobExecution describeJobExecution(String thingName, String jobId, String region) {
         describeThing(thingName, region);
         describeJob(jobId, region);
-        return jobExecutionStore.get(jobExecutionKey(region, thingName, jobId))
+        migrateJobExecutions(jobId, region);
+        String key = jobExecutionKey(region, thingName, jobId);
+        return findJobExecution(key)
                 .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Job execution not found: " + jobId, 404));
     }
 
     public IotJobExecution startNextPendingJobExecution(String thingName, Map<String, String> statusDetails, String region) {
-        IotJobExecution execution = listJobExecutionsForThing(thingName, region, null, null).items().stream()
-                .filter(item -> "QUEUED".equals(item.getStatus()) || "IN_PROGRESS".equals(item.getStatus()))
-                .findFirst()
-                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "No pending job executions for thing: " + thingName, 404));
-        if ("QUEUED".equals(execution.getStatus())) {
-            execution.setStatus("IN_PROGRESS");
-            execution.setStartedAt(Instant.now());
-            execution.setVersionNumber(execution.getVersionNumber() + 1);
+        synchronized (jobWriteLock) {
+            IotJobExecution execution = listJobExecutionsForThing(thingName, region, null, null).items().stream()
+                    .filter(item -> "QUEUED".equals(item.getStatus()) || "IN_PROGRESS".equals(item.getStatus()))
+                    .findFirst()
+                    .orElseThrow(() -> new AwsException("ResourceNotFoundException", "No pending job executions for thing: " + thingName, 404));
+            if ("QUEUED".equals(execution.getStatus())) {
+                execution.setStatus("IN_PROGRESS");
+                execution.setStartedAt(Instant.now());
+                execution.setVersionNumber(execution.getVersionNumber() + 1);
+            }
+            if (statusDetails != null && !statusDetails.isEmpty()) {
+                execution.setStatusDetails(statusDetails);
+            }
+            execution.setLastUpdatedAt(Instant.now());
+            jobExecutionStore.put(jobExecutionKey(region, thingName, execution.getJobId()), execution);
+            return execution;
         }
-        if (statusDetails != null && !statusDetails.isEmpty()) {
-            execution.setStatusDetails(statusDetails);
-        }
-        execution.setLastUpdatedAt(Instant.now());
-        jobExecutionStore.put(jobExecutionKey(region, thingName, execution.getJobId()), execution);
-        return execution;
     }
 
     public IotJobExecution updateJobExecution(String thingName, String jobId, String status, Map<String, String> statusDetails,
                                              Long expectedVersion, String region) {
-        IotJobExecution execution = describeJobExecution(thingName, jobId, region);
-        validateJobExecutionStatus(status);
-        if (expectedVersion != null && execution.getVersionNumber() != expectedVersion) {
-            throw new AwsException("VersionConflictException", "Job execution version does not match expectedVersion", 409);
+        synchronized (jobWriteLock) {
+            IotJobExecution execution = describeJobExecution(thingName, jobId, region);
+            validateJobExecutionStatus(status);
+            if (expectedVersion != null && execution.getVersionNumber() != expectedVersion) {
+                throw new AwsException("VersionConflictException", "Job execution version does not match expectedVersion", 409);
+            }
+            if (TERMINAL_JOB_EXECUTION_STATES.contains(execution.getStatus())) {
+                throw new AwsException("InvalidStateTransitionException", "Job execution is already terminal", 409);
+            }
+            execution.setStatus(status);
+            if ("IN_PROGRESS".equals(status) && execution.getStartedAt() == null) {
+                execution.setStartedAt(Instant.now());
+            }
+            if (statusDetails != null) {
+                execution.setStatusDetails(statusDetails);
+            }
+            execution.setVersionNumber(execution.getVersionNumber() + 1);
+            execution.setLastUpdatedAt(Instant.now());
+            jobExecutionStore.put(jobExecutionKey(region, thingName, jobId), execution);
+            completeSnapshotJob(jobId, region);
+            return execution;
         }
-        if (Set.of("SUCCEEDED", "FAILED", "TIMED_OUT", "REJECTED", "REMOVED", "CANCELED").contains(execution.getStatus())) {
-            throw new AwsException("InvalidStateTransitionException", "Job execution is already terminal", 409);
+    }
+
+    private void completeSnapshotJob(String jobId, String region) {
+        IotJob job = describeJob(jobId, region);
+        if (!"SNAPSHOT".equals(job.getTargetSelection()) || !"IN_PROGRESS".equals(job.getStatus())) {
+            return;
         }
-        execution.setStatus(status);
-        if ("IN_PROGRESS".equals(status) && execution.getStartedAt() == null) {
-            execution.setStartedAt(Instant.now());
+        Map<String, IotJobExecution> executions = executionsForJob(jobId, region);
+        if (!executions.isEmpty() && executions.values().stream()
+                .allMatch(execution -> TERMINAL_JOB_EXECUTION_STATES.contains(execution.getStatus()))) {
+            IotJob completed = new IotJob();
+            completed.setJobId(job.getJobId());
+            completed.setJobArn(job.getJobArn());
+            completed.setDocument(job.getDocument());
+            completed.setDocumentSource(job.getDocumentSource());
+            completed.setDescription(job.getDescription());
+            completed.setTargetSelection(job.getTargetSelection());
+            completed.setTargets(job.getTargets());
+            completed.setCreatedAt(job.getCreatedAt());
+            completed.setStatus("COMPLETED");
+            completed.setLastUpdatedAt(Instant.now());
+            jobStore.put(jobKey(region, jobId), completed);
         }
-        if (statusDetails != null) {
-            execution.setStatusDetails(statusDetails);
-        }
-        execution.setVersionNumber(execution.getVersionNumber() + 1);
-        execution.setLastUpdatedAt(Instant.now());
-        jobExecutionStore.put(jobExecutionKey(region, thingName, jobId), execution);
-        return execution;
     }
 
     public IotTopicRule createTopicRule(String ruleName, JsonNode payload, String region) {
