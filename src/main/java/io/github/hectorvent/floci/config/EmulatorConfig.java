@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.config;
 
 import io.smallrye.config.ConfigMapping;
 import io.smallrye.config.WithDefault;
+import io.smallrye.config.WithName;
 
 import java.net.URI;
 import java.util.List;
@@ -405,6 +406,8 @@ public interface EmulatorConfig {
         SecretsManagerStorageConfig secretsmanager();
         PaymentCryptographyStorageConfig paymentcryptography();
         AcmStorageConfig acm();
+        @WithName("acm-pca")
+        AcmPcaStorageConfig acmPca();
         OpenSearchStorageConfig opensearch();
         AppConfigStorageConfig appconfig();
         AppConfigDataStorageConfig appconfigdata();
@@ -527,6 +530,13 @@ public interface EmulatorConfig {
     }
 
     interface PaymentCryptographyStorageConfig {
+        Optional<String> mode();
+
+        @WithDefault("5000")
+        long flushIntervalMs();
+    }
+
+    interface AcmPcaStorageConfig {
         Optional<String> mode();
 
         @WithDefault("5000")
@@ -826,6 +836,8 @@ public interface EmulatorConfig {
         SwfServiceConfig swf();
         CloudFormationServiceConfig cloudformation();
         AcmServiceConfig acm();
+        @WithName("acm-pca")
+        AcmPcaServiceConfig acmPca();
         AthenaServiceConfig athena();
         GlueServiceConfig glue();
         SesServiceConfig ses();
@@ -2439,6 +2451,11 @@ public interface EmulatorConfig {
          */
         @WithDefault("true")
         boolean allowStubUnsupportedResourceTypes();
+    }
+
+    interface AcmPcaServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
     }
 
     interface AcmServiceConfig {

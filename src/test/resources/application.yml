@@ -55,6 +55,8 @@ floci:
         flush-interval-ms: 60000
       secretsmanager:
         flush-interval-ms: 60000
+      acm-pca:
+        flush-interval-ms: 60000
       acm:
         flush-interval-ms: 60000
       opensearch:
@@ -343,6 +345,8 @@ floci:
       # Pinned to the shipped default so a test sees what a user sees; the strict-mode test
       # overrides it with its own profile.
       allow-stub-unsupported-resource-types: true
+    acm-pca:
+      enabled: true
     acm:
       enabled: true
       validation-wait-seconds: 0

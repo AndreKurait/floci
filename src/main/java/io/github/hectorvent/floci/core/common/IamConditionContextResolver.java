@@ -217,6 +217,7 @@ public class IamConditionContextResolver {
             case "elasticloadbalancing" -> elbV2Contexts(action, ctx).stream().findFirst().orElse(null);
             case "dynamodb" -> dynamoDbConditionContext(action, ctx);
             case "iam" -> iamConditionContext(action, ctx);
+            case "acm-pca" -> privateCaConditionContext(action, ctx);
             case "logs" -> logsConditionContext(action, ctx);
             case "mq" -> mqConfigurationConditions(action, ctx);
             case "lambda" -> lambdaConditionContext(action, ctx);
@@ -388,6 +389,25 @@ public class IamConditionContextResolver {
         tags.forEach((key, value) -> conditions.put(RESOURCE_TAG_PREFIX + key,
                 List.of(value == null ? "" : value)));
         return conditions;
+    }
+
+    private Map<String, List<String>> privateCaConditionContext(String action, ContainerRequestContext ctx) {
+        if (!"acm-pca:IssueCertificate".equals(action)) {
+            return null;
+        }
+        JsonNode body = bufferedJsonBody(ctx);
+        if (body == null) {
+            return null;
+        }
+        JsonNode template = body.path("TemplateArn");
+        if (!template.isMissingNode() && !template.isNull() && !template.isTextual()) {
+            return null;
+        }
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        String value = template.isTextual() ? template.textValue()
+                : AwsArnUtils.Arn.global(AwsRegions.partitionFor(region), "acm-pca", "",
+                        "template/EndEntityCertificate/V1").toString();
+        return Map.of("acm-pca:TemplateArn", List.of(value));
     }
 
     private Map<String, List<String>> iamConditionContext(String action, ContainerRequestContext ctx) {
