@@ -31,7 +31,7 @@ descriptor keeps the `AdditionalLocations`, `BucketColumns`, `SortColumns`, `Ske
 |--------|-------------|
 | CreateDatabase | Creates a database in the local Glue Data Catalog. |
 | GetDatabase | Returns a stored Data Catalog database. |
-| GetDatabases | Lists databases in pages using `MaxResults` and `NextToken`. |
+| GetDatabases | Lists databases in the local Glue Data Catalog. |
 | DeleteDatabase | Deletes a database from the local Glue Data Catalog. |
 
 #### Tables
@@ -40,26 +40,22 @@ descriptor keeps the `AdditionalLocations`, `BucketColumns`, `SortColumns`, `Ske
 |--------|-------------|
 | CreateTable | Creates a table definition in the local Glue Data Catalog. |
 | GetTable | Returns a stored table definition and resolves schema references when possible. |
-| GetTables | Lists table definitions for a database in pages using `MaxResults` and `NextToken`. |
+| GetTables | Lists table definitions for a database. |
 | UpdateTable | Replaces a table definition; the previous version is archived unless `SkipArchive` is set. |
 | DeleteTable | Deletes a table definition from a database. |
 | BatchDeleteTable | Deletes several tables of a database, reporting the missing ones in `Errors`. |
-| GetTableVersions | Lists the current and archived versions of a table, newest first, in pages using `MaxResults` and `NextToken`. |
+| GetTableVersions | Lists the current and archived versions of a table, newest first. |
 | GetTableVersion | Returns one version by `VersionId`, or the current version when none is given. |
 | DeleteTableVersion | Deletes an archived version; the current version cannot be deleted, as on AWS. |
 | BatchDeleteTableVersion | Deletes several archived versions, reporting the ones not deleted in `Errors`. |
 | SearchTables | Searches every table of the catalog by `SearchText` (substring, or exact when quoted), property `Filters` (string keys use the tokenised match of the API reference, time keys honour `Comparator`, other keys read table parameters) and `SortCriteria`, paged by `MaxResults` and `NextToken`. |
-
-`BatchDeleteTable` requires `TablesToDelete` with 0 to 100 names. Missing or oversized lists
-fail with `InvalidInputException` before any table is deleted. Valid batches keep their per-table
-`Errors` response.
 
 #### Partitions
 
 | Action | Description |
 |--------|-------------|
 | CreatePartition | Creates a partition for a Data Catalog table. |
-| GetPartitions | Lists partitions stored for a Data Catalog table in pages using `MaxResults` and `NextToken`. With a `Segment`, returns that segment's share of them: each partition is in exactly one of `TotalSegments` (1 to 10) segments; a `Segment` member that is not an integer is a `SerializationException`. AWS documents `SegmentNumber` values from 0 through `TotalSegments` minus 1 and not what a larger one returns, so a `SegmentNumber` of `TotalSegments` or more returning no partitions is Floci's reading. |
+| GetPartitions | Lists partitions stored for a Data Catalog table. With a `Segment`, returns that segment's share of them: each partition is in exactly one of `TotalSegments` (1 to 10) segments; a `Segment` member that is not an integer is a `SerializationException`. AWS documents `SegmentNumber` values from 0 through `TotalSegments` minus 1 and not what a larger one returns, so a `SegmentNumber` of `TotalSegments` or more returning no partitions is Floci's reading. |
 | BatchDeletePartition | Deletes up to 25 partitions, reporting the ones not found in `Errors`. |
 | CreatePartitionIndex | Registers a partition index on a table. Keys must name partition columns, and a table holds at most 3 indexes. The index reports `CREATING` before `ACTIVE`. |
 | GetPartitionIndexes | Lists a table's partition indexes, each with its keys resolved to name and type. |
@@ -270,6 +266,28 @@ Blueprints are not emulated.
 | UpdateClassifier | Partially updates a classifier without changing its type. |
 | DeleteClassifier | Deletes a classifier by name. |
 
+#### Custom sensitive-data patterns
+
+| Action | Description |
+|--------|-------------|
+| CreateCustomEntityType | Stores a named regular expression, optional context words, and tags. |
+| GetCustomEntityType | Reads a stored pattern definition. |
+| BatchGetCustomEntityTypes | Reads named definitions and identifies names that were not found. |
+| ListCustomEntityTypes | Lists definitions with optional tag filters and pagination. |
+| DeleteCustomEntityType | Deletes a stored definition so its name can be reused. |
+
+Definitions are isolated by account and Region and use the configured Glue storage mode.
+List filters match every supplied tag key-value pair. Results are ordered by name, with opaque
+continuation tokens bound to the account, Region, and tag filter. Definitions retain their regular
+expression and context words without evaluating them; this configuration lifecycle does not perform
+sensitive-data detection or register CloudFormation custom-entity resources.
+
+With IAM enforcement enabled, these operations use their corresponding Glue action on `Resource: "*"`.
+Create also supports `aws:RequestTag` and `aws:TagKeys` conditions and requires `glue:TagResource` when
+tags are supplied. A custom-entity ARN does not grant these unscoped actions.
+`BatchGetCustomEntityTypes` currently checks the batch action alone. AWS's authorization reference also
+lists `glue:GetCustomEntityType` for that operation; requiring a separate Get grant is not implemented.
+
 #### Data quality rulesets
 
 | Action | Description |
@@ -441,5 +459,3 @@ aws glue list-schema-versions \
   --schema-id RegistryName=local-registry,SchemaName=orders \
   --endpoint-url $AWS_ENDPOINT_URL
 ```
-
-Catalog pagination for GetDatabases, GetTables, GetPartitions and GetTableVersions uses opaque continuation cursors ordered by database name, table name, partition values and descending version number respectively. Removing the last returned item or inserting items before its cursor does not invalidate continuation. Table schema references are resolved for the selected page.
