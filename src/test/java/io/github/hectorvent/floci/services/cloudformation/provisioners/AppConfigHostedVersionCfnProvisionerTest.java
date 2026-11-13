@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
 import io.github.hectorvent.floci.services.appconfig.AppConfigService;
 import io.github.hectorvent.floci.services.appconfig.model.HostedConfigurationVersion;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplateEngine;
@@ -13,6 +14,7 @@ import org.mockito.ArgumentCaptor;
 
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -31,10 +33,25 @@ import static org.mockito.Mockito.when;
 class AppConfigHostedVersionCfnProvisionerTest {
     private static final ObjectMapper JSON = new ObjectMapper();
     private final AppConfigService service = mock(AppConfigService.class);
-    private final AppConfigHostedVersionCfnProvisioner provisioner = new AppConfigHostedVersionCfnProvisioner(service);
+    private final ServiceConfigAccess serviceConfig = mock(ServiceConfigAccess.class);
+    private final AppConfigHostedVersionCfnProvisioner provisioner =
+            new AppConfigHostedVersionCfnProvisioner(service, serviceConfig);
     private final ProvisionContext context = new ProvisionContext(CloudFormationTemplateEngine.standalone(
             "000000000000", "us-east-1", "hosted", JSON, value -> value),
             "us-east-1", "000000000000", "hosted");
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void registryHonorsAppConfigEnablement(boolean enabled) {
+        when(serviceConfig.isEnabled("appconfig")).thenReturn(enabled);
+        CloudFormationResourceRegistry registry = new CloudFormationResourceRegistry(List.of(provisioner));
+
+        assertEquals(enabled, registry.forType("AWS::AppConfig::HostedConfigurationVersion").isPresent());
+        assertEquals(!enabled, registry.isServiceDisabled("AWS::AppConfig::HostedConfigurationVersion"));
+        assertEquals("floci.services.appconfig.enabled",
+                registry.serviceEnabledFlag("AWS::AppConfig::HostedConfigurationVersion"));
+        verifyNoInteractions(service);
+    }
 
     @Test
     void preservesContentAndSeparatesReferenceFromPhysicalIdentity() {
@@ -43,7 +60,7 @@ class AppConfigHostedVersionCfnProvisionerTest {
         version.setConfigurationProfileId("prof001");
         version.setVersionNumber(7);
         when(service.createHostedConfigurationVersion(eq("application-name"), eq("profile-name"),
-                any(byte[].class), eq("application/json"), isNull())).thenReturn(version);
+                any(byte[].class), eq("application/json"), isNull(), isNull(), isNull())).thenReturn(version);
         String content = "  {\"message\":\"café\"}\n";
         Map<String, Object> properties = properties(content);
         StackResource resource = resource();
@@ -52,10 +69,11 @@ class AppConfigHostedVersionCfnProvisionerTest {
 
         assertEquals("app0001|prof001|7", resource.getPhysicalId());
         assertEquals("7", provisioner.referenceValue(resource.getPhysicalId()));
+        assertEquals("7", provisioner.publicPhysicalId(resource.getPhysicalId()));
         assertEquals("7", resource.getAttributes().get("VersionNumber"));
         ArgumentCaptor<byte[]> bytes = ArgumentCaptor.forClass(byte[].class);
         verify(service).createHostedConfigurationVersion(
-                eq("application-name"), eq("profile-name"), bytes.capture(), eq("application/json"), isNull());
+                eq("application-name"), eq("profile-name"), bytes.capture(), eq("application/json"), isNull(), isNull(), isNull());
         assertArrayEquals(content.getBytes(StandardCharsets.UTF_8), bytes.getValue());
     }
 
@@ -75,15 +93,62 @@ class AppConfigHostedVersionCfnProvisionerTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"LatestVersionNumber", "VersionLabel"})
-    void unsupportedOptionsAreRejectedBeforeCreatingAVersion(String unsupported) {
+    @ValueSource(strings = {"release", ""})
+    void labelsAndLatestTokenReachTheServiceWithoutLosingTheEmptyProperty(String label) {
+        HostedConfigurationVersion version = new HostedConfigurationVersion();
+        version.setApplicationId("app0001");
+        version.setConfigurationProfileId("prof001");
+        version.setVersionNumber(7);
+        String serviceLabel = label.isEmpty() ? null : label;
+        when(service.createHostedConfigurationVersion(eq("application-name"), eq("profile-name"),
+                any(byte[].class), eq("application/json"), isNull(), eq(serviceLabel), eq(0))).thenReturn(version);
         Map<String, Object> properties = properties("{}");
-        properties.put(unsupported, unsupported.equals("LatestVersionNumber") ? 1 : "release");
+        properties.put("LatestVersionNumber", 0);
+        properties.put("VersionLabel", label);
+        StackResource resource = resource();
+
+        provisioner.provision(resource, JSON.valueToTree(properties), context);
+
+        verify(service).createHostedConfigurationVersion(eq("application-name"), eq("profile-name"),
+                any(byte[].class), eq("application/json"), isNull(), eq(serviceLabel), eq(0));
+        assertEquals("7", provisioner.referenceValue(resource.getPhysicalId()));
+        assertEquals("7", provisioner.publicPhysicalId(resource.getPhysicalId()));
+        assertEquals("7", resource.getAttributes().get("VersionNumber"));
+        assertEquals(JSON.valueToTree(properties).toString(), resource.getAttributes().get(
+                CfnRollback.USES_ATTR_PREFIX + "AppConfigHostedVersionProperties"));
+    }
+
+    @Test
+    void numericParameterTextRetainsItsSignedIntegerValue() {
+        HostedConfigurationVersion version = new HostedConfigurationVersion();
+        version.setApplicationId("app0001");
+        version.setConfigurationProfileId("prof001");
+        version.setVersionNumber(7);
+        when(service.createHostedConfigurationVersion(eq("application-name"), eq("profile-name"),
+                any(byte[].class), eq("application/json"), isNull(), isNull(), eq(Integer.MAX_VALUE))).thenReturn(version);
+        Map<String, Object> properties = properties("{}");
+        properties.put("LatestVersionNumber", Integer.toString(Integer.MAX_VALUE));
+
+        provisioner.provision(resource(), JSON.valueToTree(properties), context);
+
+        verify(service).createHostedConfigurationVersion(eq("application-name"), eq("profile-name"),
+                any(byte[].class), eq("application/json"), isNull(), isNull(), eq(Integer.MAX_VALUE));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"1.5", "2147483648", "-2147483649", "true", "{}", "[]"})
+    void invalidIntegerValuesRefuseBeforeAnyServiceOrResourceMutation(String value) throws Exception {
+        Map<String, Object> properties = properties("{}");
+        properties.put("LatestVersionNumber", JSON.readTree(value));
+        StackResource resource = resource();
+        resource.getAttributes().put("Existing", "unchanged");
 
         AwsException failure = assertThrows(AwsException.class,
-                () -> provisioner.provision(resource(), JSON.valueToTree(properties), context));
+                () -> provisioner.provision(resource, JSON.valueToTree(properties), context));
 
         assertEquals("ValidationError", failure.getErrorCode());
+        assertNull(resource.getPhysicalId());
+        assertEquals(Map.of("Existing", "unchanged"), resource.getAttributes());
         verifyNoInteractions(service);
     }
 
@@ -107,6 +172,14 @@ class AppConfigHostedVersionCfnProvisionerTest {
         resource.getAttributes().put("Arn", CfnResourceDispatcher.STUB_ARN_PREFIX + "Config");
         assertEquals("Config-1234abcd", provisioner.referenceValue(resource.getPhysicalId()));
         provisioner.delete(resource, "us-east-1");
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    void publicProjectionKeepsNullAndOldStubIdsWithoutCallingTheService() {
+        assertNull(provisioner.publicPhysicalId(null));
+        assertEquals("Config-1234abcd", provisioner.publicPhysicalId("Config-1234abcd"));
+        assertEquals("7", provisioner.publicPhysicalId("app0001|prof001|7"));
         verifyNoInteractions(service);
     }
 

@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.cloudformation;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
 import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.services.acm.AcmService;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayService;
@@ -206,6 +207,7 @@ import java.util.List;
 import java.util.Map;
 
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * Builds {@link CfnResourceDispatcher} for tests without a wall of positional nulls.
@@ -352,7 +354,9 @@ final class CfnProvisionerFixture {
             if (appConfigService != null) {
                 discovered.add(new AppConfigCfnProvisioner(appConfigService));
                 discovered.add(new AppConfigDeploymentCfnProvisioner(appConfigService));
-                discovered.add(new AppConfigHostedVersionCfnProvisioner(appConfigService));
+                ServiceConfigAccess serviceConfig = mock(ServiceConfigAccess.class);
+                when(serviceConfig.isEnabled("appconfig")).thenReturn(true);
+                discovered.add(new AppConfigHostedVersionCfnProvisioner(appConfigService, serviceConfig));
             }
             if (codeDeployService != null) {
                 discovered.add(new CodeDeployCfnProvisioner(codeDeployService));

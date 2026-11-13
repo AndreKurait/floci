@@ -237,7 +237,7 @@ notes:
   AWS::AppConfig::Environment: '`DeletionProtectionCheck` is accepted and not stored'
   AWS::AppConfig::ConfigurationProfile: '`KmsKeyIdentifier`, `RetrievalRoleArn`, `Validators` and `DeletionProtectionCheck` are accepted and not stored'
   AWS::AppConfig::DeploymentStrategy: '`ReplicateTo: SSM_DOCUMENT` writes no SSM document'
-  AWS::AppConfig::HostedConfigurationVersion: '`Ref` returns the version number; `LatestVersionNumber` and `VersionLabel` are rejected'
+  AWS::AppConfig::HostedConfigurationVersion: '`Ref` returns the version number as a string; `LatestVersionNumber` and `VersionLabel` are replacement properties'
   AWS::AppConfig::Deployment: 'waits through rollout and bake; deletion reverts when eligible; KMS, dynamic extensions and tags are rejected'
   AWS::SSM::Association: 'Backing configuration, references, updates, rollback and deletion; State Manager execution remains unsupported'
   AWS::SSM::Document: 'JSON content, version selection, replacement and rollback; see SSM documents for unsupported properties'
