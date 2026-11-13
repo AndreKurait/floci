@@ -256,3 +256,98 @@ def test_cfn_stopped_replacement_restores_the_previous_stack_and_configuration(
         assert _outputs(cfn, name) == original
         assert _configuration(scope) == b"second"
         assert _latest(scope)["State"] == "ROLLED_BACK"
+
+
+def _numeric_public_observations(cfn, scope, name):
+    completed = _latest(scope)
+    number = str(completed["DeploymentNumber"])
+    assert completed["State"] == "COMPLETE"
+    outputs = _outputs(cfn, name)
+    assert outputs["Number"] == number and outputs["State"] == "COMPLETE"
+    detail = cfn.describe_stack_resource(StackName=name, LogicalResourceId="Deployment")
+    resources = cfn.describe_stack_resources(StackName=name)
+    summaries = cfn.list_stack_resources(StackName=name)
+    events = cfn.describe_stack_events(StackName=name)
+    assert not resources.get("NextToken") and not summaries.get("NextToken") and not events.get("NextToken")
+    resource = next(row for row in resources["StackResources"] if row["LogicalResourceId"] == "Deployment")
+    summary = next(row for row in summaries["StackResourceSummaries"] if row["LogicalResourceId"] == "Deployment")
+    event_ids = [row["PhysicalResourceId"] for row in events["StackEvents"]
+                 if row["LogicalResourceId"] == "Deployment" and row.get("PhysicalResourceId")]
+    assert event_ids
+    return number, {
+        "Ref": outputs["Reference"],
+        "DescribeStackResource": detail["StackResourceDetail"]["PhysicalResourceId"],
+        "DescribeStackResources": resource["PhysicalResourceId"],
+        "ListStackResources": summary["PhysicalResourceId"],
+    }, event_ids
+
+
+def test_cfn_deployment_numeric_public_identifiers_preserve_deletion(
+        cloudformation_client, deployment_scope, unique_name, record_property):
+    cfn, scope = cloudformation_client, deployment_scope
+    name = "numeric-create-" + unique_name
+    with ExitStack() as cleanup:
+        cfn.create_stack(StackName=name, TemplateBody=json.dumps(_template(scope, "numeric", "instant")))
+        cleanup.callback(_delete_stack, cfn, scope, name)
+        cfn.get_waiter("stack_create_complete").wait(StackName=name, WaiterConfig=WAITER)
+        number, observations, event_ids = _numeric_public_observations(cfn, scope, name)
+        assert _configuration(scope) == b"numeric"
+        _delete_stack(cfn, scope, name)
+        assert _configuration(scope) == b"baseline"
+        reverted = _latest(scope)
+        assert reverted["DeploymentNumber"] == int(number) and reverted["State"] == "REVERTED"
+        record_property("numeric_public_observations", json.dumps({
+            "expected": number, "responses": observations, "event_ids": event_ids}, sort_keys=True))
+        assert observations == {key: number for key in observations}
+        assert set(event_ids) == {number}
+
+
+def test_cfn_deployment_numeric_change_set_and_replacement_identifiers_preserve_retention(
+        cloudformation_client, deployment_scope, unique_name, record_property):
+    cfn, scope = cloudformation_client, deployment_scope
+    name = "numeric-retain-" + unique_name
+    original_template = _template(scope, "second", "instant")
+    replacement_template = _template(scope, "third", "instant")
+    for template in (original_template, replacement_template):
+        template["Resources"]["Deployment"]["DeletionPolicy"] = "Retain"
+        template["Resources"]["Deployment"]["UpdateReplacePolicy"] = "Retain"
+    with ExitStack() as cleanup:
+        cfn.create_stack(StackName=name, TemplateBody=json.dumps(original_template))
+        cleanup.callback(_delete_stack, cfn, scope, name)
+        cfn.get_waiter("stack_create_complete").wait(StackName=name, WaiterConfig=WAITER)
+        original_number, original, original_events = _numeric_public_observations(cfn, scope, name)
+        assert _configuration(scope) == b"second"
+        cfn.create_change_set(StackName=name, ChangeSetName="numeric-replace", ChangeSetType="UPDATE",
+                              TemplateBody=json.dumps(replacement_template))
+        cfn.get_waiter("change_set_create_complete").wait(
+            StackName=name, ChangeSetName="numeric-replace", WaiterConfig=WAITER)
+        change_set = cfn.describe_change_set(StackName=name, ChangeSetName="numeric-replace")
+        assert not change_set.get("NextToken")
+        change = next(row["ResourceChange"] for row in change_set["Changes"]
+                      if row["ResourceChange"]["LogicalResourceId"] == "Deployment")
+        assert change["Action"] == "Modify" and change["Replacement"] == "True"
+        change_id = change["PhysicalResourceId"]
+        cfn.execute_change_set(StackName=name, ChangeSetName="numeric-replace")
+        cfn.get_waiter("stack_update_complete").wait(StackName=name, WaiterConfig=WAITER)
+        number, current, current_events = _numeric_public_observations(cfn, scope, name)
+        assert int(number) > int(original_number)
+        assert _configuration(scope) == b"third"
+        prior = scope["client"].get_deployment(
+            ApplicationId=scope["app"], EnvironmentId=scope["environment"],
+            DeploymentNumber=int(original_number))
+        assert prior["State"] == "COMPLETE"
+        _delete_stack(cfn, scope, name)
+        retained = _latest(scope)
+        assert retained["DeploymentNumber"] == int(number) and retained["State"] == "COMPLETE"
+        assert _configuration(scope) == b"third"
+        _stop(scope, retained)
+        assert _configuration(scope) == b"second"
+        record_property("numeric_public_observations", json.dumps({
+            "original_number": original_number, "original": original, "original_events": original_events,
+            "replacement_number": number, "replacement": current, "replacement_events": current_events,
+            "change_set": change_id}, sort_keys=True))
+        assert original == {key: original_number for key in original}
+        assert set(original_events) == {original_number}
+        assert change_id == original_number
+        assert current == {key: number for key in current}
+        assert number in current_events and set(current_events) <= {original_number, number}

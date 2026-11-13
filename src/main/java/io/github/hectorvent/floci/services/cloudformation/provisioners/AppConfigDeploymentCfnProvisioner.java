@@ -51,6 +51,18 @@ public class AppConfigDeploymentCfnProvisioner implements CfnResourceProvisioner
     }
 
     @Override
+    public String referenceValue(String physicalId) {
+        String[] parts = physicalId.split("\\|", -1);
+        // An older stack can still carry a dispatcher stub until it replaces this resource.
+        return parts.length == 3 ? parts[2] : physicalId;
+    }
+
+    @Override
+    public String publicPhysicalId(String physicalId) {
+        return physicalId == null ? null : referenceValue(physicalId);
+    }
+
+    @Override
     public void provision(StackResource resource, JsonNode properties, ProvisionContext ctx) {
         if (ctx.isUpdate()) {
             ReplacementCleanup.endRollbackRetry(resource);
