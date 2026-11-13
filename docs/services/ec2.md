@@ -2,6 +2,39 @@
 
 **Protocol:** EC2 Query (XML) — `POST http://localhost:4566/` with `Action=` parameter
 
+## Placement-group metadata
+
+`CreatePlacementGroup`, `DescribePlacementGroups`, and `DeletePlacementGroup` support native EC2 Query clients.
+Create accepts `cluster`, `spread` with explicit `SpreadLevel=rack`, and `partition` with an explicit
+`PartitionCount` from 1 to 7. Each group has a stable name, generated ID, `available` state, and a
+name-based ARN (`placement-group/<GroupName>`). Create-time placement-group tags preserve empty values.
+Deleting and recreating a name creates a new ID and discards the old tags.
+
+Describe supports names or IDs separately, and the filters `group-name`, `group-id`, `group-arn`,
+`strategy`, `state`, `spread-level`, `tag-key`, and `tag:<key>`. Filters combine with AND, values within
+each filter with OR, and matching is case-sensitive. The shared EC2 matcher supports `*` wildcards.
+Groups are scoped by account and signed Region, with partition-correct ARNs. Missing named or ID
+selectors return `InvalidPlacementGroup.Unknown`; filters with no matches return an empty list.
+
+With IAM enforcement enabled, Create and Delete authorize the exact name-based ARN; Describe requires
+`Resource: "*"`. Create supports placement-group name, strategy, Region, request-tag and tag-key conditions.
+Tagged creation also requires `ec2:CreateTags` on that same ARN with the `ec2:CreateAction` context.
+Delete resolves both resource-tag condition aliases from the stored group without writing storage.
+It captures the group's generation, or its absence, for the request and checks it again under the
+registry lock before deletion. A concurrent delete/recreate or creation after an absent authorization
+lookup cannot delete the replacement. This guard covers these metadata operations; there is no
+placement-group tag update API. `DryRun` performs authorization and validation without changing groups.
+
+The registry stores immutable records through the configured EC2 storage backend. Persistent and WAL
+modes commit create/delete before publishing the new state; a failed commit keeps the previous state.
+Hybrid mode retains its existing deferred-flush durability behavior.
+
+This is a metadata API. It does not schedule instances, enforce rack or partition placement, track
+instance membership, share groups, or implement parent groups, host spread, or client-token idempotency.
+Omitted spread/partition defaults and simultaneous name/ID selectors are outside this supported slice
+and return an error. Unknown or empty filters are rejected. These local limits and the refusal after
+a concurrent replacement do not establish AWS's error precedence, defaults, or concurrency behavior.
+
 ## Instance Execution Model
 
 `RunInstances` launches a **real Docker container** for each instance. By default, the container is kept alive with `tail -f /dev/null` so any base image works regardless of its default CMD. Catalog entries that opt into the `systemd` guest runtime start `/sbin/init` instead, with the Docker mounts needed for a systemd-based cloud-image guest. Those guests also get the Docker host's `/lib/modules/<KernelVersion>` (the running kernel's directory only, so the guest's own package manager keeps a writable `/lib/modules`) read-only, so `modprobe` finds modules the shared kernel already has (for example `br_netfilter`, which Kubernetes node setup loads). The mount is read-only, but it is not a boundary for a privileged guest: one can remount that directory read-write and load any module built for the shared kernel (see the warning below). On Docker Desktop or OrbStack, that directory is the Linux VM's, which may not hold modules matching the kernel that VM is running. If `/lib/modules/<KernelVersion>` does not exist on the Docker daemon's host, Docker creates an empty root-owned directory there and `modprobe` still fails. The bind is read-only, so a guest that installs the `linux-modules` package for the host's exact kernel version cannot write into it.
