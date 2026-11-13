@@ -1,7 +1,9 @@
 package io.github.hectorvent.floci.services.eks;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Pagination;
+import io.github.hectorvent.floci.services.eks.model.AccessPolicy;
 import io.github.hectorvent.floci.services.eks.model.Addon;
 import io.github.hectorvent.floci.services.eks.model.AssociateAccessPolicyRequest;
 import io.github.hectorvent.floci.services.eks.model.AssociatedAccessPolicy;
@@ -83,6 +85,20 @@ public class EksController {
     public Response listClusters() {
         List<String> clusterNames = eksService.listClusters();
         return Response.ok(Map.of("clusters", clusterNames)).build();
+    }
+
+    @GET
+    @Path("/access-policies")
+    public Response listAccessPolicies(@QueryParam("maxResults") String maxResults,
+                                       @QueryParam("nextToken") String nextToken) {
+        PaginatedResult<AccessPolicy> page = eksService.listAccessPolicies(
+                Pagination.parseMaxResults(maxResults, "InvalidParameterException"), nextToken);
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("accessPolicies", page.items());
+        if (page.nextToken() != null) {
+            body.put("nextToken", page.nextToken());
+        }
+        return Response.ok(body).build();
     }
 
     @GET
