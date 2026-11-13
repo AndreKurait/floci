@@ -159,6 +159,33 @@ class RequestResourcesTest {
     }
 
     @Test
+    void overlappingPermissionFormatsPreferAwsOwnershipInEitherOrder() throws Exception {
+        for (String types : List.of("\"permission\",\"awsPermission\"", "\"awsPermission\",\"permission\"")) {
+            String document = """
+                    {"namespaces":{"ram":[]},"arnFormats":{"ram":{
+                      "permission":"arn:${Partition}:ram:${Region}:${Account}:permission/${Id}",
+                      "awsPermission":"arn:${Partition}:ram:${Region}:aws:permission/${Id}"}},
+                     "operations":{"ram:GetPermission":{"resources":[{"types":[%s],"arn":"permissionArn"}]}}}
+                    """.formatted(types);
+            RequestResourceMembers.Table table = RequestResourceMembers.parse(
+                    new ByteArrayInputStream(document.getBytes(StandardCharsets.UTF_8)));
+            String owned = "arn:aws-us-gov:ram:us-gov-west-1:aws:permission/read";
+            String customer = "arn:aws-us-gov:ram:us-gov-west-1:999988887777:permission/read";
+            for (boolean form : List.of(false, true)) {
+                assertEquals(List.of(owned), RequestResources.named(table.operations().get("ram:GetPermission"),
+                        table.formats().get("ram"), form ? Map.of("permissionArn", owned) : Map.of(),
+                        form ? null : new ObjectMapper().createObjectNode().put("permissionArn", owned),
+                        "aws-us-gov", "us-gov-west-1", "111122223333", null));
+                assertEquals(List.of(customer, "arn:aws-us-gov:ram:us-gov-west-1:111122223333:permission/read"),
+                        RequestResources.named(table.operations().get("ram:GetPermission"), table.formats().get("ram"),
+                                form ? Map.of("permissionArn", customer) : Map.of(),
+                                form ? null : new ObjectMapper().createObjectNode().put("permissionArn", customer),
+                                "aws-us-gov", "us-gov-west-1", "111122223333", null));
+            }
+        }
+    }
+
+    @Test
     void aTypesVariablesAreFilledFromTheRequestAndAListGivesAResourceForEachValue() {
         assertEquals(List.of("arn:aws:ecr:us-east-1:000000000000:repository/web",
                 "arn:aws:ecr:us-east-1:000000000000:repository/api"), of("ecr:DescribeRepositories", json(

@@ -7,6 +7,7 @@ import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.MultivaluedMap;
 
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
@@ -171,7 +172,7 @@ public final class RequestResources {
     }
 
     /** The ARNs of the resources the request names, as {@link #of} reads them. */
-    private static List<String> named(List<RequestResourceMembers.Resource> resources,
+    static List<String> named(List<RequestResourceMembers.Resource> resources,
                                       Map<String, RequestResourceMembers.ArnFormat> formats, Map<String, String> form,
                                       JsonNode body, String partition, String region, String accountId,
                                       StoredResourceArns stored) {
@@ -183,8 +184,10 @@ public final class RequestResources {
             if (resource.arn() != null) {
                 for (String value : values(form, body, resource.arn())) {
                     String named = before(value, resource.before());
+                    // An ARN fitting a customer's format and one AWS owns is AWS's: the account `aws` tells them apart.
                     resource.types().stream().map(formats::get).filter(format -> format.pattern().matcher(named).matches())
-                            .findFirst().ifPresent(format -> addNamed(arns, format.checked(named), format.awsOwned(),
+                            .min(Comparator.comparing(format -> !format.awsOwned()))
+                            .ifPresent(format -> addNamed(arns, format.checked(named), format.awsOwned(),
                                     partition, region, accountId));
                 }
             } else if (resource.through() != null) {
