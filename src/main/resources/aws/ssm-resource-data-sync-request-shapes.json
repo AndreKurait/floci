@@ -6,7 +6,8 @@
   "operations": {
     "CreateResourceDataSync": "CreateResourceDataSyncRequest",
     "ListResourceDataSync": "ListResourceDataSyncRequest",
-    "DeleteResourceDataSync": "DeleteResourceDataSyncRequest"
+    "DeleteResourceDataSync": "DeleteResourceDataSyncRequest",
+    "UpdateResourceDataSync": "UpdateResourceDataSyncRequest"
   },
   "shapes": {
     "CreateResourceDataSyncRequest": {
@@ -177,6 +178,19 @@
       "type": "string",
       "min": 1,
       "max": 64
+    },
+    "UpdateResourceDataSyncRequest": {
+      "type": "structure",
+      "required": [
+        "SyncName",
+        "SyncType",
+        "SyncSource"
+      ],
+      "members": {
+        "SyncName": "ResourceDataSyncName",
+        "SyncType": "ResourceDataSyncType",
+        "SyncSource": "ResourceDataSyncSource"
+      }
     }
   }
 }

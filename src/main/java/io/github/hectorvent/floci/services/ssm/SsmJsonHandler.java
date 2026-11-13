@@ -107,6 +107,10 @@ public class SsmJsonHandler {
                 resourceDataSyncs.create(request, region);
                 yield Response.ok(Map.of()).build();
             }
+            case "UpdateResourceDataSync" -> {
+                resourceDataSyncs.update(request, region);
+                yield Response.ok(Map.of()).build();
+            }
             case "ListResourceDataSync" -> Response.ok(resourceDataSyncs.list(request, region)).build();
             case "DeleteResourceDataSync" -> {
                 resourceDataSyncs.delete(request, region);

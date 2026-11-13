@@ -30,6 +30,18 @@
     ],
     "redshift:GetClusterCredentials": [
       "redshift:DbUser"
+    ],
+    "ssm:CreateResourceDataSync": [
+      "ssm:SyncType"
+    ],
+    "ssm:DeleteResourceDataSync": [
+      "ssm:SyncType"
+    ],
+    "ssm:ListResourceDataSync": [
+      "ssm:SyncType"
+    ],
+    "ssm:UpdateResourceDataSync": [
+      "ssm:SyncType"
     ]
   },
   "members": {
@@ -51,6 +63,26 @@
     "redshift:GetClusterCredentials": {
       "redshift:DbUser": [
         "DbUser"
+      ]
+    },
+    "ssm:CreateResourceDataSync": {
+      "ssm:SyncType": [
+        "SyncType"
+      ]
+    },
+    "ssm:DeleteResourceDataSync": {
+      "ssm:SyncType": [
+        "SyncType"
+      ]
+    },
+    "ssm:ListResourceDataSync": {
+      "ssm:SyncType": [
+        "SyncType"
+      ]
+    },
+    "ssm:UpdateResourceDataSync": {
+      "ssm:SyncType": [
+        "SyncType"
       ]
     }
   }
