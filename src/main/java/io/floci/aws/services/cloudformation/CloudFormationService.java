@@ -4182,12 +4182,9 @@ public class CloudFormationService implements ResourceProvider {
             if (!failedResources.isEmpty()) {
                 String reason = "The following resource(s) failed to delete: ["
                         + String.join(", ", failedResources) + "].";
-                stack.setStatus("DELETE_FAILED");
-                stack.setStatusReason(reason);
+                // Keep retry admission closed until this operation has captured and published its token.
                 addEvent(stack, stack.getStackName(), stack.getStackId(),
                         "AWS::CloudFormation::Stack", "DELETE_FAILED", reason);
-                persistStack(stack);
-                LOG.errorv("Stack {0} delete failed: {1}", stack.getStackName(), reason);
                 throw new IllegalStateException(reason);
             }
 
@@ -4215,9 +4212,12 @@ public class CloudFormationService implements ResourceProvider {
 
         } catch (Exception e) {
             LOG.errorv("Stack {0} delete failed: {1}", stack.getStackName(), e.getMessage());
-            stack.setStatus("DELETE_FAILED");
-            stack.setStatusReason(e.getMessage());
-            persistStack(stack);
+            stacks.compute(stackKey(ownerAccount(stack), stack.getStackName(), region), (key, existing) -> {
+                stack.setStatusReason(e.getMessage());
+                stack.setStatus("DELETE_FAILED");
+                persistStack(stack);
+                return existing;
+            });
             throw (e instanceof RuntimeException re ? re : new RuntimeException(e));
         }
     }
