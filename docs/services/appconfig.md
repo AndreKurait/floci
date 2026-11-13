@@ -7,6 +7,20 @@ the calling account and region. Persisted records from older versions that did n
 record a region remain available only in `floci.default-region`. New writes store
 their region explicitly in all storage modes.
 
+With IAM enforcement enabled, AppConfig and AppConfigData requests require the
+caller's `appconfig:` permissions. Scoped policies use canonical resource IDs even
+when the request uses names. Configuration sessions authorize both creation and
+polling against the application/environment/configuration ARN; a denied poll does
+not consume its token. Passing retrieval or monitor roles also requires
+`iam:PassRole` for the AppConfig service. IAM enforcement remains disabled by default.
+
+Tagged `CreateApplication` and `CreateDeploymentStrategy` requests also require
+`appconfig:TagResource` on `application/*` or `deploymentstrategy/*` in the request's
+partition, account and Region. Both the create action and tagging action evaluate
+`aws:RequestTag` and `aws:TagKeys` conditions. An untagged create needs only its create
+permission. This tag-on-create admission currently covers these two operations;
+child-resource and deployment creation tags remain outside this admission scope.
+
 ## Management Plane (AppConfig)
 
 The management plane allows you to create and manage applications, environments, configuration profiles, and hosted configuration versions.
@@ -26,6 +40,7 @@ The management plane allows you to create and manage applications, environments,
 - `GetConfigurationProfile`
 - `ListConfigurationProfiles`
 - `DeleteConfigurationProfile`
+- `ValidateConfiguration`
 - `CreateHostedConfigurationVersion`
 - `GetHostedConfigurationVersion`
 - `DeleteHostedConfigurationVersion`
@@ -52,6 +67,22 @@ A missing or undeployed environment returns `BadRequestException`; an unknown ap
 returns `ResourceNotFoundException`.
 Only hosted configurations are served: a deployed version with no hosted configuration version behind it,
 such as one from an S3 or SSM source, returns `ResourceNotFoundException`.
+
+`CreateConfigurationProfile` stores up to two `Validators`, each with a `Type` and `Content`
+of at most 32,768 characters. Hosted freeform profiles support inline `JSON_SCHEMA` validators
+using draft-04, including references within the schema. `ValidateConfiguration` checks the
+selected hosted version and returns HTTP 204 when it passes; invalid content or an invalid
+schema returns `BadRequestException`. Validation leaves the stored profile and versions unchanged.
+`StartDeployment` applies the same validators before creating a deployment or changing the active
+configuration, so a refusal preserves the previous deployment and content. With IAM enforcement
+enabled, validation requires `appconfig:ValidateConfiguration` on both the application and
+configuration-profile ARNs.
+
+Other schema drafts and external schema references are not supported. JSON Schema validators
+are refused for feature-flag profiles. Lambda validator declarations are retained, but validation
+and deployment refuse them because Lambda invocation is not implemented. Validation of S3 and
+other external configuration sources is not implemented. The CloudFormation provisioner still
+ignores the template's `Validators`; these validators are configured through the management API.
 
 `CreateEnvironment` keeps up to five `Monitors`, each a CloudWatch `AlarmArn` with an optional IAM role
 `AlarmRoleArn`, and environment reads return them; an environment created without monitors returns none.
