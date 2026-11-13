@@ -996,6 +996,7 @@ floci:
       max-capacity-reservation-ids: ${FLOCI_SERVICES_AUTOSCALING_MAX_CAPACITY_RESERVATION_IDS:1}
     applicationautoscaling:
       enabled: true
+      scheduled-action-interval-seconds: 1
     elasticbeanstalk:
       enabled: true
     backup:

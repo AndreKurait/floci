@@ -19,6 +19,9 @@ Auto Scaling groups over the Query protocol under the `autoscaling` signing name
 | `RegisterScalableTarget` | Registers or updates a scalable target and returns its ARN |
 | `DescribeScalableTargets` | Lists scalable targets in a namespace, optionally filtered |
 | `DeregisterScalableTarget` | Deregisters a target and deletes its policies and alarms |
+| `PutScheduledAction` | Creates or updates a one-off UTC scheduled action for ECS |
+| `DescribeScheduledActions` | Lists scheduled actions with filters and pagination |
+| `DeleteScheduledAction` | Deletes a scheduled action and cancels its pending occurrence |
 | `PutScalingPolicy` | Creates or updates a scaling policy and its CloudWatch alarms |
 | `DescribeScalingPolicies` | Lists scaling policies in a namespace, optionally filtered |
 | `DeleteScalingPolicy` | Deletes a scaling policy and its CloudWatch alarms |
@@ -168,6 +171,50 @@ alarm's stored account and region.
   (MSK broker storage, DynamoDB capacity, ...) remain stored but inert, as
   described below.
 
+## Scheduled scaling (ECS and Lambda)
+
+`PutScheduledAction` accepts `at(yyyy-MM-ddTHH:mm:ss)` in UTC for
+`ecs:service:DesiredCount` and `lambda:function:ProvisionedConcurrency`. Lambda resource IDs
+use `function:<name>:<alias-or-version>`; `$LATEST` is not supported. A new action requires a schedule and a nonempty
+`ScalableTargetAction` with `MinCapacity`, `MaxCapacity`, or both. Updating an action
+preserves omitted whole fields. Supplying `ScalableTargetAction` replaces its configured
+bounds, so a minimum-only update removes any previously configured maximum.
+
+When due, an action changes its configured bounds and preserves the target's other bound.
+Requested capacity is clamped into the resulting range. An in-range count stays unchanged.
+For Lambda, positive capacity initializes real provisioned environments through the existing
+pool; zero removes the allocation. The Lambda API reports initialization readiness separately
+from the scheduled activity. Alias and version identities are preserved.
+Every successful occurrence records a `Successful` scaling activity, including unchanged
+bounds. Failed attempts record a `Failed` activity with the error message.
+A conflicting effective range fails without changing the target.
+
+Completed actions remain visible. An explicit future schedule rearms an action while
+preserving its ARN and creation time. A capacity-only update does not rearm it.
+Deleting an action cancels it. Deregistering a target removes its actions.
+`ScheduledScalingSuspended` skips due occurrences independently of dynamic suspension
+and cooldowns. Resuming does not replay missed actions.
+
+The worker runs every `floci.services.applicationautoscaling.scheduled-action-interval-seconds`
+seconds, default `1`. The environment variable is
+`FLOCI_SERVICES_APPLICATIONAUTOSCALING_SCHEDULED_ACTION_INTERVAL_SECONDS`.
+Past schedules are accepted and retained inactive. Floci compares the deadline with the
+current whole second: the current second is eligible, earlier seconds are inactive.
+This cutoff approximates AWS timing. It does not model an AWS scheduling grace period.
+
+Pending future actions survive restart in persistent, hybrid, and WAL modes. On startup,
+overdue pending actions are skipped. Claimed and terminal occurrences are never replayed.
+Execution claims are stored before effects. If the capacity adapter fails after bounds are stored, the new
+bounds remain and that occurrence fails without retry. Stores do not share a transaction,
+so execution has no exactly-once guarantee across crashes. Hybrid durability depends on
+flush. The scheduler drains before lifecycle storage flush and reset.
+
+Scheduled action ARNs use the `autoscaling` service and this resource path:
+`scheduledAction:<uuid>:resource/<namespace>/<resource-id>:scheduledActionName/<name>`.
+
+See the public [Lambda integration contract](https://docs.aws.amazon.com/autoscaling/application/userguide/services-that-can-integrate-lambda.html)
+and [PutScheduledAction API](https://docs.aws.amazon.com/autoscaling/application/APIReference/API_PutScheduledAction.html).
+
 ## Service-linked roles
 
 When `RoleARN` is omitted, Floci synthesizes and returns a service-linked role ARN in the
@@ -186,8 +233,7 @@ arn:aws:iam::<account>:role/aws-service-role/<namespace>.application-autoscaling
 - The loop consumes CloudWatch metric data; it does not synthesize Lambda utilization
   from invocations. Tests or applications must publish the metric to exercise target
   tracking.
-- `PutScheduledAction`, `DescribeScheduledActions`, and `DeleteScheduledAction` are not
-  implemented.
+- Scheduled scaling supports one-off UTC schedules for ECS desired count and Lambda provisioned concurrency. `Timezone` accepts `UTC` or omission. Recurring schedules, other timezones, `StartTime`, and `EndTime` return `ValidationException`.
 - `PredictiveScalingPolicyConfiguration` is accepted only insofar as `PolicyType` is
   validated; the configuration block is not stored.
 - **The evaluation range's exact width is an approximation.** Alarm evaluation follows
