@@ -40,7 +40,7 @@ public class LambdaRuntimeManagementController {
     public Response getRuntimeManagementConfig(@Context HttpHeaders headers,
                                                @PathParam("functionName") String functionName,
                                                @QueryParam("Qualifier") String qualifier) {
-        return response(service.get(regions.resolveRegion(headers), functionName, qualifier));
+        return response(service.get(regions.getRegion(), functionName, qualifier));
     }
 
     @PUT
@@ -54,7 +54,7 @@ public class LambdaRuntimeManagementController {
         } catch (JsonProcessingException malformed) {
             throw LambdaRuntimeManagementReference.invalid("Could not parse request body into JSON");
         }
-        return response(service.put(regions.resolveRegion(headers), functionName, qualifier, request));
+        return response(service.put(regions.getRegion(), functionName, qualifier, request));
     }
 
     private Response response(LambdaRuntimeManagementService.Result result) {
