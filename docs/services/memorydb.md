@@ -25,10 +25,54 @@ Set `FLOCI_SERVICES_MEMORYDB_MOCK=true` to manage clusters as control-plane-only
 | `CreateACL` | - |
 | `DescribeACLs` | - |
 | `DeleteACL` | - |
-| `ListTags` | List tags for a cluster, user or ACL |
-| `TagResource` | Add tags to a cluster, user or ACL |
-| `UntagResource` | Remove tags from a cluster, user or ACL |
+| `ListTags` | List tags for a cluster, user, ACL or parameter group |
+| `TagResource` | Add tags to a cluster, user, ACL or parameter group |
+| `UntagResource` | Remove tags from a cluster, user, ACL or parameter group |
+| `CreateParameterGroup` | Create a standalone parameter group for a supported family |
+| `DeleteParameterGroup` | Delete a custom parameter group, its overrides and tags |
+| `DescribeParameterGroups` | Page through scoped default and custom parameter groups |
+| `DescribeParameters` | Page through effective parameters for one group |
+| `UpdateParameterGroup` | Validate and apply up to twenty parameter overrides atomically |
+| `ResetParameterGroup` | Reset selected overrides or all overrides to family defaults |
 <!-- floci:actions:end -->
+
+## Standalone parameter groups
+
+`CreateParameterGroup`, `DeleteParameterGroup`, `DescribeParameterGroups`,
+`DescribeParameters`, `UpdateParameterGroup` and `ResetParameterGroup` manage
+standalone metadata for `memorydb_redis6`, `memorydb_redis7` and `memorydb_valkey7`.
+The five default groups include the Redis 7 and Valkey 7 search variants.
+`ListTags`, `TagResource` and `UntagResource` also accept parameter group ARNs;
+the latter returns the tags removed.
+
+Names are stored lowercase, with the documented 1-255 ASCII character syntax.
+Custom groups retain descriptions, tags and parameter overrides in the configured
+storage mode, scoped to the caller's account, Region and partition. Default group
+parameters cannot be changed or deleted; their tags use a separate stored overlay.
+Updates and resets validate the complete batch before publishing an immutable
+replacement. Reset drains current group operations and refuses new operations
+until storage reset finishes, including when another reset hook fails.
+
+The versioned catalog contains 56 parameter definitions with family-specific
+availability. Its provenance and corrections are recorded in
+`docs/memorydb-parameter-catalog-provenance.json` and each catalog entry.
+Documented and recorded values override conflicting compatibility-source values.
+This is a bounded metadata catalog, with some source-derived descriptions and
+minimum engine versions; it is not a complete, independently verified AWS catalog.
+An unavailable stored catalog version fails explicitly instead of changing defaults.
+Parameter groups are not attached to clusters and do not configure running engines.
+
+Both describe operations return sorted pages. The local `MaxResults` range is
+20-100, with a default of 100. Authenticated continuation tokens bind the operation,
+caller scope, selector, page size and current snapshot. Changes to that snapshot,
+restart or reset invalidate its tokens. The optional description has a local
+255-character ceiling. Hybrid storage keeps its normal asynchronous durability.
+
+IAM checks named operations on the canonical parameter group ARN and unfiltered
+collection requests on `*`. Create itself uses `*`; a tagged create additionally
+requires `memorydb:TagResource` on the lowercase ARN that will be stored.
+Resource-tag conditions read current scoped tags without creating or migrating
+records. Authorization and the subsequent mutation are separate operations.
 
 ## Configuration
 

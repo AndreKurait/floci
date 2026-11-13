@@ -21,6 +21,7 @@ import io.floci.aws.services.kms.KmsService;
 import io.floci.aws.services.lambda.LambdaArnUtils;
 import io.floci.aws.services.lambda.durable.DurableTokens;
 import io.floci.aws.services.lambdamicrovms.LambdaMicrovmsService;
+import io.floci.aws.services.memorydb.MemoryDbParameterGroupTarget;
 import io.floci.aws.services.s3.S3ControlArnUtils;
 import io.floci.aws.services.s3.S3ObjectKeys;
 import io.floci.aws.services.s3.S3ResourceArns;
@@ -219,6 +220,12 @@ public class ResourceArnBuilder {
                                        String region, String accountId, String partition) {
         if (credentialScope == null) {
             return List.of("*");
+        }
+        if ("memorydb".equals(credentialScope)) {
+            JsonNode body = readJsonBody(ctx);
+            if (MemoryDbParameterGroupTarget.claims(operation, body)) {
+                return List.of(MemoryDbParameterGroupTarget.resourceArn(operation, body, partition, region, accountId));
+            }
         }
         if (operation != null && operation.startsWith(credentialScope + ":") && RequestResources.reads(operation)) {
             return namedResources(credentialScope, operation, ctx, region, accountId, partition);
