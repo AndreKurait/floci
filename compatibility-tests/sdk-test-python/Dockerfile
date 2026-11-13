@@ -6,6 +6,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY conftest.py pytest.ini ./
 COPY tests/ tests/
+COPY iam/ iam/
 
 ENV FLOCI_ENDPOINT=http://floci:4566
 

@@ -10,6 +10,7 @@ import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.appconfig.model.Application;
+import io.floci.aws.services.appconfig.model.ConfigurationContent;
 import io.floci.aws.services.appconfig.model.ConfigurationProfile;
 import io.floci.aws.services.appconfig.model.ConfigurationSession;
 import io.floci.aws.services.appconfig.model.Environment;
@@ -102,6 +103,19 @@ public class AppConfigDataService {
         return getLatestConfiguration(token, null);
     }
 
+    /** The resource a valid token names, without consuming the token or changing its session. */
+    Map<String, String> configurationForToken(String token) {
+        ConfigurationSession session = sessionStore.get(token)
+                .orElseThrow(() -> new AwsException("BadRequestException", "Invalid configuration token", 400));
+        synchronized (session) {
+            if (!token.equals(session.getCurrentToken())) {
+                throw new AwsException("BadRequestException", "Invalid configuration token", 400);
+            }
+            return Map.of("ApplicationId", session.getApplicationId(), "EnvironmentId", session.getEnvironmentId(),
+                    "ConfigurationProfileId", session.getConfigurationProfileId());
+        }
+    }
+
     /** {@code accept} is the caller's Accept header: the AppConfig Agent asks for Ion to evaluate variant flags itself. */
     public ConfigurationData getLatestConfiguration(String token, String accept) {
         ConfigurationSession session = sessionStore.get(token)
@@ -121,13 +135,26 @@ public class AppConfigDataService {
         session.setRequiredMinimumPollIntervalInSeconds(pollInterval);
 
         String activeVersion = appConfigService.getActiveVersion(session.getEnvironmentId(), session.getConfigurationProfileId());
-        
-        HostedConfigurationVersion version = null;
-        if (activeVersion != null && !activeVersion.equals(session.getLastConfigurationVersion())) {
+        boolean changed = activeVersion != null && !activeVersion.equals(session.getLastConfigurationVersion());
+
+        ConfigurationContent version = null;
+        HostedConfigurationVersion hosted = null;
+        ConfigurationProfile profile = null;
+        if (activeVersion != null) {
             try {
-                version = appConfigService.getHostedConfigurationVersion(session.getApplicationId(), session.getConfigurationProfileId(), Integer.parseInt(activeVersion));
-                session.setLastConfigurationVersion(activeVersion);
-            } catch (Exception e) {
+                profile = appConfigService.getConfigurationProfile(
+                        session.getApplicationId(), session.getConfigurationProfileId());
+                if (AppConfigS3Source.matches(profile)) {
+                    version = configurationContent(profile, activeVersion);
+                } else {
+                    hosted = appConfigService.getHostedConfigurationVersion(
+                            profile.getApplicationId(), profile.getId(), hostedVersionNumber(activeVersion));
+                    version = new ConfigurationContent(hosted.getContent(), hosted.getContentType());
+                }
+                if (version != null && changed) {
+                    session.setLastConfigurationVersion(activeVersion);
+                }
+            } catch (AwsException e) {
                 LOG.warnv("Active version {0} not found for session {1}", activeVersion, session.getId());
             }
         }
@@ -141,15 +168,23 @@ public class AppConfigDataService {
         byte[] content = new byte[0];
         String contentType = "application/octet-stream";
         if (version != null) {
-            ConfigurationProfile profile = appConfigService.getConfigurationProfile(
-                    session.getApplicationId(), session.getConfigurationProfileId());
             ResolvedContent resolved = resolveContent(profile, version, accept);
-            content = resolved.bytes();
+            if (changed) {
+                content = resolved.bytes();
+            }
             contentType = resolved.contentType();
         }
-        String versionLabel = (version != null) ? String.valueOf(version.getVersionNumber()) : "";
+        String configurationVersion = version != null && changed ? activeVersion : "";
+        if (hosted != null && changed) {
+            configurationVersion = Integer.toString(hosted.getVersionNumber());
+        }
+        String versionLabel = profile != null && AppConfigS3Source.matches(profile)
+                ? null : configurationVersion;
+        if (hosted != null) {
+            versionLabel = changed ? hosted.getVersionLabel() : null;
+        }
 
-        return new ConfigurationData(content, contentType, versionLabel, nextToken,
+        return new ConfigurationData(content, contentType, configurationVersion, versionLabel, nextToken,
                 pollInterval);
     }
 
@@ -181,13 +216,12 @@ public class AppConfigDataService {
         if (active == null) {
             throw new AwsException("BadRequestException", "No configuration is deployed", 400);
         }
-        HostedConfigurationVersion version = appConfigService.getHostedConfigurationVersion(
-                app.getId(), profile.getId(), hostedVersionNumber(active));
+        ConfigurationContent version = configurationContent(profile, active);
         if (active.equals(clientVersion)) {
-            return new LegacyConfiguration(new byte[0], version.getContentType(), active);
+            return new LegacyConfiguration(new byte[0], version.contentType(), active, AppConfigS3Source.matches(profile));
         }
         ResolvedContent content = resolveContent(profile, version, accept);
-        return new LegacyConfiguration(content.bytes(), content.contentType(), active);
+        return new LegacyConfiguration(content.bytes(), content.contentType(), active, AppConfigS3Source.matches(profile));
     }
 
     /** A deployed version that is not a version number names no hosted configuration version. */
@@ -199,22 +233,31 @@ public class AppConfigDataService {
         }
     }
 
-    private ResolvedContent resolveContent(ConfigurationProfile profile, HostedConfigurationVersion version,
+    private ConfigurationContent configurationContent(ConfigurationProfile profile, String version) {
+        if (AppConfigS3Source.matches(profile)) {
+            return appConfigService.getS3ConfigurationContent(profile.getApplicationId(), profile.getId(), version);
+        }
+        HostedConfigurationVersion hosted = appConfigService.getHostedConfigurationVersion(
+                profile.getApplicationId(), profile.getId(), hostedVersionNumber(version));
+        return new ConfigurationContent(hosted.getContent(), hosted.getContentType());
+    }
+
+    private ResolvedContent resolveContent(ConfigurationProfile profile, ConfigurationContent version,
                                            String accept) {
         if (!"AWS.AppConfig.FeatureFlags".equals(profile.getType())) {
-            return new ResolvedContent(version.getContent(), version.getContentType());
+            return new ResolvedContent(version.content(), version.contentType());
         }
         // As AWS does: a caller that accepts Ion gets variant flags whole, to evaluate against its own context.
-        if (acceptsFeatureFlagIon(accept) && FeatureFlagIonEncoder.hasVariants(version.getContent(), objectMapper)) {
-            byte[] ion = FeatureFlagIonEncoder.encode(version.getContent(), objectMapper);
+        if (acceptsFeatureFlagIon(accept) && FeatureFlagIonEncoder.hasVariants(version.content(), objectMapper)) {
+            byte[] ion = FeatureFlagIonEncoder.encode(version.content(), objectMapper);
             if (ion != null) {
                 return new ResolvedContent(ion, FeatureFlagIonEncoder.CONTENT_TYPE);
             }
             LOG.warnv("Feature flag profile {0} has variants Floci cannot encode as Ion; returning the stored JSON",
                     profile.getId());
         }
-        return new ResolvedContent(transformFeatureFlags(version.getContent(), objectMapper),
-                version.getContentType());
+        return new ResolvedContent(transformFeatureFlags(version.content(), objectMapper),
+                version.contentType());
     }
 
     static boolean acceptsFeatureFlagIon(String accept) {
@@ -335,8 +378,13 @@ public class AppConfigDataService {
 
     private record ResolvedContent(byte[] bytes, String contentType) {}
 
-    public record LegacyConfiguration(byte[] content, String contentType, String configurationVersion) {}
+    public record LegacyConfiguration(byte[] content, String contentType, String configurationVersion,
+                                      boolean s3Source) {
+        public LegacyConfiguration(byte[] content, String contentType, String configurationVersion) {
+            this(content, contentType, configurationVersion, false);
+        }
+    }
 
-    public record ConfigurationData(byte[] content, String contentType, String configurationVersion,
+    public record ConfigurationData(byte[] content, String contentType, String configurationVersion, String versionLabel,
                                     String nextPollConfigurationToken, int nextPollIntervalInSeconds) {}
 }
