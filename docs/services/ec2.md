@@ -48,6 +48,8 @@ capped at 30 seconds between attempts. A transient Docker removal error does not
 another `TerminateInstances` call. The instance remains `shutting-down` and retains its
 ports, private-address reservation and cleanup identity until teardown completes.
 Repeated termination requests share the pending operation.
+Retries and synchronous shutdown resume the unfinished phases of that captured operation.
+Successful lease releases and metadata cleanup are retained in process after a later phase fails.
 Attached network interfaces stay `in-use` until physical teardown completes, so
 interface waiters cannot observe release while security groups still have a live
 instance dependency. Completion deletes interfaces with `DeleteOnTermination=true`

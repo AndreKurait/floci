@@ -2185,15 +2185,19 @@ public class Ec2ContainerManager {
      */
     public void terminate(Instance instance, Runnable afterTeardown) {
         guestReboots.forget(instance);
-        PendingTermination pending = pendingTerminations.computeIfAbsent(instance.getInstanceId(), ignored -> {
+        PendingTermination pending = pendingTermination(instance, afterTeardown);
+        if (pending != null) {
+            submitTermination(pending);
+        }
+    }
+
+    private PendingTermination pendingTermination(Instance instance, Runnable afterTeardown) {
+        return pendingTerminations.computeIfAbsent(instance.getInstanceId(), ignored -> {
             if (instance.getState() != null && "terminated".equals(instance.getState().getName())) {
                 return null;
             }
             return new PendingTermination(instance, terminationOperation(instance, afterTeardown));
         });
-        if (pending != null) {
-            submitTermination(pending);
-        }
     }
 
     private void retryPendingTerminations(Instant ignored) {
@@ -2284,15 +2288,21 @@ public class Ec2ContainerManager {
 
     /** Complete ephemeral teardown before shutdown destroys the lifecycle executor. */
     public void terminateForShutdown(Instance instance) {
-        PendingTermination pending = pendingTerminations.get(instance.getInstanceId());
-        Runnable operation = pending == null ? terminationOperation(instance, null) : pending.operation;
-        operation.run();
+        // A cancelled launch can be terminal while its captured workload cleanup remains uncertain.
+        FailedLaunchCleanup failedLaunch = failedLaunchCleanups.get(instance.getInstanceId());
+        if (failedLaunch != null) {
+            RequestScopes.runAs(failedLaunch.accountId(), failedLaunch.region(),
+                    () -> completeFailedLaunchCleanup(failedLaunch));
+        }
+        PendingTermination pending = pendingTermination(instance, null);
+        if (pending == null) {
+            return;
+        }
+        pending.operation.run();
         if (instance.getState() == null || !"terminated".equals(instance.getState().getName())) {
             throw new IllegalStateException("EC2 instance teardown did not complete: " + instance.getInstanceId());
         }
-        if (pending != null) {
-            pendingTerminations.remove(instance.getInstanceId(), pending);
-        }
+        pendingTerminations.remove(instance.getInstanceId(), pending);
     }
 
     private Runnable terminationOperation(Instance instance, Runnable afterTeardown) {
@@ -2314,74 +2324,106 @@ public class Ec2ContainerManager {
         // Capture ownership now: a retained ENI may be registered again before Docker cleanup runs.
         Runnable firewallCleanup = firewallManager != null && firewallManager.enabled() && firewallEniId != null
                 ? firewallManager.captureUnregister(firewallEniId) : null;
-        return () -> {
-            // The post-teardown hook's only precondition; see the Javadoc above for why.
-            boolean containerGone = false;
-            try {
-                portForwardManager.unpublishAll(instance);
-                if (containerId == null) {
-                    // Nothing was ever launched, so there is no container to hold the image.
-                    containerGone = true;
-                }
-                if (containerId != null) {
-                    try {
+        List<Runnable> teardownSteps = List.of(
+                () -> systemdV1.remove(instance),
+                () -> {
+                    // Retire the endpoint before removing its namespace: another termination may reconcile peers.
+                    if (firewallCleanup != null) {
+                        firewallCleanup.run();
+                    }
+                },
+                () -> removeNetworkHelper(instance));
+        List<Runnable> ownerCleanupSteps = List.of(
+                () -> {
+                    if (sshHostPort > 0) {
+                        portAllocator.release(sshHostPort);
+                    }
+                },
+                () -> metadataServer.unregisterContainer(containerIp, instance),
+                () -> metadataServer.unregisterContainer(imdsSourceIp, instance),
+                () -> metadataServer.unregisterInstance(instance),
+                // Give the address back only after its original workload and helper are gone.
+                () -> vpcNetworkManager.releasePrivateIp(instance.getRegion(), instance.getSubnetId(),
+                        instance.getPrivateIpAddress()),
+                () -> {
+                    long terminatedAt = clock.millis();
+                    instance.setState(InstanceState.terminated());
+                    instance.setTerminatedAt(terminatedAt);
+                });
+        return new Runnable() {
+            private boolean unpublished;
+            private boolean workloadGone;
+            private int nextTeardown;
+            private int nextOwnerCleanup;
+
+            @Override
+            public void run() {
+                try {
+                    advance();
+                } finally {
+                    boolean teardownComplete;
+                    synchronized (this) {
+                        teardownComplete = workloadGone && nextTeardown == teardownSteps.size();
+                    }
+                    // Callbacks may invoke shutdown from another thread; never hold the operation monitor here.
+                    if (afterTeardown != null && teardownComplete && notified.compareAndSet(false, true)) {
                         try {
-                            OwnedNamespace namespace = ownedNamespace(instance, containerId);
-                            if (namespace != null) {
-                                networkHelpers.put(instance.getInstanceId(), namespace.helperId());
-                            }
-                        } catch (NotFoundException ignored) {
-                            // A missing helper does not establish that the workload is also gone.
+                            afterTeardown.run();
+                        } catch (Exception e) {
+                            LOG.warnv("Post-teardown hook failed for instance {0}: {1}",
+                                    instance.getInstanceId(), e.getMessage());
                         }
-                        dockerClient.removeContainerCmd(containerId).withForce(true).exec();
-                        containerGone = true;
-                    } catch (NotFoundException e) {
-                        // already gone
-                        containerGone = true;
-                    } catch (Exception e) {
-                        LOG.warnv("Error removing EC2 container {0}: {1}", containerId, e.getMessage());
-                        return;
-                    }
-                    try {
-                        // iptables/veth teardown lags behind container removal; prevents port-reuse conflicts.
-                        pause.pause(500);
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
+                    } else if (afterTeardown != null && !teardownComplete) {
+                        LOG.warnv("Skipping post-teardown hook for instance {0}: its container is "
+                                + "not established to be gone, so anything waiting on the container "
+                                + "being gone would fail", instance.getInstanceId());
                     }
                 }
-                containerGone = false;
-                systemdV1.remove(instance);
-                // Retire the endpoint before removing its namespace: another termination may reconcile peers.
-                if (firewallCleanup != null) {
-                    firewallCleanup.run();
+            }
+
+            // Async retries and synchronous shutdown share this captured operation. Only a normally completed
+            // step advances: a later failure cannot release an already completed lease again after its reuse.
+            private synchronized void advance() {
+                if (!unpublished) {
+                    portForwardManager.unpublishAll(instance);
+                    unpublished = true;
                 }
-                removeNetworkHelper(instance);
-                containerGone = true;
-                if (sshHostPort > 0) {
-                    portAllocator.release(sshHostPort);
-                }
-                metadataServer.unregisterContainer(containerIp, instance);
-                metadataServer.unregisterContainer(imdsSourceIp, instance);
-                metadataServer.unregisterInstance(instance);
-                // Give the address back only now that the container is gone: releasing it while
-                // Docker still holds the endpoint would hand the same IP to the next launch and
-                // have Docker refuse it.
-                vpcNetworkManager.releasePrivateIp(instance.getRegion(), instance.getSubnetId(),
-                        instance.getPrivateIpAddress());
-                instance.setState(InstanceState.terminated());
-                instance.setTerminatedAt(clock.millis());
-            } finally {
-                if (afterTeardown != null && containerGone && notified.compareAndSet(false, true)) {
-                    try {
-                        afterTeardown.run();
-                    } catch (Exception e) {
-                        LOG.warnv("Post-teardown hook failed for instance {0}: {1}",
-                                instance.getInstanceId(), e.getMessage());
+                if (!workloadGone) {
+                    if (containerId != null) {
+                        try {
+                            try {
+                                OwnedNamespace namespace = ownedNamespace(instance, containerId);
+                                if (namespace != null) {
+                                    networkHelpers.put(instance.getInstanceId(), namespace.helperId());
+                                }
+                            } catch (NotFoundException ignored) {
+                                // A missing helper does not establish that the workload is also gone.
+                            }
+                            dockerClient.removeContainerCmd(containerId).withForce(true).exec();
+                        } catch (NotFoundException ignored) {
+                            // The exact captured workload is already gone.
+                        } catch (Exception e) {
+                            LOG.warnv("Error removing EC2 container {0}: {1}", containerId, e.getMessage());
+                            return;
+                        }
                     }
-                } else if (afterTeardown != null && !containerGone) {
-                    LOG.warnv("Skipping post-teardown hook for instance {0}: its container is "
-                            + "not established to be gone, so anything waiting on the container "
-                            + "being gone would fail", instance.getInstanceId());
+                    workloadGone = true;
+                    if (containerId != null) {
+                        try {
+                            // iptables/veth teardown lags behind container removal; pause once before lease reuse.
+                            pause.pause(500);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                }
+                while (nextTeardown < teardownSteps.size()) {
+                    teardownSteps.get(nextTeardown).run();
+                    nextTeardown++;
+                }
+                while (nextOwnerCleanup < ownerCleanupSteps.size()) {
+                    ownerCleanupSteps.get(nextOwnerCleanup).run();
+                    nextOwnerCleanup++;
                 }
             }
         };

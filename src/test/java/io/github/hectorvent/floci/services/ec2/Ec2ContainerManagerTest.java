@@ -263,10 +263,9 @@ class Ec2ContainerManagerTest {
             assertTrue(helperRemoved.get());
             verify(firewall).captureUnregister("eni-firewall-teardown");
             verify(firewallCleanup, times(peerRefreshFailure ? 2 : 1)).run();
-            assertEquals(retried ? 2 : 1, removals.get());
-            // The retry comes one second after the failure, and each successful removal adds its lag.
-            assertEquals(TestTime.DEFAULT_START.plusMillis(
-                    peerRefreshFailure ? 2_000 : transientFailure ? 1_500 : 500), time.now());
+            assertEquals(transientFailure ? 2 : 1, removals.get());
+            // A retry retains successful workload removal and its completed half-second teardown pause.
+            assertEquals(TestTime.DEFAULT_START.plusMillis(retried ? 1_500 : 500), time.now());
             assertEquals(time.clock().millis(), instance.getTerminatedAt());
         } finally {
             manager.stop();
