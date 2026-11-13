@@ -29,16 +29,14 @@ import java.util.Set;
  *
  * <p>An update that keeps every create-only property changes the entity in place. Every mutable
  * property is written, so one the template drops is cleared or back at its default, and what the
- * update replaces is kept on the resource so a failed stack update can put it back; an
- * application's tags are driven to the template's set. An update that changes a create-only
+ * update replaces is kept on the resource so a failed stack update can put it back; each
+ * resource's tags are driven to the template's set. An update that changes a create-only
  * property (the {@code ApplicationId} of an environment or profile, a profile's {@code LocationUri}
  * or {@code Type}, a strategy's {@code Name} or {@code ReplicateTo}) creates the new entity and
  * leaves the displaced one to the {@link ReplacementCleanup} record. Whether one changed is judged on
  * the resolved template values the entity was made from, as CloudFormation compares them.
  *
- * <p>Floci keeps AppConfig tags on applications only, so {@code Tags} on the other three types are
- * accepted and not stored, as Floci's AppConfig TagResource treats them. So are a profile's
- * {@code KmsKeyIdentifier}, and the
+ * <p>A profile's {@code KmsKeyIdentifier}, and the
  * {@code DeletionProtectionCheck} of an environment or profile, which Floci's create operations do
  * not keep either.
  */
@@ -130,6 +128,7 @@ public class AppConfigCfnProvisioner implements CfnResourceProvisioner {
         Map<String, Object> request = new HashMap<>();
         request.put("Name", name);
         request.put("Description", description);
+        request.put("Tags", tags);
         Application app = service.createApplication(request);
         r.setPhysicalId(app.getId());
         r.getAttributes().put("ApplicationId", app.getId());
@@ -145,6 +144,7 @@ public class AppConfigCfnProvisioner implements CfnResourceProvisioner {
         String name = requiredText(ENVIRONMENT, props, "Name", NAME_MAX_LENGTH, ctx);
         String description = optionalText(ENVIRONMENT, props, "Description", DESCRIPTION_MAX_LENGTH, ctx);
         Object monitors = jsonValue(resolved(props, "Monitors", ctx));
+        Map<String, String> tags = ctx.resolveTags(props, "Tags");
         allowed(ENVIRONMENT, "DeletionProtectionCheck", text(props, "DeletionProtectionCheck", ctx),
                 DELETION_PROTECTION_CHECKS);
         ObjectNode createOnly = MAPPER.createObjectNode().put("ApplicationId", applicationId);
@@ -152,13 +152,17 @@ public class AppConfigCfnProvisioner implements CfnResourceProvisioner {
             Environment current = service.findEnvironment(ctx.priorPhysicalId())
                     .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Environment not found", 404));
             snapshotBeforeUpdate(r, current);
-            service.updateEnvironment(current.getApplicationId(), current.getId(), name, description, monitors);
+            CfnRollback.guarded(r, ctx, false, () -> { }, () -> restoreSnapshot(r), () -> {
+                service.updateEnvironment(current.getApplicationId(), current.getId(), name, description, monitors);
+                service.setResourceTags("environment", current.getApplicationId(), current.getId(), tags);
+            });
             return;
         }
         Map<String, Object> request = new HashMap<>();
         request.put("Name", name);
         request.put("Description", description);
         request.put("Monitors", monitors);
+        request.put("Tags", tags);
         Environment env = service.createEnvironment(applicationId, request);
         r.setPhysicalId(env.getId());
         r.getAttributes().put("EnvironmentId", env.getId());
@@ -174,6 +178,7 @@ public class AppConfigCfnProvisioner implements CfnResourceProvisioner {
         String description = optionalText(PROFILE, props, "Description", DESCRIPTION_MAX_LENGTH, ctx);
         String retrievalRoleArn = optionalText(PROFILE, props, "RetrievalRoleArn", 2048, ctx);
         Object validators = jsonValue(resolved(props, "Validators", ctx));
+        Map<String, String> tags = ctx.resolveTags(props, "Tags");
         allowed(PROFILE, "DeletionProtectionCheck", text(props, "DeletionProtectionCheck", ctx),
                 DELETION_PROTECTION_CHECKS);
         ObjectNode createOnly = MAPPER.createObjectNode()
@@ -187,12 +192,16 @@ public class AppConfigCfnProvisioner implements CfnResourceProvisioner {
         request.put("Type", type);
         request.put("RetrievalRoleArn", retrievalRoleArn);
         request.put("Validators", validators);
+        request.put("Tags", tags);
         if (updating && madeFrom(r, createOnly)) {
             ConfigurationProfile current = service.findConfigurationProfile(ctx.priorPhysicalId())
                     .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                             "Configuration profile not found", 404));
             snapshotBeforeUpdate(r, current);
-            service.updateConfigurationProfile(current.getApplicationId(), current.getId(), request);
+            CfnRollback.guarded(r, ctx, false, () -> { }, () -> restoreSnapshot(r), () -> {
+                service.updateConfigurationProfile(current.getApplicationId(), current.getId(), request);
+                service.setResourceTags("configurationprofile", current.getApplicationId(), current.getId(), tags);
+            });
             return;
         }
         ConfigurationProfile profile = service.createConfigurationProfile(applicationId, request);
@@ -220,12 +229,16 @@ public class AppConfigCfnProvisioner implements CfnResourceProvisioner {
         String growthType = allowed(STRATEGY, "GrowthType", text(props, "GrowthType", ctx), GROWTH_TYPES);
         String effectiveGrowthType = growthType == null ? "LINEAR" : growthType;
         String description = optionalText(STRATEGY, props, "Description", DESCRIPTION_MAX_LENGTH, ctx);
+        Map<String, String> tags = ctx.resolveTags(props, "Tags");
         ObjectNode createOnly = MAPPER.createObjectNode().put("Name", name).put("ReplicateTo", replicateTo);
         if (updating && madeFrom(r, createOnly)) {
             String id = ctx.priorPhysicalId();
             snapshotBeforeUpdate(r, service.getDeploymentStrategy(id));
-            service.updateDeploymentStrategy(id, description, duration, finalBakeMinutes, growthFactor,
-                    effectiveGrowthType);
+            CfnRollback.guarded(r, ctx, false, () -> { }, () -> restoreSnapshot(r), () -> {
+                service.updateDeploymentStrategy(id, description, duration, finalBakeMinutes, growthFactor,
+                        effectiveGrowthType);
+                service.setResourceTags("deploymentstrategy", null, id, tags);
+            });
             return;
         }
         Map<String, Object> request = new HashMap<>();
@@ -236,6 +249,7 @@ public class AppConfigCfnProvisioner implements CfnResourceProvisioner {
         request.put("GrowthFactor", growthFactor);
         request.put("GrowthType", effectiveGrowthType);
         request.put("ReplicateTo", replicateTo);
+        request.put("Tags", tags);
         DeploymentStrategy strategy = service.createDeploymentStrategy(request);
         r.setPhysicalId(strategy.getId());
         r.getAttributes().put("Id", strategy.getId());
@@ -508,17 +522,20 @@ public class AppConfigCfnProvisioner implements CfnResourceProvisioner {
                 Environment prior = MAPPER.treeToValue(snapshot, Environment.class);
                 service.updateEnvironment(prior.getApplicationId(), prior.getId(), prior.getName(),
                         prior.getDescription(), jsonValue(snapshot.get("Monitors")));
+                service.setResourceTags("environment", prior.getApplicationId(), prior.getId(), prior.getTags());
             }
             case PROFILE -> {
                 ConfigurationProfile prior = MAPPER.treeToValue(snapshot, ConfigurationProfile.class);
                 service.updateConfigurationProfile(prior.getApplicationId(), prior.getId(),
                         MAPPER.convertValue(snapshot, new TypeReference<>() {}));
+                service.setResourceTags("configurationprofile", prior.getApplicationId(), prior.getId(), prior.getTags());
             }
             case STRATEGY -> {
                 DeploymentStrategy prior = MAPPER.treeToValue(snapshot, DeploymentStrategy.class);
                 service.updateDeploymentStrategy(prior.getId(), prior.getDescription(),
                         prior.getDeploymentDurationInMinutes(), prior.getFinalBakeTimeInMinutes(),
                         prior.getGrowthFactor(), prior.getGrowthType());
+                service.setResourceTags("deploymentstrategy", null, prior.getId(), prior.getTags());
             }
             default -> throw new IllegalArgumentException("Unsupported AppConfig resource type " + resourceType);
         }

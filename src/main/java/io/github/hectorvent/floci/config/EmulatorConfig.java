@@ -498,6 +498,7 @@ public interface EmulatorConfig {
     }
 
     interface LambdaStorageConfig {
+        // Function runtime-management settings share the Lambda storage mode and flush interval.
         Optional<String> mode();
 
         @WithDefault("5000")
@@ -911,6 +912,7 @@ public interface EmulatorConfig {
         ConnectServiceConfig connect();
         AppIntegrationsServiceConfig appintegrations();
         DlmServiceConfig dlm();
+        SignerServiceConfig signer();
         CognitoIdentityServiceConfig cognitoidentity();
         GlobalAcceleratorServiceConfig globalaccelerator();
         DataSyncServiceConfig datasync();
@@ -921,6 +923,7 @@ public interface EmulatorConfig {
         EfsServiceConfig efs();
         CodeGuruReviewerServiceConfig codegurureviewer();
         CodeArtifactServiceConfig codeartifact();
+        QuickSightServiceConfig quicksight();
         MarketplaceServiceConfig marketplace();
         DmsServiceConfig dms();
     }
@@ -984,6 +987,19 @@ public interface EmulatorConfig {
     interface DlmServiceConfig {
         @WithDefault("true")
         boolean enabled();
+    }
+
+    interface SignerServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        /**
+         * Records signing jobs as succeeded without producing an artifact, for callers that only
+         * read job metadata. Off by default: a job that reports success must have something to
+         * download, and Floci does not sign code.
+         */
+        @WithDefault("false")
+        boolean mockSigningJobs();
     }
 
     interface CognitoIdentityServiceConfig {
@@ -1071,6 +1087,14 @@ public interface EmulatorConfig {
     interface CodeGuruReviewerServiceConfig {
         @WithDefault("true")
         boolean enabled();
+    }
+
+    interface QuickSightServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        /** Public origin used by browser embedding clients. */
+        Optional<String> embedBaseUrl();
     }
 
     interface MarketplaceServiceConfig {
@@ -2890,6 +2914,10 @@ public interface EmulatorConfig {
     }
 
     interface CloudFrontServiceConfig {
+        /** Image used for a fresh, isolated Node process on each TestFunction call. */
+        @WithDefault("node:22-alpine")
+        String functionRuntimeImage();
+
         @WithDefault("true")
         boolean enabled();
 
@@ -3195,6 +3223,7 @@ public interface EmulatorConfig {
         boolean insecureSkipTlsVerify();
     }
 
+    /** Repository previews use the existing ECR repository store; hybrid durability remains asynchronous. */
     interface EcrServiceConfig {
         @WithDefault("true")
         boolean enabled();

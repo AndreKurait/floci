@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.common.AwsNamespaces;
 import io.github.hectorvent.floci.core.common.AwsPartition;
 import io.github.hectorvent.floci.core.common.AwsPartitions;
 import io.github.hectorvent.floci.core.common.AwsRegionFacts;
+import io.github.hectorvent.floci.core.common.Ec2ErrorResponses;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.SshPublicKeys;
@@ -64,13 +65,15 @@ public class Ec2QueryHandler {
     private final Ec2IpamService ipamService;
     private final RegionResolver regionResolver;
     private final Ec2ClientVpnHandler clientVpnHandler;
+    private final Ec2PlacementGroupHandler placementGroupHandler;
 
     @Inject
     public Ec2QueryHandler(Ec2Service service, EmulatorConfig config, FlowLogService flowLogService,
                            Ec2EbsEncryptionService ebsEncryptionService,
                            Ec2BlockPublicAccessService blockPublicAccessService,
                            Ec2IpamService ipamService, RegionResolver regionResolver,
-                           Ec2ClientVpnService clientVpnService) {
+                           Ec2ClientVpnService clientVpnService,
+                           Ec2PlacementGroupService placementGroupService) {
         this.service = service;
         this.config = config;
         this.flowLogService = flowLogService;
@@ -79,6 +82,17 @@ public class Ec2QueryHandler {
         this.ipamService = ipamService;
         this.regionResolver = regionResolver;
         this.clientVpnHandler = clientVpnService == null ? null : new Ec2ClientVpnHandler(clientVpnService, service);
+        this.placementGroupHandler = new Ec2PlacementGroupHandler(placementGroupService);
+    }
+
+    /** For callers that exercise no placement-group operation. */
+    public Ec2QueryHandler(Ec2Service service, EmulatorConfig config, FlowLogService flowLogService,
+                           Ec2EbsEncryptionService ebsEncryptionService,
+                           Ec2BlockPublicAccessService blockPublicAccessService,
+                           Ec2IpamService ipamService, RegionResolver regionResolver,
+                           Ec2ClientVpnService clientVpnService) {
+        this(service, config, flowLogService, ebsEncryptionService, blockPublicAccessService, ipamService,
+                regionResolver, clientVpnService, null);
     }
 
     /** For unit tests that exercise no Client VPN operation. */
@@ -94,6 +108,10 @@ public class Ec2QueryHandler {
         LOG.debugv("EC2 action: {0}", action);
         try {
             return switch (action) {
+                case "CreatePlacementGroup" -> placementGroupHandler.create(params, region,
+                        parseTagsForResource(params, "placement-group", Set.of("placement-group")));
+                case "DescribePlacementGroups" -> placementGroupHandler.describe(params, region);
+                case "DeletePlacementGroup" -> placementGroupHandler.delete(params, region);
                 // Instances
                 case "RunInstances" -> handleRunInstances(params, region);
                 case "CreateFleet" -> handleCreateFleet(params, region);
@@ -386,32 +404,12 @@ public class Ec2QueryHandler {
                 case "AllocateIpamPoolCidr" -> handleAllocateIpamPoolCidr(params, region);
                 case "ReleaseIpamPoolAllocation" -> handleReleaseIpamPoolAllocation(params, region);
                 case "GetIpamPoolAllocations" -> handleGetIpamPoolAllocations(params, region);
-                default -> ec2Error("UnsupportedOperation",
+                default -> Ec2ErrorResponses.of("UnsupportedOperation",
                         "Operation " + action + " is not supported.", 400);
             };
         } catch (AwsException e) {
-            return ec2Error(e.getErrorCode(), e.getMessage(), e.getHttpStatus());
+            return Ec2ErrorResponses.of(e.getErrorCode(), e.getMessage(), e.getHttpStatus());
         }
-    }
-
-    /**
-     * EC2 uses a different error envelope than other Query-protocol services.
-     * The AWS SDK v2 EC2 client parses {@code <Response><Errors><Error><Code>},
-     * not the standard {@code <ErrorResponse><Error><Code>} shape.
-     */
-    private Response ec2Error(String code, String message, int status) {
-        String xml = new XmlBuilder()
-                .start("Response")
-                .start("Errors")
-                .start("Error")
-                .elem("Code", code)
-                .elem("Message", message)
-                .end("Error")
-                .end("Errors")
-                .elem("RequestID", UUID.randomUUID().toString())
-                .end("Response")
-                .build();
-        return Response.status(status).entity(xml).type(MediaType.APPLICATION_XML).build();
     }
 
     // ─── Parameter helpers ────────────────────────────────────────────────────
@@ -2083,7 +2081,7 @@ public class Ec2QueryHandler {
             // Apply filters
             services = applyVpcEndpointServiceFilters(services, filters);
         } catch (AwsException e) {
-            return ec2Error(e.getErrorCode(), e.getMessage(), e.getHttpStatus());
+            return Ec2ErrorResponses.of(e.getErrorCode(), e.getMessage(), e.getHttpStatus());
         }
 
         XmlBuilder xml = new XmlBuilder()
@@ -2278,7 +2276,7 @@ public class Ec2QueryHandler {
             resourceIds = getList(p, "ResourceIds.member");
         }
         if (resourceIds.isEmpty()) {
-            return ec2Error("MissingParameter", "The request must contain at least one ResourceId.", 400);
+            return Ec2ErrorResponses.of("MissingParameter", "The request must contain at least one ResourceId.", 400);
         }
 
         XmlBuilder xml = new XmlBuilder()

@@ -12,6 +12,7 @@ import io.github.hectorvent.floci.services.appsync.AppSyncController;
 import io.github.hectorvent.floci.services.appsync.graphql.AppSyncExecutionController;
 import io.github.hectorvent.floci.services.aps.ApsController;
 import io.github.hectorvent.floci.services.backup.BackupController;
+import io.github.hectorvent.floci.services.backup.BackupFrameworkController;
 import io.github.hectorvent.floci.services.batch.BatchController;
 import io.github.hectorvent.floci.services.bedrock.BedrockController;
 import io.github.hectorvent.floci.services.bedrockagentcore.BedrockAgentCoreController;
@@ -26,6 +27,8 @@ import io.github.hectorvent.floci.services.bedrockagentcorecontrol.BedrockAgentC
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.BedrockAgentCoreToolsController;
 import io.github.hectorvent.floci.services.bedrockruntime.BedrockRuntimeController;
 import io.github.hectorvent.floci.services.cloudfront.CloudFrontController;
+import io.github.hectorvent.floci.services.cloudfront.CloudFrontFunctionTestController;
+import io.github.hectorvent.floci.services.cloudfront.CloudFrontKeyValueStoreController;
 import io.github.hectorvent.floci.services.cloudfront.CloudFrontServingController;
 import io.github.hectorvent.floci.services.codeartifact.CodeArtifactController;
 import io.github.hectorvent.floci.services.codeartifact.CodeArtifactMavenController;
@@ -77,6 +80,8 @@ import io.github.hectorvent.floci.services.oam.OamController;
 import io.github.hectorvent.floci.services.opensearch.ElasticsearchController;
 import io.github.hectorvent.floci.services.opensearch.OpenSearchController;
 import io.github.hectorvent.floci.services.pipes.PipesController;
+import io.github.hectorvent.floci.services.quicksight.QuickSightController;
+import io.github.hectorvent.floci.services.quicksight.QuickSightEmbedController;
 import io.github.hectorvent.floci.services.ram.RamController;
 import io.github.hectorvent.floci.services.rdsdata.RdsDataController;
 import io.github.hectorvent.floci.services.resourceexplorer2.ResourceExplorer2Controller;
@@ -108,6 +113,7 @@ import io.github.hectorvent.floci.services.ses.SesSuppressionController;
 import io.github.hectorvent.floci.services.ses.SesTagController;
 import io.github.hectorvent.floci.services.ses.SesTemplateController;
 import io.github.hectorvent.floci.services.ses.SesTenantController;
+import io.github.hectorvent.floci.services.signer.SignerController;
 import io.github.hectorvent.floci.services.signin.SigninController;
 import io.github.hectorvent.floci.services.ssm.SsmMessagesController;
 import io.github.hectorvent.floci.services.ssooidc.SsoOidcController;
@@ -661,7 +667,7 @@ public class ResolvedServiceCatalog {
                         "backup", storageMode(config.storage().services().backup().mode(), config.storage().mode()),
                         config.storage().services().backup().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("backup"), Set.of(), Set.of(BackupController.class))
+                        Set.of(), Set.of("backup"), Set.of(), Set.of(BackupController.class, BackupFrameworkController.class))
                         .withRequiredRestAuthentication(),
                 descriptor("resource-explorer-2", "resourceexplorer2",
                         config.services().resourceexplorer2().enabled(), true,
@@ -754,8 +760,15 @@ public class ResolvedServiceCatalog {
                         5000L, AwsNamespaces.CLOUDFRONT, ServiceProtocol.REST_XML,
                         protocols(ServiceProtocol.REST_XML),
                         Set.of(), Set.of("cloudfront"), Set.of(),
-                        Set.of(CloudFrontController.class, CloudFrontServingController.class))
-                        .withRequiredRestAuthentication(Set.of(CloudFrontController.class)),
+                        Set.of(CloudFrontController.class, CloudFrontServingController.class, CloudFrontFunctionTestController.class))
+                        .withRequiredRestAuthentication(Set.of(CloudFrontController.class, CloudFrontFunctionTestController.class)),
+                descriptor("cloudfront-keyvaluestore", "cloudfront-keyvaluestore",
+                        config.services().cloudfront().enabled(), true,
+                        null, null, 5000L, null, ServiceProtocol.REST_JSON,
+                        protocols(ServiceProtocol.REST_JSON),
+                        Set.of(), Set.of("cloudfront-keyvaluestore"), Set.of(),
+                        Set.of(CloudFrontKeyValueStoreController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("appsync", "appsync", config.services().appsync().enabled(), true,
                         "appsync", storageMode(config.storage().services().appsync().mode(), config.storage().mode()),
                         config.storage().services().appsync().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
@@ -835,6 +848,11 @@ public class ResolvedServiceCatalog {
                         protocols(ServiceProtocol.REST_JSON),
                         Set.of(), Set.of("dlm"), Set.of(), Set.of(DlmController.class))
                         .withRequiredRestAuthentication(),
+                descriptor("signer", "signer", config.services().signer().enabled(), true,
+                        "signer", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
+                        protocols(ServiceProtocol.REST_JSON),
+                        Set.of(), Set.of("signer"), Set.of(), Set.of(SignerController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("cognito-identity", "cognitoidentity",
                         config.services().cognitoidentity().enabled(), true,
                         "cognitoidentity", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
@@ -908,6 +926,11 @@ public class ResolvedServiceCatalog {
                         "verifiedpermissions", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
                         Set.of("VerifiedPermissions."), Set.of("verifiedpermissions"), Set.of(), Set.of()),
+                descriptor("quicksight", "quicksight", config.services().quicksight().enabled(), true,
+                        "quicksight", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
+                        protocols(ServiceProtocol.REST_JSON), Set.of(), Set.of("quicksight"), Set.of(),
+                        Set.of(QuickSightController.class, QuickSightEmbedController.class))
+                        .withRequiredRestAuthentication(Set.of(QuickSightController.class)),
                 descriptor("marketplace", "marketplace", config.services().marketplace().enabled(), true,
                         "marketplace", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON, ServiceProtocol.JSON, ServiceProtocol.CBOR),

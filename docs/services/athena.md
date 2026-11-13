@@ -5,13 +5,124 @@
 
 Floci emulates Amazon Athena with **real SQL execution** powered by a [floci-duck](https://hub.docker.com/r/floci/floci-duck) sidecar container running DuckDB. When a query is submitted, Floci spins up the sidecar on first use, registers every Glue database as a DuckDB schema (`CREATE SCHEMA IF NOT EXISTS "<schema>"`) with qualified views (`"<db>"."<table>"`) pointing to S3 data, creates unqualified view aliases for the query context database in DuckDB's default `main` schema, then executes the SQL and stores results as CSV in S3.
 
+## Prepared statements
+
+`CreatePreparedStatement`, `GetPreparedStatement`, `UpdatePreparedStatement`,
+`DeletePreparedStatement`, and `BatchGetPreparedStatement` store SQL text and
+optional descriptions within an existing workgroup, including `primary`.
+Names are unique within each workgroup and at most 1000 statements may be stored.
+These operations do not execute SQL, add SQL `PREPARE` or `EXECUTE` support,
+or implement `ListPreparedStatements` or a CloudFormation resource.
+
+Get and batch get return `StatementName`, `WorkGroupName`, `QueryStatement`,
+optional `Description`, and numeric epoch-seconds `LastModifiedTime`. Batch get
+accepts at most 256 statement names, as stated in the API operation description,
+and returns missing names under `UnprocessedPreparedStatementNames`. Floci uses
+`STATEMENT_NOT_FOUND` for those entries; single get, update, and delete return
+`ResourceNotFoundException` for an absent statement. Request types, name patterns,
+and documented string lengths are validated before mutation. An explicit empty
+description is invalid. Floci treats updates as replacement of SQL and description:
+omitting `Description` clears it. The API documentation does not specify this
+omission policy.
+
+Prepared statements use the existing workgroup storage in memory, persistent,
+hybrid, and WAL modes. Legacy workgroups start with no statements. Reads and
+writes are scoped to the caller's account and region. IAM uses each operation's
+same-named Athena action, the workgroup ARN, and its live `aws:ResourceTag` values.
+Updates atomically replace the stored statement map; hybrid durability retains
+its normal asynchronous flush behavior.
+
+As a Floci lifecycle policy, deleting a workgroup containing prepared statements
+requires `RecursiveDeleteOption=true`; omission and `false` reject deletion.
+Recursive deletion removes the statements with their workgroup, and recreating
+the name starts empty. AWS's DeleteWorkGroup API describes recursive deletion of
+named queries, query executions, and notebooks but does not explicitly specify
+prepared-statement children. This prepared-child policy is not presented as a
+separately measured AWS guarantee. The built-in `primary` workgroup cannot be
+deleted through the API.
+
+## Query execution batch reads
+
+`BatchGetQueryExecution` reads existing execution records using 1 to 50 IDs. Each
+ID must contain 1 to 128 non-whitespace characters; IDs are not restricted to UUID
+syntax. The response includes complete stored query metadata and
+`UnprocessedQueryExecutionIds` entries with `QUERY_EXECUTION_NOT_FOUND` for any
+accepted absent ID. The UUID-shaped absent-ID case matches recorded AWS behavior;
+classification of other accepted absent strings is a Floci policy that has not
+been independently measured against AWS. Each result uses the same public
+projection as `GetQueryExecution`, including
+numeric timestamps. Reads take a detached snapshot under the execution's existing
+status lock. A batch does not submit queries or change their states, SQL, results,
+or statistics, and does not promise one atomic snapshot across separate queries.
+
+Newly started queries retain their request Region in the existing account-scoped
+query record. The internal Region field is persisted and omitted from every public
+query projection. Batch and direct query reads cannot retrieve another Region's
+records. As a Floci migration policy, older records without Region metadata are visible
+only in the configured default Region. Legacy rows without an account prefix may
+be migrated only by the configured default account; a refused account or Region
+lookup cannot move them. Account-prefixed IDs use only the caller's explicit
+storage namespace and cannot be reinterpreted as legacy raw keys during either
+IAM authorization or response lookup. Existing persistent, hybrid and WAL storage
+reload this metadata; memory mode remains in-memory only.
+
+IAM target and tag discovery reads scoped records or matching default-account
+legacy records without migrating them. A denied request leaves those raw keys and
+records unchanged. After authorization, the batch response lookup may migrate its
+matching legacy query record; reading workgroup tags never migrates the workgroup.
+
+With IAM enforcement enabled, every found execution is authorized for
+`athena:BatchGetQueryExecution` against its actual workgroup ARN and that
+workgroup's own current resource tags. A denied found target refuses the whole
+request. Tag contexts are not combined across workgroups. As a conservative Floci
+policy, a batch containing only missing IDs uses the existing action-on-`*`
+authorization fallback because no workgroup can be resolved. A policy allowing
+only a particular workgroup therefore does not authorize an all-missing batch;
+a wildcard-resource allow can. These whole-request and all-missing authorization
+policies have not been independently measured against AWS.
+
+No query-history deletion is added. Terminal history remains in the existing query
+store, including when result objects or workgroups are removed. This change does
+not expand SQL execution support or claim measured AWS statistics equivalence.
+
+## Direct query ownership and authorization
+
+`GetQueryExecution`, `GetQueryResults` and `StopQueryExecution` resolve IDs in the
+caller's account and request Region. An unauthorized account or Region lookup
+cannot migrate a legacy query or change its state. This does not change the existing S3 result-access behavior.
+
+`ListQueryExecutions` filters the requested workgroup and Region before pagination.
+Continuation tokens remain bound to the account, Region and workgroup. As a Floci
+migration policy, unprefixed legacy history is visible only to the default account,
+uses the default Region when Region metadata is absent, is read without migration,
+and never replaces an explicitly account-scoped record with the same ID. Workgroup existence and tag lookups for
+query listings also leave legacy rows in place.
+
+With IAM enforcement enabled, the four direct actions use the exact action and
+workgroup ARN, with that workgroup's current `aws:ResourceTag` values. IAM target
+and tag discovery never migrates rows. Listing authorizes the named workgroup, or
+`primary` when omitted. A missing or out-of-scope ID cannot supply a workgroup ARN,
+so the three ID-based actions use the conservative Floci action-on-`*` fallback:
+a workgroup-only allow is insufficient; an allowed wildcard request reaches the
+existing `InvalidRequestException`. This fallback is local policy and has not
+been independently measured against AWS.
+
+This change does not alter asynchronous query callback account propagation,
+SQL execution, S3 authorization, result pagination or history retention.
+
 ## Supported Actions
 
 <!-- floci:actions:start -->
 | Action | Description |
 | --- | --- |
+| `CreatePreparedStatement` | Stores SQL text and an optional description in a workgroup |
+| `GetPreparedStatement` | Returns one stored statement and its last modification time |
+| `UpdatePreparedStatement` | Replaces a stored statement's SQL text and optional description |
+| `DeletePreparedStatement` | Deletes one stored statement |
+| `BatchGetPreparedStatement` | Returns up to 256 stored statements and per-name errors for missing entries |
 | `StartQueryExecution` | Submits a SQL query; executed asynchronously via DuckDB |
 | `GetQueryExecution` | Returns query status (`QUEUED`, `RUNNING`, `SUCCEEDED`, `FAILED`) |
+| `BatchGetQueryExecution` | Returns up to 50 stored query executions and per-ID errors for absent records |
 | `GetQueryResults` | Returns the result set for a completed query |
 | `ListQueryExecutions` | Returns a list of past query executions |
 | `StopQueryExecution` | Cancels a running query |

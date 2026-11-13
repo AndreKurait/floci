@@ -2,9 +2,11 @@ package io.github.hectorvent.floci.services.account;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.ServicePrincipals;
+import io.github.hectorvent.floci.core.common.StoredResourceArns;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.account.model.AlternateContact;
@@ -14,12 +16,14 @@ import io.github.hectorvent.floci.services.organizations.model.OrganizationAccou
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
+import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.regex.Pattern;
 
 @ApplicationScoped
-public class AccountService implements Resettable {
+public class AccountService implements Resettable, StoredResourceArns {
     private static final String ACCOUNT_MANAGEMENT_SERVICE_PRINCIPAL = ServicePrincipals.of("account");
     private static final Pattern ACCOUNT_ID = Pattern.compile("\\d{12}");
     private static final Pattern EMAIL = Pattern.compile("\\s*[\\w+=.#|!&-]+@[\\w.-]+\\.[\\w]+\\s*");
@@ -114,6 +118,36 @@ public class AccountService implements Resettable {
     @Override
     public void clear() {
         contacts.clear();
+    }
+
+    /** The namespace of the resource types this service finds, as the request-resources table names it. */
+    @Override
+    public String namespace() {
+        return "account";
+    }
+
+    /**
+     * The ARN of the member account of the caller's organization a request names by its {@code AccountId}, which
+     * Account Management acts on: {@code arn:<partition>:account::<management account>:account/<organization>/<member>}, its
+     * organization and management account being ones no request gives. Empty for a caller in no organization or an
+     * account its organization does not hold, which the handler refuses.
+     */
+    @Override
+    public Optional<String> find(String type, List<String> names, String region) {
+        if (!"accountInOrganization".equals(type) || names.size() != 1 || names.getFirst() == null) {
+            return Optional.empty();
+        }
+        String callerAccountId = contacts.accountId();
+        Organization organization;
+        try {
+            organization = organizationsService.describeOrganization(callerAccountId);
+            organizationsService.describeAccount(callerAccountId, names.getFirst());
+        } catch (AwsException e) {
+            return Optional.empty();
+        }
+        return Optional.of(AwsArnUtils.Arn.global(AwsArnUtils.parse(organization.getArn()).partition(), "account",
+                organization.getMasterAccountId(), "account/" + organization.getId() + "/" + names.getFirst())
+                .toString());
     }
 
     private static String requireContactType(JsonNode request) {

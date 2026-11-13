@@ -31,15 +31,17 @@ final class RequestResourceMembers {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final Pattern VARIABLE = Pattern.compile("\\$\\{(\\w+)}");
-    private static final Pattern MEMBER = Pattern.compile("[A-Za-z][A-Za-z0-9_]*(\\[])?");
-    /** A member holding an ARN may also be one level inside a structure or each of a list's structures. */
-    private static final Pattern ARN_MEMBER = Pattern.compile("[A-Za-z][A-Za-z0-9_]*(\\[])?(\\.[A-Za-z][A-Za-z0-9_]*(\\[])?)?");
+    private static final Pattern MEMBER = Pattern.compile("[A-Za-z][A-Za-z0-9_]*(\\[]|\\{\\})?");
+    /** An ARN may be nested in structures, array elements or map values. */
+    private static final Pattern ARN_MEMBER = Pattern.compile(
+            "[A-Za-z][A-Za-z0-9_]*(\\[])?(\\.[A-Za-z][A-Za-z0-9_]*(\\[])?)?"
+                    + "|[A-Za-z][A-Za-z0-9_]*\\{\\}(\\.[A-Za-z][A-Za-z0-9_]*){1,2}");
     /**
-     * A member filling a variable may also be a field of a structure, or of each of a list's structures, one value
-     * for each.
+     * A member filling a variable may also be a field of a structure, or of each of a list's structures or of a map's
+     * structure values, one value for each.
      */
-    private static final Pattern FILL_MEMBER = Pattern.compile(
-            "[A-Za-z][A-Za-z0-9_]*(\\[]|\\[]\\.[A-Za-z][A-Za-z0-9_]*|\\.[A-Za-z][A-Za-z0-9_]*)?");
+    private static final Pattern FILL_MEMBER = Pattern.compile("[A-Za-z][A-Za-z0-9_]*(\\[]|\\[]\\.[A-Za-z][A-Za-z0-9_]*"
+            + "|\\{}\\.[A-Za-z][A-Za-z0-9_]*|\\.[A-Za-z][A-Za-z0-9_]*)?");
     /** An ARN format's leading resource type word, and the rest of its resource. */
     private static final Pattern RESOURCE_PART = Pattern.compile(
             "^arn:\\$\\{Partition}:[^:]*:[^:]*:[^:]*:([A-Za-z][A-Za-z0-9-]*)(.*)$");
@@ -54,20 +56,26 @@ final class RequestResourceMembers {
     private static final List<String> FOUND_ONLY = List.of("absent", "arnOf", "account", "fixed", "before");
     /** The keys of a resource named through a member naming another of its service's own: it is read no other way. */
     private static final Set<String> THROUGH_KEYS = Set.of("types", "through", "when", "endpoint");
+    /** The keys of a resource its service acts on for a request naming none of it: it is read no other way. */
+    private static final Set<String> DEFAULT_KEYS = Set.of("type", "fill", "when", "default", "endpoint");
 
     /**
-     * A top-level request member that holds a string, or a list of them when {@code list}, or, with a
-     * {@code field}, a structure or a list of them, of which that field is read.
+     * A request selector that holds a string, an array when {@code list}, or map values when {@code map}.
+     * With a {@code field}, reads that field from each selected structure.
      */
-    record Member(String name, boolean list, Member field) {
+    record Member(String name, boolean list, Member field, boolean map) {
+
+        Member(String name, boolean list, Member field) {
+            this(name, list, field, false);
+        }
 
         Member(String name, boolean list) {
             this(name, list, null);
         }
 
-        /** As the file writes it: {@code Name}, {@code Name[]}, {@code Name.Field} or {@code Name[].Field}. */
+        /** The selector path, with {@code []} for array elements and {@code {}} for map values. */
         String path() {
-            return name + (list ? "[]" : "") + (field == null ? "" : "." + field.path());
+            return name + (map ? "{}" : list ? "[]" : "") + (field == null ? "" : "." + field.path());
         }
 
         /** Whether it is a field of each of a list's structures, which gives one value for each of them. */
@@ -148,12 +156,22 @@ final class RequestResourceMembers {
      * of {@code types} may be named {@code through} a member naming, by each of its values, a resource of its
      * service's own that runs on it, is in it or reaches it (a Data API session, by its {@code SessionId}; an EMR
      * instance group, by its {@code InstanceGroups[].InstanceGroupId}), {@code when} the request gives the values it
-     * names, and read no other way.
+     * names, and read no other way. A resource {@code byDefault} is the one of its type its service acts on for a
+     * request naming none of it, {@code when} the request leaves out the member that would (Resource Explorer's
+     * {@code Search} with no {@code ViewArn}, on the Region's default view), read no other way.
      */
     record Resource(List<String> types, Member arn, Map<String, Member> fill, Map<String, List<String>> when,
                     Map<String, List<String>> unless, Map<String, String> absent, Map<String, String> arnOf,
                     Member account, String before, Map<String, String> fixed, boolean made, List<Member> find,
-                    String endpoint, Member through) {
+                    String endpoint, Member through, boolean byDefault) {
+
+        Resource(List<String> types, Member arn, Map<String, Member> fill, Map<String, List<String>> when,
+                 Map<String, List<String>> unless, Map<String, String> absent, Map<String, String> arnOf,
+                 Member account, String before, Map<String, String> fixed, boolean made, List<Member> find,
+                 String endpoint, Member through) {
+            this(types, arn, fill, when, unless, absent, arnOf, account, before, fixed, made, find, endpoint, through,
+                    false);
+        }
 
         Resource(List<String> types, Member arn, Map<String, Member> fill, Map<String, List<String>> when,
                  Map<String, List<String>> unless, Map<String, String> absent, Map<String, String> arnOf,
@@ -170,14 +188,21 @@ final class RequestResourceMembers {
     record Created(String type, String parent, Member arn, String parentWord, String childWord, String separator) {
     }
 
+    /** An ordered heterogeneous id list; unsupported ids retain wildcard authorization. */
+    record Targets(Member member, String query, Map<String, String> prefixes) {
+    }
+
     /**
-     * The file: each operation's resources and the resources it creates under a parent, as
+     * The file: each operation's resources, the resource types its action acts on, the resources it creates under a
+     * parent and the one a create whose action acts on no type makes ({@code makes}), as
      * {@code <namespace>:<Operation>}, the members a REST operation's request carries outside its body, each
      * namespace's ARN formats, and the namespaces it reads, those built by hand, those not read yet, and the others
      * with resource types. A located member is a label of the request's path, {@code {Label}}, or a parameter of its
      * query, {@code ?name}, by the member's name.
      */
-    record Table(Map<String, List<Resource>> operations, Map<String, List<Created>> creates,
+    record Table(Map<String, List<Resource>> operations, Map<String, List<String>> types,
+                 Map<String, List<Created>> creates, Map<String, List<Resource>> makes,
+                 Map<String, Targets> targets,
                  Map<String, Map<String, String>> located, Map<String, Map<String, ArnFormat>> formats,
                  Set<String> namespaces, Set<String> handBuilt, Set<String> notCovered, Set<String> otherNamespaces) {
     }
@@ -233,7 +258,10 @@ final class RequestResourceMembers {
             }
         });
         Map<String, List<Resource>> entries = new LinkedHashMap<>();
+        Map<String, List<String>> actsOn = new LinkedHashMap<>();
         Map<String, List<Created>> creates = new LinkedHashMap<>();
+        Map<String, List<Resource>> makes = new LinkedHashMap<>();
+        Map<String, Targets> targets = new LinkedHashMap<>();
         Map<String, Map<String, String>> located = new LinkedHashMap<>();
         operations.properties().forEach(operation -> {
             String namespace = operation.getKey().substring(0, Math.max(0, operation.getKey().indexOf(':')));
@@ -246,12 +274,53 @@ final class RequestResourceMembers {
                 resources.add(resource(operation.getKey(), resource, formats.getOrDefault(namespace, Map.of())));
             }
             entries.put(operation.getKey(), List.copyOf(resources));
-            List<Created> made = new ArrayList<>();
-            for (JsonNode created : operation.getValue().path("creates")) {
-                made.add(created(operation.getKey(), created, formats.getOrDefault(namespace, Map.of())));
+            List<String> types = operation.getValue().path("types").valueStream().map(JsonNode::asText).toList();
+            actsOn.put(operation.getKey(), types);
+            List<Resource> made = new ArrayList<>();
+            for (JsonNode resource : operation.getValue().path("makes")) {
+                if (!types.isEmpty() || !resource.isObject() || resource.size() != 2 || !resource.has("type")
+                        || !resource.has("fill")) {
+                    throw new IllegalStateException(RESOURCE_NAME + " makes " + resource + " for " + operation.getKey()
+                            + ", no type's variables of a create acting on none");
+                }
+                made.add(resource(operation.getKey(), resource, formats.getOrDefault(namespace, Map.of())));
             }
             if (!made.isEmpty()) {
-                creates.put(operation.getKey(), List.copyOf(made));
+                makes.put(operation.getKey(), List.copyOf(made));
+            }
+            JsonNode target = operation.getValue().path("targets");
+            if (!target.isMissingNode()) {
+                String member = target.path("member").asText("");
+                String query = target.path("query").asText("");
+                if (!member.matches("[A-Za-z][A-Za-z0-9_]*\\[\\]")
+                        || !LOCATED_MEMBER.matcher(query).matches()
+                        || !target.path("prefixes").isObject() || target.path("prefixes").isEmpty()) {
+                    throw new IllegalStateException(RESOURCE_NAME + " has malformed id targets for " + operation.getKey());
+                }
+                Map<String, String> prefixes = new LinkedHashMap<>();
+                Set<String> allowed = names(operation.getValue().path("types"));
+                target.path("prefixes").properties().forEach(entry -> {
+                    ArnFormat format = formats.getOrDefault(namespace, Map.of()).get(entry.getKey());
+                    String prefix = entry.getValue().asText("");
+                    if (!allowed.contains(entry.getKey()) || format == null || prefix.isEmpty()
+                            || VARIABLE.matcher(format.format()).results().map(match -> match.group(1))
+                                    .filter(variable -> !Set.of("Partition", "Region", "Account").contains(variable))
+                                    .distinct().count() != 1
+                            || prefixes.values().stream().anyMatch(other ->
+                                    prefix.startsWith(other) || other.startsWith(prefix))) {
+                        throw new IllegalStateException(RESOURCE_NAME + " has an invalid id target for " + operation.getKey());
+                    }
+                    prefixes.put(entry.getKey(), prefix);
+                });
+                targets.put(operation.getKey(), new Targets(new Member(member.substring(0, member.length() - 2), true),
+                        query, Map.copyOf(prefixes)));
+            }
+            List<Created> under = new ArrayList<>();
+            for (JsonNode created : operation.getValue().path("creates")) {
+                under.add(created(operation.getKey(), created, formats.getOrDefault(namespace, Map.of())));
+            }
+            if (!under.isEmpty()) {
+                creates.put(operation.getKey(), List.copyOf(under));
             }
             Map<String, String> where = new LinkedHashMap<>();
             operation.getValue().path("located").properties().forEach(member -> {
@@ -266,7 +335,8 @@ final class RequestResourceMembers {
                 located.put(operation.getKey(), Map.copyOf(where));
             }
         });
-        return new Table(Map.copyOf(entries), Map.copyOf(creates), Map.copyOf(located), Map.copyOf(formats), namespaces,
+        return new Table(Map.copyOf(entries), Map.copyOf(actsOn), Map.copyOf(creates), Map.copyOf(makes),
+                Map.copyOf(targets), Map.copyOf(located), Map.copyOf(formats), namespaces,
                 names(document.path("handBuilt")),
                 Set.copyOf(document.path("notCovered").propertyStream().map(Map.Entry::getKey).toList()),
                 names(document.path("otherNamespaces")));
@@ -350,12 +420,19 @@ final class RequestResourceMembers {
             throw new IllegalStateException(RESOURCE_NAME + " finds a " + type + " for " + operation + " by "
                     + resource.path("find") + ", no members of one value each, or beside members reading it otherwise");
         }
-        if (fill.values().stream().filter(Member::list).count() > 1) {
+        if (fill.values().stream().filter(member -> member.list() || member.map()).count() > 1) {
             throw new IllegalStateException(RESOURCE_NAME + " fills " + type + " for " + operation
                     + " from more than one list");
         }
         Map<String, List<String>> when = values(operation, type, resource.path("when"));
         Map<String, List<String>> unless = values(operation, type, resource.path("unless"));
+        boolean byDefault = resource.has("default");
+        if (byDefault && (!resource.path("default").isBoolean() || !resource.path("default").booleanValue()
+                || !fill.isEmpty() || when.isEmpty() || resource.properties().stream().map(Map.Entry::getKey)
+                        .anyMatch(key -> !DEFAULT_KEYS.contains(key)))) {
+            throw new IllegalStateException(RESOURCE_NAME + " names " + type + " for " + operation
+                    + " as its service's default, which is not for a request naming none");
+        }
         Set<String> filled = Set.copyOf(fill.values().stream().map(Member::path).toList());
         Map<String, String> absent = new LinkedHashMap<>();
         resource.path("absent").properties().forEach(member -> {
@@ -382,7 +459,7 @@ final class RequestResourceMembers {
                     + " from " + account.name() + ", no member of one account or a type of none");
         }
         return new Resource(List.of(type), null, Map.copyOf(fill), when, unless, Map.copyOf(absent), Map.copyOf(arnOf),
-                account, before, Map.copyOf(fixed), made, List.copyOf(find), endpoint, null);
+                account, before, Map.copyOf(fixed), made, List.copyOf(find), endpoint, null, byDefault);
     }
 
     /** The values each member named in {@code when} or {@code unless} may have, an empty one for the member absent. */
@@ -419,12 +496,15 @@ final class RequestResourceMembers {
         if (!MEMBER.matcher(path).matches()) {
             throw new IllegalStateException(RESOURCE_NAME + " reads " + operation + " at " + path + ", which is no member");
         }
+        if (path.endsWith("{}")) {
+            return new Member(path.substring(0, path.length() - 2), false, null, true);
+        }
         return path.endsWith("[]") ? new Member(path.substring(0, path.length() - 2), true) : new Member(path, false);
     }
 
     /**
-     * A member filling a variable: {@code Name}, {@code Name[]}, or a field of a structure, {@code Name.Field}, or of
-     * each of a list's structures, {@code Name[].Field}.
+     * A member filling a variable: {@code Name}, {@code Name[]}, or a field of a structure, {@code Name.Field}, of
+     * each of a list's structures, {@code Name[].Field}, or of each of a map's structure values, {@code Name{}.Field}.
      */
     private static Member fillMember(String operation, String path) {
         if (!FILL_MEMBER.matcher(path).matches()) {
@@ -435,17 +515,17 @@ final class RequestResourceMembers {
 
     /**
      * Whether a member gives one value as it is read: one that is no list, top-level or a field of a structure, or a
-     * field of each of a list's structures that fills a variable, one value for each structure.
+     * field of each of a list's or a map's structures that fills a variable, one value for each structure.
      */
     private static boolean readAsOne(String operation, String path, Set<String> filled) {
-        if (FILL_MEMBER.matcher(path).matches() && path.contains("[].")) {
+        if (FILL_MEMBER.matcher(path).matches() && (path.contains("[].") || path.contains("{}."))) {
             return filled.contains(path);
         }
         Member member = path.contains(".") ? fillMember(operation, path) : member(operation, path);
         return !member.list() && (member.field() == null || !member.field().list());
     }
 
-    /** A member holding an ARN: {@code Name}, {@code Name[]}, or a field of it, {@code Name.Field} or {@code Name[].Field}. */
+    /** A possibly nested ARN selector; {@code []} reads array elements and {@code {}} reads map values. */
     private static Member arnMember(String operation, String path) {
         if (!ARN_MEMBER.matcher(path).matches()) {
             throw new IllegalStateException(RESOURCE_NAME + " reads " + operation + " at " + path + ", which is no member");
@@ -455,7 +535,7 @@ final class RequestResourceMembers {
             return member(operation, path);
         }
         Member outer = member(operation, path.substring(0, dot));
-        return new Member(outer.name(), outer.list(), member(operation, path.substring(dot + 1)));
+        return new Member(outer.name(), outer.list(), arnMember(operation, path.substring(dot + 1)), outer.map());
     }
 
     /**

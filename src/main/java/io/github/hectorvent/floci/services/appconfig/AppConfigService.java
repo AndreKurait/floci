@@ -38,6 +38,9 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.function.BiConsumer;
+import java.util.function.Consumer;
+import java.util.function.Function;
 import java.util.regex.Pattern;
 
 @ApplicationScoped
@@ -105,6 +108,7 @@ public class AppConfigService {
         app.setId(shortId(7));
         app.setName((String) request.get("Name"));
         app.setDescription((String) request.get("Description"));
+        app.setTags(requestTags(request));
         applicationStore.put(app.getId(), app);
         return app;
     }
@@ -191,6 +195,7 @@ public class AppConfigService {
         env.setDescription((String) request.get("Description"));
         env.setState("READY");
         env.setMonitors(monitors);
+        env.setTags(requestTags(request));
         environmentStore.put(env.getId(), env);
         return env;
     }
@@ -255,12 +260,33 @@ public class AppConfigService {
         return environmentStore.get(environmentId);
     }
 
+    /** Applies only members supplied to the native UpdateEnvironment operation. */
+    public synchronized Environment updateEnvironment(String applicationId, String environmentId,
+                                                       Map<String, Object> request) {
+        AppConfigUpdateRequest.environment(applicationId, environmentId, request);
+        List<Monitor> checked = monitors(request.get("Monitors"));
+        requireApplicationById(applicationId);
+        Environment environment = copy(environmentStore.get(environmentId)
+                .filter(value -> applicationId.equals(value.getApplicationId()))
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Environment not found", 404)));
+        if (request.get("Name") != null) {
+            environment.setName((String) request.get("Name"));
+        }
+        if (request.get("Description") != null) {
+            environment.setDescription((String) request.get("Description"));
+        }
+        if (request.get("Monitors") != null) {
+            environment.setMonitors(checked);
+        }
+        environmentStore.putAllAtomically(Map.of(environmentId, environment));
+        return environment;
+    }
+
     /**
      * Sets the name, description and monitors of an environment, as a CloudFormation update of
      * {@code AWS::AppConfig::Environment} does: all three are written, so a null description or
      * monitor list clears it. The monitors are checked as CreateEnvironment checks them, before
-     * anything is written. Floci serves no UpdateEnvironment route; the CloudFormation provisioner
-     * is the only caller.
+     * anything is written. The native PATCH overload preserves omitted members instead.
      */
     public synchronized Environment updateEnvironment(String applicationId, String environmentId, String name,
                                                       String description, Object monitors) {
@@ -321,6 +347,7 @@ public class AppConfigService {
         profile.setRetrievalRoleArn((String) role);
         AppConfigS3Source.validateProfile(profile);
         profile.setValidators(AppConfigValidators.parse(request.get("Validators"), profile.getType()));
+        profile.setTags(requestTags(request));
         profileStore.put(profile.getId(), profile);
         return profile;
     }
@@ -563,6 +590,7 @@ public class AppConfigService {
         strategy.setGrowthType((String) request.getOrDefault("GrowthType", "LINEAR"));
         strategy.setReplicateTo((String) request.getOrDefault("ReplicateTo", "NONE"));
         validateDeploymentTiming(strategy);
+        strategy.setTags(requestTags(request));
         strategyStore.put(strategy.getId(), strategy);
         return strategy;
     }
@@ -591,11 +619,38 @@ public class AppConfigService {
         return result;
     }
 
+    /** Applies only members supplied to the native UpdateDeploymentStrategy operation. */
+    public synchronized DeploymentStrategy updateDeploymentStrategy(String id, Map<String, Object> request) {
+        AppConfigUpdateRequest.strategy(id, request);
+        if (builtinStrategy(id) != null) {
+            throw new AwsException("BadRequestException", "Predefined deployment strategies cannot be updated.", 400);
+        }
+        DeploymentStrategy strategy = copy(strategyStore.get(id)
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Deployment strategy not found", 404)));
+        if (request.get("Description") != null) {
+            strategy.setDescription((String) request.get("Description"));
+        }
+        if (request.get("DeploymentDurationInMinutes") != null) {
+            strategy.setDeploymentDurationInMinutes(((Number) request.get("DeploymentDurationInMinutes")).intValue());
+        }
+        if (request.get("FinalBakeTimeInMinutes") != null) {
+            strategy.setFinalBakeTimeInMinutes(((Number) request.get("FinalBakeTimeInMinutes")).intValue());
+        }
+        if (request.get("GrowthFactor") != null) {
+            strategy.setGrowthFactor(((Number) request.get("GrowthFactor")).floatValue());
+        }
+        if (request.get("GrowthType") != null) {
+            strategy.setGrowthType((String) request.get("GrowthType"));
+        }
+        strategyStore.putAllAtomically(Map.of(id, strategy));
+        return strategy;
+    }
+
     /**
      * Sets the mutable settings of a stored deployment strategy, as a CloudFormation update of
      * {@code AWS::AppConfig::DeploymentStrategy} does; its name and {@code ReplicateTo} are
-     * create-only. The predefined strategies are not stored, so they are not found here. Floci
-     * serves no UpdateDeploymentStrategy route; the CloudFormation provisioner is the only caller.
+     * create-only. The predefined strategies are not stored, so they are not found here. The native
+     * PATCH overload preserves omitted members instead.
      */
     public synchronized DeploymentStrategy updateDeploymentStrategy(String id, String description,
                                                                     int deploymentDurationInMinutes,
@@ -1066,8 +1121,112 @@ public class AppConfigService {
 
     // ──────────────────────────── Tags ────────────────────────────
 
+    String tagResourceArn(String region, String resource) {
+        if (!regions.getRegion().equals(region)) {
+            throw missingTagResource();
+        }
+        return regions.buildArn("appconfig", region, resource);
+    }
+
+    Map<String, String> getResourceTags(String type, String applicationId, String id) {
+        return Map.copyOf(tagTarget(type, applicationId, id).tags());
+    }
+
+    synchronized void tagResource(String type, String applicationId, String id, Map<String, String> tags) {
+        TagTarget target = tagTarget(type, applicationId, id);
+        Map<String, String> merged = new HashMap<>(target.tags());
+        merged.putAll(validatedTags(tags));
+        target.write().accept(validatedTags(merged));
+    }
+
+    synchronized void untagResource(String type, String applicationId, String id, List<String> keys) {
+        TagTarget target = tagTarget(type, applicationId, id);
+        if (keys == null || keys.size() > 50) {
+            throw invalidTags();
+        }
+        keys.forEach(AppConfigService::validateTagKey);
+        Map<String, String> remaining = new HashMap<>(target.tags());
+        keys.forEach(remaining::remove);
+        target.write().accept(remaining);
+    }
+
+    /** Replaces the resource's complete tag set, including removal of omitted keys. */
+    public synchronized void setResourceTags(String type, String applicationId, String id, Map<String, String> tags) {
+        TagTarget target = tagTarget(type, applicationId, id);
+        target.write().accept(validatedTags(tags));
+    }
+
+    private TagTarget tagTarget(String type, String applicationId, String id) {
+        if (applicationId != null) {
+            requireApplicationById(applicationId);
+        }
+        return switch (type) {
+            case "application" -> tagTarget(requireApplicationById(id), Application::getTags,
+                    Application::setTags, applicationStore, id);
+            case "environment" -> tagTarget(environmentStore.get(id)
+                            .filter(value -> value.getApplicationId().equals(applicationId))
+                            .orElseThrow(AppConfigService::missingTagResource),
+                    Environment::getTags, Environment::setTags, environmentStore, id);
+            case "configurationprofile" -> tagTarget(profileStore.get(id)
+                            .filter(value -> value.getApplicationId().equals(applicationId))
+                            .orElseThrow(AppConfigService::missingTagResource),
+                    ConfigurationProfile::getTags, ConfigurationProfile::setTags, profileStore, id);
+            case "deploymentstrategy" -> tagTarget(strategyStore.get(id)
+                            .orElseThrow(AppConfigService::missingTagResource),
+                    DeploymentStrategy::getTags, DeploymentStrategy::setTags, strategyStore, id);
+            default -> throw missingTagResource();
+        };
+    }
+
+    private static <T> TagTarget tagTarget(T entity, Function<T, Map<String, String>> read,
+                                           BiConsumer<T, Map<String, String>> set,
+                                           StorageBackend<String, T> store, String id) {
+        return new TagTarget(read.apply(entity), tags -> {
+            T changed = copy(entity);
+            set.accept(changed, tags);
+            store.put(id, changed);
+        });
+    }
+
+    private record TagTarget(Map<String, String> tags, Consumer<Map<String, String>> write) {}
+
+    private static Map<String, String> requestTags(Map<String, Object> request) {
+        return request.containsKey("Tags") ? validatedTags(request.get("Tags")) : Map.of();
+    }
+
+    private static Map<String, String> validatedTags(Object value) {
+        if (!(value instanceof Map<?, ?> supplied) || supplied.size() > 50) {
+            throw invalidTags();
+        }
+        Map<String, String> tags = new HashMap<>();
+        for (Map.Entry<?, ?> entry : supplied.entrySet()) {
+            if (!(entry.getKey() instanceof String key) || !(entry.getValue() instanceof String text)
+                    || text.codePointCount(0, text.length()) > 256) {
+                throw invalidTags();
+            }
+            validateTagKey(key);
+            tags.put(key, text);
+        }
+        return tags;
+    }
+
+    private static void validateTagKey(String key) {
+        if (key == null || key.isEmpty() || key.startsWith("aws:") || key.codePointCount(0, key.length()) > 128) {
+            throw invalidTags();
+        }
+    }
+
+    private static AwsException invalidTags() {
+        return new AwsException("BadRequestException",
+                "Tags require at most 50 string entries, keys of 1 to 128 characters and values up to 256 characters.", 400);
+    }
+
+    private static AwsException missingTagResource() {
+        return new AwsException("ResourceNotFoundException", "The AppConfig resource does not exist.", 404);
+    }
+
     public Map<String, String> getApplicationTags(String appId) {
-        return getApplication(appId).getTags();
+        return Map.copyOf(getApplication(appId).getTags());
     }
 
     public synchronized void tagApplication(String appId, Map<String, String> tags) {
@@ -1091,7 +1250,7 @@ public class AppConfigService {
      */
     public synchronized void setApplicationTags(String applicationId, Map<String, String> tags) {
         Application app = copy(requireApplicationById(applicationId));
-        app.setTags(new HashMap<>(tags));
+        app.setTags(validatedTags(tags));
         applicationStore.put(app.getId(), app);
     }
 

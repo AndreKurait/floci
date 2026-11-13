@@ -12,6 +12,8 @@ Floci Lambda runs your function code locally inside real Docker containers - clo
 | `CreateFunction` | Deploy a Lambda function |
 | `GetFunction` | Get function details and download URL |
 | `GetFunctionConfiguration` | Get runtime configuration |
+| `GetRuntimeManagementConfig` | Read a version's stored runtime update mode and optional pin |
+| `PutRuntimeManagementConfig` | Replace a version's stored runtime update mode and optional pin |
 | `ListFunctions` | List all functions |
 | `UpdateFunctionCode` | Upload new code |
 | `UpdateFunctionConfiguration` | Update runtime, handler, memory, timeout, environment, architectures, tracing, layers, and more |
@@ -52,6 +54,8 @@ Floci Lambda runs your function code locally inside real Docker containers - clo
 | `PutFunctionConcurrency` | Set reserved concurrent executions |
 | `GetFunctionConcurrency` | Get reserved concurrent executions |
 | `DeleteFunctionConcurrency` | Clear reserved concurrent executions |
+| `GetFunctionRecursionConfig` | Read the function's stored recursion setting |
+| `PutFunctionRecursionConfig` | Store `Allow` or `Terminate` for an unqualified function |
 | `PutProvisionedConcurrencyConfig` | Initialize Docker environments for a published version or simple alias |
 | `GetProvisionedConcurrencyConfig` | Read the allocation's actual initialization status and capacity |
 | `ListProvisionedConcurrencyConfigs` | List configured versions and aliases with their current capacity |
@@ -83,6 +87,59 @@ each destination and the SQS queue or SNS topic SAM creates when a destination g
 Asynchronous invocations apply its retry, event age, destination settings, and dead-letter queue
 configurations (`DeadLetterConfig`).
 
+### Recursion settings
+
+`GetFunctionRecursionConfig` and `PutFunctionRecursionConfig` use the AWS SDK routes
+under `/2024-08-31/functions/{FunctionName}/recursion-config`. The stored value is
+`Allow` or `Terminate`; new functions and older stored functions without the setting
+default to `Terminate`. Both operations accept an unqualified name, partial ARN, or
+full ARN and reject version and alias suffixes. A supplied ARN must match the caller's
+account, region, and partition. Settings persist with the function, remain independent
+of published versions, and disappear when the function is deleted.
+
+`AWS::Lambda::Function.RecursiveLoop` sets the same value during stack creation and
+updates without replacing the function. Floci validates its value before changing
+code, configuration, or tags. Floci's property-removal policy resets a previously
+template-owned setting to `Terminate`, including when `Fn::If` selects `AWS::NoValue`.
+If the prior template never declared the setting, an unrelated update preserves a
+value written through the Lambda API. This removal policy is Floci reconciliation
+behavior; the AWS property reference does not specify removal semantics.
+
+Full Lambda function update rollback is not implemented. If a later stack resource
+fails after the function was updated, the stack reports `UPDATE_ROLLBACK_FAILED` and
+the applied recursion setting can remain. Invalid `RecursiveLoop` values are rejected
+before code, configuration, tags, or the setting are changed.
+
+These APIs configure and report settings. Floci does not detect or terminate recursive
+invocations, emit recursion notifications or metrics, or propagate X-Ray lineage.
+SAM forwarding of `RecursiveLoop` is not implemented.
+### Runtime management configuration
+
+`GetRuntimeManagementConfig` and `PutRuntimeManagementConfig` use the native
+`/2021-07-20/functions/{FunctionName}/runtime-management-config` route. Each function's
+`$LATEST` and numeric published versions have independent stored settings, initially `Auto`.
+`Manual` requires a modeled `RuntimeVersionArn`, which is preserved exactly. `Auto` and
+`FunctionUpdate` clear the stored and returned pin, including when a valid ARN is supplied.
+These settings do not install runtimes, alter invocation environments, or emulate runtime rollout.
+
+Local compatibility policies: aliases select their primary numeric version and retain the
+requested alias in the response ARN; newly published versions start at `Auto`, independently
+of the latest version's setting. `$LATEST.PUBLISHED` is unresolved and returns
+`ResourceNotFoundException`. Conflicting embedded/query qualifiers are rejected. IAM grants
+match the requested qualified ARN, including an alias or explicit `$LATEST`; unqualified
+requests match the unqualified ARN. Both actions use the function's current resource tags.
+Function references must belong to the caller's account, Region and partition.
+
+Reads and IAM condition lookup do not migrate legacy functions or aliases. An authorized
+first write can migrate a legacy function and persist an internal lifetime identifier before
+committing its settings; these are separate writes. Failed settings writes leave the prior
+visible settings. Immutable settings use the Lambda storage mode, including persistent reload
+and atomic replacement; hybrid mode retains asynchronous durability. Deletion clears settings
+before removing the function/version, so a later parent-store failure can leave that resource
+present with default settings. A settings deletion failure stops parent deletion. New function
+lifetimes and stale-writer checks prevent old settings from returning after name reuse.
+
+
 ### Function policies under IAM enforcement
 
 With [IAM enforcement](iam.md#resource-based-policies) on, the statements `AddPermission` adds take
@@ -99,6 +156,7 @@ part in authorizing calls to the function:
   policy to allow the caller in the same way.
 - Provisioned-concurrency configuration operations also act in the account named by the function
   reference. Cross-account access requires that function's policy to allow the caller.
+- Recursion-setting operations reject ARNs naming another account, region, or partition.
 - Other operations act on the caller's own function of the name the ARN gives, whatever account
   the ARN names, and are authorized against that function. Floci does not serve them on another
   account's function, which AWS allows through a function policy.

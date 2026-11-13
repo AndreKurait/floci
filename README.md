@@ -303,7 +303,7 @@ Floci supports local emulation for application services, data services, eventing
 | Data, analytics, and AI | Athena, Glue, Lake Formation, EMR, EMR Serverless, Redshift, Redshift Data API, Redshift Serverless, Firehose, Managed Service for Apache Flink, OpenSearch, S3 Tables, S3 Vectors, Textract, Transcribe, Comprehend, Rekognition, Translate, Bedrock, Bedrock Runtime, Bedrock AgentCore, Bedrock AgentCore Control, SageMaker |
 | Databases and caching | Aurora DSQL, RDS, RDS Data API, Neptune, DocumentDB, DMS, MemoryDB, ElastiCache, Timestream for InfluxDB |
 | Messaging and transfer | SES, Kinesis, MSK, Amazon MQ, Transfer Family, DataSync, IoT Core, Amazon Connect, Amazon AppIntegrations |
-| Security and governance | AWS Network Firewall, AWS RAM, Service Quotas, WAF v2, GuardDuty, Amazon Inspector, CloudTrail, CloudFront, Resource Groups Tagging API, Resource Explorer 2, CloudHSM v2, Organizations, AWS Account Management, IAM Access Analyzer, IAM Identity Center (SSO Admin, OIDC, Access Portal, SCIM), Identity Store, Amazon Macie, Amazon Detective, Security Hub, Amazon Verified Permissions, Control Catalog, Control Tower, Service Catalog, AWS Marketplace |
+| Security and governance | AWS Signer, AWS Network Firewall, AWS RAM, Service Quotas, WAF v2, GuardDuty, Amazon Inspector, CloudTrail, CloudFront, Resource Groups Tagging API, Resource Explorer 2, CloudHSM v2, Organizations, AWS Account Management, IAM Access Analyzer, IAM Identity Center (SSO Admin, OIDC, Access Portal, SCIM), Identity Store, Amazon Macie, Amazon Detective, Security Hub, Amazon Verified Permissions, Control Catalog, Control Tower, Service Catalog, AWS Marketplace |
 | Cost and billing | AWS Budgets, Pricing, Cost Explorer, Cost and Usage Reports, BCM Pricing Calculator, BCM Data Exports |
 | Resilience, backup, and config | AWS FIS, AWS Backup, Amazon Data Lifecycle Manager, AWS Config, AppConfig, AppConfigData, CloudFormation, Cloud Control API |
 
@@ -350,6 +350,7 @@ For operation-level compatibility, see the [Services Overview](https://floci.io/
 | DocumentDB | Real Docker, mock mode available | MongoDB-compatible cluster via real MongoDB containers; RDS-shaped control plane; MongoDB wire protocol on port 27017 |
 | MSK | Real Docker | Kafka-compatible broker via Redpanda |
 | Amazon MQ | Real Docker | RabbitMQ broker via rabbitmq:3-management; AMQP + management console |
+| QuickSight | In-process metadata | Dashboard, dataset, data-source, user and ingestion metadata; direct-user dashboard search and a limited embed page; no SQL, SPICE processing or BI visualization |
 | Athena | In-process with DuckDB sidecar | Real SQL execution over S3 and Glue-backed views |
 | Glue | In-process | Data Catalog, Schema Registry, tables consumed by Athena |
 | EMR | In-process | Cluster (job flow) lifecycle, instance groups and fleets (including resizing), bootstrap actions, steps, security configurations, scaling and termination policies, block public access, tagging |
@@ -383,11 +384,12 @@ For operation-level compatibility, see the [Services Overview](https://floci.io/
 | Elastic Beanstalk | In-process | Applications, application versions, environments, configuration templates, platform and solution stack metadata |
 | AWS Backup | In-process | Vaults, backup plans, selections, simulated job lifecycle, recovery points |
 | Amazon Data Lifecycle Manager | In-process | Lifecycle policy and tag management; schedules are stored but do not create snapshots or AMIs |
+| AWS Signer | In-process | Signing profiles with versioning, cross-account permissions, the three AWS signing platforms, and signing job records; a job completes as `Succeeded` without producing a signature or writing to S3 |
 | AWS FIS | In-process | All 26 management APIs for templates, experiments, target accounts, action and target discovery, safety lever, tagging, and pagination; experiment execution is a safe control-plane simulation and does not inject faults into other services |
 | AWS Config | In-process | Config rules, evaluation-driven compliance (PutEvaluations, compliance details and summaries), configuration recorders, delivery channels, retention configuration, conformance packs, tagging |
 | Organizations | In-process | Organizations, roots, nested OUs, member accounts, all policy types with `FullAWSAccess` and effective-policy inheritance, trusted service access, delegated administrators, resource policy, and the full invitation/handshake flow; created accounts are usable Floci accounts and member accounts can read the organization they belong to |
 | CloudTrail | In-process | Trails, event selectors (S3 data events with bucket/prefix matching), `StartLogging`/`StopLogging`, scheduled gzipped log file emission to the destination bucket at AWS-shaped key paths, IAM-deny path emits `AccessDenied` records |
-| CloudFront | In-process | Distributions, origins, cache behaviors, invalidations, tagging |
+| CloudFront | In-process | Distributions, origins, cache behaviors, invalidations, functions, key value stores, tagging |
 | WAF v2 | In-process | Web ACLs, IP sets, regex pattern sets, rule groups, logging configs, resource associations, tagging (REGIONAL and CLOUDFRONT scopes) |
 | AWS Resource Groups | In-process | Five capacity-pool operations: stored groups, verified EC2 reservation membership, scoped pagination and group deletion; no dynamic queries or capacity allocation |
 | Resource Explorer 2 | In-process | All 32 management APIs: index and view lifecycle, multi-Region setup tasks, the full search query grammar, and tagging; 30 services expose their resources for search, gathered live rather than from an index |

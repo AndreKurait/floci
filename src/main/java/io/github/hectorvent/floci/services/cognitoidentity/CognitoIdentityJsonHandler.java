@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
+import io.github.hectorvent.floci.services.cognitoidentity.model.CognitoIdentity;
 import io.github.hectorvent.floci.services.cognitoidentity.model.CognitoIdentityProvider;
 import io.github.hectorvent.floci.services.cognitoidentity.model.IdentityPool;
 import io.github.hectorvent.floci.services.cognitoidentity.model.PrincipalTagAttributeMap;
@@ -18,26 +19,34 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-/**
- * Amazon Cognito Identity (federated identity pools) management plane.
- *
- * <p>Operations that are not implemented fall through to a clean
- * {@code UnknownOperationException} rather than a stub success, so callers fail fast
- * instead of stranding a waiter. The identity and credential-vending operations
- * ({@code GetId}, {@code GetCredentialsForIdentity}, {@code GetOpenIdToken} and peers) are
- * deliberately absent: they mint STS session credentials and signed OIDC tokens, which this
- * management plane has no way to produce.
- */
+/** AWS JSON 1.1 identity-pool management and supported identity credential flows. */
 @ApplicationScoped
 public class CognitoIdentityJsonHandler {
 
     private final CognitoIdentityService cognitoIdentityService;
     private final ObjectMapper objectMapper;
+    private final CognitoIdentityTokens tokens;
+    private final CognitoIdentityCredentials credentials;
 
     @Inject
-    public CognitoIdentityJsonHandler(CognitoIdentityService cognitoIdentityService, ObjectMapper objectMapper) {
+    public CognitoIdentityJsonHandler(CognitoIdentityService cognitoIdentityService, ObjectMapper objectMapper,
+                                     CognitoIdentityTokens tokens, CognitoIdentityCredentials credentials) {
         this.cognitoIdentityService = cognitoIdentityService;
         this.objectMapper = objectMapper;
+        this.tokens = tokens;
+        this.credentials = credentials;
+    }
+
+    /** Unsigned public APIs identify their region through the regional pool or identity ID. */
+    public Response handle(String action, JsonNode request, String region, boolean signed) throws Exception {
+        if (!signed && ("GetId".equals(action) || "GetCredentialsForIdentity".equals(action)
+                || "GetOpenIdToken".equals(action))) {
+            String id = text(request, "GetId".equals(action) ? "IdentityPoolId" : "IdentityId");
+            if (CognitoIdentityService.isIdentityId(id)) {
+                return handle(action, request, id.substring(0, id.indexOf(':')));
+            }
+        }
+        return handle(action, request, region);
     }
 
     public Response handle(String action, JsonNode request, String region) throws Exception {
@@ -125,9 +134,141 @@ public class CognitoIdentityJsonHandler {
                 yield Response.ok(principalTagAttributeMapNode(identityPoolId, attributeMap)).build();
             }
 
+            case "GetId" -> {
+                CognitoIdentity identity = cognitoIdentityService.getId(text(request, "IdentityPoolId"),
+                        text(request, "AccountId"), checkedStringMap(request.get("Logins")), region);
+                yield Response.ok(objectMapper.createObjectNode().put("IdentityId", identity.identityId())).build();
+            }
+            case "DescribeIdentity" -> Response.ok(identityNode(cognitoIdentityService.describeIdentity(
+                    text(request, "IdentityId"), region))).build();
+            case "ListIdentities" -> {
+                CognitoIdentityService.IdentityPage page = cognitoIdentityService.listIdentities(
+                        text(request, "IdentityPoolId"), checkedInteger(request, "MaxResults"),
+                        text(request, "NextToken"), Boolean.TRUE.equals(bool(request, "HideDisabled")), region);
+                ObjectNode response = objectMapper.createObjectNode().put("IdentityPoolId", text(request, "IdentityPoolId"));
+                ArrayNode identities = response.putArray("Identities");
+                page.identities().forEach(identity -> identities.add(identityNode(identity)));
+                if (page.nextToken() != null) {
+                    response.put("NextToken", page.nextToken());
+                }
+                yield Response.ok(response).build();
+            }
+            case "DeleteIdentities" -> {
+                JsonNode values = request.get("IdentityIdsToDelete");
+                if (values == null || !values.isArray()) {
+                    throw new AwsException("InvalidParameterException", "IdentityIdsToDelete must be a list.", 400);
+                }
+                List<String> unprocessed = cognitoIdentityService.deleteIdentities(stringList(values), region);
+                ObjectNode response = objectMapper.createObjectNode();
+                ArrayNode results = response.putArray("UnprocessedIdentityIds");
+                unprocessed.forEach(id -> results.addObject().put("IdentityId", id)
+                        .put("ErrorCode", "InvalidParameterException"));
+                yield Response.ok(response).build();
+            }
+            case "GetOpenIdToken" -> {
+                CognitoIdentity identity = cognitoIdentityService.publicIdentity(text(request, "IdentityId"), region);
+                IdentityPool pool = cognitoIdentityService.publicPool(identity.identityPoolId(), region);
+                if (!pool.isAllowClassicFlow()) {
+                    throw new AwsException("InvalidParameterException", "Basic authentication is disabled.", 400);
+                }
+                CognitoIdentityService.requireSupportedRoleConfiguration(pool);
+                CognitoIdentityService.rejectLogins(checkedStringMap(request.get("Logins")));
+                CognitoIdentityService.requireGuest(pool, identity);
+                yield Response.ok(tokenNode(identity, tokens.mint(pool, identity, 600))).build();
+            }
+            case "GetOpenIdTokenForDeveloperIdentity" -> {
+                IdentityPool pool = cognitoIdentityService.describeIdentityPool(text(request, "IdentityPoolId"), region);
+                CognitoIdentityService.requireSupportedRoleConfiguration(pool);
+                if (!checkedStringMap(request.get("PrincipalTags")).isEmpty()) {
+                    throw new AwsException("InvalidParameterException", "PrincipalTags are not supported.", 400);
+                }
+                long duration = 900;
+                JsonNode requestedDuration = request.get("TokenDuration");
+                if (requestedDuration != null && !requestedDuration.isNull()) {
+                    if (!requestedDuration.isIntegralNumber() || !requestedDuration.canConvertToLong()
+                            || requestedDuration.asLong() < 1 || requestedDuration.asLong() > 86400) {
+                        throw new AwsException("InvalidParameterException", "TokenDuration must be between 1 and 86400.", 400);
+                    }
+                    duration = requestedDuration.asLong();
+                }
+                long tokenDuration = duration;
+                ObjectNode token = cognitoIdentityService.developerIdentity(pool.getIdentityPoolId(),
+                        text(request, "IdentityId"), checkedStringMap(request.get("Logins")), region,
+                        identity -> tokenNode(identity, tokens.mint(pool, identity, tokenDuration)));
+                yield Response.ok(token).build();
+            }
+            case "GetCredentialsForIdentity" -> {
+                CognitoIdentityCredentials.Credentials issued = credentials.enhanced(text(request, "IdentityId"),
+                        checkedStringMap(request.get("Logins")), text(request, "CustomRoleArn"), region);
+                ObjectNode response = objectMapper.createObjectNode().put("IdentityId", issued.identityId());
+                response.putObject("Credentials").put("AccessKeyId", issued.accessKeyId())
+                        .put("SecretKey", issued.secretKey()).put("SessionToken", issued.sessionToken())
+                        .put("Expiration", issued.expiration().getEpochSecond());
+                yield Response.ok(response).build();
+            }
+            case "LookupDeveloperIdentity" -> {
+                CognitoIdentityService.DeveloperLookup result = cognitoIdentityService.lookupDeveloper(
+                        text(request, "IdentityPoolId"), text(request, "IdentityId"),
+                        text(request, "DeveloperUserIdentifier"), checkedInteger(request, "MaxResults"),
+                        text(request, "NextToken"), region);
+                ObjectNode response = objectMapper.createObjectNode().put("IdentityId", result.identityId());
+                response.set("DeveloperUserIdentifierList", objectMapper.valueToTree(result.developerUserIdentifiers()));
+                if (result.nextToken() != null) {
+                    response.put("NextToken", result.nextToken());
+                }
+                yield Response.ok(response).build();
+            }
+            case "UnlinkDeveloperIdentity" -> {
+                cognitoIdentityService.unlinkDeveloper(text(request, "IdentityPoolId"), text(request, "IdentityId"),
+                        text(request, "DeveloperProviderName"), text(request, "DeveloperUserIdentifier"), region);
+                yield Response.ok(objectMapper.createObjectNode()).build();
+            }
+
             default -> throw new AwsException("UnknownOperationException",
                     "Operation " + action + " is not supported by floci", 400);
         };
+    }
+
+    private ObjectNode tokenNode(CognitoIdentity identity, String token) {
+        return objectMapper.createObjectNode().put("IdentityId", identity.identityId()).put("Token", token);
+    }
+
+    private ObjectNode identityNode(CognitoIdentity identity) {
+        ObjectNode node = objectMapper.createObjectNode().put("IdentityId", identity.identityId())
+                .put("CreationDate", identity.creationDate().getEpochSecond())
+                .put("LastModifiedDate", identity.lastModifiedDate().getEpochSecond());
+        IdentityPool pool = cognitoIdentityService.publicPool(identity.identityPoolId(), identity.region());
+        node.set("Logins", objectMapper.valueToTree(identity.developerUserIdentifiers().isEmpty()
+                ? List.of() : List.of(pool.getDeveloperProviderName())));
+        return node;
+    }
+
+    private Map<String, String> checkedStringMap(JsonNode value) {
+        if (value == null || value.isNull()) {
+            return Map.of();
+        }
+        if (!value.isObject()) {
+            throw new AwsException("SerializationException", "A string map is required.", 400);
+        }
+        Map<String, String> values = new LinkedHashMap<>();
+        value.fields().forEachRemaining(entry -> {
+            if (entry.getKey().isBlank() || !entry.getValue().isTextual() || entry.getValue().asText().isBlank()) {
+                throw new AwsException("InvalidParameterException", "Map names and values must be nonempty strings.", 400);
+            }
+            values.put(entry.getKey(), entry.getValue().asText());
+        });
+        return values;
+    }
+
+    private Integer checkedInteger(JsonNode request, String name) {
+        JsonNode value = request.get(name);
+        if (value == null || value.isNull()) {
+            return null;
+        }
+        if (!value.isIntegralNumber() || !value.canConvertToInt()) {
+            throw new AwsException("SerializationException", name + " must be an integer.", 400);
+        }
+        return value.asInt();
     }
 
     private IdentityPool parsePool(JsonNode request) {
