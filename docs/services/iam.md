@@ -1913,6 +1913,18 @@ drops it, so `POST /clusters/` is checked as `POST /clusters`. An S3 path keeps 
 may end in a slash, as a folder marker's does, and S3's rules already take a bucket's one trailing
 slash.
 
+Every route Floci serves of AWS Fault Injection Service, AWS Resource Access Manager, CloudWatch
+Observability Access Manager, AWS Resource Explorer, AWS Account Management and AWS Control Catalog is
+checked as its operation's action, on the resource its request names. An Account Management request
+naming an `AccountId` is checked on that member account of the caller's organization,
+`arn:aws:account::<management account>:account/<organization>/<AccountId>`, or on
+`arn:aws:account::*:account/o-*/<AccountId>` for an account the caller's organization does not hold, which
+Account Management refuses; one naming none is checked on the caller's own account. The Fault Injection
+Service and Resource Explorer tag routes are checked on `/tags/<arn>` and on the bare `/tags` Floci also
+serves, and OAM's on `/tags/<arn>` whether the ARN's slash is encoded or not. A `CreateLink` that carries
+tags needs `oam:TagResource` on the sink it names, where the operation is checked, since it acts on no
+link.
+
 The REST routes mapped to an action are those of S3, Lambda, API Gateway, SES v2, RDS Data,
 Kinesis, EKS, EventBridge Scheduler, EventBridge Pipes and Aurora DSQL. In EKS that is every route,
 including those Floci does not serve yet, each checked as the action of its own name, except an
@@ -2307,7 +2319,7 @@ its namespace's `CreateAction` key, as `ec2:CreateTags`, `ecs:TagResource`, Clou
 `TagResource` and Elastic Load Balancing's `AddTags` do, the key is the operation's name:
 `ec2:CreateAction` is `RunInstances` for an instance launched with tags. The operation's own action
 is checked with the same `aws:RequestTag/<key>` and `aws:TagKeys`, once for each resource's tags,
-wherever the Service Reference lists those keys for it or for a resource it acts on, which it does for 546 of the operations read, so
+wherever the Service Reference lists those keys for it or for a resource it acts on, which it does for 568 of the operations read, so
 "allow `sqs:CreateQueue` only with `aws:RequestTag/team`" and "deny it when `aws:RequestTag/team` is
 null" hold as on AWS; keys a service's own condition keys already give, as EC2's `RunInstances`
 does, are kept. It is checked once for each reading of the tags and refused if any is denied: the

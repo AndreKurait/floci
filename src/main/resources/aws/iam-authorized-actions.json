@@ -348,6 +348,7 @@
       "StartPolicyGeneration",
       "ValidatePolicy"
     ],
+    "account": [],
     "appconfig": [
       "CreateApplication",
       "CreateDeploymentStrategy",
@@ -436,6 +437,12 @@
       "UpdateSavingsPlan"
     ],
     "cloudfront-keyvaluestore": [],
+    "controlcatalog": [
+      "ListCommonControls",
+      "ListControlMappings",
+      "ListDomains",
+      "ListObjectives"
+    ],
     "dsql": [
       "InjectError",
       "ListClusters"
@@ -499,6 +506,13 @@
       "UpdatePackageScope",
       "UpdateVpcEndpoint"
     ],
+    "fis": [
+      "GetTargetResourceType",
+      "ListActions",
+      "ListExperimentTemplates",
+      "ListExperiments",
+      "ListTargetResourceTypes"
+    ],
     "lambda": [
       "ConnectMicrovm",
       "CreateCodeSigningConfig",
@@ -519,8 +533,53 @@
       "ListWebFunctions",
       "PassNetworkConnector"
     ],
+    "oam": [
+      "CreateSink",
+      "ListLinks",
+      "ListSinks"
+    ],
     "pipes": [
       "ListPipes"
+    ],
+    "ram": [
+      "EnableSharingWithAwsOrganization",
+      "GetResourcePolicies",
+      "GetResourceShareAssociations",
+      "GetResourceShareInvitations",
+      "GetResourceShares",
+      "ListPermissionAssociations",
+      "ListPermissions",
+      "ListPrincipals",
+      "ListReplacePermissionAssociationsWork",
+      "ListResourceTypes",
+      "ListResources",
+      "ListSourceAssociations"
+    ],
+    "resource-explorer-2": [
+      "AssociateDefaultView",
+      "BatchGetView",
+      "CreateIndex",
+      "CreateManagedView",
+      "CreateResourceExplorerSetup",
+      "CreateStreamingAccessForService",
+      "CreateView",
+      "DeleteResourceExplorerSetup",
+      "DeleteStreamingAccessForService",
+      "DisassociateDefaultView",
+      "GetAccountLevelServiceConfiguration",
+      "GetDefaultView",
+      "GetIndex",
+      "GetResourceExplorerSetup",
+      "GetServiceIndex",
+      "GetServiceView",
+      "ListIndexes",
+      "ListIndexesForMembers",
+      "ListManagedViews",
+      "ListServiceIndexes",
+      "ListServiceViews",
+      "ListStreamingAccessForServices",
+      "ListSupportedResourceTypes",
+      "ListViews"
     ],
     "scheduler": [
       "ListScheduleGroups",

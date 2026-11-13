@@ -49,20 +49,26 @@ HAND_ROUTED: dict[str, str] = {
 # botocore model -> the credential scope Floci authorizes its requests under.
 MODELS: dict[str, str] = {
     "accessanalyzer": "access-analyzer",
+    "account": "account",
     "apigateway": "apigateway",
     "apigatewayv2": "apigateway",
     "appconfig": "appconfig",
     "appconfigdata": "appconfig",
     "cloudfront": "cloudfront",
     "cloudfront-keyvaluestore": "cloudfront-keyvaluestore",
+    "controlcatalog": "controlcatalog",
     "dsql": "dsql",
     "eks": "eks",
     "es": "es",
+    "fis": "fis",
     "lambda": "lambda",
     "lambda-core": "lambda",
     "lambda-microvms": "lambda",
+    "oam": "oam",
     "opensearch": "es",
     "pipes": "pipes",
+    "ram": "ram",
+    "resource-explorer-2": "resource-explorer-2",
     "s3": "s3",
     "s3control": "s3",
     "scheduler": "scheduler",
@@ -70,8 +76,13 @@ MODELS: dict[str, str] = {
 
 
 # Shared-controller and ARN-spanning operations are activated with their qualified tables.
-SHARED_ROUTES: dict[str, frozenset[str]] = {}
-ARN_SPANNING_ROUTES: dict[str, frozenset[str]] = {}
+SHARED_ROUTES: dict[str, frozenset[str]] = {
+    "fis": frozenset({"TagResource", "UntagResource", "ListTagsForResource"}),
+    "resource-explorer-2": frozenset({"TagResource", "UntagResource", "ListTagsForResource"}),
+}
+ARN_SPANNING_ROUTES: dict[str, frozenset[str]] = {
+    "oam": frozenset({"TagResource", "UntagResource", "ListTagsForResource"}),
+}
 
 
 ONLY_OPERATIONS: dict[str, tuple[str, ...]] = {}

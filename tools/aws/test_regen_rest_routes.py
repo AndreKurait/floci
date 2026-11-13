@@ -109,10 +109,11 @@ def test_cloudfront_reads_key_value_stores_and_other_management_operations():
 def route_settings(monkeypatch):
     monkeypatch.setattr(r, "SHARED_ROUTES", {
         name: frozenset({"TagResource", "UntagResource", "ListTagsForResource", "GetTags"})
-        for name in ("lambda", "pipes", "apigateway")
+        for name in ("lambda", "pipes", "apigateway", "fis", "resource-explorer-2")
     })
     monkeypatch.setattr(r, "ARN_SPANNING_ROUTES", {
-        "apigatewayv2": frozenset({"TagResource", "UntagResource", "GetTags"})
+        "apigatewayv2": frozenset({"TagResource", "UntagResource", "GetTags"}),
+        "oam": frozenset({"TagResource", "UntagResource", "ListTagsForResource"})
     })
     monkeypatch.setattr(r, "HAND_ROUTED", {"s3": r.HAND_ROUTED["s3"]})
 
@@ -150,7 +151,7 @@ def test_models_sharing_a_scope_must_agree_on_the_denial_status():
         r.build({"lambda": first, "lambda-microvms": second}, "botocore test")
 
 
-@pytest.mark.parametrize("name", ["lambda", "pipes"])
+@pytest.mark.parametrize("name", ["lambda", "pipes", "fis", "resource-explorer-2"])
 @pytest.mark.parametrize("operation,method,source", [
     ("TagResource", "POST", "body"),
     ("UntagResource", "DELETE", "?resourceArn"),
@@ -170,7 +171,7 @@ def test_shared_tag_alternative_collision_is_rejected(route_settings):
             TagResource=("POST", "/tags/{resourceArn}"), OtherOperation=("POST", "/tags"))}, "test")
 
 
-@pytest.mark.parametrize("name", ["lambda", "pipes", "eks", "dsql"])
+@pytest.mark.parametrize("name", ["lambda", "pipes", "eks", "dsql", "resource-explorer-2"])
 def test_a_model_a_route_filter_moves_under_a_prefix_keeps_its_own_paths(name):
     # IAM matches a moved request on its path without the prefix its filter records, so the routes are the model's.
     doc = r.build({name: model("rest-json", "2020-01-01", GetThing=("GET", "/things/{ThingId}"))}, "test")
@@ -209,3 +210,7 @@ def test_an_arn_label_the_controller_lets_span_slashes_is_greedy(route_settings)
     operations = doc["models"]["apigatewayv2"]["operations"]
     assert operations["TagResource"] == {"method": "POST", "requestUri": "/v2/tags/{resource-arn+}"}
     assert operations["GetApi"] == {"method": "GET", "requestUri": "/v2/apis/{apiId}"}
+    # OAM's tag routes are served the same way, its sink and link ARNs holding a slash.
+    doc = r.build({"oam": model("rest-json", "2022-06-10", TagResource=("PUT", "/tags/{ResourceArn}"),
+                                GetSink=("POST", "/GetSink"))}, "test")
+    assert doc["models"]["oam"]["operations"]["TagResource"] == {"method": "PUT", "requestUri": "/tags/{ResourceArn+}"}

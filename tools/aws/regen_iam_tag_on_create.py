@@ -92,17 +92,17 @@ OUTPUT = REPO_ROOT / "src/main/resources/aws/iam-tag-on-create.json"
 
 # The IAM namespaces whose operations this file reads: those Floci serves over the JSON and Query
 # protocols and Smithy RPC v2 CBOR, and the REST ones whose routes Floci authorizes by operation.
-NAMESPACES = (
-    "access-analyzer", "acm", "application-autoscaling", "athena", "autoscaling", "bcm-data-exports",
-    "bcm-pricing-calculator", "budgets", "ce", "cloudformation", "cloudfront", "cloudhsm", "cloudtrail", "cloudwatch",
-    "codedeploy", "codepipeline", "cognito-identity", "cognito-idp", "comprehend", "config", "cur", "datasync",
-    "dms", "dsql", "dynamodb", "ec2", "ecr", "ecs", "eks", "elasticache", "elasticloadbalancing",
-    "elasticmapreduce", "events", "firehose", "globalaccelerator", "glue", "iam", "kinesis", "kinesisanalytics",
-    "kms", "lambda", "lightsail", "logs", "memorydb", "network-firewall", "organizations", "payment-cryptography",
-    "pipes", "rds", "redshift", "redshift-serverless", "rekognition", "resource-groups", "route53resolver",
-    "sagemaker", "scheduler", "secretsmanager", "servicediscovery", "ses", "sns", "sqs", "ssm", "sso", "states",
-    "sts", "swf", "textract", "timestream-influxdb", "transcribe", "transfer", "translate", "wafv2",
-)
+NAMESPACES = ("access-analyzer", "acm", "application-autoscaling", "athena", "autoscaling", "bcm-data-exports",
+              "bcm-pricing-calculator", "budgets", "ce", "cloudformation", "cloudfront", "cloudhsm", "cloudtrail",
+              "cloudwatch", "codedeploy", "codepipeline", "cognito-identity", "cognito-idp", "comprehend",
+              "config", "cur", "datasync", "dms", "dsql", "dynamodb", "ec2", "ecr", "ecs", "eks", "elasticache",
+              "elasticloadbalancing", "elasticmapreduce", "events", "firehose", "fis", "globalaccelerator", "glue",
+              "iam", "kinesis", "kinesisanalytics", "kms", "lambda", "lightsail", "logs", "memorydb",
+              "network-firewall", "oam", "organizations", "payment-cryptography", "pipes", "ram", "rds",
+              "redshift", "redshift-serverless", "rekognition", "resource-explorer-2", "resource-groups",
+              "route53resolver", "sagemaker", "scheduler", "secretsmanager", "servicediscovery", "ses", "sns",
+              "sqs", "ssm", "sso", "states", "sts", "swf", "textract", "timestream-influxdb", "transcribe",
+              "transfer", "translate", "wafv2")
 
 _NO_ROUTES = "REST routes no rule maps yet"
 # Namespaces Floci serves whose operations list a tagging action but are not read here yet, each with
@@ -113,10 +113,10 @@ NOT_COVERED = {
     "batch": _NO_ROUTES, "bedrock": _NO_ROUTES, "bedrock-agentcore": _NO_ROUTES,
     "cloudfront": _NO_ROUTES, "codeguru-reviewer": _NO_ROUTES, "connect": _NO_ROUTES,
     "controltower": _NO_ROUTES, "detective": _NO_ROUTES, "dlm": _NO_ROUTES,
-    "elasticfilesystem": _NO_ROUTES, "emr-serverless": _NO_ROUTES, "es": _NO_ROUTES, "fis": _NO_ROUTES,
+    "elasticfilesystem": _NO_ROUTES, "emr-serverless": _NO_ROUTES, "es": _NO_ROUTES,
     "guardduty": _NO_ROUTES, "inspector2": _NO_ROUTES, "iot": _NO_ROUTES, "kafka": _NO_ROUTES,
-    "macie2": _NO_ROUTES, "mq": _NO_ROUTES, "oam": _NO_ROUTES, "ram": _NO_ROUTES,
-    "resource-explorer-2": _NO_ROUTES, "rum": _NO_ROUTES, "s3tables": _NO_ROUTES, "securityhub": _NO_ROUTES,
+    "macie2": _NO_ROUTES, "mq": _NO_ROUTES,
+    "rum": _NO_ROUTES, "s3tables": _NO_ROUTES, "securityhub": _NO_ROUTES,
     "s3": "authorized by route; S3 checks s3:PutObjectTagging for an object it creates with tags itself",
     "servicecatalog": "its operations that tag are AppRegistry's, whose REST routes no rule maps yet",
 }
@@ -394,6 +394,9 @@ def entry_for(operation: str, upstream: dict, models: dict[str, dict]) -> dict:
     if len(upstream["tagging"]) != 1:
         raise ValueError(f"{operation}: needs one of {upstream['tagging']}; check it by hand (BY_HAND)")
     name = operation.split(":", 1)[1]
+    if not any(name in model["operations"] for model in models.values()):
+        return {**head, "notRead": "the pinned botocore does not have the operation yet, "
+                                 "so its request cannot be read"}
     members: dict[str, dict] = {}
     for model in models.values():
         for member in tag_members(model, name):
