@@ -394,6 +394,12 @@
         </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
+            <artifactId>kinesis</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
             <artifactId>backup</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
@@ -456,6 +462,12 @@
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>bedrock</artifactId>
             <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>cloudwatch</artifactId>
+            <version>2.57.7</version>
             <scope>test</scope>
         </dependency>
         <dependency>
