@@ -108,6 +108,16 @@ class LambdaRuntimeManagementServiceTest {
     }
 
     @Test
+    void malformedArnCannotEscapeAsAnInternalError() throws Exception {
+        put("one", null, "Manual", PIN);
+        AwsException read = assertThrows(AwsException.class, () -> service.get(REGION, "arn:foo", null));
+        assertEquals("InvalidParameterValueException", read.getErrorCode());
+        AwsException write = assertThrows(AwsException.class, () -> put("arn:foo", null, "Auto", null));
+        assertEquals("InvalidParameterValueException", write.getErrorCode());
+        assertEquals(PIN, service.get(REGION, "one", null).configuration().runtimeVersionArn());
+    }
+
+    @Test
     void conflictingAndOverlongSelectorsAreRejected() {
         assertThrows(AwsException.class, () -> service.get(REGION, "one:1", "2"));
         assertThrows(AwsException.class, () -> service.get(REGION, "one", "x".repeat(129)));
