@@ -2997,18 +2997,31 @@ class Ec2IntegrationTest {
             .body("RunInstancesResponse.instancesSet.item.tagSet.item.find { it.key == 'sample-name' }.value",
                     equalTo("sample-local"));
 
-        given()
-            .formParam("Action", "DescribeInstances")
-            .formParam("InstanceId.1", launchedInstanceId)
-            .header("Authorization", AUTH_HEADER)
-        .when()
-            .post("/")
-        .then()
-            .statusCode(200)
-            .body("DescribeInstancesResponse.reservationSet.item.instancesSet.item.instanceId",
-                    equalTo(launchedInstanceId))
-            .body("DescribeInstancesResponse.reservationSet.item.instancesSet.item.iamInstanceProfile.arn",
-                    equalTo("arn:aws:iam::000000000000:instance-profile/sample-profile-v2"));
+        try {
+            given()
+                .formParam("Action", "DescribeInstances")
+                .formParam("InstanceId.1", launchedInstanceId)
+                .header("Authorization", AUTH_HEADER)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .body("DescribeInstancesResponse.reservationSet.item.instancesSet.item.instanceId",
+                        equalTo(launchedInstanceId))
+                .body("DescribeInstancesResponse.reservationSet.item.instancesSet.item.iamInstanceProfile.arn",
+                        equalTo("arn:aws:iam::000000000000:instance-profile/sample-profile-v2"));
+        } finally {
+            given().header("Authorization", AUTH_HEADER)
+                    .formParam("Action", "TerminateInstances")
+                    .formParam("InstanceId.1", launchedInstanceId)
+                    .post("/").then().statusCode(200);
+        }
+        given().header("Authorization", AUTH_HEADER)
+                .formParam("Action", "DescribeInstances")
+                .formParam("InstanceId.1", launchedInstanceId)
+                .post("/").then().statusCode(200)
+                .body("DescribeInstancesResponse.reservationSet.item.instancesSet.item.instanceState.name",
+                        equalTo("terminated"));
     }
 
     @Test
