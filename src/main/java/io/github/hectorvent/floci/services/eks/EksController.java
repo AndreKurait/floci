@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.eks;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.services.eks.model.AccessPolicy;
@@ -17,6 +18,7 @@ import io.github.hectorvent.floci.services.eks.model.FargateProfile;
 import io.github.hectorvent.floci.services.eks.model.Nodegroup;
 import io.github.hectorvent.floci.services.eks.model.PodIdentityAssociation;
 import io.github.hectorvent.floci.services.eks.model.Update;
+import io.github.hectorvent.floci.services.eks.model.UpdateAccessEntryRequest;
 import io.github.hectorvent.floci.services.eks.model.UpdateAddonRequest;
 import io.github.hectorvent.floci.services.eks.model.UpdatePodIdentityAssociationRequest;
 import jakarta.inject.Inject;
@@ -223,6 +225,14 @@ public class EksController {
     @Path("/clusters/{name}/access-entries/{principalArn: .+}")
     public Response describeAccessEntry(@PathParam("name") String name, @PathParam("principalArn") String principalArn) {
         return Response.ok(Map.of("accessEntry", accessEntries.describe(eksService.describeCluster(name), principalArn))).build();
+    }
+
+    @POST
+    @Path("/clusters/{name}/access-entries/{principalArn: .+}")
+    public Response updateAccessEntry(@PathParam("name") String name, @PathParam("principalArn") String principalArn,
+                                      JsonNode request) {
+        return Response.ok(Map.of("accessEntry", eksService.updateAccessEntryInRequestRegion(
+                name, principalArn, UpdateAccessEntryRequest.fromJson(request)))).build();
     }
 
     @DELETE

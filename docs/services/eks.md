@@ -16,6 +16,7 @@ EKS uses a standard REST API with JSON bodies: not the JSON 1.1 (`X-Amz-Target`)
 | `ListAccessPolicies` | List the bundled access-policy catalog with pagination |
 | `CreateAccessEntry` | Create STANDARD or EC2_LINUX access-entry metadata |
 | `DescribeAccessEntry` | Describe an access entry by IAM principal ARN |
+| `UpdateAccessEntry` | Replace supplied username or Kubernetes groups while preserving access-entry identity and policies |
 | `ListAccessEntries` | List principal ARNs with pagination |
 | `DeleteAccessEntry` | Delete access-entry metadata |
 | `AssociateAccessPolicy` | Associate an EKS access policy and its cluster or namespace scope with a STANDARD access entry |
@@ -68,6 +69,28 @@ Access policies are management metadata, like the entries they belong to: Floci 
 
 The principal ARN in an access-entry path should be URL-encoded, as the SDKs and the CLI send it. Sent unencoded, a principal whose ARN ends in `/access-policies` (a role named `access-policies`) is read as the access-policies route of the shorter principal before it. A DELETE is a disassociate only when a cluster access policy ARN follows `access-policies`, so an entry with `access-policies` inside its IAM path can always be deleted.
 
+`UpdateAccessEntry` uses the native POST route and returns the complete access entry. It replaces only supplied
+`username` and `kubernetesGroups`, retaining the entry ARN, principal, type, tags, creation time, stable principal ID,
+creation token and policy associations. Both fields are validated before publishing one detached replacement;
+invalid usernames, malformed field types and node-entry overrides cannot partially apply another field.
+Floci accepts an empty group list as clearing the groups and omitted or null members as unchanged. These empty/null
+rules are local behavior consistent with the compared emulator source, without a separate live AWS oracle.
+`clientRequestToken` is accepted but does not maintain a historical update-response replay cache.
+
+The update shares the cluster-deletion lock and the access-entry service lock. Entries remain scoped to the caller's
+account, Region and cluster incarnation. The IAM lookup reads scoped rows and default-account legacy rows without
+migrating them, checking the stored ARN's owner and Region. The authorized update may migrate a matching legacy row
+before replacing it; unrelated EKS APIs retain their existing legacy-read behavior. The replacement uses the existing
+storage backend's atomic batch operation. Persistent and WAL backends publish after their synchronous write succeeds; hybrid storage retains its asynchronous durability.
+
+With IAM enforcement enabled, the new action authorizes the actual access-entry ARN, not the cluster ARN or principal
+ARN. It reads live `aws:ResourceTag` values, including empty values. `eks:clusterName` and `eks:principalArn` come from the
+path; `eks:username` and `eks:kubernetesGroups` come only from supplied request members. Omitted fields do not borrow
+stored values to satisfy conditions, and an explicit empty group list supplies an empty value set. This omitted-value
+rule is a local policy: the AWS service reference does not fully specify the fallback behavior. The update does not
+populate `eks:accessEntryType`, whose meaning for an API without a type input is not established here. This change does
+not add Kubernetes authorization, node bootstrap behavior or broader EKS IAM condition support.
+
 Access entries use EKS storage and retain the IAM principal's stable ID internally. Cluster deletion removes its entries, and a cluster recreated with the same name does not inherit previous entries or pagination tokens.
 
 ### EC2 Linux worker authentication
@@ -87,7 +110,7 @@ rejects instance credentials. Obtain fresh IMDS credentials after upgrading so t
 includes the stable role ID.
 
 !!! note "Authentication scope"
-    Non-worker IAM users and ordinary STS sessions retain the existing cluster-admin compatibility behavior. STANDARD entries, access policies, aws-auth ConfigMap, the cluster-creator bootstrap flag and automatic managed-node entries are not enforced by this change. Updating authentication mode, UpdateAccessEntry, and entry tag updates remain unimplemented. Native AL2023 images, bootstrap RBAC/CSR approval, CNI and worker networking are separate requirements for registration and Ready.
+    Non-worker IAM users and ordinary STS sessions retain the existing cluster-admin compatibility behavior. STANDARD entries, access policies, aws-auth ConfigMap, the cluster-creator bootstrap flag and automatic managed-node entries are not enforced by this change. Updating authentication mode remains unimplemented. Native AL2023 images, bootstrap RBAC/CSR approval, CNI and worker networking are separate requirements for registration and Ready.
 
 ```bash
 aws --endpoint-url http://localhost:4566 eks create-cluster \
