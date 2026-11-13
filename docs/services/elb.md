@@ -400,3 +400,17 @@ Precedence is per-region setting, global setting, then AWS behavior.
 A per-region `aws` entry restores AWS behavior even when the global rule is overridden.
 These explicit overrides intentionally change local compatibility; they do not
 change the AWS API shape or require a separate Floci process for each region.
+
+### Account-specific single-zone ALBs
+
+`floci.services.elbv2.single-zone-alb-accounts`
+(`FLOCI_SERVICES_ELBV2_SINGLE_ZONE_ALB_ACCOUNTS`) retains the account allowlist for
+local single-zone deployments. It accepts comma-separated 12-digit account IDs;
+spaces and empty entries are ignored, and malformed IDs fail startup.
+
+An explicit regional rule takes precedence, including `aws` to restore that
+region's AWS default. Otherwise a listed account permits one zone, followed by
+the global rule and AWS defaults. Unlisted accounts keep the global or regional
+behavior. Both `CreateLoadBalancer` and `SetSubnets`, including CloudFormation,
+apply the rule. Empty subnet lists are still rejected, and Network and Gateway
+Load Balancers are unchanged.

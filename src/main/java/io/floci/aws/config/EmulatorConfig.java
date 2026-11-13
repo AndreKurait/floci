@@ -3819,6 +3819,9 @@ public interface EmulatorConfig {
 
         /** A region entry takes precedence over the global rule, including an explicit AWS reset. */
         Map<String, AlbZoneRule> albZoneRuleByRegion();
+
+        /** Accounts allowed a single-zone ALB unless an explicit region rule takes precedence. */
+        Optional<List<String>> singleZoneAlbAccounts();
     }
 
     enum AlbZoneRule {
