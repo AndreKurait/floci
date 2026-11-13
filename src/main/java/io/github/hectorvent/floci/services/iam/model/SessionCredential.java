@@ -1,0 +1,244 @@
+package io.github.hectorvent.floci.services.iam.model;
+
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import io.quarkus.runtime.annotations.RegisterForReflection;
+
+import java.time.Instant;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+@RegisterForReflection
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class SessionCredential {
+
+    /** In-process provenance only; restored credentials are never admitted by the management verifier. */
+    @JsonIgnore
+    private boolean assumeRoleIssued;
+    @JsonIgnore
+    private boolean managedSessionPolicyPresent;
+    @JsonIgnore
+    private LambdaExecutionBinding lambdaExecution;
+    @JsonIgnore
+    private SessionCredential lambdaParentSession;
+
+    public LambdaExecutionBinding getLambdaExecution() { return lambdaExecution; }
+    public void setLambdaExecution(LambdaExecutionBinding value) { lambdaExecution = value; }
+    public SessionCredential getLambdaParentSession() { return lambdaParentSession; }
+    public void setLambdaParentSession(SessionCredential value) { lambdaParentSession = value; }
+
+    private String accessKeyId;
+    private String secretAccessKey;
+    private String sessionToken;
+    private String roleArn;
+    private String roleSessionName;
+    private String assumedRoleId;
+    private String sourceIdentity;
+    private Map<String, String> sessionTags = Map.of();
+    private Map<String, String> transitiveSessionTags = Map.of();
+    private Instant expiration;
+    private Instant issuedAt;
+    /** True only for credentials issued by GetSessionToken, never inferred from their key or token. */
+    private boolean sessionTokenCredential;
+    private Boolean multiFactorAuthPresent;
+    private Instant multiFactorAuthenticatedAt;
+    /** Inline session policy passed to AssumeRole/GetFederationToken — further restricts role policies. */
+    private String sessionPolicyDocument;
+    private Map<String, List<String>> cognitoIdentityClaims = Map.of();
+    private List<String> managedSessionPolicyArns = List.of();
+    /**
+     * Account of the caller that minted this session, captured at mint time. Used to route
+     * temporary credentials that carry no role ARN (e.g. GetSessionToken) back to the caller. A
+     * delegated session holds the customer's account here instead of the partner's that redeemed
+     * the token, that being the account the credentials act in.
+     */
+    private String originAccountId;
+    /** True when this session belongs to a Floci-launched Lambda container. */
+    private boolean lambdaExecutionRole;
+    private String ec2InstanceId;
+    private String ec2RoleId;
+    /** Exact launching instance; only live IMDS issuance may establish this identity. */
+    @JsonIgnore
+    private String ec2InstanceArn;
+    /** Exact ECS task ARN this session was minted for, when this is a task-role session. */
+    private String ecsTaskArn;
+    /** Exact object action and ARN for an internally generated S3 presigned URL. */
+    private String presignedAction;
+    private String presignedResourceArn;
+    /** Exact object ARN or UUID-scoped prefix permitted for an internal S3 transfer. */
+    private String scratchResourceArn;
+    /**
+     * The long-term identity whose key minted this session through GetSessionToken or
+     * GetFederationToken: an IAM user's ARN, or the account root's. Null for every other session.
+     */
+    private String issuerArn;
+    /** The unique ID of the IAM user named by {@link #issuerArn}, so a same-named replacement is not it. */
+    private String issuerUserId;
+    /**
+     * The identity that approved the delegation request these credentials were exchanged for, which
+     * AcceptDelegationRequest records as the one "that gets mapped to the delegated credential" and
+     * GetDelegatedAccessToken reports as its {@code AssumedPrincipal}. Null for every other
+     * session. It is held apart from {@link #roleArn} because it is whatever identity approved the
+     * request, an IAM user or the account root as much as a role, and reading it as a role would
+     * resolve it by name.
+     */
+    private String delegatedApproverArn;
+
+    public SessionCredential() {}
+
+    public SessionCredential(String accessKeyId, String roleArn, Instant expiration) {
+        this.accessKeyId = accessKeyId;
+        this.roleArn = roleArn;
+        this.expiration = expiration;
+    }
+
+    public SessionCredential(String accessKeyId, String roleArn, Instant expiration, String sessionPolicyDocument) {
+        this.accessKeyId = accessKeyId;
+        this.roleArn = roleArn;
+        this.expiration = expiration;
+        this.sessionPolicyDocument = sessionPolicyDocument;
+    }
+
+    public SessionCredential(String accessKeyId, String secretAccessKey, String roleArn, Instant expiration,
+                              String sessionPolicyDocument) {
+        this(accessKeyId, secretAccessKey, null, roleArn, expiration, sessionPolicyDocument);
+    }
+
+    public SessionCredential(String accessKeyId, String secretAccessKey, String sessionToken, String roleArn,
+                              Instant expiration, String sessionPolicyDocument) {
+        this.accessKeyId = accessKeyId;
+        this.secretAccessKey = secretAccessKey;
+        this.sessionToken = sessionToken;
+        this.roleArn = roleArn;
+        this.expiration = expiration;
+        this.sessionPolicyDocument = sessionPolicyDocument;
+    }
+
+    public SessionCredential(String accessKeyId, String secretAccessKey, String roleArn, Instant expiration,
+                              String sessionPolicyDocument, String originAccountId) {
+        this(accessKeyId, secretAccessKey, null, roleArn, expiration, sessionPolicyDocument, originAccountId);
+    }
+
+    public SessionCredential(String accessKeyId, String secretAccessKey, String sessionToken, String roleArn,
+                              Instant expiration, String sessionPolicyDocument, String originAccountId) {
+        this.accessKeyId = accessKeyId;
+        this.secretAccessKey = secretAccessKey;
+        this.sessionToken = sessionToken;
+        this.roleArn = roleArn;
+        this.expiration = expiration;
+        this.sessionPolicyDocument = sessionPolicyDocument;
+        this.originAccountId = originAccountId;
+    }
+
+    public boolean isAssumeRoleIssued() { return assumeRoleIssued; }
+    public void setAssumeRoleIssued(boolean value) { assumeRoleIssued = value; }
+
+    public boolean isManagedSessionPolicyPresent() { return managedSessionPolicyPresent; }
+    public void setManagedSessionPolicyPresent(boolean value) { managedSessionPolicyPresent = value; }
+
+    public String getAccessKeyId() { return accessKeyId; }
+    public void setAccessKeyId(String accessKeyId) { this.accessKeyId = accessKeyId; }
+
+    public String getSecretAccessKey() { return secretAccessKey; }
+    public void setSecretAccessKey(String secretAccessKey) { this.secretAccessKey = secretAccessKey; }
+
+    public String getSessionToken() { return sessionToken; }
+    public void setSessionToken(String sessionToken) { this.sessionToken = sessionToken; }
+
+    public String getRoleArn() { return roleArn; }
+    public void setRoleArn(String roleArn) { this.roleArn = roleArn; }
+
+    public String getRoleSessionName() { return roleSessionName; }
+    public void setRoleSessionName(String roleSessionName) { this.roleSessionName = roleSessionName; }
+
+    public String getSourceIdentity() { return sourceIdentity; }
+    public void setSourceIdentity(String value) { sourceIdentity = value; }
+
+    public String getAssumedRoleId() { return assumedRoleId; }
+    public void setAssumedRoleId(String assumedRoleId) { this.assumedRoleId = assumedRoleId; }
+
+    public Map<String, String> getTransitiveSessionTags() { return transitiveSessionTags; }
+    public void setTransitiveSessionTags(Map<String, String> tags) {
+        transitiveSessionTags = tags == null ? Map.of() : Map.copyOf(tags);
+    }
+
+    public Map<String, String> getSessionTags() { return sessionTags; }
+    public void setSessionTags(Map<String, String> tags) { sessionTags = tags == null ? Map.of() : Map.copyOf(tags); }
+
+    public Instant getIssuedAt() { return issuedAt; }
+    public void setIssuedAt(Instant issuedAt) { this.issuedAt = issuedAt; }
+
+    public boolean isSessionTokenCredential() { return sessionTokenCredential; }
+    public void setSessionTokenCredential(boolean value) { sessionTokenCredential = value; }
+
+    public Boolean getMultiFactorAuthPresent() { return multiFactorAuthPresent; }
+    public void setMultiFactorAuthPresent(Boolean multiFactorAuthPresent) {
+        this.multiFactorAuthPresent = multiFactorAuthPresent;
+    }
+
+    public Instant getMultiFactorAuthenticatedAt() { return multiFactorAuthenticatedAt; }
+    public void setMultiFactorAuthenticatedAt(Instant authenticatedAt) {
+        this.multiFactorAuthenticatedAt = authenticatedAt;
+    }
+
+    public Instant getExpiration() { return expiration; }
+    public void setExpiration(Instant expiration) { this.expiration = expiration; }
+
+    public List<String> getManagedSessionPolicyArns() { return managedSessionPolicyArns; }
+    public void setManagedSessionPolicyArns(List<String> arns) {
+        managedSessionPolicyArns = arns == null ? List.of() : List.copyOf(arns);
+    }
+
+    public String getSessionPolicyDocument() { return sessionPolicyDocument; }
+    public void setSessionPolicyDocument(String sessionPolicyDocument) { this.sessionPolicyDocument = sessionPolicyDocument; }
+
+    public String getOriginAccountId() { return originAccountId; }
+    public void setOriginAccountId(String originAccountId) { this.originAccountId = originAccountId; }
+
+    public String getEc2RoleId() { return ec2RoleId; }
+    public void setEc2RoleId(String ec2RoleId) { this.ec2RoleId = ec2RoleId; }
+
+    public String getEc2InstanceId() { return ec2InstanceId; }
+    public void setEc2InstanceId(String ec2InstanceId) { this.ec2InstanceId = ec2InstanceId; }
+    public String getEc2InstanceArn() { return ec2InstanceArn; }
+    public void setEc2InstanceArn(String ec2InstanceArn) { this.ec2InstanceArn = ec2InstanceArn; }
+
+    public String getEcsTaskArn() { return ecsTaskArn; }
+    public void setEcsTaskArn(String ecsTaskArn) { this.ecsTaskArn = ecsTaskArn; }
+
+    public String getPresignedAction() { return presignedAction; }
+    public void setPresignedAction(String presignedAction) { this.presignedAction = presignedAction; }
+
+    public String getPresignedResourceArn() { return presignedResourceArn; }
+    public void setPresignedResourceArn(String presignedResourceArn) { this.presignedResourceArn = presignedResourceArn; }
+
+    public String getScratchResourceArn() { return scratchResourceArn; }
+    public void setScratchResourceArn(String scratchResourceArn) {
+        this.scratchResourceArn = scratchResourceArn;
+    }
+
+    public boolean isLambdaExecutionRole() { return lambdaExecutionRole; }
+    public void setLambdaExecutionRole(boolean lambdaExecutionRole) { this.lambdaExecutionRole = lambdaExecutionRole; }
+
+    public String getIssuerArn() { return issuerArn; }
+    public void setIssuerArn(String issuerArn) { this.issuerArn = issuerArn; }
+
+    public String getIssuerUserId() { return issuerUserId; }
+    public void setIssuerUserId(String issuerUserId) { this.issuerUserId = issuerUserId; }
+
+    public String getDelegatedApproverArn() { return delegatedApproverArn; }
+    public void setDelegatedApproverArn(String arn) { this.delegatedApproverArn = arn; }
+
+    public Map<String, List<String>> getCognitoIdentityClaims() {
+        return cognitoIdentityClaims;
+    }
+
+    public void setCognitoIdentityClaims(Map<String, List<String>> claims) {
+        Map<String, List<String>> copy = new LinkedHashMap<>();
+        if (claims != null) {
+            claims.forEach((key, value) -> copy.put(key, List.copyOf(value)));
+        }
+        this.cognitoIdentityClaims = Map.copyOf(copy);
+    }
+}
