@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -32,6 +33,35 @@ class ServiceLinkedRolesTest {
             ServicePrincipals.of("guardduty"), "AWSServiceRoleForAmazonGuardDuty",
             ServicePrincipals.of("macie"), "AWSServiceRoleForAmazonMacie",
             ServicePrincipals.of("ram"), "AWSServiceRoleForResourceAccessManager");
+
+    /**
+     * IAM attaches the linked service's managed policy to the role it creates. Every partition form of
+     * a principal reaches the same policy; a service with no known policy gets none rather than a guess.
+     */
+    @Test
+    void openSearchPrincipalsNameTheManagedPolicyIamAttaches() {
+        assertEquals(Optional.of("AmazonOpenSearchServiceRolePolicy"),
+                ServiceLinkedRoles.managedPolicyName(ServicePrincipals.of("opensearchservice")));
+        assertEquals(Optional.of("AmazonOpenSearchServiceRolePolicy"),
+                ServiceLinkedRoles.managedPolicyName("opensearchservice.amazonaws.com.cn"));
+        assertTrue(ServiceLinkedRoles.managedPolicyName(ServicePrincipals.of("autoscaling")).isEmpty());
+        assertTrue(ServiceLinkedRoles.managedPolicyName(null).isEmpty());
+    }
+
+    /** A mapped name the bundled catalog lacks would leave the role with no permissions at all. */
+    @Test
+    void everyMappedManagedPolicyIsInTheBundledCatalog() {
+        List<String> missing = new ArrayList<>();
+        for (String policyName : ServiceLinkedRoles.managedPolicies().values()) {
+            boolean bundled = AwsManagedPolicies.POLICIES.stream()
+                    .anyMatch(policy -> policy.name().equals(policyName)
+                            && "/aws-service-role/".equals(policy.path()));
+            if (!bundled) {
+                missing.add(policyName);
+            }
+        }
+        assertTrue(missing.isEmpty(), "service-linked role policies missing from the catalog: " + missing);
+    }
 
     @Test
     void everyPrincipalAnotherServiceBuildsAnArnForIsInTheTable() {
