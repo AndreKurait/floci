@@ -7,6 +7,20 @@ the calling account and region. Persisted records from older versions that did n
 record a region remain available only in `floci.default-region`. New writes store
 their region explicitly in all storage modes.
 
+With IAM enforcement enabled, AppConfig and AppConfigData requests require the
+caller's `appconfig:` permissions. Scoped policies use canonical resource IDs even
+when the request uses names. Configuration sessions authorize both creation and
+polling against the application/environment/configuration ARN; a denied poll does
+not consume its token. Passing retrieval or monitor roles also requires
+`iam:PassRole` for the AppConfig service. IAM enforcement remains disabled by default.
+
+Tagged `CreateApplication` and `CreateDeploymentStrategy` requests also require
+`appconfig:TagResource` on `application/*` or `deploymentstrategy/*` in the request's
+partition, account and Region. Both the create action and tagging action evaluate
+`aws:RequestTag` and `aws:TagKeys` conditions. An untagged create needs only its create
+permission. This tag-on-create admission currently covers these two operations;
+child-resource and deployment creation tags remain outside this admission scope.
+
 ## Management Plane (AppConfig)
 
 The management plane allows you to create and manage applications, environments, configuration profiles, and hosted configuration versions.
