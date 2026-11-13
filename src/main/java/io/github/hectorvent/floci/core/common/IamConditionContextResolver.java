@@ -349,6 +349,7 @@ public class IamConditionContextResolver {
             case "kinesis" -> kinesisConditionContext(action, ctx);
             case "eks" -> "eks:UpdateAccessEntry".equals(action) && eksAccessEntryUpdates != null
                     && eksAccessEntryUpdates.isResolvable() ? eksAccessEntryUpdates.get().resolve(ctx) : null;
+            case "ssm" -> ssmSyncConditionContext(action, ctx);
             case "redshift" -> redshiftConditionContext(action, ctx);
             case "states" -> stepFunctionsConditionContext(action, ctx);
             default -> null;
@@ -635,6 +636,25 @@ public class IamConditionContextResolver {
             }
         }
         return conditions.isEmpty() ? null : conditions;
+    }
+
+    /** The same destination default the sync handler uses for omitted create/list/delete types. */
+    private Map<String, List<String>> ssmSyncConditionContext(String action, ContainerRequestContext ctx) {
+        if (!RequestConditionKeys.takes(action, "ssm:SyncType")) {
+            return null;
+        }
+        JsonNode body = bufferedJsonBody(ctx);
+        if (body == null || !body.isObject()) {
+            return null;
+        }
+        for (String member : RequestConditionKeys.members(action, "ssm:SyncType")) {
+            JsonNode value = body.get(member);
+            if (value != null && !value.isNull()) {
+                return value.isTextual() ? Map.of("ssm:SyncType", List.of(value.asText())) : null;
+            }
+        }
+        return "ssm:UpdateResourceDataSync".equals(action)
+                ? null : Map.of("ssm:SyncType", List.of("SyncToDestination"));
     }
 
     public static Map<String, List<String>> withGlobalContext(Map<String, List<String>> serviceContext,

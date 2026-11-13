@@ -2005,7 +2005,10 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 || "apigateway".equals(credentialScope)) {
             return arnBuilder.buildResources(credentialScope, ctx, region, accountId, requestPartition());
         }
-        String partition = "route53".equals(credentialScope)
+        boolean syncOperation = "ssm".equals(credentialScope) && operation != null
+                && Set.of("ssm:CreateResourceDataSync", "ssm:ListResourceDataSync",
+                        "ssm:UpdateResourceDataSync", "ssm:DeleteResourceDataSync").contains(operation);
+        String partition = "route53".equals(credentialScope) || syncOperation
                 || ("account".equals(credentialScope) && AccountRegionActions.supports(operation))
                 ? requestPartition() : AwsRegions.partitionFor(region);
         return arnBuilder.buildResources(credentialScope, operation, ctx, region, accountId, partition);

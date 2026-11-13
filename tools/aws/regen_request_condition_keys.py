@@ -12,6 +12,7 @@ it. `SERVICES` names, for each namespace, the keys read and where:
 - `redshift`: a Redshift request is checked with the database user it names as `redshift:DbUser`, so a policy
   can scope GetClusterCredentials and CreateClusterUser to `dbuser:<cluster>/${redshift:DbUser}`.
   `redshift:DbName` and `redshift:DurationSeconds` are not read yet.
+- `ssm`: the four resource data sync operations read `ssm:SyncType` from `SyncType`.
 
 The table comes from two sources:
 
@@ -63,6 +64,12 @@ FLAT_PROTOCOLS = ("query", "ec2")
 SERVICES = {
     "account": {"model": "account", "request": {"account:TargetRegion": "RegionName"},
                 "stored": (), "not_in_request": {}},
+    "ssm": {
+        "model": "ssm",
+        "request": {"ssm:SyncType": "SyncType"},
+        "stored": (),
+        "not_in_request": {},
+    },
     "lambda": {
         "model": "lambda-web",
         "request": {"lambda:Request/WebFunctionAuthType": "authType"},
