@@ -99,11 +99,7 @@ REQUIRED_BY_HAND = (
 # `InvalidInput` too when the list arrives empty, and `Encoding` on `GetSSHPublicKey` is answered
 # with the modelled `UnrecognizedPublicKeyEncoding` rather than as a constraint at all. The
 # simulators answer an empty `ActionNames`, `PolicyInputList` or `PolicySourceArn` with a sentence
-# of their own, "At least one ActionNames member is required.", which no capture here moves.
-# `PolicyInputList` keeps that only where the operation requires it, which is `SimulateCustomPolicy`:
-# on `SimulatePrincipalPolicy` the member is optional, so there is no sentence in front of the walk
-# to protect and the member is read here, a document held to the 131072 characters and the printable
-# set `policyDocumentType` declares. And
+# of their own, "At least one ActionNames member is required.", which no capture here moves. And
 # `TagKeys` on the untag operations is answered against the list as a whole, "Value at 'tagKeys'
 # failed to satisfy constraint: Member must satisfy constraint: [...]", where the walk names the
 # member that broke it under its own index: both forms are readings, and this is the one those
@@ -121,7 +117,7 @@ MEMBERS_BY_HAND = {
     "ListPoliciesGrantingServiceAccess": ("ServiceNamespaces",),
     "GetSSHPublicKey": ("Encoding",),
     "SimulateCustomPolicy": ("ActionNames", "PolicyInputList"),
-    "SimulatePrincipalPolicy": ("ActionNames", "PolicySourceArn"),
+    "SimulatePrincipalPolicy": ("ActionNames", "PolicyInputList", "PolicySourceArn"),
     "UntagInstanceProfile": ("TagKeys",),
     "UntagMFADevice": ("TagKeys",),
     "UntagOpenIDConnectProvider": ("TagKeys",),
@@ -167,13 +163,7 @@ def enum_order(model: dict, orders: dict[str, tuple[str, ...]] | None = None) ->
 # account on 2026-10-31, quotes `[\w+=.@-]*` for it, without the comma this model admits and with a
 # `*` where the model sets a minimum of 1. Only AWS's message is in hand rather than its shape, so
 # the member carries a shape of its own here with AWS's text beside the model's: the message is the
-# captured one and a comma is still admitted.
-#
-# The comma is what AWS publishes for this member, not what aliasing it to a group name's shape
-# brought along: the API Reference entry for the operation, read on 2026-11-03, gives
-# `AWSServiceName` the same `[\w+=,.@-]+` and the same minimum of 1, so the pattern below stays the
-# published one. Why that settles it, and what a capture of a comma refused would move, is in
-# `docs/services/iam.md` rather than repeated here.
+# captured one and a comma is still admitted, which nothing in hand settles either way.
 QUOTED_PATTERNS = {
     ("CreateServiceLinkedRole", "AWSServiceName"): ("groupNameType", r"[\w+=,.@-]+", r"[\w+=.@-]*"),
 }
