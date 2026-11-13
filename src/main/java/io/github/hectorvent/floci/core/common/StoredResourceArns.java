@@ -86,4 +86,13 @@ public interface StoredResourceArns {
     default Optional<String> findByMembers(String type, List<String> names, String region) {
         return find(type, names, region);
     }
+    /**
+     * As {@link #findByMembers}, for a resource another account owns that the request names by that account, which its
+     * service lets the caller reach when the resource's policy allows it (a Redshift Serverless snapshot shared by its
+     * owner): the ARN that account's resource is stored under; empty when there is none, or the service finds none
+     * of another account.
+     */
+    default Optional<String> findInAccount(String type, List<String> names, String account, String region) {
+        return Optional.empty();
+    }
 }
