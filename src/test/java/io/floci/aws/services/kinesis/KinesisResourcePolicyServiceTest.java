@@ -169,12 +169,29 @@ class KinesisResourcePolicyServiceTest {
     }
 
     @Test
+    void policyReplacementRetainsTheCurrentStreamStatusDeadline() {
+        Instant now = Instant.parse("2026-01-01T00:00:00Z");
+        KinesisService delayed = new KinesisService(streams, consumers, regions,
+                Clock.fixed(now, ZoneOffset.UTC), 2_000, 2_000);
+        KinesisStream created = delayed.createStream("target", 1, REGION);
+        delayed.putResourcePolicy(created.getStreamArn(), POLICY, REGION);
+        KinesisStream replaced = delayed.describeStream("target", REGION);
+        assertEquals("CREATING", replaced.getStreamStatus(now));
+        assertEquals(now.plusSeconds(2), replaced.getStatusTransitionDeadline());
+        assertEquals("ACTIVE", replaced.getStreamStatus(now.plusSeconds(2)));
+        assertEquals(POLICY, delayed.getResourcePolicy(created.getStreamArn(), REGION));
+    }
+
+    @Test
     void deletedParentGenerationRejectsRetainedConsumerEvenWithFixedClockAndIdenticalArn() {
         String arn = service.createStream("target", 1, REGION).getStreamArn();
         String consumer = service.registerStreamConsumer(arn, "child", REGION).getConsumerArn();
         service.putResourcePolicy(consumer, POLICY, REGION);
+        KinesisConsumer retained = consumers.get(REGION + "::" + consumer).orElseThrow();
         service.deleteStream("target", REGION);
-        assertTrue(consumers.get(REGION + "::" + consumer).isPresent(), "Existing consumer store retains the old record");
+        assertTrue(consumers.get(REGION + "::" + consumer).isEmpty(), "Stream deletion cleans its consumers");
+        // Simulate a stale record loaded from storage created before consumer cleanup was supported.
+        consumers.put(REGION + "::" + consumer, retained);
         service.createStream("target", 1, REGION);
         assertEquals("{}", service.getResourcePolicy(arn, REGION));
         assertThrows(AwsException.class, () -> service.getResourcePolicy(consumer, REGION));
