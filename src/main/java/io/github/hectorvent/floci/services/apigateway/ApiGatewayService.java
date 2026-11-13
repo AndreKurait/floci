@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.apigateway;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -14,6 +15,7 @@ import io.github.hectorvent.floci.core.common.AwsPartitions;
 import io.github.hectorvent.floci.core.common.AwsRegionFacts;
 import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.CloudFrontEdgeDomain;
+import io.github.hectorvent.floci.core.common.ModelTemplateGenerator;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ReservedTags;
 import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
@@ -31,6 +33,8 @@ import io.github.hectorvent.floci.services.apigateway.model.BasePathMapping;
 import io.github.hectorvent.floci.services.apigateway.model.CustomDomain;
 import io.github.hectorvent.floci.services.apigateway.model.Deployment;
 import io.github.hectorvent.floci.services.apigateway.model.DeploymentExportSnapshot;
+import io.github.hectorvent.floci.services.apigateway.model.DocumentationPart;
+import io.github.hectorvent.floci.services.apigateway.model.DocumentationVersion;
 import io.github.hectorvent.floci.services.apigateway.model.EndpointConfiguration;
 import io.github.hectorvent.floci.services.apigateway.model.EndpointType;
 import io.github.hectorvent.floci.services.apigateway.model.GatewayResponse;
@@ -59,6 +63,7 @@ import io.swagger.v3.oas.models.media.Schema;
 import io.swagger.v3.oas.models.parameters.Parameter;
 import io.swagger.v3.oas.models.security.SecurityRequirement;
 import io.swagger.v3.oas.models.security.SecurityScheme;
+import io.swagger.v3.parser.core.models.ParseOptions;
 import io.swagger.v3.parser.core.models.SwaggerParseResult;
 import io.swagger.v3.parser.util.OpenAPIDeserializer;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -82,6 +87,8 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.StringJoiner;
+import java.util.TreeMap;
 import java.util.UUID;
 import java.util.function.Function;
 import java.util.function.Predicate;
@@ -115,9 +122,10 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
 
     private final AccountAwareStorageBackend<RestApi> apiStore;
     private final StorageBackend<String, ApiGatewayResource> resourceStore;
-    private final StorageBackend<String, Deployment> deploymentStore;
+    private final AccountAwareStorageBackend<Deployment> deploymentStore;
     private final StorageBackend<String, Map<String, String>> deploymentModelStore;
-    private final StorageBackend<String, Stage> stageStore;
+    private final ApiGatewayStageDocumentationStore stageStore;
+    private final ApiGatewayDocumentationCursor documentationCursor = new ApiGatewayDocumentationCursor();
     private final StorageBackend<String, Authorizer> authorizerStore;
     private final StorageBackend<String, ApiKey> apiKeyStore;
     private final StorageBackend<String, UsagePlan> usagePlanStore;
@@ -125,6 +133,7 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
     private final StorageBackend<String, RequestValidator> requestValidatorStore;
     private final StorageBackend<String, GatewayResponse> gatewayResponseStore;
     private final StorageBackend<String, Model> modelStore;
+    private final AccountAwareStorageBackend<DocumentationPart> documentationPartStore;
     private final StorageBackend<String, VpcLink> vpcLinkStore;
     private final StorageBackend<String, Account> accountStore;
     private final AccountAwareStorageBackend<CustomDomain> domainStore;
@@ -206,9 +215,7 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
         this.deploymentModelStore = storageFactory.create("apigateway", "apigateway-deployment-models.json",
                 new TypeReference<>() {
                 });
-        this.stageStore = storageFactory.create("apigateway", "apigateway-stages.json",
-                new TypeReference<>() {
-                });
+        this.stageStore = new ApiGatewayStageDocumentationStore(storageFactory);
         this.authorizerStore = storageFactory.create("apigateway", "apigateway-authorizers.json",
                 new TypeReference<>() {
                 });
@@ -228,6 +235,9 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
                 new TypeReference<>() {
                 });
         this.modelStore = storageFactory.create("apigateway", "apigateway-models.json",
+                new TypeReference<>() {
+                });
+        this.documentationPartStore = storageFactory.create("apigateway", "apigateway-documentation-parts.json",
                 new TypeReference<>() {
                 });
         this.vpcLinkStore = storageFactory.create("apigateway", "apigateway-vpclinks.json",
@@ -298,7 +308,7 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
 
     // ──────────────────────────── REST API CRUD ────────────────────────────
 
-    public RestApi createRestApi(String region, Map<String, Object> request) {
+    public synchronized RestApi createRestApi(String region, Map<String, Object> request) {
         String name = (String) request.get("name");
         String description = (String) request.get("description");
 
@@ -472,7 +482,7 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
         return apiStore.scan(k -> k.startsWith(prefix));
     }
 
-    public void deleteRestApi(String region, String apiId) {
+    public synchronized void deleteRestApi(String region, String apiId) {
         getRestApi(region, apiId);
         apiStore.delete(apiKey(region, apiId));
         // Simple cascade: delete resources for this API
@@ -480,8 +490,11 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
         resourceStore.keys().stream().filter(k -> k.startsWith(prefix)).forEach(resourceStore::delete);
         deploymentStore.keys().stream().filter(k -> k.startsWith(prefix)).forEach(deploymentStore::delete);
         deploymentModelStore.keys().stream().filter(k -> k.startsWith(prefix)).forEach(deploymentModelStore::delete);
-        stageStore.keys().stream().filter(k -> k.startsWith(prefix)).forEach(stageStore::delete);
+        stageStore.deleteApi(region, apiId);
         modelStore.keys().stream().filter(k -> k.startsWith(prefix)).forEach(modelStore::delete);
+        Set<String> documentationPartKeys = new HashSet<>(documentationPartStore.keys());
+        documentationPartKeys.removeIf(key -> !key.startsWith(prefix));
+        documentationPartStore.deleteAllAtomically(documentationPartKeys);
         requestValidatorStore.keys().stream().filter(k -> k.startsWith(prefix)).forEach(requestValidatorStore::delete);
         authorizerStore.keys().stream().filter(k -> k.startsWith(prefix)).forEach(authorizerStore::delete);
         gatewayResponseStore.keys().stream().filter(k -> k.startsWith(prefix)).forEach(gatewayResponseStore::delete);
@@ -866,7 +879,7 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
 
     // ──────────────────────────── Deployments ────────────────────────────
 
-    public Deployment createDeployment(String region, String apiId, Map<String, Object> request) {
+    public synchronized Deployment createDeployment(String region, String apiId, Map<String, Object> request) {
         getRestApi(region, apiId);
         String description = (String) request.getOrDefault("description", "");
         String snapshot;
@@ -990,7 +1003,7 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
         return existing;
     }
 
-    public ObjectNode exportRestApi(String region, String apiId, String stageName, String exportType,
+    public synchronized ObjectNode exportRestApi(String region, String apiId, String stageName, String exportType,
                                     String extensions) {
         Stage stage = getStage(region, apiId, stageName);
         if (!"oas30".equals(exportType) && !"swagger".equals(exportType)) {
@@ -998,10 +1011,10 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
         }
         Set<String> selected = extensions == null || extensions.isBlank()
                 ? Set.of() : new HashSet<>(List.of(extensions.split(",")));
-        if (!Set.of("integrations", "authorizers", "apigateway").containsAll(selected)) {
+        if (!Set.of("integrations", "authorizers", "apigateway", "documentation").containsAll(selected)) {
             throw new AwsException("BadRequestException", "Unsupported export extensions: " + extensions, 400);
         }
-        Deployment deployment = getDeployment(region, apiId, stage.getDeploymentId());
+        Deployment deployment = documentationDeployment(region, apiId, stage.getDeploymentId());
         if (deployment.exportSnapshot() == null) {
             throw new AwsException("BadRequestException",
                     "This deployment predates export snapshots. Redeploy the API before exporting it.", 400);
@@ -1019,6 +1032,11 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
             } else {
                 document.putArray("servers").addObject().put("url", "https://" + host + "/" + stageName);
             }
+            if (stage.getDocumentationVersion() != null) {
+                RestApiDocumentationExporter.apply(document,
+                        getDocumentationVersion(region, apiId, stage.getDocumentationVersion()),
+                        "swagger".equals(exportType));
+            }
             return document;
         } catch (JsonProcessingException e) {
             throw new IllegalStateException("Cannot read REST API deployment snapshot", e);
@@ -1027,8 +1045,13 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
 
     // ──────────────────────────── Stages ────────────────────────────
 
-    public Stage createStage(String region, String apiId, Map<String, Object> request) {
-        getRestApi(region, apiId);
+    public synchronized Stage createStage(String region, String apiId, Map<String, Object> request) {
+        requireDocumentationApi(region, apiId);
+        String documentationVersion = request.get("documentationVersion") == null ? null
+                : documentationVersionName(request.get("documentationVersion"));
+        if (documentationVersion != null) {
+            getDocumentationVersion(region, apiId, documentationVersion);
+        }
         String stageName = (String) request.get("stageName");
         String deploymentId = (String) request.get("deploymentId");
 
@@ -1067,24 +1090,25 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
                     logs.get("format") instanceof String format ? format : null));
         }
 
+        stage.setDocumentationVersion(documentationVersion);
         stageStore.put(stageKey(region, apiId, stageName), stage);
         LOG.infov("Created stage {0} for API {1}", stageName, apiId);
         return stage;
     }
 
-    public Stage getStage(String region, String apiId, String stageName) {
-        getRestApi(region, apiId);
+    public synchronized Stage getStage(String region, String apiId, String stageName) {
+        requireDocumentationApi(region, apiId);
         return stageStore.get(stageKey(region, apiId, stageName))
                 .orElseThrow(() -> new AwsException("NotFoundException", "Stage not found", 404));
     }
 
-    public List<Stage> getStages(String region, String apiId) {
-        getRestApi(region, apiId);
+    public synchronized List<Stage> getStages(String region, String apiId) {
+        requireDocumentationApi(region, apiId);
         String prefix = region + "::" + apiId + "::";
         return stageStore.scan(k -> k.startsWith(prefix));
     }
 
-    public Stage updateStage(String region, String apiId, String stageName,
+    public synchronized Stage updateStage(String region, String apiId, String stageName,
                              List<Map<String, String>> patchOperations) {
         Stage stage = getStage(region, apiId, stageName);
         LOG.infov("Updating stage {0} with {1} operations", stageName, patchOperations != null ? patchOperations.size() : 0);
@@ -1095,6 +1119,16 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
                 String value = op.get("value");
                 LOG.infov("Patch operation: op={0}, path={1}, value={2}", opType, path, value);
 
+                if ("/documentationVersion".equals(path)) {
+                    if (!"replace".equals(opType)) {
+                        throw new AwsException("BadRequestException",
+                                "Stage documentationVersion supports only replace", 400);
+                    }
+                    String version = documentationVersionName(value);
+                    getDocumentationVersion(region, apiId, version);
+                    stage.setDocumentationVersion(version);
+                    continue;
+                }
                 if ("remove" .equals(opType) && "/accessLogSettings" .equals(path)) {
                     stage.setAccessLogSettings(null);
                     continue;
@@ -1202,7 +1236,7 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
         }
     }
 
-    public void deleteStage(String region, String apiId, String stageName) {
+    public synchronized void deleteStage(String region, String apiId, String stageName) {
         getStage(region, apiId, stageName);
         stageStore.delete(stageKey(region, apiId, stageName));
     }
@@ -2254,6 +2288,12 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
         return model;
     }
 
+    public String getModelTemplate(String region, String apiId, String modelName) {
+        getRestApi(region, apiId);
+        Model model = getModel(region, apiId, modelName);
+        return ModelTemplateGenerator.generate(model.getSchema(), model.getContentType(), false);
+    }
+
     public List<Model> getModels(String region, String apiId) {
         getRestApi(region, apiId);
         String prefix = region + "::" + apiId + "::";
@@ -2263,6 +2303,411 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
     public void deleteModel(String region, String apiId, String modelName) {
         getModel(region, apiId, modelName);
         modelStore.delete(modelKey(region, apiId, modelName));
+    }
+
+    // ──────────────────────────── Documentation Parts ────────────────────────────
+
+    private static final Set<String> DOCUMENTATION_PART_NAMED_TYPES = Set.of("AUTHORIZER", "MODEL",
+            "PATH_PARAMETER", "QUERY_PARAMETER", "REQUEST_HEADER", "REQUEST_BODY", "RESPONSE_HEADER");
+    private static final Set<String> DOCUMENTATION_PART_PATH_TYPES = Set.of("RESOURCE", "METHOD", "PATH_PARAMETER",
+            "QUERY_PARAMETER", "REQUEST_HEADER", "REQUEST_BODY", "RESPONSE", "RESPONSE_HEADER", "RESPONSE_BODY");
+    private static final Set<String> DOCUMENTATION_PART_METHOD_TYPES = Set.of("METHOD", "PATH_PARAMETER",
+            "QUERY_PARAMETER", "REQUEST_HEADER", "REQUEST_BODY", "RESPONSE", "RESPONSE_HEADER", "RESPONSE_BODY");
+    private static final Set<String> DOCUMENTATION_PART_STATUS_TYPES = Set.of("RESPONSE", "RESPONSE_HEADER",
+            "RESPONSE_BODY");
+
+    public record DocumentationPartImportResult(List<String> ids, List<String> warnings) {}
+
+    /** Imports documentation metadata without applying the OpenAPI document's API definitions. */
+    public synchronized DocumentationPartImportResult importDocumentationParts(String region, String apiId,
+                                                                                String mode, String body,
+                                                                                boolean failOnWarnings) {
+        getRestApi(region, apiId);
+        String effectiveMode = mode == null ? "merge" : mode;
+        if (!Set.of("merge", "overwrite").contains(effectiveMode)) {
+            throw new AwsException("BadRequestException", "Invalid documentation import mode", 400);
+        }
+        JsonNode document;
+        try {
+            document = body == null ? null : JSON.reader().with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS,
+                    DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS).readTree(body);
+        } catch (JsonProcessingException exception) {
+            throw new AwsException("BadRequestException", "Documentation import requires a JSON OpenAPI document", 400);
+        }
+        if (document == null || !document.isObject()) {
+            throw new AwsException("BadRequestException", "Documentation import requires a JSON OpenAPI document", 400);
+        }
+        JsonNode parts = document.path("x-amazon-apigateway-documentation").path("documentationParts");
+        if (!parts.isArray()) {
+            throw new AwsException("BadRequestException", "documentationParts must be an array", 400);
+        }
+        ParseOptions options = new ParseOptions();
+        options.setResolve(false);
+        options.setResolveFully(false);
+        SwaggerParseResult parsed = new OpenAPIParser().readContents(body, null, options);
+        if (parsed.getOpenAPI() == null) {
+            throw new AwsException("BadRequestException", "Invalid OpenAPI document", 400);
+        }
+        List<String> warnings = parsed.getMessages() == null ? List.of() : List.copyOf(parsed.getMessages());
+        if (failOnWarnings && !warnings.isEmpty()) {
+            throw new AwsException("BadRequestException", "Warnings found during documentation import: "
+                    + String.join("; ", warnings), 400);
+        }
+        String prefix = region + "::" + apiId + "::";
+        List<DocumentationPart> existing = documentationPartStore.scan(key -> key.startsWith(prefix));
+        Map<Map<String, String>, DocumentationPart> byLocation = new HashMap<>();
+        Set<String> usedIds = new HashSet<>();
+        existing.forEach(part -> {
+            byLocation.put(part.getLocation(), part);
+            usedIds.add(part.getId());
+        });
+        Set<Map<String, String>> incomingLocations = new HashSet<>();
+        Map<String, DocumentationPart> replacements = new LinkedHashMap<>();
+        List<String> ids = new ArrayList<>();
+        for (JsonNode input : parts) {
+            if (!input.isObject() || !input.path("properties").isObject()) {
+                throw new AwsException("BadRequestException", "Imported documentation properties must be an object", 400);
+            }
+            ObjectNode request = JSON.createObjectNode().put("restApiId", apiId)
+                    .put("properties", input.get("properties").toString());
+            request.set("location", input.get("location"));
+            ApiGatewayDocumentationRequestShapes.check("CreateDocumentationPart", request);
+            Map<String, String> location = documentationPartLocation(JSON.convertValue(input.get("location"), Map.class));
+            if (!incomingLocations.add(location)) {
+                throw new AwsException("BadRequestException", "Duplicate documentation part location in import", 400);
+            }
+            DocumentationPart previous = byLocation.get(location);
+            String id = previous == null ? shortId(6) : previous.getId();
+            while (previous == null && !usedIds.add(id)) {
+                id = shortId(6);
+            }
+            ObjectNode properties = JSON.createObjectNode();
+            if (previous != null && "merge".equals(effectiveMode)) {
+                try {
+                    properties.setAll((ObjectNode) JSON.reader().with(DeserializationFeature.USE_BIG_DECIMAL_FOR_FLOATS)
+                            .readTree(previous.getProperties()));
+                } catch (JsonProcessingException exception) {
+                    throw new IllegalStateException("Stored documentation properties are invalid", exception);
+                }
+            }
+            properties.setAll((ObjectNode) input.get("properties"));
+            DocumentationPart replacement = new DocumentationPart();
+            replacement.setId(id);
+            replacement.setLocation(location);
+            replacement.setProperties(properties.toString());
+            replacements.put(documentationPartKey(region, apiId, id), replacement);
+            ids.add(id);
+        }
+        Set<String> deletions = new HashSet<>();
+        if ("overwrite".equals(effectiveMode)) {
+            existing.forEach(part -> deletions.add(documentationPartKey(region, apiId, part.getId())));
+            deletions.removeAll(replacements.keySet());
+        }
+        documentationPartStore.applyAtomically(replacements, deletions);
+        return new DocumentationPartImportResult(List.copyOf(ids), warnings);
+    }
+
+    public synchronized DocumentationPart createDocumentationPart(String region, String apiId,
+                                                                   Map<String, Object> request) {
+        getRestApi(region, apiId);
+        if (request == null) {
+            throw new AwsException("BadRequestException", "Documentation part request is required", 400);
+        }
+        ObjectNode modeledRequest = JSON.valueToTree(request);
+        modeledRequest.put("restApiId", apiId);
+        ApiGatewayDocumentationRequestShapes.check("CreateDocumentationPart", modeledRequest);
+        Map<String, String> location = documentationPartLocation(request.get("location"));
+        String properties = documentationPartProperties(request.get("properties"));
+        String prefix = region + "::" + apiId + "::";
+        if (documentationPartStore.scan(key -> key.startsWith(prefix)).stream()
+                .anyMatch(part -> part.getLocation().equals(location))) {
+            StringJoiner fields = new StringJoiner(", ");
+            location.forEach((field, value) -> fields.add(field + " '" + value + "'"));
+            throw new AwsException("ConflictException",
+                    "Documentation part already exists for the specified location: " + fields + ".", 409);
+        }
+
+        DocumentationPart part = new DocumentationPart();
+        String id;
+        do {
+            id = shortId(6);
+        } while (documentationPartStore.get(documentationPartKey(region, apiId, id)).isPresent());
+        part.setId(id);
+        part.setLocation(location);
+        part.setProperties(properties);
+        documentationPartStore.putAllAtomically(Map.of(documentationPartKey(region, apiId, part.getId()), part));
+        return part;
+    }
+
+    public DocumentationPart getDocumentationPart(String region, String apiId, String partId) {
+        getRestApi(region, apiId);
+        return documentationPartStore.get(documentationPartKey(region, apiId, partId))
+                .orElseThrow(() -> new AwsException("NotFoundException", "Invalid documentation part id specified", 404));
+    }
+
+    public synchronized DocumentationVersion createDocumentationVersion(String region, String apiId,
+                                                                         Map<String, Object> request) {
+        ObjectNode modeled = request == null ? JSON.createObjectNode() : JSON.valueToTree(request);
+        modeled.put("restApiId", apiId);
+        ApiGatewayDocumentationRequestShapes.check("CreateDocumentationVersion", modeled);
+        requireDocumentationApi(region, apiId);
+        String version = documentationVersionName(request.get("documentationVersion"));
+        if (stageStore.hasVersion(region, apiId, version)) {
+            throw new AwsException("ConflictException", "Documentation version already exists", 409);
+        }
+        String stageName = request.get("stageName") == null ? null : documentationVersionName(request.get("stageName"));
+        Stage stage = stageName == null ? null : getStage(region, apiId, stageName);
+        List<DocumentationVersion.Part> parts = documentationSnapshot(region, apiId);
+        DocumentationVersion snapshot = new DocumentationVersion(version, (String) request.get("description"),
+                System.currentTimeMillis() / 1000L, apiStore.accountId(), region, apiId, parts);
+        if (stage != null) {
+            stage.setDocumentationVersion(version);
+            stage.setLastUpdatedDate(System.currentTimeMillis() / 1000L);
+        }
+        stageStore.publish(snapshot, stageName == null ? null : stageKey(region, apiId, stageName), stage);
+        return snapshot;
+    }
+
+    public synchronized DocumentationVersion getDocumentationVersion(String region, String apiId, String version) {
+        requireDocumentationApi(region, apiId);
+        return stageStore.version(region, apiId, version)
+                .orElseThrow(() -> new AwsException("NotFoundException", "Invalid documentation version specified", 404));
+    }
+
+    public record DocumentationVersionPage(List<DocumentationVersion> items, String position) {}
+
+    public synchronized DocumentationVersionPage getDocumentationVersions(String region, String apiId, Integer limit,
+                                                                           String position) {
+        requireDocumentationApi(region, apiId);
+        if (limit != null && (limit < 1 || limit > 500)) {
+            throw new AwsException("BadRequestException", "Documentation version limit must be between 1 and 500", 400);
+        }
+        int size = limit == null ? 25 : limit;
+        String after = position == null ? null : documentationCursor.decode(
+                position, apiStore.accountId(), region, apiId, limit);
+        List<DocumentationVersion> versions = stageStore.versions(region, apiId).stream()
+                .sorted(Comparator.comparing(DocumentationVersion::version))
+                .filter(version -> after == null || version.version().compareTo(after) > 0).toList();
+        List<DocumentationVersion> page = versions.subList(0, Math.min(size, versions.size()));
+        String next = page.size() == versions.size() ? null : documentationCursor.encode(
+                apiStore.accountId(), region, apiId, limit, page.getLast().version());
+        return new DocumentationVersionPage(List.copyOf(page), next);
+    }
+
+    public synchronized DocumentationVersion updateDocumentationVersion(String region, String apiId, String version,
+                                                                         List<Map<String, String>> operations) {
+        DocumentationVersion current = getDocumentationVersion(region, apiId, version);
+        String description = current.description();
+        if (operations != null) {
+            for (Map<String, String> operation : operations) {
+                if (operation == null || !"replace".equals(operation.get("op"))
+                        || !"/description".equals(operation.get("path")) || operation.get("value") == null) {
+                    throw new AwsException("BadRequestException",
+                            "Documentation versions support only replace /description", 400);
+                }
+                description = operation.get("value");
+            }
+        }
+        DocumentationVersion updated = new DocumentationVersion(current.version(), description, current.createdDate(),
+                current.accountId(), current.region(), current.apiId(), current.parts());
+        stageStore.publish(updated, null, null);
+        return updated;
+    }
+
+    public synchronized void deleteDocumentationVersion(String region, String apiId, String version) {
+        getDocumentationVersion(region, apiId, version);
+        String prefix = region + "::" + apiId + "::";
+        if (stageStore.scan(key -> key.startsWith(prefix)).stream()
+                .anyMatch(stage -> version.equals(stage.getDocumentationVersion()))) {
+            // Local association policy: the API documents ConflictException without defining this case.
+            throw new AwsException("ConflictException", "Documentation version is associated with a stage", 409);
+        }
+        stageStore.deleteVersion(region, apiId, version);
+    }
+
+    /** Live inherited documentation tags for IAM; never migrates even an owned legacy parent. */
+    public synchronized Map<String, String> documentationResourceTags(String account, String region, String apiId) {
+        return documentationApi(account, region, apiId).map(api -> Map.copyOf(api.getTags())).orElse(Map.of());
+    }
+
+    private RestApi requireDocumentationApi(String region, String apiId) {
+        return documentationApi(apiStore.accountId(), region, apiId)
+                .orElseThrow(() -> new AwsException("NotFoundException", "Invalid REST API identifier specified", 404));
+    }
+
+    private Optional<RestApi> documentationApi(String account, String region, String apiId) {
+        String key = apiKey(region, apiId);
+        Optional<RestApi> scoped = apiStore.getForAccount(account, key);
+        if (scoped.isPresent()) {
+            return scoped.filter(api -> apiId.equals(api.getId()));
+        }
+        return apiStore.getLegacyForAccount(account, key).filter(api -> apiId.equals(api.getId()));
+    }
+
+    private List<DocumentationVersion.Part> documentationSnapshot(String region, String apiId) {
+        String prefix = region + "::" + apiId + "::";
+        String account = apiStore.accountId();
+        Map<String, DocumentationVersion.Part> parts = new TreeMap<>();
+        for (AccountAwareStorageBackend.AccountEntry<DocumentationPart> entry
+                : documentationPartStore.scanAllAccountEntries(key -> key.startsWith(prefix))) {
+            if (!account.equals(entry.accountId())) {
+                continue;
+            }
+            Optional<DocumentationPart> scoped = documentationPartStore.getForAccount(account, entry.key());
+            DocumentationPart part = scoped.isPresent() ? scoped.get()
+                    : documentationPartStore.getLegacyForAccount(account, entry.key()).orElseThrow();
+            if (!entry.key().equals(documentationPartKey(region, apiId, part.getId()))) {
+                throw new IllegalStateException("Stored documentation part does not match its key");
+            }
+            parts.put(part.getId(), new DocumentationVersion.Part(documentationPartLocation(part.getLocation()),
+                    documentationPartProperties(part.getProperties())));
+        }
+        return List.copyOf(parts.values());
+    }
+
+    private static String documentationVersionName(Object value) {
+        if (!(value instanceof String name) || name.isBlank()) {
+            throw new AwsException("BadRequestException", "Documentation version and stage names must be nonempty strings", 400);
+        }
+        return name;
+    }
+
+    private Deployment documentationDeployment(String region, String apiId, String id) {
+        String key = deploymentKey(region, apiId, id);
+        String account = apiStore.accountId();
+        Optional<Deployment> scoped = deploymentStore.getForAccount(account, key);
+        Optional<Deployment> result = scoped.isPresent() ? scoped : deploymentStore.getLegacyForAccount(account, key);
+        return result.filter(deployment -> id.equals(deployment.id()))
+                .orElseThrow(() -> new AwsException("NotFoundException", "Invalid deployment identifier specified", 404));
+    }
+
+    public record DocumentationPartPage(List<DocumentationPart> items, String position) {}
+
+    public DocumentationPartPage getDocumentationParts(String region, String apiId, String type, String name,
+                                                        String path, String locationStatus, Integer limit,
+                                                        String position) {
+        getRestApi(region, apiId);
+        ObjectNode modeledRequest = JSON.createObjectNode().put("restApiId", apiId);
+        if (type != null) {
+            modeledRequest.put("type", type);
+        }
+        if (name != null) {
+            modeledRequest.put("nameQuery", name);
+        }
+        if (path != null) {
+            modeledRequest.put("path", path);
+        }
+        if (locationStatus != null) {
+            modeledRequest.put("locationStatus", locationStatus);
+        }
+        if (limit != null) {
+            modeledRequest.put("limit", limit);
+        }
+        if (position != null) {
+            modeledRequest.put("position", position);
+        }
+        ApiGatewayDocumentationRequestShapes.check("GetDocumentationParts", modeledRequest);
+        if (limit != null && limit < 1) {
+            throw new AwsException("BadRequestException", "Invalid limit parameter", 400);
+        }
+        int pageSize = limit == null ? 25 : Math.min(limit, 500);
+        String prefix = region + "::" + apiId + "::";
+        List<DocumentationPart> parts = documentationPartStore.scan(key -> key.startsWith(prefix)).stream()
+                .filter(part -> type == null || type.equals(part.getLocation().get("type")))
+                .filter(part -> name == null || name.equals(part.getLocation().get("name")))
+                .filter(part -> path == null || path.equals(part.getLocation().get("path")))
+                .filter(part -> !"UNDOCUMENTED".equals(locationStatus))
+                .sorted(Comparator.comparing(DocumentationPart::getId))
+                .toList();
+
+        int start = 0;
+        if (position != null && !position.isBlank()) {
+            while (start < parts.size() && !position.equals(parts.get(start).getId())) {
+                start++;
+            }
+            if (start == parts.size()) {
+                throw new AwsException("BadRequestException", "Invalid position parameter", 400);
+            }
+            start++;
+        }
+        int end = Math.min(start + pageSize, parts.size());
+        String nextPosition = end < parts.size() ? parts.get(end - 1).getId() : null;
+        return new DocumentationPartPage(List.copyOf(parts.subList(start, end)), nextPosition);
+    }
+
+    public synchronized DocumentationPart updateDocumentationPart(String region, String apiId, String partId,
+                                                                   List<Map<String, String>> patchOperations) {
+        DocumentationPart part = getDocumentationPart(region, apiId, partId);
+        String properties = part.getProperties();
+        if (patchOperations != null) {
+            for (Map<String, String> operation : patchOperations) {
+                if (!"replace".equals(operation.get("op")) || !"/properties".equals(operation.get("path"))) {
+                    throw new AwsException("BadRequestException", "Unsupported documentation part patch operation", 400);
+                }
+                properties = documentationPartProperties(operation.get("value"));
+            }
+        }
+        DocumentationPart updated = new DocumentationPart();
+        updated.setId(part.getId());
+        updated.setLocation(part.getLocation());
+        updated.setProperties(properties);
+        documentationPartStore.putAllAtomically(Map.of(documentationPartKey(region, apiId, partId), updated));
+        return updated;
+    }
+
+    public synchronized void deleteDocumentationPart(String region, String apiId, String partId) {
+        getDocumentationPart(region, apiId, partId);
+        documentationPartStore.deleteAllAtomically(Set.of(documentationPartKey(region, apiId, partId)));
+    }
+
+    private static Map<String, String> documentationPartLocation(Object value) {
+        Map<?, ?> input = (Map<?, ?>) value;
+        String type = (String) input.get("type");
+        Map<String, String> location = new LinkedHashMap<>();
+        for (Map.Entry<?, ?> entry : input.entrySet()) {
+            if (!(entry.getKey() instanceof String key) || !(entry.getValue() instanceof String fieldValue)
+                    || !Set.of("type", "path", "method", "statusCode", "name").contains(key)) {
+                throw new AwsException("BadRequestException", "Invalid documentation part location", 400);
+            }
+            location.put(key, fieldValue);
+        }
+        // AWS REST examples allow REQUEST_BODY without a name despite the model's required marker.
+        if (DOCUMENTATION_PART_NAMED_TYPES.contains(type) && !"REQUEST_BODY".equals(type)
+                && (location.get("name") == null || location.get("name").isBlank())) {
+            throw new AwsException("BadRequestException", "Documentation part location name is required", 400);
+        }
+        if (location.containsKey("name") && !DOCUMENTATION_PART_NAMED_TYPES.contains(type)
+                || location.containsKey("path") && !DOCUMENTATION_PART_PATH_TYPES.contains(type)
+                || location.containsKey("method") && !DOCUMENTATION_PART_METHOD_TYPES.contains(type)
+                || location.containsKey("statusCode") && !DOCUMENTATION_PART_STATUS_TYPES.contains(type)) {
+            throw new AwsException("BadRequestException", "Invalid documentation part location field", 400);
+        }
+        if (DOCUMENTATION_PART_PATH_TYPES.contains(type)) {
+            location.putIfAbsent("path", "/");
+        }
+        if (DOCUMENTATION_PART_METHOD_TYPES.contains(type)) {
+            location.putIfAbsent("method", "*");
+        }
+        if (DOCUMENTATION_PART_STATUS_TYPES.contains(type)) {
+            location.putIfAbsent("statusCode", "*");
+        }
+        return location;
+    }
+
+    private static String documentationPartProperties(Object value) {
+        if (!(value instanceof String properties)) {
+            throw new AwsException("BadRequestException", "Documentation part properties must be a JSON string", 400);
+        }
+        try {
+            JsonNode content = JSON.reader().with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+                    .readTree(properties);
+            if (content == null || !content.isObject()) {
+                throw new AwsException("BadRequestException", "Documentation part properties must be a JSON object", 400);
+            }
+        } catch (JsonProcessingException e) {
+            throw new AwsException("BadRequestException", "Invalid documentation part properties", 400);
+        }
+        return properties;
     }
 
     // ──────────────────────────── Custom Domains ────────────────────────────
@@ -3230,7 +3675,7 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
 
     // ──────────────────────────── Update Methods ────────────────────────────
 
-    public RestApi updateRestApi(String region, String apiId, List<Map<String, String>> patchOperations) {
+    public synchronized RestApi updateRestApi(String region, String apiId, List<Map<String, String>> patchOperations) {
         RestApi api = getRestApi(region, apiId);
         if (patchOperations != null) {
             // Worked out before anything is set: the store hands back the live API, and a rejected
@@ -3664,14 +4109,14 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
         return getRestApi(region, apiId).getTags();
     }
 
-    public void tagResource(String region, String apiId, Map<String, String> tags) {
+    public synchronized void tagResource(String region, String apiId, Map<String, String> tags) {
         RestApi api = getRestApi(region, apiId);
         ReservedTags.rejectApiGatewayReservedTagsOnUpdate(tags, apiId);
         api.getTags().putAll(ReservedTags.stripApiGatewayReservedTags(tags));
         apiStore.put(apiKey(region, apiId), api);
     }
 
-    public void untagResource(String region, String apiId, List<String> tagKeys) {
+    public synchronized void untagResource(String region, String apiId, List<String> tagKeys) {
         RestApi api = getRestApi(region, apiId);
         tagKeys.forEach(api.getTags()::remove);
         apiStore.put(apiKey(region, apiId), api);
@@ -3681,13 +4126,13 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
         return getStage(region, apiId, stageName).getTags();
     }
 
-    public void tagStage(String region, String apiId, String stageName, Map<String, String> tags) {
+    public synchronized void tagStage(String region, String apiId, String stageName, Map<String, String> tags) {
         Stage stage = getStage(region, apiId, stageName);
         stage.getTags().putAll(tags);
         stageStore.put(stageKey(region, apiId, stageName), stage);
     }
 
-    public void untagStage(String region, String apiId, String stageName, List<String> tagKeys) {
+    public synchronized void untagStage(String region, String apiId, String stageName, List<String> tagKeys) {
         Stage stage = getStage(region, apiId, stageName);
         tagKeys.forEach(stage.getTags()::remove);
         stageStore.put(stageKey(region, apiId, stageName), stage);
@@ -3836,11 +4281,11 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
         }
     }
 
-    public RestApi importRestApi(String region, String specBody) {
+    public synchronized RestApi importRestApi(String region, String specBody) {
         return importRestApi(region, specBody, false);
     }
 
-    public RestApi importRestApi(String region, String specBody, boolean failOnWarnings) {
+    public synchronized RestApi importRestApi(String region, String specBody, boolean failOnWarnings) {
         ParsedOpenApi parsed = parseOpenApiSpec(region, specBody, failOnWarnings);
         OpenAPI openAPI = parsed.openAPI();
 
@@ -3865,11 +4310,11 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
         return api;
     }
 
-    public RestApi putRestApi(String region, String apiId, String mode, String specBody) {
+    public synchronized RestApi putRestApi(String region, String apiId, String mode, String specBody) {
         return putRestApi(region, apiId, mode, specBody, false);
     }
 
-    public RestApi putRestApi(String region, String apiId, String mode, String specBody, boolean failOnWarnings) {
+    public synchronized RestApi putRestApi(String region, String apiId, String mode, String specBody, boolean failOnWarnings) {
         getRestApi(region, apiId);
         if (mode != null && !"merge".equals(mode) && !"overwrite".equals(mode)) {
             // AWS PutRestApi accepts only merge (the default) and overwrite; reject anything
@@ -4844,6 +5289,10 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
 
     private String modelKey(String region, String apiId, String modelName) {
         return region + "::" + apiId + "::" + modelName;
+    }
+
+    private String documentationPartKey(String region, String apiId, String partId) {
+        return region + "::" + apiId + "::" + partId;
     }
 
     private String accountKey(String region) {

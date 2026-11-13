@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.ReservedTags;
@@ -27,6 +28,7 @@ import io.github.hectorvent.floci.services.ec2.model.Tag;
 import io.github.hectorvent.floci.services.ec2.model.UserIdGroupPair;
 import io.github.hectorvent.floci.services.ec2.model.Vpc;
 import io.github.hectorvent.floci.services.eks.model.AccessConfig;
+import io.github.hectorvent.floci.services.eks.model.AccessPolicy;
 import io.github.hectorvent.floci.services.eks.model.CertificateAuthority;
 import io.github.hectorvent.floci.services.eks.model.Cluster;
 import io.github.hectorvent.floci.services.eks.model.ClusterIdentity;
@@ -851,6 +853,10 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
 
     boolean isInstanceJoined(String clusterName, String instanceId) {
         return clusterManager.isInstanceJoined(describeCluster(clusterName), instanceId);
+    }
+
+    public PaginatedResult<AccessPolicy> listAccessPolicies(Integer maxResults, String nextToken) {
+        return EksAccessPolicyCatalog.list(regionResolver.getPartition(), maxResults, nextToken);
     }
 
     public List<String> listClusters() {

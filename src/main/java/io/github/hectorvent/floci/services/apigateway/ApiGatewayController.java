@@ -18,6 +18,8 @@ import io.github.hectorvent.floci.services.apigateway.model.ApiGatewayResource;
 import io.github.hectorvent.floci.services.apigateway.model.ApiKey;
 import io.github.hectorvent.floci.services.apigateway.model.BasePathMapping;
 import io.github.hectorvent.floci.services.apigateway.model.CustomDomain;
+import io.github.hectorvent.floci.services.apigateway.model.DocumentationPart;
+import io.github.hectorvent.floci.services.apigateway.model.DocumentationVersion;
 import io.github.hectorvent.floci.services.apigateway.model.EndpointConfiguration;
 import io.github.hectorvent.floci.services.apigateway.model.EndpointType;
 import io.github.hectorvent.floci.services.apigateway.model.GatewayResponse;
@@ -26,6 +28,7 @@ import io.github.hectorvent.floci.services.apigateway.model.MethodResponse;
 import io.github.hectorvent.floci.services.apigateway.model.MethodSetting;
 import io.github.hectorvent.floci.services.apigateway.model.RequestValidator;
 import io.github.hectorvent.floci.services.apigateway.model.RestApi;
+import io.github.hectorvent.floci.services.apigateway.model.TestInvokeMethodResult;
 import io.github.hectorvent.floci.services.apigateway.model.UsagePlan;
 import io.github.hectorvent.floci.services.apigateway.model.UsagePlanKey;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2OpenApiImporter;
@@ -79,18 +82,21 @@ public class ApiGatewayController {
     private final RegionResolver regionResolver;
     private final ObjectMapper objectMapper;
     private final RestLambdaAuthorizer restLambdaAuthorizer;
+    private final ApiGatewayExecuteController executeController;
 
     @Inject
     public ApiGatewayController(ApiGatewayService service, ApiGatewayV2Service v2Service,
                                 ApiGatewayV2OpenApiImporter v2OpenApiImporter,
                                 RegionResolver regionResolver, ObjectMapper objectMapper,
-                                RestLambdaAuthorizer restLambdaAuthorizer) {
+                                RestLambdaAuthorizer restLambdaAuthorizer,
+                                ApiGatewayExecuteController executeController) {
         this.service = service;
         this.v2Service = v2Service;
         this.v2OpenApiImporter = v2OpenApiImporter;
         this.regionResolver = regionResolver;
         this.objectMapper = objectMapper;
         this.restLambdaAuthorizer = restLambdaAuthorizer;
+        this.executeController = executeController;
     }
 
     @DELETE
@@ -516,6 +522,17 @@ public class ApiGatewayController {
     }
 
     // ──────────────────────────── Methods (v1) ────────────────────────────
+
+    @POST
+    @Path("/restapis/{apiId}/resources/{resourceId}/methods/{httpMethod}")
+    public TestInvokeMethodResult testInvokeMethod(@Context HttpHeaders headers,
+                                                   @PathParam("apiId") String apiId,
+                                                   @PathParam("resourceId") String resourceId,
+                                                   @PathParam("httpMethod") String httpMethod,
+                                                   JsonNode request) {
+        return executeController.testInvokeMethod(regionResolver.resolveRegion(headers),
+                apiId, resourceId, httpMethod, request);
+    }
 
     @PUT
     @Path("/restapis/{apiId}/resources/{resourceId}/methods/{httpMethod}")
@@ -1203,6 +1220,16 @@ public class ApiGatewayController {
         return Response.ok(toModelNode(service.getModel(region, apiId, modelName)).toString()).type(MediaType.APPLICATION_JSON).build();
     }
 
+    @GET
+    @Path("/restapis/{apiId}/models/{modelName}/default_template")
+    public Response getModelTemplate(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
+                                     @PathParam("modelName") String modelName) {
+        String region = regionResolver.resolveRegion(headers);
+        String value = service.getModelTemplate(region, apiId, modelName);
+        return Response.ok(objectMapper.createObjectNode().put("value", value).toString())
+                .type(MediaType.APPLICATION_JSON).build();
+    }
+
     @PATCH
     @Path("/restapis/{apiId}/models/{modelName}")
     public Response updateModel(@Context HttpHeaders headers, @PathParam("apiId") String apiId, @PathParam("modelName") String modelName, String body) {
@@ -1219,6 +1246,152 @@ public class ApiGatewayController {
                                 @PathParam("modelName") String modelName) {
         String region = regionResolver.resolveRegion(headers);
         service.deleteModel(region, apiId, modelName);
+        return Response.accepted().build();
+    }
+
+    // ──────────────────────────── Documentation Parts (v1) ────────────────────────────
+
+    @POST
+    @Path("/restapis/{apiId}/documentation/versions")
+    public Response createDocumentationVersion(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
+                                                 String body) {
+        try {
+            Map<String, Object> request = objectMapper.readerFor(JSON_OBJECT)
+                    .with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS).readValue(body);
+            DocumentationVersion version = service.createDocumentationVersion(
+                    regionResolver.resolveRegion(headers), apiId, request);
+            return Response.status(201).entity(toDocumentationVersionNode(version).toString())
+                    .type(MediaType.APPLICATION_JSON).build();
+        } catch (IOException failure) {
+            throw new AwsException("BadRequestException", "Invalid documentation version request", 400);
+        }
+    }
+
+    @GET
+    @Path("/restapis/{apiId}/documentation/versions")
+    public Response getDocumentationVersions(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
+                                              @QueryParam("limit") Integer limit,
+                                              @QueryParam("position") String position) {
+        ApiGatewayService.DocumentationVersionPage page = service.getDocumentationVersions(
+                regionResolver.resolveRegion(headers), apiId, limit, position);
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode items = response.putArray("item");
+        page.items().forEach(version -> items.add(toDocumentationVersionNode(version)));
+        if (page.position() != null) {
+            response.put("position", page.position());
+        }
+        return Response.ok(response.toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @GET
+    @Path("/restapis/{apiId}/documentation/versions/{version}")
+    public Response getDocumentationVersion(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
+                                             @PathParam("version") String version) {
+        DocumentationVersion snapshot = service.getDocumentationVersion(
+                regionResolver.resolveRegion(headers), apiId, version);
+        return Response.ok(toDocumentationVersionNode(snapshot).toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @PATCH
+    @Path("/restapis/{apiId}/documentation/versions/{version}")
+    public Response updateDocumentationVersion(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
+                                                @PathParam("version") String version, String body) {
+        DocumentationVersion snapshot = service.updateDocumentationVersion(
+                regionResolver.resolveRegion(headers), apiId, version, parsePatchOperations(body));
+        return Response.ok(toDocumentationVersionNode(snapshot).toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @DELETE
+    @Path("/restapis/{apiId}/documentation/versions/{version}")
+    public Response deleteDocumentationVersion(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
+                                                @PathParam("version") String version) {
+        service.deleteDocumentationVersion(regionResolver.resolveRegion(headers), apiId, version);
+        return Response.accepted().build();
+    }
+
+    private ObjectNode toDocumentationVersionNode(DocumentationVersion version) {
+        ObjectNode node = objectMapper.createObjectNode().put("version", version.version())
+                .put("createdDate", version.createdDate());
+        if (version.description() != null) {
+            node.put("description", version.description());
+        }
+        return node;
+    }
+
+    @PUT
+    @Path("/restapis/{apiId}/documentation/parts")
+    public Response importDocumentationParts(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
+                                             @QueryParam("mode") String mode,
+                                             @QueryParam("failonwarnings") boolean failOnWarnings, String body) {
+        String region = regionResolver.resolveRegion(headers);
+        ApiGatewayService.DocumentationPartImportResult result = service.importDocumentationParts(
+                region, apiId, mode, body, failOnWarnings);
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("ids", objectMapper.valueToTree(result.ids()));
+        response.set("warnings", objectMapper.valueToTree(result.warnings()));
+        return Response.ok(response.toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @POST
+    @Path("/restapis/{apiId}/documentation/parts")
+    public Response createDocumentationPart(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
+                                            String body) {
+        String region = regionResolver.resolveRegion(headers);
+        try {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> request = objectMapper.readValue(body, Map.class);
+            DocumentationPart part = service.createDocumentationPart(region, apiId, request);
+            return Response.status(201).entity(objectMapper.valueToTree(part).toString())
+                    .type(MediaType.APPLICATION_JSON).build();
+        } catch (IOException e) {
+            throw new AwsException("BadRequestException", e.getMessage(), 400);
+        }
+    }
+
+    @GET
+    @Path("/restapis/{apiId}/documentation/parts")
+    public Response getDocumentationParts(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
+                                          @QueryParam("type") String type, @QueryParam("name") String name,
+                                          @QueryParam("path") String path,
+                                          @QueryParam("locationStatus") String locationStatus,
+                                          @QueryParam("limit") Integer limit, @QueryParam("position") String position) {
+        String region = regionResolver.resolveRegion(headers);
+        ApiGatewayService.DocumentationPartPage page = service.getDocumentationParts(region, apiId, type, name,
+                path, locationStatus, limit, position);
+        ObjectNode root = objectMapper.createObjectNode();
+        ArrayNode items = root.putArray("item");
+        page.items().forEach(part -> items.add(objectMapper.valueToTree(part)));
+        if (page.position() != null) {
+            root.put("position", page.position());
+        }
+        return Response.ok(root.toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @GET
+    @Path("/restapis/{apiId}/documentation/parts/{partId}")
+    public Response getDocumentationPart(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
+                                         @PathParam("partId") String partId) {
+        String region = regionResolver.resolveRegion(headers);
+        DocumentationPart part = service.getDocumentationPart(region, apiId, partId);
+        return Response.ok(objectMapper.valueToTree(part).toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @PATCH
+    @Path("/restapis/{apiId}/documentation/parts/{partId}")
+    public Response updateDocumentationPart(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
+                                            @PathParam("partId") String partId, String body) {
+        String region = regionResolver.resolveRegion(headers);
+        List<Map<String, String>> operations = parsePatchOperations(body);
+        DocumentationPart part = service.updateDocumentationPart(region, apiId, partId, operations);
+        return Response.ok(objectMapper.valueToTree(part).toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @DELETE
+    @Path("/restapis/{apiId}/documentation/parts/{partId}")
+    public Response deleteDocumentationPart(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
+                                            @PathParam("partId") String partId) {
+        String region = regionResolver.resolveRegion(headers);
+        service.deleteDocumentationPart(region, apiId, partId);
         return Response.accepted().build();
     }
 
@@ -2163,6 +2336,16 @@ public class ApiGatewayController {
         return Response.ok(toV2ModelNode(v2Service.getModel(region, apiId, modelId)).toString()).type(MediaType.APPLICATION_JSON).build();
     }
 
+    @GET
+    @Path("/v2/apis/{apiId}/models/{modelId}/template")
+    public Response getV2ModelTemplate(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
+                                     @PathParam("modelId") String modelId) {
+        String region = regionResolver.resolveRegion(headers);
+        String value = v2Service.getModelTemplate(region, apiId, modelId);
+        return Response.ok(objectMapper.createObjectNode().put("value", value).toString())
+                .type(MediaType.APPLICATION_JSON).build();
+    }
+
     @PATCH
     @Path("/v2/apis/{apiId}/models/{modelId}")
     public Response updateV2Model(@Context HttpHeaders headers,
@@ -2420,6 +2603,9 @@ public class ApiGatewayController {
     private ObjectNode toStageNode(io.github.hectorvent.floci.services.apigateway.model.Stage s) {
         ObjectNode node = objectMapper.createObjectNode();
         node.put("stageName", s.getStageName());
+        if (s.getDocumentationVersion() != null) {
+            node.put("documentationVersion", s.getDocumentationVersion());
+        }
         node.put("deploymentId", s.getDeploymentId());
         if (s.getDescription() != null) node.put("description", s.getDescription());
         node.put("createdDate", s.getCreatedDate());

@@ -222,6 +222,11 @@ public class ResourceArnBuilder {
         if (credentialScope == null) {
             return List.of("*");
         }
+        if ("iot".equals(credentialScope) && "iot:DeleteJob".equals(operation)) {
+            String jobId = ctx.getUriInfo().getPathParameters().getFirst("jobId");
+            return List.of(jobId == null ? "*"
+                    : AwsArnUtils.Arn.of("iot", region, accountId, "job/" + jobId).toString());
+        }
         // Task tokens resolve their authorization resource from recorded workflow ownership.
         if ("states".equals(credentialScope) && operation != null && Set.of("states:SendTaskSuccess",
                 "states:SendTaskFailure", "states:SendTaskHeartbeat").contains(operation)) {
@@ -1315,6 +1320,11 @@ public class ResourceArnBuilder {
      * stays escaped, so a segment cannot pass for more than one.
      */
     private static String buildApiGatewayArn(ContainerRequestContext ctx, String region, String partition) {
+        return new AwsArnUtils.Arn(partition, "apigateway", region, "", apiGatewayResourcePath(ctx)).toString();
+    }
+
+    /** Canonical routed API Gateway resource path, shared with its read-only tag lookup. */
+    public static String apiGatewayResourcePath(ContainerRequestContext ctx) {
         String[] raw = IamActionRegistry.routedPath(ctx).split("/", -1);
         List<String> segments = new ArrayList<>();
         for (int i = 1; i < raw.length; i++) {
@@ -1333,14 +1343,13 @@ public class ResourceArnBuilder {
         }
         if (segments.size() > 1 && segments.getFirst().equals(API_GATEWAY_TAGS_SEGMENT)) {
             String tagged = String.join("/", segments.subList(1, segments.size()));
-            return new AwsArnUtils.Arn(partition, "apigateway", region, "",
-                    "/" + API_GATEWAY_TAGS_SEGMENT + "/" + SigV4Canonicalization.uriEncode(tagged)).toString();
+            return "/" + API_GATEWAY_TAGS_SEGMENT + "/" + SigV4Canonicalization.uriEncode(tagged);
         }
         StringJoiner resource = new StringJoiner("/", "/", "");
         for (String segment : segments) {
             resource.add(segment.replace("%", "%25").replace("/", "%2F"));
         }
-        return new AwsArnUtils.Arn(partition, "apigateway", region, "", resource.toString()).toString();
+        return resource.toString();
     }
 
     /**

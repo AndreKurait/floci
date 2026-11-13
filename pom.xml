@@ -335,6 +335,12 @@
         <!-- Testing -->
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
+            <artifactId>eks</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
             <artifactId>accessanalyzer</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
@@ -421,6 +427,18 @@
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>iotdataplane</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>iot</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>iotjobsdataplane</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
         </dependency>
