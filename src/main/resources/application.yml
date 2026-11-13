@@ -323,6 +323,11 @@ floci:
     # extra-suffixes:
     #   - localhost.localstack.cloud
 
+    # Serve these suffixes from resource records or scoped VPC forwarding rules only.
+    # Unknown names return NXDOMAIN; wildcard spoofing and upstream recursion do not apply.
+    # authoritative-suffixes:                     # FLOCI_DNS_AUTHORITATIVE_SUFFIXES
+    #   - resources.example
+
     # Public resolvers appended after Floci's embedded DNS on spawned containers' HostConfig.Dns,
     # and used as the fallback upstream for Floci's own DNS forwarder. Lets Lambda/CodeBuild
     # resolve public hostnames even if the embedded forwarder cannot answer.

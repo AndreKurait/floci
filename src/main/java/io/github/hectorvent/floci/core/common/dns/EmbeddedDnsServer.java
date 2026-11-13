@@ -114,6 +114,7 @@ public class EmbeddedDnsServer {
     private volatile String serverIp;
     private Listeners listeners;
     private final SequencedSet<String> suffixes = new LinkedHashSet<>();
+    private List<String> authoritativeSuffixes = List.of();
     private volatile List<String> upstreamDnsServers = List.of();
     private volatile WorkerExecutor forwardPool;
     // Held as the Iterable a CDI Instance already is, so iterating resolves the beans lazily on
@@ -202,6 +203,8 @@ public class EmbeddedDnsServer {
         this.recordSources = recordSources;
         this.forwardingRuleSources = forwardingRuleSources;
         this.clientVpcSources = clientVpcSources;
+        authoritativeSuffixes = config.dns().authoritativeSuffixes().orElse(List.of()).stream()
+                .map(EmbeddedDnsServer::authoritativeSuffix).distinct().toList();
         boolean explicit = config.dns().listenAddress().isPresent();
         if (!explicit && !containerDetector.isRunningInContainer()) {
             return;
@@ -486,6 +489,9 @@ public class EmbeddedDnsServer {
 
     private Optional<DnsAnswer> resolveRecordWithOwnership(String name, String myIp, int type) {
         Optional<DnsAnswer> stored = resolveFromRecordSources(name, type, true);
+        if (hasAuthoritativeSuffix(name)) {
+            return Optional.of(authoritativeAnswer(stored.or(() -> resolveFromRecordSources(name, type))));
+        }
         if (stored.isPresent()) {
             return stored;
         }
@@ -533,7 +539,8 @@ public class EmbeddedDnsServer {
         boolean awsEndpointName = isAwsEndpointName(name);
         boolean routedApi = publicAwsApi && origin != null && awsEndpointName;
         boolean externalPeer = publicAwsApi && origin == null && publicApiHosts.contains(name.toLowerCase(Locale.ROOT));
-        Optional<DnsAnswer> emulatorName = externalPeer ? Optional.empty() : resolveEmulatorName(name,
+        boolean authoritative = hasAuthoritativeSuffix(name);
+        Optional<DnsAnswer> emulatorName = externalPeer || authoritative ? Optional.empty() : resolveEmulatorName(name,
                 routedApi ? EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS : myIp, type);
         if (emulatorName.isPresent() && stored.isEmpty()) {
             // Spoofing stands in for public resolution. A private zone associated with the querying
@@ -550,9 +557,13 @@ public class EmbeddedDnsServer {
         if (rule.isPresent() && rule.orElseThrow().forwards()) {
             return QueryPlan.forwardingTo(rule.orElseThrow().targets());
         }
+        Optional<DnsAnswer> resource = stored.or(() -> resolveFromRecordSources(name, type, false, origin));
+        if (authoritative) {
+            return QueryPlan.answering(authoritativeAnswer(resource));
+        }
         QueryPlan upstream = publicApiDnsResponse != null && origin != null ? QueryPlan.ROUTED_UPSTREAM
                 : QueryPlan.UPSTREAM;
-        return stored.or(() -> resolveFromRecordSources(name, type, false, origin))
+        return resource
                 .or(() -> publicAwsApi && origin != null && publicApiHosts.contains(name.toLowerCase(Locale.ROOT))
                         ? Optional.of(type == 1 ? DnsAnswer.records(
                                 List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS),
@@ -560,6 +571,28 @@ public class EmbeddedDnsServer {
                         : Optional.empty())
                 .map(answer -> answer.upstream() ? upstream : QueryPlan.answering(answer))
                 .orElse(upstream);
+    }
+
+    private boolean hasAuthoritativeSuffix(String name) {
+        String normalized = name.toLowerCase(Locale.ROOT);
+        if (normalized.endsWith(".")) {
+            normalized = normalized.substring(0, normalized.length() - 1);
+        }
+        String query = normalized;
+        return authoritativeSuffixes.stream().anyMatch(suffix -> DomainNames.isWithin(query, suffix));
+    }
+
+    private static DnsAnswer authoritativeAnswer(Optional<DnsAnswer> resource) {
+        return resource.map(answer -> answer.upstream() ? DnsAnswer.refused() : answer)
+                .orElseGet(DnsAnswer::nxDomain);
+    }
+
+    private static String authoritativeSuffix(String value) {
+        try {
+            return publicEndpointHost(value);
+        } catch (IllegalArgumentException invalid) {
+            throw new IllegalArgumentException("floci.dns.authoritative-suffixes requires exact DNS suffixes", invalid);
+        }
     }
 
     private static String publicEndpointHost(String value) {
