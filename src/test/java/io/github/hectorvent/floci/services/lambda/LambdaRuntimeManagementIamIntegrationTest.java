@@ -1,15 +1,15 @@
-package io.floci.aws.services.lambda;
+package io.github.hectorvent.floci.services.lambda;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import io.floci.aws.core.storage.AccountAwareStorageBackend;
-import io.floci.aws.core.storage.StorageBackend;
-import io.floci.aws.core.storage.StorageFactory;
-import io.floci.aws.services.iam.IamService;
-import io.floci.aws.services.iam.model.AccessKey;
-import io.floci.aws.services.lambda.model.LambdaFunction;
-import io.floci.aws.services.lambda.model.LambdaRuntimeManagementConfig;
-import io.floci.aws.testing.IamEnforcementProfile;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.StorageBackend;
+import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.iam.model.AccessKey;
+import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
+import io.github.hectorvent.floci.services.lambda.model.LambdaRuntimeManagementConfig;
+import io.github.hectorvent.floci.testing.IamEnforcementProfile;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;

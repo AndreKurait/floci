@@ -1,16 +1,16 @@
-package io.floci.aws.services.stepfunctions;
+package io.github.hectorvent.floci.services.stepfunctions;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import io.floci.aws.services.iam.AssumeRolePolicyEvaluator;
-import io.floci.aws.services.iam.IamPolicyEvaluator;
-import io.floci.aws.services.iam.IamService;
-import io.floci.aws.services.iam.ResourcePolicyProvider;
-import io.floci.aws.services.iam.ResourcePolicyProvider.ResourcePolicy;
-import io.floci.aws.services.iam.ScpProvider;
-import io.floci.aws.services.iam.model.CallerContext;
-import io.floci.aws.services.iam.model.IamRole;
-import io.floci.aws.services.stepfunctions.LambdaTaskAuthorizer.Permission;
-import io.floci.aws.services.stepfunctions.model.StateMachine;
+import io.github.hectorvent.floci.services.iam.AssumeRolePolicyEvaluator;
+import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator;
+import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.iam.ResourcePolicyProvider;
+import io.github.hectorvent.floci.services.iam.ResourcePolicyProvider.ResourcePolicy;
+import io.github.hectorvent.floci.services.iam.ScpProvider;
+import io.github.hectorvent.floci.services.iam.model.CallerContext;
+import io.github.hectorvent.floci.services.iam.model.IamRole;
+import io.github.hectorvent.floci.services.stepfunctions.LambdaTaskAuthorizer.Permission;
+import io.github.hectorvent.floci.services.stepfunctions.model.StateMachine;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;

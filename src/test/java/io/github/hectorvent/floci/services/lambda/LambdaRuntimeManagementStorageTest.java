@@ -1,18 +1,18 @@
-package io.floci.aws.services.lambda;
+package io.github.hectorvent.floci.services.lambda;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import io.floci.aws.core.common.AwsException;
-import io.floci.aws.core.common.RegionResolver;
-import io.floci.aws.core.storage.AccountAwareStorageBackend;
-import io.floci.aws.core.storage.InMemoryStorage;
-import io.floci.aws.core.storage.PersistentStorage;
-import io.floci.aws.core.storage.StorageBackend;
-import io.floci.aws.services.lambda.model.LambdaFunction;
-import io.floci.aws.services.lambda.model.LambdaRuntimeManagementConfig;
-import io.floci.aws.services.lambda.model.LambdaUrlConfig;
-import io.floci.aws.services.lambda.zip.CodeStore;
-import io.floci.aws.services.lambda.zip.ZipExtractor;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.InMemoryStorage;
+import io.github.hectorvent.floci.core.storage.PersistentStorage;
+import io.github.hectorvent.floci.core.storage.StorageBackend;
+import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
+import io.github.hectorvent.floci.services.lambda.model.LambdaRuntimeManagementConfig;
+import io.github.hectorvent.floci.services.lambda.model.LambdaUrlConfig;
+import io.github.hectorvent.floci.services.lambda.zip.CodeStore;
+import io.github.hectorvent.floci.services.lambda.zip.ZipExtractor;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -31,10 +31,10 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
-import static io.floci.aws.services.lambda.LambdaRuntimeManagementServiceTest.ACCOUNT;
-import static io.floci.aws.services.lambda.LambdaRuntimeManagementServiceTest.PIN;
-import static io.floci.aws.services.lambda.LambdaRuntimeManagementServiceTest.REGION;
-import static io.floci.aws.services.lambda.LambdaRuntimeManagementServiceTest.function;
+import static io.github.hectorvent.floci.services.lambda.LambdaRuntimeManagementServiceTest.ACCOUNT;
+import static io.github.hectorvent.floci.services.lambda.LambdaRuntimeManagementServiceTest.PIN;
+import static io.github.hectorvent.floci.services.lambda.LambdaRuntimeManagementServiceTest.REGION;
+import static io.github.hectorvent.floci.services.lambda.LambdaRuntimeManagementServiceTest.function;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.mock;
 

@@ -1,8 +1,8 @@
-package io.floci.aws.services.lambda;
+package io.github.hectorvent.floci.services.lambda;
 
-import io.floci.aws.core.common.AwsArnUtils;
-import io.floci.aws.core.common.AwsException;
-import io.floci.aws.core.common.AwsRegions;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.AwsRegions;
 
 import java.util.regex.Pattern;
 

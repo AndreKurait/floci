@@ -1,4 +1,4 @@
-package io.floci.aws.services.lambda.model;
+package io.github.hectorvent.floci.services.lambda.model;
 
 import io.quarkus.runtime.annotations.RegisterForReflection;
 

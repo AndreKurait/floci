@@ -1,14 +1,14 @@
-package io.floci.aws.services.lambda;
+package io.github.hectorvent.floci.services.lambda;
 
 import com.fasterxml.jackson.core.type.TypeReference;
-import io.floci.aws.core.common.AwsArnUtils;
-import io.floci.aws.core.common.AwsException;
-import io.floci.aws.core.common.Resettable;
-import io.floci.aws.core.storage.AccountAwareStorageBackend;
-import io.floci.aws.core.storage.StorageBackend;
-import io.floci.aws.core.storage.StorageFactory;
-import io.floci.aws.services.lambda.model.LambdaFunction;
-import io.floci.aws.services.lambda.model.LambdaRuntimeManagementConfig;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.StorageBackend;
+import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
+import io.github.hectorvent.floci.services.lambda.model.LambdaRuntimeManagementConfig;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
@@ -91,6 +91,15 @@ public class LambdaFunctionStore implements Resettable {
         }
     }
 
+    /**
+     * Drops every URL id that still points at {@code fn}. A backend that hands out the stored instance
+     * itself gives callers the object they then change and save, so by the time of the save the stored
+     * copy no longer says which URL it used to have.
+     */
+    private void deindexInstance(LambdaFunction fn) {
+        urlIdIndex.values().removeIf(indexed -> indexed == fn);
+    }
+
     private void deindexFunction(LambdaFunction fn) {
         if (fn.getUrlConfig() != null && fn.getUrlConfig().getFunctionUrl() != null) {
             String urlId = extractUrlId(fn.getUrlConfig().getFunctionUrl());
@@ -116,6 +125,7 @@ public class LambdaFunctionStore implements Resettable {
             requireCurrentGeneration(get(region, fn.getFunctionName(), fn.getVersion()), fn);
             // Remove old index entry if URL changed or was removed
             get(region, fn.getFunctionName(), fn.getVersion()).ifPresent(this::deindexFunction);
+            deindexInstance(fn);
 
             backend.put(regionKey(region, fn.getFunctionName(), fn.getVersion()), fn);
             indexFunction(fn);
@@ -152,13 +162,14 @@ public class LambdaFunctionStore implements Resettable {
         synchronized (lockForSave(accountId, region, fn)) {
             requireCurrentGeneration(getReadOnlyForAccount(accountId, region,
                     fn.getFunctionName(), fn.getVersion()), fn);
-            getForAccount(accountId, region, fn.getFunctionName(), fn.getVersion()).ifPresent(this::deindexFunction);
-
+            Optional<LambdaFunction> previous = getForAccount(accountId, region, fn.getFunctionName(), fn.getVersion());
             if (backend instanceof AccountAwareStorageBackend<LambdaFunction> aware) {
                 aware.putForAccount(accountId, regionKey(region, fn.getFunctionName(), fn.getVersion()), fn);
             } else {
                 backend.put(regionKey(region, fn.getFunctionName(), fn.getVersion()), fn);
             }
+            previous.ifPresent(this::deindexFunction);
+            deindexInstance(fn);
             indexFunction(fn);
         }
     }

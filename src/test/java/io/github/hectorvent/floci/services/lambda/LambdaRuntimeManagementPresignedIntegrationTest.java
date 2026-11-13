@@ -1,11 +1,11 @@
-package io.floci.aws.services.lambda;
+package io.github.hectorvent.floci.services.lambda;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import io.floci.aws.core.common.Digests;
-import io.floci.aws.core.common.auth.SigV4RequestValidator;
-import io.floci.aws.services.iam.IamService;
-import io.floci.aws.services.iam.model.AccessKey;
-import io.floci.aws.testing.SignedIamEnforcementProfile;
+import io.github.hectorvent.floci.core.common.Digests;
+import io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator;
+import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.iam.model.AccessKey;
+import io.github.hectorvent.floci.testing.SignedIamEnforcementProfile;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
