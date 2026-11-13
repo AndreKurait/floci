@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.iam;
 
 import io.github.hectorvent.floci.core.common.AwsProtocolClaimFilter;
 import io.github.hectorvent.floci.core.common.ProtocolClaim;
+import io.github.hectorvent.floci.core.common.SignedServiceRoute;
 import io.github.hectorvent.floci.core.common.WireProtocol;
 import io.github.hectorvent.floci.services.appconfig.AppConfigDataController;
 import io.github.hectorvent.floci.services.iot.IotController;
@@ -46,6 +47,25 @@ import static org.mockito.Mockito.when;
 class IamActionRegistryTest {
 
     private final IamActionRegistry registry = new IamActionRegistry();
+
+    @Test
+    void recordedInternalPrefixMatchesTheModelAndItsResourceLabels() {
+        ContainerRequestContext ctx = mockCtx("GET", "/_lambda/2015-03-31/functions/example",
+                new MultivaluedHashMap<>(), null, "");
+        when(ctx.getProperty(SignedServiceRoute.INTERNAL_PREFIX_PROPERTY)).thenReturn("/_lambda");
+        assertEquals("lambda:GetFunction", registry.resolveRoute("lambda", ctx));
+        assertEquals(Map.of("FunctionName", "example"), IamActionRegistry.pathLabels("lambda", ctx));
+    }
+
+    @Test
+    void anUnrecordedOrDifferentPrefixIsNotRemoved() {
+        ContainerRequestContext ctx = mockCtx("GET", "/_lambda/2015-03-31/functions/example",
+                new MultivaluedHashMap<>(), null, "");
+        assertEquals(Map.of(), IamActionRegistry.pathLabels("lambda", ctx));
+        when(ctx.getProperty(SignedServiceRoute.INTERNAL_PREFIX_PROPERTY)).thenReturn("/_other");
+        assertEquals(Map.of(), IamActionRegistry.pathLabels("lambda", ctx));
+    }
+
 
     @Test
     void iotJobDeletionFollowsItsMatchedRouteAndIgnoresActionSpoofing() {

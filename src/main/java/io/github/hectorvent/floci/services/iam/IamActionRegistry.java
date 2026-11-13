@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.core.common.AwsProtocolClaimFilter;
 import io.github.hectorvent.floci.core.common.AwsQueryServiceResolver;
 import io.github.hectorvent.floci.core.common.ProtocolClaim;
 import io.github.hectorvent.floci.core.common.RequestResources;
+import io.github.hectorvent.floci.core.common.SignedServiceRoute;
 import io.github.hectorvent.floci.core.common.WireProtocol;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayController;
 import io.github.hectorvent.floci.services.appconfig.AppConfigDataController;
@@ -842,8 +843,8 @@ public class IamActionRegistry {
                 return rule.action();
             }
         }
-        Optional<String> operation = restRoutes.operation(credentialScope, method, path,
-                ctx.getUriInfo() == null ? null : ctx.getUriInfo().getQueryParameters());
+        Optional<String> operation = restRoutes.operation(credentialScope, method, withoutInternalPrefix(ctx, path),
+                ctx.getUriInfo() == null ? null : ctx.getUriInfo().getQueryParameters(), movedUnderPrefix(ctx));
         if (operation.isPresent()) {
             String action = IamAuthorizedActions.actionFor(credentialScope, operation.get());
             if (checkedAsAws(credentialScope, operation.get(), action)) {
@@ -865,9 +866,20 @@ public class IamActionRegistry {
         if (credentialScope == null || !routes.routes(credentialScope)) {
             return Map.of();
         }
-        return routes.match(credentialScope, ctx.getMethod().toUpperCase(), routedPath(ctx),
-                        ctx.getUriInfo() == null ? null : ctx.getUriInfo().getQueryParameters())
+        return routes.match(credentialScope, ctx.getMethod().toUpperCase(), withoutInternalPrefix(ctx, routedPath(ctx)),
+                        ctx.getUriInfo() == null ? null : ctx.getUriInfo().getQueryParameters(), movedUnderPrefix(ctx))
                 .map(IamRestRoutes.Match::labels).orElse(Map.of());
+    }
+
+    static String withoutInternalPrefix(ContainerRequestContext ctx, String path) {
+        return SignedServiceRoute.internalPrefix(ctx)
+                .filter(prefix -> path.equals(prefix) || path.startsWith(prefix + "/"))
+                .map(prefix -> path.length() == prefix.length() ? "/" : path.substring(prefix.length()))
+                .orElse(path);
+    }
+
+    private static boolean movedUnderPrefix(ContainerRequestContext ctx) {
+        return SignedServiceRoute.internalPrefix(ctx).isPresent();
     }
 
     /**
