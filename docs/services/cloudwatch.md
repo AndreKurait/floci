@@ -29,6 +29,9 @@ Inflation is bounded to 10 MiB; the ordinary log-event validation still applies.
 | `PutLogEvents` | Write log events to a stream |
 | `GetLogEvents` | Read log events from a stream |
 | `FilterLogEvents` | Search log events with a filter pattern |
+| `CreateExportTask` | Export a snapshot of native log events as real S3 gzip objects |
+| `DescribeExportTasks` | Describe export status and retained task history |
+| `CancelExportTask` | Cancel queued work or stop after an already claimed object |
 | `PutRetentionPolicy` | Set log retention (days) |
 | `DeleteRetentionPolicy` | Remove log retention policy |
 | `AssociateKmsKey` | Associate a KMS key with a log group (`logGroupName` or `resourceIdentifier`) |
@@ -69,6 +72,55 @@ Inflation is bounded to 10 MiB; the ordinary log-event validation still applies.
 | `UpdateDeliveryConfiguration` | Change a delivery's record fields, delimiter or S3 configuration |
 | `DeleteDelivery` | Delete a delivery |
 | `DescribeDeliveries` | List deliveries, optionally only those from given delivery sources |
+
+### S3 export tasks
+
+`CreateExportTask` captures native, unencrypted `STANDARD` log group events and writes real UTF-8 gzip
+objects to a native S3 bucket in the same account and Region. Both timestamp boundaries are inclusive;
+`logStreamNamePrefix` selects streams before export. The immutable admission snapshot includes every
+matching stored event, independently of the Logs Insights query cap. Later ingestion or group deletion
+does not alter it. Empty selections complete without objects. The default destination prefix is
+`exportedlogs`; generated keys include the task UUID and an encoded stream name. Chunk layout and order
+are local implementation details, and keys must fit S3's 1024-byte UTF-8 limit.
+
+Tasks progress through `PENDING`, `RUNNING`, and `COMPLETED`, `FAILED`, or `CANCELLED`. This implementation
+admits one active task per account and Region. `CancelExportTask` immediately cancels queued work; if an
+object write has already been claimed, it reports `PENDING_CANCEL` until that write and its notification
+callbacks return. No later object is claimed. Cancellation and failure retain any committed objects;
+there is no rollback or automatic retry. A terminal-state persistence failure leaves the active slot
+occupied. Describe unknown IDs returns an empty list; cancelling one returns `ResourceNotFoundException`.
+Cancelling a terminal task returns `InvalidOperationException`.
+
+`DescribeExportTasks` returns account- and Region-scoped history with optional task/status filters and
+limits from 1 to 50. Its token is tied to those filters and expires after 24 hours or process restart.
+Pagination is a live keyset view, not a snapshot. Task records follow the configured CloudWatch Logs
+storage mode. On restart, persisted unfinished work becomes `FAILED`; the in-memory source snapshot is
+not replayed. Reset drains the worker before clearing storage. If a later reset hook fails, retained
+unfinished tasks become `FAILED` before admission resumes. A failed terminal write keeps admission closed.
+
+With IAM enforcement enabled, `CreateExportTask` checks the source log group ARN and its live
+`aws:ResourceTag` conditions, then the initiating caller's `s3:PutObject` permission on every planned
+object key. The bare group ARN and its trailing `:*` form are equivalent within each IAM statement;
+explicit denies and caller policy ceilings still apply. The worker separately requires the bucket
+policy to grant the regional Logs service `s3:GetBucketAcl` and `s3:PutObject`. Both checks include the
+source account and source log group ARN; only the write carries the `bucket-owner-full-control` ACL
+condition. Service-principal conditions never
+enter the initiating caller's context, and that caller is not required to hold `s3:PutObjectAcl` merely
+because the worker applies the service ACL. An empty export checks one reserved key without writing it.
+These local checks do not claim equivalence to the direct S3 HTTP authorization path.
+
+Each object rechecks the live service grant and the captured bucket lifetime under S3's existing locks.
+Deleting/recreating the bucket, even a refused deletion attempt, invalidates the export receipt. The
+ordinary S3 core preserves object ownership, versioning, retention and metadata, with overwrite refused
+for generated keys. Notifications run after releasing the export's S3 locks and use the then-current
+bucket configuration; a replacement bucket can therefore change notification selection. This guard
+protects export writes; it does not make all inherited bucket configuration writers transactional.
+IAM evaluation and later writes are not one transaction.
+
+Unscoped legacy sources/destinations, cross-account or cross-Region exports, `INFREQUENT_ACCESS` and
+`DELIVERY` groups, KMS/DSSE-KMS destinations, transformed/unmasked export modes, and FSx destinations are
+outside this implementation. Destinations may use no explicit encryption or SSE-S3. Legacy group tags
+can be inspected for IAM without migrating their rows, but actual exports require scoped native data.
 
 `DescribeLogGroups` returns names in ASCII order, with up to 50 groups per page by default.
 Set `limit` to an integer from 1 to 50 and pass the returned `nextToken` with the same region

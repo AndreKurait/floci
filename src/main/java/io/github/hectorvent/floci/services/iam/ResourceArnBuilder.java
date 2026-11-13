@@ -369,14 +369,14 @@ public class ResourceArnBuilder {
     public List<String> buildLogResources(String action, ContainerRequestContext ctx,
                                           String region, String accountId, String partition) {
         // Operations the vendored table reads (the vended-log delivery family) take their resources from it.
-        if (RequestResources.reads(action)) {
+        if (!"logs:CreateExportTask".equals(action) && RequestResources.reads(action)) {
             return namedResources("logs", action, ctx, region, accountId, partition);
         }
         boolean stream = "logs:CreateLogStream".equals(action) || "logs:DeleteLogStream".equals(action)
                 || "logs:PutLogEvents".equals(action);
         boolean group = switch (action) {
             case "logs:CreateLogGroup", "logs:DeleteLogGroup", "logs:PutRetentionPolicy",
-                    "logs:DeleteRetentionPolicy" -> true;
+                    "logs:DeleteRetentionPolicy", "logs:CreateExportTask" -> true;
             default -> false;
         };
         if (!stream && !group && !LogGroupTagTarget.supports(action)) {
@@ -396,7 +396,8 @@ public class ResourceArnBuilder {
         }
         String name = body.path("logGroupName").asText();
         String resource = "log-group:" + name + (stream
-                ? ":log-stream:" + body.path("logStreamName").asText() : ":*");
+                ? ":log-stream:" + body.path("logStreamName").asText()
+                : "logs:CreateExportTask".equals(action) ? "" : ":*");
         return List.of(new AwsArnUtils.Arn(partition, "logs", region, accountId, resource).toString());
     }
 
