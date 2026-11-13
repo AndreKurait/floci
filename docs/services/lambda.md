@@ -527,6 +527,22 @@ rejects one outright with `InvalidParameterValueException: Invalid layer version
 
 ## Provisioned concurrency
 
+`AWS::Lambda::Alias` provisions the declared `ProvisionedConcurrencyConfig` through the same
+worker pool as the Lambda API. CloudFormation waits for the requested capacity to initialize;
+initialization failure fails the resource. An update that removes a previously declared
+configuration deletes that allocation. SAM preserves the setting on the generated alias and
+requires `AutoPublishAlias`. Function initialization dependencies must be ready before the alias
+is provisioned.
+
+The readiness wait has a local five-minute limit. Removing a declaration, including a condition
+that resolves to `AWS::NoValue`, removes template-owned capacity; an update whose template never
+declared capacity preserves a directly configured allocation.
+Failed initial creation retains the alias identity so CloudFormation can roll it back. When an
+update creates an alias and its capacity fails to initialize, the new alias is removed; failed
+compensation retains ownership for later cleanup attempts. Each cleanup operation makes at most
+three attempts. This port does not add transactional rollback of a reused alias's configuration
+or change the native pool's supported targets and limits.
+
 Published versions with `SnapStart.ApplyOn=PublishedVersions` reject provisioned concurrency
 with `ResourceConflictException`, including through an alias. A configured alias cannot
 retarget to such a version. Eligibility uses the published snapshot, so changing `$LATEST`

@@ -157,6 +157,7 @@ import io.floci.aws.services.kms.KmsService;
 import io.floci.aws.services.lambda.LambdaCodeSigningConfigService;
 import io.floci.aws.services.lambda.LambdaLayerService;
 import io.floci.aws.services.lambda.LambdaService;
+import io.floci.aws.services.lambda.ProvisionedConcurrencyPool;
 import io.floci.aws.services.lambdamicrovms.LambdaMicrovmsService;
 import io.floci.aws.services.lambdaweb.LambdaWebService;
 import io.floci.aws.services.organizations.OrganizationsService;
@@ -185,6 +186,8 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
+
+import static org.mockito.Mockito.mock;
 
 /**
  * Builds {@link CfnResourceDispatcher} for tests without a wall of positional nulls.
@@ -456,7 +459,7 @@ final class CfnProvisionerFixture {
             if (lambdaService != null) {
                 discovered.add(new LambdaAddressingCfnProvisioner(lambdaService));
                 discovered.add(new LambdaEventInvokeConfigCfnProvisioner(lambdaService));
-                discovered.add(new LambdaVersionAliasCfnProvisioner(lambdaService));
+                discovered.add(new LambdaVersionAliasCfnProvisioner(lambdaService, mock(ProvisionedConcurrencyPool.class)));
                 discovered.add(new LambdaEventSourceMappingCfnProvisioner(lambdaService));
                 if (lambdaCodeSigningConfigService != null) {
                     discovered.add(new LambdaCodeSigningConfigCfnProvisioner(lambdaCodeSigningConfigService,

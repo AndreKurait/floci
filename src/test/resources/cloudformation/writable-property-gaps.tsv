@@ -389,7 +389,6 @@ AWS::KinesisFirehose::DeliveryStream	MSKSourceConfiguration	documented as ignore
 AWS::KinesisFirehose::DeliveryStream	RedshiftDestinationConfiguration	documented as ignored (docs/services/cloudformation.md, Kinesis Data Firehose)
 AWS::KinesisFirehose::DeliveryStream	SnowflakeDestinationConfiguration	documented as ignored (docs/services/cloudformation.md, Kinesis Data Firehose)
 AWS::KinesisFirehose::DeliveryStream	SplunkDestinationConfiguration	documented as ignored (docs/services/cloudformation.md, Kinesis Data Firehose)
-AWS::Lambda::Alias	ProvisionedConcurrencyConfig	accepted and ignored
 AWS::Lambda::CodeSigningConfig	Tags	accepted and ignored
 AWS::Lambda::EventSourceMapping	AmazonManagedKafkaEventSourceConfig	accepted and ignored
 AWS::Lambda::EventSourceMapping	DocumentDBEventSourceConfig	accepted and ignored

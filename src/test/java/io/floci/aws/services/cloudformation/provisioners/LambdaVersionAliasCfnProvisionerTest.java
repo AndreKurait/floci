@@ -12,6 +12,7 @@ import io.floci.aws.services.lambda.LambdaConcurrencyLimiter;
 import io.floci.aws.services.lambda.LambdaFunctionStore;
 import io.floci.aws.services.lambda.LambdaService;
 import io.floci.aws.services.lambda.LambdaTargetResolver;
+import io.floci.aws.services.lambda.ProvisionedConcurrencyPool;
 import io.floci.aws.services.lambda.WarmPool;
 import io.floci.aws.services.lambda.model.LambdaAlias;
 import io.floci.aws.services.lambda.model.LambdaFunction;
@@ -46,7 +47,8 @@ class LambdaVersionAliasCfnProvisionerTest {
             "arn:aws:lambda:us-east-1:000000000000:function:my-fn:production";
 
     private final LambdaService lambda = mock(LambdaService.class);
-    private final LambdaVersionAliasCfnProvisioner provisioner = new LambdaVersionAliasCfnProvisioner(lambda);
+    private final ProvisionedConcurrencyPool concurrency = mock(ProvisionedConcurrencyPool.class);
+    private final LambdaVersionAliasCfnProvisioner provisioner = new LambdaVersionAliasCfnProvisioner(lambda, concurrency);
     private final ObjectMapper mapper = new ObjectMapper();
 
     private ProvisionContext ctx() {
@@ -271,12 +273,12 @@ class LambdaVersionAliasCfnProvisionerTest {
 
     private StackResource deployAlias(LambdaService real, String properties) throws Exception {
         StackResource r = resource("AWS::Lambda::Alias", "MyFuncAliasproduction");
-        new LambdaVersionAliasCfnProvisioner(real).provision(r, mapper.readTree(properties), ctx());
+        new LambdaVersionAliasCfnProvisioner(real, concurrency).provision(r, mapper.readTree(properties), ctx());
         return r;
     }
 
     private void updateAlias(LambdaService real, StackResource r, String previous, String current) throws Exception {
-        new LambdaVersionAliasCfnProvisioner(real).provision(r, mapper.readTree(current),
+        new LambdaVersionAliasCfnProvisioner(real, concurrency).provision(r, mapper.readTree(current),
                 ProvisionContexts.update("us-east-1", "000000000000", "my-stack",
                         r.getPhysicalId(), previous));
     }
