@@ -1,16 +1,17 @@
-package io.floci.aws.services.cloudformation.provisioners;
+package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import io.floci.aws.core.common.AwsException;
-import io.floci.aws.services.appconfig.AppConfigService;
-import io.floci.aws.services.appconfig.model.Application;
-import io.floci.aws.services.appconfig.model.ConfigurationProfile;
-import io.floci.aws.services.appconfig.model.DeploymentStrategy;
-import io.floci.aws.services.appconfig.model.Environment;
-import io.floci.aws.services.cloudformation.model.StackResource;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.services.appconfig.AppConfigService;
+import io.github.hectorvent.floci.services.appconfig.model.Application;
+import io.github.hectorvent.floci.services.appconfig.model.ConfigurationProfile;
+import io.github.hectorvent.floci.services.appconfig.model.DeploymentStrategy;
+import io.github.hectorvent.floci.services.appconfig.model.Environment;
+import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
@@ -35,8 +36,7 @@ import java.util.Set;
  * leaves the displaced one to the {@link ReplacementCleanup} record. Whether one changed is judged on
  * the resolved template values the entity was made from, as CloudFormation compares them.
  *
- * <p>A profile's
- * {@code KmsKeyIdentifier}, {@code RetrievalRoleArn} and {@code Validators}, and the
+ * <p>A profile's {@code KmsKeyIdentifier}, and the
  * {@code DeletionProtectionCheck} of an environment or profile, which Floci's create operations do
  * not keep either.
  */
@@ -176,6 +176,8 @@ public class AppConfigCfnProvisioner implements CfnResourceProvisioner {
         String locationUri = requiredText(PROFILE, props, "LocationUri", LOCATION_URI_MAX_LENGTH, ctx);
         String type = text(props, "Type", ctx);
         String description = optionalText(PROFILE, props, "Description", DESCRIPTION_MAX_LENGTH, ctx);
+        String retrievalRoleArn = optionalText(PROFILE, props, "RetrievalRoleArn", 2048, ctx);
+        Object validators = jsonValue(resolved(props, "Validators", ctx));
         Map<String, String> tags = ctx.resolveTags(props, "Tags");
         allowed(PROFILE, "DeletionProtectionCheck", text(props, "DeletionProtectionCheck", ctx),
                 DELETION_PROTECTION_CHECKS);
@@ -183,23 +185,25 @@ public class AppConfigCfnProvisioner implements CfnResourceProvisioner {
                 .put("ApplicationId", applicationId)
                 .put("LocationUri", locationUri)
                 .put("Type", type);
+        Map<String, Object> request = new HashMap<>();
+        request.put("Name", name);
+        request.put("Description", description);
+        request.put("LocationUri", locationUri);
+        request.put("Type", type);
+        request.put("RetrievalRoleArn", retrievalRoleArn);
+        request.put("Validators", validators);
+        request.put("Tags", tags);
         if (updating && madeFrom(r, createOnly)) {
             ConfigurationProfile current = service.findConfigurationProfile(ctx.priorPhysicalId())
                     .orElseThrow(() -> new AwsException("ResourceNotFoundException",
                             "Configuration profile not found", 404));
             snapshotBeforeUpdate(r, current);
             CfnRollback.guarded(r, ctx, false, () -> { }, () -> restoreSnapshot(r), () -> {
-                service.updateConfigurationProfile(current.getApplicationId(), current.getId(), name, description);
+                service.updateConfigurationProfile(current.getApplicationId(), current.getId(), request);
                 service.setResourceTags("configurationprofile", current.getApplicationId(), current.getId(), tags);
             });
             return;
         }
-        Map<String, Object> request = new HashMap<>();
-        request.put("Name", name);
-        request.put("Description", description);
-        request.put("LocationUri", locationUri);
-        request.put("Type", type);
-        request.put("Tags", tags);
         ConfigurationProfile profile = service.createConfigurationProfile(applicationId, request);
         r.setPhysicalId(profile.getId());
         r.getAttributes().put("ConfigurationProfileId", profile.getId());
@@ -264,11 +268,25 @@ public class AppConfigCfnProvisioner implements CfnResourceProvisioner {
      */
     private static boolean madeFrom(StackResource r, ObjectNode createOnly) {
         String recorded = r.getAttributes().get(CREATE_ONLY_ATTR);
+        boolean legacy = recorded == null;
+        if (legacy) {
+            recorded = r.getAttributes().get("_floci_appconfig_properties");
+        }
         if (recorded == null) {
             return false;
         }
         try {
-            return MAPPER.readTree(recorded).equals(createOnly);
+            JsonNode prior = MAPPER.readTree(recorded);
+            if (legacy) {
+                for (Map.Entry<String, JsonNode> property : createOnly.properties()) {
+                    JsonNode old = prior.path(property.getKey());
+                    if (!(old.isMissingNode() ? MAPPER.nullNode() : old).equals(property.getValue())) {
+                        return false;
+                    }
+                }
+                return true;
+            }
+            return prior.equals(createOnly);
         } catch (JsonProcessingException e) {
             return false;
         }
@@ -381,7 +399,20 @@ public class AppConfigCfnProvisioner implements CfnResourceProvisioner {
     /** A stub left from before these types had a provisioner names nothing, so nothing is deleted. */
     @Override
     public void delete(StackResource resource, String region) {
-        if (CfnResourceDispatcher.isStub(resource.getPhysicalId(), resource.getAttributes())) {
+        if (resource.getPhysicalId() == null || resource.getPhysicalId().isBlank()
+                || CfnResourceDispatcher.isStub(resource.getPhysicalId(), resource.getAttributes())) {
+            return;
+        }
+        String applicationId = resource.getAttributes().getOrDefault(APPLICATION_ATTR,
+                resource.getAttributes().get("_floci_appconfig_application"));
+        if (applicationId != null && Set.of(ENVIRONMENT, PROFILE).contains(resource.getResourceType())) {
+            CfnDeletes.safeDelete(resource.getResourceType(), resource.getPhysicalId(), () -> {
+                if (ENVIRONMENT.equals(resource.getResourceType())) {
+                    service.deleteEnvironmentById(applicationId, resource.getPhysicalId());
+                } else {
+                    service.deleteConfigurationProfileById(applicationId, resource.getPhysicalId());
+                }
+            }, "ResourceNotFoundException");
             return;
         }
         delete(resource.getResourceType(), resource.getPhysicalId(), region);
@@ -401,13 +432,15 @@ public class AppConfigCfnProvisioner implements CfnResourceProvisioner {
         if (physicalId == null || physicalId.isBlank()) {
             return;
         }
-        switch (resourceType) {
-            case APPLICATION -> service.deleteApplicationById(physicalId);
-            case ENVIRONMENT -> service.deleteEnvironmentById(physicalId);
-            case PROFILE -> service.deleteConfigurationProfileById(physicalId);
-            case STRATEGY -> service.deleteDeploymentStrategy(physicalId);
-            default -> throw new IllegalArgumentException("Unsupported AppConfig resource type " + resourceType);
-        }
+        CfnDeletes.safeDelete(resourceType, physicalId, () -> {
+            switch (resourceType) {
+                case APPLICATION -> service.deleteApplicationById(physicalId);
+                case ENVIRONMENT -> service.deleteEnvironmentById(physicalId);
+                case PROFILE -> service.deleteConfigurationProfileById(physicalId);
+                case STRATEGY -> service.deleteDeploymentStrategy(physicalId);
+                default -> throw new IllegalArgumentException("Unsupported AppConfig resource type " + resourceType);
+            }
+        }, "ResourceNotFoundException");
     }
 
     @Override
@@ -493,8 +526,8 @@ public class AppConfigCfnProvisioner implements CfnResourceProvisioner {
             }
             case PROFILE -> {
                 ConfigurationProfile prior = MAPPER.treeToValue(snapshot, ConfigurationProfile.class);
-                service.updateConfigurationProfile(prior.getApplicationId(), prior.getId(), prior.getName(),
-                        prior.getDescription());
+                service.updateConfigurationProfile(prior.getApplicationId(), prior.getId(),
+                        MAPPER.convertValue(snapshot, new TypeReference<>() {}));
                 service.setResourceTags("configurationprofile", prior.getApplicationId(), prior.getId(), prior.getTags());
             }
             case STRATEGY -> {

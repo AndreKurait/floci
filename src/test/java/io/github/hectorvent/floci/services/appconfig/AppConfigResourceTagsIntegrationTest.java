@@ -1,9 +1,9 @@
-package io.floci.aws.services.appconfig;
+package io.github.hectorvent.floci.services.appconfig;
 
-import io.floci.aws.testing.AwsTestClients;
-import io.floci.aws.testing.EnforcementFixtures;
-import io.floci.aws.testing.IamEnforcementProfile;
-import io.floci.aws.testing.PartitionCleanup;
+import io.github.hectorvent.floci.testing.AwsTestClients;
+import io.github.hectorvent.floci.testing.EnforcementFixtures;
+import io.github.hectorvent.floci.testing.IamEnforcementProfile;
+import io.github.hectorvent.floci.testing.PartitionCleanup;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
@@ -21,7 +21,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
-import static io.floci.aws.testing.EnforcementFixtures.auth;
+import static io.github.hectorvent.floci.testing.EnforcementFixtures.auth;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.hasKey;
 import static org.hamcrest.Matchers.not;

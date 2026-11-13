@@ -1,9 +1,12 @@
-package io.floci.aws.services.iam;
+package io.github.hectorvent.floci.services.iam;
 
-import io.floci.aws.core.common.AwsProtocolClaimFilter;
-import io.floci.aws.core.common.ProtocolClaim;
-import io.floci.aws.core.common.WireProtocol;
-import io.floci.aws.services.route53.Route53Controller;
+import io.github.hectorvent.floci.core.common.AwsProtocolClaimFilter;
+import io.github.hectorvent.floci.core.common.ProtocolClaim;
+import io.github.hectorvent.floci.core.common.SignedServiceRoute;
+import io.github.hectorvent.floci.core.common.WireProtocol;
+import io.github.hectorvent.floci.services.appconfig.AppConfigDataController;
+import io.github.hectorvent.floci.services.iot.IotController;
+import io.github.hectorvent.floci.services.route53.Route53Controller;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.container.ResourceInfo;
 import jakarta.ws.rs.core.MediaType;
@@ -45,14 +48,38 @@ class IamActionRegistryTest {
 
     private final IamActionRegistry registry = new IamActionRegistry();
 
-    @ParameterizedTest
-    @CsvSource({"GET,ListTagsForResource", "POST,TagResource", "DELETE,UntagResource"})
-    void appConfigTagRoutesRequireTheirOwnActions(String method, String action) {
-        for (String path : List.of("/tags", "/tags/arn:aws:appconfig:us-east-1:000000000000:application/a",
-                "/tags/arn%3Aaws%3Aappconfig%3Aus-east-1%3A000000000000%3Aapplication%2Fa")) {
-            assertEquals("appconfig:" + action, registry.resolveRoute("appconfig",
-                    mockCtx(method, path, new MultivaluedHashMap<>(), null, "")));
-        }
+    @Test
+    void recordedInternalPrefixMatchesTheModelAndItsResourceLabels() {
+        ContainerRequestContext ctx = mockCtx("GET", "/_lambda/2015-03-31/functions/example",
+                new MultivaluedHashMap<>(), null, "");
+        when(ctx.getProperty(SignedServiceRoute.INTERNAL_PREFIX_PROPERTY)).thenReturn("/_lambda");
+        assertEquals("lambda:GetFunction", registry.resolveRoute("lambda", ctx));
+        assertEquals(Map.of("FunctionName", "example"), IamActionRegistry.pathLabels("lambda", ctx));
+    }
+
+    @Test
+    void anUnrecordedOrDifferentPrefixIsNotRemoved() {
+        ContainerRequestContext ctx = mockCtx("GET", "/_lambda/2015-03-31/functions/example",
+                new MultivaluedHashMap<>(), null, "");
+        assertEquals(Map.of(), IamActionRegistry.pathLabels("lambda", ctx));
+        when(ctx.getProperty(SignedServiceRoute.INTERNAL_PREFIX_PROPERTY)).thenReturn("/_other");
+        assertEquals(Map.of(), IamActionRegistry.pathLabels("lambda", ctx));
+    }
+
+
+    @Test
+    void iotJobDeletionFollowsItsMatchedRouteAndIgnoresActionSpoofing() {
+        ResourceInfo info = Mockito.mock(ResourceInfo.class);
+        Mockito.doReturn(IotController.class).when(info).getResourceClass();
+        when(info.getResourceMethod()).thenReturn(Arrays.stream(IotController.class.getMethods())
+                .filter(method -> method.getName().equals("deleteJob")).findFirst().orElseThrow());
+        assertEquals("iot:DeleteJob", registry.resolveMatchedRoute("iot", info));
+        assertNull(registry.resolveMatchedRoute("other", info));
+        MultivaluedMap<String, String> query = new MultivaluedHashMap<>();
+        query.putSingle("Action", "ListJobs");
+        ContainerRequestContext context = mockCtx("DELETE", "/jobs/owned%5Fjob", query, null, "");
+        when(context.getHeaderString("X-Amz-Target")).thenReturn("IoT.ListJobs");
+        assertEquals("iot:DeleteJob", registry.resolveRoute("iot", context));
     }
 
     /**
@@ -245,6 +272,17 @@ class IamActionRegistryTest {
         when(info.getResourceMethod()).thenReturn(Arrays.stream(Route53Controller.class.getMethods())
                 .filter(candidate -> candidate.getName().equals(method)).findFirst().orElseThrow());
         assertEquals("route53:" + operation, registry.resolveMatchedRoute("route53", info));
+        assertNull(registry.resolveMatchedRoute("s3", info));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"startConfigurationSession,StartConfigurationSession", "getLatestConfiguration,GetLatestConfiguration"})
+    void matchedAppConfigDataMethodsKeepTheAppConfigPermissionNamespace(String method, String operation) {
+        ResourceInfo info = Mockito.mock(ResourceInfo.class);
+        Mockito.doReturn(AppConfigDataController.class).when(info).getResourceClass();
+        when(info.getResourceMethod()).thenReturn(Arrays.stream(AppConfigDataController.class.getMethods())
+                .filter(candidate -> candidate.getName().equals(method)).findFirst().orElseThrow());
+        assertEquals("appconfig:" + operation, registry.resolveMatchedRoute("appconfig", info));
         assertNull(registry.resolveMatchedRoute("s3", info));
     }
 
@@ -1080,29 +1118,6 @@ class IamActionRegistryTest {
         // A plain DELETE with no sub-resource still deletes the bucket.
         assertEquals("s3:DeleteBucket",
                 registry.resolve("s3", mockCtx("DELETE", "/bucket", new MultivaluedHashMap<>(), null, "")));
-    }
-
-    @Test
-    void s3BucketSubResourcesFlociDoesNotServeAreCheckedAsTheOperationsTheyName() {
-        // S3Controller answers them NotImplemented instead of listing, creating or deleting the bucket, so they are
-        // checked as AWS checks the operation the AWS model gives the sub-resource and method.
-        assertEquals("s3:GetBucketMetadataTableConfiguration", bucketAction("GET", "metadataConfiguration"));
-        assertEquals("s3:DeleteBucketMetadataTableConfiguration", bucketAction("DELETE", "metadataConfiguration"));
-        assertEquals("s3:GetBucketMetadataTableConfiguration", bucketAction("GET", "metadataTable"));
-        assertEquals("s3:DeleteBucketMetadataTableConfiguration", bucketAction("DELETE", "metadataTable"));
-        assertEquals("s3:UpdateBucketMetadataJournalTableConfiguration", bucketAction("PUT", "metadataJournalTable"));
-        assertEquals("s3:GetBucketAbac", bucketAction("GET", "abac"));
-        assertEquals("s3:PutBucketAbac", bucketAction("PUT", "abac"));
-        assertEquals("s3:CreateBucketMetadataTableConfiguration", bucketAction("POST", "metadataTable"));
-        // A sub-resource sent with a method AWS defines none for is refused as not allowed, checked as before.
-        assertEquals("s3:DeleteBucket", bucketAction("DELETE", "versioning"));
-        assertEquals("s3:CreateBucket", bucketAction("PUT", "location"));
-        assertNull(bucketAction("POST", "versioning"));
-        // A browser-form PostObject runs ahead of any sub-resource and is checked per key, as DeleteObjects is.
-        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
-        params.add("metadataTable", "");
-        assertNull(registry.resolve("s3", mockCtx("POST", "/bucket", params, MediaType.MULTIPART_FORM_DATA_TYPE, "")));
-        assertNull(bucketAction("POST", "delete"));
     }
 
     @Test

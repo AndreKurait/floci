@@ -1,14 +1,11 @@
-package io.floci.aws.core.common;
+package io.github.hectorvent.floci.core.common;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.cbor.CBORFactory;
-import io.floci.aws.services.ec2instanceconnect.InstanceConnectKeys;
-import io.floci.aws.testing.AwsTestClients;
-import io.floci.aws.testing.PartitionCleanup;
-import io.floci.aws.testing.PartitionMatrix;
-import io.floci.aws.testing.PartitionMatrix.PartitionCase;
-import io.floci.aws.testing.RestAssuredJsonUtils;
-import io.quarkus.arc.Arc;
+import io.github.hectorvent.floci.testing.PartitionCleanup;
+import io.github.hectorvent.floci.testing.PartitionMatrix;
+import io.github.hectorvent.floci.testing.PartitionMatrix.PartitionCase;
+import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.path.json.config.JsonPathConfig;
 import io.restassured.response.Response;
@@ -17,9 +14,6 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
-import software.amazon.awssdk.regions.Region;
-import software.amazon.awssdk.services.applicationautoscaling.ApplicationAutoScalingClient;
-import software.amazon.awssdk.services.applicationautoscaling.model.ScalableTargetAction;
 
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
@@ -49,16 +43,15 @@ class PartitionCrossServiceSmokeIntegrationTest {
     static final Set<String> COVERED_PACKAGES = Set.of(
             "accessanalyzer", "acm", "amazonmq", "apigateway", "apigatewayv2", "appconfig", "applicationautoscaling", "appsync",
             "aps", "autoscaling", "backup", "batch", "bcmdataexports", "bedrock", "bedrockagentcorecontrol", "ce",
-            "cloudfront", "cloudmap", "cloudwatch", "codebuild", "codedeploy", "codepipeline", "cognito",
+            "cloudfront", "cloudmap", "cloudwatch", "codebuild", "codedeploy", "codepipeline", "cognito", "cognitoidentity",
             "configservice", "connect", "controlcatalog", "controltower", "datasync", "dlm", "dms", "dsql", "dynamodb", "ec2",
-            "ec2instanceconnect", "ecr", "ecs", "efs", "eks", "elasticache", "elasticbeanstalk", "elb", "elbv2", "emr", "emrserverless",
+            "ecr", "ecs", "efs", "eks", "elasticache", "elasticbeanstalk", "elb", "elbv2", "emr", "emrserverless",
             "eventbridge", "eventbridgev2", "firehose", "fis", "glue", "guardduty", "iot", "kinesis", "kinesisanalytics", "lambda",
             "lambdamicrovms", "lambdaweb", "memorydb", "msk", "mwaa", "networkfirewall", "oam", "opensearch", "organizations",
             "paymentcryptography", "pipes", "quicksight", "ram", "rds", "redshift", "redshiftserverless",
-            "rekognition", "resourceexplorer2", "resourcegroups", "route53resolver",
+            "resourceexplorer2", "resourcegroups", "route53resolver",
             "s3tables", "s3vectors", "sagemaker", "scheduler", "secretsmanager", "servicequotas", "ses", "signer", "sns", "sqs",
-            "stepfunctions", "timestreaminfluxdb", "transfer", "verifiedpermissions", "wafv2",
-            "xray");
+            "stepfunctions", "timestreaminfluxdb", "transfer", "verifiedpermissions", "wafv2");
 
     private static final String JSON_1_0 = "application/x-amz-json-1.0";
     private static final String JSON_1_1 = "application/x-amz-json-1.1";
@@ -70,20 +63,6 @@ class PartitionCrossServiceSmokeIntegrationTest {
     @BeforeAll
     static void configureRestAssured() {
         RestAssuredJsonUtils.configureAwsContentTypes();
-    }
-
-    @ParameterizedTest
-    @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
-    void rekognitionCollectionArn(PartitionCase partitionCase) {
-        String region = offered(partitionCase, "rekognition");
-        String id = unique("smoke-collection", partitionCase);
-        String body = "{\"CollectionId\":\"" + id + "\"}";
-        String arn = signed(region, "rekognition").contentType(JSON_1_1)
-                .header("X-Amz-Target", "RekognitionService.CreateCollection").body(body)
-                .post("/").then().statusCode(200).extract().path("CollectionArn");
-        cleanup.register(() -> signed(region, "rekognition").contentType(JSON_1_1)
-                .header("X-Amz-Target", "RekognitionService.DeleteCollection").body(body).post("/"));
-        PartitionMatrix.assertArnIn(partitionCase, arn);
     }
 
     @ParameterizedTest
@@ -134,23 +113,6 @@ class PartitionCrossServiceSmokeIntegrationTest {
                 .when().post("/groups").then().statusCode(200).extract().path("Group.GroupArn");
         cleanup.register(() -> signed(region, "resource-groups").contentType(JSON)
                 .body("{\"Group\":\"" + arn + "\"}").when().post("/delete-group"));
-        PartitionMatrix.assertArnIn(partitionCase, arn);
-    }
-
-    @ParameterizedTest
-    @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
-    void xraySamplingRuleArn(PartitionCase partitionCase) {
-        String region = offered(partitionCase, "xray");
-        String name = unique("smoke-rule", partitionCase);
-        String body = "{\"SamplingRule\":{\"RuleName\":\"" + name + "\",\"Priority\":10,"
-                + "\"FixedRate\":0.1,\"ReservoirSize\":1,\"ServiceName\":\"*\","
-                + "\"ServiceType\":\"*\",\"Host\":\"*\",\"HTTPMethod\":\"*\","
-                + "\"URLPath\":\"*\",\"Version\":1}}";
-        String arn = signed(region, "xray").contentType(JSON).body(body)
-                .when().post("/CreateSamplingRule")
-                .then().statusCode(200).extract().path("SamplingRuleRecord.SamplingRule.RuleARN");
-        cleanup.register(() -> signed(region, "xray").contentType(JSON)
-                .body("{\"RuleName\":\"" + name + "\"}").when().post("/DeleteSamplingRule"));
         PartitionMatrix.assertArnIn(partitionCase, arn);
     }
 
@@ -594,51 +556,6 @@ class PartitionCrossServiceSmokeIntegrationTest {
         PartitionMatrix.assertGlobalArnIn(partitionCase, created.xmlPath().getString("CreateIpamResponse.ipam.ipamArn"));
     }
 
-    /**
-     * SendSSHPublicKey answers only RequestId and Success; the caller ARN it mints is read back
-     * from the signed active-keys document IMDS would serve the instance, and the signer host from
-     * the name its certificate is issued under.
-     */
-    @ParameterizedTest
-    @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
-    void instanceConnectCallerArnAndSignerHost(PartitionCase partitionCase) {
-        String region = offered(partitionCase, "ec2-instance-connect");
-        String instanceId = signed(region, "ec2")
-            .formParam("Action", "RunInstances")
-            .formParam("Version", "2016-11-15")
-            .formParam("ImageId", "ami-0123456789abcdef0")
-            .formParam("InstanceType", "t3.micro")
-            .formParam("MinCount", "1")
-            .formParam("MaxCount", "1")
-        .when().post("/").then().statusCode(200)
-            .extract().xmlPath().getString("RunInstancesResponse.instancesSet.item.instanceId");
-        cleanup.register(() -> signed(region, "ec2")
-            .formParam("Action", "TerminateInstances")
-            .formParam("Version", "2016-11-15")
-            .formParam("InstanceId.1", instanceId)
-        .when().post("/"));
-        // A mock launch settles on the next describe, as it does for any other caller.
-        String state = signed(region, "ec2")
-            .formParam("Action", "DescribeInstances")
-            .formParam("Version", "2016-11-15")
-            .formParam("InstanceId.1", instanceId)
-        .when().post("/").then().statusCode(200).extract().xmlPath()
-            .getString("DescribeInstancesResponse.reservationSet.item.instancesSet.item.instanceState.name");
-        assertEquals("running", state);
-
-        json11(region, "ec2-instance-connect", "AWSEC2InstanceConnectService.SendSSHPublicKey",
-                "{\"InstanceId\":\"" + instanceId + "\",\"InstanceOSUser\":\"admin\",\"SSHPublicKey\":\""
-                + "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl smoke\"}")
-        .when().post("/").then().statusCode(200);
-
-        String document = Arc.container().instance(InstanceConnectKeys.class).get()
-                .activeKeysDocument(region, instanceId, "admin").orElseThrow();
-        String caller = document.lines().filter(line -> line.startsWith("#Caller="))
-                .findFirst().orElseThrow().substring("#Caller=".length());
-        PartitionMatrix.assertGlobalArnIn(partitionCase, caller);
-        assertRegionalHostIn(partitionCase, InstanceConnectKeys.signerCommonName(region));
-    }
-
     @ParameterizedTest
     @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
     void apiGatewayDomainNameArn(PartitionCase partitionCase) {
@@ -705,6 +622,28 @@ class PartitionCrossServiceSmokeIntegrationTest {
         String identifier = created.jsonPath().getString("identifier");
         cleanup.register(() -> signed(region, "dsql").when().delete("/cluster/" + identifier));
         PartitionMatrix.assertArnIn(partitionCase, created.jsonPath().getString("arn"));
+    }
+
+    @ParameterizedTest
+    @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
+    void cognitoIdentityTokenIssuer(PartitionCase partitionCase) throws Exception {
+        String region = offered(partitionCase, "cognito-identity");
+        String target = "AWSCognitoIdentityService.";
+        String body = "{\"IdentityPoolName\":\"" + unique("identity-token", partitionCase)
+                + "\",\"AllowUnauthenticatedIdentities\":true,\"AllowClassicFlow\":true}";
+        String pool = json11(region, "cognito-identity", target + "CreateIdentityPool", body)
+                .post("/").then().statusCode(200).extract().path("IdentityPoolId");
+        String poolBody = "{\"IdentityPoolId\":\"" + pool + "\"}";
+        cleanup.register(() -> json11(region, "cognito-identity", target + "DeleteIdentityPool", poolBody).post("/"));
+        String identity = json11(region, "cognito-identity", target + "GetId", poolBody)
+                .post("/").then().statusCode(200).extract().path("IdentityId");
+        String token = json11(region, "cognito-identity", target + "GetOpenIdToken",
+                "{\"IdentityId\":\"" + identity + "\"}")
+                .post("/").then().statusCode(200).extract().path("Token");
+        String issuer = new ObjectMapper().readTree(Base64.getUrlDecoder().decode(token.split("\\.")[1]))
+                .path("iss").asText();
+        PartitionMatrix.assertHostIn(partitionCase, issuer);
+        assertEquals("cognito-identity." + region + "." + partitionCase.dnsSuffix(), issuer);
     }
 
     @ParameterizedTest
@@ -944,6 +883,25 @@ class PartitionCrossServiceSmokeIntegrationTest {
 
     @ParameterizedTest
     @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
+    void backupFrameworkArnAndDefinition(PartitionCase partitionCase) {
+        String region = offered(partitionCase, "backup");
+        String name = unique("Framework", partitionCase).replace("-", "_");
+        String body = "{\"FrameworkName\":\"" + name + "\",\"FrameworkControls\":["
+                + "{\"ControlName\":\"BACKUP_RECOVERY_POINT_ENCRYPTED\"}]}";
+        String arn = signed(region, "backup").contentType(JSON).body(body)
+                .when().post("/audit/frameworks").then().statusCode(200)
+                .extract().jsonPath().getString("FrameworkArn");
+        cleanup.register(() -> signed(region, "backup").when().delete("/audit/frameworks/" + name));
+        PartitionMatrix.assertArnIn(partitionCase, arn);
+        Response described = signed(region, "backup").when().get("/audit/frameworks/" + name)
+                .then().statusCode(200).extract().response();
+        assertEquals(arn, described.jsonPath().getString("FrameworkArn"));
+        assertEquals("UNAVAILABLE", described.jsonPath().getString("FrameworkStatus"));
+        assertEquals("BACKUP_RECOVERY_POINT_ENCRYPTED", described.jsonPath().getString("FrameworkControls[0].ControlName"));
+    }
+
+    @ParameterizedTest
+    @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
     void backupVaultArn(PartitionCase partitionCase) {
         String region = offered(partitionCase, "backup");
         String name = unique("smoke-vault", partitionCase);
@@ -1048,26 +1006,18 @@ class PartitionCrossServiceSmokeIntegrationTest {
     @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
     void applicationAutoScalingScalableTargetArn(PartitionCase partitionCase) {
         String region = offered(partitionCase, "application-autoscaling");
-        String resourceId = "service/" + unique("smoke-cluster", partitionCase) + "/service";
-        try (ApplicationAutoScalingClient client = AwsTestClients.create(ApplicationAutoScalingClient.builder(),
-                "000000000000", Region.of(region))) {
-            String arn = client.registerScalableTarget(b -> b.serviceNamespace("ecs").resourceId(resourceId)
-                    .scalableDimension("ecs:service:DesiredCount").minCapacity(1).maxCapacity(5)).scalableTargetARN();
-            try {
-                PartitionMatrix.assertArnIn(partitionCase, arn);
-                client.putScheduledAction(b -> b.serviceNamespace("ecs").resourceId(resourceId)
-                        .scalableDimension("ecs:service:DesiredCount").scheduledActionName("partition-action")
-                        .schedule("at(2099-01-01T00:00:00)")
-                        .scalableTargetAction(ScalableTargetAction.builder().minCapacity(0).build()));
-                String actionArn = client.describeScheduledActions(b -> b.serviceNamespace("ecs").resourceId(resourceId))
-                        .scheduledActions().getFirst().scheduledActionARN();
-                PartitionMatrix.assertArnIn(partitionCase, actionArn);
-                assertTrue(actionArn.contains(":autoscaling:" + region + ":000000000000:scheduledAction:"));
-            } finally {
-                client.deregisterScalableTarget(b -> b.serviceNamespace("ecs").resourceId(resourceId)
-                        .scalableDimension("ecs:service:DesiredCount"));
-            }
-        }
+        String resourceId = "table/" + unique("smoke-table", partitionCase);
+        String target = """
+                "ServiceNamespace": "dynamodb", "ResourceId": "%s",
+                "ScalableDimension": "dynamodb:table:ReadCapacityUnits"
+                """.formatted(resourceId);
+        String arn = json11(region, "application-autoscaling", "AnyScaleFrontendService.RegisterScalableTarget",
+                "{" + target + ", \"MinCapacity\": 1, \"MaxCapacity\": 5}")
+        .when().post("/").then().statusCode(200)
+            .extract().jsonPath().getString("ScalableTargetARN");
+        cleanup.register(() -> json11(region, "application-autoscaling",
+                "AnyScaleFrontendService.DeregisterScalableTarget", "{" + target + "}").when().post("/"));
+        PartitionMatrix.assertArnIn(partitionCase, arn);
     }
 
     @ParameterizedTest

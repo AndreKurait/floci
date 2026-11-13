@@ -1,11 +1,11 @@
-package io.floci.aws.services.appconfig;
+package io.github.hectorvent.floci.services.appconfig;
 
-import io.floci.aws.config.EmulatorConfig;
-import io.floci.aws.core.common.AwsException;
-import io.floci.aws.core.common.RegionResolver;
-import io.floci.aws.core.common.ServiceConfigAccess;
-import io.floci.aws.core.storage.StorageFactory;
-import io.floci.aws.testing.InMemoryStorageFactory;
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
+import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.testing.InMemoryStorageFactory;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -164,7 +164,8 @@ class AppConfigResourceTagsTest {
     }
 
     private static AppConfigService service(StorageFactory factory) {
-        return new AppConfigService(factory, new RegionResolver(REGION, ACCOUNT));
+        return new AppConfigService(factory, new RegionResolver(REGION, ACCOUNT),
+                mock(AppConfigAlarmMonitor.class), mock(AppConfigS3Source.class));
     }
 
     private static Resource create(AppConfigService service, String type, Map<String, String> tags) {
@@ -203,7 +204,8 @@ class AppConfigResourceTagsTest {
         switch (resource.type()) {
             case "application" -> service.updateApplication(resource.id(), "renamed", "changed");
             case "environment" -> service.updateEnvironment(resource.parent(), resource.id(), "renamed", "changed", null);
-            case "configurationprofile" -> service.updateConfigurationProfile(resource.parent(), resource.id(), "renamed", "changed");
+            case "configurationprofile" -> service.updateConfigurationProfile(resource.parent(), resource.id(),
+                    Map.of("Name", "renamed", "Description", "changed"));
             case "deploymentstrategy" -> service.updateDeploymentStrategy(resource.id(), "changed", 0, 0, 100f, "LINEAR");
             default -> throw new IllegalArgumentException(resource.type());
         }
@@ -212,8 +214,8 @@ class AppConfigResourceTagsTest {
     private static void delete(AppConfigService service, Resource resource) {
         switch (resource.type()) {
             case "application" -> service.deleteApplicationById(resource.id());
-            case "environment" -> service.deleteEnvironmentById(resource.id());
-            case "configurationprofile" -> service.deleteConfigurationProfileById(resource.id());
+            case "environment" -> service.deleteEnvironmentById(resource.parent(), resource.id());
+            case "configurationprofile" -> service.deleteConfigurationProfileById(resource.parent(), resource.id());
             case "deploymentstrategy" -> service.deleteDeploymentStrategy(resource.id());
             default -> throw new IllegalArgumentException(resource.type());
         }

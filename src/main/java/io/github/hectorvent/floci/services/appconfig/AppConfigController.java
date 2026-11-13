@@ -1,19 +1,19 @@
-package io.floci.aws.services.appconfig;
+package io.github.hectorvent.floci.services.appconfig;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import io.floci.aws.core.common.AwsException;
-import io.floci.aws.core.common.PaginatedResult;
-import io.floci.aws.core.common.Pagination;
-import io.floci.aws.services.appconfig.AppConfigDataService.LegacyConfiguration;
-import io.floci.aws.services.appconfig.model.Application;
-import io.floci.aws.services.appconfig.model.ConfigurationProfile;
-import io.floci.aws.services.appconfig.model.Deployment;
-import io.floci.aws.services.appconfig.model.DeploymentStrategy;
-import io.floci.aws.services.appconfig.model.Environment;
-import io.floci.aws.services.appconfig.model.HostedConfigurationVersion;
-import io.floci.aws.services.appconfig.model.HostedConfigurationVersionSummary;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
+import io.github.hectorvent.floci.core.common.Pagination;
+import io.github.hectorvent.floci.services.appconfig.AppConfigDataService.LegacyConfiguration;
+import io.github.hectorvent.floci.services.appconfig.model.Application;
+import io.github.hectorvent.floci.services.appconfig.model.ConfigurationProfile;
+import io.github.hectorvent.floci.services.appconfig.model.Deployment;
+import io.github.hectorvent.floci.services.appconfig.model.DeploymentStrategy;
+import io.github.hectorvent.floci.services.appconfig.model.Environment;
+import io.github.hectorvent.floci.services.appconfig.model.HostedConfigurationVersion;
+import io.github.hectorvent.floci.services.appconfig.model.HostedConfigurationVersionSummary;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.DELETE;
@@ -26,6 +26,7 @@ import jakarta.ws.rs.PathParam;
 import jakarta.ws.rs.Produces;
 import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.core.Context;
+import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.UriInfo;
@@ -83,12 +84,12 @@ public class AppConfigController {
 
     @GET
     @Path("/applications")
-    public Response listApplications(@QueryParam("max_results") String maxResults,
-                                     @QueryParam("next_token") String nextToken,
-                                     @Context UriInfo uriInfo) {
-        PaginatedResult<Application> page = service.listApplicationsPage(
-                Pagination.parseMaxResults(maxResults, "BadRequestException"), rawNextToken(nextToken, uriInfo));
-        return listResponse(page.items(), page.nextToken());
+    public Response listApplications() {
+        List<Application> apps = service.listApplications();
+        ObjectNode root = objectMapper.createObjectNode();
+        ArrayNode items = root.putArray("Items");
+        apps.forEach(app -> items.add(resourceResponse(app)));
+        return Response.ok(root).build();
     }
 
     @DELETE
@@ -115,6 +116,14 @@ public class AppConfigController {
         return Response.ok(resourceResponse(service.getEnvironment(appId, envId))).build();
     }
 
+    @PATCH
+    @Path("/applications/{appId}/environments/{envId}")
+    public Response updateEnvironment(@PathParam("appId") String appId, @PathParam("envId") String envId,
+                                      String body) {
+        return Response.ok(service.updateEnvironment(appId, envId,
+                AppConfigUpdateRequest.read(objectMapper, body))).build();
+    }
+
     @DELETE
     @Path("/applications/{appId}/environments/{envId}")
     public Response deleteEnvironment(@PathParam("appId") String appId, @PathParam("envId") String envId) {
@@ -124,13 +133,12 @@ public class AppConfigController {
 
     @GET
     @Path("/applications/{appId}/environments")
-    public Response listEnvironments(@PathParam("appId") String appId,
-                                     @QueryParam("max_results") String maxResults,
-                                     @QueryParam("next_token") String nextToken,
-                                     @Context UriInfo uriInfo) {
-        PaginatedResult<Environment> page = service.listEnvironmentsPage(appId,
-                parseListMaxResults(maxResults, uriInfo), rawNextToken(nextToken, uriInfo));
-        return listResponse(page.items(), page.nextToken());
+    public Response listEnvironments(@PathParam("appId") String appId) {
+        List<Environment> envs = service.listEnvironments(appId);
+        ObjectNode root = objectMapper.createObjectNode();
+        ArrayNode items = root.putArray("Items");
+        envs.forEach(env -> items.add(resourceResponse(env)));
+        return Response.ok(root).build();
     }
 
     // ──────────────────────────── Configuration Profile ────────────────────────────
@@ -150,15 +158,34 @@ public class AppConfigController {
         return Response.ok(resourceResponse(service.getConfigurationProfile(appId, profileId))).build();
     }
 
+    @PATCH
+    @Path("/applications/{appId}/configurationprofiles/{profileId}")
+    public Response updateConfigurationProfile(@PathParam("appId") String appId,
+                                                @PathParam("profileId") String profileId,
+                                                String body) throws IOException {
+        @SuppressWarnings("unchecked")
+        Map<String, Object> request = objectMapper.readValue(body, Map.class);
+        return Response.ok(resourceResponse(service.updateConfigurationProfile(appId, profileId, request))).build();
+    }
+
+    @POST
+    @Path("/applications/{appId}/configurationprofiles/{profileId}/validators")
+    @Consumes(MediaType.WILDCARD)
+    public Response validateConfiguration(@PathParam("appId") String appId,
+                                          @PathParam("profileId") String profileId,
+                                          @QueryParam("configuration_version") String version) {
+        service.validateConfiguration(appId, profileId, version);
+        return Response.noContent().build();
+    }
+
     @GET
     @Path("/applications/{appId}/configurationprofiles")
-    public Response listConfigurationProfiles(@PathParam("appId") String appId,
-                                              @QueryParam("max_results") String maxResults,
-                                              @QueryParam("next_token") String nextToken,
-                                              @Context UriInfo uriInfo) {
-        PaginatedResult<ConfigurationProfile> page = service.listConfigurationProfilesPage(appId,
-                parseListMaxResults(maxResults, uriInfo), rawNextToken(nextToken, uriInfo));
-        return listResponse(page.items(), page.nextToken());
+    public Response listConfigurationProfiles(@PathParam("appId") String appId) {
+        List<ConfigurationProfile> profiles = service.listConfigurationProfiles(appId);
+        ObjectNode root = objectMapper.createObjectNode();
+        ArrayNode items = root.putArray("Items");
+        profiles.forEach(profile -> items.add(resourceResponse(profile)));
+        return Response.ok(root).build();
     }
 
     @DELETE
@@ -179,7 +206,7 @@ public class AppConfigController {
                                                     @Context UriInfo uriInfo) {
         PaginatedResult<HostedConfigurationVersionSummary> page = service.listHostedConfigurationVersionsPage(
                 appId, profileId, parseListMaxResults(maxResults, uriInfo),
-                rawNextToken(nextToken, uriInfo));
+                rawNextToken(nextToken, uriInfo), uriInfo.getQueryParameters().getFirst("version_label"));
         return listResponse(page.items(), page.nextToken());
     }
 
@@ -190,8 +217,12 @@ public class AppConfigController {
                                                      @PathParam("profileId") String profileId,
                                                      @HeaderParam("Content-Type") String contentType,
                                                      @HeaderParam("Description") String description,
+                                                     @Context HttpHeaders headers,
                                                      byte[] content) {
-        HostedConfigurationVersion version = service.createHostedConfigurationVersion(appId, profileId, content, contentType, description);
+        HostedConfigurationVersion version = service.createHostedConfigurationVersion(
+                appId, profileId, content, contentType, description,
+                headers.getHeaderString("VersionLabel"),
+                parseLatestVersionNumber(headers.getHeaderString("Latest-Version-Number")));
         return versionResponse(version, 201);
     }
 
@@ -220,6 +251,9 @@ public class AppConfigController {
         rb.header("Version-Number", v.getVersionNumber());
         rb.header("Content-Type", v.getContentType());
         if (v.getDescription() != null) rb.header("Description", v.getDescription());
+        if (v.getVersionLabel() != null) {
+            rb.header("VersionLabel", v.getVersionLabel());
+        }
         return rb.build();
     }
 
@@ -240,14 +274,21 @@ public class AppConfigController {
         return Response.ok(resourceResponse(service.getDeploymentStrategy(id))).build();
     }
 
+    @PATCH
+    @Path("/deploymentstrategies/{id}")
+    public Response updateDeploymentStrategy(@PathParam("id") String id, String body) {
+        return Response.ok(service.updateDeploymentStrategy(id,
+                AppConfigUpdateRequest.read(objectMapper, body))).build();
+    }
+
     @GET
     @Path("/deploymentstrategies")
-    public Response listDeploymentStrategies(@QueryParam("max_results") String maxResults,
-                                             @QueryParam("next_token") String nextToken,
-                                             @Context UriInfo uriInfo) {
-        PaginatedResult<DeploymentStrategy> page = service.listDeploymentStrategiesPage(
-                parseListMaxResults(maxResults, uriInfo), rawNextToken(nextToken, uriInfo));
-        return listResponse(page.items(), page.nextToken());
+    public Response listDeploymentStrategies() {
+        List<DeploymentStrategy> items = service.listDeploymentStrategies();
+        ObjectNode root = objectMapper.createObjectNode();
+        ArrayNode arr = root.putArray("Items");
+        items.forEach(strategy -> arr.add(resourceResponse(strategy)));
+        return Response.ok(root).build();
     }
 
     // AWS's own API model spells this path "deployementstrategies" (extra "e") - every other
@@ -281,15 +322,11 @@ public class AppConfigController {
                                      @QueryParam("next_token") String nextToken) {
         AppConfigService.DeploymentPage page = service.listDeployments(appId, envId,
                 Pagination.parseMaxResults(maxResults, "BadRequestException"), nextToken);
-        return listResponse(page.items(), page.nextToken());
-    }
-
-    private Response listResponse(List<?> items, String nextToken) {
         ObjectNode root = objectMapper.createObjectNode();
-        ArrayNode itemArray = root.putArray("Items");
-        items.forEach(item -> itemArray.add(resourceResponse(item)));
-        if (nextToken != null) {
-            root.put("NextToken", nextToken);
+        ArrayNode items = root.putArray("Items");
+        page.items().forEach(items::addPOJO);
+        if (page.nextToken() != null) {
+            root.put("NextToken", page.nextToken());
         }
         return Response.ok(root).build();
     }
@@ -339,6 +376,16 @@ public class AppConfigController {
                 .build();
     }
 
+    private Response listResponse(List<?> items, String nextToken) {
+        ObjectNode root = objectMapper.createObjectNode();
+        ArrayNode itemArray = root.putArray("Items");
+        items.forEach(itemArray::addPOJO);
+        if (nextToken != null) {
+            root.put("NextToken", nextToken);
+        }
+        return Response.ok(root).build();
+    }
+
     private static String rawNextToken(String nextToken, UriInfo uriInfo) {
         return nextToken == null && uriInfo.getQueryParameters().containsKey("next_token")
                 ? "" : nextToken;
@@ -350,5 +397,16 @@ public class AppConfigController {
             throw new AwsException("BadRequestException", "max_results must be an integer.", 400);
         }
         return Pagination.parseMaxResults(maxResults, "BadRequestException");
+    }
+
+    private static Integer parseLatestVersionNumber(String value) {
+        if (value == null) {
+            return null;
+        }
+        try {
+            return Integer.valueOf(value);
+        } catch (NumberFormatException e) {
+            throw new AwsException("BadRequestException", "LatestVersionNumber must be an integer.", 400);
+        }
     }
 }

@@ -1,8 +1,8 @@
-package io.floci.aws.services.appconfig;
+package io.github.hectorvent.floci.services.appconfig;
 
-import io.floci.aws.core.common.AwsArnUtils;
-import io.floci.aws.core.common.AwsException;
-import io.floci.aws.core.common.TagHandler;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.TagHandler;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
