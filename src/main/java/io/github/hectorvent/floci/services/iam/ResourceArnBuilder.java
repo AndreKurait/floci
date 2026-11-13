@@ -12,6 +12,7 @@ import io.github.hectorvent.floci.core.common.ServicePrincipals;
 import io.github.hectorvent.floci.core.common.SigV4CredentialScope;
 import io.github.hectorvent.floci.core.common.StoredResourceArns;
 import io.github.hectorvent.floci.core.common.auth.SigV4Canonicalization;
+import io.github.hectorvent.floci.services.batch.BatchSchedulingPolicyTarget;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.LogGroupTagTarget;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
@@ -235,6 +236,34 @@ public class ResourceArnBuilder {
                                        String region, String accountId, String partition) {
         if (credentialScope == null) {
             return List.of("*");
+        }
+        if ("batch".equals(credentialScope) && BatchSchedulingPolicyTarget.operation(operation)) {
+            if ("batch:DescribeSchedulingPolicies".equals(operation) || "batch:ListSchedulingPolicies".equals(operation)) {
+                return List.of("*");
+            }
+            JsonNode body = readJsonBody(ctx);
+            if (body == null || !body.isObject()) {
+                return List.of("*");
+            }
+            if ("batch:CreateSchedulingPolicy".equals(operation)) {
+                JsonNode name = body.get("name");
+                try {
+                    return List.of(BatchSchedulingPolicyTarget.arn(partition, region, accountId,
+                            name != null && name.isTextual() ? name.textValue() : null));
+                } catch (AwsException invalidName) {
+                    return List.of("*");
+                }
+            }
+            JsonNode arn = body.get("arn");
+            return List.of(arn != null && arn.isTextual() ? arn.textValue() : "*");
+        }
+        if ("batch".equals(credentialScope)
+                && ("batch:TagResource".equals(operation) || "batch:UntagResource".equals(operation)
+                || "batch:ListTagsForResource".equals(operation))) {
+            String arn = BatchSchedulingPolicyTarget.taggedArn(ctx);
+            if (BatchSchedulingPolicyTarget.isPolicySelector(arn)) {
+                return List.of(arn);
+            }
         }
         if ("rds".equals(credentialScope) && NeptuneSnapshotResources.supports(operation) && neptuneSnapshotResources != null
                 && !neptuneSnapshotResources.isUnsatisfied()) {
@@ -1491,6 +1520,10 @@ public class ResourceArnBuilder {
      * names none.
      */
     public String taggedArn(ContainerRequestContext ctx) {
+        String selected = BatchSchedulingPolicyTarget.taggedArn(ctx);
+        if (BatchSchedulingPolicyTarget.isPolicySelector(selected)) {
+            return selected;
+        }
         String path = IamActionRegistry.decodedPath(ctx);
         for (String route : List.of("/tags", "/v1/tags")) {
             if (path.startsWith(route + "/")) {
