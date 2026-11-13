@@ -21,6 +21,13 @@ A systemd guest gets a private cgroup namespace, as kind runs its nodes, so its 
 
 Terminated instances remain queryable for 1 hour (matching real EC2 tombstone behavior) before being pruned.
 
+
+Attached network interfaces stay `in-use` until the instance's physical teardown
+completes. Completion deletes launch-created primary interfaces and detaches
+caller-created interfaces in their owner's account. Both interface records protect
+their security groups while attached. A retained interface continues to protect its
+security groups until the interface is deleted.
+
 ## Instance Resource Limits
 
 By default, Docker containers launched for EC2 instances are bounded to the CPU and memory limits defined in the instance type catalog (`src/main/resources/ec2/instance-type-catalog.yaml`).
