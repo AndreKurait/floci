@@ -148,6 +148,34 @@ back, with `The instance <id> is not in InService or Standby.`, AWS's answer for
 detach; Floci does not refuse the other such states yet. Floci does not wait for connection draining and
 does not write the activity's `Details` member.
 
+### Automatic EventBridge success events
+
+Auto Scaling sends `EC2 Instance Launch Successful` and
+`EC2 Instance Terminate Successful` events with source `aws.autoscaling` to the
+group's default EventBridge bus. Rules and SQS targets receive the documented
+EventBridge envelope, including the owning account and Region, group and instance
+ARNs, instance ID, group name, placement and scaling activity metadata.
+
+Launch events follow a newly launched instance reaching `InService`. Desired
+capacity changes, instance termination and replacement, instance refresh, failed
+standby returns and group deletion use their native instance lifecycle paths.
+Attaching an existing instance or returning it from standby does not publish a new
+launch event. Termination events wait for a successful termination request and,
+for container-backed instances, verified native container teardown. An unsuccessful
+request or incomplete teardown does not produce a success event.
+
+Delivery is best effort through a bounded in-memory queue. Events pending when
+Floci stops are discarded. This does not implement unsuccessful scaling events,
+lifecycle wait events, warm-pool movement events or SNS notification configuration
+APIs. Existing load-balancer registration behavior is unchanged; these events do
+not establish application or load-balancer health.
+
+The SDK coverage consumes actual SQS messages through default-bus rules and tests
+account and Region isolation. A separate native EC2 test checks container absence
+when the termination message is received. The event shapes follow the
+[AWS Auto Scaling event reference](https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-event-reference.html)
+and [EventBridge integration guide](https://docs.aws.amazon.com/autoscaling/ec2/userguide/automating-ec2-auto-scaling-with-eventbridge.html).
+
 ### Instance Refresh
 
 | Operation | Notes |

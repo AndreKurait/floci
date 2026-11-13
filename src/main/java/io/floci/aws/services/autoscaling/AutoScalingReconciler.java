@@ -278,8 +278,11 @@ public class AutoScalingReconciler {
                 .count();
     }
 
+    private record CompletedLaunch(Instance instance, ScalingActivity activity) {}
+
     private void promoteReadyInstances(AutoScalingGroup asg) {
         boolean changed = false;
+        List<CompletedLaunch> completed = new ArrayList<>();
         for (AsgInstance asgInst : asg.getInstances()) {
             if (!"Pending".equals(asgInst.getLifecycleState())) {
                 continue;
@@ -306,10 +309,11 @@ public class AutoScalingReconciler {
                         asgService.completeActivity(standbyActivityId, "Successful", null);
                     } else {
                         asgInst.setHealthStatus("Healthy");
-                        asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
+                        ScalingActivity activity = asgService.recordActivity(
+                                asg.getRegion(), asg.getAutoScalingGroupName(),
                                 "Launching a new EC2 instance: " + asgInst.getInstanceId(),
-                                SCALE_OUT_CAUSE,
-                                "Successful");
+                                SCALE_OUT_CAUSE, "Successful");
+                        completed.add(new CompletedLaunch(ec2Instances.getFirst(), activity));
                     }
                     LOG.infov("ASG {0}: instance {1} is now InService",
                             asg.getAutoScalingGroupName(), asgInst.getInstanceId());
@@ -319,8 +323,8 @@ public class AutoScalingReconciler {
                         asg.getAutoScalingGroupName(), asgInst.getInstanceId(), e.getMessage());
             }
         }
-        if (changed) {
-            asgService.saveAutoScalingGroupIfPresent(asg);
+        if (changed && asgService.saveAutoScalingGroupIfPresent(asg)) {
+            completed.forEach(launch -> asgService.instanceLaunched(asg, launch.instance(), launch.activity()));
         }
     }
 
@@ -366,9 +370,10 @@ public class AutoScalingReconciler {
         List<String> stillThere = instanceIds.stream()
                 .filter(id -> !isMissingOrTerminalEc2Instance(asg, id, TERMINATED_STATES))
                 .toList();
+        AutoScalingEventPublisher.Termination termination = null;
         if (!stillThere.isEmpty()) {
             try {
-                ec2Service.terminateInstances(asg.getRegion(), stillThere);
+                termination = terminateEc2Instances(asg, stillThere);
             } catch (Exception e) {
                 LOG.warnv("ASG {0}: could not terminate instance(s) {1} back from standby: {2}",
                         asg.getAutoScalingGroupName(), stillThere, e.getMessage());
@@ -383,14 +388,28 @@ public class AutoScalingReconciler {
         asgService.saveAutoScalingGroupIfPresent(asg);
         String now = Instant.now().truncatedTo(ChronoUnit.SECONDS).toString();
         for (String instanceId : instanceIds) {
-            asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
+            ScalingActivity activity = asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
                     "Terminating EC2 instance: " + instanceId,
                     "At " + now + " an instance was taken out of service in response to an EC2 health check"
                             + " indicating it has been terminated or stopped.",
                     "Successful");
+            if (termination != null) {
+                termination.activity(List.of(instanceId), activity);
+            }
         }
         LOG.infov("ASG {0}: instance(s) {1} back from standby were not running and were replaced",
                 asg.getAutoScalingGroupName(), instanceIds);
+    }
+
+    private AutoScalingEventPublisher.Termination terminateEc2Instances(AutoScalingGroup group,
+                                                                        List<String> instanceIds) {
+        AutoScalingEventPublisher.Termination observer = asgService.terminationObserver(group, instanceIds);
+        if (observer == null) {
+            ec2Service.terminateInstances(group.getRegion(), instanceIds);
+        } else {
+            ec2Service.terminateInstancesWithCompletion(group.getRegion(), instanceIds, observer);
+        }
+        return observer;
     }
 
     private void failActiveSsmInvocations(AutoScalingGroup asg, List<String> instanceIds) {
@@ -473,8 +492,9 @@ public class AutoScalingReconciler {
         if (instanceIds.isEmpty()) {
             return;
         }
+        AutoScalingEventPublisher.Termination termination;
         try {
-            ec2Service.terminateInstances(asg.getRegion(), instanceIds);
+            termination = terminateEc2Instances(asg, instanceIds);
         } catch (Exception e) {
             LOG.warnv("ASG {0}: failed to terminate refreshing instances {1}: {2}",
                     asg.getAutoScalingGroupName(), instanceIds, e.getMessage());
@@ -493,10 +513,13 @@ public class AutoScalingReconciler {
         AutoScalingService.deregisterFromClassicLoadBalancers(elbClassicService, asg, instanceIds);
         asg.getInstances().removeIf(instance -> instanceIds.contains(instance.getInstanceId()));
         asgService.saveAutoScalingGroupIfPresent(asg);
-        asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
+        ScalingActivity activity = asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
                 "Terminating EC2 instance(s) for refresh: " + instanceIds,
                 "An instance refresh requested replacement of active instances.",
                 "Successful");
+        if (termination != null) {
+            termination.activity(instanceIds, activity);
+        }
         LOG.infov("ASG {0}: terminated instance(s) for refresh {1}",
                 asg.getAutoScalingGroupName(), instanceIds);
     }
@@ -813,8 +836,9 @@ public class AutoScalingReconciler {
                 .map(AsgInstance::getInstanceId)
                 .collect(Collectors.toList());
 
+        AutoScalingEventPublisher.Termination termination;
         try {
-            ec2Service.terminateInstances(asg.getRegion(), instanceIds);
+            termination = terminateEc2Instances(asg, instanceIds);
         } catch (Exception e) {
             LOG.warnv("ASG {0}: failed to terminate instances {1}: {2}",
                     asg.getAutoScalingGroupName(), instanceIds, e.getMessage());
@@ -828,10 +852,13 @@ public class AutoScalingReconciler {
 
         asg.getInstances().removeIf(i -> instanceIds.contains(i.getInstanceId()));
         asgService.saveAutoScalingGroupIfPresent(asg);
-        asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
+        ScalingActivity activity = asgService.recordActivity(asg.getRegion(), asg.getAutoScalingGroupName(),
                 "Terminating EC2 instance(s): " + instanceIds,
                 "An instance was terminated in response to a desired capacity change.",
                 "Successful");
+        if (termination != null) {
+            termination.activity(instanceIds, activity);
+        }
     }
 
     /**
