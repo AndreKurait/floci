@@ -5,8 +5,11 @@ import io.github.hectorvent.floci.core.common.AwsProtocolClaimFilter;
 import io.github.hectorvent.floci.core.common.AwsQueryServiceResolver;
 import io.github.hectorvent.floci.core.common.ProtocolClaim;
 import io.github.hectorvent.floci.core.common.RequestResources;
+import io.github.hectorvent.floci.core.common.V1TagsController;
 import io.github.hectorvent.floci.core.common.WireProtocol;
 import io.github.hectorvent.floci.services.appconfig.AppConfigDataController;
+import io.github.hectorvent.floci.services.batch.BatchController;
+import io.github.hectorvent.floci.services.batch.BatchSchedulingPolicyTarget;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbPartiQLParser;
 import io.github.hectorvent.floci.services.eks.EksController;
 import io.github.hectorvent.floci.services.route53.Route53Controller;
@@ -41,6 +44,14 @@ import java.util.regex.Pattern;
  */
 @ApplicationScoped
 public class IamActionRegistry {
+
+    private static final Map<String, String> BATCH_POLICY_ACTIONS = Map.of(
+            "createSchedulingPolicy", "batch:CreateSchedulingPolicy",
+            "deleteSchedulingPolicy", "batch:DeleteSchedulingPolicy",
+            "describeSchedulingPolicies", "batch:DescribeSchedulingPolicies",
+            "listSchedulingPolicies", "batch:ListSchedulingPolicies",
+            "updateSchedulingPolicy", "batch:UpdateSchedulingPolicy");
+
 
     private static final Map<String, String> ROUTE53_DELEGATION_ACTIONS = Map.of(
             "createReusableDelegationSet", "route53:CreateReusableDelegationSet",
@@ -96,6 +107,11 @@ public class IamActionRegistry {
      * type, so IAM checks them against the wildcard rather than a bucket.
      */
     private static final List<ActionRule> RULES = List.of(
+        rule("batch", "POST", "^/v1/createschedulingpolicy$", "batch:CreateSchedulingPolicy"),
+        rule("batch", "POST", "^/v1/deleteschedulingpolicy$", "batch:DeleteSchedulingPolicy"),
+        rule("batch", "POST", "^/v1/describeschedulingpolicies$", "batch:DescribeSchedulingPolicies"),
+        rule("batch", "POST", "^/v1/listschedulingpolicies$", "batch:ListSchedulingPolicies"),
+        rule("batch", "POST", "^/v1/updateschedulingpolicy$", "batch:UpdateSchedulingPolicy"),
         // ── S3 Control ───────────────────────────────────────────────────────────
         s3ControlRule("GET",    "^/v20180820/tags/.+",        "s3:ListTagsForResource"),
         s3ControlRule("POST",   "^/v20180820/tags/.+",        "s3:TagResource"),
@@ -675,6 +691,26 @@ public class IamActionRegistry {
     }
 
     /** The serving method identifies these actions even when path encoding or matrix parameters vary. */
+    public String resolveMatchedRoute(String credentialScope, ResourceInfo resourceInfo,
+                                       ContainerRequestContext request) {
+        if ("batch".equals(credentialScope) && resourceInfo != null
+                && resourceInfo.getResourceClass() != null && resourceInfo.getResourceMethod() != null) {
+            if (BatchController.class.isAssignableFrom(resourceInfo.getResourceClass())) {
+                return BATCH_POLICY_ACTIONS.get(resourceInfo.getResourceMethod().getName());
+            }
+            if (V1TagsController.class.isAssignableFrom(resourceInfo.getResourceClass())
+                    && BatchSchedulingPolicyTarget.isPolicySelector(BatchSchedulingPolicyTarget.taggedArn(request))) {
+                return switch (resourceInfo.getResourceMethod().getName()) {
+                    case "listTags" -> "batch:ListTagsForResource";
+                    case "tagResourcePost" -> "batch:TagResource";
+                    case "untagResource" -> "batch:UntagResource";
+                    default -> null;
+                };
+            }
+        }
+        return resolveMatchedRoute(credentialScope, resourceInfo);
+    }
+
     public String resolveMatchedRoute(String credentialScope, ResourceInfo resourceInfo) {
         if ("appconfig".equals(credentialScope) && resourceInfo != null
                 && AppConfigDataController.class.equals(resourceInfo.getResourceClass())

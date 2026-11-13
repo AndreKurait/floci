@@ -3,6 +3,8 @@ package io.github.hectorvent.floci.core.common;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.batch.BatchSchedulingPolicyService;
+import io.github.hectorvent.floci.services.batch.BatchSchedulingPolicyTarget;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.LogGroupTagTarget;
@@ -110,12 +112,42 @@ public class IamConditionContextResolver {
     private final CurrentVertxRequest currentVertxRequest;
     private final Clock clock;
     private final ResolvedServiceCatalog serviceCatalog;
+    private final Instance<BatchSchedulingPolicyService> batchSchedulingPolicies;
 
     /**
      * The system clock, not the CDI one: Object Lock's remaining retention days has to count from the
      * same now as S3Service, which checks retention against {@code Instant.now()}.
      */
     @Inject
+    public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                       Instance<Ec2Service> ec2Service,
+                                       Instance<S3Service> s3Service,
+                                       Instance<CloudWatchLogsService> logsService,
+                                       Instance<IamService> iamService,
+                                       Instance<LambdaWebService> lambdaWebService,
+                                       RequestContext requestContext,
+                                       EmulatorConfig config,
+                                       CurrentVertxRequest currentVertxRequest,
+                                       ResolvedServiceCatalog serviceCatalog,
+                                       Instance<SsmService> ssmService,
+                                       Instance<ElbV2ConditionKeys> elbV2ConditionKeys,
+                                       Instance<BatchSchedulingPolicyService> batchSchedulingPolicies) {
+        this.dynamoDbFacade = dynamoDbFacade;
+        this.ec2Service = ec2Service;
+        this.s3Service = s3Service;
+        this.logsService = logsService;
+        this.iamService = iamService;
+        this.lambdaWebService = lambdaWebService;
+        this.ssmService = ssmService;
+        this.elbV2ConditionKeys = elbV2ConditionKeys;
+        this.requestContext = requestContext;
+        this.config = config;
+        this.currentVertxRequest = currentVertxRequest;
+        this.clock = Clock.systemUTC();
+        this.serviceCatalog = serviceCatalog;
+        this.batchSchedulingPolicies = batchSchedulingPolicies;
+    }
+
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
                                        Instance<Ec2Service> ec2Service,
                                        Instance<S3Service> s3Service,
@@ -185,11 +217,13 @@ public class IamConditionContextResolver {
         this.currentVertxRequest = currentVertxRequest;
         this.clock = clock;
         this.serviceCatalog = serviceCatalog;
+        this.batchSchedulingPolicies = null;
     }
 
     public Map<String, List<String>> resolve(String credentialScope, String action,
                                              ContainerRequestContext ctx) {
         return switch (credentialScope) {
+            case "batch" -> batchSchedulingPolicyConditions(action, ctx);
             case "s3" -> s3ConditionContext(action, ctx);
             case "ec2" -> ec2ConditionContext(action, ctx);
             case "elasticloadbalancing" -> elbV2Contexts(action, ctx).stream().findFirst().orElse(null);
@@ -201,6 +235,51 @@ public class IamConditionContextResolver {
             case "states" -> stepFunctionsConditionContext(action, ctx);
             default -> null;
         };
+    }
+
+    private Map<String, List<String>> batchSchedulingPolicyConditions(String action, ContainerRequestContext ctx) {
+        boolean create = "batch:CreateSchedulingPolicy".equals(action);
+        boolean selected = "batch:UpdateSchedulingPolicy".equals(action) || "batch:DeleteSchedulingPolicy".equals(action);
+        boolean tag = "batch:TagResource".equals(action);
+        boolean untag = "batch:UntagResource".equals(action);
+        boolean listTags = "batch:ListTagsForResource".equals(action);
+        String arn = BatchSchedulingPolicyTarget.taggedArn(ctx);
+        if (!create && !selected && (!(tag || untag || listTags) || !BatchSchedulingPolicyTarget.isPolicySelector(arn))) {
+            return null;
+        }
+        JsonNode body = create || selected || tag ? PassedRoles.jsonBody(ctx) : null;
+        if (selected) {
+            arn = body != null && body.path("arn").isTextual() ? body.path("arn").textValue() : null;
+        }
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        if ((create || tag) && body != null && body.path("tags").isObject()) {
+            List<String> keys = new ArrayList<>();
+            body.path("tags").properties().forEach(entry -> {
+                if (entry.getValue().isTextual()) {
+                    keys.add(entry.getKey());
+                    conditions.put(REQUEST_TAG_PREFIX + entry.getKey(), List.of(entry.getValue().textValue()));
+                }
+            });
+            if (!keys.isEmpty()) {
+                conditions.put("aws:TagKeys", keys);
+            }
+        }
+        if (untag) {
+            List<String> keys = ctx.getUriInfo().getQueryParameters().get("tagKeys");
+            if (keys != null && !keys.isEmpty()) {
+                conditions.put("aws:TagKeys", List.copyOf(keys));
+            }
+        }
+        if (!create && batchSchedulingPolicies != null && batchSchedulingPolicies.isResolvable()) {
+            String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+            String account = requestContext.getAccountId() == null ? config.defaultAccountId() : requestContext.getAccountId();
+            String partition = requestContext.getPartition() == null
+                    ? RegionResolver.effectivePartition(config.defaultRegion(), config.partitions().id())
+                    : requestContext.getPartition();
+            batchSchedulingPolicies.get().iamTags(arn, partition, region, account).forEach((key, value) ->
+                    conditions.put(RESOURCE_TAG_PREFIX + key, List.of(value)));
+        }
+        return conditions.isEmpty() ? null : conditions;
     }
 
     private List<Map<String, List<String>>> elbV2Contexts(String action, ContainerRequestContext ctx) {
