@@ -14,6 +14,7 @@ on:
       - 'docker/healthcheck.sh'
       - 'docker/run-docker-tests.sh'
       - 'docker/test-run-docker-tests.sh'
+      - 'docker/test-signed-python-iam-runner.py'
       - 'docker/test-compat-socket.sh'
       - 'compatibility-tests/**'
       - '.github/ci/compat-timing-report.py'
@@ -48,7 +49,12 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Test Docker runner failure aggregation
-        run: bash docker/test-run-docker-tests.sh
+        run: |
+          bash docker/test-run-docker-tests.sh
+          python3 docker/test-signed-python-iam-runner.py
+
+      - name: Test Java SDK timeout and report collection
+        run: python3 -m unittest discover -s compatibility-tests/sdk-test-java -p test_runner.py -v
 
   compat-aws-cli-shim:
     name: compat / aws CLI endpoint resolution
@@ -210,6 +216,9 @@ jobs:
           key: maven-${{ runner.os }}-${{ hashFiles('pom.xml') }}
           restore-keys: maven-${{ runner.os }}-
 
+      - name: Test and install the isolated AppConfig clock fixture
+        run: mvn -f compatibility-tests/clock/pom.xml clean install -B -ntp
+
       - name: Build native executable (quick build)
         # Quarkus 3.39 switches on -H:+AOTSingleCallsiteInline for Mandrel 25.0.4+. The generated
         # REST invokers for AwsQueryController.dispatch and AwsJson11Controller.handle are each the
@@ -218,7 +227,7 @@ jobs:
         # The flag only exists on Mandrel, so it is passed here rather than in application.yml.
         # maven.test.skip rather than skipTests: skipTests only stops surefire, so the build still
         # compiled all of src/test (about 25s per arch) for a native image that never uses it.
-        run: mvn clean package -Dnative -Dmaven.test.skip=true -B -Dquarkus.native.additional-build-args-append="-Ob,-H:-AOTSingleCallsiteInline"
+        run: mvn clean package -Pcompat-clock -Dnative -Dmaven.test.skip=true -B -Dquarkus.native.additional-build-args-append="-Ob,-H:-AOTSingleCallsiteInline"
 
       # Quarkus always writes GraalVM's build-output JSON next to the native source jar. Surfacing
       # it here gives every PR a size record for both architectures: code area, image heap, total
@@ -322,6 +331,12 @@ jobs:
             runner: ubuntu-latest
 
     steps:
+      - name: Reserve time for Java SDK failure reports
+        if: matrix.test == 'sdk-test-java'
+        # The job has 20 minutes. Include setup in the test budget and leave
+        # three minutes for termination, report upload and server diagnostics.
+        run: echo "SDK_TEST_DEADLINE=$(( $(date +%s) + 17 * 60 ))" >> "$GITHUB_ENV"
+
       - name: Download native floci image
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -331,37 +346,24 @@ jobs:
       - name: Load native floci image
         run: gunzip -c /tmp/floci-native-image.tar.gz | docker load
 
-      - name: Checkout repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          sparse-checkout: |
-            compatibility-tests
-            .github/ci
-            src/main/resources
-
       # The suite makes Floci pull ~30 images on a fresh runner, about 2 minutes inside the test
-      # window. Pulling the heavy ones in the background here overlaps them with Floci's start and
-      # the test image build; a pull still running when a test needs the image is joined
+      # window. Pulling the heavy ones in the background here overlaps them with Floci's start, the
+      # checkout and the test image build; a pull still running when a test needs the image is joined
       # by the daemon, not repeated. The list follows the "Pulling image:" lines of Floci's log; a
       # stale entry only costs a wasted pull, a missing one only the time it costs today.
       - name: Pre-pull service images
         if: matrix.test == 'sdk-test-java'
         run: |
-          NEPTUNE_IMAGE="$(bash .github/ci/service-image.sh neptune default-image)"
-          if [ -z "$NEPTUNE_IMAGE" ]; then
-            echo "::warning::Cannot read Neptune default-image from application.yml; skipping Neptune pre-pull"
-          fi
           for image in \
             opensearchproject/opensearch:2.19.5 opensearchproject/opensearch:2.11.1 \
             mysql:8.0 postgres:16.3-alpine postgres:16-alpine postgres:15-alpine \
             apache/flink:2.3 rabbitmq:3-management redpandadata/redpanda:latest \
-            "$NEPTUNE_IMAGE" influxdb:2.7 valkey/valkey:8 \
+            tinkerpop/gremlin-server:3.7.3 influxdb:2.7 valkey/valkey:8 \
             rancher/k3s:latest rancher/k3s:v1.29.14-k3s1 registry:2 \
             public.ecr.aws/lambda/python:3.12 public.ecr.aws/lambda/python:3.14 \
             public.ecr.aws/lambda/nodejs:20 public.ecr.aws/lambda/provided:al2023 \
             floci/floci-duck:latest floci/floci-sidecar-cedar:1.1.0 floci/floci-sidecar-graphql:0.2.0 \
             nginx:alpine nginx:latest alpine:3 alpine:latest busybox:stable busybox:latest; do
-            [ -n "$image" ] || continue
             nohup bash -c '
               start=$SECONDS
               if err=$(docker pull -q "$1" 2>&1 >/dev/null); then result=ok; else result=FAILED; fi
@@ -377,6 +379,15 @@ jobs:
           DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
           # sdk-test-java's HTTP Task regression calls a MOCK API on http://floci:4566; every
           # other leg keeps the default rejection of plaintext http:invoke endpoints.
+          CLOCK_ARGS=()
+          if [ "${{ matrix.test }}" = "sdk-test-python" ]; then
+            APPCONFIG_CLOCK_DIR=$(mktemp -d "$RUNNER_TEMP/floci-appconfig-clock.XXXXXX")
+            chmod 755 "$APPCONFIG_CLOCK_DIR"
+            date -u +%Y-%m-%dT%H:%M:%SZ > "$APPCONFIG_CLOCK_DIR/instant"
+            printf 'APPCONFIG_CLOCK_DIR=%s\n' "$APPCONFIG_CLOCK_DIR" >> "$GITHUB_ENV"
+            CLOCK_ARGS=(-v "$APPCONFIG_CLOCK_DIR:/test-clock:ro"
+              -e FLOCI_TEST_APPCONFIG_CLOCK_FILE=/test-clock/instant)
+          fi
           docker run -d --name floci --network compat-net \
             -p 4566:4566 \
             -v /var/run/docker.sock:/var/run/docker.sock \
@@ -388,10 +399,12 @@ jobs:
             -e FLOCI_SERVICES_LAMBDA_HOT_RELOAD_ENABLED=true \
             -e FLOCI_TLS_ENABLED=true \
             -e FLOCI_SERVICES_STEPFUNCTIONS_ALLOW_PLAINTEXT_HTTP=${{ matrix.test == 'sdk-test-java' }} \
+            -e FLOCI_SECURITY_ALLOW_PRIVATE_JWT_TARGETS=${{ matrix.test == 'sdk-test-java' }} \
             -e FLOCI_SERVICES_EC2_MOCK=true \
             -e FLOCI_SERVICES_REDSHIFT_ENDPOINT_HOST=floci \
             -e FLOCI_SERVICES_RDS_ENDPOINT_HOST=floci \
             -e FLOCI_SERVICES_SSOOIDC_LOCAL_PRINCIPAL_ID=11111111-2222-3333-4444-555555555555 \
+            "${CLOCK_ARGS[@]}" \
             floci:test-native
 
       # Waits on Docker's health status rather than curling the port so the image's
@@ -417,26 +430,12 @@ jobs:
           docker logs --tail 50 floci
           exit 1
 
-      # Keep the first Neptune request inside its existing test deadline on a cold runner.
-      - name: Pre-pull Neptune image for Node SDK
-        if: matrix.test == 'sdk-test-node'
-        run: |
-          image="$(bash .github/ci/service-image.sh neptune default-image)"
-          if [ -z "$image" ]; then
-            echo "::error::Cannot read Neptune default-image from application.yml"
-            exit 1
-          fi
-          for attempt in 1 2 3; do
-            if docker pull "$image"; then
-              exit 0
-            fi
-            if [ "$attempt" -lt 3 ]; then
-              echo "::warning::Neptune image pre-pull failed (attempt $attempt/3): $image"
-              sleep 5
-            fi
-          done
-          echo "::error::Neptune image pre-pull failed after 3 attempts: $image"
-          exit 1
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            compatibility-tests
+            .github/ci
 
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
@@ -462,17 +461,26 @@ jobs:
           FLOCI_IP=$(docker inspect -f '{{(index .NetworkSettings.Networks "compat-net").IPAddress}}' floci)
           DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
 
-          EXTRA_ARGS=""
+          EXTRA_ARGS=()
+          if [ "${{ matrix.test }}" = "sdk-test-python" ]; then
+            EXTRA_ARGS=(-v "$APPCONFIG_CLOCK_DIR:/test-clock" -e FLOCI_TEST_APPCONFIG_CLOCK_FILE=/test-clock/instant -e FLOCI_TEST_REQUIRE_APPCONFIG_CLOCK=true)
+          fi
           # compat-cdk needs Docker access for CDK's DockerImageFunction (docker build + push to emulated ECR)
           if [ "${{ matrix.test }}" = "compat-cdk" ]; then
-            EXTRA_ARGS="-v /var/run/docker.sock:/var/run/docker.sock --group-add $DOCKER_GID"
+            EXTRA_ARGS=(-v /var/run/docker.sock:/var/run/docker.sock --group-add "$DOCKER_GID")
           fi
 
           # sdk-test-java: mount a host-side directory so the Docker daemon can
           # bind-mount hot-reload code paths that are written by the test container.
           if [ "${{ matrix.test }}" = "sdk-test-java" ]; then
             mkdir -p /tmp/floci-hot-reload
-            EXTRA_ARGS="$EXTRA_ARGS -v /tmp/floci-hot-reload:/tmp/floci-hot-reload -e HOT_RELOAD_BASE_DIR=/tmp/floci-hot-reload"
+            EXTRA_ARGS+=(-v /tmp/floci-hot-reload:/tmp/floci-hot-reload -e HOT_RELOAD_BASE_DIR=/tmp/floci-hot-reload)
+            remaining=$(( SDK_TEST_DEADLINE - $(date +%s) ))
+            if (( remaining <= 0 )); then
+              echo "::error::Java SDK test budget exhausted during setup"
+              exit 1
+            fi
+            EXTRA_ARGS+=(-e "SDK_TEST_TIMEOUT_SECONDS=$remaining")
           fi
 
           # --dns injects Floci's embedded DNS so *.floci wildcard subdomains
@@ -484,8 +492,45 @@ jobs:
             -e FLOCI_ENDPOINT=http://floci:4566 \
             -e FLOCI_S3_VHOST_ENDPOINT=http://floci:4566 \
             -v "$(pwd)/test-results:/results" \
-            $EXTRA_ARGS \
+            "${EXTRA_ARGS[@]}" \
             compat-${{ matrix.test }}
+
+      - name: Run signed Python SDK IAM permissions
+        if: matrix.test == 'sdk-test-python'
+        run: |
+          docker logs floci > test-results/floci-default.log 2>&1
+          docker rm -f floci
+          DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
+          docker run -d --name floci --network compat-net \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            --group-add "$DOCKER_GID" \
+            -e FLOCI_SERVICES_DOCKER_NETWORK=compat-net \
+            -e FLOCI_BASE_URL=http://floci:4566 \
+            -e FLOCI_HOSTNAME=floci \
+            -e FLOCI_AUTH_VALIDATE_SIGNATURES=true \
+            -e FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED=true \
+            -e FLOCI_SERVICES_ORGANIZATIONS_SCP_ENFORCEMENT_ENABLED=true \
+            -e FLOCI_SERVICES_CLOUDFORMATION_ALLOW_STUB_UNSUPPORTED_RESOURCE_TYPES=false \
+            floci:test-native
+          health=starting
+          for _ in $(seq 1 60); do
+            health=$(docker inspect -f '{{.State.Health.Status}}' floci)
+            if [ "$health" = healthy ] || [ "$health" = unhealthy ]; then
+              break
+            fi
+            sleep 1
+          done
+          if [ "$health" != healthy ]; then
+            echo "::error::IAM-enabled floci did not report healthy (last status: $health)"
+            docker inspect -f '{{json .State.Health}}' floci
+            docker logs --tail 50 floci
+            exit 1
+          fi
+          docker run --rm --network compat-net \
+            -e FLOCI_ENDPOINT=http://floci:4566 \
+            -v "$(pwd)/test-results:/results" \
+            --entrypoint pytest compat-sdk-test-python \
+            iam/ -v --junit-xml=/results/iam-junit.xml
 
       - name: Generate test summary
         if: always() && steps.tests.outcome != 'skipped'
@@ -493,11 +538,8 @@ jobs:
         with:
           paths: test-results/*.xml
 
-      # The test body inside the container runs its build tool quietly, so the
-      # job log carries no per-class timings and the slow legs (sdk-test-java)
-      # are a black box. Surface the timings from the junit XMLs the
-      # suites already export, and upload the raw XMLs so the numbers are
-      # machine-readable across runs.
+      # Summarize completed test classes from the exported JUnit reports.
+      # Java also exports live Maven output and any Surefire timeout dumps.
       - name: Report slowest test classes
         if: always() && steps.tests.outcome != 'skipped'
         # Measurement-only: a reporting bug must never fail an otherwise-green leg.
@@ -531,6 +573,68 @@ jobs:
         # where the server log matters most.
         if: failure() || cancelled()
         run: docker logs floci
+
+  native-ec2-systemd-v1:
+    name: native amd64 / EC2 systemd v1 AppArmor
+    needs: build-native
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            .github/ci
+            compatibility-tests/sdk-test-python
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: floci-native-image-amd64
+          path: /tmp
+
+      - name: Load the native executable and build the original AL2 guest
+        run: |
+          gunzip -c /tmp/floci-native-image.tar.gz | docker load
+          docker build -f .github/ci/ec2-systemd-v1.Dockerfile -t floci:al2-systemd-v1 .github/ci
+          python3 -m venv /tmp/native-ec2-sdk
+          /tmp/native-ec2-sdk/bin/pip install -r compatibility-tests/sdk-test-python/requirements.txt
+
+      - name: Verify independent native cleanup failures
+        run: /tmp/native-ec2-sdk/bin/python .github/ci/test_ec2_systemd_v1_apparmor.py
+
+      - name: Load the qualification AppArmor profile
+        id: profile
+        run: |
+          sudo aa-status --enabled
+          profile="floci-native-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          mkdir -p test-results
+          sed "s/__PROFILE__/$profile/g" .github/ci/ec2-systemd-v1.apparmor > test-results/native-ec2.apparmor
+          sudo apparmor_parser --add test-results/native-ec2.apparmor
+          echo "NATIVE_EC2_PROFILE=$profile" >> "$GITHUB_ENV"
+
+      - name: Verify native guest mounts, confinement, reboot and cleanup
+        run: |
+          /tmp/native-ec2-sdk/bin/python .github/ci/ec2-systemd-v1-apparmor.py \
+            --image floci:test-native --guest-image floci:al2-systemd-v1 \
+            --profile "$NATIVE_EC2_PROFILE" --output test-results/native-ec2
+
+      - name: Unload the profile after verified cleanup
+        if: always() && steps.profile.outcome == 'success'
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          result = json.loads(Path("test-results/native-ec2/result.json").read_text())
+          assert result["cleanup_passed"], "Keep the profile loaded until the failed worker is retired"
+          PY
+          sudo apparmor_parser --remove test-results/native-ec2.apparmor
+
+      - name: Upload native guest and AppArmor evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: native-ec2-systemd-v1-apparmor
+          path: test-results/
+          if-no-files-found: error
 
   native-ec2-containers:
     name: native arm64 / ec2-containers

@@ -2,6 +2,8 @@ package com.floci.test;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeAll;
@@ -31,15 +33,26 @@ import software.amazon.awssdk.services.lambda.model.FunctionCode;
 import software.amazon.awssdk.services.lambda.model.Runtime;
 
 import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.math.BigInteger;
 import java.net.ConnectException;
+import java.net.DatagramSocket;
+import java.net.InetAddress;
+import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.PrivateKey;
+import java.security.Signature;
+import java.security.interfaces.RSAPublicKey;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
@@ -64,6 +77,9 @@ class ApiGatewayV2ExecuteTest {
     private static String functionName;
     private static String baseUrl;
     private static boolean lambdaDispatchAvailable;
+    private static HttpServer issuerServer;
+    private static String issuer;
+    private static PrivateKey signingKey;
 
     @BeforeAll
     static void setup() throws Exception {
@@ -73,6 +89,7 @@ class ApiGatewayV2ExecuteTest {
                 .connectTimeout(Duration.ofSeconds(5))
                 .build();
 
+        startIssuer();
         functionName = TestFixtures.uniqueName("http-api-fn");
 
         try {
@@ -107,7 +124,7 @@ class ApiGatewayV2ExecuteTest {
                     .authorizerType(AuthorizerType.JWT)
                     .identitySource("$request.header.Authorization")
                     .jwtConfiguration(b -> b
-                            .issuer("https://issuer.example.test")
+                            .issuer(issuer)
                             .audience("my-audience"))
                     .build());
 
@@ -160,7 +177,7 @@ class ApiGatewayV2ExecuteTest {
         }
 
         // Warm the API GW → Lambda dispatch path and verify the response carries
-        // the expected Lambda proxy envelope (statusCode in body). The direct
+        // the event returned as the Lambda proxy response body. The direct
         // probe above only tests raw invoke; APIGW integration may behave differently.
         try {
             HttpResponse<String> warmup = http.send(HttpRequest.newBuilder()
@@ -171,8 +188,9 @@ class ApiGatewayV2ExecuteTest {
                             .build(),
                     HttpResponse.BodyHandlers.ofString());
             JsonNode warmupBody = JSON.readTree(warmup.body());
-            lambdaDispatchAvailable = warmup.statusCode() == 200
-                    && warmupBody.path("statusCode").asInt() == 200;
+            assertThat(warmup.statusCode()).isEqualTo(200);
+            assertThat(warmupBody.path("version").asText()).isEqualTo("2.0");
+            lambdaDispatchAvailable = true;
         } catch (HttpTimeoutException | ConnectException e) {
             // Transport-level failure: endpoint unreachable or timed out
             lambdaDispatchAvailable = false;
@@ -181,6 +199,9 @@ class ApiGatewayV2ExecuteTest {
 
     @AfterAll
     static void cleanup() {
+        if (issuerServer != null) {
+            issuerServer.stop(0);
+        }
         if (apiGatewayV2 != null && apiId != null) {
             try {
                 apiGatewayV2.deleteApi(DeleteApiRequest.builder().apiId(apiId).build());
@@ -212,11 +233,8 @@ class ApiGatewayV2ExecuteTest {
                         .build(),
                 HttpResponse.BodyHandlers.ofString());
 
-        JsonNode body = JSON.readTree(response.body());
         assertThat(response.statusCode()).isEqualTo(200);
-        assertThat(body.path("statusCode").asInt()).isEqualTo(200);
-
-        JsonNode event = JSON.readTree(body.path("body").asText());
+        JsonNode event = JSON.readTree(response.body());
 
         assertThat(event.path("version").asText()).isEqualTo("2.0");
         assertThat(event.path("routeKey").asText()).isEqualTo("POST /echo/{proxy+}");
@@ -248,7 +266,7 @@ class ApiGatewayV2ExecuteTest {
         HttpResponse<String> response = http.send(HttpRequest.newBuilder()
                         .uri(URI.create(baseUrl + "/secure"))
                         .timeout(Duration.ofSeconds(10))
-                        .header("Authorization", "Bearer " + jwt("https://issuer.example.test", "wrong-audience",
+                        .header("Authorization", "Bearer " + jwt(issuer, "wrong-audience",
                                 Instant.now().plusSeconds(300).getEpochSecond()))
                         .GET()
                         .build(),
@@ -266,7 +284,7 @@ class ApiGatewayV2ExecuteTest {
         HttpResponse<String> response = http.send(HttpRequest.newBuilder()
                         .uri(URI.create(baseUrl + "/secure"))
                         .timeout(Duration.ofSeconds(10))
-                        .header("Authorization", "Bearer " + jwt("https://issuer.example.test", "my-audience",
+                        .header("Authorization", "Bearer " + jwt(issuer, "my-audience",
                                 Instant.now().plusSeconds(300).getEpochSecond()))
                         .header("User-Agent", "sdk-test-java")
                         .GET()
@@ -275,8 +293,7 @@ class ApiGatewayV2ExecuteTest {
 
         assertThat(response.statusCode()).isEqualTo(200);
 
-        JsonNode body = JSON.readTree(response.body());
-        JsonNode event = JSON.readTree(body.path("body").asText());
+        JsonNode event = JSON.readTree(response.body());
 
         assertThat(event.path("routeKey").asText()).isEqualTo("GET /secure");
         assertThat(event.path("rawPath").asText()).isEqualTo("/secure");
@@ -284,14 +301,58 @@ class ApiGatewayV2ExecuteTest {
         assertThat(event.path("requestContext").path("http").path("method").asText()).isEqualTo("GET");
     }
 
+    private static void startIssuer() throws Exception {
+        KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA");
+        generator.initialize(2048);
+        KeyPair pair = generator.generateKeyPair();
+        signingKey = pair.getPrivate();
+        RSAPublicKey publicKey = (RSAPublicKey) pair.getPublic();
+        InetAddress address;
+        URI endpoint = TestFixtures.endpoint();
+        try (DatagramSocket route = new DatagramSocket()) {
+            route.connect(InetAddress.getByName(endpoint.getHost()), endpoint.getPort() < 0 ? 80 : endpoint.getPort());
+            address = route.getLocalAddress();
+        }
+        issuerServer = HttpServer.create(new InetSocketAddress(address, 0), 0);
+        issuer = new URI("http", null, address.getHostAddress(), issuerServer.getAddress().getPort(),
+                null, null, null).toString();
+        issuerServer.createContext("/.well-known/openid-configuration", exchange ->
+                serveJson(exchange, Map.of("issuer", issuer, "jwks_uri", issuer + "/jwks")));
+        issuerServer.createContext("/jwks", exchange -> serveJson(exchange, Map.of("keys", List.of(Map.of(
+                "kty", "RSA", "kid", "sdk-test-key", "alg", "RS256", "use", "sig",
+                "n", unsignedBase64(publicKey.getModulus()), "e", unsignedBase64(publicKey.getPublicExponent()))))));
+        issuerServer.start();
+    }
+
+    private static void serveJson(HttpExchange exchange, Object document) throws IOException {
+        try (exchange) {
+            byte[] bytes = JSON.writeValueAsBytes(document);
+            exchange.getResponseHeaders().add("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, bytes.length);
+            exchange.getResponseBody().write(bytes);
+        }
+    }
+
+    private static String unsignedBase64(BigInteger value) {
+        byte[] bytes = value.toByteArray();
+        if (bytes.length > 1 && bytes[0] == 0) {
+            bytes = Arrays.copyOfRange(bytes, 1, bytes.length);
+        }
+        return base64Url(bytes);
+    }
+
     private static String jwt(String issuer, String audience, long exp) throws Exception {
-        String header = base64Url(JSON.writeValueAsBytes(Map.of("alg", "none", "typ", "JWT")));
+        String header = base64Url(JSON.writeValueAsBytes(Map.of("alg", "RS256", "typ", "JWT", "kid", "sdk-test-key")));
         String payload = base64Url(JSON.writeValueAsBytes(Map.of(
                 "iss", issuer,
                 "aud", audience,
                 "exp", exp
         )));
-        return header + "." + payload + ".";
+        String signingInput = header + "." + payload;
+        Signature signature = Signature.getInstance("SHA256withRSA");
+        signature.initSign(signingKey);
+        signature.update(signingInput.getBytes(StandardCharsets.UTF_8));
+        return signingInput + "." + base64Url(signature.sign());
     }
 
     private static String base64Url(byte[] bytes) {

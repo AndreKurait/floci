@@ -65,6 +65,18 @@ Query-protocol request that IAM enforcement refuses answers `AuthorizationError`
 error every SNS operation lists for a caller denied access, which SDKs raise as
 `AuthorizationErrorException`.
 
+## Lambda delivery permissions
+
+With IAM enforcement enabled, a Lambda subscription requires the target function's resource
+policy to allow `sns.amazonaws.com` to perform `lambda:InvokeFunction`. The topic ARN and its
+owning account supply `aws:SourceArn` and `aws:SourceAccount`. Permissions must cover the exact
+subscription endpoint, including a version or alias qualifier. This applies to both same-account
+and cross-account delivery, for Query and JSON publishes and batch publishes.
+
+A refused delivery is logged and does not fail the publisher or stop other subscriptions.
+With IAM enforcement disabled, delivery retains the default permissive behavior. This check
+does not add Lambda delivery retries or dead-letter handling.
+
 ## SMS sandbox and opt-out
 
 A new AWS account starts in the SMS sandbox, where it can only text verified numbers. Floci
@@ -148,6 +160,23 @@ Supported subscription protocols:
 
 For `FilterPolicyScope=MessageBody`, nested policy objects descend into JSON objects and arrays.
 An object inside an array matches when one array element satisfies the complete nested policy.
+
+An SQS subscription created by the queue owner is confirmed automatically, including when the
+topic belongs to another account. A caller subscribing someone else's queue leaves the subscription
+pending and sends a signed `SubscriptionConfirmation` message to that queue. The confirmation
+bypasses notification filtering and raw delivery settings. Notifications wait until the recipient
+calls `ConfirmSubscription` with the message's token. The token identifies the topic's account and
+Region even when the call is unsigned; `AuthenticateOnUnsubscribe=true` requires credentials when
+IAM enforcement is enabled.
+
+`Subscribe` returns `pending confirmation` for a pending subscription unless
+`ReturnSubscriptionArn=true`. Confirmation state and tokens cannot be changed through subscription
+attributes, and `GetSubscriptionAttributes` never returns the token. A repeated `Subscribe` resends
+the confirmation, allowing recovery after the recipient fixes its queue policy.
+
+With IAM enforcement enabled, both confirmation and notification delivery require the destination
+queue's policy to allow `sqs:SendMessage` for the SNS service principal. The policy receives the
+topic's ARN as `aws:SourceArn` and its owning account as `aws:SourceAccount`.
 
 For SQS subscriptions, Floci retries a failed delivery up to three times total, with two immediate
 retries. If all attempts fail and the subscription has a `RedrivePolicy` containing a valid

@@ -12,18 +12,21 @@ S3 Tables requests are signed as `s3tables` and use REST JSON routes such as
 ## Metadata-only scope
 
 This service stores table-bucket, namespace, table, policy, maintenance
-configuration, and metadata-location state. It does **not** run an Apache
+configuration, bucket metrics configuration, and metadata-location state. It does **not** run an Apache
 Iceberg engine or create data-plane artifacts: manifests, warehouse objects,
-queries, compaction, snapshot expiry, replication, encryption-management, and
-metrics are intentionally outside this implementation.
+queries, compaction, snapshot expiry, replication, data encryption, and
+metrics collection or publication are intentionally outside this implementation.
 
 ## Supported operations
 
 | Area | Operations |
 |---|---|
 | Table buckets | CreateTableBucket, GetTableBucket, ListTableBuckets, DeleteTableBucket |
+| Storage classes | GetTableBucketStorageClass, PutTableBucketStorageClass, GetTableStorageClass |
+| Bucket encryption | GetTableBucketEncryption |
 | Bucket policy | PutTableBucketPolicy, GetTableBucketPolicy, DeleteTableBucketPolicy |
 | Bucket maintenance | PutTableBucketMaintenanceConfiguration, GetTableBucketMaintenanceConfiguration |
+| Bucket metrics configuration | PutTableBucketMetricsConfiguration, GetTableBucketMetricsConfiguration, DeleteTableBucketMetricsConfiguration |
 | Namespaces | CreateNamespace, GetNamespace, ListNamespaces, DeleteNamespace |
 | Tables | CreateTable, GetTable, ListTables, DeleteTable, RenameTable |
 | Metadata location | GetTableMetadataLocation, UpdateTableMetadataLocation |
@@ -33,6 +36,26 @@ metrics are intentionally outside this implementation.
 Tables must use `ICEBERG` format. `UpdateTableMetadataLocation` implements
 optimistic concurrency: supply the table's current `versionToken`; a stale
 token returns `ConflictException`.
+
+Storage classes support `STANDARD` (the default) and `INTELLIGENT_TIERING`.
+`PutTableBucketStorageClass` changes the default for new tables. Each table
+retains the class selected at creation, either its explicit configuration or
+the bucket's default at that time. Bucket settings and table classes survive
+restarts in persistent storage modes. These settings are metadata; Floci does
+not move table data between storage tiers.
+
+`GetTableBucketEncryption` reads the encryption configuration supplied at bucket
+creation, including an SSE-KMS key ARN when configured. Buckets created without
+an explicit configuration report the SSE-S3 default, `AES256`. This readback
+reflects stored metadata; it does not encrypt data or manage KMS keys.
+
+Bucket metrics configuration is disabled by default. `PutTableBucketMetricsConfiguration`
+enables it, and `GetTableBucketMetricsConfiguration` returns the bucket ARN and the
+fixed configuration ID `EntireBucket`. Repeated puts preserve that configuration.
+Deleting a configuration is idempotent; subsequent reads return `NotFoundException`
+until it is enabled again. This state uses the bucket's configured storage mode
+and is removed with the bucket. The three metrics APIs authorize their individual
+IAM actions against the exact table-bucket ARN.
 
 ## Example
 

@@ -3,21 +3,6 @@
 **Protocol:** JSON 1.1 (`X-Amz-Target: AWSCognitoIdentityProviderService.*`)
 **Endpoint:** `POST http://localhost:4566/`
 
-Browser clients can call the Cognito JSON API after their origin is admitted by
-`EXTRA_CORS_ALLOWED_ORIGINS` or `FLOCI_SECURITY_EXTRA_CORS_ALLOWED_ORIGINS`.
-For example, set `EXTRA_CORS_ALLOWED_ORIGINS=http://localhost:3000` for a local frontend.
-The default allow-list is empty. Unlisted origins receive no CORS headers, including on
-preflights and on successful or failed Cognito responses.
-
-The global CORS filter answers allowed preflights with 204 and supplies the allowed
-origin and request headers, including `content-type`, `x-amz-target`, and `x-amz-user-agent`.
-For allowed origins, Cognito responses also expose the AWS request ID and error headers.
-Those names are merged with configured extra exposed headers and any existing exposed
-headers, without duplicates that differ only in case. The global filter also controls
-Private Network Access and explicit wildcard-origin configuration.
-`FLOCI_SECURITY_DISABLE_CORS_HEADERS=true` disables CORS headers. Disabling the Cognito
-service disables its extra exposed headers. S3 and API Gateway retain their existing CORS policies.
-
 Floci serves pool-specific discovery and JWKS endpoints, plus a relaxed OAuth token endpoint, so local clients can mint and validate Cognito-like access tokens against RS256 signing keys.
 
 When configured, `PreAuthentication`, `PostAuthentication` and `PreTokenGeneration` Lambda triggers
@@ -28,15 +13,6 @@ responses return Cognito Lambda errors instead of issuing tokens without the tri
 where `errorMessage` is taken verbatim from the function's error payload, as on AWS.
 
 Sign-in by a disabled user fails with `NotAuthorizedException` (`User is disabled.`), as on AWS.
-
-`AdminCreateUser`, `SignUp`, `AdminUpdateUserAttributes` and `UpdateUserAttributes` reject
-`custom:` attributes that the user pool's schema does not declare with `InvalidParameterException`
-and `Attribute does not exist in the schema.`. Declare custom attributes with `CreateUserPool`
-or `AddCustomAttributes` before writing them. Validation runs before creating a user or changing
-any attributes, so a rejected request does not save partial changes.
-`NEW_PASSWORD_REQUIRED` responses, including custom SRP flows and administrative responses, also
-validate custom attributes before changing the password or consuming the challenge session. An
-undeclared attribute leaves both unchanged, so the client can correct the attributes and retry.
 
 `CreateUserPool` supports overriding several values using user-pool tags **only** at creation time:
 * `floci:override-id`, to pin the resulting `UserPool.Id`. Because a pinned id is caller-chosen it can be reused, which AWS never does. `DeleteUserPool` therefore deletes everything the pool owns (users, groups, app clients, resource servers, revoked token records and outstanding verification codes) so a pool recreated on the same id starts empty rather than inheriting the deleted pool's password hashes and client secrets.
@@ -562,12 +538,6 @@ empty list, matching AWS. It is enforced as if it had `ALLOW_REFRESH_TOKEN_AUTH`
 the stored or returned value. A client that signs in with `USER_PASSWORD_AUTH`, `ADMIN_USER_PASSWORD_AUTH` or
 `USER_AUTH` must list the matching `ALLOW_` value.
 
-With the app client's `PreventUserExistenceErrors` set to `ENABLED`, password authentication
-(`USER_PASSWORD_AUTH`, `ADMIN_USER_PASSWORD_AUTH` and the legacy `ADMIN_NO_SRP_AUTH`) returns
-`NotAuthorizedException` with `Incorrect username or password` for both an unknown username and
-an incorrect password. With `LEGACY`, or when the setting is omitted, an unknown username returns
-`UserNotFoundException`. See [AWS's user-existence error behavior](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-user-pool-managing-errors.html).
-
 ## Custom Message Trigger
 
 `CustomMessage` requests include the `{####}` code placeholder, the `{##Click Here##}`
@@ -720,13 +690,6 @@ plain, so branding is stored and returned rather than rendered. Two divergences 
 | `POST /cognito-idp/oauth2/token`                     | OAuth code, refresh-token and client-credentials token endpoint  |
 | `POST /cognito-idp/oauth2/revoke`                    | OAuth refresh token revocation endpoint                          |
 | `GET`, `POST /cognito-idp/oauth2/userInfo`           | OIDC userInfo endpoint, for a user's access token                |
-
-`token`, `revoke` and `userInfo` answer CORS as AWS does, so a browser app can call them with
-`fetch` from any origin, on Floci's host and on a custom domain alike: a response to a request
-with an `Origin` echoes it in `Access-Control-Allow-Origin`, with
-`Access-Control-Allow-Credentials: true`, on success and on error. A preflight is answered with
-200, the requested method and headers, and `Access-Control-Max-Age: 1800`. As on AWS,
-`authorize` and `logout`, which the browser navigates to, carry no CORS headers.
 
 The OAuth endpoints support browser-style authorization-code sign-in, for the pool's own
 users and through a federated OIDC provider, as well as the emulator-friendly
@@ -918,20 +881,6 @@ curl -s -b jar -o /dev/null -w '%{http_code} %{redirect_url}\n' \
 - Authorization-code redemption validates the client, callback URI and one-time code binding.
 - It requires `AllowedOAuthFlowsUserPoolClient=true` and `AllowedOAuthFlows=["client_credentials"]`.
 - It doesn't require a Cognito domain.
-- Client-credentials invokes the pre token generation trigger with triggerSource
-  `TokenGeneration_ClientCredentials` when, as on AWS, the pool's
-  `PreTokenGenerationConfig.LambdaVersion` is `V3_0`; a `V1_0` or `V2_0` trigger is not invoked.
-  The event carries `version` `3`, `userName` `ClientCredentials`, the granted `scopes`, empty `userAttributes`, a
-  null `groupConfiguration`, the request's `aws_client_metadata` (a URL-encoded JSON object of
-  strings) as `clientMetadata`, and `response.claimsAndScopeOverrideDetails` set to null, so a
-  function must build the response object rather than write into it. Metadata that is not a JSON
-  object, or a value that is not a JSON string (a number, boolean, null, object or array), refuses
-  the request with `invalid_request`.
-  Only `accessTokenGeneration` applies: its claims and scope changes reach the access token, while
-  `idTokenGeneration` and `groupOverrideDetails` are ignored. The trigger cannot add, change or
-  suppress `sub`, `client_id`, `token_use`, `version`, `username`, `iss`, `exp`, `iat`, `jti` or any
-  `cognito:` claim, and an `aud` it adds must equal the client ID. It changes `scope` only through
-  `scopesToAdd` and `scopesToSuppress`.
 - Client-credentials returns only `access_token`, `token_type`, and `expires_in`; authorization-code
   redemption returns the Cognito access and refresh tokens, and an ID token when the granted scopes
   include `openid`; a refresh returns the same tokens without a refresh token.
@@ -964,13 +913,6 @@ Floci follows real Cognito semantics for pools created with `UsernameAttributes`
 
 Pools **without** `UsernameAttributes` (classic pools, and pools using `AliasAttributes`) keep the
 literal `Username` you supply, unchanged.
-
-With `UsernameConfiguration.CaseSensitive=false`, username, email and `preferred_username`
-lookups and duplicate checks ignore case. An omitted setting or `CaseSensitive=true` keeps
-exact matching. Email sign-in still resolves to the same canonical UUID, and `SECRET_HASH`
-uses the exact `USERNAME` sent in each request. Challenge responses follow the pool's case-sensitivity
-setting too. Floci preserves stored casing in returned usernames, email addresses and
-`preferred_username` values. AWS lowercases these values in case-insensitive pools.
 
 ### Token claims
 

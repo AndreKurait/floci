@@ -17,7 +17,17 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
+from appconfig_clock import AppConfigClock
+
 logger = logging.getLogger(__name__)
+
+
+@pytest.fixture
+def appconfig_clock(record_property):
+    clock = AppConfigClock()
+    record_property("appconfig_clock", "manual" if clock.file else "wall")
+    with clock.exclusive():
+        yield clock
 
 
 @pytest.fixture(scope="session")

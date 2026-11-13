@@ -13,7 +13,7 @@ import static org.assertj.core.api.Assertions.*;
 class BedrockAgentCoreInvokeTest {
 
     private static final String ARN =
-            "arn:aws:bedrock-agentcore:us-east-1:000000000000:runtime/test-AbCdEfGhIj";
+            "arn:aws:bedrock-agentcore:us-east-1:000000000000:agent/abcdef12-3456-7890-abcd-ef1234567890:1";
     private static final String SESSION_ID = "session-0000000000000000000000000000abc";
 
     @Test
