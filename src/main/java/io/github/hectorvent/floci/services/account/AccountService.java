@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.account;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.ServicePrincipals;
@@ -15,6 +16,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.regex.Pattern;
 
@@ -64,7 +66,7 @@ public class AccountService implements Resettable {
         contacts.deleteForAccount(targetAccountId, type);
     }
 
-    private String resolveTargetAccount(String callerAccountId, JsonNode request) {
+    String resolveTargetAccount(String callerAccountId, JsonNode request) {
         JsonNode accountIdNode = request == null ? null : request.get("AccountId");
         if (accountIdNode == null || accountIdNode.isNull()) {
             return callerAccountId;
@@ -109,6 +111,26 @@ public class AccountService implements Resettable {
             throw validation("The management account cannot specify its own AccountId.");
         }
         return requestedAccountId;
+    }
+
+    /**
+     * Resolves only the new Region operations' organization member target. Alternate-contact admission
+     * retains its existing path. Execution separately enforces trusted access and caller membership.
+     */
+    public Optional<String> regionMemberArn(String callerAccountId, String requestedAccountId) {
+        if (requestedAccountId == null || !ACCOUNT_ID.matcher(requestedAccountId).matches()) {
+            return Optional.empty();
+        }
+        Organization organization;
+        try {
+            organization = organizationsService.describeOrganization(callerAccountId);
+            organizationsService.describeAccount(callerAccountId, requestedAccountId);
+        } catch (AwsException e) {
+            return Optional.empty();
+        }
+        return Optional.of(AwsArnUtils.Arn.global(AwsArnUtils.parse(organization.getArn()).partition(), "account",
+                organization.getMasterAccountId(), "account/" + organization.getId() + "/" + requestedAccountId)
+                .toString());
     }
 
     @Override

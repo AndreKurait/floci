@@ -190,6 +190,7 @@ public class IamConditionContextResolver {
     public Map<String, List<String>> resolve(String credentialScope, String action,
                                              ContainerRequestContext ctx) {
         return switch (credentialScope) {
+            case "account" -> accountRegionConditionContext(action, ctx);
             case "s3" -> s3ConditionContext(action, ctx);
             case "ec2" -> ec2ConditionContext(action, ctx);
             case "elasticloadbalancing" -> elbV2Contexts(action, ctx).stream().findFirst().orElse(null);
@@ -272,6 +273,24 @@ public class IamConditionContextResolver {
     }
 
     /** Group mutations and stream access use the handler's group and request scope. */
+    private Map<String, List<String>> accountRegionConditionContext(String action, ContainerRequestContext ctx) {
+        if (!("account:EnableRegion".equals(action) || "account:DisableRegion".equals(action)
+                || "account:GetRegionOptStatus".equals(action))) {
+            return null;
+        }
+        JsonNode body = PassedRoles.jsonBody(ctx);
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        for (String key : RequestConditionKeys.requestKeys(action)) {
+            for (String member : RequestConditionKeys.members(action, key)) {
+                JsonNode value = body == null ? null : body.get(member);
+                if (value != null && value.isTextual()) {
+                    putIfPresent(conditions, key, value.textValue());
+                }
+            }
+        }
+        return conditions.isEmpty() ? null : conditions;
+    }
+
     private Map<String, List<String>> logsConditionContext(String action, ContainerRequestContext ctx) {
         if (!("logs:CreateLogStream".equals(action) || "logs:DeleteLogStream".equals(action)
                 || "logs:PutLogEvents".equals(action)
