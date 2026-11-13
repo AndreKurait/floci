@@ -267,7 +267,7 @@ public class TlsConfigSource implements ConfigSource {
 
     /** Service infixes preceded by an extra label in AWS regional hostnames. */
     private static final List<String> MULTI_LABEL_REGIONAL_SERVICE_INFIXES = List.of(
-            "execute-api", "ecr", "ecr-fips", "dkr.ecr", "s3-control", "s3.dualstack", "s3-website",
+            "ddb", "execute-api", "ecr", "ecr-fips", "dkr.ecr", "s3-control", "s3.dualstack", "s3-website",
             "s3-fips", "s3-fips.dualstack");
 
     /**
