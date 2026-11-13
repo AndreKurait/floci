@@ -395,3 +395,17 @@ def test_the_vendored_file_is_well_formed():
     assert document["resourceArns"]["ec2"]["image"] == "arn:${Partition}:ec2:${Region}::image/*"
     assert operations["budgets:CreateBudget"]["requestTags"] is True
     assert operations["logs:CreateLogGroup"].get("byHand")
+
+
+def test_cloudfront_xml_reads_wrapped_tags_and_structured_payload():
+    m = model({"CreateKeyValueStore": "In", "CreateDistributionWithTags": "Payload"}, {
+        "In": structure(Tags="Tags"),
+        "Payload": {"type": "structure", "payload": "Config", "members": {"Config": {"shape": "In"}}},
+        "Tags": structure(Items="XmlTags"),
+        "XmlTags": {"type": "list", "member": {"shape": "Tag", "locationName": "Tag"}},
+        **TAG_SHAPES,
+    }, protocol="rest-xml")
+    m["metadata"]["endpointPrefix"] = "cloudfront"
+    expected = [{"member": "Tags.Items[Tag]", "key": "Key", "value": "Value"}]
+    assert r.tag_members(m, "CreateKeyValueStore") == expected
+    assert r.tag_members(m, "CreateDistributionWithTags") == expected

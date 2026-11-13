@@ -16,11 +16,29 @@ import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /** How {@link TagOnCreate} reads the tags a request carries and the condition keys it checks them with. */
 class TagOnCreateTest {
+
+    @Test
+    void cloudFrontReadsEveryTagTheXmlControllerAttaches() {
+        String xml = "<CreateKeyValueStoreRequest xmlns:c='urn:test'><Tags><Items>"
+                + "<c:Tag><c:Key>team</c:Key><c:Value>old</c:Value></c:Tag></Items></Tags>"
+                + "<Tag><Key>team</Key><Value>blue&amp;green</Value></Tag><Tag><Key>empty</Key></Tag>"
+                + "<Tag><Value>ignored</Value></Tag></CreateKeyValueStoreRequest>";
+        ContainerRequestContext ctx = mock(ContainerRequestContext.class);
+        when(ctx.getEntityStream()).thenReturn(new ByteArrayInputStream(xml.getBytes(StandardCharsets.UTF_8)));
+        Tagging tagging = TagOnCreate.of("cloudfront:CreateKeyValueStore", ctx).orElseThrow();
+        assertEquals("cloudfront:TagResource", tagging.action());
+        assertTrue(tagging.requestTags());
+        assertEquals(List.of(set(Map.of("team", "blue&green", "empty", ""))), tagging.sets());
+        assertEquals(List.of(Map.of("aws:RequestTag/team", List.of("blue&green"),
+                "aws:RequestTag/empty", List.of(""), "aws:TagKeys", List.of("team", "empty"))),
+                TagOnCreate.requestTagContexts(tagging));
+    }
 
     @Test
     void assumeRoleUsesOnlyConsumedSessionTagsAndRetainsGeneratedAuthorization() {

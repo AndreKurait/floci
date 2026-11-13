@@ -417,6 +417,9 @@ and described through the CloudFront control plane, and its keys are managed thr
   `cloudfront-keyvaluestore` signing name from its credential scope and does not verify the signature.
   With `floci.auth.validate-signatures` on, these requests are refused: signature validation does not accept
   SigV4A outside S3 yet, so leave it off when using the data plane.
+- With IAM enforcement on, a tagged `CreateKeyValueStore` also requires `cloudfront:TagResource`.
+  The shared generated tag-on-create check evaluates `aws:RequestTag` and `aws:TagKeys` before creating
+  the store. An untagged create does not require the tagging action.
 - With IAM enforcement on, the data plane is authorized as `cloudfront-keyvaluestore:<Operation>` on the store's ARN,
   and the control plane as `cloudfront:<Operation>`.
 - Keys are listed in key order, 10 per page by default and up to 50 (`MaxResults`).

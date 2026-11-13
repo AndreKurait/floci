@@ -94,7 +94,7 @@ OUTPUT = REPO_ROOT / "src/main/resources/aws/iam-tag-on-create.json"
 # protocols and Smithy RPC v2 CBOR, and the REST ones whose routes Floci authorizes by operation.
 NAMESPACES = (
     "access-analyzer", "acm", "application-autoscaling", "athena", "autoscaling", "bcm-data-exports",
-    "bcm-pricing-calculator", "budgets", "ce", "cloudformation", "cloudhsm", "cloudtrail", "cloudwatch",
+    "bcm-pricing-calculator", "budgets", "ce", "cloudformation", "cloudfront", "cloudhsm", "cloudtrail", "cloudwatch",
     "codedeploy", "codepipeline", "cognito-identity", "cognito-idp", "comprehend", "config", "cur", "datasync",
     "dms", "dsql", "dynamodb", "ec2", "ecr", "ecs", "eks", "elasticache", "elasticloadbalancing",
     "elasticmapreduce", "events", "firehose", "globalaccelerator", "glue", "iam", "kinesis", "kinesisanalytics",
@@ -278,8 +278,9 @@ def _protocols(model: dict) -> set[str]:
 
 
 def readable(model: dict) -> bool:
-    """Whether the model's requests come as form parameters or a JSON or CBOR body."""
-    return bool(READ_PROTOCOLS & _protocols(model))
+    """Whether the model uses a supported form, JSON, CBOR, or CloudFront XML body."""
+    return bool(READ_PROTOCOLS & _protocols(model)) or (
+        "rest-xml" in _protocols(model) and model["metadata"].get("endpointPrefix") == "cloudfront")
 
 
 def _serialized(name: str, member: dict, model: dict) -> str:
@@ -309,6 +310,11 @@ def _collection(model: dict, shape_name: str) -> dict | None:
     """How a shape holds tags, as the vendored path's last step and a tag structure's key and value
     names: a map of strings, or a list of tag structures. None for any other shape."""
     shape = model["shapes"][shape_name]
+    if shape["type"] == "structure" and set(shape.get("members", {})) == {"Items"}:
+        member = shape["members"]["Items"]
+        nested = _collection(model, member["shape"])
+        if nested is not None:
+            return {**nested, "step": "." + _serialized("Items", member, model) + nested["step"]}
     if shape["type"] == "map":
         key = model["shapes"][shape["key"]["shape"]]
         value = model["shapes"][shape["value"]["shape"]]
@@ -327,7 +333,11 @@ def tag_members(model: dict, operation: str) -> list[dict]:
         return []
     root = model["shapes"][spec["input"]["shape"]]
     if root.get("payload") is not None:
-        return []
+        payload = root["members"][root["payload"]]
+        shape = model["shapes"][payload["shape"]]
+        if "rest-xml" not in _protocols(model) or shape["type"] != "structure":
+            return []
+        root = shape
     found = []
     for name, member in root.get("members", {}).items():
         if member.get("location") not in BODY_LOCATIONS or not TAG_MEMBER_RE.match(name):
