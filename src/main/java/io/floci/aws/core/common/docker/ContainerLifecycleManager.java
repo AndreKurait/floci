@@ -1584,6 +1584,17 @@ public class ContainerLifecycleManager {
             hostConfig.withPrivileged(true);
         }
         LinuxOptions linux = spec.linuxOptions();
+        if (linux.pidsLimit() != null) {
+            hostConfig.withPidsLimit(linux.pidsLimit());
+        }
+        List<String> securityOptions = new ArrayList<>();
+        if (linux.noNewPrivileges()) {
+            securityOptions.add("no-new-privileges:true");
+        }
+        if (!securityOptions.isEmpty()) {
+            hostConfig.withSecurityOpts(securityOptions);
+        }
+
         List<Capability> capDrop = new ArrayList<>();
         List<Capability> capAdd = capabilities(linux.capAdd());
         if ("true".equals(ContainerStorageHelper.labelValue(

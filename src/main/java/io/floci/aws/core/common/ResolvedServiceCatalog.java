@@ -26,6 +26,7 @@ import io.floci.aws.services.bedrockagentcorecontrol.BedrockAgentCoreResourcePol
 import io.floci.aws.services.bedrockagentcorecontrol.BedrockAgentCoreToolsController;
 import io.floci.aws.services.bedrockruntime.BedrockRuntimeController;
 import io.floci.aws.services.cloudfront.CloudFrontController;
+import io.floci.aws.services.cloudfront.CloudFrontFunctionTestController;
 import io.floci.aws.services.cloudfront.CloudFrontKeyValueStoreController;
 import io.floci.aws.services.cloudfront.CloudFrontServingController;
 import io.floci.aws.services.cloudwatch.metrics.OtlpMetricsController;
@@ -716,7 +717,7 @@ public class ResolvedServiceCatalog {
                         5000L, AwsNamespaces.CLOUDFRONT, ServiceProtocol.REST_XML,
                         protocols(ServiceProtocol.REST_XML),
                         Set.of(), Set.of("cloudfront"), Set.of(),
-                        Set.of(CloudFrontController.class, CloudFrontServingController.class)),
+                        Set.of(CloudFrontController.class, CloudFrontServingController.class, CloudFrontFunctionTestController.class)),
                 descriptor("cloudfront-keyvaluestore", "cloudfront-keyvaluestore",
                         config.services().cloudfront().enabled(), true,
                         null, null, 5000L, null, ServiceProtocol.REST_JSON,
