@@ -3,24 +3,37 @@ package io.github.hectorvent.floci.core.common;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.apigateway.ApiGatewayDocumentationIamConditions;
+import io.github.hectorvent.floci.services.athena.AthenaBatchQueryService;
+import io.github.hectorvent.floci.services.athena.AthenaPreparedStatementService;
+import io.github.hectorvent.floci.services.backup.BackupFrameworkResources;
+import io.github.hectorvent.floci.services.backup.BackupFrameworkService;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationDriftService;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationDriftSnapshot;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.LogGroupTagTarget;
+import io.github.hectorvent.floci.services.cloudwatch.logs.LogTransformerTarget;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbConditionKeys;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbFacade;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbTableNames;
 import io.github.hectorvent.floci.services.dynamodb.model.TableDefinition;
+import io.github.hectorvent.floci.services.ec2.Ec2PlacementGroupService;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.model.Ec2PlacementGroup;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
+import io.github.hectorvent.floci.services.ecr.EcrService;
+import io.github.hectorvent.floci.services.eks.EksAccessEntryUpdateConditions;
 import io.github.hectorvent.floci.services.elbv2.ElbV2ConditionKeys;
 import io.github.hectorvent.floci.services.iam.IamActionRegistry;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.ResourceArnBuilder;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.iam.model.IamUser;
+import io.github.hectorvent.floci.services.kinesis.KinesisService;
+import io.github.hectorvent.floci.services.lambda.LambdaRuntimeManagementService;
+import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambdaweb.LambdaWebService;
 import io.github.hectorvent.floci.services.s3.S3ControlTagConditionKeys;
 import io.github.hectorvent.floci.services.s3.S3ObjectActions;
@@ -100,20 +113,34 @@ public class IamConditionContextResolver {
     static final String RESOURCE_AUTH_TYPE = "lambda:Resource/WebFunctionAuthType";
 
     @Inject
+    Instance<BackupFrameworkService> backupFrameworks;
+    @Inject
+    Instance<ApiGatewayDocumentationIamConditions> documentationConditions;
+    @Inject
     Instance<CloudFormationDriftService> driftService;
 
     private final Instance<DynamoDbFacade> dynamoDbFacade;
     private final Instance<Ec2Service> ec2Service;
+    /** Lazy to keep the existing IAM construction graph independent of EC2 storage creation. */
+    @Inject
+    Instance<Ec2PlacementGroupService> placementGroupService;
+    private final Instance<EcrService> ecrService;
     private final Instance<S3Service> s3Service;
     private final Instance<CloudWatchLogsService> logsService;
     private final Instance<IamService> iamService;
     private final Instance<LambdaWebService> lambdaWebService;
+    private final Instance<LambdaService> lambdaService;
+    private final Instance<KinesisService> kinesisService;
+    private final Instance<LambdaRuntimeManagementService> runtimeManagement;
     private final Instance<SsmService> ssmService;
     private final Instance<ElbV2ConditionKeys> elbV2ConditionKeys;
     private final RequestContext requestContext;
+    private final Instance<AthenaPreparedStatementService> athenaPreparedStatements;
     private final EmulatorConfig config;
     private final CurrentVertxRequest currentVertxRequest;
     private final Clock clock;
+    private final Instance<AthenaBatchQueryService> athenaBatchQueryService;
+    private final Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates;
     private final ResolvedServiceCatalog serviceCatalog;
 
     /**
@@ -132,9 +159,32 @@ public class IamConditionContextResolver {
                                        CurrentVertxRequest currentVertxRequest,
                                        ResolvedServiceCatalog serviceCatalog,
                                        Instance<SsmService> ssmService,
+                                       Instance<ElbV2ConditionKeys> elbV2ConditionKeys,
+                                       Instance<LambdaService> lambdaService,
+                                       Instance<AthenaPreparedStatementService> athenaPreparedStatements,
+                                       Instance<KinesisService> kinesisService,
+                                       Instance<AthenaBatchQueryService> athenaBatchQueryService,
+                                       Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates,
+                                       Instance<LambdaRuntimeManagementService> runtimeManagement,
+                                       Instance<EcrService> ecrService) {
+        this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys, lambdaService, athenaPreparedStatements, kinesisService, athenaBatchQueryService, eksAccessEntryUpdates, runtimeManagement, ecrService);
+    }
+
+    public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                       Instance<Ec2Service> ec2Service,
+                                       Instance<S3Service> s3Service,
+                                       Instance<CloudWatchLogsService> logsService,
+                                       Instance<IamService> iamService,
+                                       Instance<LambdaWebService> lambdaWebService,
+                                       RequestContext requestContext,
+                                       EmulatorConfig config,
+                                       CurrentVertxRequest currentVertxRequest,
+                                       ResolvedServiceCatalog serviceCatalog,
+                                       Instance<SsmService> ssmService,
                                        Instance<ElbV2ConditionKeys> elbV2ConditionKeys) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys);
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys, null, null, null, null, null, null, null);
     }
 
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -148,7 +198,7 @@ public class IamConditionContextResolver {
                                        CurrentVertxRequest currentVertxRequest,
                                        ResolvedServiceCatalog serviceCatalog) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), null, null);
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), null, null, null, null, null, null, null, null, null);
     }
 
     IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -162,7 +212,7 @@ public class IamConditionContextResolver {
                                 CurrentVertxRequest currentVertxRequest,
                                 ResolvedServiceCatalog serviceCatalog, Clock clock) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, clock, null, null);
+                config, currentVertxRequest, serviceCatalog, clock, null, null, null, null, null, null, null, null, null);
     }
 
     private IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -177,32 +227,109 @@ public class IamConditionContextResolver {
                                         ResolvedServiceCatalog serviceCatalog, Clock clock,
                                         Instance<SsmService> ssmService,
                                         Instance<ElbV2ConditionKeys> elbV2ConditionKeys) {
+        this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService,
+                requestContext, config, currentVertxRequest, serviceCatalog, clock,
+                ssmService, elbV2ConditionKeys, null, null, null, null, null, null, null);
+    }
+
+    private IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                        Instance<Ec2Service> ec2Service,
+                                        Instance<S3Service> s3Service,
+                                        Instance<CloudWatchLogsService> logsService,
+                                        Instance<IamService> iamService,
+                                        Instance<LambdaWebService> lambdaWebService,
+                                        RequestContext requestContext,
+                                        EmulatorConfig config,
+                                        CurrentVertxRequest currentVertxRequest,
+                                        ResolvedServiceCatalog serviceCatalog, Clock clock,
+                                        Instance<SsmService> ssmService,
+                                        Instance<ElbV2ConditionKeys> elbV2ConditionKeys,
+                                       Instance<LambdaService> lambdaService,
+                                       Instance<AthenaPreparedStatementService> athenaPreparedStatements,
+                                       Instance<KinesisService> kinesisService,
+                                       Instance<AthenaBatchQueryService> athenaBatchQueryService,
+                                       Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates,
+                                       Instance<LambdaRuntimeManagementService> runtimeManagement,
+                                       Instance<EcrService> ecrService) {
         this.dynamoDbFacade = dynamoDbFacade;
         this.ec2Service = ec2Service;
+        this.ecrService = ecrService;
         this.s3Service = s3Service;
         this.logsService = logsService;
         this.iamService = iamService;
         this.lambdaWebService = lambdaWebService;
+        this.lambdaService = lambdaService;
+        this.kinesisService = kinesisService;
+        this.athenaPreparedStatements = athenaPreparedStatements;
+        this.runtimeManagement = runtimeManagement;
         this.ssmService = ssmService;
         this.elbV2ConditionKeys = elbV2ConditionKeys;
         this.requestContext = requestContext;
         this.config = config;
         this.currentVertxRequest = currentVertxRequest;
         this.clock = clock;
+        this.eksAccessEntryUpdates = eksAccessEntryUpdates;
         this.serviceCatalog = serviceCatalog;
+        this.athenaBatchQueryService = athenaBatchQueryService;
+    }
+
+    private Map<String, List<String>> athenaPreparedStatementConditions(String action, ContainerRequestContext ctx) {
+        if (!AthenaPreparedStatementService.supportsAction(action)
+                || athenaPreparedStatements == null || !athenaPreparedStatements.isResolvable()) {
+            return null;
+        }
+        JsonNode body = bufferedJsonBody(ctx);
+        if (body == null || !body.path("WorkGroup").isTextual()) {
+            return null;
+        }
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        try {
+            return athenaPreparedStatements.get().resourceTagConditions(region, body.path("WorkGroup").textValue());
+        } catch (AwsException expected) {
+            // The handler validates the same selector; an absent workgroup has no resource tags.
+            return null;
+        }
+    }
+
+    private Map<String, List<String>> kinesisConditionContext(String action, ContainerRequestContext ctx) {
+        if (kinesisService == null || !kinesisService.isResolvable() || !Set.of("kinesis:GetResourcePolicy",
+                "kinesis:PutResourcePolicy", "kinesis:DeleteResourcePolicy").contains(action)) {
+            return null;
+        }
+        JsonNode body = bufferedJsonBody(ctx);
+        if (body == null || !body.path("ResourceARN").isTextual()) {
+            return null;
+        }
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        Map<String, List<String>> context = new LinkedHashMap<>();
+        try {
+            kinesisService.get().resourcePolicyTags(body.path("ResourceARN").textValue(), region)
+                    .forEach((key, value) -> context.put(RESOURCE_TAG_PREFIX + key, List.of(value)));
+        } catch (AwsException expected) {
+            // Missing or foreign resources provide no tags; the handler returns its resource error if authorized.
+        }
+        return context;
     }
 
     public Map<String, List<String>> resolve(String credentialScope, String action,
                                              ContainerRequestContext ctx) {
         return switch (credentialScope) {
+            case "backup" -> backupFrameworkConditions(action, ctx);
+            case "apigateway" -> documentationConditions != null && documentationConditions.isResolvable()
+                    ? documentationConditions.get().resolve(action, ctx) : null;
             case "cloudformation" -> driftConditionContext(action, ctx);
             case "s3" -> s3ConditionContext(action, ctx);
             case "ec2" -> ec2ConditionContext(action, ctx);
+            case "ecr" -> ecrPreviewConditionContext(action, ctx);
             case "elasticloadbalancing" -> elbV2Contexts(action, ctx).stream().findFirst().orElse(null);
             case "dynamodb" -> dynamoDbConditionContext(action, ctx);
             case "iam" -> iamConditionContext(action, ctx);
             case "logs" -> logsConditionContext(action, ctx);
             case "lambda" -> lambdaConditionContext(action, ctx);
+            case "athena" -> athenaPreparedStatementConditions(action, ctx);
+            case "kinesis" -> kinesisConditionContext(action, ctx);
+            case "eks" -> "eks:UpdateAccessEntry".equals(action) && eksAccessEntryUpdates != null
+                    && eksAccessEntryUpdates.isResolvable() ? eksAccessEntryUpdates.get().resolve(ctx) : null;
             case "redshift" -> redshiftConditionContext(action, ctx);
             case "states" -> stepFunctionsConditionContext(action, ctx);
             default -> null;
@@ -277,7 +404,56 @@ public class IamConditionContextResolver {
         return conditions;
     }
 
+    private Map<String, List<String>> backupFrameworkConditions(String action, ContainerRequestContext ctx) {
+        if (!BackupFrameworkResources.supports(action) || backupFrameworks == null || !backupFrameworks.isResolvable()) {
+            return null;
+        }
+        JsonNode body = bufferedJsonBody(ctx);
+        if (!BackupFrameworkResources.matches(action, ctx, body)) {
+            return null;
+        }
+        String target = BackupFrameworkResources.target(action, ctx, body);
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        Map<String, List<String>> conditions = new LinkedHashMap<>(
+                backupFrameworks.get().resourceConditions(region, target));
+        if ("backup:TagResource".equals(action) && body != null && body.path("Tags").isObject()) {
+            List<String> keys = new ArrayList<>();
+            body.path("Tags").properties().forEach(entry -> {
+                keys.add(entry.getKey());
+                conditions.put("aws:RequestTag/" + entry.getKey(), List.of(entry.getValue().asText()));
+            });
+            conditions.put("aws:TagKeys", keys);
+        } else if ("backup:UntagResource".equals(action) && body != null && body.path("TagKeyList").isArray()) {
+            List<String> keys = new ArrayList<>();
+            body.path("TagKeyList").forEach(key -> keys.add(key.asText()));
+            conditions.put("aws:TagKeys", keys);
+        }
+        return conditions;
+    }
+
     /** Group mutations and stream access use the handler's group and request scope. */
+    private Map<String, List<String>> ecrPreviewConditionContext(String action, ContainerRequestContext ctx) {
+        if (!("ecr:StartLifecyclePolicyPreview".equals(action) || "ecr:GetLifecyclePolicyPreview".equals(action))
+                || ecrService == null || !ecrService.isResolvable()) {
+            return null;
+        }
+        JsonNode body = bufferedJsonBody(ctx);
+        if (body == null) {
+            return null;
+        }
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        Map<String, String> tags = ecrService.get().lifecyclePreviewTags(body.path("repositoryName").asText(null),
+                body.path("registryId").asText(null), region);
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        tags.forEach((key, value) -> {
+            if (key != null && value != null) {
+                conditions.put("aws:ResourceTag/" + key, List.of(value));
+                conditions.put("ecr:ResourceTag/" + key, List.of(value));
+            }
+        });
+        return conditions;
+    }
+
     private Map<String, List<String>> driftConditionContext(String action, ContainerRequestContext ctx) {
         if (!CloudFormationDriftService.handles(action)
                 || "cloudformation:DescribeStackDriftDetectionStatus".equals(action)
@@ -296,7 +472,8 @@ public class IamConditionContextResolver {
     private Map<String, List<String>> logsConditionContext(String action, ContainerRequestContext ctx) {
         if (!("logs:CreateLogStream".equals(action) || "logs:DeleteLogStream".equals(action)
                 || "logs:PutLogEvents".equals(action)
-                || LogGroupTagTarget.supports(action) || "logs:CreateLogGroup".equals(action) || "logs:DeleteLogGroup".equals(action)
+                || LogGroupTagTarget.supports(action) || LogTransformerTarget.supports(action)
+                || "logs:CreateLogGroup".equals(action) || "logs:DeleteLogGroup".equals(action)
                 || "logs:PutRetentionPolicy".equals(action) || "logs:DeleteRetentionPolicy".equals(action))) {
             return null;
         }
@@ -346,6 +523,9 @@ public class IamConditionContextResolver {
         }
         String group = direct ? logsService.get().resolveTagTarget(body.path("resourceArn").asText(), region).name()
                 : body.path("logGroupName").asText();
+        if (LogTransformerTarget.supports(action)) {
+            group = logsService.get().resolveTransformerTarget(body.path("logGroupIdentifier").asText(), region).name();
+        }
         Map<String, String> tags;
         try {
             tags = logsService.get().listTagsLogGroup(group, region);
@@ -503,6 +683,39 @@ public class IamConditionContextResolver {
     /** The authType a web function endpoint request names, and the one the endpoint has before it. */
     private Map<String, List<String>> lambdaConditionContext(String action, ContainerRequestContext ctx) {
         Map<String, List<String>> conditions = new LinkedHashMap<>();
+        if (("lambda:GetFunctionRecursionConfig".equals(action) || "lambda:PutFunctionRecursionConfig".equals(action))
+                && lambdaService != null && lambdaService.isResolvable()) {
+            String path = ctx.getUriInfo().getPath();
+            String prefix = "2024-08-31/functions/";
+            if (path.startsWith("/")) {
+                path = path.substring(1);
+            }
+            if (path.startsWith(prefix) && path.endsWith("/recursion-config")) {
+                String reference = path.substring(prefix.length(), path.length() - "/recursion-config".length());
+                String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+                try {
+                    lambdaService.get().recursionResourceTags(region, reference)
+                            .forEach((key, value) -> {
+                                if (key != null && value != null) {
+                                    conditions.put(RESOURCE_TAG_PREFIX + key, List.of(value));
+                                }
+                            });
+                } catch (AwsException expected) {
+                    // Invalid or missing targets have no resource tags; the handler rejects them.
+                }
+            }
+        }
+        if (("lambda:GetRuntimeManagementConfig".equals(action)
+                || "lambda:PutRuntimeManagementConfig".equals(action))
+                && runtimeManagement != null && runtimeManagement.isResolvable()) {
+            String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+            String account = requestContext.getAccountId() == null ? config.defaultAccountId()
+                    : requestContext.getAccountId();
+            runtimeManagement.get().authorizationTags(region, account,
+                    ctx.getUriInfo().getPathParameters().getFirst("functionName"),
+                    ctx.getUriInfo().getQueryParameters().getFirst("Qualifier"))
+                    .forEach((key, value) -> conditions.put(RESOURCE_TAG_PREFIX + key, List.of(value)));
+        }
         for (String member : RequestConditionKeys.members(action, REQUEST_AUTH_TYPE)) {
             PassedRoles.values(PassedRoles.jsonBody(ctx), member.split("\\."))
                     .forEach(value -> putIfPresent(conditions, REQUEST_AUTH_TYPE, value));
@@ -842,6 +1055,8 @@ public class IamConditionContextResolver {
 
     private Map<String, List<String>> ec2ConditionContext(String action, ContainerRequestContext ctx) {
         return switch (action) {
+            case "ec2:CreatePlacementGroup", "ec2:DeletePlacementGroup", "ec2:DescribePlacementGroups" ->
+                    placementGroupConditionContext(action, ctx);
             case "ec2:RunInstances" -> ec2RunInstancesConditionContext(ctx);
             case "ec2:CreateTags" -> ec2CreateTagsConditionContext(ctx);
             case "ec2:DeleteTags" -> ec2ResourceTagConditionContext(ctx, "ResourceId.1");
@@ -852,6 +1067,43 @@ public class IamConditionContextResolver {
                     ec2ResourceTagConditionContext(ctx, "GroupId");
             default -> null;
         };
+    }
+
+    private Map<String, List<String>> placementGroupConditionContext(String action, ContainerRequestContext ctx) {
+        Map<String, String> form = formParameters(ctx);
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        conditions.put("ec2:Region", List.of(region));
+        if ("ec2:DescribePlacementGroups".equals(action)) {
+            return conditions;
+        }
+        String name = form.get("GroupName");
+        if (name != null) {
+            conditions.put("ec2:PlacementGroupName", List.of(name));
+        }
+        if ("ec2:CreatePlacementGroup".equals(action)) {
+            String strategy = form.get("Strategy");
+            if (strategy != null) {
+                conditions.put("ec2:PlacementGroupStrategy", List.of(strategy));
+            }
+            for (String prefix : List.of("TagSpecification.", "TagSpecifications.")) {
+                for (int spec = 1; form.containsKey(prefix + spec + ".ResourceType"); spec++) {
+                    if ("placement-group".equals(form.get(prefix + spec + ".ResourceType"))) {
+                        addRequestTags(conditions, form, prefix + spec + ".Tag.");
+                    }
+                }
+            }
+        } else if (placementGroupService != null && placementGroupService.isResolvable()) {
+            Ec2PlacementGroup group = placementGroupService.get().authorizationTarget(region, name);
+            if (group != null) {
+                conditions.put("ec2:PlacementGroupStrategy", List.of(group.strategy()));
+                group.tags().forEach((key, value) -> {
+                    conditions.put("aws:ResourceTag/" + key, List.of(value));
+                    conditions.put("ec2:ResourceTag/" + key, List.of(value));
+                });
+            }
+        }
+        return conditions;
     }
 
     /**
@@ -1121,6 +1373,30 @@ public class IamConditionContextResolver {
             }
         }
         return modes.isEmpty() ? List.of("NONE") : List.copyOf(modes);
+    }
+
+    record AthenaQueryTarget(String resource, Map<String, List<String>> context) {
+    }
+
+    static boolean athenaQueryAction(String action) {
+        if (action == null) {
+            return false;
+        }
+        return switch (action) {
+            case "athena:BatchGetQueryExecution", "athena:GetQueryExecution", "athena:GetQueryResults",
+                    "athena:StopQueryExecution", "athena:ListQueryExecutions" -> true;
+            default -> false;
+        };
+    }
+
+    List<AthenaQueryTarget> athenaQueryTargets(String action, JsonNode body,
+                                              String region, String account) {
+        if (!athenaQueryAction(action) || athenaBatchQueryService == null
+                || !athenaBatchQueryService.isResolvable()) {
+            return List.of();
+        }
+        return athenaBatchQueryService.get().authorizationTargets(action, region, account, body).stream()
+                .map(target -> new AthenaQueryTarget(target.resource(), target.context())).toList();
     }
 
     /** One transaction item keeps its action, table and condition keys together. */
