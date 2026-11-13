@@ -132,13 +132,60 @@ Unknown integration type strings produce warnings and leave the method without a
 integration. With `failOnWarnings=true`, the import or update is rejected before
 changing the API. Leading/trailing whitespace and non-ASCII lookalikes are not accepted.
 
+### Model templates
+
+`GetModelTemplate` reads the current stored model schema. REST APIs return a VTL template
+containing a typed example JSON payload; WebSocket APIs return a VTL mapping template that
+reads the input JSON. WebSocket string values are JSON-escaped, including quotes, backslashes,
+newlines and apostrophes. Nested objects, typed arrays and finite local JSON Pointer
+references (`#/definitions/...`) are supported. Updating the model changes the next generated
+template; no generated-template cache or additional persistent state is used.
+
+This is a bounded JSON-schema subset for `application/json` models. Schema composition
+(`allOf`, `anyOf`, `oneOf`, `not`), enums, const values, union types, tuple/untyped arrays,
+external or cyclic references, and property names containing VTL delimiters (`'`, `"`, `\`,
+`$`, `#`) or control characters return `UnsupportedOperation` (HTTP 501). Validation-only
+constraints such as ranges and formats do not determine the example values. A schema must
+state a supported type, or provide `properties`/`items` from which the type can be inferred.
+The WebSocket mapping projects declared properties; undeclared input fields are not copied,
+and missing or null declared values become JSON null. Mapping inputs must match the declared
+scalar and container types; templates do not validate or coerce payloads. HTTP API templates
+remain unsupported.
+
+Local generation limits are 1,048,576 schema characters, 4,096 visited schema nodes, 32 levels
+of nesting and 262,144 output characters. These are Floci limits, not AWS service quotas.
+
+### Test invocation
+
+`TestInvokeMethod` executes the current configuration of a REST API method with a
+`MOCK` integration before deployment. It uses the same request templates, response
+selection, response templates, headers, and request validators as the live MOCK
+pipeline. The response contains the executed status, body, headers, multi-value
+headers, a local execution log, and measured latency. An integration or validation
+failure is reported in that execution result; an unknown API, resource, or method
+is a management API error.
+
+The simulated body, headers, query string, path parameters, and stage variables
+come from the request payload. They do not replace management credentials or
+change a stored stage, deployment, API key, or cache. Methods with `NONE` or
+`AWS_IAM` authorization are supported; test invocation does not run viewer IAM or
+API-key checks. The live execute endpoint continues to enforce its existing
+viewer checks. Management requests use the authenticated account and region and
+require `apigateway:POST` on the method resource when IAM enforcement is enabled.
+
+The supported scope is MOCK execution. Other integration types, custom and Cognito
+authorizers, client certificates, and a header appearing in both `headers` and
+`multiValueHeaders` are explicitly refused. Local execution logs are returned in
+the response and are not delivered to CloudWatch Logs. This does not add backend
+invocation support or change live viewer execution.
+
 ### Supported Operations
 
 | Category | Operations |
 |---|---|
 | **APIs** | CreateRestApi, ImportRestApi, PutRestApi, GetRestApi, GetRestApis, UpdateRestApi, DeleteRestApi |
 | **Resources** | CreateResource, GetResource, GetResources, UpdateResource, DeleteResource |
-| **Methods** | PutMethod, GetMethod, UpdateMethod, DeleteMethod |
+| **Methods** | PutMethod, GetMethod, UpdateMethod, DeleteMethod, TestInvokeMethod |
 | **Method Responses** | PutMethodResponse, GetMethodResponse, DeleteMethodResponse |
 | **Integrations** | PutIntegration, GetIntegration, UpdateIntegration, DeleteIntegration |
 | **Integration Responses** | PutIntegrationResponse, GetIntegrationResponse, UpdateIntegrationResponse, DeleteIntegrationResponse |
@@ -150,11 +197,30 @@ changing the API. Leading/trailing whitespace and non-ASCII lookalikes are not a
 | **Usage Plan Keys** | CreateUsagePlanKey, GetUsagePlanKey, GetUsagePlanKeys, DeleteUsagePlanKey |
 | **Request Validators** | CreateRequestValidator, GetRequestValidator, GetRequestValidators, UpdateRequestValidator, DeleteRequestValidator |
 | **Gateway Responses** | PutGatewayResponse, GetGatewayResponse, GetGatewayResponses, UpdateGatewayResponse, DeleteGatewayResponse |
-| **Models** | CreateModel, GetModel, GetModels, UpdateModel, DeleteModel |
+| **Models** | CreateModel, GetModel, GetModels, GetModelTemplate, UpdateModel, DeleteModel |
+| **Documentation Parts** | CreateDocumentationPart, GetDocumentationPart, GetDocumentationParts, UpdateDocumentationPart, DeleteDocumentationPart, ImportDocumentationParts |
 | **Domain Names** | CreateDomainName, GetDomainName, GetDomainNames, UpdateDomainName, DeleteDomainName |
 | **Base Path Mappings** | CreateBasePathMapping, GetBasePathMapping, GetBasePathMappings, UpdateBasePathMapping, DeleteBasePathMapping |
 | **Account** | GetAccount, UpdateAccount |
 | **Tags** | TagResource, UntagResource, GetTags (ListTagsForResource) |
+
+`ImportDocumentationParts` accepts a JSON OpenAPI 2.0 or 3.0 document containing
+`x-amazon-apigateway-documentation.documentationParts`. Its default `merge` mode preserves
+existing part IDs and property attributes omitted from the import; an incoming attribute
+replaces the corresponding whole attribute, including an object or array. `overwrite`
+replaces the documentation collection and properties. An empty array in overwrite mode
+clears the collection. API resources, methods, models and other API definitions in the
+OpenAPI document are not changed by this operation.
+
+The complete import is validated before a single storage commit. Invalid locations or
+properties, duplicate canonical locations within one import, and `failOnWarnings=true`
+with parser warnings leave the prior collection intact. Warnings come from the local
+OpenAPI parser; their wording is not an exact AWS diagnostic catalog. YAML and external
+reference resolution are not supported. The extension's `version` is snapshot metadata;
+importing it does not create a documentation version.
+
+Documentation part listing covers created parts. The `UNDOCUMENTED` location status does not
+discover API locations without documentation content yet.
 
 `TagResource`, `UntagResource` and `GetTags` also accept API key and usage plan ARNs,
 `arn:aws:apigateway:<region>::/apikeys/<id>` and `arn:aws:apigateway:<region>::/usageplans/<id>`.
@@ -445,10 +511,8 @@ response.
 These management-plane operations have no handler in v1. Calls will return `404` or an error:
 
 - Authorizer testing: `TestInvokeAuthorizer`
-- Model templates: `GetModelTemplate`
-- Documentation parts and versions (the entire family, 10 operations)
+- Documentation versions (5 operations)
 - Client Certificates (5 operations)
-- `ImportDocumentationParts`
 
 The execute plane (actual proxied HTTP traffic via `/restapis/{id}/{stage}/_user_request_/…`)
 is implemented separately and is not counted as management-plane operations. A deployed REST
@@ -962,7 +1026,7 @@ listener relays the request unchanged and does not add a hop.
 | **Authorizers** | CreateAuthorizer, GetAuthorizer, GetAuthorizers, UpdateAuthorizer, DeleteAuthorizer |
 | **Stages** | CreateStage, GetStage, GetStages, UpdateStage, DeleteStage |
 | **Deployments** | CreateDeployment, GetDeployment, GetDeployments, UpdateDeployment, DeleteDeployment |
-| **Models** | CreateModel, GetModel, GetModels, UpdateModel, DeleteModel |
+| **Models** | CreateModel, GetModel, GetModels, GetModelTemplate, UpdateModel, DeleteModel |
 | **Domain Names** | CreateDomainName, GetDomainName, GetDomainNames, UpdateDomainName, DeleteDomainName |
 | **API Mappings** | CreateApiMapping, GetApiMapping, GetApiMappings, UpdateApiMapping, DeleteApiMapping |
 | **VPC Links** | CreateVpcLink, GetVpcLink, GetVpcLinks, UpdateVpcLink, DeleteVpcLink |

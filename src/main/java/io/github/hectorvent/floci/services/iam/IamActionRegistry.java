@@ -6,9 +6,11 @@ import io.github.hectorvent.floci.core.common.AwsQueryServiceResolver;
 import io.github.hectorvent.floci.core.common.ProtocolClaim;
 import io.github.hectorvent.floci.core.common.RequestResources;
 import io.github.hectorvent.floci.core.common.WireProtocol;
+import io.github.hectorvent.floci.services.apigateway.ApiGatewayController;
 import io.github.hectorvent.floci.services.appconfig.AppConfigDataController;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbPartiQLParser;
 import io.github.hectorvent.floci.services.eks.EksController;
+import io.github.hectorvent.floci.services.iot.IotController;
 import io.github.hectorvent.floci.services.route53.Route53Controller;
 import io.github.hectorvent.floci.services.s3.S3ObjectActions;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -96,6 +98,8 @@ public class IamActionRegistry {
      * type, so IAM checks them against the wildcard rather than a bucket.
      */
     private static final List<ActionRule> RULES = List.of(
+        rule("iot", "DELETE", "^/jobs/[^/]+/?$", "iot:DeleteJob"),
+
         // ── S3 Control ───────────────────────────────────────────────────────────
         s3ControlRule("GET",    "^/v20180820/tags/.+",        "s3:ListTagsForResource"),
         s3ControlRule("POST",   "^/v20180820/tags/.+",        "s3:TagResource"),
@@ -676,6 +680,37 @@ public class IamActionRegistry {
 
     /** The serving method identifies these actions even when path encoding or matrix parameters vary. */
     public String resolveMatchedRoute(String credentialScope, ResourceInfo resourceInfo) {
+        if ("apigateway".equals(credentialScope) && resourceInfo != null
+                && ApiGatewayController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && "importDocumentationParts".equals(resourceInfo.getResourceMethod().getName())) {
+            return "apigateway:PUT";
+        }
+        if ("apigateway".equals(credentialScope) && resourceInfo != null
+                && ApiGatewayController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && "testInvokeMethod".equals(resourceInfo.getResourceMethod().getName())) {
+            return "apigateway:POST";
+        }
+        if ("iot".equals(credentialScope) && resourceInfo != null
+                && IotController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && "deleteJob".equals(resourceInfo.getResourceMethod().getName())) {
+            return "iot:DeleteJob";
+        }
+        if ("eks".equals(credentialScope) && resourceInfo != null
+                && EksController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && "listAccessPolicies".equals(resourceInfo.getResourceMethod().getName())) {
+            return "eks:ListAccessPolicies";
+        }
+        if ("apigateway".equals(credentialScope) && resourceInfo != null
+                && ApiGatewayController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && ("getModelTemplate".equals(resourceInfo.getResourceMethod().getName())
+                || "getV2ModelTemplate".equals(resourceInfo.getResourceMethod().getName()))) {
+            return "apigateway:GET";
+        }
         if ("appconfig".equals(credentialScope) && resourceInfo != null
                 && AppConfigDataController.class.equals(resourceInfo.getResourceClass())
                 && resourceInfo.getResourceMethod() != null) {
