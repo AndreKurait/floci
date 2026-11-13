@@ -1,0 +1,229 @@
+package io.github.hectorvent.floci.core.common;
+
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator;
+import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.Decision;
+import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.ResourceAccountRelationship;
+import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.ResourcePolicyDecision;
+import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.iam.RequestPrincipal;
+import io.github.hectorvent.floci.services.iam.ResourcePolicyProvider;
+import io.github.hectorvent.floci.services.iam.ResourcePolicyProvider.ResourcePolicy;
+import io.github.hectorvent.floci.services.iam.ResourcePolicyProviders;
+import io.github.hectorvent.floci.services.iam.ScpProvider;
+import io.github.hectorvent.floci.services.iam.model.CallerContext;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Instance;
+import jakarta.inject.Inject;
+
+import java.time.Clock;
+import java.time.Instant;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
+/** Evaluates calls through the shared IAM pipeline using verified or explicitly anonymous callers. */
+@ApplicationScoped
+public class CallerCallAuthorizer {
+
+    private static final String ROOT_ALLOW_ALL =
+            "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"}}";
+
+    private final Clock clock;
+    private final EmulatorConfig config;
+    private final IamService iam;
+    private final IamPolicyEvaluator evaluator;
+    private final Instance<ResourcePolicyProvider> providers;
+    private final Instance<ScpProvider> scpProvider;
+
+    public CallerCallAuthorizer(EmulatorConfig config, IamService iam, IamPolicyEvaluator evaluator,
+                                Instance<ResourcePolicyProvider> providers, Instance<ScpProvider> scpProvider) {
+        this(config, iam, evaluator, providers, scpProvider, Clock.systemUTC());
+    }
+
+    @Inject
+    public CallerCallAuthorizer(EmulatorConfig config, IamService iam, IamPolicyEvaluator evaluator,
+                                Instance<ResourcePolicyProvider> providers, Instance<ScpProvider> scpProvider,
+                                Clock clock) {
+        this.clock = clock;
+        this.config = config;
+        this.iam = iam;
+        this.evaluator = evaluator;
+        this.providers = providers;
+        this.scpProvider = scpProvider;
+    }
+
+    /** Whether endpoints require authenticated callers for opt-in IAM policy evaluation. */
+    public boolean enforcementEnabled() {
+        return config.services().iam().enforcementEnabled();
+    }
+
+    /**
+     * The entry point must verify the signature before supplying this identity. Re-resolving it
+     * here preserves current policy, session and boundary state without trusting request headers.
+     * The verified local test credential represents account root; its implicit identity grant
+     * still goes through resource policy and SCP evaluation.
+     */
+    public Decision authorize(String accessKey, String account, String callerArn, String action,
+                              String resourceArn, String partition) {
+        return authorize(accessKey, account, callerArn, action, resourceArn, partition, Map.of());
+    }
+
+    /** Evaluates an inbound request using transport facts supplied by its endpoint. */
+    public Decision authorizeRequest(String accessKey, String account, String callerArn, String action,
+                                     String resourceArn, String partition, String sourceIp, boolean secureTransport) {
+        Map<String, List<String>> context = new HashMap<>();
+        if (sourceIp != null && !sourceIp.isBlank()) {
+            context.put("aws:SourceIp", List.of(sourceIp));
+        }
+        context.put("aws:SecureTransport", List.of(Boolean.toString(secureTransport)));
+        return authorize(accessKey, account, callerArn, action, resourceArn, partition, context);
+    }
+
+    private Decision authorize(String accessKey, String account, String callerArn, String action,
+                               String resourceArn, String partition, Map<String, List<String>> requestContext) {
+        if (!enforcementEnabled()) {
+            return Decision.ALLOW;
+        }
+        if (accessKey == null || account == null || !AwsArnUtils.isArn(callerArn)
+                || !AwsArnUtils.isArn(resourceArn)) {
+            return Decision.DENY;
+        }
+        AwsArnUtils.Arn principal = AwsArnUtils.parse(callerArn);
+        AwsArnUtils.Arn resource = AwsArnUtils.parse(resourceArn);
+        boolean localRoot = "test".equals(accessKey) && "iam".equals(principal.service())
+                && principal.region().isEmpty() && "root".equals(principal.resource());
+        if (!principal.partition().equals(partition) || !resource.partition().equals(partition)
+                || !principal.accountId().equals(account)
+                || (!localRoot && !iam.resolveAccountId(accessKey).filter(account::equals).isPresent())) {
+            return Decision.DENY;
+        }
+        return RequestScopes.callAs(account, () -> authorizeCaller(accessKey, callerArn, action,
+                resourceArn, resource, resource.region(), localRoot, requestContext));
+    }
+
+    /** Evaluates an action whose AWS authorization model has no resource type, against {@code *}. */
+    public Decision authorizeUnscopedRequest(String accessKey, String account, String callerArn, String action,
+                                            String region, String sourceIp, boolean secureTransport) {
+        if (!enforcementEnabled()) {
+            return Decision.ALLOW;
+        }
+        if (accessKey == null || account == null || !AwsArnUtils.isArn(callerArn)) {
+            return Decision.DENY;
+        }
+        AwsArnUtils.Arn principal = AwsArnUtils.parse(callerArn);
+        boolean localRoot = "test".equals(accessKey) && "iam".equals(principal.service())
+                && principal.region().isEmpty() && "root".equals(principal.resource());
+        if (!principal.partition().equals(AwsRegions.partitionFor(region))
+                || !principal.accountId().equals(account)
+                || (!localRoot && !iam.resolveAccountId(accessKey).filter(account::equals).isPresent())) {
+            return Decision.DENY;
+        }
+        Map<String, List<String>> context = new HashMap<>();
+        if (sourceIp != null && !sourceIp.isBlank()) {
+            context.put("aws:SourceIp", List.of(sourceIp));
+        }
+        context.put("aws:SecureTransport", List.of(Boolean.toString(secureTransport)));
+        return RequestScopes.callAs(account, region, () -> authorizeCaller(accessKey, callerArn, action,
+                "*", null, region, localRoot, context));
+    }
+
+    /**
+     * Evaluates an unauthenticated public endpoint's resource policy. An endpoint without a
+     * policy retains public access; an attached policy must explicitly allow the anonymous
+     * caller. The transport supplies the source address, never a forwarded identity header.
+     */
+    public Decision authorizeAnonymousResource(String action, String resourceArn, String sourceIp,
+                                               boolean secureTransport) {
+        if (!config.services().iam().enforcementEnabled()) {
+            return Decision.ALLOW;
+        }
+        if (!AwsArnUtils.isArn(resourceArn)) {
+            return Decision.DENY;
+        }
+        AwsArnUtils.Arn resource = AwsArnUtils.parse(resourceArn);
+        List<String> documents = ResourcePolicyProviders.policiesFor(providers, resource.service(), resourceArn)
+                .stream().map(ResourcePolicy::policyDocument)
+                .filter(document -> document != null && !document.isBlank()).toList();
+        if (documents.isEmpty()) {
+            return Decision.ALLOW;
+        }
+        Map<String, List<String>> context = new HashMap<>();
+        if (sourceIp != null && !sourceIp.isBlank()) {
+            context.put("aws:SourceIp", List.of(sourceIp));
+        }
+        context.put("aws:SecureTransport", List.of(Boolean.toString(secureTransport)));
+        putRequestTime(context, clock.instant());
+        context = IamConditionContextResolver.withGlobalContext(context, resourceArn, resource.region(),
+                "anonymous", resource.accountId());
+        ResourcePolicyDecision grant = evaluator.evaluateResourcePolicyFor(documents, RequestPrincipal.anonymous(),
+                action, resourceArn, context);
+        return grant == ResourcePolicyDecision.ALLOW ? Decision.ALLOW : Decision.DENY;
+    }
+
+    /** Resource-policy phase for a custom authorizer, whose principalId is not an IAM identity. */
+    public ResourcePolicyDecision evaluateAnonymousResourcePolicy(String action, String resourceArn,
+                                                                   String sourceIp, boolean secureTransport) {
+        if (!config.services().iam().enforcementEnabled()) {
+            return ResourcePolicyDecision.NEUTRAL;
+        }
+        if (!AwsArnUtils.isArn(resourceArn)) {
+            return ResourcePolicyDecision.EXPLICIT_DENY;
+        }
+        AwsArnUtils.Arn resource = AwsArnUtils.parse(resourceArn);
+        List<String> documents = ResourcePolicyProviders.policiesFor(providers, resource.service(), resourceArn)
+                .stream().map(ResourcePolicy::policyDocument)
+                .filter(document -> document != null && !document.isBlank()).toList();
+        Map<String, List<String>> context = new HashMap<>();
+        if (sourceIp != null && !sourceIp.isBlank()) {
+            context.put("aws:SourceIp", List.of(sourceIp));
+        }
+        context.put("aws:SecureTransport", List.of(Boolean.toString(secureTransport)));
+        putRequestTime(context, clock.instant());
+        context = IamConditionContextResolver.withGlobalContext(context, resourceArn, resource.region(),
+                "anonymous", resource.accountId());
+        return evaluator.evaluateResourcePolicyFor(documents, RequestPrincipal.anonymous(),
+                action, resourceArn, context);
+    }
+
+    private static void putRequestTime(Map<String, List<String>> context, Instant now) {
+        context.put("aws:CurrentTime", List.of(now.toString()));
+        context.put("aws:EpochTime", List.of(Long.toString(now.getEpochSecond())));
+    }
+
+    private Decision authorizeCaller(String accessKey, String callerArn, String action, String resourceArn,
+                                     AwsArnUtils.Arn resource, String region, boolean localRoot,
+                                     Map<String, List<String>> requestContext) {
+        Instant now = clock.instant();
+        if (iam.isInactiveAccessKey(accessKey) || iam.isExpiredSession(accessKey, now)) {
+            return Decision.DENY;
+        }
+        CallerContext caller = localRoot ? CallerContext.of(List.of(ROOT_ALLOW_ALL))
+                : iam.resolveCallerContext(accessKey, now);
+        IamService.CallerArns arns = localRoot
+                ? IamService.CallerArns.accountRoot(callerArn, AwsArnUtils.parse(callerArn).accountId())
+                : iam.resolveCallerArns(accessKey).orElse(null);
+        if (caller == null || arns == null || !callerArn.equals(arns.callerArn())) {
+            return Decision.DENY;
+        }
+        String account = AwsArnUtils.parse(callerArn).accountId();
+        List<ResourcePolicy> policies = resource == null ? List.of()
+                : ResourcePolicyProviders.policiesFor(providers, resource.service(), resourceArn);
+        String owner = resource == null ? account
+                : policies.isEmpty() ? resource.accountId() : policies.getFirst().ownerAccountId();
+        List<String> documents = policies.stream().map(ResourcePolicy::policyDocument)
+                .filter(document -> document != null && !document.isBlank()).toList();
+        List<List<String>> scps = scpProvider.isResolvable()
+                ? scpProvider.get().effectiveScpLevels(account) : null;
+        Map<String, List<String>> context = new HashMap<>(requestContext);
+        putRequestTime(context, now);
+        arns.putPrincipalKeys(context);
+        context = IamConditionContextResolver.withGlobalContext(context, resourceArn, region, account, owner);
+        ResourcePolicyDecision grant = evaluator.evaluateResourcePolicyFor(documents.isEmpty() ? null : documents,
+                RequestPrincipal.caller(arns), action, resourceArn, context);
+        ResourceAccountRelationship relationship = account.equals(owner)
+                ? ResourceAccountRelationship.SAME_ACCOUNT : ResourceAccountRelationship.CROSS_ACCOUNT;
+        return evaluator.evaluateResolvedResourcePolicy(caller.withPrincipalArn(callerArn).withScpLevels(scps),
+                grant, relationship, action, resourceArn, context);
+    }
+}
