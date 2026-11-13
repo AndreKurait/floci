@@ -2,9 +2,9 @@
 
 CloudFront management-plane and local content-delivery emulation. Supports distribution lifecycle,
 cache policies, origin request policies, response headers policies, origin access controls, origin
-access identities, public keys, trusted key groups, CloudFront Functions, invalidations, tagging, and
-viewer delivery from S3 or custom origins for every CloudFront viewer method (GET, HEAD, OPTIONS, POST,
-PUT, PATCH and DELETE).
+access identities, public keys, trusted key groups, CloudFront Functions, key value stores, invalidations,
+tagging, and viewer delivery from S3 or custom origins for every CloudFront viewer method (GET, HEAD,
+OPTIONS, POST, PUT, PATCH and DELETE).
 
 **Protocol:** REST XML
 **API version:** `2020-05-31`
@@ -75,9 +75,12 @@ PUT, PATCH and DELETE).
 | `CreateOriginAccessControl` | POST | `/2020-05-31/origin-access-control` |
 | `GetOriginAccessControl` | GET | `/2020-05-31/origin-access-control/{Id}` |
 | `GetOriginAccessControlConfig` | GET | `/2020-05-31/origin-access-control/{Id}/config` |
-| `UpdateOriginAccessControl` | PUT | `/2020-05-31/origin-access-control/{Id}` |
+| `UpdateOriginAccessControl` | PUT | `/2020-05-31/origin-access-control/{Id}/config` |
 | `DeleteOriginAccessControl` | DELETE | `/2020-05-31/origin-access-control/{Id}` |
 | `ListOriginAccessControls` | GET | `/2020-05-31/origin-access-control` |
+
+`UpdateOriginAccessControl` accepts the current `If-Match` ETag and a complete configuration.
+With IAM enforcement enabled, its permission can be scoped to the selected origin access control ARN.
 
 ### Origin Access Identity (OAI — legacy)
 
@@ -102,6 +105,31 @@ PUT, PATCH and DELETE).
 | `DeleteFunction` | DELETE | `/2020-05-31/function/{Name}` |
 | `ListFunctions` | GET | `/2020-05-31/function` |
 
+### Key Value Stores
+
+Control plane, served with the rest of CloudFront:
+
+| Operation | Method | Path |
+|---|---|---|
+| `CreateKeyValueStore` | POST | `/2020-05-31/key-value-store` |
+| `DescribeKeyValueStore` | GET | `/2020-05-31/key-value-store/{Name}` |
+| `ListKeyValueStores` | GET | `/2020-05-31/key-value-store` |
+| `UpdateKeyValueStore` | PUT | `/2020-05-31/key-value-store/{Name}` |
+| `DeleteKeyValueStore` | DELETE | `/2020-05-31/key-value-store/{Name}` |
+
+The keys of a store are read and written through the separate `cloudfront-keyvaluestore` data plane
+(REST JSON, signing name `cloudfront-keyvaluestore`). It names the store by its ARN, percent-encoded in
+the path:
+
+| Operation | Method | Path |
+|---|---|---|
+| `DescribeKeyValueStore` | GET | `/key-value-stores/{KvsARN}` |
+| `ListKeys` | GET | `/key-value-stores/{KvsARN}/keys` |
+| `UpdateKeys` | POST | `/key-value-stores/{KvsARN}/keys` |
+| `GetKey` | GET | `/key-value-stores/{KvsARN}/keys/{Key}` |
+| `PutKey` | PUT | `/key-value-stores/{KvsARN}/keys/{Key}` |
+| `DeleteKey` | DELETE | `/key-value-stores/{KvsARN}/keys/{Key}` |
+
 ### Public Keys and Key Groups
 
 | Operation | Method | Path |
@@ -118,6 +146,38 @@ PUT, PATCH and DELETE).
 | `UpdateKeyGroup` | PUT | `/2020-05-31/key-group/{Id}` |
 | `DeleteKeyGroup` | DELETE | `/2020-05-31/key-group/{Id}` |
 | `ListKeyGroups` | GET | `/2020-05-31/key-group` |
+
+### Field-level encryption configuration and profile metadata
+
+| Operation | Method | Path |
+|---|---|---|
+| `CreateFieldLevelEncryptionConfig` | POST | `/2020-05-31/field-level-encryption` |
+| `GetFieldLevelEncryption` | GET | `/2020-05-31/field-level-encryption/{Id}` |
+| `GetFieldLevelEncryptionConfig` | GET | `/2020-05-31/field-level-encryption/{Id}/config` |
+| `UpdateFieldLevelEncryptionConfig` | PUT | `/2020-05-31/field-level-encryption/{Id}/config` |
+| `DeleteFieldLevelEncryptionConfig` | DELETE | `/2020-05-31/field-level-encryption/{Id}` |
+| `CreateFieldLevelEncryptionProfile` | POST | `/2020-05-31/field-level-encryption-profile` |
+| `GetFieldLevelEncryptionProfile` | GET | `/2020-05-31/field-level-encryption-profile/{Id}` |
+| `GetFieldLevelEncryptionProfileConfig` | GET | `/2020-05-31/field-level-encryption-profile/{Id}/config` |
+| `UpdateFieldLevelEncryptionProfile` | PUT | `/2020-05-31/field-level-encryption-profile/{Id}/config` |
+| `DeleteFieldLevelEncryptionProfile` | DELETE | `/2020-05-31/field-level-encryption-profile/{Id}` |
+
+Creation and replacement updates persist the query-argument and content-type profile mappings,
+including their forwarding flags, and profile encryption entities with public-key IDs, provider
+IDs and field patterns. Omitted optional blocks remain absent, and zero-count collections remain
+empty. Declared quantities must match the submitted items. Profile IDs and public-key IDs must
+resolve in the caller's account. Field patterns are case-sensitive and cannot overlap. Rejected
+requests preserve the prior configuration and ETag. Nested configuration and profile metadata
+survive persistent, hybrid, and WAL reloads. Older persisted profiles whose encryption entities
+were discarded remain readable, but their lost entities cannot be reconstructed.
+
+`GetFieldLevelEncryption` and `GetFieldLevelEncryptionProfile` return the stored ID,
+last-modified time and nested configuration; their `Config` getters return the configuration
+directly. All four return the current ETag and authorize their own IAM action against the global
+`arn:${Partition}:cloudfront::${Account}:field-level-encryption-config/${Id}` or
+`arn:${Partition}:cloudfront::${Account}:field-level-encryption-profile/${Id}` resource.
+Ownership follows the signing credential's account. These operations manage metadata;
+viewer field encryption and profile-reference deletion constraints are outside this implementation.
 
 ### Tagging
 
@@ -342,6 +402,44 @@ PUT, PATCH and DELETE).
   `ListResponseHeadersPolicies?Type=managed`; `Type` uses the AWS lowercase `managed` or `custom`
   values.
 
+## Key Value Stores
+
+A key value store holds the key value pairs a CloudFront Function reads at the edge. The store is created
+and described through the CloudFront control plane, and its keys are managed through the
+`cloudfront-keyvaluestore` data plane, which Floci serves on the same port.
+
+- A store has a name (1 to 64 letters, digits, hyphens and underscores) and an ARN,
+  `arn:aws:cloudfront::<account>:key-value-store/<uuid>`. Stores are `READY` as soon as they are created.
+- The data plane takes the store's ARN in the request path, percent-encoded. The AWS SDKs prepend the
+  account id of that ARN to the endpoint host (`000000000000.localhost.floci.io`), which the embedded DNS
+  and the generated TLS certificate already cover. The requests are signed with SigV4A; Floci reads the
+  `cloudfront-keyvaluestore` signing name from its credential scope and does not verify the signature.
+  With `floci.auth.validate-signatures` on, these requests are refused: signature validation does not accept
+  SigV4A outside S3 yet, so leave it off when using the data plane.
+- With IAM enforcement on, the data plane is authorized as `cloudfront-keyvaluestore:<Operation>` on the store's ARN,
+  and the control plane as `cloudfront:<Operation>`.
+- Keys are listed in key order, 10 per page by default and up to 50 (`MaxResults`).
+- Quotas: a key is at most 512 bytes, a value at most 1,024 bytes and a store at most 5 MiB, counting the
+  UTF-8 bytes of every key and value. Exceeding the first two is a `ValidationException`, and exceeding the
+  store size is a `ServiceQuotaExceededException`. `ItemCount` and `TotalSizeInBytes` follow the same count.
+- Every key write needs the store's current data plane ETag in `If-Match`, and rotates it. `UpdateKeys`
+  applies its puts and deletes together (at most 50 entries and 3 MB per request), and changes nothing when any
+  entry is invalid, including a put without a `Value`. A stale or missing ETag on the
+  data plane is a `ValidationException` ("Pre-Condition failed during update of Key-Value-Store"). The control
+  plane returns `PreconditionFailed` (412) for a valid stale version, and `InvalidIfMatchVersion` (400)
+  for a missing or malformed version.
+- The control plane and the data plane keep independent ETags: a comment update rotates only the control plane
+  ETag, and a key write only the data plane ETag.
+- An account can hold at most 200 stores (`EntityLimitExceeded`), and a store can be associated with at most 100
+  functions (`TooManyFunctionsAssociatedToKeyValueStore`). Deleting a store also drops its tags.
+- Deleting a key that is not in the store is a `ResourceNotFoundException`. In `UpdateKeys` the delete of an
+  absent key is skipped.
+- A function can name at most one store in `FunctionConfig.KeyValueStoreAssociations`, and only with the
+  `cloudfront-js-2.0` runtime. The store has to exist (`EntityNotFound`), and a store that a function
+  uses cannot be deleted (`CannotDeleteEntityWhileInUse`).
+- Floci does not run CloudFront Functions. A function that reads the store with `cf.kvs()` is stored and
+  associated, but nothing executes it, so the store is useful for testing the code that writes it.
+
 ## Configuration
 
 | Property | Env var | Default | Description |
@@ -525,10 +623,16 @@ signatures must still return 403. Verify those cases through the proxy after con
 - Continuous deployment policies (`CreateContinuousDeploymentPolicy`, etc.)
 - `CopyDistribution` (staging distributions)
 - Real-time log configs (`CreateRealtimeLogConfig`, etc.)
-- Field-level encryption (`CreateFieldLevelEncryptionConfig`, etc.)
+- Field-level encryption of viewer requests (configuration metadata is supported above).
 - `TestFunction` execution (function is stored, not executed)
 - Streaming distributions (RTMP — deprecated by AWS)
-- VPC origins, Anycast IP lists, key value stores
+- VPC origins, Anycast IP lists
+- Importing keys into a key value store from S3: `CreateKeyValueStore` with an `ImportSource` is rejected with
+  `InvalidArgument`
+- Running CloudFront Functions, so the key value store can only be read and written through its API, not
+  from a function with `cf.kvs()`
+- CloudFormation provisioning of `AWS::CloudFront::KeyValueStore`, and `KeyValueStoreAssociations` on
+  `AWS::CloudFront::Function`
 - Monitoring subscriptions
 - CloudFormation provisioning of custom `AWS::CloudFront::ResponseHeadersPolicy` resources
   (literal custom or managed policy IDs are supported on distributions)
@@ -536,3 +640,18 @@ signatures must still return 403. Verify those cases through the proxy after con
 - Forwarding POST, PUT, PATCH and DELETE to S3 origins. AWS passes them to S3, which evaluates them
   against the bucket policy (OAC supports `PUT` and `DELETE`); Floci's in-process S3 origin answers
   them with 403 `Access Denied`, as S3 does for a request that holds no write grant.
+
+### Key value store version checks
+
+The control plane keeps an ETag separate from the data plane's ETag. Updating a comment changes only the
+control ETag; writing keys changes only the data ETag. `UpdateKeyValueStore` and `DeleteKeyValueStore`
+return `412 PreconditionFailed` for a valid but stale control ETag, and `400 InvalidIfMatchVersion` for a
+missing or malformed version. Rejected requests preserve the store and its current versions. Floci keeps
+accepting the UUID versions it issues and persists; it also recognizes the observed CloudFront `E` plus
+13 uppercase alphanumeric form. This is a bounded compatibility rule, not a published AWS format guarantee.
+
+The dev backport adds IAM route and resource coverage for these five KVS control operations and the six
+`cloudfront-keyvaluestore` data operations. Other CloudFront control operations keep their previous IAM
+coverage. Native SDK tests use canonical SigV4A credentials with IAM enforcement; enabling the optional
+`validate-signatures` setting still rejects SigV4A in the existing global signature filter. This feature
+adds no SigV4A cryptographic verification or CloudFront Function execution engine.

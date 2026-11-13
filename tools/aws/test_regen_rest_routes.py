@@ -59,7 +59,9 @@ def test_check_passes_on_a_fresh_generation_and_fails_on_a_stale_one(tmp_path):
         directory = tmp_path / "data" / name / "2020-01-01"
         directory.mkdir(parents=True)
         with gzip.open(directory / "service-2.json.gz", "wt", encoding="utf-8") as f:
-            json.dump(model("rest-json", "2020-01-01", Ping=("GET", "/ping")), f)
+            operations = {operation: ("GET", "/ping/" + operation)
+                          for operation in r.ONLY_OPERATIONS.get(name, ("Ping",))}
+            json.dump(model("rest-json", "2020-01-01", **operations), f)
     output = tmp_path / "rest-routes.json"
     data = ["--botocore-data", str(tmp_path / "data"), "--output", str(output)]
 
@@ -92,3 +94,11 @@ def test_the_hand_routed_scopes_are_rendered_with_their_reasons():
 
     assert json.loads(text)["handRouted"] == dict(sorted(r.HAND_ROUTED.items()))
     assert text.splitlines()[2] == '  "handRouted": {'
+
+
+def test_cloudfront_reads_only_its_qualified_key_value_store_family():
+    operations = {name: ("GET", "/kvs/" + name) for name in r.ONLY_OPERATIONS["cloudfront"]}
+    operations["ListDistributions"] = ("GET", "/distributions")
+    result = r.build({"cloudfront": model("rest-xml", "2020-05-31", **operations)}, "test")
+    assert set(result["models"]["cloudfront"]["operations"]) == set(r.ONLY_OPERATIONS["cloudfront"])
+    assert "ListDistributions" not in result["models"]["cloudfront"]["operations"]
