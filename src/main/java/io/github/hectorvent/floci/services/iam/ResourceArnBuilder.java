@@ -13,6 +13,8 @@ import io.github.hectorvent.floci.core.common.SigV4CredentialScope;
 import io.github.hectorvent.floci.core.common.StoredResourceArns;
 import io.github.hectorvent.floci.core.common.auth.SigV4Canonicalization;
 import io.github.hectorvent.floci.services.backup.BackupFrameworkResources;
+import io.github.hectorvent.floci.services.cloudformation.CloudFormationDriftService;
+import io.github.hectorvent.floci.services.cloudformation.CloudFormationDriftSnapshot;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.LogGroupTagTarget;
 import io.github.hectorvent.floci.services.cloudwatch.logs.LogTransformerTarget;
@@ -98,6 +100,9 @@ public class ResourceArnBuilder {
     /** The SSM actions whose {@code ResourceArn} names the parameter they act on, in place of {@code Name}. */
     private static final Set<String> SSM_RESOURCE_POLICY_ACTIONS =
             Set.of("PutResourcePolicy", "GetResourcePolicies", "DeleteResourcePolicy");
+
+    @Inject
+    Instance<CloudFormationDriftService> driftService;
 
     private final ObjectMapper objectMapper;
     /**
@@ -328,6 +333,17 @@ public class ResourceArnBuilder {
         if ("lambda:GetRuntimeManagementConfig".equals(operation)
                 || "lambda:PutRuntimeManagementConfig".equals(operation)) {
             return List.of(runtimeManagementArn(ctx, region, accountId));
+        }
+        if ("cloudformation".equals(credentialScope) && CloudFormationDriftService.handles(operation)) {
+            if ("cloudformation:DescribeStackDriftDetectionStatus".equals(operation)) {
+                return List.of("*");
+            }
+            if (driftService == null || !driftService.isResolvable()) {
+                return List.of("*");
+            }
+            CloudFormationDriftSnapshot stack = driftService.get().authorizationTarget(
+                    firstFormParam(ctx, "StackName"), region, accountId);
+            return List.of(stack.stackId() == null ? "*" : stack.stackId());
         }
         if (operation != null && operation.startsWith(credentialScope + ":") && RequestResources.reads(operation)) {
             return namedResources(credentialScope, operation, ctx, region, accountId, partition);

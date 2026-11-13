@@ -8,6 +8,8 @@ import io.github.hectorvent.floci.services.athena.AthenaBatchQueryService;
 import io.github.hectorvent.floci.services.athena.AthenaPreparedStatementService;
 import io.github.hectorvent.floci.services.backup.BackupFrameworkResources;
 import io.github.hectorvent.floci.services.backup.BackupFrameworkService;
+import io.github.hectorvent.floci.services.cloudformation.CloudFormationDriftService;
+import io.github.hectorvent.floci.services.cloudformation.CloudFormationDriftSnapshot;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.LogGroupTagTarget;
@@ -114,6 +116,8 @@ public class IamConditionContextResolver {
     Instance<BackupFrameworkService> backupFrameworks;
     @Inject
     Instance<ApiGatewayDocumentationIamConditions> documentationConditions;
+    @Inject
+    Instance<CloudFormationDriftService> driftService;
 
     private final Instance<DynamoDbFacade> dynamoDbFacade;
     private final Instance<Ec2Service> ec2Service;
@@ -313,6 +317,7 @@ public class IamConditionContextResolver {
             case "backup" -> backupFrameworkConditions(action, ctx);
             case "apigateway" -> documentationConditions != null && documentationConditions.isResolvable()
                     ? documentationConditions.get().resolve(action, ctx) : null;
+            case "cloudformation" -> driftConditionContext(action, ctx);
             case "s3" -> s3ConditionContext(action, ctx);
             case "ec2" -> ec2ConditionContext(action, ctx);
             case "ecr" -> ecrPreviewConditionContext(action, ctx);
@@ -447,6 +452,21 @@ public class IamConditionContextResolver {
             }
         });
         return conditions;
+    }
+
+    private Map<String, List<String>> driftConditionContext(String action, ContainerRequestContext ctx) {
+        if (!CloudFormationDriftService.handles(action)
+                || "cloudformation:DescribeStackDriftDetectionStatus".equals(action)
+                || driftService == null || !driftService.isResolvable()) {
+            return null;
+        }
+        String account = requestContext.getAccountId() == null ? config.defaultAccountId() : requestContext.getAccountId();
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        CloudFormationDriftSnapshot stack = driftService.get().authorizationTarget(
+                formParameters(ctx).get("StackName"), region, account);
+        Map<String, List<String>> context = new LinkedHashMap<>();
+        stack.tags().forEach((key, value) -> context.put("aws:ResourceTag/" + key, List.of(value)));
+        return context;
     }
 
     private Map<String, List<String>> logsConditionContext(String action, ContainerRequestContext ctx) {
