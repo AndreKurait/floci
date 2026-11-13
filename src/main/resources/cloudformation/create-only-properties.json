@@ -85,6 +85,15 @@
   "AWS::AppConfig::Environment": [
     "ApplicationId"
   ],
+  "AWS::AppConfig::HostedConfigurationVersion": [
+    "ApplicationId",
+    "ConfigurationProfileId",
+    "Description",
+    "Content",
+    "ContentType",
+    "LatestVersionNumber",
+    "VersionLabel"
+  ],
   "AWS::AppSync::ApiKey": [
     "ApiId"
   ],
