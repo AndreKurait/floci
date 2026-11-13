@@ -52,6 +52,16 @@ public class LambdaResourcePolicyProvider implements ResourcePolicyProvider {
 
     @Override
     public List<ResourcePolicy> getResourcePolicies(String credentialScope, String resourceArn) {
+        return policies(resourceArn, false);
+    }
+
+    @Override
+    public List<ResourcePolicy> getResourcePolicies(String credentialScope, String action, String resourceArn) {
+        return policies(resourceArn, "lambda:GetRuntimeManagementConfig".equals(action)
+                || "lambda:PutRuntimeManagementConfig".equals(action));
+    }
+
+    private List<ResourcePolicy> policies(String resourceArn, boolean readOnly) {
         if (!AwsArnUtils.isArnFor(resourceArn, "lambda")) {
             return List.of();
         }
@@ -61,7 +71,8 @@ public class LambdaResourcePolicyProvider implements ResourcePolicyProvider {
             return List.of();
         }
         List<Map<String, Object>> statements =
-                lambdaService.policyStatements(arn.accountId(), arn.region(), function.group(1));
+                readOnly ? lambdaService.runtimeManagementPolicyStatements(arn.accountId(), arn.region(), function.group(1))
+                        : lambdaService.policyStatements(arn.accountId(), arn.region(), function.group(1));
         return List.of(new ResourcePolicy(policyDocument(statements), arn.accountId()));
     }
 

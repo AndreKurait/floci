@@ -684,7 +684,7 @@ public class LambdaService implements ResourceProvider {
             }
         }
 
-        functionStore.save(region, fn);
+        functionStore.create(region, fn);
         LOG.infov("Created Lambda function: {0} in region {1}", functionName, region);
         if (Boolean.TRUE.equals(request.get("Publish"))) {
             return publishVersion(region, functionName, null);
@@ -4128,6 +4128,22 @@ public class LambdaService implements ResourceProvider {
         }
         synchronized (lockForPolicyMutation(observed.get().getFunctionArn())) {
             return functionStore.getForAccount(accountId, region, functionName)
+                    .map(fn -> fn.getPolicies().stream()
+                            .<Map<String, Object>>map(LinkedHashMap::new)
+                            .toList())
+                    .orElse(List.of());
+        }
+    }
+
+    /** Runtime-management authorization must not migrate the function before IAM can deny the request. */
+    public List<Map<String, Object>> runtimeManagementPolicyStatements(
+            String accountId, String region, String functionName) {
+        Optional<LambdaFunction> observed = functionStore.getReadOnlyForAccount(accountId, region, functionName, "$LATEST");
+        if (observed.isEmpty()) {
+            return List.of();
+        }
+        synchronized (lockForPolicyMutation(observed.get().getFunctionArn())) {
+            return functionStore.getReadOnlyForAccount(accountId, region, functionName, "$LATEST")
                     .map(fn -> fn.getPolicies().stream()
                             .<Map<String, Object>>map(LinkedHashMap::new)
                             .toList())
