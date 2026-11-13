@@ -3,6 +3,16 @@
 **Protocol:** JSON 1.0 (`X-Amz-Target: DynamoDB_20120810.*`)
 **Endpoint:** `POST http://localhost:4566/`
 
+## Compressed requests
+
+DynamoDB JSON 1.0 requests accept `Content-Encoding: gzip` for modern operations and the supported
+legacy operations. Signature verification uses the compressed bytes. Floci then decompresses the
+body before IAM evaluates table resources and item keys.
+
+The decompressed body is limited to 16,000,000 bytes, matching the largest request accepted in a live
+AWS probe. Floci returns HTTP 413 for larger bodies and HTTP 400 for invalid gzip; that probe received
+HTTP 500 for these cases. DynamoDB Streams and other request formats retain their existing handling.
+
 ## ListTables authorization
 
 With IAM enforcement enabled, `ListTables` evaluates the regional table collection
@@ -26,8 +36,6 @@ including batch, transaction and PartiQL table extraction.
 | `DeleteTable` | Delete a table |
 | `DescribeTable` | Get table metadata |
 | `ListTables` | List all tables |
-| `DescribeLimits` | Get the default account and table capacity quotas |
-| `DescribeEndpoints` | Get Floci's own host and port as the endpoint |
 | `UpdateTable` | Update throughput, indexes, streams |
 | `PutItem` | Write an item |
 | `GetItem` | Read an item by primary key |
@@ -58,12 +66,15 @@ including batch, transaction and PartiQL table extraction.
 | `RestoreTableFromBackup` | Create a new table from a backup |
 | `DescribeKinesisStreamingDestination` | List Kinesis streaming destinations |
 | `EnableKinesisStreamingDestination` | Enable Kinesis streaming for a table |
+| `UpdateKinesisStreamingDestination` | Update timestamp precision on an active Kinesis destination |
 | `DisableKinesisStreamingDestination` | Disable Kinesis streaming for a table |
 | `ExportTableToPointInTime` | Export table data, or the changes of a period, to S3 |
 | `CreateGlobalTable` | Make an existing table a global table (2017.11.29) |
 | `DescribeGlobalTable` | Read a global table's replication group |
 | `UpdateGlobalTable` | Add or remove replica regions |
 | `ListGlobalTables` | List global tables, optionally filtered by region |
+| `UpdateTableReplicaAutoScaling` | Store table and index auto scaling settings for logical replicas |
+| `DescribeTableReplicaAutoScaling` | Read stored logical replica auto scaling settings |
 | `DescribeExport` | Get export status and metadata |
 | `ListExports` | List exports, optionally filtered by table ARN |
 | `ImportTable` | Create a table and load DynamoDB JSON from S3 into it |
@@ -103,10 +114,6 @@ attributes returned. An attributes-only condition does not require a projection;
 use a `dynamodb:Select` condition when the policy must require specific attributes.
 
 ## Legacy conditional requests
-
-Legacy `QueryFilter` and `ScanFilter` honor `ConditionalOperator`: `OR` retains an
-item when any condition matches; `AND`, including the omitted default, requires
-every condition. Read limits and scanned counts apply before filtering.
 
 The native backend accepts `KeyConditions` together with `FilterExpression`.
 For legacy `Expected` conditions it also accepts `ComparisonOperator` with a single
@@ -593,12 +600,20 @@ record as `dynamodb.ApproximateCreationDateTimePrecision`, and reported by
 `DescribeKinesisStreamingDestination` as well as in the `EnableKinesisStreamingConfiguration` member of
 the `EnableKinesisStreamingDestination` and `DisableKinesisStreamingDestination` responses.
 
+On the native backend, `UpdateKinesisStreamingDestination` changes an active destination's precision without stopping
+forwarding. Its response carries `UpdateKinesisStreamingConfiguration`, and subsequent item changes
+use the updated precision. Omitting the configuration or its precision retains the current value.
+The update accepts a table name or table ARN, persists across restarts, and rejects missing tables,
+missing destinations, inactive destinations, and precision values other than `MILLISECOND` or
+`MICROSECOND`.
+
 Enabling a Kinesis streaming destination does not change the table's DynamoDB Streams setting.
 Kinesis forwarding works whether or not `StreamSpecification.StreamEnabled` is set.
 
 Both calls take effect at once, so `EnableKinesisStreamingDestination` answers `ACTIVE` and
 `DisableKinesisStreamingDestination` answers `DISABLED`. AWS reports the transitional `ENABLING` and
 `DISABLING` first, because it enables and disables the destination in the background.
+Updates also apply at once and answer `ACTIVE`; AWS can report `UPDATING` while applying a change.
 
 ### Delivery contract
 
@@ -634,3 +649,26 @@ With IAM enforcement enabled, `ExecuteStatement` checks `dynamodb:PartiQLSelect`
 statement's operation. A policy can grant that action on the specific table ARN; a wildcard
 resource or a `dynamodb:ExecuteStatement` permission is not required. This mapping covers the
 single-statement API; batch and transaction authorization are separate paths.
+
+## Replica auto scaling settings
+
+On the native backend, `UpdateTableReplicaAutoScaling` stores write settings for the table and its
+global secondary indexes, and read settings for named logical replicas and their indexes.
+`DescribeTableReplicaAutoScaling` returns those settings for the existing replica group. Both
+operations accept the table name or its exact account, region, and partition ARN.
+
+Updates preserve omitted settings, including policy fields. Explicit `false`, zero cooldowns, and
+64-bit capacity bounds survive readback and storage reload. Effective minimum and maximum bounds
+are validated together before any settings are written; a refused multi-member update changes no
+settings. The settings use DynamoDB's existing storage mode and `dynamodb-replica-autoscaling.json`;
+no additional configuration is required. Deleting and recreating a table starts with no settings. A settings-file
+cleanup failure is reported after the existing table, item, stream, and forwarding teardown. A
+retained settings record is tied to the deleted table's identity and cannot affect a recreated table.
+
+This is configuration metadata on the existing logical replica model. It does not replicate items,
+change provisioned throughput in response to load, or create Application Auto Scaling resources.
+Role ARNs and policy names are retained only when supplied; Floci neither creates nor assumes a
+role, verifies its existence, nor invents role or policy defaults. Replica and index descriptions
+follow the native backend's immediate `ACTIVE` state. Changing billing mode does not apply or
+remove these settings. Settings for removed replicas or indexes are hidden, but removing and
+re-adding the same replica region or index name can retain its prior settings.

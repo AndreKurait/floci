@@ -71,11 +71,11 @@ Floci follows a layered design:
 
 ## Package Layout
 
-- `io.floci.aws.config`
-- `io.floci.aws.core.common`
-- `io.floci.aws.core.storage`
-- `io.floci.aws.lifecycle`
-- `io.floci.aws.services.<service>`
+- `io.github.hectorvent.floci.config`
+- `io.github.hectorvent.floci.core.common`
+- `io.github.hectorvent.floci.core.storage`
+- `io.github.hectorvent.floci.lifecycle`
+- `io.github.hectorvent.floci.services.<service>`
 
 Typical service structure:
 
@@ -341,7 +341,9 @@ the registry and stubs what nothing serves; never add type-specific code to it.
 2. `resourceTypes()` lists the `AWS::*` types; `provision(resource, props, ctx)`
    does the work, switching on `resource.getResourceType()` when it serves several.
 3. Set **both** reference mechanisms. They are separate:
-   - `resource.setPhysicalId(...)` backs `Ref`
+   - `resource.setPhysicalId(...)` stores the durable resource identity and normally backs `Ref`.
+     When AWS returns only part of a compound identity, override `referenceValue(physicalId)`.
+     Keep the complete physical ID so deletion and rollback can still identify the resource.
    - `resource.getAttributes().put(...)` backs `Fn::GetAtt`, one entry per attribute
    Omitting an attribute does not fail; `Fn::GetAtt` resolves to the literal
    `"LogicalId.Attr"`. Source the attribute names from the type's registry schema in
@@ -377,8 +379,7 @@ the registry and stubs what nothing serves; never add type-specific code to it.
     `CfnSchemaCoverageTest` requires every unset attribute to be fixed or recorded.
     A new type also needs its row in `schema-surface.tsv` (same directory): run
     `make cfn-schema-surface-sync`. A writable property the provisioner never reads goes in
-    `writable-property-gaps.tsv`. A provisioner arm that calls `droppedProperties` records, for each
-    writable property it reads, what a drop does in `drop-policy.tsv` (same directory).
+    `writable-property-gaps.tsv`.
 
 References: `SqsCfnProvisioner` (smallest), `Ec2LaunchTemplateCfnProvisioner`
 (update-in-place and replacement), `LogsCfnProvisioner` (reconcile-vs-replace update).
@@ -468,7 +469,7 @@ not a precedent.
 - JBoss Logging, in a field named `LOG`, using the parameterized `...v()` form.
   No string concatenation in log calls.
 - No `printStackTrace`, anywhere. No `System.out` or `System.err` in `src/main`; the
-  one exception is the CLI entry point `io.floci.aws.tools.ami.AmiImageTool`,
+  one exception is the CLI entry point `io.github.hectorvent.floci.tools.ami.AmiImageTool`,
   where stdout is the program's output. A few tests print a failure repro just before
   failing, which is the only good reason to print from a test: an assertion message
   usually says it better.

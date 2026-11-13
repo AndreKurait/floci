@@ -1,8 +1,9 @@
 # sdk-test-java
 
-Compatibility tests for [Floci](https://github.com/hectorvent/floci) using the **AWS SDK for Java v2 (2.31.8)**.
+Compatibility tests for [Floci](https://github.com/hectorvent/floci) using the AWS SDK
+for Java v2 version pinned in [pom.xml](pom.xml).
 
-Runs 2981 tests across 436 test classes against a live Floci instance — no mocks.
+Tests run against a live Floci instance using standard SDK calls.
 
 ## Services Covered
 
@@ -26,8 +27,6 @@ Runs 2981 tests across 436 test classes against a live Floci instance — no moc
 | `Ec2Tests`                       | EC2 instances, VPCs, security groups, subnets            |
 | `AppSyncTest`                    | GraphQL API CRUDL, data sources, resolvers, functions, types, API keys, tags, schema validation |
 | `EcsTests`                       | ECS clusters, task definitions, services                 |
-| `PaymentCryptographyDataPlaneTest` | Payment Cryptography data plane: encrypt, decrypt, MAC |
-| `PaymentCryptographyPinTest`     | Payment Cryptography PIN operations: generate, verify, translate |
 
 ## Adding a New Test
 
@@ -112,3 +111,20 @@ docker run --rm --network host floci-sdk-java
 # Custom endpoint (macOS/Windows)
 docker run --rm -e FLOCI_ENDPOINT=http://host.docker.internal:4566 floci-sdk-java
 ```
+
+The container prints Maven progress as tests run and writes `maven.log`, JUnit XML
+and available Surefire diagnostics to `/results`. Mount that directory to retain
+evidence when a test fails or times out. Extra container arguments are passed to
+Maven, for example `-Dtest=SsmTest`.
+
+Set `SDK_TEST_TIMEOUT_SECONDS` to a positive integer to bound Maven's complete
+execution. A timeout fails the container and still collects completed reports;
+processes that ignore termination are killed after 15 seconds. Without this
+setting, the runner imposes no deadline. `SDK_TEST_RESULTS_DIR` overrides `/results`
+when running `bash run-tests.sh` locally; a configured deadline requires GNU
+`timeout`.
+
+The native compatibility workflow includes image setup in a 17-minute test
+budget, leaving three minutes of its existing 20-minute job limit for termination,
+artifact upload and Floci logs. A failed or partial report never changes the
+test process's failure into success.
