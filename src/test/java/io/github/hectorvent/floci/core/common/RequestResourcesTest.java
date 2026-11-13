@@ -32,6 +32,28 @@ class RequestResourcesTest {
     private static final String MACHINE = "arn:aws:states:us-east-1:000000000000:stateMachine:orders";
 
     @Test
+    void securityHubAndGuardDutyTagsUseCreatedResourcesWithoutNarrowingCreateActions() {
+        ContainerRequestContext request = json("{}");
+        assertTrue(RequestResources.actsOnNoResource("securityhub:CreateAutomationRule"));
+        assertEquals(List.of(), of("securityhub:CreateAutomationRule", request));
+        assertEquals(List.of("arn:aws:securityhub:us-east-1:000000000000:automation-rule/*"),
+                RequestResources.created("securityhub:CreateAutomationRule", request,
+                        "aws", "us-east-1", "000000000000"));
+        assertTrue(RequestResources.actsOnNoResource("guardduty:CreateDetector"));
+        assertEquals(List.of(), of("guardduty:CreateDetector", request));
+        assertEquals(List.of("arn:aws-cn:guardduty:cn-north-1:111122223333:detector/*"),
+                RequestResources.created("guardduty:CreateDetector", request,
+                        "aws-cn", "cn-north-1", "111122223333"));
+    }
+
+    @Test
+    void anOmittedHubArnStillNamesTheRegionalDefaultHub() {
+        assertEquals(List.of("arn:aws:securityhub:us-east-1:111111111111:hub/default"),
+                RequestResources.of("securityhub:DescribeHub", rest("GET", null, Map.of()),
+                        "aws", "us-east-1", "111111111111", null, Map.of()));
+    }
+
+    @Test
     void macieAllowListTagsUseTheCreatedArnWhileTheCreateRemainsGlobal() {
         ContainerRequestContext request = json("{\"name\":\"trusted\",\"tags\":{\"team\":\"blue\"}}");
         assertTrue(RequestResources.actsOnNoResource("macie2:CreateAllowList"));

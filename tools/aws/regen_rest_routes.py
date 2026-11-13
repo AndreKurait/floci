@@ -61,6 +61,7 @@ MODELS: dict[str, str] = {
     "dsql": "dsql",
     "eks": "eks",
     "emr-serverless": "emr-serverless",
+    "guardduty": "guardduty",
     "es": "es",
     "fis": "fis",
     "lambda": "lambda",
@@ -77,6 +78,7 @@ MODELS: dict[str, str] = {
     "s3": "s3",
     "s3control": "s3",
     "scheduler": "scheduler",
+    "securityhub": "securityhub",
 }
 
 

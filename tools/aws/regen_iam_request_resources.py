@@ -55,6 +55,10 @@ that names another resource beside the one it makes, the pipeline a webhook conn
 service is made in, marks the one it makes `made`, of a type, or with an ARN format's leading resource word,
 related to its name past the verb, so its tags are checked there alone.
 
+An optional member holding the ARN of a type whose format has no variable of its own, Security Hub's `HubArn` and
+`hub/default`, also names that type when the request leaves it out: there is one such resource in the caller's
+account and Region, the one the service acts on then (`DescribeHub`).
+
 A type nothing names is not checked: an action lists the optional resources its requests may use
 (`RunInstances` lists `elastic-gpu`), and checking one a request does not name would refuse a grant
 that covers what it does name. An operation whose action acts on no resource type, or whose request
@@ -170,9 +174,10 @@ NAMESPACES = (
     "bcm-pricing-calculator", "budgets", "ce", "cloudfront", "cloudfront-keyvaluestore", "cloudtrail",
     "codebuild", "codepipeline", "cognito-identity", "cognito-idp", "controlcatalog", "controltower", "cur",
     "datasync", "ec2", "ecr", "elasticloadbalancing", "elasticmapreduce", "emr-serverless", "es", "events",
-    "firehose", "fis", "globalaccelerator", "inspector2", "kinesisanalytics", "macie2", "oam",
+    "firehose", "fis", "globalaccelerator", "guardduty", "inspector2", "kinesisanalytics", "macie2", "oam",
     "payment-cryptography", "ram", "redshift", "redshift-data", "rekognition", "resource-explorer-2",
-    "servicediscovery", "servicequotas", "sso", "states", "swf", "textract", "timestream-influxdb", "translate",
+    "securityhub", "servicediscovery", "servicequotas", "sso", "states", "swf", "textract", "timestream-influxdb",
+    "translate",
 )
 
 # SDK clients the reference lists for a namespace's operations whose requests Floci does not serve, and why: their
@@ -257,7 +262,6 @@ NOT_COVERED: dict[str, str] = {
     "execute-api": _REST,
 
     "glue": _LATER,
-    "guardduty": _REST,
     "identitystore": _LATER,
     "iot": _LATER,
     "kafka": _REST,
@@ -281,7 +285,6 @@ NOT_COVERED: dict[str, str] = {
     "s3tables": _REST,
     "s3vectors": _REST,
     "sagemaker": _LATER,
-    "securityhub": _REST,
     "servicecatalog": "not read yet: CreatePortfolioShare, UpdatePortfolioShare and DeletePortfolioShare give in "
                       "AccountId the account a portfolio is shared with, which the rule reads as the portfolio's; a "
                       "portfolio or product imported from another account keeps its owner's account in its ARN while "
