@@ -307,6 +307,7 @@ public class AppConfigService {
         profile.setLocationUri((String) request.get("LocationUri"));
         String type = (String) request.get("Type");
         profile.setType(type == null && "hosted".equals(profile.getLocationUri()) ? "AWS.Freeform" : type);
+        profile.setValidators(AppConfigValidators.parse(request.get("Validators"), profile.getType()));
         profileStore.put(profile.getId(), profile);
         return profile;
     }
@@ -413,6 +414,30 @@ public class AppConfigService {
         StorageOperations.deleteByPrefix(versionStore, appId + "::" + profileId + "::");
         versionCounters.delete(appId + "::" + profileId);
         profileStore.delete(profileId);
+    }
+
+    public synchronized void validateConfiguration(String applicationIdentifier, String profileIdentifier,
+                                                     String configurationVersion) {
+        String appId = resolveApplication(applicationIdentifier).getId();
+        ConfigurationProfile profile = resolveConfigurationProfile(appId, profileIdentifier);
+        AppConfigValidators.validate(profile.getValidators(), validationContent(profile, configurationVersion));
+    }
+
+    private byte[] validationContent(ConfigurationProfile profile, String configurationVersion) {
+        if (configurationVersion == null || configurationVersion.isEmpty() || configurationVersion.length() > 1024) {
+            throw new AwsException("BadRequestException",
+                    "ConfigurationVersion must contain between 1 and 1024 characters.", 400);
+        }
+        if (!"hosted".equals(profile.getLocationUri())) {
+            throw new AwsException("BadRequestException", "Only hosted configuration validation is supported.", 400);
+        }
+        int version;
+        try {
+            version = Integer.parseInt(configurationVersion);
+        } catch (NumberFormatException e) {
+            throw new AwsException("BadRequestException", "Hosted ConfigurationVersion must be an integer.", 400);
+        }
+        return getHostedConfigurationVersion(profile.getApplicationId(), profile.getId(), version).getContent();
     }
 
     // ──────────────────────────── Hosted Configuration Version ────────────────────────────
@@ -702,6 +727,11 @@ public class AppConfigService {
         String strategyId = (String) request.get("DeploymentStrategyId");
 
         DeploymentStrategy strategy = getDeploymentStrategy(strategyId);
+
+        // Refuse invalid content before assigning a deployment number or changing the active version.
+        if (profile.getValidators() != null && !profile.getValidators().isEmpty()) {
+            AppConfigValidators.validate(profile.getValidators(), validationContent(profile, version));
+        }
 
         Deployment deployment = new Deployment();
         deployment.setApplicationId(appId);
