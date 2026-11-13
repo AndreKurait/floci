@@ -2,6 +2,7 @@ package io.floci.aws.services.appconfig;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.AccountAwareStorageBackend.AccountEntry;
@@ -19,9 +20,11 @@ import java.util.Map;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doCallRealMethod;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.when;
@@ -110,7 +113,59 @@ class AppConfigDeploymentScanTest {
                 fixture.backing().getForAccount(ACCOUNT, correctedKey).orElseThrow().getCompletedAt());
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void resetPauseRejectsDeploymentsWithoutLambdaValidationAndResumes(boolean schema) {
+        Fixture fixture = fixture(schema);
+        Deployment prior = fixture.deployment();
+        Map<String, Object> request = Map.of("ConfigurationProfileId", prior.getConfigurationProfileId(),
+                "ConfigurationVersion", "1", "DeploymentStrategyId", prior.getDeploymentStrategyId());
+        fixture.service().beforeReset();
+        try {
+            AwsException error = assertThrows(AwsException.class, () -> fixture.service().startDeployment(
+                    prior.getApplicationId(), prior.getEnvironmentId(), request));
+            assertEquals("BadRequestException", error.getErrorCode());
+            assertTrue(error.getMessage().contains("reset"));
+            assertEquals(1, fixture.backing().scanAllAccountEntries(value -> true).size());
+            assertEquals(MAPPER.valueToTree(prior), MAPPER.valueToTree(
+                    fixture.backing().getForAccount(ACCOUNT, fixture.key()).orElseThrow()));
+        } finally {
+            fixture.service().afterReset();
+        }
+        assertEquals(2, fixture.service().startDeployment(prior.getApplicationId(),
+                prior.getEnvironmentId(), request).getDeploymentNumber());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void resetPausePreventsCapturedScansFromWritingAndResumes(boolean pauseAfterEnumeration) {
+        Fixture fixture = fixture();
+        when(fixture.clock().instant()).thenReturn(START.plusSeconds(120));
+        if (pauseAfterEnumeration) {
+            doAnswer(invocation -> {
+                Object captured = invocation.callRealMethod();
+                fixture.service().beforeReset();
+                return captured;
+            }).when(fixture.backing()).scanAllAccountEntries(any());
+        } else {
+            fixture.service().beforeReset();
+        }
+        try {
+            fixture.service().advanceDeployments();
+            assertEquals("BAKING", fixture.backing().getForAccount(ACCOUNT, fixture.key()).orElseThrow().getState());
+        } finally {
+            doCallRealMethod().when(fixture.backing()).scanAllAccountEntries(any());
+            fixture.service().afterReset();
+        }
+        fixture.service().advanceDeployments();
+        assertEquals("COMPLETE", fixture.backing().getForAccount(ACCOUNT, fixture.key()).orElseThrow().getState());
+    }
+
     private static Fixture fixture() {
+        return fixture(false);
+    }
+
+    private static Fixture fixture(boolean schema) {
         AccountAwareStorageBackend<Deployment> backing = spy(AccountAwareStorageBackend.<Deployment>inMemory(ACCOUNT));
         InMemoryStorageFactory storage = new InMemoryStorageFactory(ACCOUNT)
                 .withStore("appconfig-deployments.json", backing);
@@ -121,8 +176,10 @@ class AppConfigDeploymentScanTest {
         String app = service.createApplication(Map.of("Name", "app")).getId();
         String env = service.createEnvironment(app, Map.of("Name", "environment")).getId();
         String profile = service.createConfigurationProfile(app,
-                Map.of("Name", "profile", "LocationUri", "hosted")).getId();
-        service.createHostedConfigurationVersion(app, profile, "one".getBytes(StandardCharsets.UTF_8), "text/plain", null);
+                Map.of("Name", "profile", "LocationUri", "hosted", "Validators", schema
+                        ? List.of(Map.of("Type", "JSON_SCHEMA", "Content", "{\"type\":\"string\"}"))
+                        : List.of())).getId();
+        service.createHostedConfigurationVersion(app, profile, "\"one\"".getBytes(StandardCharsets.UTF_8), "text/plain", null);
         String strategy = service.createDeploymentStrategy(Map.of("Name", "bake", "FinalBakeTimeInMinutes", 1)).getId();
         Deployment deployment = service.startDeployment(app, env, Map.of("ConfigurationProfileId", profile,
                 "ConfigurationVersion", "1", "DeploymentStrategyId", strategy));
