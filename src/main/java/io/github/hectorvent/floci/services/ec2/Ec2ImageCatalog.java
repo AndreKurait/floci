@@ -1,0 +1,443 @@
+package io.github.hectorvent.floci.services.ec2;
+
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.ec2.model.BlockDeviceMapping;
+import io.github.hectorvent.floci.services.ec2.model.EbsBlockDevice;
+import io.github.hectorvent.floci.services.ec2.model.Image;
+import io.github.hectorvent.floci.services.eks.EksClusterManager;
+import io.quarkus.runtime.annotations.RegisterForReflection;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+@ApplicationScoped
+public class Ec2ImageCatalog {
+
+    private static final String CATALOG_RESOURCE_NAME = "ec2/image-catalog.yaml";
+    private static final ObjectMapper YAML_MAPPER = new ObjectMapper(new YAMLFactory());
+    private static final String K8S_VERSION_PLACEHOLDER = "{k8s-version}";
+    private static final String EKS_AL2_MAX_K8S_VERSION = "1.32";
+
+    private final Path catalogPath;
+    private volatile Loaded loaded;
+
+    @Inject
+    public Ec2ImageCatalog(EmulatorConfig config) {
+        this.catalogPath = config.services().ec2().imageCatalogPath().filter(path -> !path.isBlank()).map(Path::of).orElse(null);
+    }
+
+    public Ec2ImageCatalog() {
+        this.catalogPath = null;
+        // The catalog is parsed lazily on first access rather than at bean
+        // construction. Mock mode never reads it, so eager loading would fail
+        // EC2 bean creation needlessly when the resource is unavailable.
+    }
+
+    Ec2ImageCatalog(Path catalogPath) {
+        this.catalogPath = catalogPath;
+    }
+
+    Ec2ImageCatalog(Catalog catalog) {
+        this.catalogPath = null;
+        this.loaded = new Loaded(catalog);
+    }
+
+    public String defaultDockerImage() {
+        return loaded().defaultDockerImage;
+    }
+
+    public List<CatalogImage> images() {
+        return loaded().images;
+    }
+
+    public Optional<CatalogImage> findByIdOrAlias(String imageId) {
+        if (imageId == null || imageId.isBlank()) {
+            return Optional.empty();
+        }
+        return Optional.ofNullable(loaded().imagesByIdOrAlias.get(imageId));
+    }
+
+    /** Resolves only explicitly declared, exact RegisterImage names. */
+    public Optional<CatalogImage> findByRegistrationName(String name) {
+        if (name == null || name.isBlank()) {
+            return Optional.empty();
+        }
+        return Optional.ofNullable(loaded().imagesByRegistrationName.get(name));
+    }
+
+    /**
+     * Looks up the image published under one of AWS's public SSM parameter names, such as
+     * {@code /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64}.
+     */
+    public Optional<CatalogImage> findByPublicParameterName(String parameterName) {
+        if (parameterName == null || parameterName.isBlank()) {
+            return Optional.empty();
+        }
+        return Optional.ofNullable(loaded().imagesByPublicParameterName.get(parameterName));
+    }
+
+    /** Every public SSM parameter name the catalog answers, in catalog order. */
+    public List<String> publicParameterNames() {
+        return List.copyOf(loaded().imagesByPublicParameterName.keySet());
+    }
+
+    private Loaded loaded() {
+        Loaded result = loaded;
+        if (result == null) {
+            synchronized (this) {
+                result = loaded;
+                if (result == null) {
+                    result = new Loaded(catalogPath == null
+                            ? readResource(CATALOG_RESOURCE_NAME, Catalog.class) : readFile(catalogPath));
+                    loaded = result;
+                }
+            }
+        }
+        return result;
+    }
+
+    private static final class Loaded {
+        private final String defaultDockerImage;
+        private final List<CatalogImage> images;
+        private final Map<String, CatalogImage> imagesByIdOrAlias;
+        private final Map<String, CatalogImage> imagesByPublicParameterName;
+        private final Map<String, CatalogImage> imagesByRegistrationName;
+
+        Loaded(Catalog catalog) {
+            Catalog effective = includeDefaultImages(catalog);
+            this.defaultDockerImage = require(effective.defaultDockerImage, "defaultDockerImage");
+            this.images = List.copyOf(effective.images == null ? List.of() : effective.images);
+            if (this.images.isEmpty()) {
+                throw new IllegalStateException("EC2 image catalog has no images: " + CATALOG_RESOURCE_NAME);
+            }
+            this.imagesByIdOrAlias = indexImages(this.images);
+            this.imagesByPublicParameterName = indexPublicParameterNames(this.images);
+            this.imagesByRegistrationName = indexRegistrationNames(this.images);
+        }
+    }
+
+    private static Catalog includeDefaultImages(Catalog catalog) {
+        if (!catalog.includeDefaultImages) {
+            return catalog;
+        }
+        Catalog combined = readResource(CATALOG_RESOURCE_NAME, Catalog.class);
+        if (catalog.defaultDockerImage != null) {
+            combined.defaultDockerImage = catalog.defaultDockerImage;
+        }
+        List<CatalogImage> images = new ArrayList<>(combined.images);
+        images.addAll(catalog.images == null ? List.of() : catalog.images);
+        combined.images = images;
+        return combined;
+    }
+
+    private static Catalog readFile(Path path) {
+        try (InputStream input = Files.newInputStream(path)) {
+            return YAML_MAPPER.readValue(input, Catalog.class);
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to load EC2 image catalog file: " + path, e);
+        }
+    }
+
+    private static <T> T readResource(String resourceName, Class<T> type) {
+        ClassLoader loader = Thread.currentThread().getContextClassLoader();
+        try (InputStream input = loader.getResourceAsStream(resourceName)) {
+            if (input == null) {
+                throw new IllegalStateException("Missing EC2 image catalog resource: " + resourceName);
+            }
+            return YAML_MAPPER.readValue(input, type);
+        } catch (IOException e) {
+            throw new IllegalStateException("Failed to load EC2 image catalog resource: " + resourceName, e);
+        }
+    }
+
+    private static Map<String, CatalogImage> indexImages(List<CatalogImage> images) {
+        Map<String, CatalogImage> index = new LinkedHashMap<>();
+        for (CatalogImage image : images) {
+            addIndexEntry(index, require(image.imageId, "imageId"), image);
+            require(image.dockerImage, "dockerImage");
+            require(image.name, "name");
+            require(image.description, "description");
+            require(image.architecture, "architecture");
+            require(image.creationDate, "creationDate");
+            image.validateVolumeMounts();
+
+            for (String alias : image.aliases()) {
+                addIndexEntry(index, alias, image);
+            }
+        }
+        return Map.copyOf(index);
+    }
+
+    private static Map<String, CatalogImage> indexPublicParameterNames(List<CatalogImage> images) {
+        Map<String, CatalogImage> index = new LinkedHashMap<>();
+        for (CatalogImage image : images) {
+            for (String parameterName : image.publicParameterNames()) {
+                CatalogImage previous = index.putIfAbsent(parameterName, image);
+                if (previous != null) {
+                    throw new IllegalStateException(
+                            "Duplicate EC2 image catalog public parameter name: " + parameterName);
+                }
+            }
+        }
+        return Collections.unmodifiableMap(index);
+    }
+
+    private static Map<String, CatalogImage> indexRegistrationNames(List<CatalogImage> images) {
+        Map<String, CatalogImage> index = new LinkedHashMap<>();
+        for (CatalogImage image : images) {
+            if (image.registrationNames == null) {
+                continue;
+            }
+            for (String name : image.registrationNames) {
+                require(name, "registrationNames");
+                if (index.putIfAbsent(name, image) != null) {
+                    throw new IllegalStateException("Duplicate EC2 image catalog registration name: " + name);
+                }
+            }
+        }
+        return Map.copyOf(index);
+    }
+
+    private static void addIndexEntry(Map<String, CatalogImage> index, String imageIdOrAlias, CatalogImage image) {
+        CatalogImage previous = index.putIfAbsent(imageIdOrAlias, image);
+        if (previous != null) {
+            throw new IllegalStateException("Duplicate EC2 image catalog id or alias: " + imageIdOrAlias);
+        }
+    }
+
+    private static String require(String value, String field) {
+        if (value == null || value.isBlank()) {
+            throw new IllegalStateException("EC2 image catalog entry is missing required field: " + field);
+        }
+        return value;
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    @RegisterForReflection
+    public static final class Catalog {
+        public boolean includeDefaultImages;
+        public String defaultDockerImage;
+        public List<CatalogImage> images = List.of();
+    }
+
+    @RegisterForReflection
+    public record VolumeMount(String device, String target, String filesystem) {
+        public VolumeMount {
+            require(device, "volumeMounts.device");
+            if (!Ec2Service.validDeviceName(device)) {
+                throw new IllegalStateException("Invalid EC2 image catalog volume device: " + device);
+            }
+            device = Ec2Service.normalizedDevice(device);
+            Path path = Path.of(require(target, "volumeMounts.target")).normalize();
+            if (!path.isAbsolute() || path.equals(Path.of("/"))
+                    || path.startsWith("/dev") || path.startsWith("/proc") || path.startsWith("/sys")) {
+                throw new IllegalStateException("Invalid EC2 image catalog volume target: " + target);
+            }
+            target = path.toString();
+            if (!"ext4".equals(filesystem)) {
+                throw new IllegalStateException("EC2 image catalog volume filesystem must be ext4");
+            }
+        }
+    }
+
+    @JsonIgnoreProperties(ignoreUnknown = true)
+    @RegisterForReflection
+    public static final class CatalogImage {
+        public String imageId;
+        public List<String> aliases = List.of();
+        public List<String> publicParameterNames = List.of();
+        public List<String> registrationNames = List.of();
+        public String dockerImage;
+        public String name;
+        public String description;
+        public String state;
+        public String ownerId;
+        public Boolean publicImage;
+        public String architecture;
+        public String rootDeviceType;
+        public String rootDeviceName;
+        /** Root EBS volume type, set only where the AMI name states it; answers block-device-mapping.volume-type. */
+        public String rootVolumeType;
+        public String virtualizationType;
+        public String hypervisor;
+        public String platform;
+        public String imageOwnerAlias;
+        public String creationDate;
+        public Boolean advertised;
+        public String guestRuntime;
+        public Boolean cloudInit;
+        /** The guest kubelet owns EKS Node creation and status instead of Floci simulating them. */
+        public Boolean kubeletRegistersNode;
+        public String provenance;
+        public List<VolumeMount> volumeMounts = List.of();
+
+        public List<VolumeMount> volumeMounts() {
+            return volumeMounts == null ? List.of() : List.copyOf(volumeMounts);
+        }
+
+        private void validateVolumeMounts() {
+            volumeMounts = volumeMounts();
+            if (!volumeMounts.isEmpty() && !ResolvedAmiImage.IMAGE_RUNTIME.equals(guestRuntime)) {
+                throw new IllegalStateException("EC2 image catalog volume mounts require guestRuntime: image");
+            }
+            for (int i = 0; i < volumeMounts.size(); i++) {
+                VolumeMount mount = volumeMounts.get(i);
+                for (int j = 0; j < i; j++) {
+                    VolumeMount previous = volumeMounts.get(j);
+                    if (mount.device().equals(previous.device())
+                            || Path.of(mount.target()).startsWith(previous.target())
+                            || Path.of(previous.target()).startsWith(mount.target())) {
+                        throw new IllegalStateException("Conflicting EC2 image catalog volume mounts");
+                    }
+                }
+            }
+        }
+
+        public boolean advertised() {
+            return advertised == null || advertised;
+        }
+
+        public List<String> aliases() {
+            return aliases == null ? List.of() : List.copyOf(aliases);
+        }
+
+        /**
+         * The public SSM parameter names AWS publishes this image under. AWS seeds them in every
+         * account with no setup, so SSM answers a read of one of these names from the catalog.
+         * Parameter templates containing {@code {k8s-version}} are expanded for each supported
+         * Kubernetes version in {@link EksClusterManager#SUPPORTED_K8S_VERSIONS}. AL2 is capped
+         * at Kubernetes 1.32, matching AWS's deprecation cutoff.
+         */
+        public List<String> publicParameterNames() {
+            return expandPublicParameterNames(publicParameterNames);
+        }
+
+        private static List<String> expandPublicParameterNames(List<String> templates) {
+            if (templates == null || templates.isEmpty()) {
+                return List.of();
+            }
+            List<String> expanded = new ArrayList<>();
+            for (String template : templates) {
+                if (template != null && template.contains(K8S_VERSION_PLACEHOLDER)) {
+                    for (String version : EksClusterManager.SUPPORTED_K8S_VERSIONS.keySet().stream().sorted().toList()) {
+                        if (isSupportedK8sVersionForTemplate(template, version)) {
+                            expanded.add(template.replace(K8S_VERSION_PLACEHOLDER, version));
+                        }
+                    }
+                } else if (template != null) {
+                    expanded.add(template);
+                }
+            }
+            return Collections.unmodifiableList(expanded);
+        }
+
+        private static boolean isSupportedK8sVersionForTemplate(String template, String version) {
+            if (template.contains("/amazon-linux-2/")) {
+                return compareK8sVersions(version, EKS_AL2_MAX_K8S_VERSION) <= 0;
+            }
+            return true;
+        }
+
+        private static int compareK8sVersions(String v1, String v2) {
+            String[] parts1 = v1.split("\\.");
+            String[] parts2 = v2.split("\\.");
+            int major1 = Integer.parseInt(parts1[0]);
+            int major2 = Integer.parseInt(parts2[0]);
+            if (major1 != major2) {
+                return Integer.compare(major1, major2);
+            }
+            int minor1 = parts1.length > 1 ? Integer.parseInt(parts1[1]) : 0;
+            int minor2 = parts2.length > 1 ? Integer.parseInt(parts2[1]) : 0;
+            return Integer.compare(minor1, minor2);
+        }
+
+        public List<String> idsAndAliases() {
+            List<String> ids = new ArrayList<>();
+            ids.add(imageId);
+            ids.addAll(aliases());
+            return ids;
+        }
+
+        public boolean matchesIdOrAlias(List<String> candidates) {
+            if (candidates == null || candidates.isEmpty()) {
+                return true;
+            }
+            for (String id : idsAndAliases()) {
+                if (candidates.contains(id)) {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        public boolean matchesOwner(List<String> owners) {
+            if (owners == null || owners.isEmpty()) {
+                return true;
+            }
+            Image image = toImage();
+            return owners.contains(image.getOwnerId()) || owners.contains(image.getImageOwnerAlias());
+        }
+
+        public Image toImage() {
+            Image image = new Image();
+            image.setImageId(imageId);
+            image.setName(name);
+            image.setDescription(description);
+            if (state != null) {
+                image.setState(state);
+            }
+            if (ownerId != null) {
+                image.setOwnerId(ownerId);
+            }
+            if (publicImage != null) {
+                image.setPublic(publicImage);
+            }
+            image.setArchitecture(architecture);
+            if (rootDeviceType != null) {
+                image.setRootDeviceType(rootDeviceType);
+            }
+            if (rootDeviceName != null) {
+                image.setRootDeviceName(rootDeviceName);
+            }
+            if (virtualizationType != null) {
+                image.setVirtualizationType(virtualizationType);
+            }
+            if (hypervisor != null) {
+                image.setHypervisor(hypervisor);
+            }
+            image.setPlatform(platform);
+            if (imageOwnerAlias != null) {
+                image.setImageOwnerAlias(imageOwnerAlias);
+            }
+            image.setCreationDate(creationDate);
+            if (rootVolumeType != null) {
+                // Same value the volume-type filter matches on, so the returned image shows
+                // the mapping it was selected by and a CopyImage keeps that type.
+                EbsBlockDevice ebs = new EbsBlockDevice();
+                // No SnapshotId: it is optional in EbsBlockDevice, and an invented one would not
+                // resolve through DescribeSnapshots.
+                ebs.setVolumeSize(8);
+                ebs.setVolumeType(rootVolumeType);
+                ebs.setDeleteOnTermination(true);
+                BlockDeviceMapping mapping = new BlockDeviceMapping();
+                mapping.setDeviceName(image.getRootDeviceName());
+                mapping.setEbs(ebs);
+                image.setBlockDeviceMappings(List.of(mapping));
+            }
+            return image;
+        }
+    }
+}
