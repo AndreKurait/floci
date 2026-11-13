@@ -911,6 +911,7 @@ floci:
       backend-keep-alive-timeout-seconds: 60
 
       alb-zone-rule: ${FLOCI_SERVICES_ELBV2_ALB_ZONE_RULE:aws}
+      # single-zone-alb-accounts: 111111111111,222222222222
       # Per-region entries override this global setting, including an explicit aws reset.
       # alb-zone-rule-by-region:
       #   ap-northeast-3: require-two-zones

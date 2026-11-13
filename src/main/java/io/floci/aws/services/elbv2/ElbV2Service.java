@@ -23,8 +23,10 @@ import io.floci.aws.services.ec2.VpcDependencyProvider;
 import io.floci.aws.services.ec2.model.Subnet;
 import io.floci.aws.services.elbv2.model.*;
 import io.floci.aws.services.iam.ServerCertificateReferenceProvider;
+import io.quarkus.runtime.StartupEvent;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
@@ -96,6 +98,30 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
 
     // tags: resource-ARN → {key → value}
     private Map<String, Map<String, String>> tags = new ConcurrentHashMap<>();
+
+    private Set<String> singleZoneAlbAccounts = Set.of();
+
+    void validateAlbZoneConfiguration(@Observes StartupEvent event) {
+        readSingleZoneAlbAccounts();
+    }
+
+    void readSingleZoneAlbAccounts() {
+        if (config == null) {
+            singleZoneAlbAccounts = Set.of();
+            return;
+        }
+        List<String> accounts = config.services().elbv2().singleZoneAlbAccounts().orElse(List.of()).stream()
+                .filter(account -> account != null && !account.isBlank())
+                .map(String::trim)
+                .toList();
+        for (String account : accounts) {
+            if (!account.matches("[0-9]{12}")) {
+                throw new IllegalStateException("floci.services.elbv2.single-zone-alb-accounts must list"
+                        + " 12-digit account ids, not '" + account + "'");
+            }
+        }
+        singleZoneAlbAccounts = Set.copyOf(accounts);
+    }
 
     @PostConstruct
     void initializeStorage()
@@ -344,8 +370,10 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                 rule = settings.albZoneRule();
             }
             Map<String, EmulatorConfig.AlbZoneRule> regions = settings.albZoneRuleByRegion();
-            if (regions != null) {
-                rule = regions.getOrDefault(region, rule);
+            if (regions != null && regions.containsKey(region)) {
+                rule = regions.get(region);
+            } else if (singleZoneAlbAccounts.contains(regionResolver.getAccountId())) {
+                return false;
             }
         }
         return switch (rule) {
