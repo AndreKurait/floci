@@ -144,6 +144,7 @@ Floci's embedded DNS server always resolves the following wildcard suffixes to F
 | Variable | Default | Description |
 |---|---|---|
 | `FLOCI_DNS_EXTRA_SUFFIXES` | _(none)_ | Comma-separated list of additional hostname suffixes to resolve to Floci's container IP. Use this for custom domains beyond the built-in ones above (e.g. a private internal suffix). |
+| `FLOCI_DNS_AUTHORITATIVE_SUFFIXES` | _(none)_ | Comma-separated DNS suffixes served from live resource records or matching VPC forwarding rules. Unknown names and children return NXDOMAIN, including beneath a spoofed suffix. These scopes never fall back to recursive upstream DNS. |
 | `FLOCI_DNS_SPOOF_AWS_ENDPOINTS` | `false` | Resolve every AWS partition's DNS and dual-stack suffix (`amazonaws.com`, `api.aws`, `amazonaws.eu`, and more) and every subdomain to Floci's container IP inside spawned containers (transparent endpoint injection). See below. |
 
 ### Transparent endpoints

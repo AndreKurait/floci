@@ -234,6 +234,13 @@ public interface EmulatorConfig {
         Optional<List<String>> extraSuffixes();
 
         /**
+         * Suffixes served only from live resource records or a matching VPC forwarding rule.
+         * Unknown names return NXDOMAIN instead of wildcard spoofing or upstream recursion.
+         * Env: {@code FLOCI_DNS_AUTHORITATIVE_SUFFIXES}, comma-separated.
+         */
+        Optional<List<String>> authoritativeSuffixes();
+
+        /**
          * When {@code true} (default), the configured {@link #containerFallbackServers()} are
          * appended after Floci's embedded DNS to every spawned container's {@code HostConfig.Dns}.
          * This gives Lambda/CodeBuild/etc. a real secondary resolver so public hostnames still
