@@ -88,7 +88,10 @@ public record DockerFlags(
      * @param owner names the service in error messages, e.g. "Lambda" or "ECS"
      */
     public void applyTo(ContainerBuilder.Builder builder, String owner) {
-        builder.withEnv(environment);
+        // Only what is set is applied, so no flags leave the builder exactly as it was.
+        if (!environment.isEmpty()) {
+            builder.withEnv(environment);
+        }
         for (String volume : volumes) {
             String[] parts = volume.split(":", -1);
             if (parts.length < 2 || parts.length > 3 || parts[0].isBlank() || parts[1].isBlank()) {
@@ -131,14 +134,18 @@ public record DockerFlags(
         for (String dnsServer : dnsServers) {
             builder.withDnsServer(dnsServer);
         }
-        builder.withLabels(labels);
+        if (!labels.isEmpty()) {
+            builder.withLabels(labels);
+        }
         if (network != null) {
             builder.withNetworkMode(network);
         }
         if (user != null) {
             builder.withUser(user);
         }
-        builder.withPrivileged(privileged);
+        if (privileged) {
+            builder.withPrivileged(true);
+        }
     }
 
     private static String value(List<String> tokens, int index, String flag, String owner) {

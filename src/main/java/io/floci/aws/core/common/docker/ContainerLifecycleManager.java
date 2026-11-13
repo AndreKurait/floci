@@ -143,7 +143,7 @@ public class ContainerLifecycleManager {
 
     /** Starts a disposable container, reclaiming its anonymous volumes if startup fails. */
     public ContainerInfo createAndStartEphemeral(ContainerSpec spec) {
-        return createAndStart(spec, true);
+        return createAndStart(spec, null, true, containerId -> { });
     }
 
     /**
@@ -153,23 +153,31 @@ public class ContainerLifecycleManager {
      * @param platform Docker platform, such as {@code linux/amd64}, or null for the daemon's own
      */
     public ContainerInfo createAndStartEphemeral(ContainerSpec spec, String platform) {
-        return createAndStart(spec, platform, true);
+        return createAndStart(spec, platform, true, containerId -> { });
+    }
+
+    /**
+     * {@link #createAndStartEphemeral(ContainerSpec, String)} that runs {@code beforeStart} on the
+     * created container before it starts, e.g. to join it to additional networks. A failure there
+     * removes the container as a failed start does.
+     */
+    public ContainerInfo createAndStartEphemeral(ContainerSpec spec, String platform,
+                                                 java.util.function.Consumer<String> beforeStart) {
+        return createAndStart(spec, platform, true, beforeStart);
     }
 
     private ContainerInfo createAndStart(ContainerSpec spec, boolean removeAnonymousVolumes) {
-        String resolvedImage = imageCacheService.ensureImageExists(spec.image());
-        return createAndStart(spec, resolvedImage, null, removeAnonymousVolumes);
+        return createAndStart(spec, null, removeAnonymousVolumes, containerId -> { });
     }
 
-    private ContainerInfo createAndStart(ContainerSpec spec, String platform, boolean removeAnonymousVolumes) {
-        String resolvedImage = imageCacheService.ensureImageExists(spec.image(), platform);
-        return createAndStart(spec, resolvedImage, platform, removeAnonymousVolumes);
-    }
-
-    private ContainerInfo createAndStart(ContainerSpec spec, String resolvedImage, String platform,
-                                         boolean removeAnonymousVolumes) {
+    private ContainerInfo createAndStart(ContainerSpec spec, String platform, boolean removeAnonymousVolumes,
+                                         java.util.function.Consumer<String> beforeStart) {
+        String resolvedImage = platform == null
+                ? imageCacheService.ensureImageExists(spec.image())
+                : imageCacheService.ensureImageExists(spec.image(), platform);
         String containerId = create(spec, resolvedImage, platform, removeAnonymousVolumes);
         try {
+            beforeStart.accept(containerId);
             return withPublishedHostPorts(startCreated(containerId, spec), spec);
         } catch (RuntimeException failure) {
             removeFailedContainer(containerId, failure, removeAnonymousVolumes);

@@ -253,7 +253,7 @@ class EcsGracefulStopConcurrencyServiceTest {
     }
 
     @Test
-    void stopTaskWaitsForTheStopTheSchedulerAlreadyStarted() throws Exception {
+    void stopTaskAnswersStoppingWhileTheStopTheSchedulerStartedLandsIt() throws Exception {
         EcsService service = newService();
         createService(service, "slow", 1);
         tick(service);
@@ -262,26 +262,27 @@ class EcsGracefulStopConcurrencyServiceTest {
         service.updateService(CLUSTER, "slow", null, 0, null, REGION);
 
         FutureTask<Void> scaleIn = startTick(service);
-        CompletableFuture<EcsTask> userStop;
         try {
             assertTrue(slowStopEntered.await(5, TimeUnit.SECONDS), "the scale-in stop never started");
-            userStop = CompletableFuture.supplyAsync(() ->
-                    service.stopTask(CLUSTER, task.getTaskArn(), "user stop", REGION));
-            assertThrows(TimeoutException.class, () -> userStop.get(500, TimeUnit.MILLISECONDS),
-                    "StopTask answers once the stop already running has landed");
+            // StopTask answers at once, as ECS does; the stop already running is the one that lands it.
+            EcsTask answer = CompletableFuture.supplyAsync(() ->
+                    service.stopTask(CLUSTER, task.getTaskArn(), "user stop", REGION))
+                    .get(TICK_BUDGET.toMillis(), TimeUnit.MILLISECONDS);
+            assertEquals("STOPPING", answer.getLastStatus());
         } finally {
             releaseSlowStop.countDown();
         }
 
-        EcsTask stopped = userStop.get(TICK_BUDGET.toMillis(), TimeUnit.MILLISECONDS);
         scaleIn.get(TICK_BUDGET.toMillis(), TimeUnit.MILLISECONDS);
+        service.awaitPendingStops();
+        EcsTask stopped = describe(service, task);
         assertEquals("STOPPED", stopped.getLastStatus());
         assertEquals(EcsService.STOP_CODE_SERVICE_SCHEDULER_INITIATED, stopped.getStopCode());
         verify(containerManager, times(1)).stopTaskAndCollectExitCodes(handleOf(task));
     }
 
     @Test
-    void stopTaskWaitsForATickRetryOfAStopThatFailedWhileItWaited() throws Exception {
+    void stopTaskDuringAStopThatFailsLeavesTheRetryToTheTick() throws Exception {
         EcsService service = newService();
         createService(service, "flaky", 1);
         tick(service);
@@ -306,13 +307,13 @@ class EcsGracefulStopConcurrencyServiceTest {
         service.updateService(CLUSTER, "flaky", null, 0, null, REGION);
 
         tick(service);
-        CompletableFuture<EcsTask> userStop;
         try {
             assertTrue(firstStopEntered.await(5, TimeUnit.SECONDS), "the scale-in stop never started");
-            userStop = CompletableFuture.supplyAsync(() ->
-                    service.stopTask(CLUSTER, task.getTaskArn(), "user stop", REGION));
-            assertThrows(TimeoutException.class, () -> userStop.get(500, TimeUnit.MILLISECONDS),
-                    "StopTask waits for the stop already running");
+            // StopTask answers at once and starts no second Docker stop next to the running one.
+            EcsTask answer = CompletableFuture.supplyAsync(() ->
+                    service.stopTask(CLUSTER, task.getTaskArn(), "user stop", REGION))
+                    .get(TICK_BUDGET.toMillis(), TimeUnit.MILLISECONDS);
+            assertEquals("STOPPING", answer.getLastStatus());
             // Holding the task's monitor while the first stop fails lets a tick retry it before
             // StopTask, woken by the failure, can take the monitor back.
             synchronized (task) {
@@ -322,14 +323,13 @@ class EcsGracefulStopConcurrencyServiceTest {
                 }
                 assertEquals(0, retryEntered.getCount(), "no tick retried the failed stop");
             }
-            assertThrows(TimeoutException.class, () -> userStop.get(500, TimeUnit.MILLISECONDS),
-                    "StopTask answers once the retry has landed, not while it runs");
         } finally {
             failFirstStop.countDown();
             releaseRetry.countDown();
         }
 
-        EcsTask stopped = userStop.get(TICK_BUDGET.toMillis(), TimeUnit.MILLISECONDS);
+        await().atMost(TICK_BUDGET).until(() -> "STOPPED".equals(lastStatus(service, task)));
+        EcsTask stopped = describe(service, task);
         assertEquals("STOPPED", stopped.getLastStatus());
         assertEquals(137, stopped.getContainers().getFirst().getExitCode());
         assertEquals(2, stops.get());

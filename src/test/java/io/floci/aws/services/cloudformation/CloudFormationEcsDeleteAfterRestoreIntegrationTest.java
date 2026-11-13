@@ -62,8 +62,10 @@ class CloudFormationEcsDeleteAfterRestoreIntegrationTest {
 
         // The cluster still has a running task at delete time (a genuine ClusterContainsTasksException),
         // which must NOT be treated as already-gone. ECS runs in mock mode under test, so the task is
-        // in-memory RUNNING with no container behind it.
+        // in-memory RUNNING with no container behind it. FARGATE is named: with no launch type the
+        // task would be an EC2 task, as on ECS, and the cluster has no container instance for it.
         ecs("RunTask", "{\"cluster\":\"" + cluster + "\",\"taskDefinition\":\"" + family + "\",\"count\":1,"
+                + "\"launchType\":\"FARGATE\","
                 + "\"networkConfiguration\":{\"awsvpcConfiguration\":"
                 + "{\"subnets\":[\"subnet-default-us-east-1-a\"]}}}");
 

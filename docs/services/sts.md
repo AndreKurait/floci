@@ -366,5 +366,5 @@ existing token and trust-policy errors take precedence over this role-specific c
 
 Role chaining limits `AssumeRole` to one hour, including when the target role permits a longer
 session. A live role credential must carry its matching session token. `GetSessionToken` user
-credentials are not role chaining. The cap is checked after trust and role-maximum validation,
+credentials and EC2 instance-profile credentials (as IMDS serves them) are not role chaining. The cap is checked after trust and role-maximum validation,
 before registering the new session.
