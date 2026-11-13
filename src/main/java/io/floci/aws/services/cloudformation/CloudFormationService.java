@@ -5731,6 +5731,103 @@ public class CloudFormationService implements ResourceProvider {
         return false;
     }
 
+    /** Captures a detached lifetime without adopting a later stack with the same name. */
+    public CloudFormationDriftSnapshot captureDriftStack(String requested, String region, String account) {
+        String name = driftStackName(requested, region, account);
+        CloudFormationDriftSnapshot[] captured = new CloudFormationDriftSnapshot[1];
+        stacks.compute(stackKey(account, name, region), (key, current) -> {
+            captured[0] = driftSnapshot(requested, name, region, account, current);
+            return current;
+        });
+        return captured[0];
+    }
+
+    /** Root-stack update/delete admissions use this same map key's compute boundary. */
+    void withCurrentDriftStack(CloudFormationDriftSnapshot captured, Runnable publish) {
+        captured.requirePresent();
+        stacks.compute(stackKey(captured.accountId(), captured.stackName(), captured.region()), (key, current) -> {
+            CloudFormationDriftSnapshot now = driftSnapshot(captured.requestedName(), captured.stackName(),
+                    captured.region(), captured.accountId(), current);
+            if (!captured.equals(now) || now.operationInProgress()) {
+                throw driftValidation("Stack changed during drift detection; retry the request");
+            }
+            publish.run();
+            return current;
+        });
+    }
+
+    private CloudFormationDriftSnapshot driftSnapshot(String requested, String name, String region,
+                                                       String account, Stack current) {
+        if (current == null) {
+            return new CloudFormationDriftSnapshot(requested, account, region, name, null,
+                    null, null, null, null, Map.of(), Map.of(), Map.of(), null, null, false);
+        }
+        try {
+            AwsArnUtils.Arn arn = AwsArnUtils.parse(current.getStackId());
+            String[] identity = arn.resource().split("/", -1);
+            if (!account.equals(current.getAccountId()) || !region.equals(current.getRegion())
+                    || !name.equals(current.getStackName()) || !account.equals(arn.accountId())
+                    || !region.equals(arn.region()) || !"cloudformation".equals(arn.service())
+                    || !AwsRegions.partitionFor(region).equals(arn.partition())
+                    || identity.length != 3 || !"stack".equals(identity[0]) || !name.equals(identity[1])
+                    || identity[2].isEmpty() || current.getCreationTime() == null) {
+                throw driftValidation("Stored stack identity does not match its account, Region or name");
+            }
+            // An old ARN must not select the replacement now stored under the same friendly name.
+            if (AwsArnUtils.isArn(requested) && !requested.equals(current.getStackId())) {
+                return new CloudFormationDriftSnapshot(requested, account, region, name, null,
+                        null, null, null, null, Map.of(), Map.of(), Map.of(), null, null, false);
+            }
+            Map<String, CloudFormationDriftSnapshot.Resource> resources = new LinkedHashMap<>();
+            current.resourcesSnapshot().forEach((id, resource) -> {
+                if (!id.equals(resource.getLogicalId()) || resource.getResourceType() == null) {
+                    throw driftValidation("Stored stack resource identity is inconsistent");
+                }
+                resources.put(id, new CloudFormationDriftSnapshot.Resource(id, resource.getPhysicalId(),
+                        resource.getResourceType(), resource.getStatus()));
+            });
+            return new CloudFormationDriftSnapshot(requested, account, region, name, current.getStackId(),
+                    current.getCreationTime(), current.getLastUpdatedTime(), current.getStatus(),
+                    (current.getOriginalTemplateBody() == null ? current.getTemplateBody()
+                            : current.getOriginalTemplateBody()), current.parametersSnapshot(), current.tagsSnapshot(),
+                    resources, null, current.getParentId(),
+                    runningExecutions.containsKey(current.getStackId())
+                            || deferredDeletes.containsKey(current.getStackId()));
+        } catch (IllegalArgumentException | NullPointerException invalid) {
+            throw driftValidation("Stored stack identity is corrupt");
+        }
+    }
+
+    private static String driftStackName(String requested, String region, String account) {
+        if (requested == null || requested.isEmpty() || requested.length() > 1024) {
+            throw driftValidation("StackName is required and must not exceed 1024 characters");
+        }
+        if (!AwsArnUtils.isArn(requested)) {
+            if (!requested.matches("[a-zA-Z][-a-zA-Z0-9]*")) {
+                throw driftValidation("Invalid StackName");
+            }
+            return requested;
+        }
+        try {
+            AwsArnUtils.Arn arn = AwsArnUtils.parse(requested);
+            String[] identity = arn.resource().split("/", -1);
+            if (!account.equals(arn.accountId()) || !region.equals(arn.region())
+                    || !"cloudformation".equals(arn.service())
+                    || !AwsRegions.partitionFor(region).equals(arn.partition())
+                    || identity.length != 3 || !"stack".equals(identity[0])
+                    || !identity[1].matches("[a-zA-Z][-a-zA-Z0-9]*") || identity[2].isEmpty()) {
+                throw driftValidation("Stack ARN does not match the request account or Region");
+            }
+            return identity[1];
+        } catch (IllegalArgumentException invalid) {
+            throw driftValidation("Invalid StackName ARN");
+        }
+    }
+
+    private static AwsException driftValidation(String message) {
+        return new AwsException("ValidationError", message, 400);
+    }
+
     private static String stackStorageKey(String stackName, String region) {
         return region + ":" + stackName;
     }

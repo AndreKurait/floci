@@ -599,6 +599,53 @@ public class SnsService implements Resettable, ResourceProvider {
                 "The phone number is not in the SMS sandbox.", 404);
     }
 
+    /** A native, read-only projection: no legacy migration, synthesized policy or subscription scan. */
+    public synchronized DriftTopic readTopicForDrift(String topicArn, String region, String account) {
+        AwsArnUtils.Arn arn;
+        try {
+            arn = AwsArnUtils.parse(topicArn);
+        } catch (IllegalArgumentException | NullPointerException invalid) {
+            throw new AwsException("ValidationError", "Invalid SNS physical topic ARN for drift", 400);
+        }
+        if (!"sns".equals(arn.service()) || !region.equals(arn.region()) || !account.equals(arn.accountId())
+                || !AwsRegions.partitionFor(region).equals(arn.partition()) || arn.resource().isEmpty()
+                || arn.resource().contains(":") || arn.resource().contains("/")) {
+            throw new AwsException("ValidationError", "SNS physical topic is outside the stack scope", 400);
+        }
+        String key = topicKey(region, topicArn);
+        Topic topic;
+        if (topicStore instanceof AccountAwareStorageBackend<Topic> aware) {
+            topic = aware.getForAccount(account, key)
+                    .or(() -> aware.getLegacyForAccount(account, key)).orElse(null);
+        } else {
+            topic = topicStore.get(key).orElse(null);
+        }
+        if (topic == null) {
+            return new DriftTopic(topicArn, arn.resource(), null, Map.of(), Map.of(), true);
+        }
+        if (!topicArn.equals(topic.getTopicArn()) || !arn.resource().equals(topic.getName())
+                || topic.getAttributes() == null || topic.getTags() == null
+                || topic.getCreatedAt() == null
+                || topic.getAttributes().containsKey("TopicArn")
+                && !topicArn.equals(topic.getAttributes().get("TopicArn"))) {
+            throw new AwsException("ValidationError", "Stored SNS topic identity is corrupt or foreign", 400);
+        }
+        try {
+            return new DriftTopic(topicArn, topic.getName(), topic.getCreatedAt(),
+                    topic.getAttributes(), topic.getTags(), false);
+        } catch (NullPointerException invalid) {
+            throw new AwsException("ValidationError", "Stored SNS topic attributes or tags are corrupt", 400);
+        }
+    }
+
+    public record DriftTopic(String arn, String name, Instant createdAt, Map<String, String> attributes,
+                             Map<String, String> tags, boolean absent) {
+        public DriftTopic {
+            attributes = Map.copyOf(attributes);
+            tags = Map.copyOf(tags);
+        }
+    }
+
     public Topic createTopic(String name, Map<String, String> attributes,
                              Map<String, String> tags, String region) {
         return createTopicWithStatus(name, attributes, tags, region).topic();
