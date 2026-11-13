@@ -16,6 +16,7 @@ import io.github.hectorvent.floci.services.eks.EksController;
 import io.github.hectorvent.floci.services.iot.IotController;
 import io.github.hectorvent.floci.services.route53.Route53Controller;
 import io.github.hectorvent.floci.services.s3.S3ObjectActions;
+import io.github.hectorvent.floci.services.s3tables.S3TablesController;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.container.ResourceInfo;
@@ -53,6 +54,11 @@ public class IamActionRegistry {
             "getReusableDelegationSet", "route53:GetReusableDelegationSet",
             "listReusableDelegationSets", "route53:ListReusableDelegationSets",
             "deleteReusableDelegationSet", "route53:DeleteReusableDelegationSet");
+
+    private static final Map<String, String> S3TABLES_METRICS_ACTIONS = Map.of(
+            "putTableBucketMetricsConfiguration", "s3tables:PutTableBucketMetricsConfiguration",
+            "getTableBucketMetricsConfiguration", "s3tables:GetTableBucketMetricsConfiguration",
+            "deleteTableBucketMetricsConfiguration", "s3tables:DeleteTableBucketMetricsConfiguration");
 
     private static final Logger LOG = Logger.getLogger(IamActionRegistry.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -733,6 +739,11 @@ public class IamActionRegistry {
                 && BackupFrameworkController.class.equals(resourceInfo.getResourceClass())
                 && resourceInfo.getResourceMethod() != null) {
             return BackupFrameworkController.iamAction(resourceInfo.getResourceMethod().getName());
+        }
+        if ("s3tables".equals(credentialScope) && resourceInfo != null
+                && S3TablesController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            return S3TABLES_METRICS_ACTIONS.get(resourceInfo.getResourceMethod().getName());
         }
         if ("appconfig".equals(credentialScope) && resourceInfo != null
                 && AppConfigDataController.class.equals(resourceInfo.getResourceClass())

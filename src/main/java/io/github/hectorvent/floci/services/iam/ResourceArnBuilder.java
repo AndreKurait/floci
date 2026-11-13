@@ -63,6 +63,11 @@ public class ResourceArnBuilder {
 
     private static final Pattern ACCESS_POLICY_ARN = Pattern.compile(EksController.ACCESS_POLICY_ARN);
 
+    private static final Set<String> S3TABLES_METRICS_ACTIONS = Set.of(
+            "s3tables:PutTableBucketMetricsConfiguration",
+            "s3tables:GetTableBucketMetricsConfiguration",
+            "s3tables:DeleteTableBucketMetricsConfiguration");
+
     /** The only scheme IAM accepts on an OIDC provider URL, and the part its ARN drops. */
     private static final String OIDC_URL_SCHEME = "https://";
 
@@ -278,6 +283,12 @@ public class ResourceArnBuilder {
         if ("backup".equals(credentialScope) && BackupFrameworkResources.matches(operation, ctx, readJsonBody(ctx))) {
             return BackupFrameworkResources.arns(operation, ctx, readJsonBody(ctx), partition, region, accountId,
                     storedResourceArns("backup"));
+        }
+        if ("s3tables".equals(credentialScope) && operation != null && S3TABLES_METRICS_ACTIONS.contains(operation)) {
+            String bucketArn = ctx.getUriInfo().getPathParameters().getFirst("tableBucketARN");
+            return AwsArnUtils.isArnFor(bucketArn, "s3tables")
+                    && AwsArnUtils.parse(bucketArn).resource().startsWith("bucket/")
+                    ? List.of(bucketArn) : List.of("*");
         }
         // Task tokens resolve their authorization resource from recorded workflow ownership.
         if ("states".equals(credentialScope) && operation != null && Set.of("states:SendTaskSuccess",
