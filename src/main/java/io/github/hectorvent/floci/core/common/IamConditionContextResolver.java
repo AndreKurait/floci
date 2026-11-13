@@ -10,7 +10,9 @@ import io.github.hectorvent.floci.services.dynamodb.DynamoDbConditionKeys;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbFacade;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbTableNames;
 import io.github.hectorvent.floci.services.dynamodb.model.TableDefinition;
+import io.github.hectorvent.floci.services.ec2.Ec2PlacementGroupService;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.model.Ec2PlacementGroup;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
 import io.github.hectorvent.floci.services.elbv2.ElbV2ConditionKeys;
@@ -99,6 +101,9 @@ public class IamConditionContextResolver {
 
     private final Instance<DynamoDbFacade> dynamoDbFacade;
     private final Instance<Ec2Service> ec2Service;
+    /** Lazy to keep the existing IAM construction graph independent of EC2 storage creation. */
+    @Inject
+    Instance<Ec2PlacementGroupService> placementGroupService;
     private final Instance<S3Service> s3Service;
     private final Instance<CloudWatchLogsService> logsService;
     private final Instance<IamService> iamService;
@@ -821,6 +826,8 @@ public class IamConditionContextResolver {
 
     private Map<String, List<String>> ec2ConditionContext(String action, ContainerRequestContext ctx) {
         return switch (action) {
+            case "ec2:CreatePlacementGroup", "ec2:DeletePlacementGroup", "ec2:DescribePlacementGroups" ->
+                    placementGroupConditionContext(action, ctx);
             case "ec2:RunInstances" -> ec2RunInstancesConditionContext(ctx);
             case "ec2:CreateTags" -> ec2CreateTagsConditionContext(ctx);
             case "ec2:DeleteTags" -> ec2ResourceTagConditionContext(ctx, "ResourceId.1");
@@ -831,6 +838,43 @@ public class IamConditionContextResolver {
                     ec2ResourceTagConditionContext(ctx, "GroupId");
             default -> null;
         };
+    }
+
+    private Map<String, List<String>> placementGroupConditionContext(String action, ContainerRequestContext ctx) {
+        Map<String, String> form = formParameters(ctx);
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        conditions.put("ec2:Region", List.of(region));
+        if ("ec2:DescribePlacementGroups".equals(action)) {
+            return conditions;
+        }
+        String name = form.get("GroupName");
+        if (name != null) {
+            conditions.put("ec2:PlacementGroupName", List.of(name));
+        }
+        if ("ec2:CreatePlacementGroup".equals(action)) {
+            String strategy = form.get("Strategy");
+            if (strategy != null) {
+                conditions.put("ec2:PlacementGroupStrategy", List.of(strategy));
+            }
+            for (String prefix : List.of("TagSpecification.", "TagSpecifications.")) {
+                for (int spec = 1; form.containsKey(prefix + spec + ".ResourceType"); spec++) {
+                    if ("placement-group".equals(form.get(prefix + spec + ".ResourceType"))) {
+                        addRequestTags(conditions, form, prefix + spec + ".Tag.");
+                    }
+                }
+            }
+        } else if (placementGroupService != null && placementGroupService.isResolvable()) {
+            Ec2PlacementGroup group = placementGroupService.get().authorizationTarget(region, name);
+            if (group != null) {
+                conditions.put("ec2:PlacementGroupStrategy", List.of(group.strategy()));
+                group.tags().forEach((key, value) -> {
+                    conditions.put("aws:ResourceTag/" + key, List.of(value));
+                    conditions.put("ec2:ResourceTag/" + key, List.of(value));
+                });
+            }
+        }
+        return conditions;
     }
 
     /**
