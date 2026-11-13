@@ -1,16 +1,15 @@
 package io.github.hectorvent.floci.services.kms;
 
+import io.github.hectorvent.floci.testing.AwsTestClients;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.Response;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
-import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
-import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.core.SdkBytes;
-import software.amazon.awssdk.http.urlconnection.UrlConnectionHttpClient;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.kms.KmsClient;
 import software.amazon.awssdk.services.kms.model.InvalidMarkerException;
@@ -95,23 +94,23 @@ class KmsKeyRotationsIntegrationTest {
         "{\"KeyId\":\"00000000-0000-0000-0000-000000000000\",\"IncludeKeyMaterial\":\"invalid\"}"
     })
     void malformedRequestsReturnAwsValidationErrors(String request) {
-        given().contentType("application/x-amz-json-1.1")
-                .header("X-Amz-Target", "TrentService.ListKeyRotations")
-                .body(request).post("/")
+        listRotations(request)
                 .then().statusCode(400).body("__type", equalTo("ValidationException"));
     }
 
     @Test
     void aliasesAreRejectedForKeyOnlyListing() {
-        given().contentType("application/x-amz-json-1.1")
-                .header("X-Amz-Target", "TrentService.ListKeyRotations")
-                .body("{\"KeyId\":\"alias/rotation-history\"}").post("/")
+        listRotations("{\"KeyId\":\"alias/rotation-history\"}")
                 .then().statusCode(400).body("__type", equalTo("InvalidArnException"));
     }
 
+    private Response listRotations(String request) {
+        return given().contentType("application/x-amz-json-1.1")
+                .header("X-Amz-Target", "TrentService.ListKeyRotations")
+                .body(request).post("/");
+    }
+
     private KmsClient client() {
-        return KmsClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
-                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test")))
-                .httpClientBuilder(UrlConnectionHttpClient.builder()).build();
+        return AwsTestClients.create(KmsClient.builder(), "test", Region.US_EAST_1, endpoint);
     }
 }

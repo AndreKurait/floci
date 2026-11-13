@@ -576,6 +576,10 @@ class EcsServiceTeardownTest {
         service.runTask(null, "teardown-fam", 1, LaunchType.FARGATE, null, null,
                 List.of(), null, REGION);
 
+        service.beginTeardown();
+        assertTrue(service.isReconcilerShutdown());
+        verify(containerManager, never()).stopTask(handle);
+
         service.stopManagedContainers();
         verify(containerManager, times(1)).stopTask(handle);
 

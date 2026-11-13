@@ -66,6 +66,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
@@ -112,17 +113,22 @@ class ElbV2ServiceTest {
 
     @ParameterizedTest
     @CsvSource({
-        "ap-northeast-3,AWS,none,true",
-        "us-east-1,AWS,none,false",
-        "us-east-1,ALLOW_SINGLE_ZONE,none,true",
-        "ap-northeast-3,REQUIRE_TWO_ZONES,none,false",
-        "us-east-1,ALLOW_SINGLE_ZONE,REQUIRE_TWO_ZONES,false",
-        "us-east-1,REQUIRE_TWO_ZONES,ALLOW_SINGLE_ZONE,true",
-        "ap-northeast-3,REQUIRE_TWO_ZONES,AWS,true",
-        "us-east-1,ALLOW_SINGLE_ZONE,AWS,false"
+        "ap-northeast-3,AWS,none,true,false",
+        "us-east-1,AWS,none,false,false",
+        "us-east-1,ALLOW_SINGLE_ZONE,none,true,false",
+        "ap-northeast-3,REQUIRE_TWO_ZONES,none,false,false",
+        "us-east-1,ALLOW_SINGLE_ZONE,REQUIRE_TWO_ZONES,false,false",
+        "us-east-1,REQUIRE_TWO_ZONES,ALLOW_SINGLE_ZONE,true,false",
+        "ap-northeast-3,REQUIRE_TWO_ZONES,AWS,true,false",
+        "us-east-1,ALLOW_SINGLE_ZONE,AWS,false,false",
+        "us-east-1,AWS,none,true,true",
+        "us-east-1,REQUIRE_TWO_ZONES,none,true,true",
+        "us-east-1,AWS,REQUIRE_TWO_ZONES,false,true",
+        "us-east-1,ALLOW_SINGLE_ZONE,AWS,false,true",
+        "ap-northeast-3,REQUIRE_TWO_ZONES,AWS,true,true"
     })
     void albZonePolicyAppliesToCreateAndSetSubnets(String region, EmulatorConfig.AlbZoneRule global,
-                                                  String regional, boolean allowed) {
+                                                  String regional, boolean allowed, boolean listed) {
         EmulatorConfig settings = mock(EmulatorConfig.class);
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
         EmulatorConfig.ElbV2ServiceConfig elbv2 = mock(EmulatorConfig.ElbV2ServiceConfig.class);
@@ -132,8 +138,11 @@ class ElbV2ServiceTest {
         Map<String, EmulatorConfig.AlbZoneRule> overrides = "none".equals(regional) ? Map.of()
                 : Map.of(region, EmulatorConfig.AlbZoneRule.valueOf(regional));
         when(elbv2.albZoneRuleByRegion()).thenReturn(overrides);
+        when(elbv2.singleZoneAlbAccounts()).thenReturn(listed
+                ? Optional.of(List.of(" 000000000000 ", "", "111111111111")) : Optional.empty());
         lenient().when(settings.hostname()).thenReturn(Optional.empty());
         service.config = settings;
+        service.readSingleZoneAlbAccounts();
         service.regionResolver = new RegionResolver(region, "000000000000");
         lenient().when(ec2Service.describeSubnets(eq(region), anyList(), eq(Map.of())))
                 .thenAnswer(invocation -> invocation.<List<String>>getArgument(1).stream()
@@ -159,6 +168,15 @@ class ElbV2ServiceTest {
                 "application", "ipv4", List.of(), List.of(), Map.of()));
         assertThrows(AwsException.class, () -> service.setSubnetsFromRequest(region,
                 twoZones.getLoadBalancerArn(), List.of()));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"1", "1234567890123", "12345678901x", "-12345678901"})
+    void singleZoneAccountConfigurationRejectsMalformedAccounts(String account) {
+        EmulatorConfig settings = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(settings.services().elbv2().singleZoneAlbAccounts()).thenReturn(Optional.of(List.of(account)));
+        service.config = settings;
+        assertThrows(IllegalStateException.class, service::readSingleZoneAlbAccounts);
     }
 
     @Test
