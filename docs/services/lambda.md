@@ -485,6 +485,13 @@ rejected with `InvalidParameterValueException`, a version an alias points at is 
 `ResourceConflictException`, and a version that does not exist is a silent success rather than
 a 404.
 
+A version referenced as either an alias's primary target or an `AdditionalVersionWeights`
+entry cannot be deleted. Removing that reference allows the same qualified delete request
+without changing the other versions. `UpdateAlias` preserves weights when `RoutingConfig`
+is omitted; an explicitly empty weights map or routing object clears them. Scalar or list values for
+the `AdditionalVersionWeights` field are rejected before alias changes. These are alias configuration and deletion rules;
+weighted invocation and provisioned allocation support are unchanged.
+
 **Layers:** `PublishLayerVersion`, `GetLayerVersion`, `GetLayerVersionByArn`, `ListLayerVersions`,
 `ListLayers`, and `DeleteLayerVersion` are implemented, with real local storage under
 `{lambda.codePath}/layers/{name}/{version}`. `ListLayers` and `ListLayerVersions` honour
