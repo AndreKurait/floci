@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
 import io.github.hectorvent.floci.services.appconfig.AppConfigService;
 import io.github.hectorvent.floci.services.appconfig.DeploymentStopException;
 import io.github.hectorvent.floci.services.appconfig.model.Deployment;
@@ -40,11 +41,12 @@ import static org.mockito.Mockito.when;
 class AppConfigDeploymentCfnProvisionerTest {
     private static final ObjectMapper JSON = new ObjectMapper();
     private final AppConfigService service = mock(AppConfigService.class);
+    private final ServiceConfigAccess serviceConfig = mock(ServiceConfigAccess.class);
     private final TestTime time = TestTime.create();
     private final List<Duration> waits = new ArrayList<>();
     private final List<StackEvent> events = new ArrayList<>();
     private final AppConfigDeploymentCfnProvisioner provisioner = new AppConfigDeploymentCfnProvisioner(
-            service, time::nanoTime, delay -> {
+            service, serviceConfig, time::nanoTime, delay -> {
                 waits.add(delay);
                 time.sleepAdvancing(delay);
             });
@@ -207,7 +209,7 @@ class AppConfigDeploymentCfnProvisionerTest {
         startReturns("DEPLOYING");
         when(service.getDeployment("app0001", "env0001", 7)).thenReturn(deployment("DEPLOYING"));
         AppConfigDeploymentCfnProvisioner interrupted = new AppConfigDeploymentCfnProvisioner(
-                service, time::nanoTime, delay -> {
+                service, serviceConfig, time::nanoTime, delay -> {
                     throw new InterruptedException("stop test");
                 });
         try {

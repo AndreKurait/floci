@@ -224,6 +224,9 @@ a version created and then removed by rollback leaves an allocation gap. Outputs
 Deployment `Ref` and public physical IDs return the deployment number as a string. Resource descriptions,
 lists, events and change-set previews use that number; deletion and rollback retain the full stored identity.
 
+Deployment provisioning respects `floci.services.appconfig.enabled`. Disabling AppConfig
+removes its Deployment provisioner from active CloudFormation routing.
+
 Deployment creation waits for AppConfig's `COMPLETE` state, preserving the strategy's
 rollout and final bake durations. `Fn::GetAtt DeploymentNumber` is a string and `State`
 reports completion. The physical identity and `Ref` include application, environment

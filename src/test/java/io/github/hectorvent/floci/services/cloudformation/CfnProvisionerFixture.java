@@ -351,9 +351,9 @@ final class CfnProvisionerFixture {
             discovered.add(new CdkMetadataCfnProvisioner());
             if (appConfigService != null) {
                 discovered.add(new AppConfigCfnProvisioner(appConfigService));
-                discovered.add(new AppConfigDeploymentCfnProvisioner(appConfigService));
                 ServiceConfigAccess serviceConfig = mock(ServiceConfigAccess.class);
                 when(serviceConfig.isEnabled("appconfig")).thenReturn(true);
+                discovered.add(new AppConfigDeploymentCfnProvisioner(appConfigService, serviceConfig));
                 discovered.add(new AppConfigHostedVersionCfnProvisioner(appConfigService, serviceConfig));
             }
             if (codeDeployService != null) {
