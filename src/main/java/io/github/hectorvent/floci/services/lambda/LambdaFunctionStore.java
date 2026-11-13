@@ -162,14 +162,14 @@ public class LambdaFunctionStore implements Resettable {
         synchronized (lockForSave(accountId, region, fn)) {
             requireCurrentGeneration(getReadOnlyForAccount(accountId, region,
                     fn.getFunctionName(), fn.getVersion()), fn);
-            getForAccount(accountId, region, fn.getFunctionName(), fn.getVersion()).ifPresent(this::deindexFunction);
-            deindexInstance(fn);
-
+            Optional<LambdaFunction> previous = getForAccount(accountId, region, fn.getFunctionName(), fn.getVersion());
             if (backend instanceof AccountAwareStorageBackend<LambdaFunction> aware) {
                 aware.putForAccount(accountId, regionKey(region, fn.getFunctionName(), fn.getVersion()), fn);
             } else {
                 backend.put(regionKey(region, fn.getFunctionName(), fn.getVersion()), fn);
             }
+            previous.ifPresent(this::deindexFunction);
+            deindexInstance(fn);
             indexFunction(fn);
         }
     }
