@@ -607,18 +607,33 @@ State transitions publish to same-account standard SNS topics in `AlarmActions`,
 Failures are logged per target without blocking other targets. Notifications include a
 single-metric `Trigger`; durable retries, FIFO topics, and metric-math payloads are not covered.
 
-### Metric-math alarm definitions
+### Metric math and alarms
 
 `PutMetricAlarm` stores the `Metrics` query definitions and `DescribeAlarms` returns them over
 both JSON and Query protocols. `AWS::CloudWatch::Alarm` resolves and stores the same definitions.
-Expressions, labels, `ReturnData`, account IDs, query periods,
+Expressions, labels, `ReturnData`, the current account ID, query periods,
 and nested metric statistics (including dimensions and units) survive storage reloads.
 Metric-math alarm responses omit the single-metric fields, including top-level `Period`.
 Updating an alarm replaces its metric definition, so changing between `Metrics` and a single
 metric does not retain the previous definition.
 
-This is management-plane support: the alarm evaluator currently evaluates only single-metric
-alarms, not metric-math expressions. `SetAlarmState` remains available for manual transitions.
+`GetMetricData` and the periodic alarm evaluator share arithmetic support for `+`, `-`, `*`,
+`/`, `^`, unary signs, parentheses and references to other query IDs. Hidden queries can supply
+operands, and dependencies can appear in any order. Missing arithmetic operands are zero;
+division by zero drops that point. An alarm watches one returned time series and applies its
+normal threshold, evaluation range and `TreatMissingData` policy to the calculated values.
+
+`PERIOD(metric)` returns the metric's period in seconds. `SERVICE_QUOTA(metric)` supports
+account-wide `AWS/Lambda` `ConcurrentExecutions` and reads the current Lambda concurrency
+value from Floci's Service Quotas service. That service's existing catalog value is synthetic;
+this does not infer or fetch a production account's quota.
+
+The supported expressions require matching metric periods. Cyclic references, unsupported
+functions, scalar-only results, mixed periods and cross-account queries are refused.
+Invalid updates preserve the existing alarm. Advanced functions, arrays, search, anomaly
+detection and other service-quota metric bindings remain unsupported. Expressions have bounded
+syntax size and depth, and generated quota series are limited to 100800 points per request.
+`SetAlarmState` remains available for manual transitions.
 
 ### DescribeAlarms filters {#describealarms-filters}
 
