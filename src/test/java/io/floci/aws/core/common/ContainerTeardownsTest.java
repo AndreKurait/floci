@@ -26,6 +26,51 @@ class ContainerTeardownsTest {
     private static final Logger LOG = Logger.getLogger(ContainerTeardownsTest.class);
 
     @Test
+    void preparesEveryServiceBeforeTheFirstDrain() {
+        List<String> phases = new ArrayList<>();
+        ContainerTeardown first = teardown("first", phases, false);
+        ContainerTeardown second = teardown("second", phases, false);
+        @SuppressWarnings("unchecked")
+        Instance<ContainerTeardown> teardowns = mock(Instance.class);
+        when(teardowns.iterator()).thenAnswer(ignored -> List.of(first, second).iterator());
+
+        ContainerTeardowns.stopAll(teardowns, LOG);
+
+        assertEquals(List.of("prepare-first", "prepare-second", "stop-first", "stop-second"), phases);
+    }
+
+    @Test
+    void failedPreparationStillPreparesAndDrainsEveryService() {
+        List<String> phases = new ArrayList<>();
+        ContainerTeardown first = teardown("first", phases, true);
+        ContainerTeardown second = teardown("second", phases, false);
+        @SuppressWarnings("unchecked")
+        Instance<ContainerTeardown> teardowns = mock(Instance.class);
+        when(teardowns.iterator()).thenAnswer(ignored -> List.of(first, second).iterator());
+
+        ContainerTeardowns.stopAll(teardowns, LOG);
+
+        assertEquals(List.of("prepare-first", "prepare-second", "stop-first", "stop-second"), phases);
+    }
+
+    private static ContainerTeardown teardown(String name, List<String> phases, boolean failPreparation) {
+        return new ContainerTeardown() {
+            @Override
+            public void beginTeardown() {
+                phases.add("prepare-" + name);
+                if (failPreparation) {
+                    throw new IllegalStateException("injected preparation failure");
+                }
+            }
+
+            @Override
+            public void stopManagedContainers() {
+                phases.add("stop-" + name);
+            }
+        };
+    }
+
+    @Test
     void stopAllRunsATeardownWhoseContainersOthersUseAfterTheirs() {
         List<String> stopped = new ArrayList<>();
         ContainerTeardown storage = new ContainerTeardown() {
