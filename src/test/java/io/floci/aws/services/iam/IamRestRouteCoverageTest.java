@@ -43,7 +43,7 @@ class IamRestRouteCoverageTest {
     private static final Pattern LABEL = Pattern.compile("\\{([^}+]+)(\\+?)}");
 
     /** The REST namespaces whose entries in {@code iam-authorized-actions.json} only the route table can apply. */
-    private static final Set<String> ROUTED_NAMESPACES = Set.of("s3", "apigateway", "lambda");
+    private static final Set<String> ROUTED_NAMESPACES = Set.of("s3", "apigateway", "lambda", "appconfig");
 
     /**
      * The S3 Control operations Floci serves, the rest-routes entry of which is a route the
@@ -72,6 +72,25 @@ class IamRestRouteCoverageTest {
             "DeletePublicAccessBlock", "s3:PutAccountPublicAccessBlock");
 
     private final IamActionRegistry registry = new IamActionRegistry();
+
+    @TestFactory
+    Stream<DynamicTest> appConfigControlAndDataRoutesUseTheSamePermissionNamespace() throws IOException {
+        JsonNode models = load("/aws/rest-routes.json").path("models");
+        List<DynamicTest> tests = new ArrayList<>();
+        for (String client : List.of("appconfig", "appconfigdata")) {
+            JsonNode model = models.path(client);
+            assertFalse(model.isMissingNode(), client + " routes must be vendored from the AWS model");
+            assertEquals("appconfig", model.path("credentialScope").asText());
+            model.path("operations").fields().forEachRemaining(entry -> {
+                JsonNode http = entry.getValue();
+                Route route = new Route("appconfig", client, entry.getKey(),
+                        http.path("method").asText(), http.path("requestUri").asText());
+                tests.add(DynamicTest.dynamicTest(client + " " + entry.getKey(),
+                        () -> assertEquals("appconfig:" + entry.getKey(), resolve(route), route.toString())));
+            });
+        }
+        return tests.stream();
+    }
 
     @TestFactory
     Stream<DynamicTest> servedAccessAnalyzerOperationsUseTheirModeledRoutes() throws IOException {
