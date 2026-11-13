@@ -26,6 +26,13 @@ class IamAuthorizedActionsTest {
     }
 
     @Test
+    void casesBatchOperationsRetainTheirAcceptedSingleItemActions() {
+        assertEquals("cases:CreateRelatedItem", IamAuthorizedActions.actionFor("cases", "BatchCreateRelatedItem"));
+        assertEquals("cases:UpdateCase", IamAuthorizedActions.actionFor("cases", "BatchUpdateCase"));
+        assertEquals("cases:GetCase", IamAuthorizedActions.actionFor("cases", "GetCase"));
+    }
+
+    @Test
     void budgetsOperationsAreAuthorizedAsModifyBudgetOrViewBudget() {
         assertEquals("budgets:ModifyBudget", IamAuthorizedActions.actionFor("budgets", "CreateBudget"));
         assertEquals("budgets:ModifyBudget", IamAuthorizedActions.actionFor("budgets", "UpdateSubscriber"));
