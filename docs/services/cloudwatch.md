@@ -630,10 +630,19 @@ operands, and dependencies can appear in any order. Missing arithmetic operands 
 division by zero drops that point. An alarm watches one returned time series and applies its
 normal threshold, evaluation range and `TreatMissingData` policy to the calculated values.
 
-`PERIOD(metric)` returns the metric's period in seconds. `SERVICE_QUOTA(metric)` supports
-account-wide `AWS/Lambda` `ConcurrentExecutions` and reads the current Lambda concurrency
-value from Floci's Service Quotas service. That service's existing catalog value is synthetic;
-this does not infer or fetch a production account's quota.
+`PERIOD(metric)` returns the metric's period in seconds. `SERVICE_QUOTA(metric)` "Returns the
+service quota for the given usage metric". It reads the quota whose Service Quotas `UsageMetric`
+is the metric (the same namespace, name and dimensions) from Floci's Service Quotas service, in
+alarms and in `GetMetricData`. The catalog has two such quotas:
+- CloudWatch's `L-8BC498D4` "Rate of PutMetricData requests" (500), for the `AWS/Usage` `CallCount`
+  metric with `Service` `CloudWatch`, `Type` `API` and `Resource` `PutMetricData`. A `Class` `None`
+  dimension may be present too;
+- Lambda's `L-B99A9384` "Concurrent executions", for account-wide `AWS/Lambda`
+  `ConcurrentExecutions`.
+
+A metric that no quota in the catalog tracks is refused with `InvalidParameterValue`. AWS
+documents no such error; it is Floci's signal that the catalog lacks the quota. The values are
+catalog values; this does not infer or fetch a production account's quota.
 
 `FILL(series, filler)` fills the missing values of one time series. The first argument is any
 expression that yields a time series; the filler is a scalar expression (`FILL(m, 0)`,
