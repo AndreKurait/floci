@@ -29,6 +29,10 @@ Inflation is bounded to 10 MiB; the ordinary log-event validation still applies.
 | `PutLogEvents` | Write log events to a stream |
 | `GetLogEvents` | Read log events from a stream |
 | `FilterLogEvents` | Search log events with a filter pattern |
+| `PutTransformer` | Create or replace a supported group parseJSON transformer |
+| `GetTransformer` | Read a group transformer with its ARN and timestamps |
+| `DeleteTransformer` | Remove a group transformer for future ingestion |
+| `TestTransformer` | Preview the supported parseJSON processor without storing events |
 | `CreateExportTask` | Export a snapshot of native log events as real S3 gzip objects |
 | `DescribeExportTasks` | Describe export status and retained task history |
 | `CancelExportTask` | Cancel queued work or stop after an already claimed object |
@@ -147,6 +151,48 @@ metric filters and subscription filters use: terms, quoted phrases, `?` alternat
 exclusions, JSON and space-delimited patterns. An invalid pattern is refused with
 `InvalidParameterException`, and so is a request that names no log group by `logGroupName` or
 `logGroupIdentifier`.
+
+### Group log transformers
+
+`PutTransformer`, `GetTransformer` and `DeleteTransformer` manage a persistent transformer on an
+owned Standard log group, selected by its name or canonical ARN. A transformer contains exactly one
+`parseJSON` processor. Its source is omitted or `@message`; its optional destination is a dotted
+identifier path of at most three components and 128 characters. Omitting the destination places the
+parsed fields at the JSON root. Other processors, processor chains and unsupported source or
+destination expressions are rejected before changing the stored definition. Get preserves omitted
+optional members, the original creation time and the last replacement time.
+
+`TestTransformer` runs the same parser without storing events. It accepts up to 50 nonempty messages
+and returns each original message with its transformed JSON. The optional event number is omitted.
+The supported input is a JSON object smaller than 512 KiB, with at most 64 nesting levels and 200
+extracted fields. This subset counts JSON object members throughout the parsed tree, including
+objects inside arrays; destination wrapper keys are not extracted input fields. Preview rejects
+malformed, non-object, oversized and over-limit input with `InvalidParameterException`. This is a
+bounded local subset, not a claim of exact AWS malformed-input diagnostics or every processor limit.
+
+Transformation runs during ingestion. Each event keeps its original message and a separate
+transformed view. Replacing or deleting a transformer affects future ingestion only. Stored event
+views survive restart and remain subject to the group's ordinary retention and deletion behavior.
+`GetLogEvents` and `FilterLogEvents` return originals. Logs Insights reads transformed fields while
+`@message` remains the original input. Failed parsing retains the original event, exposes
+`@transformationError` to field projection and filters, and creates no transformed result.
+
+Metric and subscription filters with `applyOnTransformedLogs=true` select transformed messages when
+available. Subscription delivery uses the selected message through its existing destination path.
+Filters using false or omission select originals. An event whose transformation failed is skipped by
+transformed filters, while ordinary filters can still process the original. Without a configured
+transformation the original view remains available. Configuration changes and event publication use
+the same metadata-before-event-index lock order as group deletion, so each batch uses one definition.
+
+The three lifecycle IAM actions use the exact log-group ARN and stored resource-tag conditions.
+`TestTransformer` is authorized against `*`. Foreign-account or foreign-region ARNs cannot select a
+local group. External monitoring-account links are unsupported.
+
+Account-level transformer policies remain stored metadata only: their processor execution, selection
+criteria and fallback after deleting a group transformer are unsupported. This feature does not emit
+transformation telemetry metrics or implement Contributor Insights, field indexes or additional
+processors. It does publish ordinary configured metric-filter metrics and delivers matching
+subscription events through the existing delivery implementation.
 
 ### Vended log delivery {#vended-log-delivery}
 
@@ -310,11 +356,12 @@ rejected when the filter is stored.
 `emitSystemFieldDimensions` adds `@aws.account` and `@aws.region` on matching contributions as
 described above. They count toward the same combined limit of three dimensions.
 
-`applyOnTransformedLogs` is stored and returned unchanged. Request acceptance was verified on AWS,
-including `true` on the tested group without a group-level transformer. Floci does not execute
-group-level or account-level log transformations, including stored `TRANSFORMER_POLICY`
-configuration. Accepting the flag therefore does not establish transformed-log processing or
-full compatibility with an AWS group that has an active transformer.
+`applyOnTransformedLogs` is stored and returned unchanged. With the supported group transformer,
+`true` selects the stored transformed message for matching and metric extraction; false or omission
+selects the original. An event whose transformation failed contributes no transformed-filter metric,
+including a default value. Without a configured transformation, filters retain the original view.
+Request acceptance of `true` without a group transformer was verified on AWS. Account-level
+`TRANSFORMER_POLICY` execution remains unsupported.
 
 See [Metric-filter contract verification](cloudwatch-metric-filters-verification.md) for the
 scenarios tagged **Verified on Live AWS**, the recorded fixtures and their evidence boundaries.
