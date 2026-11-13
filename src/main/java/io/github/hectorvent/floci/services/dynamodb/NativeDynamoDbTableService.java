@@ -108,6 +108,13 @@ public class NativeDynamoDbTableService {
      *                      a table an ImportTable job is still loading
      */
     TableDefinition createTable(CreateTableRequest request, String initialStatus, String region) {
+        DynamoDbTableNames.requireShortName(request.tableName());
+        synchronized (dynamoDbService.tableControlLock(request.tableName(), region)) {
+            return createTableWithCapacityLock(request, initialStatus, region);
+        }
+    }
+
+    private TableDefinition createTableWithCapacityLock(CreateTableRequest request, String initialStatus, String region) {
         String tableName = request.tableName();
         TableSettings settings = request.settings();
         String billingMode = settings.billingMode();
@@ -176,6 +183,7 @@ public class NativeDynamoDbTableService {
         // backend serializes on write rather than holding the live object. Flush once so the
         // stream, billing, class, tag and SSE settings survive a restart: stream state
         // especially, since startup rebuilds streams from the persisted table.
+        table.initializeWarmThroughput();
         dynamoDbService.persistTable(tableName, table, region);
         return table;
     }
@@ -407,6 +415,12 @@ public class NativeDynamoDbTableService {
      * stay with the caller, which runs them while it parses so their error precedence holds.
      */
     TableDefinition updateTable(UpdateTableRequest request, String region) {
+        synchronized (dynamoDbService.tableControlLock(request.tableName(), region)) {
+            return applyUpdate(request, region);
+        }
+    }
+
+    private TableDefinition applyUpdate(UpdateTableRequest request, String region) {
         String tableName = request.tableName();
         TableSettings settings = request.settings();
         List<String> addRegions = request.replicaAdds();
@@ -437,6 +451,7 @@ public class NativeDynamoDbTableService {
                 request.vectorCreates(), request.vectorDeletes(),
                 settings.billingMode(), region);
 
+        table.retainWarmThroughput();
         for (GsiThroughputUpdate update : request.gsiUpdates()) {
             GlobalSecondaryIndex gsi = table.findGsi(update.indexName()).orElseThrow();
             Throughput gsiThroughput = update.provisionedThroughput();
@@ -509,6 +524,7 @@ public class NativeDynamoDbTableService {
         // the table from storage for its own persist. A persistent backend serializes on write
         // rather than holding the live object, so without this flush first, that re-fetch would
         // see neither the stream nor the SSE mutations above.
+        table.retainWarmThroughput();
         dynamoDbService.persistTable(tableName, table, region);
 
         if (replicaUpdates) {
@@ -525,6 +541,13 @@ public class NativeDynamoDbTableService {
      * @return a snapshot of what this call left on the destination, with the canonical table name
      */
     public KinesisDestination enableKinesisStreamingDestination(String tableName, String streamArn, String precision,
+                                                                String region) {
+        synchronized (dynamoDbService.tableControlLock(tableName, region)) {
+            return enableKinesisStreamingDestinationLocked(tableName, streamArn, precision, region);
+        }
+    }
+
+    private KinesisDestination enableKinesisStreamingDestinationLocked(String tableName, String streamArn, String precision,
                                                                 String region) {
         TableDefinition table = dynamoDbService.describeTable(tableName, region);
         String resolvedTableName = table.getTableName();
@@ -569,6 +592,12 @@ public class NativeDynamoDbTableService {
      * @return a snapshot of what this call left on the destination, with the canonical table name
      */
     public KinesisDestination disableKinesisStreamingDestination(String tableName, String streamArn, String region) {
+        synchronized (dynamoDbService.tableControlLock(tableName, region)) {
+            return disableKinesisStreamingDestinationLocked(tableName, streamArn, region);
+        }
+    }
+
+    private KinesisDestination disableKinesisStreamingDestinationLocked(String tableName, String streamArn, String region) {
         TableDefinition table = dynamoDbService.describeTable(tableName, region);
         String resolvedTableName = table.getTableName();
 
@@ -600,12 +629,22 @@ public class NativeDynamoDbTableService {
      * does. Forwarding never stops: records already captured are still delivered, and the forwarder
      * stamps each later write with the new precision.
      *
-     * @param precision an already validated ApproximateCreationDateTimePrecision
+     * @param precision an already validated ApproximateCreationDateTimePrecision, or null to retain it
      * @return a snapshot of what this call left on the destination, with the canonical table name
      */
     public KinesisDestination updateKinesisStreamingDestination(String tableName, String streamArn, String precision,
                                                                 String region) {
+        synchronized (dynamoDbService.tableControlLock(tableName, region)) {
+            return updateKinesisStreamingDestinationLocked(tableName, streamArn, precision, region);
+        }
+    }
+
+    private KinesisDestination updateKinesisStreamingDestinationLocked(String tableName, String streamArn, String precision,
+                                                                String region) {
         TableDefinition table = dynamoDbService.describeTable(tableName, region);
+        if (AwsArnUtils.looksLikeArn(tableName) && !tableName.equals(table.getTableArn())) {
+            throw new AwsException("ResourceNotFoundException", "Requested table not found: " + tableName, 400);
+        }
         String resolvedTableName = table.getTableName();
 
         Optional<KinesisStreamingDestination> existing = table.findKinesisStreamingDestination(streamArn);
@@ -618,8 +657,10 @@ public class NativeDynamoDbTableService {
                     "Kinesis streaming destination is not active for stream: " + streamArn, 400);
         }
 
-        existing.get().setApproximateCreationDateTimePrecision(precision);
-        KinesisDestination updated = new KinesisDestination(resolvedTableName, streamArn, "ACTIVE", precision);
+        KinesisStreamingDestination destination = existing.get();
+        String effectivePrecision = precision != null ? precision : destination.getApproximateCreationDateTimePrecision();
+        destination.setApproximateCreationDateTimePrecision(effectivePrecision);
+        KinesisDestination updated = new KinesisDestination(resolvedTableName, streamArn, "ACTIVE", effectivePrecision);
         dynamoDbService.persistTable(resolvedTableName, table, region);
         return updated;
     }

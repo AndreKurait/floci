@@ -18,12 +18,14 @@ import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
+import io.github.hectorvent.floci.core.common.StripedLocks;
 import io.github.hectorvent.floci.core.common.Totp;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.applicationautoscaling.DynamoDbRegistrationTarget;
 import io.github.hectorvent.floci.services.dynamodb.model.AttributeDefinition;
 import io.github.hectorvent.floci.services.dynamodb.model.ConditionalCheckFailedException;
 import io.github.hectorvent.floci.services.dynamodb.model.ContributorInsights;
@@ -36,6 +38,7 @@ import io.github.hectorvent.floci.services.dynamodb.model.IncrementalExportSpeci
 import io.github.hectorvent.floci.services.dynamodb.model.KeySchemaElement;
 import io.github.hectorvent.floci.services.dynamodb.model.LocalSecondaryIndex;
 import io.github.hectorvent.floci.services.dynamodb.model.PointInTimeChange;
+import io.github.hectorvent.floci.services.dynamodb.model.ProvisionedThroughput;
 import io.github.hectorvent.floci.services.dynamodb.model.StreamDescription;
 import io.github.hectorvent.floci.services.dynamodb.model.TableBackup;
 import io.github.hectorvent.floci.services.dynamodb.model.TableDefinition;
@@ -115,6 +118,7 @@ public class DynamoDbService {
     static final String DEFAULT_STREAM_VIEW_TYPE = "NEW_AND_OLD_IMAGES";
 
     private final StorageBackend<String, TableDefinition> tableStore;
+    private final StripedLocks tableControlLocks = new StripedLocks(256);
     private final StorageBackend<String, Map<String, JsonNode>> itemStore;
     private final StorageBackend<String, ExportDescription> exportStore;
     private final StorageBackend<String, ImportTableDescription> importStore;
@@ -507,6 +511,22 @@ public class DynamoDbService {
                                         List<VectorIndexCreate> vectorIndexes,
                                         String billingMode,
                                         String region) {
+        DynamoDbTableNames.requireShortName(tableName);
+        synchronized (tableControlLock(tableName, region)) {
+            return createTableWithCapacityLock(tableName, keySchema, attributeDefinitions, readCapacity, writeCapacity,
+                gsis, lsis, vectorIndexes, billingMode, region);
+        }
+    }
+
+    private TableDefinition createTableWithCapacityLock(String tableName,
+                                        List<KeySchemaElement> keySchema,
+                                        List<AttributeDefinition> attributeDefinitions,
+                                        Long readCapacity, Long writeCapacity,
+                                        List<GlobalSecondaryIndex> gsis,
+                                        List<LocalSecondaryIndex> lsis,
+                                        List<VectorIndexCreate> vectorIndexes,
+                                        String billingMode,
+                                        String region) {
         // Enforce at the service boundary: CreateTable persists its input as the
         // canonical table name and derives TableArn from it. An ARN-form input
         // would produce ARN-on-ARN TableArn values. Handler-layer rejection alone
@@ -681,6 +701,7 @@ public class DynamoDbService {
             table.setVectorIndexes(created);
         }
 
+        table.initializeWarmThroughput();
         tableStore.put(storageKey, table);
         itemsByTable.put(scopedItemsKey(storageKey), new ConcurrentSkipListMap<>());
         LOG.infov("Created table: {0} in region {1}", tableName, region);
@@ -992,7 +1013,17 @@ public class DynamoDbService {
         return table;
     }
 
+    Object tableControlLock(String tableName, String region) {
+        return tableControlLocks.lockFor(scopedItemsKey(regionKey(region, canonicalTableName(region, tableName))));
+    }
+
     public void deleteTable(String tableName, String region) {
+        synchronized (tableControlLock(tableName, region)) {
+            deleteTableLocked(tableName, region);
+        }
+    }
+
+    private void deleteTableLocked(String tableName, String region) {
         String canonicalTableName = canonicalTableName(region, tableName);
         String storageKey = regionKey(region, canonicalTableName);
         TableDefinition table = tableStore.get(storageKey)
@@ -2508,6 +2539,107 @@ public class DynamoDbService {
 
     // --- UpdateTable ---
 
+
+    /** Reconcile this registration only; this is not a policy-executor capacity adapter. */
+    public void reconcileScalableTarget(String resourceId, String dimension, int min, int max,
+                                       String region, DynamoDbRegistrationTarget publication) {
+        if (!Set.of("dynamodb:table:ReadCapacityUnits", "dynamodb:table:WriteCapacityUnits",
+                "dynamodb:index:ReadCapacityUnits", "dynamodb:index:WriteCapacityUnits").contains(dimension)) {
+            throw new AwsException("ValidationException", "Unsupported DynamoDB scalable dimension.", 400);
+        }
+        boolean index = dimension.startsWith("dynamodb:index:");
+        String[] parts = resourceId.split("/", -1);
+        if (parts.length != (index ? 4 : 2) || !"table".equals(parts[0]) || parts[1].isBlank()
+                || index && (!"index".equals(parts[2]) || parts[3].isBlank())) {
+            throw new AwsException("ValidationException", "ResourceId does not match the scalable dimension.", 400);
+        }
+        if (min <= 0) {
+            throw new AwsException("ValidationException", "Minimum capacity cannot be less than 1", 400);
+        }
+        if (max <= 0 || min > max) {
+            throw new AwsException("ValidationException",
+                    "DynamoDB capacity bounds must be positive with MinCapacity <= MaxCapacity.", 400);
+        }
+        synchronized (tableControlLock(parts[1], region)) {
+            reconcileScalableTargetLocked(resourceId, parts[1], index ? parts[3] : null,
+                    dimension.endsWith("ReadCapacityUnits"), min, max, region, publication);
+        }
+    }
+
+    private void reconcileScalableTargetLocked(String resourceId, String tableName, String indexName,
+                                              boolean read, int min, int max, String region,
+                                              DynamoDbRegistrationTarget publication) {
+        String storageKey = regionKey(region, canonicalTableName(region, tableName));
+        String missing = "DynamoDB " + (indexName == null ? "table" : "index") + " does not exist: " + resourceId;
+        TableDefinition table = tableStore.get(storageKey)
+                .orElseThrow(() -> new AwsException("ValidationException", missing, 400));
+        GlobalSecondaryIndex index = indexName == null ? null : table.findGsi(indexName)
+                .orElseThrow(() -> new AwsException("ValidationException", missing, 400));
+        if ("PAY_PER_REQUEST".equals(table.getBillingMode())) {
+            throw new AwsException("ValidationException",
+                    "Validation failed for scalable target. Reason: PAY_PER_REQUEST table mode is not scalable.", 400);
+        }
+        ProvisionedThroughput throughput = index == null
+                ? table.getProvisionedThroughput() : index.getProvisionedThroughput();
+        long oldCapacity = read ? throughput.getReadCapacityUnits() : throughput.getWriteCapacityUnits();
+        long desired = Math.max(min, Math.min(max, oldCapacity));
+        if (!"ACTIVE".equals(table.getTableStatus()) || desired == oldCapacity) {
+            publication.publish();
+            return;
+        }
+
+        long oldWarm = registrationWarm(table, index, read, true);
+        long desiredWarm = Math.max(desired, registrationWarm(table, index, read, false));
+        try {
+            setRegistrationCapacity(throughput, read, desired);
+            setRegistrationWarm(table, index, read, desiredWarm);
+            tableStore.put(storageKey, table);
+            publication.publish();
+        } catch (RuntimeException failure) {
+            setRegistrationCapacity(throughput, read, oldCapacity);
+            setRegistrationWarm(table, index, read, oldWarm);
+            try {
+                tableStore.put(storageKey, table);
+            } catch (RuntimeException restorationFailure) {
+                failure.addSuppressed(restorationFailure);
+            }
+            throw failure;
+        }
+    }
+
+    private static long registrationWarm(TableDefinition table, GlobalSecondaryIndex index, boolean read,
+                                         boolean raw) {
+        if (index == null) {
+            return read ? raw ? table.rawWarmReadUnitsPerSecond() : table.getWarmReadUnitsPerSecond()
+                    : raw ? table.rawWarmWriteUnitsPerSecond() : table.getWarmWriteUnitsPerSecond();
+        }
+        return read ? raw ? index.rawWarmReadUnitsPerSecond() : index.getWarmReadUnitsPerSecond(table.getBillingMode())
+                : raw ? index.rawWarmWriteUnitsPerSecond() : index.getWarmWriteUnitsPerSecond(table.getBillingMode());
+    }
+
+    private static void setRegistrationWarm(TableDefinition table, GlobalSecondaryIndex index,
+                                            boolean read, long value) {
+        if (index == null) {
+            if (read) {
+                table.setWarmReadUnitsPerSecond(value);
+            } else {
+                table.setWarmWriteUnitsPerSecond(value);
+            }
+        } else if (read) {
+            index.setWarmReadUnitsPerSecond(value);
+        } else {
+            index.setWarmWriteUnitsPerSecond(value);
+        }
+    }
+
+    private static void setRegistrationCapacity(ProvisionedThroughput throughput, boolean read, long value) {
+        if (read) {
+            throughput.setReadCapacityUnits(value);
+        } else {
+            throughput.setWriteCapacityUnits(value);
+        }
+    }
+
     public TableDefinition updateTable(String tableName, Long readCapacity, Long writeCapacity, String region) {
         return updateTable(tableName, readCapacity, writeCapacity, List.of(), List.of(), List.of(), region);
     }
@@ -2520,6 +2652,17 @@ public class DynamoDbService {
     }
 
     public TableDefinition updateTable(String tableName, Long readCapacity, Long writeCapacity,
+                                        List<GlobalSecondaryIndex> gsiCreates, List<String> gsiDeletes,
+                                        List<AttributeDefinition> newAttrDefs,
+                                        List<VectorIndexCreate> vectorCreates, List<String> vectorDeletes,
+                                        String billingMode, String region) {
+        synchronized (tableControlLock(tableName, region)) {
+            return updateTableWithCapacityLock(tableName, readCapacity, writeCapacity, gsiCreates, gsiDeletes,
+                newAttrDefs, vectorCreates, vectorDeletes, billingMode, region);
+        }
+    }
+
+    private TableDefinition updateTableWithCapacityLock(String tableName, Long readCapacity, Long writeCapacity,
                                         List<GlobalSecondaryIndex> gsiCreates, List<String> gsiDeletes,
                                         List<AttributeDefinition> newAttrDefs,
                                         List<VectorIndexCreate> vectorCreates, List<String> vectorDeletes,
@@ -2588,6 +2731,7 @@ public class DynamoDbService {
                 gsiCreates.size() + gsiDeletes.size(), knownAttrDefs,
                 billingMode != null ? billingMode : table.getBillingMode());
 
+        table.retainWarmThroughput();
         if (readCapacity != null) {
             table.getProvisionedThroughput().setReadCapacityUnits(readCapacity);
         }
@@ -2600,6 +2744,7 @@ public class DynamoDbService {
         }
 
         for (GlobalSecondaryIndex gsi : gsiCreates) {
+            gsi.initializeWarmThroughput(table.getBillingMode());
             gsi.setIndexArn(table.getTableArn() + "/index/" + gsi.getIndexName());
             table.getGlobalSecondaryIndexes().add(gsi);
         }
@@ -2631,6 +2776,7 @@ public class DynamoDbService {
         }
         pruneUnusedAttributeDefinitions(table);
 
+        table.retainWarmThroughput();
         tableStore.put(storageKey, table);
         LOG.infov("Updated table: {0} in region {1}", canonicalTableName, region);
         return table;
