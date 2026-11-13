@@ -76,13 +76,15 @@ feature flags are resolved as on the [data plane](#data-plane), including Ion fo
 An exact resource ID takes precedence over another resource's name. If multiple resources in the
 selected scope share a name, name lookup returns `BadRequestException`; use the intended resource's ID.
 This also applies to the management operations and `StartConfigurationSession` that use these lookups.
-A `client_configuration_version` equal to the deployed version returns HTTP 204 with an empty body
-and `Configuration-Version`, without `Content-Type` or `Content-Length`. An empty configuration
+For hosted configurations, a `client_configuration_version` equal to the deployed version returns HTTP 204 with an empty body
+and `Configuration-Version`, without `Content-Type` or `Content-Length`.
+An unchanged retained S3 version returns HTTP 200 with an empty body and its stored content type,
+matching the observed S3 response. The AWS API reference documents HTTP 204 for matching versions generally.
+An empty configuration
 that the caller has not received still returns HTTP 200 and its stored content type.
 A missing or undeployed environment returns `BadRequestException`; an unknown application or configuration profile
 returns `ResourceNotFoundException`.
-Only hosted configurations are served: a deployed version with no hosted configuration version behind it,
-such as one from an S3 or SSM source, returns `ResourceNotFoundException`.
+Hosted and versioned S3 configurations are served. Other external configuration sources remain unsupported.
 
 `UpdateConfigurationProfile` accepts application/profile IDs or names and updates supplied
 `Name`, `Description` and `Validators` fields. Omitted fields retain their values; an empty
@@ -90,15 +92,15 @@ description or validator list clears that field. The update returns the complete
 preserves its ID, parent application, type and location. Validator declaration checks run before
 the stored profile is replaced; schema compilation and Lambda invocation remain in configuration
 validation and deployment. Updating validators does not replace hosted versions or active content.
-Retrieval-role and KMS-key updates are not implemented.
+S3 profiles also accept `RetrievalRoleArn` updates. Retrieval-role updates for other sources and KMS-key updates remain unsupported.
 
 Clearing `Description` with an empty string returns `Description: ""` in the update response.
 The following `GetConfigurationProfile` response omits `Description`; other fields retain their values.
 
 `CreateConfigurationProfile` stores up to two `Validators`, each with a `Type` and `Content`
-of at most 32,768 characters. Hosted freeform profiles support inline `JSON_SCHEMA` validators
+of at most 32,768 characters. Hosted and S3 freeform profiles support inline `JSON_SCHEMA` validators
 using draft-04, including references within the schema. `ValidateConfiguration` checks the
-selected hosted version and returns HTTP 204 when it passes; invalid content or an invalid
+selected hosted or S3 version and returns HTTP 204 when it passes; invalid content or an invalid
 schema returns `BadRequestException`. Validation leaves the stored profile and versions unchanged.
 `StartDeployment` applies the same validators before creating a deployment or changing the active
 configuration, so a refusal preserves the previous deployment and content. With IAM enforcement
@@ -106,9 +108,19 @@ enabled, validation requires `appconfig:ValidateConfiguration` on both the appli
 configuration-profile ARNs.
 
 Other schema drafts and external schema references are not supported. JSON Schema validators
-are refused for feature-flag profiles. Validation of S3 and other external configuration sources
+are refused for feature-flag profiles. Validation of external sources other than S3
 is not implemented. The CloudFormation provisioner still
 ignores the template's `Validators`; these validators are configured through the management API.
+
+S3 profiles require a versioned bucket, an explicit immutable object VersionId and a retrieval role
+that trusts AppConfig. Floci retrieves the selected object before admitting a deployment and retains
+its bytes for both configuration APIs and rollback. Later source deletion or permission changes do
+not trigger another retrieval for an admitted version. S3 data responses do not use a hosted version label.
+With IAM enforcement enabled, the retrieval role needs `s3:GetBucketVersioning` and `s3:GetObjectVersion`;
+version-specific tags, bucket policies, permission boundaries and SCPs use the existing authorizer.
+S3 URIs and object ARNs are accepted. The local source limit is 1 MiB; only unencrypted and SSE-S3
+objects in supported immediately readable storage classes are implemented. SSE-KMS, SSE-C, mutable
+`null` versions and S3 Lambda validation remain unsupported.
 
 Hosted profiles also support `LAMBDA` validators naming a function ARN. Both validation and deployment
 invoke the function with five string fields: `applicationId`, `configurationProfileId`,
@@ -136,7 +148,7 @@ composite alarms require wildcard resource permission. Role permissions boundari
 Default monitoring-role discovery is not implemented.
 
 During rollout and final bake, enabled alarms in `ALARM` or `INSUFFICIENT_DATA` trigger automatic rollback
-to the previous available hosted configuration. A background worker advances deployments without requiring
+to the previous available hosted or retained S3 configuration. A background worker advances deployments without requiring
 deployment-status reads. Disabled alarm actions suppress rollback. The returned `EventLog` contains
 `ROLLBACK_COMPLETED` and `ROLLBACK_STARTED`, newest first, identifying the alarm and its state. Monitoring
 ends at the captured rollout-plus-bake deadline; a delayed worker completes an elapsed deployment before
@@ -166,6 +178,11 @@ If the previous hosted configuration version has been deleted, the stop is rejec
 with `BadRequestException` before changing the active version or stopping the deployment.
 Older persisted deployments without completion timestamps cannot be reverted because
 that window cannot be verified.
+
+Completed reverts preserve `StartedAt` and `CompletedAt`. They prepend a
+`REVERT_COMPLETED` event with `TriggeredBy: USER` and the revert time, retaining all
+recorded event history. Environment state aggregation, ordinary deployment start
+and completion events, and event `ActionInvocations` fields remain unimplemented.
 Explicit stop/revert bypasses alarm reads, so an unhealthy or deleted monitor does not prevent recovery.
 
 ## Data Plane (AppConfigData) {#data-plane}
@@ -215,9 +232,14 @@ place and deletes what it created.
 
 Deleting an environment deletes its deployments, and deleting a configuration profile deletes its hosted configuration
 versions. Floci keeps tags on applications only, so `Tags` on the other three types are accepted and not stored, as
-`TagResource` treats them; so are a configuration profile's `KmsKeyIdentifier`, `RetrievalRoleArn` and `Validators`,
+`TagResource` treats them; so are a configuration profile's `KmsKeyIdentifier` and `Validators`,
 and `DeletionProtectionCheck`. `ReplicateTo: SSM_DOCUMENT` writes no SSM document.
 `AWS::AppConfig::HostedConfigurationVersion`, `Deployment`, `Extension` and `ExtensionAssociation` are not provisioned.
+
+CloudFormation configuration profiles pass `RetrievalRoleArn` to S3 source creation and can update
+it in place. Failed stack updates restore the prior role with the profile's name and description.
+Non-S3 CloudFormation profiles retain their existing behavior: retrieval-role properties are accepted
+and ignored, and updates restore only their name and description.
 
 A stack created before Floci provisioned these types holds stubs for them, and an update creates the real resource in
 place of a stub only when it changes that resource. An update that changes an environment or configuration profile of

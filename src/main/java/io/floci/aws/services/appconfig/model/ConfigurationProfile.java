@@ -21,6 +21,8 @@ public class ConfigurationProfile {
     private String locationUri;
     @JsonProperty("Type")
     private String type; // AWS.AppConfig.FeatureFlags, AWS.Freeform
+    @JsonProperty("RetrievalRoleArn")
+    private String retrievalRoleArn;
     @JsonProperty("Validators")
     private List<Validator> validators;
 
@@ -43,6 +45,9 @@ public class ConfigurationProfile {
 
     public String getType() { return type; }
     public void setType(String type) { this.type = type; }
+
+    public String getRetrievalRoleArn() { return retrievalRoleArn; }
+    public void setRetrievalRoleArn(String retrievalRoleArn) { this.retrievalRoleArn = retrievalRoleArn; }
 
     public List<Validator> getValidators() { return validators; }
     public void setValidators(List<Validator> validators) {

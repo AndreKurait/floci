@@ -13,6 +13,7 @@ import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.core.storage.StorageOperations;
 import io.floci.aws.services.appconfig.model.Application;
+import io.floci.aws.services.appconfig.model.ConfigurationContent;
 import io.floci.aws.services.appconfig.model.ConfigurationProfile;
 import io.floci.aws.services.appconfig.model.Deployment;
 import io.floci.aws.services.appconfig.model.DeploymentEvent;
@@ -57,6 +58,8 @@ public class AppConfigService implements Resettable {
     private final StorageBackend<String, HostedConfigurationVersion> versionStore;
     private final StorageBackend<String, Integer> versionCounters;
     private final AppConfigStorage<Deployment> deploymentStore;
+    private final StorageBackend<String, ConfigurationContent> sourceContentStore;
+    private final AppConfigS3Source s3Source;
     private final StorageBackend<String, String> activeConfigStore; // envId::profileId -> versionNumber
     private final Clock clock;
     private final RegionResolver regions;
@@ -72,6 +75,12 @@ public class AppConfigService implements Resettable {
     private static final Pattern ROLE_ARN = Pattern.compile("arn:" + AwsArnUtils.PARTITION_REGEX + ":iam::\\d{12}:role/.*");
 
     @Inject
+    public AppConfigService(StorageFactory storageFactory, RegionResolver regions,
+                            AppConfigAlarmMonitor alarms, AppConfigLambdaValidator lambdaValidator,
+                            AppConfigS3Source s3Source) {
+        this(storageFactory, regions, Clock.systemUTC(), alarms, lambdaValidator, s3Source);
+    }
+
     public AppConfigService(StorageFactory storageFactory, RegionResolver regions,
                             AppConfigAlarmMonitor alarms, AppConfigLambdaValidator lambdaValidator) {
         this(storageFactory, regions, Clock.systemUTC(), alarms, lambdaValidator);
@@ -105,6 +114,13 @@ public class AppConfigService implements Resettable {
 
     AppConfigService(StorageFactory storageFactory, RegionResolver regions, Clock clock,
                      AppConfigAlarmMonitor alarms, AppConfigLambdaValidator lambdaValidator) {
+        this(storageFactory, regions, clock, alarms, lambdaValidator, null);
+    }
+
+    AppConfigService(StorageFactory storageFactory, RegionResolver regions, Clock clock,
+                     AppConfigAlarmMonitor alarms, AppConfigLambdaValidator lambdaValidator,
+                     AppConfigS3Source s3Source) {
+        this.s3Source = s3Source;
         this.lambdaValidator = lambdaValidator;
         this.clock = clock;
         this.regions = regions;
@@ -125,6 +141,8 @@ public class AppConfigService implements Resettable {
                 "appconfig", "appconfig-deployments.json", new TypeReference<>() {});
         this.activeConfigStore = new AppConfigStorage<>(storageFactory, regions,
                 "appconfig", "appconfig-active-configs.json", new TypeReference<>() {});
+        this.sourceContentStore = new AppConfigStorage<>(storageFactory, regions,
+                "appconfig", "appconfig-source-content.json", new TypeReference<>() {});
     }
 
     // ──────────────────────────── Application ────────────────────────────
@@ -346,7 +364,16 @@ public class AppConfigService implements Resettable {
         profile.setDescription((String) request.get("Description"));
         profile.setLocationUri((String) request.get("LocationUri"));
         String type = (String) request.get("Type");
-        profile.setType(type == null && "hosted".equals(profile.getLocationUri()) ? "AWS.Freeform" : type);
+        profile.setType(type == null && ("hosted".equals(profile.getLocationUri()) || AppConfigS3Source.matches(profile))
+                ? "AWS.Freeform" : type);
+        if (AppConfigS3Source.matches(profile)) {
+            Object role = request.get("RetrievalRoleArn");
+            if (role != null && !(role instanceof String)) {
+                throw new AwsException("BadRequestException", "RetrievalRoleArn must be a string.", 400);
+            }
+            profile.setRetrievalRoleArn((String) role);
+            AppConfigS3Source.validateProfile(profile);
+        }
         profile.setValidators(AppConfigValidators.parse(request.get("Validators"), profile.getType()));
         profileStore.put(profile.getId(), profile);
         return profile;
@@ -408,7 +435,12 @@ public class AppConfigService implements Resettable {
         if (request.containsKey("Validators")) {
             profile.setValidators(AppConfigValidators.parse(request.get("Validators"), profile.getType()));
         }
-        if (request.get("RetrievalRoleArn") != null) {
+        if (AppConfigS3Source.matches(profile)) {
+            if (request.containsKey("RetrievalRoleArn")) {
+                profile.setRetrievalRoleArn(profileText(request, "RetrievalRoleArn", 1, 2048, true));
+            }
+            AppConfigS3Source.validateProfile(profile);
+        } else if (request.get("RetrievalRoleArn") != null) {
             throw new AwsException("BadRequestException", "RetrievalRoleArn is not currently supported.", 400);
         }
         if (request.get("KmsKeyIdentifier") != null) {
@@ -434,8 +466,8 @@ public class AppConfigService implements Resettable {
     /**
      * Sets the name and description of a configuration profile, as a CloudFormation update of
      * {@code AWS::AppConfig::ConfigurationProfile} does: both are written, so a null description
-     * clears it. The CloudFormation provisioner uses this full-property helper; native PATCH calls
-     * use the map overload to retain omitted fields.
+     * clears it. The CloudFormation provisioner retains this helper for non-S3 profiles. S3 profile
+     * updates and native PATCH calls use the map overload, which also handles retrieval roles.
      */
     public synchronized ConfigurationProfile updateConfigurationProfile(String applicationId, String profileId,
                                                                         String name, String description) {
@@ -489,6 +521,7 @@ public class AppConfigService implements Resettable {
         // lifecycle - cascade the delete so a caller can't still fetch versions for a profile
         // that's supposedly gone.
         StorageOperations.deleteByPrefix(versionStore, appId + "::" + profileId + "::");
+        StorageOperations.deleteByPrefix(sourceContentStore, appId + "::" + profileId + "::");
         versionCounters.delete(appId + "::" + profileId);
         profileStore.delete(profileId);
     }
@@ -497,7 +530,23 @@ public class AppConfigService implements Resettable {
                                                      String configurationVersion) {
         String appId = resolveApplication(applicationIdentifier).getId();
         ConfigurationProfile profile = resolveConfigurationProfile(appId, profileIdentifier);
-        validateProfile(profile, validationVersion(profile, configurationVersion));
+        if (AppConfigS3Source.matches(profile)) {
+            ConfigurationContent source = retrieveS3Content(profile, configurationVersion);
+            AppConfigValidators.validate(profile.getValidators(), source.content());
+        } else {
+            validateProfile(profile, validationVersion(profile, configurationVersion));
+        }
+    }
+
+    private ConfigurationContent retrieveS3Content(ConfigurationProfile profile, String version) {
+        if (version == null || version.isEmpty() || version.length() > 1024) {
+            throw new AwsException("BadRequestException",
+                    "ConfigurationVersion must contain between 1 and 1024 characters.", 400);
+        }
+        if (s3Source == null) {
+            throw new AwsException("BadRequestException", "S3 configuration retrieval is unavailable.", 400);
+        }
+        return s3Source.retrieve(profile, version);
     }
 
     private HostedConfigurationVersion validationVersion(ConfigurationProfile profile, String configurationVersion) {
@@ -850,6 +899,9 @@ public class AppConfigService implements Resettable {
     public synchronized Deployment startDeployment(String applicationIdentifier,
                                                     String environmentIdentifier,
                                                     Map<String, Object> request) {
+        if (validationPaused) {
+            throw new AwsException("BadRequestException", "Deployments are unavailable while a reset is in progress.", 400);
+        }
         String appId = resolveApplication(applicationIdentifier).getId();
         Environment environment = resolveEnvironment(appId, environmentIdentifier);
         String envId = environment.getId();
@@ -866,13 +918,19 @@ public class AppConfigService implements Resettable {
         }
 
         // Refuse invalid content before assigning a deployment number or changing the active version.
+        ConfigurationContent sourceContent = AppConfigS3Source.matches(profile)
+                ? retrieveS3Content(profile, version) : null;
         HostedConfigurationVersion selected = null;
         if ("hosted".equals(profile.getLocationUri())) {
             selected = validationVersion(profile, version);
             validateProfile(profile, selected);
             version = Integer.toString(selected.getVersionNumber());
         } else if (profile.getValidators() != null && !profile.getValidators().isEmpty()) {
-            validateProfile(profile, validationVersion(profile, version));
+            if (sourceContent != null) {
+                AppConfigValidators.validate(profile.getValidators(), sourceContent.content());
+            } else {
+                validateProfile(profile, validationVersion(profile, version));
+            }
         }
 
         Deployment deployment = new Deployment();
@@ -904,6 +962,9 @@ public class AppConfigService implements Resettable {
         }
         deployment.setDescription((String) request.get("Description"));
 
+        if (sourceContent != null) {
+            sourceContentStore.put(appId + "::" + profileId + "::" + version, sourceContent);
+        }
         deploymentStore.put(appId + "::" + envId + "::" + deployment.getDeploymentNumber(), deployment);
 
         // Update active configuration
@@ -971,6 +1032,13 @@ public class AppConfigService implements Resettable {
                 throw new AwsException("BadRequestException",
                         "The previous hosted configuration version is no longer available.", 400);
             }
+            if (location != null && (location.startsWith("s3://") || AwsArnUtils.isArnFor(location, "s3"))
+                    && sourceContentStore.get(previous.getApplicationId() + "::"
+                            + previous.getConfigurationProfileId() + "::"
+                            + previous.getConfigurationVersion()).isEmpty()) {
+                throw new AwsException("BadRequestException",
+                        "The previous S3 configuration was not retrieved by a deployment.", 400);
+            }
         }
         String activeKey = deployment.getEnvironmentId() + "::" + deployment.getConfigurationProfileId();
         if (previous == null) {
@@ -980,7 +1048,15 @@ public class AppConfigService implements Resettable {
         }
         deployment.setState(completed ? "REVERTED" : "ROLLED_BACK");
         deployment.setPercentageComplete(0.0f);
-        deployment.setCompletedAt(clock.instant().toString());
+        if (completed) {
+            List<DeploymentEvent> events = new ArrayList<>();
+            events.add(new DeploymentEvent("REVERT_COMPLETED", "Deployment reverted by user request",
+                    clock.instant().toString(), "USER"));
+            events.addAll(deployment.getEventLog());
+            deployment.setEventLog(events);
+        } else {
+            deployment.setCompletedAt(clock.instant().toString());
+        }
         if (alarmCause != null) {
             List<DeploymentEvent> events = new ArrayList<>();
             events.add(new DeploymentEvent("ROLLBACK_COMPLETED", alarmCause,
@@ -1032,6 +1108,9 @@ public class AppConfigService implements Resettable {
             try {
                 RequestScopes.runAs(owner.accountId(), owner.region(), () -> {
                     synchronized (this) {
+                        if (validationPaused) {
+                            return;
+                        }
                         deploymentStore.get(owner.key()).filter(AppConfigService::active)
                                 .ifPresent(deployment -> {
                                     String key = deployment.getApplicationId() + "::" + deployment.getEnvironmentId()
@@ -1221,6 +1300,14 @@ public class AppConfigService implements Resettable {
     }
 
     // ──────────────────────────── Tags ────────────────────────────
+
+    /** Reads admitted S3 content without using its retrieval role again. */
+    public ConfigurationContent getS3ConfigurationContent(String applicationId, String profileId, String version) {
+        getConfigurationProfile(applicationId, profileId);
+        return sourceContentStore.get(applicationId + "::" + profileId + "::" + version)
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                        "S3 configuration content was not retrieved by a deployment.", 404));
+    }
 
     public Map<String, String> getApplicationTags(String appId) {
         return getApplication(appId).getTags();

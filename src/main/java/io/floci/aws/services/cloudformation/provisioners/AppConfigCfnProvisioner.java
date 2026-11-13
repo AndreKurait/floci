@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.services.appconfig.AppConfigService;
 import io.floci.aws.services.appconfig.model.Application;
@@ -37,7 +38,7 @@ import java.util.Set;
  *
  * <p>Floci keeps AppConfig tags on applications only, so {@code Tags} on the other three types are
  * accepted and not stored, as Floci's AppConfig TagResource treats them. So are a profile's
- * {@code KmsKeyIdentifier}, {@code RetrievalRoleArn} and {@code Validators}, and the
+ * {@code KmsKeyIdentifier} and {@code Validators}, and the
  * {@code DeletionProtectionCheck} of an environment or profile, which Floci's create operations do
  * not keep either.
  */
@@ -165,31 +166,44 @@ public class AppConfigCfnProvisioner implements CfnResourceProvisioner {
         r.getAttributes().put(CREATE_ONLY_ATTR, createOnly.toString());
     }
 
+    private static boolean isS3Location(String location) {
+        return location != null && (location.startsWith("s3://") || AwsArnUtils.isArnFor(location, "s3"));
+    }
+
     private void provisionProfile(StackResource r, JsonNode props, ProvisionContext ctx, boolean updating) {
         String applicationId = requiredText(PROFILE, props, "ApplicationId", 0, ctx);
         String name = requiredText(PROFILE, props, "Name", PROFILE_NAME_MAX_LENGTH, ctx);
         String locationUri = requiredText(PROFILE, props, "LocationUri", LOCATION_URI_MAX_LENGTH, ctx);
         String type = text(props, "Type", ctx);
         String description = optionalText(PROFILE, props, "Description", DESCRIPTION_MAX_LENGTH, ctx);
+        boolean s3Profile = isS3Location(locationUri);
+        String retrievalRoleArn = s3Profile ? optionalText(PROFILE, props, "RetrievalRoleArn", 2048, ctx) : null;
         allowed(PROFILE, "DeletionProtectionCheck", text(props, "DeletionProtectionCheck", ctx),
                 DELETION_PROTECTION_CHECKS);
         ObjectNode createOnly = MAPPER.createObjectNode()
                 .put("ApplicationId", applicationId)
                 .put("LocationUri", locationUri)
                 .put("Type", type);
-        if (updating && madeFrom(r, createOnly)) {
-            ConfigurationProfile current = service.findConfigurationProfile(ctx.priorPhysicalId())
-                    .orElseThrow(() -> new AwsException("ResourceNotFoundException",
-                            "Configuration profile not found", 404));
-            snapshotBeforeUpdate(r, current);
-            service.updateConfigurationProfile(current.getApplicationId(), current.getId(), name, description);
-            return;
-        }
         Map<String, Object> request = new HashMap<>();
         request.put("Name", name);
         request.put("Description", description);
         request.put("LocationUri", locationUri);
         request.put("Type", type);
+        if (s3Profile) {
+            request.put("RetrievalRoleArn", retrievalRoleArn);
+        }
+        if (updating && madeFrom(r, createOnly)) {
+            ConfigurationProfile current = service.findConfigurationProfile(ctx.priorPhysicalId())
+                    .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                            "Configuration profile not found", 404));
+            snapshotBeforeUpdate(r, current);
+            if (s3Profile) {
+                service.updateConfigurationProfile(current.getApplicationId(), current.getId(), request);
+            } else {
+                service.updateConfigurationProfile(current.getApplicationId(), current.getId(), name, description);
+            }
+            return;
+        }
         ConfigurationProfile profile = service.createConfigurationProfile(applicationId, request);
         r.setPhysicalId(profile.getId());
         r.getAttributes().put("ConfigurationProfileId", profile.getId());
@@ -477,8 +491,16 @@ public class AppConfigCfnProvisioner implements CfnResourceProvisioner {
             }
             case PROFILE -> {
                 ConfigurationProfile prior = MAPPER.treeToValue(snapshot, ConfigurationProfile.class);
-                service.updateConfigurationProfile(prior.getApplicationId(), prior.getId(), prior.getName(),
-                        prior.getDescription());
+                if (isS3Location(prior.getLocationUri())) {
+                    Map<String, Object> request = new HashMap<>();
+                    request.put("Name", prior.getName());
+                    request.put("Description", prior.getDescription());
+                    request.put("RetrievalRoleArn", prior.getRetrievalRoleArn());
+                    service.updateConfigurationProfile(prior.getApplicationId(), prior.getId(), request);
+                } else {
+                    service.updateConfigurationProfile(prior.getApplicationId(), prior.getId(), prior.getName(),
+                            prior.getDescription());
+                }
             }
             case STRATEGY -> {
                 DeploymentStrategy prior = MAPPER.treeToValue(snapshot, DeploymentStrategy.class);
