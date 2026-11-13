@@ -17,6 +17,7 @@ public class ContainerHandle {
     private final boolean hotReload;
     private final String executionRoleAccessKeyId;
     private final String executionRoleSessionAccountId;
+    private final LambdaVpcNetworkManager.Attachment vpcNetwork;
     private volatile ContainerState state;
     private volatile long lastUsedMs;
     private Closeable logStream;
@@ -36,6 +37,14 @@ public class ContainerHandle {
     public ContainerHandle(String containerId, String functionName,
                            RuntimeApiServer runtimeApiServer, ContainerState state, boolean hotReload,
                            String executionRoleAccessKeyId, String executionRoleSessionAccountId) {
+        this(containerId, functionName, runtimeApiServer, state, hotReload, executionRoleAccessKeyId,
+                executionRoleSessionAccountId, null);
+    }
+
+    ContainerHandle(String containerId, String functionName,
+                    RuntimeApiServer runtimeApiServer, ContainerState state, boolean hotReload,
+                    String executionRoleAccessKeyId, String executionRoleSessionAccountId,
+                    LambdaVpcNetworkManager.Attachment vpcNetwork) {
         this.containerId = containerId;
         this.functionName = functionName;
         this.runtimeApiServer = runtimeApiServer;
@@ -43,6 +52,7 @@ public class ContainerHandle {
         this.hotReload = hotReload;
         this.executionRoleAccessKeyId = executionRoleAccessKeyId;
         this.executionRoleSessionAccountId = executionRoleSessionAccountId;
+        this.vpcNetwork = vpcNetwork;
         this.createdAt = System.currentTimeMillis();
         this.lastUsedMs = this.createdAt;
     }
@@ -52,6 +62,7 @@ public class ContainerHandle {
     public boolean isHotReload() { return hotReload; }
     public String getExecutionRoleAccessKeyId() { return executionRoleAccessKeyId; }
     public String getExecutionRoleSessionAccountId() { return executionRoleSessionAccountId; }
+    LambdaVpcNetworkManager.Attachment getVpcNetwork() { return vpcNetwork; }
     public RuntimeApiServer getRuntimeApiServer() { return runtimeApiServer; }
     public long getCreatedAt() { return createdAt; }
     public long getLastUsedMs() { return lastUsedMs; }
