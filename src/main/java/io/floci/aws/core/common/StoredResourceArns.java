@@ -1,6 +1,7 @@
 package io.floci.aws.core.common;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 /**
@@ -36,6 +37,15 @@ public interface StoredResourceArns {
      * type is not one it finds.
      */
     Optional<String> find(String type, List<String> names, String region);
+
+    /**
+     * Resolves names filling an ARN's variables, including compound identities such as an AppConfig profile
+     * under its application. Single-variable resources retain the existing name lookup.
+     */
+    default Optional<String> findByVariables(String type, Map<String, String> variables, String region) {
+        return variables.size() == 1
+                ? find(type, List.of(variables.values().iterator().next()), region) : Optional.empty();
+    }
 
     /**
      * The ARNs of the resources the caller's resource named by {@code value} in {@code member}, as the table writes

@@ -14,6 +14,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -93,6 +94,8 @@ class AppConfigServicePersistenceTest {
         String environmentId = service.createEnvironment(appId, Map.of("Name", "restarted-env")).getId();
         String profileId = service.createConfigurationProfile(appId, Map.of(
                 "Name", "service-settings", "LocationUri", "hosted")).getId();
+        service.createHostedConfigurationVersion(appId, profileId,
+                "{}".getBytes(StandardCharsets.UTF_8), "application/json", null);
         String strategyId = service.createDeploymentStrategy(Map.of(
                 "Name", "gradual", "DeploymentDurationInMinutes", 15, "FinalBakeTimeInMinutes", 5,
                 "GrowthFactor", 25, "GrowthType", "EXPONENTIAL")).getId();

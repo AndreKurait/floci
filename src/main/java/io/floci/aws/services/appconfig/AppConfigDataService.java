@@ -102,6 +102,19 @@ public class AppConfigDataService {
         return getLatestConfiguration(token, null);
     }
 
+    /** The resource a valid token names, without consuming the token or changing its session. */
+    Map<String, String> configurationForToken(String token) {
+        ConfigurationSession session = sessionStore.get(token)
+                .orElseThrow(() -> new AwsException("BadRequestException", "Invalid configuration token", 400));
+        synchronized (session) {
+            if (!token.equals(session.getCurrentToken())) {
+                throw new AwsException("BadRequestException", "Invalid configuration token", 400);
+            }
+            return Map.of("ApplicationId", session.getApplicationId(), "EnvironmentId", session.getEnvironmentId(),
+                    "ConfigurationProfileId", session.getConfigurationProfileId());
+        }
+    }
+
     /** {@code accept} is the caller's Accept header: the AppConfig Agent asks for Ion to evaluate variant flags itself. */
     public ConfigurationData getLatestConfiguration(String token, String accept) {
         ConfigurationSession session = sessionStore.get(token)
@@ -121,12 +134,15 @@ public class AppConfigDataService {
         session.setRequiredMinimumPollIntervalInSeconds(pollInterval);
 
         String activeVersion = appConfigService.getActiveVersion(session.getEnvironmentId(), session.getConfigurationProfileId());
-        
+        boolean changed = activeVersion != null && !activeVersion.equals(session.getLastConfigurationVersion());
+
         HostedConfigurationVersion version = null;
-        if (activeVersion != null && !activeVersion.equals(session.getLastConfigurationVersion())) {
+        if (activeVersion != null) {
             try {
                 version = appConfigService.getHostedConfigurationVersion(session.getApplicationId(), session.getConfigurationProfileId(), Integer.parseInt(activeVersion));
-                session.setLastConfigurationVersion(activeVersion);
+                if (changed) {
+                    session.setLastConfigurationVersion(activeVersion);
+                }
             } catch (Exception e) {
                 LOG.warnv("Active version {0} not found for session {1}", activeVersion, session.getId());
             }
@@ -144,12 +160,18 @@ public class AppConfigDataService {
             ConfigurationProfile profile = appConfigService.getConfigurationProfile(
                     session.getApplicationId(), session.getConfigurationProfileId());
             ResolvedContent resolved = resolveContent(profile, version, accept);
-            content = resolved.bytes();
+            if (changed) {
+                content = resolved.bytes();
+            }
             contentType = resolved.contentType();
         }
-        String versionLabel = (version != null) ? String.valueOf(version.getVersionNumber()) : "";
+        String configurationVersion = version != null && changed ? Integer.toString(version.getVersionNumber()) : "";
+        String versionLabel = "";
+        if (version != null) {
+            versionLabel = changed ? version.getVersionLabel() : null;
+        }
 
-        return new ConfigurationData(content, contentType, versionLabel, nextToken,
+        return new ConfigurationData(content, contentType, configurationVersion, versionLabel, nextToken,
                 pollInterval);
     }
 
@@ -337,6 +359,6 @@ public class AppConfigDataService {
 
     public record LegacyConfiguration(byte[] content, String contentType, String configurationVersion) {}
 
-    public record ConfigurationData(byte[] content, String contentType, String configurationVersion,
+    public record ConfigurationData(byte[] content, String contentType, String configurationVersion, String versionLabel,
                                     String nextPollConfigurationToken, int nextPollIntervalInSeconds) {}
 }

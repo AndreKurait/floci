@@ -1,6 +1,7 @@
 package io.floci.aws.services.appconfig.model;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
@@ -19,6 +20,9 @@ public class HostedConfigurationVersion {
     private byte[] content;
     @JsonProperty("ContentType")
     private String contentType;
+    @JsonProperty("VersionLabel")
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private String versionLabel;
 
     public HostedConfigurationVersion() {}
 
@@ -39,4 +43,6 @@ public class HostedConfigurationVersion {
 
     public String getContentType() { return contentType; }
     public void setContentType(String contentType) { this.contentType = contentType; }
+    public String getVersionLabel() { return versionLabel; }
+    public void setVersionLabel(String versionLabel) { this.versionLabel = versionLabel; }
 }
