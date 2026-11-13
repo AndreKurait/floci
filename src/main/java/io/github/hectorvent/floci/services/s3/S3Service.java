@@ -15,6 +15,7 @@ import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.Base64Url;
 import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.FileTrees;
+import io.github.hectorvent.floci.core.common.IamConditionContextResolver;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.Resettable;
@@ -684,6 +685,120 @@ public class S3Service implements Resettable, ResourceProvider {
         }
 
         return bucket.getLoggingConfiguration();
+    }
+
+    record AccessLogTarget(String account, String region, String sourceName, Bucket source,
+                           String sourceDocument, S3AccessLogConfiguration configuration, Bucket destination) { }
+
+    /** Captures both incarnations; a later same-name bucket must not inherit queued requests. */
+    AccessLogTarget accessLogTarget(String bucketName) {
+        AccountAwareStorageBackend.OwnedEntry<Bucket> source = resolveBucketEntry(bucketName).orElse(null);
+        if (source == null) {
+            return null;
+        }
+        String document = source.value().getLoggingConfiguration();
+        S3AccessLogConfiguration configuration = S3AccessLogConfiguration.parse(document);
+        if (configuration == null) {
+            return null;
+        }
+        Bucket destination = accessLogBucket(source.account(), configuration.destination());
+        String region = source.value().getRegion();
+        if (destination == null || region == null || !region.equals(destination.getRegion())) {
+            return null;
+        }
+        return new AccessLogTarget(source.account(), region, bucketName, source.value(),
+                document, configuration, destination);
+    }
+
+    private Bucket accessLogBucket(String account, String bucketName) {
+        AccountAwareStorageBackend<Bucket> aware = accountAwareBucketStore();
+        if (aware != null) {
+            return aware.getForAccount(account, bucketName)
+                    .or(() -> aware.getLegacyForAccount(account, bucketName)).orElse(null);
+        }
+        return account.equals(ownerId()) ? bucketStore.get(bucketName).orElse(null) : null;
+    }
+
+    String accessLogRequester(String accessKeyId) {
+        CallerArns caller = resolveCaller(accessKeyId).orElse(null);
+        if (caller == null) {
+            return null;
+        }
+        if (CallerArns.TYPE_ACCOUNT.equals(caller.principalType())) {
+            return AwsCanonicalUserId.forAccount(caller.userId());
+        }
+        // The role-session ARN is a documented log field. The older IAM-user display form
+        // is not reconstructed from a key or username; leave that field unavailable.
+        return CallerArns.TYPE_ASSUMED_ROLE.equals(caller.principalType()) ? caller.callerArn() : null;
+    }
+
+    /** Runs in the source account/Region, independently of the original HTTP request. */
+    void deliverAccessLog(AccessLogTarget target, String key, byte[] bytes) {
+        if (key.getBytes(StandardCharsets.UTF_8).length > 1024
+                || bytes.length > S3AccessLogRecord.MAX_RECORD_BYTES
+                || accessLogBucket(target.account(), target.sourceName()) != target.source()
+                || !target.sourceDocument().equals(target.source().getLoggingConfiguration())) {
+            return;
+        }
+        Bucket destination = target.destination();
+        S3Object object;
+        synchronized (destination) {
+            if (accessLogBucket(target.account(), target.configuration().destination()) != destination
+                    || !target.region().equals(destination.getRegion())
+                    || destination.isObjectLockEnabled() || destination.getDefaultRetention() != null
+                    || "Requester".equals(destination.getRequestPaymentPayer())
+                    || !S3AccessLogConfiguration.supportsDestinationEncryption(destination.getEncryptionConfiguration())
+                    || !allowsAccessLog(target, key)) {
+                return;
+            }
+            AccountAwareStorageBackend.OwnedEntry<Bucket> current =
+                    resolveBucketEntry(target.configuration().destination()).orElse(null);
+            if (current == null || current.value() != destination || !target.account().equals(current.account())) {
+                return;
+            }
+            object = storeObject(current, target.configuration().destination(), key, new BytesBody(bytes),
+                    "text/plain", Map.of(), null, null,
+                    new PutObjectOptions().withServerSideEncryption("AES256"), null, target.account());
+        }
+        fireNotifications(target.configuration().destination(), key, "ObjectCreated:Put", object);
+    }
+
+    private boolean allowsAccessLog(AccessLogTarget target, String key) {
+        Bucket destination = target.destination();
+        String partition = AwsRegions.partitionFor(target.region());
+        String sourceArn = AwsArnUtils.Arn.global(partition, "s3", "", target.sourceName()).toString();
+        String resourceArn = AwsArnUtils.Arn.global(partition, "s3", "",
+                target.configuration().destination() + "/" + key).toString();
+        String principal = ServicePrincipals.of("logging.s3");
+        Map<String, List<String>> context = IamConditionContextResolver.serviceCallContext(
+                principal, resourceArn, target.account(), sourceArn, target.account(), "s3:PutObject");
+        context.put("aws:RequestedRegion", List.of(target.region()));
+        context.put("s3:x-amz-server-side-encryption", List.of("AES256"));
+        String policy = destination.getPolicy();
+        ResourcePolicyDecision decision = policy == null || policy.isBlank()
+                ? ResourcePolicyDecision.NEUTRAL
+                : policyEvaluator.evaluateResourcePolicyFor(List.of(policy), RequestPrincipal.service(principal),
+                        "s3:PutObject", resourceArn, context);
+        if (decision == ResourcePolicyDecision.EXPLICIT_DENY) {
+            return false;
+        }
+        if (decision == ResourcePolicyDecision.ALLOW) {
+            return true;
+        }
+        if (ownershipIsEnforced(destination) || destination.getAcl() == null) {
+            return false;
+        }
+        try {
+            List<S3AclPolicy.Grant> grants = S3AclPolicy.parse(destination.getAcl()).grants().stream()
+                    .filter(grant -> LOG_DELIVERY_GROUP_URI.equals(grant.grantee().uri())).toList();
+            boolean writes = grants.stream().anyMatch(grant -> grant.permission().allowsWrite());
+            boolean readsAcl = grants.stream().anyMatch(grant ->
+                    grant.permission() == S3AclPolicy.Permission.READ_ACP
+                            || grant.permission() == S3AclPolicy.Permission.FULL_CONTROL);
+            return writes && readsAcl;
+        } catch (S3AclPolicy.AclParseException malformed) {
+            return false;
+        }
     }
 
     public S3Object putObject(String bucketName, String key, byte[] data,

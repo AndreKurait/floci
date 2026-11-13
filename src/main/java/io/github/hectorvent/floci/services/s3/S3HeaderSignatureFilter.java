@@ -82,6 +82,11 @@ import java.util.Optional;
 @Priority(Priorities.AUTHENTICATION)
 public class S3HeaderSignatureFilter implements ContainerRequestFilter {
 
+    static final String VERIFIED_SIGV4_PROPERTY = S3HeaderSignatureFilter.class.getName() + ".verifiedSigV4";
+
+    /** Request-local evidence of successful HMAC header and declared-payload verification. */
+    record VerifiedSigV4(String accessKeyId) { }
+
     private static final Logger LOG = Logger.getLogger(S3HeaderSignatureFilter.class);
 
     private static final String ALGORITHM = "AWS4-HMAC-SHA256";
@@ -120,6 +125,7 @@ public class S3HeaderSignatureFilter implements ContainerRequestFilter {
 
     @Override
     public void filter(ContainerRequestContext ctx) throws IOException {
+        ctx.removeProperty(VERIFIED_SIGV4_PROPERTY);
         if (!S3SignatureFilterScope.routedToS3(resourceInfo)
                 || !S3SignatureFilterScope.verifiesSignatures(s3Service, presignGenerator)) {
             return;
@@ -230,6 +236,10 @@ public class S3HeaderSignatureFilter implements ContainerRequestFilter {
         if (SigV4RequestValidator.isSha256Hex(declaredHash) && !bodyMatches(ctx, declaredHash)) {
             abort(ctx, 400, "XAmzContentSHA256Mismatch",
                     "The provided 'x-amz-content-sha256' header does not match what was computed.");
+            return;
+        }
+        if (!asymmetric) {
+            ctx.setProperty(VERIFIED_SIGV4_PROPERTY, new VerifiedSigV4(accessKeyId));
         }
     }
 
