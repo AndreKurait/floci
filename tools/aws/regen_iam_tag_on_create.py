@@ -105,7 +105,7 @@ OUTPUT = REPO_ROOT / "src/main/resources/aws/iam-tag-on-create.json"
 # The IAM namespaces whose operations this file reads: those Floci serves over the JSON and Query
 # protocols and Smithy RPC v2 CBOR, and the REST ones whose routes Floci authorizes by operation.
 NAMESPACES = (
-    "access-analyzer", "acm", "application-autoscaling", "athena", "autoscaling", "bcm-data-exports",
+    "access-analyzer", "acm", "acm-pca", "application-autoscaling", "athena", "autoscaling", "bcm-data-exports",
     "bcm-pricing-calculator", "budgets", "ce", "cloudformation", "cloudhsm", "cloudtrail", "cloudwatch",
     "codedeploy", "codepipeline", "cognito-identity", "cognito-idp", "comprehend", "config", "controltower", "cur",
     "datasync", "dms", "dsql", "dynamodb", "ec2", "ecr", "ecs", "eks", "elasticache", "elasticloadbalancing",

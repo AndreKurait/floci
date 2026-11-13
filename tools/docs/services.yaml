@@ -29,6 +29,10 @@ services:
     doc: docs/services/ec2-instance-connect.md
     sources:
       - { path: services/ec2instanceconnect/InstanceConnectJsonHandler.java, mode: switch }
+  - service: acm-pca
+    doc: docs/services/acm-pca.md
+    sources:
+      - { path: services/acmpca/AcmPcaJsonHandler.java, mode: switch }
   - service: acm
     doc: docs/services/acm.md
     sources:

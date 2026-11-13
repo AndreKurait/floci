@@ -2383,6 +2383,19 @@ class IamEnforcementFilterTest {
     }
 
     @Test
+    void privateCaIssueDenialsUseObservedBadRequestStatus() {
+        Response response = IamEnforcementFilter.accessDeniedResponse(
+                "acm-pca:IssueCertificate", "acm-pca",
+                MediaType.valueOf("application/x-amz-json-1.1"), null, WireProtocol.AWS_JSON_1_1);
+
+        assertEquals(400, response.getStatus());
+        assertEquals(MediaType.APPLICATION_JSON_TYPE, response.getMediaType());
+        String body = entityString(response);
+        assertTrue(body.contains("\"__type\":\"AccessDeniedException\""), body);
+        assertTrue(body.contains("User is not authorized to perform: acm-pca:IssueCertificate"), body);
+    }
+
+    @Test
     void jsonProtocolGetsJsonErrorResponse() {
         // DynamoDB / Cognito / Kinesis / ... — JSON 1.0/1.1, JSON error response.
         Response r = IamEnforcementFilter.accessDeniedResponse(

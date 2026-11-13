@@ -251,6 +251,8 @@ floci:
         flush-interval-ms: 5000
       secretsmanager:
         flush-interval-ms: 5000
+      acm-pca:
+        flush-interval-ms: 5000
       acm:
         flush-interval-ms: 5000
       opensearch:
@@ -694,6 +696,8 @@ floci:
       # ARN attribute, CREATE_COMPLETE, reported at warn with a resource status reason. Set
       # false to fail such a resource instead, which rolls the stack back.
       allow-stub-unsupported-resource-types: true
+    acm-pca:
+      enabled: true
     acm:
       enabled: true
       validation-wait-seconds: 0
