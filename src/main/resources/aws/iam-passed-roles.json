@@ -979,9 +979,7 @@
     ]},
     "ssm:UpdateServiceSetting": {"passedTo": ["ssm"], "notRead": "a role is only ever a setting's value, which the request names by SettingId"},
     "states:CreateStateMachine": {"passedTo": ["states"], "byHand": "the state machine's role"},
-    "states:TestState": {"passedTo": ["states"], "roles": [
-      {"member": "roleArn", "passedTo": "states"}
-    ]},
+    "states:TestState": {"passedTo": ["states"], "byHand": "the test state execution role"},
     "states:UpdateStateMachine": {"passedTo": ["states"], "byHand": "the state machine's role"},
     "swf:RegisterWorkflowType": {"passedTo": ["swf"], "roles": [
       {"member": "defaultLambdaRole", "passedTo": "swf"}
