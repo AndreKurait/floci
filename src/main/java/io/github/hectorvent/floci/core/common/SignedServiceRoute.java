@@ -25,6 +25,8 @@ import java.util.function.Predicate;
  */
 public final class SignedServiceRoute {
 
+    public static final String INTERNAL_PREFIX_PROPERTY = SignedServiceRoute.class.getName() + ".internalPrefix";
+
     private final ResolvedServiceCatalog catalog;
     private final String externalKey;
     private final String internalPrefix;
@@ -62,6 +64,11 @@ public final class SignedServiceRoute {
                         ctx.getUriInfo().getQueryParameters().getFirst("X-Amz-Credential")));
     }
 
+    public static Optional<String> internalPrefix(ContainerRequestContext ctx) {
+        return ctx.getProperty(INTERNAL_PREFIX_PROPERTY) instanceof String prefix ? Optional.of(prefix)
+                : Optional.empty();
+    }
+
     public void apply(ContainerRequestContext ctx) {
         String path = ctx.getUriInfo().getPath();
         String normalizedPath = path.startsWith("/") ? path : "/" + path;
@@ -69,7 +76,9 @@ public final class SignedServiceRoute {
         if (under(internalPrefix).test(normalizedPath)) {
             if (!signedForService(ctx)) {
                 ctx.abortWith(invalidBucketName());
+                return;
             }
+            ctx.setProperty(INTERNAL_PREFIX_PROPERTY, internalPrefix);
             return;
         }
         if (!publicPaths.test(normalizedPath) || !signedForService(ctx)) {
@@ -78,6 +87,7 @@ public final class SignedServiceRoute {
         ctx.setRequestUri(ctx.getUriInfo().getRequestUriBuilder()
                 .replacePath(internalPrefix + normalizedPath)
                 .build());
+        ctx.setProperty(INTERNAL_PREFIX_PROPERTY, internalPrefix);
     }
 
     private boolean signedForService(ContainerRequestContext ctx) {

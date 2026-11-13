@@ -32,7 +32,8 @@ import java.util.stream.Collectors;
  *
  * <p>Backward compatibility: on a {@link #get} miss for the prefixed key, the un-prefixed
  * key is tried and the entry is migrated on read. This covers existing persistent/WAL data
- * created before multi-account support was added.
+ * created before multi-account support was added. A key already carrying an account prefix
+ * is only read inside the caller's explicit namespace, never as a raw legacy key.
  */
 public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> {
 
@@ -125,10 +126,25 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
     }
 
     @Override
+    public void applyAtomically(Map<String, V> entries, Set<String> keys) {
+        applyAtomicallyForAccount(prefix(), entries, keys);
+    }
+
+    public void applyAtomicallyForAccount(String accountId, Map<String, V> entries, Set<String> keys) {
+        Map<String, V> replacements = Map.copyOf(entries);
+        Set<String> deletions = Set.copyOf(keys);
+        Map<String, V> prefixedEntries = new LinkedHashMap<>();
+        replacements.forEach((key, value) -> prefixedEntries.put(accountId + "/" + key, value));
+        Set<String> prefixedKeys = deletions.stream().map(key -> accountId + "/" + key).collect(Collectors.toSet());
+        delegate.applyAtomically(prefixedEntries, prefixedKeys);
+        trackOwner(accountId);
+    }
+
+    @Override
     public Optional<V> get(String key) {
         String prefixedKey = prefixed(key);
         Optional<V> result = delegate.get(prefixedKey);
-        if (result.isPresent()) {
+        if (result.isPresent() || hasAccountPrefix(key)) {
             return result;
         }
         // Backward-compat: try un-prefixed key (pre-multi-account data) and migrate on read. The
@@ -412,16 +428,35 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
     }
 
     /**
+     * Reads an explicitly scoped entry, or an owner-approved legacy entry, without migration.
+     *
+     * <p>A present scoped row takes precedence even if its value fails the caller's later
+     * ownership check. The monitor spans both reads so a concurrent legacy migration cannot
+     * move the row between them. No owner registration or storage write occurs.
+     */
+    public synchronized Optional<V> getForAccountIncludingLegacyReadOnly(
+            String accountId, String key, Predicate<V> legacyOwner) {
+        Optional<V> scoped = getForAccount(accountId, key);
+        return scoped.isPresent() ? scoped : getLegacyMatching(key, legacyOwner);
+    }
+
+    /** Reads an unprefixed entry without migration when its stored metadata proves ownership. */
+    public synchronized Optional<V> getLegacyMatching(String key, Predicate<V> legacyOwner) {
+        return hasAccountPrefix(key) ? Optional.empty() : delegate.get(key).filter(legacyOwner);
+    }
+
+    /**
      * Returns an explicitly scoped entry, or safely migrates a matching legacy unscoped entry.
      *
      * <p>The caller-supplied predicate must establish that the legacy value belongs to the
      * destination account. This opt-in path avoids {@link #get(String)}'s request-context fallback,
-     * which cannot validate ownership before migrating old data.
+     * which cannot validate ownership before migrating old data. Account-prefixed logical
+     * keys are only eligible for the explicit scoped lookup, not the raw legacy fallback.
      */
     public synchronized Optional<V> getForAccountMigratingLegacy(
             String accountId, String key, Predicate<V> legacyOwner) {
         Optional<V> scoped = getForAccount(accountId, key);
-        if (scoped.isPresent()) {
+        if (scoped.isPresent() || hasAccountPrefix(key)) {
             return scoped;
         }
         Optional<V> legacy = delegate.get(key).filter(legacyOwner);

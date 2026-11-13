@@ -12,6 +12,7 @@ import io.github.hectorvent.floci.services.apigateway.ApiGatewayAwsExecuteContro
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayExecuteController;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayUserRequestController;
 import io.github.hectorvent.floci.services.appsync.graphql.AppSyncExecutionController;
+import io.github.hectorvent.floci.services.cloudfront.CloudFrontFunctionTestController;
 import io.github.hectorvent.floci.services.iam.DerivedSigningKeyController;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.RequestBodyReader;
@@ -90,10 +91,13 @@ import java.util.function.UnaryOperator;
  * <p>Errors follow the protocol the request used: a Query or REST-XML request (Route 53,
  * CloudFront, S3 Control) receives an {@code <ErrorResponse>}, a CBOR request a CBOR body, and
  * everything else JSON, which REST-JSON clients read through {@code X-Amzn-Errortype}. The codes
- * are AWS's: {@code IncompleteSignature} for a header that cannot be checked,
+ * use EC2's {@code Response/Errors/Error} envelope when the Query request identifies EC2.
+ * The codes are AWS's: {@code IncompleteSignature} for a header that cannot be checked,
  * {@code InvalidClientTokenId} / {@code UnrecognizedClientException} for an access key Floci does
- * not know, and {@code SignatureDoesNotMatch} / {@code InvalidSignatureException} for a signature
+ * not know (EC2 instead answers {@code AuthFailure} in its own envelope), and
+ * {@code SignatureDoesNotMatch} / {@code InvalidSignatureException} for a signature
  * that does not verify, exceeds its query expiry or falls outside the header clock-skew window.
+ * EC2 uses {@code RequestExpired} for expiry and clock skew, including expired temporary credentials.
  *
  * <p>With global verification off, the optional Lambda identity facility authenticates only
  * native execution-role and one-hop session records. Other credentials retain their existing
@@ -235,6 +239,11 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
                     + "'codedeploy-commands'");
             return;
         }
+        if (resource != null && CloudFrontFunctionTestController.class.isAssignableFrom(resource)
+                && !"cloudfront".equals(scope.service())) {
+            signatureDoesNotMatch(ctx, resource, "Credential should be scoped to correct service: 'cloudfront'");
+            return;
+        }
         if (resource == AccountController.class && resourceInfo.getResourceMethod() != null
                 && AccountRegionActions.forMethod(resourceInfo.getResourceMethod().getName()) != null
                 && !"account".equals(scope.service())) {
@@ -285,6 +294,14 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
         if (secretKey.isEmpty()) {
             LOG.debugv("Refusing {0} request signed with unknown access key {1}",
                     scope.service(), SigV4RequestValidator.sanitizeForLog(scope.accessKeyId()));
+            if (resource == AwsQueryController.class && "ec2".equals(scope.service())) {
+                if (iamService.isExpiredSessionToken(scope.accessKeyId(), token)) {
+                    ctx.abortWith(IamEnforcementFilter.expiredTokenResponse(scope.service(), ctx));
+                    return;
+                }
+                ctx.abortWith(Ec2ErrorResponses.authFailure());
+                return;
+            }
             abort(ctx, resource, 403, "InvalidClientTokenId", "UnrecognizedClientException", INVALID_TOKEN_MESSAGE);
             return;
         }
@@ -292,17 +309,17 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
         String amzDate = AMZ_DATE.format(requestTime);
         Instant now = Instant.now();
         if (presigned && !now.isBefore(requestTime.plusSeconds(expires))) {
-            signatureDoesNotMatch(ctx, resource, "Signature expired: " + amzDate + " is now earlier than "
+            requestExpired(ctx, resource, "Signature expired: " + amzDate + " is now earlier than "
                     + AMZ_DATE.format(now.minusSeconds(expires)));
             return;
         }
         if (requestTime.isAfter(now.plus(MAX_CLOCK_SKEW))) {
-            signatureDoesNotMatch(ctx, resource, "Signature not yet current: " + amzDate + " is still later than "
+            requestExpired(ctx, resource, "Signature not yet current: " + amzDate + " is still later than "
                     + AMZ_DATE.format(now.plus(MAX_CLOCK_SKEW)));
             return;
         }
         if (!presigned && requestTime.isBefore(now.minus(MAX_CLOCK_SKEW))) {
-            signatureDoesNotMatch(ctx, resource, "Signature expired: " + amzDate + " is now earlier than "
+            requestExpired(ctx, resource, "Signature expired: " + amzDate + " is now earlier than "
                     + AMZ_DATE.format(now.minus(MAX_CLOCK_SKEW)));
             return;
         }
@@ -503,6 +520,14 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
         abort(ctx, resource, 400, "IncompleteSignature", "IncompleteSignatureException", message);
     }
 
+    private void requestExpired(ContainerRequestContext ctx, Class<?> resource, String message) {
+        if (resource == AwsQueryController.class && Ec2ErrorResponses.isEc2QueryRequest(ctx)) {
+            ctx.abortWith(Ec2ErrorResponses.of("RequestExpired", message, 400));
+            return;
+        }
+        signatureDoesNotMatch(ctx, resource, message);
+    }
+
     private void signatureDoesNotMatch(ContainerRequestContext ctx, Class<?> resource, String message) {
         abort(ctx, resource, 403, "SignatureDoesNotMatch", "InvalidSignatureException", message);
     }
@@ -516,6 +541,10 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
      */
     private void abort(ContainerRequestContext ctx, Class<?> resource, int status, String queryCode,
                        String jsonCode, String message) {
+        if (resource == AwsQueryController.class && Ec2ErrorResponses.isEc2QueryRequest(ctx)) {
+            ctx.abortWith(Ec2ErrorResponses.of(queryCode, message, status));
+            return;
+        }
         String contentType = requestContentType(ctx);
         if (isCbor(ctx, contentType)) {
             ctx.abortWith(CborErrorResponses.of(new AwsException(jsonCode, message, status),

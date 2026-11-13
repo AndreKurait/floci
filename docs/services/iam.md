@@ -1791,7 +1791,8 @@ Map, ACM, CodePipeline, CodeBuild, Amazon Managed Service for Apache Flink (Kine
 Application Auto Scaling, AWS Budgets, Cost and Usage Reports, Service Quotas, Amazon Textract, Amazon Translate, Amazon Athena,
 AWS Data Exports, AWS Pricing Calculator, Cost Explorer, CloudTrail, Global Accelerator, Amazon
 Timestream for InfluxDB, Amazon Redshift, the Amazon Redshift Data API, AWS Payment Cryptography, AWS DataSync, Amazon EMR,
-Amazon Rekognition, IAM Identity Center, Amazon OpenSearch Service and IAM Access Analyzer they come from a table generated from AWS's Service Reference and botocore, `src/main/resources/aws/iam-request-resources.json`, which gives each
+Amazon Rekognition, IAM Identity Center, Amazon Inspector, Amazon Macie, Amazon OpenSearch Service, IAM Access Analyzer,
+AWS Security Hub and Amazon GuardDuty they come from a table generated from AWS's Service Reference and botocore, `src/main/resources/aws/iam-request-resources.json`, which gives each
 operation's action, the resource types that action acts on with their ARN formats, and the request
 members that name them: a member holding a resource's ARN, which counts when it matches the format
 of a type the action acts on, or members filling the variables of a type's format. A member holding
@@ -1899,8 +1900,14 @@ Region than the request's is checked as given and as each resource of that name 
 on instead, in the ARN's account or the caller's and in the ARN's Region or the request's (ECR's
 tag handlers keep the ARN's account in the request's Region), and the request is refused if any is
 denied; one of a type AWS owns, whose ARN's account is `aws` (an IAM Identity Center application
-provider), is checked in that account alone. Every other request is checked on `*`, as is an operation whose action acts on no
-resource type or whose request names none, where AWS checks `*` too. `make
+provider), is checked in that account alone, and so is one its service acts on in the account the ARN names
+(the sink an OAM `CreateLink` links to, a RAM invitation sent to the caller or a share another account owns). A
+request leaving out an optional member holding the ARN of a resource its service then uses one of its own for
+is checked on the one the service finds: Resource Explorer's `Search` and `ListResources` with no `ViewArn`
+on the Region's default view. A field of each value of a map of structures, named after a type the action acts
+on, names one resource for each: an FIS experiment template's create and update are checked on each action
+its `actions` map names by `actionId`, `action/<actionId>`. Every other request is checked on `*`, as is an
+operation whose action acts on no resource type or whose request names none, where AWS checks `*` too. `make
 iam-request-resources-check` re-derives the table from the pinned botocore, `make
 iam-request-resources-verify` checks it against AWS, and the namespaces it does not read yet are
 listed in it with their reason.
@@ -1913,6 +1920,18 @@ drops it, so `POST /clusters/` is checked as `POST /clusters`. An S3 path keeps 
 may end in a slash, as a folder marker's does, and S3's rules already take a bucket's one trailing
 slash.
 
+Every route Floci serves of AWS Fault Injection Service, AWS Resource Access Manager, CloudWatch
+Observability Access Manager, AWS Resource Explorer, AWS Account Management and AWS Control Catalog is
+checked as its operation's action, on the resource its request names. An Account Management request
+naming an `AccountId` is checked on that member account of the caller's organization,
+`arn:aws:account::<management account>:account/<organization>/<AccountId>`, or on
+`arn:aws:account::*:account/o-*/<AccountId>` for an account the caller's organization does not hold, which
+Account Management refuses; one naming none is checked on the caller's own account. The Fault Injection
+Service and Resource Explorer tag routes are checked on `/tags/<arn>` and on the bare `/tags` Floci also
+serves, and OAM's on `/tags/<arn>` whether the ARN's slash is encoded or not. A `CreateLink` that carries
+tags needs `oam:TagResource` on the sink it names, where the operation is checked, since it acts on no
+link.
+
 The REST routes mapped to an action are those of S3, Lambda, API Gateway, SES v2, RDS Data,
 Kinesis, EKS, EventBridge Scheduler, EventBridge Pipes and Aurora DSQL. In EKS that is every route,
 including those Floci does not serve yet, each checked as the action of its own name, except an
@@ -1924,11 +1943,18 @@ Functions routes, each checked as the action of its own name except `InvokeWithR
 (checked as `lambda:InvokeFunction`) and `GetLayerVersionByArn` (`lambda:GetLayerVersion`). AWS also
 checks `lambda:AddPermission`, `lambda:GetPolicy` or `lambda:RemovePermission` for the resource
 policy operations, which Floci does not serve; their routes are checked as their own action alone.
-API Gateway's management API, v1 and v2, is checked as `apigateway:` and the HTTP
-method, `apigateway:GET`, `apigateway:POST` and so on, except `RejectDomainNameAccessAssociation`
-(`apigateway:RejectAccessAssociation`) and `PutRoutingRule` (`apigateway:UpdateRoutingRule`); the
-v2 routing rule, portal and portal product operations, which AWS checks as actions of their own
-names, are not served. A management call is checked against the path it names, in the request's
+API Gateway's management API, v1 and v2, is checked by the routes of botocore's two models, each
+operation as the Service Reference gives it: as `apigateway:` and the HTTP method, `apigateway:GET`,
+`apigateway:POST` and so on, `TagResource` a `PUT` in v1 and a `POST` in v2, except
+`RejectDomainNameAccessAssociation` (`apigateway:RejectAccessAssociation`), `PutRoutingRule`
+(`apigateway:UpdateRoutingRule`) and the v2 routing rule, portal and portal product operations,
+which AWS checks as actions of their own names and Floci does not serve. A v1 resource's tags are
+also set on the shared bare `/tags` path, a `POST` naming the ARN in its body, checked as `apigateway:POST`.
+AWS also checks `apigateway:UpdateRestApiPolicy` for a request carrying a resource policy,
+`apigateway:AddCertificateToDomain` and `apigateway:RemoveCertificateFromDomain` for a domain's
+mutual TLS certificate, `apigateway:PATCH` on a resource whose tags change, and `iam:PassRole` for
+a role. Floci retains its separate API Gateway credential-role checks; the additional policy,
+certificate and tag actions listed here remain unimplemented. A management call is checked against the path it names, in the request's
 Region and partition and with no account, as the
 [API Gateway ARN reference](https://docs.aws.amazon.com/apigateway/latest/developerguide/arn-format-reference.html)
 gives it: `GET /restapis/<id>/stages` against `arn:aws:apigateway:<region>::/restapis/<id>/stages`.
@@ -1979,8 +2005,8 @@ it is signed with. The ARN is
 the one after `/tags/` or `/v1/tags/`, the body's `resourceArn` on `POST /tags`, and the
 `resourceArn` query parameter on the other bare routes.
 
-A REST request names its resources in its path and its query as well as its body. For OpenSearch
-Service and IAM Access Analyzer, the REST services the table reads, a member its path carries, the
+A REST request names its resources in its path and its query as well as its body. For the REST
+services the table reads, OpenSearch Service, IAM Access Analyzer, Security Hub and GuardDuty among them, a member its path carries, the
 `DomainName` of `/2021-01-01/opensearch/domain/{DomainName}` or the `analyzerName` of
 `/analyzer/{analyzerName}`, is read from the route the request matches in the vendored routes below,
 and one its query carries, the `arn` of `ListTags`, from the query, as members of the body are:
@@ -1996,6 +2022,16 @@ Floci serves neither. Of Access Analyzer's, Floci serves the analyzer operations
 is checked on the analyzer its body names, and so are its tags, which also need
 `access-analyzer:TagResource` (below), and `GetAnalyzer` and `DeleteAnalyzer` on the one their path
 names.
+Security Hub checks most of its actions on the caller's hub in the Region, `hub/default`, which no
+member names: `EnableSecurityHub`, `DescribeStandards` and the organization and standards operations
+are checked on that hub, and `DescribeHub` on the hub its `HubArn` query names, or on that one when it
+names none: an optional member holding the ARN of a type whose format has no variable of its own names
+that type when it is left out. GuardDuty's detector operations are checked on `detector/<DetectorId>`
+from their path, and a publishing destination on
+`detector/<DetectorId>/publishingdestination/<DestinationId>`; its list, member and organization
+operations act on no resource type and are checked on `*`. An `EnableSecurityHub` or a GuardDuty
+create carrying tags also needs `securityhub:TagResource` on the hub or `guardduty:TagResource` on
+the resource created, with a generated id left open (below).
 
 A route no rule maps is the operation whose route it matches in botocore's model of its service,
 vendored in `src/main/resources/aws/rest-routes.json` (`make aws-data-sync` regenerates it): of the
@@ -2007,14 +2043,20 @@ when the Service Reference gives the action no resource type, as AWS authorizes 
 The actions of no resource type are vendored in `src/main/resources/aws/iam-authorized-actions.json`
 for each scope whose routes are read (`make iam-authorized-actions-sync` regenerates them). So
 OpenSearch Service's `ListDomainNames`, `ListVersions` and VPC endpoint operations, in both API
-versions, and Access Analyzer's `ListAnalyzers` and `ValidatePolicy` are checked by their routes, and
-so are OpenSearch Service's domain operations and Access Analyzer's analyzer operations, the table of
-request resources reading the domain or the analyzer they name. A route whose action AWS checks on a
+versions, Access Analyzer's `ListAnalyzers` and `ValidatePolicy`, and GuardDuty's operations of no
+resource type are checked by their routes, and so are OpenSearch Service's domain operations, Access
+Analyzer's analyzer operations, Security Hub's hub operations and GuardDuty's detector operations, the
+table of request resources reading the resource they name. Every route Floci serves of AWS Lake
+Formation and Amazon Inspector is one AWS authorizes on no resource type, as is every one of Amazon Macie's but
+`CreateMember`, so those are checked by their routes alone. `CreateMember`, on `POST /members`, is checked on the
+member its `account.accountId` names, and needs `macie2:TagResource` when it carries tags. API Gateway's
+routes are checked by their routes alone too, on the path Floci builds the ARN from, and the authorized
+actions list the operations AWS checks as the action their HTTP method names (above). A route whose action AWS checks on a
 resource Floci neither builds nor reads would not be checked, since checked on `*` a grant scoped to
 the resource would be refused; no vendored route is one now. The routes of
 Lambda, EKS, EventBridge Scheduler, EventBridge Pipes and Aurora DSQL are all mapped by their rules,
-so none is checked differently. S3 and API Gateway are routed by their rules alone: S3 tells apart the
-operations of one route by their query and headers, and API Gateway is checked by HTTP method. A route
+so none is checked differently. S3 is routed by its rules alone, since it tells apart the
+operations of one route by their query and headers. A route
 matching nothing is not checked, as an unsigned REST request is not; the other REST services' routes
 are not vendored yet.
 
@@ -2122,10 +2164,10 @@ role each passes:
   `CreateTaskSet` pass the roles of the task definition they name. The infrastructure roles go to
   `ecs.amazonaws.com`: a managed EBS volume's `roleArn` (`RunTask`, `StartTask`, `CreateService`,
   `UpdateService`), the service's `role` and the load balancer, lifecycle hook, Service Connect TLS
-  and VPC Lattice roles (`CreateService`, `UpdateService`), and a Managed Instances provider's
-  `infrastructureRoleArn` (`CreateCapacityProvider`, `UpdateCapacityProvider`). A role given by its
-  name is the role of that name in the caller's account, and a task definition that does not exist
-  passes nothing.
+  and VPC Lattice roles (`CreateService`, `UpdateService`), and the `infrastructureRoleArn` of a
+  Managed Instances provider (`CreateCapacityProvider`, `UpdateCapacityProvider`) and of a gateway
+  (`CreateGateway`, `UpdateGateway`). A role given by its name is the role of that name in the
+  caller's account, and a task definition that does not exist passes nothing.
 - **Step Functions:** `CreateStateMachine` and `UpdateStateMachine` pass `roleArn` to
   `states.amazonaws.com`, in a JSON or a CBOR body.
 - **EventBridge:** `PutRule` passes `RoleArn`, and `PutTargets` each target's `RoleArn`, to
@@ -2241,15 +2283,18 @@ when the caller may not pass the role.
   `LocalRoleName`, which is checked on the ARN IAM holds the role under, and an update goes by the
   type of the constraint it changes. The type is matched in any case, since Floci keeps it as given.
   An SWF decision is read from the attributes its `decisionType` names.
-- Not read: an operation whose request names no role (SSM `CreateDocument`, for one); one whose role
-  is a parameter of the runbook it runs (SSM `StartAutomationExecution`, Config
-  `PutRemediationConfigurations`); one the Service Reference passes roles from to several services
-  without saying which member goes where (EMR `RunJobFlow`, whose `JobFlowRole` also names an
-  instance profile, EKS `UpdateClusterConfig`, CloudWatch Logs `CreateImportTask`, SageMaker
-  `CreateTrainingSession`); and one whose body is XML (S3 `PutBucketReplication`). EC2's
-  `RequestSpotFleet` names its roles in EC2's own protocol, one of them as an instance profile. The
-  REST services whose routes no rule maps yet, and API Gateway, which is authorized by HTTP method,
-  are not read either.
+- Not read: an operation whose request names no role (SSM `CreateDocument` and CloudWatch Logs
+  `StartQuery`, for two); one whose role is a parameter of the runbook it runs (SSM
+  `StartAutomationExecution`, Config `PutRemediationConfigurations`); one the Service Reference
+  passes roles from to several services without saying which member goes where (EMR `RunJobFlow`,
+  whose `JobFlowRole` also names an instance profile, EKS `UpdateClusterConfig`, CloudWatch Logs
+  `CreateImportTask`, SageMaker `CreateTrainingSession`); one whose body is XML (S3
+  `PutBucketReplication`); and one the botocore models Floci is pinned to do not have yet (SSM
+  `RegisterDefaultHostManagementConfiguration`, Kinesis Analytics `ImportSnapshot`), whose role is
+  read as soon as a release that has it is pinned, since the generator and its offline gate refuse
+  that reason once the models carry the operation. EC2's `RequestSpotFleet` names its roles in
+  EC2's own protocol, one of them as an instance profile. The REST services whose routes no rule
+  maps yet, and API Gateway, which is authorized by HTTP method, are not read either.
 
 A request that names a Lambda network connector also needs `lambda:PassNetworkConnector` on it. The
 Lambda developer guide has "The caller must have `lambda:PassNetworkConnector` on the referenced
@@ -2291,7 +2336,7 @@ on: Lambda's `CreateFunction` is checked on the function its body names, in the 
 Region, as the Service Reference gives it the `function` resource, so a function's tags are checked
 there too, and a create of a service the table of request resources reads is checked on the resource
 it creates (a target group on `targetgroup/<Name>/*`, an application load balancer on
-`loadbalancer/app/<Name>/*`, an Access Analyzer analyzer on `analyzer/<analyzerName>`). A create of
+`loadbalancer/app/<Name>/*`, an Access Analyzer analyzer on `analyzer/<analyzerName>`, a Security Hub hub on `hub/default`). A create of
 a resource under a parent its action acts on tags the new
 resource, so its tags are checked on that one, built from the parent's ARN with its own id open:
 `CreateListener` acts on a load balancer and its tags are checked on
@@ -2301,13 +2346,18 @@ resource, so its tags are checked on that one, built from the parent's ARN with 
 listeners and rules, holds. A create that names another resource beside the one it makes tags the
 one it makes alone, the resource of the type it is named after: Cloud Map's `CreateService` is
 checked on its namespace and on `service/*`, and its tags on `service/*`; CodePipeline's
-`PutWebhook` on the webhook and the pipeline it connects to, and its tags on the webhook. Where the
+`PutWebhook` on the webhook and the pipeline it connects to, and its tags on the webhook. A create
+whose action acts on no resource type is checked on `*`, and its tags on the resource it makes, of the
+type it is named after with the ids its service mints open, where its tagging action acts on that type:
+Resource Explorer's `CreateView` on `view/<ViewName>/*`, OAM's `CreateSink` on `sink/*`, ACM's
+`RequestCertificate` on `certificate/*`; a Cloud Map namespace's tags, whose `TagResource` acts on no
+type, stay on `*`. Where the
 tagging action takes
 its namespace's `CreateAction` key, as `ec2:CreateTags`, `ecs:TagResource`, CloudFormation's
 `TagResource` and Elastic Load Balancing's `AddTags` do, the key is the operation's name:
 `ec2:CreateAction` is `RunInstances` for an instance launched with tags. The operation's own action
 is checked with the same `aws:RequestTag/<key>` and `aws:TagKeys`, once for each resource's tags,
-wherever the Service Reference lists those keys for it or for a resource it acts on, which it does for 546 of the operations read, so
+wherever the Service Reference lists those keys for it or for a resource it acts on, which it does for 580 of the operations read, so
 "allow `sqs:CreateQueue` only with `aws:RequestTag/team`" and "deny it when `aws:RequestTag/team` is
 null" hold as on AWS; keys a service's own condition keys already give, as EC2's `RunInstances`
 does, are kept. It is checked once for each reading of the tags and refused if any is denied: the
@@ -2520,6 +2570,28 @@ The resource type is not the parameter the action happens to take. `AddUserToGro
 acting on something that already exists is checked against that resource's stored ARN, path and
 partition included; a create is checked against an ARN minted from the request's own `Path`, since
 reading a stored path would authorize a create into a path the policy does not name.
+
+When a named role is absent and the operation's generated input shape declares `RoleName`
+but no `Path`, the request is checked against `role/<name>` in the request account and partition.
+This lets an authorized `GetRole` probe receive `NoSuchEntity` and proceed with creation, and
+also applies to other role operations such as `DeleteRole` and `ListRolePolicies`. An injected
+`Path` cannot change this ARN. Once the role exists, its stored path and partition apply;
+creation still uses the path the request asks for.
+
+EC2 tagging targets come from `regen_iam_request_resources.py`, with EC2 among its namespaces.
+The Service Reference supplies the resource types and ARN formats, botocore supplies the
+`Resources` list and its EC2 Query spelling (`ResourceId.N`), and a documented generator
+mapping identifies instance IDs. The generated entries select `CreateTags` and `DeleteTags`
+from their input shapes and resource types, without an operation-name branch in Java.
+Each instance ARN is evaluated with that target's existing tags; every target must be authorized
+before the handler changes any tags. The dev composition retains image, snapshot and security-group
+ARN resolution alongside generated instance targets, including their accountless or account-scoped
+formats. Concrete targets use their own stored-tag context; unmodeled targets retain wildcard
+authorization against every target context. Resource resolution reuses the decoded form parameters
+rather than reparsing the body for each target. The readers preserve the handler's parameter
+ordering, first duplicate value and stop at the first missing list index. This staged EC2 read
+adds instances to heterogeneous target lists; other EC2 operations retain their existing
+resource resolution, including launch, termination, image and security-group authorization.
 
 Which type each action takes is vendored, not written out in Java:
 `src/main/resources/aws/iam-action-resources.json` is generated by

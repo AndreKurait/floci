@@ -29,6 +29,13 @@ Inflation is bounded to 10 MiB; the ordinary log-event validation still applies.
 | `PutLogEvents` | Write log events to a stream |
 | `GetLogEvents` | Read log events from a stream |
 | `FilterLogEvents` | Search log events with a filter pattern |
+| `PutTransformer` | Create or replace a supported group parseJSON transformer |
+| `GetTransformer` | Read a group transformer with its ARN and timestamps |
+| `DeleteTransformer` | Remove a group transformer for future ingestion |
+| `TestTransformer` | Preview the supported parseJSON processor without storing events |
+| `CreateExportTask` | Export a snapshot of native log events as real S3 gzip objects |
+| `DescribeExportTasks` | Describe export status and retained task history |
+| `CancelExportTask` | Cancel queued work or stop after an already claimed object |
 | `PutRetentionPolicy` | Set log retention (days) |
 | `DeleteRetentionPolicy` | Remove log retention policy |
 | `AssociateKmsKey` | Associate a KMS key with a log group (`logGroupName` or `resourceIdentifier`) |
@@ -70,6 +77,55 @@ Inflation is bounded to 10 MiB; the ordinary log-event validation still applies.
 | `DeleteDelivery` | Delete a delivery |
 | `DescribeDeliveries` | List deliveries, optionally only those from given delivery sources |
 
+### S3 export tasks
+
+`CreateExportTask` captures native, unencrypted `STANDARD` log group events and writes real UTF-8 gzip
+objects to a native S3 bucket in the same account and Region. Both timestamp boundaries are inclusive;
+`logStreamNamePrefix` selects streams before export. The immutable admission snapshot includes every
+matching stored event, independently of the Logs Insights query cap. Later ingestion or group deletion
+does not alter it. Empty selections complete without objects. The default destination prefix is
+`exportedlogs`; generated keys include the task UUID and an encoded stream name. Chunk layout and order
+are local implementation details, and keys must fit S3's 1024-byte UTF-8 limit.
+
+Tasks progress through `PENDING`, `RUNNING`, and `COMPLETED`, `FAILED`, or `CANCELLED`. This implementation
+admits one active task per account and Region. `CancelExportTask` immediately cancels queued work; if an
+object write has already been claimed, it reports `PENDING_CANCEL` until that write and its notification
+callbacks return. No later object is claimed. Cancellation and failure retain any committed objects;
+there is no rollback or automatic retry. A terminal-state persistence failure leaves the active slot
+occupied. Describe unknown IDs returns an empty list; cancelling one returns `ResourceNotFoundException`.
+Cancelling a terminal task returns `InvalidOperationException`.
+
+`DescribeExportTasks` returns account- and Region-scoped history with optional task/status filters and
+limits from 1 to 50. Its token is tied to those filters and expires after 24 hours or process restart.
+Pagination is a live keyset view, not a snapshot. Task records follow the configured CloudWatch Logs
+storage mode. On restart, persisted unfinished work becomes `FAILED`; the in-memory source snapshot is
+not replayed. Reset drains the worker before clearing storage. If a later reset hook fails, retained
+unfinished tasks become `FAILED` before admission resumes. A failed terminal write keeps admission closed.
+
+With IAM enforcement enabled, `CreateExportTask` checks the source log group ARN and its live
+`aws:ResourceTag` conditions, then the initiating caller's `s3:PutObject` permission on every planned
+object key. The bare group ARN and its trailing `:*` form are equivalent within each IAM statement;
+explicit denies and caller policy ceilings still apply. The worker separately requires the bucket
+policy to grant the regional Logs service `s3:GetBucketAcl` and `s3:PutObject`. Both checks include the
+source account and source log group ARN; only the write carries the `bucket-owner-full-control` ACL
+condition. Service-principal conditions never
+enter the initiating caller's context, and that caller is not required to hold `s3:PutObjectAcl` merely
+because the worker applies the service ACL. An empty export checks one reserved key without writing it.
+These local checks do not claim equivalence to the direct S3 HTTP authorization path.
+
+Each object rechecks the live service grant and the captured bucket lifetime under S3's existing locks.
+Deleting/recreating the bucket, even a refused deletion attempt, invalidates the export receipt. The
+ordinary S3 core preserves object ownership, versioning, retention and metadata, with overwrite refused
+for generated keys. Notifications run after releasing the export's S3 locks and use the then-current
+bucket configuration; a replacement bucket can therefore change notification selection. This guard
+protects export writes; it does not make all inherited bucket configuration writers transactional.
+IAM evaluation and later writes are not one transaction.
+
+Unscoped legacy sources/destinations, cross-account or cross-Region exports, `INFREQUENT_ACCESS` and
+`DELIVERY` groups, KMS/DSSE-KMS destinations, transformed/unmasked export modes, and FSx destinations are
+outside this implementation. Destinations may use no explicit encryption or SSE-S3. Legacy group tags
+can be inspected for IAM without migrating their rows, but actual exports require scoped native data.
+
 `DescribeLogGroups` returns names in ASCII order, with up to 50 groups per page by default.
 Set `limit` to an integer from 1 to 50 and pass the returned `nextToken` with the same region
 and name prefix to continue. The final page omits `nextToken`.
@@ -95,6 +151,48 @@ metric filters and subscription filters use: terms, quoted phrases, `?` alternat
 exclusions, JSON and space-delimited patterns. An invalid pattern is refused with
 `InvalidParameterException`, and so is a request that names no log group by `logGroupName` or
 `logGroupIdentifier`.
+
+### Group log transformers
+
+`PutTransformer`, `GetTransformer` and `DeleteTransformer` manage a persistent transformer on an
+owned Standard log group, selected by its name or canonical ARN. A transformer contains exactly one
+`parseJSON` processor. Its source is omitted or `@message`; its optional destination is a dotted
+identifier path of at most three components and 128 characters. Omitting the destination places the
+parsed fields at the JSON root. Other processors, processor chains and unsupported source or
+destination expressions are rejected before changing the stored definition. Get preserves omitted
+optional members, the original creation time and the last replacement time.
+
+`TestTransformer` runs the same parser without storing events. It accepts up to 50 nonempty messages
+and returns each original message with its transformed JSON. The optional event number is omitted.
+The supported input is a JSON object smaller than 512 KiB, with at most 64 nesting levels and 200
+extracted fields. This subset counts JSON object members throughout the parsed tree, including
+objects inside arrays; destination wrapper keys are not extracted input fields. Preview rejects
+malformed, non-object, oversized and over-limit input with `InvalidParameterException`. This is a
+bounded local subset, not a claim of exact AWS malformed-input diagnostics or every processor limit.
+
+Transformation runs during ingestion. Each event keeps its original message and a separate
+transformed view. Replacing or deleting a transformer affects future ingestion only. Stored event
+views survive restart and remain subject to the group's ordinary retention and deletion behavior.
+`GetLogEvents` and `FilterLogEvents` return originals. Logs Insights reads transformed fields while
+`@message` remains the original input. Failed parsing retains the original event, exposes
+`@transformationError` to field projection and filters, and creates no transformed result.
+
+Metric and subscription filters with `applyOnTransformedLogs=true` select transformed messages when
+available. Subscription delivery uses the selected message through its existing destination path.
+Filters using false or omission select originals. An event whose transformation failed is skipped by
+transformed filters, while ordinary filters can still process the original. Without a configured
+transformation the original view remains available. Configuration changes and event publication use
+the same metadata-before-event-index lock order as group deletion, so each batch uses one definition.
+
+The three lifecycle IAM actions use the exact log-group ARN and stored resource-tag conditions.
+`TestTransformer` is authorized against `*`. Foreign-account or foreign-region ARNs cannot select a
+local group. External monitoring-account links are unsupported.
+
+Account-level transformer policies remain stored metadata only: their processor execution, selection
+criteria and fallback after deleting a group transformer are unsupported. This feature does not emit
+transformation telemetry metrics or implement Contributor Insights, field indexes or additional
+processors. It does publish ordinary configured metric-filter metrics and delivers matching
+subscription events through the existing delivery implementation.
 
 ### Vended log delivery {#vended-log-delivery}
 
@@ -258,11 +356,12 @@ rejected when the filter is stored.
 `emitSystemFieldDimensions` adds `@aws.account` and `@aws.region` on matching contributions as
 described above. They count toward the same combined limit of three dimensions.
 
-`applyOnTransformedLogs` is stored and returned unchanged. Request acceptance was verified on AWS,
-including `true` on the tested group without a group-level transformer. Floci does not execute
-group-level or account-level log transformations, including stored `TRANSFORMER_POLICY`
-configuration. Accepting the flag therefore does not establish transformed-log processing or
-full compatibility with an AWS group that has an active transformer.
+`applyOnTransformedLogs` is stored and returned unchanged. With the supported group transformer,
+`true` selects the stored transformed message for matching and metric extraction; false or omission
+selects the original. An event whose transformation failed contributes no transformed-filter metric,
+including a default value. Without a configured transformation, filters retain the original view.
+Request acceptance of `true` without a group transformer was verified on AWS. Account-level
+`TRANSFORMER_POLICY` execution remains unsupported.
 
 See [Metric-filter contract verification](cloudwatch-metric-filters-verification.md) for the
 scenarios tagged **Verified on Live AWS**, the recorded fixtures and their evidence boundaries.

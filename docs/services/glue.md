@@ -266,6 +266,28 @@ Blueprints are not emulated.
 | UpdateClassifier | Partially updates a classifier without changing its type. |
 | DeleteClassifier | Deletes a classifier by name. |
 
+#### Custom sensitive-data patterns
+
+| Action | Description |
+|--------|-------------|
+| CreateCustomEntityType | Stores a named regular expression, optional context words, and tags. |
+| GetCustomEntityType | Reads a stored pattern definition. |
+| BatchGetCustomEntityTypes | Reads named definitions and identifies names that were not found. |
+| ListCustomEntityTypes | Lists definitions with optional tag filters and pagination. |
+| DeleteCustomEntityType | Deletes a stored definition so its name can be reused. |
+
+Definitions are isolated by account and Region and use the configured Glue storage mode.
+List filters match every supplied tag key-value pair. Results are ordered by name, with opaque
+continuation tokens bound to the account, Region, and tag filter. Definitions retain their regular
+expression and context words without evaluating them; this configuration lifecycle does not perform
+sensitive-data detection or register CloudFormation custom-entity resources.
+
+With IAM enforcement enabled, these operations use their corresponding Glue action on `Resource: "*"`.
+Create also supports `aws:RequestTag` and `aws:TagKeys` conditions and requires `glue:TagResource` when
+tags are supplied. A custom-entity ARN does not grant these unscoped actions.
+`BatchGetCustomEntityTypes` currently checks the batch action alone. AWS's authorization reference also
+lists `glue:GetCustomEntityType` for that operation; requiring a separate Get grant is not implemented.
+
 #### Data quality rulesets
 
 | Action | Description |
