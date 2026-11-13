@@ -449,6 +449,18 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         stopManagedContainers();
     }
 
+    /** Stop replacement tasks before shutdown starts retiring their credentials and network. */
+    @Override
+    public void beginTeardown() {
+        ScheduledExecutorService current = reconciler;
+        current.shutdownNow();
+        try {
+            current.awaitTermination(2, TimeUnit.SECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
     /**
      * Stops the Docker containers of all still-running tasks on emulator shutdown and on a
      * state reset. Task state is transient (memory-only), so without this the containers
@@ -460,13 +472,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
      */
     @Override
     public void stopManagedContainers() {
-        ScheduledExecutorService current = reconciler;
-        current.shutdownNow();
-        try {
-            current.awaitTermination(2, TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        beginTeardown();
         drainTaskStopper();
         try (ExecutorService shutdownStopper = newTaskStopper()) {
             List<CompletableFuture<Void>> stops = new ArrayList<>();
