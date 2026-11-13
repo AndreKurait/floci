@@ -5,8 +5,10 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.aws.core.common.JsonErrorResponseUtils;
+import io.floci.aws.core.common.PaginatedResult;
 import io.floci.aws.core.common.RequestContext;
 import io.floci.aws.services.account.model.AccountInformation;
+import io.floci.aws.services.account.model.AccountRegion;
 import io.floci.aws.services.account.model.AlternateContact;
 import io.floci.aws.services.account.model.ContactInformation;
 import jakarta.inject.Inject;
@@ -28,12 +30,15 @@ public class AccountController {
     private static final String VERIFICATION_STATUS_NOT_SUPPORTED = "NOT_SUPPORTED";
 
     private final AccountService accountService;
+    private final AccountRegionService regionService;
     private final ObjectMapper objectMapper;
     private final RequestContext requestContext;
 
     @Inject
-    public AccountController(AccountService accountService, ObjectMapper objectMapper, RequestContext requestContext) {
+    public AccountController(AccountService accountService, AccountRegionService regionService,
+                             ObjectMapper objectMapper, RequestContext requestContext) {
         this.accountService = accountService;
+        this.regionService = regionService;
         this.objectMapper = objectMapper;
         this.requestContext = requestContext;
     }
@@ -80,6 +85,18 @@ public class AccountController {
     }
 
     @POST
+    @Path("/listRegions")
+    public Response listRegions(String body) {
+        PaginatedResult<AccountRegion> page = regionService.listRegions(requestContext.getAccountId(), readTree(body));
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("Regions", objectMapper.valueToTree(page.items()));
+        if (page.nextToken() != null) {
+            response.put("NextToken", page.nextToken());
+        }
+        return Response.ok(response).build();
+    }
+
+    @POST
     @Path("/getAccountInformation")
     public Response getAccountInformation(String body) {
         AccountInformation information = accountService.getAccountInformation(
@@ -101,6 +118,26 @@ public class AccountController {
     @Path("/putAccountName")
     public Response putAccountName(String body) {
         accountService.putAccountName(requestContext.getAccountId(), readTree(body));
+        return Response.ok().build();
+    }
+
+    @POST
+    @Path("/getRegionOptStatus")
+    public Response getRegionOptStatus(String body) {
+        return Response.ok(regionService.getRegionOptStatus(requestContext.getAccountId(), readTree(body))).build();
+    }
+
+    @POST
+    @Path("/enableRegion")
+    public Response enableRegion(String body) {
+        regionService.enableRegion(requestContext.getAccountId(), readTree(body));
+        return Response.ok().build();
+    }
+
+    @POST
+    @Path("/disableRegion")
+    public Response disableRegion(String body) {
+        regionService.disableRegion(requestContext.getAccountId(), readTree(body));
         return Response.ok().build();
     }
 
