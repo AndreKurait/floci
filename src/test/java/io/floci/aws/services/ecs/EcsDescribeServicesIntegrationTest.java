@@ -264,7 +264,7 @@ class EcsDescribeServicesIntegrationTest {
         seedClusterAndTaskDef("dep-cluster-23", "dep-td-23");
         given().contentType(CT).header("X-Amz-Target", TARGET + "CreateService")
                 .body("{\"cluster\":\"dep-cluster-23\",\"serviceName\":\"dep-svc-23\","
-                        + "\"taskDefinition\":\"dep-td-23\",\"schedulingStrategy\":\"DAEMON\"}")
+                        + "\"taskDefinition\":\"dep-td-23\",\"launchType\":\"FARGATE\",\"schedulingStrategy\":\"DAEMON\"}")
                 .when().post("/")
                 .then().statusCode(400)
                 .body("__type", containsString("InvalidParameterException"))

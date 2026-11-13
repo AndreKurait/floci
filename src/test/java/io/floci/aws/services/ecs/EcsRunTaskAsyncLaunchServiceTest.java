@@ -194,6 +194,7 @@ class EcsRunTaskAsyncLaunchServiceTest {
     void theExecAgentIsPendingUntilTheTaskRuns() {
         EcsService service = newService(true);
         registerTaskDefinition(service, "exec");
+        service.registerContainerInstance(null, null, null, REGION);
         RunTaskRequest request = new RunTaskRequest();
         request.setTaskDefinition("exec");
         request.setEnableExecuteCommand(true);

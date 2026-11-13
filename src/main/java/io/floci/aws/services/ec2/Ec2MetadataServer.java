@@ -37,6 +37,7 @@ import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiFunction;
+import java.util.function.Supplier;
 
 /**
  * IMDS-compatible HTTP server bound to port 9169 on the Floci host.
@@ -66,6 +67,13 @@ public class Ec2MetadataServer {
     private final Map<String, SessionToken> tokens = new ConcurrentHashMap<>();
     /** IMDSv1 fallback: container bridge IP → Instance */
     private final Map<String, Instance> containerIpToInstance = new ConcurrentHashMap<>();
+    /** The task that registered an ECS container address, so releasing another task leaves it alone. */
+    private final Map<String, String> containerIpOwners = new ConcurrentHashMap<>();
+    /**
+     * ECS task containers about to start, by container id. Docker assigns the address at start, so a
+     * request from an address IMDS does not know yet is matched against these before it is refused.
+     */
+    private final Map<String, PendingContainer> pendingContainers = new ConcurrentHashMap<>();
     /** Cluster nodes whose instance-profile identity their registrar synthesizes rather than IAM holding it. */
     private final Set<Instance> synthesizedProfiles = ConcurrentHashMap.newKeySet();
 
@@ -105,6 +113,75 @@ public class Ec2MetadataServer {
         }
     }
 
+    /**
+     * Registers an ECS task container's address on behalf of its task. A later address of the same
+     * value (Docker reuses a stopped container's) replaces the owner.
+     */
+    public void registerContainer(String containerIp, String instanceId, Instance instance, String owner) {
+        if (containerIp != null && !containerIp.isBlank()) {
+            // Owner first: a release of the previous owner racing this call then finds nothing of its own.
+            containerIpOwners.put(containerIp, owner);
+            registerContainer(containerIp, instanceId, instance);
+        }
+    }
+
+    /** Drops a pending container once its address is registered. */
+    public void forgetPendingContainer(String containerId) {
+        pendingContainers.remove(containerId);
+    }
+
+    /**
+     * Registers an ECS task container before Docker starts it, so its process is served from its
+     * first request; {@code address} resolves the container's address once it runs.
+     */
+    public void registerPendingContainer(String containerId, String owner, Supplier<String> address,
+                                         Instance instance) {
+        credentials.register(instance);
+        pendingContainers.put(containerId, new PendingContainer(owner, address, instance));
+    }
+
+    /** Unregisters a task's address only while that task still owns it, and forgets its pending containers. */
+    public void unregisterContainer(String containerIp, Instance instance, String owner) {
+        // The owner entry goes only with the mapping it guards: the caller asks every instance in turn.
+        if (containerIp != null && instance != null && owner.equals(containerIpOwners.get(containerIp))
+                && containerIpToInstance.remove(containerIp, instance)) {
+            containerIpOwners.remove(containerIp, owner);
+        }
+        pendingContainers.values().removeIf(pending -> pending.owner().equals(owner));
+    }
+
+    private record PendingContainer(String owner, Supplier<String> address, Instance instance) {
+        String addressOrNull() {
+            try {
+                return address.get();
+            } catch (RuntimeException e) {
+                return null;
+            }
+        }
+    }
+
+    /** The instance an address belongs to, resolving a pending ECS container on a miss. */
+    /** ECS task containers registered before start and not yet matched or released. */
+    public int pendingContainerCount() {
+        return pendingContainers.size();
+    }
+
+    Instance instanceForAddress(String remoteIp) {
+        Instance inst = containerIpToInstance.get(remoteIp);
+        if (inst != null || pendingContainers.isEmpty()) {
+            return inst;
+        }
+        for (Map.Entry<String, PendingContainer> entry : pendingContainers.entrySet()) {
+            PendingContainer pending = entry.getValue();
+            if (remoteIp.equals(pending.addressOrNull()) && pendingContainers.remove(entry.getKey(), pending)) {
+                containerIpToInstance.put(remoteIp, pending.instance());
+                containerIpOwners.put(remoteIp, pending.owner());
+                return pending.instance();
+            }
+        }
+        return null;
+    }
+
     /** Called by Ec2ContainerManager when a container is terminated. */
     public void unregisterContainer(String containerIp, Instance instance) {
         if (containerIp != null && instance != null) {
@@ -137,6 +214,8 @@ public class Ec2MetadataServer {
             credentials.unregister(instance);
             tokens.values().removeIf(token -> token.instance() == instance);
             containerIpToInstance.entrySet().removeIf(entry -> entry.getValue() == instance);
+            containerIpOwners.keySet().retainAll(containerIpToInstance.keySet());
+            pendingContainers.values().removeIf(pending -> pending.instance() == instance);
         }
     }
 
@@ -224,6 +303,8 @@ public class Ec2MetadataServer {
         credentials.clear();
         tokens.clear();
         containerIpToInstance.clear();
+        containerIpOwners.clear();
+        pendingContainers.clear();
         synthesizedProfiles.clear();
         if (httpServer != null) {
             httpServer.close();
@@ -548,8 +629,7 @@ public class Ec2MetadataServer {
     // ── Instance resolution ───────────────────────────────────────────────────
 
     private Instance resolveInstanceByIp(RoutingContext ctx) {
-        String remoteIp = ctx.request().remoteAddress().host();
-        return containerIpToInstance.get(remoteIp);
+        return containerIpToInstance.get(ctx.request().remoteAddress().host());
     }
 
     /**
@@ -557,6 +637,17 @@ public class Ec2MetadataServer {
      * is required refuses tokenless GET and HEAD requests before looking up any data.
      */
     private void enforceMetadataOptions(RoutingContext ctx) {
+        String remoteIp = ctx.request().remoteAddress().host();
+        if (pendingContainers.isEmpty() || containerIpToInstance.containsKey(remoteIp)) {
+            enforceResolvedMetadataOptions(ctx);
+            return;
+        }
+        // Matching a pending ECS container inspects it through Docker: off the event loop.
+        vertx.<Instance>executeBlocking(() -> instanceForAddress(remoteIp), false)
+                .onComplete(ignored -> enforceResolvedMetadataOptions(ctx));
+    }
+
+    private void enforceResolvedMetadataOptions(RoutingContext ctx) {
         HttpMethod method = ctx.request().method();
         String token = ctx.request().getHeader("x-aws-ec2-metadata-token");
         Instance inst = resolveInstanceByIp(ctx);
