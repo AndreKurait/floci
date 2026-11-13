@@ -236,6 +236,13 @@ public class ResourceArnBuilder {
             return id == null ? List.of("*")
                     : List.of(AwsArnUtils.Arn.global(partition, "cloudfront", accountId, type + id).toString());
         }
+        if ("cloudfront".equals(credentialScope)
+                && "cloudfront:UpdateOriginAccessControl".equals(operation)) {
+            String id = ctx.getUriInfo().getPathParameters().getFirst("Id");
+            return List.of(id == null || id.isBlank() ? "*"
+                    : AwsArnUtils.Arn.global(partition, "cloudfront", accountId,
+                            "origin-access-control/" + id).toString());
+        }
         // Task tokens resolve their authorization resource from recorded workflow ownership.
         if ("states".equals(credentialScope) && operation != null && Set.of("states:SendTaskSuccess",
                 "states:SendTaskFailure", "states:SendTaskHeartbeat").contains(operation)) {
