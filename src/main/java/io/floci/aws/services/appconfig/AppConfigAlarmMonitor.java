@@ -13,6 +13,7 @@ import io.floci.aws.services.cloudwatch.metrics.model.CompositeAlarm;
 import io.floci.aws.services.iam.IamPolicyEvaluator.Decision;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
+import org.jboss.logging.Logger;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -22,6 +23,7 @@ import java.util.Map;
 /** Reads an environment's alarms using its configured monitoring role. */
 @ApplicationScoped
 public class AppConfigAlarmMonitor {
+    private static final Logger LOG = Logger.getLogger(AppConfigAlarmMonitor.class);
     private final CloudWatchMetricsService cloudWatch;
     private final ServiceRoleCallAuthorizer authorizer;
     private final RegionResolver regions;
@@ -34,18 +36,40 @@ public class AppConfigAlarmMonitor {
         this.regions = regions;
     }
 
-    /** Returns the first rollback cause, after validating access to every configured monitor. */
+    /** Validates every monitor before admitting a deployment. */
+    void validateMonitors(List<Monitor> monitors) {
+        if (monitors != null) {
+            for (Monitor monitor : monitors) {
+                read(monitor);
+            }
+        }
+    }
+
+    /** Retains a confirmed rollback cause even when another monitor cannot be read. */
     String rollbackCause(List<Monitor> monitors) {
         if (monitors == null) {
             return null;
         }
         String cause = null;
+        RuntimeException unreadable = null;
         for (Monitor monitor : monitors) {
-            Alarm alarm = read(monitor);
-            if (cause == null && alarm.isActionsEnabled()
-                    && ("ALARM".equals(alarm.getStateValue()) || "INSUFFICIENT_DATA".equals(alarm.getStateValue()))) {
-                cause = alarm.getAlarmArn() + " is " + alarm.getStateValue();
+            try {
+                Alarm alarm = read(monitor);
+                if (cause == null && alarm.isActionsEnabled()
+                        && ("ALARM".equals(alarm.getStateValue()) || "INSUFFICIENT_DATA".equals(alarm.getStateValue()))) {
+                    cause = alarm.getAlarmArn() + " is " + alarm.getStateValue();
+                }
+            } catch (RuntimeException failure) {
+                if (unreadable == null) {
+                    unreadable = failure;
+                }
             }
+        }
+        if (unreadable != null) {
+            if (cause == null) {
+                throw unreadable;
+            }
+            LOG.warnv(unreadable, "Rolling back for {0} despite an unreadable monitor", cause);
         }
         return cause;
     }
