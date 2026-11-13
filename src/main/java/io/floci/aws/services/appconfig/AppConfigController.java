@@ -50,6 +50,12 @@ public class AppConfigController {
         this.objectMapper = objectMapper;
     }
 
+    private ObjectNode resourceResponse(Object resource) {
+        ObjectNode response = objectMapper.valueToTree(resource);
+        response.remove("tags");
+        return response;
+    }
+
     // ──────────────────────────── Application ────────────────────────────
 
     @POST
@@ -58,13 +64,13 @@ public class AppConfigController {
         @SuppressWarnings("unchecked")
         Map<String, Object> request = objectMapper.readValue(body, Map.class);
         Application app = service.createApplication(request);
-        return Response.status(201).entity(app).build();
+        return Response.status(201).entity(resourceResponse(app)).build();
     }
 
     @GET
     @Path("/applications/{id}")
     public Response getApplication(@PathParam("id") String id) {
-        return Response.ok(service.getApplication(id)).build();
+        return Response.ok(resourceResponse(service.getApplication(id))).build();
     }
 
     @PATCH
@@ -72,7 +78,7 @@ public class AppConfigController {
     public Response updateApplication(@PathParam("id") String id, String body) throws IOException {
         @SuppressWarnings("unchecked")
         Map<String, Object> request = objectMapper.readValue(body, Map.class);
-        return Response.ok(service.updateApplication(id, request)).build();
+        return Response.ok(resourceResponse(service.updateApplication(id, request))).build();
     }
 
     @GET
@@ -100,13 +106,13 @@ public class AppConfigController {
         @SuppressWarnings("unchecked")
         Map<String, Object> request = objectMapper.readValue(body, Map.class);
         Environment env = service.createEnvironment(appId, request);
-        return Response.status(201).entity(env).build();
+        return Response.status(201).entity(resourceResponse(env)).build();
     }
 
     @GET
     @Path("/applications/{appId}/environments/{envId}")
     public Response getEnvironment(@PathParam("appId") String appId, @PathParam("envId") String envId) {
-        return Response.ok(service.getEnvironment(appId, envId)).build();
+        return Response.ok(resourceResponse(service.getEnvironment(appId, envId))).build();
     }
 
     @DELETE
@@ -135,13 +141,13 @@ public class AppConfigController {
         @SuppressWarnings("unchecked")
         Map<String, Object> request = objectMapper.readValue(body, Map.class);
         ConfigurationProfile profile = service.createConfigurationProfile(appId, request);
-        return Response.status(201).entity(profile).build();
+        return Response.status(201).entity(resourceResponse(profile)).build();
     }
 
     @GET
     @Path("/applications/{appId}/configurationprofiles/{profileId}")
     public Response getConfigurationProfile(@PathParam("appId") String appId, @PathParam("profileId") String profileId) {
-        return Response.ok(service.getConfigurationProfile(appId, profileId)).build();
+        return Response.ok(resourceResponse(service.getConfigurationProfile(appId, profileId))).build();
     }
 
     @GET
@@ -225,13 +231,13 @@ public class AppConfigController {
         @SuppressWarnings("unchecked")
         Map<String, Object> request = objectMapper.readValue(body, Map.class);
         DeploymentStrategy strategy = service.createDeploymentStrategy(request);
-        return Response.status(201).entity(strategy).build();
+        return Response.status(201).entity(resourceResponse(strategy)).build();
     }
 
     @GET
     @Path("/deploymentstrategies/{id}")
     public Response getDeploymentStrategy(@PathParam("id") String id) {
-        return Response.ok(service.getDeploymentStrategy(id)).build();
+        return Response.ok(resourceResponse(service.getDeploymentStrategy(id))).build();
     }
 
     @GET
@@ -281,7 +287,7 @@ public class AppConfigController {
     private Response listResponse(List<?> items, String nextToken) {
         ObjectNode root = objectMapper.createObjectNode();
         ArrayNode itemArray = root.putArray("Items");
-        items.forEach(itemArray::addPOJO);
+        items.forEach(item -> itemArray.add(resourceResponse(item)));
         if (nextToken != null) {
             root.put("NextToken", nextToken);
         }

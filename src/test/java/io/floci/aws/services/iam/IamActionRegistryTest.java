@@ -42,6 +42,16 @@ class IamActionRegistryTest {
 
     private final IamActionRegistry registry = new IamActionRegistry();
 
+    @ParameterizedTest
+    @CsvSource({"GET,ListTagsForResource", "POST,TagResource", "DELETE,UntagResource"})
+    void appConfigTagRoutesRequireTheirOwnActions(String method, String action) {
+        for (String path : List.of("/tags", "/tags/arn:aws:appconfig:us-east-1:000000000000:application/a",
+                "/tags/arn%3Aaws%3Aappconfig%3Aus-east-1%3A000000000000%3Aapplication%2Fa")) {
+            assertEquals("appconfig:" + action, registry.resolveRoute("appconfig",
+                    mockCtx(method, path, new MultivaluedHashMap<>(), null, "")));
+        }
+    }
+
     /**
      * A REST request no rule maps is checked as the operation whose vendored route it matches, as that operation's
      * action, when Floci checks it on the resources AWS does: built by hand for its namespace ({@code Invoke} as
