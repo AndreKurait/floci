@@ -10,7 +10,9 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Path;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
@@ -56,6 +58,38 @@ class AppConfigStorageTest {
             east.clear();
             assertEquals(Set.of(), east.keys());
             assertEquals(Optional.of("west"), west.get("existing"));
+        } finally {
+            factory.shutdownAll();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"memory", "persistent", "hybrid", "wal"})
+    void atomicSnapshotsPreserveRegionBoundariesAndShadowLegacyUntilDeletion(String mode) {
+        StorageFactory factory = StorageFactories.open(directory, mode, "000000000000");
+        try {
+            StorageBackend<String, String> legacy = factory.create(
+                    "appconfig", "records.json", new TypeReference<>() {});
+            legacy.put("existing", "legacy");
+            AppConfigStorage<String> east = store(factory, "us-east-1");
+            AppConfigStorage<String> west = store(factory, "us-west-2");
+            east.putAllAtomically(Map.of("existing", "east", "fresh", "new"));
+            assertEquals(Optional.of("legacy"), legacy.get("existing"));
+            assertEquals(Optional.of("east"), east.get("existing"));
+            assertEquals(Optional.empty(), west.get("existing"));
+            west.putAllAtomically(Map.of("existing", "west"));
+            Map<String, String> invalid = new LinkedHashMap<>();
+            invalid.put("existing", "must-not-store");
+            invalid.put("us-west-2/existing", "wrong-region");
+            assertThrows(IllegalArgumentException.class, () -> east.putAllAtomically(invalid));
+            assertEquals(Optional.of("east"), east.get("existing"));
+            assertEquals(Optional.of("west"), west.get("existing"));
+            assertEquals(Set.of("existing", "fresh"), east.keys());
+            east.delete("existing");
+            assertEquals(Optional.empty(), east.get("existing"));
+            assertEquals(Optional.empty(), legacy.get("existing"));
+            assertEquals(Optional.of("west"), west.get("existing"));
+            assertEquals(Optional.of("new"), east.get("fresh"));
         } finally {
             factory.shutdownAll();
         }

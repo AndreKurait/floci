@@ -92,6 +92,8 @@ public class IamActionRegistry {
      * type, so IAM checks them against the wildcard rather than a bucket.
      */
     private static final List<ActionRule> RULES = List.of(
+        rule("appconfig", "PATCH", "^/applications/[^/]+/environments/[^/]+/?$", "appconfig:UpdateEnvironment"),
+        rule("appconfig", "PATCH", "^/deploymentstrategies/[^/]+/?$", "appconfig:UpdateDeploymentStrategy"),
         // ── S3 Control ───────────────────────────────────────────────────────────
         s3ControlRule("GET",    "^/v20180820/tags/.+",        "s3:ListTagsForResource"),
         s3ControlRule("POST",   "^/v20180820/tags/.+",        "s3:TagResource"),

@@ -9,6 +9,7 @@ import io.floci.aws.core.storage.StorageFactory;
 
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -38,6 +39,23 @@ final class AppConfigStorage<V> implements StorageBackend<String, V> {
         if (defaultRegion() && delegate.get(key).isPresent()) {
             delegate.delete(key);
         }
+    }
+
+    /**
+     * Publishes new region-scoped snapshots in one backend commit. Legacy entries stay shadowed
+     * until normal deletion, avoiding a second fallible write after the replacement commits.
+     */
+    @Override
+    public void putAllAtomically(Map<String, V> entries) {
+        Map<String, V> scoped = new LinkedHashMap<>();
+        String regionPrefix = prefix();
+        entries.forEach((key, value) -> {
+            if (!logicalKey(key)) {
+                throw new IllegalArgumentException("AppConfig storage keys cannot contain a region prefix");
+            }
+            scoped.put(regionPrefix + key, value);
+        });
+        delegate.putAllAtomically(scoped);
     }
 
     @Override
