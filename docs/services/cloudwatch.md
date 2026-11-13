@@ -564,8 +564,15 @@ It does not expand repeated samples in memory. Periods containing negative value
 sets with an unrecoverable distribution have no percentile datapoint. Exact AWS interpolation
 and precision have not been qualified.
 
-Omitted `EvaluateLowSampleCountPercentile` and explicit `evaluate` are supported. The `ignore`
-policy is rejected because suppression for statistically insignificant samples is not implemented.
+`EvaluateLowSampleCountPercentile` accepts `evaluate` (the default when omitted) and `ignore`,
+through `PutMetricAlarm` and `AWS::CloudWatch::Alarm`; any other value is rejected. With `ignore`,
+a single-metric percentile alarm keeps its state while a period has fewer samples than AWS's
+documented floor: 10/(1-p) for p from 0.5 up to (not including) 1, and 10/p below 0.5, p being
+the percentile as a fraction (p90 needs 100 samples, p99 needs 1000). AWS leaves three details
+open, and Floci takes these readings: a period holding exactly the floor is evaluated; `p0` and
+`p100` have no floor; and the state is held when any of the datapoints that would decide it is
+below the floor. A period with no samples at all is missing data and is still governed by
+`TreatMissingData`. The setting has no effect on metric math (`Metrics`) alarms.
 Other extended statistics, such as trimmed means, and the console API's `ExtendedStatistics`
 request shape remain unsupported.
 
