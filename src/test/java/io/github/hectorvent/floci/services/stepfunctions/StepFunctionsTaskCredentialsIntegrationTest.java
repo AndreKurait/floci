@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.services.lambda.LambdaExecutorService;
+import io.github.hectorvent.floci.services.lambda.launcher.LambdaRuntimeLauncher;
 import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.sqs.SqsService;
 import io.github.hectorvent.floci.testing.EnforcementFixtures;
@@ -57,6 +58,9 @@ class StepFunctionsTaskCredentialsIntegrationTest {
 
     @InjectMock
     LambdaExecutorService lambdaExecutor;
+
+    @InjectMock
+    LambdaRuntimeLauncher lambdaRuntimeLauncher;
 
     @InjectSpy
     JsonataEvaluator jsonataEvaluator;

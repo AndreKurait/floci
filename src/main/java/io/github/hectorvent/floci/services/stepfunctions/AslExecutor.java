@@ -1336,7 +1336,7 @@ public class AslExecutor {
             NestedTaskCredentials.validateShape(credentials);
         }
         lambdaTaskAuthorizer.authorize(sm, credentials == null ? null : credentials.path("RoleArn").asText(),
-                required.get().errorPrefix(), required.get().permissions());
+                required.get().errorPrefix() + "AccessDeniedException", required.get().permissions());
     }
 
     private boolean iamEnforcementEnabled() {
