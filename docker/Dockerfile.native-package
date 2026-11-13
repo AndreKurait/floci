@@ -26,6 +26,11 @@ ENV FLOCI_STORAGE_PERSISTENT_PATH=/app/data
 ENV LD_LIBRARY_PATH=/app
 COPY --chmod=755 --chown=1001:root native/${TARGETARCH}/ /app/
 
+ARG NETWORK_HELPER_IMAGE=floci/network-helper:local
+ENV FLOCI_SERVICES_EC2_METADATA_HELPER_IMAGE=${NETWORK_HELPER_IMAGE}
+ENV FLOCI_NETWORK_SECURITY_GROUP_ENFORCEMENT_HELPER_IMAGE=${NETWORK_HELPER_IMAGE}
+ENV FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_PROXY_IMAGE=${NETWORK_HELPER_IMAGE}
+
 LABEL org.opencontainers.image.title="Floci" \
       org.opencontainers.image.description="Local AWS emulator — open-source alternative to LocalStack Community" \
       org.opencontainers.image.url="https://floci.io" \

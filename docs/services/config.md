@@ -36,9 +36,15 @@
 | `PutConfigurationRecorder` | Create or update a configuration recorder |
 | `DescribeConfigurationRecorders` | List configuration recorders |
 | `DeleteConfigurationRecorder` | Delete a configuration recorder |
-| `StartConfigurationRecorder` | Start recording configuration changes |
+| `StartConfigurationRecorder` | Start recording configuration changes; requires a delivery channel in the same account and region |
 | `StopConfigurationRecorder` | Stop recording configuration changes |
 | `DescribeConfigurationRecorderStatus` | Get the status of configuration recorders. Whether a recorder is recording, and when it last started and stopped, persist with the recorder, so a started recorder is still recording after a restart |
+
+`DescribeConfigurationRecorders` and `DescribeConfigurationRecorderStatus` accept at
+most one entry in `ConfigurationRecorderNames`. More than one entry returns HTTP 400
+`ValidationException`, including repeated names and requests made before any recorder exists.
+An omitted or empty list selects all recorders; one unknown name returns
+`NoSuchConfigurationRecorderException`.
 
 ### Delivery Channel
 
@@ -138,7 +144,13 @@ aws configservice put-configuration-recorder --configuration-recorder '{
   }
 }'
 
-# Start recording
+# Create a delivery channel before starting the recorder
+aws configservice put-delivery-channel --delivery-channel '{
+  "name": "default",
+  "s3BucketName": "my-config-bucket"
+}'
+
+# Start recording (without a delivery channel, returns NoAvailableDeliveryChannelException)
 aws configservice start-configuration-recorder --configuration-recorder-name default
 
 # Check recorder status

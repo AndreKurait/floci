@@ -6,6 +6,9 @@
 *.bat text eol=crlf
 mvnw.cmd text eol=crlf
 
+# The schema TSV retains an empty final column for resources with no writable properties.
+src/test/resources/cloudformation/schema-surface.tsv whitespace=-blank-at-eol
+
 # Denote all files that are truly binary and should not be modified.
 *.png binary
 *.jpg binary

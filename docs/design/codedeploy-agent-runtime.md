@@ -1,0 +1,213 @@
+# CodeDeploy Server deployment through the AWS agent
+
+Server revisions need to be installed inside their selected instances. Reporting
+`DownloadBundle` or `Install` success without downloading the revision or copying
+its files does not establish a deployment.
+
+The runtime uses the ordinary CodeDeploy agent command protocol. Floci owns
+deployment scheduling, target selection and command state. The AWS agent owns
+archive extraction, AppSpec validation, file installation, permissions and guest
+lifecycle scripts. S3 serves the actual revision selected by `CreateDeployment`.
+The guest uses its own credentials and the configured emulator endpoints.
+The requested `DISALLOW`, `OVERWRITE` or `RETAIN` file behavior is included in
+the signed specification and applied by the agent.
+
+The runtime targets S3 zip, tar and tgz revisions and in-place deployments,
+with optional Classic load-balancer traffic control. It selects existing
+`InService` Auto Scaling members and EC2 instances matched by the group's tags,
+deduplicating instances selected both ways. Stopped EC2 instances remain targets;
+they must receive the command or encounter the normal agent-start deadline.
+
+`OneAtATime` sends work to one instance at a time, stops after an early failure,
+and permits the documented last-instance failure when preceding instances
+succeeded. `AllAtOnce` starts all selected hosts and requires at least one
+successful deployment. `HalfAtATime` takes up to half the selected instances
+offline concurrently, rounding down. Failed hosts consume that unavailable-host
+budget, so subsequent concurrency decreases after a failure. It stops when no
+further host can be taken offline, and requires all hosts to have been attempted
+with at least half succeeding, rounding up. Custom health policies, target-group
+traffic control, and blue/green Server deployments are rejected before queuing
+agent commands.
+Auto Scaling launch deployments select a new waiting instance and install the
+last successful revision before completing their managed launch action. They
+can overlap a normal deployment to different hosts. A newer successful revision
+triggers a follow-on update unless the group's outdated-instance strategy is
+`IGNORE`. Prior revision-health scheduling remains unsupported.
+Enabled deployment alarms, restart mode, outdated-instance filtering, ignored
+stop failures, and per-request alarm, target or EC2-process overrides
+are rejected rather than silently discarded.
+
+## Failure recovery and explicit stop
+
+An S3 Server deployment can enable `DEPLOYMENT_FAILURE` rollback through its
+group or a per-deployment `autoRollbackConfiguration` override. The effective
+policy is captured when the deployment starts. An explicit disabled override
+prevents automatic recovery even when the group enables it.
+
+Recovery creates a new deployment of the group's last successful S3 revision,
+including its version, ETag and `fileExistsBehavior`. The original deployment
+keeps its failed or stopped status. `rollbackInfo` links the two IDs, and the
+recovery's creator is `codeDeployRollback`. A failed recovery does not trigger
+another automatic rollback. A first failure with no successful revision records
+that recovery is unavailable.
+
+`StopDeployment(autoRollbackEnabled=false)` stops without recovery. Explicit
+`true` schedules the last successful revision after all old controller workers
+have settled. Stop remains pending while acknowledged commands complete within
+their existing lifecycle deadline. Queued commands are cancelled atomically
+with acknowledgement, and no subsequent phase starts. The agent's completion
+and diagnostics remain visible before the group is released for recovery.
+A recovery uses the normal agent and traffic phases; cancellation
+itself never restores load-balancer membership. Automatic alarm and
+`DEPLOYMENT_STOP_ON_REQUEST` policy triggers remain unsupported.
+
+Admission, stop and recovery share a group lock. Another S3 agent deployment
+cannot overlap the handoff. History uses the account, Region and immutable group
+ID, so renaming a group retains its history while deleting and recreating the
+same name does not. Recovery resolves the current group and its existing
+permission checks under the captured owner. Successful revisions persist through
+`StorageFactory`; active commands and deployment records remain transient.
+
+## Classic load-balancer traffic
+
+An `IN_PLACE` group with `WITH_TRAFFIC_CONTROL` names its Classic load balancers
+in `loadBalancerInfo.elbInfoList`. Each instance runs `BeforeBlockTraffic`,
+`BlockTraffic` and `AfterBlockTraffic` before the ordinary installation phases,
+then `BeforeAllowTraffic`, `AllowTraffic` and `AfterAllowTraffic` after
+`ValidateService`. The AWS agent executes the four surrounding hooks, including
+its normal selection of the previous successful revision for the blocking
+hooks. Floci performs the two reserved traffic operations.
+
+`BlockTraffic` deregisters the instance from each selected balancer and waits
+until its existing connections have drained. `AllowTraffic` registers it and
+waits for `InService` health from every selected balancer. These checks read the
+same membership, frontend connection and health state as the Classic APIs.
+They do not substitute a timer for application health or connection completion.
+The traffic deadline is one hour; a test may inject a shorter deadline.
+
+The deployment captures the owning account, Region, service role and balancer
+names before starting workers. Each operation uses that account's request
+scope and evaluates the configured CodeDeploy service role's trust, policies,
+permissions boundary and SCPs. Register/deregister permissions use the
+balancer ARN and current resource tags. `DescribeInstanceHealth` uses `*`,
+as required by its AWS authorization model. A missing permission fails the
+traffic phase and the deployment response names the denied action. A concurrent
+deployment failure or explicit stop releases other workers waiting for traffic
+state. Cancellation does not re-register an instance or report a stopped
+application healthy.
+
+## Supported actions
+
+The reference client is the published AWS CodeDeploy agent `v2.1.2`, source commit
+`f2acaacb9f223feee055b5679384bbceae4154f1`. Its command service uses JSON 1.1 and
+PascalCase fields, with these operations:
+
+<!-- floci:actions:start -->
+| Action | Description |
+| --- | --- |
+| `PollHostCommand` | Wait for an outstanding command for the polling host |
+| `PutHostCommandAcknowledgement` | Move that command into execution |
+| `GetDeploymentSpecification` | Return the signed revision and deployment metadata |
+| `PostHostCommandUpdate` | Return command state without completing it |
+| `PutHostCommandComplete` | Record the agent's terminal result and diagnostics |
+<!-- floci:actions:end -->
+
+Both `CodeDeployCommandService` and the legacy
+`CodeDeployCommandService_v20141006` target prefixes identify the command
+protocol. They must remain distinct from the public CodeDeploy control API.
+
+Deployment specifications use attached `PKCS7/JSON` signatures from the
+emulator's certificate authority. Agent developer mode and unsigned
+specifications are unnecessary. This is a local signer, not an AWS production
+identity.
+
+Command state is bound to the deployment's account, Region and selected host.
+Retries must not run a completed command again, acknowledge another tenant's
+command, or change a terminal result. A deployment group has one active
+deployment; independent groups may deploy to the same host. Stop cancels queued
+work and retains the group's reservation until active commands settle.
+It does not kill a script already executing inside the agent. Shutdown and
+expired lifecycle deadlines still invalidate unfinished commands.
+
+Polling waits up to 60 seconds for eligible work and wakes when a command is
+queued or its state changes. A delivered command stays unavailable for five
+seconds while its acknowledgement is in flight; if the response was lost,
+the pending command becomes deliverable again. These are bounded Floci
+delivery intervals, not a claim about AWS's internal timing. They prevent rapid
+duplicate or empty responses from making the stock agent sleep between every
+lifecycle event. Shutdown and interrupted requests release waiting polls.
+
+The start deadline is five minutes per lifecycle event; the completion deadline
+is one hour after acknowledgement. Tests may inject shorter coordinator
+durations. Runtime requests use the normal deadlines, and agent completion
+retains the script name, error, message and log. Download and installation have
+the same acknowledgement/result requirements as script hooks.
+
+The default agent configuration (`enable_auth_policy: false`) uses
+`codedeploy-commands`. With IAM enforcement enabled, Floci verifies its SigV4
+signature and live IMDS-issued instance-profile credential, even if general
+signature validation is disabled. The issuing account, Region, partition and
+instance must match the requested host or the command's recorded host. A role
+session merely named after an instance, an IAM user and the separate EC2
+identity-role credential cannot establish that binding. The instance ARN is
+recorded at issuance and is never restored from serialized session state.
+
+The optional `enable_auth_policy: true` configuration uses
+`codedeploy-commands-secure` and retains ordinary IAM policy enforcement. Public
+`codedeploy:*` permissions do not grant either agent mode. Default EC2 operation
+does not need a `codedeploy-commands:*` policy. See AWS's
+[agent configuration reference](https://docs.aws.amazon.com/codedeploy/latest/userguide/reference-agent-configuration.html)
+and [VPC endpoint authentication instructions](https://docs.aws.amazon.com/codedeploy/latest/userguide/vpc-endpoints.html).
+On-premises agent authentication remains outside this EC2 runtime's support.
+
+## Qualification
+
+The runtime is not qualified by this design document. Before publication it
+needs an actual AWS agent to download an S3 bundle, install its files and run
+AppSpec scripts in an owned guest. Evidence must include installed file hashes,
+script output, first-install behavior, a failed script, stopped deployment,
+command retries, account/Region isolation and complete cleanup.
+
+`CodeDeployAgentDockerIntegrationTest` exercises the stock agent in two Auto
+Scaling guests with IMDS role credentials. It verifies versioned S3 content
+hashes, file-conflict policies, hook diagnostics, cancellation during a hook
+blocked on a pipe, and automatic recovery to the exact successful S3 version.
+The fixture launches the agent's
+foreground master in the background so user data can finish; it checks that
+bootstrap continued before deploying.
+
+`CodeDeployClassicTrafficIntegrationTest` checks the public SDK path in
+nondefault accounts and Regions, including current tag conditions and the
+unscoped health-read permission. Its mailbox replies simulate an agent.
+`CodeDeployClassicTrafficDockerIntegrationTest` instead uses the stock agent
+and a Classic frontend with actual connections: a held request blocks draining,
+missing HTTP health blocks registration, and an explicit stop prevents later
+hooks. Traffic control also applies to the first deployment, when no previous
+revision exists. Explicit stop-and-rollback also restores both guests after
+registration waits on failed health. Its private HTTP fixture
+does not establish production TLS, caller NAT routing or a native service rollout.
+The two Docker tests share the same agent image and ASG/S3 setup.
+
+`CodeDeployAgentRollbackIntegrationTest` verifies policy overrides, stop choices,
+owner and Region isolation, group replacement and rename, nonrecursive recovery
+and exclusive admission through the signed SDK. Its mailbox replies are
+simulated. `CodeDeployServicePersistenceTest` independently reloads persistent
+JSON before failing a deployment and recovering the stored revision.
+
+The SDK compatibility suite's `CodeDeployAgentTest` verifies signed
+specifications and command completion against the standalone server, including
+native-image CI. It simulates the agent protocol and verifies the CMS signature;
+the Docker fixture supplies the separate guest-installation evidence.
+
+`CodeDeployDefaultAgentAuthenticationIntegrationTest` obtains credentials over
+IMDS and uses the AWS SDK signer for the default command protocol. It covers
+commercial, GovCloud and China partitions, ownership of all command operations,
+signature and token failures, revocation, lookalike role-session names, and the
+secure endpoint's separate permission requirement.
+
+Configuration-only API tests, a command-protocol simulator and a
+`CreateDeployment` success response are insufficient. Native AMI initialization,
+complete service rollouts and native Auto Scaling launch deployments remain
+separate qualifications until their real paths execute. The signed SDK launch
+tests use explicit agent mailbox replies; they establish orchestration behavior,
+not guest installation.

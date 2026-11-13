@@ -12,6 +12,8 @@ Floci Lambda runs your function code locally inside real Docker containers - clo
 | `CreateFunction` | Deploy a Lambda function |
 | `GetFunction` | Get function details and download URL |
 | `GetFunctionConfiguration` | Get runtime configuration |
+| `GetRuntimeManagementConfig` | Read a version's stored runtime update mode and optional pin |
+| `PutRuntimeManagementConfig` | Replace a version's stored runtime update mode and optional pin |
 | `ListFunctions` | List all functions |
 | `UpdateFunctionCode` | Upload new code |
 | `UpdateFunctionConfiguration` | Update runtime, handler, memory, timeout, environment, architectures, tracing, layers, and more |
@@ -43,6 +45,7 @@ Floci Lambda runs your function code locally inside real Docker containers - clo
 | `ListCodeSigningConfigs` | List the configurations in the region |
 | `CreateFunctionUrlConfig` | Provision a function URL |
 | `GetFunctionUrlConfig` | Read function URL config |
+| `ListFunctionUrlConfigs` | List a function's URL configurations across its unpublished version and aliases, with marker pagination |
 | `UpdateFunctionUrlConfig` | Update function URL config |
 | `DeleteFunctionUrlConfig` | Delete function URL config |
 | `ListTags` | List tags on a function or event source mapping |
@@ -51,6 +54,8 @@ Floci Lambda runs your function code locally inside real Docker containers - clo
 | `PutFunctionConcurrency` | Set reserved concurrent executions |
 | `GetFunctionConcurrency` | Get reserved concurrent executions |
 | `DeleteFunctionConcurrency` | Clear reserved concurrent executions |
+| `GetFunctionRecursionConfig` | Read the function's stored recursion setting |
+| `PutFunctionRecursionConfig` | Store `Allow` or `Terminate` for an unqualified function |
 | `PutProvisionedConcurrencyConfig` | Initialize Docker environments for a published version or simple alias |
 | `GetProvisionedConcurrencyConfig` | Read the allocation's actual initialization status and capacity |
 | `ListProvisionedConcurrencyConfigs` | List configured versions and aliases with their current capacity |
@@ -82,6 +87,59 @@ each destination and the SQS queue or SNS topic SAM creates when a destination g
 Asynchronous invocations apply its retry, event age, destination settings, and dead-letter queue
 configurations (`DeadLetterConfig`).
 
+### Recursion settings
+
+`GetFunctionRecursionConfig` and `PutFunctionRecursionConfig` use the AWS SDK routes
+under `/2024-08-31/functions/{FunctionName}/recursion-config`. The stored value is
+`Allow` or `Terminate`; new functions and older stored functions without the setting
+default to `Terminate`. Both operations accept an unqualified name, partial ARN, or
+full ARN and reject version and alias suffixes. A supplied ARN must match the caller's
+account, region, and partition. Settings persist with the function, remain independent
+of published versions, and disappear when the function is deleted.
+
+`AWS::Lambda::Function.RecursiveLoop` sets the same value during stack creation and
+updates without replacing the function. Floci validates its value before changing
+code, configuration, or tags. Floci's property-removal policy resets a previously
+template-owned setting to `Terminate`, including when `Fn::If` selects `AWS::NoValue`.
+If the prior template never declared the setting, an unrelated update preserves a
+value written through the Lambda API. This removal policy is Floci reconciliation
+behavior; the AWS property reference does not specify removal semantics.
+
+Full Lambda function update rollback is not implemented. If a later stack resource
+fails after the function was updated, the stack reports `UPDATE_ROLLBACK_FAILED` and
+the applied recursion setting can remain. Invalid `RecursiveLoop` values are rejected
+before code, configuration, tags, or the setting are changed.
+
+These APIs configure and report settings. Floci does not detect or terminate recursive
+invocations, emit recursion notifications or metrics, or propagate X-Ray lineage.
+SAM forwarding of `RecursiveLoop` is not implemented.
+### Runtime management configuration
+
+`GetRuntimeManagementConfig` and `PutRuntimeManagementConfig` use the native
+`/2021-07-20/functions/{FunctionName}/runtime-management-config` route. Each function's
+`$LATEST` and numeric published versions have independent stored settings, initially `Auto`.
+`Manual` requires a modeled `RuntimeVersionArn`, which is preserved exactly. `Auto` and
+`FunctionUpdate` clear the stored and returned pin, including when a valid ARN is supplied.
+These settings do not install runtimes, alter invocation environments, or emulate runtime rollout.
+
+Local compatibility policies: aliases select their primary numeric version and retain the
+requested alias in the response ARN; newly published versions start at `Auto`, independently
+of the latest version's setting. `$LATEST.PUBLISHED` is unresolved and returns
+`ResourceNotFoundException`. Conflicting embedded/query qualifiers are rejected. IAM grants
+match the requested qualified ARN, including an alias or explicit `$LATEST`; unqualified
+requests match the unqualified ARN. Both actions use the function's current resource tags.
+Function references must belong to the caller's account, Region and partition.
+
+Reads and IAM condition lookup do not migrate legacy functions or aliases. An authorized
+first write can migrate a legacy function and persist an internal lifetime identifier before
+committing its settings; these are separate writes. Failed settings writes leave the prior
+visible settings. Immutable settings use the Lambda storage mode, including persistent reload
+and atomic replacement; hybrid mode retains asynchronous durability. Deletion clears settings
+before removing the function/version, so a later parent-store failure can leave that resource
+present with default settings. A settings deletion failure stops parent deletion. New function
+lifetimes and stale-writer checks prevent old settings from returning after name reuse.
+
+
 ### Function policies under IAM enforcement
 
 With [IAM enforcement](iam.md#resource-based-policies) on, the statements `AddPermission` adds take
@@ -98,6 +156,7 @@ part in authorizing calls to the function:
   policy to allow the caller in the same way.
 - Provisioned-concurrency configuration operations also act in the account named by the function
   reference. Cross-account access requires that function's policy to allow the caller.
+- Recursion-setting operations reject ARNs naming another account, region, or partition.
 - Other operations act on the caller's own function of the name the ARN gives, whatever account
   the ARN names, and are authorized against that function. Floci does not serve them on another
   account's function, which AWS allows through a function policy.
@@ -411,15 +470,18 @@ disabled fails with Lambda's error as the resource status reason.
     Reserved concurrency is enforced function-wide: invocations of every
     version and alias count against the function's reservation, and
     invocations beyond the reserved value return `TooManyRequestsException`
-    (HTTP 429). Functions without a reserved value share a **per-region**
+    (HTTP 429). Functions without a reserved value share a **per-account-per-region**
     pool. AWS Lambda's "account-level" limit is in fact a
     per-account-per-region quota, and Floci mirrors that by partitioning
-    counters on the ARN's region segment. The pool size (default 1000) is
+    counters on the ARN's account and region segments. The pool size (default 1000) is
     configurable via `floci.services.lambda.region-concurrency-limit` and
-    applies independently to each region. `PutFunctionConcurrency` validates
+    applies independently to each account and region. `PutFunctionConcurrency` validates
     that the requested value leaves at least
     `floci.services.lambda.unreserved-concurrency-min` (default 100) available
-    for unreserved functions in that region.
+    for unreserved functions in that account and region.
+
+    Deleting a function drains only its account and region across all published versions.
+    Same-named functions in another account or region retain their warm environments.
 
     Reducing or clearing a function's reserved value does not kill
     invocations that are already in flight. This matches AWS, which
@@ -498,6 +560,13 @@ rejects one outright with `InvalidParameterValueException: Invalid layer version
 
 ## Provisioned concurrency
 
+`AWS::Lambda::Alias` provisions the declared `ProvisionedConcurrencyConfig` through the same
+worker pool as the Lambda API. CloudFormation waits for the requested capacity to initialize;
+initialization failure fails the resource. An update that removes a previously declared
+configuration deletes that allocation. SAM preserves the setting on the generated alias and
+requires `AutoPublishAlias`. Function initialization dependencies must be ready before the alias
+is provisioned.
+
 Published versions with `SnapStart.ApplyOn=PublishedVersions` reject provisioned concurrency
 with `ResourceConflictException`, including through an alias. A configured alias cannot
 retarget to such a version. Eligibility uses the published snapshot, so changing `$LATEST`
@@ -553,15 +622,25 @@ This implementation supports the non-ephemeral Docker executor with immutable pu
 versions and simple aliases. It refuses `$LATEST`, weighted aliases, hot reload, durable
 functions and other executors. Allocations share the configured `warm-pool-max-per-function`
 ceiling across a function's qualifiers, and the optional `warm-pool-max-total` ceiling across
-provisioned allocations. A function's reserved concurrency is also a ceiling. These local
-resource bounds do not implement AWS's complete regional provisioned-concurrency quota
-accounting, automatic scaling, or weighted-alias allocation. Provisioned runtimes receive
+provisioned allocations. A function's reserved concurrency is also a ceiling. Without a
+reservation, provisioned allocations consume the account and region's unreserved capacity;
+Put leaves at least `unreserved-concurrency-min` available. `GetAccountSettings` reflects
+these allocations without counting provisioned capacity twice when a function has a
+reservation. Cold spillover still consumes ordinary unreserved permits. Automatic scaling
+and weighted-alias allocation remain unsupported. Provisioned runtimes receive
 their numeric `AWS_LAMBDA_FUNCTION_VERSION` and
-`AWS_LAMBDA_INITIALIZATION_TYPE=provisioned-concurrency`.
+`AWS_LAMBDA_INITIALIZATION_TYPE=provisioned-concurrency`. For both provisioned and ordinary
+invocations, `context.invoked_function_arn` retains the requested qualifier, including an
+alias name, without changing the executed function version.
 
 Configuration replacement and deletion remain committed if environment removal fails.
 Failed removals retain ownership and are retried while Floci is running; they continue
 to count against local container limits until cleanup succeeds.
+
+When Docker is already removing a container, Floci waits up to five seconds for that
+removal and confirms the container is absent before releasing its runtime resources.
+A timeout, interruption or unconfirmed removal keeps ownership for a later cleanup
+attempt.
 
 Shutdown drains provisioned and on-demand containers concurrently within one
 `floci.services.lambda.container-drain-timeout-seconds` budget. The default is 15 seconds;
@@ -577,6 +656,18 @@ does not guarantee cancellation of an unresponsive container launcher.
 If an invocation finishes after the shutdown deadline, releasing its still-owned
 container starts a separate bounded cleanup attempt. This does not extend the
 initial shutdown wait.
+
+Lambda containers use the engine's init process to forward signals and reap children.
+A runtime without a SIGTERM handler therefore exits normally instead of inheriting
+PID 1's special signal behavior and waiting for the forced-kill timeout. The one-second
+runtime stop timeout remains a fallback ceiling, not a minimum delay.
+
+External extensions receive SHUTDOWN while the Runtime API remains available. Floci
+waits for their exec output streams to finish within a shared two-second budget before
+stopping the container, so prompt extension cleanup and final logs are preserved.
+An extension that does not finish cannot add another stop grace period after that
+budget expires. Functions without extensions incur no extension wait. This is Floci's
+container teardown behavior, not an implementation of AWS's underlying compute fabric.
 
 When using `floci-cli`, set `floci stop --timeout <seconds>` above the configured
 drain budget. The CLI currently defaults to 10 seconds, including for `floci restart`.
@@ -614,7 +705,6 @@ Configuration resource reads and `ListFunctionsByCodeSigningConfig` return
 |---|---|---|
 | `FLOCI_SERVICES_LAMBDA_ENABLED` | `true` | Enable or disable the service |
 | `FLOCI_SERVICES_LAMBDA_EPHEMERAL` | `false` | Remove containers after each invocation |
-| `FLOCI_SERVICES_LAMBDA_RECONCILE_CONTAINERS_ON_STARTUP` | `true` | Reclaim owned Docker containers from previous runs at startup and retry incomplete cleanup on cold starts; disable when deployments share the same owner identity |
 | `FLOCI_SERVICES_LAMBDA_HONOUR_ARCHITECTURES` | `false` | Select each function's declared architecture for Docker image pulls and containers |
 | `FLOCI_SERVICES_LAMBDA_DEFAULT_MEMORY_MB` | `128` | Default function memory (MB) |
 | `FLOCI_SERVICES_LAMBDA_DEFAULT_TIMEOUT_SECONDS` | `3` | Default function timeout (seconds) |
@@ -636,7 +726,10 @@ Configuration resource reads and `ListFunctionsByCodeSigningConfig` return
 | `FLOCI_SERVICES_LAMBDA_REACTIVE_S3_SYNC_ENABLED` | `true` | Re-deploy a function when its S3 deployment object is overwritten. See [Reactive S3 Sync](#reactive-s3-sync-configuration) |
 | `FLOCI_SERVICES_LAMBDA_REACTIVE_S3_SYNC_ASYNC` | `false` | Run that re-deploy in the background so the upload does not wait for it |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_NETWORK` | *(unset)* | Docker network to attach Lambda containers to (overrides `FLOCI_SERVICES_DOCKER_NETWORK`) |
+| `FLOCI_SERVICES_LAMBDA_ADDITIONAL_DOCKER_NETWORKS` | *(unset)* | Comma-separated existing Docker network names or IDs joined before a function starts. Name/ID aliases attach once. Additional endpoints use a lower gateway priority where Docker supports it, preserving the primary route. A failed attachment aborts and cleans up the launch; duplicate or invalid names are rejected |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_FLAGS` | *(unset)* | Additional Docker flags applied to Lambda containers, including `--env`, `--volume`, `--publish`, `--add-host`, `--dns`, `--label`, `--network`, `--user`, `--privileged`, and `--platform`. Explicit `--dns` entries replace automatic embedded DNS and public fallback resolvers. Published ports support `host:container` and `127.0.0.1:host:container` forms |
+| `FLOCI_SERVICES_LAMBDA_CONTAINER_READINESS_COMMAND` | *(unset)* | Optional Docker exec command that must succeed before a new container enters either invocation pool; quoted arguments are supported, with no implicit shell |
+| `FLOCI_SERVICES_LAMBDA_CONTAINER_READINESS_TIMEOUT_SECONDS` | `60` | One readiness budget, from 1 to 900 seconds, including the final fractional second; nonzero results retry, while timeout, interruption or an unavailable executable fails launch and cleans up the container |
 | `FLOCI_SERVICES_LAMBDA_EXTRA_HOSTS` | *(unset)* | Comma-separated `hostname:ip` entries added to each Lambda container's `/etc/hosts`; `ip` may be `host-gateway`, mirroring `docker run --add-host` |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_HOST_OVERRIDE` | *(unset)* | Explicit host/IP that spawned Lambda containers use to reach Floci's Runtime API, bypassing auto-detection |
 | `FLOCI_SERVICES_LAMBDA_CONTAINER_NAME_PREFIX` | `floci` | Base name prefix for spawned Lambda containers and code volumes (e.g. `acme` → `acme-<function>-<id>` containers, `acme-code-<function>-<hash>` volumes; with `FLOCI_DOCKER_RESOURCE_NAMESPACE` set, the namespace follows the prefix and a short hash of it ends the volume name, e.g. `acme-<namespace>-code-<function>-<hash>-<namespace hash>`). Must be a valid Docker name segment (`[A-Za-z0-9][A-Za-z0-9_.-]*`); invalid values are ignored with a warning |
@@ -683,25 +776,11 @@ Configuration resource reads and `ListFunctionsByCodeSigningConfig` return
     finishes or fails. It runs no Lambda code; actual execution environments retain
     their normal shutdown and extension-drain behavior.
 
-!!! note "Cleanup after an unclean Docker shutdown"
-    At startup, Floci removes running and exited Lambda containers left by a previous run,
-    including temporary code-copy helpers. Cleanup is scoped to the Docker resource namespace
-    and Floci API port, and preserves containers from the current run and named code volumes.
-    If Docker is unavailable or removal fails, the next cold start retries cleanup.
-
-    This applies to containers created with ownership and run labels. Containers from older
-    versions without those labels are left alone because their deployment cannot be identified
-    safely. Use distinct `FLOCI_DOCKER_RESOURCE_NAMESPACE` values for deployments sharing a daemon.
-
-    If two deployments must share the same namespace and API port, set
-    `FLOCI_SERVICES_LAMBDA_RECONCILE_CONTAINERS_ON_STARTUP=false` to disable both startup cleanup
-    and cold-start retries. Cleanup is enabled by default. Each distinct Docker listing or removal
-    failure warns once; repeated failures log at DEBUG until cleanup recovers.
-
 !!! note "Bounding warm containers"
     After an invocation the container stays warm so the next call skips the cold start, and is
     reaped only after `container-idle-timeout-seconds` of inactivity. Each function keeps up to
-    `warm-pool-max-per-function` idle containers, but nothing limits the sum: a stack of many
+    `warm-pool-max-per-function` idle containers across its versions within its account and region,
+    independently of same-named functions owned elsewhere. Without a global cap, nothing limits the sum: a stack of many
     functions that fan out through streams and triggers can accumulate one warm container per
     function touched, and each runtime container holds its own memory. On a Docker Desktop with
     a modest memory allocation that is enough to have Floci OOM-killed. `ephemeral: true` avoids
@@ -716,9 +795,9 @@ Configuration resource reads and `ListFunctionsByCodeSigningConfig` return
     ```
 
     This bounds idle containers only, emulator-wide. Busy containers do not count toward it;
-    their ceiling is `region-concurrency-limit`, which applies independently in each region, so
+    their ceiling is `region-concurrency-limit`, which applies independently in each account and region, so
     peak container count is `warm-pool-max-total` plus the in-flight invocations across every
-    active region. A cap that is smaller than the number of functions invoked in a tight loop
+    active account and region. A cap that is smaller than the number of functions invoked in a tight loop
     trades some warm hits for the memory bound. A negative value is ignored with a warning and
     leaves the total unbounded, like `0`.
 
@@ -869,9 +948,7 @@ subjects:
 
 #### Running Floci in-cluster
 
-The Helm chart in `charts/floci` sets all of this up, with the RBAC above, a Lambda
-namespace of your choice and `helm test` checks: see
-[Kubernetes (Helm)](../getting-started/kubernetes.md). Without Helm, a minimal Deployment (namespace `floci` assumed, RBAC from above bound to the
+A minimal Deployment (namespace `floci` assumed, RBAC from above bound to the
 `floci` ServiceAccount):
 
 ```yaml
@@ -1027,23 +1104,45 @@ on create and on update with `InvalidParameterValueException` ("LogLevel is not 
 LogFormat is set to "Text". Remove LogLevel from your request or change the LogFormat to
 "JSON" and try again."), as Lambda refuses it (measured in eu-west-1, 2026-10-18).
 
-`VpcConfig` accepts placeholder subnet and security-group IDs that are unknown in
-Floci's request account and region. This local compatibility behavior preserves the
-requested IDs but omits `VpcId` whenever any requested resource is unknown. Known
-subnets and security groups must still belong to one VPC, even when the request also
-contains unknown IDs. Mixed known VPCs or specifying only subnets or only security
-groups fail with `InvalidParameterValueException` before the function is mutated.
-A rejected update preserves the configuration and revision. Empty subnet and security
+`VpcConfig` requires existing subnets and security groups in the request's account and
+region, all belonging to one VPC. Missing resources, mixed VPCs, or specifying only
+subnets or only security groups fail with `InvalidParameterValueException`. A rejected
+update preserves the function's configuration and revision. Empty subnet and security
 group lists detach the function, and the response then omits `VpcConfig`. Published
 versions retain their network configuration when `$LATEST` changes.
 
-These checks validate the declaration. Function containers still use the configured
-Docker network. With Docker-backed VPC networks (`FLOCI_SERVICES_EC2_VPC_NETWORKS_ENABLED=true`
-and `FLOCI_SERVICES_EC2_MOCK=false`) and a known `VpcId`, the container also joins that VPC's
-Docker network at an address leased from the first subnet in `SubnetIds`, so it reaches EC2
-instances and `awsvpc` ECS tasks in the VPC at the private addresses they report. The address is
-returned once the container is removed. `VpcConfig` does not yet enforce security-group rules or
-NAT egress, and the other subnets are not used.
+For Docker execution with `FLOCI_NETWORK_SECURITY_GROUP_ENFORCEMENT_ENABLED=true`,
+each VPC-connected execution environment gets an ENI in a declared subnet and a
+protected network namespace. Subnet selection rotates across the declared subnets
+when new environments start. Security-group rules are installed before function
+code starts, and SDK rule changes update warm environments. A missing ingress or
+egress rule drops real packets, leaving the function's own client to time out.
+With `FLOCI_SERVICES_EC2_VPC_NETWORKS_ENABLED=true`, the namespace also holds
+the ENI's private IP on its VPC network. Same-VPC connections use that address
+at both ends. Policy and DNS ownership track both actual interfaces, and an
+attachment failure prevents the environment from starting.
+
+The namespace permits the exact IP and TCP port of that environment's Runtime API,
+so blocked application traffic does not prevent invocation delivery or results.
+This does not open the emulator's other API ports. EC2 instance metadata is blocked.
+Privileged containers and Docker network, port, DNS or host overrides cannot be
+combined with protected VPC execution. Ordinary environment retirement removes the
+container before releasing its helper and ENI. The firewall retires the namespace
+while its helper is still present, and the ENI remains reserved until helper removal
+is confirmed. Concurrent retirements share the peer-policy refresh and wait for its
+result. Startup retires surviving owned helpers and their workloads.
+
+This currently allocates an ENI per execution environment. Hyperplane ENI sharing,
+attachment-time IAM permission checks and NACLs are not emulated by this path.
+The security-group flag is opt-in and applies to Docker execution.
+
+The optional [public VPC routing mode](ec2.md#nat-gateways) adds managed NAT
+destinations. With `FLOCI_NETWORK_VPC_ROUTING_ENABLED=true` and
+`FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API=true`, protected Docker functions receive
+no automatic `AWS_ENDPOINT_URL`. Their SDKs use normal AWS endpoints through the
+configured DNS, TLS and NAT path. Explicit function and Docker environment
+settings retain their precedence. The Runtime API remains reachable when an
+application's API route or security-group egress is blocked.
 
 `RuntimeVersionConfig.RuntimeVersionArn` is returned for managed (non-image)
 runtimes. Its value is derived from the runtime name, so it is stable across
@@ -1115,6 +1214,19 @@ FLOCI_DNS_EXTRA_SUFFIXES=localhost.localstack.cloud
 # Multiple suffixes
 FLOCI_DNS_EXTRA_SUFFIXES=localhost.localstack.cloud,localhost.example.internal
 ```
+
+On an internal Docker bridge, Docker's embedded resolver does not forward external
+queries. When a Lambda has configured DNS servers, Floci supplies a read-only
+resolver file before the runtime starts. Docker's resolver remains first for
+container aliases; configured servers handle queries Docker cannot forward.
+The runtime retains its image
+user, entrypoint, and filesystem permissions. A small, labelled Docker volume
+holds the file and is removed when the Lambda execution environment is removed.
+Preparation uses Docker APIs, including with a remote daemon; no helper process
+runs and no additional image is needed. Explicit resolver mounts and containers
+sharing another container's network namespace keep their existing DNS setup.
+Failed helper or resolver-volume removal remains queued for the existing cleanup
+sweep. Retrying cleanup does not release the Runtime API port a second time.
 
 ### Real AWS Credentials
 
@@ -1443,3 +1555,20 @@ remain in effect.
 
 Environment variables use the quoted map-key form, for example
 `FLOCI_SERVICES_LAMBDA_RUNTIME_IMAGES__JAVA17_LINUX_ARM64__`.
+
+### Provisioned concurrency recovery
+
+Terminal runtime failures, failed leases, alias updates and completed teardown wake
+the serial capacity reconciler. A ten-second repair sweep covers unobserved changes.
+Replacement environments still finish actual initialization and obey account and
+function capacity limits before becoming available.
+
+### Container readiness
+
+The readiness command runs inside each new Lambda container, including provisioned concurrency.
+Use it when a local network controller must finish configuring that namespace before invocation.
+The executable must exist in the runtime image. It is disabled by default and does not modify
+function code or AWS API responses. `/_floci/health` advertises
+`features.lambda_container_readiness: 1` so controllers can reject images without this support.
+When Lambda identity verification is enabled, Floci binds the running identity before
+the probe so initialization retains authenticated access while invocation waits.

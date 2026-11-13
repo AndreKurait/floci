@@ -40,7 +40,7 @@ existing application storage and region visibility.
 | `CreateDeploymentGroup` | Stores group config; supports `ecsServices` and `loadBalancerInfo` for ECS blue/green; deployment config defaults to `CodeDeployDefault.OneAtATime` |
 | `GetDeploymentGroup` | Returns group metadata |
 | `UpdateDeploymentGroup` | Partial update; supports rename via `newDeploymentGroupName` |
-| `DeleteDeploymentGroup` | Returns `hooksNotCleanedUp: []` |
+| `DeleteDeploymentGroup` | Removes managed launch hooks and reports any `hooksNotCleanedUp` |
 | `ListDeploymentGroups` | Returns all group names for an application |
 | `BatchGetDeploymentGroups` | Returns info for multiple groups |
 
@@ -53,19 +53,48 @@ existing application storage and region visibility.
 | `DeleteDeploymentConfig` | Custom configs only; built-ins cannot be deleted |
 | `ListDeploymentConfigs` | Returns all configs including all 17 pre-seeded built-ins |
 
+CloudFormation provisions `AWS::CodeDeploy::DeploymentConfig` through these
+APIs. `Ref` returns the configuration name. The resource supports
+`ComputePlatform`, `MinimumHealthyHosts`, `TrafficRoutingConfig`, and
+`ZonalConfig`, including per-zone host counts and monitoring durations.
+
+Configuration properties are immutable. An unchanged resource keeps its name
+and identity. Changes replace an unnamed configuration, while a configuration
+with an explicit `DeploymentConfigName` requires a new name. Stack rollback
+restores the previous configuration and removes the attempted replacement;
+stack deletion removes the owned configuration.
+
 ### Deployment Execution
 
 | Operation | Notes |
 |---|---|
-| `CreateDeployment` | Starts a real Lambda or ECS blue/green deployment; shifts traffic via alias weights (Lambda) or ELB listener rules (ECS); invokes lifecycle hooks |
+| `CreateDeployment` | Starts Lambda/ECS traffic shifting or an S3 Server deployment through the AWS agent; Server file handling follows DISALLOW, OVERWRITE or RETAIN |
 | `GetDeployment` | Returns current deployment state; poll `status` until `Succeeded`, `Failed`, or `Stopped` |
-| `StopDeployment` | Signals an in-progress deployment to stop; transitions to `Stopped` |
+| `StopDeployment` | Stops an in-progress deployment; S3 Server deployments honor explicit `autoRollbackEnabled` |
 | `ContinueDeployment` | Accepted (no-op for fully automated deployments) |
 | `ListDeployments` | Returns deployment IDs filtered by application, group, or status |
 | `BatchGetDeployments` | Returns info for multiple deployments |
 | `ListDeploymentTargets` | Returns target IDs for a deployment |
+| `GetDeploymentTarget` | Returns one target and its lifecycle event diagnostics |
 | `BatchGetDeploymentTargets` | Returns target details including lifecycle event status |
-| `PutLifecycleEventHookExecutionStatus` | Called by lifecycle hook Lambda to report `Succeeded` or `Failed`; failure triggers auto-rollback |
+| `PutLifecycleEventHookExecutionStatus` | Called by lifecycle hook Lambda to report `Succeeded` or `Failed`; a failed hook fails the deployment |
+
+Lambda deployment workers retain the requesting account and region while
+resolving deployment configurations, invoking lifecycle hooks, and shifting
+alias traffic. Identically named functions in another account remain separate.
+
+With IAM enforcement enabled, Lambda deployments use the deployment group's
+service role. It must trust CodeDeploy and permit `lambda:GetAlias` and
+`lambda:UpdateAlias` on the qualified alias ARN, plus `lambda:InvokeFunction`
+on configured lifecycle hooks. Permission checks run before each operation,
+including later traffic shifts, and honor explicit denies and permissions
+boundaries. A denied operation fails the deployment with `IAM_ROLE_PERMISSIONS`.
+An in-progress deployment keeps the role selected when it started.
+
+Lambda canary and linear deployments honor their configured intervals in minutes. The deployment
+stays `InProgress` between traffic shifts. Stop requests are observed during the wait, leave
+later shifts unexecuted, and mark the interrupted `AllowTraffic` event `Skipped`.
+`LambdaAllAtOnce` moves traffic immediately.
 
 ### Tagging
 
@@ -86,6 +115,64 @@ existing application storage and region visibility.
 | `ListOnPremisesInstances` | Lists registered names, optionally filtered by status or tags |
 | `AddTagsToOnPremisesInstances` | Adds or replaces tags by key on named instances |
 | `RemoveTagsFromOnPremisesInstances` | Removes matching tag keys from named instances |
+
+## EC2 S3 deployments
+
+For `Server` applications, an S3 revision is downloaded and installed by the AWS
+CodeDeploy agent running inside each selected EC2 instance. Floci selects
+existing Auto Scaling members and EC2 tags, schedules the lifecycle commands,
+and records the agent's results. `DownloadBundle` and `Install` require actual
+agent completion. The existing inline-AppSpec path uses SSM for script hooks.
+
+An in-place group can specify `WITH_TRAFFIC_CONTROL` and Classic load balancers.
+Floci waits for connections to drain before installation and for healthy
+registration before the agent's final traffic hook. These operations use the
+deployment group's service-role permissions and owning account. Target-group
+traffic control remains unsupported.
+
+S3 Server deployments support `DEPLOYMENT_FAILURE` rollback and explicit
+stop-and-rollback. Stop cancels queued commands and waits for acknowledged
+commands to finish within their existing deadlines before starting recovery.
+Recovery is a new deployment of the group's last successful
+revision and its file handling policy; the original result remains visible.
+Per-deployment rollback settings override the group's settings. Successful
+revision history persists across restarts and is scoped to the account, Region
+and group ID. Automatic alarm and request-stop policy triggers remain unsupported.
+
+### Auto Scaling launch deployments
+
+Creating or updating a Server deployment group with Auto Scaling groups installs
+a managed launch hook in each group. These operations use the CodeDeploy service
+role. Groups stored by an older Floci version gain their hooks on the next
+`UpdateDeploymentGroup`. A new instance waits while the agent installs the last
+successful S3 revision, including its recorded object version, ETag and file handling policy. A group with
+no successful revision releases its first instances for an initial deployment.
+
+The managed hook has a ten-minute heartbeat timeout. The coordinator sends
+five-minute heartbeats while a deployment is running. Success completes
+the launch action with `CONTINUE`; failure or stop completes it with `ABANDON`, so
+Auto Scaling replaces the failed instance. Normal agent deadlines still apply.
+Launch deployments run the application and allow-traffic events, without block-traffic
+events. They select only the new instance and can run alongside a normal deployment
+to other members. Two deployments in the same group cannot occupy the same host.
+
+If a normal deployment finishes while an older launch revision is being installed,
+a follow-on deployment updates the new instance after admission. Setting the group's
+`outdatedInstancesStrategy` to `IGNORE` retains the older revision. Finishing an
+automatic deployment never replaces the group's successful-revision history.
+
+Detach and delete remove the managed hooks. Both `UpdateDeploymentGroup` and
+`DeleteDeploymentGroup` return actual `hooksNotCleanedUp` references when cleanup
+is denied; custom hooks are preserved. Termination deployments and delivery of
+lifecycle notifications through a customer-visible SNS or SQS resource remain
+unsupported. The local coordinator observes stored launch actions directly.
+
+With IAM enforcement enabled, the default host-agent API authenticates signed
+instance-profile credentials and limits them to that instance's commands. It
+does not require an extra IAM policy. The optional `enable_auth_policy: true`
+agent mode uses the `codedeploy-commands-secure` IAM namespace. See the
+[agent runtime contract](../design/codedeploy-agent-runtime.md) for supported
+deployment policies, endpoint configuration, deadlines and qualification limits.
 
 ## Pre-seeded Built-in Deployment Configs
 
@@ -125,6 +212,7 @@ For `computePlatform: ECS`, `CreateDeployment` performs a full blue/green traffi
    - `ECSAllAtOnce`: immediately shifts 100% of traffic to the green target group
    - `ECSCanary*`: shifts the canary percentage first, waits a short interval (capped at 5 s in emulator), then shifts to 100%
    - `ECSLinear*`: shifts traffic in equal increments (capped at 2 s per step in emulator)
+   - A stop request is observed during either wait and leaves the later shifts unexecuted
 5. Promotes the green task set to **PRIMARY** on the ECS service and deletes the original blue task set
 6. Marks the deployment `Succeeded`; if any lifecycle hook reports `Failed`, the deployment is marked `Failed`
 
@@ -194,12 +282,15 @@ The ECS service must be created with `deploymentController.type: EXTERNAL`.
 
 For `computePlatform: Lambda`, `CreateDeployment` performs real traffic shifting:
 
-1. Reads the deployment group's `deploymentStyle` and `deploymentConfigName` to determine the traffic shift strategy
-2. For **canary** and **linear** strategies: updates the Lambda alias `RoutingConfig` to route a percentage to the new function version, waits the configured interval, then shifts to 100%
-3. For **all-at-once**: shifts directly to 100% of the new version
-4. Invokes `BeforeAllowTraffic` lifecycle hook Lambda (if configured) and waits for `PutLifecycleEventHookExecutionStatus` callback
-5. Invokes `AfterAllowTraffic` lifecycle hook Lambda (if configured) and waits for the callback
-6. If any lifecycle hook reports `Failed`, auto-rolls back the alias to the previous version and marks the deployment `Failed`
+1. Reads the alias and selects the deployment configuration using the deployment group's service role.
+2. Invokes `BeforeAllowTraffic` (if configured) and waits for its `PutLifecycleEventHookExecutionStatus` callback.
+3. For **canary** and **linear** strategies, updates the alias `RoutingConfig`, waits the configured intervals, and shifts to 100%. For **all-at-once**, shifts directly to the new version.
+4. Invokes `AfterAllowTraffic` (if configured) and waits for its callback.
+5. Marks the deployment `Succeeded` only after those operations succeed. A failed hook or denied operation fails the deployment.
+
+Lambda alarm monitoring and automatic rollback are not implemented. A failed
+deployment can leave its last traffic shift in place; CloudFormation's alias
+update policy performs its own rollback deployment.
 
 ## Configuration
 

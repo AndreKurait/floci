@@ -41,7 +41,7 @@ env:
   # Hardcoded on purpose: strategy.job-total counts EVERY matrix job, so adding an
   # unrelated matrix entry later would change the modulus and silently leave part
   # of the suite running in no shard. Keep in sync with the matrix below.
-  SHARD_TOTAL: 5
+  SHARD_TOTAL: 8
 
 jobs:
   test:
@@ -66,7 +66,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -87,6 +87,12 @@ jobs:
           restore-keys: |
             maven-${{ runner.os }}-
 
+      - name: Test shard partitioner
+        if: matrix.shard == 1
+        run: |
+          python3 -m unittest discover -s .github/ci -p 'test_partition.py'
+          python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+
       # Derived from test sources, not target/test-classes, so shard.txt exists
       # before Compile and the image prefetch below overlaps the compile instead
       # of starting moments before the tests that need the images. Every test is
@@ -100,7 +106,6 @@ jobs:
             | sed 's|^\./||; s|\.java$||' | LC_ALL=C sort \
             > "$GITHUB_WORKSPACE/all-classes.txt"
           cd "$GITHUB_WORKSPACE"
-          python3 -m unittest discover -s .github/ci -p test_partition.py
           .github/ci/partition.sh all-classes.txt "$SHARD_TOTAL" "${{ matrix.shard }}" > shard.txt
           # An empty includesFile makes surefire fall back to its default includes
           # and run the ENTIRE suite into this shard's timeout.
@@ -129,15 +134,23 @@ jobs:
           cmp -s all-classes.txt "$RUNNER_TEMP/compiled-classes.txt" \
             || { echo "::error::test class list from src/test/java differs from target/test-classes:"; diff all-classes.txt "$RUNNER_TEMP/compiled-classes.txt" | head -50; exit 1; }
 
-      # surefire.timeout bounds the reused test fork for 25 minutes from its first test set,
-      # including deadlocks or blocking I/O that ignore JUnit's interrupt. The 35-minute job
-      # ceiling also covers compilation, test startup, and report upload.
+      # surefire.timeout kills a fork whose test ignores JUnit's interrupt (deadlock, blocking
+      # I/O). It caps the whole shard (one fork runs all its tests). Balance recorded suite
+      # durations across eight shards while keeping shared profiles together. The fork
+      # reports before the 35-minute job limit. Keep the partition-completeness check enabled.
       - name: Run tests
-        run: >
-          ./mvnw surefire:test -B
-          -Dsurefire.includesFile="$GITHUB_WORKSPACE/shard.txt"
-          -Dsurefire.failIfNoTests=true
-          -Dsurefire.timeout=1500
+        run: |
+          # Protected workload DNS must reach this host JVM. Bind only the
+          # Docker bridge address, and restore the ephemeral runner's port policy.
+          dns_address="$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')"
+          test -n "$dns_address"
+          port_floor="$(sysctl -n net.ipv4.ip_unprivileged_port_start)"
+          trap 'sudo sysctl -w "net.ipv4.ip_unprivileged_port_start=$port_floor" >/dev/null' EXIT
+          sudo sysctl -w net.ipv4.ip_unprivileged_port_start=0
+          FLOCI_TEST_HOST_DNS_ADDRESS="$dns_address" ./mvnw surefire:test -B \
+            -Dsurefire.includesFile="$GITHUB_WORKSPACE/shard.txt" \
+            -Dsurefire.failIfNoTests=true \
+            -Dsurefire.timeout=1500
 
       # The prefetch runs in the background past its own step, so its per-image
       # results are only complete once the tests are done. A pull still running
@@ -196,10 +209,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     needs: test
-    # always() so a failed shard still reaches the partition check and report, but not on a
-    # draft: there the shards are skipped and this would fail on them. Same condition as the shards.
+    # Report failed shards, but let canceled revisions release their concurrency slot.
+    # Drafts skip the shards and this summary.
     if: >-
-      always() && (
+      !cancelled() && (
         github.event_name != 'pull_request' || (
           github.event.pull_request.draft == false &&
           github.event.pull_request.state != 'closed' &&

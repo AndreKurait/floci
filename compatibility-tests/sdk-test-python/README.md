@@ -45,6 +45,20 @@ pytest tests/test_s3.py
 just test-python
 ```
 
+`iam/test_eventbridge_lambda_permissions.py` runs with IAM enforcement enabled.
+It uses real Python 3.12 Lambda handlers on default and custom event buses to
+check qualified grants, revocation, recovery and `NO_PERMISSIONS` dead letters
+while another SQS target continues receiving events.
+
+`iam/test_eventbridge_lambda_roles.py` checks cross-account targets on both bus
+types. It creates an Organizations member account, uses STS-issued credentials
+for management calls, and checks role trust, qualified identity grants,
+permissions boundaries, SCP denial, target grant revocation and recovery with
+real Lambda handlers. Enable `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED=true`,
+`FLOCI_SERVICES_ORGANIZATIONS_SCP_ENFORCEMENT_ENABLED=true`, and
+`FLOCI_AUTH_VALIDATE_SIGNATURES=true` on the emulator. EventBridge's internal
+service-role identity remains modeled.
+
 ## Legacy DynamoDB client
 
 `legacy/test_dynamodb_20111205.py` exercises the 2011-12-05 API with Boto 2,
@@ -73,6 +87,15 @@ python3.9 -m venv .venv-legacy
 .venv-legacy/bin/pip install boto==2.49.0 boto3 pytest cryptography
 FLOCI_ENDPOINT=http://localhost:4566 .venv-legacy/bin/python -m pytest legacy/test_elb_query_get.py
 ```
+
+## Classic load balancer public aliases
+
+`tests/test_elb_classic_public_alias.py` creates a Classic load balancer and
+weighted public alias through Boto 3, checking account ownership, missing-target
+responses and alias/load-balancer deletion through the shared HTTP edge.
+It creates an Organizations member account and assumes its access role through
+STS, so account isolation is exercised with issued credentials and works with
+IAM enforcement and signature validation enabled.
 
 ## Configuration
 
@@ -134,3 +157,12 @@ docker run --rm --network host floci-sdk-python
 # Custom endpoint (macOS/Windows)
 docker run --rm -e FLOCI_ENDPOINT=http://host.docker.internal:4566 floci-sdk-python
 ```
+
+The isolated ALB/Route 53 tests in `tests/test_elbv2_route53_alias_routing.py`
+use `FLOCI_ALB_ALIAS_TEST_IMAGE` to start their own Floci servers through the Docker CLI.
+Their HTTP/TCP echo target runs in a separate container on the same network.
+When pytest runs in a container, connect it to a Docker network and pass that network's
+name as `FLOCI_ALB_ALIAS_TEST_NETWORK`; the tests leave that shared network in place.
+Without it, each fixture creates and removes its own internal network for a host runner.
+`FLOCI_ALB_ALIAS_ECHO_IMAGE` can select a preloaded Python 3.12 image; the default is
+`python:3.12-slim`.
