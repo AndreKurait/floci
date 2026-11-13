@@ -1,0 +1,73 @@
+package io.github.hectorvent.floci.services.cloudformation.model;
+
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import io.quarkus.runtime.annotations.RegisterForReflection;
+
+import java.time.Instant;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+@RegisterForReflection
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class ChangeSet {
+    private String changeSetId;
+    private String changeSetName;
+    private String stackName;
+    private String stackId;
+    private String status = "CREATE_COMPLETE";
+    private String executionStatus = "AVAILABLE";
+    private String statusReason;
+    private String templateBody;
+    /** A requested execution-role change is applied only when this change set executes. */
+    private String roleArn;
+    private Map<String, String> parameters;
+    private List<String> capabilities;
+    private Map<String, String> tags;
+    private String changeSetType; // CREATE, UPDATE or IMPORT
+    private List<ResourceToImport> resourcesToImport = List.of();
+    private Map<String, String> importPhysicalIds = Map.of();
+    private Instant creationTime = Instant.now();
+    // AWS change sets carry no stack policy; this is the policy a CreateStack or UpdateStack
+    // applies with its change set.
+    private String stackPolicyBody;
+
+    public String getChangeSetId() { return changeSetId; }
+    public void setChangeSetId(String changeSetId) { this.changeSetId = changeSetId; }
+    public String getChangeSetName() { return changeSetName; }
+    public void setChangeSetName(String changeSetName) { this.changeSetName = changeSetName; }
+    public String getStackName() { return stackName; }
+    public void setStackName(String stackName) { this.stackName = stackName; }
+    public String getStackId() { return stackId; }
+    public void setStackId(String stackId) { this.stackId = stackId; }
+    public String getStatus() { return status; }
+    public void setStatus(String status) { this.status = status; }
+    public String getExecutionStatus() { return executionStatus; }
+    public void setExecutionStatus(String executionStatus) { this.executionStatus = executionStatus; }
+    public String getStatusReason() { return statusReason; }
+    public void setStatusReason(String statusReason) { this.statusReason = statusReason; }
+    public String getTemplateBody() { return templateBody; }
+    public void setTemplateBody(String templateBody) { this.templateBody = templateBody; }
+    public String getRoleArn() { return roleArn; }
+    public void setRoleArn(String roleArn) { this.roleArn = roleArn; }
+    public Map<String, String> getParameters() { return parameters; }
+    public void setParameters(Map<String, String> parameters) { this.parameters = parameters; }
+    public List<String> getCapabilities() { return capabilities; }
+    public void setCapabilities(List<String> capabilities) { this.capabilities = capabilities; }
+    public Map<String, String> getTags() { return tags; }
+    public void setTags(Map<String, String> tags) { this.tags = tags == null ? null : new LinkedHashMap<>(tags); }
+    public String getChangeSetType() { return changeSetType; }
+    public void setChangeSetType(String changeSetType) { this.changeSetType = changeSetType; }
+    public List<ResourceToImport> getResourcesToImport() { return resourcesToImport; }
+    public Map<String, String> getImportPhysicalIds() { return importPhysicalIds; }
+    public void setImportPhysicalIds(Map<String, String> importPhysicalIds) {
+        this.importPhysicalIds = Map.copyOf(importPhysicalIds);
+    }
+    public void setResourcesToImport(List<ResourceToImport> resourcesToImport) {
+        this.resourcesToImport = List.copyOf(resourcesToImport);
+    }
+    public Instant getCreationTime() { return creationTime; }
+    public void setCreationTime(Instant creationTime) { this.creationTime = creationTime; }
+    public String getStackPolicyBody() { return stackPolicyBody; }
+    public void setStackPolicyBody(String stackPolicyBody) { this.stackPolicyBody = stackPolicyBody; }
+}
