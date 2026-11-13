@@ -95,6 +95,29 @@ class AppConfigServiceUpdateRaceTest {
         assertTrue(service.findEnvironment(env.getId()).isEmpty(), "the entity outlived its delete");
     }
 
+    @Test
+    void aNativeEnvironmentPatchCannotResurrectADeletedEnvironment() throws Exception {
+        ParkingStore<Environment> store = new ParkingStore<>();
+        AppConfigService service = serviceWithStore(ENVIRONMENTS, store);
+        String app = service.createApplication(Map.of("Name", "app")).getId();
+        Environment env = service.createEnvironment(app, Map.of("Name", "environment"));
+        deleteWaitsForTheWrite(store,
+                () -> service.updateEnvironment(app, env.getId(), Map.of("Description", "patched")),
+                () -> service.deleteEnvironment(app, env.getId()));
+        assertTrue(service.findEnvironment(env.getId()).isEmpty());
+    }
+
+    @Test
+    void aNativeStrategyPatchCannotResurrectADeletedStrategy() throws Exception {
+        ParkingStore<DeploymentStrategy> store = new ParkingStore<>();
+        AppConfigService service = serviceWithStore(STRATEGIES, store);
+        DeploymentStrategy strategy = service.createDeploymentStrategy(Map.of("Name", "strategy", "GrowthFactor", 20));
+        deleteWaitsForTheWrite(store,
+                () -> service.updateDeploymentStrategy(strategy.getId(), Map.of("Description", "patched")),
+                () -> service.deleteDeploymentStrategy(strategy.getId()));
+        assertTrue(service.listDeploymentStrategies().stream().noneMatch(value -> value.getId().equals(strategy.getId())));
+    }
+
     /**
      * Parks {@code write} in its next write to {@code store}, starts {@code delete}, and requires
      * the delete to be unfinished and blocked on the service's monitor until the write is released;
