@@ -1286,7 +1286,9 @@ public class LambdaService implements ResourceProvider {
         String name = fn.getFunctionName();
         List<String> referencing = aliasStore == null ? List.of()
                 : aliasStore.list(region, name).stream()
-                        .filter(alias -> qualifier.equals(alias.getFunctionVersion()))
+                        .filter(alias -> qualifier.equals(alias.getFunctionVersion())
+                                || (alias.getRoutingConfig() != null
+                                && alias.getRoutingConfig().containsKey(qualifier)))
                         .map(LambdaAlias::getName)
                         .toList();
         if (!referencing.isEmpty()) {
@@ -3349,7 +3351,7 @@ public class LambdaService implements ResourceProvider {
         alias.setFunctionName(functionName);
         alias.setFunctionVersion(functionVersion != null ? functionVersion : "$LATEST");
         alias.setDescription(description);
-        alias.setRoutingConfig(routingConfig);
+        alias.setRoutingConfig(routingConfig == null || routingConfig.isEmpty() ? null : routingConfig);
         alias.setAliasArn(fn.getFunctionArn() + ":" + aliasName);
         long now = System.currentTimeMillis() / 1000L;
         alias.setCreatedDate(now);
