@@ -854,7 +854,9 @@
     "sagemaker:CreateTrainingJob": {"passedTo": ["sagemaker"], "roles": [
       {"member": "RoleArn", "passedTo": "sagemaker"}
     ]},
-    "sagemaker:CreateTrainingSession": {"passedTo": ["sagemaker", "training-session.sagemaker"], "notRead": "the reference passes the role to sagemaker or training-session.sagemaker and nothing says which"},
+    "sagemaker:CreateTrainingSession": {"passedTo": ["training-session.sagemaker"], "roles": [
+      {"member": "RoleArn", "passedTo": "training-session.sagemaker"}
+    ]},
     "sagemaker:CreateTransformJob": {"passedTo": ["sagemaker"], "notRead": "no member of the request names a role"},
     "sagemaker:CreateUserProfile": {"passedTo": ["sagemaker"], "roles": [
       {"member": "UserSettings.CanvasAppSettings.EmrServerlessSettings.ExecutionRoleArn", "passedTo": "sagemaker"},

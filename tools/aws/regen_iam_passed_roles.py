@@ -281,8 +281,6 @@ NOT_READ = {
     "s3:PutBucketReplication": XML_BODY,
     "redshift:ModifyLakehouseConfiguration": NO_ROLE_MEMBER,
     "redshift-serverless:UpdateLakehouseConfiguration": NO_ROLE_MEMBER,
-    "sagemaker:CreateTrainingSession": "the reference passes the role to sagemaker or training-session.sagemaker "
-                                       "and nothing says which",
     "sagemaker:CreateTransformJob": NO_ROLE_MEMBER,
     "sagemaker:ImportHubContent": NO_ROLE_MEMBER,
     "ssm:CreateDocument": NO_ROLE_MEMBER,

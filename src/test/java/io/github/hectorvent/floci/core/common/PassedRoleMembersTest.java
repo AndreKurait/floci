@@ -105,6 +105,13 @@ class PassedRoleMembersTest {
     }
 
     @Test
+    void trainingSessionPassesItsRoleToTheTrainingSessionService() {
+        assertEquals(List.of(new PassedRole(ROLE, ServicePrincipals.of("training-session.sagemaker"))),
+                PassedRoles.of("sagemaker:CreateTrainingSession", json("{\"RoleArn\":\"" + ROLE + "\"}"), LOOKUPS));
+        assertEquals(List.of(), PassedRoles.of("sagemaker:CreateTrainingSession", json("{}"), LOOKUPS));
+    }
+
+    @Test
     void aMemberPathIsReadAsItsSteps() {
         Member list = member("Rule.Actions[].S3Action.IamRoleArn", "ses");
         assertEquals(List.of(new Step("Rule", Into.NONE, null), new Step("Actions", Into.LIST, ""),

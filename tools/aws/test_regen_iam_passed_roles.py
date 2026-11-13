@@ -322,3 +322,12 @@ def test_the_vendored_file_is_well_formed():
     assert document["operations"]["budgets:CreateBudgetAction"]["roles"] == [
         {"member": "ExecutionRoleArn", "passedTo": "budgets"}]
     assert document["operations"]["ec2:RunInstances"].get("byHand")
+
+
+def test_training_session_reads_role_for_its_single_service():
+    training = model({"CreateTrainingSession": "Input"}, {"Input": structure(RoleArn="String")})
+    assert r.entry_for("sagemaker:CreateTrainingSession", ["training-session.sagemaker"],
+                       {"sagemaker": training}) == {
+        "passedTo": ["training-session.sagemaker"],
+        "roles": [{"member": "RoleArn", "passedTo": "training-session.sagemaker"}],
+    }
