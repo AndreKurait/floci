@@ -649,6 +649,12 @@ public class IamActionRegistry {
 
     /** The serving method identifies these actions even when path encoding or matrix parameters vary. */
     public String resolveMatchedRoute(String credentialScope, ResourceInfo resourceInfo) {
+        if ("eks".equals(credentialScope) && resourceInfo != null
+                && EksController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && "listAccessPolicies".equals(resourceInfo.getResourceMethod().getName())) {
+            return "eks:ListAccessPolicies";
+        }
         if (resourceInfo == null || resourceInfo.getResourceClass() == null) {
             return null;
         }

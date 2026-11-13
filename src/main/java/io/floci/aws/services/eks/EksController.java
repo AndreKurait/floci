@@ -2,6 +2,7 @@ package io.floci.aws.services.eks;
 
 import io.floci.aws.core.common.PaginatedResult;
 import io.floci.aws.core.common.Pagination;
+import io.floci.aws.services.eks.model.AccessPolicy;
 import io.floci.aws.services.eks.model.Addon;
 import io.floci.aws.services.eks.model.AssociateAccessPolicyRequest;
 import io.floci.aws.services.eks.model.AssociatedAccessPolicy;
@@ -85,6 +86,20 @@ public class EksController {
                 Pagination.parseMaxResults(maxResults, "InvalidParameterException"), nextToken);
         return Response.ok(page.nextToken() == null ? Map.of("clusters", page.items())
                 : Map.of("clusters", page.items(), "nextToken", page.nextToken())).build();
+    }
+
+    @GET
+    @Path("/access-policies")
+    public Response listAccessPolicies(@QueryParam("maxResults") String maxResults,
+                                       @QueryParam("nextToken") String nextToken) {
+        PaginatedResult<AccessPolicy> page = eksService.listAccessPolicies(
+                Pagination.parseMaxResults(maxResults, "InvalidParameterException"), nextToken);
+        Map<String, Object> body = new LinkedHashMap<>();
+        body.put("accessPolicies", page.items());
+        if (page.nextToken() != null) {
+            body.put("nextToken", page.nextToken());
+        }
+        return Response.ok(body).build();
     }
 
     @GET

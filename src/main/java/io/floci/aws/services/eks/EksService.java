@@ -29,6 +29,7 @@ import io.floci.aws.services.ec2.model.Tag;
 import io.floci.aws.services.ec2.model.UserIdGroupPair;
 import io.floci.aws.services.ec2.model.Vpc;
 import io.floci.aws.services.eks.model.AccessConfig;
+import io.floci.aws.services.eks.model.AccessPolicy;
 import io.floci.aws.services.eks.model.CertificateAuthority;
 import io.floci.aws.services.eks.model.Cluster;
 import io.floci.aws.services.eks.model.ClusterIdentity;
@@ -1033,6 +1034,10 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
 
     boolean isInstanceJoined(String clusterName, String instanceId) {
         return clusterManager.isInstanceJoined(describeCluster(clusterName), instanceId);
+    }
+
+    public PaginatedResult<AccessPolicy> listAccessPolicies(Integer maxResults, String nextToken) {
+        return EksAccessPolicyCatalog.list(regionResolver.getPartition(), maxResults, nextToken);
     }
 
     public List<String> listClusters() {
