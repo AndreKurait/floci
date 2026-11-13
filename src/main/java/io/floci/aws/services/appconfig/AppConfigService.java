@@ -8,6 +8,7 @@ import io.floci.aws.core.common.PaginatedResult;
 import io.floci.aws.core.common.Pagination;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestScopes;
+import io.floci.aws.core.common.Resettable;
 import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.core.storage.StorageOperations;
@@ -21,6 +22,7 @@ import io.floci.aws.services.appconfig.model.Environment;
 import io.floci.aws.services.appconfig.model.HostedConfigurationVersion;
 import io.floci.aws.services.appconfig.model.HostedConfigurationVersionSummary;
 import io.floci.aws.services.appconfig.model.Monitor;
+import io.floci.aws.services.appconfig.model.Validator;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -45,7 +47,7 @@ import java.util.function.Function;
 import java.util.regex.Pattern;
 
 @ApplicationScoped
-public class AppConfigService {
+public class AppConfigService implements Resettable {
     private static final Logger LOG = Logger.getLogger(AppConfigService.class);
 
     private final StorageBackend<String, Application> applicationStore;
@@ -59,6 +61,8 @@ public class AppConfigService {
     private final Clock clock;
     private final RegionResolver regions;
     private final AppConfigAlarmMonitor alarms;
+    private final AppConfigLambdaValidator lambdaValidator;
+    private boolean validationPaused;
     private final Map<String, DeploymentPageToken> deploymentPageTokens = new ConcurrentHashMap<>();
     private final Map<AppConfigStorage.ScopedKey, String> monitorFailures = new ConcurrentHashMap<>();
     private static final int MAX_DEPLOYMENT_PAGE_TOKENS = 1000;
@@ -68,19 +72,31 @@ public class AppConfigService {
     private static final Pattern ROLE_ARN = Pattern.compile("arn:" + AwsArnUtils.PARTITION_REGEX + ":iam::\\d{12}:role/.*");
 
     @Inject
-    public AppConfigService(StorageFactory storageFactory, RegionResolver regions, AppConfigAlarmMonitor alarms) {
-        this(storageFactory, regions, Clock.systemUTC(), alarms);
+    public AppConfigService(StorageFactory storageFactory, RegionResolver regions, AppConfigAlarmMonitor alarms,
+                            AppConfigLambdaValidator lambdaValidator) {
+        this(storageFactory, regions, Clock.systemUTC(), alarms, lambdaValidator);
     }
 
     public AppConfigService(StorageFactory storageFactory, RegionResolver regions) {
-        this(storageFactory, regions, Clock.systemUTC(), null);
+        this(storageFactory, regions, Clock.systemUTC(), null, null);
     }
 
     AppConfigService(StorageFactory storageFactory, RegionResolver regions, Clock clock) {
-        this(storageFactory, regions, clock, null);
+        this(storageFactory, regions, clock, null, null);
     }
 
     AppConfigService(StorageFactory storageFactory, RegionResolver regions, Clock clock, AppConfigAlarmMonitor alarms) {
+        this(storageFactory, regions, clock, alarms, null);
+    }
+
+    AppConfigService(StorageFactory storageFactory, RegionResolver regions, Clock clock,
+                     AppConfigLambdaValidator lambdaValidator) {
+        this(storageFactory, regions, clock, null, lambdaValidator);
+    }
+
+    AppConfigService(StorageFactory storageFactory, RegionResolver regions, Clock clock, AppConfigAlarmMonitor alarms,
+                     AppConfigLambdaValidator lambdaValidator) {
+        this.lambdaValidator = lambdaValidator;
         this.clock = clock;
         this.regions = regions;
         this.alarms = alarms;
@@ -435,10 +451,10 @@ public class AppConfigService {
                                                      String configurationVersion) {
         String appId = resolveApplication(applicationIdentifier).getId();
         ConfigurationProfile profile = resolveConfigurationProfile(appId, profileIdentifier);
-        AppConfigValidators.validate(profile.getValidators(), validationContent(profile, configurationVersion));
+        validateProfile(profile, validationVersion(profile, configurationVersion));
     }
 
-    private byte[] validationContent(ConfigurationProfile profile, String configurationVersion) {
+    private HostedConfigurationVersion validationVersion(ConfigurationProfile profile, String configurationVersion) {
         if (configurationVersion == null || configurationVersion.isEmpty() || configurationVersion.length() > 1024) {
             throw new AwsException("BadRequestException",
                     "ConfigurationVersion must contain between 1 and 1024 characters.", 400);
@@ -452,7 +468,42 @@ public class AppConfigService {
         } catch (NumberFormatException e) {
             throw new AwsException("BadRequestException", "Hosted ConfigurationVersion must be an integer.", 400);
         }
-        return getHostedConfigurationVersion(profile.getApplicationId(), profile.getId(), version).getContent();
+        return getHostedConfigurationVersion(profile.getApplicationId(), profile.getId(), version);
+    }
+
+    private void validateProfile(ConfigurationProfile profile, HostedConfigurationVersion version) {
+        List<Validator> validators = profile.getValidators();
+        if (validators == null || validators.stream().noneMatch(validator -> "LAMBDA".equals(validator.type()))) {
+            AppConfigValidators.validate(validators, version.getContent());
+            return;
+        }
+        for (Validator validator : validators) {
+            if ("LAMBDA".equals(validator.type())) {
+                if (validationPaused || lambdaValidator == null) {
+                    throw new AwsException("BadRequestException", "Lambda validator execution is unavailable.", 400);
+                }
+                lambdaValidator.validate(validator.content(), profile, version);
+            } else {
+                AppConfigValidators.validate(List.of(validator), version.getContent());
+            }
+        }
+    }
+
+    @Override
+    public synchronized void beforeReset() {
+        // The same monitor covers validation and deployment publication, so storage cannot be
+        // cleared between a timely result and the writes it authorizes.
+        validationPaused = true;
+    }
+
+    @Override
+    public synchronized void clear() {
+        // StorageFactory owns the stores. The new runtime state is only the admission fence.
+    }
+
+    @Override
+    public synchronized void afterReset() {
+        validationPaused = false;
     }
 
     // ──────────────────────────── Hosted Configuration Version ────────────────────────────
@@ -763,7 +814,7 @@ public class AppConfigService {
 
         // Refuse invalid content before assigning a deployment number or changing the active version.
         if (profile.getValidators() != null && !profile.getValidators().isEmpty()) {
-            AppConfigValidators.validate(profile.getValidators(), validationContent(profile, version));
+            validateProfile(profile, validationVersion(profile, version));
         }
 
         Deployment deployment = new Deployment();
