@@ -23,8 +23,10 @@ import io.floci.aws.services.ec2.VpcDependencyProvider;
 import io.floci.aws.services.ec2.model.Subnet;
 import io.floci.aws.services.elbv2.model.*;
 import io.floci.aws.services.iam.ServerCertificateReferenceProvider;
+import io.quarkus.runtime.StartupEvent;
 import jakarta.annotation.PostConstruct;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.Observes;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
@@ -96,6 +98,30 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
 
     // tags: resource-ARN → {key → value}
     private Map<String, Map<String, String>> tags = new ConcurrentHashMap<>();
+
+    private Set<String> singleZoneAlbAccounts = Set.of();
+
+    void validateAlbZoneConfiguration(@Observes StartupEvent event) {
+        readSingleZoneAlbAccounts();
+    }
+
+    void readSingleZoneAlbAccounts() {
+        if (config == null) {
+            singleZoneAlbAccounts = Set.of();
+            return;
+        }
+        List<String> accounts = config.services().elbv2().singleZoneAlbAccounts().orElse(List.of()).stream()
+                .filter(account -> account != null && !account.isBlank())
+                .map(String::trim)
+                .toList();
+        for (String account : accounts) {
+            if (!account.matches("[0-9]{12}")) {
+                throw new IllegalStateException("floci.services.elbv2.single-zone-alb-accounts must list"
+                        + " 12-digit account ids, not '" + account + "'");
+            }
+        }
+        singleZoneAlbAccounts = Set.copyOf(accounts);
+    }
 
     @PostConstruct
     void initializeStorage()
@@ -297,7 +323,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         String id = randomHex16();
         String arn = AwsArnUtils.Arn.of("elasticloadbalancing", region, regionResolver.getAccountId(), "loadbalancer/" + typePrefix + "/" + name + "/" + id).toString();
         String dnsName = name + "-" + id + ".elb." + loadBalancerDnsSuffix();
-        requireSubnets(lbType, subnets);
+        requireSubnets(region, lbType, subnets);
         String vpcId = resolveSubnetVpcId(region, lbType, subnets);
 
         LoadBalancer lb = new LoadBalancer();
@@ -324,29 +350,37 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         return lb;
     }
 
-    /**
-     * Every load balancer type takes {@code Subnets} or {@code SubnetMappings}, and an Application Load
-     * Balancer takes at least two, so a CreateLoadBalancer with fewer is refused before anything is
-     * created, with the message AWS gives an Application or a Network Load Balancer. A Gateway Load
-     * Balancer, which takes subnets the way a Network Load Balancer does, gets the Network one. AWS
-     * counts before it looks a subnet up, so one subnet that does not exist gets this error too, not
-     * SubnetNotFound. On create this runs after the duplicate-name check, because a CloudFormation stack
-     * update finds the balancer it keeps through DuplicateLoadBalancerName, whatever subnets its
-     * template names. SetSubnets takes the same subnets, so {@link #setSubnetsFromRequest} runs this on
-     * a SetSubnets that names none, and {@link #setSubnets} on a list that names some, once it has the
-     * balancer's type; whether the subnets span two Availability Zones is checked after they are looked
-     * up. No public report shows what AWS answers a SetSubnets with one subnet, so it gets the create
-     * message and order.
-     */
-    private static void requireSubnets(String lbType, List<String> subnets) {
+    /** Validate cardinality before subnet lookup; resolved zones are validated separately. */
+    private void requireSubnets(String region, String lbType, List<String> subnets) {
         int count = subnets == null ? 0 : subnets.size();
-        if ("application".equals(lbType) && count < 2) {
+        if ("application".equals(lbType) && requiresTwoAlbZones(region) && count < 2) {
             throw new AwsException("ValidationError",
                     "At least two subnets in two different Availability Zones must be specified", 400);
         }
         if (count == 0) {
             throw new AwsException("ValidationError", "At least one subnet must be specified", 400);
         }
+    }
+
+    private boolean requiresTwoAlbZones(String region) {
+        EmulatorConfig.AlbZoneRule rule = EmulatorConfig.AlbZoneRule.AWS;
+        if (config != null) {
+            EmulatorConfig.ElbV2ServiceConfig settings = config.services().elbv2();
+            if (settings.albZoneRule() != null) {
+                rule = settings.albZoneRule();
+            }
+            Map<String, EmulatorConfig.AlbZoneRule> regions = settings.albZoneRuleByRegion();
+            if (regions != null && regions.containsKey(region)) {
+                rule = regions.get(region);
+            } else if (singleZoneAlbAccounts.contains(regionResolver.getAccountId())) {
+                return false;
+            }
+        }
+        return switch (rule) {
+            case AWS -> !"ap-northeast-3".equals(region); // partition-literal: verified Osaka ALB policy exception
+            case ALLOW_SINGLE_ZONE -> false;
+            case REQUIRE_TWO_ZONES -> true;
+        };
     }
 
     /**
@@ -483,7 +517,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     void setSubnetsFromRequest(String region, String arn, List<String> subnets) {
         LoadBalancer lb = requireLoadBalancer(region, arn);
         if (subnets.isEmpty()) {
-            requireSubnets(lb.getType(), subnets);
+            requireSubnets(region, lb.getType(), subnets);
         }
         setSubnets(region, arn, subnets);
     }
@@ -498,7 +532,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
             LoadBalancer lb = requireLoadBalancer(region, arn);
             // Counted as on create, before any subnet is looked up; an empty list is taken, as above.
             if (subnets != null && !subnets.isEmpty()) {
-                requireSubnets(lb.getType(), subnets);
+                requireSubnets(region, lb.getType(), subnets);
             }
             String vpcId = resolveSubnetVpcId(region, lb.getType(), subnets);
             if (vpcId != null && lb.getVpcId() != null && !lb.getVpcId().equals(vpcId)) {
@@ -1590,9 +1624,13 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                     .map(Subnet::getAvailabilityZone)
                     .distinct()
                     .count();
-            if (distinctAvailabilityZones < 2) {
+            if (requiresTwoAlbZones(region) && distinctAvailabilityZones < 2) {
                 throw new AwsException("InvalidConfigurationRequest",
                         "Application Load Balancers must be attached to subnets in at least two Availability Zones.", 400);
+            }
+            if (distinctAvailabilityZones < subnetIds.size()) {
+                throw new AwsException("InvalidConfigurationRequest",
+                        "A load balancer cannot be attached to multiple subnets in the same Availability Zone", 400);
             }
         }
 

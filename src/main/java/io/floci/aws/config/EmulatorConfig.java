@@ -3792,6 +3792,22 @@ public interface EmulatorConfig {
         /** Default idle-pool timeout in seconds; zero disables expiry. Target Keep-Alive may override it. */
         @WithDefault("60")
         int backendKeepAliveTimeoutSeconds();
+
+        /** AWS defaults unless explicitly overridden for local deployments. */
+        @WithDefault("aws")
+        AlbZoneRule albZoneRule();
+
+        /** A region entry takes precedence over the global rule, including an explicit AWS reset. */
+        Map<String, AlbZoneRule> albZoneRuleByRegion();
+
+        /** Accounts allowed a single-zone ALB unless an explicit region rule takes precedence. */
+        Optional<List<String>> singleZoneAlbAccounts();
+    }
+
+    enum AlbZoneRule {
+        AWS,
+        ALLOW_SINGLE_ZONE,
+        REQUIRE_TWO_ZONES
     }
 
     interface EksServiceConfig {
