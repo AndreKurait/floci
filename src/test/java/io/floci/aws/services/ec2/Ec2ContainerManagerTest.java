@@ -85,7 +85,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Answers.RETURNS_DEEP_STUBS;
 import static org.mockito.Answers.RETURNS_SELF;
@@ -116,10 +116,14 @@ class Ec2ContainerManagerTest {
     @Test
     void terminationRetainsFirewallIdentityAfterInterfacesAreReleased() throws Exception {
         DockerClient docker = mock(DockerClient.class);
-        SecurityGroupFirewallManager firewall = mock(SecurityGroupFirewallManager.class);
+        ContainerLifecycleManager helperLifecycle = mock(ContainerLifecycleManager.class);
+        SecurityGroupFirewallManager firewall = spy(new SecurityGroupFirewallManager(
+                mock(DockerClient.class, RETURNS_DEEP_STUBS), mock(ContainerBuilder.class), helperLifecycle,
+                mock(EmulatorConfig.class), mock(EmbeddedDnsServer.class)));
+        doNothing().when(firewall).reconcileAll();
         doReturn(true).when(firewall).enabled();
-        Runnable firewallCleanup = mock(Runnable.class);
-        when(firewall.captureUnregister("eni-firewall-teardown")).thenReturn(firewallCleanup);
+        firewall.register(new SecurityGroupNftCompiler.Endpoint("111111111111", "us-east-1", "vpc-old",
+                "eni-firewall-teardown", "10.0.1.10", "172.18.0.2", Set.of(), List.of()), "old-helper", Map.of());
         Ec2ContainerManager manager = new Ec2ContainerManager(
                 mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class),
                 mock(ContainerLogStreamer.class), mock(ContainerDetector.class),
@@ -144,8 +148,8 @@ class Ec2ContainerManagerTest {
             manager.terminate(instance, completed::countDown);
             assertTrue(completed.await(5, TimeUnit.SECONDS), "Container teardown must finish");
             assertEquals("terminated", instance.getState().getName());
-            verify(firewall).captureUnregister("eni-firewall-teardown");
-            verify(firewallCleanup).run();
+            verify(firewall).captureOwnerCleanup(eq(instance), eq("eni-firewall-teardown"), any(), any());
+            verify(helperLifecycle).removeIfExistsStrict("old-helper");
         } finally {
             manager.stop();
         }
@@ -181,9 +185,10 @@ class Ec2ContainerManagerTest {
             // The service releases ENIs while container teardown is still in progress.
             instance.getNetworkInterfaces().clear();
             if (replace) {
-                firewall.register(new SecurityGroupNftCompiler.Endpoint("111111111111", "us-east-1", "vpc-new",
-                        "eni-firewall-teardown", "10.0.1.10", "172.18.0.3", Set.of(), List.of()),
-                        "new-helper", Map.of());
+                assertThrows(IllegalStateException.class, () -> firewall.register(
+                        new SecurityGroupNftCompiler.Endpoint("111111111111", "us-east-1", "vpc-new",
+                                "eni-firewall-teardown", "10.0.1.10", "172.18.0.3", Set.of(), List.of()),
+                        "new-helper", Map.of()));
             }
             return null;
         }).when(remove).exec();
@@ -194,6 +199,13 @@ class Ec2ContainerManagerTest {
             assertEquals("terminated", instance.getState().getName());
             verify(lifecycle).removeIfExistsStrict("old-helper");
             verify(lifecycle, never()).removeIfExistsStrict("new-helper");
+            if (replace) {
+                // Admission reopens only after the original owner completed all retained phases.
+                firewall.register(new SecurityGroupNftCompiler.Endpoint("111111111111", "us-east-1", "vpc-new",
+                        "eni-firewall-teardown", "10.0.1.10", "172.18.0.3", Set.of(), List.of()),
+                        "new-helper", Map.of());
+                verify(lifecycle, never()).removeIfExistsStrict("new-helper");
+            }
             assertEquals(replace, firewall.vpcForClient("172.18.0.3").isPresent());
         } finally {
             manager.stop();

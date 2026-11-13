@@ -1593,12 +1593,24 @@ public class Ec2ContainerManager {
         String containerIp;
         String imdsSourceIp;
         String firewallEniId;
+        String capturedRegion;
+        String capturedOwner;
+        String capturedSubnet;
+        String capturedPrivateIp;
         int sshHostPort;
         synchronized (instance) {
+            // Repeated termination must not reopen completed bookkeeping or infer workload absence.
+            if (instance.getState() != null && "terminated".equals(instance.getState().getName())) {
+                return;
+            }
             containerId = instance.getDockerContainerId();
             containerIp = instance.getContainerBridgeIp();
             imdsSourceIp = instance.getImdsSourceIp();
             sshHostPort = instance.getSshHostPort();
+            capturedRegion = instance.getRegion();
+            capturedOwner = instance.getOwnerId();
+            capturedSubnet = instance.getSubnetId();
+            capturedPrivateIp = instance.getPrivateIpAddress();
             firewallEniId = instance.getNetworkInterfaces() == null || instance.getNetworkInterfaces().isEmpty()
                     ? null : instance.getNetworkInterfaces().getFirst().getNetworkInterfaceId();
             instance.setState(InstanceState.shuttingDown());
@@ -1606,65 +1618,86 @@ public class Ec2ContainerManager {
             serviceNetworkRetries.remove(instance.getInstanceId());
             serviceNetworkLookups.remove(instance.getInstanceId());
         }
-        Runnable firewallCleanup = firewallManager != null && firewallManager.enabled() && firewallEniId != null
-                ? firewallManager.captureUnregister(firewallEniId) : null;
-        executor.submit(() -> {
-            // The post-teardown hook's only precondition; see the Javadoc above for why.
-            boolean containerGone = false;
-            try {
-                portForwardManager.unpublishAll(instance);
-                if (containerId == null) {
-                    // Nothing was ever launched, so there is no container to hold the image.
-                    containerGone = true;
-                }
-                if (containerId != null) {
-                    try {
-                        dockerClient.removeContainerCmd(containerId).withForce(true).exec();
+        List<SecurityGroupFirewallManager.CleanupStep> cleanupSteps = List.of(
+                new SecurityGroupFirewallManager.CleanupStep(
+                        () -> { if (sshHostPort > 0) { portAllocator.release(sshHostPort); } }, false),
+                new SecurityGroupFirewallManager.CleanupStep(
+                        () -> metadataServer.unregisterContainer(containerIp, instance), true),
+                new SecurityGroupFirewallManager.CleanupStep(
+                        () -> metadataServer.unregisterContainer(imdsSourceIp, instance), true),
+                new SecurityGroupFirewallManager.CleanupStep(() -> metadataServer.unregisterInstance(instance), true),
+                new SecurityGroupFirewallManager.CleanupStep(
+                        () -> vpcNetworkManager.releasePrivateIp(capturedRegion, capturedSubnet, capturedPrivateIp), false),
+                new SecurityGroupFirewallManager.CleanupStep(() -> {
+                    instance.setState(InstanceState.terminated());
+                    instance.setTerminatedAt(System.currentTimeMillis());
+                }, true));
+        SecurityGroupFirewallManager.OwnedCleanup ownerCleanup = firewallManager != null && firewallManager.enabled()
+                ? firewallManager.captureOwnerCleanup(instance, firewallEniId,
+                    () -> Objects.equals(containerId, instance.getDockerContainerId())
+                            && Objects.equals(capturedOwner, instance.getOwnerId())
+                            && Objects.equals(capturedRegion, instance.getRegion())
+                            && Objects.equals(capturedSubnet, instance.getSubnetId())
+                            && Objects.equals(capturedPrivateIp, instance.getPrivateIpAddress())
+                            && Objects.equals(containerIp, instance.getContainerBridgeIp())
+                            && Objects.equals(imdsSourceIp, instance.getImdsSourceIp())
+                            && sshHostPort == instance.getSshHostPort()
+                            && instance.getState() != null
+                            && List.of("shutting-down", "terminated").contains(instance.getState().getName()),
+                    () -> cleanupSteps) : null;
+        try {
+            executor.submit(() -> {
+                // The post-teardown hook's only precondition; see the Javadoc above for why.
+                boolean containerGone = false;
+                try {
+                    portForwardManager.unpublishAll(instance);
+                    if (containerId == null) {
+                        // Nothing was ever launched, so there is no container to hold the image.
                         containerGone = true;
-                    } catch (NotFoundException e) {
-                        // already gone
-                        containerGone = true;
-                    } catch (Exception e) {
-                        LOG.warnv("Error removing EC2 container {0}: {1}", containerId, e.getMessage());
                     }
-                    try {
-                        // iptables/veth teardown lags behind container removal; prevents port-reuse conflicts.
-                        Thread.sleep(500);
-                    } catch (InterruptedException ie) {
-                        Thread.currentThread().interrupt();
+                    if (containerId != null) {
+                        try {
+                            dockerClient.removeContainerCmd(containerId).withForce(true).exec();
+                            containerGone = true;
+                        } catch (NotFoundException e) {
+                            // already gone
+                            containerGone = true;
+                        } catch (Exception e) {
+                            LOG.warnv("Error removing EC2 container {0}: {1}", containerId, e.getMessage());
+                        }
+                        try {
+                            // iptables/veth teardown lags behind container removal; prevents port-reuse conflicts.
+                            Thread.sleep(500);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                        }
+                    }
+                    if (ownerCleanup != null) {
+                        ownerCleanup.run();
+                    } else {
+                        cleanupSteps.forEach(step -> step.action().run());
+                    }
+                } finally {
+                    if (afterTeardown != null && containerGone) {
+                        try {
+                            afterTeardown.run();
+                        } catch (Exception e) {
+                            LOG.warnv("Post-teardown hook failed for instance {0}: {1}",
+                                    instance.getInstanceId(), e.getMessage());
+                        }
+                    } else if (afterTeardown != null) {
+                        LOG.warnv("Skipping post-teardown hook for instance {0}: its container is "
+                                + "not established to be gone, so anything waiting on the container "
+                                + "being gone would fail", instance.getInstanceId());
                     }
                 }
-                if (firewallCleanup != null) {
-                    firewallCleanup.run();
-                }
-                if (sshHostPort > 0) {
-                    portAllocator.release(sshHostPort);
-                }
-                metadataServer.unregisterContainer(containerIp, instance);
-                metadataServer.unregisterContainer(imdsSourceIp, instance);
-                metadataServer.unregisterInstance(instance);
-                // Give the address back only now that the container is gone: releasing it while
-                // Docker still holds the endpoint would hand the same IP to the next launch and
-                // have Docker refuse it.
-                vpcNetworkManager.releasePrivateIp(instance.getRegion(), instance.getSubnetId(),
-                        instance.getPrivateIpAddress());
-                instance.setState(InstanceState.terminated());
-                instance.setTerminatedAt(System.currentTimeMillis());
-            } finally {
-                if (afterTeardown != null && containerGone) {
-                    try {
-                        afterTeardown.run();
-                    } catch (Exception e) {
-                        LOG.warnv("Post-teardown hook failed for instance {0}: {1}",
-                                instance.getInstanceId(), e.getMessage());
-                    }
-                } else if (afterTeardown != null) {
-                    LOG.warnv("Skipping post-teardown hook for instance {0}: its container is "
-                            + "not established to be gone, so anything waiting on the container "
-                            + "being gone would fail", instance.getInstanceId());
-                }
+            });
+        } catch (RejectedExecutionException failure) {
+            if (ownerCleanup != null) {
+                ownerCleanup.cancelBeforeStart();
             }
-        });
+            throw failure;
+        }
     }
 
     /**

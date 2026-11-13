@@ -1714,3 +1714,7 @@ Under `none` the rule still runs, but a mock instance has only the Elastic IP, i
 Otherwise a mock instance's address appears whether DescribeInstances or DescribeInstanceStatus
 observes the launch first. A terminated mock instance has no public address, and stopping it does not bring it
 back.
+
+## Cleanup after partial teardown
+
+With protected network helpers enabled, caller cleanup retains the original instance or task identity while strict helper removal and later bookkeeping finish. Completed bookkeeping phases are not repeated. A lease release with an unknown outcome remains pending, and pending caller cleanup prevents a state reset. This progress is local to the running process.

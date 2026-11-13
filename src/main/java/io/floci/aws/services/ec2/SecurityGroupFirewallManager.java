@@ -9,6 +9,7 @@ import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.Info;
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.core.common.Resettable;
 import io.floci.aws.core.common.SweepWorker;
 import io.floci.aws.core.common.dns.DnsClientVpcSource;
 import io.floci.aws.core.common.dns.EmbeddedDnsServer;
@@ -34,20 +35,26 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.WeakHashMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
+import java.util.function.BooleanSupplier;
+import java.util.function.Supplier;
 
 /** Owns the protected namespace and the Floci-only nftables table for each managed ENI. */
 @ApplicationScoped
-public class SecurityGroupFirewallManager implements DnsClientVpcSource {
+public class SecurityGroupFirewallManager implements DnsClientVpcSource, Resettable {
 
     private static final Logger LOG = Logger.getLogger(SecurityGroupFirewallManager.class);
     private final DockerClient dockerClient;
@@ -61,6 +68,11 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     private final Map<String, CompletableFuture<Void>> helperRemovalsInProgress = new HashMap<>();
     private final ConcurrentMap<String, DnsOrigin> dnsOrigins = new ConcurrentHashMap<>();
     private boolean peerPoliciesNeedRefresh;
+    // Only Instance and EcsTask are owner keys; both retain Object identity equality.
+    private final Map<Object, OwnedCleanup> ownerCleanups = new IdentityHashMap<>();
+    private final Map<Object, Boolean> completedOwnerCleanups = new WeakHashMap<>();
+    private final ReentrantLock ownerCleanupExecution = new ReentrantLock();
+    private boolean ownerCleanupPaused;
     private final SweepWorker dnsOriginObserver = new SweepWorker(
             "protected-namespace-dns", true, 1, false, ignored -> retireDnsOrigins());
 
@@ -105,7 +117,11 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         try {
             observeDnsOrigins();
         } finally {
-            retryRequestedHelperCleanup();
+            try {
+                retryRequestedHelperCleanup();
+            } finally {
+                retryOwnerCleanups();
+            }
         }
     }
 
@@ -215,6 +231,8 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             lifecycleManager.removeIfExistsStrict(helper);
             synchronized (this) {
                 forgetHelperCleanup(helper);
+                // Registration also forgets old pending state; only strict removal proves absence.
+                ownerCleanups.values().forEach(cleanup -> cleanup.remainingHelpers.remove(helper));
             }
             removal.complete(null);
         } catch (RuntimeException | Error failure) {
@@ -348,6 +366,11 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     /** Registers only after the default-deny table exists, before workload startup. */
     public synchronized void register(SecurityGroupNftCompiler.Endpoint endpoint, String helperId,
                                       Map<String, List<String>> prefixLists) {
+        if (ownerCleanups.values().stream().anyMatch(cleanup ->
+                Objects.equals(cleanup.eniId, endpoint.eniId())
+                        || cleanup.capturedHelpers.contains(helperId))) {
+            throw new IllegalStateException("Caller cleanup still reserves this ENI or helper");
+        }
         if (helperRemovalsInProgress.containsKey(helperId)) {
             throw new IllegalStateException("Security-group helper removal is in progress");
         }
@@ -414,6 +437,209 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             helpers.add(captured.helperId());
         }
         return () -> unregisterCaptured(eniId, captured, helpers);
+    }
+
+    /**
+     * Reserves the exact caller before asynchronous teardown. The observer does not run its
+     * continuation until run() is invoked after the caller's workload-removal attempt.
+     */
+    public OwnedCleanup captureOwnerCleanup(Object owner, String eniId, BooleanSupplier stillOwned,
+                                             Supplier<List<CleanupStep>> stepsFactory) {
+        OwnedCleanup cleanup;
+        synchronized (this) {
+            if (ownerCleanupPaused) {
+                throw new IllegalStateException("Caller cleanup is paused for reset");
+            }
+            OwnedCleanup existing = ownerCleanups.get(owner);
+            if (existing != null) {
+                if (!Objects.equals(existing.eniId, eniId)) {
+                    throw new IllegalStateException("Caller cleanup belongs to another captured ENI");
+                }
+                return existing;
+            }
+            ProtectedEndpoint endpoint = eniId == null ? null : endpoints.get(eniId);
+            Set<String> helpers = new HashSet<>(pendingHelperCleanup.getOrDefault(eniId, Set.of()));
+            if (endpoint != null) {
+                helpers.add(endpoint.helperId());
+            }
+            if (!completedOwnerCleanups.containsKey(owner) && ownerCleanups.values().stream().anyMatch(other ->
+                    eniId != null && eniId.equals(other.eniId)
+                            || helpers.stream().anyMatch(other.capturedHelpers::contains))) {
+                throw new IllegalStateException("Another caller owns cleanup for this ENI or helper");
+            }
+            cleanup = new OwnedCleanup(owner, eniId, endpoint, helpers, stillOwned);
+            if (completedOwnerCleanups.containsKey(owner)) {
+                cleanup.completed = true;
+                return cleanup;
+            }
+            ownerCleanups.put(owner, cleanup);
+        }
+        // Publish reset admission first; never call another service under this monitor.
+        try {
+            List<CleanupStep> steps = List.copyOf(stepsFactory.get());
+            synchronized (this) {
+                cleanup.steps = steps;
+            }
+        } catch (RuntimeException failure) {
+            cleanup.cancelBeforeStart();
+            throw failure;
+        }
+        return cleanup;
+    }
+
+    /** A failed unqualified release must not later free a reused lease. */
+    public record CleanupStep(Runnable action, boolean retryAfterFailure) {}
+
+    private void retryOwnerCleanups() {
+        List<OwnedCleanup> cleanups;
+        synchronized (this) {
+            if (ownerCleanupPaused) {
+                return;
+            }
+            cleanups = ownerCleanups.values().stream()
+                    .filter(cleanup -> cleanup.started && cleanup.remainingHelpers.isEmpty()
+                            && !cleanup.ownershipLost && !cleanup.uncertainStep).toList();
+        }
+        for (OwnedCleanup cleanup : cleanups) {
+            try {
+                cleanup.run();
+            } catch (RuntimeException failure) {
+                LOG.warnv(failure, "Caller cleanup remains incomplete for ENI {0}", cleanup.eniId);
+            }
+        }
+    }
+
+    public final class OwnedCleanup implements Runnable {
+        private final Object owner;
+        private final String eniId;
+        private final ProtectedEndpoint captured;
+        private final Set<String> capturedHelpers;
+        private final Set<String> remainingHelpers;
+        private final BooleanSupplier stillOwned;
+        private List<CleanupStep> steps;
+        private boolean started;
+        private boolean completed;
+        private boolean ownershipLost;
+        private boolean uncertainStep;
+        private int nextStep;
+
+        private OwnedCleanup(Object owner, String eniId, ProtectedEndpoint captured, Set<String> helpers,
+                             BooleanSupplier stillOwned) {
+            this.owner = Objects.requireNonNull(owner);
+            this.eniId = eniId;
+            this.captured = captured;
+            this.capturedHelpers = Set.copyOf(helpers);
+            this.remainingHelpers = new HashSet<>(helpers);
+            this.stillOwned = Objects.requireNonNull(stillOwned);
+        }
+
+        /** A rejected executor submission never armed the continuation. */
+        public void cancelBeforeStart() {
+            synchronized (SecurityGroupFirewallManager.this) {
+                if (!started && !completed) {
+                    ownerCleanups.remove(owner, this);
+                    completed = true;
+                }
+            }
+        }
+
+        @Override
+        public void run() {
+            ownerCleanupExecution.lock();
+            try {
+                synchronized (SecurityGroupFirewallManager.this) {
+                    if (completed) {
+                        return;
+                    }
+                    if (ownerCleanupPaused) {
+                        throw new IllegalStateException("Caller cleanup is paused for reset");
+                    }
+                    if (steps == null) {
+                        throw new IllegalStateException("Caller cleanup capture has not completed");
+                    }
+                    started = true;
+                    if (ownershipLost || uncertainStep) {
+                        throw new IllegalStateException("Captured caller ownership or release outcome is uncertain");
+                    }
+                    ProtectedEndpoint current = eniId == null ? null : endpoints.get(eniId);
+                    if (current != null && (captured == null || current.dnsOrigin() != captured.dnsOrigin())) {
+                        ownershipLost = true;
+                        throw new IllegalStateException("A replacement owns the captured ENI");
+                    }
+                }
+                synchronized (owner) {
+                    if (!stillOwned.getAsBoolean()) {
+                        synchronized (SecurityGroupFirewallManager.this) {
+                            ownershipLost = true;
+                        }
+                        throw new IllegalStateException("Captured caller identity changed");
+                    }
+                    if (eniId != null) {
+                        unregisterCaptured(eniId, captured, capturedHelpers);
+                    }
+                    synchronized (SecurityGroupFirewallManager.this) {
+                        if (!remainingHelpers.isEmpty()) {
+                            throw new IllegalStateException("Captured helper absence is not established");
+                        }
+                    }
+                    while (nextStep < steps.size()) {
+                        CleanupStep step = steps.get(nextStep);
+                        try {
+                            step.action().run();
+                        } catch (RuntimeException failure) {
+                            if (!step.retryAfterFailure()) {
+                                uncertainStep = true;
+                            }
+                            throw failure;
+                        }
+                        nextStep++;
+                    }
+                    synchronized (SecurityGroupFirewallManager.this) {
+                        completed = true;
+                        ownerCleanups.remove(owner, this);
+                        completedOwnerCleanups.put(owner, Boolean.TRUE);
+                    }
+                }
+            } finally {
+                ownerCleanupExecution.unlock();
+            }
+        }
+    }
+
+    @Override
+    public synchronized void checkReset() {
+        if (!ownerCleanups.isEmpty()) {
+            throw new IllegalStateException("Caller cleanup must complete before reset");
+        }
+    }
+
+    @Override
+    public void beforeReset() {
+        synchronized (this) {
+            ownerCleanupPaused = true;
+        }
+        dnsOriginObserver.pause();
+        ownerCleanupExecution.lock();
+        try {
+            checkReset();
+        } finally {
+            ownerCleanupExecution.unlock();
+        }
+    }
+
+    @Override
+    public synchronized void clear() {
+        // A pending identity is never discarded as successful cleanup by reset.
+        checkReset();
+        completedOwnerCleanups.clear();
+    }
+
+    @Override
+    public void afterReset() {
+        synchronized (this) {
+            ownerCleanupPaused = false;
+        }
+        dnsOriginObserver.resume();
     }
 
     private void unregisterCaptured(String eniId, ProtectedEndpoint captured, Set<String> capturedHelpers) {
