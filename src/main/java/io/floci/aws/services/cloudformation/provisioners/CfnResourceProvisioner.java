@@ -26,6 +26,11 @@ public interface CfnResourceProvisioner {
 
     Set<String> resourceTypes();
 
+    /** Ref can expose one part of a resource's compound physical identity. */
+    default String referenceValue(String physicalId) {
+        return physicalId;
+    }
+
     /** GetAtt attributes the registry schema types as integers, by resource type. */
     default Map<String, Set<String>> integerAttributes() {
         return Map.of();
