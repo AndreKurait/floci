@@ -692,6 +692,7 @@ public class AwsConfigService {
     }
 
     public List<ConfigurationRecorder> describeConfigurationRecorders(String region, List<String> names) {
+        validateConfigurationRecorderNames(names);
         ConfigurationRecorder recorder = configurationRecorders.get(region);
         if (recorder == null) {
             if (names != null && !names.isEmpty()) {
@@ -709,6 +710,13 @@ public class AwsConfigService {
             }
         }
         return List.of(recorder);
+    }
+
+    private static void validateConfigurationRecorderNames(List<String> names) {
+        if (names != null && names.size() > 1) {
+            throw new AwsException("ValidationException",
+                    "You have specified more than one configuration recorder.", 400);
+        }
     }
 
     public void deleteConfigurationRecorder(String region, String name) {
@@ -748,6 +756,7 @@ public class AwsConfigService {
     }
 
     public List<ConfigurationRecorderStatus> describeConfigurationRecorderStatus(String region, List<String> names) {
+        validateConfigurationRecorderNames(names);
         ConfigurationRecorder recorder = configurationRecorders.get(region);
         if (recorder == null) {
             if (names != null && !names.isEmpty()) {

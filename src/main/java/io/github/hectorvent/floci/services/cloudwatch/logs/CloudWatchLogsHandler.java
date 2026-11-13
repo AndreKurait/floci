@@ -41,6 +41,10 @@ public class CloudWatchLogsHandler {
     private final CloudWatchLogsDeliveryService deliveryService;
     private final CloudWatchLogsDeliveryHandler deliveryHandler;
     private final ObjectMapper objectMapper;
+    private final CloudWatchLogsTransformerHandler transformerHandler;
+
+    @Inject
+    CloudWatchLogsExportHandler exportHandler;
 
     @Inject
     public CloudWatchLogsHandler(CloudWatchLogsService logsService,
@@ -54,6 +58,7 @@ public class CloudWatchLogsHandler {
         this.deliveryService = deliveryService;
         this.deliveryHandler = new CloudWatchLogsDeliveryHandler(deliveryService, objectMapper);
         this.objectMapper = objectMapper;
+        this.transformerHandler = new CloudWatchLogsTransformerHandler(logsService, objectMapper);
     }
 
     /** For unit tests that exercise log groups only: deliveries live in memory. */
@@ -66,7 +71,13 @@ public class CloudWatchLogsHandler {
     }
 
     public Response handle(String action, JsonNode request, String region) {
+        return handle(action, request, region, null);
+    }
+
+    public Response handle(String action, JsonNode request, String region, String authorization) {
         return switch (action) {
+            case "CreateExportTask", "DescribeExportTasks", "CancelExportTask" ->
+                    exportHandler.handle(action, request, region, authorization);
             case "CreateLogGroup" -> handleCreateLogGroup(request, region);
             case "DeleteLogGroup" -> handleDeleteLogGroup(request, region);
             case "DescribeLogGroups" -> handleDescribeLogGroups(request, region);
@@ -76,6 +87,8 @@ public class CloudWatchLogsHandler {
             case "PutLogEvents" -> handlePutLogEvents(request, region);
             case "GetLogEvents" -> handleGetLogEvents(request, region);
             case "FilterLogEvents" -> handleFilterLogEvents(request, region);
+            case "PutTransformer", "GetTransformer", "DeleteTransformer", "TestTransformer" ->
+                    transformerHandler.handle(action, request, region);
             case "PutRetentionPolicy" -> handlePutRetentionPolicy(request, region);
             case "DeleteRetentionPolicy" -> handleDeleteRetentionPolicy(request, region);
             case "PutLogGroupDeletionProtection" -> handlePutLogGroupDeletionProtection(request, region);
@@ -677,7 +690,12 @@ public class CloudWatchLogsHandler {
                     "distribution must be Random or ByLogStream.", 400);
         }
 
-        logsService.putSubscriptionFilter(logGroupName, filterName, filterPattern, destinationArn, distribution, region);
+        JsonNode transformed = request.get("applyOnTransformedLogs");
+        if (transformed != null && !transformed.isBoolean()) {
+            throw new AwsException("InvalidParameterException", "applyOnTransformedLogs must be a boolean.", 400);
+        }
+        logsService.putSubscriptionFilter(logGroupName, filterName, filterPattern, destinationArn, distribution,
+                transformed == null ? null : transformed.booleanValue(), region);
         return Response.ok(objectMapper.createObjectNode()).build();
     }
 
@@ -698,6 +716,9 @@ public class CloudWatchLogsHandler {
             node.put("logGroupName", f.getLogGroupName());
             node.put("filterPattern", f.getFilterPattern());
             node.put("destinationArn", f.getDestinationArn());
+            if (f.getApplyOnTransformedLogs() != null) {
+                node.put("applyOnTransformedLogs", f.getApplyOnTransformedLogs());
+            }
             if (f.getDistribution() != null) {
                 node.put("distribution", f.getDistribution());
             }
