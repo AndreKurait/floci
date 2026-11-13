@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 import regen_apigateway_documentation_shapes
+import regen_cloudfront_keyvaluestore_shapes
 import regen_apigateway_shapes
 import regen_dynamodb_shapes
 import regen_ecr_shapes
@@ -336,6 +337,9 @@ def test_build_constraints_output_is_stable():
     (regen_iam_shapes, "iam/2010-05-08", "iam-request-shapes.json",
      {"prepare": regen_iam_shapes.prepare}),
     (regen_sts_shapes, "sts/2011-06-15", "sts-request-shapes.json", {}),
+    (regen_cloudfront_keyvaluestore_shapes, "cloudfront-keyvaluestore/2022-07-26",
+     "cloudfront-keyvaluestore-request-shapes.json",
+     {"prepare": regen_cloudfront_keyvaluestore_shapes.widen_partition_and_region}),
 ])
 def test_each_constraints_script_runs_the_shared_main_with_its_operations(script, model, output, extra,
                                                                          monkeypatch):
@@ -359,7 +363,8 @@ def vendored(script) -> tuple[str, ...]:
 
 
 @pytest.mark.parametrize("script", [
-    regen_apigateway_documentation_shapes, regen_ecr_shapes, regen_iam_shapes, regen_logs_delivery_shapes,
+    regen_apigateway_documentation_shapes, regen_cloudfront_keyvaluestore_shapes,
+    regen_ecr_shapes, regen_iam_shapes, regen_logs_delivery_shapes,
     regen_payment_cryptography_shapes,
     regen_resource_groups_shapes, regen_sts_shapes,
 ])
