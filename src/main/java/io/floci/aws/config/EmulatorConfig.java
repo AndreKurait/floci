@@ -1353,6 +1353,9 @@ public interface EmulatorConfig {
     interface AutoScalingServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        @WithDefault("true")
+        boolean cloudwatchMetricsEnabled();
     }
 
     interface ApplicationAutoScalingServiceConfig {
