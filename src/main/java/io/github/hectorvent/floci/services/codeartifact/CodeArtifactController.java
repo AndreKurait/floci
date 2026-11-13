@@ -12,9 +12,10 @@ import io.github.hectorvent.floci.core.common.JsonErrorResponseUtils;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.StreamingResponses;
 import io.github.hectorvent.floci.services.codeartifact.CodeArtifactService.AuthorizationToken;
 import io.github.hectorvent.floci.services.codeartifact.CodeArtifactService.DomainView;
-import io.github.hectorvent.floci.services.codeartifact.CodeArtifactService.PackageVersionAssetResult;
+import io.github.hectorvent.floci.services.codeartifact.CodeArtifactService.PackageVersionAssetStreamResult;
 import io.github.hectorvent.floci.services.codeartifact.CodeArtifactService.PackageVersionReadmeResult;
 import io.github.hectorvent.floci.services.codeartifact.CodeArtifactService.PublishPackageVersionResult;
 import io.github.hectorvent.floci.services.codeartifact.CodeArtifactService.ResourcePolicy;
@@ -38,6 +39,7 @@ import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 
+import java.io.InputStream;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -322,7 +324,7 @@ public class CodeArtifactController {
                                            @QueryParam("asset") String assetName,
                                            @QueryParam("unfinished") String unfinished,
                                            @HeaderParam("x-amz-content-sha256") String assetSha256,
-                                           byte[] body) {
+                                           InputStream body) {
         String region = regionResolver.resolveRegion(headers);
         PublishPackageVersionResult result = service.publishPackageVersion(region, domain, domainOwner, repository,
                 format, namespace, packageName, version, assetName, assetSha256, unfinished, body);
@@ -405,13 +407,16 @@ public class CodeArtifactController {
                                             @QueryParam("asset") String assetName,
                                             @QueryParam("revision") String revision) {
         String region = regionResolver.resolveRegion(headers);
-        PackageVersionAssetResult result = service.getPackageVersionAsset(region, domain, domainOwner, repository,
-                format, namespace, packageName, version, assetName, revision);
-        return Response.ok(result.asset().getContent(), MediaType.APPLICATION_OCTET_STREAM)
-                .header("X-AssetName", result.asset().getName())
+        PackageVersionAssetStreamResult result = service.getPackageVersionAssetStreamed(region, domain, domainOwner,
+                repository, format, namespace, packageName, version, assetName, revision);
+        Response.ResponseBuilder builder = Response.ok().type(MediaType.APPLICATION_OCTET_STREAM)
+                .header("X-AssetName", result.assetName())
                 .header("X-PackageVersion", version)
-                .header("X-PackageVersionRevision", result.packageVersionRevision())
-                .build();
+                .header("X-PackageVersionRevision", result.packageVersionRevision());
+        if (result.contentLength() >= 0) {
+            builder.header("Content-Length", result.contentLength());
+        }
+        return StreamingResponses.streamingResponse(result.content(), stream -> builder.entity(stream).build());
     }
 
     @POST
