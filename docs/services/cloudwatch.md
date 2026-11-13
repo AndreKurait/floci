@@ -628,11 +628,29 @@ account-wide `AWS/Lambda` `ConcurrentExecutions` and reads the current Lambda co
 value from Floci's Service Quotas service. That service's existing catalog value is synthetic;
 this does not infer or fetch a production account's quota.
 
+`FILL(series, filler)` fills the missing values of one time series. The first argument is any
+expression that yields a time series; the filler is a scalar expression (`FILL(m, 0)`,
+`FILL(m, PERIOD(m) / 60)`), `REPEAT` (the most recent earlier value) or `LINEAR` (interpolation
+between the values on both sides of a gap). A missing value is a period of the requested range,
+on the same epoch-aligned grid the metric's datapoints use, that has no value, so `FILL(m, 0)`
+over a metric with no data returns zeros for every period. An alarm on such an expression
+therefore evaluates the filled values and does not reach `TreatMissingData`. As AWS warns, a
+period whose datapoints arrive after the alarm evaluates it is filled too, so a FILL alarm on a
+short period can briefly read the filler; use an M out of N alarm (`DatapointsToAlarm`) for such
+alarms. AWS leaves some details open, and Floci takes these readings: a gap
+before the first value in range stays empty for `REPEAT` and `LINEAR`, a gap after the last value
+stays empty for `LINEAR`, values before `StartTime` are not consulted, and a non-finite filler
+(such as `1/0`) fills nothing. The array forms (`FILL(METRICS(), ...)`) and a time-series filler
+are refused.
+
 The supported expressions require matching metric periods. Cyclic references, unsupported
 functions, scalar-only results, mixed periods and cross-account queries are refused.
-Invalid updates preserve the existing alarm. Advanced functions, arrays, search, anomaly
+Invalid updates preserve the existing alarm. Other functions, arrays, search, anomaly
 detection and other service-quota metric bindings remain unsupported. Expressions have bounded
-syntax size and depth, and generated quota series are limited to 100800 points per request.
+syntax size and depth. Each generated series (`FILL` or `SERVICE_QUOTA`) is limited to 100800
+points, and the series a request's expressions compute (arithmetic, `FILL` and `SERVICE_QUOTA`
+results) to 1008000 points in total; AWS paginates larger `GetMetricData` results, while Floci
+refuses them.
 `SetAlarmState` remains available for manual transitions.
 
 ### DescribeAlarms filters {#describealarms-filters}
