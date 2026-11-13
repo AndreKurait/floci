@@ -24,6 +24,7 @@ import io.github.hectorvent.floci.services.iam.model.OpenIDConnectProvider;
 import io.github.hectorvent.floci.services.iam.model.OrganizationRootFeatures;
 import io.github.hectorvent.floci.services.iam.model.PolicyVersion;
 import io.github.hectorvent.floci.services.iam.model.SessionCredential;
+import io.github.hectorvent.floci.services.iam.model.VerifiedIdentityContext;
 import io.github.hectorvent.floci.services.iam.model.VirtualMfaDevice;
 import io.github.hectorvent.floci.testing.ManualClock;
 import io.github.hectorvent.floci.testing.MutableClock;
@@ -582,7 +583,7 @@ class IamServiceTest {
         // aws:username, which the guide lists as not present for a role.
         assertEquals(new IamService.CallerArns("arn:aws:sts::123456789012:assumed-role/TestRole/s",
                         "arn:aws:iam::123456789012:role/team/TestRole",
-                        IamService.CallerArns.TYPE_ASSUMED_ROLE, "AROATESTROLEID:s", null),
+                        IamService.CallerArns.TYPE_ASSUMED_ROLE, "AROATESTROLEID:s", null).withVerifiedIdentityContext(new VerifiedIdentityContext(Map.of())),
                 service.resolveCallerArns("ASIALIVESESSION").orElseThrow().withTokenIssueTime(null));
         // An expired session answers for neither, never for one and not the other.
         assertTrue(service.resolveCallerArns("ASIAEXPIREDSESSION").isEmpty());
@@ -757,7 +758,7 @@ class IamServiceTest {
         // Acting as the user means carrying the user's principal keys, aws:username included:
         // the guide gives one to an IAM user and to no other principal.
         assertEquals(new IamService.CallerArns(alice.getArn(), alice.getArn(),
-                        IamService.CallerArns.TYPE_USER, alice.getUserId(), "alice"),
+                        IamService.CallerArns.TYPE_USER, alice.getUserId(), "alice").withVerifiedIdentityContext(new VerifiedIdentityContext(Map.of())),
                 service.resolveCallerArns("ASIASESSIONTOKEN").orElseThrow().withTokenIssueTime(null));
         assertEquals(alice.getUserId(), service.resolveCallerUserId("ASIASESSIONTOKEN", "token").orElseThrow());
     }
@@ -776,7 +777,7 @@ class IamServiceTest {
         // present for the account root.
         assertEquals(new IamService.CallerArns("arn:aws:iam::000000000000:root",
                         "arn:aws:iam::000000000000:root", IamService.CallerArns.TYPE_ACCOUNT,
-                        "000000000000", null),
+                        "000000000000", null).withVerifiedIdentityContext(new VerifiedIdentityContext(Map.of())),
                 service.resolveCallerArns("ASIAROOTSESSION").orElseThrow().withTokenIssueTime(null));
     }
 
@@ -886,7 +887,7 @@ class IamServiceTest {
         // The same aws:userid both ways, since one derivation now serves both readers, and no
         // aws:username: the guide lists it as not present for a federated user.
         assertEquals(new IamService.CallerArns(federatedArn, federatedArn,
-                        IamService.CallerArns.TYPE_FEDERATED_USER, "000000000000:Bob", null),
+                        IamService.CallerArns.TYPE_FEDERATED_USER, "000000000000:Bob", null).withVerifiedIdentityContext(new VerifiedIdentityContext(Map.of())),
                 service.resolveCallerArns("ASIAWITHPOLICY").orElseThrow().withTokenIssueTime(null));
         assertEquals("000000000000:Bob", service.resolveCallerUserId("ASIAWITHPOLICY", "token").orElseThrow());
     }
