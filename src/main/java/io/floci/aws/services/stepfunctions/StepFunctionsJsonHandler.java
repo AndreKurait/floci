@@ -15,6 +15,7 @@ import io.floci.aws.core.common.SmithyValidationErrors;
 import io.floci.aws.services.stepfunctions.model.Activity;
 import io.floci.aws.services.stepfunctions.model.ActivityTask;
 import io.floci.aws.services.stepfunctions.model.Execution;
+import io.floci.aws.services.stepfunctions.model.ExecutionConfiguration;
 import io.floci.aws.services.stepfunctions.model.HistoryEvent;
 import io.floci.aws.services.stepfunctions.model.MapRun;
 import io.floci.aws.services.stepfunctions.model.RoutingConfiguration;
@@ -58,6 +59,7 @@ public class StepFunctionsJsonHandler {
             case "CreateStateMachine" -> handleCreateStateMachine(request, region);
             case "UpdateStateMachine" -> handleUpdateStateMachine(request);
             case "DescribeStateMachine" -> handleDescribeStateMachine(request);
+            case "DescribeStateMachineForExecution" -> handleDescribeStateMachineForExecution(request);
             case "ListStateMachines" -> handleListStateMachines(request, region);
             case "DeleteStateMachine" -> handleDeleteStateMachine(request);
             case "PublishStateMachineVersion" -> handlePublishStateMachineVersion(request);
@@ -291,6 +293,50 @@ public class StepFunctionsJsonHandler {
         return Response.ok(response).build();
     }
 
+    private Response handleDescribeStateMachineForExecution(JsonNode request) {
+        String included = optionalText(request, "includedData");
+        if (included != null && !"ALL_DATA".equals(included) && !"METADATA_ONLY".equals(included)) {
+            throw new AwsException("ValidationException", "includedData must be ALL_DATA or METADATA_ONLY.", 400);
+        }
+        ExecutionConfiguration configuration = service.describeStateMachineForExecution(
+                requiredText(request, "executionArn"));
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("stateMachineArn", configuration.stateMachineArn());
+        response.put("name", configuration.name());
+        response.put("definition", "METADATA_ONLY".equals(included) ? "{}" : configuration.definition());
+        response.put("roleArn", configuration.roleArn());
+        response.put("updateDate", configuration.updateDate());
+        if (configuration.revisionId() != null) {
+            response.put("revisionId", configuration.revisionId());
+        }
+        if (configuration.loggingConfiguration() != null) {
+            JsonNode logging = executionConfigurationResponse(configuration.loggingConfiguration(),
+                    "LoggingConfiguration");
+            if (logging instanceof ObjectNode object && object.path("destinations").isArray()
+                    && object.path("destinations").isEmpty()) {
+                object.remove("destinations");
+            }
+            response.set("loggingConfiguration", logging);
+        }
+        if (configuration.tracingConfiguration() != null) {
+            response.set("tracingConfiguration", executionConfigurationResponse(
+                    configuration.tracingConfiguration(), "TracingConfiguration"));
+        }
+        if (configuration.encryptionConfiguration() != null) {
+            response.set("encryptionConfiguration", executionConfigurationResponse(
+                    configuration.encryptionConfiguration(), "EncryptionConfiguration"));
+        }
+        return Response.ok(response).build();
+    }
+
+    private JsonNode executionConfigurationResponse(JsonNode source, String type) {
+        JsonNode copy = source.deepCopy();
+        if (copy instanceof ObjectNode object) {
+            object.put("__type", "com.amazonaws.swf.base.model#" + type);
+        }
+        return copy;
+    }
+
     private Response handleListStateMachines(JsonNode request, String region) {
         Integer maxResults = parseOptionalInt(request, "maxResults");
         String nextToken = optionalText(request, "nextToken");
@@ -405,7 +451,7 @@ public class StepFunctionsJsonHandler {
     }
 
     private Response handleDescribeExecution(JsonNode request) {
-        Execution exec = service.describeExecution(request.path("executionArn").asText());
+        Execution exec = service.describeExecutionForApi(request.path("executionArn").asText());
         ObjectNode response = objectMapper.createObjectNode();
         response.put("executionArn", exec.getExecutionArn());
         response.put("stateMachineArn", exec.getStateMachineArn());
