@@ -155,6 +155,24 @@ class EcsTaskMetadataControllerTest {
         return objectMapper.valueToTree(response.getEntity());
     }
 
+    /**
+     * The endpoint reports the five ECS agent labels the task's containers carry. A key whose value
+     * Floci does not know (a task restored without its cluster ARN) is still reported, as null, as it
+     * was before the labels moved to {@code EcsAgentLabels}.
+     */
+    @Test
+    void containerMetadataReportsTheAgentLabelsAndKeepsAnUnknownCluster() {
+        JsonNode labels = body(controller.container(METADATA_ID)).path("Labels");
+        assertEquals("arn:aws:ecs:us-east-1:000000000000:cluster/metadata-cluster",
+                labels.path("com.amazonaws.ecs.cluster").asText());
+        assertEquals("app", labels.path("com.amazonaws.ecs.container-name").asText());
+
+        task.setClusterArn(null);
+        labels = body(controller.container(METADATA_ID)).path("Labels");
+        assertTrue(labels.has("com.amazonaws.ecs.cluster"), labels.toString());
+        assertTrue(labels.path("com.amazonaws.ecs.cluster").isNull(), labels.toString());
+    }
+
     @Test
     void containerMetadataReportsTheAwsMembers() {
         Response response = controller.container(METADATA_ID);
