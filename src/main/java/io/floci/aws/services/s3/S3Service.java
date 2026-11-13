@@ -481,7 +481,133 @@ public class S3Service implements Resettable, ResourceProvider {
         }
     }
 
+
+    /** A read-only native bucket receipt. It is valid only for the captured local export lifetime. */
+    public record LogExportDestination(String accountId, String region, String bucketName,
+                                       Instant creationDate, Long epoch, String policy) {
+        public List<String> policyDocuments() {
+            return policy == null || policy.isBlank() ? List.of() : List.of(policy);
+        }
+
+        public String objectArn(String key) {
+            return AwsArnUtils.Arn.global(AwsRegions.partitionFor(region), "s3", "", bucketName + "/" + key).toString();
+        }
+    }
+
+    private final ConcurrentHashMap<String, Long> logExportEpochs = new ConcurrentHashMap<>();
+    private final AtomicLong logExportEpochSequence = new AtomicLong();
+
+    public LogExportDestination readLogExportDestination(String account, String region, String bucketName) {
+        return withLock(multipartBucketLock(bucketName).readLock(), () -> {
+            Bucket bucket = nativeLogExportBucket(account, region, bucketName);
+            synchronized (bucket) {
+                return new LogExportDestination(account, region, bucketName, bucket.getCreationDate(),
+                        logExportEpochs.get(account + "/" + bucketName), bucket.getPolicy());
+            }
+        });
+    }
+
+    public LogExportDestination admitLogExportDestination(LogExportDestination receipt, String sourceArn,
+                                                           List<String> keys) {
+        return withLock(multipartBucketLock(receipt.bucketName()).writeLock(), () -> {
+            Bucket bucket = currentLogExportBucket(receipt);
+            synchronized (bucket) {
+                for (String key : keys) {
+                    requireLogExportGrant(receipt, bucket, sourceArn, key);
+                }
+                Long epoch = logExportEpochs.computeIfAbsent(receipt.accountId() + "/" + receipt.bucketName(),
+                        ignored -> logExportEpochSequence.incrementAndGet());
+                return new LogExportDestination(receipt.accountId(), receipt.region(), receipt.bucketName(),
+                        bucket.getCreationDate(), epoch, bucket.getPolicy());
+            }
+        });
+    }
+
+    public void writeLogExportObject(LogExportDestination receipt, String sourceArn, String key, byte[] bytes) {
+        S3Object written = RequestScopes.callAs(receipt.accountId(), () ->
+                withLock(multipartBucketLock(receipt.bucketName()).readLock(), () -> {
+                    Bucket bucket = currentLogExportBucket(receipt);
+                    synchronized (bucket) {
+                        requireLogExportGrant(receipt, bucket, sourceArn, key);
+                        // This core never invokes notifications. Both the stripe and monitor are released below.
+                        return storeObjectInternal(receipt.accountId(), bucket, receipt.bucketName(), key,
+                                new BytesBody(bytes), "application/gzip", Map.of(), null, null,
+                                new PutObjectOptions().withAcl("bucket-owner-full-control").withIfNoneMatch("*")
+                                        .withServerSideEncryption(bucket.getEncryptionConfiguration() == null
+                                                || bucket.getEncryptionConfiguration().isBlank() ? null : "AES256"),
+                                null, receipt.accountId());
+                    }
+                }));
+        RequestScopes.runAs(receipt.accountId(), receipt.region(), () ->
+                fireNotifications(receipt.bucketName(), key, "ObjectCreated:Put", written));
+    }
+
+    private Bucket currentLogExportBucket(LogExportDestination receipt) {
+        Bucket bucket = nativeLogExportBucket(receipt.accountId(), receipt.region(), receipt.bucketName());
+        if (!receipt.creationDate().equals(bucket.getCreationDate())
+                || !Objects.equals(receipt.epoch(), logExportEpochs.get(receipt.accountId() + "/" + receipt.bucketName()))) {
+            throw logExportDestinationError("The destination bucket lifetime changed.");
+        }
+        return bucket;
+    }
+
+    private Bucket nativeLogExportBucket(String account, String region, String bucketName) {
+        Optional<Bucket> found;
+        if (bucketStore instanceof AccountAwareStorageBackend<?> raw) {
+            @SuppressWarnings("unchecked")
+            AccountAwareStorageBackend<Bucket> aware = (AccountAwareStorageBackend<Bucket>) raw;
+            found = aware.getForAccount(account, bucketName);
+        } else {
+            found = ownerId().equals(account) ? bucketStore.get(bucketName) : Optional.empty();
+        }
+        Bucket bucket = found.filter(value -> bucketName.equals(value.getName())
+                && region.equals(value.getRegion()) && value.getCreationDate() != null)
+                .orElseThrow(() -> logExportDestinationError(
+                        "The destination must be a native bucket in the source account and Region."));
+        String encryption = bucket.getEncryptionConfiguration();
+        if (encryption != null && !encryption.isBlank()
+                && !XmlParser.extractAll(encryption, "SSEAlgorithm").equals(List.of("AES256"))) {
+            throw logExportDestinationError("This local export supports unencrypted or SSE-S3 destinations only.");
+        }
+        return bucket;
+    }
+
+    private void requireLogExportGrant(LogExportDestination receipt, Bucket bucket, String sourceArn, String key) {
+        if (!AwsArnUtils.isArnFor(sourceArn, "logs")) {
+            throw logExportDestinationError("Invalid export source.");
+        }
+        AwsArnUtils.Arn source = AwsArnUtils.parse(sourceArn);
+        if (!receipt.accountId().equals(source.accountId()) || !receipt.region().equals(source.region())
+                || !source.resource().startsWith("log-group:")) {
+            throw logExportDestinationError("Invalid export source scope.");
+        }
+        String principal = "logs." + receipt.region() + "." + AwsRegions.dnsSuffixFor(receipt.region());
+        Map<String, List<String>> conditions = Map.of(
+                "aws:PrincipalIsAWSService", List.of("true"),
+                "aws:PrincipalServiceName", List.of(principal),
+                "aws:SourceAccount", List.of(receipt.accountId()),
+                "aws:SourceArn", List.of(sourceArn),
+                "aws:ResourceAccount", List.of(receipt.accountId()),
+                "aws:RequestedRegion", List.of(receipt.region()));
+        Map<String, List<String>> writeConditions = new HashMap<>(conditions);
+        writeConditions.put("s3:x-amz-acl", List.of("bucket-owner-full-control"));
+        List<String> policy = bucket.getPolicy() == null ? List.of() : List.of(bucket.getPolicy());
+        String bucketArn = AwsArnUtils.Arn.global(AwsRegions.partitionFor(receipt.region()),
+                "s3", "", receipt.bucketName()).toString();
+        if (policyEvaluator.evaluateServicePrincipal(policy, principal, "s3:GetBucketAcl", bucketArn, conditions)
+                != IamPolicyEvaluator.Decision.ALLOW
+                || policyEvaluator.evaluateServicePrincipal(policy, principal, "s3:PutObject", receipt.objectArn(key), writeConditions)
+                != IamPolicyEvaluator.Decision.ALLOW) {
+            throw logExportDestinationError("The destination policy must allow the regional Logs service to read its ACL and write export objects.");
+        }
+    }
+
+    private static AwsException logExportDestinationError(String message) {
+        return new AwsException("InvalidParameterException", message, 400);
+    }
+
     public void clear() {
+        logExportEpochs.replaceAll((key, epoch) -> logExportEpochSequence.incrementAndGet());
         memoryDataStore.clear();
         memoryAnnotationStore.clear();
         memoryMultipartStore.clear();
@@ -604,6 +730,7 @@ public class S3Service implements Resettable, ResourceProvider {
         bucket.setOwnershipControlsConfiguration(ownershipControlsXml(ownership));
         bucket.setAcl(requestedAcl);
         bucketStore.put(bucketName, bucket);
+        logExportEpochs.put(ownerId() + "/" + bucketName, logExportEpochSequence.incrementAndGet());
         LOG.infov("Created bucket: {0} in region: {1}", bucketName, region);
         return bucket;
     }
@@ -632,6 +759,7 @@ public class S3Service implements Resettable, ResourceProvider {
             // Multipart operations take the stripe before the bucket monitor, so a delete cannot
             // sweep their temporary parts or miss an upload created just after its scan.
             synchronized (bucket) {
+                logExportEpochs.put(ownerId() + "/" + bucketName, logExportEpochSequence.incrementAndGet());
                 deleteBucketLocked(bucketName);
             }
             LOG.infov("Deleted bucket: {0}", bucketName);

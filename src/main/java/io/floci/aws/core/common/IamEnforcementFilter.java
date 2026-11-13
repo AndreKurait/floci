@@ -1500,6 +1500,13 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
      * As the public overloads; a denial is also recorded in CloudTrail when {@code deniedEvent} is given, and
      * {@code requestConditions}, when given, joins the condition context.
      */
+    /** Caller-only secondary authorization using a service's explicitly scoped, read-only policy snapshot. */
+    public void authorizeAdditionalResourceWithPolicies(String authorizationHeader, String action, String resource,
+                                                        String ownerAccount, List<String> policyDocuments) {
+        authorizeAdditionalResource(authorizationHeader, action, resource, null, ownerAccount, null, null,
+                List.copyOf(policyDocuments));
+    }
+
     private void authorizeAdditionalResource(
             String authorizationHeader,
             String action,
@@ -1508,6 +1515,18 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             String resourceOwnerAccountId,
             DeniedEvent deniedEvent,
             Map<String, List<String>> requestConditions) {
+        authorizeAdditionalResource(authorizationHeader, action, resource, resourcePolicyDecision,
+                resourceOwnerAccountId, deniedEvent, requestConditions, null);
+    }
+
+    private void authorizeAdditionalResource(
+            String authorizationHeader,
+            String action,
+            String resource,
+            ResourcePolicyDecision resourcePolicyDecision,
+            String resourceOwnerAccountId,
+            DeniedEvent deniedEvent,
+            Map<String, List<String>> requestConditions, List<String> providedPolicyDocuments) {
         if (!config.services().iam().enforcementEnabled()) {
             return;
         }
@@ -1591,8 +1610,8 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
 
             ResourcePolicyDecision effectiveDecision = resourcePolicyDecision;
             String effectiveOwnerAccountId = resourceOwnerAccountId;
-            List<String> policyDocs = null;
-            if (effectiveDecision == null) {
+            List<String> policyDocs = providedPolicyDocuments;
+            if (effectiveDecision == null && providedPolicyDocuments == null) {
                 // Resource policies belong to the service that owns the resource, which is the action's
                 // service, not whichever service the caller signed for. filter() picks them by the route's
                 // serving service for the same reason; a credential scoped to another service, or to a

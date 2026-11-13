@@ -322,7 +322,7 @@ public class AwsJson11Controller {
                 case "elasticmapreduce" -> emrHandler.handle(action, request, region);
                 case "wafv2" -> wafV2Handler.handle(action, request, region);
                 case "memorydb" -> memoryDbHandler.handle(action, request, region);
-                case "logs" -> cloudWatchLogsHandler.handle(action, request, region);
+                case "logs" -> cloudWatchLogsHandler.handle(action, request, region, authorization);
                 case "secretsmanager" -> secretsManagerJsonHandler.handle(action, request, region, authorization);
                 case "kinesis" -> kinesisJsonHandler.handle(action, request, region);
                 case "kinesisanalytics" -> kinesisAnalyticsV2JsonHandler.handle(action, request, region);
