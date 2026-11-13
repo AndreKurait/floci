@@ -582,6 +582,18 @@
         </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
+            <artifactId>cloudfrontkeyvaluestore</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>http-auth-aws-crt</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
             <artifactId>codedeploy</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
