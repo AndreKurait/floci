@@ -36,7 +36,7 @@ mark those members `failed` until a successful retry.
 
 Floci manages real PostgreSQL, MySQL, MariaDB, and SQL Server Docker containers and proxies TCP connections to them, including IAM authentication support where the protocol supports it. SQL Server uses a transparent TCP relay for its native TDS protocol.
 
-MySQL and MariaDB master-grant script uploads, and snapshot dump script and restore archive uploads,
+MySQL and MariaDB master-grant script uploads, and PostgreSQL snapshot restore archive uploads,
 retry transient Docker connection failures up to six attempts with exponential backoff starting
 at 500 ms. Every attempt sends a fresh archive. Containers start, or snapshot restore commands
 run, only after the upload succeeds. A permanent Docker error or exhausted retries follows the
@@ -165,10 +165,6 @@ RDS endpoints return the us-east-1 hosted zone ID `Z2R2ITUGPM61AM` in all region
 | `FailoverGlobalCluster` | Promote a secondary to primary (failover with `AllowDataLoss`, or switchover) |
 | `SwitchoverGlobalCluster` | Promote a secondary to primary and demote the current primary to a secondary |
 | `FailoverDBCluster` | Move a DB cluster's writer role to a reader instance, the named one or the first |
-| `CreateBlueGreenDeployment` | Stage a green copy of a DB instance with a new engine version, parameter group, class or storage; see [Blue/Green deployments](#bluegreen-deployments) |
-| `DescribeBlueGreenDeployments` | List blue/green deployments, by identifier and the `blue-green-deployment-identifier`, `blue-green-deployment-name`, `source` and `target` filters |
-| `SwitchoverBlueGreenDeployment` | Make the green instance production: it takes the blue name, ARN, endpoint and tags, and blue becomes `<name>-old1` |
-| `DeleteBlueGreenDeployment` | Delete a deployment, with `DeleteTarget` also deleting the green instance before switchover |
 | `AddTagsToResource` | Add tags to a DB resource |
 | `ListTagsForResource` | List tags for a DB resource |
 | `RemoveTagsFromResource` | Remove tags from a DB resource |
@@ -215,20 +211,6 @@ checked against the instance's other window. Modifications apply immediately —
     `Copy`, `Delete` and the `restore` attribute behave as they do for instance snapshots, under
     `arn:aws:rds:<region>:<account>:cluster-snapshot:<name>`. RDS reserved instances aren't
     modeled (there's no reserved-instance API), so tagging doesn't apply to them.
-
-!!! note "DB snapshot engines"
-
-    `CreateDBSnapshot` takes a logical copy of a PostgreSQL, MySQL or MariaDB instance, and
-    `RestoreDBInstanceFromDBSnapshot` loads it into the new instance. PostgreSQL uses `pg_dumpall`.
-    MySQL and MariaDB use `mysqldump` (`mariadb-dump`) of every user schema, with routines,
-    triggers and events, run as the master user, followed by every account other than `root` and
-    the image's system accounts, recreated from `SHOW CREATE USER` and `SHOW GRANTS` so they keep
-    their passwords. Roles are copied too, and created before any grant names them. The `mysql`
-    system schema itself is not copied. The restore waits until the new server accepts the master
-    user over TCP before loading the copy. SQL Server instances are refused with
-    `InvalidDBInstanceState`. The dump runs in one transaction, so InnoDB tables are copied as of
-    one moment; as with `mysqldump --single-transaction` elsewhere, a MyISAM or other
-    non-transactional table written to during the snapshot may not be.
 
 ## Cluster parameter groups
 
@@ -459,7 +441,7 @@ keep a cluster awake; and parameter group changes do not resume one.
 
 ## Modifying a DB instance
 
-`ModifyDBInstance` applies `DBInstanceClass` and `AllocatedStorage`, and
+`ModifyDBInstance` applies `DBInstanceClass`, `AllocatedStorage` and `EngineVersion`, and
 `DescribeDBInstances` reports the new values. Members the request leaves out keep their current
 value, so a partial modify does not reset anything.
 
@@ -471,29 +453,7 @@ value, so a partial modify does not reset anything.
   rather than refused, which is what AWS does. SQL Server takes the size it is given.
 - The same size is not a change and is left alone.
 
-Standalone container-backed instances support minor `EngineVersion` upgrades when the default
-image follows the requested version. Floci stops the proxy and database container, starts the new
-engine image on the same storage volume, and rebinds the existing endpoint. It reports `available`
-only after both the new backend and proxy have started. A failed restart reports `failed` and
-retains the storage volume.
-
-Major upgrades and downgrades fail with `InvalidParameterCombination` before any settings change.
-PostgreSQL 10 and later use the leading component as the major version; older PostgreSQL releases,
-MySQL, and MariaDB use the first two components. Existing databases need a migration for a major
-upgrade, which Floci does not perform. `AllowMajorVersionUpgrade` does not bypass this limitation.
-Custom image overrides and SQL Server do not map `EngineVersion` to a new image, so their version
-changes are also refused. Cluster members must use cluster-level engine management. Repeating the
-current version is allowed alongside other changes without restarting the database.
-
-A standalone instance created while Docker is unavailable may change its version before its first
-backend startup when its image follows the requested version. Its eventual container uses the
-updated version. Floci persists this never-started
-state, and protects the version before attempting to initialize the database, including when a later
-proxy startup fails. Existing databases remain protected against major changes after a reboot,
-storage reload, or lost container. Older records without this state are treated as existing databases.
-
-In mock mode (`FLOCI_SERVICES_RDS_MOCK=true`), `EngineVersion` updates the instance metadata.
-A minor upgrade is accepted on its own. A different major version needs
+`EngineVersion` accepts a minor upgrade on its own. A different major version needs
 `AllowMajorVersionUpgrade`, without which the request fails with `InvalidParameterCombination`.
 Major versions are compared on the leading version component, so a MySQL 8.0 to 8.4 upgrade reads
 as a minor one here while AWS treats it as major.
@@ -502,11 +462,17 @@ A refused member fails the whole request: a modify that carries a new `DBInstanc
 shrinking `AllocatedStorage` returns `InvalidParameterCombination` and leaves the class as it was,
 so a read-back never reports a value the request did not get.
 
-Accepted changes apply immediately. AWS defers a class, storage or engine-version change to the
-preferred maintenance window unless `ApplyImmediately` is set, and reports it under
-`PendingModifiedValues` until then. Floci runs no maintenance window and does not model
-`PendingModifiedValues`, so it applies accepted changes as soon as the request lands whatever
-`ApplyImmediately` says.
+Two deviations are worth knowing:
+
+- **Changes apply immediately.** AWS defers a class, storage or engine-version change to the
+  preferred maintenance window unless `ApplyImmediately` is set, and reports it under
+  `PendingModifiedValues` until then. Floci runs no maintenance window and does not model
+  `PendingModifiedValues`, so it applies the change as soon as the request lands whatever
+  `ApplyImmediately` says. Without this a deferred change would never be applied at all, and every
+  read-back would report the same drift.
+- **The backing container is not re-imaged.** An engine-version change is recorded on the instance
+  and reported on read, but the container started at create time keeps running the image it was
+  started with. This is control-plane compatibility, like Aurora Serverless v2 scaling above.
 
 For standalone, non-Aurora instances with instance-owned storage, `CreateDBInstance` and
 `ModifyDBInstance` retain the `StorageType` values `gp2`, `gp3`, `io1` and `io2`. A modify
@@ -674,14 +640,11 @@ Known gaps, all deliberate:
 ## Pagination
 
 `DescribeDBInstances`, `DescribeDBClusters`, `DescribeDBSubnetGroups`,
-`DescribeDBParameterGroups`, `DescribeDBParameters`,
+`DescribeDBParameterGroups`, `DescribeDBClusterParameterGroups`, `DescribeDBParameters`,
 `DescribeDBClusterParameters`, `DescribeOrderableDBInstanceOptions` and `DescribeOptionGroups`
 return all matching results without a `Marker`. These handlers do not yet split results by
 `MaxRecords` or resume from `Marker`. An absent marker ends pagination, including for an empty
 result; an empty marker string must not be used as a continuation token.
-
-`DescribeDBClusterParameterGroups` supports `MaxRecords` pagination and returns a
-non-empty `Marker` only when another page is available.
 
 ## Read replicas
 
@@ -702,7 +665,7 @@ The replica's database is initialised from a `pg_dumpall` of the source taken wh
 created, the same mechanism `RestoreDBInstanceFromDBSnapshot` uses, so it holds the source's data
 as of that moment. Writes made to the source afterwards are not streamed to the replica. Because
 the copy is dump based, only PostgreSQL sources are accepted; MySQL and MariaDB sources are refused
-with `InvalidDBInstanceState`, although `CreateDBSnapshot` accepts them. A source with automated backups
+with `InvalidDBInstanceState`, as `CreateDBSnapshot` refuses them. A source with automated backups
 off (`BackupRetentionPeriod` 0) is refused with the same error AWS uses.
 
 `PromoteReadReplica` clears the link on both ends, sets the requested `BackupRetentionPeriod`
@@ -711,42 +674,6 @@ connections drop while the container, endpoint and data stay. Deleting a source 
 same-region replicas; a cross-region replica keeps its link with the replication status
 `terminated` until it is promoted or deleted, which is what AWS does for PostgreSQL. Deleting a
 replica drops it from its source's list.
-
-## Blue/Green deployments
-
-`CreateBlueGreenDeployment` takes a PostgreSQL, MySQL or MariaDB DB instance by ARN as `Source`
-and creates its green copy, named `<source>-green-<suffix>`. The green instance inherits the
-blue one's settings and tags, with `TargetEngineVersion`, `TargetDBParameterGroupName`,
-`TargetDBInstanceClass`, `TargetAllocatedStorage` and `TargetStorageType` applied. Without
-`TargetDBParameterGroupName` it keeps the blue parameter group when the engine version stays in the
-same family, and gets the default group of the new family on a major upgrade. Both instances report
-the link in `DescribeDBInstances` as a read replica pair. The green database is initialised from a
-dump of the blue one taken at creation, the mechanism snapshots use, so it holds the blue data as
-of that moment; writes made to blue afterwards are not streamed to it.
-
-Creation finishes before the response, so the deployment is reported `AVAILABLE` straight away
-with its `SwitchoverDetails` and `Tasks`. As on AWS, a source needs automated backups on
-(`InvalidDBInstanceState` otherwise), a lower `TargetEngineVersion` is refused, and an instance can
-be in one deployment at a time. Floci refuses with `SourceDatabaseNotSupportedFault` an instance
-that belongs to a cluster, is a read replica or has read replicas, keeps its master password in
-Secrets Manager, or is a DB proxy target, and refuses a DB cluster source with
-`SourceClusterNotSupportedFault`. `TargetIops`, `TargetStorageThroughput` and
-`UpgradeTargetStorageConfig` are accepted and not applied, as `CreateDBInstance` treats IOPS.
-
-`SwitchoverBlueGreenDeployment` requires the deployment to be `AVAILABLE` and both instances
-available. Green takes the blue identifier, ARN, endpoint and tags, so clients that connect to the
-blue endpoint reach the new database without a change. Blue is renamed `<name>-old<n>`, moves to
-the endpoint green had, and keeps running. The deployment ends `SWITCHOVER_COMPLETED`, with
-`Source` naming the old instance and `Target` the new production one. The switchover completes
-before the response; `SwitchoverTimeout` is checked against the 30 to 3600 second range and has
-nothing else to bound. The old instance is not made read only.
-
-Before switchover, a deployment whose blue or green instance has been deleted, or whose green
-instance was promoted, reports `INVALID_CONFIGURATION` and can no longer be switched over.
-`DeleteBlueGreenDeployment` deletes the green instance too with `DeleteTarget`, which is refused
-after switchover; without it the green instance is kept as a standalone instance. The blue
-instance is never touched. A deployment is tagged through its
-`arn:aws:rds:<region>:<account>:deployment:<identifier>` ARN.
 
 ## Engine catalogue
 
@@ -933,8 +860,8 @@ they are added with `CreateDBInstance`, as on AWS.
 Floci keeps no transaction log, so it cannot rebuild a database as it was at an earlier time. The
 target is seeded from a `pg_dumpall` of the source taken when the request arrives, the mechanism read
 replicas use, so the restored data is the source's latest state whatever time in the window is
-asked for; this is also why `LatestRestorableTime` is always the current time. Only PostgreSQL
-sources are accepted.
+asked for; this is also why `LatestRestorableTime` is always the current time. As with
+`CreateDBSnapshot`, only PostgreSQL sources are accepted.
 
 ## Automated backups
 
@@ -1023,8 +950,7 @@ What differs from RDS:
 - The IAM role is not assumed and the KMS key encrypts nothing: both are recorded and reported back
   as given. The bucket must exist, or the request fails with `InvalidS3BucketFault`. A bucket in
   another region than the snapshot's is accepted and the task then ends `FAILED`, as on RDS.
-- Only PostgreSQL snapshots can be exported: the export reads a `pg_dumpall`, and a MySQL or
-  MariaDB snapshot holds a `mysqldump` instead.
+- Only PostgreSQL snapshots can be exported, since Floci's snapshots hold PostgreSQL data only.
   Any other source is refused with `InvalidExportSourceState`, and so is a snapshot that is not
   `available`.
 - `SourceArn` must name a snapshot: exporting a live DB cluster (`SourceType` `CLUSTER`) is not

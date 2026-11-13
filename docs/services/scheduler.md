@@ -10,12 +10,12 @@
 | `CreateScheduleGroup` | `POST` | `/schedule-groups/{Name}` | Create a schedule group |
 | `GetScheduleGroup` | `GET` | `/schedule-groups/{Name}` | Get schedule group details |
 | `DeleteScheduleGroup` | `DELETE` | `/schedule-groups/{Name}` | Delete a schedule group and its schedules |
-| `ListScheduleGroups` | `GET` | `/schedule-groups` | List schedule groups, paged with `MaxResults` (1-100) and `NextToken` |
+| `ListScheduleGroups` | `GET` | `/schedule-groups` | List schedule groups |
 | `CreateSchedule` | `POST` | `/schedules/{Name}` | Create a schedule |
 | `GetSchedule` | `GET` | `/schedules/{Name}` | Get schedule details |
 | `UpdateSchedule` | `PUT` | `/schedules/{Name}` | Update a schedule |
 | `DeleteSchedule` | `DELETE` | `/schedules/{Name}` | Delete a schedule |
-| `ListSchedules` | `GET` | `/schedules` | List schedules, paged with `MaxResults` (1-100) and `NextToken` |
+| `ListSchedules` | `GET` | `/schedules` | List schedules |
 | `TagResource` | `POST` | `/tags/{ResourceArn}` | Add tags to a schedule group |
 | `UntagResource` | `DELETE` | `/tags/{ResourceArn}?TagKeys=...` | Remove tags from a schedule group |
 | `ListTagsForResource` | `GET` | `/tags/{ResourceArn}` | List tags on a schedule group |
@@ -163,6 +163,7 @@ Invocation support and time-window limitations are the same as the Scheduler API
 ## Not Yet Supported
 
 - `FlexibleTimeWindow` jitter (fires deterministically at the scheduled time)
+- `NextToken`-based pagination for List operations
 
 ## Examples
 

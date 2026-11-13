@@ -92,8 +92,7 @@ class CloudFormationRedshiftClusterTest {
                 .build());
 
         WaiterResponse<DescribeStacksResponse> waiterResponse = cloudFormation.waiter()
-                .waitUntilStackCreateComplete(DescribeStacksRequest.builder().stackName(stackName).build(),
-                        TestFixtures.waiterOverride(Duration.ofHours(1)));
+                .waitUntilStackCreateComplete(r -> r.stackName(stackName));
 
         Stack stack = waiterResponse.matched().response()
                 .orElseGet(() -> cloudFormation.describeStacks(

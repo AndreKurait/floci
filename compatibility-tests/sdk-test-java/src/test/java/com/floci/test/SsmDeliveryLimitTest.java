@@ -21,10 +21,11 @@ import static org.junit.jupiter.api.Assumptions.assumeFalse;
 class SsmDeliveryLimitTest {
     @ParameterizedTest
     @ValueSource(ints = {2592001, Integer.MAX_VALUE})
-    void rejectsOversizedDeliveryWithoutCreatingWork(int timeout) {
+    void rejectsOversizedDeliveryWithoutCreatingWork(int timeout) throws Exception {
         assumeFalse(TestFixtures.isRealAws(), "Uses an emulator-only managed node");
         String instance = "i-" + UUID.randomUUID().toString().replace("-", "").substring(0, 17);
         try (SsmClient client = TestFixtures.ssmClient()) {
+            SsmManagedNodeFixture.register(instance);
             try {
                 SsmException error = assertThrows(SsmException.class,
                         () -> client.sendCommand(request(instance).timeoutSeconds(timeout).build()));
@@ -42,10 +43,11 @@ class SsmDeliveryLimitTest {
 
     @ParameterizedTest
     @ValueSource(ints = {30, 2592000})
-    void acceptsInclusiveDeliveryBounds(int timeout) {
+    void acceptsInclusiveDeliveryBounds(int timeout) throws Exception {
         assumeFalse(TestFixtures.isRealAws(), "Uses an emulator-only managed node");
         String instance = "i-" + UUID.randomUUID().toString().replace("-", "").substring(0, 17);
         try (SsmClient client = TestFixtures.ssmClient()) {
+            SsmManagedNodeFixture.register(instance);
             try {
                 Command command = client.sendCommand(request(instance).timeoutSeconds(timeout).build()).command();
                 assertEquals(timeout, command.timeoutSeconds());
@@ -58,10 +60,11 @@ class SsmDeliveryLimitTest {
     }
 
     @Test
-    void preservesOmittedDeliveryDefault() {
+    void preservesOmittedDeliveryDefault() throws Exception {
         assumeFalse(TestFixtures.isRealAws(), "Uses an emulator-only managed node");
         String instance = "i-" + UUID.randomUUID().toString().replace("-", "").substring(0, 17);
         try (SsmClient client = TestFixtures.ssmClient()) {
+            SsmManagedNodeFixture.register(instance);
             try {
                 assertEquals(3600, client.sendCommand(request(instance).build()).command().timeoutSeconds());
             } finally {

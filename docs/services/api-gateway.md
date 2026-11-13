@@ -5,6 +5,42 @@ Floci supports both API Gateway v1 (REST APIs) and API Gateway v2 (HTTP APIs).
 HTTP integrations preserve path encoding through custom domains and `execute-api` hosts as well
 as path-based endpoints. For example, `/files/a%25b` reaches an HTTP backend with `%25` intact.
 
+## REST Lambda integration permissions
+
+With IAM enforcement enabled, REST API `AWS` and `AWS_PROXY` Lambda integrations
+without configured credentials require a matching Lambda resource policy. The
+check uses the `apigateway` service principal, the exact function/version/alias
+ARN, and the API owner's `SourceAccount` and method `SourceArn`. For cross-region
+integrations, the source ARN uses the function's region, as documented by AWS.
+Removing a grant prevents subsequent integration invocations. An existing cached
+API response does not invoke Lambda again.
+
+Configured IAM roles must exist in the API owner's account, trust the `apigateway`
+service principal, and allow the qualified Lambda target through the shared IAM
+identity/resource-policy evaluator, permissions boundary and account SCPs.
+Cross-account targets require a resource-policy grant as well. Each invocation
+rechecks permissions and invokes the same captured target that was authorized.
+The role's full path and boundary attachment are retained during evaluation.
+Attached execution-role tags supply `aws:PrincipalTag/<key>` to target identity,
+resource, permissions-boundary and SCP policies. Later calls read the current tags,
+so tag changes and removal affect authorization. These role tags are not added to
+the service principal's trust context; session-tag overrides are not implemented.
+
+Trust and target-policy evaluation use the same server-clock instant for
+`aws:CurrentTime` and `aws:EpochTime`. Time-conditioned grants and denies are
+reevaluated on each invocation; this request time is not `aws:TokenIssueTime`.
+
+After trust succeeds, each evaluation resolves a temporary local role credential
+through IAM. Its session identity supplies `aws:userid` and its recorded issuance
+time supplies `aws:TokenIssueTime`. The authorization credential is revoked after
+evaluation; the Lambda workload retains its own execution-role credentials.
+
+Role checks do not synthesize service-specific trust `SourceArn` or `SourceAccount`
+conditions. Caller-passthrough credentials, HTTP/WebSocket integrations and Lambda
+authorizers remain separate paths. IAM enforcement disabled retains the existing
+permissive behavior.
+
+
 ## JWT issuer network policy
 
 HTTP API JWT authorizers fetch the configured issuer's OIDC discovery document and JWKS. Floci
@@ -96,13 +132,60 @@ Unknown integration type strings produce warnings and leave the method without a
 integration. With `failOnWarnings=true`, the import or update is rejected before
 changing the API. Leading/trailing whitespace and non-ASCII lookalikes are not accepted.
 
+### Model templates
+
+`GetModelTemplate` reads the current stored model schema. REST APIs return a VTL template
+containing a typed example JSON payload; WebSocket APIs return a VTL mapping template that
+reads the input JSON. WebSocket string values are JSON-escaped, including quotes, backslashes,
+newlines and apostrophes. Nested objects, typed arrays and finite local JSON Pointer
+references (`#/definitions/...`) are supported. Updating the model changes the next generated
+template; no generated-template cache or additional persistent state is used.
+
+This is a bounded JSON-schema subset for `application/json` models. Schema composition
+(`allOf`, `anyOf`, `oneOf`, `not`), enums, const values, union types, tuple/untyped arrays,
+external or cyclic references, and property names containing VTL delimiters (`'`, `"`, `\`,
+`$`, `#`) or control characters return `UnsupportedOperation` (HTTP 501). Validation-only
+constraints such as ranges and formats do not determine the example values. A schema must
+state a supported type, or provide `properties`/`items` from which the type can be inferred.
+The WebSocket mapping projects declared properties; undeclared input fields are not copied,
+and missing or null declared values become JSON null. Mapping inputs must match the declared
+scalar and container types; templates do not validate or coerce payloads. HTTP API templates
+remain unsupported.
+
+Local generation limits are 1,048,576 schema characters, 4,096 visited schema nodes, 32 levels
+of nesting and 262,144 output characters. These are Floci limits, not AWS service quotas.
+
+### Test invocation
+
+`TestInvokeMethod` executes the current configuration of a REST API method with a
+`MOCK` integration before deployment. It uses the same request templates, response
+selection, response templates, headers, and request validators as the live MOCK
+pipeline. The response contains the executed status, body, headers, multi-value
+headers, a local execution log, and measured latency. An integration or validation
+failure is reported in that execution result; an unknown API, resource, or method
+is a management API error.
+
+The simulated body, headers, query string, path parameters, and stage variables
+come from the request payload. They do not replace management credentials or
+change a stored stage, deployment, API key, or cache. Methods with `NONE` or
+`AWS_IAM` authorization are supported; test invocation does not run viewer IAM or
+API-key checks. The live execute endpoint continues to enforce its existing
+viewer checks. Management requests use the authenticated account and region and
+require `apigateway:POST` on the method resource when IAM enforcement is enabled.
+
+The supported scope is MOCK execution. Other integration types, custom and Cognito
+authorizers, client certificates, and a header appearing in both `headers` and
+`multiValueHeaders` are explicitly refused. Local execution logs are returned in
+the response and are not delivered to CloudWatch Logs. This does not add backend
+invocation support or change live viewer execution.
+
 ### Supported Operations
 
 | Category | Operations |
 |---|---|
 | **APIs** | CreateRestApi, ImportRestApi, PutRestApi, GetRestApi, GetRestApis, UpdateRestApi, DeleteRestApi |
 | **Resources** | CreateResource, GetResource, GetResources, UpdateResource, DeleteResource |
-| **Methods** | PutMethod, GetMethod, UpdateMethod, DeleteMethod |
+| **Methods** | PutMethod, GetMethod, UpdateMethod, DeleteMethod, TestInvokeMethod |
 | **Method Responses** | PutMethodResponse, GetMethodResponse, DeleteMethodResponse |
 | **Integrations** | PutIntegration, GetIntegration, UpdateIntegration, DeleteIntegration |
 | **Integration Responses** | PutIntegrationResponse, GetIntegrationResponse, UpdateIntegrationResponse, DeleteIntegrationResponse |
@@ -114,12 +197,28 @@ changing the API. Leading/trailing whitespace and non-ASCII lookalikes are not a
 | **Usage Plan Keys** | CreateUsagePlanKey, GetUsagePlanKey, GetUsagePlanKeys, DeleteUsagePlanKey |
 | **Request Validators** | CreateRequestValidator, GetRequestValidator, GetRequestValidators, UpdateRequestValidator, DeleteRequestValidator |
 | **Gateway Responses** | PutGatewayResponse, GetGatewayResponse, GetGatewayResponses, UpdateGatewayResponse, DeleteGatewayResponse |
-| **Models** | CreateModel, GetModel, GetModels, UpdateModel, DeleteModel |
-| **Documentation Parts** | CreateDocumentationPart, GetDocumentationPart, GetDocumentationParts, UpdateDocumentationPart, DeleteDocumentationPart |
+| **Models** | CreateModel, GetModel, GetModels, GetModelTemplate, UpdateModel, DeleteModel |
+| **Documentation Parts** | CreateDocumentationPart, GetDocumentationPart, GetDocumentationParts, UpdateDocumentationPart, DeleteDocumentationPart, ImportDocumentationParts |
+| **Documentation Versions** | CreateDocumentationVersion, GetDocumentationVersion, GetDocumentationVersions, UpdateDocumentationVersion, DeleteDocumentationVersion |
 | **Domain Names** | CreateDomainName, GetDomainName, GetDomainNames, UpdateDomainName, DeleteDomainName |
 | **Base Path Mappings** | CreateBasePathMapping, GetBasePathMapping, GetBasePathMappings, UpdateBasePathMapping, DeleteBasePathMapping |
 | **Account** | GetAccount, UpdateAccount |
 | **Tags** | TagResource, UntagResource, GetTags (ListTagsForResource) |
+
+`ImportDocumentationParts` accepts a JSON OpenAPI 2.0 or 3.0 document containing
+`x-amazon-apigateway-documentation.documentationParts`. Its default `merge` mode preserves
+existing part IDs and property attributes omitted from the import; an incoming attribute
+replaces the corresponding whole attribute, including an object or array. `overwrite`
+replaces the documentation collection and properties. An empty array in overwrite mode
+clears the collection. API resources, methods, models and other API definitions in the
+OpenAPI document are not changed by this operation.
+
+The complete import is validated before a single storage commit. Invalid locations or
+properties, duplicate canonical locations within one import, and `failOnWarnings=true`
+with parser warnings leave the prior collection intact. Warnings come from the local
+OpenAPI parser; their wording is not an exact AWS diagnostic catalog. YAML and external
+reference resolution are not supported. The extension's `version` is snapshot metadata;
+importing it does not create a documentation version.
 
 Documentation part listing covers created parts. The `UNDOCUMENTED` location status does not
 discover API locations without documentation content yet.
@@ -131,6 +230,54 @@ An ARN with an account segment is rejected with `BadRequestException` and an ARN
 Tagged REST APIs, stages, API keys, usage plans and custom domain names are discoverable through the
 [Resource Groups Tagging API](resource-groups-tagging.md), whose `TagResources` and `UntagResources`
 write REST API, stage, API key, usage plan and custom domain name tags through to API Gateway.
+
+### Documentation Versions
+
+`CreateDocumentationVersion`, `GetDocumentationVersion`, `GetDocumentationVersions`,
+`UpdateDocumentationVersion` and `DeleteDocumentationVersion` manage immutable snapshots
+of an API's documentation parts. Creation returns `201`; deletion returns `202`. A version
+retains the captured locations and typed properties after live parts are edited, imported
+or deleted. Updating a version supports only `replace /description` and preserves its
+creation date and snapshot.
+
+Associate a snapshot through `CreateDocumentationVersion.stageName`,
+`CreateStage.documentationVersion`, or `UpdateStage` with `replace /documentationVersion`.
+The stage response includes its selected version. Stage patch operations `add`, `remove`
+and `copy` for this path are unsupported. Floci returns `ConflictException` when deleting
+a version still associated with a stage; this association conflict is a local compatibility
+policy. Deleting the stage removes the association. New CloudFormation documentation
+resources are outside this feature.
+
+Creation with `stageName` publishes the snapshot and association together. Refusal of the
+storage batch leaves neither a new snapshot nor a changed association. An old, unscoped
+stage may first move unchanged into the default account's storage partition; that
+representation change can survive a later refused publication. Reads and IAM checks do
+not perform this migration. Hybrid mode retains its asynchronous durability behavior.
+
+Version listing defaults to 25 items and accepts limits from 1 through 500. Floci sorts
+versions lexically and binds each pagination token to the caller, Region, API and supplied
+limit. Keep those arguments unchanged between pages. Tokens are valid only for the current
+server process; listing does not hold a snapshot across concurrent mutations.
+
+The five version operations use their native HTTP-verb IAM actions and canonical API
+Gateway resource paths. Documentation children inherit the current REST API tags for
+`aws:ResourceTag` conditions. This inheritance grants no `GetTags` support for documentation
+children. Policy evaluation and later publication are separate operations.
+
+A pinned stage's `GetExport` includes the captured
+`x-amazon-apigateway-documentation` extension in both Swagger and OpenAPI 3 exports,
+including default exports and explicit `extensions=documentation`. Importing those
+exported bytes with `ImportDocumentationParts` reproduces the captured parts without
+creating a documentation version. The deployment definition and documentation snapshot
+remain independently selected by the stage.
+
+The complete snapshot stays in the extension. Inline documentation is limited to named
+API, model and authorizer fields, literal resource and method locations, and literal
+response status codes already present in the export. Only supported descriptive fields
+with the expected top-level JSON kind and ordinary `x-` extensions are projected;
+operational `x-amazon-apigateway-` fields are preserved. Wildcard inheritance and request or
+response parameter/body projection are not implemented. This is not full OpenAPI schema
+validation of documentation properties.
 
 ### API Key Behaviour Notes
 
@@ -172,8 +319,7 @@ explicitly request values.
 
 `DeleteApiKey` detaches the key from every usage plan before removing it, matching AWS. A usage plan key
 stores its own copy of the key value, so without that sweep a deleted key would stay listed by
-`GetUsagePlanKeys` and keep being recognised on the data plane. `DeleteUsagePlan` drops the plan's keys
-the same way, so a plan recreated with the same pinned id starts with none.
+`GetUsagePlanKeys` and keep being recognised on the data plane.
 
 `requestContext.identity.apiKey` is only populated when the `x-api-key` header matches a key that still
 exists and has `enabled` set to `true`, so disabling a key through `UpdateApiKey` takes effect
@@ -183,11 +329,6 @@ A method with `apiKeyRequired` rejects a request whose `x-api-key` is missing, u
 deleted, or not bound to the stage by a usage plan, with `403` `{"message":"Forbidden"}` and
 `x-amzn-ErrorType: ForbiddenException`, as AWS does. The header stays when the API customises its
 `INVALID_API_KEY` gateway response.
-
-A request whose key is attached to the stage's usage plan is metered on every method of that stage,
-including methods without `apiKeyRequired`, and before request validation, as measured against AWS.
-An unknown key, or one outside the stage's plans, is not metered on a method that does not require a
-key. See [Usage plan enforcement](#usage-plan-enforcement).
 
 #### API key source
 
@@ -288,6 +429,13 @@ rewrites it to internally. Both
 placements AWS accepts are honoured: an `Authorization` header and a presigned query string
 (`X-Amz-Algorithm=AWS4-HMAC-SHA256`). The credential must be scoped to the `execute-api` service.
 
+REST `AWS_IAM` permission checks retain a request's trailing slash in the
+execution ARN. A request to `/items/` is evaluated against `.../GET/items/`,
+including identity policies, cross-account API resource grants, and explicit
+denies. Resource routing still matches the `/items` method. This correction is
+limited to REST `AWS_IAM`; custom-authorizer event ARNs and HTTP API permission
+paths retain their existing behavior.
+
 Temporary credentials must also present the session token they were issued with, as
 `X-Amz-Security-Token` (a header, or a query parameter on a presigned request). As on AWS, the
 token is read only from where the signature is, and an empty one counts as sent. The token is
@@ -331,10 +479,18 @@ handling; a hand-rolled signer must include it.
 > the full check.
 
 > [!NOTE]
-> Floci authenticates the caller but does not authorize the call: it does not evaluate
-> `execute-api:Invoke` against the caller's IAM policies or a resource policy, so any validly
-> signed, known caller is let through. `principalOrgId` and `cognitoIdentity` are always null -
-> Organizations membership and identity-pool federation are not modelled.
+> With IAM enforcement enabled, HTTP API `AWS_IAM` routes require `execute-api:Invoke`
+> for the API owner's ARN and the requested stage, HTTP method and path. The `$default`
+> route uses the stage's `/$default` resource instead of a method and path. Identity policies,
+> session policies, permissions boundaries and SCPs are evaluated before dispatch, including
+> for HTTP proxy integrations. Inbound checks supply `aws:SourceIp` from the connection and
+> `aws:SecureTransport` from the request URI. Forwarded headers do not override these facts
+> under the default proxy configuration. Downstream Lambda caller checks retain their separate
+> service-call context. HTTP APIs do not support resource policies. IAM-off behavior
+> remains signature-only. The verified local `test` credential retains account-root access,
+> subject to SCPs. REST and WebSocket route policy evaluation remains unimplemented.
+> `principalOrgId` and `cognitoIdentity` are always null; Organizations membership and
+> identity-pool federation are not modelled in those event fields.
 
 ### Request Model Validation
 
@@ -385,8 +541,6 @@ This is what lets a browser read a `401`/`403`/`400` as such instead of as a COR
 | Lambda authorizer fails or throws | `AUTHORIZER_FAILURE` | `AuthorizerConfigurationException` |
 | Cognito authorizer gets no token, an invalid one, one from another pool, or one claiming none of the method's authorization scopes (`401 Unauthorized`) | `UNAUTHORIZED` | `UnauthorizedException` |
 | Method with `apiKeyRequired` and no usable `x-api-key` (`403 Forbidden`) | `INVALID_API_KEY` | `ForbiddenException` |
-| Usage plan throttle refuses the key (`429 Too Many Requests`) | `THROTTLED` | `TooManyRequestsException` |
-| Usage plan quota for the period is used up (`429 Limit Exceeded`) | `QUOTA_EXCEEDED` | `LimitExceededException` |
 | Request validator rejects a parameter / the body | `BAD_REQUEST_PARAMETERS` / `BAD_REQUEST_BODY` | `BadRequestException` |
 | `passthroughBehavior` rejects the request `Content-Type` (`415`) | `UNSUPPORTED_MEDIA_TYPE` | `BadRequestException` |
 | Missing or unresolvable integration or URI, MOCK template that does not render | `API_CONFIGURATION_ERROR` | `InternalServerErrorException` |
@@ -395,20 +549,19 @@ This is what lets a browser read a `401`/`403`/`400` as such instead of as a COR
 A customised `statusCode` overrides the status Floci would otherwise send; the `x-amzn-ErrorType` stays, as on AWS.
 A gateway response that maps its own `gatewayresponse.header.x-amzn-ErrorType` (that exact key) replaces it for
 `BAD_REQUEST_PARAMETERS`, `BAD_REQUEST_BODY`, `UNSUPPORTED_MEDIA_TYPE`, `API_CONFIGURATION_ERROR` and
-`INTEGRATION_FAILURE`, and is sent ahead of it for the other types, as AWS does. Request size and WAF
-answers are not produced on the execute plane, so `REQUEST_TOO_LARGE` and `WAF_FILTERED` can be
-configured but never fire, and an `HTTP`/`HTTP_PROXY` backend's own status is relayed rather than
-treated as a gateway response.
+`INTEGRATION_FAILURE`, and is sent ahead of it for the other types, as AWS does. Throttling, quota, request
+size and WAF answers are not produced on the execute plane, so
+`THROTTLED`, `QUOTA_EXCEEDED`, `REQUEST_TOO_LARGE` and `WAF_FILTERED` can be configured but never
+fire, and an `HTTP`/`HTTP_PROXY` backend's own status is relayed rather than treated as a gateway
+response.
 
 ### Not Implemented
 
 These management-plane operations have no handler in v1. Calls will return `404` or an error:
 
 - Authorizer testing: `TestInvokeAuthorizer`
-- Model templates: `GetModelTemplate`
 - Documentation versions (5 operations)
 - Client Certificates (5 operations)
-- `ImportDocumentationParts`
 
 The execute plane (actual proxied HTTP traffic via `/restapis/{id}/{stage}/_user_request_/…`)
 is implemented separately and is not counted as management-plane operations. A deployed REST
@@ -525,7 +678,7 @@ persisted deployments without a snapshot must be redeployed before export; Floci
 `BadRequestException` rather than exporting the live definition.
 
 This exports Floci's stored configuration, not the original uploaded document. Unsupported metadata,
-Postman extensions and full documentation exports are outside this operation's scope. Non-JSON models are rejected. Swagger supports only one body schema per
+Postman extensions and inline documentation beyond the supported projections described above are outside this operation's scope. Non-JSON models are rejected. Swagger supports only one body schema per
 operation, so methods using different request models per content type cannot be exported as Swagger;
 use `oas30` instead. Swagger response headers do not retain the method-response required flag.
 Integration responses must have distinct selection patterns to fit OpenAPI's response map. Duplicate
@@ -546,7 +699,7 @@ in that map, return `BadRequestException` rather than silently discarding or cha
 | `contentHandling` | `CONVERT_TO_TEXT` base64-encodes a binary request for mapping templates; `CONVERT_TO_BINARY` base64-decodes a text request before sending it |
 | `connectionType` / `connectionId` | `VPC_LINK` requires `connectionId` to name an existing, available VPC link; an unknown link yields `502` |
 | `cacheNamespace` / `cacheKeyParameters` | Form the response cache key (see below) |
-| `credentials` | Persisted and returned. Floci does not enforce IAM, so the role is not actually assumed |
+| `credentials` | Persisted and returned. With IAM enforcement enabled, REST Lambda integration roles and documented caller passthrough are checked as described above. Other service integrations retain their existing behavior |
 
 Integration responses additionally accept `contentHandling`, applied as an output conversion after response templates.
 
@@ -640,12 +793,8 @@ an offset inside it, a per-method throttle needs a plan throttle, and adding a s
 lists is a `ConflictException`. `AWS::ApiGateway::UsagePlan` maps its `ApiStages`, with each stage's
 `Throttle`, and its `Throttle` and `Quota` the same way, and an update replaces them.
 
-`GetUsagePlans` with a `keyId` returns only the plans that key is added to, and an empty list for a key
-in no plan or an unknown key. A blank `keyId` lists every plan, as on AWS. Every matching plan comes
-back in one page.
-
-Floci does not check that a stage's API, stage or method exists. The plan's throttle and quota are
-enforced on the execute plane, see [Usage plan enforcement](#usage-plan-enforcement).
+Floci does not check that a stage's API, stage or method exists, does not filter `GetUsagePlans` by
+`keyId`, and does not enforce throttles or quotas.
 
 A `CreateUsagePlan` body member of the wrong JSON type is a `SerializationException` with API
 Gateway's deserializer message, before anything else is validated. The message names the Java class
@@ -688,32 +837,9 @@ The lower bound is a deliberate divergence: real API Gateway answers `limit=0` a
 an `InternalFailure`, which is a fault rather than a contract, so a page size below one is rejected
 as a `BadRequestException` instead of reproducing a 500.
 
-`used` is the number of calls the key made through the plan's stages on that UTC day, and `remaining`
-is the quota limit minus the key's use from the start of the quota period through that day. A plan
-without a quota reports `[0, 0]` for every day, as AWS does. Floci lists every key attached to the
-plan, while AWS lists only the keys with usage in the range.
-
-### Usage plan enforcement
-
-A call with a key attached to the stage's usage plan is counted against that key, per plan and UTC
-day, across all stages of the plan. Counts are kept in the `apigateway-usage.json` store, so they
-follow the configured storage mode. Deleting the plan or the key drops its counts, so a plan or key
-recreated with the same id starts unused.
-
-- **Quota.** Once the key's use in the current period reaches `quota.limit`, the call is refused with
-  `429` `{"message":"Limit Exceeded"}` and `x-amzn-ErrorType: LimitExceededException`. A `DAY` period
-  starts at UTC midnight, a `WEEK` period on Sunday and a `MONTH` period on the 1st, each shifted by
-  `quota.offset` days. AWS bounds the offset to the period's length but does not document the anchor,
-  so the anchor is inferred.
-- **Throttle.** The plan's `throttle` is a token bucket per key that starts full at `burstLimit` and
-  refills at `rateLimit` requests per second. Buckets are held in memory, so a restart or an emulator
-  reset refills them. An empty bucket refuses the call with `429`
-  `{"message":"Too Many Requests"}` and `x-amzn-ErrorType: TooManyRequestsException`. AWS throttles on
-  a best-effort basis, so the exact moment a burst is cut off can differ. Per-method stage throttles
-  and stage or account level throttles are stored but not enforced.
-
-A refused call is not counted, and a call without a key, or with a key outside the stage's plans, is
-not metered.
+**Both numbers are always zero.** Nothing meters requests per API key, so there is no use to report
+or to subtract from a plan's quota. Throttle settings and quotas are stored and returned but never
+enforced.
 
 ### Usage Plan Tags and Custom IDs
 
@@ -770,15 +896,6 @@ Gateway v1 (`AWS`/Lambda mapping templates) and the AppSync resolver templates d
 
 ## API Gateway v2 (HTTP and WebSocket APIs) {#v2}
 
-### Integration descriptions
-
-`CreateIntegration` and `UpdateIntegration` retain the optional `description`, which
-is returned by create, update, get, and list operations. Omitting it or supplying null on update
-preserves the stored value; setting it to an empty string clears the description.
-The JSON 1.1 compatibility endpoint exposes the same field as `Description`.
-Non-null descriptions must be strings. Other JSON types return `400 BadRequestException`
-before the integration is created or changed.
-
 ### HTTP and WebSocket integration credentials
 
 V2 management APIs retain `credentialsArn` for integrations and
@@ -790,8 +907,12 @@ HTTP targets. OpenAPI import and CloudFormation API `Body` map the integration
 Integration copies and authorizer restore paths retain them too.
 
 This models credential selection; execution-role assumption and credential-based
-Lambda invocation authorization are not implemented by this change. Dedicated
-CloudFormation credential properties remain outside this support.
+Lambda invocation authorization are not implemented by this change.
+
+CloudFormation V2 integrations and authorizers retain their credential role properties.
+Updating a template replaces credentials in place; removing the property clears the role
+and selects resource-based permissions. Integration connection rollback also restores
+credentials. This models credential selection, not invocation authorization or role assumption.
 
 **Protocol:** REST JSON
 **Endpoint:** `http://localhost:4566/v2/apis/...`
@@ -847,63 +968,6 @@ authorizer's context into request headers, query strings, and paths. For a retur
 `requestParameters`. String, numeric, and boolean context values are rendered as
 text. This works with format `1.0` policy responses and format `2.0` simple responses.
 
-HTTP API `AWS_PROXY` integrations accept every `integrationSubtype` AWS defines:
-`EventBridge-PutEvents`, `SQS-SendMessage`, `SQS-ReceiveMessage`, `SQS-DeleteMessage`,
-`SQS-PurgeQueue`, `AppConfig-GetConfiguration`, `Kinesis-PutRecord`,
-`StepFunctions-StartExecution`, `StepFunctions-StartSyncExecution` and
-`StepFunctions-StopExecution`. `requestParameters` name the action's inputs, and create, update
-and OpenAPI import and reimport check them against that subtype's required and optional
-parameters from the AWS reference. They reject a required parameter that is missing, null or
-empty, any other parameter name, a JSON parameter such as `MessageAttributes` that is neither a
-JSON object nor a whole expression, a name that is not a subtype, a subtype on a non-`AWS_PROXY`
-integration or a WebSocket API, and a `payloadFormatVersion` other than `1.0`. `1.0` is the default
-when a subtype is set, including on an update that adds a subtype to an integration that had none.
-A number or boolean parameter value is stored as its text, and an object or array value is
-rejected. `UpdateIntegration` merges `requestParameters` into the stored ones for every HTTP API
-integration, as AWS does: a key it names is added or replaced, a key whose value is an empty string
-is removed, and a key it leaves out is kept. The subtype check runs on the merged parameters, so an
-update that sets only `DelaySeconds` keeps `QueueUrl` and `MessageBody`, and one that sets `QueueUrl`
-to an empty string is rejected. Import and reimport check every integration in the document before changing anything,
-so a rejected reimport leaves the API as it was. CloudFormation carries `IntegrationSubtype` and
-`RequestParameters` from an `AWS::ApiGatewayV2::Integration` and from the
-`x-amazon-apigateway-integration` extension of an `AWS::ApiGatewayV2::Api` `Body`. OpenAPI import
-and a CloudFormation `Body` read a `requestParameters` value the same way: a number or boolean as
-its text, and an object or array as its JSON text, so an object `MessageAttributes` is accepted and
-an array one is rejected as not a JSON object. A CloudFormation
-update that drops `IntegrationSubtype` removes it from the integration, and a failed update that
-added one rolls back to an integration without it.
-
-Only `SQS-SendMessage` is invoked: each request is sent to an SQS queue instead of a Lambda
-function. A request that reaches any other subtype answers `500` with
-`{"message":"Internal Server Error"}`. For `SQS-SendMessage`, `QueueUrl` and `MessageBody` are
-required, and `DelaySeconds`, `MessageAttributes`, `MessageDeduplicationId`, `MessageGroupId`,
-`MessageSystemAttributes` and `Region` are optional. A value is a static string, a whole
-expression, or text with expressions embedded as `${request.header.Authorization}`. The
-expressions are `$request.body`, `$request.body.<JSONPath>`, `$request.header.<name>`,
-`$request.querystring.<name>`, `$request.path.<name>`, `$stageVariables.<name>`, and these
-`$context` variables: `accountId`, `apiId`, `domainName`, `domainPrefix`, `extendedRequestId`,
-`httpMethod`, `path`, `protocol`, `requestTime`, `requestTimeEpoch`, `routeKey`, `stage`,
-`requestId`, `identity.sourceIp`, `authorizer.<key>` and `authorizer.claims.<claim>`. `requestId`
-and `domainName` are the values the rest of the gateway reports for the request, and `path`
-starts with the stage name, as in `/test/send`, except on the `$default` stage. An expression
-with any other source is rejected with `400 BadRequestException` on create, update and import,
-including one embedded as `${...}` or inside a JSON parameter's string values. A `$` inside static
-text without braces, as in `price $5`, stays literal. A `$context` variable outside the list
-resolves to nothing, or to an empty string where it is embedded. `MessageAttributes`
-and `MessageSystemAttributes` are JSON object templates: expressions are resolved only inside
-their string values, so a header holding quotes or braces stays one string value and cannot add
-attributes. This differs from AWS, which substitutes the raw text into the template before
-parsing it: a value that is meant to add JSON structure becomes one string here. A JSON parameter
-that is a whole expression and resolves to anything but a JSON object answers `400` with
-`InvalidParameterValue`. `Region` selects the queue's region; when it is absent or resolves to an
-empty string, the API's region is used. `QueueUrl` is sent as resolved, so a mapped value can
-name any queue in the emulator. A sent message answers `200` with
-`{"SendMessageResponse":{"ResponseMetadata":{"RequestId":...},"SendMessageResult":{...}}}`; a
-required parameter that resolves to nothing, such as an empty body for `$request.body`, answers
-`400` with `{"Error":{"Code":"MissingParameter",...}}` (a value of only whitespace is sent as it is,
-since SQS accepts it), and an SQS error is relayed in the same
-shape with its status. `credentialsArn` is stored but not enforced, as for every other integration.
-
 A Lambda proxy integration's response is read as AWS reads it (measured): a function that raises, a
 format 1.0 result that is not an object with a `statusCode`, and a `statusCode` that is not a whole
 number from 100 to 599 (text that spells one, such as `"201"`, is taken) are answered `500` with
@@ -952,6 +1016,10 @@ Conditions can test `aws:SourceIp` (IPv4 and IPv6 CIDR ranges), `aws:SecureTrans
 `aws:CurrentTime`. The source IP is the connection's transport address, so a
 caller-supplied `X-Forwarded-For` header does not override it. An empty `Condition`
 object places no condition on its statement, as in IAM.
+
+HTTP API Lambda proxy events and both REQUEST authorizer payload formats report that
+same connection address in their `sourceIp` field. Forwarded headers remain headers;
+they do not replace the client address in the event context.
 
 ### HTTP API private integrations
 
@@ -1007,7 +1075,7 @@ listener relays the request unchanged and does not add a hop.
 | **Authorizers** | CreateAuthorizer, GetAuthorizer, GetAuthorizers, UpdateAuthorizer, DeleteAuthorizer |
 | **Stages** | CreateStage, GetStage, GetStages, UpdateStage, DeleteStage |
 | **Deployments** | CreateDeployment, GetDeployment, GetDeployments, UpdateDeployment, DeleteDeployment |
-| **Models** | CreateModel, GetModel, GetModels, UpdateModel, DeleteModel |
+| **Models** | CreateModel, GetModel, GetModels, GetModelTemplate, UpdateModel, DeleteModel |
 | **Domain Names** | CreateDomainName, GetDomainName, GetDomainNames, UpdateDomainName, DeleteDomainName |
 | **API Mappings** | CreateApiMapping, GetApiMapping, GetApiMappings, UpdateApiMapping, DeleteApiMapping |
 | **VPC Links** | CreateVpcLink, GetVpcLink, GetVpcLinks, UpdateVpcLink, DeleteVpcLink |
@@ -1016,10 +1084,6 @@ listener relays the request unchanged and does not add a hop.
 `TagResource`, `UntagResource` and `GetTags` accept API, stage and VPC link ARNs
 (`arn:<partition>:apigateway:<region>::/vpclinks/<vpcLinkId>`). `UpdateVpcLink` changes only the
 name, as in the API model.
-
-`GetApis` pages with `MaxResults` and `NextToken`: a page holds at most `MaxResults` APIs and
-carries a `NextToken` unless it is the last. Without `MaxResults` every API comes back on one page.
-A `MaxResults` below 1 or an unreadable `NextToken` is refused with `BadRequestException`.
 
 ### Custom Domain Names and API Mappings
 
@@ -1203,3 +1267,188 @@ aws apigatewayv2 create-stage \
 # Disconnect a client
 # curl -X DELETE http://localhost:4566/execute-api/$WS_API_ID/prod/@connections/$CONNECTION_ID
 ```
+
+REST Lambda authorizers retain `authorizerCredentials` through management, OpenAPI import/export and CloudFormation provisioning. The credential patch path supports `replace`; a null replacement clears the configured role. Omitted credential updates preserve the stored value. Credential retention does not itself enforce invocation permissions or assume the configured role.
+
+HTTP API import and reimport check `iam:PassRole` for assigned AWS integration and REQUEST
+Lambda authorizer execution roles when IAM enforcement is enabled. The check uses the same
+normalized OpenAPI plan as the importer, including YAML and ANY-method operations, before
+creating or replacing API resources. Caller credentials, omitted or null credentials, HTTP
+integration credentials and JWT authorizer fields do not pass an execution role. This check
+does not add OpenAPI reference resolution or AWS-variable substitution beyond the existing importer.
+
+REST Lambda authorizers without `authorizerCredentials` check the Lambda resource
+policy when IAM enforcement is enabled. TOKEN and REQUEST authorizers use the API
+owner, the `execute-api` ARN `<api-id>/authorizers/<authorizer-id>`, and the exact
+qualified Lambda target. Missing permission returns an authorizer configuration
+error before invoking Lambda. Cached authorizer results do not invoke Lambda; a
+cache miss or stage cache flush makes the next invocation check permission again.
+Configured REST Lambda authorizer roles are checked when IAM enforcement is enabled.
+The role must belong to the API owner, trust API Gateway, and permit invocation of
+the qualified target through identity/resource policies, permissions boundaries
+and SCPs. Cached authorizer results do not invoke Lambda; the next invocation after
+cache expiry or flush checks current permissions. Missing credentials continue to
+use Lambda resource-based permissions.
+
+This local role evaluation does not issue STS credentials or establish all
+service-specific trust condition keys. Integration caller-passthrough credentials
+are not an authorizer credential mode. Live AWS or native-image parity remains
+outside this support.
+
+WebSocket REQUEST authorizers without `authorizerCredentialsArn` check the Lambda
+resource policy when IAM enforcement is enabled. The check uses the API account,
+the `execute-api` ARN `<api-id>/authorizers/<authorizer-id>`, and the exact
+qualified Lambda target. Missing permission returns the existing authorizer
+configuration error before invocation. Configured authorizer roles retain their
+separate execution path; this check does not implement role assumption.
+
+HTTP API Lambda REQUEST authorizers without `authorizerCredentialsArn` check the
+Lambda resource policy when IAM enforcement is enabled. The permission uses the API
+owner and region, the source ARN `<api-id>/authorizers/<authorizer-id>`, and the exact
+qualified Lambda target. Missing permission returns HTTP 500 before invocation;
+missing identity still returns HTTP 401 first. Configured authorizer roles retain
+their separate execution path. This check does not implement role assumption.
+
+WebSocket Lambda integrations (`AWS` and `AWS_PROXY`) without credentials check Lambda resource permissions when IAM enforcement is enabled. Grants must allow API Gateway for the qualified function and source API, stage, and selected route. Configured-role and caller-passthrough credentials retain their separate invocation behavior.
+
+HTTP API AWS/AWS_PROXY Lambda integrations without `credentialsArn` check Lambda
+resource policies when IAM enforcement is enabled. The check uses the API owner,
+stage, HTTP method and request path, the Lambda function region, and the exact
+qualified target passed to invocation. Missing permission returns HTTP 500 before
+invocation. Configured roles and caller passthrough retain their separate paths;
+this check does not implement role assumption.
+
+### REST Lambda caller passthrough
+
+For REST `AWS` and `AWS_PROXY` Lambda integrations, the documented IAM caller sentinel
+(`arn:<partition>:iam::*:user/*`) forwards a verified SigV4 identity into Lambda permission
+evaluation when IAM enforcement is enabled. The caller's current identity and session policies,
+permissions boundary, SCPs and the target's resource policy are evaluated for the exact qualified
+function. Cross-account calls require both identity and resource grants. No execution role is
+assumed for this mode, and an anonymous or invalid signature cannot supply a caller identity.
+The API owner still determines the integration configuration; the caller can belong to a different
+account. Cached responses do not invoke Lambda again.
+
+The verified local `test` credential represents account root and still obeys resource-policy and SCP denials.
+IAM-disabled behavior and the historical bare `*` credential spelling retain their local bypass;
+bare `*` is not the documented AWS sentinel. This check is distinct from `execute-api:Invoke`
+route authorization. Issued session identities are read from IAM, not synthesized; full forwarded
+request condition context, other service integrations and HTTP/WebSocket caller modes remain
+outside this implementation.
+
+When IAM enforcement is enabled, HTTP API Lambda integrations with an execution role
+require API Gateway role trust and invocation permission through the shared identity,
+resource-policy, permissions-boundary and SCP evaluators. Cross-account targets also
+require a resource-policy grant. Authorization and invocation use one qualified target.
+The partition-aware `arn:aws:iam::*:user/*` credentials sentinel forwards the verified
+caller's invocation permissions. Signature verification binds the request path, query
+and body; identity, resource policies, session policies, permissions boundaries and
+SCPs use the shared IAM evaluator. Missing or invalid caller credentials return HTTP
+500 before invocation when IAM enforcement is enabled. The historical bare `*`
+compatibility spelling is preserved separately. Full forwarded condition context and
+issuance of execution-role STS sessions remain outside this behavior.
+
+HTTP API REQUEST Lambda authorizers with configured execution roles check API-owner role trust and Lambda invocation permissions when IAM enforcement is enabled. Role identity policies, resource policies, permissions boundaries and SCPs are evaluated against the same qualified target used for invocation. Absent credentials retain service-principal resource-policy authorization. Authorizer credentials support role ARNs, not the integration caller-credentials sentinel. Actual execution-role STS session issuance and full condition-context forwarding are not modeled by this check.
+
+WebSocket REQUEST Lambda authorizers with configured credentials check the API owner's IAM role trust and Lambda invocation permissions when IAM enforcement is enabled. The role must trust API Gateway; shared identity/resource policy, permissions boundary and SCP evaluation applies to the same qualified function invoked. Foreign-account targets also require a resource grant. Missing credentials retain Lambda resource-policy authorization. Full service trust condition context and actual issued execution-role STS sessions are not modeled by this check.
+
+WebSocket Lambda integrations with a configured execution role check API Gateway service trust and the role's identity, resource, permissions-boundary and SCP policies when IAM enforcement is enabled. The API owner account and partition constrain the role; qualified targets are resolved once before authorization and invocation. The caller-credentials sentinel and legacy bare-star compatibility path remain separate from role enforcement. Issued execution-role STS sessions and full condition-context forwarding are not modeled by this check.
+
+WebSocket Lambda integrations using the documented `arn:<partition>:iam::*:user/*` caller credential require a verified SigV4 handshake identity when IAM enforcement is enabled. The private connection identity is retained for message and disconnect invocations, but permissions are evaluated again for every invocation against current caller/session, identity, resource, boundary and SCP policies. Signature headers and caller metadata are not read from message payloads. The legacy bare `*` credential remains a local compatibility bypass. This forwarding check does not enforce `execute-api:Invoke` route permissions or issue execution-role STS sessions.
+
+WebSocket `$connect` routes configured with `AWS_IAM` require a verified SigV4 handshake and `execute-api:Invoke` on the API owner, region, stage and `$connect` route when IAM enforcement is enabled. Authorization runs before the upgrade, including when no integration is configured. It uses current caller/session policies, permissions boundaries and SCPs. New connections observe revocation; route authorization is performed at connection time. This is separate from the Lambda caller-permission check on each message or disconnect invocation. IAM-disabled local connections and non-IAM routes retain their existing behavior. REST route authorization, full forwarded condition context and issued execution-role STS sessions remain separate work.
+
+
+### REST IAM route authorization
+
+With IAM enforcement enabled, REST methods configured with `AWS_IAM` require both a verified
+SigV4 caller and authorization for `execute-api:Invoke` on the API owner, region, stage, concrete
+HTTP method and requested resource path. The shared IAM evaluator combines identity, session,
+permissions-boundary, SCP and stored REST resource policies. Cross-account access requires both
+identity and resource grants. Explicit denials take precedence. Lambda integration permissions
+remain a separate check against the same qualified function that is invoked.
+
+Stored policy resources using `execute-api:/stage/METHOD/path` are expanded for evaluation against
+the owning API without changing stored readback. AWS expands this shorthand when saving the policy.
+This uses the existing live API policy storage; deployment-snapshot policy activation is not modeled
+here. Resource-policy workflows for unsigned, CUSTOM and Cognito routes, full inbound condition
+context and actual service execution-role STS sessions remain separate work. IAM-disabled routes
+retain signature validation without requiring policy grants.
+
+When IAM enforcement is enabled, REST methods using `NONE` require an explicit anonymous grant from an attached resource policy. Cognito user-pool methods authenticate the token first, then require that resource-policy grant. Missing policies retain existing access; an explicit deny or an attached policy without a matching allow rejects the request before backend dispatch. Source-IP conditions use the connection address, not `X-Forwarded-For`. These checks evaluate the current stored policy, not a deployment snapshot. CUSTOM authorizer/resource-policy combination, complete inbound condition context and actual service execution-role sessions remain separate limitations.
+
+REST `CUSTOM` authorizers combine their validated policy with the API resource policy when IAM enforcement is enabled. An explicit resource-policy deny stops the request before the authorizer is called. After authorizer evaluation, either policy can grant access, while an explicit deny from either policy wins. The API policy is evaluated for every request, including authorizer cache hits; flushing the authorizer cache still invalidates its cached policy. Custom `principalId` strings do not establish a verified IAM identity. The current transport source-IP and secure-transport conditions are supported; complete inbound condition context and deployment-snapshot policy activation remain separate limitations.
+
+REST `AWS_IAM` route policy evaluation supplies `aws:SourceIp` from the connection and
+`aws:SecureTransport` from the request URI scheme to the shared identity, resource, session,
+boundary and SCP evaluators. Forwarded IP/protocol headers do not supply these values under
+the default server configuration. The downstream Lambda caller-permission check remains a
+separate service call and does not inherit these inbound transport keys. Other inbound
+condition keys and transport-context propagation for HTTP/WebSocket routes remain separate work.
+
+WebSocket `AWS_IAM` connection authorization evaluates `aws:SourceIp` and
+`aws:SecureTransport` from the upgrade connection through the shared caller policy
+evaluator. Forwarded headers do not replace these connection facts. This applies
+to connection authorization, separately from downstream integration permissions.
+
+Caller policy evaluation supplies `aws:CurrentTime` and `aws:EpochTime` from the
+server clock. The same instant is used for caller session expiry and time-based
+identity, session, boundary, SCP and resource-policy conditions. REST anonymous
+and custom-authorizer resource-policy checks also receive these time keys.
+These values do not come from client-supplied date headers.
+
+REST resource-policy evaluation for callers without verified AWS credentials leaves
+`aws:PrincipalIsAWSService` absent. `Bool` matching `false` does not match an
+absent key; `Null` and `BoolIfExists` retain their IAM condition semantics.
+A Cognito token or custom authorizer principal does not become an AWS credential.
+
+### WebSocket connection management permissions
+
+With IAM enforcement enabled, GET, POST and DELETE requests to `@connections`
+require a verified SigV4 caller and `execute-api:ManageConnections` permission.
+The resource is the API owner's `api-id/stage/METHOD/@connections` ARN, without
+an individual connection ID. Identity policies, session policies, permissions
+boundaries and SCPs use the shared caller evaluator. Policy changes apply to
+every request, and a permitted endpoint cannot access another API or stage's
+connection. IAM-disabled local connection management remains unsigned.
+
+Policy denial returns 403 `ForbiddenException` before connection lookup; an
+authorized request for another API's, stage's or region's connection returns 410.
+POST retains its 128 KiB payload limit after authorization, including when the
+connection is absent.
+
+### CloudFormation V2 authorizer update rollback
+
+CloudFormation in-place updates to standalone V2 authorizers snapshot their complete
+configuration before mutation. Failure during the update or in a later stack
+resource restores the previous authorizer ID, credentials and settings. Failed
+restoration keeps the snapshot for rollback retry; successful stack updates clear
+it. Deployment activation, concurrent transaction isolation and process-crash
+recovery remain outside this rollback support.
+
+### CloudFormation V2 child replacement
+
+CloudFormation replaces standalone V2 authorizers, integrations, routes, stages and
+deployments when their `ApiId` changes. Replacement cleanup tracks the owning API
+alongside each child ID, including stages with the same name on different APIs.
+`Ref` continues to return the child ID or stage name. A later stack failure restores
+the previous child; `UpdateReplacePolicy: Retain` keeps a displaced child. Stage
+name changes also replace the stage. Cleanup uses the recorded `ApiId`.
+
+Older persisted children without `ApiId` recover ownership from the previous stack
+template, saved parameters and resource identities before update or deletion.
+Recovered metadata is saved before a child changes, and failed updates retain the
+previous stack tags. Policy-retained resources and resources explicitly retained by
+`DeleteStack` need no ownership recovery. Unresolved historical ownership fails
+without scanning other APIs or guessing from live exports, dynamic references or
+current SSM values. Stored-record reload support does not establish process-crash
+atomicity.
+
+CloudFormation replaces an `AWS::ApiGatewayV2::Api` when `ProtocolType` changes.
+Referenced children move to the new API through their recorded parent identities.
+The old API remains available until the update commits, and
+`UpdateReplacePolicy: Retain` preserves it. Rollback restores the old API identity
+and Body ownership metadata, deleting the replacement through the shared retryable
+cleanup lifecycle. Ordinary API name updates remain in place. These lifecycle
+checks use local SDK and service tests; they do not establish deployment activation
+or live AWS parity.

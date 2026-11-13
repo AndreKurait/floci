@@ -13,7 +13,6 @@ import software.amazon.awssdk.services.ecs.EcsClient;
 import software.amazon.awssdk.services.ecs.model.ContainerDefinition;
 import software.amazon.awssdk.services.ecs.model.CreateClusterRequest;
 import software.amazon.awssdk.services.ecs.model.DeleteClusterRequest;
-import software.amazon.awssdk.services.ecs.model.DescribeTasksRequest;
 import software.amazon.awssdk.services.ecs.model.ExecuteCommandRequest;
 import software.amazon.awssdk.services.ecs.model.LaunchType;
 import software.amazon.awssdk.services.ecs.model.LogConfiguration;
@@ -30,7 +29,6 @@ import java.net.http.WebSocket;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
-import java.time.Duration;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -90,12 +88,6 @@ class EcsRunningTaskTest {
                 .enableExecuteCommand(true)
                 .count(1)
                 .build()).tasks().get(0).taskArn();
-        // RunTask answers before the images are pulled; ExecuteCommand needs the task RUNNING.
-        ecs.waiter().waitUntilTasksRunning(DescribeTasksRequest.builder()
-                        .cluster(clusterName)
-                        .tasks(taskArn)
-                        .build(),
-                TestFixtures.waiterOverride(Duration.ofSeconds(60)));
     }
 
     @AfterAll

@@ -7,6 +7,7 @@ Route53 emulation supporting hosted zones, reusable delegation sets, resource re
 <!-- floci:actions:start -->
 | Action | Description |
 | --- | --- |
+| `TestDNSAnswer` | `GET /2013-04-01/testdnsanswer`. Evaluates supported records in a selected public hosted zone; see limitations below. |
 | `CreateReusableDelegationSet` | `POST /2013-04-01/delegationset`. Optionally promotes an existing public zone with `HostedZoneId`. |
 | `GetReusableDelegationSet` | `GET /2013-04-01/delegationset/{Id}` |
 | `DeleteReusableDelegationSet` | `DELETE /2013-04-01/delegationset/{Id}`. Refuses to delete a set in use by a zone. |
@@ -60,26 +61,82 @@ Route53 emulation supporting hosted zones, reusable delegation sets, resource re
 - Private hosted zones support up to 300 VPC associations and up to 1000 outstanding cross-account VPC association authorizations, matching the documented Route 53 default quotas.
 - Set `FLOCI_SERVICES_ROUTE53_VPC_ASSOCIATION_CONTROL_PLANE_DELAY_MS` above `0` to emulate a short in-flight control-plane window for retry testing. During that window, a subsequent `AssociateVPCWithHostedZone` for the same hosted zone returns `PriorRequestNotComplete`; overlapping create/delete authorization requests return `ConcurrentModification`. These are the retryable overlap errors documented by Route 53 for those operations.
 
+## Testing public DNS answers
+
+`TestDNSAnswer` evaluates records in the caller's selected public hosted zone.
+It returns stored DNS presentation values (including quoted TXT chunks), the
+submitted record name and type, a member of the zone's assigned delegation set,
+and a DNS response code. Exact names, wildcards, empty nonterminals, `NXDOMAIN`
+and `NOERROR` without answer data follow the existing record lookup rules.
+Simple records, weighted selection, and `A`/`AAAA` aliases to records in the
+same zone are supported. Subdomain NS delegations are referrals and are not
+returned as answer data; DS records at a delegation owner remain parent-zone
+answers.
+
+The operation validates IPv4/IPv6 resolver and EDNS client subnet options.
+Location-dependent, failover, health-evaluated, and other unsupported routing
+policies return `REFUSED`; resolver and subnet options do not alter simple or
+weighted selection. External aliases, CNAME chasing, alias cycles, alias chains
+beyond eight visited names, and queries outside the selected zone also return
+`REFUSED`. This is an in-process answer
+simulation with `Protocol=UDP`; it does not contact external resolvers or
+simulate packet-size limits, TCP fallback, DNSSEC, or recursive resolution.
+Private zones return `InvalidInput`; missing or other-account zones return
+`NoSuchHostedZone`. With IAM enforcement enabled, access requires
+`route53:TestDNSAnswer` on `Resource: "*"`.
+
 ## Private Hosted Zone DNS Resolution
 
 Floci resolves private hosted zone DNS records directly through its embedded DNS server on port 53. Cluster containers (such as EKS k3s containers) and workloads wired to embedded DNS automatically query Floci as their primary resolver.
 
-- **Record Types**: Resolves IPv4 `A` records (including `CNAME` and `ALIAS` target chasing across private zones, EC2 internal names, and external hostnames). A target that is one of Floci's own names, under `localhost.floci.io`, `localhost.localstack.cloud`, `FLOCI_HOSTNAME` or a `FLOCI_DNS_EXTRA_SUFFIXES` suffix, resolves to Floci's container IP, the address the embedded DNS server answers that name with. When a private CNAME targets a public hostname, Floci resolves the target addresses off the event loop so container stub resolvers succeed. Multiple values are returned as separate answers. Simple private `SRV` record sets also resolve, preserving each value's priority, weight (including zero), port, target, and the record set TTL. The target `.` encodes an unavailable service. Malformed SRV values and SRV sets requiring routing policies or health evaluation return REFUSED; SRV CNAME chasing is not implemented.
-- **TTL and Negative Answers**: Answers carry the record set's `TTL`. A chased `CNAME` chain is flattened to `A` records, so it answers with the shortest TTL in the chain; an alias answers with its target's TTL, and an alias or `CNAME` to a name outside the private zones answers with at most 60 seconds, since Floci cannot see that target's TTL. A name absent from the zone receives NXDOMAIN; a name that exists without the requested record type (only `TXT`, for example, or only records beneath it) receives NOERROR with no answers. A private `CNAME` chain preserves that distinction from its target, including after the target is created or deleted. A wildcard record such as `*.example.internal` answers only when neither the name nor an ancestor closer than the wildcard exists, so a record at `api.team.example.internal` keeps the wildcard from answering for `team.example.internal` or anything beneath it.
-- **Zone Visibility and Fallthrough**: Private hosted zones (created with a VPC association) provide IPv4 and SRV resolution. Public zones support the authoritative record types described below; unowned external domains fall through to upstream forwarders. Because the standard DNS wire protocol carries no caller VPC identifier, Floci resolves across private zones without filtering by account or VPC ID.
+When Floci runs as a host process, set `FLOCI_DNS_LISTEN_ADDRESS` to a local IPv4
+address reachable from its workload containers. This starts the same UDP and
+TCP resolver on port 53 and advertises that address to spawned containers.
+Startup fails if the explicit address is invalid or either listener cannot
+bind. The host process needs permission to bind port 53. Leave the setting
+unset for automatic container DNS only.
+
+- **Record Types**: Resolves IPv4 `A` records (including `CNAME` and `ALIAS` target chasing across private zones, EC2 internal names, and external hostnames). When a private CNAME targets a public hostname, Floci resolves the target addresses off the event loop so container stub resolvers succeed. Multiple values are returned as separate answers.
+- **TTL and Negative Answers**: Answers carry the record set's `TTL`. A chased `CNAME` chain is flattened to `A` records, so it answers with the shortest TTL in the chain; an alias answers with its target's TTL, and an alias or `CNAME` to a name outside the private zones answers with at most 60 seconds, since Floci cannot see that target's TTL. A name absent from the zone receives NXDOMAIN; a name that exists without an `A` record (only `TXT`, for example, or only records beneath it) receives NOERROR with no answers. A private `CNAME` chain preserves that distinction from its target, including after the target is created or deleted. A wildcard record such as `*.example.internal` answers only when neither the name nor an ancestor closer than the wildcard exists, so a record at `api.team.example.internal` keeps the wildcard from answering for `team.example.internal` or anything beneath it.
+- **Zone Visibility and Fallthrough**: The querying managed workload identifies the caller account, region and VPC. Private answers, including aliases and CNAMEs, use only zones associated with that VPC. Association filtering happens before choosing the most specific zone. An unknown or unassociated caller uses public DNS; an associated private zone with no matching record answers negatively without falling back to public records. Association and disassociation changes apply to subsequent queries. Cloud Map uses the same backing-zone visibility rules.
 - **Resolver Rule Precedence**: A Route 53 Resolver rule associated with the querying container's VPC takes precedence over a private hosted zone that matches the same name, as it does in AWS: the query is forwarded to the rule's targets instead of answered from the zone. See [Route 53 Resolver](route53resolver.md#resolver-rules-and-dns-resolution).
 - **Zero-Restart Propagation**: Record changes via `ChangeResourceRecordSets` take effect immediately without restarts.
 - **Kubernetes and external-dns Compatibility**: In-cluster controllers like `external-dns` provisioning Route 53 private records for Services or Ingresses are immediately resolvable.
 
 ## Public Authoritative DNS
 
-The same embedded UDP server serves stored public `TXT`, `NS`, and `SOA` records with authoritative answers and their configured TTLs. DNS clients must be able to reach Floci on UDP port 53. The HTTP endpoint published by Testcontainers wrappers does not publish this UDP listener. Host clients need an explicit UDP port mapping; containers on the same network can query Floci's container address directly.
+The same embedded UDP and TCP server serves stored public `A`, `AAAA`, `TXT`, `NS`, and `SOA` records with authoritative answers and their configured TTLs. Explicit public address records take precedence over broad AWS endpoint suffix spoofing, so a local fixture can route one hostname to its own listener. With spoofing on, a Route 53 private hosted zone associated with the querying VPC also takes precedence over the spoofed answer for an AWS endpoint name, for that VPC alone: this is the pattern that points a VPC at a centralized endpoint. The zone answers as it holds the name: its `A` records, NODATA for other types, or NXDOMAIN for a name it does not hold. In any private zone, a `CNAME` or alias whose target is a name Floci spoofs (not one of its private zones) now receives Floci's spoofed address for that client instead of an upstream lookup. Every other client keeps the spoofed answer. Floci's own names and EC2 internal names are not affected, and, as for every name Floci answers itself, a Resolver forwarding rule does not steer these names (on AWS a rule takes precedence over a private zone). DNS clients must be able to reach Floci on UDP and TCP port 53. The HTTP endpoint published by Testcontainers wrappers does not publish these DNS listeners. Host clients need explicit port mappings; containers on the same network can query Floci's container address directly.
 
-For a Docker host client, publish UDP separately from HTTP, for example `-p 5353:53/udp`, then query `dig @127.0.0.1 -p 5353 example.com TXT`. Configure the equivalent UDP binding explicitly when using a Testcontainers wrapper; its standard HTTP port mapping is insufficient.
+For a Floci container attached to multiple Docker networks, `FLOCI_SERVICES_DOCKER_NETWORK` selects the network name or ID shared with its service containers. Embedded DNS advertises Floci's address on that network, including the default Route53 nameserver names. Private CNAMEs targeting emulator names use the same address. An explicitly configured network that cannot be inspected or is not attached prevents DNS initialization instead of advertising an unrelated interface. Without an explicit network, Floci prefers its container's creation network, then another usable attachment. Later VPC attachments therefore do not change the advertised address on restart. The system-hostname fallback applies when Docker inspection is unavailable.
+
+For a Docker host client, publish DNS separately from HTTP, for example `-p 5353:53/udp -p 5353:53/tcp`, then query `dig @127.0.0.1 -p 5353 example.com TXT`. Add `+tcp` to select TCP explicitly. Configure both bindings when using a Testcontainers wrapper; its standard HTTP port mapping is insufficient.
 
 The longest matching public zone answers. Missing names return NXDOMAIN; existing names without the requested supported type return NOERROR with no answers. Both include the zone SOA with the smaller of its TTL and minimum field for negative caching. Changes and deletes affect DNS through the same stored record sets as the Route 53 API.
 
-Public address routing, aliases, CNAME chasing, health-based or weighted record selection, and delegation referrals are not implemented. Queries for supported types that require these features, ambiguous duplicate public zones, or malformed stored records return REFUSED without claiming authority. Other query types retain the existing emulator-name and upstream resolution paths. Private-zone and VPC forwarding-rule precedence remains unchanged. UDP responses honor legacy/EDNS size limits and set truncation when necessary; TCP fallback is not implemented.
+Public `A` aliases can target an existing API Gateway custom domain's reported regional
+or edge endpoint. Resolution verifies its reported hosted-zone ID and refuses unknown,
+deleted or ambiguous targets. The source does not infer ownership from a hostname suffix.
+Deleting the alias while keeping its hosted zone returns NXDOMAIN; an external transport
+fallback does not conceal that missing native record.
+
+The answer uses Floci's API listener. With native public routing enabled, a known VPC
+caller receives the public API bridge address and remains subject to its NAT, route and
+security-group rules. Unknown callers retain the ordinary listener address. This uses
+the existing custom-domain API routing; it does not add CloudFront distribution behavior
+or private API Gateway custom-domain support.
+
+Public `A` aliases can target an existing Classic load balancer when VPC frontends are enabled. The target DNS name, including the optional `dualstack.` prefix, and canonical hosted-zone ID must identify that load balancer. Answers use its current frontend addresses and 60-second TTL, including when the public zone and load balancer belong to different accounts. Alias resolution reads owned resources without following DNS or replacing targets with the emulator API address. Removing the target makes its aliases return REFUSED.
+
+Public `A` aliases can target an existing Application Load Balancer using its exact
+DNS name and canonical hosted-zone ID. The answer is Floci's listener IPv4 address
+with a 60-second TTL. The target is located across accounts without changing
+management API authorization. Unknown, deleted, ambiguous, or mismatched targets
+are refused; the resolver never infers ownership from an emulator suffix.
+See [ELB v2](elb.md#route-53-aliases).
+
+Weighted public records select one record set per DNS response, in proportion to its `Weight`. A zero-weight record is excluded when another record in the group has positive weight; if every weight is zero, each record set has an equal chance. Selection preserves all values and the TTL of the chosen record set, including the target TTL and validated transport of supported aliases. Each weighted record requires a distinct `SetIdentifier` and a weight from 0 through 255. Simple and weighted records cannot be mixed in the same name/type group.
+
+Other public alias targets, alias `AAAA` records, `EvaluateTargetHealth=true`, CNAME chasing, health-based or other routing policies, and delegation referrals are not implemented. Queries for supported types that require these features, ambiguous duplicate public zones or alias targets, or malformed stored records return REFUSED without claiming authority. Other query types retain the existing emulator-name and upstream resolution paths. Private-zone and VPC forwarding-rule precedence remains unchanged. UDP responses honor legacy/EDNS size limits and set truncation when necessary. Clients can retry over TCP, which supports messages up to 65,535 bytes, fragmented input, pipelining and connection reuse. TCP admission is bounded to 128 connections and 16 pending queries per connection; idle connections expire after 30 seconds.
 
 ## Default Nameservers
 
@@ -208,5 +265,4 @@ the record. DELETE still requires matching record values and routing properties.
 - Traffic policies and traffic policy instances
 - Query logging configs
 - DNSSEC (key signing keys, enabling/disabling)
-- `TestDNSAnswer`
-- Public authoritative record types other than simple TXT, NS, and SOA; public routing policies, delegation referrals, and DNS-over-TCP
+- Public authoritative record types other than A, AAAA, TXT, NS, and SOA; routing policies other than the weighted selection above; delegation referrals

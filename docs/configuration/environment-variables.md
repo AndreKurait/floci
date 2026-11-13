@@ -39,7 +39,7 @@ Anyone who can reach Floci's port can call its APIs. The Docker images listen on
 docker run --rm -p 127.0.0.1:4566:4566 floci/floci:latest
 ```
 
-Running Floci directly on a Linux host (not in a container) with services that start containers, such as Lambda functions or ECS tasks, needs a non-loopback address. Those containers reach Floci through `host.docker.internal`, which resolves to the Docker bridge gateway (`172.17.0.1` by default) rather than to the host's loopback. Set `QUARKUS_HTTP_HOST=0.0.0.0` and `FLOCI_SECURITY_ALLOW_UNSAFE_NETWORK_EXPOSURE=true`, and keep port 4566 closed to other networks with a firewall. See also [Lambda on native Linux Docker](../getting-started/quick-start.md#lambda-on-native-linux-docker-ufw).
+Running Floci directly on a Linux host (not in a container) with services that start containers, such as Lambda functions or ECS tasks, needs a non-loopback address. Those containers reach Floci through `host.docker.internal` (ECS task containers through the address it stands for), which resolves to the Docker bridge gateway (`172.17.0.1` by default) rather than to the host's loopback. Set `QUARKUS_HTTP_HOST=0.0.0.0` and `FLOCI_SECURITY_ALLOW_UNSAFE_NETWORK_EXPOSURE=true`, and keep port 4566 closed to other networks with a firewall. See also [Lambda on native Linux Docker](../getting-started/quick-start.md#lambda-on-native-linux-docker-ufw).
 
 ## Browser CORS
 
@@ -51,11 +51,6 @@ Running Floci directly on a Linux host (not in a container) with services that s
 | `FLOCI_SECURITY_DISABLE_CORS_HEADERS` | `false` | Disable Floci's global CORS response headers. Alias: `DISABLE_CORS_HEADERS` |
 | `FLOCI_SECURITY_CORS_ALLOW_PRIVATE_NETWORK` | `false` | Answer Private Network Access preflights with `Access-Control-Allow-Private-Network: true`, letting a page on a public/secure origin reach this loopback backend. Only applies after the origin passes the allow-list above. |
 
-The [Cognito JSON API](../services/cognito.md) follows this same origin allow-list,
-including its empty default, for both preflights and actual responses. For allowed
-origins, Cognito's request ID and error headers are exposed alongside configured extra
-exposed headers. The disable-CORS switch above also disables this behavior.
-
 ---
 
 ## TLS / HTTPS
@@ -65,7 +60,6 @@ exposed headers. The disable-CORS switch above also disables this behavior.
 | `FLOCI_TLS_ENABLED` | `false` | Enable TLS/HTTPS on all endpoints (HTTP remains available simultaneously) |
 | `FLOCI_TLS_CERT_PATH` | _(none)_ | Path to a PEM certificate file. When set, disables auto-generation |
 | `FLOCI_TLS_KEY_PATH` | _(none)_ | Path to a PEM private key file. Required when `FLOCI_TLS_CERT_PATH` is set |
-| `FLOCI_TLS_EXTRA_CA_PATH` | _(none)_ | Path to a PEM file of extra CA certificates that Floci's own outbound HTTPS clients (EventBridge API destinations, SNS HTTPS subscriptions, JWT issuer fetch) trust on top of the JVM's roots. Works with TLS on or off; containers Floci launches do not receive them |
 | `FLOCI_TLS_SELF_SIGNED` | `true` | Auto-generate and persist a server certificate signed by Floci's local CA when no cert/key paths are provided |
 
 See [TLS / HTTPS](./tls.md) for SDK configuration examples and WebSocket (`wss://`) support.
@@ -272,7 +266,10 @@ See [Initialization Hooks](./initialization-hooks.md) for lifecycle phases and s
 | `FLOCI_SERVICES_LAMBDA_REACTIVE_S3_SYNC_ENABLED` | `true` | Re-deploy a function when the S3 object it was deployed from is overwritten. See [Reactive S3 Sync](../services/lambda.md#reactive-s3-sync-configuration) |
 | `FLOCI_SERVICES_LAMBDA_REACTIVE_S3_SYNC_ASYNC` | `false` | Run that re-deploy in the background so the upload returns at once; the function reports `LastUpdateStatus` `InProgress` until it finishes |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_NETWORK` | _(none)_ | Docker network for Lambda containers (overrides `FLOCI_SERVICES_DOCKER_NETWORK`) |
+| `FLOCI_SERVICES_LAMBDA_ADDITIONAL_DOCKER_NETWORKS` | _(none)_ | Comma-separated existing Docker network names or IDs joined before a function starts. Name/ID aliases attach once. Additional endpoints use a lower gateway priority where Docker supports it, preserving the primary route. A failed attachment aborts and cleans up the launch; duplicate or invalid names are rejected |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_FLAGS` | _(none)_ | Additional Docker flags applied to Lambda containers, such as `--env`, `--volume`, `--publish`, `--add-host`, `--dns`, `--label`, `--network`, `--user`, `--privileged`, and `--platform`. Explicit `--dns` entries replace automatic embedded DNS and public fallback resolvers. Published ports support `host:container` and `127.0.0.1:host:container` forms |
+| `FLOCI_SERVICES_LAMBDA_CONTAINER_READINESS_COMMAND` | _(none)_ | Docker exec command required to succeed before first invocation in each new Lambda container; no implicit shell |
+| `FLOCI_SERVICES_LAMBDA_CONTAINER_READINESS_TIMEOUT_SECONDS` | `60` | Overall readiness budget in seconds (1–900); failed admission cleans up the new container |
 | `FLOCI_SERVICES_LAMBDA_CONTAINER_NAME_PREFIX` | `floci` | Base name prefix for Lambda-spawned containers and code volumes (must match `[A-Za-z0-9][A-Za-z0-9_.-]*`) |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_HOST_OVERRIDE` | _(none)_ | Explicit host/IP Lambda containers use to reach the Runtime API, bypassing auto-detection (e.g. rootless Podman) |
 | `FLOCI_SERVICES_LAMBDA_AWS_CONFIG_PATH` | _(none)_ | Host path bind-mounted read-only at `/opt/aws-config` inside Lambda containers for real credential discovery |
@@ -294,6 +291,8 @@ See [Initialization Hooks](./initialization-hooks.md) for lifecycle phases and s
 | Variable | Default | Description |
 |---|---|---|
 | `FLOCI_SERVICES_IAM_ENABLED` | `true` | Enable the IAM service |
+| `FLOCI_SERVICES_IAM_ISSUED_SESSION_VERIFICATION_ENABLED` | `false` | Enable bounded local metadata lookup and SigV4 proof verification for current normal AssumeRole sessions; does not grant permissions |
+| `FLOCI_SERVICES_IAM_LAMBDA_IDENTITY_VERIFICATION_ENABLED` | `false` | Enable local observation and proof verification of current Lambda execution-role identities; does not grant permissions |
 | `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED` | `false` | When `true`, enforce IAM policies on API calls. Leave `false` for most local development scenarios |
 | `FLOCI_SERVICES_IAM_SEED_DEPLOYER_PRINCIPAL` | `false` | Create a local `floci-deployer` IAM user with `AdministratorAccess` and static `floci`/`floci` credentials |
 
@@ -544,6 +543,7 @@ These services spawn Docker containers. They require access to the Docker socket
 | `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_TTL_SECONDS` | `21600` | Lifetime of the vended credentials. Matches the six hours AWS documents for task-role credentials |
 | `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_PORT` | `51679` | Port on the Floci host serving the credentials endpoint. Not the address task containers use, which is always `169.254.170.2:80` |
 | `FLOCI_SERVICES_ECS_TASK_ROLE_CREDENTIALS_PROXY_IMAGE` | `floci/network-helper:local` | Image for the per-network proxy that holds `169.254.170.2` and forwards to the port above |
+| `FLOCI_SERVICES_ECS_EXTRA_HOSTS` | _(none)_ | Comma-separated `hostname:ip` entries (ip may be `host-gateway`) added to every task container after its definition's `extraHosts`. Unset by default: like the ECS agent, Floci adds no hosts entry of its own. `host.docker.internal:host-gateway` restores the entry Floci used to add on Linux |
 
 ### EC2
 
@@ -552,9 +552,12 @@ These services spawn Docker containers. They require access to the Docker socket
 | `FLOCI_SERVICES_EC2_ENFORCE_VCPU_QUOTAS` | `false` | Opt in to EC2 Run/Start admission against current running Standard On-Demand vCPU usage |
 | `FLOCI_SERVICES_EC2_ENABLED` | `true` | Enable the EC2 service |
 | `FLOCI_SERVICES_EC2_MOCK` | `false` | When `true`, instances are registered in state but no containers are spawned |
-| `FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESSES` | `none` | Automatic public IPv4 address of a mock instance: `none`, `documentation` (from `203.0.113.0/24`) or `fixed` (`FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESS`) |
+| `FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESSES` | `none` | Automatic public IPv4 address of a mock instance: `none`, `documentation` (from `203.0.113.0/24`), `fixed` (`FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESS`) or `pool` (`FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESS_POOL`) |
 | `FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESS` | `127.0.0.1` | Address given to every mock instance due one when `FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESSES` is `fixed`, and shown by an Elastic IP on its primary private address |
+| `FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESS_POOL` | (unset) | Network-aligned `/24` to `/32` IPv4 CIDR required in `pool` mode. Addresses are unique across accounts and regions and released on stop or termination |
 | `FLOCI_SERVICES_EC2_IMAGE_CATALOG_PATH` | (unset) | Path to a complete YAML image catalog replacing the bundled EC2 catalog; mount the file at this path when running in Docker |
+| `FLOCI_SERVICES_EC2_EXTRA_ENV` | (unset) | Explicit guest `KEY=VALUE` entries, comma-separated (escape a literal comma as `\,`). Duplicate keys and reserved identity, credential, region, endpoint and IMDS settings are rejected |
+| `FLOCI_SERVICES_EC2_ULIMITS` | (unset) | Guest process limits as comma-separated `name=soft[:hard]`, for example `memlock=-1,nofile=1024000`. Omitted hard equals soft; `-1` means unlimited |
 | `FLOCI_SERVICES_EC2_IMDS_PORT` | `9169` | Port for the EC2 Instance Metadata Service (IMDS) endpoint |
 | `FLOCI_SERVICES_EC2_SSH_PORT_RANGE_START` | `2200` | First port in the SSH port range for EC2 instances |
 | `FLOCI_SERVICES_EC2_SSH_PORT_RANGE_END` | `2299` | Last port in the SSH port range |
@@ -617,8 +620,7 @@ See [Web Console](../ui/index.md) for running the console and swapping in a thir
 | `FLOCI_SERVICES_ROUTE53_VPC_ASSOCIATION_CONTROL_PLANE_DELAY_MS` | `0` | Simulated processing window for Route 53 VPC association/auth mutations; positive values make documented overlap errors (`PriorRequestNotComplete` / `ConcurrentModification`) reproducible for retry tests |
 | `FLOCI_SERVICES_ELBV2_ENABLED` | `true` | Enable the ELBv2 (ALB/NLB) service |
 | `FLOCI_SERVICES_ELBV2_MOCK` | `false` | When `true`, load balancers are registered but no containers are spawned |
-| `FLOCI_SERVICES_ELBV2_BACKEND_KEEP_ALIVE` | `true` | Reuse backend HTTP/1.x connections for ordinary HTTP forwarding. Set to `false` for fresh connections per request; WebSocket and TCP transports are unaffected. See [backend connection reuse](../services/elb.md#backend-connection-reuse) |
-| `FLOCI_SERVICES_ELBV2_BACKEND_KEEP_ALIVE_TIMEOUT_SECONDS` | `60` | Default idle-pool timeout for backend HTTP/1.x connections, in non-negative seconds; `0` disables expiry. A target's advertised `Keep-Alive` timeout overrides it. Does not time out active responses or WebSockets |
+| `FLOCI_SERVICES_ELBV2_MAX_HEALTH_CHECK_INTERVAL_MILLIS` | `0` | Optional local health probe interval ceiling in milliseconds. Zero preserves target group intervals; positive values accelerate probes without changing their timeouts or success thresholds |
 | `FLOCI_SERVICES_AUTOSCALING_ENABLED` | `true` | Enable the Auto Scaling service |
 | `FLOCI_SERVICES_CODEBUILD_ENABLED` | `true` | Enable the CodeBuild service |
 | `FLOCI_SERVICES_CODEBUILD_DOCKER_NETWORK` | _(none)_ | Docker network for CodeBuild build containers |

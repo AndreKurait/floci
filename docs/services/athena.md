@@ -5,19 +5,124 @@
 
 Floci emulates Amazon Athena with **real SQL execution** powered by a [floci-duck](https://hub.docker.com/r/floci/floci-duck) sidecar container running DuckDB. When a query is submitted, Floci spins up the sidecar on first use, registers every Glue database as a DuckDB schema (`CREATE SCHEMA IF NOT EXISTS "<schema>"`) with qualified views (`"<db>"."<table>"`) pointing to S3 data, creates unqualified view aliases for the query context database in DuckDB's default `main` schema, then executes the SQL and stores results as CSV in S3.
 
+## Prepared statements
+
+`CreatePreparedStatement`, `GetPreparedStatement`, `UpdatePreparedStatement`,
+`DeletePreparedStatement`, and `BatchGetPreparedStatement` store SQL text and
+optional descriptions within an existing workgroup, including `primary`.
+Names are unique within each workgroup and at most 1000 statements may be stored.
+These operations do not execute SQL, add SQL `PREPARE` or `EXECUTE` support,
+or implement `ListPreparedStatements` or a CloudFormation resource.
+
+Get and batch get return `StatementName`, `WorkGroupName`, `QueryStatement`,
+optional `Description`, and numeric epoch-seconds `LastModifiedTime`. Batch get
+accepts at most 256 statement names, as stated in the API operation description,
+and returns missing names under `UnprocessedPreparedStatementNames`. Floci uses
+`STATEMENT_NOT_FOUND` for those entries; single get, update, and delete return
+`ResourceNotFoundException` for an absent statement. Request types, name patterns,
+and documented string lengths are validated before mutation. An explicit empty
+description is invalid. Floci treats updates as replacement of SQL and description:
+omitting `Description` clears it. The API documentation does not specify this
+omission policy.
+
+Prepared statements use the existing workgroup storage in memory, persistent,
+hybrid, and WAL modes. Legacy workgroups start with no statements. Reads and
+writes are scoped to the caller's account and region. IAM uses each operation's
+same-named Athena action, the workgroup ARN, and its live `aws:ResourceTag` values.
+Updates atomically replace the stored statement map; hybrid durability retains
+its normal asynchronous flush behavior.
+
+As a Floci lifecycle policy, deleting a workgroup containing prepared statements
+requires `RecursiveDeleteOption=true`; omission and `false` reject deletion.
+Recursive deletion removes the statements with their workgroup, and recreating
+the name starts empty. AWS's DeleteWorkGroup API describes recursive deletion of
+named queries, query executions, and notebooks but does not explicitly specify
+prepared-statement children. This prepared-child policy is not presented as a
+separately measured AWS guarantee. The built-in `primary` workgroup cannot be
+deleted through the API.
+
+## Query execution batch reads
+
+`BatchGetQueryExecution` reads existing execution records using 1 to 50 IDs. Each
+ID must contain 1 to 128 non-whitespace characters; IDs are not restricted to UUID
+syntax. The response includes complete stored query metadata and
+`UnprocessedQueryExecutionIds` entries with `QUERY_EXECUTION_NOT_FOUND` for any
+accepted absent ID. The UUID-shaped absent-ID case matches recorded AWS behavior;
+classification of other accepted absent strings is a Floci policy that has not
+been independently measured against AWS. Each result uses the same public
+projection as `GetQueryExecution`, including
+numeric timestamps. Reads take a detached snapshot under the execution's existing
+status lock. A batch does not submit queries or change their states, SQL, results,
+or statistics, and does not promise one atomic snapshot across separate queries.
+
+Newly started queries retain their request Region in the existing account-scoped
+query record. The internal Region field is persisted and omitted from every public
+query projection. Batch and direct query reads cannot retrieve another Region's
+records. As a Floci migration policy, older records without Region metadata are visible
+only in the configured default Region. Legacy rows without an account prefix may
+be migrated only by the configured default account; a refused account or Region
+lookup cannot move them. Account-prefixed IDs use only the caller's explicit
+storage namespace and cannot be reinterpreted as legacy raw keys during either
+IAM authorization or response lookup. Existing persistent, hybrid and WAL storage
+reload this metadata; memory mode remains in-memory only.
+
+IAM target and tag discovery reads scoped records or matching default-account
+legacy records without migrating them. A denied request leaves those raw keys and
+records unchanged. After authorization, the batch response lookup may migrate its
+matching legacy query record; reading workgroup tags never migrates the workgroup.
+
+With IAM enforcement enabled, every found execution is authorized for
+`athena:BatchGetQueryExecution` against its actual workgroup ARN and that
+workgroup's own current resource tags. A denied found target refuses the whole
+request. Tag contexts are not combined across workgroups. As a conservative Floci
+policy, a batch containing only missing IDs uses the existing action-on-`*`
+authorization fallback because no workgroup can be resolved. A policy allowing
+only a particular workgroup therefore does not authorize an all-missing batch;
+a wildcard-resource allow can. These whole-request and all-missing authorization
+policies have not been independently measured against AWS.
+
+No query-history deletion is added. Terminal history remains in the existing query
+store, including when result objects or workgroups are removed. This change does
+not expand SQL execution support or claim measured AWS statistics equivalence.
+
+## Direct query ownership and authorization
+
+`GetQueryExecution`, `GetQueryResults` and `StopQueryExecution` resolve IDs in the
+caller's account and request Region. An unauthorized account or Region lookup
+cannot migrate a legacy query or change its state. This does not change the existing S3 result-access behavior.
+
+`ListQueryExecutions` filters the requested workgroup and Region before pagination.
+Continuation tokens remain bound to the account, Region and workgroup. As a Floci
+migration policy, unprefixed legacy history is visible only to the default account,
+uses the default Region when Region metadata is absent, is read without migration,
+and never replaces an explicitly account-scoped record with the same ID. Workgroup existence and tag lookups for
+query listings also leave legacy rows in place.
+
+With IAM enforcement enabled, the four direct actions use the exact action and
+workgroup ARN, with that workgroup's current `aws:ResourceTag` values. IAM target
+and tag discovery never migrates rows. Listing authorizes the named workgroup, or
+`primary` when omitted. A missing or out-of-scope ID cannot supply a workgroup ARN,
+so the three ID-based actions use the conservative Floci action-on-`*` fallback:
+a workgroup-only allow is insufficient; an allowed wildcard request reaches the
+existing `InvalidRequestException`. This fallback is local policy and has not
+been independently measured against AWS.
+
+This change does not alter asynchronous query callback account propagation,
+SQL execution, S3 authorization, result pagination or history retention.
+
 ## Supported Actions
 
 <!-- floci:actions:start -->
 | Action | Description |
 | --- | --- |
-| `CreateNamedQuery` | Saves SQL text in a workgroup and returns its ID |
-| `GetNamedQuery` | Returns a saved query's name, database, SQL text, description and workgroup |
-| `BatchGetNamedQuery` | Returns up to 50 saved queries and per-ID errors for missing queries |
-| `ListNamedQueries` | Lists saved query IDs in a workgroup with pagination |
-| `UpdateNamedQuery` | Updates a saved query's name, SQL text and description |
-| `DeleteNamedQuery` | Deletes a saved query |
+| `CreatePreparedStatement` | Stores SQL text and an optional description in a workgroup |
+| `GetPreparedStatement` | Returns one stored statement and its last modification time |
+| `UpdatePreparedStatement` | Replaces a stored statement's SQL text and optional description |
+| `DeletePreparedStatement` | Deletes one stored statement |
+| `BatchGetPreparedStatement` | Returns up to 256 stored statements and per-name errors for missing entries |
 | `StartQueryExecution` | Submits a SQL query; executed asynchronously via DuckDB |
 | `GetQueryExecution` | Returns query status (`QUEUED`, `RUNNING`, `SUCCEEDED`, `FAILED`) |
+| `BatchGetQueryExecution` | Returns up to 50 stored query executions and per-ID errors for absent records |
 | `GetQueryResults` | Returns the result set for a completed query |
 | `ListQueryExecutions` | Returns a list of past query executions |
 | `StopQueryExecution` | Cancels a running query |
@@ -39,46 +144,11 @@ Floci emulates Amazon Athena with **real SQL execution** powered by a [floci-duc
 | `DeleteWorkGroup` | Deletes a workgroup |
 <!-- floci:actions:end -->
 
-Named queries store SQL text without executing it or requiring the database to
-exist. `CreateNamedQuery` defaults to the `primary` workgroup; a named workgroup
-must already exist. `ClientRequestToken` is optional; requests without a token
-create a new query each time. The AWS SDK and CLI supply a token automatically.
-When supplied, it must contain 32 to 128 characters. Retrying the same token returns
-the original ID, while changing its creation parameters returns
-`InvalidRequestException`. Saved queries and retry requests use Athena's configured
-storage mode and are isolated by account and region.
-
-Every request is checked by `RequestConstraintCheck` against the types, required
-members, bounds, patterns and enums generated from botocore's Athena service model.
-`tools/aws/regen_athena_shapes.py` vendors every operation's input constraints;
-`make aws-data-sync` regenerates them and `make aws-data-check` checks for drift.
-
-`UpdateNamedQuery` changes the name, SQL text, and optionally the description;
-the database and workgroup stay fixed. Omitting the description preserves it,
-and an empty description clears it. A missing query returns
-`InvalidRequestException` from get or update; batch get reports it under
-`UnprocessedNamedQueryIds`. Deleting an absent query succeeds.
-
-`DeleteWorkGroup` rejects a workgroup containing saved queries unless
-`RecursiveDeleteOption` is `true`. Recursive deletion removes the group's saved
-queries and creation retry records in the caller's account and region before
-removing the workgroup. Recreating the same workgroup name starts with no saved
-queries. The `primary` workgroup cannot be deleted.
-
-`ListNamedQueries` defaults to `primary` and returns IDs in deterministic order.
-`MaxResults` accepts 0 to 50; Floci uses 50 when it is omitted, null, or zero,
-matching its `ListQueryExecutions` convention because AWS documents neither a
-default nor the behavior of zero. Pass the opaque `NextToken` to continue; final
-pages omit it. Tokens are scoped to the action, account, region, and workgroup,
-and remain resumable after a cursor query is deleted. Invalid sizes or tokens
-return `InvalidRequestException`.
-
 `ListDataCatalogs` accepts `MaxResults` from 2 to 50. Floci uses 50 when it is
 omitted, since the API reference does not document a default. The built-in
 `AwsDataCatalog` stays first, followed by registered catalogs in name order.
-`GetDataCatalog` requires `Name`; `ListDatabases`, `ListTableMetadata` and
-`GetTableMetadata` require `CatalogName`. Name `AwsDataCatalog` explicitly to
-read the built-in catalog.
+`GetDataCatalog`, `ListDatabases`, `ListTableMetadata` and `GetTableMetadata`
+read `AwsDataCatalog` when the request names no catalog or a JSON null.
 Pass the opaque `NextToken` to continue; final pages omit it. Tokens are scoped
 to the action, caller account, and request region and remain resumable after a
 cursor catalog is deleted. Malformed tokens, tokens outside the 1-to-1024
@@ -110,7 +180,7 @@ results storage.
 1. **Lazy sidecar start**: On the first `StartQueryExecution` call, Floci checks for a local `floci/floci-duck:latest` image and starts the container. Subsequent queries reuse the running container.
 2. **Glue DDL injection**: Floci registers every Glue database as a DuckDB schema (`CREATE SCHEMA IF NOT EXISTS "<schema>"`) and creates qualified views (`CREATE OR REPLACE VIEW "<db>"."<table>"`) mapping each table to its S3 location via DuckDB's `read_parquet`, `read_json_auto`, or `read_csv_auto` functions, chosen based on the table's `InputFormat` or SerDe serialization library. In addition, tables in the query context database receive unqualified view aliases (`CREATE OR REPLACE VIEW "<table>"` in DuckDB's default `main` schema), so queries can reference tables as both `FROM db.table` and `FROM table`.
 3. **Query execution**: The user's SQL is wrapped in `COPY (...) TO 's3://...' (FORMAT CSV, HEADER)` and executed. Results are written directly to the output S3 path.
-4. **Results retrieval**: `GetQueryResults` reads the CSV back from S3 and returns it in the standard Athena `ResultSet` shape. Each column's `Type` comes from DuckDB describing the query, mapped to the Athena name (`bigint`, `integer`, `double`, `boolean`, `date`, `time`, `timestamp`, `decimal` and so on), with `Precision` and `Scale` for a decimal; a column whose type has no Athena name, such as an interval, and every column of a query DuckDB cannot describe are reported as `varchar`.
+4. **Results retrieval**: `GetQueryResults` reads the CSV back from S3 and returns it in the standard Athena `ResultSet` shape.
 
 ## Format inference
 

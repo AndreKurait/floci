@@ -10,6 +10,7 @@ import software.amazon.awssdk.services.appconfigdata.model.GetLatestConfiguratio
 import software.amazon.awssdk.services.appconfigdata.model.GetLatestConfigurationResponse;
 import software.amazon.awssdk.services.appconfigdata.model.StartConfigurationSessionRequest;
 import software.amazon.awssdk.services.appconfigdata.model.StartConfigurationSessionResponse;
+import software.amazon.awssdk.services.cloudwatch.CloudWatchClient;
 
 import java.nio.charset.StandardCharsets;
 import java.util.Collections;
@@ -618,15 +619,25 @@ class AppConfigTest {
     @Order(57)
     @DisplayName("Environments return their monitors and deployments their profile's name and location")
     void monitorsAndDeploymentSourceRoundTrip() {
+        String errorAlarm = TestFixtures.uniqueName("configuration-errors");
+        String latencyAlarm = TestFixtures.uniqueName("configuration-latency");
         String monitoredAppId = appConfig.createApplication(CreateApplicationRequest.builder()
                 .name(TestFixtures.uniqueName("monitored-app")).build()).id();
-        try {
+        try (CloudWatchClient cloudWatch = TestFixtures.cloudWatchClient()) {
+            for (String alarmName : new String[]{errorAlarm, latencyAlarm}) {
+                cloudWatch.putMetricAlarm(request -> request.alarmName(alarmName)
+                        .namespace("AppConfigLifecycle").metricName("Errors").statistic("Sum")
+                        .period(60).evaluationPeriods(1).threshold(1.0)
+                        .comparisonOperator("GreaterThanThreshold").actionsEnabled(false));
+            }
             Monitor withRole = Monitor.builder()
-                    .alarmArn("arn:aws:cloudwatch:us-east-1:000000000000:alarm:configuration-errors")
+                    .alarmArn(cloudWatch.describeAlarms(request -> request.alarmNames(errorAlarm))
+                            .metricAlarms().get(0).alarmArn())
                     .alarmRoleArn("arn:aws:iam::000000000000:role/appconfig-alarm-monitor")
                     .build();
             Monitor withoutRole = Monitor.builder()
-                    .alarmArn("arn:aws:cloudwatch:us-east-1:000000000000:alarm:configuration-latency")
+                    .alarmArn(cloudWatch.describeAlarms(request -> request.alarmNames(latencyAlarm))
+                            .metricAlarms().get(0).alarmArn())
                     .build();
             CreateEnvironmentResponse monitored = appConfig.createEnvironment(CreateEnvironmentRequest.builder()
                     .applicationId(monitoredAppId).name("monitored").monitors(withRole, withoutRole).build());
@@ -672,6 +683,9 @@ class AppConfigTest {
                     .applicationId(monitoredAppId).name("untyped").locationUri("hosted").build()).type())
                     .isEqualTo("AWS.Freeform");
         } finally {
+            try (CloudWatchClient cloudWatch = TestFixtures.cloudWatchClient()) {
+                cloudWatch.deleteAlarms(request -> request.alarmNames(errorAlarm, latencyAlarm));
+            }
             try {
                 appConfig.deleteApplication(DeleteApplicationRequest.builder().applicationId(monitoredAppId).build());
             } catch (Exception ignored) {

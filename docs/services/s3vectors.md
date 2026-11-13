@@ -1,7 +1,7 @@
 # S3 Vectors
 
 **Protocol:** REST JSON
-**Endpoint:** `POST /{OperationName}` (e.g. `POST /CreateVectorBucket`)
+**Endpoint:** `POST /{OperationName}` (e.g. `POST /CreateVectorBucket`); tagging uses `GET`, `POST`, and `DELETE /tags/{resourceArn}`
 
 Floci emulates the S3 Vectors API: vector buckets, vector indexes, and vector
 storage with similarity queries. All operations use the AWS REST JSON wire
@@ -11,9 +11,10 @@ shape, so the AWS SDK and CLI `s3vectors` clients work without modification.
 
 | Category | Operations |
 |---|---|
-| **Vector buckets** | CreateVectorBucket, GetVectorBucket, ListVectorBuckets, DeleteVectorBucket, PutVectorBucketPolicy, GetVectorBucketPolicy, DeleteVectorBucketPolicy |
+| **Vector buckets** | CreateVectorBucket, GetVectorBucket, ListVectorBuckets, DeleteVectorBucket |
 | **Indexes** | CreateIndex, GetIndex, ListIndexes, DeleteIndex |
-| **Vectors** | PutVectors, GetVectors, ListVectors, DeleteVectors, QueryVectors |
+| **Vectors** | PutVectors, GetVectors, DeleteVectors, QueryVectors |
+| **Tags** | TagResource, UntagResource, ListTagsForResource |
 
 ## Example
 
@@ -69,17 +70,15 @@ Index dimensions must be between 1 and 4096. Metadata configuration accepts up t
 10 unique non-filterable keys, each a non-blank string of 1 to 63 characters.
 Queries reject filters on these keys, including filters nested in logical expressions.
 
-Writes to the same bucket are serialized across policies, tags, indexes, vectors, and
-bucket deletion so concurrent changes do not overwrite each other or restore deleted data.
-
-Bucket policies can be attached, retrieved, and deleted by either `vectorBucketName` or
-`vectorBucketArn`. `PutVectorBucketPolicy` validates that the policy is a JSON object and
-stores it with the bucket; `GetVectorBucketPolicy` returns `NotFoundException` when no
-policy is attached. Bucket policies are stored and returned, but Floci does not evaluate
-or enforce them on requests.
+Writes to the same bucket are serialized across tags, indexes, vectors, and bucket
+deletion so concurrent changes do not overwrite each other or restore deleted data.
 
 Encryption settings are stored and returned; Floci does not perform KMS encryption.
-Standalone S3 Vectors tagging APIs are not implemented.
+`TagResource`, `UntagResource`, and `ListTagsForResource` work with vector bucket
+and index ARNs. Tagging merges keys and replaces the values of existing keys;
+untagging removes only the requested keys. Each resource can have up to 50 tags,
+and rejected updates leave its tags unchanged. Tag changes use the configured
+storage backend and survive restarts in persistent storage modes.
 
 ## CloudFormation
 

@@ -250,8 +250,7 @@ service you need already has a `*CfnProvisioner`, add your type there; otherwise
     "not emulated" stays distinguishable from "forgotten".
     A new type also needs its row in `schema-surface.tsv` (same directory): run
     `make cfn-schema-surface-sync`. A writable property the provisioner never reads goes in
-    `writable-property-gaps.tsv`. A provisioner arm that calls `droppedProperties` records, for each
-    writable property it reads, what a drop does in `drop-policy.tsv` (same directory).
+    `writable-property-gaps.tsv`.
 
 `SqsCfnProvisioner` is the smallest reference implementation; `Ec2LaunchTemplateCfnProvisioner`
 shows update-in-place and replacement handling; `LogsCfnProvisioner` shows a full reconcile-vs-replace
