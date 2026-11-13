@@ -411,6 +411,7 @@ public class AutoScalingService implements PassedRoleLookup {
 
         AutoScalingGroup asg = new AutoScalingGroup();
         asg.setAutoScalingGroupName(name);
+        asg.setMetricsIncarnation(UUID.randomUUID().toString());
         asg.setAutoScalingGroupArn(
                 AwsArnUtils.Arn.of("autoscaling", region, regionResolver.getAccountId(),
                         "autoScalingGroup:" + name).toString());
