@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.core.common;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.applicationautoscaling.DynamoDbRegistrationTarget;
 import io.github.hectorvent.floci.services.cloudtrail.CloudTrailService;
 import io.github.hectorvent.floci.services.iam.AccessDeniedMessages;
 import io.github.hectorvent.floci.services.iam.AccessDeniedMessages.PolicyType;
@@ -1883,8 +1884,21 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 || "apigateway".equals(credentialScope)) {
             return arnBuilder.buildResources(credentialScope, ctx, region, accountId, requestPartition());
         }
-        String partition = "route53".equals(credentialScope) ? requestPartition() : AwsRegions.partitionFor(region);
+        String partition = "route53".equals(credentialScope)
+                || isDynamoDbRegistration(credentialScope, operation, ctx)
+                ? requestPartition() : AwsRegions.partitionFor(region);
         return arnBuilder.buildResources(credentialScope, operation, ctx, region, accountId, partition);
+    }
+
+    private static boolean isDynamoDbRegistration(String scope, String operation, ContainerRequestContext ctx) {
+        if (!"application-autoscaling".equals(scope) || !"application-autoscaling:RegisterScalableTarget".equals(operation)) {
+            return false;
+        }
+        JsonNode request = PassedRoles.jsonBody(ctx);
+        return request != null && request.path("ServiceNamespace").isTextual()
+                && request.path("ScalableDimension").isTextual()
+                && DynamoDbRegistrationTarget.supports(request.path("ServiceNamespace").textValue(),
+                        request.path("ScalableDimension").textValue());
     }
 
     /**

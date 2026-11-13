@@ -64,6 +64,39 @@ PolicyARN          arn:aws:autoscaling:<region>:<account>:scalingPolicy:<uuid>:r
 Under IAM enforcement, a request naming a target by its triple is checked on that ARN, and a
 `RegisterScalableTarget` registering a new one on `scalable-target/*`, as its id is not assigned yet.
 
+## DynamoDB capacity at registration
+
+With Floci's built-in DynamoDB backend, `RegisterScalableTarget` reconciles the
+selected provisioned capacity for all four DynamoDB dimensions:
+
+- `dynamodb:table:ReadCapacityUnits`
+- `dynamodb:table:WriteCapacityUnits`
+- `dynamodb:index:ReadCapacityUnits`
+- `dynamodb:index:WriteCapacityUnits`
+
+Use `table/<name>` for a table and `table/<name>/index/<index>` for a global secondary
+index. Both bounds are required for a new target. Updating a target preserves each
+omitted bound. Bounds must be positive and the minimum cannot exceed the maximum.
+The table must exist and use `PROVISIONED` billing; an index target must also name an
+existing index. Missing resources and on-demand tables return `ValidationException`.
+
+For an active table, capacity below the minimum rises to that minimum and capacity
+above the maximum falls to that maximum. Capacity already in range stays unchanged.
+The opposite read/write capacity and sibling indexes stay unchanged. An inactive
+table accepts the target metadata without changing capacity; registration does not
+schedule a later retry. Index activity follows the built-in backend's table status,
+since it does not model a separate asynchronous index lifecycle.
+
+The target and capacity belong to the request's account and Region. IAM checks the
+new-target wildcard or the stored target ARN, plus the existing explicit `RoleARN`
+and tagging permissions. Registration does not require the caller to receive a
+separate `dynamodb:UpdateTable` grant.
+
+A successful capacity change retains the table or index's prior warm throughput
+peak. See [DynamoDB warm throughput](dynamodb.md#warm-throughput).
+DynamoDB scaling-policy execution, utilization metric publication, and scheduled
+capacity changes are not implemented by this registration path.
+
 ## CloudWatch alarms
 
 A `TargetTrackingScaling` policy creates a real pair of CloudWatch alarms, exactly as AWS
@@ -165,8 +198,8 @@ alarm's stored account and region.
   test) has to push them to exercise the loop, the same way a real CloudWatch agent
   would against real AWS.
 - Scalable dimensions other than ECS desired count and Lambda provisioned concurrency
-  (MSK broker storage, DynamoDB capacity, ...) remain stored but inert, as
-  described below.
+  (MSK broker storage, DynamoDB capacity, ...) are not driven by this policy
+  evaluator. DynamoDB registration reconciles capacity as described above.
 
 ## Service-linked roles
 
@@ -180,9 +213,9 @@ arn:aws:iam::<account>:role/aws-service-role/<namespace>.application-autoscaling
 ## Limitations
 
 - **The control loop drives ECS desired count and Lambda provisioned concurrency.**
-  Other scalable dimensions remain stored but do not adjust underlying capacity.
-  ECS registration retains its existing control-plane behavior; immediate registration
-  reconciliation is implemented for Lambda.
+  Other scalable dimensions have no policy-driven capacity executor here.
+  ECS registration retains its existing control-plane behavior; registration
+  reconciliation is implemented for Lambda and DynamoDB.
 - The loop consumes CloudWatch metric data; it does not synthesize Lambda utilization
   from invocations. Tests or applications must publish the metric to exercise target
   tracking.
