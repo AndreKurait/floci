@@ -5421,6 +5421,7 @@ public class CloudFormationService implements ResourceProvider {
         }
 
         if (!childCreate) {
+            childStack.setClientRequestToken(null);
             resource.getAttributes().put(CfnRollback.NESTED_STACK_UPDATE_SNAPSHOT_ATTR,
                     savedChildDeployment(childStack, region, accountId).toString());
         }
