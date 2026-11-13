@@ -8,6 +8,7 @@ import io.floci.aws.core.common.Pagination;
 import io.floci.aws.core.common.XmlBuilder;
 import io.floci.aws.services.cloudwatch.dashboards.CloudWatchDashboardsService;
 import io.floci.aws.services.cloudwatch.dashboards.model.Dashboard;
+import io.floci.aws.services.cloudwatch.insights.CloudWatchInsightRulesHandler;
 import io.floci.aws.services.cloudwatch.metrics.model.Alarm;
 import io.floci.aws.services.cloudwatch.metrics.model.AlarmHistoryItem;
 import io.floci.aws.services.cloudwatch.metrics.model.AlarmMetricDataQuery;
@@ -45,18 +46,30 @@ public class CloudWatchMetricsQueryHandler {
     private CloudWatchMetricsService metricsService;
     private final CloudWatchDashboardsService dashboardsService;
     private final CloudWatchMetricStreamsService metricStreamsService;
+    private final CloudWatchInsightRulesHandler insightRules;
+
+    public CloudWatchMetricsQueryHandler(CloudWatchMetricsService metricsService,
+                                         CloudWatchDashboardsService dashboardsService,
+                                         CloudWatchMetricStreamsService metricStreamsService) {
+        this(metricsService, dashboardsService, metricStreamsService, null);
+    }
 
     @Inject
     public CloudWatchMetricsQueryHandler(CloudWatchMetricsService metricsService,
                                          CloudWatchDashboardsService dashboardsService,
-                                         CloudWatchMetricStreamsService metricStreamsService) {
+                                         CloudWatchMetricStreamsService metricStreamsService,
+                                         CloudWatchInsightRulesHandler insightRules) {
         this.metricsService = metricsService;
         this.dashboardsService = dashboardsService;
         this.metricStreamsService = metricStreamsService;
+        this.insightRules = insightRules;
     }
 
     public Response handle(String action, MultivaluedMap<String, String> params, String region) {
         String normalizedAction = action.substring(0, 1).toUpperCase() + action.substring(1);
+        if (insightRules != null && insightRules.handles(normalizedAction, params.getFirst("ResourceARN"))) {
+            return insightRules.query(normalizedAction, params, region);
+        }
         return switch (normalizedAction) {
             case "PutMetricData" -> handlePutMetricData(params, region);
             case "ListMetrics" -> handleListMetrics(params, region);

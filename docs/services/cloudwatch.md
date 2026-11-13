@@ -427,6 +427,48 @@ aws logs put-retention-policy \
 
 ---
 
+## Contributor Insights
+
+Floci evaluates JSON `CloudWatchLogRule` version 1 rules with `AggregateOn: Count`, one to four
+contribution keys, and up to four `StartsWith` filters. Filters use AND between fields and OR
+between prefixes. Field names and values are case sensitive. JSON dot paths and array indices
+are supported. Local log groups can be selected by exact name or a trailing wildcard.
+Referenced numbers outside -1e9 to 1e9 do not contribute; contributor keys are limited to 1 KB.
+
+`PutInsightRule`, `DescribeInsightRules`, `EnableInsightRules`, `DisableInsightRules`,
+`DeleteInsightRules`, and `GetInsightRuleReport` use the same account- and Region-scoped records
+through both CloudWatch Query and JSON. An omitted state enables a new rule and preserves an
+existing rule's state. Only new ingestion contributes: enabling a rule does not scan old Logs,
+and disabled rules accumulate no counts.
+Definition and state changes affect the next ingested batch. Existing counts survive body,
+state, and tag updates. A deleted and recreated rule starts with empty history.
+
+Reports retain minute contributor datapoints and combine metric counts into periods that are
+multiples of 60 seconds, up to 86400 seconds, starting at the request's first minute.
+They support windows up to 24 hours within the preceding 15 days, all seven
+report metrics, and `Sum` or `Maximum` ranking with at most 100 contributors. Count reports use
+`AggregationStatistic: SampleCount`. Global totals and unique counts include contributors
+outside the returned top list. `Maximum` uses each contributor's greatest minute count.
+Only requested metrics are returned; omitted or empty `Metrics` omits `MetricDatapoints`.
+Empty buckets expose requested zero sample and unique counts without fabricated minimum or average values.
+
+Rules, tags, and count history use the `cloudwatchmetrics` storage configuration. Original log
+messages are evaluated even when the log group has a transformer. A failed count storage write
+is logged; Logs ingestion remains committed and those contributions are not retried.
+Tags on `PutInsightRule` apply only on creation; use `TagResource` and `UntagResource` to change
+existing tags. `ListTagsForResource` returns the current tags.
+
+`Sum` rules, CLF, other filter operators, managed rules, cross-account `LogGroupARNs`, and
+`ApplyOnTransformedLogs: true` are explicitly unsupported. Changing contributor key paths after
+counts have accumulated is also unsupported, so existing history cannot be relabeled.
+
+`AWS::CloudWatch::InsightRule` creates the same native rule in the requested state. `Ref` and
+`Fn::GetAtt Arn` return its ARN; `Fn::GetAtt RuleName` returns its name. Body, state, and tag
+updates preserve the ARN and existing counts, while a name update creates a replacement with
+new history. CloudFormation reconciles its own tag keys and retains independently added native
+tags. Replacement cleanup follows `UpdateReplacePolicy`, and deletion follows `DeletionPolicy`.
+An existing native rule with the same name is not adopted by a stack.
+
 ## CloudWatch Metrics {#metrics}
 
 **Protocol:** Query (XML), JSON 1.0, and OTLP/HTTP.
