@@ -6,6 +6,8 @@ import io.github.hectorvent.floci.core.common.auth.SigV4AuthorizationHeader;
 import io.github.hectorvent.floci.core.common.auth.SigV4Canonicalization;
 import io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator;
 import io.github.hectorvent.floci.core.common.auth.SigV4aSignature;
+import io.github.hectorvent.floci.services.account.AccountController;
+import io.github.hectorvent.floci.services.account.AccountRegionActions;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayAwsExecuteController;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayExecuteController;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayUserRequestController;
@@ -231,6 +233,12 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
         if (defaultAgent && !"codedeploy-commands".equals(scope.service())) {
             signatureDoesNotMatch(ctx, resource, "Credential should be scoped to correct service: "
                     + "'codedeploy-commands'");
+            return;
+        }
+        if (resource == AccountController.class && resourceInfo.getResourceMethod() != null
+                && AccountRegionActions.forMethod(resourceInfo.getResourceMethod().getName()) != null
+                && !"account".equals(scope.service())) {
+            signatureDoesNotMatch(ctx, resource, "Credential should be scoped to correct service: 'account'");
             return;
         }
         if (!SigV4RequestValidator.containsHeader(signed.signedHeaders(), "host")) {
