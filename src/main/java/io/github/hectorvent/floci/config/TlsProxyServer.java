@@ -372,7 +372,11 @@ public class TlsProxyServer {
         socket.handler(null);
         socket.pause();
         boolean tls = buffer.length() > 0 && buffer.getByte(0) == TLS_HANDSHAKE;
-        connectBackend(socket, buffer, tls ? httpsBackendPort : httpBackendPort, addresses);
+        if (tls && !fallbackNames.isEmpty()) {
+            readClientHello(socket, buffer, socket.localAddress().port(), addresses, true);
+        } else {
+            connectBackend(socket, buffer, tls ? httpsBackendPort : httpBackendPort, addresses);
+        }
     }
 
     private void dispatch(NetSocket socket, Buffer buffer, PublicApiProxySources.Addresses addresses) {
@@ -381,7 +385,7 @@ public class TlsProxyServer {
         boolean tls = buffer.length() > 0 && buffer.getByte(0) == TLS_HANDSHAKE;
         int port = socket.localAddress().port();
         if (tls && sharedTlsRoutes.containsKey(port)) {
-            readClientHello(socket, buffer, port, addresses);
+            readClientHello(socket, buffer, port, addresses, false);
         } else if (tls) {
             connectTlsBackend(socket, buffer, port, 0, addresses);
         } else {
@@ -389,7 +393,8 @@ public class TlsProxyServer {
         }
     }
 
-    private void readClientHello(NetSocket socket, Buffer first, int port, PublicApiProxySources.Addresses addresses) {
+    private void readClientHello(NetSocket socket, Buffer first, int port,
+                                 PublicApiProxySources.Addresses addresses, boolean publicApi) {
         TlsClientHello hello = new TlsClientHello();
         Buffer pending = Buffer.buffer();
         long timer = vertx.setTimer(5000, ignored -> socket.close());
@@ -414,8 +419,13 @@ public class TlsProxyServer {
                 SharedTlsRoute route = sharedTlsRoutes.get(port);
                 boolean shared = port == config.tls().awsHttpsPort() && port != config.port()
                         && fallbackNames.contains(normalizeHostname(hello.hostname()));
-                int selected = shared || route == null || hello.hostname() == null
-                        ? 0 : route.backend().applyAsInt(hello.hostname());
+                int selected;
+                if (publicApi) {
+                    selected = shared ? 0 : httpsBackendPort;
+                } else {
+                    selected = shared || route == null || hello.hostname() == null
+                            ? 0 : route.backend().applyAsInt(hello.hostname());
+                }
                 hello.close();
                 connectTlsBackend(socket, pending, port, selected, addresses);
             } catch (RuntimeException failure) {
