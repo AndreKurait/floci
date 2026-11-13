@@ -8,6 +8,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -22,10 +23,13 @@ import java.util.regex.Pattern;
 final class MetricMath {
     private static final Pattern ID = Pattern.compile("[a-z][a-zA-Z0-9_]*");
     private static final int MAX_DEPTH = 128;
+    private static final int MAX_SERIES_POINTS = 100800;
+    private static final long MAX_GENERATED_POINTS = 10L * MAX_SERIES_POINTS;
     private final Map<String, MetricDataQuery> queries = new LinkedHashMap<>();
     private final Map<String, Node> expressions = new HashMap<>();
     private final Map<String, Shape> shapes = new HashMap<>();
     private final Set<String> quotaMetrics = new HashSet<>();
+    private final Map<Node, Integer> fillPeriods = new IdentityHashMap<>();
     private int shapeDepth;
 
     MetricMath(List<MetricDataQuery> input) {
@@ -234,7 +238,7 @@ final class MetricMath {
 
         @Override
         public Value evaluate(Evaluation evaluation) {
-            return left.evaluate(evaluation).combine(operator, right.evaluate(evaluation));
+            return evaluation.charge(left.evaluate(evaluation).combine(operator, right.evaluate(evaluation)));
         }
     }
 
@@ -256,12 +260,64 @@ final class MetricMath {
         }
     }
 
+    private enum FillMode { CONSTANT, REPEAT, LINEAR }
+
+    private record Fill(Node series, FillMode mode, Node filler) implements Node {
+        @Override
+        public Shape shape(MetricMath plan, Set<String> visiting) {
+            Shape shape = plan.nodeShape(series, visiting);
+            if (shape.period() == null) {
+                throw invalid("FILL requires a time series as its first argument.");
+            }
+            int depth = shape.depth();
+            if (filler != null) {
+                Shape fillerShape = plan.nodeShape(filler, visiting);
+                if (fillerShape.period() != null) {
+                    throw invalid("FILL of a single time series accepts a scalar, REPEAT or LINEAR filler.");
+                }
+                depth = Math.max(depth, fillerShape.depth());
+            }
+            plan.fillPeriods.put(this, shape.period());
+            return new Shape(shape.period(), depth + 1);
+        }
+
+        @Override
+        public Value evaluate(Evaluation evaluation) {
+            TreeMap<Instant, Double> actual = new TreeMap<>(series.evaluate(evaluation).samples());
+            List<Instant> grid = evaluation.grid(evaluation.fillPeriod(this));
+            Map<Instant, Double> result = new TreeMap<>(actual);
+            double constant = mode == FillMode.CONSTANT ? filler.evaluate(evaluation).scalar() : Double.NaN;
+            if (mode == FillMode.CONSTANT && !Double.isFinite(constant)) {
+                return evaluation.charge(Value.series(result));
+            }
+            for (Instant time : grid) {
+                if (actual.containsKey(time)) {
+                    continue;
+                }
+                Map.Entry<Instant, Double> before = actual.lowerEntry(time);
+                Map.Entry<Instant, Double> after = actual.higherEntry(time);
+                if (mode == FillMode.CONSTANT) {
+                    result.put(time, constant);
+                } else if (mode == FillMode.REPEAT && before != null) {
+                    result.put(time, before.getValue());
+                } else if (mode == FillMode.LINEAR && before != null && after != null) {
+                    double span = after.getKey().getEpochSecond() - before.getKey().getEpochSecond();
+                    double offset = time.getEpochSecond() - before.getKey().getEpochSecond();
+                    result.put(time, before.getValue() + (after.getValue() - before.getValue()) * offset / span);
+                }
+            }
+            return evaluation.charge(Value.series(result));
+        }
+    }
+
     private final class Evaluation {
         private final Instant start;
         private final Instant end;
         private final Function<MetricStat, Map<Instant, Double>> readMetric;
         private final ToDoubleFunction<MetricStat> readQuota;
         private final Map<String, Value> values = new HashMap<>();
+        private final Map<Integer, List<Instant>> grids = new HashMap<>();
+        private long computedPoints;
 
         Evaluation(Instant start, Instant end, Function<MetricStat, Map<Instant, Double>> readMetric,
                    ToDoubleFunction<MetricStat> readQuota) {
@@ -273,6 +329,44 @@ final class MetricMath {
 
         MetricStat metric(String id) {
             return MetricMath.this.metric(id);
+        }
+
+        int fillPeriod(Fill fill) {
+            return fillPeriods.get(fill);
+        }
+
+        /** Every period start in [start, end) on the epoch-aligned grid that metric buckets use. */
+        List<Instant> grid(int period) {
+            List<Instant> grid = grids.get(period);
+            if (grid == null) {
+                long first = Math.floorDiv(start.getEpochSecond(), period) * period;
+                long last = end.minusNanos(1).getEpochSecond();
+                if (first < Instant.MIN.getEpochSecond()) {
+                    throw invalid("StartTime is outside the supported time range.");
+                }
+                long count = last < first ? 0 : Math.floorDiv(last - first, period) + 1;
+                if (count > MAX_SERIES_POINTS) {
+                    throw invalid("Generated time series currently support at most " + MAX_SERIES_POINTS
+                            + " points per request.");
+                }
+                List<Instant> times = new ArrayList<>((int) count);
+                for (long index = 0; index < count; index++) {
+                    times.add(Instant.ofEpochSecond(first + index * period));
+                }
+                grid = List.copyOf(times);
+                grids.put(period, grid);
+            }
+            return grid;
+        }
+
+        /** Counts every series an expression computes, so chained references cannot multiply the work. */
+        Value charge(Value value) {
+            computedPoints += value.samples().size();
+            if (computedPoints > MAX_GENERATED_POINTS) {
+                throw invalid("Metric math currently supports at most " + MAX_GENERATED_POINTS
+                        + " computed points across a request.");
+            }
+            return value;
         }
 
         Value query(String id) {
@@ -291,17 +385,11 @@ final class MetricMath {
             if (!Double.isFinite(quota) || quota <= 0) {
                 throw invalid("The service quota must be a positive finite number.");
             }
-            long first = Math.floorDiv(start.getEpochSecond(), metric.period()) * metric.period();
-            long last = end.minusNanos(1).getEpochSecond();
-            long count = last < first ? 0 : Math.floorDiv(last - first, metric.period()) + 1;
-            if (count > 100800) {
-                throw invalid("Quota time series currently support at most 100800 points per request.");
-            }
             Map<Instant, Double> samples = new TreeMap<>();
-            for (long index = 0; index < count; index++) {
-                samples.put(Instant.ofEpochSecond(first + index * metric.period()), quota);
+            for (Instant time : grid(metric.period())) {
+                samples.put(time, quota);
             }
-            return Value.series(samples);
+            return charge(Value.series(samples));
         }
     }
 
@@ -400,6 +488,9 @@ final class MetricMath {
             }
             String identifier = identifier();
             if (take('(')) {
+                if ("FILL".equals(identifier)) {
+                    return fill();
+                }
                 if (!"PERIOD".equals(identifier) && !"SERVICE_QUOTA".equals(identifier)) {
                     throw invalid("Unsupported metric math function: " + identifier);
                 }
@@ -408,6 +499,28 @@ final class MetricMath {
                 return node(new MetricFunction(identifier, argument));
             }
             return node(new Reference(identifier));
+        }
+
+        private Node fill() {
+            Node series = sum();
+            require(',');
+            for (FillMode mode : List.of(FillMode.REPEAT, FillMode.LINEAR)) {
+                int start = position;
+                whitespace();
+                String keyword = mode.name();
+                int after = position + keyword.length();
+                if (text.startsWith(keyword, position) && (after == text.length()
+                        || !(Character.isLetterOrDigit(text.charAt(after)) || text.charAt(after) == '_'))) {
+                    position = after;
+                    if (take(')')) {
+                        return node(new Fill(series, mode, null));
+                    }
+                }
+                position = start;
+            }
+            Node filler = sum();
+            require(')');
+            return node(new Fill(series, FillMode.CONSTANT, filler));
         }
 
         private String identifier() {
