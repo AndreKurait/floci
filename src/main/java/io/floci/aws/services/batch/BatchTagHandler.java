@@ -7,6 +7,7 @@ import jakarta.inject.Inject;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * Batch's tag endpoints, which AWS puts on {@code /v1/tags/{resourceArn}}: served by the shared
@@ -24,10 +25,19 @@ import java.util.Map;
 public class BatchTagHandler implements TagHandler {
 
     private final BatchService batchService;
+    private final BatchSchedulingPolicyService policies;
+    private final BatchSchedulingPolicyReader policyReader;
 
     @Inject
-    public BatchTagHandler(BatchService batchService) {
+    public BatchTagHandler(BatchService batchService, BatchSchedulingPolicyService policies,
+                           BatchSchedulingPolicyReader policyReader) {
         this.batchService = batchService;
+        this.policies = policies;
+        this.policyReader = policyReader;
+    }
+
+    public BatchTagHandler(BatchService batchService) {
+        this(batchService, null, null);
     }
 
     @Override
@@ -47,16 +57,33 @@ public class BatchTagHandler implements TagHandler {
 
     @Override
     public Map<String, String> listTags(String region, String arn) {
+        if (BatchSchedulingPolicyTarget.isPolicySelector(arn)) {
+            return policies.listTags(arn);
+        }
         return batchService.listTagsForResource(arn);
     }
 
     @Override
     public void tagResource(String region, String arn, Map<String, String> tags) {
+        if (BatchSchedulingPolicyTarget.isPolicySelector(arn)) {
+            policies.tag(arn, tags);
+            return;
+        }
         batchService.tagResource(arn, tags);
     }
 
     @Override
     public void untagResource(String region, String arn, List<String> tagKeys) {
+        if (BatchSchedulingPolicyTarget.isPolicySelector(arn)) {
+            policies.untag(arn, tagKeys);
+            return;
+        }
         batchService.untagResource(arn, tagKeys);
+    }
+
+    @Override
+    public Optional<Map<String, String>> parseTagResourceBody(String arn, String body) {
+        return BatchSchedulingPolicyTarget.isPolicySelector(arn)
+                ? Optional.of(BatchSchedulingPolicyReader.tags(policyReader.object(body), true)) : Optional.empty();
     }
 }
