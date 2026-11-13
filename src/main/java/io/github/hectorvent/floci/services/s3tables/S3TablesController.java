@@ -94,6 +94,29 @@ public class S3TablesController {
         return Response.ok().build();
     }
 
+    @PUT
+    @Path("/buckets/{tableBucketARN}/metrics")
+    public Response putTableBucketMetricsConfiguration(@Context HttpHeaders headers,
+            @Encoded @PathParam("tableBucketARN") String tableBucketArn) {
+        service.putTableBucketMetricsConfiguration(decode(tableBucketArn), region(headers));
+        return Response.noContent().build();
+    }
+
+    @GET
+    @Path("/buckets/{tableBucketARN}/metrics")
+    public Response getTableBucketMetricsConfiguration(@Context HttpHeaders headers,
+            @Encoded @PathParam("tableBucketARN") String tableBucketArn) {
+        return Response.ok(service.getTableBucketMetricsConfiguration(decode(tableBucketArn), region(headers))).build();
+    }
+
+    @DELETE
+    @Path("/buckets/{tableBucketARN}/metrics")
+    public Response deleteTableBucketMetricsConfiguration(@Context HttpHeaders headers,
+            @Encoded @PathParam("tableBucketARN") String tableBucketArn) {
+        service.deleteTableBucketMetricsConfiguration(decode(tableBucketArn), region(headers));
+        return Response.noContent().build();
+    }
+
     @GET
     @Path("/buckets/{tableBucketARN}/policy")
     public Response getTableBucketPolicy(@Context HttpHeaders headers, @Encoded @PathParam("tableBucketARN") String tableBucketArn) {
