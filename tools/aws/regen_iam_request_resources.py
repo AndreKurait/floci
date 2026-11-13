@@ -184,6 +184,9 @@ CLIENTS_NOT_READ: dict[str, str] = {
                                  "plane by the handler, not by its path",
 }
 
+# Qualified identifiers need a separately qualified service alias resolver before activation.
+QUALIFIED_MEMBERS: tuple[str, ...] = ()
+
 # The namespaces whose resources ResourceArnBuilder builds itself.
 HAND_BUILT = ("apigateway", "bedrock", "dsql", "dynamodb", "eks", "iam", "kinesis", "kms", "lambda", "logs", "pipes",
               "resource-groups", "s3", "scheduler", "secretsmanager", "sns", "sqs", "ssm", "sts")
@@ -776,6 +779,39 @@ def _reading(model: dict) -> str | None:
     return "located" if LOCATED_ONLY_PROTOCOLS & protocols else None
 
 
+def with_absent_arn(resources: list[dict], formats: dict[str, str], optional: set[str]) -> list[dict]:
+    """Adds, for an optional top-level member holding the ARN of a type whose format has no variable of its own
+    (Security Hub's `hub/default`), that type for a request leaving the member out: there is one resource of the
+    type in the caller's account and Region, the one its service acts on then (`DescribeHub` with no `HubArn`)."""
+    named = {resource["type"] for resource in resources if "type" in resource}
+    added = []
+    for resource in resources:
+        member = resource.get("arn")
+        if "types" not in resource or member not in optional:
+            continue
+        for kind in resource["types"]:
+            variables = [v for v in VARIABLE_RE.findall(formats.get(kind, "")) if v not in KNOWN_VARIABLES]
+            if kind in formats and not variables and kind not in named and related(stem(member), stem(kind)):
+                added.append({"type": kind, "fill": {}, "when": {member: [None]}})
+                named.add(kind)
+    return resources + added
+
+
+def optional_members(models: dict[str, dict], operation: str) -> set[str]:
+    """The top-level members of the operation's request that hold a string and that it may leave out."""
+    found: set[str] = set()
+    for model in models.values():
+        spec = model["operations"].get(operation)
+        if spec is None or "input" not in spec or not READ_PROTOCOLS & _protocols(model):
+            continue
+        root = model["shapes"][spec["input"]["shape"]]
+        required = set(root.get("required", []))
+        for name, member in root.get("members", {}).items():
+            if name not in required and model["shapes"][member["shape"]].get("type") == "string":
+                found.add(name)
+    return found
+
+
 def request_members(models: dict[str, dict], operation: str) -> dict[str, str]:
     """The top-level members of the operation's request that hold a string (`Name`) or a list of
     strings (`Name[]`), by name, and the ARN members one level inside one (`Name.FieldArn`,
@@ -1044,6 +1080,7 @@ def resources_for(operation: str, types: list[str], formats: dict[str, str], mem
     names = {member: path for member, path in members.items() if member not in arns}
     by_arn: dict[str, list[str]] = {}
     filled: dict[str, dict[str, str]] = {}
+    used: dict[str, str] = {}
     complete: dict[str, bool] = {}
     for kind in types:
         if kind not in formats:
@@ -1059,9 +1096,11 @@ def resources_for(operation: str, types: list[str], formats: dict[str, str], mem
         fill: dict[str, str] = {}
         for variable in sorted(variables, key=lambda v: (kind_of(v) == "", v)):
             choice = _filling(variable, kind_stem, len(variables), {m: p for m, p in names.items() if m not in fill.values()},
-                              bare=not held and related(subject, kind_stem))
+                              bare=not held and related(subject, kind_stem),
+                              qualified=namespace_of(operation) in QUALIFIED_MEMBERS)
             if choice is not None:
                 fill[variable] = choice
+                used[kind] = choice
         fill = {variable: names[member] for variable, member in fill.items()}
         if len([path for path in fill.values() if path.endswith("[]")]) > 1:
             fill = {variable: path for variable, path in fill.items() if not path.endswith("[]")}
@@ -1079,7 +1118,9 @@ def resources_for(operation: str, types: list[str], formats: dict[str, str], mem
             full = [kind for kind in kinds if complete[kind]]
             kept += kinds if len(kinds) == 1 else (full if len(full) == 1 else [])
     specs = [{"types": kinds, "arn": arns[member]} for member, kinds in sorted(by_arn.items())]
-    return specs + [{"type": kind, "fill": dict(sorted(filled[kind].items()))} for kind in types if kind in kept]
+    qualified = namespace_of(operation) in QUALIFIED_MEMBERS
+    return specs + [{"type": kind, "fill": dict(sorted(filled[kind].items()))} for kind in types if kind in kept] + \
+        also_filled(types, members, filled, kept, used, qualified)
 
 
 RESOURCE_PART_RE = re.compile(r"^arn:\$\{Partition}:[^:]*:[^:]*:[^:]*:([A-Za-z][A-Za-z0-9-]*)(.*)$")
@@ -1148,7 +1189,42 @@ def by_members_key_is_empty(kinds: list[str], filled: dict[str, dict[str, str]])
     return all(not filled[kind] for kind in kinds)
 
 
-def _filling(variable: str, kind_stem: str, variables: int, names: dict[str, str], bare: bool) -> str | None:
+def also_filled(types: list[str], members: dict[str, str], filled: dict[str, dict[str, str]],
+                kept: list[str], used: dict[str, str], qualified: bool) -> list[dict]:
+    """The resources a request names besides the one it fills a type with, when it names several of that type and
+    acts on each of them.
+
+    <p>A re-encryption decrypts under the key its path names and encrypts under the key its body names, so both are
+    acted on and both are checked. A member that names a resource of the type, with a word before it saying which of
+    them it is, fills the type's variable as well."""
+    found = []
+    for kind in types:
+        if kind not in kept or kind not in filled or not filled[kind]:
+            continue
+        kind_stem = stem(kind)
+        variable = next(iter(filled[kind]))
+        for member in sorted(members):
+            if used.get(kind) == member:
+                continue
+            if not qualified or not names_type(member, kind_stem):
+                continue
+            if not compatible(member, variable):
+                continue
+            found.append({"type": kind, "fill": {variable: members[member]}})
+    return found
+
+
+def names_type(member: str, kind_stem: str) -> bool:
+    """Whether the member names a resource of the type, with a word before it saying which of them it is: an
+    `IncomingKeyIdentifier` names a key, and so does an `OutgoingKeyIdentifier`.
+
+    <p>Only a member that identifies a resource does: a list of tag keys is no key, however its name ends."""
+    member_stem = stem(member)
+    return kind_of(member) == "identifier" and member_stem != kind_stem and member_stem.endswith(kind_stem)
+
+
+def _filling(variable: str, kind_stem: str, variables: int, names: dict[str, str], bare: bool,
+             qualified: bool = False) -> str | None:
     """The member that fills the variable: one of a compatible kind whose stem relates to the variable's,
     or, for the variable named after the type or a type's only one, a member named after the type, or,
     when `bare`, a bare `Name` or `Id`, of a compatible kind; the closest of them, and a string before a
@@ -1158,7 +1234,9 @@ def _filling(variable: str, kind_stem: str, variables: int, names: dict[str, str
                   if stem(member) and related(stem(member), variable_stem) and compatible(member, variable)]
     if not candidates and (related(variable_stem, kind_stem) or variables == 1):
         candidates = [member for member in names if compatible(member, variable)
-                      and ((bare and member.lower() in BARE) or (stem(member) and related(stem(member), kind_stem)))]
+                      and ((bare and member.lower() in BARE)
+                           or (stem(member) and (related(stem(member), kind_stem)
+                                                 or (qualified and names_type(member, kind_stem)))))]
     if not candidates:
         return None
     return min(candidates, key=lambda member: (stem(member) != variable_stem, names[member].endswith("[]"), len(member), member))
@@ -1225,6 +1303,7 @@ def entry_for(operation: str, upstream: dict, formats: dict[str, str], models: d
                                                             formats, types, members),
                                             namespace_of(operation), types, members),
                                  namespace_of(operation), types, members)
+        resources = with_absent_arn(resources, formats, optional_members(models, operation.split(":", 1)[1]))
     resources = with_account(resources, formats, account_members(models, operation.split(":", 1)[1]))
     resources = with_arn_of(resources, formats, name_or_arn_members(models, operation.split(":", 1)[1]))
     resources = with_made(resources, operation, formats)

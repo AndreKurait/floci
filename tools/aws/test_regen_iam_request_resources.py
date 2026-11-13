@@ -1032,3 +1032,39 @@ def test_id_targets_reject_unknown_types_ambiguous_prefixes_and_malformed_member
         invalid = copy.deepcopy(document)
         invalid["operations"]["ec2:CreateTags"]["targets"][field] = value
         assert r.validate(invalid), (field, value)
+
+
+def test_an_optional_arn_member_of_a_type_without_variables_names_it_when_absent():
+    named = [{"types": ["catalog", "thing"], "arn": "CatalogArn"}]
+    assert r.with_absent_arn(named, FORMATS, {"CatalogArn"}) == named + [
+        {"type": "catalog", "fill": {}, "when": {"CatalogArn": [None]}}]
+    assert r.with_absent_arn(named, FORMATS, set()) == named
+    assert r.with_absent_arn([{"types": ["thing"], "arn": "ThingArn"}], FORMATS, {"ThingArn"}) == [
+        {"types": ["thing"], "arn": "ThingArn"}]
+
+
+def test_optional_members_are_only_optional_top_level_strings():
+    model = {
+        "metadata": {"protocol": "rest-json"},
+        "operations": {"DescribeCatalog": {"input": {"shape": "Request"}}},
+        "shapes": {
+            "Request": {"type": "structure", "required": ["RequiredArn"], "members": {
+                "CatalogArn": {"shape": "Text"}, "RequiredArn": {"shape": "Text"},
+                "Nested": {"shape": "Nested"}, "Count": {"shape": "Count"}}},
+            "Text": {"type": "string"}, "Count": {"type": "integer"},
+            "Nested": {"type": "structure", "members": {"CatalogArn": {"shape": "Text"}}},
+        },
+    }
+    assert r.optional_members({"test": model}, "DescribeCatalog") == {"CatalogArn"}
+    assert r.optional_members({"test": model}, "Missing") == set()
+
+
+def test_qualified_identifier_resources_are_all_retained_only_for_resolving_namespaces(monkeypatch):
+    monkeypatch.setattr(r, "QUALIFIED_MEMBERS", ("svc",), raising=False)
+    formats = {"key": "arn:${Partition}:svc:${Region}:${Account}:key/${KeyIdentifier}"}
+    named = members("IncomingKeyIdentifier", "OutgoingKeyIdentifier", "TagKeys[]")
+    assert r.resources_for("svc:ReEncrypt", ["key"], formats, named) == [
+        {"type": "key", "fill": {"KeyIdentifier": "IncomingKeyIdentifier"}},
+        {"type": "key", "fill": {"KeyIdentifier": "OutgoingKeyIdentifier"}},
+    ]
+    assert r.resources_for("other:ReEncrypt", ["key"], formats, named) == []
