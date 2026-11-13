@@ -366,6 +366,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     // a concurrent allocation, which reads persisted resources to see what is taken, cannot pick
     // the same address in between. Taken after imageRegistryLock where a caller holds both.
     private final Object privateIpAllocationLock = new Object();
+    private final Object[] natGatewayLifecycleLocks = newLockStripes();
     private final Object amazonProvidedIpv6AllocationLock = new Object();
     /** Host part (1-254) of the last 203.0.113.0/24 address handed out; guarded by the allocation lock. */
     private int documentationHost;
@@ -12575,7 +12576,22 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         VpcEndpoint endpoint = vpcEndpoints.get(storeKey).orElse(null);
         if (endpoint != null) { endpoint.setTags(new ArrayList<>(tagList)); vpcEndpoints.put(storeKey, endpoint); return; }
         NatGateway natGateway = natGateways.get(storeKey).orElse(null);
-        if (natGateway != null) { natGateway.setTags(new ArrayList<>(tagList)); natGateways.put(storeKey, natGateway); return; }
+        if (natGateway != null) {
+            if (natGateway.getClientToken() == null) {
+                natGateway.setTags(new ArrayList<>(tagList));
+                natGateways.put(storeKey, natGateway);
+            } else {
+                synchronized (privateIpAllocationLock) {
+                    NatGateway current = natGateways.get(storeKey).orElse(null);
+                    if (current != null) {
+                        NatGateway updated = new NatGateway(current);
+                        updated.setTags(new ArrayList<>(tagList));
+                        natGateways.put(storeKey, updated);
+                    }
+                }
+            }
+            return;
+        }
         NetworkAcl networkAcl = networkAcls.get(storeKey).orElse(null);
         if (networkAcl != null) { networkAcl.setTags(new ArrayList<>(tagList)); networkAcls.put(storeKey, networkAcl); return; }
         Address address = addresses.get(storeKey).orElse(null);
@@ -14852,8 +14868,35 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                                        List<String> secondaryPrivateIpAddresses,
                                        String secondaryPrivateIpAddressCount,
                                        List<Tag> natGatewayTags) {
+        return createNatGateway(region, subnetId, allocationId, connectivityType, privateIpAddress,
+                secondaryAllocationIds, secondaryPrivateIpAddresses, secondaryPrivateIpAddressCount,
+                natGatewayTags, null);
+    }
+
+    public NatGateway createNatGateway(String region, String subnetId, String allocationId,
+                                       String connectivityType, String privateIpAddress,
+                                       List<String> secondaryAllocationIds,
+                                       List<String> secondaryPrivateIpAddresses,
+                                       String secondaryPrivateIpAddressCount,
+                                       List<Tag> natGatewayTags, String clientToken) {
+        validateNatGatewayClientToken(clientToken);
+        Map<String, List<String>> creationParameters = natGatewayCreationParameters(subnetId, allocationId,
+                connectivityType, privateIpAddress, secondaryAllocationIds, secondaryPrivateIpAddresses,
+                secondaryPrivateIpAddressCount, natGatewayTags);
+        synchronized (privateIpAllocationLock) {
+            NatGateway replay = replayNatGateway(region, clientToken, null, creationParameters);
+            if (replay != null) {
+                return replay;
+            }
+        }
         ensureDefaultResources(region);
         Subnet subnet = requireSubnet(region, subnetId);
+        synchronized (privateIpAllocationLock) {
+            NatGateway replay = replayNatGateway(region, clientToken, subnet.getAvailabilityZone(), creationParameters);
+            if (replay != null) {
+                return replay;
+            }
+        }
         boolean privateGateway = "private".equalsIgnoreCase(connectivityType);
         VpcRoutingManager routing = packetRouting();
         if (routing != null) {
@@ -14886,6 +14929,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 .toList();
 
         NatGateway natGateway = new NatGateway();
+        if (clientToken != null) {
+            natGateway.setClientToken(clientToken);
+            natGateway.setCreationAccountId(callerAccountId());
+            natGateway.setCreationAvailabilityZone(subnet.getAvailabilityZone());
+            natGateway.setCreationParameters(creationParameters);
+        }
         natGateway.setNatGatewayId("nat-" + randomHex(17));
         natGateway.setSubnetId(subnetId);
         natGateway.setVpcId(subnet.getVpcId());
@@ -14902,36 +14951,58 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             }
         }
         synchronized (privateIpAllocationLock) {
-            // Checked under the same lock that writes the association below, so two gateways
-            // cannot both see the allocation free. As on AWS, an allocation already held by an
-            // instance or another gateway does not fail the call: the gateway is created in state
-            // failed, with no interface, and the allocation is left with its holder.
-            List<String> eips = new ArrayList<>();
-            if (isSet(allocationId)) {
-                eips.add(allocationId);
+            NatGateway replay = replayNatGateway(region, clientToken, subnet.getAvailabilityZone(), creationParameters);
+            if (replay != null) {
+                return replay;
             }
-            eips.addAll(secondaryEips);
-            Set<String> seen = new HashSet<>();
-            for (String eipId : eips) {
-                if (!seen.add(eipId) || isElasticIpTaken(region, eipId)) {
-                    natGateway.setState("failed");
-                    natGateway.setFailureCode("Resource.AlreadyAssociated");
-                    natGateway.setFailureMessage("Elastic IP address " + eipId + " is already associated");
-                    break;
+            try {
+                // Checked under the same lock that writes the association below, so two gateways
+                // cannot both see the allocation free. As on AWS, an allocation already held by an
+                // instance or another gateway does not fail the call: the gateway is created in state
+                // failed, with no interface, and the allocation is left with its holder.
+                List<String> eips = new ArrayList<>();
+                if (isSet(allocationId)) {
+                    eips.add(allocationId);
                 }
+                eips.addAll(secondaryEips);
+                Set<String> seen = new HashSet<>();
+                for (String eipId : eips) {
+                    if (!seen.add(eipId) || isElasticIpTaken(region, eipId)) {
+                        natGateway.setState("failed");
+                        natGateway.setFailureCode("Resource.AlreadyAssociated");
+                        natGateway.setFailureMessage("Elastic IP address " + eipId + " is already associated");
+                        break;
+                    }
+                }
+                if (!"failed".equals(natGateway.getState())) {
+                    natGateway.getNatGatewayAddresses().addAll(natGatewayAddresses(region, natGateway.getNatGatewayId(),
+                            subnetId, allocationId, requestedPrivateIp, secondaryEips, requestedSecondaryIps, secondaryCount));
+                    natGateway.getNatGatewayAddresses().forEach(a -> holdNatGatewayEip(region, a));
+                }
+                if (natGatewayTags != null && !natGatewayTags.isEmpty()) {
+                    natGateway.setTags(new ArrayList<>(natGatewayTags));
+                    List<Tag> storedTags = clientToken == null ? new ArrayList<>(natGatewayTags)
+                            : natGatewayTags.stream().map(tag -> new Tag(tag.getKey(), tag.getValue()))
+                                    .collect(Collectors.toCollection(ArrayList::new));
+                    putTags(region, natGateway.getNatGatewayId(), storedTags);
+                }
+                if (clientToken == null) {
+                    natGateways.put(key(region, natGateway.getNatGatewayId()), natGateway);
+                } else {
+                    natGateways.putAllAtomically(Map.of(key(region, natGateway.getNatGatewayId()),
+                            new NatGateway(natGateway)));
+                }
+            } catch (RuntimeException failure) {
+                if (clientToken != null) {
+                    rollbackUnpublishedNatGateway(region, natGateway, failure);
+                }
+                throw failure;
             }
-            if (!"failed".equals(natGateway.getState())) {
-                natGateway.getNatGatewayAddresses().addAll(natGatewayAddresses(region, natGateway.getNatGatewayId(),
-                        subnetId, allocationId, requestedPrivateIp, secondaryEips, requestedSecondaryIps, secondaryCount));
-                natGateway.getNatGatewayAddresses().forEach(a -> holdNatGatewayEip(region, a));
-            }
-            if (natGatewayTags != null && !natGatewayTags.isEmpty()) {
-                natGateway.setTags(new ArrayList<>(natGatewayTags));
-                putTags(region, natGateway.getNatGatewayId(), new ArrayList<>(natGatewayTags));
-            }
-            natGateways.put(key(region, natGateway.getNatGatewayId()), natGateway);
         }
         if (routing != null && !"failed".equals(natGateway.getState())) {
+            if (clientToken != null) {
+                return completeTokenNatGatewayCreation(region, natGateway, routing);
+            }
             try {
                 routing.createNat(callerAccountId(), region, natGateway);
                 natGateway.setState("available");
@@ -14945,7 +15016,133 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 LOG.errorv(failure, "Failed to prepare NAT gateway {0}", natGateway.getNatGatewayId());
             }
         }
-        return natGateway;
+        return clientToken == null ? natGateway : new NatGateway(natGateway);
+    }
+
+
+
+    private Object natGatewayLifecycleLock(String region, String natGatewayId) {
+        return natGatewayLifecycleLocks[Math.floorMod(
+                (callerAccountId() + "/" + key(region, natGatewayId)).hashCode(), natGatewayLifecycleLocks.length)];
+    }
+
+    private NatGateway completeTokenNatGatewayCreation(String region, NatGateway created, VpcRoutingManager routing) {
+        synchronized (natGatewayLifecycleLock(region, created.getNatGatewayId())) {
+            NatGateway current;
+            synchronized (privateIpAllocationLock) {
+                current = natGateways.get(key(region, created.getNatGatewayId())).orElse(null);
+                if (current == null || "deleted".equals(current.getState())) {
+                    NatGateway deleted = new NatGateway(created);
+                    deleted.setState("deleted");
+                    return deleted;
+                }
+                current = new NatGateway(current);
+            }
+            RuntimeException nativeFailure = null;
+            try {
+                routing.createNat(callerAccountId(), region, current);
+            } catch (RuntimeException failure) {
+                nativeFailure = failure;
+                LOG.errorv(failure, "Failed to prepare NAT gateway {0}", created.getNatGatewayId());
+            }
+            synchronized (privateIpAllocationLock) {
+                NatGateway stored = natGateways.get(key(region, created.getNatGatewayId())).orElse(null);
+                if (stored == null || "deleted".equals(stored.getState())) {
+                    current.setState("deleted");
+                    return current;
+                }
+                current = new NatGateway(stored);
+                current.setState(nativeFailure == null ? "available" : "failed");
+                if (nativeFailure != null) {
+                    current.setFailureCode("InternalError");
+                    current.setFailureMessage("Cannot prepare the local NAT packet runtime");
+                }
+                natGateways.putAllAtomically(Map.of(key(region, current.getNatGatewayId()), new NatGateway(current)));
+            }
+            if (nativeFailure == null) {
+                routing.reconcile();
+            }
+            return current;
+        }
+    }
+
+    private static void validateNatGatewayClientToken(String clientToken) {
+        if (clientToken != null && (clientToken.length() > 64
+                || clientToken.chars().anyMatch(character -> character > 127))) {
+            throw new AwsException("InvalidParameterValue",
+                    "ClientToken must contain at most 64 ASCII characters.", 400);
+        }
+    }
+
+    private static Map<String, List<String>> natGatewayCreationParameters(
+            String subnetId, String allocationId, String connectivityType, String privateIpAddress,
+            List<String> secondaryAllocationIds, List<String> secondaryPrivateIpAddresses,
+            String secondaryPrivateIpAddressCount, List<Tag> natGatewayTags) {
+        Map<String, List<String>> parameters = new LinkedHashMap<>();
+        parameters.put("SubnetId", subnetId == null ? List.of() : List.of(subnetId));
+        parameters.put("AllocationId", allocationId == null ? List.of() : List.of(allocationId));
+        parameters.put("ConnectivityType", List.of(connectivityType == null ? "public" : connectivityType));
+        parameters.put("PrivateIpAddress", privateIpAddress == null ? List.of() : List.of(privateIpAddress));
+        parameters.put("SecondaryAllocationIds", secondaryAllocationIds == null
+                ? List.of() : new ArrayList<>(secondaryAllocationIds));
+        parameters.put("SecondaryPrivateIpAddresses", secondaryPrivateIpAddresses == null
+                ? List.of() : new ArrayList<>(secondaryPrivateIpAddresses));
+        parameters.put("SecondaryPrivateIpAddressCount", secondaryPrivateIpAddressCount == null
+                ? List.of() : List.of(secondaryPrivateIpAddressCount));
+        List<String> creationTags = new ArrayList<>();
+        if (natGatewayTags != null) {
+            for (Tag tag : natGatewayTags) {
+                creationTags.add(tag.getKey());
+                creationTags.add(tag.getValue());
+            }
+        }
+        parameters.put("Tags", creationTags);
+        return parameters;
+    }
+
+    /** The token is literal and scoped to its original account, Region and availability zone. */
+    private NatGateway replayNatGateway(String region, String clientToken, String availabilityZone,
+                                        Map<String, List<String>> parameters) {
+        if (clientToken == null) {
+            return null;
+        }
+        for (NatGateway gateway : natGateways.scan(k -> true)) {
+            if (!clientToken.equals(gateway.getClientToken())
+                    || !callerAccountId().equals(gateway.getCreationAccountId())
+                    || !region.equals(gateway.getRegion())) {
+                continue;
+            }
+            boolean sameParameters = parameters.equals(gateway.getCreationParameters());
+            // Before looking up mutable resources, an exact replay can use its stored zone.
+            if (availabilityZone == null ? sameParameters
+                    : availabilityZone.equals(gateway.getCreationAvailabilityZone())) {
+                if (!sameParameters) {
+                    throw new AwsException("IdempotentParameterMismatch",
+                            "Arguments on this idempotent request are inconsistent "
+                                    + "with arguments used in previous request(s).", 400);
+                }
+                return new NatGateway(gateway);
+            }
+        }
+        return null;
+    }
+
+    private void rollbackUnpublishedNatGateway(String region, NatGateway gateway, RuntimeException failure) {
+        List<Runnable> cleanup = new ArrayList<>();
+        gateway.getNatGatewayAddresses().forEach(address ->
+                cleanup.add(() -> releaseNatGatewayEip(region, address)));
+        gateway.getNatGatewayAddresses().forEach(address ->
+                cleanup.add(() -> releasePrivateIps(region, gateway.getSubnetId(), List.of(address.getPrivateIp()))));
+        cleanup.add(() -> removeTags(region, gateway.getNatGatewayId()));
+        for (Runnable action : cleanup) {
+            try {
+                action.run();
+            } catch (RuntimeException cleanupFailure) {
+                if (cleanupFailure != failure) {
+                    failure.addSuppressed(cleanupFailure);
+                }
+            }
+        }
     }
 
     /**
@@ -15410,6 +15607,12 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     public NatGateway deleteNatGateway(String region, String natGatewayId) {
+        synchronized (natGatewayLifecycleLock(region, natGatewayId)) {
+            return deleteNatGatewayUnderLifecycleLock(region, natGatewayId);
+        }
+    }
+
+    private NatGateway deleteNatGatewayUnderLifecycleLock(String region, String natGatewayId) {
         ensureDefaultResources(region);
         getRequiredNatGateway(region, natGatewayId);
         NatGateway natGateway;

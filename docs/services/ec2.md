@@ -1313,6 +1313,15 @@ Route table ids follow the live API's own inconsistency: an id that does not exi
 targets before changing the route table. Gateway deletion also blackholes a route whose concurrent
 creation or replacement validated the target immediately before deletion.
 
+`CreateNatGateway` accepts an optional, case-sensitive ASCII `ClientToken` of at most 64
+characters and echoes it in the response. An identical creation request with that token in the
+same account, Region and Availability Zone returns the existing gateway, including its current
+state and tags. Changing creation parameters in that scope fails with
+`IdempotentParameterMismatch`; using a subnet in another Availability Zone has an independent
+token scope. Updating the gateway's tags does not change its original creation request.
+After gateway deletion completes, the token can create a new gateway. Active token identity
+is stored with the gateway and follows the configured storage backend's persistence behavior.
+
 Every NAT gateway Floci creates is zonal: it sits in the subnet it was created in, and responses
 report `availabilityMode` as `zonal`. Regional NAT gateways are not supported: `CreateNatGateway` with
 `AvailabilityMode=regional` fails with `UnsupportedOperation`, and an `AWS::EC2::NatGateway` whose
