@@ -79,11 +79,73 @@ creation and update. Attributes omitted by an update retain their current values
 A failed stack update restores only the attributes changed by that update,
 preserving changes to other attributes.
 
+## Native drift detection
+
+`DetectStackResourceDrift` and `DetectStackDrift` compare the committed template's
+explicit literal `TopicName` and `DisplayName` properties of `AWS::SNS::Topic`
+with a scoped native SNS read. A missing topic is `DELETED`; unequal properties
+are `MODIFIED`; equal declared properties are `IN_SYNC`. Omitted properties are
+not compared. `ActualProperties` contains only those declared properties, not a
+full SNS resource projection. Parameterized, transformed, conditional, dynamic
+reference, nested-stack and other provider templates are refused explicitly.
+A whole-stack request containing an unsupported selected resource fails rather
+than treating that resource as in sync. Root stacks must have completed creation,
+update, or update rollback and have no operation still running.
+
+This branch does not persist a stack's parent identity. Detection therefore requires
+one retained, completed CREATE change set whose identity matches the exact root
+stack lifetime. Live and retained rollback resource maps are checked for scoped
+nested-stack ancestry, and origin is checked again before result publication.
+Missing, corrupt, ambiguous or unresolved ancestry is refused. Legacy/imported
+roots without that provenance, roots after deleting their CREATE change set, and
+roots after an explicit `ExecuteChangeSet` update discards the CREATE record are
+unsupported. An unresolved nested physical ID in the same account and Region
+also conservatively refuses detection. This read-only check adds no persisted
+fields and is not a transaction with all nested-stack lifecycle writers.
+
+Whole-stack checks complete synchronously and return a stored detection UUID.
+`DescribeStackDriftDetectionStatus` reads its completed status and changed count;
+`DescribeStackResourceDrifts` lists the latest checked resources, with status
+filters and pages of 1–100 entries. Detection history and resource results are
+scoped to account, Region and stack ID. Pagination uses logical-ID order locally;
+its opaque tokens bind the stack lifetime, result revision and filters. Results
+are stored together through the existing atomic storage batch: persistent and
+WAL write failures publish no candidate result; hybrid durability remains
+asynchronous. Deleted stack detection history is retained, while a replacement
+stack with the same name starts with no results.
+
+With IAM enforcement enabled, the three stack operations use the actual stack
+ARN and captured stack tags. Describing a detection UUID requires the action on
+`*`. Whole detection also requires `cloudformation:DetectStackResourceDrift` and
+`cloudformation:BatchDescribeTypeConfigurations`. Both detection operations
+require the original caller's `sns:GetTopicAttributes` on each selected topic,
+including a missing topic. Each SNS check uses that topic's captured policy and
+tags, with the caller's permission ceilings; stack tags do not carry into it.
+Reads do not migrate legacy SNS rows. Corrupt or foreign rows are errors rather
+than missing resources. Authorization and result comparison share immutable
+request snapshots; publication checks the stack lifetime again under the root
+stack update/delete admission lock. This does not make arbitrary native SNS
+mutations or all inherited CloudFormation lifecycle operations one transaction.
+
+Stacks with a recorded execution `RoleARN` are refused for drift. Drift does not
+assume an execution role or claim AWS execution-role precedence.
+
+CloudFormation now applies SNS `DisplayName` on creation and update, preserves an
+explicit empty string, and resets a removed previously declared value to empty.
+Templates that never declared it leave out-of-band values alone. Rollback restores
+the previous native display name only for literal `TopicName`/`DisplayName` updates
+on the same topic. Broader SNS rollback and concurrent delete/recreate atomicity
+are outside that bounded support.
+
 ## Supported Actions
 
 <!-- floci:actions:start -->
 | Action | Description |
 | --- | --- |
+| `DetectStackDrift` | Check selected supported resources and record a completed detection |
+| `DetectStackResourceDrift` | Compare one supported resource with its declared properties |
+| `DescribeStackDriftDetectionStatus` | Read a scoped detection result |
+| `DescribeStackResourceDrifts` | Page and filter the latest checked resource results |
 | `DescribeStacks` | Get stack status, parameters, and outputs |
 | `CreateStack` | Deploy a CloudFormation template |
 | `UpdateStack` | Update an existing stack |

@@ -81,6 +81,7 @@ services:
     doc: docs/services/cloudformation.md
     sources:
       - { path: services/cloudformation/CloudFormationQueryHandler.java, mode: switch }
+      - { path: services/cloudformation/CloudFormationDriftHandler.java, mode: switch }
   - service: cloudhsmv2
     doc: docs/services/cloudhsmv2.md
     sources:

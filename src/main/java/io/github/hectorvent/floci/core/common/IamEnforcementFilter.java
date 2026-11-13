@@ -2,6 +2,9 @@ package io.github.hectorvent.floci.core.common;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.cloudformation.CloudFormationDriftHandler;
+import io.github.hectorvent.floci.services.cloudformation.CloudFormationDriftService;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnDriftProjection;
 import io.github.hectorvent.floci.services.cloudtrail.CloudTrailService;
 import io.github.hectorvent.floci.services.iam.AccessDeniedMessages;
 import io.github.hectorvent.floci.services.iam.AccessDeniedMessages.PolicyType;
@@ -211,6 +214,9 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
     private final CloudTrailService cloudTrailService;
     private final CurrentVertxRequest currentVertxRequest;
     private final ResolvedServiceCatalog catalog;
+    @Inject
+    Instance<CloudFormationDriftService> driftService;
+
     private final Instance<ScpProvider> scpProvider;
     private final SessionAccountLookup sessionAccountLookup;
     private final Instance<ResourcePolicyProvider> resourcePolicyProviders;
@@ -661,6 +667,10 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         }
         if (abortIfDenied(ctx, caller, principal, action, credentialScope, resources, targetContexts,
                 region, accountId, akid)) {
+            return;
+        }
+        if (abortIfDriftReadDenied(ctx, caller, principal, callerArns.orElse(null), action,
+                resources, targetContexts, region, accountId, akid)) {
             return;
         }
         if (abortIfRolePassDenied(ctx, caller, principal, callerArns.orElse(null), action, credentialScope,
@@ -1329,6 +1339,70 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             context.put("aws:SecureTransport", List.of(Boolean.toString(routingContext.request().isSSL())));
         }
         return context;
+    }
+
+    /** Drift's native provider reads use the original caller and the captured provider policy and tags. */
+    private boolean abortIfDriftReadDenied(ContainerRequestContext ctx, CallerContext caller,
+                                           RequestPrincipal principal, CallerArns callerArns, String action,
+                                           List<String> resources, List<Map<String, List<String>>> targetContexts,
+                                           String region, String accountId, String akid) {
+        if (!"cloudformation:DetectStackDrift".equals(action)
+                && !"cloudformation:DetectStackResourceDrift".equals(action)) {
+            return false;
+        }
+        if (driftService == null || !driftService.isResolvable()) {
+            throw new AwsException("ValidationError", "CloudFormation drift service is unavailable", 400);
+        }
+        if ("cloudformation:DetectStackDrift".equals(action)) {
+            if (abortIfDenied(ctx, caller, principal, "cloudformation:DetectStackResourceDrift", action,
+                    "cloudformation", resources, targetContexts, region, accountId, akid)) {
+                return true;
+            }
+            Map<String, List<String>> typeContext = new HashMap<>();
+            if (callerArns != null) {
+                callerArns.putPrincipalKeys(typeContext);
+            }
+            if (abortIfDenied(ctx, caller, principal, "cloudformation:BatchDescribeTypeConfigurations", action,
+                    "cloudformation", List.of("*"), List.of(typeContext), region, accountId, akid)) {
+                return true;
+            }
+        }
+        Map<String, String> form = IamConditionContextResolver.formParameters(ctx);
+        List<String> selected;
+        if ("cloudformation:DetectStackResourceDrift".equals(action)) {
+            String id = form.get("LogicalResourceId");
+            if (id == null) {
+                throw new AwsException("ValidationError", "LogicalResourceId is required", 400);
+            }
+            selected = List.of(id);
+        } else {
+            Map<String, List<String>> members = new HashMap<>();
+            form.forEach((key, value) -> members.put(key, List.of(value)));
+            selected = CloudFormationDriftHandler.members(members, "LogicalResourceIds.member.");
+        }
+        for (CfnDriftProjection.Permission permission : driftService.get().readPermissions(
+                form.get("StackName"), selected, region, accountId)) {
+            Map<String, List<String>> nativeContext = new HashMap<>();
+            permission.tags().forEach((key, value) -> nativeContext.put("aws:ResourceTag/" + key, List.of(value)));
+            if (callerArns != null) {
+                callerArns.putPrincipalKeys(nativeContext);
+            }
+            Map<String, List<String>> effective = withRequestContext(nativeContext,
+                    permission.resourceArn(), region, accountId, permission.accountId(), permission.action());
+            List<String> policies = permission.policyDocument() == null || permission.policyDocument().isBlank()
+                    ? null : List.of(permission.policyDocument());
+            ResourcePolicyDecision resourceDecision = evaluator.evaluateResourcePolicyFor(
+                    policies, principal, permission.action(), permission.resourceArn(), effective);
+            ResourceAccountRelationship relationship = accountId.equals(permission.accountId())
+                    ? ResourceAccountRelationship.SAME_ACCOUNT : ResourceAccountRelationship.CROSS_ACCOUNT;
+            if (evaluator.evaluateResolvedResourcePolicy(caller, resourceDecision, relationship,
+                    permission.action(), permission.resourceArn(), effective) == Decision.DENY) {
+                ctx.abortWith(accessDeniedForRequest(permission.action(), "cloudformation", ctx,
+                        permission.resourceArn()));
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
