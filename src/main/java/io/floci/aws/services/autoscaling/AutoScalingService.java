@@ -139,11 +139,18 @@ public class AutoScalingService implements PassedRoleLookup {
 
     private final ElbV2Service elbV2Service;
     private final ElbClassicService elbClassicService;
+    private final AutoScalingEventPublisher eventPublisher;
+
+    public AutoScalingService(ElbV2Service elbV2Service, ElbClassicService elbClassicService) {
+        this(elbV2Service, elbClassicService, null);
+    }
 
     @Inject
-    public AutoScalingService(ElbV2Service elbV2Service, ElbClassicService elbClassicService) {
+    public AutoScalingService(ElbV2Service elbV2Service, ElbClassicService elbClassicService,
+                              AutoScalingEventPublisher eventPublisher) {
         this.elbV2Service = elbV2Service;
         this.elbClassicService = elbClassicService;
+        this.eventPublisher = eventPublisher;
     }
 
     AutoScalingService() {
@@ -605,7 +612,18 @@ public class AutoScalingService implements PassedRoleLookup {
                         .filter(Objects::nonNull)
                         .forEach(instanceId -> {
                             try {
-                                ec2Service.terminateInstances(region, List.of(instanceId));
+                                AutoScalingEventPublisher.Termination termination =
+                                        terminateEc2Instances(asg, ec2Service, List.of(instanceId));
+                                if (termination != null) {
+                                    try {
+                                        ScalingActivity activity = recordActivity(region, name,
+                                                "Terminating EC2 instance: " + instanceId,
+                                                "The Auto Scaling group was deleted.", "Successful");
+                                        termination.activity(List.of(instanceId), activity);
+                                    } catch (RuntimeException failure) {
+                                        LOG.warnv(failure, "Could not record termination event activity for {0}", instanceId);
+                                    }
+                                }
                             }
                             catch (AwsException ignored) {
                                 // ForceDelete should remove stale ASG membership even if EC2 no longer has the instance.
@@ -623,6 +641,27 @@ public class AutoScalingService implements PassedRoleLookup {
         scheduledActions.entrySet().removeIf(e -> region.equals(e.getValue().getRegion())
                 && name.equals(e.getValue().getAutoScalingGroupName()));
         warmPools.remove(warmPoolKey(region, name));
+    }
+
+    void instanceLaunched(AutoScalingGroup group, Instance instance, ScalingActivity activity) {
+        if (eventPublisher != null) {
+            eventPublisher.launched(group, instance, activity);
+        }
+    }
+
+    AutoScalingEventPublisher.Termination terminateEc2Instances(AutoScalingGroup group, Ec2Service ec2,
+                                                                List<String> instanceIds) {
+        AutoScalingEventPublisher.Termination observer = terminationObserver(group, instanceIds);
+        if (observer == null) {
+            ec2.terminateInstances(group.getRegion(), instanceIds);
+        } else {
+            ec2.terminateInstancesWithCompletion(group.getRegion(), instanceIds, observer);
+        }
+        return observer;
+    }
+
+    AutoScalingEventPublisher.Termination terminationObserver(AutoScalingGroup group, List<String> instanceIds) {
+        return eventPublisher == null ? null : eventPublisher.termination(group, instanceIds);
     }
 
     public List<AutoScalingGroup> describeAutoScalingGroups(String region, List<String> names) {
