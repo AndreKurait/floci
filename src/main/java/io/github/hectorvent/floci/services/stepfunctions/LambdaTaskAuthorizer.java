@@ -218,8 +218,9 @@ public class LambdaTaskAuthorizer {
         // stay absent, which is what makes a condition on either of them not match.
         CallerArns trustCaller = new CallerArns(sessionArn(callerRoleArn), callerRoleArn,
                 CallerArns.TYPE_ASSUMED_ROLE, null, null);
-        TrustDecision trust = trustEvaluator.decide(target.get().getAssumeRolePolicyDocument(), trustCaller,
-                callerId.accountId(), context);
+        TrustDecision trust = trustEvaluator.decideWithPrincipalId(
+                target.get().getAssumeRolePolicyDocument(), trustCaller,
+                callerId.accountId(), context, executionRole.get().getRoleId());
         ResourceAccountRelationship relationship = relationship(callerId.accountId(), roleAccount);
         // A grant to the execution role's account delegates to that account, so within it the
         // role's own policies have to allow the call too, as they do across accounts anyway.
