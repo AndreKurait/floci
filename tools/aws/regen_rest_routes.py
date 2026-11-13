@@ -59,6 +59,7 @@ MODELS: dict[str, str] = {
     "controlcatalog": "controlcatalog",
     "dsql": "dsql",
     "eks": "eks",
+    "emr-serverless": "emr-serverless",
     "es": "es",
     "fis": "fis",
     "lambda": "lambda",

@@ -169,7 +169,7 @@ NAMESPACES = ("access-analyzer", "account", "acm", "appconfig", "application-aut
               "bcm-data-exports", "bcm-pricing-calculator", "budgets", "ce", "cloudfront",
               "cloudfront-keyvaluestore", "cloudtrail", "codebuild", "codepipeline", "cognito-identity",
               "cognito-idp", "controlcatalog", "cur", "datasync", "ec2", "ecr", "elasticloadbalancing",
-              "elasticmapreduce", "es", "events", "firehose", "fis", "globalaccelerator", "kinesisanalytics",
+              "elasticmapreduce", "emr-serverless", "es", "events", "firehose", "fis", "globalaccelerator", "kinesisanalytics",
               "oam", "payment-cryptography", "ram", "redshift", "redshift-data", "rekognition",
               "resource-explorer-2", "servicediscovery", "servicequotas", "sso", "states", "swf", "textract",
               "timestream-influxdb", "translate")
@@ -253,7 +253,6 @@ NOT_COVERED: dict[str, str] = {
                         "`environment/<application>/<name>`, while most of its requests name it by EnvironmentName "
                         "or EnvironmentId alone, so reading it needs the stored environment those find",
     "elasticfilesystem": _REST,
-    "emr-serverless": _REST,
     "execute-api": _REST,
 
     "glue": _LATER,

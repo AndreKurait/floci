@@ -458,6 +458,10 @@
       "ListEksAnywhereSubscriptions",
       "RegisterCluster"
     ],
+    "emr-serverless": [
+      "CreateApplication",
+      "ListApplications"
+    ],
     "es": [
       "AcceptInboundConnection",
       "AcceptInboundCrossClusterSearchConnection",
