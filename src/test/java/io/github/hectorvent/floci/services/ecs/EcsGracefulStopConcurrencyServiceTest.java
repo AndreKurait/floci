@@ -400,6 +400,8 @@ class EcsGracefulStopConcurrencyServiceTest {
         assertEquals(2, stops.get());
     }
 
+
+
     // ── helpers ──────────────────────────────────────────────────────────────
 
     /** One full reconcile tick, on a thread of its own, so a tick stuck behind a stop fails rather than hangs. */

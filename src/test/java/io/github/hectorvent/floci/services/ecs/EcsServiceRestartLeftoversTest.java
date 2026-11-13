@@ -21,12 +21,14 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
+import java.time.Duration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
+import static io.github.hectorvent.floci.testing.EcsTaskWaits.awaitLastStatus;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -35,6 +37,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -66,8 +69,11 @@ class EcsServiceRestartLeftoversTest {
         EcsService restarted = service(storage, false, manager, mock(EcsLoadBalancerRegistrar.class), null);
         restarted.releasePreviousRunLeftovers();
         restarted.registerContainerInstance("app-cluster", null, null, REGION);
-        EcsTask task = restarted.runTask("app-cluster", "web", 1, LaunchType.EC2, null, null,
-                null, null, REGION).getFirst();
+        String taskArn = restarted.runTask("app-cluster", "web", 1,
+                LaunchType.EC2, null, null, null, null, REGION).getFirst().getTaskArn();
+        EcsTask task = awaitLastStatus(
+                () -> restarted.describeTasks("app-cluster", List.of(taskArn), REGION).getFirst(),
+                EcsTask::getLastStatus, Duration.ofSeconds(5), "RUNNING", "STOPPED");
         assertEquals("RUNNING", task.getLastStatus());
         restarted.reconcileServices();
         verify(manager, times(2)).startTask(any(), any(), any(), anyString());
@@ -102,7 +108,10 @@ class EcsServiceRestartLeftoversTest {
         restarted.registerTaskDefinition("web", List.of(definition), NetworkMode.bridge, null, null,
                 null, null, List.of(), REGION);
         restarted.registerContainerInstance(null, null, null, REGION);
-        restarted.runTask(null, "web", 1, LaunchType.EC2, null, null, null, null, REGION);
+        String taskArn = restarted.runTask(null, "web", 1, LaunchType.EC2, null, null, null, null, REGION)
+                .getFirst().getTaskArn();
+        awaitLastStatus(() -> restarted.describeTasks(null, List.of(taskArn), REGION).getFirst(),
+                EcsTask::getLastStatus, Duration.ofSeconds(5), "RUNNING", "STOPPED");
         restarted.reconcile();
         restarted.reconcile();
         restarted.reconcile();
@@ -169,15 +178,21 @@ class EcsServiceRestartLeftoversTest {
 
         restarted.releasePreviousRunLeftovers();
         restarted.registerContainerInstance("app-cluster", null, null, REGION);
-        EcsTask blocked = restarted.runTask("app-cluster", "web", 1, LaunchType.EC2, null, null,
-                null, null, REGION).getFirst();
+        String blockedArn = restarted.runTask("app-cluster", "web", 1,
+                LaunchType.EC2, null, null, null, null, REGION).getFirst().getTaskArn();
+        EcsTask blocked = awaitLastStatus(
+                () -> restarted.describeTasks("app-cluster", List.of(blockedArn), REGION).getFirst(),
+                EcsTask::getLastStatus, Duration.ofSeconds(5), "RUNNING", "STOPPED");
 
         assertEquals("STOPPED", blocked.getLastStatus());
         assertThat(blocked.getStoppedReason(), containsString("previous run"));
         verify(containerManager, never()).startTask(any(), any(), any(), anyString());
 
         restarted.registerContainerInstance("app-cluster", null, null, REGION);
-        restarted.runTask("app-cluster", "web", 1, LaunchType.EC2, null, null, null, null, REGION);
+        String taskArn = restarted.runTask("app-cluster", "web", 1, LaunchType.EC2, null, null, null, null, REGION)
+                .getFirst().getTaskArn();
+        awaitLastStatus(() -> restarted.describeTasks("app-cluster", List.of(taskArn), REGION).getFirst(),
+                EcsTask::getLastStatus, Duration.ofSeconds(5), "RUNNING", "STOPPED");
 
         verify(containerManager, times(3)).removeLeftoverContainers();
         verify(containerManager).startTask(any(), any(), any(), anyString());
@@ -220,7 +235,10 @@ class EcsServiceRestartLeftoversTest {
 
         restarted.releasePreviousRunLeftovers();
         restarted.registerContainerInstance("app-cluster", null, null, REGION);
-        restarted.runTask("app-cluster", "web", 1, LaunchType.EC2, null, null, null, null, REGION);
+        String taskArn = restarted.runTask("app-cluster", "web", 1, LaunchType.EC2, null, null, null, null, REGION)
+                .getFirst().getTaskArn();
+        awaitLastStatus(() -> restarted.describeTasks("app-cluster", List.of(taskArn), REGION).getFirst(),
+                EcsTask::getLastStatus, Duration.ofSeconds(5), "RUNNING", "STOPPED");
 
         verify(containerManager, never()).removeLeftoverContainers();
         verify(containerManager, never()).removeLeftoverTaskVolumes();
@@ -285,15 +303,18 @@ class EcsServiceRestartLeftoversTest {
 
         // A task of no service at all: any container can take the address a stale entry points at.
         ecs.registerContainerInstance("app-cluster", null, null, REGION);
-        EcsTask task = ecs.runTask("app-cluster", "web", 1, LaunchType.EC2, null, null, null, null, REGION)
-                .getFirst();
+        String taskArn = ecs.runTask("app-cluster", "web", 1, LaunchType.EC2, null, null, null, null, REGION)
+                .getFirst().getTaskArn();
+        EcsTask task = awaitLastStatus(
+                () -> ecs.describeTasks("app-cluster", List.of(taskArn), REGION).getFirst(),
+                EcsTask::getLastStatus, Duration.ofSeconds(5), "RUNNING", "STOPPED");
 
         assertEquals("RUNNING", task.getLastStatus());
         Set<EcsTaskAddress> expectedTargets = attached
                 ? Set.of(new EcsTaskAddress(host, targetPort), new EcsTaskAddress("10.0.1.5", 80, "vpc-app"))
                 : Set.of(new EcsTaskAddress(host, targetPort));
-        verify(lbRegistrar).evictUnrecordedTargets(task, Set.of(TARGET_GROUP_ARN), expectedTargets, REGION);
-        verify(discoveryRegistrar).evictUnrecordedInstances(task, Set.of("srv-alpha"),
+        verify(lbRegistrar, timeout(5000)).evictUnrecordedTargets(task, Set.of(TARGET_GROUP_ARN), expectedTargets, REGION);
+        verify(discoveryRegistrar, timeout(5000)).evictUnrecordedInstances(task, Set.of("srv-alpha"),
                 Set.of(new EcsTaskAddress("10.0.1.5", null, "vpc-app"), new EcsTaskAddress("172.19.0.4", null)),
                 REGION);
     }

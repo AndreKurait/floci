@@ -29,6 +29,10 @@ public final class ContainerTeardowns {
     }
 
     public static void stopAll(Instance<ContainerTeardown> teardowns, Logger log) {
+        stopPrepared(prepareAll(teardowns, log), log);
+    }
+
+    public static List<ContainerTeardown> prepareAll(Instance<ContainerTeardown> teardowns, Logger log) {
         List<ContainerTeardown> ordered = new ArrayList<>();
         for (ContainerTeardown teardown : teardowns) {
             ordered.add(teardown);
@@ -38,10 +42,14 @@ public final class ContainerTeardowns {
             try {
                 teardown.beginTeardown();
             } catch (Exception e) {
-                log.warnv("Container teardown preparation failed for {0}: {1}",
-                        teardown.getClass().getSimpleName(), e.getMessage());
+                log.warnv(e, "Container teardown preparation failed for {0}; producers may still be active during best-effort cleanup",
+                        teardown.getClass().getSimpleName());
             }
         }
+        return List.copyOf(ordered);
+    }
+
+    public static void stopPrepared(List<ContainerTeardown> ordered, Logger log) {
         for (ContainerTeardown teardown : ordered) {
             try {
                 teardown.stopManagedContainers();

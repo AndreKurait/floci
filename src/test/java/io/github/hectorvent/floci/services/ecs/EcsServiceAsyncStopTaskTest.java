@@ -20,11 +20,13 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
+import static io.github.hectorvent.floci.testing.EcsTaskWaits.awaitLastStatus;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -67,20 +69,28 @@ class EcsServiceAsyncStopTaskTest {
         service.registerContainerInstance("app-cluster", DOCUMENT, null, REGION);
         EcsTask task = service.runTask("app-cluster", "app", 1, LaunchType.EC2, null, null, null, null, REGION).getFirst();
 
-        long started = System.nanoTime();
-        EcsTask answer = service.stopTask("app-cluster", task.getTaskArn(), "drain", REGION);
-        long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+        try {
+            awaitLastStatus(() -> describe(service, task), EcsTask::getLastStatus,
+                    Duration.ofSeconds(5), "RUNNING");
 
-        assertEquals("STOPPING", answer.getLastStatus());
-        assertEquals("STOPPED", answer.getDesiredStatus());
-        assertTrue(elapsedMillis < 5_000, "StopTask waited for the teardown: " + elapsedMillis + " ms");
-        assertTrue(stopCalled.await(10, TimeUnit.SECONDS), "the teardown never started");
-        assertEquals("STOPPING", describe(service, task).getLastStatus());
+            long started = System.nanoTime();
+            EcsTask answer = service.stopTask("app-cluster", task.getTaskArn(), "drain", REGION);
+            long elapsedMillis = TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
 
-        draining.countDown();
-        service.awaitPendingStops();
-        assertEquals("STOPPED", describe(service, task).getLastStatus());
-        assertEquals(0, describe(service, task).getContainers().getFirst().getExitCode());
+            assertEquals("STOPPING", answer.getLastStatus());
+            assertEquals("STOPPED", answer.getDesiredStatus());
+            assertTrue(elapsedMillis < 5_000, "StopTask waited for the teardown: " + elapsedMillis + " ms");
+            assertTrue(stopCalled.await(10, TimeUnit.SECONDS), "the teardown never started");
+            assertEquals("STOPPING", describe(service, task).getLastStatus());
+
+            draining.countDown();
+            service.awaitPendingStops();
+            assertEquals("STOPPED", describe(service, task).getLastStatus());
+            assertEquals(0, describe(service, task).getContainers().getFirst().getExitCode());
+        } finally {
+            draining.countDown();
+            service.stopManagedContainers();
+        }
     }
 
     private static EcsTask describe(EcsService service, EcsTask task) {

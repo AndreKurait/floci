@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static io.github.hectorvent.floci.testing.EcsTaskWaits.awaitLastStatus;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -78,6 +79,10 @@ class EcsServiceTimelineTest {
         EcsTask task = service.runTask("tl-task-cluster", "tl-task-fam", 1, LaunchType.FARGATE, null, null,
                 List.of(), null, REGION).getFirst();
         assertEquals(START, task.getCreatedAt());
+        String taskArn = task.getTaskArn();
+        task = awaitLastStatus(
+                () -> service.describeTasks("tl-task-cluster", List.of(taskArn), REGION).getFirst(),
+                EcsTask::getLastStatus, Duration.ofSeconds(5), "RUNNING");
         assertEquals(START, task.getStartedAt());
         assertEquals(START, task.getConnectivityAt());
         assertNull(task.getStoppedAt());

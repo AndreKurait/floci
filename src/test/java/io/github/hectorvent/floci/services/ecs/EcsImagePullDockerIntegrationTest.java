@@ -31,6 +31,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -38,6 +39,7 @@ import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static io.github.hectorvent.floci.testing.EcsTaskWaits.awaitLastStatus;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -147,7 +149,10 @@ class EcsImagePullDockerIntegrationTest {
         EcsTask task = ecsService.runTask(clusterName, taskDef.getTaskDefinitionArn(), 1,
                 LaunchType.FARGATE, null, null, null, null, REGION).getFirst();
         taskArns.add(task.getTaskArn());
-        EcsTask described = ecsService.describeTasks(clusterName, List.of(task.getTaskArn()), REGION).getFirst();
+        // RunTask answers before the launch; wait for it to land the task RUNNING or STOPPED.
+        EcsTask described = awaitLastStatus(
+                () -> ecsService.describeTasks(clusterName, List.of(task.getTaskArn()), REGION).getFirst(),
+                EcsTask::getLastStatus, Duration.ofMinutes(2), "RUNNING", "STOPPED");
         assertEquals("RUNNING", described.getLastStatus(), "the container must be up: " + described.getStoppedReason());
         return described;
     }
