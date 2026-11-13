@@ -1372,6 +1372,7 @@ class CodePipelineServiceTest {
                 } else if (!requested && approvalPolling.getCount() > 0) {
                     synchronized (execution) {
                         if (execution.getActionExecutions().stream().anyMatch(action -> action.getToken() != null)) {
+                            worker.compareAndSet(null, Thread.currentThread());
                             approvalPolling.countDown();
                         }
                     }
