@@ -1,48 +1,48 @@
-package io.floci.aws.services.ecs;
+package io.github.hectorvent.floci.services.ecs;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import io.floci.aws.core.common.EpochSeconds;
-import io.floci.aws.services.ecs.model.Attribute;
-import io.floci.aws.services.ecs.model.AwsVpcConfiguration;
-import io.floci.aws.services.ecs.model.CapacityProvider;
-import io.floci.aws.services.ecs.model.CapacityProviderStrategyItem;
-import io.floci.aws.services.ecs.model.Container;
-import io.floci.aws.services.ecs.model.ContainerDefinition;
-import io.floci.aws.services.ecs.model.ContainerDependency;
-import io.floci.aws.services.ecs.model.ContainerImage;
-import io.floci.aws.services.ecs.model.ContainerInstance;
-import io.floci.aws.services.ecs.model.ContainerOverride;
-import io.floci.aws.services.ecs.model.Deployment;
-import io.floci.aws.services.ecs.model.EcsCluster;
-import io.floci.aws.services.ecs.model.EcsLoadBalancer;
-import io.floci.aws.services.ecs.model.EcsServiceModel;
-import io.floci.aws.services.ecs.model.EcsTask;
-import io.floci.aws.services.ecs.model.EfsVolumeConfiguration;
-import io.floci.aws.services.ecs.model.EnvironmentFile;
-import io.floci.aws.services.ecs.model.EphemeralStorage;
-import io.floci.aws.services.ecs.model.Failure;
-import io.floci.aws.services.ecs.model.FirelensConfiguration;
-import io.floci.aws.services.ecs.model.HealthCheck;
-import io.floci.aws.services.ecs.model.KeyValuePair;
-import io.floci.aws.services.ecs.model.LogConfiguration;
-import io.floci.aws.services.ecs.model.ManagedAgent;
-import io.floci.aws.services.ecs.model.MountPoint;
-import io.floci.aws.services.ecs.model.NetworkBinding;
-import io.floci.aws.services.ecs.model.PortMapping;
-import io.floci.aws.services.ecs.model.ProtectedTask;
-import io.floci.aws.services.ecs.model.RuntimePlatform;
-import io.floci.aws.services.ecs.model.Secret;
-import io.floci.aws.services.ecs.model.ServiceDeployment;
-import io.floci.aws.services.ecs.model.ServiceEvent;
-import io.floci.aws.services.ecs.model.ServiceRevision;
-import io.floci.aws.services.ecs.model.TaskDefinition;
-import io.floci.aws.services.ecs.model.TaskNetworkInterface;
-import io.floci.aws.services.ecs.model.TaskOverride;
-import io.floci.aws.services.ecs.model.TaskSet;
-import io.floci.aws.services.ecs.model.Volume;
-import io.floci.aws.services.ecs.model.VolumeFrom;
+import io.github.hectorvent.floci.core.common.EpochSeconds;
+import io.github.hectorvent.floci.services.ecs.model.Attribute;
+import io.github.hectorvent.floci.services.ecs.model.AwsVpcConfiguration;
+import io.github.hectorvent.floci.services.ecs.model.CapacityProvider;
+import io.github.hectorvent.floci.services.ecs.model.CapacityProviderStrategyItem;
+import io.github.hectorvent.floci.services.ecs.model.Container;
+import io.github.hectorvent.floci.services.ecs.model.ContainerDefinition;
+import io.github.hectorvent.floci.services.ecs.model.ContainerDependency;
+import io.github.hectorvent.floci.services.ecs.model.ContainerImage;
+import io.github.hectorvent.floci.services.ecs.model.ContainerInstance;
+import io.github.hectorvent.floci.services.ecs.model.ContainerOverride;
+import io.github.hectorvent.floci.services.ecs.model.Deployment;
+import io.github.hectorvent.floci.services.ecs.model.EcsCluster;
+import io.github.hectorvent.floci.services.ecs.model.EcsLoadBalancer;
+import io.github.hectorvent.floci.services.ecs.model.EcsServiceModel;
+import io.github.hectorvent.floci.services.ecs.model.EcsTask;
+import io.github.hectorvent.floci.services.ecs.model.EfsVolumeConfiguration;
+import io.github.hectorvent.floci.services.ecs.model.EnvironmentFile;
+import io.github.hectorvent.floci.services.ecs.model.EphemeralStorage;
+import io.github.hectorvent.floci.services.ecs.model.Failure;
+import io.github.hectorvent.floci.services.ecs.model.FirelensConfiguration;
+import io.github.hectorvent.floci.services.ecs.model.HealthCheck;
+import io.github.hectorvent.floci.services.ecs.model.KeyValuePair;
+import io.github.hectorvent.floci.services.ecs.model.LogConfiguration;
+import io.github.hectorvent.floci.services.ecs.model.ManagedAgent;
+import io.github.hectorvent.floci.services.ecs.model.MountPoint;
+import io.github.hectorvent.floci.services.ecs.model.NetworkBinding;
+import io.github.hectorvent.floci.services.ecs.model.PortMapping;
+import io.github.hectorvent.floci.services.ecs.model.ProtectedTask;
+import io.github.hectorvent.floci.services.ecs.model.RuntimePlatform;
+import io.github.hectorvent.floci.services.ecs.model.Secret;
+import io.github.hectorvent.floci.services.ecs.model.ServiceDeployment;
+import io.github.hectorvent.floci.services.ecs.model.ServiceEvent;
+import io.github.hectorvent.floci.services.ecs.model.ServiceRevision;
+import io.github.hectorvent.floci.services.ecs.model.TaskDefinition;
+import io.github.hectorvent.floci.services.ecs.model.TaskNetworkInterface;
+import io.github.hectorvent.floci.services.ecs.model.TaskOverride;
+import io.github.hectorvent.floci.services.ecs.model.TaskSet;
+import io.github.hectorvent.floci.services.ecs.model.Volume;
+import io.github.hectorvent.floci.services.ecs.model.VolumeFrom;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
@@ -422,7 +422,7 @@ public class EcsResponseWriter {
     }
 
     /** Renders an ECS task to its data-plane JSON shape. Reused by the Step Functions
-     *  ecs:runTask integration ({@link io.floci.aws.services.stepfunctions.AslExecutor}). */
+     *  ecs:runTask integration ({@link io.github.hectorvent.floci.services.stepfunctions.AslExecutor}). */
     public ObjectNode taskNode(EcsTask t) {
         ObjectNode n = objectMapper.createObjectNode();
         n.put("taskArn", t.getTaskArn());

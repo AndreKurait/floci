@@ -1,4 +1,4 @@
-package io.floci.aws.services.ecs.model;
+package io.github.hectorvent.floci.services.ecs.model;
 
 import io.quarkus.runtime.annotations.RegisterForReflection;
 

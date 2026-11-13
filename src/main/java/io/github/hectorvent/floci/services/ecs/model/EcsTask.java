@@ -1,5 +1,6 @@
-package io.floci.aws.services.ecs.model;
+package io.github.hectorvent.floci.services.ecs.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
@@ -37,6 +38,15 @@ public class EcsTask {
     private String stoppedReason;
     private List<Container> containers;
     private String containerInstanceArn;
+    /** The EC2 instance behind {@link #containerInstanceArn}; Floci's own, not part of the ECS Task shape. */
+    @JsonIgnore
+    private String ec2InstanceId;
+    /**
+     * The instance profile of the container instance the task was placed on, from its
+     * {@code floci.iam-instance-profile} attribute; Floci's own, not part of the ECS Task shape.
+     */
+    @JsonIgnore
+    private String iamInstanceProfileArn;
     private boolean protectionEnabled;
     private Instant protectedUntil;
     private Map<String, String> tags = new HashMap<>();
@@ -276,4 +286,16 @@ public class EcsTask {
 
     /** Advances the version AWS bumps on every task state transition. */
     public void bumpVersion() { this.version++; }
+
+    @JsonIgnore
+    public String getEc2InstanceId() { return ec2InstanceId; }
+
+    @JsonIgnore
+    public void setEc2InstanceId(String ec2InstanceId) { this.ec2InstanceId = ec2InstanceId; }
+
+    @JsonIgnore
+    public String getIamInstanceProfileArn() { return iamInstanceProfileArn; }
+
+    @JsonIgnore
+    public void setIamInstanceProfileArn(String iamInstanceProfileArn) { this.iamInstanceProfileArn = iamInstanceProfileArn; }
 }
