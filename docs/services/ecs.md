@@ -1274,3 +1274,7 @@ RunTaskResponse response = ecs.runTask(r -> r
 
 String taskArn = response.tasks().get(0).taskArn();
 ```
+
+## Cleanup after partial teardown
+
+A stopped task's attachment becomes `DELETED` after its captured ENI cleanup completes. A failed protected-helper removal retains the task's original cleanup so a later retry can finish the ENI release in its owning account and region. This progress is local to the running process.

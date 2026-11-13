@@ -19,6 +19,7 @@ import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.Digests;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.RequestScopes;
 import io.floci.aws.core.common.docker.ContainerBuilder;
 import io.floci.aws.core.common.docker.ContainerDetector;
 import io.floci.aws.core.common.docker.ContainerLifecycleManager;
@@ -86,6 +87,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
@@ -1189,28 +1191,39 @@ public class EcsContainerManager {
     }
 
     /**
-     * Releases a stopped task's ENI. The interface id stays on the task, with its attachment
-     * reported as {@code DELETED}, because AWS keeps describing a stopped task's attachment.
-     * Idempotent: the status is flipped first, so a second teardown path does nothing.
+     * Releases the exact stopped task's interface. DELETED records completed ENI cleanup;
+     * strict helper failure and caller cleanup failure remain independently retryable.
      */
     public void releaseTaskNetwork(EcsTask task, String region) {
-        String eniId = task.getNetworkInterfaceId();
-        if (eniId == null || ec2Service == null || ATTACHMENT_DELETED.equals(task.getAttachmentStatus())) {
-            return;
+        SecurityGroupFirewallManager.OwnedCleanup cleanup;
+        synchronized (task) {
+            String eniId = task.getNetworkInterfaceId();
+            if (eniId == null || ec2Service == null || ATTACHMENT_DELETED.equals(task.getAttachmentStatus())) {
+                return;
+            }
+            String taskArn = task.getTaskArn();
+            String attachmentId = task.getAttachmentId();
+            String account = AwsArnUtils.accountOrDefault(taskArn, regionResolver.getAccountId());
+            if (firewallManager == null) {
+                ec2Service.releaseNetworkInterfaceFromService(region, eniId);
+                ec2Service.deleteNetworkInterface(region, eniId);
+                task.setAttachmentStatus(ATTACHMENT_DELETED);
+                return;
+            }
+            cleanup = firewallManager.captureOwnerCleanup(task, eniId,
+                    () -> Objects.equals(taskArn, task.getTaskArn())
+                            && Objects.equals(eniId, task.getNetworkInterfaceId())
+                            && Objects.equals(attachmentId, task.getAttachmentId()),
+                    () -> {
+                        Runnable releaseEni = RequestScopes.callAs(account, region,
+                                () -> ec2Service.captureNetworkInterfaceCleanupForService(task, region, eniId));
+                        return List.of(new SecurityGroupFirewallManager.CleanupStep(releaseEni, true),
+                                new SecurityGroupFirewallManager.CleanupStep(
+                                        () -> task.setAttachmentStatus(ATTACHMENT_DELETED), true));
+                    });
         }
-        task.setAttachmentStatus(ATTACHMENT_DELETED);
-        if (firewallManager != null) {
-            firewallManager.unregister(eniId);
-        }
-        try {
-            // EC2 refuses to delete an interface that is in use, and attachTaskNetwork marked
-            // this one as held by the task, so the hold goes before the interface does.
-            ec2Service.releaseNetworkInterfaceFromService(region, eniId);
-            ec2Service.deleteNetworkInterface(region, eniId);
-        } catch (RuntimeException e) {
-            LOG.debugv("Could not delete the ENI {0} of task {1}: {2}",
-                    eniId, task.getTaskArn(), e.getMessage());
-        }
+        // Never acquire the cleanup execution lock while holding the task monitor.
+        cleanup.run();
     }
 
     /**

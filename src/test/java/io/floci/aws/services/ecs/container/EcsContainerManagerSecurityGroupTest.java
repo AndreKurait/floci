@@ -6,6 +6,7 @@ import com.github.dockerjava.api.command.InspectVolumeCmd;
 import com.github.dockerjava.api.command.InspectVolumeResponse;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.dns.EmbeddedDnsServer;
 import io.floci.aws.core.common.docker.ContainerBuilder;
 import io.floci.aws.core.common.docker.ContainerDetector;
 import io.floci.aws.core.common.docker.ContainerLifecycleManager;
@@ -186,6 +187,17 @@ class EcsContainerManagerSecurityGroupTest {
         verify(firewallManager, atLeastOnce()).unregister("eni-1");
         verify(ec2Service, never()).deleteNetworkInterface(any(), any());
 
+        SecurityGroupFirewallManager cleanupOwner = new SecurityGroupFirewallManager(
+                mock(DockerClient.class), mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class),
+                mock(EmulatorConfig.class), mock(EmbeddedDnsServer.class));
+        when(ec2Service.captureNetworkInterfaceCleanupForService(task, "us-east-1", "eni-1"))
+                .thenReturn(() -> {
+                    ec2Service.releaseNetworkInterfaceFromService("us-east-1", "eni-1");
+                    ec2Service.deleteNetworkInterface("us-east-1", "eni-1");
+                });
+        when(firewallManager.captureOwnerCleanup(eq(task), eq("eni-1"), any(), any()))
+                .thenAnswer(invocation -> cleanupOwner.captureOwnerCleanup(invocation.getArgument(0),
+                        invocation.getArgument(1), invocation.getArgument(2), invocation.getArgument(3)));
         manager.releaseTaskNetwork(task, "us-east-1");
         verify(ec2Service).deleteNetworkInterface("us-east-1", "eni-1");
     }
