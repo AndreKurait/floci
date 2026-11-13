@@ -255,11 +255,14 @@ public class KinesisService implements ResourceProvider {
                                                    Map<String, String> tags, String region) {
         String streamName = streamArn.substring(streamArn.lastIndexOf('/') + 1);
         synchronized (lockFor(regionKey(region, streamName))) {
-            describeStreamByArn(streamArn, region);
             String consumerArn = streamArn + "/consumer/" + consumerName + ":" + clock.millis();
+            String parentGeneration = resourcePolicies.clearConsumerPolicy(consumerArn, region);
+            if (parentGeneration == null) {
+                throw new AwsException("ResourceNotFoundException", "Stream " + streamName + " not found", 400);
+            }
             KinesisConsumer consumer = new KinesisConsumer(consumerName, consumerArn, streamArn);
             consumer.setConsumerCreationTimestamp(clock.instant());
-            consumer.setPolicyStreamGeneration(resourcePolicies.clearConsumerPolicy(consumerArn, region));
+            consumer.setPolicyStreamGeneration(parentGeneration);
             consumer.setTags(tags);
             consumerStore.put(region + "::" + consumerArn, consumer);
             LOG.infov("Registered Kinesis consumer: {0} for stream {1}", consumerName, streamArn);

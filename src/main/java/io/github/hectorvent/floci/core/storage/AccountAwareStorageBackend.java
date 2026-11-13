@@ -411,6 +411,19 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
                 ? delegate.get(key) : Optional.empty();
     }
 
+    /**
+     * Reads an explicitly scoped entry, or an owner-approved legacy entry, without migration.
+     *
+     * <p>A present scoped row takes precedence even if its value fails the caller's later
+     * ownership check. The monitor spans both reads so a concurrent legacy migration cannot
+     * move the row between them. No owner registration or storage write occurs.
+     */
+    public synchronized Optional<V> getForAccountIncludingLegacyReadOnly(
+            String accountId, String key, Predicate<V> legacyOwner) {
+        Optional<V> scoped = getForAccount(accountId, key);
+        return scoped.isPresent() ? scoped : getLegacyMatching(key, legacyOwner);
+    }
+
     /** Reads an unprefixed entry without migration when its stored metadata proves ownership. */
     public synchronized Optional<V> getLegacyMatching(String key, Predicate<V> legacyOwner) {
         return hasAccountPrefix(key) ? Optional.empty() : delegate.get(key).filter(legacyOwner);

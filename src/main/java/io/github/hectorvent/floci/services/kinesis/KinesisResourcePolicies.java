@@ -157,8 +157,7 @@ final class KinesisResourcePolicies {
             if (migrate) {
                 return scoped.getForAccountMigratingLegacy(account, key, owner).filter(owner);
             }
-            return scoped.getForAccount(account, key).filter(owner)
-                    .or(() -> scoped.getLegacyMatching(key, owner));
+            return scoped.getForAccountIncludingLegacyReadOnly(account, key, owner).filter(owner);
         }
         return store.get(key).filter(owner);
     }
@@ -255,11 +254,17 @@ final class KinesisResourcePolicies {
         }
         JsonNode principal = exclusive(statement, "Principal", "NotPrincipal");
         if (principal.isObject()) {
-            if (principal.isEmpty() || !principal.properties().stream().allMatch(entry -> strings(entry.getValue()))) {
-                throw invalid("Policy statement must name a principal");
+            if (principal.size() != 1 || !principal.has("AWS")) {
+                throw invalid("Policy principals must use the AWS principal type");
             }
-        } else if (!strings(principal)) {
+            principal = principal.path("AWS");
+        }
+        if (!strings(principal)) {
             throw invalid("Policy statement must name a principal");
+        }
+        if (principal.isTextual() ? principal.textValue().contains("*")
+                : principal.valueStream().anyMatch(value -> value.textValue().contains("*"))) {
+            throw invalid("Policy principals must not contain wildcards");
         }
         JsonNode actions = exclusive(statement, "Action", "NotAction");
         if (!strings(actions)) {
