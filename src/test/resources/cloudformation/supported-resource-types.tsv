@@ -22,8 +22,10 @@ AWS::ApiGatewayV2::Stage	ApiGatewayV2CfnProvisioner
 AWS::ApiGatewayV2::VpcLink	ApiGatewayV2CfnProvisioner
 AWS::AppConfig::Application	AppConfigCfnProvisioner
 AWS::AppConfig::ConfigurationProfile	AppConfigCfnProvisioner
+AWS::AppConfig::Deployment	AppConfigDeploymentCfnProvisioner
 AWS::AppConfig::DeploymentStrategy	AppConfigCfnProvisioner
 AWS::AppConfig::Environment	AppConfigCfnProvisioner
+AWS::AppConfig::HostedConfigurationVersion	AppConfigHostedVersionCfnProvisioner
 AWS::AppSync::ApiKey	AppSyncCfnProvisioner
 AWS::AppSync::DataSource	AppSyncCfnProvisioner
 AWS::AppSync::FunctionConfiguration	AppSyncCfnProvisioner
@@ -46,7 +48,8 @@ AWS::BedrockAgentCore::RuntimeEndpoint	BedrockAgentCoreCfnProvisioner
 AWS::CDK::Metadata	CdkMetadataCfnProvisioner
 AWS::CertificateManager::Certificate	AcmCfnProvisioner
 AWS::CloudFormation::CustomResource	CustomResourceCfnProvisioner
-AWS::CloudFormation::StackSet	StackSetCfnProvisioner
+AWS::CloudFormation::WaitCondition	WaitConditionCfnProvisioner
+AWS::CloudFormation::WaitConditionHandle	WaitConditionHandleCfnProvisioner
 AWS::CloudFront::CachePolicy	CloudFrontCfnProvisioner
 AWS::CloudFront::Distribution	CloudFrontCfnProvisioner
 AWS::CloudFront::Function	CloudFrontCfnProvisioner
@@ -60,6 +63,9 @@ AWS::CloudWatch::Alarm	CloudWatchCfnProvisioner
 AWS::CloudWatch::CompositeAlarm	CloudWatchCompositeAlarmCfnProvisioner
 AWS::CloudWatch::Dashboard	CloudWatchDashboardCfnProvisioner
 AWS::CodeBuild::Project	CodeBuildCfnProvisioner
+AWS::CodeDeploy::Application	CodeDeployCfnProvisioner
+AWS::CodeDeploy::DeploymentConfig	CodeDeployCfnProvisioner
+AWS::CodeDeploy::DeploymentGroup	CodeDeployCfnProvisioner
 AWS::CodePipeline::CustomActionType	CodePipelineCfnProvisioner
 AWS::CodePipeline::Pipeline	CodePipelineCfnProvisioner
 AWS::CodePipeline::Webhook	CodePipelineCfnProvisioner
@@ -75,6 +81,7 @@ AWS::Config::ConfigRule	ConfigCfnProvisioner
 AWS::DSQL::Cluster	DsqlCfnProvisioner
 AWS::DynamoDB::GlobalTable	DynamoDbCfnProvisioner
 AWS::DynamoDB::Table	DynamoDbCfnProvisioner
+AWS::EC2::DHCPOptions	Ec2DhcpCfnProvisioner
 AWS::EC2::EIP	Ec2NetworkCfnProvisioner
 AWS::EC2::FlowLog	Ec2FlowLogCfnProvisioner
 AWS::EC2::Instance	Ec2InstanceCfnProvisioner
@@ -94,6 +101,7 @@ AWS::EC2::Subnet	Ec2NetworkCfnProvisioner
 AWS::EC2::SubnetNetworkAclAssociation	Ec2NetworkAclCfnProvisioner
 AWS::EC2::SubnetRouteTableAssociation	Ec2NetworkCfnProvisioner
 AWS::EC2::VPC	Ec2VpcCfnProvisioner
+AWS::EC2::VPCDHCPOptionsAssociation	Ec2DhcpCfnProvisioner
 AWS::EC2::VPCEndpoint	Ec2VpcEndpointCfnProvisioner
 AWS::EC2::VPCGatewayAttachment	Ec2VpcGatewayAttachmentCfnProvisioner
 AWS::ECR::Repository	EcrCfnProvisioner
@@ -109,6 +117,7 @@ AWS::ElastiCache::ServerlessCache	ElastiCacheServerlessCfnProvisioner
 AWS::ElastiCache::SubnetGroup	ElastiCacheCfnProvisioner
 AWS::ElastiCache::User	ElastiCacheCfnProvisioner
 AWS::ElastiCache::UserGroup	ElastiCacheCfnProvisioner
+AWS::ElasticLoadBalancing::LoadBalancer	ElbClassicCfnProvisioner
 AWS::ElasticLoadBalancingV2::Listener	ElbV2CfnProvisioner
 AWS::ElasticLoadBalancingV2::ListenerRule	ElbV2CfnProvisioner
 AWS::ElasticLoadBalancingV2::LoadBalancer	ElbV2CfnProvisioner
@@ -188,7 +197,11 @@ AWS::SNS::Topic	SnsCfnProvisioner
 AWS::SNS::TopicPolicy	SnsCfnProvisioner
 AWS::SQS::Queue	SqsCfnProvisioner
 AWS::SQS::QueuePolicy	SqsCfnProvisioner
+AWS::SSM::Association	SsmAssociationCfnProvisioner
+AWS::SSM::Document	SsmDocumentCfnProvisioner
 AWS::SSM::Parameter	SsmCfnProvisioner
+AWS::SSM::PatchBaseline	SsmPatchBaselineCfnProvisioner
+AWS::SSM::ResourceDataSync	SsmResourceDataSyncCfnProvisioner
 AWS::Scheduler::Schedule	SchedulerScheduleCfnProvisioner
 AWS::Scheduler::ScheduleGroup	SchedulerScheduleGroupCfnProvisioner
 AWS::SecretsManager::Secret	SecretsManagerCfnProvisioner
@@ -198,6 +211,7 @@ AWS::ServiceDiscovery::PrivateDnsNamespace	CloudMapCfnProvisioner
 AWS::ServiceDiscovery::PublicDnsNamespace	CloudMapCfnProvisioner
 AWS::ServiceDiscovery::Service	CloudMapCfnProvisioner
 AWS::Signer::SigningProfile	SignerCfnProvisioner
+AWS::StepFunctions::Activity	StepFunctionsActivityCfnProvisioner
 AWS::StepFunctions::StateMachine	StepFunctionsCfnProvisioner
 AWS::Transfer::Server	TransferCfnProvisioner
 AWS::Transfer::User	TransferCfnProvisioner

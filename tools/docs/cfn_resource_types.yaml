@@ -10,6 +10,7 @@
 # Row order. Namespaces omitted here are appended alphabetically after these, so a forgotten
 # entry degrades to a sensible position rather than disappearing.
 order:
+  - AWS::AppConfig
   - AWS::S3
   - AWS::S3Vectors
   - AWS::SQS
@@ -32,6 +33,7 @@ order:
   - AWS::Redshift
   - AWS::RedshiftServerless
   - AWS::EC2
+  - AWS::ElasticLoadBalancing
   - AWS::ElasticLoadBalancingV2
   - AWS::AutoScaling
   - AWS::ApplicationAutoScaling
@@ -44,6 +46,7 @@ order:
   - AWS::StepFunctions
   - AWS::CodePipeline
   - AWS::CodeBuild
+  - AWS::CodeDeploy
   - AWS::Batch
   - AWS::Cognito
   - AWS::CertificateManager
@@ -119,11 +122,12 @@ type_order:
   AWS::Cognito: [UserPool, UserPoolClient]
   AWS::Events: [Rule, EventBus, EventBusPolicy]
   AWS::EventsV2: [EventBus, Subscriber]
-  AWS::CloudFormation: [CustomResource]
+  AWS::CloudFormation: [CustomResource, WaitCondition, WaitConditionHandle]
   AWS::BedrockAgentCore: [Runtime, RuntimeEndpoint, Memory]
 
 # Namespace -> the service name shown in the Service column.
 service_labels:
+  AWS::AppConfig: AppConfig
   AWS::ApiGateway: API Gateway (v1)
   AWS::ApiGatewayV2: API Gateway v2
   AWS::AppConfig: AppConfig
@@ -140,6 +144,7 @@ service_labels:
   AWS::CloudTrail: CloudTrail
   AWS::CloudWatch: CloudWatch
   AWS::CodeBuild: CodeBuild
+  AWS::CodeDeploy: CodeDeploy
   AWS::CodePipeline: CodePipeline
   AWS::Cognito: Cognito
   AWS::Config: Config
@@ -149,6 +154,7 @@ service_labels:
   AWS::ECR: ECR
   AWS::ECS: ECS
   AWS::EKS: EKS
+  AWS::ElasticLoadBalancing: Elastic Load Balancing Classic
   AWS::ElasticLoadBalancingV2: Elastic Load Balancing v2
   AWS::Events: EventBridge
   AWS::EventsV2: EventBridge V2
@@ -184,8 +190,10 @@ service_labels:
 
 # Parenthetical shown after a type name. Keyed by the full type.
 notes:
+  AWS::SSM::PatchBaseline: 'backed by SSM configuration, tags and patch-group bindings; OperatingSystem changes replace the baseline; DefaultBaseline only registers a default; does not execute patches on managed nodes'
+  AWS::SSM::ResourceDataSync: 'owns SSM inventory delivery configuration with legacy or nested S3 destinations; destination changes require replacement; checks SSM admission status; does not collect guest inventory'
   AWS::S3::BucketPolicy: document stored on the bucket; S3 does not evaluate it
-  AWS::SQS::QueuePolicy: accepted; policy not enforced
+  AWS::SQS::QueuePolicy: applies policies to queues; reconciles targets on update, restores policies on rollback, and detaches on delete
   AWS::Lambda::Function: Zip via S3/inline `ZipFile`, Image, and the `hot-reload` bind-mount bucket
   AWS::Lambda::EventSourceMapping: 'SQS, Kinesis, DynamoDB Streams; `ParallelizationFactor` and `TumblingWindowInSeconds` are ignored'
   AWS::Lambda::Alias: also what SAM's `AutoPublishAlias` expands into
@@ -219,16 +227,20 @@ notes:
   AWS::IoT::Policy: 'deleted after detaching it from its principals; on AWS the delete fails with `DeleteConflictException` while the policy is attached'
   AWS::Route53::RecordSetGroup: 'written in one change batch, so a record set that cannot be written leaves the zone unchanged; every record set must be in the group''s hosted zone'
   Custom::DynamoDBReplica: applied natively against DynamoDB, not via a provider Lambda
-  AWS::DynamoDB::Table: '`TimeToLiveSpecification` applied on create and update; to rename an enabled TTL attribute, disable TTL in one update and enable the new attribute in a later one. `KinesisStreamSpecification` applied on create and update; with the DynamoDB Local backend, `StreamArn` is checked as on AWS but nothing is forwarded'
+  AWS::DynamoDB::Table: '`TimeToLiveSpecification`, `DeletionProtectionEnabled` and `KinesisStreamSpecification` applied on create and update; failed updates restore prior settings; deletion fails while protection is enabled; rename an enabled TTL attribute by disabling it in one update and enabling the new attribute in a later one; with the DynamoDB Local backend, `StreamArn` is checked as on AWS but nothing is forwarded'
   AWS::Cognito::UserPool: '`ProviderURL` is the local issuer of the tokens Floci mints, `<base-url>/<pool id>`; `EnabledMfas` is applied with `SetUserPoolMfaConfig`, as on AWS, and once `SMS_MFA` is on only `MfaConfiguration: OFF` turns it off'
   AWS::Cognito::UserPoolIdentityProvider: 'Ref returns the ProviderName; changing only `ProviderType` is refused, as on AWS, because the name is always the template''s and the replacement would need the same address'
   AWS::SES::EmailIdentity: 'BYODKIM is not supported by this resource; Easy DKIM DNS attributes use the shared emulator signing zone `dkim.amazonses.com` rather than AWS''s region- and identity-specific zone assignment'
   AWS::SES::ReceiptRule: 'stored in an existing SES receipt rule set; Ref and RuleName return the rule name; management plane only, with no inbound mail delivery'
   AWS::Events::Archive: '`KmsKeyIdentifier` is ignored'
   AWS::EventsV2::Subscriber: 'delivers only to Amazon SQS queues; `Transformer` RAW or WITH_METADATA; a target parameter takes a literal or a `$events` path'
-  AWS::AppConfig::Environment: '`Tags` and `DeletionProtectionCheck` are accepted and not stored'
-  AWS::AppConfig::ConfigurationProfile: '`Tags`, `KmsKeyIdentifier`, `RetrievalRoleArn`, `Validators` and `DeletionProtectionCheck` are accepted and not stored'
-  AWS::AppConfig::DeploymentStrategy: '`Tags` are accepted and not stored; `ReplicateTo: SSM_DOCUMENT` writes no SSM document'
+  AWS::AppConfig::Environment: '`DeletionProtectionCheck` is accepted and not stored'
+  AWS::AppConfig::ConfigurationProfile: '`KmsKeyIdentifier`, `RetrievalRoleArn`, `Validators` and `DeletionProtectionCheck` are accepted and not stored'
+  AWS::AppConfig::DeploymentStrategy: '`ReplicateTo: SSM_DOCUMENT` writes no SSM document'
+  AWS::AppConfig::HostedConfigurationVersion: '`Ref` returns the version number; `LatestVersionNumber` and `VersionLabel` are rejected'
+  AWS::AppConfig::Deployment: 'waits through rollout and bake; deletion reverts when eligible; KMS, dynamic extensions and tags are rejected'
+  AWS::SSM::Association: 'Backing configuration, references, updates, rollback and deletion; State Manager execution remains unsupported'
+  AWS::SSM::Document: 'JSON content, version selection, replacement and rollback; see SSM documents for unsupported properties'
   AWS::CloudFront::Function: '`KeyValueStoreAssociations` is ignored'
   AWS::GuardDuty::MalwareProtectionPlan: 'management plane only: no scan runs, so the plan stays ACTIVE; Ref returns the plan id; a BucketName change is rejected'
   AWS::BedrockAgentCore::Runtime: 'Ref returns the AgentRuntimeId; CapacityProviderConfiguration, FilesystemConfigurations, LifecycleConfiguration, PlatformVersion and RequestHeaderConfiguration are accepted and not stored'
@@ -243,7 +255,7 @@ row_notes:
     Composite alarms have backing definitions with name Ref and Arn GetAtt, rollback, and
     replacement cleanup. Composite actions are stored only; suppression properties are rejected.
   AWS::AppConfig: >-
-    `Ref` returns the AppConfig ID of each. See [AppConfig](appconfig.md#cloudformation) for updates
+    `Ref` returns the AppConfig ID, or the hosted version number. See [AppConfig](appconfig.md#cloudformation) for updates
     and replacement.
   AWS::AppSync: >-
     `Ref` on `GraphQLApi` and `ApiKey` returns the id where AWS returns the ARN. See

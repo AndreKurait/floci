@@ -1,0 +1,154 @@
+{
+  "baseline": {
+    "label": "baseline",
+    "revision": "f2173e8de69004da4d2ebcba63a7905166fac13a",
+    "endpoint": "http://127.0.0.1:24566",
+    "timestamp": "2026-10-24T18:05:44.623103+00:00",
+    "scope": "warm JVM; mock EC2 ASG coordination; real loopback HTTP probes; not a fleet lifecycle",
+    "host_load_start": [
+      21.08,
+      18.83,
+      17.76
+    ],
+    "asg": [
+      {
+        "api_seconds": 0.004862335976213217,
+        "in_service_seconds": 11.053087210981175
+      },
+      {
+        "api_seconds": 0.0023296980652958155,
+        "in_service_seconds": 13.375998598057777
+      },
+      {
+        "api_seconds": 0.0021463220473378897,
+        "in_service_seconds": 13.423083742032759
+      }
+    ],
+    "health": [
+      {
+        "api_seconds": 0.007753247977234423,
+        "first_probe_round_seconds": 12.88557517901063,
+        "all_targets_healthy_seconds": 25.750911618000828,
+        "requests": 64,
+        "targets": 32,
+        "response_delay_seconds": 0.4,
+        "healthy_threshold": 2,
+        "probe_interval_seconds": 5
+      },
+      {
+        "api_seconds": 0.0040246209828183055,
+        "first_probe_round_seconds": 12.872623007046059,
+        "all_targets_healthy_seconds": 25.748467897996306,
+        "requests": 64,
+        "targets": 32,
+        "response_delay_seconds": 0.4,
+        "healthy_threshold": 2,
+        "probe_interval_seconds": 5
+      },
+      {
+        "api_seconds": 0.002948181005194783,
+        "first_probe_round_seconds": 12.861612201086245,
+        "all_targets_healthy_seconds": 25.712123720091768,
+        "requests": 64,
+        "targets": 32,
+        "response_delay_seconds": 0.4,
+        "healthy_threshold": 2,
+        "probe_interval_seconds": 5
+      }
+    ],
+    "medians": {
+      "asg": {
+        "api_seconds": 0.0023296980652958155,
+        "in_service_seconds": 13.375998598057777
+      },
+      "health": {
+        "api_seconds": 0.0040246209828183055,
+        "first_probe_round_seconds": 12.872623007046059,
+        "all_targets_healthy_seconds": 25.748467897996306,
+        "response_delay_seconds": 0.4,
+        "probe_interval_seconds": 5
+      }
+    },
+    "host_load_end": [
+      23.92,
+      21.56,
+      18.94
+    ]
+  },
+  "candidate": {
+    "label": "candidate",
+    "revision": "707e3452d",
+    "endpoint": "http://127.0.0.1:24567",
+    "timestamp": "2026-10-24T18:08:15.431810+00:00",
+    "scope": "warm JVM; mock EC2 ASG coordination; real loopback HTTP probes; not a fleet lifecycle",
+    "host_load_start": [
+      23.72,
+      21.63,
+      19.04
+    ],
+    "asg": [
+      {
+        "api_seconds": 0.00481715495698154,
+        "in_service_seconds": 0.057482362957671285
+      },
+      {
+        "api_seconds": 0.003359177033416927,
+        "in_service_seconds": 0.00684125698171556
+      },
+      {
+        "api_seconds": 0.00272481597494334,
+        "in_service_seconds": 0.02812538598664105
+      }
+    ],
+    "health": [
+      {
+        "api_seconds": 0.007701965980231762,
+        "first_probe_round_seconds": 0.43193296797107905,
+        "all_targets_healthy_seconds": 5.436916809063405,
+        "requests": 64,
+        "targets": 32,
+        "response_delay_seconds": 0.4,
+        "healthy_threshold": 2,
+        "probe_interval_seconds": 5
+      },
+      {
+        "api_seconds": 0.004079911974258721,
+        "first_probe_round_seconds": 0.4177775860298425,
+        "all_targets_healthy_seconds": 5.423008403042331,
+        "requests": 64,
+        "targets": 32,
+        "response_delay_seconds": 0.4,
+        "healthy_threshold": 2,
+        "probe_interval_seconds": 5
+      },
+      {
+        "api_seconds": 0.0038545980351045728,
+        "first_probe_round_seconds": 0.42933995299972594,
+        "all_targets_healthy_seconds": 5.4169601399917156,
+        "requests": 64,
+        "targets": 32,
+        "response_delay_seconds": 0.4,
+        "healthy_threshold": 2,
+        "probe_interval_seconds": 5
+      }
+    ],
+    "medians": {
+      "asg": {
+        "api_seconds": 0.003359177033416927,
+        "in_service_seconds": 0.02812538598664105
+      },
+      "health": {
+        "api_seconds": 0.004079911974258721,
+        "first_probe_round_seconds": 0.42933995299972594,
+        "all_targets_healthy_seconds": 5.423008403042331,
+        "response_delay_seconds": 0.4,
+        "probe_interval_seconds": 5
+      }
+    },
+    "host_load_end": [
+      23.19,
+      21.66,
+      19.11
+    ]
+  }
+}
