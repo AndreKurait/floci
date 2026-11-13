@@ -12,6 +12,7 @@ import io.github.hectorvent.floci.core.common.ServicePrincipals;
 import io.github.hectorvent.floci.core.common.SigV4CredentialScope;
 import io.github.hectorvent.floci.core.common.StoredResourceArns;
 import io.github.hectorvent.floci.core.common.auth.SigV4Canonicalization;
+import io.github.hectorvent.floci.services.cloudfront.CloudFrontFunctionTestRoute;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.LogGroupTagTarget;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
@@ -221,6 +222,10 @@ public class ResourceArnBuilder {
                                        String region, String accountId, String partition) {
         if (credentialScope == null) {
             return List.of("*");
+        }
+        if ("cloudfront".equals(credentialScope) && "cloudfront:TestFunction".equals(operation)) {
+            return List.of(AwsArnUtils.Arn.global(partition, "cloudfront", accountId,
+                    "function/" + CloudFrontFunctionTestRoute.name(ctx)).toString());
         }
         // Task tokens resolve their authorization resource from recorded workflow ownership.
         if ("states".equals(credentialScope) && operation != null && Set.of("states:SendTaskSuccess",

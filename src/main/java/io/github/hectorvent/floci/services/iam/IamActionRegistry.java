@@ -7,6 +7,8 @@ import io.github.hectorvent.floci.core.common.ProtocolClaim;
 import io.github.hectorvent.floci.core.common.RequestResources;
 import io.github.hectorvent.floci.core.common.WireProtocol;
 import io.github.hectorvent.floci.services.appconfig.AppConfigDataController;
+import io.github.hectorvent.floci.services.cloudfront.CloudFrontFunctionTestController;
+import io.github.hectorvent.floci.services.cloudfront.CloudFrontFunctionTestRoute;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbPartiQLParser;
 import io.github.hectorvent.floci.services.eks.EksController;
 import io.github.hectorvent.floci.services.route53.Route53Controller;
@@ -676,6 +678,10 @@ public class IamActionRegistry {
 
     /** The serving method identifies these actions even when path encoding or matrix parameters vary. */
     public String resolveMatchedRoute(String credentialScope, ResourceInfo resourceInfo) {
+        if ("cloudfront".equals(credentialScope) && resourceInfo != null
+                && CloudFrontFunctionTestController.class.equals(resourceInfo.getResourceClass())) {
+            return "cloudfront:TestFunction";
+        }
         if ("appconfig".equals(credentialScope) && resourceInfo != null
                 && AppConfigDataController.class.equals(resourceInfo.getResourceClass())
                 && resourceInfo.getResourceMethod() != null) {
@@ -712,6 +718,9 @@ public class IamActionRegistry {
      * ALLOW).
      */
     public String resolveRoute(String credentialScope, ContainerRequestContext ctx) {
+        if ("cloudfront".equals(credentialScope) && CloudFrontFunctionTestRoute.matches(ctx)) {
+            return "cloudfront:TestFunction";
+        }
         String method = ctx.getMethod().toUpperCase();
         // An S3 key may end in a slash, PUT /bucket// writes the key "/", and S3's rules already take a
         // bucket's one trailing slash, so an S3 path is matched as sent.

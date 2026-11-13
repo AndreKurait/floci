@@ -1678,6 +1678,11 @@ public class CloudFrontService implements ServerCertificateReferenceProvider {
 
     // ── CloudFront Functions ──────────────────────────────────────────────────
 
+    /** Executes a read on the contextual service's monitor, shared by the existing function writers. */
+    public synchronized <T> T readFunctionState(Supplier<T> read) {
+        return read.get();
+    }
+
     public synchronized CloudFrontFunction createFunction(CloudFrontFunction fn) {
         validateFunctionRuntime(fn.getRuntime());
         // The bare name holds the DEVELOPMENT stage, and the LIVE stage of releases before

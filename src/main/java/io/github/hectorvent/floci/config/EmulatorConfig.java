@@ -2883,6 +2883,10 @@ public interface EmulatorConfig {
     }
 
     interface CloudFrontServiceConfig {
+        /** Image used for a fresh, isolated Node process on each TestFunction call. */
+        @WithDefault("node:22-alpine")
+        String functionRuntimeImage();
+
         @WithDefault("true")
         boolean enabled();
 
