@@ -10,6 +10,7 @@ import io.floci.aws.services.cognito.CognitoService;
 import io.floci.aws.services.cognito.model.UserPool;
 import io.floci.aws.services.cognito.model.UserPoolClient;
 import io.floci.aws.services.cognito.model.UserPoolDomain;
+import io.floci.aws.testing.ThreadStates;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
@@ -19,6 +20,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -697,7 +699,11 @@ class CognitoCfnProvisionerTest {
 
     @Test
     void concurrentCreatesOfTheSameDerivedIdLetExactlyOneThrough() throws Exception {
-        when(cognito.deterministicClientIdFor(POOL_ID, "web")).thenReturn("web");
+        CountDownLatch resolved = new CountDownLatch(2);
+        when(cognito.deterministicClientIdFor(POOL_ID, "web")).thenAnswer(inv -> {
+            resolved.countDown();
+            return "web";
+        });
         AtomicBoolean created = new AtomicBoolean();
         when(cognito.describeUserPoolClient("web")).thenAnswer(inv -> {
             if (created.get()) {
@@ -706,11 +712,20 @@ class CognitoCfnProvisionerTest {
             throw new AwsException("ResourceNotFoundException", "User pool client not found", 400);
         });
         AtomicInteger creates = new AtomicInteger();
+        List<Thread> workers = new CopyOnWriteArrayList<>();
         when(cognito.createUserPoolClient(any(), any(), anyBoolean(), anyBoolean(), any(), any(), any(), any(),
                 any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenAnswer(inv -> {
-                    creates.incrementAndGet();
-                    Thread.sleep(50);
+                    if (creates.incrementAndGet() == 1) {
+                        // Keep the first create open until the other provision has resolved the same id
+                        // and is parked behind the lock; unguarded, it runs its own create to the end.
+                        assertTrue(resolved.await(5, TimeUnit.SECONDS), "both provisions resolve the id");
+                        for (Thread worker : workers) {
+                            if (worker != Thread.currentThread()) {
+                                ThreadStates.awaitBlockedOrDone(worker);
+                            }
+                        }
+                    }
                     created.set(true);
                     return client("web", POOL_ID, "web", null);
                 });
@@ -720,6 +735,7 @@ class CognitoCfnProvisionerTest {
             List<Future<Throwable>> outcomes = new ArrayList<>();
             for (int i = 0; i < 2; i++) {
                 outcomes.add(pool.submit(() -> {
+                    workers.add(Thread.currentThread());
                     ready.countDown();
                     ready.await(5, TimeUnit.SECONDS);
                     try {

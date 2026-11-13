@@ -5,6 +5,8 @@ import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.Response;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
+
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.not;
@@ -204,14 +206,8 @@ class CloudFormationSecurityGroupRulesIntegrationTest {
         .when().post("/").then().statusCode(200);
 
         // DeleteStack is asynchronous.
-        String group = null;
-        for (int i = 0; i < 100; i++) {
-            group = describeGroup(groupId);
-            if (!group.contains("<cidrIp>10.2.0.0/16</cidrIp>")) {
-                break;
-            }
-            Thread.sleep(50);
-        }
+        String group = CfnStackWaits.lastStateWithin(Duration.ofSeconds(5), () -> describeGroup(groupId),
+                described -> !described.contains("<cidrIp>10.2.0.0/16</cidrIp>"));
         assertFalse(group.contains("<cidrIp>10.2.0.0/16</cidrIp>"),
                 "stack deletion left the standalone rule on the group");
         assertTrue(group.contains("<cidrIp>10.1.0.0/16</cidrIp>"),
@@ -341,19 +337,13 @@ class CloudFormationSecurityGroupRulesIntegrationTest {
 
     /** A deleted stack is only describable by id, as in AWS; it is retained for a grace period. */
     private static boolean awaitStackStatus(String stackId, String status) throws InterruptedException {
-        for (int i = 0; i < 100; i++) {
-            String xml = given()
+        String wanted = "<StackStatus>" + status + "</StackStatus>";
+        return CfnStackWaits.lastStateWithin(Duration.ofSeconds(5), () -> given()
                 .contentType("application/x-www-form-urlencoded")
                 .header("Authorization", CFN_AUTH)
                 .formParam("Action", "DescribeStacks")
                 .formParam("StackName", stackId)
-            .when().post("/").then().extract().asString();
-            if (xml.contains("<StackStatus>" + status + "</StackStatus>")) {
-                return true;
-            }
-            Thread.sleep(50);
-        }
-        return false;
+            .when().post("/").then().extract().asString(), xml -> xml.contains(wanted)).contains(wanted);
     }
 
     private static String standaloneIngressTemplate(String groupId, String cidr) {

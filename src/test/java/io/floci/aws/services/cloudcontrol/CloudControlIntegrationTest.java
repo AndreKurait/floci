@@ -3,6 +3,7 @@ package io.floci.aws.services.cloudcontrol;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.floci.aws.testing.CfnStackWaits;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.RestAssured;
 import io.restassured.parsing.Parser;
@@ -11,6 +12,8 @@ import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+
+import java.time.Duration;
 
 import static io.restassured.RestAssured.given;
 import static io.restassured.config.EncoderConfig.encoderConfig;
@@ -127,22 +130,7 @@ class CloudControlIntegrationTest {
                 .extract().path("ProgressEvent.RequestToken");
 
         // Poll GetResourceRequestStatus until the async provision reaches SUCCESS.
-        String identifier = null;
-        for (int i = 0; i < 20 && identifier == null; i++) {
-            ExtractableResponse<Response> pe = given()
-                    .config(config().encoderConfig(encoderConfig().encodeContentTypeAs(ct, TEXT)))
-                    .contentType(ct)
-                    .header("X-Amz-Target", "CloudApiService.GetResourceRequestStatus")
-                    .body("{\"RequestToken\":\"" + token + "\"}")
-                    .when().post("/")
-                    .then().statusCode(200)
-                    .extract();
-            if ("SUCCESS".equals(pe.path("ProgressEvent.OperationStatus"))) {
-                identifier = pe.path("ProgressEvent.Identifier");
-            } else {
-                Thread.sleep(100);
-            }
-        }
+        String identifier = awaitIdentifier(token, ct);
         assertThat(identifier, containsString("vpc-"));
 
         // The created VPC is now visible on the read side.
@@ -314,18 +302,14 @@ class CloudControlIntegrationTest {
     }
 
     private String awaitIdentifier(String token, String ct, String auth) throws InterruptedException {
-        for (int i = 0; i < 20; i++) {
+        ExtractableResponse<Response> pe = CfnStackWaits.lastStateWithin(Duration.ofSeconds(2), () -> {
             RequestSpecification request = given().config(config().encoderConfig(encoderConfig().encodeContentTypeAs(ct, TEXT)))
                     .contentType(ct).header("X-Amz-Target", "CloudApiService.GetResourceRequestStatus");
             if (auth != null) request.header("Authorization", auth);
-            ExtractableResponse<Response> pe = request.body("{\"RequestToken\":\"" + token + "\"}")
+            return request.body("{\"RequestToken\":\"" + token + "\"}")
                     .when().post("/").then().statusCode(200).extract();
-            if ("SUCCESS".equals(pe.path("ProgressEvent.OperationStatus"))) {
-                return pe.path("ProgressEvent.Identifier");
-            }
-            Thread.sleep(100);
-        }
-        return null;
+        }, status -> "SUCCESS".equals(status.path("ProgressEvent.OperationStatus")));
+        return "SUCCESS".equals(pe.path("ProgressEvent.OperationStatus")) ? pe.path("ProgressEvent.Identifier") : null;
     }
 
     @Test
@@ -362,26 +346,15 @@ class CloudControlIntegrationTest {
     }
 
     private void awaitTerminated(String instanceId) {
-        for (int i = 0; i < 100; i++) {
-            String state = given()
+        CfnStackWaits.awaitState(Duration.ofSeconds(10), () -> given()
                     .formParam("Action", "DescribeInstances")
                     .formParam("InstanceId.1", instanceId)
                     .header("Authorization", EC2_AUTH)
                     .when().post("/")
                     .then().statusCode(200)
                     .extract().xmlPath()
-                    .getString("DescribeInstancesResponse.reservationSet.item.instancesSet.item.instanceState.name");
-            if ("terminated".equals(state)) {
-                return;
-            }
-            try {
-                Thread.sleep(100);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new AssertionError("interrupted waiting for " + instanceId + " to terminate", e);
-            }
-        }
-        throw new AssertionError(instanceId + " did not reach terminated within 10s");
+                    .getString("DescribeInstancesResponse.reservationSet.item.instancesSet.item.instanceState.name"),
+                "terminated"::equals, state -> instanceId + " did not reach terminated within 10s");
     }
 
     private void assertListed(String typeName, String identifier, String propertyName) {

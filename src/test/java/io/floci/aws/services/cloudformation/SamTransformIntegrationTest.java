@@ -2364,7 +2364,8 @@ class SamTransformIntegrationTest {
             given().contentType("application/x-www-form-urlencoded")
                     .formParam("Action", "DeleteStack").formParam("StackName", stack)
                     .when().post("/").then().statusCode(200);
-            await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+            await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() ->
                     given().when().get("/2018-10-31/layers/sam-shared-layer/versions/2")
                             .then().statusCode(404));
         } finally {
@@ -2397,10 +2398,7 @@ class SamTransformIntegrationTest {
 
     private static void waitForStackStatus(String stackName, String status) {
         String expected = "<StackStatus>" + status + "</StackStatus>";
-        String body = "";
-        long deadline = System.nanoTime() + Duration.ofSeconds(5).toNanos();
-        while (System.nanoTime() < deadline) {
-            body = given()
+        String body = CfnStackWaits.lastStateWithin(Duration.ofSeconds(5), () -> given()
                 .contentType("application/x-www-form-urlencoded")
                 .formParam("Action", "DescribeStacks")
                 .formParam("StackName", stackName)
@@ -2409,18 +2407,7 @@ class SamTransformIntegrationTest {
             .then()
                 .statusCode(200)
                 .extract()
-                .asString();
-            if (body.contains(expected)) {
-                return;
-            }
-            try {
-                Thread.sleep(100);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                throw new AssertionError("Interrupted while waiting for stack " + stackName
-                        + " to reach " + expected, e);
-            }
-        }
+                .asString(), described -> described.contains(expected));
         assertThat(body, containsString(expected));
     }
 }

@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.aws.core.common.XmlParser;
 import io.floci.aws.services.lambda.LambdaService;
+import io.floci.aws.testing.CfnStackWaits;
 import io.floci.aws.testing.RestAssuredJsonUtils;
 import io.quarkus.test.InjectMock;
 import io.quarkus.test.junit.QuarkusTest;
@@ -12,6 +13,7 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 
@@ -20,7 +22,6 @@ import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 
 /**
  * A stack update that changes a custom resource and then fails on a later resource rolls the custom
@@ -216,17 +217,10 @@ class CloudFormationCustomResourceRollbackIntegrationTest {
 
     /** Polls DescribeStacks by stack id and returns its XML once the stack reaches {@code status}. */
     private static String awaitStackStatus(String stackId, String status) throws InterruptedException {
-        String xml = "";
-        long deadline = System.currentTimeMillis() + 10_000;
-        while (System.currentTimeMillis() < deadline) {
-            xml = cfn(Map.of("Action", "DescribeStacks", "StackName", stackId));
-            if (xml.contains("<StackStatus>" + status + "</StackStatus>")) {
-                return xml;
-            }
-            Thread.sleep(50);
-        }
-        fail("stack " + stackId + " never reached " + status + ": " + xml);
-        return xml;
+        return CfnStackWaits.awaitState(Duration.ofSeconds(10),
+                () -> cfn(Map.of("Action", "DescribeStacks", "StackName", stackId)),
+                xml -> xml.contains("<StackStatus>" + status + "</StackStatus>"),
+                xml -> "stack " + stackId + " never reached " + status + ": " + xml);
     }
 
     private static String cfn(Map<String, String> params) {

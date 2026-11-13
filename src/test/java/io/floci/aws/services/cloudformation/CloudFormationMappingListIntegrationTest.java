@@ -54,7 +54,8 @@ class CloudFormationMappingListIntegrationTest {
                     .map(StackResource::physicalResourceId).toList();
             cfn.deleteStack(request -> request.stackName(name));
             assertEquals(3, subnetIds.size(), "Capture every created subnet before deleting the stack");
-            await().atMost(Duration.ofSeconds(15)).untilAsserted(() -> {
+            await().atMost(Duration.ofSeconds(15)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> {
                 CloudFormationException absent = assertThrows(CloudFormationException.class,
                         () -> cfn.describeStacks(request -> request.stackName(name)));
                 assertEquals("ValidationError", absent.awsErrorDetails().errorCode());

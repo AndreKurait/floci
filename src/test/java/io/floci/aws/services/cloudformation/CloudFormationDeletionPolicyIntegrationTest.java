@@ -1,6 +1,7 @@
 package io.floci.aws.services.cloudformation;
 
 import io.floci.aws.core.common.XmlParser;
+import io.floci.aws.testing.CfnStackWaits;
 import io.floci.aws.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.Response;
@@ -960,20 +961,12 @@ class CloudFormationDeletionPolicyIntegrationTest {
                     .when().post("/").then().statusCode(200);
 
             // Await parent stack terminal status
-            long deadline = System.currentTimeMillis() + 15_000;
-            String parentStatus = "";
-            while (System.currentTimeMillis() < deadline) {
+            String parentStatus = CfnStackWaits.lastStateWithin(Duration.ofSeconds(15), () -> {
                 String xml = describeStacks(stackName);
                 int start = xml.indexOf("<StackStatus>") + "<StackStatus>".length();
                 int end = xml.indexOf("</StackStatus>", start);
-                if (start > "<StackStatus>".length() && end > start) {
-                    parentStatus = xml.substring(start, end);
-                    if (!parentStatus.endsWith("_IN_PROGRESS")) {
-                        break;
-                    }
-                }
-                Thread.sleep(100);
-            }
+                return start > "<StackStatus>".length() && end > start ? xml.substring(start, end) : "";
+            }, status -> !status.isEmpty() && !status.endsWith("_IN_PROGRESS"));
 
             assertThat(parentStatus, equalTo("ROLLBACK_COMPLETE"));
 
@@ -1083,20 +1076,12 @@ class CloudFormationDeletionPolicyIntegrationTest {
                     .when().post("/").then().statusCode(200);
 
             // Await parent stack terminal status
-            long deadline = System.currentTimeMillis() + 15_000;
-            String parentStatus = "";
-            while (System.currentTimeMillis() < deadline) {
+            String parentStatus = CfnStackWaits.lastStateWithin(Duration.ofSeconds(15), () -> {
                 String xml = describeStacks(stackName);
                 int start = xml.indexOf("<StackStatus>") + "<StackStatus>".length();
                 int end = xml.indexOf("</StackStatus>", start);
-                if (start > "<StackStatus>".length() && end > start) {
-                    parentStatus = xml.substring(start, end);
-                    if (!parentStatus.endsWith("_IN_PROGRESS")) {
-                        break;
-                    }
-                }
-                Thread.sleep(100);
-            }
+                return start > "<StackStatus>".length() && end > start ? xml.substring(start, end) : "";
+            }, status -> !status.isEmpty() && !status.endsWith("_IN_PROGRESS"));
 
             assertThat(parentStatus, equalTo("UPDATE_ROLLBACK_COMPLETE"));
 
@@ -1485,16 +1470,9 @@ class CloudFormationDeletionPolicyIntegrationTest {
     }
 
     private static void awaitStackStatus(String stackId, String status, String auth) throws InterruptedException {
-        String xml = "";
-        long deadline = System.currentTimeMillis() + 10_000;
-        while (System.currentTimeMillis() < deadline) {
-            xml = describeStacks(stackId, auth);
-            if (xml.contains("<StackStatus>" + status + "</StackStatus>")) {
-                return;
-            }
-            Thread.sleep(50);
-        }
-        fail("stack " + stackId + " never reached " + status + ": " + xml);
+        CfnStackWaits.awaitState(Duration.ofSeconds(10), () -> describeStacks(stackId, auth),
+                xml -> xml.contains("<StackStatus>" + status + "</StackStatus>"),
+                xml -> "stack " + stackId + " never reached " + status + ": " + xml);
     }
 
     private static String describeStacks(String stackId) {
