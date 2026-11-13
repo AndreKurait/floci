@@ -186,6 +186,12 @@ public class WarmPool implements ContainerTeardown, Resettable {
 
     }
 
+    /** Drain the Lambda namespaces together before other services reconcile their shared peers. */
+    @Override
+    public int teardownOrder() {
+        return -1;
+    }
+
     /**
      * Invoked from EmulatorLifecycle.onStop for a deterministic drain during the
      * ShutdownEvent phase; the {@code @PreDestroy} below stays as an idempotent fallback.
