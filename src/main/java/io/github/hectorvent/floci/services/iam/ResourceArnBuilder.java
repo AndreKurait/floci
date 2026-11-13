@@ -260,6 +260,15 @@ public class ResourceArnBuilder {
                     ? null : stepFunctionsService.get().callbackResourceArn(body.path("taskToken").asText(null), accountId);
             return List.of(resource == null ? "*" : resource);
         }
+        if ("eks".equals(credentialScope) && "eks:UpdateAccessEntry".equals(operation)) {
+            String[] updatePath = IamActionRegistry.routedPath(ctx).substring(1).split("/", 4);
+            if (eksService == null || updatePath.length != 4 || !"clusters".equals(updatePath[0])
+                    || !"access-entries".equals(updatePath[2])) {
+                return List.of("*");
+            }
+            return List.of(eksService.get().findAccessEntryUpdateTarget(pathSegment(updatePath[1]), pathSegment(updatePath[3]))
+                    .map(entry -> entry.accessEntryArn()).orElse("*"));
+        }
         if (operation != null && operation.startsWith(credentialScope + ":") && RequestResources.reads(operation)) {
             return namedResources(credentialScope, operation, ctx, region, accountId, partition);
         }
