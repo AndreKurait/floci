@@ -11,6 +11,7 @@ import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RequestScopes;
 import io.floci.aws.core.common.docker.ContainerLifecycleManager;
 import io.floci.aws.core.common.docker.ContainerStorageHelper;
+import io.floci.aws.core.common.docker.DockerFlags;
 import io.floci.aws.services.ec2.Ec2Service;
 import io.floci.aws.services.ec2.SecurityGroupFirewallManager;
 import io.floci.aws.services.ec2.SecurityGroupNftCompiler;
@@ -54,7 +55,7 @@ public class LambdaVpcNetworkManager {
     }
 
     Optional<Attachment> prepare(LambdaFunction function, String resourceId, String runtimeHost, int runtimePort,
-                                 LambdaDockerFlags flags) {
+                                 DockerFlags flags) {
         if (!firewall.enabled()) {
             return Optional.empty();
         }
