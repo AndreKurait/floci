@@ -284,10 +284,8 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
                                        String schedule, boolean actionSupplied, Integer min, Integer max,
                                        String timezone, String region, Instant now) {
         validateTriple(namespace, resourceId, dimension);
-        validateActionName(name);
-        if (!"ecs".equals(namespace) || !"ecs:service:DesiredCount".equals(dimension)) {
-            throw new AwsException("ValidationException", "Scheduled actions support ECS desired count only.", 400);
-        }
+        validatePutActionName(name);
+        scheduledCapacityAdjuster(namespace, dimension);
         if (timezone != null && !"UTC".equals(timezone)) {
             throw new AwsException("ValidationException", "Only UTC is supported for Timezone.", 400);
         }
@@ -333,7 +331,7 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
 
     public void deleteScheduledAction(String namespace, String resourceId, String dimension, String name, String region) {
         validateTriple(namespace, resourceId, dimension);
-        validateActionName(name);
+        validateDeleteActionName(name);
         synchronized (targetLock(region, namespace, resourceId, dimension)) {
             String key = policyKey(region, namespace, resourceId, dimension, name);
             if (scheduledActions.get(key).isEmpty()) {
@@ -373,11 +371,32 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
         return action.getScheduledActionName() + "\u0000" + action.getResourceId() + "\u0000" + action.getScalableDimension();
     }
 
-    private static void validateActionName(String name) {
-        if (name == null || name.isBlank() || name.length() > 256
+    private static void validatePutActionName(String name) {
+        if (name == null || name.isEmpty() || name.codePointCount(0, name.length()) > 256
+                || name.startsWith(" ") || name.endsWith(" ")
                 || name.chars().anyMatch(c -> c == ':' || c == '/' || c == '|' || Character.isISOControl(c))) {
             throw new AwsException("ValidationException", "Invalid ScheduledActionName.", 400);
         }
+    }
+
+    private static void validateDeleteActionName(String name) {
+        if (name == null || name.isEmpty() || name.codePointCount(0, name.length()) > 1600
+                || name.codePoints().anyMatch(c -> !(c == '\t' || c == '\n' || c == '\r'
+                        || c >= 0x20 && c <= 0xd7ff || c >= 0xe000 && c <= 0xfffd
+                        || c >= 0x10000 && c <= 0x10ffff))) {
+            throw new AwsException("ValidationException", "Invalid ScheduledActionName.", 400);
+        }
+    }
+
+    private CapacityAdjuster scheduledCapacityAdjuster(String namespace, String dimension) {
+        if ("ecs".equals(namespace) && "ecs:service:DesiredCount".equals(dimension)) {
+            return ecsCapacityAdjuster;
+        }
+        if ("lambda".equals(namespace) && "lambda:function:ProvisionedConcurrency".equals(dimension)) {
+            return lambdaCapacity;
+        }
+        throw new AwsException("ValidationException",
+                "Scheduled actions support ECS desired count and Lambda provisioned concurrency.", 400);
     }
 
     private static Instant parseSchedule(String schedule) {
@@ -498,10 +517,12 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
             target.setMaxCapacity(max);
             targets.putAllAtomically(Map.of(targetKey(region, target.getServiceNamespace(), target.getResourceId(),
                     target.getScalableDimension()), target));
-            int current = ecsCapacityAdjuster.getCurrentCapacity(target.getResourceId(), region);
+            CapacityAdjuster adjuster = scheduledCapacityAdjuster(
+                    target.getServiceNamespace(), target.getScalableDimension());
+            int current = adjuster.getCurrentCapacity(target.getResourceId(), region);
             int desired = Math.max(min, Math.min(max, current));
             if (desired != current) {
-                ecsCapacityAdjuster.setCapacity(target.getResourceId(), desired, region);
+                adjuster.setCapacity(target.getResourceId(), desired, region);
             }
             description = "Setting capacity bounds to " + min + " and " + max;
             action.setState(State.SUCCEEDED);

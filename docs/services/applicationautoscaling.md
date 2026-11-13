@@ -173,16 +173,20 @@ alarm's stored account and region.
   (MSK broker storage, DynamoDB capacity, ...) remain stored but inert, as
   described below.
 
-## Scheduled scaling (ECS only)
+## Scheduled scaling (ECS and Lambda)
 
 `PutScheduledAction` accepts `at(yyyy-MM-ddTHH:mm:ss)` in UTC for
-`ecs:service:DesiredCount`. A new action requires a schedule and a nonempty
+`ecs:service:DesiredCount` and `lambda:function:ProvisionedConcurrency`. Lambda resource IDs
+use `function:<name>:<alias-or-version>`; `$LATEST` is not supported. A new action requires a schedule and a nonempty
 `ScalableTargetAction` with `MinCapacity`, `MaxCapacity`, or both. Updating an action
 preserves omitted whole fields. Supplying `ScalableTargetAction` replaces its configured
 bounds, so a minimum-only update removes any previously configured maximum.
 
 When due, an action changes its configured bounds and preserves the target's other bound.
-Desired count is clamped into the resulting range. An in-range count stays unchanged.
+Requested capacity is clamped into the resulting range. An in-range count stays unchanged.
+For Lambda, positive capacity initializes real provisioned environments through the existing
+pool; zero removes the allocation. The Lambda API reports initialization readiness separately
+from the scheduled activity. Alias and version identities are preserved.
 Every successful occurrence records a `Successful` scaling activity, including unchanged
 bounds. Failed attempts record a `Failed` activity with the error message.
 A conflicting effective range fails without changing the target.
@@ -202,13 +206,16 @@ This cutoff approximates AWS timing. It does not model an AWS scheduling grace p
 
 Pending future actions survive restart in persistent, hybrid, and WAL modes. On startup,
 overdue pending actions are skipped. Claimed and terminal occurrences are never replayed.
-Execution claims are stored before effects. If ECS fails after bounds are stored, the new
+Execution claims are stored before effects. If the capacity adapter fails after bounds are stored, the new
 bounds remain and that occurrence fails without retry. Stores do not share a transaction,
 so execution has no exactly-once guarantee across crashes. Hybrid durability depends on
 flush. The scheduler drains before lifecycle storage flush and reset.
 
 Scheduled action ARNs use the `autoscaling` service and this resource path:
-`scheduledAction:<uuid>:resource/ecs/service/<cluster>/<service>:scheduledActionName/<name>`.
+`scheduledAction:<uuid>:resource/<namespace>/<resource-id>:scheduledActionName/<name>`.
+
+See the public [Lambda integration contract](https://docs.aws.amazon.com/autoscaling/application/userguide/services-that-can-integrate-lambda.html)
+and [PutScheduledAction API](https://docs.aws.amazon.com/autoscaling/application/APIReference/API_PutScheduledAction.html).
 
 ## Service-linked roles
 
@@ -228,7 +235,7 @@ arn:aws:iam::<account>:role/aws-service-role/<namespace>.application-autoscaling
 - The loop consumes CloudWatch metric data; it does not synthesize Lambda utilization
   from invocations. Tests or applications must publish the metric to exercise target
   tracking.
-- Scheduled scaling supports only one-off UTC schedules for ECS desired count. `Timezone` accepts `UTC` or omission. Recurring schedules, other timezones, `StartTime`, and `EndTime` return `ValidationException`.
+- Scheduled scaling supports one-off UTC schedules for ECS desired count and Lambda provisioned concurrency. `Timezone` accepts `UTC` or omission. Recurring schedules, other timezones, `StartTime`, and `EndTime` return `ValidationException`.
 - `PredictiveScalingPolicyConfiguration` is accepted only insofar as `PolicyType` is
   validated; the configuration block is not stored.
 - **The evaluation range's exact width is an approximation.** Alarm evaluation follows
