@@ -58,6 +58,7 @@ including batch, transaction and PartiQL table extraction.
 | `RestoreTableFromBackup` | Create a new table from a backup |
 | `DescribeKinesisStreamingDestination` | List Kinesis streaming destinations |
 | `EnableKinesisStreamingDestination` | Enable Kinesis streaming for a table |
+| `UpdateKinesisStreamingDestination` | Update timestamp precision on an active Kinesis destination |
 | `DisableKinesisStreamingDestination` | Disable Kinesis streaming for a table |
 | `ExportTableToPointInTime` | Export table data, or the changes of a period, to S3 |
 | `CreateGlobalTable` | Make an existing table a global table (2017.11.29) |
@@ -173,6 +174,27 @@ record:
 A Lambda event source mapping or an EventBridge pipe that should see only TTL deletions filters on
 it with the pattern
 `{"userIdentity": {"type": ["Service"], "principalId": ["dynamodb.amazonaws.com"]}}`.
+
+## Warm throughput
+
+The built-in backend reports warm throughput for tables and global secondary indexes
+with at least their current provisioned read/write capacity. A capacity increase
+raises that resource's persisted warm peak; a later decrease retains the peak.
+New on-demand resources start with 12,000 read units and 4,000 write units. Billing
+mode changes retain a higher recorded peak.
+
+`CreateTable`, `UpdateTable`, index creation and updates, and
+[Application Auto Scaling registration](applicationautoscaling.md#dynamodb-capacity-at-registration)
+share this behavior. Explicit prewarming requests are not implemented. A legacy
+stored table or index without peak fields uses its current capacity as a floor;
+peak history that was never stored cannot be recovered.
+
+Registration serializes capacity changes with table create, update and delete.
+If a storage operation reports failure before target replacement, it restores the
+selected capacity and decoded stored warm value and attempts to persist that
+restoration. The table and target stores do not share a transaction. Persistence
+errors hidden by a backend, compensation failures, intermediate reads and process
+loss retain their backend-specific limits.
 
 ## DynamoDB Local backend
 
@@ -593,12 +615,20 @@ record as `dynamodb.ApproximateCreationDateTimePrecision`, and reported by
 `DescribeKinesisStreamingDestination` as well as in the `EnableKinesisStreamingConfiguration` member of
 the `EnableKinesisStreamingDestination` and `DisableKinesisStreamingDestination` responses.
 
+On the native backend, `UpdateKinesisStreamingDestination` changes an active destination's precision without stopping
+forwarding. Its response carries `UpdateKinesisStreamingConfiguration`, and subsequent item changes
+use the updated precision. Omitting the configuration or its precision retains the current value.
+The update accepts a table name or table ARN, persists across restarts, and rejects missing tables,
+missing destinations, inactive destinations, and precision values other than `MILLISECOND` or
+`MICROSECOND`.
+
 Enabling a Kinesis streaming destination does not change the table's DynamoDB Streams setting.
 Kinesis forwarding works whether or not `StreamSpecification.StreamEnabled` is set.
 
 Both calls take effect at once, so `EnableKinesisStreamingDestination` answers `ACTIVE` and
 `DisableKinesisStreamingDestination` answers `DISABLED`. AWS reports the transitional `ENABLING` and
 `DISABLING` first, because it enables and disables the destination in the background.
+Updates also apply at once and answer `ACTIVE`; AWS can report `UPDATING` while applying a change.
 
 ### Delivery contract
 
