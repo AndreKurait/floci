@@ -909,7 +909,21 @@ class PartitionCrossServiceSmokeIntegrationTest {
     @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
     void applicationAutoScalingScalableTargetArn(PartitionCase partitionCase) {
         String region = offered(partitionCase, "application-autoscaling");
-        String resourceId = "table/" + unique("smoke-table", partitionCase);
+        String tableName = unique("smoke-scaling-table", partitionCase);
+        String body = """
+                {
+                  "TableName": "%s",
+                  "AttributeDefinitions": [{"AttributeName": "id", "AttributeType": "S"}],
+                  "KeySchema": [{"AttributeName": "id", "KeyType": "HASH"}],
+                  "BillingMode": "PROVISIONED",
+                  "ProvisionedThroughput": {"ReadCapacityUnits": 1, "WriteCapacityUnits": 1}
+                }
+                """.formatted(tableName);
+        json10(region, "dynamodb", "DynamoDB_20120810.CreateTable", body)
+                .when().post("/").then().statusCode(200);
+        cleanup.register(() -> json10(region, "dynamodb", "DynamoDB_20120810.DeleteTable",
+                "{\"TableName\":\"" + tableName + "\"}").when().post("/").then().statusCode(200));
+        String resourceId = "table/" + tableName;
         String target = """
                 "ServiceNamespace": "dynamodb", "ResourceId": "%s",
                 "ScalableDimension": "dynamodb:table:ReadCapacityUnits"
@@ -919,7 +933,8 @@ class PartitionCrossServiceSmokeIntegrationTest {
         .when().post("/").then().statusCode(200)
             .extract().jsonPath().getString("ScalableTargetARN");
         cleanup.register(() -> json11(region, "application-autoscaling",
-                "AnyScaleFrontendService.DeregisterScalableTarget", "{" + target + "}").when().post("/"));
+                "AnyScaleFrontendService.DeregisterScalableTarget", "{" + target + "}")
+                .when().post("/").then().statusCode(200));
         PartitionMatrix.assertArnIn(partitionCase, arn);
     }
 
