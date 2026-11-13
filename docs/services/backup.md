@@ -75,6 +75,42 @@
 | `ListRecoveryPointsByBackupVault` | `GET` | `/backup-vaults/{backupVaultName}/recovery-points/` | List recovery points in a vault |
 | `DeleteRecoveryPoint` | `DELETE` | `/backup-vaults/{backupVaultName}/recovery-points/{recoveryPointArn}` | Delete a recovery point |
 
+### Framework Definitions
+
+| Action | Method | Path | Description |
+|---|---|---|---|
+| `CreateFramework` | `POST` | `/audit/frameworks` | Persist a framework definition |
+| `DescribeFramework` | `GET` | `/audit/frameworks/{frameworkName}` | Read controls, parameters and scope |
+| `ListFrameworks` | `GET` | `/audit/frameworks` | Page through framework summaries |
+| `UpdateFramework` | `PUT` | `/audit/frameworks/{frameworkName}` | Replace supplied definition members |
+| `DeleteFramework` | `DELETE` | `/audit/frameworks/{frameworkName}` | Remove a framework definition |
+
+Frameworks have account/region ownership and partition-aware `framework:<name>-<id>` ARNs.
+Definitions, creation tags and idempotency receipts use the configured Backup storage mode.
+Omitted update members are retained. Same-request retries do not reapply earlier mutations;
+reusing a token with different input is refused. Receipts remain after deletion, so a late
+retry does not restore a deleted framework. No AWS token-expiration window is emulated.
+List cursors are account/region bound; `MaxResults` accepts 1–1000. Limits are 15 frameworks
+and 50 controls per account/region. Duplicate control/parameter/scope definitions are refused.
+
+`DeploymentStatus=COMPLETED` describes completion of the local definition write.
+`FrameworkStatus=UNAVAILABLE` reports that governed Config recording coverage is not validated.
+Frameworks do not deploy Config rules, evaluate compliance, collect resource changes or generate
+reports. There is no timed transition to ACTIVE or synthetic compliant result.
+
+All 11 documented control names are accepted. The definitions validate string/map/list types,
+unique control and parameter names, scope forms, and the documented sample parameters for
+retention, minimum frequency, manual-delete role exceptions, restore time and air-gapped vault
+recovery-point age. Nonempty parameter lists for cross-account, cross-region, vault-lock and
+last-recovery-point controls are currently unsupported. Their empty/default parameter forms
+remain available. Defaults are stored as supplied rather than expanded into invented values.
+
+Frameworks support the existing `ListTags`, `TagResource` and `UntagResource` routes. An old ARN
+cannot tag a deleted-and-recreated name. IAM checks the framework ARN and resource/request tags;
+creating a tagged framework also requires `backup:TagResource`. ListFrameworks uses `*`.
+These checks are limited to framework routes and framework tagging and do not change the
+existing vault, plan or Config recording behavior.
+
 ### Tagging
 
 | Action | Method | Path | Description |

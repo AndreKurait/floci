@@ -12,6 +12,7 @@ import io.github.hectorvent.floci.services.appsync.AppSyncController;
 import io.github.hectorvent.floci.services.appsync.graphql.AppSyncExecutionController;
 import io.github.hectorvent.floci.services.aps.ApsController;
 import io.github.hectorvent.floci.services.backup.BackupController;
+import io.github.hectorvent.floci.services.backup.BackupFrameworkController;
 import io.github.hectorvent.floci.services.batch.BatchController;
 import io.github.hectorvent.floci.services.bedrock.BedrockController;
 import io.github.hectorvent.floci.services.bedrockagentcore.BedrockAgentCoreController;
@@ -662,7 +663,7 @@ public class ResolvedServiceCatalog {
                         "backup", storageMode(config.storage().services().backup().mode(), config.storage().mode()),
                         config.storage().services().backup().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("backup"), Set.of(), Set.of(BackupController.class))
+                        Set.of(), Set.of("backup"), Set.of(), Set.of(BackupController.class, BackupFrameworkController.class))
                         .withRequiredRestAuthentication(),
                 descriptor("resource-explorer-2", "resourceexplorer2",
                         config.services().resourceexplorer2().enabled(), true,
