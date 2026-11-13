@@ -53,6 +53,8 @@ MODELS: dict[str, str] = {
     "apigatewayv2": "apigateway",
     "appconfig": "appconfig",
     "appconfigdata": "appconfig",
+    "cloudfront": "cloudfront",
+    "cloudfront-keyvaluestore": "cloudfront-keyvaluestore",
     "dsql": "dsql",
     "eks": "eks",
     "es": "es",
@@ -67,6 +69,14 @@ MODELS: dict[str, str] = {
 }
 
 
+# CloudFront's existing management APIs still need their own IAM resource qualification.
+# Read only the KVS family added with scoped IAM coverage in this branch.
+ONLY_OPERATIONS: dict[str, tuple[str, ...]] = {
+    "cloudfront": ("CreateKeyValueStore", "DeleteKeyValueStore", "DescribeKeyValueStore",
+                   "ListKeyValueStores", "UpdateKeyValueStore"),
+}
+
+
 def build(models: dict[str, dict], provenance: str) -> dict:
     """The vendored document from each loaded model."""
     routes = {}
@@ -75,7 +85,7 @@ def build(models: dict[str, dict], provenance: str) -> dict:
         if model["metadata"].get("protocol") not in ("rest-json", "rest-xml"):
             raise SystemExit(f"error: {name} is not a REST model")
         operations = {}
-        for operation in sorted(model["operations"]):
+        for operation in sorted(ONLY_OPERATIONS.get(name, model["operations"])):
             http = model["operations"][operation]["http"]
             operations[operation] = {"method": http["method"], "requestUri": http["requestUri"]}
         routes[name] = {
