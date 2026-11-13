@@ -1,0 +1,300 @@
+package io.github.hectorvent.floci.services.ec2;
+
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.services.ec2.model.Instance;
+import io.github.hectorvent.floci.services.ec2.model.InstanceNetworkInterface;
+import io.github.hectorvent.floci.services.ec2.model.LaunchTemplateData;
+import io.github.hectorvent.floci.services.ec2.model.Reservation;
+import io.github.hectorvent.floci.services.ec2.model.Tag;
+import jakarta.ws.rs.core.MultivaluedHashMap;
+import jakarta.ws.rs.core.MultivaluedMap;
+import jakarta.ws.rs.core.Response;
+import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
+
+import java.util.ArrayList;
+import java.util.List;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.nullable;
+import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+/**
+ * What RunInstances takes from the interface spec.
+ *
+ * <p>The launch-time public-IP override arrives in two wire shapes: the primary network-interface spec
+ * (what Terraform sends) and the legacy top-level parameter (what the CLI and older SDKs send). Both
+ * must reach Ec2Service; absent must stay null so the subnet's MapPublicIpOnLaunch default still applies.
+ *
+ * <p>Terraform's aws_instance also sends its security groups on the primary interface spec
+ * ({@code NetworkInterface.1.SecurityGroupId.N}) whenever private_ip or associate_public_ip_address is
+ * set. RunInstances read only the top-level {@code SecurityGroupId.N}, so the instance landed in the
+ * VPC's default group.
+ */
+class Ec2RunInstancesPublicIpParamTest {
+
+    private static final String REGION = "us-east-1";
+
+    @Test
+    void topLevelAssociatePublicIpAddressReachesTheService() {
+        assertEquals(Boolean.TRUE, forward(params("AssociatePublicIpAddress", "true")).associatePublicIp());
+        assertEquals(Boolean.FALSE, forward(params("AssociatePublicIpAddress", "false")).associatePublicIp());
+    }
+
+    @Test
+    void networkInterfaceSpecStillReachesTheService() {
+        assertEquals(Boolean.TRUE,
+                forward(params("NetworkInterface.1.AssociatePublicIpAddress", "true")).associatePublicIp());
+        assertEquals(Boolean.FALSE,
+                forward(params("NetworkInterface.1.AssociatePublicIpAddress", "false")).associatePublicIp());
+    }
+
+    @Test
+    void networkInterfaceSpecWinsWhenBothArePresent() {
+        MultivaluedMap<String, String> p = params("NetworkInterface.1.AssociatePublicIpAddress", "false");
+        p.putSingle("AssociatePublicIpAddress", "true");
+        assertEquals(Boolean.FALSE, forward(p).associatePublicIp());
+    }
+
+    @Test
+    void absentStaysNullSoTheSubnetDefaultApplies() {
+        assertNull(forward(baseParams()).associatePublicIp(),
+                "an absent override must stay null so the subnet default decides");
+    }
+
+    @Test
+    void groupsOnThePrimaryInterfaceSpecReachTheService() {
+        MultivaluedMap<String, String> p = baseParams();
+        p.putSingle("NetworkInterface.1.SecurityGroupId.1", "sg-0123456789abcdef0");
+        p.putSingle("NetworkInterface.1.DeviceIndex", "0");
+        assertEquals(List.of("sg-0123456789abcdef0"), forward(p).securityGroupIds());
+    }
+
+    @Test
+    void aSecondaryInterfaceSpecsGroupsAreNotTheInstances() {
+        MultivaluedMap<String, String> p = baseParams();
+        p.putSingle("NetworkInterface.1.SecurityGroupId.1", "sg-0123456789abcdef0");
+        p.putSingle("NetworkInterface.1.DeviceIndex", "1");
+        assertEquals(List.of(), forward(p).securityGroupIds());
+    }
+
+    @Test
+    void topLevelAndInterfaceGroupsTogetherAreRefused() {
+        MultivaluedMap<String, String> p = baseParams();
+        p.putSingle("NetworkInterface.1.SecurityGroupId.1", "sg-0123456789abcdef0");
+        p.putSingle("SecurityGroupId.1", "sg-0fedcba9876543210");
+        Response response = handler(mock(Ec2Service.class)).handle("RunInstances", p, REGION);
+        assertEquals(400, response.getStatus());
+        assertEquals(true, String.valueOf(response.getEntity()).contains("InvalidParameterCombination"));
+    }
+
+    @Test
+    void templateTagsApplyOnlyToCreatedPrimaryBeforeRequestOverrides() {
+        assertTemplateTagTargets(false, false);
+    }
+
+    @Test
+    void templateTagsDoNotApplyToTemplateSelectedExistingInterface() {
+        assertTemplateTagTargets(true, false);
+    }
+
+    @Test
+    void templateTagsDoNotApplyToRequestSelectedExistingInterface() {
+        assertTemplateTagTargets(false, true);
+    }
+
+    @Test
+    void combinedTemplateAndRequestInterfaceTagsRejectBeforeLaunch() {
+        assertInterfaceTagAdmission(50, "additional", false, false, true);
+    }
+
+    @Test
+    void requestOverrideAtInterfaceTagLimitStillLaunches() {
+        assertInterfaceTagAdmission(50, "key0", false, false, false);
+    }
+
+    @Test
+    void combinedInterfaceTagsAtLimitStillLaunch() {
+        assertInterfaceTagAdmission(49, "additional", false, false, false);
+    }
+
+    @Test
+    void templateTagsExcludedForTemplateSuppliedInterface() {
+        assertInterfaceTagAdmission(50, "additional", true, false, false);
+    }
+
+    @Test
+    void templateTagsExcludedForRequestSuppliedInterface() {
+        assertInterfaceTagAdmission(50, "additional", false, true, false);
+    }
+
+    @Test
+    void requestOnlyInterfaceTagsStillLaunch() {
+        assertInterfaceTagAdmission(0, "additional", false, false, false);
+    }
+
+    private void assertInterfaceTagAdmission(int templateCount, String requestKey,
+                                             boolean templateExisting, boolean requestExisting, boolean rejected) {
+        Ec2Service service = mock(Ec2Service.class);
+        LaunchTemplateData data = new LaunchTemplateData();
+        LaunchTemplateData.NetworkInterface primary = new LaunchTemplateData.NetworkInterface();
+        primary.setDeviceIndex(0);
+        if (templateExisting) {
+            primary.setNetworkInterfaceId("eni-primary");
+        }
+        data.setNetworkInterfaces(List.of(primary));
+        List<Tag> tags = new ArrayList<>();
+        for (int i = 0; i < templateCount; i++) {
+            tags.add(new Tag("key" + i, "template"));
+        }
+        data.setTagSpecifications(List.of(new LaunchTemplateData.TagSpecification("network-interface", tags)));
+        when(service.resolveRunInstancesLaunchTemplateData(eq(REGION), eq("lt-tags"), nullable(String.class),
+                nullable(String.class), eq(true))).thenReturn(data);
+        when(service.runInstances(anyString(), nullable(String.class), nullable(String.class),
+                anyInt(), anyInt(), nullable(String.class), anyList(), nullable(String.class),
+                nullable(String.class), anyList(), nullable(String.class), nullable(String.class),
+                nullable(Boolean.class), nullable(String.class), anyInt(), nullable(String.class),
+                nullable(LaunchTemplateData.MetadataOptions.class), nullable(String.class), nullable(String.class), eq(false),
+                nullable(String.class), nullable(String.class), nullable(List.class), eq(false), nullable(String.class),
+                nullable(LaunchTemplateData.CapacityReservationSpecification.class), nullable(Boolean.class)))
+                .thenAnswer(invocation -> {
+                    if (rejected) {
+                        throw new AssertionError("RunInstances allocated before combined interface tag validation");
+                    }
+                    return new Reservation();
+                });
+        MultivaluedMap<String, String> p = baseParams();
+        p.putSingle("LaunchTemplate.LaunchTemplateId", "lt-tags");
+        if (requestExisting) {
+            p.putSingle("NetworkInterface.1.NetworkInterfaceId", "eni-primary");
+        }
+        p.putSingle("TagSpecification.1.ResourceType", "network-interface");
+        p.putSingle("TagSpecification.1.Tag.1.Key", requestKey);
+        p.putSingle("TagSpecification.1.Tag.1.Value", "request");
+        Ec2QueryHandler handler = handler(service);
+        if (rejected) {
+            Response response = handler.handle("RunInstances", p, REGION);
+            assertEquals(400, response.getStatus());
+            assertTrue(response.getEntity().toString().contains("TagLimitExceeded"));
+        } else {
+            assertEquals(200, handler.handle("RunInstances", p, REGION).getStatus());
+        }
+    }
+
+    private void assertTemplateTagTargets(boolean templateExisting, boolean requestExisting) {
+        Ec2Service service = mock(Ec2Service.class);
+        LaunchTemplateData data = new LaunchTemplateData();
+        LaunchTemplateData.NetworkInterface primary = new LaunchTemplateData.NetworkInterface();
+        primary.setDeviceIndex(0);
+        if (templateExisting) {
+            primary.setNetworkInterfaceId("eni-primary");
+        }
+        data.setNetworkInterfaces(List.of(primary));
+        List<Tag> templateTags = List.of(new Tag("shared", "template"), new Tag("template", "only"));
+        data.setTagSpecifications(List.of(new LaunchTemplateData.TagSpecification("network-interface", templateTags)));
+        when(service.resolveRunInstancesLaunchTemplateData(eq(REGION), eq("lt-tags"), nullable(String.class),
+                nullable(String.class), eq(true))).thenReturn(data);
+        Instance instance = new Instance();
+        instance.setInstanceId("i-tags");
+        InstanceNetworkInterface secondary = new InstanceNetworkInterface();
+        secondary.setNetworkInterfaceId("eni-secondary");
+        secondary.setDeviceIndex(1);
+        InstanceNetworkInterface created = new InstanceNetworkInterface();
+        created.setNetworkInterfaceId("eni-primary");
+        created.setDeviceIndex(0);
+        instance.setNetworkInterfaces(List.of(secondary, created));
+        Reservation reservation = new Reservation();
+        reservation.setInstances(List.of(instance));
+        when(service.runInstances(anyString(), nullable(String.class), nullable(String.class),
+                anyInt(), anyInt(), nullable(String.class), anyList(), nullable(String.class),
+                nullable(String.class), anyList(), nullable(String.class), nullable(String.class),
+                nullable(Boolean.class), nullable(String.class), anyInt(), nullable(String.class),
+                nullable(LaunchTemplateData.MetadataOptions.class), nullable(String.class), nullable(String.class), eq(false),
+                nullable(String.class), nullable(String.class), nullable(List.class), eq(false), nullable(String.class),
+                nullable(LaunchTemplateData.CapacityReservationSpecification.class), nullable(Boolean.class)))
+                .thenReturn(reservation);
+        MultivaluedMap<String, String> p = baseParams();
+        p.putSingle("LaunchTemplate.LaunchTemplateId", "lt-tags");
+        if (requestExisting) {
+            p.putSingle("NetworkInterface.1.NetworkInterfaceId", "eni-primary");
+        }
+        p.putSingle("TagSpecification.1.ResourceType", "network-interface");
+        p.putSingle("TagSpecification.1.Tag.1.Key", "shared");
+        p.putSingle("TagSpecification.1.Tag.1.Value", "request");
+        Ec2QueryHandler handler = handler(service);
+        handler.handle("RunInstances", p, REGION);
+        InOrder order = inOrder(service);
+        if (templateExisting || requestExisting) {
+            verify(service, never()).tagRunInstancesInterfaces(REGION, List.of("eni-primary"), templateTags, null);
+        } else {
+            order.verify(service).tagRunInstancesInterfaces(REGION, List.of("eni-primary"), templateTags, null);
+        }
+        ArgumentCaptor<List<Tag>> requestTags = ArgumentCaptor.forClass(List.class);
+        order.verify(service).createTags(eq(REGION), eq(List.of("eni-secondary", "eni-primary")), requestTags.capture());
+        assertEquals(1, requestTags.getValue().size());
+        assertEquals("request", requestTags.getValue().getFirst().getValue());
+    }
+
+    /** The interface-spec arguments of the runInstances call the handler forwarded. */
+    private record Forwarded(List<String> securityGroupIds, Boolean associatePublicIp) {
+    }
+
+    /** Runs RunInstances through the handler and captures the call it forwards to Ec2Service. */
+    @SuppressWarnings("unchecked")
+    private static Forwarded forward(MultivaluedMap<String, String> p) {
+        Ec2Service service = mock(Ec2Service.class);
+        when(service.runInstances(anyString(), nullable(String.class), nullable(String.class),
+                anyInt(), anyInt(), nullable(String.class), anyList(), nullable(String.class),
+                nullable(String.class), anyList(), nullable(String.class), nullable(String.class),
+                nullable(Boolean.class), nullable(String.class), anyInt(), nullable(String.class),
+                nullable(LaunchTemplateData.MetadataOptions.class), nullable(String.class), nullable(String.class), eq(false),
+                nullable(String.class), nullable(String.class), nullable(List.class), eq(false), nullable(String.class),
+                nullable(LaunchTemplateData.CapacityReservationSpecification.class), nullable(Boolean.class)))
+                .thenReturn(new Reservation());
+        handler(service).handle("RunInstances", p, REGION);
+
+        ArgumentCaptor<List<String>> groups = ArgumentCaptor.forClass(List.class);
+        ArgumentCaptor<Boolean> associatePublicIp = ArgumentCaptor.forClass(Boolean.class);
+        verify(service).runInstances(anyString(), nullable(String.class), nullable(String.class),
+                anyInt(), anyInt(), nullable(String.class), groups.capture(), nullable(String.class),
+                nullable(String.class), anyList(), nullable(String.class), nullable(String.class),
+                associatePublicIp.capture(), nullable(String.class), anyInt(), nullable(String.class),
+                nullable(LaunchTemplateData.MetadataOptions.class), nullable(String.class), nullable(String.class), eq(false),
+                nullable(String.class), nullable(String.class), nullable(List.class), eq(false), nullable(String.class),
+                nullable(LaunchTemplateData.CapacityReservationSpecification.class), nullable(Boolean.class));
+        return new Forwarded(groups.getValue(), associatePublicIp.getValue());
+    }
+
+    private static Ec2QueryHandler handler(Ec2Service service) {
+        return new Ec2QueryHandler(service, mock(EmulatorConfig.class), mock(FlowLogService.class),
+                mock(Ec2EbsEncryptionService.class), mock(Ec2BlockPublicAccessService.class),
+                mock(Ec2IpamService.class), mock(RegionResolver.class));
+    }
+
+    private static MultivaluedMap<String, String> baseParams() {
+        MultivaluedMap<String, String> p = new MultivaluedHashMap<>();
+        p.putSingle("ImageId", "ami-0abcdef1234567890");
+        p.putSingle("InstanceType", "t3.micro");
+        p.putSingle("MinCount", "1");
+        p.putSingle("MaxCount", "1");
+        return p;
+    }
+
+    private static MultivaluedMap<String, String> params(String key, String value) {
+        MultivaluedMap<String, String> p = baseParams();
+        p.putSingle(key, value);
+        return p;
+    }
+}
