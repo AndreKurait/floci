@@ -138,6 +138,9 @@ versions. Floci keeps tags on applications only, so `Tags` on the other three ty
 `TagResource` treats them; so are a configuration profile's `KmsKeyIdentifier`, `RetrievalRoleArn` and `Validators`,
 and `DeletionProtectionCheck`. `ReplicateTo: SSM_DOCUMENT` writes no SSM document.
 Hosted configuration versions retain their application, profile and version identity for deletion and rollback.
+CFN resource descriptions, resource lists, events and change-set previews expose the version number as
+the public physical ID. Different profiles can both report `1` while their stored ownership remains distinct.
+Use `StackName` for resource reads; numeric hosted IDs are not resolved by `PhysicalResourceId`-only stack lookup.
 `Ref` and `Fn::GetAtt VersionNumber` return the version number as a string. Changing a hosted version property
 creates a replacement; rollback removes the attempted version, while retention policies preserve versions whose
 parent profile remains.

@@ -31,6 +31,11 @@ public interface CfnResourceProvisioner {
         return physicalId;
     }
 
+    /** Public CFN responses can expose one part of an internally compound physical identity. */
+    default String publicPhysicalId(String physicalId) {
+        return physicalId;
+    }
+
     /** GetAtt attributes the registry schema types as integers, by resource type. */
     default Map<String, Set<String>> integerAttributes() {
         return Map.of();
