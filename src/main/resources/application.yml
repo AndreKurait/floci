@@ -247,6 +247,7 @@ floci:
       sns:
         flush-interval-ms: 5000
       lambda:
+        # Includes per-version runtime-management settings.
         flush-interval-ms: 5000
       cloudwatchlogs:
         flush-interval-ms: 15000

@@ -16,6 +16,8 @@ public class LambdaFunction {
     private String functionName;
     private String functionArn;
     private String accountId;
+    /** Stable internal identity of a function's lifetime, separate from its mutable revision. */
+    private String runtimeManagementGeneration;
     private String runtime;
     private String role;
     private String handler;
@@ -91,6 +93,9 @@ public class LambdaFunction {
 
     public String getAccountId() { return accountId; }
     public void setAccountId(String accountId) { this.accountId = accountId; }
+
+    public String getRuntimeManagementGeneration() { return runtimeManagementGeneration; }
+    public void setRuntimeManagementGeneration(String generation) { this.runtimeManagementGeneration = generation; }
 
     public String getFunctionArn() { return functionArn; }
     public void setFunctionArn(String functionArn) { this.functionArn = functionArn; }
