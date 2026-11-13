@@ -4,7 +4,6 @@ import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
-import java.util.HashMap;
 import java.util.Map;
 
 @RegisterForReflection
@@ -15,7 +14,8 @@ public class KinesisConsumer {
     private String consumerStatus;
     private Instant consumerCreationTimestamp;
     private String streamArn;
-    private Map<String, String> tags = new HashMap<>();
+    private String policyStreamGeneration;
+    private Map<String, String> tags = Map.of();
 
     public KinesisConsumer() {}
 
@@ -25,6 +25,25 @@ public class KinesisConsumer {
         this.streamArn = streamArn;
         this.consumerStatus = "ACTIVE";
         this.consumerCreationTimestamp = Instant.now();
+    }
+
+    public String getPolicyStreamGeneration() { return policyStreamGeneration; }
+    public void setPolicyStreamGeneration(String generation) { this.policyStreamGeneration = generation; }
+
+    public Map<String, String> getTags() { return tags; }
+    public void setTags(Map<String, String> tags) { this.tags = tags == null ? Map.of() : Map.copyOf(tags); }
+
+    /** Detached replacement published under the parent stream's lifecycle monitor. */
+    public KinesisConsumer withTags(Map<String, String> replacement) {
+        KinesisConsumer copy = new KinesisConsumer();
+        copy.consumerName = consumerName;
+        copy.consumerArn = consumerArn;
+        copy.consumerStatus = consumerStatus;
+        copy.consumerCreationTimestamp = consumerCreationTimestamp;
+        copy.streamArn = streamArn;
+        copy.policyStreamGeneration = policyStreamGeneration;
+        copy.setTags(replacement);
+        return copy;
     }
 
     public String getConsumerName() { return consumerName; }
@@ -41,7 +60,4 @@ public class KinesisConsumer {
 
     public String getStreamArn() { return streamArn; }
     public void setStreamArn(String streamArn) { this.streamArn = streamArn; }
-
-    public Map<String, String> getTags() { return tags; }
-    public void setTags(Map<String, String> tags) { this.tags = tags == null ? new HashMap<>() : tags; }
 }

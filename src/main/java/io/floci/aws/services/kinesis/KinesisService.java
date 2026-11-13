@@ -76,6 +76,7 @@ public class KinesisService implements ResourceProvider {
     private final StorageBackend<String, KinesisConsumer> consumerStore;
     private final RegionResolver regionResolver;
     private final Clock clock;
+    private final KinesisResourcePolicies resourcePolicies;
     private final AtomicLong sequenceGenerator = new AtomicLong(System.currentTimeMillis());
     // One monitor per stream key, handed out by lockFor. Serializes sequence allocation + shard
     // append + persist so the in-memory log, the assigned sequence order and the WAL write order
@@ -117,6 +118,7 @@ public class KinesisService implements ResourceProvider {
         this.consumerStore = consumerStore;
         this.regionResolver = regionResolver;
         this.clock = clock;
+        this.resourcePolicies = new KinesisResourcePolicies(store, consumerStore, regionResolver, this::lockFor);
     }
 
     public KinesisStream createStream(String streamName, int shardCount, String region) {
@@ -144,30 +146,32 @@ public class KinesisService implements ResourceProvider {
         }
 
         String storageKey = regionKey(region, streamName);
-        if (store.get(storageKey).isPresent()) {
-            throw new AwsException("ResourceInUseException", "Stream already exists: " + streamName, 400);
-        }
+        synchronized (lockFor(storageKey)) {
+            if (store.get(storageKey).isPresent()) {
+                throw new AwsException("ResourceInUseException", "Stream already exists: " + streamName, 400);
+            }
 
-        String arn = regionResolver.buildArn("kinesis", region, "stream/" + streamName);
-        KinesisStream stream = new KinesisStream(streamName, arn);
-        stream.setAccountId(regionResolver.getAccountId());
-        stream.setStreamMode(resolvedMode);
-        if (maxRecordSizeInKiB != null) {
-            stream.setMaxRecordSizeInKiB(maxRecordSizeInKiB);
-        }
+            String arn = regionResolver.buildArn("kinesis", region, "stream/" + streamName);
+            KinesisStream stream = new KinesisStream(streamName, arn);
+            stream.setAccountId(regionResolver.getAccountId());
+            stream.setStreamMode(resolvedMode);
+            if (maxRecordSizeInKiB != null) {
+                stream.setMaxRecordSizeInKiB(maxRecordSizeInKiB);
+            }
 
-        for (int i = 0; i < shardCount; i++) {
-            String shardId = String.format("shardId-%012d", i);
-            stream.getShards().add(new KinesisShard(shardId,
-                    shardStartingHashKey(i, shardCount),
-                    shardEndingHashKey(i, shardCount),
-                    INITIAL_SEQUENCE_NUMBER));
-        }
+            for (int i = 0; i < shardCount; i++) {
+                String shardId = String.format("shardId-%012d", i);
+                stream.getShards().add(new KinesisShard(shardId,
+                        shardStartingHashKey(i, shardCount),
+                        shardEndingHashKey(i, shardCount),
+                        INITIAL_SEQUENCE_NUMBER));
+            }
 
-        store.put(storageKey, stream);
-        LOG.infov("Created Kinesis stream: {0} in region {1} with {2} shards (mode: {3})",
-                streamName, region, shardCount, resolvedMode);
-        return stream;
+            store.put(storageKey, stream);
+            LOG.infov("Created Kinesis stream: {0} in region {1} with {2} shards (mode: {3})",
+                    streamName, region, shardCount, resolvedMode);
+            return stream;
+        }
     }
 
     public void updateStreamMode(String streamName, String streamMode, String region) {
@@ -222,6 +226,23 @@ public class KinesisService implements ResourceProvider {
         return stream;
     }
 
+    public String getResourcePolicy(String resourceArn, String region) {
+        return resourcePolicies.get(resourceArn, region);
+    }
+
+    public void putResourcePolicy(String resourceArn, String policy, String region) {
+        resourcePolicies.put(resourceArn, policy, region);
+    }
+
+    public void deleteResourcePolicy(String resourceArn, String region) {
+        resourcePolicies.delete(resourceArn, region);
+    }
+
+    /** Read-only ownership-checked context for the three resource-policy IAM actions. */
+    public Map<String, String> resourcePolicyTags(String resourceArn, String region) {
+        return resourcePolicies.tags(resourceArn, region);
+    }
+
     public KinesisConsumer registerStreamConsumer(String streamArn, String consumerName, String region) {
         return registerStreamConsumer(streamArn, consumerName, Map.of(), region);
     }
@@ -229,26 +250,35 @@ public class KinesisService implements ResourceProvider {
     public KinesisConsumer registerStreamConsumer(String streamArn, String consumerName,
                                                    Map<String, String> tags, String region) {
         validateResourceTagLimit(Map.of(), tags);
-        String consumerArn = streamArn + "/consumer/" + consumerName + ":" + System.currentTimeMillis();
-        KinesisConsumer consumer = new KinesisConsumer(consumerName, consumerArn, streamArn);
-        consumer.getTags().putAll(tags);
-        synchronized (consumerStore) {
-            consumerStore.put(regionKey(region, consumerArn), consumer);
+        String streamName = streamArn.substring(streamArn.lastIndexOf('/') + 1);
+        synchronized (lockFor(regionKey(region, streamName))) {
+            String consumerArn = streamArn + "/consumer/" + consumerName + ":" + clock.millis();
+            String parentGeneration = resourcePolicies.clearConsumerPolicy(consumerArn, region);
+            if (parentGeneration == null) {
+                throw new AwsException("ResourceNotFoundException", "Stream " + streamName + " not found", 400);
+            }
+            KinesisConsumer consumer = new KinesisConsumer(consumerName, consumerArn, streamArn);
+            consumer.setConsumerCreationTimestamp(clock.instant());
+            consumer.setPolicyStreamGeneration(parentGeneration);
+            consumer.setTags(tags);
+            consumerStore.put(region + "::" + consumerArn, consumer);
+            LOG.infov("Registered Kinesis consumer: {0} for stream {1}", consumerName, streamArn);
+            return consumer;
         }
-        LOG.infov("Registered Kinesis consumer: {0} for stream {1}", consumerName, streamArn);
-        return consumer;
     }
 
     public void deregisterStreamConsumer(String streamArn, String consumerName, String consumerArn, String region) {
-        synchronized (consumerStore) {
-            String resolvedArn = consumerArn;
-            if (resolvedArn == null && streamArn != null && consumerName != null) {
-                resolvedArn = consumerStore.scan(k -> true).stream()
-                        .filter(c -> c.getStreamArn().equals(streamArn) && c.getConsumerName().equals(consumerName))
-                        .findFirst().map(KinesisConsumer::getConsumerArn).orElse(null);
-            }
-            if (resolvedArn != null) {
-                consumerStore.delete(regionKey(region, resolvedArn));
+        String resolvedArn = consumerArn;
+        if (resolvedArn == null && streamArn != null && consumerName != null) {
+            resolvedArn = consumerStore.scan(k -> true).stream()
+                    .filter(c -> c.getStreamArn().equals(streamArn) && c.getConsumerName().equals(consumerName))
+                    .findFirst().map(KinesisConsumer::getConsumerArn).orElse(null);
+        }
+        if (resolvedArn != null) {
+            String key = resourcePolicies.consumerKey(resolvedArn, region);
+            synchronized (lockFor(key)) {
+                resourcePolicies.clearConsumerPolicy(resolvedArn, region);
+                consumerStore.delete(region + "::" + resolvedArn);
                 LOG.infov("Deregistered Kinesis consumer: {0}", resolvedArn);
             }
         }
@@ -308,11 +338,12 @@ public class KinesisService implements ResourceProvider {
     public void tagResource(String resourceArn, Map<String, String> tags, String region) {
         if (isConsumerTagResource(resourceArn, region)) {
             String key = regionKey(region, resourceArn);
-            synchronized (consumerStore) {
-                KinesisConsumer consumer = resolveConsumerForTags(key);
+            synchronized (lockFor(resourcePolicies.consumerKey(resourceArn, region))) {
+                KinesisConsumer consumer = resourcePolicies.consumerForTags(resourceArn, region);
                 validateResourceTagLimit(consumer.getTags(), tags);
-                consumer.getTags().putAll(tags);
-                consumerStore.put(key, consumer);
+                Map<String, String> replacement = new HashMap<>(consumer.getTags());
+                replacement.putAll(tags);
+                consumerStore.putAllAtomically(Map.of(key, consumer.withTags(replacement)));
             }
             return;
         }
@@ -321,18 +352,20 @@ public class KinesisService implements ResourceProvider {
         synchronized (lockFor(key)) {
             KinesisStream stream = describeStreamByArn(resourceArn, region);
             validateResourceTagLimit(stream.getTags(), tags);
-            stream.getTags().putAll(tags);
-            store.put(key, stream);
+            Map<String, String> replacement = new HashMap<>(stream.getTags());
+            replacement.putAll(tags);
+            commitResourceTags(key, stream, replacement);
         }
     }
 
     public void untagResource(String resourceArn, List<String> tagKeys, String region) {
         if (isConsumerTagResource(resourceArn, region)) {
             String key = regionKey(region, resourceArn);
-            synchronized (consumerStore) {
-                KinesisConsumer consumer = resolveConsumerForTags(key);
-                tagKeys.forEach(consumer.getTags()::remove);
-                consumerStore.put(key, consumer);
+            synchronized (lockFor(resourcePolicies.consumerKey(resourceArn, region))) {
+                KinesisConsumer consumer = resourcePolicies.consumerForTags(resourceArn, region);
+                Map<String, String> replacement = new HashMap<>(consumer.getTags());
+                tagKeys.forEach(replacement::remove);
+                consumerStore.putAllAtomically(Map.of(key, consumer.withTags(replacement)));
             }
             return;
         }
@@ -340,15 +373,16 @@ public class KinesisService implements ResourceProvider {
         String key = regionKey(region, streamName);
         synchronized (lockFor(key)) {
             KinesisStream stream = describeStreamByArn(resourceArn, region);
-            tagKeys.forEach(stream.getTags()::remove);
-            store.put(key, stream);
+            Map<String, String> replacement = new HashMap<>(stream.getTags());
+            tagKeys.forEach(replacement::remove);
+            commitResourceTags(key, stream, replacement);
         }
     }
 
     public Map<String, String> listTagsForResource(String resourceArn, String region) {
         if (isConsumerTagResource(resourceArn, region)) {
-            synchronized (consumerStore) {
-                return new HashMap<>(resolveConsumerForTags(regionKey(region, resourceArn)).getTags());
+            synchronized (lockFor(resourcePolicies.consumerKey(resourceArn, region))) {
+                return new HashMap<>(resourcePolicies.consumerForTags(resourceArn, region).getTags());
             }
         }
         String streamName = streamNameFromTagArn(resourceArn);
@@ -374,9 +408,10 @@ public class KinesisService implements ResourceProvider {
         return AwsArnUtils.parse(resourceArn).resource().substring("stream/".length());
     }
 
-    private KinesisConsumer resolveConsumerForTags(String key) {
-        return consumerStore.get(key)
-                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Consumer not found", 400));
+    private void commitResourceTags(String key, KinesisStream stream, Map<String, String> tags) {
+        KinesisStream replacement = stream.withResourcePolicies(stream.getResourcePolicies());
+        replacement.setTags(tags);
+        store.putAllAtomically(Map.of(key, replacement));
     }
 
     private void validateResourceTagLimit(Map<String, String> current, Map<String, String> added) {
