@@ -30,6 +30,11 @@ public final class CloudFormationServiceFixture {
 
     public static CloudFormationService create(CfnResourceDispatcher dispatcher, S3Service s3Service, Clock clock,
             StorageFactory storageFactory) {
+        return create(dispatcher, s3Service, clock, storageFactory, null);
+    }
+
+    public static CloudFormationService create(CfnResourceDispatcher dispatcher, S3Service s3Service, Clock clock,
+            StorageFactory storageFactory, CloudFormationEventPublisher eventPublisher) {
         ObjectMapper objectMapper = new ObjectMapper();
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.defaultAccountId()).thenReturn(ACCOUNT);
@@ -37,6 +42,6 @@ public final class CloudFormationServiceFixture {
         when(regionResolver.getAccountId()).thenReturn(ACCOUNT);
         return new CloudFormationService(dispatcher, s3Service, mock(SsmService.class),
                 mock(GetStackOutputRoleAuthorizer.class), new CfnDynamicReferences(null, null, objectMapper),
-                objectMapper, config, regionResolver, clock, storageFactory);
+                objectMapper, config, regionResolver, clock, storageFactory, eventPublisher);
     }
 }
