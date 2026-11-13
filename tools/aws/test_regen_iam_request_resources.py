@@ -717,10 +717,12 @@ def test_every_correction_is_the_vendored_entry_of_an_operation_the_file_reads()
     assert r.CORRECTIONS
     for operation, (resources, reason) in r.CORRECTIONS.items():
         assert operation in operations and reason, operation
-        # A resource's account and the ARNs its members may give are botocore's, and whether a create makes it the
-        # rule's, on top of the correction.
-        assert [{key: value for key, value in resource.items() if key not in ("account", "arnOf", "made")}
-                for resource in operations[operation]["resources"]] == resources, operation
+        # Derived metadata may extend a correction; metadata explicitly supplied by the correction must survive.
+        actual = operations[operation]["resources"]
+        assert len(actual) == len(resources), operation
+        for resource, correction in zip(actual, resources, strict=True):
+            assert {key: value for key, value in resource.items()
+                    if key not in ("account", "arnOf", "made") or key in correction} == correction, operation
 
 
 def test_a_correction_gives_the_operation_its_resources(corrections):
@@ -1192,3 +1194,80 @@ def test_an_account_alone_applies_to_a_request_leaving_out_the_optional_account_
 ACCOUNTS = {"account": "arn:${Partition}:account::${Account}:account",
             "accountInOrganization":
                 "arn:${Partition}:account::${ManagementAccountId}:account/o-${OrganizationId}/${MemberAccountId}"}
+@pytest.mark.parametrize("operation", [
+    "GetLandingZone", "UpdateLandingZone", "DeleteLandingZone", "ResetLandingZone",
+    "GetBaseline", "GetEnabledBaseline", "UpdateEnabledBaseline", "ResetEnabledBaseline", "DisableBaseline",
+    "GetEnabledControl", "UpdateEnabledControl", "ResetEnabledControl", "DisableControl", "EnableControl",
+])
+def test_controltower_entries_are_derived_without_operation_corrections(operation):
+    from regen_partitions import resolve_botocore_data
+
+    key = "controltower:" + operation
+    assert key not in r.CORRECTIONS
+    document = json.loads(r.OUTPUT.read_text())
+    data, _ = resolve_botocore_data(None)
+    model = r.load_models(data, {"controltower"})
+    expected = document["operations"][key]
+    assert r.entry_for(key, {"action": expected["action"], "types": expected["types"]},
+                       document["arnFormats"]["controltower"], model) == expected
+
+
+@pytest.mark.parametrize("pattern, expected", [
+    (None, False), ("", False), ("arn:aws:service:.*", True),
+    (r"^arn:(aws|aws-cn):service:[a-z0-9-]+:.*$", True),
+    (r"arn:aws:service:[a|b]+", True), (r"arn:aws:service:foo\|bar", True),
+    (r"^arn:aws:service:.*$|plain-name", False),
+    (r"(arn:aws:service:.*)?plain-name", False),
+])
+def test_arn_only_patterns_distinguish_nested_and_top_level_alternatives(pattern, expected):
+    assert r.only_arn(pattern) is expected
+
+
+def test_arn_only_identifier_never_fills_a_different_resource_id():
+    formats = {"EnabledControl": "arn:${Partition}:svc:${Region}:${Account}:enabledcontrol/${EnabledControlId}"}
+    result = r.resources_for("svc:EnableControl", ["EnabledControl"], formats,
+                             {"controlIdentifier": "controlIdentifier"}, {"controlIdentifier"})
+    assert result == [{"types": ["EnabledControl"], "arn": "controlIdentifier"},
+                      {"type": "EnabledControl", "fill": {}}]
+
+
+def test_explicit_arn_member_set_is_respected_by_resource_mapping():
+    formats = {"pool": "arn:${Partition}:svc:${Region}:${Account}:pool/${PoolId}"}
+    assert r.resources_for("svc:ReadPool", ["pool"], formats,
+                           {"opaqueReference": "opaqueReference"}, {"opaqueReference"}) == [
+        {"types": ["pool"], "arn": "opaqueReference"}]
+
+
+
+@pytest.mark.parametrize("member", ["opaqueReference", "targetApplicationArn", "applicationArn"])
+def test_arn_pattern_does_not_turn_unrelated_members_into_identifiers(member):
+    model = {
+        "metadata": {"protocol": "json", "endpointPrefix": "svc"},
+        "operations": {"ReadPool": {"input": {"shape": "Input"}}},
+        "shapes": {"Input": {"type": "structure", "members": {member: {"shape": "Value"}}},
+                   "Value": {"type": "string", "pattern": "arn:.*"}},
+    }
+    formats = {"pool": "arn:${Partition}:svc:${Region}:${Account}:pool/${PoolId}"}
+    entry = r.entry_for("svc:ReadPool", {"action": "svc:ReadPool", "types": ["pool"]}, formats, {"svc": model})
+    assert entry["resources"] == r.resources_for("svc:ReadPool", ["pool"], formats, {member: member})
+
+
+def test_no_inferred_identifier_metadata_or_withdrawn_redshift_rows():
+    document = json.loads(r.OUTPUT.read_text())
+    resource = document["operations"]["redshift:DescribeClusters"]["resources"][0]
+    assert "arnOf" not in resource
+    assert "redshift:CreateCluster" not in r.CORRECTIONS
+    assert "redshift:AssociateDataShareConsumer" not in r.CORRECTIONS
+
+
+def test_sso_access_scope_does_not_authorize_target_applications():
+    from regen_partitions import resolve_botocore_data
+
+    document = json.loads(r.OUTPUT.read_text())
+    data, _ = resolve_botocore_data(None)
+    operation = "sso:PutApplicationAccessScope"
+    entry = document["operations"][operation]
+    models = r.load_models(data, set(document["namespaces"]["sso"]))
+    derived = r.entry_for(operation, {"action": entry["action"], "types": entry["types"]},
+                          document["arnFormats"]["sso"], models)
+    assert derived["resources"] == [{"types": ["Application"], "arn": "ApplicationArn"}]

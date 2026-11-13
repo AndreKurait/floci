@@ -109,7 +109,7 @@ def test_cloudfront_reads_key_value_stores_and_other_management_operations():
 def route_settings(monkeypatch):
     monkeypatch.setattr(r, "SHARED_ROUTES", {
         name: frozenset({"TagResource", "UntagResource", "ListTagsForResource", "GetTags"})
-        for name in ("lambda", "pipes", "apigateway", "fis", "resource-explorer-2")
+        for name in ("lambda", "pipes", "apigateway", "fis", "resource-explorer-2", "controltower")
     })
     monkeypatch.setattr(r, "ARN_SPANNING_ROUTES", {
         "apigatewayv2": frozenset({"TagResource", "UntagResource", "GetTags"}),
@@ -151,7 +151,7 @@ def test_models_sharing_a_scope_must_agree_on_the_denial_status():
         r.build({"lambda": first, "lambda-microvms": second}, "botocore test")
 
 
-@pytest.mark.parametrize("name", ["lambda", "pipes", "fis", "resource-explorer-2"])
+@pytest.mark.parametrize("name", ["lambda", "pipes", "fis", "resource-explorer-2", "controltower"])
 @pytest.mark.parametrize("operation,method,source", [
     ("TagResource", "POST", "body"),
     ("UntagResource", "DELETE", "?resourceArn"),

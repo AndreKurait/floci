@@ -54,6 +54,21 @@ class TagOnCreateTest {
     }
 
     @Test
+    void controlTowerUsesModeledTagMapsAndChecksTheCreateActionWithTheirTags() {
+        for (String operation : List.of("CreateLandingZone", "EnableControl", "EnableBaseline")) {
+            Tagging tagging = TagOnCreate.of("controltower:" + operation, json(
+                    "{\"tags\":{\"team\":\"blue\"}}")).orElseThrow();
+            assertEquals("controltower:TagResource", tagging.action());
+            assertEquals(List.of(set(Map.of("team", "blue"))), tagging.sets());
+            assertTrue(tagging.requestTags());
+            assertFalse(tagging.createAction());
+            assertEquals(List.of(Map.of("aws:RequestTag/team", List.of("blue"), "aws:TagKeys", List.of("team"))),
+                    TagOnCreate.requestTagContexts(tagging));
+            assertFalse(TagOnCreate.of("controltower:" + operation, json("{\"tags\":{}}")).isPresent());
+        }
+    }
+
+    @Test
     void aFormsTagsAreReadFromOneToTheFirstNumberWithNoKey() {
         assertEquals(List.of(set(Map.of("a", "1", "b", "2"))), sets("sns:CreateTopic", form("Name=t"
                 + "&Tags.member.2.Key=b&Tags.member.2.Value=2&Tags.member.1.Key=a&Tags.member.1.Value=1"

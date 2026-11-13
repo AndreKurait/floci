@@ -12,6 +12,7 @@ import org.junit.jupiter.api.Test;
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
 import java.util.Map;
@@ -80,6 +81,83 @@ class RequestResourcesTest {
             assertEquals(List.of(), of(operation, json("{\"name\":\"orders\",\"domain\":\"orders\"}")));
         }
     }
+
+    @Test
+    void inferredLandingZoneIdentifiersKeepRawContextAcrossOperations() {
+        String arn = "arn:aws:controltower:::landingzone/missing";
+        for (String operation : List.of("GetLandingZone", "UpdateLandingZone", "ResetLandingZone", "DeleteLandingZone")) {
+            assertEquals(List.of(arn), of("controltower:" + operation,
+                    json("{\"landingZoneIdentifier\":\"" + arn + "\"}")));
+        }
+    }
+
+    @Test
+    void controlTowerIdentifiersKeepFullArnsAndLandingZoneIds() {
+        String prefix = "arn:aws:controltower:us-east-1:000000000000:";
+        for (String operation : List.of("GetLandingZone", "UpdateLandingZone", "ResetLandingZone", "DeleteLandingZone")) {
+            for (String identifier : List.of("zone-one", prefix + "landingzone/zone-one")) {
+                assertEquals(List.of(prefix + "landingzone/zone-one"), of("controltower:" + operation,
+                        json("{\"landingZoneIdentifier\":\"" + identifier + "\"}")));
+            }
+        }
+        for (String kind : List.of("Baseline", "Control")) {
+            String member = "enabled" + kind + "Identifier";
+            String arn = prefix + "enabled" + kind.toLowerCase() + "/one";
+            for (String verb : List.of("Get", "Update", "Reset")) {
+                assertEquals(List.of(arn), of("controltower:" + verb + "Enabled" + kind,
+                        json("{\"" + member + "\":\"" + arn + "\"}")));
+            }
+        }
+        assertEquals(List.of(prefix + "enabledcontrol/*"), of("controltower:EnableControl",
+                json("{\"controlIdentifier\":\"arn:aws:controlcatalog:::control/catalog-one\"}")));
+        assertTrue(RequestResources.actsOnNoResource("controltower:ListLandingZones"));
+        assertTrue(RequestResources.actsOnNoResource("controltower:CreateLandingZone"));
+        assertEquals(List.of(prefix + "landingzone/*"), RequestResources.created("controltower:CreateLandingZone",
+                "controltower:TagResource", json("{}"), "aws", "us-east-1", "000000000000", Map.of()));
+        assertEquals(List.of("arn:aws-us-gov:controltower:us-gov-west-1:111122223333:landingzone/zone-one"),
+                RequestResources.of("controltower:GetLandingZone", json("{\"landingZoneIdentifier\":\"zone-one\"}"),
+                        "aws-us-gov", "us-gov-west-1", "111122223333"));
+    }
+
+    @Test
+    void inferredControlArnsIgnoreOtherResourceTypesAndKeepTheCreatedWildcard() {
+        String enabled = "arn:aws:controltower:us-east-1:000000000000:enabledcontrol/one";
+        String references = "\"controlIdentifier\":\"arn:aws:controlcatalog:::control/catalog-one\","
+                + "\"targetIdentifier\":\"arn:aws:organizations::111122223333:ou/o-one/ou-one\"";
+        assertEquals(List.of(enabled), of("controltower:DisableControl",
+                json("{" + references + ",\"enabledControlIdentifier\":\"" + enabled + "\"}")));
+        assertEquals(List.of("arn:aws:controltower:us-east-1:000000000000:enabledcontrol/*"),
+                of("controltower:EnableControl", json("{" + references + "}")));
+    }
+
+    @Test
+    void sharedBareTagsReadTheirActualBodyOrQueryWithoutChangingArnPathPrecedence() {
+        String arn = "arn:aws:controltower:us-east-1:000000000000:landingzone/one";
+        String spoof = arn + "other";
+        for (String method : List.of("POST", "GET", "DELETE")) {
+            String operation = "controltower:" + switch (method) {
+                case "POST" -> "TagResource";
+                case "GET" -> "ListTagsForResource";
+                default -> "UntagResource";
+            };
+            ContainerRequestContext bare = rest(method, "{\"resourceArn\":\"" + (method.equals("POST") ? arn : spoof)
+                    + "\"}", Map.of("resourceArn", arn));
+            when(bare.getUriInfo().getRequestUri()).thenReturn(URI.create("http://localhost/tags///"));
+            when(bare.getUriInfo().getBaseUri()).thenReturn(URI.create("http://localhost/"));
+            assertEquals(List.of(arn), of(operation, bare));
+            ContainerRequestContext path = rest(method, "{\"resourceArn\":\"" + spoof + "\"}", Map.of("resourceArn", spoof));
+            when(path.getUriInfo().getRequestUri()).thenReturn(URI.create("http://localhost/tags/" + arn));
+            when(path.getUriInfo().getBaseUri()).thenReturn(URI.create("http://localhost/"));
+            assertEquals(List.of(arn), RequestResources.of(operation, path, "aws", "us-east-1", "000000000000",
+                    null, Map.of("resourceArn", arn)));
+            assertEquals(List.of(), of(operation, path));
+        }
+        ContainerRequestContext absentQuery = rest("GET", "{\"resourceArn\":\"" + arn + "\"}", Map.of());
+        when(absentQuery.getUriInfo().getRequestUri()).thenReturn(URI.create("http://localhost/tags"));
+        when(absentQuery.getUriInfo().getBaseUri()).thenReturn(URI.create("http://localhost/"));
+        assertEquals(List.of(), of("controltower:ListTagsForResource", absentQuery));
+    }
+
 
     @Test
     void generatedIdTargetsReadModelListsAndSerializedQueryNamesInOrder() throws Exception {
@@ -1022,6 +1100,25 @@ class RequestResourcesTest {
                 json("{\"names\":[\"a\",\"" + project + "b\"]}")));
         assertEquals(List.of(project + "a", project + "b"), of("codebuild:BatchGetProjects",
                 json("{\"names\":[\"" + project + "a\",\"" + project + "b\"]}")));
+    }
+
+    @Test
+    void identifierInferenceDoesNotAuthorizeUnrelatedArnPatternMembers() {
+        String prefix = "arn:aws:";
+        assertEquals(List.of(prefix + "athena:us-east-1:000000000000:workgroup/team"), of("athena:StartSession",
+                json("{\"WorkGroup\":\"team\",\"ExecutionRole\":\"arn:aws:iam::000000000000:role/runner\"}")));
+        assertEquals(List.of(prefix + "kinesisanalytics:us-east-1:000000000000:application/job"),
+                of("kinesisanalytics:UpdateApplication", json("{\"ApplicationName\":\"job\","
+                        + "\"ServiceExecutionRoleUpdate\":\"arn:aws:iam::000000000000:role/runner\"}")));
+        String subscription = prefix + "ce::000000000000:anomalysubscription/subscription";
+        assertEquals(List.of(subscription), of("ce:UpdateAnomalySubscription",
+                json("{\"SubscriptionArn\":\"" + subscription + "\",\"MonitorArnList\":["
+                        + "\"arn:aws:ce::000000000000:anomalymonitor/monitor\"]}")));
+
+        String application = prefix + "sso::000000000000:application/ssoins-1234567890123456/apl-1234567890123456";
+        assertEquals(List.of(application), of("sso:PutApplicationAccessScope",
+                json("{\"ApplicationArn\":\"" + application + "\",\"AuthorizedTargets\":["
+                        + "\"arn:aws:sso::000000000000:application/ssoins-1234567890123456/apl-9999999999999999\"]}")));
     }
 
     /**

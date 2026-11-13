@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.core.common;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.services.iam.IamActionRegistry;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.MultivaluedMap;
 
@@ -292,7 +293,7 @@ public final class RequestResources {
      */
     private static JsonNode located(RequestResourceMembers.Table table, String operation, JsonNode body,
                                     ContainerRequestContext ctx, Map<String, String> labels) {
-        Map<String, String> located = table.located().getOrDefault(operation, Map.of());
+        Map<String, String> located = locatedMembers(table, operation, ctx);
         if (located.isEmpty()) {
             return body;
         }
@@ -311,7 +312,7 @@ public final class RequestResources {
     private static Map<String, String> located(RequestResourceMembers.Table table, String operation,
                                                Map<String, String> form, ContainerRequestContext ctx,
                                                Map<String, String> labels) {
-        Map<String, String> located = table.located().getOrDefault(operation, Map.of());
+        Map<String, String> located = locatedMembers(table, operation, ctx);
         if (form.isEmpty() || located.isEmpty()) {
             return form;
         }
@@ -319,6 +320,24 @@ public final class RequestResources {
         overlaid.keySet().removeAll(located.keySet());
         overlaid.putAll(locatedValues(located, ctx, labels));
         return overlaid;
+    }
+
+    private static Map<String, String> locatedMembers(RequestResourceMembers.Table table, String operation,
+                                                       ContainerRequestContext ctx) {
+        Map<String, String> located = table.located().getOrDefault(operation, Map.of());
+        Map<String, String> alternatives = IamActionRegistry.routeMemberLocations(operation, ctx);
+        if (alternatives.isEmpty()) {
+            return located;
+        }
+        Map<String, String> merged = new HashMap<>(located);
+        alternatives.forEach((member, source) -> {
+            if ("body".equals(source)) {
+                merged.remove(member);
+            } else {
+                merged.put(member, source);
+            }
+        });
+        return merged;
     }
 
     /**
@@ -499,7 +518,8 @@ public final class RequestResources {
             RequestResourceMembers.ArnFormat named = arnOf(resource, variable.getValue().path(), formats);
             if (resource.fill().size() == 1 && fromRequest == null) {
                 List<String> asArns = values.stream()
-                        .filter(value -> !isArnOf(named, value) && format.pattern().matcher(value).matches()).toList();
+                        .filter(value -> !isArnOf(named, value)
+                                && format.pattern().matcher(value).matches()).toList();
                 asArns.forEach(value -> addNamed(arns, format.checked(value), format.awsOwned(), partition, region,
                         accountId, stored));
                 values = values.stream().filter(value -> !asArns.contains(value)).toList();

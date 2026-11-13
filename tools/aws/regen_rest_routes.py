@@ -57,6 +57,7 @@ MODELS: dict[str, str] = {
     "cloudfront": "cloudfront",
     "cloudfront-keyvaluestore": "cloudfront-keyvaluestore",
     "controlcatalog": "controlcatalog",
+    "controltower": "controltower",
     "dsql": "dsql",
     "eks": "eks",
     "emr-serverless": "emr-serverless",
@@ -78,6 +79,7 @@ MODELS: dict[str, str] = {
 
 # Shared-controller and ARN-spanning operations are activated with their qualified tables.
 SHARED_ROUTES: dict[str, frozenset[str]] = {
+    "controltower": frozenset({"TagResource", "UntagResource", "ListTagsForResource"}),
     "fis": frozenset({"TagResource", "UntagResource", "ListTagsForResource"}),
     "resource-explorer-2": frozenset({"TagResource", "UntagResource", "ListTagsForResource"}),
 }

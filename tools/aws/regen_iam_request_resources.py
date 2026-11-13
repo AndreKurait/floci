@@ -168,7 +168,7 @@ OUTPUT = REPO_ROOT / "src/main/resources/aws/iam-request-resources.json"
 NAMESPACES = ("access-analyzer", "account", "acm", "appconfig", "application-autoscaling", "athena",
               "bcm-data-exports", "bcm-pricing-calculator", "budgets", "ce", "cloudfront",
               "cloudfront-keyvaluestore", "cloudtrail", "codebuild", "codepipeline", "cognito-identity",
-              "cognito-idp", "controlcatalog", "cur", "datasync", "ec2", "ecr", "elasticloadbalancing",
+              "cognito-idp", "controlcatalog", "controltower", "cur", "datasync", "ec2", "ecr", "elasticloadbalancing",
               "elasticmapreduce", "emr-serverless", "es", "events", "firehose", "fis", "globalaccelerator", "kinesisanalytics",
               "oam", "payment-cryptography", "ram", "redshift", "redshift-data", "rekognition",
               "resource-explorer-2", "servicediscovery", "servicequotas", "sso", "states", "swf", "textract",
@@ -242,7 +242,7 @@ NOT_COVERED: dict[str, str] = {
     "config": _LATER,
     "connect": _REST,
 
-    "controltower": _REST,
+
     "detective": _REST,
     "dlm": _REST,
     "dms": _LATER,
@@ -586,40 +586,6 @@ CORRECTIONS: dict[str, tuple[list[dict], str]] = {
                                  "Name (ARN) to which you want to add the tag or tags'), whose name does not end in "
                                  "Arn")
        for operation in ("CreateTags", "DeleteTags", "DescribeTags")},
-    **{f"redshift:{operation}": ([{"type": kind, "fill": fill}], f"{why}, never a {kind}'s")
-       for operation, kind, fill, why in (
-           ("CreateCluster", "cluster", {"ClusterName": "ClusterIdentifier"},
-            "its DefaultIamRoleArn is an IAM role's ARN and its RedshiftIdcApplicationArn an IAM Identity Center "
-            "application's"),
-           ("CreateCustomDomainAssociation", "cluster", {"ClusterName": "ClusterIdentifier"},
-            "its CustomDomainCertificateArn is an ACM certificate's ARN"),
-           ("CreateEventSubscription", "eventsubscription", {"EventSubscriptionName": "SubscriptionName"},
-            "its SnsTopicArn is an SNS topic's ARN"),
-           ("CreateIntegration", "integration", {},
-            "its SourceArn is the source database's ARN and its TargetArn the target data warehouse's"),
-           ("DescribeClusterSnapshots", "cluster", {"ClusterName": "ClusterIdentifier"},
-            "its SnapshotArn is a snapshot's ARN"),
-           ("DescribeNodeConfigurationOptions", "cluster", {"ClusterName": "ClusterIdentifier"},
-            "its SnapshotArn is a snapshot's ARN"),
-           ("ListRecommendations", "cluster", {"ClusterName": "ClusterIdentifier"},
-            "its NamespaceArn is a namespace's ARN"),
-           ("ModifyClusterIamRoles", "cluster", {"ClusterName": "ClusterIdentifier"},
-            "its DefaultIamRoleArn is an IAM role's ARN"),
-           ("ModifyCustomDomainAssociation", "cluster", {"ClusterName": "ClusterIdentifier"},
-            "its CustomDomainCertificateArn is an ACM certificate's ARN"),
-           ("ModifyEventSubscription", "eventsubscription", {"EventSubscriptionName": "SubscriptionName"},
-            "its SnsTopicArn is an SNS topic's ARN"),
-           ("ModifyLakehouseConfiguration", "cluster", {"ClusterName": "ClusterIdentifier"},
-            "its LakehouseIdcApplicationArn is an IAM Identity Center application's ARN"))},
-    **{f"redshift:{operation}": ([{"types": [kind], "arn": arn}], f"{why}, never a {kind}'s")
-       for operation, kind, arn, why in (
-           ("AssociateDataShareConsumer", "datashare", "DataShareArn",
-            "its ConsumerArn is the consumer namespace's ARN"),
-           ("DisassociateDataShareConsumer", "datashare", "DataShareArn",
-            "its ConsumerArn is the consumer namespace's ARN"),
-           ("ModifyRedshiftIdcApplication", "redshiftidcapplication", "RedshiftIdcApplicationArn",
-            "its IamRoleArn is an IAM role's ARN and its AuthorizedTokenIssuerList's TrustedTokenIssuerArn a trusted "
-            "token issuer's"))},
 }
 
 # Resource types whose ARN a request may give with a qualifier, one more `:<name>` past its format, which their
@@ -695,7 +661,7 @@ BARE = {"name", "names", "id", "ids", "identifier", "identifiers"}
 # The patterns botocore gives a string shape that holds an account id.
 ACCOUNT_ID_PATTERNS = {"[0-9]{12}", "^[0-9]{12}$", r"\d{12}", r"^\d{12}$"}
 # The verbs an operation that creates the resource it is named after starts with.
-CREATING_RE = re.compile(r"^(Create|Run|Allocate|Register|Put|Import|Copy|Request|Start|Add)")
+CREATING_RE = re.compile(r"^(Create|Run|Allocate|Register|Put|Import|Copy|Request|Start|Add|Enable)")
 # An operation's verb: what follows is what it acts on.
 SUBJECT_RE = re.compile(r"^[A-Z][a-z]+")
 # The protocols whose requests RequestResources reads: form parameters or a JSON or CBOR body.
@@ -1170,7 +1136,8 @@ def resources_for(operation: str, types: list[str], formats: dict[str, str], mem
         # A top-level ARN member named for the type, or for whatever the action acts on, holds it, and a bare
         # name then names something else.
         held = [member for member in arns if "." not in member and (stem(member) in ("", "resource")
-                or related(stem(member), kind_stem) or kind_stem.startswith(stem(member)))]
+                or (stem(member) == kind_stem if member in (arn_members or set())
+                    else related(stem(member), kind_stem) or kind_stem.startswith(stem(member))))]
         variables = [v for v in VARIABLE_RE.findall(formats[kind]) if v not in KNOWN_VARIABLES]
         # A bare `Name` or `Id` names the type the operation is about, or the one the path segment before it
         # names: `UpdateSafetyLeverState`'s `id`, in `/safetyLevers/{id}/state`, is the lever's.
