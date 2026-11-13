@@ -79,12 +79,32 @@
     "LocationUri",
     "Type"
   ],
+  "AWS::AppConfig::Deployment": [
+    "ApplicationId",
+    "ConfigurationProfileId",
+    "ConfigurationVersion",
+    "DeploymentStrategyId",
+    "Description",
+    "DynamicExtensionParameters",
+    "EnvironmentId",
+    "KmsKeyIdentifier",
+    "Tags"
+  ],
   "AWS::AppConfig::DeploymentStrategy": [
     "Name",
     "ReplicateTo"
   ],
   "AWS::AppConfig::Environment": [
     "ApplicationId"
+  ],
+  "AWS::AppConfig::HostedConfigurationVersion": [
+    "ApplicationId",
+    "ConfigurationProfileId",
+    "Content",
+    "ContentType",
+    "Description",
+    "LatestVersionNumber",
+    "VersionLabel"
   ],
   "AWS::AppSync::ApiKey": [
     "ApiId"
@@ -189,6 +209,13 @@
   ],
   "AWS::CodeBuild::Project": [
     "Name"
+  ],
+  "AWS::CodeDeploy::DeploymentConfig": [
+    "ComputePlatform",
+    "DeploymentConfigName",
+    "MinimumHealthyHosts",
+    "TrafficRoutingConfig",
+    "ZonalConfig"
   ],
   "AWS::CodePipeline::CustomActionType": [
     "Category",
@@ -805,8 +832,32 @@
     "QueueName"
   ],
   "AWS::SQS::QueuePolicy": [],
+  "AWS::SSM::Association": [
+    "InstanceId"
+  ],
+  "AWS::SSM::Document": [
+    "Name",
+    "DocumentType"
+  ],
   "AWS::SSM::Parameter": [
     "Name"
+  ],
+  "AWS::SSM::PatchBaseline": [
+    "OperatingSystem"
+  ],
+  "AWS::SSM::ResourceDataSync": [
+    "KMSKeyArn",
+    "SyncFormat",
+    "BucketPrefix",
+    "SyncName",
+    "BucketRegion",
+    "BucketName",
+    "S3Destination",
+    "SyncType"
+  ],
+  "AWS::StepFunctions::Activity": [
+    "Name",
+    "EncryptionConfiguration"
   ],
   "AWS::StepFunctions::StateMachine": [
     "StateMachineName",
@@ -822,5 +873,12 @@
   "AWS::WAFv2::WebACL": [
     "Name",
     "Scope"
+  ],
+  "AWS::EC2::KeyPair": [
+    "KeyName",
+    "KeyType",
+    "KeyFormat",
+    "PublicKeyMaterial",
+    "Tags"
   ]
 }
