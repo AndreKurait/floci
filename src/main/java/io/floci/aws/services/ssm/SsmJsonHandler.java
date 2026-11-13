@@ -48,14 +48,21 @@ public class SsmJsonHandler {
 
     private final SsmService ssmService;
     private final SsmCommandService commandService;
+    private final SsmResourceDataSyncService resourceDataSyncs;
     private final ObjectMapper objectMapper;
     private final IamEnforcementFilter iamEnforcementFilter;
 
-    @Inject
     public SsmJsonHandler(SsmService ssmService, SsmCommandService commandService, ObjectMapper objectMapper,
                           IamEnforcementFilter iamEnforcementFilter) {
+        this(ssmService, commandService, objectMapper, iamEnforcementFilter, null);
+    }
+
+    @Inject
+    public SsmJsonHandler(SsmService ssmService, SsmCommandService commandService, ObjectMapper objectMapper,
+                          IamEnforcementFilter iamEnforcementFilter, SsmResourceDataSyncService resourceDataSyncs) {
         this.ssmService = ssmService;
         this.commandService = commandService;
+        this.resourceDataSyncs = resourceDataSyncs;
         this.objectMapper = objectMapper;
         this.iamEnforcementFilter = iamEnforcementFilter;
     }
@@ -86,6 +93,19 @@ public class SsmJsonHandler {
             case "ListCommandInvocations" -> handleListCommandInvocations(request, region);
             case "CancelCommand" -> handleCancelCommand(request, region);
             case "DescribeInstanceInformation" -> handleDescribeInstanceInformation(request, region);
+            case "CreateResourceDataSync" -> {
+                resourceDataSyncs.create(request, region);
+                yield Response.ok(Map.of()).build();
+            }
+            case "UpdateResourceDataSync" -> {
+                resourceDataSyncs.update(request, region);
+                yield Response.ok(Map.of()).build();
+            }
+            case "ListResourceDataSync" -> Response.ok(resourceDataSyncs.list(request, region)).build();
+            case "DeleteResourceDataSync" -> {
+                resourceDataSyncs.delete(request, region);
+                yield Response.ok(Map.of()).build();
+            }
             // Service settings (LZA ssm-block-public-document-sharing)
             case "GetServiceSetting" -> handleGetServiceSetting(request, region);
             case "UpdateServiceSetting" -> handleUpdateServiceSetting(request, region);

@@ -1,0 +1,196 @@
+{
+  "_source": {
+    "generator": "tools/aws/regen_ssm_resource_data_sync_shapes.py",
+    "botocore": "botocore 1.43.118 (installed package)"
+  },
+  "operations": {
+    "CreateResourceDataSync": "CreateResourceDataSyncRequest",
+    "ListResourceDataSync": "ListResourceDataSyncRequest",
+    "DeleteResourceDataSync": "DeleteResourceDataSyncRequest",
+    "UpdateResourceDataSync": "UpdateResourceDataSyncRequest"
+  },
+  "shapes": {
+    "CreateResourceDataSyncRequest": {
+      "type": "structure",
+      "required": [
+        "SyncName"
+      ],
+      "members": {
+        "SyncName": "ResourceDataSyncName",
+        "S3Destination": "ResourceDataSyncS3Destination",
+        "SyncType": "ResourceDataSyncType",
+        "SyncSource": "ResourceDataSyncSource"
+      }
+    },
+    "DeleteResourceDataSyncRequest": {
+      "type": "structure",
+      "required": [
+        "SyncName"
+      ],
+      "members": {
+        "SyncName": "ResourceDataSyncName",
+        "SyncType": "ResourceDataSyncType"
+      }
+    },
+    "ListResourceDataSyncRequest": {
+      "type": "structure",
+      "members": {
+        "SyncType": "ResourceDataSyncType",
+        "NextToken": "NextToken",
+        "MaxResults": "MaxResults"
+      }
+    },
+    "MaxResults": {
+      "type": "integer",
+      "min": 1,
+      "max": 50
+    },
+    "NextToken": {
+      "type": "string"
+    },
+    "ResourceDataSyncAWSKMSKeyARN": {
+      "type": "string",
+      "min": 1,
+      "max": 512,
+      "pattern": "arn:.*"
+    },
+    "ResourceDataSyncAwsOrganizationsSource": {
+      "type": "structure",
+      "required": [
+        "OrganizationSourceType"
+      ],
+      "members": {
+        "OrganizationSourceType": "ResourceDataSyncOrganizationSourceType",
+        "OrganizationalUnits": "ResourceDataSyncOrganizationalUnitList"
+      }
+    },
+    "ResourceDataSyncDestinationDataSharing": {
+      "type": "structure",
+      "members": {
+        "DestinationDataSharingType": "ResourceDataSyncDestinationDataSharingType"
+      }
+    },
+    "ResourceDataSyncDestinationDataSharingType": {
+      "type": "string",
+      "min": 1,
+      "max": 64
+    },
+    "ResourceDataSyncEnableAllOpsDataSources": {
+      "type": "boolean"
+    },
+    "ResourceDataSyncIncludeFutureRegions": {
+      "type": "boolean"
+    },
+    "ResourceDataSyncName": {
+      "type": "string",
+      "min": 1,
+      "max": 64
+    },
+    "ResourceDataSyncOrganizationSourceType": {
+      "type": "string",
+      "min": 1,
+      "max": 64
+    },
+    "ResourceDataSyncOrganizationalUnit": {
+      "type": "structure",
+      "members": {
+        "OrganizationalUnitId": "ResourceDataSyncOrganizationalUnitId"
+      }
+    },
+    "ResourceDataSyncOrganizationalUnitId": {
+      "type": "string",
+      "min": 1,
+      "max": 128,
+      "pattern": "^ou-[0-9a-z]{4,32}-[a-z0-9]{8,32}$"
+    },
+    "ResourceDataSyncOrganizationalUnitList": {
+      "type": "list",
+      "min": 1,
+      "max": 1000,
+      "member": "ResourceDataSyncOrganizationalUnit"
+    },
+    "ResourceDataSyncS3BucketName": {
+      "type": "string",
+      "min": 1,
+      "max": 2048
+    },
+    "ResourceDataSyncS3Destination": {
+      "type": "structure",
+      "required": [
+        "BucketName",
+        "SyncFormat",
+        "Region"
+      ],
+      "members": {
+        "BucketName": "ResourceDataSyncS3BucketName",
+        "Prefix": "ResourceDataSyncS3Prefix",
+        "SyncFormat": "ResourceDataSyncS3Format",
+        "Region": "ResourceDataSyncS3Region",
+        "AWSKMSKeyARN": "ResourceDataSyncAWSKMSKeyARN",
+        "DestinationDataSharing": "ResourceDataSyncDestinationDataSharing"
+      }
+    },
+    "ResourceDataSyncS3Format": {
+      "type": "string",
+      "enum": [
+        "JsonSerDe"
+      ]
+    },
+    "ResourceDataSyncS3Prefix": {
+      "type": "string",
+      "min": 1,
+      "max": 256
+    },
+    "ResourceDataSyncS3Region": {
+      "type": "string",
+      "min": 1,
+      "max": 64
+    },
+    "ResourceDataSyncSource": {
+      "type": "structure",
+      "required": [
+        "SourceType",
+        "SourceRegions"
+      ],
+      "members": {
+        "SourceType": "ResourceDataSyncSourceType",
+        "AwsOrganizationsSource": "ResourceDataSyncAwsOrganizationsSource",
+        "SourceRegions": "ResourceDataSyncSourceRegionList",
+        "IncludeFutureRegions": "ResourceDataSyncIncludeFutureRegions",
+        "EnableAllOpsDataSources": "ResourceDataSyncEnableAllOpsDataSources"
+      }
+    },
+    "ResourceDataSyncSourceRegion": {
+      "type": "string",
+      "min": 1,
+      "max": 64
+    },
+    "ResourceDataSyncSourceRegionList": {
+      "type": "list",
+      "member": "ResourceDataSyncSourceRegion"
+    },
+    "ResourceDataSyncSourceType": {
+      "type": "string",
+      "min": 1,
+      "max": 64
+    },
+    "ResourceDataSyncType": {
+      "type": "string",
+      "min": 1,
+      "max": 64
+    },
+    "UpdateResourceDataSyncRequest": {
+      "type": "structure",
+      "required": [
+        "SyncName",
+        "SyncType",
+        "SyncSource"
+      ],
+      "members": {
+        "SyncName": "ResourceDataSyncName",
+        "SyncType": "ResourceDataSyncType",
+        "SyncSource": "ResourceDataSyncSource"
+      }
+    }
+  }
+}

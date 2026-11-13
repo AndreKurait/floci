@@ -281,3 +281,30 @@ Parameters a CloudFormation stack creates or deletes publish the same events. A 
 such as a `PutParameter` on an existing name without `Overwrite`, publishes nothing, and so do
 `AddTagsToResource`, a label already on the requested version and an invalid label. Publishing
 is best effort: a delivery failure is logged and never fails or undoes the write.
+
+## Source resource data syncs
+
+| Action | Description |
+|---|---|
+| `CreateResourceDataSync` | Store a single-account source configuration |
+| `ListResourceDataSync` | List configurations of the requested sync type |
+| `UpdateResourceDataSync` | Replace an existing source configuration |
+| `DeleteResourceDataSync` | Delete the named configuration of the requested type |
+
+`CreateResourceDataSync`, `ListResourceDataSync`, `UpdateResourceDataSync`, and
+`DeleteResourceDataSync` manage `SyncFromSource` configurations with
+`SourceType=SingleAccountMultiRegions`. Configurations are isolated by account and
+Region, with at most five source syncs in each account and Region. The source
+regions and supported flags round-trip; update replaces the source configuration,
+preserves its creation time, and defaults an omitted `IncludeFutureRegions` to
+`false`. Account options cannot change.
+
+This is configuration metadata only: Floci does not collect or aggregate OpsData
+for these sources, and does not report an export status. Organizations sources,
+mixed source/S3-destination requests, and source syncs through CloudFormation are
+unsupported. Omitted `SyncType` on list and delete selects `SyncToDestination`,
+retaining existing compatibility; specify `SyncFromSource` for source configurations.
+Named sync operations authorize the exact `resource-data-sync/<SyncName>` ARN;
+listing authorizes `*`. All four operations support the `ssm:SyncType` IAM condition.
+
+`SyncToDestination` delivery is not implemented on this branch.
