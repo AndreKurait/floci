@@ -103,6 +103,13 @@ class IamRestRoutesTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"access-analyzer", "apigateway", "cloudfront", "cloudfront-keyvaluestore",
+            "dsql", "eks", "es", "lambda", "s3"})
+    void vendoredDenialStatusesOverrideAnUnmodelledFallback(String scope) {
+        assertEquals(403, IamRestRoutes.vendored().accessDeniedStatus(scope, 400));
+    }
+
     @Test
     void denialStatusComesFromTheModelAndFallsBackWhenMissing() {
         IamRestRoutes modelled = routes(ROUTES.replace("\"credentialScope\": \"svc\"", "\"credentialScope\": \"svc\", \"accessDeniedStatus\": 402"));
