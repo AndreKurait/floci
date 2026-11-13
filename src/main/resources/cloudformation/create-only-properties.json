@@ -88,9 +88,9 @@
   "AWS::AppConfig::HostedConfigurationVersion": [
     "ApplicationId",
     "ConfigurationProfileId",
+    "Description",
     "Content",
     "ContentType",
-    "Description",
     "LatestVersionNumber",
     "VersionLabel"
   ],
