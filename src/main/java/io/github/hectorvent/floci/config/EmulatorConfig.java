@@ -3193,6 +3193,7 @@ public interface EmulatorConfig {
         boolean insecureSkipTlsVerify();
     }
 
+    /** Repository previews use the existing ECR repository store; hybrid durability remains asynchronous. */
     interface EcrServiceConfig {
         @WithDefault("true")
         boolean enabled();

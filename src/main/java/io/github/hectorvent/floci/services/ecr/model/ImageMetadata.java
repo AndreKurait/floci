@@ -10,6 +10,8 @@ import java.time.Instant;
  */
 @RegisterForReflection
 public class ImageMetadata {
+    private String repositoryGeneration;
+    private boolean nativeFirstPush;
     private String digest;
     private Instant pushedAt;
 
@@ -19,6 +21,18 @@ public class ImageMetadata {
         this.digest = digest;
         this.pushedAt = pushedAt;
     }
+
+    public ImageMetadata(String digest, Instant pushedAt, String generation, boolean nativeFirstPush) {
+        this.digest = digest;
+        this.pushedAt = pushedAt;
+        this.repositoryGeneration = generation;
+        this.nativeFirstPush = nativeFirstPush;
+    }
+
+    public String getRepositoryGeneration() { return repositoryGeneration; }
+    public void setRepositoryGeneration(String generation) { repositoryGeneration = generation; }
+    public boolean isNativeFirstPush() { return nativeFirstPush; }
+    public void setNativeFirstPush(boolean value) { nativeFirstPush = value; }
 
     public String getDigest() { return digest; }
     public void setDigest(String digest) { this.digest = digest; }
