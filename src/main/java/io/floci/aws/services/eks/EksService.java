@@ -1127,6 +1127,13 @@ public class EksService implements TagHandler, ResourceProvider, Ec2InstanceLaun
             if (addons != null) {
                 addons.deleteClusterAddons(cluster);
             }
+            // Node groups and Fargate profiles are keyed by cluster name alone, so a cluster
+            // created later under this name would otherwise list them as its own.
+            String childPrefix = name + "/";
+            nodeGroupStorage.keys().stream().filter(key -> key.startsWith(childPrefix)).toList()
+                    .forEach(nodeGroupStorage::delete);
+            fargateProfileStorage.keys().stream().filter(key -> key.startsWith(childPrefix)).toList()
+                    .forEach(fargateProfileStorage::delete);
             synchronized (clustersBeingDeleted) {
                 storage.delete(clusterKey(cluster));
                 clearAppliedClusterUserData(cluster, name);

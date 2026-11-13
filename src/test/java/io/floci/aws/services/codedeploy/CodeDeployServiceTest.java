@@ -457,6 +457,28 @@ class CodeDeployServiceTest {
         assertEquals("Succeeded", service.getDeployment(REGION, deploymentId).getStatus());
     }
 
+    // ---- ECS platform -------------------------------------------------------------------
+
+    @Test
+    void ecsDeployment_refusedForAGroupWithoutAService_leavesNoDeploymentBehind() {
+        service.createApplication(REGION, "ecs-app", "ECS", null);
+        service.createDeploymentGroup(REGION, "ecs-app", "bare-group", "CodeDeployDefault.ECSAllAtOnce", ROLE_ARN,
+                Map.of());
+        String appSpec = """
+                {"version": 0.0, "Resources": [{"TargetService": {"Type": "AWS::ECS::Service",
+                  "Properties": {"TaskDefinition": "web:2",
+                    "LoadBalancerInfo": {"ContainerName": "web", "ContainerPort": 80}}}}]}
+                """;
+
+        AwsException refused = assertThrows(AwsException.class,
+                () -> service.createDeployment(REGION, "ecs-app", "bare-group", "CodeDeployDefault.ECSAllAtOnce",
+                        Map.of("revisionType", "AppSpecContent", "appSpecContent", Map.of("content", appSpec)),
+                        "shift"));
+
+        assertEquals("InvalidDeploymentConfigException", refused.getErrorCode());
+        assertEquals(List.of(), service.listDeployments(REGION, "ecs-app", "bare-group", List.of()));
+    }
+
     // ---- Helpers --------------------------------------------------------------------------
 
     private String createServerDeployment(String appName, String groupName, int timeoutSeconds) {

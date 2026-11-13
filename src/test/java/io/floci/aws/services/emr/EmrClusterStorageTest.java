@@ -2172,6 +2172,30 @@ class EmrClusterStorageTest {
     }
 
     @Test
+    void aResetSweepRemovesTheNetworksListedAfterOneThatCarriesNoClusterLabel() {
+        ListContainersCmd list = mock(ListContainersCmd.class, RETURNS_SELF);
+        when(docker.listContainersCmd()).thenReturn(list);
+        when(list.exec()).thenReturn(List.of());
+        Network unlabelled = mock(Network.class);
+        when(unlabelled.getLabels()).thenReturn(Map.of());
+        when(unlabelled.getName()).thenReturn("unlabelled-net");
+        Network labelled = mock(Network.class);
+        when(labelled.getLabels()).thenReturn(Map.of(ContainerStorageHelper.RESOURCE_ID_LABEL, "j-ended"));
+        when(labelled.getName()).thenReturn("labelled-net");
+        ListNetworksCmd networks = mock(ListNetworksCmd.class, RETURNS_SELF);
+        when(docker.listNetworksCmd()).thenReturn(networks);
+        when(networks.exec()).thenReturn(List.of(unlabelled, labelled));
+        ListVolumesCmd volumes = mock(ListVolumesCmd.class, RETURNS_SELF);
+        when(docker.listVolumesCmd()).thenReturn(volumes);
+        when(volumes.exec()).thenReturn(mock(ListVolumesResponse.class));
+
+        storage.removeAllBut(Set.of());
+
+        verify(lifecycle).removeNetwork("unlabelled-net");
+        verify(lifecycle).removeNetwork("labelled-net");
+    }
+
+    @Test
     void theSweepHasFlocisContainerLeaveTheNetworksItRemoves() {
         when(currentContainer.resolveContainerId()).thenReturn(Optional.of("floci-container"));
         ListContainersCmd list = mock(ListContainersCmd.class, RETURNS_SELF);
@@ -2316,14 +2340,18 @@ class EmrClusterStorageTest {
         });
     }
 
-    // Waits until the thread of thread waits for a lock another holds, or has ended, or a second has passed.
+    // Waits until the thread of thread waits for a lock another holds, or has ended; a thread that does neither
+    // within ten seconds fails the caller, as the two starts then never overlapped the way the test needs.
     private static void awaitBlockedOrDone(AtomicReference<Thread> thread) {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(1);
-        while (System.nanoTime() < deadline) {
+        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
+        while (true) {
             Thread waiting = thread.get();
             if (waiting != null && (waiting.getState() == Thread.State.BLOCKED
                     || waiting.getState() == Thread.State.TERMINATED || waiting.getState() == Thread.State.WAITING)) {
                 return;
+            }
+            if (System.nanoTime() - deadline > 0) {
+                throw new IllegalStateException("The second step neither waited for the first nor ended");
             }
             Thread.onSpinWait();
         }

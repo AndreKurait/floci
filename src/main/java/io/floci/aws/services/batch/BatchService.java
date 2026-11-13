@@ -168,7 +168,7 @@ public class BatchService {
                     .toList();
         }
         ArrayNode list = objectMapper.createArrayNode();
-        int end = Math.min(envs.size(), offset + maxResults);
+        int end = (int) Math.min(envs.size(), (long) offset + maxResults);
         for (int i = offset; i < end; i++) {
             list.add(computeEnvironmentDetail(envs.get(i)));
         }
@@ -268,21 +268,24 @@ public class BatchService {
 
     public synchronized ObjectNode updateJobQueue(JsonNode request) {
         BatchJobQueue queue = resolveJobQueue(requiredText(request, "jobQueue"));
-        if (request.hasNonNull("state")) {
-            queue.setState(request.path("state").asText());
-        }
-        if (request.hasNonNull("priority")) {
-            queue.setPriority(request.path("priority").asInt());
-        }
+        // Checked before anything is applied: the stored queue is live, so a refused update must not touch it.
+        List<BatchComputeEnvironmentOrder> orders = null;
         if (request.hasNonNull("computeEnvironmentOrder")) {
-            List<BatchComputeEnvironmentOrder> orders =
-                    computeEnvironmentOrder(request.path("computeEnvironmentOrder"));
+            orders = computeEnvironmentOrder(request.path("computeEnvironmentOrder"));
             for (BatchComputeEnvironmentOrder order : orders) {
                 BatchComputeEnvironment env = resolveComputeEnvironment(order.getComputeEnvironment());
                 if (!"VALID".equals(env.getStatus())) {
                     throw client("Compute environment is not VALID: " + order.getComputeEnvironment());
                 }
             }
+        }
+        if (request.hasNonNull("state")) {
+            queue.setState(request.path("state").asText());
+        }
+        if (request.hasNonNull("priority")) {
+            queue.setPriority(request.path("priority").asInt());
+        }
+        if (orders != null) {
             queue.setComputeEnvironmentOrder(orders);
         }
         jobQueueStore.put(queue.getJobQueueArn(), queue);
@@ -465,7 +468,7 @@ public class BatchService {
                     .toList();
         }
         ArrayNode list = objectMapper.createArrayNode();
-        int end = Math.min(queues.size(), offset + maxResults);
+        int end = (int) Math.min(queues.size(), (long) offset + maxResults);
         for (int i = offset; i < end; i++) {
             list.add(jobQueueDetail(queues.get(i)));
         }
@@ -553,7 +556,7 @@ public class BatchService {
                         .thenComparing(BatchJobDefinition::getRevision))
                 .toList();
         ArrayNode list = objectMapper.createArrayNode();
-        int end = Math.min(definitions.size(), offset + maxResults);
+        int end = (int) Math.min(definitions.size(), (long) offset + maxResults);
         for (int i = offset; i < end; i++) {
             list.add(jobDefinitionDetail(definitions.get(i)));
         }
@@ -920,7 +923,7 @@ public class BatchService {
                 .toList();
 
         ArrayNode summaries = objectMapper.createArrayNode();
-        int end = Math.min(jobs.size(), offset + maxResults);
+        int end = (int) Math.min(jobs.size(), (long) offset + maxResults);
         for (int i = offset; i < end; i++) {
             summaries.add(jobSummary(jobs.get(i)));
         }
@@ -947,7 +950,7 @@ public class BatchService {
                 .toList();
 
         ArrayNode summaries = objectMapper.createArrayNode();
-        int end = Math.min(children.size(), offset + maxResults);
+        int end = (int) Math.min(children.size(), (long) offset + maxResults);
         for (int i = offset; i < end; i++) {
             summaries.add(jobSummary(children.get(i)));
         }

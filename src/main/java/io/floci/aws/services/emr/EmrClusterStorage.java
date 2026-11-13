@@ -1383,7 +1383,7 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
                     .exec()) {
                 Map<String, String> labels = container.getLabels() != null ? container.getLabels() : Map.of();
                 String clusterId = labels.get(ContainerStorageHelper.RESOURCE_ID_LABEL);
-                if (!kept.contains(clusterId)) {
+                if (clusterId == null || !kept.contains(clusterId)) {
                     // Known first, so one Docker refuses to remove stays for the next reset or shutdown to remove.
                     String name = clusterId != null ? hdfsName(clusterId) : container.getId();
                     running.add(name);
@@ -1402,7 +1402,9 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
                             ContainerStorageHelper.OWNER_LABEL + "=" + ContainerStorageHelper.ownerIdentity(config)))
                     .exec()) {
                 Map<String, String> labels = network.getLabels() != null ? network.getLabels() : Map.of();
-                if (!kept.contains(labels.get(ContainerStorageHelper.RESOURCE_ID_LABEL))) {
+                // An immutable set refuses a null lookup, which would end the sweep at an object without the label.
+                String clusterId = labels.get(ContainerStorageHelper.RESOURCE_ID_LABEL);
+                if (clusterId == null || !kept.contains(clusterId)) {
                     detachFloci(network.getName());
                     lifecycleManager.removeNetwork(network.getName());
                 }
@@ -1419,7 +1421,8 @@ public class EmrClusterStorage implements ClusterStorage, ContainerTeardown {
                     ? response.getVolumes() : List.of();
             for (InspectVolumeResponse volume : volumes) {
                 Map<String, String> labels = volume.getLabels() != null ? volume.getLabels() : Map.of();
-                if (!kept.contains(labels.get(ContainerStorageHelper.RESOURCE_ID_LABEL))) {
+                String clusterId = labels.get(ContainerStorageHelper.RESOURCE_ID_LABEL);
+                if (clusterId == null || !kept.contains(clusterId)) {
                     lifecycleManager.removeVolume(volume.getName());
                 }
             }

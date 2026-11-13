@@ -906,6 +906,22 @@ class EksServiceTest {
     }
 
     @Test
+    void deleteCluster_forgetsItsNodeGroupsAndFargateProfiles() {
+        CreateClusterRequest req = new CreateClusterRequest();
+        req.setName("recreated");
+        req.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
+        eksService.createCluster(req);
+        eksService.createNodeGroup("recreated", nodeGroupRequest("old-group"));
+        eksService.createFargateProfile("recreated", fargateProfileRequest("old-profile"));
+
+        eksService.deleteCluster("recreated");
+        eksService.createCluster(req);
+
+        assertEquals(List.of(), eksService.listNodeGroups("recreated"));
+        assertEquals(List.of(), eksService.listFargateProfiles("recreated"));
+    }
+
+    @Test
     void deleteClusterDeletesAddons() {
         StorageFactory storageFactory = new StorageFactory(null, null) {
             @Override
