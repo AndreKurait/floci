@@ -286,6 +286,18 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     public Namespace createNamespace(String service, String resourceId, String accountId, String region,
                                      Optional<String> dockerNetwork, Map<Integer, Integer> portBindings,
                                      Map<String, String> extraLabels, String hostIp) {
+        return createNamespace(service, resourceId, accountId, region, dockerNetwork, portBindings,
+                extraLabels, hostIp, null);
+    }
+
+    /**
+     * Lets the owning service choose the hosts entries its workloads see, as "hostname:ip" pairs.
+     * Workloads join this namespace and so read its hosts file; {@code null} keeps the default of
+     * {@code host.docker.internal} on a Linux host.
+     */
+    public Namespace createNamespace(String service, String resourceId, String accountId, String region,
+                                     Optional<String> dockerNetwork, Map<Integer, Integer> portBindings,
+                                     Map<String, String> extraLabels, String hostIp, List<String> workloadHosts) {
         if (!enabled()) {
             throw new IllegalStateException("Security-group enforcement is disabled");
         }
@@ -305,13 +317,20 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 .withDockerNetwork(dockerNetwork)
                 // Workloads join this network namespace and use its resolver and hosts file.
                 .withEmbeddedDns()
-                .withHostDockerInternalOnLinux()
                 .withEntrypoint(List.of("sh", "-c"))
                 .withCmd(List.of("exec sleep 2147483647"))
                 .withLabels(ContainerStorageHelper.resourceIdentityLabels(service, resourceId, accountId, region))
                 .withLabels(Map.of(ContainerStorageHelper.SECURITY_GROUP_HELPER_LABEL, "true",
                         ContainerStorageHelper.OWNER_LABEL, ContainerStorageHelper.ownerIdentity(config)))
                 .withLabels(extraLabels);
+        if (workloadHosts == null) {
+            builder.withHostDockerInternalOnLinux();
+        } else {
+            for (String entry : workloadHosts) {
+                int separator = entry.indexOf(':');
+                builder.withExtraHost(entry.substring(0, separator), entry.substring(separator + 1));
+            }
+        }
         if (portBindings != null) {
             portBindings.forEach((containerPort, hostPort) -> {
                 if (hostIp == null) {

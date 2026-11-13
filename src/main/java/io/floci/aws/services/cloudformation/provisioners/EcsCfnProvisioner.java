@@ -541,10 +541,16 @@ public class EcsCfnProvisioner implements CfnResourceProvisioner {
             def.setSecrets(parseSecrets(item.path("Secrets")));
             def.setLogConfiguration(parseLogConfiguration(item.path("LogConfiguration")));
             def.setFirelensConfiguration(parseFirelensConfiguration(item.path("FirelensConfiguration")));
+            Map<String, Object> unparsed = new LinkedHashMap<>();
             Map<String, Object> linuxParameters = parseLinuxParameters(item.path("LinuxParameters"));
             if (linuxParameters != null) {
-                Map<String, Object> unparsed = new LinkedHashMap<>();
                 unparsed.put("linuxParameters", linuxParameters);
+            }
+            List<Map<String, Object>> extraHosts = parseExtraHosts(item.path("ExtraHosts"));
+            if (extraHosts != null) {
+                unparsed.put("extraHosts", extraHosts);
+            }
+            if (!unparsed.isEmpty()) {
                 def.setUnparsed(unparsed);
             }
             if (item.path("Command").isArray()) {
@@ -600,6 +606,25 @@ public class EcsCfnProvisioner implements CfnResourceProvisioner {
      * The devices and tmpfs lists are always sent, empty when the template has none, as
      * CloudFormation's handler sends them (measured).
      */
+    /** ExtraHosts in the API's HostEntry shape; RegisterTaskDefinition validates each entry. */
+    private static List<Map<String, Object>> parseExtraHosts(JsonNode node) {
+        if (node == null || !node.isArray()) {
+            return null;
+        }
+        List<Map<String, Object>> entries = new ArrayList<>();
+        for (JsonNode entry : node) {
+            Map<String, Object> host = new LinkedHashMap<>();
+            if (entry.hasNonNull("Hostname")) {
+                host.put("hostname", entry.path("Hostname").asText());
+            }
+            if (entry.hasNonNull("IpAddress")) {
+                host.put("ipAddress", entry.path("IpAddress").asText());
+            }
+            entries.add(host);
+        }
+        return entries;
+    }
+
     private static Map<String, Object> parseLinuxParameters(JsonNode node) {
         if (!node.isObject()) {
             return null;
