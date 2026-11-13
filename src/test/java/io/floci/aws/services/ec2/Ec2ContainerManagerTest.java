@@ -106,6 +106,7 @@ import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.timeout;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
@@ -118,7 +119,9 @@ class Ec2ContainerManagerTest {
     void terminationRetainsFirewallIdentityAfterInterfacesAreReleased() throws Exception {
         DockerClient docker = mock(DockerClient.class);
         SecurityGroupFirewallManager firewall = mock(SecurityGroupFirewallManager.class);
-        when(firewall.enabled()).thenReturn(true);
+        doReturn(true).when(firewall).enabled();
+        Runnable firewallCleanup = mock(Runnable.class);
+        when(firewall.captureUnregister("eni-firewall-teardown")).thenReturn(firewallCleanup);
         Ec2ContainerManager manager = new Ec2ContainerManager(
                 mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class),
                 mock(ContainerLogStreamer.class), mock(ContainerDetector.class),
@@ -143,7 +146,57 @@ class Ec2ContainerManagerTest {
             manager.terminate(instance, completed::countDown);
             assertTrue(completed.await(5, TimeUnit.SECONDS), "Container teardown must finish");
             assertEquals("terminated", instance.getState().getName());
-            verify(firewall).unregister("eni-firewall-teardown");
+            verify(firewall).captureUnregister("eni-firewall-teardown");
+            verify(firewallCleanup).run();
+        } finally {
+            manager.stop();
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false", "true"})
+    void terminationCannotRemoveAReplacementRegisteredBeforeDockerCleanup(boolean replace) throws Exception {
+        DockerClient docker = mock(DockerClient.class);
+        ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
+        SecurityGroupFirewallManager firewall = spy(new SecurityGroupFirewallManager(
+                mock(DockerClient.class, RETURNS_DEEP_STUBS), mock(ContainerBuilder.class), lifecycle,
+                mock(EmulatorConfig.class), mock(EmbeddedDnsServer.class)));
+        doNothing().when(firewall).reconcileAll();
+        doReturn(true).when(firewall).enabled();
+        firewall.register(new SecurityGroupNftCompiler.Endpoint("111111111111", "us-east-1", "vpc-old",
+                "eni-firewall-teardown", "10.0.1.10", "172.18.0.2", Set.of(), List.of()), "old-helper", Map.of());
+        Ec2ContainerManager manager = new Ec2ContainerManager(
+                mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class),
+                mock(ContainerLogStreamer.class), mock(ContainerDetector.class),
+                mock(DockerHostResolver.class), docker, mock(PortAllocator.class), mock(EmulatorConfig.class),
+                mock(Ec2MetadataServer.class), mock(Ec2PortForwardManager.class), mock(RegionResolver.class),
+                mock(ContainerNetworkReachability.class), mock(VpcNetworkManager.class),
+                mock(ContainerReachableEndpoint.class), firewall);
+        Instance instance = instance("i-firewall-teardown");
+        instance.setDockerContainerId(TEST_CONTAINER_ID);
+        InstanceNetworkInterface eni = new InstanceNetworkInterface();
+        eni.setNetworkInterfaceId("eni-firewall-teardown");
+        instance.setNetworkInterfaces(new ArrayList<>(List.of(eni)));
+        RemoveContainerCmd remove = mock(RemoveContainerCmd.class, RETURNS_SELF);
+        when(docker.removeContainerCmd(TEST_CONTAINER_ID)).thenReturn(remove);
+        doAnswer(invocation -> {
+            // The service releases ENIs while container teardown is still in progress.
+            instance.getNetworkInterfaces().clear();
+            if (replace) {
+                firewall.register(new SecurityGroupNftCompiler.Endpoint("111111111111", "us-east-1", "vpc-new",
+                        "eni-firewall-teardown", "10.0.1.10", "172.18.0.3", Set.of(), List.of()),
+                        "new-helper", Map.of());
+            }
+            return null;
+        }).when(remove).exec();
+        CountDownLatch completed = new CountDownLatch(1);
+        try {
+            manager.terminate(instance, completed::countDown);
+            assertTrue(completed.await(5, TimeUnit.SECONDS), "Container teardown must finish");
+            assertEquals("terminated", instance.getState().getName());
+            verify(lifecycle).removeIfExistsStrict("old-helper");
+            verify(lifecycle, never()).removeIfExistsStrict("new-helper");
+            assertEquals(replace, firewall.vpcForClient("172.18.0.3").isPresent());
         } finally {
             manager.stop();
         }
