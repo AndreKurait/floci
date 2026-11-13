@@ -104,6 +104,15 @@ public interface StoredResourceArns {
     }
 
     /**
+     * Resolves names filling an ARN's variables, including compound identities such as an AppConfig profile
+     * under its application. Single-variable resources retain the existing name lookup.
+     */
+    default Optional<String> findByVariables(String type, Map<String, String> variables, String region) {
+        return variables.size() == 1
+                ? find(type, List.of(variables.values().iterator().next()), region) : Optional.empty();
+    }
+
+    /**
      * The ARNs of the resources the caller's resource named by {@code value} in {@code member}, as the table writes
      * the member's path, runs on, is in or reaches in the Region, which a request naming it acts on (the cluster or
      * workgroup of a Data API session, by its {@code SessionId}; the cluster of an instance group, by its

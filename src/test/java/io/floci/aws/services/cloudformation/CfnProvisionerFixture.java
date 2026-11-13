@@ -27,6 +27,7 @@ import io.floci.aws.services.cloudformation.provisioners.ApiGatewayUsagePlanCfnP
 import io.floci.aws.services.cloudformation.provisioners.ApiGatewayV2CfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.ApiGatewayV2DomainCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.AppConfigCfnProvisioner;
+import io.floci.aws.services.cloudformation.provisioners.AppConfigDeploymentCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.AppConfigHostedVersionCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.AppSyncCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.ApplicationAutoScalingCfnProvisioner;
@@ -501,6 +502,7 @@ final class CfnProvisionerFixture {
             }
             if (appConfigService != null) {
                 discovered.add(new AppConfigCfnProvisioner(appConfigService));
+                discovered.add(new AppConfigDeploymentCfnProvisioner(appConfigService));
                 ServiceConfigAccess serviceConfig = mock(ServiceConfigAccess.class);
                 when(serviceConfig.isEnabled("appconfig")).thenReturn(true);
                 discovered.add(new AppConfigHostedVersionCfnProvisioner(appConfigService, serviceConfig));
