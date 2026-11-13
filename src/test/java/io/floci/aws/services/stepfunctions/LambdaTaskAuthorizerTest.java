@@ -585,6 +585,23 @@ class LambdaTaskAuthorizerTest {
         when(iamService.findRole(SFN_ACCOUNT, "sfn-exec")).thenReturn(Optional.of(role));
     }
 
+    @Test
+    void taskRoleTrustUsesTheExecutionRoleIdWithoutInventingAUserid() {
+        roleWithPolicies(ASSUME_ANY_ROLE);
+        IamRole execution = new IamRole("AROAEXECUTION", "sfn-exec", "/service-role/", ROLE, STATES_TRUST);
+        when(iamService.findRole(SFN_ACCOUNT, "sfn-exec")).thenReturn(Optional.of(execution));
+        taskRole(TASK_ROLE, trust("{\"AWS\":\"AROAEXECUTION\"}"));
+        assertEquals(Optional.empty(), authorizer.assumeRefusal(ROLE, TASK_ROLE, STATE_MACHINE));
+        taskRole(TASK_ROLE, """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:AssumeRole",
+                 "Principal":{"AWS":"AROAEXECUTION"},"Condition":{"StringLike":{"aws:userid":"*"}}}]}
+                """);
+        assertTrue(authorizer.assumeRefusal(ROLE, TASK_ROLE, STATE_MACHINE).isPresent());
+        taskRole(TASK_ROLE, trust("{\"AWS\":\"AROAEXECUTION\"}"));
+        execution.setRoleId("AROAREPLACEMENT");
+        assertTrue(authorizer.assumeRefusal(ROLE, TASK_ROLE, STATE_MACHINE).isPresent());
+    }
+
     private static StateMachine machine() {
         StateMachine machine = new StateMachine();
         machine.setStateMachineArn(STATE_MACHINE);

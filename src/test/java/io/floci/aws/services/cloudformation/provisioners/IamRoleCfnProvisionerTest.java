@@ -166,6 +166,32 @@ class IamRoleCfnProvisionerTest {
         assertEquals("new owner", realIam.getRole("app-role").getDescription());
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"AROASTALE", "arn:aws:iam::000000000000:role/deleted"})
+    void failedAdoptionRestoresHistoricalTrustWithoutRebinding(String principal) {
+        IamService realIam = IamServiceTestHelper.iamServiceWithUserPolicy("test", "secret", "user", EMPTY_TRUST);
+        IamRoleCfnProvisioner owner = new IamRoleCfnProvisioner(realIam);
+        StackResource r = resource();
+        owner.provision(r, props("{\"RoleName\":\"app-role\",\"MaxSessionDuration\":7200}"), ctx());
+        String roleId = realIam.getRole("app-role").getRoleId();
+        String historical = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
+                + "\"Action\":\"sts:AssumeRole\",\"Principal\":{\"AWS\":\"" + principal + "\"}}]}";
+        realIam.restoreAssumeRolePolicy("app-role", historical, roleId);
+        String policyArn = "arn:aws:iam::" + ACCOUNT_ID + ":policy/missing";
+
+        AwsException failure = assertThrows(AwsException.class, () -> owner.provision(r,
+                props("{\"RoleName\":\"app-role\",\"MaxSessionDuration\":14400,"
+                        + "\"AssumeRolePolicyDocument\":" + EMPTY_TRUST + ","
+                        + "\"ManagedPolicyArns\":[\"" + policyArn + "\"]}"), ctx()));
+
+        assertEquals("NoSuchEntity", failure.getErrorCode());
+        assertEquals(0, failure.getSuppressed().length);
+        assertEquals(roleId, realIam.getRole("app-role").getRoleId());
+        assertEquals(historical, realIam.getRole("app-role").getAssumeRolePolicyDocument());
+        assertEquals(7200, realIam.getRole("app-role").getMaxSessionDuration());
+        assertTrue(realIam.getRole("app-role").getAttachedPolicyArns().isEmpty());
+    }
+
     @Test
     void stackRollbackRestoresDurationFromSerializedResource() throws Exception {
         IamService realIam = IamServiceTestHelper.iamServiceWithUserPolicy("test", "secret", "user", EMPTY_TRUST);
