@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.core.common.AwsPartitions;
 import io.github.hectorvent.floci.core.common.AwsRegionFacts;
 import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.CloudFrontEdgeDomain;
+import io.github.hectorvent.floci.core.common.ModelTemplateGenerator;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ReservedTags;
 import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
@@ -2252,6 +2253,12 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
         model.setContentType(newContentType);
         modelStore.put(modelKey(region, apiId, modelName), model);
         return model;
+    }
+
+    public String getModelTemplate(String region, String apiId, String modelName) {
+        getRestApi(region, apiId);
+        Model model = getModel(region, apiId, modelName);
+        return ModelTemplateGenerator.generate(model.getSchema(), model.getContentType(), false);
     }
 
     public List<Model> getModels(String region, String apiId) {
