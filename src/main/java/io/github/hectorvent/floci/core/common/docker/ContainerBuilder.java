@@ -184,6 +184,8 @@ public class ContainerBuilder {
         private final Map<String, String> tmpfs = new HashMap<>();
         private Long memorySwapBytes;
         private Long memorySwappiness;
+        private Long pidsLimit;
+        private boolean noNewPrivileges;
         private boolean javaTrustStore;
 
         Builder(String image, EmulatorConfig config, DockerHostResolver dockerHostResolver,
@@ -738,6 +740,21 @@ public class ContainerBuilder {
             return this;
         }
 
+        /** Caps the container's processes and threads. */
+        public Builder withPidsLimit(long limit) {
+            if (limit < 1) {
+                throw new IllegalArgumentException("The PID limit must be positive");
+            }
+            this.pidsLimit = limit;
+            return this;
+        }
+
+        /** Prevents exec from granting privileges through setuid or file capabilities. */
+        public Builder withNoNewPrivileges() {
+            this.noNewPrivileges = true;
+            return this;
+        }
+
         private void requireNoExistingDeviceRequest() {
             if (!deviceRequests.isEmpty()) {
                 throw new IllegalStateException(
@@ -828,7 +845,7 @@ public class ContainerBuilder {
                     init,
                     new LinuxOptions(List.copyOf(capAdd), List.copyOf(capDrop), List.copyOf(devices),
                             shmSizeBytes, Map.copyOf(tmpfs), memorySwapBytes, memorySwappiness,
-                            networkSysctls, pidMode, apparmorProfile, stopSignal),
+                            networkSysctls, pidMode, apparmorProfile, stopSignal, pidsLimit, noNewPrivileges),
                     javaTrustStore
             );
         }
