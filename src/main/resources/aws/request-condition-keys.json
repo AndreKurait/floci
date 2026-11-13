@@ -6,6 +6,15 @@
     "note": "make request-condition-keys-check re-derives members from botocore; make request-condition-keys-verify checks actions against AWS."
   },
   "actions": {
+    "account:DisableRegion": [
+      "account:TargetRegion"
+    ],
+    "account:EnableRegion": [
+      "account:TargetRegion"
+    ],
+    "account:GetRegionOptStatus": [
+      "account:TargetRegion"
+    ],
     "ec2-instance-connect:OpenTunnel": [
       "ec2-instance-connect:MaxTunnelDuration",
       "ec2-instance-connect:privateIpAddress",
@@ -38,6 +47,21 @@
     ]
   },
   "members": {
+    "account:DisableRegion": {
+      "account:TargetRegion": [
+        "RegionName"
+      ]
+    },
+    "account:EnableRegion": {
+      "account:TargetRegion": [
+        "RegionName"
+      ]
+    },
+    "account:GetRegionOptStatus": {
+      "account:TargetRegion": [
+        "RegionName"
+      ]
+    },
     "ec2-instance-connect:OpenTunnel": {
       "ec2-instance-connect:MaxTunnelDuration": [
         "maxTunnelDuration"

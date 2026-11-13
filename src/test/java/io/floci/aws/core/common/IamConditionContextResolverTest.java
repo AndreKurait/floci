@@ -130,6 +130,36 @@ class IamConditionContextResolverTest {
     }
 
     @Test
+    void accountTargetRegionReadsAndRestoresAnUncachedRequestBody() throws Exception {
+        for (String action : List.of("EnableRegion", "DisableRegion", "GetRegionOptStatus")) {
+            byte[] bytes = "{\"RegionName\":\"ap-east-2\"}".getBytes(StandardCharsets.UTF_8);
+            ContainerRequestContext request = mock(ContainerRequestContext.class);
+            when(request.getEntityStream()).thenReturn(new ByteArrayInputStream(bytes));
+            assertNull(request.getProperty(IamConditionContextResolver.BUFFERED_JSON_BODY));
+            assertEquals(Map.of("account:TargetRegion", List.of("ap-east-2")),
+                    resolver.resolve("account", "account:" + action, request));
+            ArgumentCaptor<InputStream> restored = ArgumentCaptor.forClass(InputStream.class);
+            verify(request).setEntityStream(restored.capture());
+            assertArrayEquals(bytes, restored.getValue().readAllBytes());
+            verify(request).setProperty(eq(IamConditionContextResolver.BUFFERED_JSON_BODY), any(JsonNode.class));
+        }
+    }
+
+    @Test
+    void accountListAndNonTextualTargetsDoNotInventTargetRegionConditions() throws Exception {
+        for (String action : List.of("ListRegions", "GetAlternateContact", "PutAlternateContact", "DeleteAlternateContact")) {
+            ContainerRequestContext request = mock(ContainerRequestContext.class);
+            when(request.getEntityStream()).thenThrow(new AssertionError("Unrelated action must not read the body"));
+            assertNull(resolver.resolve("account", "account:" + action, request));
+        }
+        for (String body : List.of("{}", "{\"RegionName\":4}", "{\"RegionName\":null}")) {
+            ContainerRequestContext request = mock(ContainerRequestContext.class);
+            when(request.getEntityStream()).thenReturn(new ByteArrayInputStream(body.getBytes(StandardCharsets.UTF_8)));
+            assertNull(resolver.resolve("account", "account:GetRegionOptStatus", request));
+        }
+    }
+
+    @Test
     void aWebFunctionEndpointRequestCarriesTheAuthTypeItNamesAndTheOneItHas() throws Exception {
         String function = "arn:aws:lambda:us-east-1:123456789012:web-function/app";
         WebFunctionEndpoint stored = new WebFunctionEndpoint();

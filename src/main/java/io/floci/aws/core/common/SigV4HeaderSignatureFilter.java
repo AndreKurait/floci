@@ -6,6 +6,8 @@ import io.floci.aws.core.common.auth.SigV4AuthorizationHeader;
 import io.floci.aws.core.common.auth.SigV4Canonicalization;
 import io.floci.aws.core.common.auth.SigV4RequestValidator;
 import io.floci.aws.core.common.auth.SigV4aSignature;
+import io.floci.aws.services.account.AccountController;
+import io.floci.aws.services.account.AccountRegionActions;
 import io.floci.aws.services.apigateway.ApiGatewayAwsExecuteController;
 import io.floci.aws.services.apigateway.ApiGatewayExecuteController;
 import io.floci.aws.services.apigateway.ApiGatewayUserRequestController;
@@ -185,6 +187,12 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
             incompleteSignature(ctx, resource, "Authorization header requires 'Credential' (in the form "
                     + "<access key>/<date>/<region>/<service>/aws4_request), 'SignedHeaders' and "
                     + "'Signature' parameters.");
+            return;
+        }
+        if (resource == AccountController.class && resourceInfo.getResourceMethod() != null
+                && AccountRegionActions.forMethod(resourceInfo.getResourceMethod().getName()) != null
+                && !"account".equals(scope.service())) {
+            signatureDoesNotMatch(ctx, resource, "Credential should be scoped to correct service: 'account'");
             return;
         }
         if (!SigV4RequestValidator.containsHeader(signed.signedHeaders(), "host")) {
