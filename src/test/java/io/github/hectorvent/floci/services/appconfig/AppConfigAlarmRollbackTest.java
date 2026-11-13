@@ -207,7 +207,7 @@ class AppConfigAlarmRollbackTest {
     }
 
     @Test
-    void metricMonitorUsesAlarmResourceTagsAndChecksEveryConfiguredRole() {
+    void metricMonitorUsesAlarmResourceTagsAndAdmissionChecksEveryConfiguredRole() {
         Fixture fixture = fixture(new InMemoryStorageFactory(ACCOUNT));
         scope(fixture);
         String arn = fixture.regions().buildArn("cloudwatch", REGION, "alarm:health");
@@ -218,8 +218,37 @@ class AppConfigAlarmRollbackTest {
         verify(fixture.authorizer(), atLeastOnce()).authorizeWithoutSourceContext(
                 eq("appconfig"), eq(ROLE), eq("cloudwatch:DescribeAlarms"), eq(arn),
                 eq(ACCOUNT), eq("aws"), eq(Map.of("aws:ResourceTag/team", List.of("service"))));
-        assertThrows(AwsException.class, () -> monitor.rollbackCause(List.of(
+        assertTrue(monitor.rollbackCause(List.of(
+                new Monitor(arn, ROLE), new Monitor(arn + "-missing", ROLE))).contains(arn));
+        assertThrows(AwsException.class, () -> monitor.validateMonitors(List.of(
                 new Monitor(arn, ROLE), new Monitor(arn + "-missing", ROLE))));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"true,ALARM", "false,ALARM", "true,INSUFFICIENT_DATA", "false,INSUFFICIENT_DATA"})
+    void confirmedAlarmRollsBackDespiteAnotherUnreadableMonitor(boolean unreadableFirst, String state) {
+        Fixture fixture = fixture(new InMemoryStorageFactory(ACCOUNT));
+        Scope scope = scope(fixture);
+        String arn = fixture.regions().buildArn("cloudwatch", REGION, "alarm:health");
+        String otherRole = ROLE + "-other";
+        Map<String, String> healthy = Map.of("AlarmArn", arn, "AlarmRoleArn", ROLE);
+        Map<String, String> unreadable = Map.of("AlarmArn", arn, "AlarmRoleArn", otherRole);
+        fixture.service().updateEnvironment(scope.app(), scope.env(), "environment", null,
+                unreadableFirst ? List.of(unreadable, healthy) : List.of(healthy, unreadable));
+        Deployment next = deploy(fixture, scope, "2", 5, 5);
+        fixture.cloudWatch().setAlarmState("health", state, "test", null, REGION);
+        when(fixture.authorizer().authorizeWithoutSourceContext(
+                eq("appconfig"), eq(otherRole), anyString(), anyString(), anyString(), anyString(), anyMap()))
+                .thenReturn(Decision.DENY);
+
+        fixture.service().advanceDeployments();
+
+        Deployment stored = fixture.service().getDeployment(scope.app(), scope.env(), next.getDeploymentNumber());
+        assertEquals("ROLLED_BACK", stored.getState());
+        assertEquals("1", fixture.service().getActiveVersion(scope.env(), scope.profile()));
+        assertTrue(stored.getEventLog().getLast().description().contains(arn + " is " + state));
+        assertThrows(AwsException.class, () -> deploy(fixture, scope, "3", 5, 5));
+        assertEquals("1", fixture.service().getActiveVersion(scope.env(), scope.profile()));
     }
 
     @Test

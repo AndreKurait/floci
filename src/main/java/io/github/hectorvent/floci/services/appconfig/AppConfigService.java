@@ -844,7 +844,7 @@ public class AppConfigService implements Resettable {
 
         DeploymentStrategy strategy = getDeploymentStrategy(strategyId);
         validateDeploymentTiming(strategy);
-        alarms.rollbackCause(environment.getMonitors());
+        alarms.validateMonitors(environment.getMonitors());
         ConfigurationContent sourceContent = AppConfigS3Source.matches(profile)
                 ? Objects.requireNonNull(s3Source.retrieve(profile, version)) : null;
         HostedConfigurationVersion selected = null;

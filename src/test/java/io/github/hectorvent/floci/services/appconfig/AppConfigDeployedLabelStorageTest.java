@@ -218,7 +218,7 @@ class AppConfigDeployedLabelStorageTest {
             }).when(lambda).validate(eq(FUNCTION), any(ConfigurationProfile.class), any(HostedConfigurationVersion.class));
             assertDeployment(start(service, selection, "release-a"), "1", "release-a");
             InOrder order = inOrder(alarms, lambda);
-            order.verify(alarms).rollbackCause(null);
+            order.verify(alarms).validateMonitors(null);
             order.verify(lambda).validate(eq(FUNCTION), any(ConfigurationProfile.class), selected.capture());
             assertEquals(1, selected.getValue().getVersionNumber());
             assertArrayEquals(ORIGINAL, selected.getValue().getContent());
