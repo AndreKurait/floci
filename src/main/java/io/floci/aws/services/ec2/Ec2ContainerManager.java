@@ -1632,6 +1632,10 @@ public class Ec2ContainerManager {
                         Thread.currentThread().interrupt();
                     }
                 }
+                if (!containerGone) {
+                    // Keep ownership while Docker still holds the endpoint. TerminateInstances can retry.
+                    return;
+                }
                 if (firewallManager != null && firewallManager.enabled() && firewallEniId != null) {
                     firewallManager.unregister(firewallEniId);
                 }
