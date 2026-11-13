@@ -26,6 +26,9 @@ public class Deployment {
     private String configurationLocationUri;
     @JsonProperty("ConfigurationVersion")
     private String configurationVersion;
+    @JsonProperty("VersionLabel")
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    private String versionLabel;
     @JsonProperty("DeploymentStrategyId")
     private String deploymentStrategyId;
     // The strategy's settings as the deployment started with them, so changing or deleting the strategy
@@ -81,6 +84,9 @@ public class Deployment {
 
     public String getConfigurationVersion() { return configurationVersion; }
     public void setConfigurationVersion(String configurationVersion) { this.configurationVersion = configurationVersion; }
+
+    public String getVersionLabel() { return versionLabel; }
+    public void setVersionLabel(String versionLabel) { this.versionLabel = versionLabel; }
 
     public String getDeploymentStrategyId() { return deploymentStrategyId; }
     public void setDeploymentStrategyId(String deploymentStrategyId) { this.deploymentStrategyId = deploymentStrategyId; }

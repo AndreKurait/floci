@@ -532,6 +532,15 @@ final class TagOnCreate {
      */
     static List<String> resources(String operation, TagSet set, String partition, String region, String accountId,
                                   List<String> resources) {
+        String createdType = switch (operation) {
+            case "appconfig:CreateApplication" -> "application";
+            case "appconfig:CreateDeploymentStrategy" -> "deploymentstrategy";
+            case null, default -> null;
+        };
+        if (createdType != null) {
+            return List.of(new AwsArnUtils.Arn(partition, "appconfig", region, accountId,
+                    createdType + "/*").toString());
+        }
         if (set.resourceType() == null) {
             return resources;
         }
