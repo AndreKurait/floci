@@ -105,6 +105,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.LambdaWeb
 import io.github.hectorvent.floci.services.cloudformation.provisioners.LogsCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.LogsLogStreamCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.LogsMetricFilterCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.LogsSubscriptionFilterCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.OrganizationsCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.PipesCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.RdsCfnProvisioner;
@@ -140,6 +141,8 @@ import io.github.hectorvent.floci.services.cloudtrail.CloudTrailService;
 import io.github.hectorvent.floci.services.cloudwatch.dashboards.CloudWatchDashboardsService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsMetricFilterService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
+import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsSubscriptionAdmissionService;
+import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsSubscriptionFilterService;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.CloudWatchMetricsService;
 import io.github.hectorvent.floci.services.codedeploy.CodeDeployService;
 import io.github.hectorvent.floci.services.cognito.CognitoService;
@@ -437,6 +440,9 @@ final class CfnProvisionerFixture {
             if (logsService != null) {
                 discovered.add(new LogsCfnProvisioner(logsService));
                 discovered.add(new LogsLogStreamCfnProvisioner(logsService));
+                discovered.add(new LogsSubscriptionFilterCfnProvisioner(
+                        new CloudWatchLogsSubscriptionFilterService(logsService,
+                                mock(CloudWatchLogsSubscriptionAdmissionService.class))));
             }
             if (logsMetricFilterService != null) {
                 discovered.add(new LogsMetricFilterCfnProvisioner(logsMetricFilterService));

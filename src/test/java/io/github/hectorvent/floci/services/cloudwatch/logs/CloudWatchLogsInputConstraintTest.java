@@ -12,6 +12,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.Mockito;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -49,10 +50,11 @@ class CloudWatchLogsInputConstraintTest {
                 service,
                 new CloudWatchLogsCrossAccountService(
                         new InMemoryStorage<>(), new InMemoryStorage<>(),
-                        new RegionResolver(REGION, ACCOUNT), MAPPER),
+                        new RegionResolver(REGION, ACCOUNT), MAPPER,
+                        Mockito.mock(CloudWatchLogsDestinationTargetService.class)),
                 new CloudWatchLogsMetricFilterService(service,
                         mock(CloudWatchMetricsService.class), new RegionResolver(REGION, ACCOUNT)),
-                MAPPER);
+                MAPPER, Mockito.mock(CloudWatchLogsSubscriptionAdmissionService.class));
         service.createLogGroup(GROUP, null, null, REGION);
         service.createLogStream(GROUP, "s1", REGION);
     }
