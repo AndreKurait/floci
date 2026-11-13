@@ -32,6 +32,19 @@ class RequestResourcesTest {
     private static final String MACHINE = "arn:aws:states:us-east-1:000000000000:stateMachine:orders";
 
     @Test
+    void macieAllowListTagsUseTheCreatedArnWhileTheCreateRemainsGlobal() {
+        ContainerRequestContext request = json("{\"name\":\"trusted\",\"tags\":{\"team\":\"blue\"}}");
+        assertTrue(RequestResources.actsOnNoResource("macie2:CreateAllowList"));
+        assertEquals(List.of(), of("macie2:CreateAllowList", request));
+        assertEquals(List.of("arn:aws:macie2:us-east-1:000000000000:allow-list/*"),
+                RequestResources.created("macie2:CreateAllowList", request,
+                        "aws", "us-east-1", "000000000000"));
+        assertEquals(List.of("arn:aws-cn:macie2:cn-north-1:111122223333:allow-list/*"),
+                RequestResources.created("macie2:CreateAllowList", request,
+                        "aws-cn", "cn-north-1", "111122223333"));
+    }
+
+    @Test
     void aConfigurationNamesTheCanonicalApplicationEnvironmentAndProfileTogether() {
         StoredResourceArns stored = new StoredResourceArns() {
             @Override

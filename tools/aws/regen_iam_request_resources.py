@@ -165,14 +165,15 @@ OUTPUT = REPO_ROOT / "src/main/resources/aws/iam-request-resources.json"
 
 # The namespaces read, in batches: each moves here from NOT_COVERED with the tests that show its ARNs
 # are the ones its handlers mint.
-NAMESPACES = ("access-analyzer", "account", "acm", "appconfig", "application-autoscaling", "athena",
-              "bcm-data-exports", "bcm-pricing-calculator", "budgets", "ce", "cloudfront",
-              "cloudfront-keyvaluestore", "cloudtrail", "codebuild", "codepipeline", "cognito-identity",
-              "cognito-idp", "controlcatalog", "controltower", "cur", "datasync", "ec2", "ecr", "elasticloadbalancing",
-              "elasticmapreduce", "emr-serverless", "es", "events", "firehose", "fis", "globalaccelerator", "kinesisanalytics",
-              "oam", "payment-cryptography", "ram", "redshift", "redshift-data", "rekognition",
-              "resource-explorer-2", "servicediscovery", "servicequotas", "sso", "states", "swf", "textract",
-              "timestream-influxdb", "translate")
+NAMESPACES = (
+    "access-analyzer", "account", "acm", "appconfig", "application-autoscaling", "athena", "bcm-data-exports",
+    "bcm-pricing-calculator", "budgets", "ce", "cloudfront", "cloudfront-keyvaluestore", "cloudtrail",
+    "codebuild", "codepipeline", "cognito-identity", "cognito-idp", "controlcatalog", "controltower", "cur",
+    "datasync", "ec2", "ecr", "elasticloadbalancing", "elasticmapreduce", "emr-serverless", "es", "events",
+    "firehose", "fis", "globalaccelerator", "inspector2", "kinesisanalytics", "macie2", "oam",
+    "payment-cryptography", "ram", "redshift", "redshift-data", "rekognition", "resource-explorer-2",
+    "servicediscovery", "servicequotas", "sso", "states", "swf", "textract", "timestream-influxdb", "translate",
+)
 
 # SDK clients the reference lists for a namespace's operations whose requests Floci does not serve, and why: their
 # members are not read.
@@ -258,11 +259,9 @@ NOT_COVERED: dict[str, str] = {
     "glue": _LATER,
     "guardduty": _REST,
     "identitystore": _LATER,
-    "inspector2": _REST,
     "iot": _LATER,
     "kafka": _REST,
     "lightsail": _LATER,
-    "macie2": _REST,
     "memorydb": _LATER,
     "mq": _REST,
     "network-firewall": _LATER,
@@ -586,6 +585,9 @@ CORRECTIONS: dict[str, tuple[list[dict], str]] = {
                                  "Name (ARN) to which you want to add the tag or tags'), whose name does not end in "
                                  "Arn")
        for operation in ("CreateTags", "DeleteTags", "DescribeTags")},
+    "macie2:CreateMember": ([{"type": "Member", "fill": {"ResourceId": "account.accountId"}}],
+                            "the member ARN ends in the account the request associates, which it names as "
+                            "account.accountId, nested where the rule does not look for the member's id"),
 }
 
 # Resource types whose ARN a request may give with a qualifier, one more `:<name>` past its format, which their

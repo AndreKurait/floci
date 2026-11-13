@@ -92,17 +92,19 @@ OUTPUT = REPO_ROOT / "src/main/resources/aws/iam-tag-on-create.json"
 
 # The IAM namespaces whose operations this file reads: those Floci serves over the JSON and Query
 # protocols and Smithy RPC v2 CBOR, and the REST ones whose routes Floci authorizes by operation.
-NAMESPACES = ("access-analyzer", "acm", "application-autoscaling", "athena", "autoscaling", "bcm-data-exports",
-              "bcm-pricing-calculator", "budgets", "ce", "cloudformation", "cloudfront", "cloudhsm", "cloudtrail",
-              "cloudwatch", "codedeploy", "codepipeline", "cognito-identity", "cognito-idp", "comprehend",
-              "config", "controltower", "cur", "datasync", "dms", "dsql", "dynamodb", "ec2", "ecr", "ecs", "eks", "elasticache",
-              "elasticloadbalancing", "elasticmapreduce", "emr-serverless", "events", "firehose", "fis", "globalaccelerator", "glue",
-              "iam", "kinesis", "kinesisanalytics", "kms", "lambda", "lightsail", "logs", "memorydb",
-              "network-firewall", "oam", "organizations", "payment-cryptography", "pipes", "ram", "rds",
-              "redshift", "redshift-serverless", "rekognition", "resource-explorer-2", "resource-groups",
-              "route53resolver", "sagemaker", "scheduler", "secretsmanager", "servicediscovery", "ses", "sns",
-              "sqs", "ssm", "sso", "states", "sts", "swf", "textract", "timestream-influxdb", "transcribe",
-              "transfer", "translate", "wafv2")
+NAMESPACES = (
+    "access-analyzer", "acm", "application-autoscaling", "athena", "autoscaling", "bcm-data-exports",
+    "bcm-pricing-calculator", "budgets", "ce", "cloudformation", "cloudfront", "cloudhsm", "cloudtrail",
+    "cloudwatch", "codedeploy", "codepipeline", "cognito-identity", "cognito-idp", "comprehend", "config",
+    "controltower", "cur", "datasync", "dms", "dsql", "dynamodb", "ec2", "ecr", "ecs", "eks", "elasticache",
+    "elasticloadbalancing", "elasticmapreduce", "emr-serverless", "events", "firehose", "fis",
+    "globalaccelerator", "glue", "iam", "kinesis", "kinesisanalytics", "kms", "lambda", "lightsail", "logs",
+    "macie2", "memorydb", "network-firewall", "oam", "organizations", "payment-cryptography", "pipes", "ram",
+    "rds", "redshift", "redshift-serverless", "rekognition", "resource-explorer-2", "resource-groups",
+    "route53resolver", "sagemaker", "scheduler", "secretsmanager", "servicediscovery", "ses", "sns", "sqs", "ssm",
+    "sso", "states", "sts", "swf", "textract", "timestream-influxdb", "transcribe", "transfer", "translate",
+    "wafv2",
+)
 
 _NO_ROUTES = "REST routes no rule maps yet"
 # Namespaces Floci serves whose operations list a tagging action but are not read here yet, each with
@@ -115,7 +117,7 @@ NOT_COVERED = {
     "detective": _NO_ROUTES, "dlm": _NO_ROUTES,
     "elasticfilesystem": _NO_ROUTES, "es": _NO_ROUTES,
     "guardduty": _NO_ROUTES, "inspector2": _NO_ROUTES, "iot": _NO_ROUTES, "kafka": _NO_ROUTES,
-    "macie2": _NO_ROUTES, "mq": _NO_ROUTES,
+    "mq": _NO_ROUTES,
     "rum": _NO_ROUTES, "s3tables": _NO_ROUTES, "securityhub": _NO_ROUTES,
     "s3": "authorized by route; S3 checks s3:PutObjectTagging for an object it creates with tags itself",
     "servicecatalog": "its operations that tag are AppRegistry's, whose REST routes no rule maps yet",
