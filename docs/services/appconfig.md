@@ -89,11 +89,24 @@ enabled, validation requires `appconfig:ValidateConfiguration` on both the appli
 configuration-profile ARNs.
 
 Other schema drafts and external schema references are not supported. JSON Schema validators
-are refused for feature-flag profiles. Lambda validator declarations are retained, but validation
-and deployment refuse them because Lambda invocation is not implemented. Validation of S3 and
-other external configuration sources is not implemented. The CloudFormation provisioner still
+are refused for feature-flag profiles. Validation of S3 and other external configuration sources
+is not implemented. The CloudFormation provisioner still
 ignores the template's `Validators`; these validators are configured through the management API.
 
+Hosted profiles also support `LAMBDA` validators naming a function ARN. Both validation and deployment
+invoke the function with five string fields: `applicationId`, `configurationProfileId`,
+`configurationVersion`, base64-encoded `content`, and `uri` set to `hosted`. The event uses the resolved
+resource IDs and numeric hosted version. An ordinary return value, including `false` or an error-shaped
+JSON object, succeeds; a Lambda function error refuses validation with `BadRequestException`.
+With IAM enforcement enabled, the function's resource policy must allow `appconfig.amazonaws.com`
+to invoke it. Source conditions receive the exact configuration-profile ARN and the calling account.
+
+The validation wait has a 15-second budget, including invocation startup. A function already running
+when that budget expires may finish later; its result cannot publish a deployment or active content.
+Floci tracks at most 32 outstanding validator invocations per process and refuses reset while any remain.
+Explicit process shutdown requests worker interruption and waits up to five seconds for them to drain;
+that shutdown behavior is separate from an ordinary validation timeout. Lambda validation of external
+configuration sources is not supported.
 `CreateEnvironment` keeps up to five `Monitors`, each a CloudWatch `AlarmArn` with an optional IAM role
 `AlarmRoleArn`, and environment reads return them; an environment created without monitors returns none.
 More than five monitors, or an `AlarmRoleArn` that is not an IAM role ARN, returns `BadRequestException`.
