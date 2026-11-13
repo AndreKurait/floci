@@ -2008,7 +2008,8 @@ public class CloudFormationService implements ResourceProvider {
             if (existing == null) {
                 throw new AwsException("ValidationError", CONTINUE_STACK_MISSING.formatted(stackNameOrArn), 400);
             }
-            if (!"UPDATE_ROLLBACK_FAILED".equals(existing.getStatus())) {
+            if (!"UPDATE_ROLLBACK_FAILED".equals(existing.getStatus())
+                    || deferredDeletes.containsKey(existing.getStackId())) {
                 throw new AwsException("ValidationError", CONTINUE_ROLLBACK_REFUSED, 400);
             }
             String selectedRole = roleArn != null ? roleArn : existing.getRoleArn();
