@@ -121,6 +121,28 @@ An operation AWS starts paging later needs `make aws-data-sync`, not new handler
 
 A role `Description` is held to the shape AWS publishes for it on every action that takes one, `CreateRole`, `UpdateRole`, `UpdateRoleDescription` and `CreateServiceLinkedRole`: at most 1000 characters of `[\u0009\u000A\u000D\u0020-\u007E\u00A1-\u00FF]`, which admits tab, newline and carriage return and no other control character, otherwise `ValidationError`. The check runs before the role is looked up or created, so a refused description never reaches a stored role, and the `Role` these actions and `GetRole` answer always stays parsable XML.
 
+`CreateRole` and `UpdateAssumeRolePolicy` bind role and user entries in `Principal.AWS`
+to the identity's immutable ID. The principal must exist at its exact partition, account, path and name, in the target role's
+partition; an explicit live role or user ID from that partition is also accepted. A missing ARN or stale ID returns
+`MalformedPolicyDocument` (HTTP 400) before the target policy changes. An existing target
+still returns `EntityAlreadyExists` for `CreateRole`, and a missing update target returns
+`NoSuchEntity`, before principal admission.
+
+IAM role responses, including `ListRoles` and `GetAccountAuthorizationDetails`, display a
+live identity's current ARN. Deleting it exposes the saved ID. Recreating the same name and
+path produces a different ID and does not restore the old trust; an explicit policy update
+is needed. User renames retain the ID and display the new ARN. These IDs persist in the
+existing trust-policy field across storage reloads.
+
+Only `Principal.AWS` role and user identities are bound. ARN strings in conditions such as
+`aws:PrincipalArn` keep matching the ARN, including after recreation. Account, root, service,
+federated and explicit session principals retain their existing behavior. Historical policy
+rows containing ARNs keep ARN matching until a new policy save; reading does not migrate
+them. CloudFormation saves use the same admission rules, so referenced identities must be
+created first. Compensation can restore a captured historical policy without rebinding it,
+while checking that the target role still has the expected ID. This is trust-policy binding;
+resource-policy principal strings and general policy grammar behavior are unchanged.
+
 ### Role Templates
 
 | Action | Description |
@@ -495,7 +517,8 @@ policy was the sharpest case: the evaluator reads a document it cannot parse as 
 a role written that way could no longer be assumed.
 
 Which reading an operation applies follows what the document is. A trust policy, on `CreateRole` and
-`UpdateAssumeRolePolicy`, is held to the grammar alone and under the wording IAM's trust-policy
+`UpdateAssumeRolePolicy`, is held to the grammar and the principal binding described above. Its grammar uses
+IAM's trust-policy
 validator uses: `This policy contains invalid Json` for a text that is not, in its entirety, a JSON object,
 and `Policy has no statements` for an object carrying no `Statement`, "the main element for a policy.
 This element is required." Its statements name a principal and the actions it may take rather than
@@ -789,8 +812,9 @@ keys, inline policies, attached managed policies, group memberships, an
 [service-specific credential](#service-specific-credentials): remove those first. That is every
 item on AWS's own list of what to delete before deleting a user programmatically. Renaming a user
 with `UpdateUser` carries all of them to the new name, along with its login profile, access keys and
-group membership. Unlike AWS, Floci does not rewrite policy documents that name the user's ARN, so a
-resource or trust policy that referred to the old name still refers to it after a rename.
+group membership. Bound trust principals follow the user's immutable ID and display its new ARN.
+Floci does not rewrite other policy strings naming the old ARN, including historical trust-policy
+ARN entries and resource-policy entries.
 
 ### Policy Simulation
 
