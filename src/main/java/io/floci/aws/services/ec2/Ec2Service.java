@@ -4175,6 +4175,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             // since the unlocked check above.
                             validateHostPlacement(getRequiredAvailableHost(region, hostId), az, effectiveInstanceType, tenancy);
                         }
+                        if (suppliedEni != null && suppliedEni.getAttachment() != null) {
+                            throw new AwsException("InvalidNetworkInterface.InUse",
+                                    "Interface: '" + suppliedEni.getNetworkInterfaceId() + "' is currently in use.", 400);
+                        }
                         List<String> privateIps = allocateLaunchAddresses(region, finalSubnetId, suppliedEni,
                                 privateIpAddress, admitted);
                         for (int i = 0; i < admitted; i++) {
@@ -5236,13 +5240,20 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     clearPublicAddress(inst);
                 }
                 inst.setTerminatedAt(System.currentTimeMillis());
+                releaseStandaloneInterfacesOnTermination(region, inst);
             } else {
                 // Also attempt the reclaim once this container is really gone. The synchronous
                 // attempt below runs while teardown is still scheduled, so for a batch whose
                 // containers all tear down slowly every in-loop attempt can be refused by the
                 // daemon and, without this, nothing would try again.
-                containerManager.terminate(inst, () ->
-                        RequestScopes.runAs(owner, () -> reclaimCapturesPinnedBy(region, inst, terminating)));
+                containerManager.terminate(inst, () -> RequestScopes.runAs(owner, () -> {
+                    try {
+                        releaseStandaloneInterfacesOnTermination(region, inst);
+                        instances.put(key(region, inst.getInstanceId()), inst);
+                    } finally {
+                        reclaimCapturesPinnedBy(region, inst, terminating);
+                    }
+                }));
                 // Termination releases the public address with a container too, under the lock a
                 // DescribeAddresses re-point holds, so one already under way cannot write it back.
                 synchronized (privateIpAllocationLock) {
@@ -5250,7 +5261,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 }
             }
             detachAttachedVolumesOnTermination(region, inst);
-            releaseStandaloneInterfacesOnTermination(region, inst);
             instances.put(key(region, id), inst);
             synchronized (capacityReservationLock) {
                 reconcileCapacityMembership(region);
@@ -8017,6 +8027,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 .filter(instance -> instance.getState() == null || !"terminated".equals(instance.getState().getName()))
                 .anyMatch(instance -> nullToEmpty(instance.getSecurityGroups()).stream()
                         .anyMatch(group -> groupId.equals(group.getGroupId())))) {
+            return true;
+        }
+        if (instances.scan(k -> k.startsWith(region + "::")).stream()
+                .filter(instance -> instance.getState() == null || !"terminated".equals(instance.getState().getName()))
+                .flatMap(instance -> nullToEmpty(instance.getNetworkInterfaces()).stream())
+                .flatMap(eni -> nullToEmpty(eni.getGroups()).stream())
+                .anyMatch(group -> group != null && groupId.equals(group.getGroupId()))) {
             return true;
         }
         if (vpcEndpoints.scan(k -> k.startsWith(region + "::")).stream()
@@ -15722,74 +15739,80 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      */
     public NetworkInterfaceAttachment attachNetworkInterface(String region, String networkInterfaceId,
                                                               String instanceId, int deviceIndex) {
-        NetworkInterface ni = requireStandaloneNetworkInterface(region, networkInterfaceId);
-        if (ni.getAttachment() != null) {
-            throw new AwsException("InvalidNetworkInterface.InUse",
-                    "Interface: '" + networkInterfaceId + "' is currently in use.", 400);
-        }
-        Instance inst = getRequiredInstance(region, instanceId);
-        if (!List.of("running", "stopped").contains(inst.getState().getName())) {
-            throw new AwsException("IncorrectInstanceState",
-                    "The instance '" + instanceId + "' is not in a state from which an interface can be attached", 400);
-        }
-        boolean indexTaken = inst.getNetworkInterfaces().stream()
-                .anyMatch(eni -> eni.getDeviceIndex() == deviceIndex);
-        if (indexTaken) {
-            throw new AwsException("InvalidParameterValue",
-                    "Device index " + deviceIndex + " is already in use on instance '" + instanceId + "'", 400);
-        }
+        synchronized (privateIpAllocationLock) {
+            NetworkInterface ni = requireStandaloneNetworkInterface(region, networkInterfaceId);
+            if (ni.getAttachment() != null) {
+                throw new AwsException("InvalidNetworkInterface.InUse",
+                        "Interface: '" + networkInterfaceId + "' is currently in use.", 400);
+            }
+            Instance inst = getRequiredInstance(region, instanceId);
+            if (!List.of("running", "stopped").contains(inst.getState().getName())) {
+                throw new AwsException("IncorrectInstanceState",
+                        "The instance '" + instanceId + "' is not in a state from which an interface can be attached", 400);
+            }
+            boolean indexTaken = inst.getNetworkInterfaces().stream()
+                    .anyMatch(eni -> eni.getDeviceIndex() == deviceIndex);
+            if (indexTaken) {
+                throw new AwsException("InvalidParameterValue",
+                        "Device index " + deviceIndex + " is already in use on instance '" + instanceId + "'", 400);
+            }
 
-        NetworkInterfaceAttachment attachment = new NetworkInterfaceAttachment();
-        attachment.setAttachmentId("eni-attach-" + randomHex(17));
-        attachment.setDeviceIndex(deviceIndex);
-        attachment.setStatus("attached");
-        attachment.setInstanceId(instanceId);
-        attachment.setInstanceOwnerId(callerAccountId());
-        attachment.setAttachTime(ISO_FMT.format(Instant.now()));
-        attachment.setDeleteOnTermination(false);
+            NetworkInterfaceAttachment attachment = new NetworkInterfaceAttachment();
+            attachment.setAttachmentId("eni-attach-" + randomHex(17));
+            attachment.setDeviceIndex(deviceIndex);
+            attachment.setStatus("attached");
+            attachment.setInstanceId(instanceId);
+            attachment.setInstanceOwnerId(callerAccountId());
+            attachment.setAttachTime(ISO_FMT.format(Instant.now()));
+            attachment.setDeleteOnTermination(false);
 
-        ni.setAttachment(attachment);
-        ni.setStatus("in-use");
-        networkInterfaces.put(key(region, networkInterfaceId), ni);
+            ni.setAttachment(attachment);
+            ni.setStatus("in-use");
+            networkInterfaces.put(key(region, networkInterfaceId), ni);
 
-        // The instance must carry it as well, or DescribeInstances would deny an attachment
-        // DescribeNetworkInterfaces reports, and the device-index check above, which reads this
-        // very list, would never see an interface attached by this method.
-        InstanceNetworkInterface attached = new InstanceNetworkInterface();
-        attached.setNetworkInterfaceId(ni.getNetworkInterfaceId());
-        attached.setSubnetId(ni.getSubnetId());
-        attached.setVpcId(ni.getVpcId());
-        attached.setDescription(ni.getDescription());
-        attached.setOwnerId(ni.getOwnerId());
-        attached.setStatus("in-use");
-        attached.setMacAddress(ni.getMacAddress());
-        attached.setPrivateIpAddress(ni.getPrivateIpAddress());
-        attached.setPrivateDnsName(ni.getPrivateDnsName());
-        attached.setGroups(new ArrayList<>(ni.getGroups()));
-        attached.setAttachmentId(attachment.getAttachmentId());
-        attached.setDeviceIndex(deviceIndex);
-        attached.setAttachTime(attachment.getAttachTime());
-        inst.getNetworkInterfaces().add(attached);
-        instances.put(key(region, instanceId), inst);
-        return attachment;
+            // The instance must carry it as well, or DescribeInstances would deny an attachment
+            // DescribeNetworkInterfaces reports, and the device-index check above, which reads this
+            // very list, would never see an interface attached by this method.
+            InstanceNetworkInterface attached = new InstanceNetworkInterface();
+            attached.setNetworkInterfaceId(ni.getNetworkInterfaceId());
+            attached.setSubnetId(ni.getSubnetId());
+            attached.setVpcId(ni.getVpcId());
+            attached.setDescription(ni.getDescription());
+            attached.setOwnerId(ni.getOwnerId());
+            attached.setStatus("in-use");
+            attached.setMacAddress(ni.getMacAddress());
+            attached.setPrivateIpAddress(ni.getPrivateIpAddress());
+            attached.setPrivateDnsName(ni.getPrivateDnsName());
+            attached.setGroups(new ArrayList<>(ni.getGroups()));
+            attached.setAttachmentId(attachment.getAttachmentId());
+            attached.setDeviceIndex(deviceIndex);
+            attached.setAttachTime(attachment.getAttachTime());
+            inst.getNetworkInterfaces().add(attached);
+            instances.put(key(region, instanceId), inst);
+            return attachment;
+
+        }
     }
 
     /** Detaches a standalone ENI by attachment id, floci-kt9. */
     public NetworkInterfaceAttachment detachNetworkInterface(String region, String attachmentId, boolean force) {
-        if (attachmentId == null || attachmentId.isBlank()) {
-            throw new AwsException("MissingParameter", "The request must contain the parameter AttachmentId", 400);
+        synchronized (privateIpAllocationLock) {
+            if (attachmentId == null || attachmentId.isBlank()) {
+                throw new AwsException("MissingParameter", "The request must contain the parameter AttachmentId", 400);
+            }
+            NetworkInterface ni = networkInterfaces.scan(k -> k.startsWith(region + "::")).stream()
+                    .filter(n -> n.getAttachment() != null && attachmentId.equals(n.getAttachment().getAttachmentId()))
+                    .findFirst()
+                    .orElseThrow(() -> new AwsException("InvalidAttachmentID.NotFound",
+                            "The attachment ID '" + attachmentId + "' does not exist", 400));
+            NetworkInterfaceAttachment detached = ni.getAttachment();
+            ni.setAttachment(null);
+            ni.setStatus("available");
+            networkInterfaces.put(key(region, ni.getNetworkInterfaceId()), ni);
+            detachFromInstance(region, detached.getInstanceId(), ni.getNetworkInterfaceId());
+            return detached;
+
         }
-        NetworkInterface ni = networkInterfaces.scan(k -> k.startsWith(region + "::")).stream()
-                .filter(n -> n.getAttachment() != null && attachmentId.equals(n.getAttachment().getAttachmentId()))
-                .findFirst()
-                .orElseThrow(() -> new AwsException("InvalidAttachmentID.NotFound",
-                        "The attachment ID '" + attachmentId + "' does not exist", 400));
-        NetworkInterfaceAttachment detached = ni.getAttachment();
-        ni.setAttachment(null);
-        ni.setStatus("available");
-        networkInterfaces.put(key(region, ni.getNetworkInterfaceId()), ni);
-        detachFromInstance(region, detached.getInstanceId(), ni.getNetworkInterfaceId());
-        return detached;
     }
 
     /** Removes an interface from an instance's own list, the mirror of attaching it. */
@@ -15825,22 +15848,30 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * dies with its instance.
      */
     private void releaseStandaloneInterfacesOnTermination(String region, Instance inst) {
-        for (InstanceNetworkInterface e : List.copyOf(inst.getNetworkInterfaces())) {
-            NetworkInterface ni = networkInterfaces.get(key(region, e.getNetworkInterfaceId())).orElse(null);
-            NetworkInterfaceAttachment att = ni != null ? ni.getAttachment() : null;
-            boolean deleted = ni == null || (att != null && att.isDeleteOnTermination());
-            releaseInterfaceAddresses(region, e.getNetworkInterfaceId(), deleted);
-            inst.getNetworkInterfaces().remove(e);
-            if (ni == null) {
-                continue;
+        synchronized (privateIpAllocationLock) {
+            for (InstanceNetworkInterface e : List.copyOf(inst.getNetworkInterfaces())) {
+                NetworkInterface ni = networkInterfaces.get(key(region, e.getNetworkInterfaceId())).orElse(null);
+                NetworkInterfaceAttachment att = ni != null ? ni.getAttachment() : null;
+                if (ni != null && (att == null || !inst.getInstanceId().equals(att.getInstanceId())
+                        || !Objects.equals(e.getAttachmentId(), att.getAttachmentId()))) {
+                    inst.getNetworkInterfaces().remove(e);
+                    continue;
+                }
+                boolean deleted = ni == null || (att != null && att.isDeleteOnTermination());
+                releaseInterfaceAddresses(region, e.getNetworkInterfaceId(), deleted);
+                inst.getNetworkInterfaces().remove(e);
+                if (ni == null) {
+                    continue;
+                }
+                if (deleted) {
+                    networkInterfaces.delete(key(region, ni.getNetworkInterfaceId()));
+                    continue;
+                }
+                ni.setAttachment(null);
+                ni.setStatus("available");
+                networkInterfaces.put(key(region, ni.getNetworkInterfaceId()), ni);
             }
-            if (deleted) {
-                networkInterfaces.delete(key(region, ni.getNetworkInterfaceId()));
-                continue;
-            }
-            ni.setAttachment(null);
-            ni.setStatus("available");
-            networkInterfaces.put(key(region, ni.getNetworkInterfaceId()), ni);
+
         }
     }
 
@@ -15973,32 +16004,35 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     private NetworkInterface releaseIfHostIsGone(String accountId, String region, NetworkInterface ni) {
-        NetworkInterfaceAttachment attachment = ni.getAttachment();
-        if (attachment == null || attachment.getInstanceId() == null) {
+        synchronized (privateIpAllocationLock) {
+            NetworkInterfaceAttachment attachment = ni.getAttachment();
+            if (attachment == null || attachment.getInstanceId() == null) {
+                return ni;
+            }
+            String safeAccount = accountId != null ? accountId : (ni.getOwnerId() != null ? ni.getOwnerId() : callerAccountId());
+            Instance host = instances instanceof AccountAwareStorageBackend<Instance> aware
+                    ? aware.getForAccount(safeAccount, key(region, attachment.getInstanceId())).orElse(null)
+                    : instances.get(key(region, attachment.getInstanceId())).orElse(null);
+            boolean hostIsGone = host == null || host.getState() == null
+                    || "terminated".equals(host.getState().getName());
+            if (!hostIsGone) {
+                return ni;
+            }
+            ni.setAttachment(null);
+            ni.setStatus("available");
+            if (networkInterfaces instanceof AccountAwareStorageBackend<NetworkInterface> aware) {
+                aware.putForAccount(safeAccount, key(region, ni.getNetworkInterfaceId()), ni);
+            } else {
+                networkInterfaces.put(key(region, ni.getNetworkInterfaceId()), ni);
+            }
+            // The dead instance has to let go of its copy as well. Releasing only the standalone
+            // record would leave the terminated instance still reporting the interface, so once it is
+            // reused two instance records would claim it, and a real one is not the winner by any
+            // rule DescribeInstances applies.
+            detachFromInstance(safeAccount, region, attachment.getInstanceId(), ni.getNetworkInterfaceId());
             return ni;
+
         }
-        String safeAccount = accountId != null ? accountId : (ni.getOwnerId() != null ? ni.getOwnerId() : callerAccountId());
-        Instance host = instances instanceof AccountAwareStorageBackend<Instance> aware
-                ? aware.getForAccount(safeAccount, key(region, attachment.getInstanceId())).orElse(null)
-                : instances.get(key(region, attachment.getInstanceId())).orElse(null);
-        boolean hostIsGone = host == null || host.getState() == null
-                || "terminated".equals(host.getState().getName());
-        if (!hostIsGone) {
-            return ni;
-        }
-        ni.setAttachment(null);
-        ni.setStatus("available");
-        if (networkInterfaces instanceof AccountAwareStorageBackend<NetworkInterface> aware) {
-            aware.putForAccount(safeAccount, key(region, ni.getNetworkInterfaceId()), ni);
-        } else {
-            networkInterfaces.put(key(region, ni.getNetworkInterfaceId()), ni);
-        }
-        // The dead instance has to let go of its copy as well. Releasing only the standalone
-        // record would leave the terminated instance still reporting the interface, so once it is
-        // reused two instance records would claim it, and a real one is not the winner by any
-        // rule DescribeInstances applies.
-        detachFromInstance(safeAccount, region, attachment.getInstanceId(), ni.getNetworkInterfaceId());
-        return ni;
     }
 
     /**
