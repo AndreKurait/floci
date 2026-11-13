@@ -335,6 +335,12 @@
         <!-- Testing -->
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
+            <artifactId>eks</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
             <artifactId>accessanalyzer</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
@@ -347,7 +353,25 @@
         </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
+            <artifactId>cognitoidentity</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>apache-client</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
             <artifactId>sts</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>config</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
         </dependency>
@@ -378,6 +402,12 @@
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>dynamodb</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>kinesis</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
         </dependency>
@@ -421,6 +451,18 @@
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>iotdataplane</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>iot</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>iotjobsdataplane</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
         </dependency>
@@ -481,6 +523,12 @@
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>cloudwatchlogs</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>kinesis</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
         </dependency>
@@ -559,6 +607,18 @@
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>cloudfront</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>cloudfrontkeyvaluestore</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>http-auth-aws-crt</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
         </dependency>
@@ -675,6 +735,12 @@
         </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
+            <artifactId>docdb</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
             <artifactId>ram</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
@@ -706,6 +772,12 @@
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>url-connection-client</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>kms</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
         </dependency>
@@ -774,6 +846,18 @@
             <groupId>com.h2database</groupId>
             <artifactId>h2</artifactId>
             <version>2.5.252</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>neptune</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.tinkerpop</groupId>
+            <artifactId>gremlin-driver</artifactId>
+            <version>3.7.3</version>
             <scope>test</scope>
         </dependency>
         <!-- openCypher/Bolt client for the Neptune neo4j db-type integration test -->
