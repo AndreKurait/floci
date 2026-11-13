@@ -687,6 +687,22 @@ public class IotController {
         return Response.ok(response).build();
     }
 
+    @DELETE
+    @Path("/jobs/{jobId}")
+    public Response deleteJob(@Context HttpHeaders headers,
+                              @PathParam("jobId") String jobId,
+                              @QueryParam("force") String force,
+                              @QueryParam("namespaceId") String namespaceId) {
+        if (force != null && !"true".equals(force) && !"false".equals(force)) {
+            throw new AwsException("InvalidRequestException", "force must be true or false", 400);
+        }
+        if (namespaceId != null) {
+            throw new AwsException("InvalidRequestException", "Namespace-scoped jobs are not supported.", 400);
+        }
+        iotService.deleteJob(jobId, "true".equals(force), regionResolver.resolveRegion(headers));
+        return Response.ok().build();
+    }
+
     @GET
     @Path("/jobs")
     public Response listJobs(@Context HttpHeaders headers,
