@@ -32,6 +32,27 @@ class RequestResourcesTest {
     private static final String MACHINE = "arn:aws:states:us-east-1:000000000000:stateMachine:orders";
 
     @Test
+    void signerProfileTagsUseTheCreatedArnWhileTheCreateRemainsGlobal() {
+        ContainerRequestContext request = rest("PUT", "{\"platformId\":\"AWSLambda-SHA384-ECDSA\"}", Map.of());
+        when(request.getUriInfo().getRequestUri()).thenReturn(URI.create("http://localhost/signing-profiles/profile"));
+        when(request.getUriInfo().getBaseUri()).thenReturn(URI.create("http://localhost/"));
+        assertTrue(RequestResources.actsOnNoResource("signer:PutSigningProfile"));
+        assertEquals(List.of(), of("signer:PutSigningProfile", request));
+        assertEquals(List.of("arn:aws:signer:us-east-1:000000000000:/signing-profiles/profile"),
+                RequestResources.created("signer:PutSigningProfile", request,
+                        "aws", "us-east-1", "000000000000", Map.of("profileName", "profile")));
+    }
+
+    @Test
+    void sharedSignerBareTagsUseTheSameLocatedMemberContract() {
+        String arn = "arn:aws:signer:us-east-1:000000000000:/signing-profiles/profile";
+        ContainerRequestContext request = rest("POST", "{\"resourceArn\":\"" + arn + "\"}", Map.of());
+        when(request.getUriInfo().getRequestUri()).thenReturn(URI.create("http://localhost/tags"));
+        when(request.getUriInfo().getBaseUri()).thenReturn(URI.create("http://localhost/"));
+        assertEquals(List.of(arn), of("signer:TagResource", request));
+    }
+
+    @Test
     void securityHubAndGuardDutyTagsUseCreatedResourcesWithoutNarrowingCreateActions() {
         ContainerRequestContext request = json("{}");
         assertTrue(RequestResources.actsOnNoResource("securityhub:CreateAutomationRule"));

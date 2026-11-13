@@ -111,6 +111,7 @@ import io.github.hectorvent.floci.services.ses.SesSuppressionController;
 import io.github.hectorvent.floci.services.ses.SesTagController;
 import io.github.hectorvent.floci.services.ses.SesTemplateController;
 import io.github.hectorvent.floci.services.ses.SesTenantController;
+import io.github.hectorvent.floci.services.signer.SignerController;
 import io.github.hectorvent.floci.services.signin.SigninController;
 import io.github.hectorvent.floci.services.ssm.SsmMessagesController;
 import io.github.hectorvent.floci.services.ssooidc.SsoOidcController;
@@ -844,6 +845,11 @@ public class ResolvedServiceCatalog {
                         "dlm", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
                         Set.of(), Set.of("dlm"), Set.of(), Set.of(DlmController.class))
+                        .withRequiredRestAuthentication(),
+                descriptor("signer", "signer", config.services().signer().enabled(), true,
+                        "signer", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
+                        protocols(ServiceProtocol.REST_JSON),
+                        Set.of(), Set.of("signer"), Set.of(), Set.of(SignerController.class))
                         .withRequiredRestAuthentication(),
                 descriptor("cognito-identity", "cognitoidentity",
                         config.services().cognitoidentity().enabled(), true,

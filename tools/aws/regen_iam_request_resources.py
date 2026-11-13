@@ -176,7 +176,7 @@ NAMESPACES = (
     "datasync", "ec2", "ecr", "elasticloadbalancing", "elasticmapreduce", "emr-serverless", "es", "events",
     "firehose", "fis", "globalaccelerator", "guardduty", "inspector2", "kinesisanalytics", "macie2", "oam",
     "payment-cryptography", "ram", "redshift", "redshift-data", "rekognition", "resource-explorer-2",
-    "securityhub", "servicediscovery", "servicequotas", "sso", "states", "swf", "textract", "timestream-influxdb",
+    "securityhub", "servicediscovery", "servicequotas", "signer", "sso", "states", "swf", "textract", "timestream-influxdb",
     "translate",
 )
 

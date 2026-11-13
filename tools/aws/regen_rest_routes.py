@@ -79,12 +79,14 @@ MODELS: dict[str, str] = {
     "s3control": "s3",
     "scheduler": "scheduler",
     "securityhub": "securityhub",
+    "signer": "signer",
 }
 
 
 # Shared-controller and ARN-spanning operations are activated with their qualified tables.
 SHARED_ROUTES: dict[str, frozenset[str]] = {
     "controltower": frozenset({"TagResource", "UntagResource", "ListTagsForResource"}),
+    "signer": frozenset({"TagResource", "UntagResource", "ListTagsForResource"}),
     "fis": frozenset({"TagResource", "UntagResource", "ListTagsForResource"}),
     "resource-explorer-2": frozenset({"TagResource", "UntagResource", "ListTagsForResource"}),
 }

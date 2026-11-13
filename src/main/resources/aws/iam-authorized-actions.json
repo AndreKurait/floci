@@ -946,6 +946,13 @@
       "ListSecurityControlDefinitions",
       "ListStandardsControlAssociations",
       "UpdateSecurityControl"
+    ],
+    "signer": [
+      "GetSigningPlatform",
+      "ListSigningJobs",
+      "ListSigningPlatforms",
+      "ListSigningProfiles",
+      "PutSigningProfile"
     ]
   }
 }

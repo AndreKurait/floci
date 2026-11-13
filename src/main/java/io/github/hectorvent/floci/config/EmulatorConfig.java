@@ -912,6 +912,7 @@ public interface EmulatorConfig {
         ConnectServiceConfig connect();
         AppIntegrationsServiceConfig appintegrations();
         DlmServiceConfig dlm();
+        SignerServiceConfig signer();
         CognitoIdentityServiceConfig cognitoidentity();
         GlobalAcceleratorServiceConfig globalaccelerator();
         DataSyncServiceConfig datasync();
@@ -985,6 +986,19 @@ public interface EmulatorConfig {
     interface DlmServiceConfig {
         @WithDefault("true")
         boolean enabled();
+    }
+
+    interface SignerServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        /**
+         * Records signing jobs as succeeded without producing an artifact, for callers that only
+         * read job metadata. Off by default: a job that reports success must have something to
+         * download, and Floci does not sign code.
+         */
+        @WithDefault("false")
+        boolean mockSigningJobs();
     }
 
     interface CognitoIdentityServiceConfig {
