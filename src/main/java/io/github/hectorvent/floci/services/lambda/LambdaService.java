@@ -699,6 +699,71 @@ public class LambdaService implements ResourceProvider {
                         "Function not found: " + functionName, 404));
     }
 
+    public String getFunctionRecursionConfig(String region, String functionName) {
+        String account = regionResolver.getAccountId();
+        String name = recursionFunctionName(region, account, functionName);
+        String arn = AwsArnUtils.Arn.of("lambda", region, account, "function:" + name).toString();
+        synchronized (lockForConcurrencyOp(arn)) {
+            return recursionFunction(account, region, name).getRecursiveLoop();
+        }
+    }
+
+    /** Live resource tags for the same strictly scoped target as the recursion settings APIs. */
+    public Map<String, String> recursionResourceTags(String region, String functionName) {
+        String accountId = regionResolver.getAccountId();
+        String name = recursionFunctionName(region, accountId, functionName);
+        String arn = AwsArnUtils.Arn.of("lambda", region, accountId, "function:" + name).toString();
+        synchronized (lockForConcurrencyOp(arn)) {
+            Map<String, String> tags = recursionFunction(accountId, region, name).getTags();
+            return tags == null ? Map.of() : new HashMap<>(tags);
+        }
+    }
+
+    public String putFunctionRecursionConfig(String region, String functionName, String recursiveLoop) {
+        validateRecursiveLoop(recursiveLoop);
+        String account = regionResolver.getAccountId();
+        String name = recursionFunctionName(region, account, functionName);
+        String arn = AwsArnUtils.Arn.of("lambda", region, account, "function:" + name).toString();
+        synchronized (lockForConcurrencyOp(arn)) {
+            LambdaFunction function = recursionFunction(account, region, name);
+            String previous = function.getRecursiveLoop();
+            function.setRecursiveLoop(recursiveLoop);
+            try {
+                functionStore.saveForAccount(account, region, function);
+            } catch (RuntimeException e) {
+                function.setRecursiveLoop(previous);
+                throw e;
+            }
+            return recursiveLoop;
+        }
+    }
+
+    public static void validateRecursiveLoop(String recursiveLoop) {
+        if (recursiveLoop == null) {
+            throw SmithyValidationErrors.validationException(
+                    "Value null at 'recursiveLoop' failed to satisfy constraint: Member must not be null");
+        }
+        validateEnum(recursiveLoop, "recursiveLoop", List.of("Allow", "Terminate"));
+    }
+
+    private LambdaFunction recursionFunction(String account, String region, String name) {
+        return functionStore.getForAccount(account, region, name)
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                        "Function not found: " + name, 404));
+    }
+
+    private String recursionFunctionName(String region, String account, String functionName) {
+        LambdaArnUtils.ResolvedFunctionRef reference =
+                LambdaArnUtils.resolveUnqualifiedFunctionName(functionName);
+        if ((reference.region() != null && !region.equals(reference.region()))
+                || (reference.account() != null && !account.equals(reference.account()))
+                || (AwsArnUtils.isArn(functionName) && !regionResolver.partitionForRegion(region)
+                        .equals(AwsArnUtils.parse(functionName).partition()))) {
+            throw new AwsException("ResourceNotFoundException", "Function not found: " + functionName, 404);
+        }
+        return reference.name();
+    }
+
     /** Resolves the $LATEST record that owns the code-signing attachment. */
     public LambdaFunction getFunctionForCodeSigningConfig(String region, String functionName) {
         String name = codeSigningFunctionName(region, functionName);

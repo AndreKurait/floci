@@ -398,7 +398,6 @@ AWS::Lambda::Function	CapacityProviderConfig	accepted and ignored
 AWS::Lambda::Function	FunctionScalingConfig	accepted and ignored
 AWS::Lambda::Function	KmsKeyArn	accepted and ignored
 AWS::Lambda::Function	PublishToLatestPublished	accepted and ignored
-AWS::Lambda::Function	RecursiveLoop	accepted and ignored
 AWS::Lambda::Function	RuntimeManagementConfig	accepted and ignored
 AWS::Lambda::Function	SnapStart	accepted and ignored
 AWS::Lambda::Function	TenancyConfig	accepted and ignored
