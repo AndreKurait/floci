@@ -252,6 +252,28 @@ class ApplicationAutoScalingServiceTest {
     }
 
     @Test
+    void policyPagesKeepTheDefaultAndAcceptLargeExplicitSizesAfterACursor() {
+        register();
+        for (int index = 0; index < 12; index++) {
+            service.putScalingPolicy("page-policy-" + index, "StepScaling", NAMESPACE, RESOURCE_ID, DIMENSION,
+                    null, null, REGION);
+        }
+        PaginatedResult<ScalingPolicy> first = service.describeScalingPolicies(
+                NAMESPACE, RESOURCE_ID, DIMENSION, null, null, null, REGION);
+        assertEquals(10, first.items().size());
+        assertNotNull(first.nextToken());
+        PaginatedResult<ScalingPolicy> all = service.describeScalingPolicies(
+                NAMESPACE, RESOURCE_ID, DIMENSION, null, 50, null, REGION);
+        assertEquals(12, all.items().size());
+        assertNull(all.nextToken());
+        PaginatedResult<ScalingPolicy> rest = service.describeScalingPolicies(
+                NAMESPACE, RESOURCE_ID, DIMENSION, null, Integer.MAX_VALUE, first.nextToken(), REGION);
+        assertEquals(all.items().subList(10, 12), rest.items());
+        assertNull(rest.nextToken());
+        assertEquals(all.items().subList(0, 10), first.items());
+    }
+
+    @Test
     void describeScalingPoliciesHonorsMaxResultsAndNextToken() {
         register();
         service.putScalingPolicy("policy-a", "StepScaling", NAMESPACE, RESOURCE_ID, DIMENSION,
@@ -370,13 +392,12 @@ class ApplicationAutoScalingServiceTest {
     }
 
     @Test
-    void scalingPolicyPageSizeHasItsOwnMaximum() {
+    void scalingPolicyPagesAcceptPositiveLimits() {
         register();
         assertEquals(1, service.describeScalableTargets(NAMESPACE, null, null, 50, null, REGION).items().size());
         assertEquals(0, service.describeScalingPolicies(NAMESPACE, null, null, null, 10, null, REGION).items().size());
-        AwsException error = assertThrows(AwsException.class,
-                () -> service.describeScalingPolicies(NAMESPACE, null, null, null, 11, null, REGION));
-        assertEquals("ValidationException", error.getErrorCode());
+        assertEquals(0, service.describeScalingPolicies(NAMESPACE, null, null, null, 11, null, REGION)
+                .items().size());
     }
 
     private static String editedToken(String token) {

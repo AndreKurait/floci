@@ -49,7 +49,7 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
 
     private static final Logger LOG = Logger.getLogger(ApplicationAutoScalingService.class);
     private static final int MAX_TARGET_PAGE_SIZE = 50;
-    private static final int MAX_POLICY_PAGE_SIZE = 10;
+    private static final int DEFAULT_POLICY_PAGE_SIZE = 10;
 
     static final Set<String> SERVICE_NAMESPACES = Set.of(
             "ecs", "elasticmapreduce", "ec2", "appstream", "dynamodb", "rds", "sagemaker",
@@ -317,7 +317,7 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
         List<ScalingPolicy> matching = describeScalingPolicies(serviceNamespace, resourceId,
                 scalableDimension, policyNames, region);
         return signedPage(Pagination.paginate(matching, ApplicationAutoScalingService::scalingPolicyCursor,
-                pageSize(maxResults, MAX_POLICY_PAGE_SIZE), cursor,
+                pageSize(maxResults == null ? DEFAULT_POLICY_PAGE_SIZE : maxResults, Integer.MAX_VALUE), cursor,
                 pageNamespace(policyNames, "DescribeScalingPolicies", region, serviceNamespace,
                         resourceId, scalableDimension),
                 token -> invalidNextToken("DescribeScalingPolicies")));
