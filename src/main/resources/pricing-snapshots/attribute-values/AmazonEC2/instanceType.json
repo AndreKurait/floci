@@ -5,6 +5,7 @@
   {"Value": "t3.medium"},
   {"Value": "m5.large"},
   {"Value": "m5.xlarge"},
+  {"Value": "m6g.large"},
   {"Value": "c5.large"},
   {"Value": "r5.large"}
 ]

@@ -1,9 +1,9 @@
 {
   "_source": {
     "generator": "tools/aws/regen_iam_authorized_actions.py",
+    "note": "make iam-authorized-actions-verify checks every entry against AWS. QuickSight actions without resource types added from its AWS Service Reference on 2026-11-05; other entries retain their vendored snapshot.",
     "reference": "https://servicereference.us-east-1.amazonaws.com/",
-    "retrieved": "2026-11-12",
-    "note": "make iam-authorized-actions-verify checks every entry against AWS."
+    "retrieved": "2026-11-06"
   },
   "authorizedActions": {
     "access-analyzer": {
@@ -354,7 +354,21 @@
       "StartPolicyGeneration",
       "ValidatePolicy"
     ],
+    "account": [],
     "apigateway": [],
+    "appconfig": [
+      "CreateApplication",
+      "CreateDeploymentStrategy",
+      "CreateExtension",
+      "CreateExtensionAssociation",
+      "GetAccountSettings",
+      "ListApplications",
+      "ListDeploymentStrategies",
+      "ListExperimentDefinitions",
+      "ListExtensionAssociations",
+      "ListExtensions",
+      "UpdateAccountSettings"
+    ],
     "cloudfront": [
       "CreateAnycastIpList",
       "CreateCachePolicy",
@@ -430,6 +444,12 @@
       "UpdateSavingsPlan"
     ],
     "cloudfront-keyvaluestore": [],
+    "controlcatalog": [
+      "ListCommonControls",
+      "ListControlMappings",
+      "ListDomains",
+      "ListObjectives"
+    ],
     "controltower": [
       "CreateLandingZone",
       "CreateManagedAccount",
@@ -546,6 +566,13 @@
       "UpdatePackage",
       "UpdatePackageScope",
       "UpdateVpcEndpoint"
+    ],
+    "fis": [
+      "GetTargetResourceType",
+      "ListActions",
+      "ListExperimentTemplates",
+      "ListExperiments",
+      "ListTargetResourceTypes"
     ],
     "guardduty": [
       "AcceptAdministratorInvitation",
@@ -841,16 +868,10 @@
       "UpdateRevealConfiguration",
       "UpdateSensitivityInspectionTemplate"
     ],
-    "payment-cryptography": [
-      "CreateKey",
-      "DisableDefaultKeyReplicationRegions",
-      "EnableDefaultKeyReplicationRegions",
-      "GetDefaultKeyReplicationRegions",
-      "GetParametersForExport",
-      "GetParametersForImport",
-      "ImportKey",
-      "ListAliases",
-      "ListKeys"
+    "oam": [
+      "CreateSink",
+      "ListLinks",
+      "ListSinks"
     ],
     "pipes": [
       "ListPipes"
@@ -952,6 +973,46 @@
       "UpdateSPICECapacityConfiguration",
       "UpdateSelfUpgradeConfiguration"
     ],
+    "ram": [
+      "EnableSharingWithAwsOrganization",
+      "GetResourcePolicies",
+      "GetResourceShareAssociations",
+      "GetResourceShareInvitations",
+      "GetResourceShares",
+      "ListPermissionAssociations",
+      "ListPermissions",
+      "ListPrincipals",
+      "ListReplacePermissionAssociationsWork",
+      "ListResourceTypes",
+      "ListResources",
+      "ListSourceAssociations"
+    ],
+    "resource-explorer-2": [
+      "AssociateDefaultView",
+      "BatchGetView",
+      "CreateIndex",
+      "CreateManagedView",
+      "CreateResourceExplorerSetup",
+      "CreateStreamingAccessForService",
+      "CreateView",
+      "DeleteResourceExplorerSetup",
+      "DeleteStreamingAccessForService",
+      "DisassociateDefaultView",
+      "GetAccountLevelServiceConfiguration",
+      "GetDefaultView",
+      "GetIndex",
+      "GetResourceExplorerSetup",
+      "GetServiceIndex",
+      "GetServiceView",
+      "ListIndexes",
+      "ListIndexesForMembers",
+      "ListManagedViews",
+      "ListServiceIndexes",
+      "ListServiceViews",
+      "ListStreamingAccessForServices",
+      "ListSupportedResourceTypes",
+      "ListViews"
+    ],
     "scheduler": [
       "ListScheduleGroups",
       "ListSchedules",
@@ -996,42 +1057,6 @@
       "ListSigningPlatforms",
       "ListSigningProfiles",
       "PutSigningProfile"
-    ],
-    "xray": [
-      "BatchGetTraceSummaryById",
-      "BatchGetTraces",
-      "CallWithBearerToken",
-      "CancelTraceRetrieval",
-      "DeleteResourcePolicy",
-      "GetDistinctTraceGraphs",
-      "GetEncryptionConfig",
-      "GetGroups",
-      "GetIndexingRules",
-      "GetInsight",
-      "GetInsightEvents",
-      "GetInsightImpactGraph",
-      "GetInsightSummaries",
-      "GetRetrievedTracesGraph",
-      "GetSamplingRules",
-      "GetSamplingStatisticSummaries",
-      "GetSamplingTargets",
-      "GetServiceGraph",
-      "GetTimeSeriesServiceStatistics",
-      "GetTraceGraph",
-      "GetTraceSegmentDestination",
-      "GetTraceSummaries",
-      "Link",
-      "ListResourcePolicies",
-      "ListRetrievedTraces",
-      "PutEncryptionConfig",
-      "PutResourcePolicy",
-      "PutSpans",
-      "PutSpansForIndexing",
-      "PutTelemetryRecords",
-      "PutTraceSegments",
-      "StartTraceRetrieval",
-      "UpdateIndexingRule",
-      "UpdateTraceSegmentDestination"
     ]
   },
   "authorizedByMethod": {

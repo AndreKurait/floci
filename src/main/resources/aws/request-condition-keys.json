@@ -6,10 +6,14 @@
     "note": "make request-condition-keys-check re-derives members from botocore; make request-condition-keys-verify checks actions against AWS."
   },
   "actions": {
-    "ec2-instance-connect:OpenTunnel": [
-      "ec2-instance-connect:MaxTunnelDuration",
-      "ec2-instance-connect:privateIpAddress",
-      "ec2-instance-connect:remotePort"
+    "account:DisableRegion": [
+      "account:TargetRegion"
+    ],
+    "account:EnableRegion": [
+      "account:TargetRegion"
+    ],
+    "account:GetRegionOptStatus": [
+      "account:TargetRegion"
     ],
     "lambda:CreateWebFunction": [
       "lambda:Request/WebFunctionAuthType"
@@ -35,18 +39,34 @@
     ],
     "redshift:GetClusterCredentials": [
       "redshift:DbUser"
+    ],
+    "ssm:CreateResourceDataSync": [
+      "ssm:SyncType"
+    ],
+    "ssm:DeleteResourceDataSync": [
+      "ssm:SyncType"
+    ],
+    "ssm:ListResourceDataSync": [
+      "ssm:SyncType"
+    ],
+    "ssm:UpdateResourceDataSync": [
+      "ssm:SyncType"
     ]
   },
   "members": {
-    "ec2-instance-connect:OpenTunnel": {
-      "ec2-instance-connect:MaxTunnelDuration": [
-        "maxTunnelDuration"
-      ],
-      "ec2-instance-connect:privateIpAddress": [
-        "privateIpAddress"
-      ],
-      "ec2-instance-connect:remotePort": [
-        "remotePort"
+    "account:DisableRegion": {
+      "account:TargetRegion": [
+        "RegionName"
+      ]
+    },
+    "account:EnableRegion": {
+      "account:TargetRegion": [
+        "RegionName"
+      ]
+    },
+    "account:GetRegionOptStatus": {
+      "account:TargetRegion": [
+        "RegionName"
       ]
     },
     "lambda:CreateWebFunction": {
@@ -67,6 +87,26 @@
     "redshift:GetClusterCredentials": {
       "redshift:DbUser": [
         "DbUser"
+      ]
+    },
+    "ssm:CreateResourceDataSync": {
+      "ssm:SyncType": [
+        "SyncType"
+      ]
+    },
+    "ssm:DeleteResourceDataSync": {
+      "ssm:SyncType": [
+        "SyncType"
+      ]
+    },
+    "ssm:ListResourceDataSync": {
+      "ssm:SyncType": [
+        "SyncType"
+      ]
+    },
+    "ssm:UpdateResourceDataSync": {
+      "ssm:SyncType": [
+        "SyncType"
       ]
     }
   }
