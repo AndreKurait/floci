@@ -23,6 +23,7 @@ import io.floci.aws.services.appconfig.model.HostedConfigurationVersion;
 import io.floci.aws.services.appconfig.model.HostedConfigurationVersionSummary;
 import io.floci.aws.services.appconfig.model.Monitor;
 import io.floci.aws.services.appconfig.model.Validator;
+import io.smallrye.common.annotation.Identifier;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -73,7 +74,6 @@ public class AppConfigService implements Resettable {
     private static final ObjectMapper COPIER = new ObjectMapper();
     private static final Pattern ROLE_ARN = Pattern.compile("arn:" + AwsArnUtils.PARTITION_REGEX + ":iam::\\d{12}:role/.*");
 
-    @Inject
     public AppConfigService(StorageFactory storageFactory, RegionResolver regions, AppConfigAlarmMonitor alarms,
                             AppConfigLambdaValidator lambdaValidator) {
         this(storageFactory, regions, Clock.systemUTC(), alarms, lambdaValidator);
@@ -96,8 +96,9 @@ public class AppConfigService implements Resettable {
         this(storageFactory, regions, clock, null, lambdaValidator);
     }
 
-    AppConfigService(StorageFactory storageFactory, RegionResolver regions, Clock clock, AppConfigAlarmMonitor alarms,
-                     AppConfigLambdaValidator lambdaValidator) {
+    @Inject
+    AppConfigService(StorageFactory storageFactory, RegionResolver regions, @Identifier("appconfig") Clock clock,
+                     AppConfigAlarmMonitor alarms, AppConfigLambdaValidator lambdaValidator) {
         this.lambdaValidator = lambdaValidator;
         this.clock = clock;
         this.regions = regions;
