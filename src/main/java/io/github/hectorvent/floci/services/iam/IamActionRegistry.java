@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.services.cloudfront.CloudFrontController;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbPartiQLParser;
 import io.github.hectorvent.floci.services.eks.EksController;
 import io.github.hectorvent.floci.services.iot.IotController;
+import io.github.hectorvent.floci.services.lambda.LambdaRuntimeManagementController;
 import io.github.hectorvent.floci.services.route53.Route53Controller;
 import io.github.hectorvent.floci.services.s3.S3ObjectActions;
 import io.github.hectorvent.floci.services.s3tables.S3TablesController;
@@ -744,6 +745,15 @@ public class IamActionRegistry {
                 && S3TablesController.class.equals(resourceInfo.getResourceClass())
                 && resourceInfo.getResourceMethod() != null) {
             return S3TABLES_METRICS_ACTIONS.get(resourceInfo.getResourceMethod().getName());
+        }
+        if ("lambda".equals(credentialScope) && resourceInfo != null
+                && LambdaRuntimeManagementController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            return switch (resourceInfo.getResourceMethod().getName()) {
+                case "getRuntimeManagementConfig" -> "lambda:GetRuntimeManagementConfig";
+                case "putRuntimeManagementConfig" -> "lambda:PutRuntimeManagementConfig";
+                default -> null;
+            };
         }
         if ("appconfig".equals(credentialScope) && resourceInfo != null
                 && AppConfigDataController.class.equals(resourceInfo.getResourceClass())
