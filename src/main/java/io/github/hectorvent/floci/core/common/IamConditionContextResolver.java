@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.core.common;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.athena.AthenaBatchQueryService;
 import io.github.hectorvent.floci.services.athena.AthenaPreparedStatementService;
 import io.github.hectorvent.floci.services.backup.BackupFrameworkResources;
 import io.github.hectorvent.floci.services.backup.BackupFrameworkService;
@@ -121,6 +122,7 @@ public class IamConditionContextResolver {
     private final EmulatorConfig config;
     private final CurrentVertxRequest currentVertxRequest;
     private final Clock clock;
+    private final Instance<AthenaBatchQueryService> athenaBatchQueryService;
     private final ResolvedServiceCatalog serviceCatalog;
 
     /**
@@ -142,9 +144,10 @@ public class IamConditionContextResolver {
                                        Instance<ElbV2ConditionKeys> elbV2ConditionKeys,
                                        Instance<LambdaService> lambdaService,
                                        Instance<AthenaPreparedStatementService> athenaPreparedStatements,
-                                       Instance<KinesisService> kinesisService) {
+                                       Instance<KinesisService> kinesisService,
+                                       Instance<AthenaBatchQueryService> athenaBatchQueryService) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys, lambdaService, athenaPreparedStatements, kinesisService);
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys, lambdaService, athenaPreparedStatements, kinesisService, athenaBatchQueryService);
     }
 
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -160,7 +163,7 @@ public class IamConditionContextResolver {
                                        Instance<SsmService> ssmService,
                                        Instance<ElbV2ConditionKeys> elbV2ConditionKeys) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys, null, null, null);
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys, null, null, null, null);
     }
 
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -174,7 +177,7 @@ public class IamConditionContextResolver {
                                        CurrentVertxRequest currentVertxRequest,
                                        ResolvedServiceCatalog serviceCatalog) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), null, null, null, null, null);
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), null, null, null, null, null, null);
     }
 
     IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -188,7 +191,7 @@ public class IamConditionContextResolver {
                                 CurrentVertxRequest currentVertxRequest,
                                 ResolvedServiceCatalog serviceCatalog, Clock clock) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, clock, null, null, null, null, null);
+                config, currentVertxRequest, serviceCatalog, clock, null, null, null, null, null, null);
     }
 
     private IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -205,7 +208,7 @@ public class IamConditionContextResolver {
                                         Instance<ElbV2ConditionKeys> elbV2ConditionKeys) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService,
                 requestContext, config, currentVertxRequest, serviceCatalog, clock,
-                ssmService, elbV2ConditionKeys, null, null, null);
+                ssmService, elbV2ConditionKeys, null, null, null, null);
     }
 
     private IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -222,7 +225,8 @@ public class IamConditionContextResolver {
                                         Instance<ElbV2ConditionKeys> elbV2ConditionKeys,
                                        Instance<LambdaService> lambdaService,
                                        Instance<AthenaPreparedStatementService> athenaPreparedStatements,
-                                       Instance<KinesisService> kinesisService) {
+                                       Instance<KinesisService> kinesisService,
+                                       Instance<AthenaBatchQueryService> athenaBatchQueryService) {
         this.dynamoDbFacade = dynamoDbFacade;
         this.ec2Service = ec2Service;
         this.s3Service = s3Service;
@@ -239,6 +243,7 @@ public class IamConditionContextResolver {
         this.currentVertxRequest = currentVertxRequest;
         this.clock = clock;
         this.serviceCatalog = serviceCatalog;
+        this.athenaBatchQueryService = athenaBatchQueryService;
     }
 
     private Map<String, List<String>> athenaPreparedStatementConditions(String action, ContainerRequestContext ctx) {
@@ -1248,6 +1253,30 @@ public class IamConditionContextResolver {
             }
         }
         return modes.isEmpty() ? List.of("NONE") : List.copyOf(modes);
+    }
+
+    record AthenaQueryTarget(String resource, Map<String, List<String>> context) {
+    }
+
+    static boolean athenaQueryAction(String action) {
+        if (action == null) {
+            return false;
+        }
+        return switch (action) {
+            case "athena:BatchGetQueryExecution", "athena:GetQueryExecution", "athena:GetQueryResults",
+                    "athena:StopQueryExecution", "athena:ListQueryExecutions" -> true;
+            default -> false;
+        };
+    }
+
+    List<AthenaQueryTarget> athenaQueryTargets(String action, JsonNode body,
+                                              String region, String account) {
+        if (!athenaQueryAction(action) || athenaBatchQueryService == null
+                || !athenaBatchQueryService.isResolvable()) {
+            return List.of();
+        }
+        return athenaBatchQueryService.get().authorizationTargets(action, region, account, body).stream()
+                .map(target -> new AthenaQueryTarget(target.resource(), target.context())).toList();
     }
 
     /** One transaction item keeps its action, table and condition keys together. */
