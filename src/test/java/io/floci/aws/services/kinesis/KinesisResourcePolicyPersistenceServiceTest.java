@@ -25,7 +25,7 @@ import java.util.Map;
 import static io.floci.aws.services.kinesis.KinesisResourcePolicyServiceTest.*;
 import static org.junit.jupiter.api.Assertions.*;
 
-class KinesisResourcePolicyPersistenceTest {
+class KinesisResourcePolicyPersistenceServiceTest {
     @ParameterizedTest
     @ValueSource(strings = {"persistent", "hybrid", "wal"})
     void resourceTagUpdatesAndBothPoliciesSurviveReload(String mode, @TempDir Path directory) {

@@ -12,6 +12,7 @@ import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.services.kinesis.model.KinesisConsumer;
 import io.floci.aws.services.kinesis.model.KinesisStream;
 
+import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
@@ -162,7 +163,7 @@ final class KinesisResourcePolicies {
                 return scoped.getForAccountMigratingLegacy(account, key, owner).filter(owner);
             }
             return scoped.getForAccount(account, key).filter(owner)
-                    .or(() -> scoped.getLegacyForAccount(account, key).filter(owner));
+                    .or(() -> scoped.getLegacyMatching(key, owner));
         }
         return store.get(key).filter(owner);
     }
@@ -230,6 +231,9 @@ final class KinesisResourcePolicies {
         if (policy == null || policy.isEmpty()) {
             throw invalid("Policy must be a nonempty string");
         }
+        if (policy.getBytes(StandardCharsets.UTF_8).length > 20 * 1024) {
+            throw invalid("Policy must not exceed 20 KB");
+        }
         JsonNode document;
         try {
             document = JSON.readTree(policy);
@@ -262,8 +266,13 @@ final class KinesisResourcePolicies {
         } else if (!strings(principal)) {
             throw invalid("Policy statement must name a principal");
         }
-        if (!strings(exclusive(statement, "Action", "NotAction"))) {
+        JsonNode actions = exclusive(statement, "Action", "NotAction");
+        if (!strings(actions)) {
             throw invalid("Policy statement must name an action");
+        }
+        if (actions.isTextual() ? actions.textValue().contains("*")
+                : actions.valueStream().anyMatch(value -> value.textValue().contains("*"))) {
+            throw invalid("Policy actions must not contain wildcards");
         }
         if ((statement.has("Resource") || statement.has("NotResource"))
                 && !strings(exclusive(statement, "Resource", "NotResource"))) {
