@@ -6,13 +6,20 @@ import io.github.hectorvent.floci.core.common.AwsQueryServiceResolver;
 import io.github.hectorvent.floci.core.common.ProtocolClaim;
 import io.github.hectorvent.floci.core.common.RequestResources;
 import io.github.hectorvent.floci.core.common.WireProtocol;
+import io.github.hectorvent.floci.services.apigateway.ApiGatewayController;
 import io.github.hectorvent.floci.services.appconfig.AppConfigDataController;
+import io.github.hectorvent.floci.services.backup.BackupFrameworkController;
+import io.github.hectorvent.floci.services.backup.BackupFrameworkResources;
+import io.github.hectorvent.floci.services.cloudfront.CloudFrontController;
 import io.github.hectorvent.floci.services.cloudfront.CloudFrontFunctionTestController;
 import io.github.hectorvent.floci.services.cloudfront.CloudFrontFunctionTestRoute;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbPartiQLParser;
 import io.github.hectorvent.floci.services.eks.EksController;
+import io.github.hectorvent.floci.services.iot.IotController;
+import io.github.hectorvent.floci.services.lambda.LambdaRuntimeManagementController;
 import io.github.hectorvent.floci.services.route53.Route53Controller;
 import io.github.hectorvent.floci.services.s3.S3ObjectActions;
+import io.github.hectorvent.floci.services.s3tables.S3TablesController;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.container.ResourceInfo;
@@ -44,11 +51,17 @@ import java.util.regex.Pattern;
 @ApplicationScoped
 public class IamActionRegistry {
 
-    private static final Map<String, String> ROUTE53_DELEGATION_ACTIONS = Map.of(
+    private static final Map<String, String> ROUTE53_ACTIONS = Map.of(
+            "testDnsAnswer", "route53:TestDNSAnswer",
             "createReusableDelegationSet", "route53:CreateReusableDelegationSet",
             "getReusableDelegationSet", "route53:GetReusableDelegationSet",
             "listReusableDelegationSets", "route53:ListReusableDelegationSets",
             "deleteReusableDelegationSet", "route53:DeleteReusableDelegationSet");
+
+    private static final Map<String, String> S3TABLES_METRICS_ACTIONS = Map.of(
+            "putTableBucketMetricsConfiguration", "s3tables:PutTableBucketMetricsConfiguration",
+            "getTableBucketMetricsConfiguration", "s3tables:GetTableBucketMetricsConfiguration",
+            "deleteTableBucketMetricsConfiguration", "s3tables:DeleteTableBucketMetricsConfiguration");
 
     private static final Logger LOG = Logger.getLogger(IamActionRegistry.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -98,6 +111,8 @@ public class IamActionRegistry {
      * type, so IAM checks them against the wildcard rather than a bucket.
      */
     private static final List<ActionRule> RULES = List.of(
+        rule("iot", "DELETE", "^/jobs/[^/]+/?$", "iot:DeleteJob"),
+
         // ── S3 Control ───────────────────────────────────────────────────────────
         s3ControlRule("GET",    "^/v20180820/tags/.+",        "s3:ListTagsForResource"),
         s3ControlRule("POST",   "^/v20180820/tags/.+",        "s3:TagResource"),
@@ -678,6 +693,70 @@ public class IamActionRegistry {
 
     /** The serving method identifies these actions even when path encoding or matrix parameters vary. */
     public String resolveMatchedRoute(String credentialScope, ResourceInfo resourceInfo) {
+        if ("apigateway".equals(credentialScope) && resourceInfo != null
+                && ApiGatewayController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && "importDocumentationParts".equals(resourceInfo.getResourceMethod().getName())) {
+            return "apigateway:PUT";
+        }
+        if ("apigateway".equals(credentialScope) && resourceInfo != null
+                && ApiGatewayController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && "testInvokeMethod".equals(resourceInfo.getResourceMethod().getName())) {
+            return "apigateway:POST";
+        }
+        if ("iot".equals(credentialScope) && resourceInfo != null
+                && IotController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && "deleteJob".equals(resourceInfo.getResourceMethod().getName())) {
+            return "iot:DeleteJob";
+        }
+        if ("eks".equals(credentialScope) && resourceInfo != null
+                && EksController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && "listAccessPolicies".equals(resourceInfo.getResourceMethod().getName())) {
+            return "eks:ListAccessPolicies";
+        }
+        if ("apigateway".equals(credentialScope) && resourceInfo != null
+                && ApiGatewayController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && ("getModelTemplate".equals(resourceInfo.getResourceMethod().getName())
+                || "getV2ModelTemplate".equals(resourceInfo.getResourceMethod().getName()))) {
+            return "apigateway:GET";
+        }
+        if ("cloudfront".equals(credentialScope) && resourceInfo != null
+                && CloudFrontController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            String action = switch (resourceInfo.getResourceMethod().getName()) {
+                case "getFieldLevelEncryption" -> "cloudfront:GetFieldLevelEncryption";
+                case "getFieldLevelEncryptionConfig" -> "cloudfront:GetFieldLevelEncryptionConfig";
+                case "getFieldLevelEncryptionProfile" -> "cloudfront:GetFieldLevelEncryptionProfile";
+                case "getFieldLevelEncryptionProfileConfig" -> "cloudfront:GetFieldLevelEncryptionProfileConfig";
+                default -> null;
+            };
+            if (action != null) {
+                return action;
+            }
+        }
+        if ("backup".equals(credentialScope) && resourceInfo != null
+                && BackupFrameworkController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            return BackupFrameworkController.iamAction(resourceInfo.getResourceMethod().getName());
+        }
+        if ("s3tables".equals(credentialScope) && resourceInfo != null
+                && S3TablesController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            return S3TABLES_METRICS_ACTIONS.get(resourceInfo.getResourceMethod().getName());
+        }
+        if ("lambda".equals(credentialScope) && resourceInfo != null
+                && LambdaRuntimeManagementController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            return switch (resourceInfo.getResourceMethod().getName()) {
+                case "getRuntimeManagementConfig" -> "lambda:GetRuntimeManagementConfig";
+                case "putRuntimeManagementConfig" -> "lambda:PutRuntimeManagementConfig";
+                default -> null;
+            };
+        }
         if ("cloudfront".equals(credentialScope) && resourceInfo != null
                 && CloudFrontFunctionTestController.class.equals(resourceInfo.getResourceClass())) {
             return "cloudfront:TestFunction";
@@ -695,7 +774,13 @@ public class IamActionRegistry {
         if ("route53".equals(credentialScope) && resourceInfo != null
                 && Route53Controller.class.equals(resourceInfo.getResourceClass())
                 && resourceInfo.getResourceMethod() != null) {
-            return ROUTE53_DELEGATION_ACTIONS.get(resourceInfo.getResourceMethod().getName());
+            return ROUTE53_ACTIONS.get(resourceInfo.getResourceMethod().getName());
+        }
+        if ("cloudfront".equals(credentialScope) && resourceInfo != null
+                && CloudFrontController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && "updateOriginAccessControl".equals(resourceInfo.getResourceMethod().getName())) {
+            return "cloudfront:UpdateOriginAccessControl";
         }
         return null;
     }
@@ -725,6 +810,12 @@ public class IamActionRegistry {
         // An S3 key may end in a slash, PUT /bucket// writes the key "/", and S3's rules already take a
         // bucket's one trailing slash, so an S3 path is matched as sent.
         String path = "s3".equals(credentialScope) ? sentPath(ctx.getUriInfo()) : routedPath(ctx);
+        if ("backup".equals(credentialScope)) {
+            String frameworkAction = BackupFrameworkResources.routeAction(method, decodedPath(ctx));
+            if (frameworkAction != null) {
+                return frameworkAction;
+            }
+        }
 
         if ("s3".equals(credentialScope)) {
             // An S3 Control route is matched before the query overrides below, which would read the

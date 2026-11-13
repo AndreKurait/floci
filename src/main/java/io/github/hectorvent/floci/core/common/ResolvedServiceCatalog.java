@@ -12,6 +12,7 @@ import io.github.hectorvent.floci.services.appsync.AppSyncController;
 import io.github.hectorvent.floci.services.appsync.graphql.AppSyncExecutionController;
 import io.github.hectorvent.floci.services.aps.ApsController;
 import io.github.hectorvent.floci.services.backup.BackupController;
+import io.github.hectorvent.floci.services.backup.BackupFrameworkController;
 import io.github.hectorvent.floci.services.batch.BatchController;
 import io.github.hectorvent.floci.services.bedrock.BedrockController;
 import io.github.hectorvent.floci.services.bedrockagentcore.BedrockAgentCoreController;
@@ -27,6 +28,7 @@ import io.github.hectorvent.floci.services.bedrockagentcorecontrol.BedrockAgentC
 import io.github.hectorvent.floci.services.bedrockruntime.BedrockRuntimeController;
 import io.github.hectorvent.floci.services.cloudfront.CloudFrontController;
 import io.github.hectorvent.floci.services.cloudfront.CloudFrontFunctionTestController;
+import io.github.hectorvent.floci.services.cloudfront.CloudFrontKeyValueStoreController;
 import io.github.hectorvent.floci.services.cloudfront.CloudFrontServingController;
 import io.github.hectorvent.floci.services.codeartifact.CodeArtifactController;
 import io.github.hectorvent.floci.services.codeartifact.CodeArtifactMavenController;
@@ -662,7 +664,7 @@ public class ResolvedServiceCatalog {
                         "backup", storageMode(config.storage().services().backup().mode(), config.storage().mode()),
                         config.storage().services().backup().flushIntervalMs(), null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("backup"), Set.of(), Set.of(BackupController.class))
+                        Set.of(), Set.of("backup"), Set.of(), Set.of(BackupController.class, BackupFrameworkController.class))
                         .withRequiredRestAuthentication(),
                 descriptor("resource-explorer-2", "resourceexplorer2",
                         config.services().resourceexplorer2().enabled(), true,
@@ -757,6 +759,13 @@ public class ResolvedServiceCatalog {
                         Set.of(), Set.of("cloudfront"), Set.of(),
                         Set.of(CloudFrontController.class, CloudFrontServingController.class, CloudFrontFunctionTestController.class))
                         .withRequiredRestAuthentication(Set.of(CloudFrontController.class, CloudFrontFunctionTestController.class)),
+                descriptor("cloudfront-keyvaluestore", "cloudfront-keyvaluestore",
+                        config.services().cloudfront().enabled(), true,
+                        null, null, 5000L, null, ServiceProtocol.REST_JSON,
+                        protocols(ServiceProtocol.REST_JSON),
+                        Set.of(), Set.of("cloudfront-keyvaluestore"), Set.of(),
+                        Set.of(CloudFrontKeyValueStoreController.class))
+                        .withRequiredRestAuthentication(),
                 descriptor("appsync", "appsync", config.services().appsync().enabled(), true,
                         "appsync", storageMode(config.storage().services().appsync().mode(), config.storage().mode()),
                         config.storage().services().appsync().flushIntervalMs(), null, ServiceProtocol.REST_JSON,

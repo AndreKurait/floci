@@ -12,16 +12,22 @@ import io.github.hectorvent.floci.core.common.ServicePrincipals;
 import io.github.hectorvent.floci.core.common.SigV4CredentialScope;
 import io.github.hectorvent.floci.core.common.StoredResourceArns;
 import io.github.hectorvent.floci.core.common.auth.SigV4Canonicalization;
+import io.github.hectorvent.floci.services.backup.BackupFrameworkResources;
+import io.github.hectorvent.floci.services.cloudformation.CloudFormationDriftService;
+import io.github.hectorvent.floci.services.cloudformation.CloudFormationDriftSnapshot;
 import io.github.hectorvent.floci.services.cloudfront.CloudFrontFunctionTestRoute;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.LogGroupTagTarget;
+import io.github.hectorvent.floci.services.cloudwatch.logs.LogTransformerTarget;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.eks.EksController;
 import io.github.hectorvent.floci.services.eks.EksService;
 import io.github.hectorvent.floci.services.kms.KmsService;
 import io.github.hectorvent.floci.services.lambda.LambdaArnUtils;
+import io.github.hectorvent.floci.services.lambda.LambdaRuntimeManagementReference;
 import io.github.hectorvent.floci.services.lambda.durable.DurableTokens;
 import io.github.hectorvent.floci.services.lambdamicrovms.LambdaMicrovmsService;
+import io.github.hectorvent.floci.services.neptune.NeptuneSnapshotResources;
 import io.github.hectorvent.floci.services.s3.S3ControlArnUtils;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
 import io.github.hectorvent.floci.services.sqs.SqsService;
@@ -61,6 +67,11 @@ public class ResourceArnBuilder {
 
     private static final Pattern ACCESS_POLICY_ARN = Pattern.compile(EksController.ACCESS_POLICY_ARN);
 
+    private static final Set<String> S3TABLES_METRICS_ACTIONS = Set.of(
+            "s3tables:PutTableBucketMetricsConfiguration",
+            "s3tables:GetTableBucketMetricsConfiguration",
+            "s3tables:DeleteTableBucketMetricsConfiguration");
+
     /** The only scheme IAM accepts on an OIDC provider URL, and the part its ARN drops. */
     private static final String OIDC_URL_SCHEME = "https://";
 
@@ -91,6 +102,9 @@ public class ResourceArnBuilder {
     private static final Set<String> SSM_RESOURCE_POLICY_ACTIONS =
             Set.of("PutResourcePolicy", "GetResourcePolicies", "DeleteResourcePolicy");
 
+    @Inject
+    Instance<CloudFormationDriftService> driftService;
+
     private final ObjectMapper objectMapper;
     /**
      * Looked up lazily through a provider: this builder is constructed by the enforcement filter,
@@ -112,6 +126,7 @@ public class ResourceArnBuilder {
     private final Instance<StoredResourceArns> storedResourceArns;
     private final Instance<StepFunctionsService> stepFunctionsService;
     private final Instance<Ec2Service> ec2Service;
+    private final Instance<NeptuneSnapshotResources> neptuneSnapshotResources;
 
     @Inject
     public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
@@ -121,7 +136,8 @@ public class ResourceArnBuilder {
                               Instance<KmsService> kmsService,
                               Instance<StoredResourceArns> storedResourceArns,
                               Instance<StepFunctionsService> stepFunctionsService,
-                              Instance<Ec2Service> ec2Service) {
+                              Instance<Ec2Service> ec2Service,
+                              Instance<NeptuneSnapshotResources> neptuneSnapshotResources) {
         this.objectMapper = objectMapper;
         this.iamService = iamService;
         this.secretsManagerService = secretsManagerService;
@@ -131,6 +147,17 @@ public class ResourceArnBuilder {
         this.storedResourceArns = storedResourceArns;
         this.stepFunctionsService = stepFunctionsService;
         this.ec2Service = ec2Service;
+        this.neptuneSnapshotResources = neptuneSnapshotResources;
+    }
+
+    public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
+                              Instance<SecretsManagerService> secretsManagerService,
+                              Instance<LambdaMicrovmsService> microvmsService,
+                              Instance<EksService> eksService, Instance<KmsService> kmsService,
+                              Instance<StoredResourceArns> storedResourceArns,
+                              Instance<StepFunctionsService> stepFunctionsService, Instance<Ec2Service> ec2Service) {
+        this(objectMapper, iamService, secretsManagerService, microvmsService, eksService, kmsService,
+                storedResourceArns, stepFunctionsService, ec2Service, null);
     }
 
     public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
@@ -223,6 +250,59 @@ public class ResourceArnBuilder {
         if (credentialScope == null) {
             return List.of("*");
         }
+        if ("iot".equals(credentialScope) && "iot:DeleteJob".equals(operation)) {
+            String jobId = ctx.getUriInfo().getPathParameters().getFirst("jobId");
+            return List.of(jobId == null ? "*"
+                    : AwsArnUtils.Arn.of("iot", region, accountId, "job/" + jobId).toString());
+        }
+        if ("cloudfront".equals(credentialScope) && operation != null && Set.of("cloudfront:GetFieldLevelEncryption",
+                "cloudfront:GetFieldLevelEncryptionConfig", "cloudfront:GetFieldLevelEncryptionProfile",
+                "cloudfront:GetFieldLevelEncryptionProfileConfig").contains(operation)) {
+            String id = ctx.getUriInfo().getPathParameters().getFirst("Id");
+            String type = operation.startsWith("cloudfront:GetFieldLevelEncryptionProfile")
+                    ? "field-level-encryption-profile/" : "field-level-encryption-config/";
+            return id == null ? List.of("*")
+                    : List.of(AwsArnUtils.Arn.global(partition, "cloudfront", accountId, type + id).toString());
+        }
+        if ("cloudfront".equals(credentialScope)
+                && "cloudfront:UpdateOriginAccessControl".equals(operation)) {
+            String id = ctx.getUriInfo().getPathParameters().getFirst("Id");
+            return List.of(id == null || id.isBlank() ? "*"
+                    : AwsArnUtils.Arn.global(partition, "cloudfront", accountId,
+                            "origin-access-control/" + id).toString());
+        }
+        if ("rds".equals(credentialScope) && NeptuneSnapshotResources.supports(operation) && neptuneSnapshotResources != null
+                && !neptuneSnapshotResources.isUnsatisfied()) {
+            Map<String, String> parameters = new LinkedHashMap<>();
+            for (String member : List.of("Engine", "DBClusterIdentifier", "DBClusterSnapshotIdentifier",
+                    "SnapshotIdentifier", "DBClusterParameterGroupName", "DBSubnetGroupName")) {
+                String value = firstFormParam(ctx, member);
+                if (value != null) {
+                    parameters.put(member, value);
+                }
+            }
+            Optional<List<String>> resources = neptuneSnapshotResources.get().resolve(operation,
+                    parameters, partition, region, accountId);
+            if (resources.isPresent()) {
+                return resources.get();
+            }
+        }
+        if ("backup".equals(credentialScope) && BackupFrameworkResources.matches(operation, ctx, readJsonBody(ctx))) {
+            return BackupFrameworkResources.arns(operation, ctx, readJsonBody(ctx), partition, region, accountId,
+                    storedResourceArns("backup"));
+        }
+        if ("s3tables".equals(credentialScope) && operation != null && S3TABLES_METRICS_ACTIONS.contains(operation)) {
+            String bucketArn = ctx.getUriInfo().getPathParameters().getFirst("tableBucketARN");
+            return AwsArnUtils.isArnFor(bucketArn, "s3tables")
+                    && AwsArnUtils.parse(bucketArn).resource().startsWith("bucket/")
+                    ? List.of(bucketArn) : List.of("*");
+        }
+        if ("kinesis".equals(credentialScope) && operation != null && Set.of("kinesis:GetResourcePolicy",
+                "kinesis:PutResourcePolicy", "kinesis:DeleteResourcePolicy").contains(operation)) {
+            JsonNode body = readJsonBody(ctx);
+            String resource = body == null ? null : body.path("ResourceARN").asText(null);
+            return List.of(resource == null || resource.isEmpty() ? "*" : resource);
+        }
         if ("cloudfront".equals(credentialScope) && "cloudfront:TestFunction".equals(operation)) {
             return List.of(AwsArnUtils.Arn.global(partition, "cloudfront", accountId,
                     "function/" + CloudFrontFunctionTestRoute.name(ctx)).toString());
@@ -234,6 +314,41 @@ public class ResourceArnBuilder {
             String resource = body == null || stepFunctionsService == null || stepFunctionsService.isUnsatisfied()
                     ? null : stepFunctionsService.get().callbackResourceArn(body.path("taskToken").asText(null), accountId);
             return List.of(resource == null ? "*" : resource);
+        }
+        if ("eks".equals(credentialScope) && "eks:UpdateAccessEntry".equals(operation)) {
+            String[] updatePath = IamActionRegistry.routedPath(ctx).substring(1).split("/", 4);
+            if (eksService == null || updatePath.length != 4 || !"clusters".equals(updatePath[0])
+                    || !"access-entries".equals(updatePath[2])) {
+                return List.of("*");
+            }
+            return List.of(eksService.get().findAccessEntryUpdateTarget(pathSegment(updatePath[1]), pathSegment(updatePath[3]))
+                    .map(entry -> entry.accessEntryArn()).orElse("*"));
+        }
+        if ("ec2".equals(credentialScope)) {
+            if ("ec2:DescribePlacementGroups".equals(operation)) {
+                return List.of("*");
+            }
+            if ("ec2:CreatePlacementGroup".equals(operation) || "ec2:DeletePlacementGroup".equals(operation)) {
+                String name = firstFormParam(ctx, "GroupName");
+                return name == null || name.isBlank() ? List.of("*")
+                        : List.of(new AwsArnUtils.Arn(partition, "ec2", region, accountId,
+                                "placement-group/" + name).toString());
+            }
+        }
+        if ("lambda:GetRuntimeManagementConfig".equals(operation)
+                || "lambda:PutRuntimeManagementConfig".equals(operation)) {
+            return List.of(runtimeManagementArn(ctx, region, accountId));
+        }
+        if ("cloudformation".equals(credentialScope) && CloudFormationDriftService.handles(operation)) {
+            if ("cloudformation:DescribeStackDriftDetectionStatus".equals(operation)) {
+                return List.of("*");
+            }
+            if (driftService == null || !driftService.isResolvable()) {
+                return List.of("*");
+            }
+            CloudFormationDriftSnapshot stack = driftService.get().authorizationTarget(
+                    firstFormParam(ctx, "StackName"), region, accountId);
+            return List.of(stack.stackId() == null ? "*" : stack.stackId());
         }
         if (operation != null && operation.startsWith(credentialScope + ":") && RequestResources.reads(operation)) {
             return namedResources(credentialScope, operation, ctx, region, accountId, partition);
@@ -343,15 +458,23 @@ public class ResourceArnBuilder {
     /** Uses the serving operation and the same raw names as the handler. */
     public List<String> buildLogResources(String action, ContainerRequestContext ctx,
                                           String region, String accountId, String partition) {
+        if (LogTransformerTarget.supports(action)) {
+            JsonNode body = readJsonBody(ctx);
+            String identifier = body == null ? null : body.path("logGroupIdentifier").asText(null);
+            return List.of(LogTransformerTarget.resolve(identifier, region, accountId, partition).arn());
+        }
+        if ("logs:TestTransformer".equals(action)) {
+            return List.of("*");
+        }
         // Operations the vendored table reads (the vended-log delivery family) take their resources from it.
-        if (RequestResources.reads(action)) {
+        if (!"logs:CreateExportTask".equals(action) && RequestResources.reads(action)) {
             return namedResources("logs", action, ctx, region, accountId, partition);
         }
         boolean stream = "logs:CreateLogStream".equals(action) || "logs:DeleteLogStream".equals(action)
                 || "logs:PutLogEvents".equals(action);
         boolean group = switch (action) {
             case "logs:CreateLogGroup", "logs:DeleteLogGroup", "logs:PutRetentionPolicy",
-                    "logs:DeleteRetentionPolicy" -> true;
+                    "logs:DeleteRetentionPolicy", "logs:CreateExportTask" -> true;
             default -> false;
         };
         if (!stream && !group && !LogGroupTagTarget.supports(action)) {
@@ -371,7 +494,8 @@ public class ResourceArnBuilder {
         }
         String name = body.path("logGroupName").asText();
         String resource = "log-group:" + name + (stream
-                ? ":log-stream:" + body.path("logStreamName").asText() : ":*");
+                ? ":log-stream:" + body.path("logStreamName").asText()
+                : "logs:CreateExportTask".equals(action) ? "" : ":*");
         return List.of(new AwsArnUtils.Arn(partition, "logs", region, accountId, resource).toString());
     }
 
@@ -1012,6 +1136,9 @@ public class ResourceArnBuilder {
         if (path.endsWith("/code-signing-config")) {
             return codeSigningFunctionArn(name, region, accountId);
         }
+        if (path.startsWith("/2024-08-31/functions/") && path.endsWith("/recursion-config")) {
+            return recursionFunctionArn(name, region, accountId);
+        }
         boolean qualifiedTarget = path.endsWith("/functions/" + name + "/invocations")
                 || path.endsWith("/functions/" + name + "/response-streaming-invocations")
                 || path.endsWith("/functions/" + name + "/provisioned-concurrency");
@@ -1039,6 +1166,22 @@ public class ResourceArnBuilder {
         }
     }
 
+    private String runtimeManagementArn(ContainerRequestContext ctx, String region, String accountId) {
+        String reference = ctx.getUriInfo().getPathParameters().getFirst("functionName");
+        if (reference == null) {
+            reference = extractSegmentAfter(IamActionRegistry.decodedPath(ctx), "functions");
+        }
+        try {
+            return LambdaRuntimeManagementReference.resolve(reference,
+                    ctx.getUriInfo().getQueryParameters().getFirst("Qualifier"), region, accountId)
+                    .authorizationArn();
+        } catch (AwsException expected) {
+            // Preserve a malformed or foreign identifier for policy matching; the service refuses it.
+            return AwsArnUtils.looksLikeArn(reference) ? reference
+                    : AwsArnUtils.Arn.of("lambda", region, accountId, "function:" + reference).toString();
+        }
+    }
+
     /** Code-signing attachment routes use Lambda's broader NamespacedFunctionName shape. */
     private static String codeSigningFunctionArn(String name, String region, String accountId) {
         try {
@@ -1050,6 +1193,15 @@ public class ResourceArnBuilder {
         }
     }
 
+    private static String recursionFunctionArn(String name, String region, String accountId) {
+        try {
+            LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolveUnqualifiedFunctionName(name);
+            return AwsArnUtils.Arn.of("lambda", region, accountId, "function:" + ref.name()).toString();
+        } catch (AwsException e) {
+            // The handler rejects malformed references before reading or mutating a function.
+            return AwsArnUtils.Arn.of("lambda", region, accountId, "function:" + name).toString();
+        }
+    }
     /**
      * The function {@code CreateFunction} makes, which its body names, in the caller's account and Region, as
      * every route but an invoke acts there: the Service Reference gives it the {@code function} resource, so
@@ -1320,6 +1472,11 @@ public class ResourceArnBuilder {
      * stays escaped, so a segment cannot pass for more than one.
      */
     private static String buildApiGatewayArn(ContainerRequestContext ctx, String region, String partition) {
+        return new AwsArnUtils.Arn(partition, "apigateway", region, "", apiGatewayResourcePath(ctx)).toString();
+    }
+
+    /** Canonical routed API Gateway resource path, shared with its read-only tag lookup. */
+    public static String apiGatewayResourcePath(ContainerRequestContext ctx) {
         String[] raw = IamActionRegistry.routedPath(ctx).split("/", -1);
         List<String> segments = new ArrayList<>();
         for (int i = 1; i < raw.length; i++) {
@@ -1338,14 +1495,13 @@ public class ResourceArnBuilder {
         }
         if (segments.size() > 1 && segments.getFirst().equals(API_GATEWAY_TAGS_SEGMENT)) {
             String tagged = String.join("/", segments.subList(1, segments.size()));
-            return new AwsArnUtils.Arn(partition, "apigateway", region, "",
-                    "/" + API_GATEWAY_TAGS_SEGMENT + "/" + SigV4Canonicalization.uriEncode(tagged)).toString();
+            return "/" + API_GATEWAY_TAGS_SEGMENT + "/" + SigV4Canonicalization.uriEncode(tagged);
         }
         StringJoiner resource = new StringJoiner("/", "/", "");
         for (String segment : segments) {
             resource.add(segment.replace("%", "%25").replace("/", "%2F"));
         }
-        return new AwsArnUtils.Arn(partition, "apigateway", region, "", resource.toString()).toString();
+        return resource.toString();
     }
 
     /**
