@@ -3,6 +3,8 @@ package io.github.hectorvent.floci.core.common;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.cloudformation.CloudFormationDriftService;
+import io.github.hectorvent.floci.services.cloudformation.CloudFormationDriftSnapshot;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.LogGroupTagTarget;
@@ -97,6 +99,9 @@ public class IamConditionContextResolver {
     static final String REQUEST_AUTH_TYPE = "lambda:Request/WebFunctionAuthType";
     static final String RESOURCE_AUTH_TYPE = "lambda:Resource/WebFunctionAuthType";
 
+    @Inject
+    Instance<CloudFormationDriftService> driftService;
+
     private final Instance<DynamoDbFacade> dynamoDbFacade;
     private final Instance<Ec2Service> ec2Service;
     private final Instance<S3Service> s3Service;
@@ -190,6 +195,7 @@ public class IamConditionContextResolver {
     public Map<String, List<String>> resolve(String credentialScope, String action,
                                              ContainerRequestContext ctx) {
         return switch (credentialScope) {
+            case "cloudformation" -> driftConditionContext(action, ctx);
             case "s3" -> s3ConditionContext(action, ctx);
             case "ec2" -> ec2ConditionContext(action, ctx);
             case "elasticloadbalancing" -> elbV2Contexts(action, ctx).stream().findFirst().orElse(null);
@@ -272,6 +278,21 @@ public class IamConditionContextResolver {
     }
 
     /** Group mutations and stream access use the handler's group and request scope. */
+    private Map<String, List<String>> driftConditionContext(String action, ContainerRequestContext ctx) {
+        if (!CloudFormationDriftService.handles(action)
+                || "cloudformation:DescribeStackDriftDetectionStatus".equals(action)
+                || driftService == null || !driftService.isResolvable()) {
+            return null;
+        }
+        String account = requestContext.getAccountId() == null ? config.defaultAccountId() : requestContext.getAccountId();
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        CloudFormationDriftSnapshot stack = driftService.get().authorizationTarget(
+                formParameters(ctx).get("StackName"), region, account);
+        Map<String, List<String>> context = new LinkedHashMap<>();
+        stack.tags().forEach((key, value) -> context.put("aws:ResourceTag/" + key, List.of(value)));
+        return context;
+    }
+
     private Map<String, List<String>> logsConditionContext(String action, ContainerRequestContext ctx) {
         if (!("logs:CreateLogStream".equals(action) || "logs:DeleteLogStream".equals(action)
                 || "logs:PutLogEvents".equals(action)
