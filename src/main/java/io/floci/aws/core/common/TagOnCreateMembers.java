@@ -89,6 +89,7 @@ final class TagOnCreateMembers {
         if (!operations.isObject() || operations.isEmpty()) {
             throw new IllegalStateException(RESOURCE_NAME + " carries no operations");
         }
+        validatePartialNamespaces(document, operations);
         Map<String, Entry> entries = new LinkedHashMap<>();
         Set<String> byHand = new LinkedHashSet<>();
         Set<String> notRead = new LinkedHashSet<>();
@@ -135,6 +136,40 @@ final class TagOnCreateMembers {
                 Set.copyOf(document.path("notCovered").propertyStream().map(Map.Entry::getKey).toList()),
                 Set.copyOf(document.path("otherNamespaces").valueStream().map(JsonNode::asText).toList()),
                 Map.copyOf(resourceArns));
+    }
+
+    /** Partial REST coverage is an exact operation set, never a namespace-wide fallback. */
+    private static void validatePartialNamespaces(JsonNode document, JsonNode operations) {
+        JsonNode partial = document.get("partialNamespaces");
+        if (partial == null) {
+            return;
+        }
+        if (!partial.isObject()) {
+            throw new IllegalStateException(RESOURCE_NAME + " partialNamespaces must be an object");
+        }
+        partial.properties().forEach(entry -> {
+            String namespace = entry.getKey();
+            JsonNode names = entry.getValue();
+            if (!document.path("namespaces").has(namespace) || !names.isArray() || names.isEmpty()) {
+                throw new IllegalStateException(RESOURCE_NAME + " has invalid partial namespace " + namespace);
+            }
+            Set<String> selected = new LinkedHashSet<>();
+            for (JsonNode name : names) {
+                if (!name.isTextual() || !name.textValue().matches("[A-Za-z][A-Za-z0-9]*")
+                        || !selected.add(namespace + ":" + name.textValue())) {
+                    throw new IllegalStateException(RESOURCE_NAME + " has invalid partial operation names for " + namespace);
+                }
+            }
+            Set<String> present = new LinkedHashSet<>();
+            operations.properties().forEach(operation -> {
+                if (operation.getKey().startsWith(namespace + ":")) {
+                    present.add(operation.getKey());
+                }
+            });
+            if (!selected.equals(present)) {
+                throw new IllegalStateException(RESOURCE_NAME + " partial namespace does not match its operations: " + namespace);
+            }
+        });
     }
 
     private static Member member(String operation, JsonNode member) {

@@ -78,12 +78,32 @@
     "LocationUri",
     "ApplicationId"
   ],
+  "AWS::AppConfig::Deployment": [
+    "ApplicationId",
+    "ConfigurationProfileId",
+    "ConfigurationVersion",
+    "DeploymentStrategyId",
+    "Description",
+    "DynamicExtensionParameters",
+    "EnvironmentId",
+    "KmsKeyIdentifier",
+    "Tags"
+  ],
   "AWS::AppConfig::DeploymentStrategy": [
     "Name",
     "ReplicateTo"
   ],
   "AWS::AppConfig::Environment": [
     "ApplicationId"
+  ],
+  "AWS::AppConfig::HostedConfigurationVersion": [
+    "ApplicationId",
+    "ConfigurationProfileId",
+    "Content",
+    "ContentType",
+    "Description",
+    "LatestVersionNumber",
+    "VersionLabel"
   ],
   "AWS::AppSync::ApiKey": [
     "ApiId"

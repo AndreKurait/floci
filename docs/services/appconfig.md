@@ -7,9 +7,32 @@ the calling account and region. Persisted records from older versions that did n
 record a region remain available only in `floci.default-region`. New writes store
 their region explicitly in all storage modes.
 
+With IAM enforcement enabled, AppConfig and AppConfigData requests require the
+caller's `appconfig:` permissions. Scoped policies use canonical resource IDs even
+when the request uses names. Configuration sessions authorize both creation and
+polling against the application/environment/configuration ARN; a denied poll does
+not consume its token. Passing retrieval or monitor roles also requires
+`iam:PassRole` for the AppConfig service. IAM enforcement remains disabled by default.
+
+Tagged `CreateApplication` and `CreateDeploymentStrategy` requests also require
+`appconfig:TagResource` on `application/*` or `deploymentstrategy/*` in the request's
+partition, account and Region. Both the create action and tagging action evaluate
+`aws:RequestTag` and `aws:TagKeys` conditions. An untagged create needs only its create
+permission. This tag-on-create admission currently covers these two operations;
+child-resource and deployment creation tags remain outside this admission scope.
+
 ## Management Plane (AppConfig)
 
 The management plane allows you to create and manage applications, environments, configuration profiles, and hosted configuration versions.
+
+Hosted versions accept a case-sensitive `VersionLabel` of 1–64 characters containing at least
+one non-numeric character. Labels are unique among versions still stored in the profile and
+are returned by create, get and list. Deleting a version releases its label.
+`LatestVersionNumber` checks the highest version currently stored (zero for an empty profile);
+a mismatch returns `ConflictException` without creating a version. Version numbers continue
+increasing after deletion and persist across restart. Lists support `MaxResults`, `NextToken`,
+and exact or trailing-asterisk prefix label filters. A label filter excludes unlabeled versions.
+Hosted deployment and validation requests still select configurations by numeric version.
 
 ### Supported Operations
 
@@ -26,8 +49,10 @@ The management plane allows you to create and manage applications, environments,
 - `GetConfigurationProfile`
 - `ListConfigurationProfiles`
 - `DeleteConfigurationProfile`
+- `ValidateConfiguration`
 - `CreateHostedConfigurationVersion`
 - `GetHostedConfigurationVersion`
+- `ListHostedConfigurationVersions`
 - `DeleteHostedConfigurationVersion`
 - `CreateDeploymentStrategy`
 - `GetDeploymentStrategy`
@@ -53,10 +78,52 @@ returns `ResourceNotFoundException`.
 Only hosted configurations are served: a deployed version with no hosted configuration version behind it,
 such as one from an S3 or SSM source, returns `ResourceNotFoundException`.
 
+`CreateConfigurationProfile` stores up to two `Validators`, each with a `Type` and `Content`
+of at most 32,768 characters. Hosted freeform profiles support inline `JSON_SCHEMA` validators
+using draft-04, including references within the schema. `ValidateConfiguration` checks the
+selected hosted version and returns HTTP 204 when it passes; invalid content or an invalid
+schema returns `BadRequestException`. Validation leaves the stored profile and versions unchanged.
+`StartDeployment` applies the same validators before creating a deployment or changing the active
+configuration, so a refusal preserves the previous deployment and content. With IAM enforcement
+enabled, validation requires `appconfig:ValidateConfiguration` on both the application and
+configuration-profile ARNs.
+
+Other schema drafts and external schema references are not supported. JSON Schema validators
+are refused for feature-flag profiles. Validation of S3 and other external configuration sources
+is not implemented. The CloudFormation provisioner still
+ignores the template's `Validators`; these validators are configured through the management API.
+
+Hosted profiles also support `LAMBDA` validators naming a function ARN. Both validation and deployment
+invoke the function with five string fields: `applicationId`, `configurationProfileId`,
+`configurationVersion`, base64-encoded `content`, and `uri` set to `hosted`. The event uses the resolved
+resource IDs and numeric hosted version. An ordinary return value, including `false` or an error-shaped
+JSON object, succeeds; a Lambda function error refuses validation with `BadRequestException`.
+With IAM enforcement enabled, the function's resource policy must allow `appconfig.amazonaws.com`
+to invoke it. Source conditions receive the exact configuration-profile ARN and the calling account.
+
+The validation wait has a 15-second budget, including invocation startup. A function already running
+when that budget expires may finish later; its result cannot publish a deployment or active content.
+Floci tracks at most 32 outstanding validator invocations per process and refuses reset while any remain.
+Explicit process shutdown requests worker interruption and waits up to five seconds for them to drain;
+that shutdown behavior is separate from an ordinary validation timeout. Lambda validation of external
+configuration sources is not supported.
+
 `CreateEnvironment` keeps up to five `Monitors`, each a CloudWatch `AlarmArn` with an optional IAM role
 `AlarmRoleArn`, and environment reads return them; an environment created without monitors returns none.
-Floci does not evaluate the alarms or trigger automatic rollback. More than five monitors, or an `AlarmRoleArn`
-that is not an IAM role ARN, returns `BadRequestException`.
+More than five monitors, or an `AlarmRoleArn` that is not an IAM role ARN, returns `BadRequestException`.
+Before starting a deployment, Floci checks every configured alarm in the deployment's account, Region and
+partition. A missing or unreadable monitor returns `BadRequestException` before deployment or active-content
+changes. With IAM enforcement enabled, configure an explicit monitoring role that trusts AppConfig and
+allows `cloudwatch:DescribeAlarms`. Metric alarms use their ARN and stored resource tags for authorization;
+composite alarms require wildcard resource permission. Role permissions boundaries and SCPs also apply.
+Default monitoring-role discovery is not implemented.
+
+During rollout and final bake, enabled alarms in `ALARM` or `INSUFFICIENT_DATA` trigger automatic rollback
+to the previous available hosted configuration. A background worker advances deployments without requiring
+deployment-status reads. Disabled alarm actions suppress rollback. The returned `EventLog` contains
+`ROLLBACK_COMPLETED` and `ROLLBACK_STARTED`, newest first, identifying the alarm and its state. Monitoring
+ends at the captured rollout-plus-bake deadline; a delayed worker completes an elapsed deployment before
+checking its alarms. The polling interval does not guarantee an AWS response-time bound.
 `StartDeployment` and `GetDeployment` return the deployed profile's name and location URI as
 `ConfigurationName` and `ConfigurationLocationUri`. Deployments stored by earlier Floci versions did not
 record them, so on those neither is set.
@@ -67,10 +134,12 @@ A deployment stored by an earlier Floci version returns no strategy settings fro
 `ListDeployments` reports the strategy's current settings while the strategy exists.
 A configuration profile created without `Type` reports no type, as AWS documents no default.
 
-Configuration content becomes available immediately. A positive `FinalBakeTimeInMinutes`
-keeps the deployment in `BAKING` at 100 percent until that time has elapsed; get and list
-readback then report `COMPLETE`. Started and completed timestamps use the API's ISO 8601
-format and survive restart. Gradual per-client rollout and alarm evaluation are not implemented.
+Configuration content becomes available immediately. A positive `DeploymentDurationInMinutes` starts
+the deployment in `DEPLOYING` at zero percent, with captured LINEAR or EXPONENTIAL growth steps.
+After rollout, a positive `FinalBakeTimeInMinutes` keeps it in `BAKING` at 100 percent until the final
+deadline, then it becomes `COMPLETE`. Started and completed timestamps use the API's ISO 8601 format
+and survive restart; completion records the scheduled deadline. Gradual per-client distribution,
+extension ticks and external configuration retrieval are not implemented.
 
 `StopDeployment` with `AllowRevert=true` returns an in-progress deployment as `ROLLED_BACK`
 or a completed deployment as `REVERTED`, restoring the previous available configuration
@@ -80,6 +149,7 @@ If the previous hosted configuration version has been deleted, the stop is rejec
 with `BadRequestException` before changing the active version or stopping the deployment.
 Older persisted deployments without completion timestamps cannot be reverted because
 that window cannot be verified.
+Explicit stop/revert bypasses alarm reads, so an unhealthy or deleted monitor does not prevent recovery.
 
 ## Data Plane (AppConfigData) {#data-plane}
 
@@ -109,9 +179,25 @@ Floci provisions these resource types:
 - `AWS::AppConfig::Environment`
 - `AWS::AppConfig::ConfigurationProfile`
 - `AWS::AppConfig::DeploymentStrategy`
+- `AWS::AppConfig::HostedConfigurationVersion`
+- `AWS::AppConfig::Deployment`
 
-`Ref` returns the AppConfig ID of each, which `Fn::GetAtt` also returns as `ApplicationId`, `EnvironmentId`,
+For the first four types, `Ref` returns the AppConfig ID, which `Fn::GetAtt` also returns as `ApplicationId`, `EnvironmentId`,
 `ConfigurationProfileId` and `Id`. A configuration profile's `KmsKeyArn` is not set.
+
+Deployment `Ref` and public physical IDs return the deployment number as a string. Resource descriptions,
+lists, events and change-set previews use that number; deletion and rollback retain the full stored identity.
+
+Deployment creation waits for AppConfig's `COMPLETE` state through rollout and final bake.
+`Fn::GetAtt DeploymentNumber` is a string, and `State` reports completion. The wait is
+interruptible and bounded to 24 hours. Changing deployment properties starts a replacement.
+
+Stack deletion and failed updates use `StopDeployment` with `AllowRevert=true`.
+Deleting a displaced deployment preserves a newer deployment. Already reverted deployments
+and deployments outside their 72-hour revert window need no further change. Other failures,
+including unavailable prior configuration content, remain cleanup failures.
+`KmsKeyIdentifier`, `DynamicExtensionParameters`, and deployment `Tags` are rejected.
+Configuration distribution retains the management service's existing behavior.
 
 An update that changes only mutable properties keeps the ID and changes the resource in place: the name and
 description of an application, environment or configuration profile, an environment's `Monitors`, an application's
@@ -126,7 +212,18 @@ Deleting an environment deletes its deployments, and deleting a configuration pr
 versions. Floci keeps tags on applications only, so `Tags` on the other three types are accepted and not stored, as
 `TagResource` treats them; so are a configuration profile's `KmsKeyIdentifier`, `RetrievalRoleArn` and `Validators`,
 and `DeletionProtectionCheck`. `ReplicateTo: SSM_DOCUMENT` writes no SSM document.
-`AWS::AppConfig::HostedConfigurationVersion`, `Deployment`, `Extension` and `ExtensionAssociation` are not provisioned.
+Hosted configuration versions retain their application, profile and version identity for deletion and rollback.
+CFN resource descriptions, resource lists, events and change-set previews expose the version number as
+the public physical ID. Different profiles can both report `1` while their stored ownership remains distinct.
+Use `StackName` for resource reads; numeric hosted IDs are not resolved by `PhysicalResourceId`-only stack lookup.
+`Ref` and `Fn::GetAtt VersionNumber` return the version number as a string. Changing a hosted version property
+creates a replacement; rollback removes the attempted version, while retention policies preserve versions whose
+parent profile remains.
+The hosted provider accepts `VersionLabel` and `LatestVersionNumber`; each is a replacement property.
+An empty CloudFormation label creates an unlabeled version and remains an empty property in the stack template.
+The locking token checks the highest currently stored version before creation. Failed creates consume no number;
+a version created and then removed by rollback leaves an allocation gap. Outputs-only updates retain the version.
+`AWS::AppConfig::Extension` and `ExtensionAssociation` are not provisioned.
 
 A stack created before Floci provisioned these types holds stubs for them, and an update creates the real resource in
 place of a stub only when it changes that resource. An update that changes an environment or configuration profile of

@@ -356,6 +356,19 @@
     ],
     "account": [],
     "apigateway": [],
+    "appconfig": [
+      "CreateApplication",
+      "CreateDeploymentStrategy",
+      "CreateExtension",
+      "CreateExtensionAssociation",
+      "GetAccountSettings",
+      "ListApplications",
+      "ListDeploymentStrategies",
+      "ListExperimentDefinitions",
+      "ListExtensionAssociations",
+      "ListExtensions",
+      "UpdateAccountSettings"
+    ],
     "cloudfront": [
       "CreateAnycastIpList",
       "CreateCachePolicy",
