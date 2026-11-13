@@ -4,7 +4,8 @@
 A REST request is authorized by its route: `IamActionRegistry` maps the HTTP method and path to the
 IAM action, by its rules first and then by these routes, and a route neither maps is left unchecked.
 This vendors, for each operation of the models below, its HTTP method and request URI exactly as the
-SDKs send them. A request no rule maps is the operation whose route it matches, checked as the action
+SDKs send them, plus the explicit access-denied HTTP status of each model when it declares one.
+A request no rule maps is the operation whose route it matches, checked as the action
 `iam-authorized-actions.json` names for it, or as its own; `IamRestRouteCoverageTest` builds a
 request on each route and compares the action the registry gives with that one.
 
@@ -73,6 +74,7 @@ MODELS: dict[str, str] = {
     "macie2": "macie2",
     "opensearch": "es",
     "pipes": "pipes",
+    "quicksight": "quicksight",
     "ram": "ram",
     "resource-explorer-2": "resource-explorer-2",
     "s3": "s3",

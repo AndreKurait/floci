@@ -32,6 +32,35 @@ class RequestResourcesTest {
     private static final String MACHINE = "arn:aws:states:us-east-1:000000000000:stateMachine:orders";
 
     @Test
+    void quickSightAccountCustomizationCreatedTarget() {
+        assertQuickSightCreatedTarget("CreateAccountCustomization", "", "customization/*");
+    }
+
+    @Test
+    void quickSightDataSourceCreatedTarget() {
+        assertQuickSightCreatedTarget("CreateDataSource", "DataSourceId", "datasource/resource");
+    }
+
+    @Test
+    void quickSightOAuthClientCreatedTarget() {
+        assertQuickSightCreatedTarget("CreateOAuthClientApplication", "OAuthClientApplicationId", "oauthClientApplication/resource");
+    }
+
+    @Test
+    void quickSightVpcConnectionCreatedTarget() {
+        assertQuickSightCreatedTarget("CreateVPCConnection", "VPCConnectionId", "vpcConnection/resource");
+    }
+
+    private void assertQuickSightCreatedTarget(String name, String member, String resource) {
+        String operation = "quicksight:" + name;
+        ContainerRequestContext request = json(member.isEmpty() ? "{}" : "{\"" + member + "\":\"resource\"}");
+        assertTrue(RequestResources.actsOnNoResource(operation), operation);
+        assertEquals(List.of(), of(operation, request), operation);
+        assertEquals(List.of("arn:aws:quicksight:us-east-1:000000000000:" + resource),
+                RequestResources.created(operation, request, "aws", "us-east-1", "000000000000", Map.of()), operation);
+    }
+
+    @Test
     void signerProfileTagsUseTheCreatedArnWhileTheCreateRemainsGlobal() {
         ContainerRequestContext request = rest("PUT", "{\"platformId\":\"AWSLambda-SHA384-ECDSA\"}", Map.of());
         when(request.getUriInfo().getRequestUri()).thenReturn(URI.create("http://localhost/signing-profiles/profile"));
@@ -1171,6 +1200,10 @@ class RequestResourcesTest {
                 json("{\"SubscriptionArn\":\"" + subscription + "\",\"MonitorArnList\":["
                         + "\"arn:aws:ce::000000000000:anomalymonitor/monitor\"]}")));
 
+        assertEquals(List.of(prefix + "quicksight:us-east-1:000000000000:dashboard/dashboard"),
+                RequestResources.of("quicksight:UpdateDashboardLinks", json("{\"LinkEntities\":["
+                        + "\"arn:aws:quicksight:us-east-1:000000000000:analysis/analysis\"]}"),
+                        "aws", "us-east-1", "000000000000", null, Map.of("DashboardId", "dashboard")));
         String application = prefix + "sso::000000000000:application/ssoins-1234567890123456/apl-1234567890123456";
         assertEquals(List.of(application), of("sso:PutApplicationAccessScope",
                 json("{\"ApplicationArn\":\"" + application + "\",\"AuthorizedTargets\":["

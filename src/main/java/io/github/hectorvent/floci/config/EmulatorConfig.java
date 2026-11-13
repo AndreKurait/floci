@@ -923,6 +923,7 @@ public interface EmulatorConfig {
         EfsServiceConfig efs();
         CodeGuruReviewerServiceConfig codegurureviewer();
         CodeArtifactServiceConfig codeartifact();
+        QuickSightServiceConfig quicksight();
         MarketplaceServiceConfig marketplace();
         DmsServiceConfig dms();
     }
@@ -1086,6 +1087,14 @@ public interface EmulatorConfig {
     interface CodeGuruReviewerServiceConfig {
         @WithDefault("true")
         boolean enabled();
+    }
+
+    interface QuickSightServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        /** Public origin used by browser embedding clients. */
+        Optional<String> embedBaseUrl();
     }
 
     interface MarketplaceServiceConfig {

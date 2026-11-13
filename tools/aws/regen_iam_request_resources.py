@@ -175,7 +175,7 @@ NAMESPACES = (
     "codebuild", "codepipeline", "cognito-identity", "cognito-idp", "controlcatalog", "controltower", "cur",
     "datasync", "ec2", "ecr", "elasticloadbalancing", "elasticmapreduce", "emr-serverless", "es", "events",
     "firehose", "fis", "globalaccelerator", "guardduty", "inspector2", "kinesisanalytics", "macie2", "oam",
-    "payment-cryptography", "ram", "redshift", "redshift-data", "rekognition", "resource-explorer-2",
+    "payment-cryptography", "quicksight", "ram", "redshift", "redshift-data", "rekognition", "resource-explorer-2",
     "securityhub", "servicediscovery", "servicequotas", "signer", "sso", "states", "swf", "textract", "timestream-influxdb",
     "translate",
 )
@@ -325,6 +325,21 @@ CORRECTIONS: dict[str, tuple[list[dict], str]] = {
             "ApplicationId": "Application", "ConfigurationProfileId": "Configuration"}},
     ], "the legacy data API takes application, environment and configuration profile IDs or names in its path; "
        "their fields omit the Id suffix, and AppConfig resolves names to the stored IDs before IAM evaluation"),
+    "quicksight:CreateDataSet": ([{"types": ["datasource"], "arn": f"PhysicalTableMap{{}}.{kind}.DataSourceArn"}
+                                 for kind in ("S3Source", "RelationalTable", "CustomSql", "SaaSTable", "FileSource")],
+                                "CreateDataSet acts on each data source named by its physical tables; "
+                                "FolderArns and RowLevelPermissionDataSet.Arn name other resource types"),
+    "quicksight:CreateDashboard": ([{"type": "dashboard", "fill": {"ResourceId": "DashboardId"}}],
+                                   "DashboardId names the created dashboard; FolderArns and ThemeArn name "
+                                   "other resource types and are not dashboard ARN selectors"),
+    **{f"quicksight:{operation}": ([{"type": "ingestion", "fill": {"DatasetId": "DataSetId", "ResourceId": "IngestionId"}}],
+                                   "the ingestion ARN contains its dataset id and ingestion id, named by "
+                                   "DataSetId and IngestionId in the REST path")
+       for operation in ("CreateIngestion", "DescribeIngestion")},
+    **{f"quicksight:{operation}": ([{"type": "user", "fill": {}, "find": ["AwsAccountId", "Namespace", "UserName"]}],
+                                   "the user ARN ends in namespace/user-name, which the reference combines as "
+                                   "ResourceId; QuickSight resolves it from the account, namespace and user name")
+       for operation in ("RegisterUser", "DescribeUser")},
     "logs:PutDeliverySource": ([{"type": "delivery-source", "fill": {"DeliverySourceName": "name"}}],
                                "resourceArn is the ARN of the resource that sends the logs (an event bus, a load "
                                "balancer), never the delivery source's, which the request names by name"),
@@ -1419,7 +1434,7 @@ def _named(value: object) -> set[str]:
         return set().union(*(_named(key) | _named(item) for key, item in value.items())) if value else set()
     if isinstance(value, list):
         return set().union(*(_named(item) for item in value)) if value else set()
-    return {re.split(r"[\[.]", value, maxsplit=1)[0]} if isinstance(value, str) else set()
+    return {re.split(r"[\[{.]", value, maxsplit=1)[0]} if isinstance(value, str) else set()
 
 
 def with_found(resources: list[dict], namespace: str, types: list[str], members: dict[str, str]) -> list[dict]:

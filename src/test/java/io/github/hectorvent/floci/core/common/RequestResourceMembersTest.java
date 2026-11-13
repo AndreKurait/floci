@@ -377,6 +377,7 @@ class RequestResourceMembersTest {
                     });
                     // A member the table locates in a REST request's path or query goes there, where the reader takes it
                     // from, and the body and the form give it another value, which names nothing.
+                    // REST map selectors have no Query form encoding, so they are checked only as JSON.
                     Map<String, String> located = table.located().getOrDefault(operation.getKey(), Map.of());
                     Map<String, String> labels = new LinkedHashMap<>();
                     MultivaluedMap<String, String> query = new MultivaluedHashMap<>();

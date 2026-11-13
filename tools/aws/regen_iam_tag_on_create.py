@@ -119,6 +119,7 @@ NOT_COVERED = {
     "inspector2": _NO_ROUTES, "iot": _NO_ROUTES, "kafka": _NO_ROUTES,
     "mq": _NO_ROUTES,
     "rum": _NO_ROUTES, "s3tables": _NO_ROUTES,
+    "quicksight": "metadata-only REST subset; creation-tag IAM authorization is not implemented",
     "s3": "authorized by route; S3 checks s3:PutObjectTagging for an object it creates with tags itself",
     "servicecatalog": "its operations that tag are AppRegistry's, whose REST routes no rule maps yet",
 }

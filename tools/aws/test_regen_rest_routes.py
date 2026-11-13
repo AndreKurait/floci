@@ -128,6 +128,9 @@ def test_denial_status_comes_from_the_declared_error_shape(status):
         "Unused": {"type": "structure", "exception": True,
                    "error": {"code": "AccessDeniedException", "httpStatusCode": 499}},
     }
+    doc = r.build({"quicksight": service}, "botocore test")
+    assert doc["models"]["quicksight"]["accessDeniedStatus"] == status
+    assert json.loads(r.render(doc))["models"]["quicksight"]["accessDeniedStatus"] == status
     doc = r.build({"lambda": service}, "botocore test")
     assert doc["models"]["lambda"]["accessDeniedStatus"] == status
     assert json.loads(r.render(doc))["models"]["lambda"]["accessDeniedStatus"] == status
@@ -137,6 +140,8 @@ def test_a_non_denial_error_does_not_supply_the_denial_status():
     service = model("rest-json", "2020-01-01", GetThing=("GET", "/things/{Name}"))
     service["operations"]["GetThing"]["errors"] = [{"shape": "ValidationException"}]
     service["shapes"] = {"ValidationException": {"error": {"httpStatusCode": 400}}}
+    doc = r.build({"quicksight": service}, "botocore test")
+    assert "accessDeniedStatus" not in doc["models"]["quicksight"]
     doc = r.build({"lambda": service}, "botocore test")
     assert "accessDeniedStatus" not in doc["models"]["lambda"]
 

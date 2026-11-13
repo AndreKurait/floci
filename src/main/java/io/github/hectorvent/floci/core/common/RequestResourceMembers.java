@@ -60,8 +60,8 @@ final class RequestResourceMembers {
     private static final Set<String> DEFAULT_KEYS = Set.of("type", "fill", "when", "default", "endpoint");
 
     /**
-     * A top-level request member that holds a string, or a list of them when {@code list}, or, with a
-     * {@code field}, a structure or a list of them, of which that field is read.
+     * A request selector that holds a string, an array when {@code list}, or map values when {@code map}.
+     * With a {@code field}, reads that field from each selected structure.
      */
     record Member(String name, boolean list, Member field, boolean map) {
 
@@ -525,7 +525,7 @@ final class RequestResourceMembers {
         return !member.list() && (member.field() == null || !member.field().list());
     }
 
-    /** A member holding an ARN: {@code Name}, {@code Name[]}, or a field of it, {@code Name.Field} or {@code Name[].Field}. */
+    /** A possibly nested ARN selector; {@code []} reads array elements and {@code {}} reads map values. */
     private static Member arnMember(String operation, String path) {
         if (!ARN_MEMBER.matcher(path).matches()) {
             throw new IllegalStateException(RESOURCE_NAME + " reads " + operation + " at " + path + ", which is no member");
