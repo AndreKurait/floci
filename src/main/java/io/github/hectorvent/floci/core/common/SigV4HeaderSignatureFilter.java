@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.services.apigateway.ApiGatewayAwsExecuteContro
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayExecuteController;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayUserRequestController;
 import io.github.hectorvent.floci.services.appsync.graphql.AppSyncExecutionController;
+import io.github.hectorvent.floci.services.cloudfront.CloudFrontFunctionTestController;
 import io.github.hectorvent.floci.services.iam.DerivedSigningKeyController;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.RequestBodyReader;
@@ -231,6 +232,11 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
         if (defaultAgent && !"codedeploy-commands".equals(scope.service())) {
             signatureDoesNotMatch(ctx, resource, "Credential should be scoped to correct service: "
                     + "'codedeploy-commands'");
+            return;
+        }
+        if (resource != null && CloudFrontFunctionTestController.class.isAssignableFrom(resource)
+                && !"cloudfront".equals(scope.service())) {
+            signatureDoesNotMatch(ctx, resource, "Credential should be scoped to correct service: 'cloudfront'");
             return;
         }
         if (!SigV4RequestValidator.containsHeader(signed.signedHeaders(), "host")) {

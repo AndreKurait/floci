@@ -1529,9 +1529,20 @@ public class ContainerLifecycleManager implements ContainerTeardown {
             hostConfig.withPrivileged(true);
         }
         LinuxOptions linux = spec.linuxOptions();
-        if (linux.apparmorProfile() != null) {
-            hostConfig.withSecurityOpts(List.of("apparmor=" + linux.apparmorProfile()));
+        if (linux.pidsLimit() != null) {
+            hostConfig.withPidsLimit(linux.pidsLimit());
         }
+        List<String> securityOptions = new ArrayList<>();
+        if (linux.apparmorProfile() != null) {
+            securityOptions.add("apparmor=" + linux.apparmorProfile());
+        }
+        if (linux.noNewPrivileges()) {
+            securityOptions.add("no-new-privileges:true");
+        }
+        if (!securityOptions.isEmpty()) {
+            hostConfig.withSecurityOpts(securityOptions);
+        }
+
         if (linux.pidMode() != null && !linux.pidMode().isBlank()) {
             hostConfig.withPidMode(linux.pidMode());
         }
