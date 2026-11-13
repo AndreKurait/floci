@@ -1,11 +1,11 @@
-package io.floci.aws.services.cloudformation;
+package io.github.hectorvent.floci.services.cloudformation;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import io.floci.aws.core.common.XmlParser;
-import io.floci.aws.testing.AwsTestClients;
-import io.floci.aws.testing.CfnStackWaits;
-import io.floci.aws.testing.RestAssuredJsonUtils;
+import io.github.hectorvent.floci.core.common.XmlParser;
+import io.github.hectorvent.floci.testing.AwsTestClients;
+import io.github.hectorvent.floci.testing.CfnStackWaits;
+import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.http.ContentType;
 import io.restassured.path.json.JsonPath;
@@ -23,7 +23,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
-import static io.floci.aws.testing.CfnRequests.cfn;
+import static io.github.hectorvent.floci.testing.CfnRequests.cfn;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasKey;
@@ -90,56 +90,67 @@ class CloudFormationAppConfigIntegrationTest {
     @Test
     void aStackCreatesTheFourTypesAndItsDeleteRemovesThemWithTheirVersionsAndDeployments() throws Exception {
         String stack = unique("cfn-appconfig-create");
+        String monitorArn = "arn:aws:cloudwatch:us-east-1:000000000000:alarm:" + stack;
         Map<String, Object> resources = first();
+        resources.put("Monitor", Map.of("Type", "AWS::CloudWatch::Alarm", "Properties", props(
+                "AlarmName", stack, "ActionsEnabled", false, "Namespace", "AppConfigFixture",
+                "MetricName", "Errors", "Statistic", "Sum", "Period", 60,
+                "EvaluationPeriods", 1, "ComparisonOperator", "GreaterThanThreshold", "Threshold", 1)));
+        properties(resources, "Env").put("Monitors", List.of(
+                Map.of("AlarmArn", Map.of("Fn::GetAtt", List.of("Monitor", "Arn")))));
         resources.put("Untyped", Map.of("Type", "AWS::AppConfig::ConfigurationProfile", "Properties",
                 Map.of("ApplicationId", ref("App"), "Name", "untyped", "LocationUri", "hosted")));
-        deploy("CreateStack", stack, template(resources, false));
-        assertStatus(stack, "CREATE_COMPLETE");
+        try {
+            deploy("CreateStack", stack, template(resources, false));
+            assertStatus(stack, "CREATE_COMPLETE");
 
-        Map<String, String> outputs = outputs(stack);
-        Map<String, String> physicalIds = physicalIds(stack);
-        for (String resource : RESOURCES) {
-            assertEquals(outputs.get(resource + "Ref"), outputs.get(resource + "Id"), resource);
-            assertEquals(physicalIds.get(resource), outputs.get(resource + "Ref"), resource);
+            Map<String, String> outputs = outputs(stack);
+            Map<String, String> physicalIds = physicalIds(stack);
+            for (String resource : RESOURCES) {
+                assertEquals(outputs.get(resource + "Ref"), outputs.get(resource + "Id"), resource);
+                assertEquals(physicalIds.get(resource), outputs.get(resource + "Ref"), resource);
+            }
+            String app = outputs.get("AppRef");
+            String env = outputs.get("EnvRef");
+            String profile = outputs.get("ProfileRef");
+            String strategy = outputs.get("StrategyRef");
+            String envPath = "/applications/" + app + "/environments/" + env;
+            String profilePath = "/applications/" + app + "/configurationprofiles/" + profile;
+
+            appconfig().get("/applications/" + app).then().statusCode(200)
+                    .body("Name", equalTo("orders"), "Description", equalTo("Order service"));
+            assertEquals(Map.of("team", "payments", "tier", "gold"), applicationTags(app));
+            appconfig().get(envPath).then().statusCode(200)
+                    .body("Name", equalTo("beta"), "Monitors[0].AlarmArn", equalTo(monitorArn))
+                    .body("Monitors[0]", not(hasKey("AlarmRoleArn")));
+            appconfig().get(profilePath).then().statusCode(200)
+                    .body("Name", equalTo("settings"), "LocationUri", equalTo("hosted"), "Type", equalTo("AWS.Freeform"));
+            appconfig().get("/applications/" + app + "/configurationprofiles/" + physicalIds.get("Untyped"))
+                    .then().statusCode(200).body("Type", equalTo("AWS.Freeform"));
+            appconfig().get("/deploymentstrategies/" + strategy).then().statusCode(200)
+                    .body("Name", equalTo("gradual"), "DeploymentDurationInMinutes", equalTo(0),
+                            "FinalBakeTimeInMinutes", equalTo(0), "GrowthFactor", equalTo(100f),
+                            "GrowthType", equalTo("LINEAR"), "ReplicateTo", equalTo("NONE"));
+
+            // The stack's resources work together: a hosted version deploys with the stack's strategy.
+            appconfig().body("{\"enabled\":true}").post(profilePath + "/hostedconfigurationversions")
+                    .then().statusCode(201).header("Version-Number", equalTo("1"));
+            int deployment = appconfig().body(Map.of("ConfigurationProfileId", profile, "ConfigurationVersion", "1",
+                            "DeploymentStrategyId", strategy))
+                    .post(envPath + "/deployments").then().statusCode(201)
+                    .body("ConfigurationName", equalTo("settings"), "ConfigurationLocationUri", equalTo("hosted"))
+                    .extract().path("DeploymentNumber");
+
+            deleteStack(stack);
+            appconfig().get(envPath + "/deployments/" + deployment).then().statusCode(404);
+            appconfig().get(envPath).then().statusCode(404);
+            appconfig().get(profilePath + "/hostedconfigurationversions/1").then().statusCode(404);
+            appconfig().get(profilePath).then().statusCode(404);
+            appconfig().get("/deploymentstrategies/" + strategy).then().statusCode(404);
+            appconfig().get("/applications/" + app).then().statusCode(404);
+        } finally {
+            deleteStack(stack);
         }
-        String app = outputs.get("AppRef");
-        String env = outputs.get("EnvRef");
-        String profile = outputs.get("ProfileRef");
-        String strategy = outputs.get("StrategyRef");
-        String envPath = "/applications/" + app + "/environments/" + env;
-        String profilePath = "/applications/" + app + "/configurationprofiles/" + profile;
-
-        appconfig().get("/applications/" + app).then().statusCode(200)
-                .body("Name", equalTo("orders"), "Description", equalTo("Order service"));
-        assertEquals(Map.of("team", "payments", "tier", "gold"), applicationTags(app));
-        appconfig().get(envPath).then().statusCode(200)
-                .body("Name", equalTo("beta"), "Monitors[0].AlarmArn", equalTo(ALARM))
-                .body("Monitors[0]", not(hasKey("AlarmRoleArn")));
-        appconfig().get(profilePath).then().statusCode(200)
-                .body("Name", equalTo("settings"), "LocationUri", equalTo("hosted"), "Type", equalTo("AWS.Freeform"));
-        appconfig().get("/applications/" + app + "/configurationprofiles/" + physicalIds.get("Untyped"))
-                .then().statusCode(200).body("Type", equalTo("AWS.Freeform"));
-        appconfig().get("/deploymentstrategies/" + strategy).then().statusCode(200)
-                .body("Name", equalTo("gradual"), "DeploymentDurationInMinutes", equalTo(0),
-                        "FinalBakeTimeInMinutes", equalTo(0), "GrowthFactor", equalTo(100f),
-                        "GrowthType", equalTo("LINEAR"), "ReplicateTo", equalTo("NONE"));
-
-        // The stack's resources work together: a hosted version deploys with the stack's strategy.
-        appconfig().body("{\"enabled\":true}").post(profilePath + "/hostedconfigurationversions")
-                .then().statusCode(201).header("Version-Number", equalTo("1"));
-        int deployment = appconfig().body(Map.of("ConfigurationProfileId", profile, "ConfigurationVersion", "1",
-                        "DeploymentStrategyId", strategy))
-                .post(envPath + "/deployments").then().statusCode(201)
-                .body("ConfigurationName", equalTo("settings"), "ConfigurationLocationUri", equalTo("hosted"))
-                .extract().path("DeploymentNumber");
-
-        deleteStack(stack);
-        appconfig().get(envPath + "/deployments/" + deployment).then().statusCode(404);
-        appconfig().get(envPath).then().statusCode(404);
-        appconfig().get(profilePath + "/hostedconfigurationversions/1").then().statusCode(404);
-        appconfig().get(profilePath).then().statusCode(404);
-        appconfig().get("/deploymentstrategies/" + strategy).then().statusCode(404);
-        appconfig().get("/applications/" + app).then().statusCode(404);
     }
 
     @Test

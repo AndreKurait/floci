@@ -1,4 +1,4 @@
-package io.floci.aws.services.appconfig.model;
+package io.github.hectorvent.floci.services.appconfig.model;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;

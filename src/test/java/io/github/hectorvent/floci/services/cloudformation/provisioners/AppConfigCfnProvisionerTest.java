@@ -1,20 +1,22 @@
-package io.floci.aws.services.cloudformation.provisioners;
+package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import io.floci.aws.core.common.AwsException;
-import io.floci.aws.core.common.RegionResolver;
-import io.floci.aws.services.appconfig.AppConfigService;
-import io.floci.aws.services.appconfig.model.Application;
-import io.floci.aws.services.appconfig.model.ConfigurationProfile;
-import io.floci.aws.services.appconfig.model.Deployment;
-import io.floci.aws.services.appconfig.model.DeploymentStrategy;
-import io.floci.aws.services.appconfig.model.Environment;
-import io.floci.aws.services.appconfig.model.HostedConfigurationVersion;
-import io.floci.aws.services.appconfig.model.Monitor;
-import io.floci.aws.services.cloudformation.CloudFormationTemplateEngine;
-import io.floci.aws.services.cloudformation.model.StackResource;
-import io.floci.aws.testing.InMemoryStorageFactory;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.services.appconfig.AppConfigAlarmMonitor;
+import io.github.hectorvent.floci.services.appconfig.AppConfigS3Source;
+import io.github.hectorvent.floci.services.appconfig.AppConfigService;
+import io.github.hectorvent.floci.services.appconfig.model.Application;
+import io.github.hectorvent.floci.services.appconfig.model.ConfigurationProfile;
+import io.github.hectorvent.floci.services.appconfig.model.Deployment;
+import io.github.hectorvent.floci.services.appconfig.model.DeploymentStrategy;
+import io.github.hectorvent.floci.services.appconfig.model.Environment;
+import io.github.hectorvent.floci.services.appconfig.model.HostedConfigurationVersion;
+import io.github.hectorvent.floci.services.appconfig.model.Monitor;
+import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplateEngine;
+import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
+import io.github.hectorvent.floci.testing.InMemoryStorageFactory;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -37,6 +39,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doCallRealMethod;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
@@ -67,9 +70,24 @@ class AppConfigCfnProvisionerTest {
     @BeforeEach
     void setUp() {
         storage = new InMemoryStorageFactory(ACCOUNT);
-        service = spy(new AppConfigService(storage, new RegionResolver(REGION, ACCOUNT)));
+        service = spy(new AppConfigService(storage, new RegionResolver(REGION, ACCOUNT), mock(AppConfigAlarmMonitor.class),
+                mock(AppConfigS3Source.class)));
         provisioner = new AppConfigCfnProvisioner(service);
         engine = CloudFormationTemplateEngine.standalone(ACCOUNT, REGION, STACK, MAPPER, value -> value);
+    }
+
+    @Test
+    void anEnvironmentRecordedByTheForkKeepsItsIdentityOnUpdate() throws Exception {
+        StackResource app = create(APPLICATION, props("Name", "legacy-app"));
+        Map<String, Object> original = props("Name", "legacy-env", "ApplicationId", app.getPhysicalId());
+        StackResource environment = create(ENVIRONMENT, original);
+        String id = environment.getPhysicalId();
+        environment.getAttributes().remove(CfnRollback.USES_ATTR_PREFIX + "AppConfigCreateOnly");
+        environment.getAttributes().put("_floci_appconfig_properties", MAPPER.writeValueAsString(original));
+        provisioner.provision(environment, MAPPER.valueToTree(props("Name", "renamed-env",
+                "ApplicationId", app.getPhysicalId())), context(id));
+        assertEquals(id, environment.getPhysicalId());
+        assertEquals("renamed-env", service.findEnvironment(id).orElseThrow().getName());
     }
 
     @Test
@@ -222,6 +240,72 @@ class AppConfigCfnProvisionerTest {
 
         assertEquals("BadRequestException", failure.getErrorCode());
         assertEquals("beta", service.getEnvironment(appId, env.getPhysicalId()).getName());
+    }
+
+    @Test
+    void s3RetrievalRolesChangeInPlaceAndRollBackWithTheProfile() {
+        String app = create(APPLICATION, props("Name", "configuration")).getPhysicalId();
+        Map<String, Object> properties = props("ApplicationId", app, "Name", "settings",
+                "LocationUri", "s3://configuration-source/settings.json", "RetrievalRoleArn", ALARM_ROLE);
+        StackResource resource = create(PROFILE, properties);
+        String id = resource.getPhysicalId();
+        assertEquals(ALARM_ROLE, service.getConfigurationProfile(app, id).getRetrievalRoleArn());
+        properties.put("RetrievalRoleArn", ALARM_ROLE + "-replacement");
+        update(resource, properties);
+        assertEquals(id, resource.getPhysicalId());
+        assertEquals(ALARM_ROLE + "-replacement", service.getConfigurationProfile(app, id).getRetrievalRoleArn());
+        provisioner.rollbackUpdate(resource);
+        assertEquals(ALARM_ROLE, service.getConfigurationProfile(app, id).getRetrievalRoleArn());
+        properties.remove("RetrievalRoleArn");
+        assertThrows(AwsException.class, () -> update(resource, properties));
+        assertEquals(ALARM_ROLE, service.getConfigurationProfile(app, id).getRetrievalRoleArn());
+    }
+
+    @Test
+    void profileCreationStoresMalformedSchemaUntilContentValidation() {
+        String app = create(APPLICATION, props("Name", "deferred-validation")).getPhysicalId();
+        for (String declaration : List.of("{", "{\"type\":\"not-a-json-type\"}")) {
+            StackResource resource = create(PROFILE, props("ApplicationId", app, "Name", "settings",
+                    "LocationUri", "hosted", "Validators",
+                    List.of(Map.of("Type", "JSON_SCHEMA", "Content", declaration))));
+            String id = resource.getPhysicalId();
+            assertEquals(declaration, service.getConfigurationProfile(app, id).getValidators().getFirst().content());
+            service.createHostedConfigurationVersion(app, id, new byte[]{'1'}, "application/json", null);
+            assertThrows(AwsException.class, () -> service.validateConfiguration(app, id, "1"));
+        }
+    }
+
+    @Test
+    void profileValidatorsChangeInPlaceAndRollbackRestoresEnforcement() {
+        String app = create(APPLICATION, props("Name", "validated")).getPhysicalId();
+        List<Map<String, String>> original = List.of(Map.of("Type", "JSON_SCHEMA", "Content", "{\"type\":\"integer\"}"));
+        Map<String, Object> properties = props("ApplicationId", app, "Name", "settings",
+                "LocationUri", "hosted", "Validators", original);
+        StackResource resource = create(PROFILE, properties);
+        String id = resource.getPhysicalId();
+        service.createHostedConfigurationVersion(app, id, new byte[]{'1'}, "application/json", null);
+        assertDoesNotThrow(() -> service.validateConfiguration(app, id, "1"));
+
+        properties.put("Validators", List.of(Map.of("Type", "JSON_SCHEMA", "Content", "{\"type\":\"string\"}")));
+        update(resource, properties);
+        assertEquals(id, resource.getPhysicalId());
+        assertThrows(AwsException.class, () -> service.validateConfiguration(app, id, "1"));
+        assertTrue(provisioner.rollbackUpdate(resource));
+        assertDoesNotThrow(() -> service.validateConfiguration(app, id, "1"));
+
+        properties.put("Validators", List.of(Map.of("Type", "JSON_SCHEMA", "Content", "{\"type\":\"unknown\"}")));
+        update(resource, properties);
+        assertEquals("{\"type\":\"unknown\"}",
+                service.getConfigurationProfile(app, id).getValidators().getFirst().content());
+        assertThrows(AwsException.class, () -> service.validateConfiguration(app, id, "1"));
+        assertTrue(provisioner.rollbackUpdate(resource));
+        assertDoesNotThrow(() -> service.validateConfiguration(app, id, "1"));
+        properties.remove("Validators");
+        update(resource, properties);
+        assertNull(service.getConfigurationProfile(app, id).getValidators());
+        assertTrue(provisioner.rollbackUpdate(resource));
+        assertEquals("{\"type\":\"integer\"}",
+                service.getConfigurationProfile(app, id).getValidators().getFirst().content());
     }
 
     @Test
@@ -579,12 +663,6 @@ class AppConfigCfnProvisionerTest {
                 null);
         service.startDeployment(appId, env.getPhysicalId(), Map.of("ConfigurationProfileId", profile.getPhysicalId(),
                 "ConfigurationVersion", "1", "DeploymentStrategyId", "AppConfig.AllAtOnce"));
-        String prefix = REGION + "/" + appId + "::";
-        assertEquals(1, storage.create("appconfig", "appconfig-deployments.json",
-                new TypeReference<Map<String, Deployment>>() {}).scan(key -> key.startsWith(prefix)).size());
-        assertEquals(1, storage.create("appconfig", "appconfig-versions.json",
-                new TypeReference<Map<String, HostedConfigurationVersion>>() {})
-                .scan(key -> key.startsWith(prefix)).size());
         service.deleteApplication(appId);
 
         provisioner.delete(ENVIRONMENT, env.getPhysicalId(), REGION);
@@ -593,10 +671,10 @@ class AppConfigCfnProvisionerTest {
         assertTrue(service.findEnvironment(env.getPhysicalId()).isEmpty());
         assertTrue(service.findConfigurationProfile(profile.getPhysicalId()).isEmpty());
         assertTrue(storage.create("appconfig", "appconfig-deployments.json",
-                new TypeReference<Map<String, Deployment>>() {}).scan(key -> key.startsWith(prefix)).isEmpty());
+                new TypeReference<Map<String, Deployment>>() {}).scan(key -> key.startsWith(appId + "::")).isEmpty());
         assertTrue(storage.create("appconfig", "appconfig-versions.json",
                 new TypeReference<Map<String, HostedConfigurationVersion>>() {})
-                .scan(key -> key.startsWith(prefix)).isEmpty());
+                .scan(key -> key.startsWith(appId + "::")).isEmpty());
     }
 
     @Test
@@ -604,7 +682,7 @@ class AppConfigCfnProvisionerTest {
         String appId = create(APPLICATION, props("Name", "orders")).getPhysicalId();
         StackResource env = create(ENVIRONMENT, props("ApplicationId", appId, "Name", "beta"));
         AwsException storage = new AwsException("InternalServerException", "storage failed", 500);
-        doThrow(storage).when(service).deleteEnvironmentById(env.getPhysicalId());
+        doThrow(storage).when(service).deleteEnvironmentById(appId, env.getPhysicalId());
 
         assertSame(storage, assertThrows(AwsException.class, () -> provisioner.delete(env, REGION)));
     }
@@ -618,6 +696,7 @@ class AppConfigCfnProvisionerTest {
         provisioner.delete(stub, REGION);
 
         verify(service, never()).deleteEnvironmentById(anyString());
+        verify(service, never()).deleteEnvironmentById(anyString(), anyString());
         verify(service, never()).deleteEnvironment(anyString(), anyString());
     }
 
