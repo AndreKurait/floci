@@ -325,8 +325,9 @@ class ApiGatewayV2WebSocketDataPlaneTest {
     void chatStyleBroadcast() throws Exception {
         Assumptions.assumeTrue(lambdaAvailable, "Lambda dispatch required");
 
-        String broadcastFn = createLambda("broadcast", BROADCAST_HANDLER,
-                Map.of("FLOCI_ENDPOINT", "http://host.docker.internal:4566"));
+        // Floci injects FLOCI_ENDPOINT into the function; the host gateway does not reach a
+        // port published on loopback only.
+        String broadcastFn = createLambda("broadcast", BROADCAST_HANDLER);
         String echoFn = createLambda("bc-echo", ECHO_HANDLER);
         String apiId = createWsApi("broadcast");
 
