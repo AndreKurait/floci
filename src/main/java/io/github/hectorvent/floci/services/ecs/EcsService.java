@@ -449,6 +449,14 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
         stopManagedContainers();
     }
 
+    /** Waits for the current pass before any owner drains shared containers or networking. */
+    @Override
+    public void beginTeardown() {
+        synchronized (reconciliationPassLock) {
+            reconciler.shutdownNow();
+        }
+    }
+
     /**
      * Stops the Docker containers of all still-running tasks on emulator shutdown and on a
      * state reset. Task state is transient (memory-only), so without this the containers
@@ -460,13 +468,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
      */
     @Override
     public void stopManagedContainers() {
-        ScheduledExecutorService current = reconciler;
-        current.shutdownNow();
-        try {
-            current.awaitTermination(2, TimeUnit.SECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        }
+        beginTeardown();
         drainTaskStopper();
         try (ExecutorService shutdownStopper = newTaskStopper()) {
             List<CompletableFuture<Void>> stops = new ArrayList<>();
@@ -5346,6 +5348,9 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
 
     void reconcile() {
         synchronized (reconciliationPassLock) {
+            if (reconciler.isShutdown()) {
+                return;
+            }
             try {
                 retryPreviousRunTaskVolumes();
             } catch (Exception e) {
@@ -5810,6 +5815,9 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
 
     void reconcileServices() {
         synchronized (reconciliationPassLock) {
+            if (reconciler.isShutdown()) {
+                return;
+            }
             for (Map.Entry<String, EcsServiceModel> entry : services.entrySet()) {
                 try {
                     reconcileService(entry.getKey(), entry.getValue());
