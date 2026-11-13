@@ -26,6 +26,7 @@ import io.github.hectorvent.floci.services.apigateway.model.MethodResponse;
 import io.github.hectorvent.floci.services.apigateway.model.MethodSetting;
 import io.github.hectorvent.floci.services.apigateway.model.RequestValidator;
 import io.github.hectorvent.floci.services.apigateway.model.RestApi;
+import io.github.hectorvent.floci.services.apigateway.model.TestInvokeMethodResult;
 import io.github.hectorvent.floci.services.apigateway.model.UsagePlan;
 import io.github.hectorvent.floci.services.apigateway.model.UsagePlanKey;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2OpenApiImporter;
@@ -79,18 +80,21 @@ public class ApiGatewayController {
     private final RegionResolver regionResolver;
     private final ObjectMapper objectMapper;
     private final RestLambdaAuthorizer restLambdaAuthorizer;
+    private final ApiGatewayExecuteController executeController;
 
     @Inject
     public ApiGatewayController(ApiGatewayService service, ApiGatewayV2Service v2Service,
                                 ApiGatewayV2OpenApiImporter v2OpenApiImporter,
                                 RegionResolver regionResolver, ObjectMapper objectMapper,
-                                RestLambdaAuthorizer restLambdaAuthorizer) {
+                                RestLambdaAuthorizer restLambdaAuthorizer,
+                                ApiGatewayExecuteController executeController) {
         this.service = service;
         this.v2Service = v2Service;
         this.v2OpenApiImporter = v2OpenApiImporter;
         this.regionResolver = regionResolver;
         this.objectMapper = objectMapper;
         this.restLambdaAuthorizer = restLambdaAuthorizer;
+        this.executeController = executeController;
     }
 
     @DELETE
@@ -516,6 +520,17 @@ public class ApiGatewayController {
     }
 
     // ──────────────────────────── Methods (v1) ────────────────────────────
+
+    @POST
+    @Path("/restapis/{apiId}/resources/{resourceId}/methods/{httpMethod}")
+    public TestInvokeMethodResult testInvokeMethod(@Context HttpHeaders headers,
+                                                   @PathParam("apiId") String apiId,
+                                                   @PathParam("resourceId") String resourceId,
+                                                   @PathParam("httpMethod") String httpMethod,
+                                                   JsonNode request) {
+        return executeController.testInvokeMethod(regionResolver.resolveRegion(headers),
+                apiId, resourceId, httpMethod, request);
+    }
 
     @PUT
     @Path("/restapis/{apiId}/resources/{resourceId}/methods/{httpMethod}")
@@ -1201,6 +1216,16 @@ public class ApiGatewayController {
                              @PathParam("modelName") String modelName) {
         String region = regionResolver.resolveRegion(headers);
         return Response.ok(toModelNode(service.getModel(region, apiId, modelName)).toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @GET
+    @Path("/restapis/{apiId}/models/{modelName}/default_template")
+    public Response getModelTemplate(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
+                                     @PathParam("modelName") String modelName) {
+        String region = regionResolver.resolveRegion(headers);
+        String value = service.getModelTemplate(region, apiId, modelName);
+        return Response.ok(objectMapper.createObjectNode().put("value", value).toString())
+                .type(MediaType.APPLICATION_JSON).build();
     }
 
     @PATCH
@@ -2161,6 +2186,16 @@ public class ApiGatewayController {
                                @PathParam("modelId") String modelId) {
         String region = regionResolver.resolveRegion(headers);
         return Response.ok(toV2ModelNode(v2Service.getModel(region, apiId, modelId)).toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @GET
+    @Path("/v2/apis/{apiId}/models/{modelId}/template")
+    public Response getV2ModelTemplate(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
+                                     @PathParam("modelId") String modelId) {
+        String region = regionResolver.resolveRegion(headers);
+        String value = v2Service.getModelTemplate(region, apiId, modelId);
+        return Response.ok(objectMapper.createObjectNode().put("value", value).toString())
+                .type(MediaType.APPLICATION_JSON).build();
     }
 
     @PATCH
