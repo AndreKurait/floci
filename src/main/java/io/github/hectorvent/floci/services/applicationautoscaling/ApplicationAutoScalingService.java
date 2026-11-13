@@ -21,6 +21,7 @@ import io.github.hectorvent.floci.services.applicationautoscaling.model.TargetTr
 import io.github.hectorvent.floci.services.cloudwatch.metrics.CloudWatchMetricsService;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.Dimension;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricAlarm;
+import io.github.hectorvent.floci.services.dynamodb.DynamoDbService;
 import io.github.hectorvent.floci.services.iam.ServiceLinkedRoles;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -88,6 +89,8 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
     private final StorageBackend<String, ScalableTarget> targets;
     private final StorageBackend<String, ScalingPolicy> policies;
     private final StorageBackend<String, ScalingActivity> activities;
+    private final Object[] targetLocks = new Object[256];
+    private final DynamoDbService dynamoDbService;
     private final RegionResolver regionResolver;
     private final CloudWatchMetricsService cloudWatchMetricsService;
     private final LambdaCapacityAdjuster lambdaCapacity;
@@ -97,7 +100,7 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
     public ApplicationAutoScalingService(StorageFactory factory,
                                          RegionResolver regionResolver,
                                          CloudWatchMetricsService cloudWatchMetricsService,
-                                         LambdaCapacityAdjuster lambdaCapacity) {
+                                         LambdaCapacityAdjuster lambdaCapacity, DynamoDbService dynamoDbService) {
         this(factory.create("applicationautoscaling", "application-autoscaling-targets.json",
                         new TypeReference<Map<String, ScalableTarget>>() {}),
                 factory.create("applicationautoscaling", "application-autoscaling-policies.json",
@@ -105,7 +108,7 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
                 factory.create("applicationautoscaling", "application-autoscaling-activities.json",
                         new TypeReference<Map<String, ScalingActivity>>() {}),
                 regionResolver,
-                cloudWatchMetricsService, lambdaCapacity);
+                cloudWatchMetricsService, lambdaCapacity, dynamoDbService);
     }
 
     ApplicationAutoScalingService(StorageBackend<String, ScalableTarget> targets,
@@ -113,10 +116,14 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
                                   StorageBackend<String, ScalingActivity> activities,
                                   RegionResolver regionResolver,
                                   CloudWatchMetricsService cloudWatchMetricsService,
-                                  LambdaCapacityAdjuster lambdaCapacity) {
+                                  LambdaCapacityAdjuster lambdaCapacity, DynamoDbService dynamoDbService) {
         this.targets = targets;
         this.policies = policies;
         this.activities = activities;
+        this.dynamoDbService = dynamoDbService;
+        for (int i = 0; i < targetLocks.length; i++) {
+            targetLocks[i] = new Object();
+        }
         this.regionResolver = regionResolver;
         this.cloudWatchMetricsService = cloudWatchMetricsService;
         this.lambdaCapacity = lambdaCapacity;
@@ -130,6 +137,12 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
                                                  SuspendedState suspendedState,
                                                  Map<String, String> tags, String region) {
         validateTriple(serviceNamespace, resourceId, scalableDimension);
+        if (DynamoDbRegistrationTarget.supports(serviceNamespace, scalableDimension)) {
+            synchronized (targetLock(region, serviceNamespace, resourceId, scalableDimension)) {
+                return registerDynamoDbTarget(serviceNamespace, resourceId, scalableDimension,
+                        minCapacity, maxCapacity, roleArn, suspendedState, tags, region);
+            }
+        }
 
         String key = targetKey(region, serviceNamespace, resourceId, scalableDimension);
         ScalableTarget existing = targets.get(key).orElse(null);
@@ -185,6 +198,58 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
         return existing;
     }
 
+    private ScalableTarget registerDynamoDbTarget(String namespace, String resourceId, String dimension,
+                                                   Integer min, Integer max, String roleArn,
+                                                   SuspendedState suspended, Map<String, String> tags, String region) {
+        String key = targetKey(region, namespace, resourceId, dimension);
+        ScalableTarget existing = targets.get(key).map(ScalableTarget::new).orElse(null);
+        if (existing == null && (min == null || max == null)) {
+            throw new AwsException("ValidationException",
+                    "Min and max capacity are required when registering a new scalable target.", 400);
+        }
+        ScalableTarget candidate = existing != null ? existing : new ScalableTarget();
+        if (existing == null) {
+            candidate.setServiceNamespace(namespace);
+            candidate.setResourceId(resourceId);
+            candidate.setScalableDimension(dimension);
+            candidate.setRoleArn(serviceLinkedRoleArn(namespace));
+            candidate.setScalableTargetArn(buildScalableTargetArn(region));
+            candidate.setCreationTime(nowEpochSeconds());
+        }
+        if (min != null) {
+            candidate.setMinCapacity(min);
+        }
+        if (max != null) {
+            candidate.setMaxCapacity(max);
+        }
+        if (roleArn != null) {
+            candidate.setRoleArn(roleArn);
+        }
+        if (suspended != null) {
+            candidate.setSuspendedState(suspended);
+        }
+        if (tags != null) {
+            candidate.putTags(tags);
+        }
+        publishRegistration(key, candidate, region);
+        return candidate;
+    }
+
+    private Object targetLock(String region, String namespace, String resourceId, String dimension) {
+        int hash = (regionResolver.getAccountId() + "::" + targetKey(region, namespace, resourceId, dimension)).hashCode();
+        return targetLocks[Math.floorMod(hash, targetLocks.length)];
+    }
+
+    private void publishRegistration(String key, ScalableTarget candidate, String region) {
+        if (DynamoDbRegistrationTarget.supports(candidate.getServiceNamespace(), candidate.getScalableDimension())) {
+            DynamoDbRegistrationTarget publication = new DynamoDbRegistrationTarget(targets, key, candidate);
+            dynamoDbService.reconcileScalableTarget(candidate.getResourceId(), candidate.getScalableDimension(),
+                    candidate.getMinCapacity(), candidate.getMaxCapacity(), region, publication);
+        } else {
+            targets.putAllAtomically(Map.of(key, candidate));
+        }
+    }
+
     public List<ScalableTarget> describeScalableTargets(String serviceNamespace, List<String> resourceIds,
                                                         String scalableDimension, String region) {
         requireNamespace(serviceNamespace);
@@ -219,6 +284,17 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
      */
     public void deregisterScalableTarget(String serviceNamespace, String resourceId,
                                          String scalableDimension, String region) {
+        if (DynamoDbRegistrationTarget.supports(serviceNamespace, scalableDimension)) {
+            synchronized (targetLock(region, serviceNamespace, resourceId, scalableDimension)) {
+                deregisterTarget(serviceNamespace, resourceId, scalableDimension, region);
+            }
+        } else {
+            deregisterTarget(serviceNamespace, resourceId, scalableDimension, region);
+        }
+    }
+
+    private void deregisterTarget(String serviceNamespace, String resourceId,
+                                  String scalableDimension, String region) {
         validateTriple(serviceNamespace, resourceId, scalableDimension);
         String key = targetKey(region, serviceNamespace, resourceId, scalableDimension);
         if (targets.get(key).isEmpty()) {
@@ -231,7 +307,11 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
             deleteAlarms(policy, region);
             policies.delete(policyKey(region, serviceNamespace, resourceId, scalableDimension, policy.getPolicyName()));
         }
-        targets.delete(key);
+        if (DynamoDbRegistrationTarget.supports(serviceNamespace, scalableDimension)) {
+            targets.deleteAllAtomically(Set.of(key));
+        } else {
+            targets.delete(key);
+        }
         LOG.infov("DeregisterScalableTarget: {0} {1} {2} in {3}",
                 serviceNamespace, resourceId, scalableDimension, region);
     }
@@ -352,6 +432,16 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
             throw new AwsException("ValidationException", "Tags are required.", 400);
         }
         ScalableTarget target = findTargetByArn(resourceArn, region);
+        if (DynamoDbRegistrationTarget.supports(target.getServiceNamespace(), target.getScalableDimension())) {
+            synchronized (targetLock(region, target.getServiceNamespace(), target.getResourceId(),
+                    target.getScalableDimension())) {
+                ScalableTarget candidate = new ScalableTarget(findTargetByArn(resourceArn, region));
+                candidate.putTags(tags);
+                targets.putAllAtomically(Map.of(targetKey(region, candidate.getServiceNamespace(),
+                        candidate.getResourceId(), candidate.getScalableDimension()), candidate));
+            }
+            return;
+        }
         target.putTags(tags);
         targets.put(targetKey(region, target.getServiceNamespace(), target.getResourceId(),
                 target.getScalableDimension()), target);
@@ -362,6 +452,16 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
             throw new AwsException("ValidationException", "TagKeys are required.", 400);
         }
         ScalableTarget target = findTargetByArn(resourceArn, region);
+        if (DynamoDbRegistrationTarget.supports(target.getServiceNamespace(), target.getScalableDimension())) {
+            synchronized (targetLock(region, target.getServiceNamespace(), target.getResourceId(),
+                    target.getScalableDimension())) {
+                ScalableTarget candidate = new ScalableTarget(findTargetByArn(resourceArn, region));
+                candidate.removeTags(tagKeys);
+                targets.putAllAtomically(Map.of(targetKey(region, candidate.getServiceNamespace(),
+                        candidate.getResourceId(), candidate.getScalableDimension()), candidate));
+            }
+            return;
+        }
         target.removeTags(tagKeys);
         targets.put(targetKey(region, target.getServiceNamespace(), target.getResourceId(),
                 target.getScalableDimension()), target);
