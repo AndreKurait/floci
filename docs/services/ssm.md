@@ -26,6 +26,9 @@
 | `GetResourcePolicies` | List the resource policy attached to a parameter |
 | `DeleteResourcePolicy` | Remove a parameter's resource policy |
 
+`GetParameters` returns successful parameters alphabetically by `Name`, preserving
+the selected versions and labels.
+
 `DescribeParameters` includes the stored parameter's `ARN` in each metadata entry, matching
 `GetParameter`. This applies to filtered and paginated results as well.
 
