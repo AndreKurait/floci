@@ -26,8 +26,16 @@ public record CallerContext(
         String boundaryPolicyDocument,
         List<List<String>> scpLevels,
         String principalArn,
-        List<String> managedSessionPolicyDocuments
+        List<String> managedSessionPolicyDocuments,
+        VerifiedIdentityContext verifiedIdentityContext
 ) {
+    public CallerContext(List<String> identityPolicies, String sessionPolicyDocument,
+                         String boundaryPolicyDocument, List<List<String>> scpLevels, String principalArn,
+                         List<String> managedSessionPolicyDocuments) {
+        this(identityPolicies, sessionPolicyDocument, boundaryPolicyDocument, scpLevels, principalArn,
+                managedSessionPolicyDocuments, null);
+    }
+
     public CallerContext {
         managedSessionPolicyDocuments = managedSessionPolicyDocuments == null
                 ? List.of() : List.copyOf(managedSessionPolicyDocuments);
@@ -48,7 +56,7 @@ public record CallerContext(
 
     public CallerContext withManagedSessionPolicies(List<String> documents) {
         return new CallerContext(identityPolicies, sessionPolicyDocument, boundaryPolicyDocument,
-                scpLevels, principalArn, documents);
+                scpLevels, principalArn, documents, verifiedIdentityContext);
     }
 
     /** Source-compatible constructor for callers predating principalArn support. */
@@ -71,7 +79,7 @@ public record CallerContext(
     /** Copy of this context with the effective SCP levels attached. */
     public CallerContext withScpLevels(List<List<String>> levels) {
         return new CallerContext(identityPolicies, sessionPolicyDocument, boundaryPolicyDocument,
-                levels, principalArn, managedSessionPolicyDocuments);
+                levels, principalArn, managedSessionPolicyDocuments, verifiedIdentityContext);
     }
 
     /** Copy of this context with one more identity policy, evaluated like the caller's own. */
@@ -79,12 +87,18 @@ public record CallerContext(
         List<String> policies = new ArrayList<>(identityPolicies);
         policies.add(policyDocument);
         return new CallerContext(policies, sessionPolicyDocument, boundaryPolicyDocument,
-                scpLevels, principalArn, managedSessionPolicyDocuments);
+                scpLevels, principalArn, managedSessionPolicyDocuments, verifiedIdentityContext);
     }
 
     /** Copy of this context with the caller principal ARN attached. */
     public CallerContext withPrincipalArn(String principalArn) {
         return new CallerContext(identityPolicies, sessionPolicyDocument, boundaryPolicyDocument,
-                scpLevels, principalArn, managedSessionPolicyDocuments);
+                scpLevels, principalArn, managedSessionPolicyDocuments, verifiedIdentityContext);
+    }
+
+    /** Attaches facts captured by credential resolution, retaining all policy ceilings. */
+    public CallerContext withVerifiedIdentityContext(VerifiedIdentityContext context) {
+        return new CallerContext(identityPolicies, sessionPolicyDocument, boundaryPolicyDocument,
+                scpLevels, principalArn, managedSessionPolicyDocuments, context);
     }
 }

@@ -43,7 +43,7 @@ class PartitionCrossServiceSmokeIntegrationTest {
     static final Set<String> COVERED_PACKAGES = Set.of(
             "accessanalyzer", "acm", "amazonmq", "apigateway", "apigatewayv2", "appconfig", "applicationautoscaling", "appsync",
             "aps", "autoscaling", "backup", "batch", "bcmdataexports", "bedrock", "bedrockagentcorecontrol", "ce",
-            "cloudfront", "cloudmap", "cloudwatch", "codebuild", "codedeploy", "codepipeline", "cognito",
+            "cloudfront", "cloudmap", "cloudwatch", "codebuild", "codedeploy", "codepipeline", "cognito", "cognitoidentity",
             "configservice", "connect", "controlcatalog", "controltower", "datasync", "dlm", "dms", "dsql", "dynamodb", "ec2",
             "ecr", "ecs", "efs", "eks", "elasticache", "elasticbeanstalk", "elb", "elbv2", "emr", "emrserverless",
             "eventbridge", "eventbridgev2", "firehose", "fis", "glue", "guardduty", "iot", "kinesis", "kinesisanalytics", "lambda",
@@ -609,6 +609,28 @@ class PartitionCrossServiceSmokeIntegrationTest {
         String identifier = created.jsonPath().getString("identifier");
         cleanup.register(() -> signed(region, "dsql").when().delete("/cluster/" + identifier));
         PartitionMatrix.assertArnIn(partitionCase, created.jsonPath().getString("arn"));
+    }
+
+    @ParameterizedTest
+    @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
+    void cognitoIdentityTokenIssuer(PartitionCase partitionCase) throws Exception {
+        String region = offered(partitionCase, "cognito-identity");
+        String target = "AWSCognitoIdentityService.";
+        String body = "{\"IdentityPoolName\":\"" + unique("identity-token", partitionCase)
+                + "\",\"AllowUnauthenticatedIdentities\":true,\"AllowClassicFlow\":true}";
+        String pool = json11(region, "cognito-identity", target + "CreateIdentityPool", body)
+                .post("/").then().statusCode(200).extract().path("IdentityPoolId");
+        String poolBody = "{\"IdentityPoolId\":\"" + pool + "\"}";
+        cleanup.register(() -> json11(region, "cognito-identity", target + "DeleteIdentityPool", poolBody).post("/"));
+        String identity = json11(region, "cognito-identity", target + "GetId", poolBody)
+                .post("/").then().statusCode(200).extract().path("IdentityId");
+        String token = json11(region, "cognito-identity", target + "GetOpenIdToken",
+                "{\"IdentityId\":\"" + identity + "\"}")
+                .post("/").then().statusCode(200).extract().path("Token");
+        String issuer = new ObjectMapper().readTree(Base64.getUrlDecoder().decode(token.split("\\.")[1]))
+                .path("iss").asText();
+        PartitionMatrix.assertHostIn(partitionCase, issuer);
+        assertEquals("cognito-identity." + region + "." + partitionCase.dnsSuffix(), issuer);
     }
 
     @ParameterizedTest
