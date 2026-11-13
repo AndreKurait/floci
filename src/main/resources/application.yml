@@ -83,6 +83,7 @@ quarkus:
         - pricing-snapshots/**
         - ui/*.html
         - appsync/*.mjs
+        - cloudfront/*.cjs
         - lambdaweb/*.mjs
         - emr/*.py
         - ec2/*.yaml
@@ -993,6 +994,7 @@ floci:
       enabled: true
     cloudfront:
       enabled: true
+      function-runtime-image: node:22-alpine
       allowed-private-origin-hosts: []
     appsync:
       enabled: true
