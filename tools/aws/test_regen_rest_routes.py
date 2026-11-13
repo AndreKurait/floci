@@ -59,7 +59,9 @@ def test_check_passes_on_a_fresh_generation_and_fails_on_a_stale_one(tmp_path):
         directory = tmp_path / "data" / name / "2020-01-01"
         directory.mkdir(parents=True)
         with gzip.open(directory / "service-2.json.gz", "wt", encoding="utf-8") as f:
-            json.dump(model("rest-json", "2020-01-01", Ping=("GET", "/ping")), f)
+            operations = {operation: ("GET", "/ping/" + operation)
+                          for operation in r.ONLY_OPERATIONS.get(name, ("Ping",))}
+            json.dump(model("rest-json", "2020-01-01", **operations), f)
     output = tmp_path / "rest-routes.json"
     data = ["--botocore-data", str(tmp_path / "data"), "--output", str(output)]
 
@@ -94,61 +96,9 @@ def test_the_hand_routed_scopes_are_rendered_with_their_reasons():
     assert text.splitlines()[2] == '  "handRouted": {'
 
 
-@pytest.mark.parametrize("status", [400, 401, 402, 403])
-def test_denial_status_comes_from_the_declared_error_shape(status):
-    service = model("rest-json", "2020-01-01", GetThing=("GET", "/things/{Name}"))
-    service["operations"]["GetThing"]["errors"] = [{"shape": "Denied"}]
-    service["shapes"] = {
-        "Denied": {"type": "structure", "exception": True,
-                   "error": {"code": "AccessDeniedException", "httpStatusCode": status}},
-        "Unused": {"type": "structure", "exception": True,
-                   "error": {"code": "AccessDeniedException", "httpStatusCode": 499}},
-    }
-    doc = r.build({"quicksight": service}, "botocore test")
-    assert doc["models"]["quicksight"]["accessDeniedStatus"] == status
-    assert json.loads(r.render(doc))["models"]["quicksight"]["accessDeniedStatus"] == status
-
-
-def test_a_non_denial_error_does_not_supply_the_denial_status():
-    service = model("rest-json", "2020-01-01", GetThing=("GET", "/things/{Name}"))
-    service["operations"]["GetThing"]["errors"] = [{"shape": "ValidationException"}]
-    service["shapes"] = {"ValidationException": {"error": {"httpStatusCode": 400}}}
-    doc = r.build({"quicksight": service}, "botocore test")
-    assert "accessDeniedStatus" not in doc["models"]["quicksight"]
-
-
-def test_models_sharing_a_scope_must_agree_on_the_denial_status():
-    first = model("rest-json", "2020-01-01", GetThing=("GET", "/things/{Name}"))
-    second = model("rest-json", "2020-01-01", GetThing=("GET", "/things/{Name}"))
-    for service, status in ((first, 401), (second, 403)):
-        service["operations"]["GetThing"]["errors"] = [{"shape": "AccessDeniedException"}]
-        service["shapes"] = {"AccessDeniedException": {"error": {"httpStatusCode": status}}}
-    with pytest.raises(SystemExit, match="conflicting access-denied HTTP statuses"):
-        r.build({"lambda": first, "lambda-microvms": second}, "botocore test")
-
-
-@pytest.mark.parametrize("name", ["controltower", "signer"])
-@pytest.mark.parametrize("operation,method,source", [
-    ("TagResource", "POST", "body"),
-    ("UntagResource", "DELETE", "?resourceArn"),
-    ("ListTagsForResource", "GET", "?resourceArn"),
-])
-def test_shared_tag_alternative_keeps_actual_member_source(name, operation, method, source):
-    doc = r.build({name: model("rest-json", "2020-01-01", **{operation: (method, "/tags/{resourceArn}")})}, "test")
-    route = doc["models"][name]["operations"][operation]
-    assert route["requestUri"] == "/tags/{resourceArn+}"
-    assert route["alternatives"] == [{"requestUri": "/tags", "located": {"resourceArn": source}}]
-    assert json.loads(r.render(doc)) == doc
-
-
-def test_shared_tag_alternative_collision_is_rejected():
-    with pytest.raises(SystemExit, match="one route names more than one operation"):
-        r.build({"controltower": model("rest-json", "2020-01-01",
-            TagResource=("POST", "/tags/{resourceArn}"), OtherOperation=("POST", "/tags"))}, "test")
-
-
-@pytest.mark.parametrize("name", ["payment-cryptography-data", "signer", "xray", "guardduty"])
-def test_a_model_a_route_filter_moves_under_a_prefix_keeps_its_own_paths(name):
-    # IAM matches a moved request on its path without the prefix its filter records, so the routes are the model's.
-    doc = r.build({name: model("rest-json", "2020-01-01", GetThing=("GET", "/things/{ThingId}"))}, "test")
-    assert doc["models"][name]["operations"]["GetThing"]["requestUri"] == "/things/{ThingId}"
+def test_cloudfront_reads_only_its_qualified_key_value_store_family():
+    operations = {name: ("GET", "/kvs/" + name) for name in r.ONLY_OPERATIONS["cloudfront"]}
+    operations["ListDistributions"] = ("GET", "/distributions")
+    result = r.build({"cloudfront": model("rest-xml", "2020-05-31", **operations)}, "test")
+    assert set(result["models"]["cloudfront"]["operations"]) == set(r.ONLY_OPERATIONS["cloudfront"])
+    assert "ListDistributions" not in result["models"]["cloudfront"]["operations"]

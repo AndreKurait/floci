@@ -10,11 +10,6 @@ it. `SERVICES` names, for each namespace, the keys read and where:
 - `redshift`: a Redshift request is checked with the database user it names as `redshift:DbUser`, so a policy
   can scope GetClusterCredentials and CreateClusterUser to `dbuser:<cluster>/${redshift:DbUser}`.
   `redshift:DbName` and `redshift:DurationSeconds` are not read yet.
-- `ec2-instance-connect`: an OpenTunnel request is checked with the `remotePort`, `privateIpAddress` and
-  `maxTunnelDuration` query parameters of its presigned WebSocket URL as the keys of the same names (the
-  Service Reference spells the action's third key `MaxTunnelDuration`; IAM keys are case-insensitive).
-  botocore does not model OpenTunnel (it is a WebSocket upgrade, not an API operation), so `SERVICES` gives
-  its members itself (`"model": None`) and `--check` has no botocore model to compare them to.
 
 The table comes from two sources:
 
@@ -70,14 +65,6 @@ SERVICES = {
         "stored": ("lambda:Resource/WebFunctionAuthType",),
         "not_in_request": {},
     },
-    "ec2-instance-connect": {
-        "model": None,
-        "request": {"ec2-instance-connect:remotePort": "remotePort",
-                    "ec2-instance-connect:privateIpAddress": "privateIpAddress",
-                    "ec2-instance-connect:MaxTunnelDuration": "maxTunnelDuration"},
-        "stored": (),
-        "not_in_request": {},
-    },
     "redshift": {
         "model": "redshift",
         "request": {"redshift:DbUser": "DbUser"},
@@ -108,11 +95,11 @@ def action_keys(namespace: str, reference: dict) -> dict[str, list[str]]:
     return found
 
 
-def request_members(namespace: str, model: dict | None,
+def request_members(namespace: str, model: dict,
                     actions: dict[str, list[str]]) -> dict[str, dict[str, list[str]]]:
     """For every action of the namespace and key read from its request, where the request carries the value."""
     service = SERVICES[namespace]
-    flat = model is not None and model.get("metadata", {}).get("protocol") in FLAT_PROTOCOLS
+    flat = model.get("metadata", {}).get("protocol") in FLAT_PROTOCOLS
     found = {}
     for action, keys in sorted(actions.items()):
         if not action.startswith(f"{namespace}:"):
@@ -121,9 +108,6 @@ def request_members(namespace: str, model: dict | None,
             if key not in service["request"] or (action, key) in service["not_in_request"]:
                 continue
             name = service["request"][key]
-            if model is None:  # not modelled by botocore: the member is the name SERVICES gives
-                found.setdefault(action, {})[key] = [name]
-                continue
             operation = model["operations"].get(action.split(":", 1)[1])
             if operation is None or "input" not in operation:
                 raise ValueError(f"{action} takes {key} but botocore has no request for it")
@@ -156,8 +140,6 @@ def validate(document: dict) -> list[str]:
         problems.append("lambda:GetWebFunctionEndpoint takes no lambda:Resource/WebFunctionAuthType")
     if members.get("redshift:GetClusterCredentials", {}).get("redshift:DbUser") != ["DbUser"]:
         problems.append("redshift:GetClusterCredentials does not read redshift:DbUser from DbUser")
-    if members.get("ec2-instance-connect:OpenTunnel", {}).get("ec2-instance-connect:remotePort") != ["remotePort"]:
-        problems.append("ec2-instance-connect:OpenTunnel does not read ec2-instance-connect:remotePort from remotePort")
     return problems
 
 
@@ -180,8 +162,7 @@ def _members(actions: dict[str, list[str]], botocore_data: Path | None) -> tuple
     data, provenance = resolve_botocore_data(botocore_data)
     members = {}
     for namespace, service in SERVICES.items():
-        model = service["model"] and load_model(latest_model_dir(data, service["model"]))
-        members.update(request_members(namespace, model, actions))
+        members.update(request_members(namespace, load_model(latest_model_dir(data, service["model"])), actions))
     return dict(sorted(members.items())), provenance
 
 
