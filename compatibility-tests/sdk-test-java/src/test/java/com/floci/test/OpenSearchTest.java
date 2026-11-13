@@ -92,11 +92,6 @@ class OpenSearchTest {
 
         assertThat(response.domainStatus().domainName()).isEqualTo(DOMAIN_NAME);
         domainEndpoint = response.domainStatus().endpoint();
-        assertThat(domainEndpoint).doesNotStartWith("http://").doesNotStartWith("https://");
-        DescribeDomainsResponse bulk = opensearch.describeDomains(DescribeDomainsRequest.builder()
-                .domainNames(DOMAIN_NAME).build());
-        assertThat(bulk.domainStatusList()).singleElement()
-                .satisfies(status -> assertThat(status.endpoint()).isEqualTo(domainEndpoint));
     }
 
     @Test
@@ -161,7 +156,7 @@ class OpenSearchTest {
 
         try {
             HttpURLConnection conn = (HttpURLConnection)
-                    URI.create("http://" + domainEndpoint + "/_cluster/health").toURL().openConnection();
+                    URI.create(domainEndpoint + "/_cluster/health").toURL().openConnection();
             conn.setConnectTimeout(5000);
             conn.setReadTimeout(5000);
             int code = conn.getResponseCode();

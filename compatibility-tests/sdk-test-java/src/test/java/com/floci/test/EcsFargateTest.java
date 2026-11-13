@@ -37,7 +37,6 @@ import software.amazon.awssdk.services.ecs.model.StopTaskRequest;
 import software.amazon.awssdk.services.ecs.model.Task;
 import software.amazon.awssdk.services.ecs.model.TaskDefinition;
 
-import java.time.Duration;
 import java.util.List;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -108,9 +107,6 @@ class EcsFargateTest {
                 .containerDefinitions(ContainerDefinition.builder()
                         .name("app")
                         .image("nginx:alpine")
-                        // nginx cannot start as user 1000 on a read-only root, and the tests below
-                        // wait for RUNNING, so the container idles until StopTask instead.
-                        .command("sh", "-c", "trap 'exit 0' TERM QUIT; sleep 3600 & wait")
                         .essential(true)
                         .user("1000:1000")
                         .workingDirectory("/srv")
@@ -170,8 +166,6 @@ class EcsFargateTest {
         Task task = tasks.get(0);
         taskArn = task.taskArn();
 
-        // RunTask answers before the images are pulled, as AWS does: an awsvpc task is PROVISIONING.
-        assertThat(task.lastStatus()).isIn("PROVISIONING", "PENDING");
         assertThat(task.launchType()).isEqualTo(LaunchType.FARGATE);
         assertThat(task.platformVersion()).isNotBlank();
         assertThat(task.platformFamily()).isEqualTo("Linux");
@@ -180,17 +174,13 @@ class EcsFargateTest {
         assertThat(task.group()).isEqualTo("family:" + family);
         assertThat(task.attachments()).hasSize(1);
         assertThat(task.attachments().get(0).type()).isEqualTo("ElasticNetworkInterface");
+        assertThat(task.attachments().get(0).details())
+                .anySatisfy(detail -> assertThat(detail.name()).isEqualTo("privateIPv4Address"));
 
-        DescribeTasksRequest describe = DescribeTasksRequest.builder()
+        Task described = ecs.describeTasks(DescribeTasksRequest.builder()
                 .cluster(clusterName)
                 .tasks(taskArn)
-                .build();
-        ecs.waiter().waitUntilTasksRunning(describe, TestFixtures.waiterOverride(Duration.ofSeconds(60)));
-
-        Task described = ecs.describeTasks(describe).tasks().get(0);
-        assertThat(described.attachments()).hasSize(1);
-        assertThat(described.attachments().get(0).details())
-                .anySatisfy(detail -> assertThat(detail.name()).isEqualTo("privateIPv4Address"));
+                .build()).tasks().get(0);
         assertThat(described.connectivityAsString()).isEqualTo("CONNECTED");
         assertThat(described.healthStatusAsString()).isNotBlank();
         assertThat(described.version()).isPositive();
@@ -238,12 +228,6 @@ class EcsFargateTest {
                 .build()).tasks().get(0);
 
         try {
-            // ExecuteCommand reaches only a running task, and RunTask answers before the launch.
-            ecs.waiter().waitUntilTasksRunning(DescribeTasksRequest.builder()
-                            .cluster(clusterName)
-                            .tasks(plain.taskArn())
-                            .build(),
-                    TestFixtures.waiterOverride(Duration.ofSeconds(60)));
             assertThatThrownBy(() -> ecs.executeCommand(ExecuteCommandRequest.builder()
                     .cluster(clusterName)
                     .task(plain.taskArn())

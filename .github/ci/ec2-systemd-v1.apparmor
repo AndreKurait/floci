@@ -1,0 +1,17 @@
+# Qualification fixture, not a recommended workload policy. The explicit denial
+# proves this profile is enforcing while native init performs its required mounts.
+#include <tunables/global>
+profile __PROFILE__ flags=(attach_disconnected,mediate_deleted) {
+  #include <abstractions/base>
+  capability,
+  network,
+  file,
+  mount,
+  umount,
+  pivot_root,
+  signal,
+  ptrace,
+  dbus,
+  unix,
+  deny /floci-native-apparmor-denied w,
+}

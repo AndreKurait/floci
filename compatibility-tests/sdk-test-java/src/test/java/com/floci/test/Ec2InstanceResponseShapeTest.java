@@ -250,6 +250,22 @@ class Ec2InstanceResponseShapeTest {
     }
 
     @Test
+    @Order(17)
+    @DisplayName("primary ENI MAC is present and stable across instance and interface descriptions")
+    void primaryEniMacAddressIsStableAcrossDescriptions() {
+        InstanceNetworkInterface primary = instance.networkInterfaces().get(0);
+        assertThat(primary.macAddress()).matches("(?:[0-9a-f]{2}:){5}[0-9a-f]{2}");
+        String describedMac = ec2.describeNetworkInterfaces(DescribeNetworkInterfacesRequest.builder()
+                .networkInterfaceIds(primary.networkInterfaceId()).build())
+                .networkInterfaces().get(0).macAddress();
+        assertThat(describedMac).isEqualTo(primary.macAddress());
+        String instanceMac = ec2.describeInstances(DescribeInstancesRequest.builder()
+                .instanceIds(instanceId).build()).reservations().get(0).instances().get(0)
+                .networkInterfaces().get(0).macAddress();
+        assertThat(instanceMac).isEqualTo(primary.macAddress());
+    }
+
+    @Test
     @Order(12)
     @DisplayName("primary ENI has non-null attachment — critical for Terraform DeviceIndex read")
     void eniAttachmentNotNull() {
