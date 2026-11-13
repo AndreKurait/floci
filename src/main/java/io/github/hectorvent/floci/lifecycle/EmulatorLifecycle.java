@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.lifecycle.inithook.InitializationHook;
 import io.github.hectorvent.floci.lifecycle.inithook.InitializationHooksRunner;
 import io.github.hectorvent.floci.services.amazonmq.container.RabbitMqManager;
 import io.github.hectorvent.floci.services.appsync.graphql.SchemaCreationWorker;
+import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsExportService;
 import io.github.hectorvent.floci.services.docdb.container.DocDbContainerManager;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbRuntime;
 import io.github.hectorvent.floci.services.ec2.Ec2MetadataServer;
@@ -63,6 +64,9 @@ import java.util.concurrent.CompletableFuture;
 
 @ApplicationScoped
 public class EmulatorLifecycle {
+
+    @Inject
+    CloudWatchLogsExportService logsExportService;
 
     private static final Logger LOG = Logger.getLogger(EmulatorLifecycle.class);
 
@@ -242,6 +246,9 @@ public class EmulatorLifecycle {
 
         serviceRegistry.logEnabledServices();
         storageFactory.loadAll();
+        if (logsExportService != null) {
+            logsExportService.recoverAfterRestart();
+        }
         if (config.services().ec2().enabled() && !config.services().ec2().mock()) {
             // ALB and ECS runtime restoration needs the persisted VPC and subnet address plans.
             ec2Service.restoreVpcNetworks();
@@ -420,6 +427,9 @@ public class EmulatorLifecycle {
         runCleanup("DynamoDB Streams poller", dynamodbStreamsPoller::shutdown);
         runCleanup("Kinesis poller", kinesisPoller::shutdown);
         runCleanup("Redshift zero-ETL consumer", redshiftZeroEtlConsumer::shutdown);
+        if (logsExportService != null) {
+            runCleanup("Logs export worker", logsExportService::shutdown);
+        }
         runCleanup("storage flush", storageFactory::flushAll);
         runCleanup("EC2 metadata server", () -> {
             if (isMetadataServerNeeded()) {
