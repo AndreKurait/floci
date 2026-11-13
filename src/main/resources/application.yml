@@ -640,6 +640,7 @@ floci:
       scheduled-action-sweep-interval-seconds: ${FLOCI_SERVICES_REDSHIFT_SERVERLESS_SCHEDULED_ACTION_SWEEP_INTERVAL_SECONDS:60}
     neptune:
       enabled: true
+      mock: false
       proxy-base-port: 8182
       proxy-max-port: 8282
       db-type: "gremlin"

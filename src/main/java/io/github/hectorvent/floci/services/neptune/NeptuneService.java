@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.StripedLocks;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
@@ -12,6 +13,7 @@ import io.github.hectorvent.floci.services.neptune.container.NeptuneContainerHan
 import io.github.hectorvent.floci.services.neptune.container.NeptuneContainerManager;
 import io.github.hectorvent.floci.services.neptune.model.NeptuneCluster;
 import io.github.hectorvent.floci.services.neptune.model.NeptuneClusterSettings;
+import io.github.hectorvent.floci.services.neptune.model.NeptuneClusterSnapshot;
 import io.github.hectorvent.floci.services.neptune.model.NeptuneDbType;
 import io.github.hectorvent.floci.services.neptune.model.NeptuneInstance;
 import io.github.hectorvent.floci.services.neptune.model.NeptuneInstanceSettings;
@@ -24,8 +26,10 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -41,12 +45,14 @@ public class NeptuneService {
 
     private final StorageBackend<String, NeptuneCluster> clusters;
     private final StorageBackend<String, NeptuneInstance> instances;
+    private final StorageBackend<String, NeptuneClusterSnapshot> snapshots;
     private final EmulatorConfig config;
     private final RegionResolver regionResolver;
     private final NeptuneContainerManager containerManager;
     private final NeptuneProxyManager proxyManager;
     private final Set<Integer> usedPorts = ConcurrentHashMap.newKeySet();
     private final Set<String> provisioningClusterNames = ConcurrentHashMap.newKeySet();
+    private final StripedLocks clusterMutationLocks = new StripedLocks(256);
 
     @Inject
     public NeptuneService(EmulatorConfig config,
@@ -62,6 +68,8 @@ public class NeptuneService {
                 new TypeReference<Map<String, NeptuneCluster>>() {});
         this.instances = storageFactory.create("neptune", "neptune-instances.json",
                 new TypeReference<Map<String, NeptuneInstance>>() {});
+        this.snapshots = storageFactory.create("neptune", "neptune-cluster-snapshots.json",
+                new TypeReference<Map<String, NeptuneClusterSnapshot>>() {});
     }
 
     // ── Clusters ──────────────────────────────────────────────────────────────
@@ -79,14 +87,22 @@ public class NeptuneService {
                     "Neptune cluster " + id + " already exists.", 400);
         }
         try {
-            return provisionDbCluster(id, engineVersion, iamEnabled, settings, tags);
+            synchronized (clusterMutationLock(id)) {
+                return provisionDbCluster(id, engineVersion, iamEnabled, settings, tags, null);
+            }
         } finally {
             provisioningClusterNames.remove(identity);
         }
     }
 
+    private static AwsException clusterAlreadyExists(String id) {
+        return new AwsException("DBClusterAlreadyExistsFault",
+                "Neptune cluster " + id + " already exists.", 400);
+    }
+
     private NeptuneCluster provisionDbCluster(String id, String engineVersion, boolean iamEnabled,
-                                             NeptuneClusterSettings settings, Map<String, String> tags) {
+                                             NeptuneClusterSettings settings, Map<String, String> tags,
+                                             NeptuneClusterSnapshot restore) {
         if (getStoredCluster(id).isPresent()) {
             throw new AwsException("DBClusterAlreadyExistsFault",
                     "Neptune cluster " + id + " already exists.", 400);
@@ -118,7 +134,20 @@ public class NeptuneService {
             String accountId = currentAccount();
             String identity = resourceIdentity(accountId, region, id);
             // graph database needs the container.
-            handle = containerManager.tryStart(id, image, dbType, accountId, region);
+            handle = config.services().neptune().mock() ? null
+                    : containerManager.tryStart(id, image, dbType, accountId, region);
+            if (restore != null && !restore.metadataOnly()) {
+                if (handle == null || dbType != NeptuneDbType.GREMLIN) {
+                    throw new AwsException("InvalidRestoreFault",
+                            "A real Neptune snapshot requires a running Gremlin backend.", 400);
+                }
+                try {
+                    containerManager.restoreGraph(handle, restore.archiveBase64());
+                } catch (RuntimeException exception) {
+                    throw new AwsException("InvalidRestoreFault",
+                            "The Neptune snapshot archive could not be restored: " + exception.getMessage(), 400);
+                }
+            }
             String endpointHost = resolveEndpointHost();
 
             NeptuneCluster cluster = new NeptuneCluster();
@@ -152,7 +181,11 @@ public class NeptuneService {
                         + "the cluster do not until a daemon appears.", id);
             }
 
-            putCluster(cluster);
+            if (restore == null) {
+                putCluster(cluster);
+            } else {
+                putRestoredCluster(cluster);
+            }
             provisioned = true;
             LOG.infov("Neptune cluster {0} created ({1}), endpoint={2}:{3}",
                     id, dbType, endpointHost, String.valueOf(proxyPort));
@@ -221,7 +254,8 @@ public class NeptuneService {
         if (!AwsArnUtils.looksLikeArn(arn)) {
             return false;
         }
-        return scanClusters().stream()
+        return scanSnapshots().stream().anyMatch(snapshot -> arn.equalsIgnoreCase(snapshot.dbClusterSnapshotArn()))
+                || scanClusters().stream()
                         .anyMatch(c -> arn.equalsIgnoreCase(c.getDbClusterArn()))
                 || scanInstances().stream()
                         .anyMatch(i -> arn.equalsIgnoreCase(i.getDbInstanceArn()));
@@ -249,6 +283,13 @@ public class NeptuneService {
 
     public NeptuneCluster modifyDbCluster(String id, String engineVersion, Boolean iamEnabled,
                                           NeptuneClusterSettings settings) {
+        synchronized (clusterMutationLock(id)) {
+            return modifyClusterLocked(id, engineVersion, iamEnabled, settings);
+        }
+    }
+
+    private NeptuneCluster modifyClusterLocked(String id, String engineVersion, Boolean iamEnabled,
+                                                NeptuneClusterSettings settings) {
         settings.validate();
         NeptuneCluster cluster = getDbCluster(id);
         if (engineVersion != null && !engineVersion.isBlank()) {
@@ -264,6 +305,12 @@ public class NeptuneService {
     }
 
     public void deleteDbCluster(String id) {
+        synchronized (clusterMutationLock(id)) {
+            deleteClusterLocked(id);
+        }
+    }
+
+    private void deleteClusterLocked(String id) {
         NeptuneCluster cluster = getStoredCluster(id).orElseThrow(() ->
                 new AwsException("DBClusterNotFoundFault",
                         "Neptune cluster " + id + " not found.", 404));
@@ -292,6 +339,188 @@ public class NeptuneService {
         releaseProxyPort(cluster.getProxyPort());
         deleteCluster(cluster);
         LOG.infov("Neptune cluster {0} deleted", id);
+    }
+
+    /** Explicit manual snapshots preserve a real GraphSON archive unless mock mode was requested. */
+    public synchronized NeptuneClusterSnapshot createDbClusterSnapshot(String snapshotId, String clusterId,
+                                                                        Map<String, String> tags) {
+        String id = snapshotIdentifier(snapshotId);
+        if (findSnapshot(id).isPresent()) {
+            throw new AwsException("DBClusterSnapshotAlreadyExistsFault", "Snapshot " + id + " already exists.", 400);
+        }
+        NeptuneCluster source = snapshotSource(clusterId);
+        synchronized (clusterMutationLock(source.getDbClusterIdentifier())) {
+            source = snapshotSource(clusterId);
+            if (!"available".equals(source.getStatus())) {
+                throw new AwsException("InvalidDBClusterStateFault", "The source Neptune cluster is not available.", 400);
+            }
+            boolean mock = config.services().neptune().mock();
+            String archive = null;
+            if (!mock) {
+                if (source.getContainerId() == null
+                        || "neo4j".equalsIgnoreCase(config.services().neptune().dbType())) {
+                    throw new AwsException("InvalidDBClusterStateFault",
+                            "Neptune snapshots require a running Gremlin backend; Neo4j snapshots are unsupported.", 400);
+                }
+                try {
+                    archive = containerManager.snapshotGraph(new NeptuneContainerHandle(source.getContainerId(),
+                            resourceIdentity(source), source.getContainerHost(), source.getContainerPort()));
+                } catch (RuntimeException exception) {
+                    throw new AwsException("InvalidDBClusterStateFault",
+                            "The Neptune graph could not be archived: " + exception.getMessage(), 400);
+                }
+            }
+            Map<String, String> snapshotTags = new LinkedHashMap<>();
+            if (source.isCopyTagsToSnapshot()) {
+                snapshotTags.putAll(source.getTags());
+            }
+            if (tags != null) {
+                snapshotTags.putAll(tags);
+            }
+            NeptuneClusterSnapshot snapshot = new NeptuneClusterSnapshot(id,
+                    regionResolver.buildArn("rds", currentRegion(), "cluster-snapshot:" + id),
+                    source.getDbClusterIdentifier(), source.getDbClusterArn(), source.getEngineVersion(),
+                    source.isIamDatabaseAuthenticationEnabled(), source.getCreatedAt(), Instant.now(),
+                    snapshotSettings(source, source.isDeletionProtection()), snapshotTags, mock, archive);
+            putSnapshot(snapshot);
+            return snapshot;
+        }
+    }
+
+    public NeptuneClusterSnapshot getDbClusterSnapshot(String identifier) {
+        return findSnapshot(identifier).orElseThrow(() -> new AwsException("DBClusterSnapshotNotFoundFault",
+                "Neptune snapshot " + identifier + " not found.", 404));
+    }
+
+    public boolean hasClusterSnapshot(String identifier) {
+        return identifier != null && !identifier.isBlank() && findSnapshot(identifier).isPresent();
+    }
+
+    public List<NeptuneClusterSnapshot> listDbClusterSnapshots(String identifier, String clusterIdentifier) {
+        if (identifier != null && !identifier.isBlank()) {
+            return List.of(getDbClusterSnapshot(identifier));
+        }
+        return scanSnapshots().stream()
+                .filter(snapshot -> clusterIdentifier == null || clusterIdentifier.isBlank()
+                        || clusterIdentifier.equalsIgnoreCase(snapshot.dbClusterIdentifier())
+                        || clusterIdentifier.equalsIgnoreCase(snapshot.dbClusterArn()))
+                .sorted(Comparator.comparing(NeptuneClusterSnapshot::dbClusterSnapshotIdentifier))
+                .toList();
+    }
+
+    public synchronized NeptuneClusterSnapshot deleteDbClusterSnapshot(String identifier) {
+        NeptuneClusterSnapshot snapshot = getDbClusterSnapshot(identifier);
+        String key = clusterKey(currentRegion(), snapshot.dbClusterSnapshotIdentifier());
+        if (snapshots instanceof AccountAwareStorageBackend<NeptuneClusterSnapshot> aware) {
+            aware.deleteAllAtomicallyForAccounts(Map.of(currentAccount(), Set.of(key)));
+        } else {
+            snapshots.deleteAllAtomically(Set.of(key));
+        }
+        return snapshot;
+    }
+
+    public synchronized NeptuneCluster restoreDbClusterFromSnapshot(String targetIdentifier, String snapshotIdentifier,
+                                                                     String engineVersion, Boolean iamEnabled,
+                                                                     NeptuneClusterSettings overrides,
+                                                                     Map<String, String> tags) {
+        String id = snapshotIdentifier(targetIdentifier);
+        NeptuneClusterSnapshot snapshot = getDbClusterSnapshot(snapshotIdentifier);
+        boolean mock = config.services().neptune().mock();
+        if (snapshot.metadataOnly() != mock) {
+            throw new AwsException("InvalidRestoreFault",
+                    "Metadata-only Neptune snapshots can only be restored in explicit mock mode.", 400);
+        }
+        if (!mock && (snapshot.archiveBase64() == null
+                || !"gremlin".equalsIgnoreCase(config.services().neptune().dbType()))) {
+            throw new AwsException("InvalidRestoreFault",
+                    "A real Neptune snapshot requires its stored archive and a Gremlin backend.", 400);
+        }
+        NeptuneCluster settingsCarrier = new NeptuneCluster();
+        snapshot.settings().applyTo(settingsCarrier);
+        settingsCarrier.setPort(snapshot.settings().port());
+        overrides.validate();
+        overrides.applyTo(settingsCarrier);
+        if (overrides.port() != null) {
+            settingsCarrier.setPort(overrides.port());
+        }
+        NeptuneClusterSettings settings = snapshotSettings(settingsCarrier,
+                Boolean.TRUE.equals(overrides.deletionProtection()));
+        String identity = resourceIdentity(currentAccount(), currentRegion(), id);
+        if (!provisioningClusterNames.add(identity)) {
+            throw clusterAlreadyExists(id);
+        }
+        try {
+            synchronized (clusterMutationLock(id)) {
+                return provisionDbCluster(id, engineVersion != null ? engineVersion : snapshot.engineVersion(),
+                        iamEnabled != null ? iamEnabled : snapshot.iamDatabaseAuthenticationEnabled(),
+                        settings, tags, snapshot);
+            }
+        } finally {
+            provisioningClusterNames.remove(identity);
+        }
+    }
+
+    private static NeptuneClusterSettings snapshotSettings(NeptuneCluster source, boolean deletionProtection) {
+        return new NeptuneClusterSettings(List.copyOf(source.getAvailabilityZones()), source.getPort(),
+                source.getBackupRetentionPeriod(), source.getPreferredBackupWindow(),
+                source.getPreferredMaintenanceWindow(), source.getDbSubnetGroupName(),
+                source.getDbClusterParameterGroupName(), List.copyOf(source.getVpcSecurityGroupIds()),
+                source.isStorageEncrypted(), source.getKmsKeyId(), source.getStorageType(), deletionProtection,
+                source.isCopyTagsToSnapshot(), List.copyOf(source.getEnabledCloudwatchLogsExports()), null,
+                null, source.getServerlessV2MinCapacity(), source.getServerlessV2MaxCapacity());
+    }
+
+    private NeptuneCluster snapshotSource(String identifier) {
+        return scanClusters().stream().filter(cluster ->
+                        identifier != null && (identifier.equalsIgnoreCase(cluster.getDbClusterIdentifier())
+                                || identifier.equalsIgnoreCase(cluster.getDbClusterArn())))
+                .findFirst().orElseThrow(() -> new AwsException("DBClusterNotFoundFault",
+                        "Neptune cluster " + identifier + " not found.", 404));
+    }
+
+    private static String snapshotIdentifier(String identifier) {
+        if (identifier == null || !identifier.matches("[A-Za-z][A-Za-z0-9-]{0,62}")
+                || identifier.endsWith("-") || identifier.contains("--")) {
+            throw new AwsException("InvalidParameterValue", "Invalid Neptune cluster or snapshot identifier.", 400);
+        }
+        return identifier.toLowerCase(Locale.ROOT);
+    }
+
+    private Optional<NeptuneClusterSnapshot> findSnapshot(String identifier) {
+        if (identifier == null || identifier.isBlank()) {
+            return Optional.empty();
+        }
+        if (AwsArnUtils.looksLikeArn(identifier)) {
+            return scanSnapshots().stream().filter(snapshot ->
+                    identifier.equalsIgnoreCase(snapshot.dbClusterSnapshotArn())).findFirst();
+        }
+        String key = clusterKey(currentRegion(), identifier.toLowerCase(Locale.ROOT));
+        if (snapshots instanceof AccountAwareStorageBackend<NeptuneClusterSnapshot> aware) {
+            return aware.getForAccount(currentAccount(), key);
+        }
+        return snapshots.get(key);
+    }
+
+    private List<NeptuneClusterSnapshot> scanSnapshots() {
+        String region = currentRegion();
+        if (snapshots instanceof AccountAwareStorageBackend<NeptuneClusterSnapshot> aware) {
+            return aware.scanForAccount(currentAccount(), key -> key.startsWith(region + "/"));
+        }
+        return snapshots.scan(key -> key.startsWith(region + "/"));
+    }
+
+    private void putSnapshot(NeptuneClusterSnapshot snapshot) {
+        String key = clusterKey(currentRegion(), snapshot.dbClusterSnapshotIdentifier());
+        if (snapshots instanceof AccountAwareStorageBackend<NeptuneClusterSnapshot> aware) {
+            aware.putAllAtomicallyForAccount(currentAccount(), Map.of(key, snapshot));
+        } else {
+            snapshots.putAllAtomically(Map.of(key, snapshot));
+        }
+    }
+
+    private Object clusterMutationLock(String identifier) {
+        return clusterMutationLocks.lockFor(resourceIdentity(currentAccount(), currentRegion(),
+                identifier.toLowerCase(Locale.ROOT)));
     }
 
     public NeptuneCluster addRoleToDbCluster(String id, String roleArn) {
@@ -492,6 +721,10 @@ public class NeptuneService {
         String type = resource.substring(0, separator);
         String id = resource.substring(separator + 1);
         return switch (type) {
+            case "cluster-snapshot" -> {
+                NeptuneClusterSnapshot snapshot = getDbClusterSnapshot(resourceName);
+                yield new TagTarget(snapshot.tags(), updated -> putSnapshot(snapshot.withTags(updated)));
+            }
             case "cluster" -> {
                 NeptuneCluster cluster = scanClusters().stream()
                         .filter(c -> resourceName.equalsIgnoreCase(c.getDbClusterArn()))
@@ -643,6 +876,16 @@ public class NeptuneService {
             aware.putForAccount(account, key, cluster);
         } else {
             clusters.put(key, cluster);
+        }
+    }
+
+    private void putRestoredCluster(NeptuneCluster cluster) {
+        String account = arnAccount(cluster.getDbClusterArn());
+        String key = clusterKey(arnRegion(cluster.getDbClusterArn()), cluster.getDbClusterIdentifier());
+        if (clusters instanceof AccountAwareStorageBackend<NeptuneCluster> aware) {
+            aware.putAllAtomicallyForAccount(account, Map.of(key, cluster));
+        } else {
+            clusters.putAllAtomically(Map.of(key, cluster));
         }
     }
 
