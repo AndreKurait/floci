@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler.ControlConnection;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler.ControlListener;
 
+import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
 
@@ -162,16 +163,23 @@ final class VpcRoutingCommands {
 
     static String publicInstanceSource(String privateAddress, String publicAddress, String publicDevice,
                                        List<String> destinations) {
+        return publicInstanceSources(privateAddress, publicAddress, publicAddress == null ? List.of()
+                : destinations.stream().map(destination -> new Hop(destination, destination, publicDevice, false))
+                        .toList());
+    }
+
+    static String publicInstanceSources(String privateAddress, String publicAddress, List<Hop> destinations) {
         String rules = """
                 add table ip floci_instance_api
                 add chain ip floci_instance_api outgoing { type nat hook postrouting priority srcnat; }
                 flush chain ip floci_instance_api outgoing
                 """;
         if (publicAddress != null) {
-            for (String destination : destinations.stream().distinct().sorted().toList()) {
-                rules += "add rule ip floci_instance_api outgoing oifname \"" + device(publicDevice)
+            for (Hop destination : destinations.stream().distinct()
+                    .sorted(Comparator.comparing(Hop::destination).thenComparing(Hop::device)).toList()) {
+                rules += "add rule ip floci_instance_api outgoing oifname \"" + destination.device()
                         + "\" ip saddr " + VpcRouteSelection.ipv4(privateAddress) + " ip daddr "
-                        + VpcRouteSelection.ipv4(destination)
+                        + destination.destination()
                         + " snat to " + VpcRouteSelection.ipv4(publicAddress) + "\n";
             }
         }
