@@ -57,6 +57,7 @@ import java.util.function.ToIntFunction;
  * reach Floci. The extra binding is skipped when the port is {@code 0} or equals the public port.
  * HTTPS load balancers may register a loopback backend for declared SNI hostnames on this
  * extra port. Other TLS uses the explicitly configured fallback, or the API backend by default.
+ * Connections admitted by the managed public AWS API bridge always retain the API backend.
  *
  * <p>Both listen on the configured {@code quarkus.http.host}, not the loopback pin
  * {@link TlsConfigSource} applies to Quarkus itself, and a non-loopback host needs the same consent
@@ -353,9 +354,9 @@ public class TlsProxyServer {
                         PublicApiProxySources.Addresses addresses = publicSources.decode(ticket, header.toString());
                         vertx.cancelTimer(timer);
                         if (index + 1 < buffer.length()) {
-                            dispatch(socket, buffer.getBuffer(index + 1, buffer.length()), addresses);
+                            dispatchPublicApi(socket, buffer.getBuffer(index + 1, buffer.length()), addresses);
                         } else {
-                            readFirst(socket, addresses);
+                            socket.handler(bytes -> dispatchPublicApi(socket, bytes, addresses));
                         }
                         return;
                     }
@@ -365,6 +366,13 @@ public class TlsProxyServer {
                 socket.close();
             }
         });
+    }
+
+    private void dispatchPublicApi(NetSocket socket, Buffer buffer, PublicApiProxySources.Addresses addresses) {
+        socket.handler(null);
+        socket.pause();
+        boolean tls = buffer.length() > 0 && buffer.getByte(0) == TLS_HANDSHAKE;
+        connectBackend(socket, buffer, tls ? httpsBackendPort : httpBackendPort, addresses);
     }
 
     private void dispatch(NetSocket socket, Buffer buffer, PublicApiProxySources.Addresses addresses) {
