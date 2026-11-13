@@ -147,9 +147,13 @@ workload control-network exemption.
 
 An EC2 instance with a native public IPv4 address can instead use its subnet's
 attached internet-gateway route. Its protected namespace joins the owned public
-transport bridge, preserving its public source address without Docker masquerading.
-Managed public EC2 peers and the optional public API bridge use this route,
-subject to the instance's security-group egress. A private neighbor cannot borrow it. Removing
+transport bridge for managed public EC2 peers. Public API traffic uses the
+native address's original Docker network when that network is not internal.
+Keeping that public source on its owning bridge prevents Docker's host
+masquerading rule from replacing it with a transport gateway address. Internal
+control networks retain the managed public transport for the routed API address.
+Both paths preserve the native public source and remain subject to the instance's
+internet route and security-group egress. A private neighbor cannot borrow them. Removing
 an Elastic IP or stopping the instance withdraws its admission; reassociation or
 start restores it when the declared public address and internet route exist.
 Removing the last NAT and public caller retires the bridge.
