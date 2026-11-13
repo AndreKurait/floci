@@ -25,6 +25,15 @@ class CloudWatchMetricFilterQueryNamespaceTest {
         params.putSingle("Period", "60");
         params.putSingle("StartTime", "2026-09-16T00:00:00Z");
         params.putSingle("EndTime", "2026-09-16T00:01:00Z");
+        if ("GetMetricStatistics".equals(action)) {
+            params.putSingle("Statistics.member.1", "Sum");
+        } else {
+            params.putSingle("MetricDataQueries.member.1.Id", "count");
+            params.putSingle("MetricDataQueries.member.1.MetricStat.Metric.Namespace", "MetricFilters");
+            params.putSingle("MetricDataQueries.member.1.MetricStat.Metric.MetricName", "Count");
+            params.putSingle("MetricDataQueries.member.1.MetricStat.Period", "60");
+            params.putSingle("MetricDataQueries.member.1.MetricStat.Stat", "Sum");
+        }
         try (Response response = handler.handle(action, params, "us-east-1")) {
             assertEquals(200, response.getStatus());
             assertEquals(AwsNamespaces.CW, XmlParser.parseDocument((String) response.getEntity())
