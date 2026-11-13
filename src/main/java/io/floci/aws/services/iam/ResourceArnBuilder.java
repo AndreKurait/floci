@@ -220,6 +220,11 @@ public class ResourceArnBuilder {
         if (credentialScope == null) {
             return List.of("*");
         }
+        if ("iot".equals(credentialScope) && "iot:DeleteJob".equals(operation)) {
+            String jobId = ctx.getUriInfo().getPathParameters().getFirst("jobId");
+            return List.of(jobId == null ? "*"
+                    : AwsArnUtils.Arn.of("iot", region, accountId, "job/" + jobId).toString());
+        }
         if (operation != null && operation.startsWith(credentialScope + ":") && RequestResources.reads(operation)) {
             return namedResources(credentialScope, operation, ctx, region, accountId, partition);
         }
