@@ -13,6 +13,7 @@ import io.github.hectorvent.floci.services.dynamodb.model.TableDefinition;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
+import io.github.hectorvent.floci.services.ecr.EcrService;
 import io.github.hectorvent.floci.services.elbv2.ElbV2ConditionKeys;
 import io.github.hectorvent.floci.services.iam.IamActionRegistry;
 import io.github.hectorvent.floci.services.iam.IamService;
@@ -99,6 +100,7 @@ public class IamConditionContextResolver {
 
     private final Instance<DynamoDbFacade> dynamoDbFacade;
     private final Instance<Ec2Service> ec2Service;
+    private final Instance<EcrService> ecrService;
     private final Instance<S3Service> s3Service;
     private final Instance<CloudWatchLogsService> logsService;
     private final Instance<IamService> iamService;
@@ -127,9 +129,9 @@ public class IamConditionContextResolver {
                                        CurrentVertxRequest currentVertxRequest,
                                        ResolvedServiceCatalog serviceCatalog,
                                        Instance<SsmService> ssmService,
-                                       Instance<ElbV2ConditionKeys> elbV2ConditionKeys) {
+                                       Instance<ElbV2ConditionKeys> elbV2ConditionKeys, Instance<EcrService> ecrService) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys);
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys, ecrService);
     }
 
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -143,7 +145,7 @@ public class IamConditionContextResolver {
                                        CurrentVertxRequest currentVertxRequest,
                                        ResolvedServiceCatalog serviceCatalog) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), null, null);
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), null, null, null);
     }
 
     IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -157,7 +159,7 @@ public class IamConditionContextResolver {
                                 CurrentVertxRequest currentVertxRequest,
                                 ResolvedServiceCatalog serviceCatalog, Clock clock) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, clock, null, null);
+                config, currentVertxRequest, serviceCatalog, clock, null, null, null);
     }
 
     private IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -171,9 +173,10 @@ public class IamConditionContextResolver {
                                         CurrentVertxRequest currentVertxRequest,
                                         ResolvedServiceCatalog serviceCatalog, Clock clock,
                                         Instance<SsmService> ssmService,
-                                        Instance<ElbV2ConditionKeys> elbV2ConditionKeys) {
+                                        Instance<ElbV2ConditionKeys> elbV2ConditionKeys, Instance<EcrService> ecrService) {
         this.dynamoDbFacade = dynamoDbFacade;
         this.ec2Service = ec2Service;
+        this.ecrService = ecrService;
         this.s3Service = s3Service;
         this.logsService = logsService;
         this.iamService = iamService;
@@ -192,6 +195,7 @@ public class IamConditionContextResolver {
         return switch (credentialScope) {
             case "s3" -> s3ConditionContext(action, ctx);
             case "ec2" -> ec2ConditionContext(action, ctx);
+            case "ecr" -> ecrPreviewConditionContext(action, ctx);
             case "elasticloadbalancing" -> elbV2Contexts(action, ctx).stream().findFirst().orElse(null);
             case "dynamodb" -> dynamoDbConditionContext(action, ctx);
             case "iam" -> iamConditionContext(action, ctx);
@@ -272,6 +276,28 @@ public class IamConditionContextResolver {
     }
 
     /** Group mutations and stream access use the handler's group and request scope. */
+    private Map<String, List<String>> ecrPreviewConditionContext(String action, ContainerRequestContext ctx) {
+        if (!("ecr:StartLifecyclePolicyPreview".equals(action) || "ecr:GetLifecyclePolicyPreview".equals(action))
+                || ecrService == null || !ecrService.isResolvable()) {
+            return null;
+        }
+        JsonNode body = bufferedJsonBody(ctx);
+        if (body == null) {
+            return null;
+        }
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        Map<String, String> tags = ecrService.get().lifecyclePreviewTags(body.path("repositoryName").asText(null),
+                body.path("registryId").asText(null), region);
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        tags.forEach((key, value) -> {
+            if (key != null && value != null) {
+                conditions.put("aws:ResourceTag/" + key, List.of(value));
+                conditions.put("ecr:ResourceTag/" + key, List.of(value));
+            }
+        });
+        return conditions;
+    }
+
     private Map<String, List<String>> logsConditionContext(String action, ContainerRequestContext ctx) {
         if (!("logs:CreateLogStream".equals(action) || "logs:DeleteLogStream".equals(action)
                 || "logs:PutLogEvents".equals(action)
