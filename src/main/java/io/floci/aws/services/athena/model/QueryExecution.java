@@ -26,6 +26,12 @@ public class QueryExecution {
     @JsonProperty("QueryExecutionContext")
     private QueryExecutionContext queryExecutionContext;
 
+    @JsonProperty("_flociRegion")
+    private String storedRegion;
+
+    public String storedRegion() { return storedRegion; }
+    public void storeRegion(String region) { this.storedRegion = region; }
+
     public QueryExecution() {}
     public QueryExecution(String id, String query, String workGroup,
                           ResultConfiguration resultConfiguration,
