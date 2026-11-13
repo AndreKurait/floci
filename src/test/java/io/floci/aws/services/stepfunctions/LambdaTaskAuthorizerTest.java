@@ -9,7 +9,6 @@ import io.floci.aws.services.iam.ResourcePolicyProvider.ResourcePolicy;
 import io.floci.aws.services.iam.ScpProvider;
 import io.floci.aws.services.iam.model.CallerContext;
 import io.floci.aws.services.iam.model.IamRole;
-import io.floci.aws.services.lambda.LambdaResourcePolicyProvider;
 import io.floci.aws.services.stepfunctions.LambdaTaskAuthorizer.Permission;
 import io.floci.aws.services.stepfunctions.model.StateMachine;
 import jakarta.enterprise.inject.Instance;
@@ -64,7 +63,7 @@ class LambdaTaskAuthorizerTest {
               "Principal":{"Service":"states.amazonaws.com"}}]}""";
 
     private IamService iamService;
-    private LambdaResourcePolicyProvider functionPolicies;
+    private ResourcePolicyProvider functionPolicies;
     private ResourcePolicyProvider bucketPolicies;
     private Instance<ScpProvider> scpProvider;
     private LambdaTaskAuthorizer authorizer;
@@ -73,7 +72,7 @@ class LambdaTaskAuthorizerTest {
     @SuppressWarnings("unchecked")
     void setUp() {
         iamService = mock(IamService.class);
-        functionPolicies = mock(LambdaResourcePolicyProvider.class);
+        functionPolicies = mock(ResourcePolicyProvider.class);
         scpProvider = mock(Instance.class);
         when(functionPolicies.getResourcePolicies(eq("lambda"), anyString()))
                 .thenReturn(List.of(new ResourcePolicy(null, FUNCTION_ACCOUNT)));
