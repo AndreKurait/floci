@@ -1411,9 +1411,9 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
             filter.setDestinationArn(destinationArn);
             filter.setDistribution(distribution != null ? distribution : "ByLogStream");
             filter.setApplyOnTransformedLogs(applyOnTransformedLogs);
-            filter.setCreationTime(clock.getAsLong());
-
             String filterKey = subscriptionFilterKey(region, logGroupName, filterName);
+            SubscriptionFilter previous = subscriptionFilterStore.get(filterKey).orElse(null);
+            filter.setCreationTime(previous == null ? clock.getAsLong() : previous.getCreationTime());
             subscriptionFilterStore.put(filterKey, filter);
             LOG.infov("Created subscription filter: {0} on log group: {1}", filterName, logGroupName);
         }

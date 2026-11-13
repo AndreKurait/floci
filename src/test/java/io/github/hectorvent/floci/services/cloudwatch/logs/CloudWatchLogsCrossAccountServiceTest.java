@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -15,7 +16,8 @@ class CloudWatchLogsCrossAccountServiceTest {
 
     private final CloudWatchLogsCrossAccountService service = new CloudWatchLogsCrossAccountService(
             new InMemoryStorage<>(), new InMemoryStorage<>(),
-            new RegionResolver(REGION, "000000000000"), new ObjectMapper());
+            new RegionResolver(REGION, "000000000000"), new ObjectMapper(),
+            Mockito.mock(CloudWatchLogsDestinationTargetService.class));
 
     @Test
     void transformerGlobalAndScopedPoliciesCannotCoexist() {
