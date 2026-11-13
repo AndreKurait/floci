@@ -48,7 +48,7 @@ class KinesisResourcePolicyIntegrationTest {
                     assertThrows(ResourceNotFoundException.class, () -> client.deleteResourcePolicy(r -> r.resourceARN(target)));
                 }
                 // Configuration is persisted, but resource-policy data-plane evaluation is explicitly not implemented.
-                client.putResourcePolicy(r -> r.resourceARN(arn).policy(DENY.replace("kinesis:GetRecords", "kinesis:*")));
+                client.putResourcePolicy(r -> r.resourceARN(arn).policy(DENY.replace("kinesis:GetRecords", "kinesis:PutRecord").replace("222222222222", ACCOUNT)));
                 assertNotNull(client.putRecord(r -> r.streamName(name).partitionKey("key")
                         .data(SdkBytes.fromUtf8String("metadata scope"))).sequenceNumber());
             } finally {
@@ -59,6 +59,30 @@ class KinesisResourcePolicyIntegrationTest {
                 }
                 client.deleteStream(r -> r.streamName(name));
                 assertThrows(ResourceNotFoundException.class, () -> client.getResourcePolicy(r -> r.resourceARN(arn)));
+            }
+        }
+    }
+
+    @Test
+    void nativeSdkRejectsMissingParentsAndInvalidPolicyReplacements() {
+        String name = "policy-validation-" + UUID.randomUUID();
+        String arn = "arn:aws:kinesis:us-east-1:" + ACCOUNT + ":stream/" + name;
+        try (KinesisClient client = AwsTestClients.create(KinesisClient.builder(), ACCOUNT, Region.US_EAST_1)) {
+            assertThrows(ResourceNotFoundException.class,
+                    () -> client.registerStreamConsumer(r -> r.streamARN(arn).consumerName("child")));
+            client.createStream(r -> r.streamName(name).shardCount(1));
+            try {
+                assertTrue(client.listStreamConsumers(r -> r.streamARN(arn)).consumers().isEmpty());
+                client.putResourcePolicy(r -> r.resourceARN(arn).policy(POLICY));
+                for (String invalid : new String[]{POLICY + " ".repeat(20 * 1024),
+                        POLICY.replace("kinesis:GetRecords", "kinesis:*"),
+                        POLICY.replace("\"kinesis:GetRecords\"", "[\"kinesis:GetRecords\",\"*\"]")}) {
+                    assertThrows(InvalidArgumentException.class,
+                            () -> client.putResourcePolicy(r -> r.resourceARN(arn).policy(invalid)));
+                    assertEquals(POLICY, client.getResourcePolicy(r -> r.resourceARN(arn)).policy());
+                }
+            } finally {
+                client.deleteStream(r -> r.streamName(name));
             }
         }
     }

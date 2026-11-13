@@ -24,7 +24,7 @@ import java.util.Map;
 import static io.github.hectorvent.floci.services.kinesis.KinesisResourcePolicyServiceTest.*;
 import static org.junit.jupiter.api.Assertions.*;
 
-class KinesisResourcePolicyPersistenceTest {
+class KinesisResourcePolicyPersistenceServiceTest {
     @ParameterizedTest
     @ValueSource(strings = {"persistent", "hybrid", "wal"})
     void streamConsumerPoliciesTagsAndDeletionSurviveReload(String mode, @TempDir Path directory) {

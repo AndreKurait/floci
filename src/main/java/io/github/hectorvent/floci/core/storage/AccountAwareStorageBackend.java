@@ -411,6 +411,11 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
                 ? delegate.get(key) : Optional.empty();
     }
 
+    /** Reads an unprefixed entry without migration when its stored metadata proves ownership. */
+    public synchronized Optional<V> getLegacyMatching(String key, Predicate<V> legacyOwner) {
+        return hasAccountPrefix(key) ? Optional.empty() : delegate.get(key).filter(legacyOwner);
+    }
+
     /**
      * Returns an explicitly scoped entry, or safely migrates a matching legacy unscoped entry.
      *
