@@ -58,6 +58,7 @@ Inflation is bounded to 10 MiB; the ordinary log-event validation still applies.
 | `DeleteDestination` | Remove a logical destination without deleting its target |
 | `PutAccountPolicy` | Create or update an account-level Logs policy |
 | `DescribeAccountPolicies` | List account-level Logs policies by type and optional name |
+| `DeleteAccountPolicy` | Delete an account-level Logs policy by exact name and type |
 | `GetDataProtectionPolicy` | Return the resolved log group identifier (see note below) |
 | `StartQuery` | Start a Logs Insights query (see [Logs Insights](#logs-insights)) |
 | `GetQueryResults` | Get the status and results of a Logs Insights query |
@@ -101,6 +102,23 @@ metric filters and subscription filters use: terms, quoted phrases, `?` alternat
 exclusions, JSON and space-delimited patterns. An invalid pattern is refused with
 `InvalidParameterException`, and so is a request that names no log group by `logGroupName` or
 `logGroupIdentifier`.
+
+### Account policies
+
+`DeleteAccountPolicy` removes only the named account policy of the requested type in the
+caller's account and Region. Missing policies return `ResourceNotFoundException`; group-level
+settings and other policy types remain intact. The existing five policy types are supported.
+`RETENTION_POLICY` and every non-null `dryRun` value, including `false`, are explicitly
+rejected before deletion. JSON null follows the existing optional-field omission convention.
+
+Authorization requires `logs:DeleteAccountPolicy` plus the documented delete action for data
+protection, subscription filters, transformers, or field indexes. Metric extraction has no
+additional documented delete action. This operation does not extend account-policy document
+validation or delivery behavior.
+
+Like `DescribeAccountPolicies`, deletion sees only keys scoped to the caller's account.
+Unprefixed legacy entries remain invisible and unchanged; this operation does not migrate
+them into an account or expand existing legacy visibility.
 
 ### Group log transformers
 

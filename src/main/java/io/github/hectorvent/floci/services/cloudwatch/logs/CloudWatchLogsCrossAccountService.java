@@ -221,6 +221,18 @@ public class CloudWatchLogsCrossAccountService {
         return policy;
     }
 
+    public synchronized void deleteAccountPolicy(String policyName, String policyType, String region) {
+        validatePolicyName(policyName);
+        if (policyType == null || !POLICY_TYPES.contains(policyType)) {
+            throw invalid("policyType is required and must be valid.");
+        }
+        String key = policyKey(region, policyType, policyName);
+        if (accountPolicies.scan(key::equals).isEmpty()) {
+            throw new AwsException("ResourceNotFoundException", "The specified account policy does not exist.", 400);
+        }
+        accountPolicies.delete(key);
+    }
+
     public List<AccountPolicy> describeAccountPolicies(String policyType, String policyName, String region) {
         if (policyType == null || !POLICY_TYPES.contains(policyType)) {
             throw invalid("policyType is required and must be valid.");

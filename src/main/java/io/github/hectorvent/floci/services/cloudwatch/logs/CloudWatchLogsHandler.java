@@ -113,6 +113,7 @@ public class CloudWatchLogsHandler {
             case "DeleteDestination" -> handleDeleteDestination(request, region);
             case "PutAccountPolicy" -> handlePutAccountPolicy(request, region);
             case "DescribeAccountPolicies" -> handleDescribeAccountPolicies(request, region);
+            case "DeleteAccountPolicy" -> handleDeleteAccountPolicy(request, region);
             case "GetDataProtectionPolicy" -> handleGetDataProtectionPolicy(request, region);
             case "StartQuery" -> handleStartQuery(request, region);
             case "GetQueryResults" -> handleGetQueryResults(request, region);
@@ -298,6 +299,21 @@ public class CloudWatchLogsHandler {
         ObjectNode response = objectMapper.createObjectNode();
         response.set("accountPolicy", buildAccountPolicy(policy));
         return Response.ok(response).build();
+    }
+
+    private Response handleDeleteAccountPolicy(JsonNode request, String region) {
+        JsonNode policyName = request.path("policyName");
+        JsonNode policyType = request.path("policyType");
+        if (!policyName.isTextual() || !policyType.isTextual()) {
+            throw new AwsException("InvalidParameterException", "policyName and policyType must be strings.", 400);
+        }
+        JsonNode dryRun = request.get("dryRun");
+        if (dryRun != null && !dryRun.isNull()) {
+            throw new AwsException("InvalidParameterException",
+                    "dryRun is valid only for RETENTION_POLICY, which is not supported.", 400);
+        }
+        crossAccountService.deleteAccountPolicy(policyName.textValue(), policyType.textValue(), region);
+        return Response.ok(objectMapper.createObjectNode()).build();
     }
 
     private Response handleDescribeAccountPolicies(JsonNode request, String region) {
