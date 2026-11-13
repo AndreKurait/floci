@@ -44,13 +44,40 @@ and zero capacity. Both groups had identical configuration except for name, ARN
 and creation time. The SDK regression is
 `compatibility-tests/sdk-test-python/tests/test_autoscaling_subnet_whitespace.py`.
 
-Capacity reservation targets remain limited to one reservation ID or one resource
+When `AvailabilityZones` is omitted, group creation and subnet updates derive the
+distinct zones from `VPCZoneIdentifier`. Updates without placement fields retain
+the group's current subnet and zone selection.
+
+By default, capacity reservation targets are limited to one reservation ID or one resource
 group ARN. Multiple entries, including duplicates, return `ValidationError`;
 mixing IDs and group ARNs returns a distinct validation message. These messages
 match live AWS comparisons on November 2, 2026 in `us-east-1` and `eu-west-1`
 for create, and `eu-west-1` for update, using zero desired capacity.
-Rejected updates preserve the group's existing configuration. This does not
-enable preview support for multiple reservation targets.
+Rejected updates preserve the group's existing configuration.
+
+To model a workload with a different direct-reservation limit, explicitly set
+`floci.services.autoscaling.max-capacity-reservation-ids` (environment variable
+`FLOCI_SERVICES_AUTOSCALING_MAX_CAPACITY_RESERVATION_IDS`) to a positive integer.
+Zero and negative values are rejected at startup. The default is `1`. This
+emulator setting does not reproduce account or service allowlisting, and an
+increased value is not a claim of general AWS availability.
+Resource-group ARN targets remain limited to one, and mixing target types is
+always rejected. For accepted direct ID lists, scale-out and instance refresh
+try the supplied reservations using EC2's zone, type, platform, tenancy and
+capacity checks. `capacity-reservations-first` falls back to on-demand only after
+all supplied targets lack matching capacity; `capacity-reservations-only` remains
+under desired capacity until a target can satisfy the launch. Other EC2 errors
+remain failures.
+
+To restrict the increased limit to selected accounts and regions, set
+`FLOCI_SERVICES_AUTOSCALING_MULTIPLE_CAPACITY_RESERVATION_SCOPES` to a
+comma-separated list of exact `account-id/region` pairs, such as
+`123456789012/us-east-1,123456789012/us-west-2`, alongside the increased limit.
+Whitespace around each pair is ignored. All other scopes retain the one-ID limit.
+With no scope list, the configured limit continues to apply throughout this emulator
+deployment. Scope selection
+uses the resolved request account and operation region; it adds no request
+headers, grants no IAM permissions, and does not deploy AWS service principals.
 
 When `AvailabilityZones` is omitted, group creation and subnet updates derive the
 distinct zones from `VPCZoneIdentifier`. Updates without placement fields retain
@@ -94,6 +121,26 @@ EC2 launch behavior and counts each member under the requested zone. This permit
 real zones outside the local subnet catalog, such as `us-east-1d`; the underlying
 EC2 instance can use a default subnet in a different zone.
 
+### Tags
+
+| Operation | Notes |
+|---|---|
+| `DescribeTags` | Returns stored group tags in the caller's account and region. Filters support `auto-scaling-group`, `key`, `value`, and `propagate-at-launch`, with AND across filters and OR across values. Names are case-insensitive; string values are case-sensitive. Boolean values accept case and surrounding whitespace. Empty `Values` ignores a valid filter; missing `Name` or `Values` raises `ValidationError`. `MaxRecords` defaults to 50 and accepts 1 to 100; `NextToken` continues the result |
+| `CreateOrUpdateTags` | Creates or updates tags and their `PropagateAtLaunch` values |
+| `DeleteTags` | Removes tags from the named group |
+
+For tags sent with `CreateAutoScalingGroup` or `CreateOrUpdateTags`, an omitted
+`PropagateAtLaunch` defaults to `true`. Explicit `true` and `false` values are
+preserved. The [AWS Tag API reference](https://docs.aws.amazon.com/autoscaling/ec2/APIReference/API_Tag.html)
+marks this field optional without documenting a default. Floci's default for both
+actions is an inferred compatibility choice, not an AWS-documented default.
+Existing tags whose omitted flag was stored as `false` remain
+`false`; stored flags are not automatically migrated. A later `CreateOrUpdateTags`
+replaces the value and flag for that tag, so omitting the flag on an update sets
+it to `true`. Group and tag writes do not automatically retag existing instances.
+A later `AttachInstances` operation applies the propagated group tags as
+described below.
+
 ### Instance Management
 
 | Operation | Notes |
@@ -101,14 +148,26 @@ EC2 instance can use a default subnet in a different zone.
 | `DescribeAutoScalingInstances` | Returns all ASG-tracked instances with their group name, lifecycle state and health status. Health is in capitals here: `HEALTHY`, as the AWS samples show, and `UNHEALTHY` by the same rule. `DescribeAutoScalingGroups` reports `Healthy` or `Unhealthy` |
 | `SetInstanceHealth` | Updates an instance's health status immediately; accepts but does not enforce the grace-period flag |
 | `SetInstanceProtection` | Enables or disables scale-in protection for named instances in a group |
-| `SetDesiredCapacity` | Updates desired count; reconciler handles scale-out / scale-in within 10 s |
-| `AttachInstances` | Attaches existing EC2 instances to a group; sets lifecycle state to `InService`. Refuses the whole batch with `ValidationError` when an instance already belongs to a group |
+| `SetDesiredCapacity` | Queues capacity reconciliation; Classic draining can postpone termination |
+| `AttachInstances` | Attaches existing EC2 instances to a group; waits for configured load-balancer registration before `InService`. Refuses the whole batch with `ValidationError` when an instance already belongs to a group |
 | `DetachInstances` | Detaches instances from a group; optionally decrements desired capacity |
+| `EnterStandby` | Preserves membership while removing traffic and excluding the instances from active capacity; optionally decrements desired capacity within the group's minimum |
+| `ExitStandby` | Restores traffic and `InService` state; increments desired capacity within the group's maximum |
 | `TerminateInstanceInAutoScalingGroup` | Terminates a specific instance; optionally decrements desired capacity |
 | `EnterStandby` | Moves `InService` instances to `EnteringStandby` and returns one `InProgress` activity (progress 50) per instance; the reconciler deregisters them from the group's target groups and Classic Load Balancers and sets `Standby` within 10 s. `ShouldDecrementDesiredCapacity=true` lowers desired capacity by the number of instances, refused with `ValidationError` below `MinSize`; `false` keeps it, so the group launches replacements |
 | `ExitStandby` | Moves `Standby` instances to `Pending`, raises desired capacity by the number of instances (refused with `ValidationError` above `MaxSize`) and returns one `PreInService` activity (progress 30) per instance; the reconciler registers them with the group's load balancers and sets `InService` within 10 s |
 | `SuspendProcesses` | Records suspended scaling processes (empty list suspends all); reported back by `DescribeAutoScalingGroups` |
 | `ResumeProcesses` | Clears suspended processes (empty list resumes all) |
+
+Standby transitions complete asynchronously through the reconciler. Entering standby
+preserves the EC2 instance and its group tags. See the lifecycle and capacity rules below.
+
+`TerminateInstanceInAutoScalingGroup` returns an `InProgress` activity. Poll its ID in
+the `ActivityIds` filter of `DescribeScalingActivities` for the reconciliation outcome. The activity remains pending
+while Classic connections drain and survives storage reloads. An EC2 termination failure
+completes that request as `Failed`; deleting the group cancels a pending request.
+An explicit request can take over a refresh selection, including a paused refresh.
+Repeating an accepted scale-in request is rejected without decrementing capacity again.
 
 `CreateAutoScalingGroup` defaults an omitted tag `PropagateAtLaunch` to `true`;
 an explicit `false` keeps that tag on the group. `CreateOrUpdateTags` requires the
@@ -120,13 +179,72 @@ Member instances carry the tags the
 [EC2 instance tagging lifecycle](https://docs.aws.amazon.com/autoscaling/ec2/userguide/ec2-auto-scaling-tagging.html#tag-lifecycle)
 describes. An instance the group launches gets its launch template's instance tags, then the
 group's `PropagateAtLaunch` tags, which win a key both set, then `aws:autoscaling:groupName` with
-the group's name. `AttachInstances` adds the same group tags and `aws:autoscaling:groupName`,
+the group's name. See [Tags](#tags) for Floci's omitted-flag default and stored-tag
+behavior.
+`AttachInstances` adds the same group tags and `aws:autoscaling:groupName`,
 overwriting existing tags with the same keys. `DetachInstances` removes only
 `aws:autoscaling:groupName`, and only while it names the group being detached from.
 
-`AttachInstances` does not yet refuse what AWS refuses for the instance's state or zone or for
-the group's `MaxSize`, and does not grow desired capacity by the number of instances attached.
-An ID EC2 has no instance for joins the group without tags.
+Attachment checks EC2 existence, running state and the group's effective Availability
+Zones before changing tags or membership. A different subnet or VPC in a matching
+zone is accepted. Repeated IDs count once toward desired capacity. Suspended Launch
+or capacity above the maximum rejects the attachment.
+When the group names target groups or Classic load balancers, attached instances
+remain `Pending` until registration succeeds. Failed registrations retry through
+reconciliation, including after a storage reload. Groups without load balancers
+complete attachment immediately.
+
+Detach validates the whole batch before deleting membership tags or refresh ownership.
+Missing members, Pending or Detaching members, and a decremented desired capacity below
+the minimum are rejected. Retained lifecycle states require
+`ShouldDecrementDesiredCapacity=false`, as the
+[DetachInstances API](https://docs.aws.amazon.com/autoscaling/ec2/APIReference/API_DetachInstances.html)
+specifies. Selected refresh originals remain detachable while their EC2
+instances are still running, including refreshes stored before replacement ownership
+was recorded. A missing EC2 original produces the same lifecycle `ValidationError`
+as a terminated original. Detachment completes synchronously; Floci does not
+reproduce AWS's asynchronous Detaching transition.
+
+Group deletion retains a `Delete in progress` entry until child cleanup finishes.
+If a storage operation fails, retrying deletion continues cleanup; reconciliation
+does not launch replacement instances for the retained deleting group.
+
+### Standby
+
+`DescribeAutoScalingInstances` includes the required `AutoScalingGroupName` and reports
+`HEALTHY` or `UNHEALTHY`. Group instance descriptions and `SetInstanceHealth` keep
+`Healthy` and `Unhealthy`, matching the operation-specific AWS examples.
+
+`EnterStandby` accepts up to 20 instances belonging to the named group, all in
+`InService`. It starts one `InProgress` activity per instance and moves each through
+`EnteringStandby` to `Standby`. The reconciler deregisters each instance from the
+group's target groups and Classic Load Balancers before completing its transition.
+With `ShouldDecrementDesiredCapacity=true`, desired capacity decreases by the number
+of selected instances. Otherwise, desired capacity stays unchanged and replacement
+capacity is launched.
+
+`ExitStandby` accepts only `Standby` members and rejects requests while `Launch`
+is suspended. It increments desired capacity and starts a `PreInService` activity
+for each returning instance. Instances wait in
+`Pending` until EC2 is running and load-balancer registration succeeds, then return
+to `InService`. Both operations validate the entire batch and the resulting minimum
+and maximum capacity bounds before changing group state.
+
+Standby members remain in the group without health checks or automatic replacement.
+Their health status remains the same while on standby. A stopped or terminated
+instance is checked when it exits standby and replaced; a stopped instance is
+terminated before its membership is removed. Transitions and their activities
+survive storage reloads. Registration failures are retried, while references to
+deleted load balancers or target groups are ignored. Superseding termination,
+group deletion or instance refresh completes the pending activity as `Cancelled`.
+As in AWS, suspending `Terminate` protects `InService` instances, not instances
+that fail to resume from standby. See the AWS
+[suspension considerations](https://docs.aws.amazon.com/autoscaling/ec2/userguide/suspend-resume-considerations.html).
+
+Standby transitions remove target registrations immediately and do not wait for
+connection draining before reporting `Standby`. See the AWS
+[standby guide](https://docs.aws.amazon.com/autoscaling/ec2/userguide/as-enter-exit-standby.html)
+for the lifecycle and capacity rules.
 
 Standby follows the
 [user guide](https://docs.aws.amazon.com/autoscaling/ec2/userguide/as-enter-exit-standby.html).
@@ -145,8 +263,8 @@ Each move's activity carries the description and cause AWS writes and completes 
 instance refresh on its way back to service, or when the group is deleted. `DetachInstances` refuses
 an instance whose move is still in progress, such as one in `EnteringStandby` or `Pending` on its way
 back, with `The instance <id> is not in InService or Standby.`, AWS's answer for a state it does not
-detach; Floci does not refuse the other such states yet. Floci does not wait for connection draining and
-does not write the activity's `Details` member.
+detach; Floci does not refuse the other such states yet. Standby completion does not wait for connection
+draining and does not write the activity's `Details` member.
 
 ### Instance Refresh
 
@@ -176,6 +294,11 @@ or cancellation. Refreshes saved by older versions without replacement ownership
 retain the previous reconciliation behavior. Storage reload coverage does not
 imply an atomic transaction spanning Auto Scaling and EC2 after a process crash.
 
+`Preferences.StandbyInstances` is stored and reported but not applied: refresh
+always excludes `Standby` members, including when `Wait` (the AWS default) or
+`Terminate` is requested. See AWS's
+[refresh preferences](https://docs.aws.amazon.com/autoscaling/ec2/APIReference/API_RefreshPreferences.html).
+
 ### Load Balancer Attachment
 
 | Operation | Notes |
@@ -204,6 +327,24 @@ imply an atomic transaction spanning Auto Scaling and EC2 after a process crash.
 | `DeleteLifecycleHook` | Removes a hook |
 | `CompleteLifecycleAction` | Signals `CONTINUE` or `ABANDON` for a pending lifecycle action |
 | `RecordLifecycleActionHeartbeat` | Extends the heartbeat timeout for an in-progress lifecycle action |
+
+Launch hooks keep a newly running EC2 host in `Pending:Wait`. Waiting hosts count
+toward desired capacity and are not registered with the group's load balancers.
+Every launch hook must complete with `CONTINUE` before the host moves through
+`Pending:Proceed` to `InService`. An `ABANDON` result terminates the host and lets
+ordinary capacity reconciliation replace it.
+
+Completion and heartbeat calls identify an active action by its hook and either
+instance ID or action token. Heartbeats extend the captured timeout, bounded by
+48 hours or 100 heartbeat periods, whichever is smaller. An expired action uses
+its captured `DefaultResult`; later hook updates do not rewrite actions already
+in progress. Deleting a launch hook abandons its outstanding actions. Action
+tokens, deadlines and results are stored with the owning instance.
+
+CodeDeploy installs and completes managed launch hooks for its attached deployment
+groups; see [Auto Scaling launch deployments](codedeploy.md#auto-scaling-launch-deployments).
+Termination lifecycle actions and lifecycle notification delivery to SNS or SQS
+are not implemented yet.
 
 ### Scaling Policies
 
@@ -235,10 +376,6 @@ imply an atomic transaction spanning Auto Scaling and EC2 after a process crash.
 |---|---|
 | `DescribeScalingActivities` | Returns the activity log for a group; activities recorded on scale-out and scale-in events |
 
-The optional `ActivityIds` filter selects matching activities within the requested group,
-account and region. Matches retain newest-first order, repeated IDs do not duplicate results,
-and unknown IDs are ignored. Omitting the filter returns the full matching activity history.
-
 ### Metadata
 
 | Operation | Notes |
@@ -263,13 +400,28 @@ and omit the optional reason. Floci does not invent a date for those existing
 suspensions. A repeated suspension leaves an unknown time unknown until the
 process is resumed and suspended again.
 
-## Capacity Reconciler (Phase 2)
+## Capacity reconciliation
 
-Floci runs a background reconciler (10 s fixed rate) that keeps each group's InService instance count aligned with `DesiredCapacity`:
+Group changes enqueue reconciliation; a 10-second repair sweep catches pending transitions.
+The reconciler keeps active capacity aligned with `DesiredCapacity`:
 
 - **Scale-out**: calls `RunInstances` with the group's launch configuration; new instances are tracked as `Pending` until the EC2 state transitions to `running`, at which point they move to `InService` and are registered with all attached ELB v2 target groups.
-- **Scale-in**: selects InService instances not protected from scale-in, deregisters them from target groups, then calls `TerminateInstances`.
+- **Scale-in**: selects unprotected `InService` instances, persists them as `Terminating`, and deregisters them from target groups and Classic load balancers before terminating EC2.
 - Activity records are written on each scale-out and scale-in event.
+
+For protected Classic frontends, scale-in, instance refresh and explicit
+`TerminateInstanceInAutoScalingGroup` requests wait for actual proxy sessions to
+finish or reach the configured drain deadline. Draining-disabled frontends close
+existing sessions immediately. An instance waits for every attached Classic
+balancer; an already drained peer can terminate independently.
+
+Deregistration, drain-observation and EC2 termination failures retain membership
+for retry. Selected scale-in members no longer count as active capacity and
+cannot return to service when desired capacity increases. Selection survives
+group storage reloads. Successful termination activities are recorded after
+EC2 accepts termination. Standby completion, forced group deletion, ELB v2
+deregistration delays and proxy-session recovery across process restarts remain
+separate limitations.
 
 `SuspendProcesses` pauses desired-capacity scale-out for `Launch` and scale-in for
 `Terminate`. The desired count remains stored, and `ResumeProcesses` allows the
@@ -302,6 +454,10 @@ Direct and mixed launch templates retain the selected version's original user-da
 encoding for instance attributes and metadata, including compressed and binary
 payloads. Execution still uses decoded text. Older templates that store only
 execution text retain that text through a UTF-8 fallback.
+
+For direct and mixed launch templates, omitting the version selects `$Default`.
+Explicit `$Default`, `$Latest`, and numeric versions keep their requested selection.
+Image validation and instance-profile authorization use that same version selection.
 
 Auto Scaling groups preserve either a launch configuration, a top-level launch template, or a `MixedInstancesPolicy`. These launch sources are mutually exclusive in create/update requests. When a mixed instances policy is supplied, Floci stores and returns:
 
@@ -357,8 +513,8 @@ without consuming reservations. `capacity-reservations-only` requires matching r
 `capacity-reservations-first` falls back to unreserved On-Demand capacity on a capacity shortage.
 An omitted group target inherits the template target; with neither target, matching open
 reservations are eligible. Updating the group affects subsequent launches, not existing instances.
-Missing or invalid targets do not trigger On-Demand fallback. Resource group targeting remains
-unsupported, as in EC2, and reports a failed scaling activity without allocating an instance.
+Missing or invalid targets do not trigger On-Demand fallback. Capacity reservation group targets
+select matching available EC2 reservations from the group's members for each launch.
 
 ## Scaling Policy Compatibility
 
@@ -406,3 +562,29 @@ aws autoscaling set-desired-capacity \
 Launch configurations accept an IAM instance profile name or ARN. Unknown and foreign profiles fail creation with `ValidationError`. At launch, the reconciler resolves a stored name to its ARN in the owning account. `CreateAutoScalingGroup` and `UpdateAutoScalingGroup` refuse, with `ValidationError`, a launch template that names both an instance profile name and an ARN, directly or through the mixed instances policy.
 
 Launch-configuration metadata options (`HttpTokens`, `HttpEndpoint`, and `HttpPutResponseHopLimit`) round-trip through Query and CloudFormation and reach EC2 launches. CloudFormation resolves intrinsics inside the block, so `Fn::If` and `AWS::NoValue` can select or omit the block or any of its members. When the structure is omitted it stays absent from `DescribeLaunchConfigurations`; a supplied partial structure reports defaults for unspecified fields. Launch templates, mixed-instance templates and EC2 Fleet launches likewise forward their existing metadata options.
+
+### Reconciliation scheduling
+
+Successful group mutations and completed local EC2 launches request reconciliation
+for the owning account, region and group. Notifications coalesce, each group remains
+serialized, and up to four groups can progress concurrently. A ten-second repair
+sweep covers changes without a local notification. Readiness still requires the
+actual EC2 state; a successful mutation response does not imply capacity is ready.
+
+### Group metrics
+
+`EnableMetricsCollection` publishes the eight basic group metrics to CloudWatch once per minute in
+`AWS/AutoScaling`, with the `AutoScalingGroupName` dimension and unit `None`. Collection starts disabled.
+An omitted metric list enables all collection settings; only the selected basic metrics produce samples:
+`GroupMinSize`, `GroupMaxSize`, `GroupDesiredCapacity`, `GroupInServiceInstances`, `GroupPendingInstances`,
+`GroupStandbyInstances`, `GroupTerminatingInstances`, and `GroupTotalInstances`. Pending and terminating
+lifecycle-hook wait/proceed states are included in their respective counts. The total is in-service plus
+pending plus terminating instances; standby instances have their own metric.
+
+Disabling collection or deleting the group stops future samples and preserves existing CloudWatch history.
+Samples remain isolated by account and Region, include zero values, and are available through the
+CloudWatch metric APIs. Missed collection intervals are not backfilled. Capacity-unit and warm-pool
+collection settings retain their metadata behavior without synthesized datapoints.
+
+Set `floci.services.autoscaling.cloudwatch-metrics-enabled=false` to disable the background publisher.
+The publisher also requires Auto Scaling and CloudWatch metrics to be enabled.

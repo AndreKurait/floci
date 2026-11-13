@@ -258,12 +258,12 @@ are evaluated as the identity whose long-term key signed the call, as on AWS:
 
 - `GetSessionToken` credentials have the permissions of that IAM user, or of the account root when its key minted them,
   still bounded by the account's service control policies.
-- `GetFederationToken` credentials have no permissions without a session policy (`Policy`). With one, they have the
+- `GetFederationToken` credentials have no permissions without an inline or managed session policy. With one, they have the
   intersection of that policy and the permissions of the IAM user that minted them, never those of a role that shares
   the federated user's name. A resource policy naming the federated user's ARN can grant access on its own, but not
   past an explicit `Deny` in the user's policies or permissions boundary. Whatever their policies allow, they cannot
   call any IAM operation, nor any STS operation except `GetCallerIdentity`.
-  Managed session policies (`PolicyArns`) are not supported yet.
+  Managed session policies (`PolicyArns`) are resolved and evaluated alongside the inline policy, as described below.
 
 A session minted with another session's temporary credentials, which AWS does not accept here, with an inactive access
 key or one that belongs to another account, or by an IAM user since deleted and recreated under the same name, is not
@@ -300,15 +300,11 @@ request context holds `sts:RoleSessionName`, `sts:ExternalId` when the caller pa
 guard, refuses a call that omits it or passes another value, and a conditional `Deny` applies only
 when its condition matches.
 
-`aws:PrincipalTag/<key>` contains the stored tags of the calling IAM user or assumed role.
-The target role's tags do not supply the caller's principal tags. A chained request reads the
-current caller role's tags; tags on the user that originally assumed it are not inherited.
-
 ### Known limitations
 
-- **Session tags and source identity are not modelled.** `aws:RequestTag/*`, `aws:TagKeys`,
-  `sts:TransitiveTagKeys` and `sts:SourceIdentity` are not in the request context, so a condition
-  on them does not match, and `sts:TagSession` and `sts:SetSourceIdentity` are not checked.
+- Federation support is operation-specific. Direct `AssumeRole` session tags and source identity
+  are documented below. Verified OIDC and SAML source identity are supported;
+  federation session-tag ingestion remains a separate limitation.
 
 ## Web Identity Validation (IRSA)
 
@@ -360,11 +356,106 @@ credentials for STS operations, including `GetCallerIdentity`, `GetSessionToken`
 and `AssumeRole`. It checks the request signature, credential scope, expiry and session token before
 execution. Nonblank Authorization headers retain priority. See [signature checks](../configuration/multi-account.md#signature-validation).
 
+### GetSessionToken MFA context
+
+GetSessionToken records whether its credentials were issued with verified MFA. A request without
+MFA has `aws:MultiFactorAuthPresent=false`; a request with a valid code from the caller's assigned
+virtual MFA device has `true`. Invalid, unassigned or another user's devices are refused before
+session registration. Virtual codes use the shared TOTP implementation with one adjacent
+30-second window on either side. Existing credentials without recorded MFA provenance and
+GetFederationToken credentials leave the condition key absent.
+
+Hardware and account-root MFA devices are not supported. The API restrictions and
+AssumeRole request authentication are described below.
+
+Verified GetSessionToken MFA sessions retain their authentication instant. Shared caller policy
+context computes `aws:MultiFactorAuthAge` in whole elapsed seconds when resolving the session.
+Non-MFA, federated and legacy records without verified authentication time leave age absent.
+A server clock moving before the authentication instant yields zero elapsed seconds. This does
+not establish hardware MFA or live AWS clock-drift parity.
+
+GetSessionToken credentials retain explicit issuance provenance. With IAM enforcement enabled,
+IAM API calls require verified MFA and STS calls are limited to AssumeRole and GetCallerIdentity.
+These restrictions apply before identity-policy grants; other services still evaluate the issuer's
+policies. Previously stored credentials without issuance provenance retain their existing behavior.
+This does not add hardware/root MFA devices or workload credential delivery.
+
+### AssumeRole MFA authentication
+
+AssumeRole validates supplied `SerialNumber` and `TokenCode` against the caller's assigned
+virtual MFA device before identity and trust policy evaluation. Valid MFA supplies
+`aws:MultiFactorAuthPresent=true` and `aws:MultiFactorAuthAge=0` for that request. A missing,
+invalid, unassigned, revoked or another user's device cannot authenticate the request. Omitting
+both parameters preserves the calling credential's existing condition context.
+
+The resulting assumed-role credentials do not inherit these MFA condition keys. AWS distinguishes
+AssumeRole request authentication from GetSessionToken credentials, which retain MFA information
+for later API calls. Hardware/root devices, MFA supplied by temporary callers and exact precedence
+between multiple invalid request fields are not qualified here.
+
+### Direct AssumeRole session tags
+
+AssumeRole validates the supplied session tags before registration. With IAM enforcement enabled,
+`sts:TagSession` must be permitted by the target trust policy and the shared caller-policy evaluation,
+including identity, session-policy, permissions-boundary and SCP restrictions. Request-tag and tag-key
+conditions use only tag members the STS handler consumes. A same-account trust grant naming the caller
+is distinct from a grant delegating to the caller's account.
+
+Issued credentials retain immutable session-owned tags. These override matching attached role tags
+case-insensitively for `aws:PrincipalTag` conditions without changing the role or another session.
+Stored session tags survive credential serialization; expiry and revocation keep their existing behavior.
+IAM-disabled requests still validate tag shapes and retain the tags, without checking policy permissions.
+
+This covers direct AssumeRole tag input and local credential authorization. SAML/web-identity/federation
+tagging, packed session-token size limits and full request condition context remain separate limitations. Local JVM and signed SDK tests do not establish managed
+AWS, native-image or workload credential-delivery parity.
+
 AssumeRoleWithWebIdentity rejects a requested duration above the target role's
 `MaxSessionDuration` before issuing credentials. The default remains 3,600 seconds;
 existing token and trust-policy errors take precedence over this role-specific check.
 
 Role chaining limits `AssumeRole` to one hour, including when the target role permits a longer
 session. A live role credential must carry its matching session token. `GetSessionToken` user
-credentials are not role chaining. The cap is checked after trust and role-maximum validation,
+credentials and EC2 instance-profile credentials (as IMDS serves them) are not role chaining. The cap is checked after trust and role-maximum validation,
 before registering the new session.
+
+### Direct AssumeRole tag chaining
+
+`AssumeRole` retains explicitly selected `TransitiveTagKeys` as session-owned metadata.
+Subsequent role assumptions inherit those tags, including across multiple hops, and reject
+explicit tags that collide with inherited keys. Unmarked session tags and attached role tags
+are not inherited. Requested transitive keys are available to identity and trust policy
+conditions; inherited tags do not become new request tags. Each receiving role must permit
+`sts:TagSession` when IAM enforcement is enabled.
+
+This applies to direct `AssumeRole` sessions. SAML and web-identity tag issuance and packed-token
+size accounting are separate limitations. Local
+signature-enforcing SDK tests do not establish managed AWS error-message or runtime parity.
+
+### Direct AssumeRole source identity
+
+`AssumeRole` retains a supplied `SourceIdentity` in the issued session and returns it in the response. Role chaining inherits the value and rejects attempts to change it. With IAM enforcement enabled, setting or inheriting it requires the target trust policy's `sts:SetSourceIdentity` permission and applicable caller permission ceilings. Role chaining requires the caller role's identity permission as well.
+
+Trust and identity policies can use `sts:SourceIdentity` during assumption; downstream policies receive `aws:SourceIdentity` from the issued credentials. Requests without source identity leave that condition key absent. CloudTrail source-identity reporting remains separate work.
+
+### Verified OIDC source identity
+
+`AssumeRoleWithWebIdentity` reads the `https://aws.amazon.com/source_identity` string claim only after token signature, issuer, audience and lifetime verification. A supplied value must satisfy the source identity constraints. The federated trust policy must allow both `sts:AssumeRoleWithWebIdentity` and `sts:SetSourceIdentity`; both evaluations can use `sts:SourceIdentity`. An explicit deny prevents credential issuance.
+
+The response and issued session retain the value, and signed downstream requests receive `aws:SourceIdentity`. Missing claims leave that context absent. This does not extend the set of supported OIDC issuers or claim full federation condition, session-tag, native-image or managed AWS parity.
+
+### Verified SAML source identity
+
+`AssumeRoleWithSAML` reads the `https://aws.amazon.com/SAML/Attributes/SourceIdentity` attribute only from the verified assertion. A present attribute must contain one valid source identity value. The role trust policy must allow both `sts:AssumeRoleWithSAML` and `sts:SetSourceIdentity`; each evaluation receives the verified `sts:SourceIdentity` value. Explicit denial prevents session creation.
+
+The response and issued session retain the source identity through the existing shared session metadata. Missing attributes preserve the existing trust contract. This does not establish full SAML condition support, session-tag issuance, CloudTrail reporting, native-image behavior or managed AWS parity.
+
+### SAML inline session policies
+
+`AssumeRoleWithSAML` retains the supplied inline `Policy` with the issued credentials. With IAM enforcement enabled, signed downstream requests must satisfy both the role policies and this session policy. A session policy can restrict the role's permissions, including through conditions, but cannot expand them. Omitting `Policy` preserves the role's existing permissions. Managed session policies (`PolicyArns`) are evaluated separately alongside the inline policy.
+
+### Managed session policies
+
+`AssumeRole`, `AssumeRoleWithSAML`, `AssumeRoleWithWebIdentity`, and `GetFederationToken` resolve `PolicyArns` before registering credentials. Customer-managed policies must belong to the session's account and partition; AWS-managed policies use the existing catalog. Requests permit at most ten ARNs and 2,048 combined characters of inline policy and ARN text.
+
+The issued session retains the inline document and managed policy ARNs separately. Each authorization resolves the current default document for those ARNs, preserving each document's policy-language version. The shared IAM evaluator unions their statements and intersects that permission set with the issuing identity, while preserving explicit denies, permissions boundaries, and SCPs. Default-version changes affect existing sessions; a deleted policy contributes no permissions without removing the session restriction. A bounded AWS AssumeRole probe confirmed version updates and deletion affecting already-issued credentials. Propagation timing, delete-and-recreate identity behavior, other STS lifecycle paths on AWS, exact AWS error precedence, and packed-token size reporting remain outside that proof.

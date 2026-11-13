@@ -9,7 +9,7 @@ EMR Serverless is an AWS service that provides serverless data analytics environ
 | `floci.emrserverless.enabled` | Whether the EMR Serverless API is enabled | `true` |
 | `floci.emrserverless.port` | The port the service is exposed on | `4566` |
 | `floci.services.emrserverless.job-run-duration-seconds` | How long a `BATCH` job run stays `RUNNING` before it succeeds; `0` makes it `SUCCESS` as soon as it starts | `0` |
-| `floci.services.emrserverless.runner-mode` | `immediate` moves job runs through their states without running anything; `docker` runs each job run in a container (see [Running Spark job runs](#running-spark-job-runs) and [Running Hive job runs](#running-hive-job-runs)) | `immediate` |
+| `floci.services.emrserverless.runner-mode` | `immediate` moves job runs through their states without running anything; `docker` runs each job run in a container (see [Running Spark job runs](#running-spark-job-runs) and [Running Hive job runs](#running-hive-job-runs)); `refuse` ends every job run `FAILED` as it is admitted (see [Refusing job runs](#refusing-job-runs)) | `immediate` |
 | `floci.services.emrserverless.docker-network` | Docker network for job run containers | the global default |
 | `floci.services.emrserverless.image-template` | Image for a `docker` job run whose application names no custom image, `%s` standing for the release label | `public.ecr.aws/emr-serverless/spark/%s:latest`, or `spark4/` in place of `spark/` for an `emr-spark-*` release |
 | `floci.services.emrserverless.hive-image-template` | Image for a `docker` Hive job run whose application names no custom image, `%s` standing for the release label | `public.ecr.aws/emr-serverless/hive/%s:latest` |
@@ -83,11 +83,6 @@ runner mode a Spark run executes; see [Running Spark job runs](#running-spark-jo
   the 7.11.0 release notes say; a run outside that is refused with `ValidationException`.
 * **CancelJobRun** moves a run that has not finished to `CANCELLED`. A finished run answers
   `ValidationException` "Job run is not in a cancellable state".
-* **StopApplication** refuses an application with a run that has not finished, a `STREAMING` run or
-  a `CANCELLING` one included, as the API reference says "All scheduled and running jobs must be
-  completed or cancelled before stopping an application." It answers `ValidationException`, the one
-  error the model declares for this, with that sentence as its message: AWS's own message is not
-  recorded, so the wording is Floci's reading.
 * **ListJobRuns** returns the newest runs first, filtered by `states`, `createdAtAfter`,
   `createdAtBefore` and `mode`, at most 50 per page. With several `states`, the runs are grouped by
   state in the order the filter names them. A state or mode that does not exist, or more than 8
@@ -108,6 +103,17 @@ runner mode a Spark run executes; see [Running Spark job runs](#running-spark-jo
   No source says whether a run's timeout spans its attempts; Floci applies it to each.
 * `createdBy` is the caller's ARN, as `GetCallerIdentity` reports it. `releaseLabel` and
   `networkConfiguration` come from the application.
+
+### Refusing job runs
+
+With `runner-mode` set to `refuse` (`FLOCI_SERVICES_EMRSERVERLESS_RUNNER_MODE=refuse`), no job run
+executes and none reports that it did. `StartJobRun` validates and admits the run as in the other modes,
+its client token and auto-start included, and the run is `FAILED` at once with the `stateDetails`
+"Job execution is not available on this emulator: floci.services.emrserverless.runner-mode is refuse, so
+no job run executes." It never starts, so it has no `startedAt` and a `totalExecutionDurationSeconds` of
+0, and it is not tried again, whatever its `retryPolicy`. A `STREAMING` run is refused the same way. Use
+it where a run that did not execute must not read as `SUCCESS` or `RUNNING`. Applications, tags and
+every other operation behave as in the default mode.
 
 A state machine drives applications and job runs through the `emr-serverless:` integrations, `.sync`
 included; see [Step Functions: Amazon EMR Serverless tasks](step-functions.md#amazon-emr-serverless-tasks).
@@ -246,6 +252,7 @@ application's `imageConfiguration`; a `TezTask` image is not used, as Tez's task
   directory; Spark alone unpacks the others, into its own files folder. Floci reads an archive itself,
   whatever the execution role may read, though Spark's own read of it uses the role's credentials.
 * **Custom images**: Floci does not check an `imageUri` against the model's pattern, which would refuse the repository URIs Floci's own ECR hands out, nor that the image was built from its release's base image (AWS refuses one that was not from `emr-7.14.0` and `emr-spark-8.1.0` on), nor the image's size. An image that cannot be pulled fails the run, not the request that names it. Every run resolves its image again, as releases from 7.14 do and earlier ones with `applicationLevelDigestResolution` false: Floci keeps no digest from the application's start, and reports no `resolvedImageDigest`, on the application or on a job run.
+* **StopApplication with running jobs**: AWS requires running jobs to finish or be cancelled before an application stops. Floci does not enforce it; with the default duration of `0` no `BATCH` run is ever running.
 * **Not emulated**: the "EMR Serverless Job Run Retry" event, as Floci sends no EMR Serverless events, queuing (`QUEUED`), `totalResourceUtilization` and `billedResourceUtilization`, and `shutdownGracePeriodInSeconds` (accepted and ignored: a cancelled run's driver is stopped at once).
 * **Instant Start/Stop**: Floci marks the application `STARTED` or `STOPPED` immediately without provisioning actual compute capacity in the background.
 * **Data Plane**: Floci does not implement the data-plane API, such as interactive sessions.

@@ -53,12 +53,15 @@ class SsmTest {
     private static SsmClient ssm;
     private static final String PARAM_NAME = "/sdk-test/param";
     private static final String PARAM_VALUE = "param-value-123";
-    private static final String COMMAND_INSTANCE_ID = "i-sdk-ssm-1";
+    private static final String COMMAND_INSTANCE_ID = "i-" + UUID.randomUUID().toString().replace("-", "").substring(0, 17);
     private static String commandId;
 
     @BeforeAll
-    static void setup() {
+    static void setup() throws Exception {
         ssm = TestFixtures.ssmClient();
+        if (!TestFixtures.isRealAws()) {
+            SsmManagedNodeFixture.register(COMMAND_INSTANCE_ID);
+        }
     }
 
     @AfterAll
@@ -282,6 +285,7 @@ class SsmTest {
     @Test
     @Order(13)
     void sendCommandRejectsTimeoutBelowAwsMinimum() {
+        Assumptions.assumeFalse(TestFixtures.isRealAws(), "Uses an emulator-only managed-node fixture");
         assertThatThrownBy(() -> ssm.sendCommand(SendCommandRequest.builder()
                 .documentName("AWS-RunShellScript")
                 .instanceIds(COMMAND_INSTANCE_ID)
@@ -301,6 +305,7 @@ class SsmTest {
     @Test
     @Order(14)
     void sendCommandCreatesPendingInvocation() {
+        Assumptions.assumeFalse(TestFixtures.isRealAws(), "Uses an emulator-only managed-node fixture");
         SendCommandResponse response = ssm.sendCommand(SendCommandRequest.builder()
                 .documentName("AWS-RunShellScript")
                 .instanceIds(COMMAND_INSTANCE_ID)
@@ -327,6 +332,7 @@ class SsmTest {
     @Test
     @Order(15)
     void listRunCommandsAndInvocations() {
+        Assumptions.assumeFalse(TestFixtures.isRealAws(), "Uses an emulator-only managed-node fixture");
         ListCommandsResponse commands = ssm.listCommands(
                 ListCommandsRequest.builder().commandId(commandId).build());
         assertThat(commands.commands())
@@ -354,6 +360,7 @@ class SsmTest {
     @Test
     @Order(16)
     void cancelCommandUpdatesInvocationStatus() {
+        Assumptions.assumeFalse(TestFixtures.isRealAws(), "Uses an emulator-only managed-node fixture");
         ssm.cancelCommand(CancelCommandRequest.builder()
                 .commandId(commandId)
                 .instanceIds(COMMAND_INSTANCE_ID)

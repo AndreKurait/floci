@@ -55,6 +55,10 @@ class EcsTests {
                             .task(taskArn)
                             .build());
                 }
+                awaitTasksStopped(ecs.listTasks(ListTasksRequest.builder()
+                        .cluster(clusterName)
+                        .desiredStatus(DesiredStatus.STOPPED)
+                        .build()).taskArns());
             } catch (Exception ignored) {}
 
             try {
@@ -487,18 +491,13 @@ class EcsTests {
         assertThat(started.get(0).taskArn()).isNotNull();
         assertThat(started.get(0).containerInstanceArn()).isEqualTo(instanceArn);
 
-        // Stop the task. StartTask answers before the launch, so the stop lands asynchronously;
-        // wait for it so the task no longer counts as running in the tests below.
+        // Stop the task
         if (!started.isEmpty()) {
             ecs.stopTask(StopTaskRequest.builder()
                     .cluster(clusterName)
                     .task(started.get(0).taskArn())
                     .build());
-            ecs.waiter().waitUntilTasksStopped(DescribeTasksRequest.builder()
-                            .cluster(clusterName)
-                            .tasks(started.get(0).taskArn())
-                            .build(),
-                    TestFixtures.waiterOverride(Duration.ofSeconds(60)));
+            awaitTasksStopped(List.of(started.get(0).taskArn()));
         }
 
         // Deregister
@@ -625,16 +624,7 @@ class EcsTests {
         assertThat(task.taskArn()).isNotNull();
         assertThat(task.clusterArn()).isEqualTo(cluster.clusterArn());
         assertThat(task.taskDefinitionArn()).isEqualTo(taskDef.taskDefinitionArn());
-        // RunTask answers before the images are pulled, as AWS does; the task reaches RUNNING later.
-        assertThat(task.lastStatus()).isIn("PROVISIONING", "PENDING");
-
-        WaiterResponse<DescribeTasksResponse> running = ecs.waiter().waitUntilTasksRunning(
-                DescribeTasksRequest.builder()
-                        .cluster(clusterName)
-                        .tasks(task.taskArn())
-                        .build(),
-                TestFixtures.waiterOverride(Duration.ofSeconds(60)));
-        assertThat(running.matched().response()).isPresent();
+        assertThat(task.lastStatus()).isEqualTo("RUNNING");
     }
 
     @Test
@@ -727,12 +717,15 @@ class EcsTests {
     @Order(37)
     @DisplayName("StopTask - stop running task")
     void stopTask() {
-        Task stopped = ecs.stopTask(StopTaskRequest.builder()
+        Task stopping = ecs.stopTask(StopTaskRequest.builder()
                 .cluster(clusterName)
                 .task(task.taskArn())
                 .reason("sdk-test-stop")
                 .build()).task();
 
+        assertThat(stopping.taskArn()).isEqualTo(task.taskArn());
+        assertThat(stopping.desiredStatus()).isEqualTo("STOPPED");
+        Task stopped = awaitTasksStopped(List.of(task.taskArn())).get(0);
         assertThat(stopped.lastStatus()).isEqualTo("STOPPED");
         assertThat(stopped.stoppedReason()).isEqualTo("sdk-test-stop");
         assertThat(stopped.stoppedAt()).isNotNull();
@@ -1142,21 +1135,28 @@ class EcsTests {
                     .task(taskArn)
                     .build());
         }
-        // A task stopped while still launching lands STOPPED asynchronously, and a cluster with a
-        // task that has not stopped cannot be deleted.
-        if (!running.isEmpty()) {
-            ecs.waiter().waitUntilTasksStopped(DescribeTasksRequest.builder()
-                            .cluster(clusterName)
-                            .tasks(running)
-                            .build(),
-                    TestFixtures.waiterOverride(Duration.ofSeconds(60)));
-        }
+        // ListTasks filters desired status, so it also returns earlier stops still in progress.
+        awaitTasksStopped(ecs.listTasks(ListTasksRequest.builder()
+                .cluster(clusterName)
+                .desiredStatus(DesiredStatus.STOPPED)
+                .build()).taskArns());
 
         Cluster deleted = ecs.deleteCluster(DeleteClusterRequest.builder()
                 .cluster(clusterName)
                 .build()).cluster();
 
         assertThat(deleted.status()).isEqualTo("INACTIVE");
+    }
+
+    private static List<Task> awaitTasksStopped(List<String> taskArns) {
+        if (taskArns.isEmpty()) {
+            return List.of();
+        }
+        WaiterResponse<DescribeTasksResponse> response = ecs.waiter().waitUntilTasksStopped(
+                DescribeTasksRequest.builder().cluster(clusterName).tasks(taskArns).build(),
+                TestFixtures.waiterOverride(Duration.ofSeconds(60)));
+        return response.matched().response().orElseThrow(() ->
+                new IllegalStateException("ECS tasks did not stop", response.matched().exception().orElse(null))).tasks();
     }
 
     @Test

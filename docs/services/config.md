@@ -36,9 +36,15 @@
 | `PutConfigurationRecorder` | Create or update a configuration recorder |
 | `DescribeConfigurationRecorders` | List configuration recorders |
 | `DeleteConfigurationRecorder` | Delete a configuration recorder |
-| `StartConfigurationRecorder` | Start recording configuration changes |
+| `StartConfigurationRecorder` | Start recording configuration changes; requires a delivery channel in the same account and region |
 | `StopConfigurationRecorder` | Stop recording configuration changes |
 | `DescribeConfigurationRecorderStatus` | Get the status of configuration recorders. Whether a recorder is recording, and when it last started and stopped, persist with the recorder, so a started recorder is still recording after a restart |
+
+`DescribeConfigurationRecorders` and `DescribeConfigurationRecorderStatus` accept at
+most one entry in `ConfigurationRecorderNames`. More than one entry returns HTTP 400
+`ValidationException`, including repeated names and requests made before any recorder exists.
+An omitted or empty list selects all recorders; one unknown name returns
+`NoSuchConfigurationRecorderException`.
 
 ### Delivery Channel
 
@@ -138,7 +144,13 @@ aws configservice put-configuration-recorder --configuration-recorder '{
   }
 }'
 
-# Start recording
+# Create a delivery channel before starting the recorder
+aws configservice put-delivery-channel --delivery-channel '{
+  "name": "default",
+  "s3BucketName": "my-config-bucket"
+}'
+
+# Start recording (without a delivery channel, returns NoAvailableDeliveryChannelException)
 aws configservice start-configuration-recorder --configuration-recorder-name default
 
 # Check recorder status
@@ -195,15 +207,14 @@ aws configservice delete-config-rule --config-rule-name s3-bucket-versioning
       `DeleteAggregationAuthorization` on an authorization that does not exist succeeds,
       because the Config API models no "not found" error for that operation.
     - `TagResource`, `UntagResource` and `ListTagsForResource` answer
-      `ResourceNotFoundException` for a config rule, conformance pack, aggregation
-      authorization or configuration recorder ARN that does not name an existing resource in the
-      caller's account and region. ARNs of resource kinds Floci does not model (configuration
-      aggregators, stored queries, organization rules and packs) are accepted without a check.
+      `ResourceNotFoundException` for a config rule, conformance pack or aggregation
+      authorization ARN that does not name an existing resource in the caller's account and
+      region. ARNs of resource kinds Floci does not model (configuration aggregators, stored
+      queries, organization rules and packs, recorders) are accepted without a check.
     - `PutConfigRule` applies its `Tags` only when it creates the rule; a later
       `PutConfigRule` for the same rule leaves its tags unchanged, as AWS documents. Use
       `TagResource` and `UntagResource` to change them. `DeleteConfigRule` drops the rule's tags.
-      `PutConfigurationRecorder` and `DeleteConfigurationRecorder` do the same for the recorder.
     - `PutConfigRule` and `PutAggregationAuthorization` reject more than 50 `Tags`, a tag
       without a 1-128 character `Key`, or a `Value` over 256 characters with
-      `InvalidParameterValueException`, and store nothing. `PutConfigurationRecorder` rejects
-      the same with `ValidationException`. A tag with no `Value` is stored with an empty value.
+      `InvalidParameterValueException`, and store nothing. A tag with no `Value` is stored with
+      an empty value.

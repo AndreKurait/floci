@@ -162,10 +162,6 @@
         </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
-            <artifactId>paymentcryptographydata</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>software.amazon.awssdk</groupId>
             <artifactId>cognitoidentityprovider</artifactId>
         </dependency>
         <dependency>
@@ -228,10 +224,6 @@
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>ec2</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>software.amazon.awssdk</groupId>
-            <artifactId>ec2instanceconnect</artifactId>
         </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
@@ -538,10 +530,6 @@
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>scheduler</artifactId>
         </dependency>
-        <dependency>
-            <groupId>software.amazon.awssdk</groupId>
-            <artifactId>applicationautoscaling</artifactId>
-        </dependency>
         <!-- Auto Scaling client -->
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
@@ -663,11 +651,6 @@
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>signer</artifactId>
-        </dependency>
-        <!-- X-Ray client -->
-        <dependency>
-            <groupId>software.amazon.awssdk</groupId>
-            <artifactId>xray</artifactId>
         </dependency>
         <!-- DataSync client -->
         <dependency>
