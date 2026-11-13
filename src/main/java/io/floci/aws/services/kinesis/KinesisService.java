@@ -252,6 +252,7 @@ public class KinesisService implements ResourceProvider {
         validateResourceTagLimit(Map.of(), tags);
         String streamName = streamArn.substring(streamArn.lastIndexOf('/') + 1);
         synchronized (lockFor(regionKey(region, streamName))) {
+            describeStreamByArn(streamArn, region);
             String consumerArn = streamArn + "/consumer/" + consumerName + ":" + clock.millis();
             KinesisConsumer consumer = new KinesisConsumer(consumerName, consumerArn, streamArn);
             consumer.setConsumerCreationTimestamp(clock.instant());
