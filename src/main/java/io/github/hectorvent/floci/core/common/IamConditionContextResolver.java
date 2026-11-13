@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.core.common;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.apigateway.ApiGatewayDocumentationIamConditions;
 import io.github.hectorvent.floci.services.athena.AthenaBatchQueryService;
 import io.github.hectorvent.floci.services.athena.AthenaPreparedStatementService;
 import io.github.hectorvent.floci.services.backup.BackupFrameworkResources;
@@ -111,6 +112,8 @@ public class IamConditionContextResolver {
 
     @Inject
     Instance<BackupFrameworkService> backupFrameworks;
+    @Inject
+    Instance<ApiGatewayDocumentationIamConditions> documentationConditions;
 
     private final Instance<DynamoDbFacade> dynamoDbFacade;
     private final Instance<Ec2Service> ec2Service;
@@ -308,6 +311,8 @@ public class IamConditionContextResolver {
                                              ContainerRequestContext ctx) {
         return switch (credentialScope) {
             case "backup" -> backupFrameworkConditions(action, ctx);
+            case "apigateway" -> documentationConditions != null && documentationConditions.isResolvable()
+                    ? documentationConditions.get().resolve(action, ctx) : null;
             case "s3" -> s3ConditionContext(action, ctx);
             case "ec2" -> ec2ConditionContext(action, ctx);
             case "ecr" -> ecrPreviewConditionContext(action, ctx);
