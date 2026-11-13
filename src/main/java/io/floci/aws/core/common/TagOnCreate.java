@@ -3,6 +3,7 @@ package io.floci.aws.core.common;
 import com.fasterxml.jackson.databind.JsonNode;
 import jakarta.ws.rs.container.ContainerRequestContext;
 
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
@@ -86,6 +87,29 @@ final class TagOnCreate {
         TagOnCreateMembers.Entry entry = TagOnCreateMembers.of(operation);
         if (entry == null) {
             return Optional.empty();
+        }
+        // CloudFront's XML handlers read every modeled Tag element, including outside the Tags wrapper.
+        // Read exactly that set before the controller can attach any of it.
+        if (operation.startsWith("cloudfront:")) {
+            byte[] body = IamConditionContextResolver.bufferEntity(ctx);
+            Map<String, String> tags = new LinkedHashMap<>();
+            if (body != null) {
+                String xml = new String(body, StandardCharsets.UTF_8);
+                for (TagOnCreateMembers.Member member : entry.members()) {
+                    PassedRoleMembers.Step last = member.steps().getLast();
+                    if (last.into() == PassedRoleMembers.Into.LIST && !last.key().isEmpty()) {
+                        for (Map<String, String> tag : XmlParser.extractGroups(xml, last.key())) {
+                            String key = tag.get(member.key());
+                            if (key != null) {
+                                tags.put(key, tag.getOrDefault(member.value(), ""));
+                            }
+                        }
+                    }
+                }
+            }
+            return tags.isEmpty() ? Optional.empty() : Optional.of(new Tagging(entry.tagging(),
+                    List.of(new TagSet(null, Collections.unmodifiableMap(tags))), List.of(),
+                    entry.createAction(), entry.requestTags()));
         }
         Map<String, String> form = IamConditionContextResolver.formParameters(ctx);
         JsonNode body = form.isEmpty() ? PassedRoles.jsonBody(ctx) : null;
