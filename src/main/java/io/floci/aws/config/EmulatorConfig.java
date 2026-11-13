@@ -357,6 +357,7 @@ public interface EmulatorConfig {
     }
 
     interface ServiceStorageOverrides {
+        RekognitionStorageConfig rekognition();
         SsmStorageConfig ssm();
         SqsStorageConfig sqs();
         S3StorageConfig s3();
@@ -407,6 +408,13 @@ public interface EmulatorConfig {
         LakeFormationStorageConfig lakeformation();
         EfsStorageConfig efs();
         SageMakerStorageConfig sagemaker();
+    }
+
+    interface RekognitionStorageConfig {
+        Optional<String> mode();
+
+        @WithDefault("5000")
+        long flushIntervalMs();
     }
 
     interface ApsStorageConfig {
@@ -468,6 +476,7 @@ public interface EmulatorConfig {
     }
 
     interface CloudWatchLogsStorageConfig {
+        // Saved query definitions share the Logs storage mode and flush interval.
         Optional<String> mode();
 
         // Log events are the largest and most write-heavy store, so they flush less often than the rest.
@@ -875,6 +884,7 @@ public interface EmulatorConfig {
         AppIntegrationsServiceConfig appintegrations();
         DlmServiceConfig dlm();
         SignerServiceConfig signer();
+        XrayServiceConfig xray();
         CognitoIdentityServiceConfig cognitoidentity();
         GlobalAcceleratorServiceConfig globalaccelerator();
         DataSyncServiceConfig datasync();
@@ -963,6 +973,11 @@ public interface EmulatorConfig {
          */
         @WithDefault("false")
         boolean mockSigningJobs();
+    }
+
+    interface XrayServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
     }
 
     interface CognitoIdentityServiceConfig {
@@ -1166,6 +1181,16 @@ public interface EmulatorConfig {
         Optional<String> hiveImageTemplate();
 
         /**
+         * How many executors a {@code docker} Spark job run may have at once, each in a container of its own, as each
+         * has a worker of its own on EMR Serverless; 0, the default, runs a job's executors in its driver's container, in
+         * Spark's local mode. The application's maximum capacity limits them too.
+         *
+         * Env var: FLOCI_SERVICES_EMRSERVERLESS_EXECUTOR_CONTAINERS
+         */
+        @WithDefault("0")
+        int executorContainers();
+
+        /**
          * When true, Floci removes, in the {@code docker} runner mode, every EMR Serverless driver a
          * previous run of <em>this same</em> Floci left on the daemon (matched by the
          * {@code io.floci.owner} label) before its first job run starts. Turn it off when two Floci
@@ -1333,6 +1358,9 @@ public interface EmulatorConfig {
     interface ApplicationAutoScalingServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        @WithDefault("1")
+        long scheduledActionIntervalSeconds();
     }
 
     interface ElasticBeanstalkServiceConfig {
@@ -1524,6 +1552,10 @@ public interface EmulatorConfig {
          */
         @WithDefault("false")
         boolean globalBucketNamespace();
+
+        /** Seconds before RestoreObject reports a completed temporary copy. */
+        @WithDefault("0")
+        long restoreCompletionDelaySeconds();
 
         /**
          * Run the background sweep that applies bucket lifecycle expiration rules: Expiration,
@@ -2102,6 +2134,33 @@ public interface EmulatorConfig {
          * clusters run their HDFS in emr-7.5.0's.
          */
         Optional<String> hiveImageTemplate();
+
+        /**
+         * The memory, in MB, a {@code docker} cluster's NodeManager offers the YARN containers its steps' Spark
+         * executors run in. EMR sizes it by the instance type; Floci's node shares the machine it runs on.
+         *
+         * Env var: FLOCI_SERVICES_EMR_YARN_NODE_MEMORY_MB
+         */
+        @WithDefault("4096")
+        int yarnNodeMemoryMb();
+
+        /**
+         * The virtual cores a {@code docker} cluster's NodeManager offers YARN's containers.
+         *
+         * Env var: FLOCI_SERVICES_EMR_YARN_NODE_VCORES
+         */
+        @WithDefault("4")
+        int yarnNodeVcores();
+
+        /**
+         * The most core and task nodes a {@code docker} cluster runs as containers of their own, core nodes first; each
+         * costs 300 to 800 MB while idle. With 0 the primary node holds its DataNode and NodeManager, as a cluster of one
+         * node does.
+         *
+         * Env var: FLOCI_SERVICES_EMR_YARN_MAX_WORKER_NODES
+         */
+        @WithDefault("4")
+        int yarnMaxWorkerNodes();
 
         /**
          * When true, Floci removes, in the {@code docker} runner mode, every EMR step driver and bootstrap

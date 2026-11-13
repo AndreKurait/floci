@@ -20,6 +20,9 @@ import io.floci.aws.services.iam.model.ServerCertificate;
 import io.floci.aws.services.kms.KmsService;
 import io.floci.aws.services.lambdamicrovms.LambdaMicrovmsService;
 import io.floci.aws.services.secretsmanager.SecretsManagerService;
+import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
+import io.vertx.core.http.HttpServerRequest;
+import io.vertx.ext.web.RoutingContext;
 import jakarta.enterprise.inject.Instance;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.MediaType;
@@ -71,10 +74,9 @@ class ResourceArnBuilderTest {
         for (String id : List.of("N1", "%2Fdelegationset%2FN1")) {
             when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost/2013-04-01/delegationset/" + id));
             when(uriInfo.getBaseUri()).thenReturn(URI.create("http://localhost/"));
-            MultivaluedMap<String, String> parameters = new MultivaluedHashMap<>();
-            parameters.putSingle("Id", id.equals("N1") ? "N1" : "/delegationset/N1");
-            when(uriInfo.getPathParameters()).thenReturn(parameters);
             for (String operation : List.of("GetReusableDelegationSet", "DeleteReusableDelegationSet")) {
+                // The id is read from the route the request matched, the type's path Route 53 returns it under dropped.
+                when(ctx.getMethod()).thenReturn(operation.startsWith("Get") ? "GET" : "DELETE");
                 assertEquals(List.of("arn:" + partition + ":route53:::delegationset/N1"),
                         builder.buildResources("route53", "route53:" + operation, ctx, region, ACCOUNT, partition));
             }
@@ -884,6 +886,34 @@ class ResourceArnBuilderTest {
                 assertEquals(List.of(arn), builder.buildLogResources(action, ctx, region, ACCOUNT, partition));
             }
         }
+    }
+
+    @Test
+    void destinationTagTargetsUseDestinationArn() {
+        for (String action : List.of("logs:TagResource", "logs:UntagResource", "logs:ListTagsForResource")) {
+            for (String region : List.of("us-east-1", "cn-north-1", "us-gov-west-1")) {
+                String partition = AwsRegions.partitionFor(region);
+                String arn = "arn:" + partition + ":logs:" + region + ":" + ACCOUNT + ":destination:central";
+                setJsonBody("{\"resourceArn\":\"" + arn + "\"}");
+                assertEquals(List.of(arn), builder.buildLogResources(action, ctx, region, ACCOUNT, partition));
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"aws,us-east-1", "aws-cn,cn-north-1", "aws-us-gov,us-gov-west-1"})
+    void putDestinationTargetsTheDestinationItNames(String partition, String region) {
+        setJsonBody("{\"destinationName\":\"central\"}");
+        assertEquals(List.of("arn:" + partition + ":logs:" + region + ":" + ACCOUNT + ":destination:central"),
+                builder.buildLogResources("logs:PutDestination", ctx, region, ACCOUNT, partition));
+        String targetArn = "arn:" + partition + ":kinesis:" + region + ":" + ACCOUNT + ":stream/central";
+        String roleArn = "arn:" + partition + ":iam::" + ACCOUNT + ":role/logs-delivery";
+        setJsonBody("{\"destinationName\":\"central\",\"targetArn\":\"" + targetArn
+                + "\",\"roleArn\":\"" + roleArn + "\"}");
+        assertEquals(List.of("arn:" + partition + ":logs:" + region + ":" + ACCOUNT + ":destination:central"),
+                builder.buildLogResources("logs:PutDestination", ctx, region, ACCOUNT, partition));
+        setJsonBody("{}");
+        assertEquals(List.of("*"), builder.buildLogResources("logs:PutDestination", ctx, region, ACCOUNT, partition));
     }
 
     @Test
@@ -1768,6 +1798,65 @@ class ResourceArnBuilderTest {
         assertEquals("arn:aws:s3:::my-bucket/folder/", arn);
     }
 
+    /**
+     * A key keeps the slashes it is sent with, and so does the ARN the request is checked against.
+     * {@code PUT /bucket//email.txt} stores the key {@code /email.txt}; read from the collapsed
+     * path it was checked on {@code bucket/email.txt}, so a grant on that object covered this one
+     * and a statement naming {@code bucket//*} reached nothing.
+     */
+    @Test
+    void s3ReadsAKeysOwnLeadingSlashFromThePathAsSent() {
+        when(uriInfo.getPath()).thenReturn("/my-bucket/email.txt");
+        when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost/my-bucket//email.txt"));
+
+        assertEquals("arn:aws:s3:::my-bucket//email.txt", builder.build("s3", ctx, "us-east-1", ACCOUNT));
+    }
+
+    /** The same inside a key, where the collapsed path named a key one separator short. */
+    @Test
+    void s3KeepsADoubleSlashInsideAKey() {
+        when(uriInfo.getPath()).thenReturn("/my-bucket/a/b.txt");
+        when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost/my-bucket/a//b.txt"));
+
+        assertEquals("arn:aws:s3:::my-bucket/a//b.txt", builder.build("s3", ctx, "us-east-1", ACCOUNT));
+    }
+
+    /**
+     * Virtual-hosted, where the bucket came from the Host header and S3VirtualHostFilter rewrote the
+     * path: the key's leading slash is then only in the request the server received.
+     */
+    @Test
+    void s3ReadsAVirtualHostedKeysOwnSlashFromTheRequestAsReceived() {
+        when(uriInfo.getPath()).thenReturn("/my-bucket/email.txt");
+        when(uriInfo.getRequestUri()).thenReturn(URI.create("http://my-bucket.localhost/my-bucket/email.txt"));
+        ResourceArnBuilder withRequest = new ResourceArnBuilder(new ObjectMapper(), vertxRequestOn("//email.txt"));
+
+        assertEquals("arn:aws:s3:::my-bucket//email.txt", withRequest.build("s3", ctx, "us-east-1", ACCOUNT));
+    }
+
+    /**
+     * A key of slashes alone reaches the object route through the escaped path S3SlashOnlyKeyFilter
+     * rewrites it to, and still reads as that object rather than as the bucket.
+     */
+    @Test
+    void s3KeepsAKeyOfOnlySlashes() {
+        when(uriInfo.getPath()).thenReturn("/my-bucket//");
+        when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost/my-bucket/%2F"));
+
+        assertEquals("arn:aws:s3:::my-bucket//", builder.build("s3", ctx, "us-east-1", ACCOUNT));
+    }
+
+    /** A current request whose path is {@code sentPath}, the path the server received. */
+    private static CurrentVertxRequest vertxRequestOn(String sentPath) {
+        HttpServerRequest request = mock(HttpServerRequest.class);
+        when(request.path()).thenReturn(sentPath);
+        RoutingContext routingContext = mock(RoutingContext.class);
+        when(routingContext.request()).thenReturn(request);
+        CurrentVertxRequest current = mock(CurrentVertxRequest.class);
+        when(current.getCurrent()).thenReturn(routingContext);
+        return current;
+    }
+
     // ── S3 Control ─────────────────────────────────────────────────────────────
 
     /**
@@ -1789,6 +1878,20 @@ class ResourceArnBuilderTest {
             assertEquals(List.of("arn:aws:s3:us-east-1:000000000000:bucket/repro-bucket"),
                     builder.buildResources("s3", action, ctx, "us-east-1", ACCOUNT, "aws"), action);
         }
+    }
+
+    /**
+     * An S3 Control route names no object, so nothing of it is read as a bucket and a key: the ARN
+     * in its path is still taken as written, percent-encoded as the Go SDK sends it or not.
+     */
+    @Test
+    void s3ControlTaggingIsNotReadAsABucketAndAKey() {
+        when(uriInfo.getPath()).thenReturn("/v20180820/tags/arn:aws:s3:::repro-bucket");
+        when(uriInfo.getRequestUri())
+                .thenReturn(URI.create("http://localhost/v20180820/tags/arn%3Aaws%3As3%3A%3A%3Arepro-bucket"));
+
+        assertEquals(List.of("arn:aws:s3:::repro-bucket"),
+                builder.buildResources("s3", "s3:TagResource", ctx, "us-east-1", ACCOUNT, "aws"));
     }
 
     /** A tagging route naming no ARN stays on the wildcard, under which the handler refuses it. */
@@ -1824,7 +1927,7 @@ class ResourceArnBuilderTest {
     /**
      * The operation tells S3 Control's requests from the data plane, not the path: a request a
      * data-plane action claims under the same prefix, a bucket actually named v20180820, keeps
-     * the bucket and object ARN of its own path.
+     * the bucket and object ARN of its own path, the slashes of its key included.
      */
     @Test
     void aDataPlaneOperationUnderTheS3ControlPrefixKeepsItsOwnArn() {
@@ -1834,6 +1937,10 @@ class ResourceArnBuilderTest {
         when(uriInfo.getPath()).thenReturn("/v20180820");
         assertEquals(List.of("arn:aws:s3:::v20180820"),
                 builder.buildResources("s3", "s3:ListBucket", ctx, "us-east-1", ACCOUNT, "aws"));
+        when(uriInfo.getPath()).thenReturn("/v20180820/a/b.txt");
+        when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost/v20180820/a//b.txt"));
+        assertEquals(List.of("arn:aws:s3:::v20180820/a//b.txt"),
+                builder.buildResources("s3", "s3:PutObject", ctx, "us-east-1", ACCOUNT, "aws"));
     }
 
     // ── The vendored table of request resources ─────────────────────────────────
@@ -2457,8 +2564,8 @@ class ResourceArnBuilderTest {
 
     // ── EKS ──────────────────────────────────────────────────────────────────────
 
-    /** The cluster {@code held}, which EKS keeps in us-west-2 and finds by its name alone, and what it holds. */
-    private static final String HELD_CLUSTER = "arn:aws:eks:us-west-2:000000000000:cluster/held";
+    /** The cluster {@code held}, which EKS keeps in the request's Region (us-east-1), and what it holds. */
+    private static final String HELD_CLUSTER = "arn:aws:eks:us-east-1:000000000000:cluster/held";
     private static final String WORKER = "arn:aws:iam::000000000000:role/team/worker";
     private static final String RUNNER = "arn:aws:iam::000000000000:role/ci/access-policies/runner";
 
@@ -2476,7 +2583,7 @@ class ResourceArnBuilderTest {
             {"access-entries", RUNNER, "access-entry/held/role/000000000000/runner/7"},
         }) {
             when(eks.findResourceArn("held", held[0], held[1]))
-                    .thenReturn(Optional.of("arn:aws:eks:us-west-2:000000000000:" + held[2]));
+                    .thenReturn(Optional.of("arn:aws:eks:us-east-1:000000000000:" + held[2]));
         }
         return backedBy(eks);
     }
@@ -2509,7 +2616,7 @@ class ResourceArnBuilderTest {
     @Test
     void anEksRouteOnWhatAClusterHoldsActsOnTheArnEksHoldsItUnder() {
         ResourceArnBuilder eks = eksHolding();
-        String held = "arn:aws:eks:us-west-2:000000000000:";
+        String held = "arn:aws:eks:us-east-1:000000000000:";
         assertEquals(held + "nodegroup/held/ng/1", eksResource(eks, "GET", "/clusters/held/node-groups/ng"));
         assertEquals(held + "nodegroup/held/ng/1",
                 eksResource(eks, "POST", "/clusters/held/node-groups/ng/update-version"));
@@ -2552,7 +2659,7 @@ class ResourceArnBuilderTest {
     void anEksUpdateActsOnItsAddonAndATagOnTheCallersClusterOfThatName() {
         ResourceArnBuilder eks = eksHolding();
         // EKS returns an add-on's update whatever add-on the request names, if any, so it acts on its own add-on.
-        String addon = "arn:aws:eks:us-west-2:000000000000:addon/held/vpc-cni/4";
+        String addon = "arn:aws:eks:us-east-1:000000000000:addon/held/vpc-cni/4";
         assertEquals(addon, eksResource(eks, "GET", "/clusters/held/updates/u-1"));
         queryParams.putSingle("addonName", "coredns");
         assertEquals(addon, eksResource(eks, "GET", "/clusters/held/updates/u-1"));
@@ -2573,6 +2680,22 @@ class ResourceArnBuilderTest {
                 "/cluster-registrations", "/eks-anywhere-subscriptions")) {
             assertEquals("*", eksResource(eks, "GET", route), route);
         }
+    }
+
+    @Test
+    void anEksRouteOnAClusterHeldInAnotherRegionActsOnTheRequestsRegion() {
+        // EKS clusters are Regional: a request signed for us-east-1 does not reach a cluster EKS keeps in us-west-2,
+        // so it acts on the cluster of that name a create would mint in us-east-1, and on nothing the other holds.
+        EksService eks = mock(EksService.class);
+        when(eks.findResourceArn(any(), any(), any())).thenReturn(Optional.empty());
+        when(eks.findResourceArn("west", null, null))
+                .thenReturn(Optional.of("arn:aws:eks:us-west-2:000000000000:cluster/west"));
+        when(eks.findResourceArn("west", "node-groups", "ng"))
+                .thenReturn(Optional.of("arn:aws:eks:us-west-2:000000000000:nodegroup/west/ng/1"));
+        ResourceArnBuilder builder = backedBy(eks);
+
+        assertEquals("arn:aws:eks:us-east-1:000000000000:cluster/west", eksResource(builder, "GET", "/clusters/west"));
+        assertEquals("*", eksResource(builder, "GET", "/clusters/west/node-groups/ng"));
     }
 
     /** Stubs the request path as sent and, decoded, as {@link UriInfo#getPath()} gives it. */

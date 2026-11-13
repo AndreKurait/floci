@@ -92,6 +92,7 @@ quarkus:
         - bedrock/*.yaml
         - eks/*.json
         - aws/*.json
+        - proto/**/*.proto
         - iam/service-linked-roles.tsv
         - cloudformation/*.json
         - redshift/*.sql
@@ -155,6 +156,7 @@ quarkus:
       - --initialize-at-run-time=io.floci.aws.services.bedrockagentcore.BedrockAgentCoreEventService
       - --initialize-at-run-time=io.floci.aws.services.cloudfront.CloudFrontService
       - --initialize-at-run-time=io.floci.aws.services.emr.EmrService
+      - --initialize-at-run-time=io.floci.aws.services.emrserverless.EmrServerlessSparkRunner
       - --initialize-at-run-time=io.floci.aws.services.elasticbeanstalk.ElasticBeanstalkService
       - --initialize-at-run-time=io.floci.aws.services.elb.ElbClassicService
       - --initialize-at-run-time=io.floci.aws.services.datasync.DataSyncService
@@ -221,6 +223,8 @@ floci:
       # metric datapoints, the S3 object index) fold their .wal file into the store's JSON file.
       compaction-interval-ms: 30000
     services:
+      rekognition:
+        flush-interval-ms: 5000
       ssm:
         flush-interval-ms: 5000
       dynamodb:
@@ -239,6 +243,7 @@ floci:
       lambda:
         flush-interval-ms: 5000
       cloudwatchlogs:
+        # Includes saved Logs Insights query definitions.
         flush-interval-ms: 15000
       cloudwatchmetrics:
         flush-interval-ms: 5000
@@ -428,6 +433,7 @@ floci:
       enforce-auth: false
       default-presign-expiry-seconds: 3600
       global-bucket-namespace: false
+      restore-completion-delay-seconds: 0   # FLOCI_SERVICES_S3_RESTORE_COMPLETION_DELAY_SECONDS
       lifecycle-sweep-enabled: true          # FLOCI_SERVICES_S3_LIFECYCLE_SWEEP_ENABLED - apply lifecycle expiration rules in the background
       lifecycle-sweep-interval-seconds: 60   # FLOCI_SERVICES_S3_LIFECYCLE_SWEEP_INTERVAL_SECONDS
     dynamodb:
@@ -628,6 +634,9 @@ floci:
       # docker-network: floci-network
       # image-template: "registry.internal/emr-serverless/spark/%s:20250425"   # %s = the release label
       # hive-image-template: "registry.internal/emr-serverless/hive/%s:20250425"   # every cluster's HDFS, and Hive
+      yarn-node-memory-mb: 4096             # memory a cluster's NodeManager offers its YARN containers
+      yarn-node-vcores: 4                   # virtual cores it offers them
+      yarn-max-worker-nodes: 4              # the most core and task nodes a cluster runs as containers of their own
       # Remove the step drivers a previous run of this deployment left on the daemon, and the images
       # bootstrap actions left for clusters that are gone or have ended, when the EMR service starts.
       # Scoped to this deployment's own containers and images.
@@ -927,6 +936,7 @@ floci:
       enabled: true
     applicationautoscaling:
       enabled: true
+      scheduled-action-interval-seconds: ${FLOCI_SERVICES_APPLICATIONAUTOSCALING_SCHEDULED_ACTION_INTERVAL_SECONDS:1}
     elasticbeanstalk:
       enabled: true
     backup:
@@ -1040,8 +1050,9 @@ floci:
       # docker-network: floci-network
       # image-template: "registry.internal/emr-serverless/spark/%s:20250425"   # %s = the release label
       # hive-image-template: "registry.internal/emr-serverless/hive/%s:20250425"   # for Hive job runs
-      # Remove the drivers a previous run of this deployment left on the daemon before the first
-      # job run starts. Scoped to this deployment's own containers.
+      executor-containers: 0        # a docker Spark run's executors at once, each in a container; 0 = local mode
+      # Remove the drivers and executors a previous run of this deployment left on the daemon before
+      # the first job run starts. Scoped to this deployment's own containers.
       reconcile-containers-on-startup: true
     ssoadmin:
       enabled: true
@@ -1079,6 +1090,8 @@ floci:
     dlm:
       enabled: true
     signer:
+      enabled: true
+    xray:
       enabled: true
     cognitoidentity:
       enabled: true

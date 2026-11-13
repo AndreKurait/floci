@@ -3,9 +3,11 @@ package io.floci.aws.services.emr;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.ContainerTeardown;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.services.emr.model.EmrCluster;
+import io.floci.aws.services.emr.model.EmrInstanceFleet;
 import io.floci.aws.services.emr.model.EmrInstanceGroup;
 import io.floci.aws.services.emr.model.EmrStep;
 import io.floci.aws.services.emrserverless.EmrServerlessSparkRunner;
@@ -34,6 +36,7 @@ import static io.floci.aws.services.emr.EmrServiceFixture.cluster;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
@@ -218,6 +221,24 @@ class EmrServiceContainerStepsTest {
     }
 
     @Test
+    void aClusterEndedWithErrorsRefusesChangesAndTagChanges() {
+        String id = service.runJobFlow(cluster("doomed", true, sparkStep("breaks", "TERMINATE_CLUSTER")), REGION)
+                .getId();
+        runner.outcome = SparkJobRunner.Outcome.exitedWith(1);
+        fixture.runStepThread();
+
+        AwsException modifying = assertThrows(AwsException.class, () -> service.modifyCluster(id, 2));
+        AwsException protecting = assertThrows(AwsException.class,
+                () -> service.setTerminationProtection(List.of(id), true));
+        AwsException tagging = assertThrows(AwsException.class, () -> service.addTags(id, Map.of("team", "data")));
+
+        assertEquals("TERMINATED_WITH_ERRORS", service.describeCluster(id).getState());
+        assertEquals(Map.of("ErrorCode", "INVALID_JOB_SHUT_DOWN"), modifying.getExtendedData());
+        assertEquals("ValidationException", protecting.getErrorCode());
+        assertEquals("Tags cannot be modified on terminated clusters.", tagging.getMessage());
+    }
+
+    @Test
     void terminateClusterLeavesAProtectedClusterThatWaitsAfterItsStepsRunning() {
         EmrCluster requested = cluster("protected", true, sparkStep("breaks", "TERMINATE_CLUSTER"),
                 sparkStep("next", "CONTINUE"));
@@ -318,6 +339,223 @@ class EmrServiceContainerStepsTest {
     }
 
     @Test
+    void aClustersCoreAndTaskGroupsAreItsNodesNamedAsListInstancesNamesThem() {
+        fixture.clusterStorage.ownNetwork = true;
+        EmrCluster requested = cluster("nodes", true, sparkStep("report", "CONTINUE"));
+        requested.setInstanceGroups(new ArrayList<>(List.of(group("CORE", 2), group("MASTER", 1), group("TASK", 1))));
+        service.runJobFlow(requested, REGION);
+
+        fixture.runStepThread();
+
+        ClusterStorage.Yarn yarn = fixture.clusterStorage.yarns.get(0);
+        assertEquals(List.of(new ClusterStorage.Node("1-1", "ip-10-1-0-1.ec2.internal", true),
+                new ClusterStorage.Node("1-2", "ip-10-1-0-2.ec2.internal", true),
+                new ClusterStorage.Node("2-1", "ip-10-2-0-1.ec2.internal", false)), yarn.nodes());
+        assertEquals(1, yarn.replication());
+    }
+
+    @Test
+    void aPrimaryNodeWorksUnlessItsClusterWasCreatedWithCoreNodes() {
+        fixture.clusterStorage.ownNetwork = true;
+        EmrCluster withoutCore = cluster("task-only", true, sparkStep("report", "CONTINUE"));
+        withoutCore.setInstanceGroups(new ArrayList<>(List.of(group("MASTER", 1), group("TASK", 1))));
+        EmrCluster grown = service.runJobFlow(withoutCore, REGION);
+        fixture.runStepThread();
+        EmrCluster withCore = cluster("with-core", true, sparkStep("report", "CONTINUE"));
+        withCore.setInstanceGroups(new ArrayList<>(List.of(group("MASTER", 1), group("CORE", 1))));
+        service.runJobFlow(withCore, REGION);
+        fixture.runStepThread();
+
+        service.addInstanceGroups(grown.getId(), List.of(group("CORE", 2)));
+        fixture.runStepThread();
+
+        assertTrue(fixture.clusterStorage.yarns.get(0).primaryWorks());
+        assertFalse(fixture.clusterStorage.yarns.get(1).primaryWorks());
+        // Its DataNode holds the blocks written before, which core nodes added since do not.
+        ClusterStorage.Yarn withCoreNodes = fixture.clusterStorage.resizes.get(0);
+        assertEquals(List.of(true, true, false), withCoreNodes.nodes().stream().map(ClusterStorage.Node::core).toList());
+        assertTrue(withCoreNodes.primaryWorks());
+    }
+
+    @Test
+    void aFleetsUnitOfCapacityIsOneNode() {
+        fixture.clusterStorage.ownNetwork = true;
+        EmrCluster requested = cluster("fleets", true, sparkStep("report", "CONTINUE"));
+        requested.setInstanceFleets(new ArrayList<>(List.of(fleet("MASTER", 1, 0), fleet("CORE", 1, 1),
+                fleet("TASK", 0, 1))));
+        service.runJobFlow(requested, REGION);
+
+        fixture.runStepThread();
+
+        assertEquals(List.of(new ClusterStorage.Node("1-1", "ip-10-1-0-1.ec2.internal", true),
+                new ClusterStorage.Node("1-2", "ip-10-1-0-2.ec2.internal", true),
+                new ClusterStorage.Node("2-1", "ip-10-2-0-1.ec2.internal", false)),
+                fixture.clusterStorage.yarns.get(0).nodes());
+    }
+
+    @Test
+    void aFleetListedBeforeThePrimaryOneIsNamedAsListInstancesNamesIt() {
+        fixture.clusterStorage.ownNetwork = true;
+        EmrCluster requested = cluster("core-first", true, sparkStep("report", "CONTINUE"));
+        requested.setInstanceFleets(new ArrayList<>(List.of(fleet("CORE", 1, 0), fleet("MASTER", 1, 0),
+                fleet("TASK", 0, 1))));
+        service.runJobFlow(requested, REGION);
+
+        fixture.runStepThread();
+
+        assertEquals(List.of(new ClusterStorage.Node("1-1", "ip-10-1-0-1.ec2.internal", true),
+                new ClusterStorage.Node("2-1", "ip-10-2-0-1.ec2.internal", false)),
+                fixture.clusterStorage.yarns.get(0).nodes());
+    }
+
+    @Test
+    void noMoreNodesRunThanTheSettingAllowsCoreNodesFirst() {
+        fixture.clusterStorage.ownNetwork = true;
+        EmrCluster requested = cluster("capped", true, sparkStep("report", "CONTINUE"));
+        requested.setInstanceGroups(new ArrayList<>(List.of(group("MASTER", 1), group("TASK", 5), group("CORE", 3))));
+        service.runJobFlow(requested, REGION);
+
+        fixture.runStepThread();
+
+        List<ClusterStorage.Node> nodes = fixture.clusterStorage.yarns.get(0).nodes();
+        assertEquals(4, nodes.size());
+        assertEquals(List.of(true, true, true, false), nodes.stream().map(ClusterStorage.Node::core).toList());
+    }
+
+    @Test
+    void itsHdfsKeepsTheCopiesEmrKeepsForTheCoreNodesItWasCreatedWith() {
+        assertEquals(1, replicationOf(3, null));
+        assertEquals(2, replicationOf(4, null));
+        assertEquals(3, replicationOf(10, null));
+        // Never more than the nodes that hold them.
+        assertEquals(2, replicationOf(2, "3"));
+        // "To overwrite the default value, use the hdfs-site classification."
+        assertEquals(3, replicationOf(3, "3"));
+        // One it cannot use keeps EMR's default, which its log says.
+        assertEquals(1, replicationOf(2, "not-a-number"));
+        assertEquals(2, replicationOf(4, "0"));
+        assertEquals(2, replicationOf(4, "-1"));
+    }
+
+    private int replicationOf(int coreNodes, String configured) {
+        EmrServiceFixture own = EmrServiceFixture.docker(runner, null);
+        own.clusterStorage.ownNetwork = true;
+        EmrCluster requested = cluster("copies", true, sparkStep("report", "CONTINUE"));
+        requested.setInstanceGroups(new ArrayList<>(List.of(group("MASTER", 1), group("CORE", coreNodes))));
+        if (configured != null) {
+            requested.setConfigurations("[{\"Classification\":\"hdfs-site\",\"Properties\":"
+                    + "{\"dfs.replication\":\"" + configured + "\"}}]");
+        }
+        own.service.runJobFlow(requested, REGION);
+        own.runStepThread();
+        return own.clusterStorage.yarns.get(0).replication();
+    }
+
+    @Test
+    void itsCoreNodesAreNotShrunkBelowTheCopiesItsHdfsKeeps() {
+        fixture.clusterStorage.ownNetwork = true;
+        EmrCluster requested = cluster("floor", true, sparkStep("report", "CONTINUE"));
+        requested.setInstanceGroups(new ArrayList<>(List.of(group("MASTER", 1), group("CORE", 4))));
+        EmrCluster cluster = service.runJobFlow(requested, REGION);
+        fixture.runStepThread();
+        String core = cluster.getInstanceGroups().get(1).getId();
+
+        service.modifyInstanceGroups(cluster.getId(), REGION,
+                List.of(new EmrService.InstanceGroupModification(core, 1, null)));
+        fixture.runStepThread();
+
+        assertEquals(2, fixture.clusterStorage.resizes.get(0).nodes().size());
+        assertEquals(2, fixture.clusterStorage.resizes.get(0).replication());
+    }
+
+    @Test
+    void aResizeReachesTheNodesOnceAStepHasStartedThem() {
+        fixture.clusterStorage.ownNetwork = true;
+        EmrCluster requested = cluster("resize", true, sparkStep("report", "CONTINUE"));
+        requested.setInstanceGroups(new ArrayList<>(List.of(group("MASTER", 1), group("CORE", 1), group("TASK", 1))));
+        EmrCluster cluster = service.runJobFlow(requested, REGION);
+        fixture.runStepThread();
+        String task = cluster.getInstanceGroups().get(2).getId();
+
+        service.modifyInstanceGroups(cluster.getId(), REGION,
+                List.of(new EmrService.InstanceGroupModification(task, 3, null)));
+        fixture.runStepThread();
+        assertEquals(4, fixture.clusterStorage.resizes.get(0).nodes().size());
+
+        EmrInstanceGroup added = group("TASK", 1);
+        service.addInstanceGroups(cluster.getId(), List.of(added));
+        fixture.runStepThread();
+        assertEquals(4, fixture.clusterStorage.resizes.get(1).nodes().size());
+        assertEquals(new ClusterStorage.Node("2-3", "ip-10-2-0-3.ec2.internal", false),
+                fixture.clusterStorage.resizes.get(1).nodes().get(3));
+    }
+
+    @Test
+    void aResizeOfAFleetReachesItsNodesToo() {
+        fixture.clusterStorage.ownNetwork = true;
+        EmrCluster requested = cluster("fleet-resize", true, sparkStep("report", "CONTINUE"));
+        requested.setInstanceFleets(new ArrayList<>(List.of(fleet("MASTER", 1, 0), fleet("CORE", 1, 0))));
+        EmrCluster cluster = service.runJobFlow(requested, REGION);
+        fixture.runStepThread();
+        String core = cluster.getInstanceFleets().get(1).getId();
+
+        service.modifyInstanceFleet(cluster.getId(), core, 2, null);
+        fixture.runStepThread();
+        assertEquals(2, fixture.clusterStorage.resizes.get(0).nodes().size());
+
+        service.addInstanceFleet(cluster.getId(), fleet("TASK", 1, 0));
+        fixture.runStepThread();
+        assertEquals(3, fixture.clusterStorage.resizes.get(1).nodes().size());
+    }
+
+    @Test
+    void aResizeBeforeAStepHasStartedTheNodesIsLeftToThatStep() {
+        fixture.clusterStorage.ownNetwork = true;
+        EmrCluster requested = cluster("early", true);
+        requested.setInstanceGroups(new ArrayList<>(List.of(group("MASTER", 1), group("CORE", 1))));
+        EmrCluster cluster = service.runJobFlow(requested, REGION);
+        String core = cluster.getInstanceGroups().get(1).getId();
+
+        service.modifyInstanceGroups(cluster.getId(), REGION,
+                List.of(new EmrService.InstanceGroupModification(core, 2, null)));
+
+        assertEquals(0, fixture.stepThreadsWaiting());
+        assertEquals(List.of(), fixture.clusterStorage.resizes);
+    }
+
+    @Test
+    void aStepQueuedBeforeAResizeStartsTheNodesItAsksForByThen() {
+        fixture.clusterStorage.ownNetwork = true;
+        EmrCluster requested = cluster("queued", true, sparkStep("report", "CONTINUE"));
+        requested.setInstanceGroups(new ArrayList<>(List.of(group("MASTER", 1), group("CORE", 1))));
+        EmrCluster cluster = service.runJobFlow(requested, REGION);
+        String core = cluster.getInstanceGroups().get(1).getId();
+
+        // The step's thread has not run yet.
+        service.modifyInstanceGroups(cluster.getId(), REGION,
+                List.of(new EmrService.InstanceGroupModification(core, 3, null)));
+        fixture.runStepThread();
+
+        assertEquals(3, fixture.clusterStorage.yarns.get(0).nodes().size());
+    }
+
+    @Test
+    void aClusterThatDoesNotRunYarnFollowsNoResize() {
+        fixture.clusterStorage.ownNetwork = false;
+        EmrCluster requested = cluster("no-yarn", true, sparkStep("report", "CONTINUE"));
+        requested.setInstanceGroups(new ArrayList<>(List.of(group("MASTER", 1), group("TASK", 1))));
+        EmrCluster cluster = service.runJobFlow(requested, REGION);
+        fixture.runStepThread();
+        String task = cluster.getInstanceGroups().get(1).getId();
+
+        service.modifyInstanceGroups(cluster.getId(), REGION,
+                List.of(new EmrService.InstanceGroupModification(task, 2, null)));
+
+        assertEquals(0, fixture.stepThreadsWaiting());
+        assertEquals(List.of(), fixture.clusterStorage.resizes);
+    }
+
+    @Test
     void aStepStartsItsClustersHdfsOnItsPrimaryNodeFromTheReleasesHiveImage() {
         EmrCluster requested = cluster("hdfs", true, sparkStep("report", "CONTINUE"), sparkStep("next", "CONTINUE"));
         // ListInstances lists the core group's two instances before the master's, which it numbers first.
@@ -343,6 +581,147 @@ class EmrServiceContainerStepsTest {
     }
 
     @Test
+    void aClusterOnANetworkOfItsOwnRunsYarnOnItsPrimaryNodeInTheImageItsStepsRunIn() {
+        fixture.clusterStorage.ownNetwork = true;
+        EmrCluster cluster = service.runJobFlow(cluster("yarn", true, sparkStep("report", "CONTINUE")), REGION);
+
+        fixture.runStepThread();
+
+        // Its release's image with Hadoop's services, as it has no Hive, made on the step's thread: its steps and its
+        // primary node's HDFS and YARN run in it, the NodeManager offering what Floci gives it.
+        assertEquals(List.of(List.of("emr-7.5.0", "public.ecr.aws/emr-serverless/spark/emr-7.5.0:latest",
+                "public.ecr.aws/emr-serverless/hive/emr-7.5.0:latest", "false")), fixture.releaseImages.asked);
+        SparkJobRunner.Job job = runner.jobs.get(0);
+        assertEquals(EmrServiceFixture.RecordingReleaseImages.IMAGE, job.imageTemplate());
+        assertEquals(EmrServiceFixture.RecordingReleaseImages.IMAGE, fixture.clusterStorage.hdfs.get(0).get(2));
+        assertEquals(List.of(new ClusterStorage.Yarn(4096, 4)), fixture.clusterStorage.yarns);
+        assertEquals(hdfsStorage(cluster).withYarn("ip-10-0-0-1.ec2.internal",
+                EmrServiceFixture.RecordingStorage.FLOCI_ON_NETWORK), job.storage());
+    }
+
+    @Test
+    void aStepOnYarnPutsItsClustersContainerLogsInItsLogUriBeforeItEnds() {
+        fixture.clusterStorage.ownNetwork = true;
+        EmrCluster requested = cluster("yarn", true, sparkStep("report", "CONTINUE"));
+        requested.setLogUri("s3://logs/emr/");
+        EmrCluster cluster = service.runJobFlow(requested, REGION);
+
+        fixture.runStepThread();
+
+        assertEquals(List.of(List.of(cluster.getId(), "s3://logs/emr/" + cluster.getId() + "/containers/")),
+                fixture.clusterStorage.containerLogs);
+    }
+
+    @Test
+    void aStepThatCouldNotStartPutsNoContainerLogs() {
+        fixture.clusterStorage.ownNetwork = true;
+        fixture.clusterStorage.hdfsFailure = new IllegalStateException("The HDFS did not start");
+        EmrCluster requested = cluster("yarn", true, sparkStep("report", "CONTINUE"));
+        requested.setLogUri("s3://logs/emr/");
+        service.runJobFlow(requested, REGION);
+
+        fixture.runStepThread();
+
+        assertEquals(List.of(), fixture.clusterStorage.containerLogs);
+    }
+
+    @Test
+    void aClusterWithoutALogUriOrWithoutYarnPutsNoContainerLogs() {
+        fixture.clusterStorage.ownNetwork = true;
+        EmrCluster noLogUri = cluster("yarn", true, sparkStep("report", "CONTINUE"));
+        noLogUri.setLogUri(null);
+        service.runJobFlow(noLogUri, REGION);
+        fixture.runStepThread();
+        fixture.clusterStorage.ownNetwork = false;
+        EmrCluster noYarn = cluster("local", true, sparkStep("report", "CONTINUE"));
+        noYarn.setLogUri("s3://logs/emr/");
+        service.runJobFlow(noYarn, REGION);
+        fixture.runStepThread();
+
+        assertEquals(List.of(), fixture.clusterStorage.containerLogs);
+    }
+
+    @Test
+    void aClusterBootstrappedOnYarnRunsItsStepsThereFromTheImageItsBootstrapLeft() {
+        EmrServiceFixture bootstrapping = EmrServiceFixture.docker(runner, bootstrap, null);
+        bootstrapping.clusterStorage.ownNetwork = true;
+        bootstrapping.service.runJobFlow(bootstrapped(cluster("on-yarn", true, sparkStep("report", "CONTINUE"))), REGION);
+
+        bootstrapping.runStepThread();
+        bootstrapping.runStepThread();
+
+        assertEquals(1, bootstrapping.clusterStorage.yarns.size());
+        assertEquals(runner.jobs.get(0).imageTemplate(), bootstrapping.clusterStorage.hdfs.get(0).get(2));
+        assertEquals("ip-10-0-0-1.ec2.internal", runner.jobs.get(0).storage().resourceManager());
+    }
+
+    @Test
+    void aClusterBootstrappedByAnEarlierFlociKeepsToLocalModeAndItsHdfsToTheHiveImage() {
+        // As an earlier Floci left it: a bootstrap image with no YARN in it.
+        EmrServiceFixture bootstrapping = EmrServiceFixture.docker(runner, bootstrap, null);
+        bootstrapping.clusterStorage.ownNetwork = false;
+        EmrCluster cluster = bootstrapping.service.runJobFlow(bootstrapped(cluster("from-before", true)), REGION);
+        bootstrapping.runStepThread();
+        bootstrapping.clusterStorage.ownNetwork = true;
+
+        bootstrapping.service.addJobFlowSteps(cluster.getId(), List.of(sparkStep("report", "CONTINUE")));
+        bootstrapping.runStepThread();
+
+        assertEquals(List.of(), bootstrapping.clusterStorage.yarns);
+        assertEquals("public.ecr.aws/emr-serverless/hive/emr-7.5.0:latest",
+                bootstrapping.clusterStorage.hdfs.get(0).get(2));
+        assertEquals(null, runner.jobs.get(0).storage().resourceManager());
+    }
+
+    @Test
+    void aSparkStepOnAClusterThatRunsYarnKeepsItsOwnMasterAndDeployMode() {
+        fixture.clusterStorage.ownNetwork = true;
+        EmrStep step = sparkStep("report", "CONTINUE");
+        step.setArgs(new ArrayList<>(List.of("spark-submit", "--master", "yarn", "--deploy-mode", "cluster", REPORT)));
+        service.runJobFlow(cluster("yarn", true, step), REGION);
+
+        fixture.runStepThread();
+
+        // As EMR's spark-submit takes them: a cluster-mode driver runs on the cluster's YARN.
+        assertEquals(List.of("--master", "yarn", "--deploy-mode", "cluster", REPORT), runner.jobs.get(0).application());
+    }
+
+    @Test
+    void aClusterOfTheAwsRuntimeForSparkRunsYarnFromTheHadoopItsImageKeepsApart() {
+        fixture.clusterStorage.ownNetwork = true;
+        EmrCluster requested = cluster("spark-runtime", true, sparkStep("report", "CONTINUE"));
+        requested.setReleaseLabel("emr-spark-8.1.0");
+        EmrCluster cluster = service.runJobFlow(requested, REGION);
+
+        fixture.runStepThread();
+
+        // Its release has no Hive image, so emr-7.5.0's gives the Hadoop its image holds for the node's daemons.
+        assertEquals(List.of(List.of("emr-spark-8.1.0", "public.ecr.aws/emr-serverless/spark4/emr-spark-8.1.0:latest",
+                "public.ecr.aws/emr-serverless/hive/emr-7.5.0:latest", "false")), fixture.releaseImages.asked);
+        SparkJobRunner.Job job = runner.jobs.get(0);
+        assertEquals(EmrServiceFixture.RecordingReleaseImages.IMAGE, job.imageTemplate());
+        assertEquals(EmrServiceFixture.RecordingReleaseImages.IMAGE, fixture.clusterStorage.hdfs.get(0).get(2));
+        assertEquals(List.of(new ClusterStorage.Yarn(4096, 4).withHadoopFolder("/opt")),
+                fixture.clusterStorage.yarns);
+        assertEquals(hdfsStorage(cluster).withYarn("ip-10-0-0-1.ec2.internal",
+                EmrServiceFixture.RecordingStorage.FLOCI_ON_NETWORK), job.storage());
+    }
+
+    @Test
+    void aClusterOfTheAwsRuntimeForSparkOnYarnNamingHiveStillRunsNoHive() {
+        fixture.clusterStorage.ownNetwork = true;
+        EmrCluster requested = cluster("spark-runtime-hive", true, sparkStep("report", "CONTINUE"));
+        requested.setReleaseLabel("emr-spark-8.1.0");
+        requested.setApplications("[{\"Name\": \"Hive\"}, {\"Name\": \"Spark\"}]");
+        service.runJobFlow(requested, REGION);
+
+        fixture.runStepThread();
+
+        assertEquals("false", fixture.releaseImages.asked.get(0).get(3));
+        assertEquals("false", fixture.clusterStorage.hdfs.get(0).get(4));
+    }
+
+    @Test
     void aHiveStepOnAClusterWithHCatalogRunsHiveInTheReleasesImageWithHive() {
         EmrCluster requested = cluster("hcatalog", true, hiveStep("report", "-e", "show tables;"));
         requested.setApplications("[{\"Name\": \"HCatalog\"}]");
@@ -354,7 +733,7 @@ class EmrServiceContainerStepsTest {
         SparkJobRunner.Job job = runner.jobs.get(0);
         assertEquals(SparkJobRunner.Engine.HIVE, job.engine());
         assertEquals(List.of(List.of("emr-7.5.0", "public.ecr.aws/emr-serverless/spark/emr-7.5.0:latest",
-                "public.ecr.aws/emr-serverless/hive/emr-7.5.0:latest")), fixture.releaseImages.asked);
+                "public.ecr.aws/emr-serverless/hive/emr-7.5.0:latest", "true")), fixture.releaseImages.asked);
         assertEquals(EmrServiceFixture.RecordingReleaseImages.IMAGE, job.imageTemplate());
         assertEquals(hdfsStorage(cluster).withHiveMetastore("thrift://ip-10-0-0-1.ec2.internal:9083"), job.storage());
     }
@@ -635,6 +1014,51 @@ class EmrServiceContainerStepsTest {
     }
 
     @Test
+    void aStepCancelledAsItRunsOnYarnLeavesItsApplicationsLogsInS3() {
+        fixture.clusterStorage.ownNetwork = true;
+        EmrCluster requested = cluster("cancel-logs", true, sparkStep("report", "CONTINUE"));
+        requested.setLogUri("s3://logs/emr/");
+        EmrCluster cluster = service.runJobFlow(requested, REGION);
+        String stepId = cluster.getSteps().get(0).getId();
+        runner.whileRunning = () -> service.cancelSteps(cluster.getId(), List.of(stepId));
+
+        fixture.runStepThread();
+
+        assertEquals("CANCELLED", service.describeStep(cluster.getId(), stepId).getState());
+        assertEquals(List.of(List.of(cluster.getId(), "s3://logs/emr/" + cluster.getId() + "/containers/")),
+                fixture.clusterStorage.containerLogs);
+    }
+
+    @Test
+    void aStepCancelledBeforeItsDriverStartedHasNoLogsToArchive() {
+        fixture.clusterStorage.ownNetwork = true;
+        EmrCluster requested = cluster("cancel-early", true, sparkStep("never", "CONTINUE"));
+        requested.setLogUri("s3://logs/emr/");
+        EmrCluster cluster = service.runJobFlow(requested, REGION);
+
+        service.cancelSteps(cluster.getId(), List.of(cluster.getSteps().get(0).getId()));
+        fixture.runStepThread();
+
+        assertEquals(List.of(), fixture.clusterStorage.containerLogs);
+    }
+
+    @Test
+    void aStepFlociStopsInATeardownLeavesItsApplicationsLogsOnTheNode() {
+        fixture.clusterStorage.ownNetwork = true;
+        EmrCluster requested = cluster("teardown-logs", true, sparkStep("cut", "CONTINUE"));
+        requested.setLogUri("s3://logs/emr/");
+        EmrCluster cluster = service.runJobFlow(requested, REGION);
+        runner.whileRunning = () -> {
+            service.stopManagedContainers();
+            runner.stop(cluster.getSteps().get(0).getId());
+        };
+
+        fixture.runStepThread();
+
+        assertEquals(List.of(), fixture.clusterStorage.containerLogs);
+    }
+
+    @Test
     void aStepCancelledBeforeItsDriverStartsNeverStartsIt() {
         EmrCluster cluster = service.runJobFlow(cluster("early", true, sparkStep("never", "CONTINUE")), REGION);
 
@@ -868,7 +1292,7 @@ class EmrServiceContainerStepsTest {
         assertEquals(stepId, job.runId());
         // The release's EMR Serverless image with its EMR Serverless Hive image's Hive, made on the step's thread.
         assertEquals(List.of(List.of("emr-7.5.0", "public.ecr.aws/emr-serverless/spark/emr-7.5.0:latest",
-                "public.ecr.aws/emr-serverless/hive/emr-7.5.0:latest")), fixture.releaseImages.asked);
+                "public.ecr.aws/emr-serverless/hive/emr-7.5.0:latest", "true")), fixture.releaseImages.asked);
         assertEquals(EmrServiceFixture.RecordingReleaseImages.IMAGE, job.imageTemplate());
         assertNull(job.customImage());
         assertEquals(List.of("hive-script", "--run-hive-script", "--args"), job.command());
@@ -896,7 +1320,7 @@ class EmrServiceContainerStepsTest {
         fixture.runStepThread();
 
         assertEquals(List.of(List.of("emr-7.5.0", "public.ecr.aws/emr-serverless/spark/emr-7.5.0:latest",
-                "registry.internal/emr-serverless/hive/emr-7.5.0:20250425")), fixture.releaseImages.asked);
+                "registry.internal/emr-serverless/hive/emr-7.5.0:20250425", "true")), fixture.releaseImages.asked);
         assertEquals(SparkJobRunner.Engine.SPARK, runner.jobs.get(0).engine());
         assertEquals(EmrServiceFixture.RecordingReleaseImages.IMAGE, runner.jobs.get(0).imageTemplate());
     }
@@ -1270,6 +1694,14 @@ class EmrServiceContainerStepsTest {
                  {"Name": "jars", "ScriptBootstrapAction": {"Path": "s3://bucket/bootstrap/jars.sh"}}]"""
                 .formatted(INSTALL));
         return cluster;
+    }
+
+    private static EmrInstanceFleet fleet(String type, int onDemand, int spot) {
+        EmrInstanceFleet fleet = new EmrInstanceFleet();
+        fleet.setInstanceFleetType(type);
+        fleet.setTargetOnDemandCapacity(onDemand);
+        fleet.setTargetSpotCapacity(spot);
+        return fleet;
     }
 
     private static EmrInstanceGroup group(String type, int count) {

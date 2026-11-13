@@ -3,6 +3,7 @@ package io.floci.aws.core.common;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.services.cloudtrail.CloudTrailService;
+import io.floci.aws.services.cloudwatch.metrics.OtlpMetricsController;
 import io.floci.aws.services.iam.AccessDeniedMessages;
 import io.floci.aws.services.iam.AccessDeniedMessages.PolicyType;
 import io.floci.aws.services.iam.IamActionRegistry;
@@ -363,6 +364,12 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         boolean emptyHeader = auth != null && auth.isBlank();
         if (auth == null || emptyHeader) {
             auth = requestAuthorization(null, ctx.getUriInfo().getQueryParameters());
+        }
+        if (resourceInfo != null && resourceInfo.getResourceClass() == OtlpMetricsController.class
+                && (auth == null || !claimsSigV4(auth))) {
+            ctx.abortWith(AwsProtocolClaimFilter.errorResponse(403, "MissingAuthenticationTokenException",
+                    "Request is missing Authentication Token"));
+            return;
         }
         if (auth == null) {
             if (emptyHeader) {
@@ -1118,8 +1125,8 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                                              String credentialScope, List<String> resources,
                                              String region, String accountId, String akid) {
         // A create tags the resource it makes, not the parent it makes it in (see RequestResources.created).
-        List<String> created = RequestResources.created(operation, ctx, AwsRegions.partitionFor(region), region,
-                accountId, IamActionRegistry.pathLabels(credentialScope, ctx));
+        List<String> created = RequestResources.created(operation, tagging.action(), ctx,
+                AwsRegions.partitionFor(region), region, accountId, IamActionRegistry.pathLabels(credentialScope, ctx));
         List<String> made = created.isEmpty() ? resources : created;
         for (TagOnCreate.TagSet set : tagging.checked()) {
             Map<String, List<String>> context = TagOnCreate.conditionContext(tagging, set, operation);
@@ -1450,6 +1457,20 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             String resource,
             Map<String, List<String>> requestConditions) {
         authorizeAdditionalResource(authorizationHeader, action, resource, null, null, null, requestConditions);
+    }
+
+    /**
+     * Authorizes a secondary resource for a request {@link #filter} never sees, such as a WebSocket upgrade,
+     * with the condition keys the request carries in the members {@code request-condition-keys.json} names
+     * for {@code action}, read through {@code parameter}.
+     */
+    public void authorizeRequestParameters(
+            String authorizationHeader,
+            String action,
+            String resource,
+            Function<String, String> parameter) {
+        authorizeAdditionalResource(authorizationHeader, action, resource,
+                IamConditionContextResolver.requestConditions(action, parameter));
     }
 
     /**

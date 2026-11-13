@@ -16,6 +16,8 @@ import io.floci.aws.core.common.PaginatedResult;
 import io.floci.aws.core.common.Pagination;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestContext;
+import io.floci.aws.core.common.ResteasyRequests;
+import io.floci.aws.core.common.StreamingResponses;
 import io.floci.aws.core.common.XmlBuilder;
 import io.floci.aws.core.common.XmlParser;
 import io.floci.aws.core.common.auth.SigV4Canonicalization;
@@ -59,6 +61,7 @@ import org.jboss.resteasy.reactive.server.ServerExceptionMapper;
 import javax.xml.stream.XMLStreamConstants;
 import javax.xml.stream.XMLStreamException;
 import javax.xml.stream.XMLStreamReader;
+
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.Closeable;
@@ -239,7 +242,7 @@ public class S3Controller {
         if (target != null) {
             return null;
         }
-        MultivaluedMap<String, String> queryParams = uriInfo.getQueryParameters();
+        MultivaluedMap<String, String> queryParams = ResteasyRequests.queryParameters(uriInfo);
         String action = queryParams.getFirst("Action");
         // SNS emits SubscribeURL/UnsubscribeURL as plain GET links against the
         // service root, which collides with the S3 ListBuckets endpoint. Delegate
@@ -308,6 +311,7 @@ public class S3Controller {
                     return headOnlyResponse(websiteResponse);
                 }
             }
+            rejectUnservedSubresource("HEAD", uriInfo);
             s3Service.authorizeBucketRead(bucket, "s3:ListBucket", authorization);
             s3Service.headBucket(bucket);
             String bucketRegion = s3Service.getBucketRegion(bucket);
@@ -418,20 +422,14 @@ public class S3Controller {
                 s3Service.putBucketReplication(bucket, new String(body, StandardCharsets.UTF_8));
                 return Response.ok().build();
             }
-            // Must be handled here: an unmatched subresource falls through to CreateBucket below,
-            // which answers a metrics call with BucketAlreadyOwnedByYou.
             if (hasQueryParam(uriInfo, "metrics")) {
                 s3Service.authorizeBucketWrite(bucket, "s3:PutMetricsConfiguration", authorization);
                 return handlePutBucketMetricsConfiguration(bucket, uriInfo, body);
             }
-            // Same fall-through hazard as metrics: an intelligent-tiering PUT must not become a
-            // CreateBucket.
             if (hasQueryParam(uriInfo, "intelligent-tiering")) {
                 s3Service.authorizeBucketWrite(bucket, "s3:PutIntelligentTieringConfiguration", authorization);
                 return handlePutBucketIntelligentTieringConfiguration(bucket, uriInfo, body);
             }
-            // Same fall-through hazard as metrics: an analytics or inventory PUT must not become
-            // a CreateBucket.
             if (hasQueryParam(uriInfo, "analytics")) {
                 s3Service.authorizeBucketWrite(bucket, "s3:PutAnalyticsConfiguration", authorization);
                 return handlePutBucketAnalyticsConfiguration(bucket, uriInfo, body);
@@ -440,12 +438,14 @@ public class S3Controller {
                 s3Service.authorizeBucketWrite(bucket, "s3:PutInventoryConfiguration", authorization);
                 return handlePutBucketInventoryConfiguration(bucket, uriInfo, body);
             }
+            rejectUnservedSubresource("PUT", uriInfo);
 
             // Detect a PutObject request that reached this handler before virtual-host rewriting.
             if (isMisplacedObjectPut(httpHeaders, body, bucket)) {
                 String actualBucket = resolveActualBucket(httpHeaders, uriInfo);
                 if (actualBucket != null && !actualBucket.equalsIgnoreCase(bucket)) {
                     LOG.infov("Rerouting misplaced virtual-hosted PutObject to bucket {0}, key {1}", actualBucket, bucket);
+                    MultivaluedMap<String, String> queryParams = ResteasyRequests.queryParameters(uriInfo);
                     return putObject(actualBucket, bucket,
                             httpHeaders.getHeaderString("Content-Type"),
                             httpHeaders.getHeaderString("Content-Encoding"),
@@ -454,8 +454,8 @@ public class S3Controller {
                             httpHeaders.getHeaderString("x-amz-tagging"),
                             httpHeaders.getHeaderString("If-Match"),
                             httpHeaders.getHeaderString("If-None-Match"),
-                            uriInfo.getQueryParameters().getFirst("uploadId"),
-                            uriInfo.getQueryParameters().getFirst("partNumber"),
+                            queryParams.getFirst("uploadId"),
+                            queryParams.getFirst("partNumber"),
                             uriInfo,
                             httpHeaders,
                             body != null ? new ByteArrayInputStream(body) : null);
@@ -569,36 +569,27 @@ public class S3Controller {
                 return Response.noContent().build();
             }
             if (hasQueryParam(uriInfo, "metrics")) {
-                // Likewise this must not fall through to deleting the bucket.
                 s3Service.authorizeBucketWrite(bucket, "s3:PutMetricsConfiguration", authorization);
                 s3Service.deleteBucketMetricsConfiguration(bucket, requireMetricsId(uriInfo));
                 return Response.noContent().build();
             }
             if (hasQueryParam(uriInfo, "intelligent-tiering")) {
-                // Likewise this must not fall through to deleting the bucket.
                 s3Service.authorizeBucketWrite(bucket, "s3:PutIntelligentTieringConfiguration", authorization);
                 s3Service.deleteBucketIntelligentTieringConfiguration(bucket,
                         requireIntelligentTieringId(uriInfo));
                 return Response.noContent().build();
             }
             if (hasQueryParam(uriInfo, "analytics")) {
-                // Likewise this must not fall through to deleting the bucket.
                 s3Service.authorizeBucketWrite(bucket, "s3:PutAnalyticsConfiguration", authorization);
                 s3Service.deleteBucketAnalyticsConfiguration(bucket, requireAnalyticsId(uriInfo));
                 return Response.noContent().build();
             }
             if (hasQueryParam(uriInfo, "inventory")) {
-                // Likewise this must not fall through to deleting the bucket.
                 s3Service.authorizeBucketWrite(bucket, "s3:PutInventoryConfiguration", authorization);
                 s3Service.deleteBucketInventoryConfiguration(bucket, requireInventoryId(uriInfo));
                 return Response.noContent().build();
             }
-            if (hasQueryParam(uriInfo, "accelerate")) {
-                // AWS defines no DELETE for the accelerate subresource; reject it here so
-                // it does NOT fall through to deleting the whole bucket.
-                throw new AwsException("MethodNotAllowed",
-                        "The specified method is not allowed against this resource.", 405);
-            }
+            rejectUnservedSubresource("DELETE", uriInfo);
             s3Service.authorizeBucketWrite(bucket, "s3:DeleteBucket", authorization);
             s3Service.deleteBucket(bucket);
             return Response.noContent().build();
@@ -643,7 +634,7 @@ public class S3Controller {
             if (params.has("versions")) {
                 s3Service.authorizeBucketRead(bucket, "s3:ListBucketVersions", authorization);
                 return handleListObjectVersions(bucket, prefix, delimiter, maxKeys, keyMarker, versionIdMarker,
-                        encodingType);
+                        encodingType, httpHeaders);
             }
             if (params.has("location")) {
                 s3Service.authorizeBucketRead(bucket, "s3:GetBucketLocation", authorization);
@@ -773,6 +764,7 @@ public class S3Controller {
                     return website;
                 }
             }
+            rejectUnservedSubresource("GET", uriInfo);
 
             s3Service.authorizeListBucket(bucket, authorization);
 
@@ -785,6 +777,7 @@ public class S3Controller {
             List<S3Object> objects = result.objects();
             List<String> commonPrefixes = result.commonPrefixes();
             boolean v2 = "2".equals(listType);
+            boolean includeRestoreStatus = includesRestoreStatus(httpHeaders);
             String bucketOwnerAccount = (v1 || Boolean.parseBoolean(params.first("fetch-owner")))
                     ? s3Service.getBucketOwnerAccountId(bucket) : null;
             boolean ownershipEnforced = bucketOwnerAccount != null && s3Service.bucketOwnershipIsEnforced(bucket);
@@ -814,6 +807,9 @@ public class S3Controller {
                    .elem("ETag", obj.getETag())
                    .elem("Size", obj.getSize())
                    .elem("StorageClass", obj.getStorageClass());
+                if (includeRestoreStatus) {
+                    appendRestoreStatus(xml, obj);
+                }
                 if (bucketOwnerAccount != null) {
                     xml.start("Owner")
                        .elem("ID", AwsCanonicalUserId.forAccount(S3Service.effectiveObjectOwnerAccount(
@@ -1132,6 +1128,7 @@ public class S3Controller {
             S3Object obj = read.object();
             boolean bodyHandedOff = false;
             try {
+                s3Service.requireArchivedObjectReadable(obj);
                 if (hasPreconditions(ifMatch, ifNoneMatch, ifModifiedSince, ifUnmodifiedSince)) {
                     // Evaluate preconditions against the same snapshot that is served: a separate
                     // metadata fetch could approve one version (e.g. If-Match for a CAS read) while a
@@ -1204,26 +1201,8 @@ public class S3Controller {
     /** Streams {@code body}, opened together with {@code obj} by {@link S3Service#openObject}, and closes it. */
     private Response fullObjectResponse(S3Object obj, InputStream body, ResponseHeaderOverrides overrides,
                                         boolean includeChecksum) {
-        return streamingResponse(body,
+        return StreamingResponses.streamingResponse(body,
                 stream -> objectResponseHeaders(Response.ok(stream), obj, overrides, includeChecksum).build());
-    }
-
-    /**
-     * Builds a response whose entity streams {@code body} and then closes it. If building the
-     * response fails, the entity is never written, so {@code body} is closed here instead.
-     */
-    static Response streamingResponse(InputStream body, Function<StreamingOutput, Response> build) {
-        StreamingOutput stream = output -> {
-            try (InputStream in = body) {
-                in.transferTo(output);
-            }
-        };
-        try {
-            return build.apply(stream);
-        } catch (RuntimeException e) {
-            closeQuietly(body);
-            throw e;
-        }
     }
 
     /** Applies the standard GetObject response headers derived from {@code obj} to {@code resp}. */
@@ -1313,7 +1292,7 @@ public class S3Controller {
             }
             return resp.build();
         };
-        return body == null ? build.apply(null) : streamingResponse(part.slice(body), build);
+        return body == null ? build.apply(null) : StreamingResponses.streamingResponse(part.slice(body), build);
     }
 
     /**
@@ -1360,6 +1339,12 @@ public class S3Controller {
     }
 
     private Response websiteObjectResponse(S3Service.ObjectRead read, ResponseHeaderOverrides overrides) {
+        try {
+            s3Service.requireArchivedObjectReadable(read.object());
+        } catch (AwsException e) {
+            closeQuietly(read);
+            throw e;
+        }
         return fullObjectResponse(read, overrides, false);
     }
 
@@ -1665,9 +1650,10 @@ public class S3Controller {
                 String actualBucket = resolveActualBucket(httpHeaders, uriInfo);
                 if (actualBucket != null && !actualBucket.equalsIgnoreCase(bucket)) {
                     LOG.infov("Rerouting misplaced virtual-hosted multipart POST to bucket {0}, key {1}", actualBucket, bucket);
+                    MultivaluedMap<String, String> queryParams = ResteasyRequests.queryParameters(uriInfo);
                     return handleMultipartPost(actualBucket, bucket,
-                            uriInfo.getQueryParameters().getFirst("uploadId"),
-                            uriInfo.getQueryParameters().getFirst("versionId"),
+                            queryParams.getFirst("uploadId"),
+                            queryParams.getFirst("versionId"),
                             contentType,
                             httpHeaders.getHeaderString("If-Match"),
                             httpHeaders.getHeaderString("If-None-Match"),
@@ -1676,6 +1662,7 @@ public class S3Controller {
                             body);
                 }
             }
+            rejectUnservedSubresource("POST", uriInfo);
             return xmlErrorResponse(new AwsException("InvalidArgument",
                     "POST on bucket requires ?delete parameter.", 400));
         } catch (AwsException e) {
@@ -1752,10 +1739,11 @@ public class S3Controller {
             }
 
             if (hasQueryParam(uriInfo, "restore")) {
-                checkVersionId(bucket, uriInfo.getQueryParameters().getFirst("versionId"));
+                checkVersionId(bucket, ResteasyRequests.queryParameters(uriInfo).getFirst("versionId"));
                 s3Service.authorizeObjectWrite(bucket, key, "s3:RestoreObject", authorization);
-                s3Service.restoreObject(bucket, key, versionId, new String(body, StandardCharsets.UTF_8));
-                return Response.accepted().build();
+                boolean started = s3Service.restoreObject(bucket, key, versionId,
+                        new String(body, StandardCharsets.UTF_8));
+                return started ? Response.accepted().build() : Response.ok().build();
             }
 
             if (hasQueryParam(uriInfo, "select")) {
@@ -2001,7 +1989,7 @@ public class S3Controller {
 
     /** Evaluates one action on one DeleteObjects entry's object, answering a denial as S3 does per key. */
     private void authorizeEntryIdentity(String iamCredential, String action, String bucket, String key) {
-        String resource = S3PublicAccessEvaluator.objectArn(s3Service.bucketPartition(bucket), bucket, key);
+        String resource = S3ResourceArns.object(s3Service.bucketPartition(bucket), bucket, key);
         try {
             iamEnforcementFilter.authorizeAdditionalResource(iamCredential, action, resource);
         } catch (AwsException e) {
@@ -2074,7 +2062,7 @@ public class S3Controller {
     }
 
     private Response handleListMultipartUploads(String bucket, UriInfo uriInfo) {
-        MultivaluedMap<String, String> params = uriInfo.getQueryParameters();
+        MultivaluedMap<String, String> params = ResteasyRequests.queryParameters(uriInfo);
         String prefix = params.getFirst("prefix");
         String delimiter = params.getFirst("delimiter");
         String keyMarker = params.getFirst("key-marker");
@@ -2206,7 +2194,8 @@ public class S3Controller {
     }
 
     private Response handleListObjectVersions(String bucket, String prefix, String delimiter, String maxKeys,
-                                              String keyMarker, String versionIdMarker, String encodingType) {
+                                              String keyMarker, String versionIdMarker, String encodingType,
+                                              HttpHeaders httpHeaders) {
         if (hasText(versionIdMarker) && !hasText(keyMarker)) {
             throw new AwsException("InvalidArgument",
                     "A version-id marker cannot be specified without a key marker.", 400);
@@ -2214,6 +2203,7 @@ public class S3Controller {
         int max = resolveMaxKeys(maxKeys);
         S3Service.ListVersionsResult result =
                 s3Service.listObjectVersions(bucket, prefix, delimiter, max, keyMarker, versionIdMarker);
+        boolean includeRestoreStatus = includesRestoreStatus(httpHeaders);
         XmlBuilder xml = new XmlBuilder()
                 .raw("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
                 .start("ListVersionsResult", AwsNamespaces.S3)
@@ -2247,8 +2237,11 @@ public class S3Controller {
                    .elem("LastModified", ISO_FORMAT.format(obj.getLastModified()))
                    .elem("ETag", obj.getETag())
                    .elem("Size", obj.getSize())
-                   .elem("StorageClass", obj.getStorageClass())
-                   .end("Version");
+                   .elem("StorageClass", obj.getStorageClass());
+                if (includeRestoreStatus) {
+                    appendRestoreStatus(xml, obj);
+                }
+                xml.end("Version");
             }
         }
         for (String cp : result.commonPrefixes()) {
@@ -2261,6 +2254,24 @@ public class S3Controller {
         }
         xml.end("ListVersionsResult");
         return Response.ok(xml.build()).type(MediaType.APPLICATION_XML).build();
+    }
+
+    private static boolean includesRestoreStatus(HttpHeaders httpHeaders) {
+        String optionalAttributes = httpHeaders.getHeaderString("x-amz-optional-object-attributes");
+        return optionalAttributes != null && Arrays.stream(optionalAttributes.split(","))
+                .map(String::trim).anyMatch("RestoreStatus"::equals);
+    }
+
+    private void appendRestoreStatus(XmlBuilder xml, S3Object obj) {
+        S3Service.RestoreStatus restore = s3Service.restoreStatus(obj);
+        if (restore != null) {
+            xml.start("RestoreStatus")
+               .elem("IsRestoreInProgress", restore.inProgress());
+            if (restore.expiryDate() != null) {
+                xml.elem("RestoreExpiryDate", DateTimeFormatter.ISO_INSTANT.format(restore.expiryDate()));
+            }
+            xml.end("RestoreStatus");
+        }
     }
 
     // --- Notification Configuration ---
@@ -2541,8 +2552,10 @@ public class S3Controller {
     private static Long multipartObjectSize(HttpHeaders httpHeaders, UriInfo uriInfo) {
         String name = "x-amz-mp-object-size";
         String value = httpHeaders != null ? httpHeaders.getHeaderString(name) : null;
-        if (value == null && uriInfo != null && uriInfo.getQueryParameters() != null) {
-            for (Map.Entry<String, List<String>> entry : uriInfo.getQueryParameters().entrySet()) {
+        MultivaluedMap<String, String> queryParams = value == null && uriInfo != null
+                ? ResteasyRequests.queryParameters(uriInfo) : null;
+        if (queryParams != null) {
+            for (Map.Entry<String, List<String>> entry : queryParams.entrySet()) {
                 if (entry.getKey().equalsIgnoreCase(name) && !entry.getValue().isEmpty()) {
                     value = entry.getValue().getFirst();
                     break;
@@ -2747,7 +2760,7 @@ public class S3Controller {
      * at. AWS's own answer here was not verified, so floci gives one rejection for both verbs.
      */
     private String requireMetricsId(UriInfo uriInfo) {
-        String id = uriInfo.getQueryParameters().getFirst("id");
+        String id = ResteasyRequests.queryParameters(uriInfo).getFirst("id");
         if (id == null) {
             throw new AwsException("InvalidArgument", "The metrics id must be specified.", 400);
         }
@@ -2777,7 +2790,7 @@ public class S3Controller {
      * at, mirroring the metrics subresource.
      */
     private String requireIntelligentTieringId(UriInfo uriInfo) {
-        String id = uriInfo.getQueryParameters().getFirst("id");
+        String id = ResteasyRequests.queryParameters(uriInfo).getFirst("id");
         if (id == null) {
             throw new AwsException("InvalidArgument",
                     "The intelligent-tiering configuration id must be specified.", 400);
@@ -2806,7 +2819,7 @@ public class S3Controller {
      * at, mirroring the metrics subresource.
      */
     private String requireAnalyticsId(UriInfo uriInfo) {
-        String id = uriInfo.getQueryParameters().getFirst("id");
+        String id = ResteasyRequests.queryParameters(uriInfo).getFirst("id");
         if (id == null) {
             throw new AwsException("InvalidArgument",
                     "The analytics configuration id must be specified.", 400);
@@ -2835,7 +2848,7 @@ public class S3Controller {
      * at, mirroring the metrics subresource.
      */
     private String requireInventoryId(UriInfo uriInfo) {
-        String id = uriInfo.getQueryParameters().getFirst("id");
+        String id = ResteasyRequests.queryParameters(uriInfo).getFirst("id");
         if (id == null) {
             throw new AwsException("InvalidArgument",
                     "The inventory configuration id must be specified.", 400);
@@ -2888,8 +2901,9 @@ public class S3Controller {
             byte[] payload = decodeAwsChunked(body != null ? body : new byte[0],
                     httpHeaders.getHeaderString("Content-Encoding"),
                     httpHeaders.getHeaderString("x-amz-content-sha256"));
-            String annotationName = uriInfo.getQueryParameters().getFirst("annotationName");
-            String versionId = uriInfo.getQueryParameters().getFirst("versionId");
+            MultivaluedMap<String, String> queryParams = ResteasyRequests.queryParameters(uriInfo);
+            String annotationName = queryParams.getFirst("annotationName");
+            String versionId = queryParams.getFirst("versionId");
             String algorithmHeader = getChecksumAlgorithm(httpHeaders);
             ChecksumAlgorithm algorithm = ChecksumAlgorithm.fromWireValue(algorithmHeader);
             validateChecksumHeaders(httpHeaders, uriInfo, payload);
@@ -2914,8 +2928,9 @@ public class S3Controller {
     private Response handleGetObjectAnnotation(String bucket, String key,
                                                UriInfo uriInfo, HttpHeaders httpHeaders) {
         try {
-            String annotationName = uriInfo.getQueryParameters().getFirst("annotationName");
-            String versionId = uriInfo.getQueryParameters().getFirst("versionId");
+            MultivaluedMap<String, String> queryParams = ResteasyRequests.queryParameters(uriInfo);
+            String annotationName = queryParams.getFirst("annotationName");
+            String versionId = queryParams.getFirst("versionId");
             ObjectAnnotation annotation = s3Service.getObjectAnnotation(bucket, key, annotationName, versionId);
             byte[] payload = s3Service.readObjectAnnotationPayload(annotation);
             Response.ResponseBuilder response = Response.ok((Object) payload)
@@ -2941,10 +2956,11 @@ public class S3Controller {
 
     private Response handleListObjectAnnotations(String bucket, String key, UriInfo uriInfo) {
         try {
-            String versionId = uriInfo.getQueryParameters().getFirst("versionId");
-            String prefix = uriInfo.getQueryParameters().getFirst("annotation-prefix");
-            String token = uriInfo.getQueryParameters().getFirst("continuation-token");
-            String maxRaw = uriInfo.getQueryParameters().getFirst("max-annotation-results");
+            MultivaluedMap<String, String> queryParams = ResteasyRequests.queryParameters(uriInfo);
+            String versionId = queryParams.getFirst("versionId");
+            String prefix = queryParams.getFirst("annotation-prefix");
+            String token = queryParams.getFirst("continuation-token");
+            String maxRaw = queryParams.getFirst("max-annotation-results");
             Integer max = null;
             if (maxRaw != null && !maxRaw.isBlank()) {
                 try {
@@ -3003,8 +3019,9 @@ public class S3Controller {
                                                   UriInfo uriInfo, HttpHeaders httpHeaders,
                                                   boolean bypassGovernance) {
         try {
-            String annotationName = uriInfo.getQueryParameters().getFirst("annotationName");
-            String versionId = uriInfo.getQueryParameters().getFirst("versionId");
+            MultivaluedMap<String, String> queryParams = ResteasyRequests.queryParameters(uriInfo);
+            String annotationName = queryParams.getFirst("annotationName");
+            String versionId = queryParams.getFirst("versionId");
             String parentVersionId = s3Service.deleteObjectAnnotation(bucket, key, annotationName, versionId,
                     httpHeaders.getHeaderString("x-amz-object-if-match"), bypassGovernance);
             Response.ResponseBuilder response = Response.noContent();
@@ -3194,6 +3211,14 @@ public class S3Controller {
                                      boolean includeChecksum) {
         if (obj.getStorageClass() != null) {
             resp.header("x-amz-storage-class", obj.getStorageClass());
+        }
+        S3Service.RestoreStatus restore = s3Service.restoreStatus(obj);
+        if (restore != null) {
+            String header = "ongoing-request=\"" + restore.inProgress() + "\"";
+            if (restore.expiryDate() != null) {
+                header += ", expiry-date=\"" + rfc822(restore.expiryDate()) + "\"";
+            }
+            resp.header("x-amz-restore", header);
         }
         String contentEncoding = overrides.contentEncoding() != null ? overrides.contentEncoding() : obj.getContentEncoding();
         if (contentEncoding != null) {
@@ -3540,7 +3565,7 @@ public class S3Controller {
      * with the same key, because the presigned URL signature covers the query value.
      */
     private Map<String, String> extractUserMetadata(HttpHeaders httpHeaders, UriInfo uriInfo) {
-        return extractUserMetadata(httpHeaders, uriInfo != null ? uriInfo.getQueryParameters() : null);
+        return extractUserMetadata(httpHeaders, uriInfo != null ? ResteasyRequests.queryParameters(uriInfo) : null);
     }
 
     private Map<String, String> extractUserMetadata(HttpHeaders httpHeaders, MultivaluedMap<String, String> query) {
@@ -3566,7 +3591,7 @@ public class S3Controller {
 
     static String resolveHeaderOrQueryParam(HttpHeaders httpHeaders, UriInfo uriInfo, String name) {
         String headerVal = httpHeaders != null ? httpHeaders.getHeaderString(name) : null;
-        return resolveHeaderOrQueryParam(headerVal, uriInfo != null ? uriInfo.getQueryParameters() : null, name);
+        return resolveHeaderOrQueryParam(headerVal, uriInfo != null ? ResteasyRequests.queryParameters(uriInfo) : null, name);
     }
 
     static String resolveHeaderOrQueryParam(String headerValue, MultivaluedMap<String, String> query, String name) {
@@ -3744,9 +3769,16 @@ public class S3Controller {
         // The routing layer strips a trailing slash from the object key, so the "directory" intent
         // has to be recovered from the raw request path before handing off to the service.
         String rawPath = currentVertxRequest.getCurrent().request().path();
-        return renderWebsiteResolution(bucket,
-                s3Service.resolveWebsiteRequest(bucket, key, rawPath.endsWith("/"), authorization),
-                rawPath, includeBody);
+        try {
+            return renderWebsiteResolution(bucket,
+                    s3Service.resolveWebsiteRequest(bucket, key, rawPath.endsWith("/"), authorization),
+                    rawPath, includeBody);
+        } catch (AwsException e) {
+            if (!"InvalidObjectState".equals(e.getErrorCode())) {
+                throw e;
+            }
+            return serveWebsiteErrorResponse(bucket, authorization, e);
+        }
     }
 
     private Response serveWebsiteErrorResponse(String bucket,
@@ -3869,11 +3901,11 @@ public class S3Controller {
         // S3 InvalidArgument responses carry ArgumentName and ArgumentValue so the SDK can
         // surface which input was rejected, and EntityTooSmall and EntityTooLarge the proposed and
         // allowed sizes. Multipart size errors also identify the rejected part, MethodNotAllowed
-        // the method and the kind of resource that refused it, and NoSuchKey and NoSuchVersion
-        // the key and version that are missing.
+        // the method and the kind of resource that refused it, NoSuchKey and NoSuchVersion
+        // the key and version that are missing, and InvalidObjectState the storage class.
         // They travel through AwsException.extendedData.
         if (e.getExtendedData() != null) {
-            for (String field : List.of("Key", "VersionId", "Method", "ResourceType", "ProposedSize",
+            for (String field : List.of("StorageClass", "Key", "VersionId", "Method", "ResourceType", "ProposedSize",
                     "MinSizeAllowed", "MaxSizeAllowed", "PartNumber", "ETag")) {
                 Object value = e.getExtendedData().get(field);
                 if (value != null) {
@@ -4149,7 +4181,7 @@ public class S3Controller {
         rejectUnknownPostRegion(credential);
         if (credential != null && !credential.isEmpty()) {
             iamEnforcementFilter.authorizePostObject(AccountResolver.SIGV4_SCHEME + " Credential=" + credential,
-                    S3PublicAccessEvaluator.objectArn(s3Service.bucketPartition(bucket), bucket, key),
+                    S3ResourceArns.object(s3Service.bucketPartition(bucket), bucket, key),
                     regionResolver.resolveRegionFromPresignedCredential(credential), requestConditions);
         }
 
@@ -4487,7 +4519,7 @@ public class S3Controller {
      * {@link #parseInlineTaggingHeader(String)} unchanged. Real S3 honors both forms.
      */
     private static String resolveInlineTaggingSource(String taggingHeader, UriInfo uriInfo) {
-        return resolveInlineTaggingSource(taggingHeader, uriInfo.getQueryParameters());
+        return resolveInlineTaggingSource(taggingHeader, ResteasyRequests.queryParameters(uriInfo));
     }
 
     private static String resolveInlineTaggingSource(String taggingHeader, MultivaluedMap<String, String> query) {
@@ -4591,6 +4623,32 @@ public class S3Controller {
         }
     }
 
+    /**
+     * Refuses a bucket request that names a sub-resource the handler above did not serve, rather than running the
+     * bucket's own operation in its place, which would create, list or delete the bucket: one S3 defines for the
+     * method is not implemented here, and one it defines for other methods only is not allowed. The names are read
+     * from the parsed query parameters, as the IAM check reads them, so an escaped {@code &} inside a value, as in
+     * {@code ?prefix=reports%26abac}, names no sub-resource.
+     */
+    private static void rejectUnservedSubresource(String method, UriInfo uriInfo) {
+        S3BucketSubresources subresources = S3BucketSubresources.vendored();
+        MultivaluedMap<String, String> params = ResteasyRequests.queryParameters(uriInfo);
+        boolean named = false;
+        for (String name : subresources.names()) {
+            if (params.containsKey(name)) {
+                if (!subresources.operations(method, name).isEmpty()) {
+                    throw new AwsException("NotImplemented",
+                            "A header you provided implies functionality that is not implemented.", 501);
+                }
+                named = true;
+            }
+        }
+        if (named) {
+            throw new AwsException("MethodNotAllowed",
+                    "The specified method is not allowed against this resource.", 405);
+        }
+    }
+
     private void validateRawUri() {
         String rawPath = currentVertxRequest.getCurrent().request().path();
         String decodedPath;
@@ -4691,7 +4749,7 @@ public class S3Controller {
     private void authorizeCopySourceRead(HttpHeaders httpHeaders, UriInfo uriInfo, CopySourceRef source,
                                          S3Service.RequestAuthorization authorization) {
         String action = source.versionId() == null ? "s3:GetObject" : "s3:GetObjectVersion";
-        String resource = S3PublicAccessEvaluator.objectArn(
+        String resource = S3ResourceArns.object(
                 s3Service.bucketPartition(source.bucket()), source.bucket(), source.objectKey());
         S3Service.SignedPrincipalResourcePolicyEvaluation resourcePolicyEvaluation =
                 s3Service.signedPrincipalResourcePolicyDecision(
@@ -4735,7 +4793,7 @@ public class S3Controller {
         }
         String action = "s3:PutObjectTagging";
         if (checksIdentity) {
-            String resource = S3PublicAccessEvaluator.objectArn(
+            String resource = S3ResourceArns.object(
                     s3Service.bucketPartition(destBucket), destBucket, destKey);
             S3Service.SignedPrincipalResourcePolicyEvaluation resourcePolicyEvaluation =
                     s3Service.signedPrincipalResourcePolicyDecision(destBucket, action, resource, authorization);
@@ -4757,7 +4815,7 @@ public class S3Controller {
             return;
         }
         String credential = iamCredential(httpHeaders, uriInfo);
-        String resource = S3PublicAccessEvaluator.bucketArn(AwsRegions.partitionFor(region), bucket);
+        String resource = S3ResourceArns.bucket(AwsRegions.partitionFor(region), bucket);
         ResourcePolicyDecision policyDecision = s3Service.ownsBucket(bucket) ? null : ResourcePolicyDecision.NEUTRAL;
         for (String action : actions) {
             iamEnforcementFilter.authorizeAdditionalResource(
@@ -4776,7 +4834,7 @@ public class S3Controller {
         if (authorizationHeader != null && authorizationHeader.isBlank()) {
             authorizationHeader = null;
         }
-        return IamEnforcementFilter.requestAuthorization(authorizationHeader, uriInfo.getQueryParameters());
+        return IamEnforcementFilter.requestAuthorization(authorizationHeader, ResteasyRequests.queryParameters(uriInfo));
     }
 
     /**

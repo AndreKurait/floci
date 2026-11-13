@@ -2,6 +2,7 @@ package io.floci.aws.services.s3;
 
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
@@ -11,6 +12,7 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.util.List;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.*;
@@ -36,6 +38,24 @@ class S3LeadingSlashKeyIntegrationTest {
 
     @TestHTTPResource("/")
     URI baseUri;
+
+    /** The slash-only key test's bucket. Every {@code @QuarkusTest} class shares one emulator, so it goes too. */
+    private String slashOnlyBucket;
+
+    @AfterEach
+    void deleteTheSlashOnlyBucket() throws Exception {
+        if (slashOnlyBucket == null) {
+            return;
+        }
+        HttpClient client = HttpClient.newHttpClient();
+        String base = baseUri.toString().replaceAll("/$", "");
+        for (String key : List.of("/", "//")) {
+            HttpRequest delete = HttpRequest.newBuilder(URI.create(base + "/" + slashOnlyBucket + "/" + key))
+                    .DELETE().build();
+            assertEquals(204, client.send(delete, HttpResponse.BodyHandlers.ofString()).statusCode(), key);
+        }
+        given().when().delete("/" + slashOnlyBucket).then().statusCode(204);
+    }
 
     // --- Setup ---
 
@@ -281,5 +301,44 @@ class S3LeadingSlashKeyIntegrationTest {
         assertTrue(keyCount >= 2,
                 "List should show at least 2 objects (file.txt and /file.txt) but found " +
                 keyCount + " <Key> entries. Bug: both keys collapsed into one. Response: " + body);
+    }
+
+    @Test
+    @Order(6)
+    void aKeyOfOnlySlashesIsThatObjectNotTheBucket() throws Exception {
+        // "/bucket//" names the key "/" and "/bucket///" the key "//": collapsed, either reads as the bucket.
+        String bucket = "test-slash-only-bucket";
+        given().when().put("/" + bucket).then().statusCode(200);
+        slashOnlyBucket = bucket;
+        HttpClient client = HttpClient.newHttpClient();
+        String base = baseUri.toString().replaceAll("/$", "");
+        URI oneSlash = URI.create(base + "/" + bucket + "//");
+        URI twoSlashes = URI.create(base + "/" + bucket + "///");
+
+        assertEquals(200, client.send(HttpRequest.newBuilder(oneSlash).PUT(HttpRequest.BodyPublishers.ofString("one"))
+                .build(), HttpResponse.BodyHandlers.ofString()).statusCode());
+        assertEquals(200, client.send(HttpRequest.newBuilder(twoSlashes).PUT(HttpRequest.BodyPublishers.ofString("two"))
+                .build(), HttpResponse.BodyHandlers.ofString()).statusCode());
+        assertEquals("one", client.send(HttpRequest.newBuilder(oneSlash).GET().build(),
+                HttpResponse.BodyHandlers.ofString()).body());
+        assertEquals("two", client.send(HttpRequest.newBuilder(twoSlashes).GET().build(),
+                HttpResponse.BodyHandlers.ofString()).body());
+        HttpResponse<String> head = client.send(HttpRequest.newBuilder(oneSlash)
+                .method("HEAD", HttpRequest.BodyPublishers.noBody()).build(), HttpResponse.BodyHandlers.ofString());
+        assertEquals(200, head.statusCode());
+        assertEquals("3", head.headers().firstValue("content-length").orElse(null));
+        given().when().get("/" + bucket + "?list-type=2").then().statusCode(200)
+                .body(containsString("<Key>/</Key>"), containsString("<Key>//</Key>"));
+
+        HttpResponse<String> delete = client.send(HttpRequest.newBuilder(oneSlash).DELETE().build(),
+                HttpResponse.BodyHandlers.ofString());
+        assertEquals(204, delete.statusCode(), delete.body());
+        assertEquals(404, client.send(HttpRequest.newBuilder(oneSlash).GET().build(),
+                HttpResponse.BodyHandlers.ofString()).statusCode());
+        given().when().get("/" + bucket + "?list-type=2").then().statusCode(200)
+                .body(not(containsString("<Key>/</Key>")), containsString("<Key>//</Key>"));
+
+        // One trailing slash is still the bucket.
+        given().when().get("/" + bucket + "/").then().statusCode(200).body(containsString("<ListBucketResult"));
     }
 }

@@ -49,7 +49,6 @@ AWS::ApiGatewayV2::Deployment	StageName	accepted and ignored
 AWS::ApiGatewayV2::Integration	ContentHandlingStrategy	accepted and ignored
 AWS::ApiGatewayV2::Integration	CredentialsArn	accepted and ignored
 AWS::ApiGatewayV2::Integration	Description	accepted and ignored
-AWS::ApiGatewayV2::Integration	IntegrationSubtype	accepted and ignored
 AWS::ApiGatewayV2::Integration	PassthroughBehavior	accepted and ignored
 AWS::ApiGatewayV2::Integration	ResponseParameters	accepted and ignored
 AWS::ApiGatewayV2::Integration	TlsConfig	accepted and ignored
@@ -141,6 +140,7 @@ AWS::CloudTrail::Trail	CloudWatchLogsLogGroupArn	accepted and ignored
 AWS::CloudTrail::Trail	CloudWatchLogsRoleArn	accepted and ignored
 AWS::CloudTrail::Trail	InsightSelectors	accepted and ignored
 AWS::CloudTrail::Trail	KMSKeyId	accepted and ignored
+AWS::CloudTrail::Trail	RecursiveLogging	accepted and ignored
 AWS::CloudTrail::Trail	Tags	accepted and ignored
 AWS::CloudWatch::Alarm	ActionConfiguration	accepted and ignored
 AWS::CloudWatch::Alarm	EvaluateLowSampleCountPercentile	accepted and ignored
@@ -157,7 +157,6 @@ AWS::Cognito::UserPoolClient	AuthSessionValidity	accepted and ignored
 AWS::Cognito::UserPoolClient	EnablePropagateAdditionalUserContextData	accepted and ignored
 AWS::Cognito::UserPoolDomain	Routing	accepted and ignored, as the CognitoCfnProvisioner javadoc records
 AWS::Config::ConfigRule	Compliance	accepted and ignored
-AWS::DynamoDB::GlobalTable	BillingMode	accepted and ignored
 AWS::DynamoDB::GlobalTable	GlobalTableSourceArn	accepted and ignored
 AWS::DynamoDB::GlobalTable	GlobalTableWitnesses	accepted and ignored
 AWS::DynamoDB::GlobalTable	MultiRegionConsistency	accepted and ignored
@@ -169,7 +168,6 @@ AWS::DynamoDB::GlobalTable	VectorIndexes	accepted and ignored
 AWS::DynamoDB::GlobalTable	WarmThroughput	accepted and ignored
 AWS::DynamoDB::GlobalTable	WriteOnDemandThroughputSettings	accepted and ignored
 AWS::DynamoDB::GlobalTable	WriteProvisionedThroughputSettings	accepted and ignored
-AWS::DynamoDB::Table	BillingMode	accepted and ignored
 AWS::DynamoDB::Table	ContributorInsightsSpecification	accepted and ignored
 AWS::DynamoDB::Table	DeletionProtectionEnabled	accepted and ignored
 AWS::DynamoDB::Table	ImportSourceSpecification	accepted and ignored
@@ -352,10 +350,8 @@ AWS::ElasticLoadBalancingV2::LoadBalancer	LoadBalancerAttributes	accepted and ig
 AWS::ElasticLoadBalancingV2::LoadBalancer	MinimumLoadBalancerCapacity	accepted and ignored
 AWS::ElasticLoadBalancingV2::TargetGroup	TargetControlPort	accepted and ignored
 AWS::ElasticLoadBalancingV2::TargetGroup	TargetGroupAttributes	accepted and ignored
-AWS::ElasticLoadBalancingV2::TargetGroup	Targets	accepted and ignored
 AWS::Events::Archive	KmsKeyIdentifier	documented as ignored (docs/services/cloudformation.md, EventBridge)
 AWS::Events::EventBus	DeadLetterConfig	rejected with a ValidationError, not supported by Floci
-AWS::Events::EventBus	EventSourceName	rejected with a ValidationError, not supported by Floci
 AWS::Events::EventBus	KmsKeyIdentifier	rejected with a ValidationError, not supported by Floci
 AWS::Events::EventBus	LogConfig	rejected with a ValidationError, not supported by Floci
 AWS::IAM::ManagedPolicy	Description	accepted and ignored
@@ -537,14 +533,12 @@ AWS::RDS::DBInstance	SourceDBInstanceAutomatedBackupsArn	accepted and ignored
 AWS::RDS::DBInstance	SourceDBInstanceIdentifier	accepted and ignored
 AWS::RDS::DBInstance	SourceDbiResourceId	accepted and ignored
 AWS::RDS::DBInstance	SourceRegion	accepted and ignored
-AWS::RDS::DBInstance	StorageEncrypted	accepted and ignored
 AWS::RDS::DBInstance	StorageThroughput	accepted and ignored
 AWS::RDS::DBInstance	StorageType	accepted and ignored
 AWS::RDS::DBInstance	Tags	accepted and ignored
 AWS::RDS::DBInstance	Timezone	accepted and ignored
 AWS::RDS::DBInstance	UseDefaultProcessorFeatures	accepted and ignored
 AWS::RDS::DBInstance	UseLatestRestorableTime	accepted and ignored
-AWS::RDS::DBInstance	VPCSecurityGroups	accepted and ignored
 AWS::RDS::DBParameterGroup	Parameters	accepted and ignored
 AWS::RDS::DBParameterGroup	Tags	accepted and ignored
 AWS::RDS::DBProxyTargetGroup	Tags	accepted and ignored
@@ -606,7 +600,6 @@ AWS::Route53::HostedZone	QueryLoggingConfig	accepted and ignored
 AWS::Route53::RecordSet	CidrRoutingConfig	accepted and ignored
 AWS::Route53::RecordSet	Comment	accepted and ignored
 AWS::Route53::RecordSet	GeoLocation	accepted and ignored
-AWS::Route53::RecordSet	MultiValueAnswer	accepted and ignored
 AWS::S3::Bucket	AbacStatus	accepted and ignored
 AWS::S3::Bucket	AccelerateConfiguration	silently dropped, as the S3CfnProvisioner javadoc records
 AWS::S3::Bucket	AccessControl	silently dropped, as the S3CfnProvisioner javadoc records

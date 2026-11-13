@@ -310,9 +310,18 @@ address. Dropping exhausted debt prevents later retries, but does not establish 
 the bus name, and `Fn::GetAtt` supports `Arn` and `Name`. `Description` and `Tags` are applied when
 the bus is created. Rules that reference the bus are removed before stack deletion.
 
-The current implementation is limited to custom buses with the `Name`, `Description`, `Tags`, and
-`Policy` properties. `EventSourceName`, `KmsKeyIdentifier`, `DeadLetterConfig`, and `LogConfig` are
-rejected with `ValidationError` instead of being silently ignored. AWS models a `Name` change as
+The current implementation supports the `Name`, `EventSourceName`, `Description`, `Tags`, and
+`Policy` properties. With `EventSourceName` the resource creates a
+[partner event bus](eventbridge.md#partner-event-buses), whose `Name` must equal it, as AWS
+requires; a template with a different `Name` fails with `ValidationError`. A partner bus takes no
+`Policy` and fails with `ValidationError` when one is given; an `AWS::Events::EventBusPolicy`
+on a partner bus fails its stack. AWS treats `Name` and `EventSourceName` as replacement-only, so
+dropping `EventSourceName` makes AWS attempt to replace the bus; on `UpdateStack` with the same
+`Name`, Floci keeps the bus as it is instead. An `EventSourceName` the template gives is checked as
+on creation, so a malformed source, one that differs from `Name`, or one added to a custom bus fails
+the update.
+`KmsKeyIdentifier`, `DeadLetterConfig`, and `LogConfig` are rejected with `ValidationError`
+instead of being silently ignored. AWS models a `Name` change as
 resource replacement; Floci currently rejects that update until generic replacement handling is
 available. `Policy` is applied when the bus is created. On `UpdateStack` the template's `Tags` are
 applied to the same bus in place: a key the stack recorded setting and the new template drops is
@@ -379,7 +388,9 @@ returns the management account id, while `Fn::GetAtt Org.Id` returns the organiz
 - `Policy` — `TargetIds` is reconciled on update: targets the template adds are attached and ones
   it drops are detached. Deleting the resource detaches its remaining targets first, since
   `DeletePolicy` refuses while a policy is still attached.
-- `ResourcePolicy` — backed by `PutResourcePolicy`, which is already create-or-update.
+- `ResourcePolicy` — backed by `PutResourcePolicy`, which is create-or-update but applies `Tags`
+  only when it creates the policy, so an update converges `Tags` through `TagResource` and
+  `UntagResource` on the policy's `rp-` id.
 
 `Fn::GetAtt OrganizationalUnit.Path` and `Fn::GetAtt Account.Paths` return the organization path —
 `o-<org>/r-<root>/[ou-<ou>/…]<id>/`. An account has one parent and therefore one path, so the
@@ -567,6 +578,57 @@ Dynamic-reference expansion is currently scoped to these RDS credential properti
 - On `UpdateStack` (no interruption, as in AWS), a cluster's list is checked first, then the roles the template gained are added, and the roles the previous template declared and the new one drops are removed. A role associated outside the stack is kept while the template leaves it out; declaring it fails the update with `DBClusterRoleAlreadyExists`, as in AWS. If any step of an update is refused, the roles it already added are removed and the ones it removed are put back, so the database matches what the stack still records and a retry starts from there. A rolled-back cluster replacement restores the record of which roles the stack declared.
 - An Aurora cluster member (`AWS::RDS::DBInstance` with `DBClusterIdentifier`) cannot carry `AssociatedRoles`: the schema documents the property as not applicable there, since the cluster manages its roles. The resource fails with a `ValidationError` pointing at the cluster's `AssociatedRoles`.
 
+## RDS DB instance security groups and encryption
+
+`AWS::RDS::DBInstance` creates the instance with its `VPCSecurityGroups` and `StorageEncrypted`, as
+`CreateDBInstance` does, so `DescribeDBInstances` reports the declared groups and the encryption.
+
+- On `UpdateStack`, a changed `VPCSecurityGroups` moves the instance to the new groups in place, as
+  in AWS. A cluster member's groups are its cluster's, so an update whose template changes a
+  member's list fails with `InvalidParameterCombination` before anything changes, as RDS refuses
+  that change for a member. When the previous template declared groups and the new one does not, a
+  standalone instance is put on its VPC's default security group, as AWS's handler does; a cluster
+  member, or an instance whose VPC has no default group, keeps its groups. While the template never
+  declares groups, groups set outside the stack are kept.
+- A failed update puts the groups back. The rollback is complete when the update changed nothing
+  else Floci applies; a change to the password, IAM authentication, subnet group, CA certificate or
+  roles is still reported as not rolled back.
+- `StorageEncrypted` is createOnly, so changing it, including dropping `StorageEncrypted: true`,
+  replaces the instance under a new generated name. The old instance is deleted once the update
+  commits, or kept, with the replacement deleted, when the update rolls back. An instance with a
+  custom `DBInstanceIdentifier` cannot be replaced, so that update fails with a `ValidationError`, as
+  in AWS. An instance created before Floci applied `StorageEncrypted` is unencrypted whatever its
+  template said, and is replaced only by an update that changes the property. Its first update
+  reads the previous value from the previous template, resolved on that update, so a change made
+  only through a parameter, or anything else the update changes, is not seen there.
+- `KmsKeyId` is still accepted and ignored, so an encrypted instance reports no key.
+
+## ELBv2 target group targets
+
+`AWS::ElasticLoadBalancingV2::TargetGroup` registers its `Targets` once the group is created, as
+`RegisterTargets` does, so `DescribeTargetHealth` reports them. A target is its `Id` and its `Port`,
+the group's port when it names none, so one instance can be declared on several ports. A Lambda
+target has no port and is its function ARN alone.
+
+- On `UpdateStack` (no interruption, as in AWS), the group keeps its ARN. The targets the template
+  gains are registered first, then the targets the previous template declared and the new one
+  drops are deregistered. A template that drops `Targets` deregisters every target the stack
+  declared. A target registered some other way, by `RegisterTargets`, an Auto Scaling group or an
+  ECS service, stays registered until a template declares it and a later one drops it. A declared
+  target registered with another `AvailabilityZone` is registered again with the declared one.
+- A target `RegisterTargets` refuses registers nothing, as it checks every target before it
+  registers any. A group the stack had just created for the resource is then deleted again, and a
+  group the update kept is left as it was. If deregistering fails after the registration, a kept
+  group gets back the registrations it had.
+- A failed update deregisters the targets the update registered and registers the ones it
+  deregistered again. When the group is gone by then, the rollback fails with
+  `TargetGroupNotFound` and leaves the stack in `UPDATE_ROLLBACK_FAILED`. `ContinueUpdateRollback`
+  fails the same way until the target group is passed in `ResourcesToSkip` (see
+  [Failed update rollbacks](#failed-update-rollbacks)).
+- A target group created before Floci registered `Targets` has no targets from its template. The
+  first update that changes the group registers the declared targets and deregisters nothing.
+- `QuicServerId` is accepted and ignored, as Floci's `RegisterTargets` has no QUIC support.
+
 ## S3 ownership controls
 
 `AWS::S3::Bucket` applies `OwnershipControls` through the same S3 call as
@@ -740,8 +802,11 @@ regenerates it from AWS's published schemas, and `cfn-schema-drift.yml` compares
 A property the previous template declared and the new template drops is cleared on `UpdateStack`,
 goes back to its create default, or is kept, on the AppSync resources, the EC2 networking types
 (`Subnet`, `InternetGateway`, `RouteTable`, `NatGateway`, `EIP`, `PrefixList`), an
-`AWS::ApiGatewayV2::Stage`, an `AWS::EC2::Instance` and an `AWS::ECS::Service`. Kept: required members
-(`AuthenticationType`, `Type`, a function's `DataSourceName`), a data source's and a function's `Name`,
+`AWS::ApiGatewayV2::Stage`, `Route` and `Authorizer`, an `AWS::EC2::Instance`, an `AWS::ECS::Service`, an
+`AWS::Lambda::Alias`, an `AWS::SecretsManager::Secret`, an `AWS::Cognito::UserPoolGroup` and an
+`AWS::CloudTrail::Trail`. Kept: required members (`AuthenticationType`, `Type`, a function's
+`DataSourceName`, a `Route`'s `RouteKey`, an authorizer's `Name` and `AuthorizerType`), a data source's
+and a function's `Name`,
 an API key's `Expires`, a GraphQL API's `ApiType` and `Visibility`, a UNIT resolver's `DataSourceName`,
 a `NatGateway`'s `PrivateIpAddress`, a `PrefixList`'s `MaxEntries`, a `Stage`'s `StageName` and an
 `Instance`'s `SecurityGroupIds`, `NetworkInterfaces` and `LaunchTemplate`. A dropped `LaunchTemplate` keeps
@@ -751,13 +816,22 @@ their defaults, and the instance profile it supplied is disassociated. A service
 `ServiceRegistries` are kept, and its `DesiredCount` goes back to 1. A service's dropped
 `DeploymentConfiguration` is cleared. An empty `CapacityProviderStrategy` or `ServiceRegistries` in the
 template clears it; a failed stabilisation puts the prior values back, and a deployment configuration
-the service did not have goes back to none. A `Stage`'s dropped `StageVariables` become empty. An `Instance`'s dropped `UserData` is
+the service did not have goes back to none. A `Stage`'s dropped `StageVariables` become empty. A `Route`'s
+dropped `Target` and `AuthorizerId`, and an `Authorizer`'s dropped `AuthorizerUri`,
+`AuthorizerPayloadFormatVersion`, `JwtConfiguration`, `AuthorizerResultTtlInSeconds` and
+`EnableSimpleResponses`, read back absent, as on a create without them. A dropped `AuthorizerId` is kept
+while the route's authorization type stays `JWT` or `CUSTOM`. An `Instance`'s dropped `UserData` is
 cleared: a running instance is stopped for the rewrite and started again, and a stopped one stays stopped.
-An update that drops a `PrefixList`'s `AddressFamily` or `PrefixListName` fails. Create-only members are
-not cleared either.
-A property the stack never declared keeps the value set outside it, with one exception: a GraphQL API's
-`Tags` and `EnvironmentVariables`, which every update drives to the template. The table says so on
-those rows. The three `NatGateway` `Secondary*` properties count as one
+An `Alias`'s, a `Secret`'s and a `UserPoolGroup`'s dropped `Description` and a `Trail`'s dropped
+`S3KeyPrefix` are cleared. A dropped `RoutingConfig` removes the alias weights. The other members of
+those four types are kept or create-only when dropped, as the drop policy table lists them, except a
+`Secret`'s `Tags`, which every update drives to the template.
+An update that drops a `PrefixList`'s `AddressFamily` or `PrefixListName`, or a `Route`'s or
+`Authorizer`'s `ApiId`, fails. Create-only members are not cleared either.
+A property the stack never declared keeps the value set outside it, with these exceptions, which every
+update drives to the template: a GraphQL API's `Tags` and `EnvironmentVariables`, a Secret's `Tags`, a
+Lambda alias's `RoutingConfig`, a `Route`'s `AuthorizationScopes` and an `Authorizer`'s
+`IdentitySource`. The table says so on those rows. The three `NatGateway` `Secondary*` properties count as one
 address set: when the new or the previous template declares any of them, an update brings all three
 to the template.
 

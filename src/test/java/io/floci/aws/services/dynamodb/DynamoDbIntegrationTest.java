@@ -23,6 +23,7 @@ import java.util.zip.CRC32;
 
 import static io.floci.aws.testing.DynamoDbRequests.assertEpochMillisBetween;
 import static io.floci.aws.testing.DynamoDbRequests.decimalAt;
+import static io.floci.aws.testing.DynamoDbRequests.nestedMap;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.*;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -649,6 +650,56 @@ class DynamoDbIntegrationTest {
     }
 
     @Test
+    void createTableListsTheGsiErrorsBeforeTheBillingModeAndLsiErrors() {
+        assertIndexNameRejected("CreateTable", """
+                {
+                    "TableName": "IndexNameListTable",
+                    "KeySchema": [
+                        {"AttributeName": "pk", "KeyType": "HASH"},
+                        {"AttributeName": "sk", "KeyType": "RANGE"}
+                    ],
+                    "AttributeDefinitions": [
+                        {"AttributeName": "pk", "AttributeType": "S"},
+                        {"AttributeName": "sk", "AttributeType": "S"},
+                        {"AttributeName": "l", "AttributeType": "S"},
+                        {"AttributeName": "g", "AttributeType": "S"}
+                    ],
+                    "LocalSecondaryIndexes": [{
+                        "IndexName": "aa",
+                        "KeySchema": [
+                            {"AttributeName": "pk", "KeyType": "HASH"},
+                            {"AttributeName": "l", "KeyType": "RANGE"}
+                        ],
+                        "Projection": {"ProjectionType": "ALL"}
+                    }],
+                    "BillingMode": "BOGUS",
+                    "GlobalSecondaryIndexes": [
+                        {
+                            "IndexName": "zz",
+                            "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+                            "Projection": {"ProjectionType": "ALL"}
+                        },
+                        {
+                            "IndexName": "g2",
+                            "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+                            "Projection": {"ProjectionType": "BOGUS"}
+                        }
+                    ]
+                }
+                """, "5 validation errors detected: "
+                + "Value 'zz' at 'globalSecondaryIndexes.1.member.indexName' failed to satisfy constraint: "
+                + "Member must have length greater than or equal to 3; "
+                + "Value 'g2' at 'globalSecondaryIndexes.2.member.indexName' failed to satisfy constraint: "
+                + "Member must have length greater than or equal to 3; "
+                + "Value 'BOGUS' at 'globalSecondaryIndexes.2.member.projection.projectionType' failed to satisfy "
+                + "constraint: Member must satisfy enum value set: [ALL, INCLUDE, KEYS_ONLY]; "
+                + "Value 'BOGUS' at 'billingMode' failed to satisfy constraint: "
+                + "Member must satisfy enum value set: [PROVISIONED, PAY_PER_REQUEST]; "
+                + "Value 'aa' at 'localSecondaryIndexes.1.member.indexName' failed to satisfy constraint: "
+                + "Member must have length greater than or equal to 3");
+    }
+
+    @Test
     void updateTableRejectsAnInvalidIndexNameBeforeTheTableLookup() {
         assertIndexNameRejected("UpdateTable", """
                 {
@@ -825,6 +876,85 @@ class DynamoDbIntegrationTest {
         .then()
             .statusCode(200)
             .body("TableNames", hasItem("TestTable"));
+    }
+
+    @Test
+    void describeLimitsReportsTheDefaultQuotas() {
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.DescribeLimits")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("{}")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("AccountMaxReadCapacityUnits", equalTo(80000))
+            .body("AccountMaxWriteCapacityUnits", equalTo(80000))
+            .body("TableMaxReadCapacityUnits", equalTo(40000))
+            .body("TableMaxWriteCapacityUnits", equalTo(40000));
+    }
+
+    @Test
+    void updateTableRefusesIndexCapacityAboveThePerIndexMaximum() {
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.CreateTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "QuotaTable",
+                    "KeySchema": [{"AttributeName": "pk", "KeyType": "HASH"}],
+                    "AttributeDefinitions": [
+                        {"AttributeName": "pk", "AttributeType": "S"},
+                        {"AttributeName": "g", "AttributeType": "S"}
+                    ],
+                    "ProvisionedThroughput": {"ReadCapacityUnits": 1, "WriteCapacityUnits": 1},
+                    "GlobalSecondaryIndexes": [{
+                        "IndexName": "gsi1",
+                        "KeySchema": [{"AttributeName": "g", "KeyType": "HASH"}],
+                        "Projection": {"ProjectionType": "KEYS_ONLY"},
+                        "ProvisionedThroughput": {"ReadCapacityUnits": 1, "WriteCapacityUnits": 1}
+                    }]
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200);
+
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.UpdateTable")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("""
+                {
+                    "TableName": "QuotaTable",
+                    "GlobalSecondaryIndexUpdates": [{"Update": {
+                        "IndexName": "gsi1",
+                        "ProvisionedThroughput": {"ReadCapacityUnits": 40001, "WriteCapacityUnits": 1}
+                    }}]
+                }
+                """)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("LimitExceededException"))
+            .body("message", equalTo("The requested ReadCapacityUnits for index gsi1, 40001, is above the per index "
+                    + "maximum for the account in us-east-1. Per table maximum: 40000. Refer to the Amazon DynamoDB "
+                    + "Developer Guide for current limits and how to request higher limits."));
+    }
+
+    @Test
+    void describeEndpointsNamesFloci() {
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810.DescribeEndpoints")
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body("{}")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("Endpoints.Address", contains("localhost:4566"))
+            .body("Endpoints.CachePeriodInMinutes", contains(1440));
     }
 
     @Test
@@ -5954,7 +6084,27 @@ given()
             """)
     void itemWritesGetTheOlderChecksWhenTheNewerValidatorGivesUp(String operation, String body,
             String message) {
-        String deep = "{\"M\": {\"n\": ".repeat(63) + "{\"S\": \"leaf\"}" + "}}".repeat(63);
+        String deep = nestedMap(63, "n", "{\"S\": \"leaf\"}");
+        given()
+            .header("X-Amz-Target", "DynamoDB_20120810." + operation)
+            .contentType(DYNAMODB_CONTENT_TYPE)
+            .body(body.replace("\"DEEP\"", deep))
+        .when().post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", containsString("ValidationException"))
+            .body("message", equalTo(message));
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', quoteCharacter = '`', textBlock = """
+            Query | {"TableName": "Missing", "KeyConditions": {"pk": {"ComparisonOperator": "EQ", "AttributeValueList": [{"S": "a"}]}}, "QueryFilter": {"b": {"ComparisonOperator": "NULL"}, "c": {"ComparisonOperator": "NULL"}}, "ConditionalOperator": "XOR", "Select": "BOGUS"} | Value 'XOR' at 'conditionalOperator' failed to satisfy constraint: Member must satisfy enum value set: [AND, OR]
+            Scan  | {"TableName": "Missing", "ScanFilter": {"a": {"ComparisonOperator": "EQ", "AttributeValueList": ["DEEP"]}}, "ConditionalOperator": "AND"} | ConditionalOperator can only be used when Filter or Expected has two or more elements
+            Scan  | {"TableName": "Missing", "ConditionalOperator": "AND"} | ConditionalOperator cannot be used without Filter or Expected
+            """)
+    void queryAndScanCheckTheConditionalOperatorBeforeTheTableLookup(String operation, String body,
+            String message) {
+        String deep = nestedMap(40, "n", "{\"S\": \"leaf\"}");
         given()
             .header("X-Amz-Target", "DynamoDB_20120810." + operation)
             .contentType(DYNAMODB_CONTENT_TYPE)
