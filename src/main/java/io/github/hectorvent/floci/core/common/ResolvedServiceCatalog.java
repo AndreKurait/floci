@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.core.common;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.accessanalyzer.AccessAnalyzerController;
 import io.github.hectorvent.floci.services.account.AccountController;
+import io.github.hectorvent.floci.services.amazonmq.AmazonMqConfigurationController;
 import io.github.hectorvent.floci.services.amazonmq.AmazonMqController;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayController;
 import io.github.hectorvent.floci.services.appconfig.AppConfigController;
@@ -217,7 +218,7 @@ public class ResolvedServiceCatalog {
                 descriptor("mq", "amazonmq", config.services().amazonmq().enabled(), true,
                         "amazonmq", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,
                         protocols(ServiceProtocol.REST_JSON),
-                        Set.of(), Set.of("mq"), Set.of(), Set.of(AmazonMqController.class))
+                        Set.of(), Set.of("mq"), Set.of(), Set.of(AmazonMqController.class, AmazonMqConfigurationController.class))
                         .withRequiredRestAuthentication(),
                 descriptor("sts", "iam", config.services().iam().enabled(), false,
                         null, null, 5000L, AwsNamespaces.STS, ServiceProtocol.QUERY,
