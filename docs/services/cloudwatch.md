@@ -54,6 +54,8 @@ Inflation is bounded to 10 MiB; the ordinary log-event validation still applies.
 | `DescribeResourcePolicies` | List account-level resource policies |
 | `PutDestination` | Create or update a cross-account subscription destination |
 | `PutDestinationPolicy` | Create or update the access policy for a destination |
+| `DescribeDestinations` | List logical destinations in the current account and Region, with prefix and pagination |
+| `DeleteDestination` | Remove a logical destination without deleting its target |
 | `PutAccountPolicy` | Create or update an account-level Logs policy |
 | `DescribeAccountPolicies` | List account-level Logs policies by type and optional name |
 | `GetDataProtectionPolicy` | Return the resolved log group identifier (see note below) |
@@ -192,9 +194,40 @@ and `logEvents` (an array of `{id, timestamp, message}`). Lambda receives the pa
 under `awslogs.data`. Kinesis and Firehose receive the gzip-compressed JSON bytes directly as record data.
 
 For Kinesis destinations, `distribution` controls the partition key: `ByLogStream` uses the log stream
-name, while `Random` assigns a randomized UUID partition key. Cross-account Logs destinations
-(`PutDestination`), IAM role permission checks, and the `CONTROL_MESSAGE` ping on filter creation
-are deferred.
+name, while `Random` assigns a randomized UUID partition key.
+
+Logical Logs destinations support recipient-owned Kinesis streams, including streams in another Region
+of the same partition. `PutDestination` requires an existing role and active stream, checks the Logs
+service trust and `kinesis:PutRecord` permission, and writes a gzip `CONTROL_MESSAGE` before saving the
+destination. Control delivery uses the recipient account; subscription data uses the source account
+with the recipient's role. The control trust context supports the documented recipient-account Logs
+ARN wildcard; the exact AWS control source-resource identity is not modeled. Logical Firehose targets
+are explicitly unsupported: AWS's subscription API lists them, while its destination API documents
+Kinesis targets.
+
+Cross-account subscriptions require a destination access-policy grant to the source account. Data
+delivery resolves the destination in its owning account and rechecks that policy, role trust and target
+permission for each batch. Account IDs, account root ARNs and wildcard principals are supported, with
+`aws:PrincipalAccount`, `aws:ResourceAccount` and `aws:RequestedRegion` conditions. Identity and
+organization conditions, IAM user or role principals, `NotPrincipal`, policy variables and unsupported
+or malformed condition forms are refused. Shared IAM enforcement-off mode retains its existing
+permission bypass; destination, role and target existence checks still apply.
+
+`DescribeDestinations` lists only the current account and Region, sorts names, and scopes its 24-hour
+pagination tokens to the account, Region and prefix. `DeleteDestination` removes the logical metadata
+and stops later delivery without deleting the stream. Same-account Lambda subscription admission
+checks function existence and its resource permission for the source log group. Mutable filter updates
+preserve `creationTime`; replacing the group/name identity creates a new timestamp. The existing
+regex quotas remain enforced; a total subscription count quota and Lambda filter-creation control
+messages are not implemented. Existing direct Kinesis/Firehose role handling remains outside this
+logical-destination implementation.
+
+`AWS::Logs::SubscriptionFilter` manages these native filter definitions through CloudFormation.
+Its name and log group form the stored identity; `Ref` returns the name. Mutable updates retain
+creation time. Replacement deletes the old filter first, even with `UpdateReplacePolicy: Retain`,
+and failed updates retain the full prior definition for rollback. The provider uses the same
+validated same-account Lambda and logical Logs destination admission as the native API.
+Direct role-backed destinations, `RoleArn`, and the three advanced CFN properties remain unsupported.
 
 ### Metric filters {#metric-filters}
 

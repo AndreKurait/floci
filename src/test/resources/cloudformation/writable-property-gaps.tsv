@@ -128,11 +128,11 @@ AWS::CloudFormation::CustomResource	ServiceTimeout	accepted and ignored
 AWS::CloudFront::Distribution	Tags	accepted and ignored
 AWS::CloudFront::Function	FunctionMetadata	accepted and ignored
 AWS::CloudTrail::Trail	AggregationConfigurations	accepted and ignored
-AWS::CloudTrail::Trail	RecursiveLogging	accepted and ignored; recursive logging is not implemented
 AWS::CloudTrail::Trail	CloudWatchLogsLogGroupArn	accepted and ignored
 AWS::CloudTrail::Trail	CloudWatchLogsRoleArn	accepted and ignored
 AWS::CloudTrail::Trail	InsightSelectors	accepted and ignored
 AWS::CloudTrail::Trail	KMSKeyId	accepted and ignored
+AWS::CloudTrail::Trail	RecursiveLogging	accepted and ignored; recursive logging is not implemented
 AWS::CloudTrail::Trail	Tags	accepted and ignored
 AWS::CloudWatch::Alarm	ActionConfiguration	accepted and ignored
 AWS::CloudWatch::Alarm	EvaluationCriteria	accepted and ignored
@@ -427,6 +427,10 @@ AWS::Logs::LogGroup	FieldIndexPolicies	accepted and ignored
 AWS::Logs::LogGroup	KmsKeyId	accepted and ignored
 AWS::Logs::LogGroup	LogGroupClass	accepted and ignored
 AWS::Logs::LogGroup	ResourcePolicyDocument	accepted and ignored
+AWS::Logs::SubscriptionFilter	ApplyOnTransformedLogs	explicitly rejected; native subscription filters do not support this property
+AWS::Logs::SubscriptionFilter	EmitSystemFields	explicitly rejected; native subscription filters do not support this property
+AWS::Logs::SubscriptionFilter	FieldSelectionCriteria	explicitly rejected; native subscription filters do not support this property
+AWS::Logs::SubscriptionFilter	RoleArn	explicitly rejected; native subscription filters do not support this property
 AWS::Organizations::Account	RoleName	accepted and ignored
 AWS::Pipes::Pipe	KmsKeyIdentifier	accepted and ignored
 AWS::Pipes::Pipe	LogConfiguration	accepted and ignored

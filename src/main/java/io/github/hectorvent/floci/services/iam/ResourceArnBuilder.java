@@ -12,6 +12,7 @@ import io.github.hectorvent.floci.core.common.ServicePrincipals;
 import io.github.hectorvent.floci.core.common.SigV4CredentialScope;
 import io.github.hectorvent.floci.core.common.StoredResourceArns;
 import io.github.hectorvent.floci.core.common.auth.SigV4Canonicalization;
+import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsCrossAccountService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.LogGroupTagTarget;
 import io.github.hectorvent.floci.services.cloudwatch.logs.LogTransformerTarget;
@@ -376,6 +377,17 @@ public class ResourceArnBuilder {
         }
         if ("logs:TestTransformer".equals(action)) {
             return List.of("*");
+        }
+        if ("logs:PutSubscriptionFilter".equals(action)) {
+            JsonNode body = readJsonBody(ctx);
+            if (body == null) {
+                return List.of("*");
+            }
+            String group = new AwsArnUtils.Arn(partition, "logs", region, accountId,
+                    "log-group:" + body.path("logGroupName").asText() + ":*").toString();
+            String destination = body.path("destinationArn").asText();
+            return CloudWatchLogsCrossAccountService.isCrossAccountDestinationArn(destination)
+                    ? List.of(group, destination) : List.of(group);
         }
         // Operations the vendored table reads (the vended-log delivery family) take their resources from it.
         if (RequestResources.reads(action)) {

@@ -665,6 +665,10 @@
     "FilterName",
     "LogGroupName"
   ],
+  "AWS::Logs::SubscriptionFilter": [
+    "FilterName",
+    "LogGroupName"
+  ],
   "AWS::Organizations::Account": [],
   "AWS::Organizations::Organization": [],
   "AWS::Organizations::OrganizationalUnit": [
