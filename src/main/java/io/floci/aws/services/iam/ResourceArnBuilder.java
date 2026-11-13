@@ -220,6 +220,15 @@ public class ResourceArnBuilder {
         if (credentialScope == null) {
             return List.of("*");
         }
+        if ("cloudfront".equals(credentialScope) && operation != null && Set.of("cloudfront:GetFieldLevelEncryption",
+                "cloudfront:GetFieldLevelEncryptionConfig", "cloudfront:GetFieldLevelEncryptionProfile",
+                "cloudfront:GetFieldLevelEncryptionProfileConfig").contains(operation)) {
+            String id = ctx.getUriInfo().getPathParameters().getFirst("Id");
+            String type = operation.startsWith("cloudfront:GetFieldLevelEncryptionProfile")
+                    ? "field-level-encryption-profile/" : "field-level-encryption-config/";
+            return id == null ? List.of("*")
+                    : List.of(AwsArnUtils.Arn.global(partition, "cloudfront", accountId, type + id).toString());
+        }
         if (operation != null && operation.startsWith(credentialScope + ":") && RequestResources.reads(operation)) {
             return namedResources(credentialScope, operation, ctx, region, accountId, partition);
         }

@@ -9,6 +9,7 @@ import io.floci.aws.core.common.RequestResources;
 import io.floci.aws.core.common.ResteasyRequests;
 import io.floci.aws.core.common.SignedServiceRoute;
 import io.floci.aws.core.common.WireProtocol;
+import io.floci.aws.services.cloudfront.CloudFrontController;
 import io.floci.aws.services.dynamodb.DynamoDbPartiQLParser;
 import io.floci.aws.services.eks.EksController;
 import io.floci.aws.services.s3.S3BucketSubresources;
@@ -649,6 +650,20 @@ public class IamActionRegistry {
 
     /** The serving method identifies these actions even when path encoding or matrix parameters vary. */
     public String resolveMatchedRoute(String credentialScope, ResourceInfo resourceInfo) {
+        if ("cloudfront".equals(credentialScope) && resourceInfo != null
+                && CloudFrontController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            String action = switch (resourceInfo.getResourceMethod().getName()) {
+                case "getFieldLevelEncryption" -> "cloudfront:GetFieldLevelEncryption";
+                case "getFieldLevelEncryptionConfig" -> "cloudfront:GetFieldLevelEncryptionConfig";
+                case "getFieldLevelEncryptionProfile" -> "cloudfront:GetFieldLevelEncryptionProfile";
+                case "getFieldLevelEncryptionProfileConfig" -> "cloudfront:GetFieldLevelEncryptionProfileConfig";
+                default -> null;
+            };
+            if (action != null) {
+                return action;
+            }
+        }
         if (resourceInfo == null || resourceInfo.getResourceClass() == null) {
             return null;
         }
