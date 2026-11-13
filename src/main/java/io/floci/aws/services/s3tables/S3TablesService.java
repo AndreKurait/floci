@@ -43,7 +43,7 @@ public class S3TablesService {
             throw conflict("The table bucket " + name + " already exists.");
         }
         TableBucket bucket = new TableBucket(name, bucketArn(region, name), now(), regionResolver.getAccountId(),
-                encryptionConfiguration, storageClassConfiguration, tags);
+                encryptionConfiguration, storageClassConfiguration(storageClassConfiguration), tags);
         store.put(key, bucket);
         LOG.infov("Created S3 Tables bucket {0} in region {1}", name, region);
         return bucket;
@@ -72,6 +72,28 @@ public class S3TablesService {
             throw conflict("The table bucket is not empty.");
         }
         store.delete(storageKey(region, bucket.getName()));
+    }
+
+    public synchronized Map<String, String> getTableBucketStorageClass(String tableBucketArn, String region) {
+        return storageClassConfiguration(getTableBucket(tableBucketArn, region).getStorageClassConfiguration());
+    }
+
+    public synchronized void putTableBucketStorageClass(String tableBucketArn, Object configuration, String region) {
+        if (configuration == null) {
+            throw badRequest("storageClassConfiguration is required.");
+        }
+        Map<String, String> replacement = storageClassConfiguration(configuration);
+        TableBucket bucket = getTableBucket(tableBucketArn, region);
+        Map<String, String> previousDefault = storageClassConfiguration(bucket.getStorageClassConfiguration());
+        // Older snapshots did not settle a table's inherited class at creation.
+        // Preserve that effective class before replacing the bucket's default.
+        bucket.getNamespaces().values().forEach(namespace -> namespace.getTables().values().forEach(table -> {
+            if (table.getStorageClassConfiguration() == null) {
+                table.setStorageClassConfiguration(previousDefault);
+            }
+        }));
+        bucket.setStorageClassConfiguration(replacement);
+        persist(bucket, region);
     }
 
     public synchronized Namespace createNamespace(String tableBucketArn, List<String> namespace, String region) {
@@ -121,7 +143,8 @@ public class S3TablesService {
         }
         S3Table table = new S3Table(name, bucket.getArn() + "/table/" + name, namespaceName, format,
                 versionToken(), metadataLocation(metadata), now(), regionResolver.getAccountId(), metadata,
-                encryptionConfiguration, storageClassConfiguration, tags);
+                encryptionConfiguration, storageClassConfiguration(storageClassConfiguration == null
+                        ? bucket.getStorageClassConfiguration() : storageClassConfiguration), tags);
         namespace.getTables().put(name, table);
         persist(bucket, region);
         return table;
@@ -129,6 +152,14 @@ public class S3TablesService {
 
     public synchronized S3Table getTable(String tableBucketArn, String namespaceName, String name, String region) {
         return getTable(getTableBucket(tableBucketArn, region), namespaceName, name);
+    }
+
+    public synchronized Map<String, String> getTableStorageClass(String tableBucketArn, String namespaceName,
+                                                                String name, String region) {
+        TableBucket bucket = getTableBucket(tableBucketArn, region);
+        S3Table table = getTable(bucket, namespaceName, name);
+        return storageClassConfiguration(table.getStorageClassConfiguration() == null
+                ? bucket.getStorageClassConfiguration() : table.getStorageClassConfiguration());
     }
 
     public synchronized List<S3Table> listTables(String tableBucketArn, String namespaceName, String prefix, String region) {
@@ -290,6 +321,17 @@ public class S3TablesService {
             throw notFound("The namespace does not exist.");
         }
         return namespace;
+    }
+
+    private Map<String, String> storageClassConfiguration(Object configuration) {
+        if (configuration == null) {
+            return Map.of("storageClass", "STANDARD");
+        }
+        if (!(configuration instanceof Map<?, ?> map) || !(map.get("storageClass") instanceof String storageClass)
+                || (!"STANDARD".equals(storageClass) && !"INTELLIGENT_TIERING".equals(storageClass))) {
+            throw badRequest("storageClassConfiguration.storageClass must be STANDARD or INTELLIGENT_TIERING.");
+        }
+        return Map.of("storageClass", storageClass);
     }
 
     private S3Table getTable(TableBucket bucket, String namespaceName, String name) {
