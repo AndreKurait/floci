@@ -7,39 +7,47 @@ import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.PaginatedResult;
 import io.floci.aws.core.common.Pagination;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.RequestScopes;
+import io.floci.aws.core.common.Resettable;
 import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.core.storage.StorageOperations;
 import io.floci.aws.services.appconfig.model.Application;
 import io.floci.aws.services.appconfig.model.ConfigurationProfile;
 import io.floci.aws.services.appconfig.model.Deployment;
+import io.floci.aws.services.appconfig.model.DeploymentEvent;
 import io.floci.aws.services.appconfig.model.DeploymentStrategy;
 import io.floci.aws.services.appconfig.model.DeploymentSummary;
 import io.floci.aws.services.appconfig.model.Environment;
 import io.floci.aws.services.appconfig.model.HostedConfigurationVersion;
 import io.floci.aws.services.appconfig.model.HostedConfigurationVersionSummary;
 import io.floci.aws.services.appconfig.model.Monitor;
+import io.floci.aws.services.appconfig.model.Validator;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Function;
 import java.util.regex.Pattern;
 
 @ApplicationScoped
-public class AppConfigService {
+public class AppConfigService implements Resettable {
     private static final Logger LOG = Logger.getLogger(AppConfigService.class);
 
     private final StorageBackend<String, Application> applicationStore;
@@ -47,11 +55,16 @@ public class AppConfigService {
     private final StorageBackend<String, ConfigurationProfile> profileStore;
     private final StorageBackend<String, DeploymentStrategy> strategyStore;
     private final StorageBackend<String, HostedConfigurationVersion> versionStore;
-    private final StorageBackend<String, Deployment> deploymentStore;
+    private final StorageBackend<String, Integer> versionCounters;
+    private final AppConfigStorage<Deployment> deploymentStore;
     private final StorageBackend<String, String> activeConfigStore; // envId::profileId -> versionNumber
     private final Clock clock;
     private final RegionResolver regions;
+    private final AppConfigAlarmMonitor alarms;
+    private final AppConfigLambdaValidator lambdaValidator;
+    private boolean validationPaused;
     private final Map<String, DeploymentPageToken> deploymentPageTokens = new ConcurrentHashMap<>();
+    private final Map<AppConfigStorage.ScopedKey, String> monitorFailures = new ConcurrentHashMap<>();
     private static final int MAX_DEPLOYMENT_PAGE_TOKENS = 1000;
     private static final int MAX_MONITORS = 5;
     private static final int MAX_ARN_LENGTH = 2048;
@@ -59,13 +72,43 @@ public class AppConfigService {
     private static final Pattern ROLE_ARN = Pattern.compile("arn:" + AwsArnUtils.PARTITION_REGEX + ":iam::\\d{12}:role/.*");
 
     @Inject
+    public AppConfigService(StorageFactory storageFactory, RegionResolver regions,
+                            AppConfigAlarmMonitor alarms, AppConfigLambdaValidator lambdaValidator) {
+        this(storageFactory, regions, Clock.systemUTC(), alarms, lambdaValidator);
+    }
+
+    public AppConfigService(StorageFactory storageFactory, RegionResolver regions, AppConfigAlarmMonitor alarms) {
+        this(storageFactory, regions, Clock.systemUTC(), alarms, null);
+    }
+
+    public AppConfigService(StorageFactory storageFactory, RegionResolver regions,
+                            AppConfigLambdaValidator lambdaValidator) {
+        this(storageFactory, regions, Clock.systemUTC(), null, lambdaValidator);
+    }
+
     public AppConfigService(StorageFactory storageFactory, RegionResolver regions) {
-        this(storageFactory, regions, Clock.systemUTC());
+        this(storageFactory, regions, Clock.systemUTC(), null, null);
     }
 
     AppConfigService(StorageFactory storageFactory, RegionResolver regions, Clock clock) {
+        this(storageFactory, regions, clock, null, null);
+    }
+
+    AppConfigService(StorageFactory storageFactory, RegionResolver regions, Clock clock, AppConfigAlarmMonitor alarms) {
+        this(storageFactory, regions, clock, alarms, null);
+    }
+
+    AppConfigService(StorageFactory storageFactory, RegionResolver regions, Clock clock,
+                     AppConfigLambdaValidator lambdaValidator) {
+        this(storageFactory, regions, clock, null, lambdaValidator);
+    }
+
+    AppConfigService(StorageFactory storageFactory, RegionResolver regions, Clock clock,
+                     AppConfigAlarmMonitor alarms, AppConfigLambdaValidator lambdaValidator) {
+        this.lambdaValidator = lambdaValidator;
         this.clock = clock;
         this.regions = regions;
+        this.alarms = alarms;
         this.applicationStore = new AppConfigStorage<>(storageFactory, regions,
                 "appconfig", "appconfig-applications.json", new TypeReference<>() {});
         this.environmentStore = new AppConfigStorage<>(storageFactory, regions,
@@ -76,6 +119,8 @@ public class AppConfigService {
                 "appconfig", "appconfig-strategies.json", new TypeReference<>() {});
         this.versionStore = new AppConfigStorage<>(storageFactory, regions,
                 "appconfig", "appconfig-versions.json", new TypeReference<>() {});
+        this.versionCounters = new AppConfigStorage<>(storageFactory, regions,
+                "appconfig", "appconfig-version-counters.json", new TypeReference<>() {});
         this.deploymentStore = new AppConfigStorage<>(storageFactory, regions,
                 "appconfig", "appconfig-deployments.json", new TypeReference<>() {});
         this.activeConfigStore = new AppConfigStorage<>(storageFactory, regions,
@@ -302,6 +347,7 @@ public class AppConfigService {
         profile.setLocationUri((String) request.get("LocationUri"));
         String type = (String) request.get("Type");
         profile.setType(type == null && "hosted".equals(profile.getLocationUri()) ? "AWS.Freeform" : type);
+        profile.setValidators(AppConfigValidators.parse(request.get("Validators"), profile.getType()));
         profileStore.put(profile.getId(), profile);
         return profile;
     }
@@ -348,11 +394,48 @@ public class AppConfigService {
         return profileStore.get(profileId);
     }
 
+    public synchronized ConfigurationProfile updateConfigurationProfile(String applicationIdentifier,
+                                                                        String profileIdentifier,
+                                                                        Map<String, Object> request) {
+        String appId = resolveApplication(applicationIdentifier).getId();
+        ConfigurationProfile profile = copy(resolveConfigurationProfile(appId, profileIdentifier));
+        if (request.containsKey("Name")) {
+            profile.setName(profileText(request, "Name", 1, 128, false));
+        }
+        if (request.containsKey("Description")) {
+            profile.setDescription(profileText(request, "Description", 0, 1024, true));
+        }
+        if (request.containsKey("Validators")) {
+            profile.setValidators(AppConfigValidators.parse(request.get("Validators"), profile.getType()));
+        }
+        if (request.get("RetrievalRoleArn") != null) {
+            throw new AwsException("BadRequestException", "RetrievalRoleArn is not currently supported.", 400);
+        }
+        if (request.get("KmsKeyIdentifier") != null) {
+            throw new AwsException("BadRequestException", "KmsKeyIdentifier is not currently supported.", 400);
+        }
+        profileStore.put(profile.getId(), profile);
+        return profile;
+    }
+
+    private static String profileText(Map<String, Object> request, String field, int minimum,
+                                      int maximum, boolean nullable) {
+        Object value = request.get(field);
+        if (value == null && nullable) {
+            return null;
+        }
+        if (!(value instanceof String text) || text.length() < minimum || text.length() > maximum) {
+            throw new AwsException("BadRequestException",
+                    field + " must be a string of " + minimum + " to " + maximum + " characters.", 400);
+        }
+        return text;
+    }
+
     /**
      * Sets the name and description of a configuration profile, as a CloudFormation update of
      * {@code AWS::AppConfig::ConfigurationProfile} does: both are written, so a null description
-     * clears it. Floci serves no UpdateConfigurationProfile route; the CloudFormation provisioner is
-     * the only caller.
+     * clears it. The CloudFormation provisioner uses this full-property helper; native PATCH calls
+     * use the map overload to retain omitted fields.
      */
     public synchronized ConfigurationProfile updateConfigurationProfile(String applicationId, String profileId,
                                                                         String name, String description) {
@@ -406,7 +489,74 @@ public class AppConfigService {
         // lifecycle - cascade the delete so a caller can't still fetch versions for a profile
         // that's supposedly gone.
         StorageOperations.deleteByPrefix(versionStore, appId + "::" + profileId + "::");
+        versionCounters.delete(appId + "::" + profileId);
         profileStore.delete(profileId);
+    }
+
+    public synchronized void validateConfiguration(String applicationIdentifier, String profileIdentifier,
+                                                     String configurationVersion) {
+        String appId = resolveApplication(applicationIdentifier).getId();
+        ConfigurationProfile profile = resolveConfigurationProfile(appId, profileIdentifier);
+        validateProfile(profile, validationVersion(profile, configurationVersion));
+    }
+
+    private HostedConfigurationVersion validationVersion(ConfigurationProfile profile, String configurationVersion) {
+        if (configurationVersion == null || configurationVersion.isEmpty() || configurationVersion.length() > 1024) {
+            throw new AwsException("BadRequestException",
+                    "ConfigurationVersion must contain between 1 and 1024 characters.", 400);
+        }
+        if (!"hosted".equals(profile.getLocationUri())) {
+            throw new AwsException("BadRequestException", "Only hosted configuration validation is supported.", 400);
+        }
+        String prefix = profile.getApplicationId() + "::" + profile.getId() + "::";
+        HostedConfigurationVersion labeled = versionStore.scan(key -> key.startsWith(prefix)).stream()
+                .filter(candidate -> configurationVersion.equals(candidate.getVersionLabel()))
+                .findFirst().orElse(null);
+        if (labeled != null) {
+            return labeled;
+        }
+        int version;
+        try {
+            version = Integer.parseInt(configurationVersion);
+        } catch (NumberFormatException e) {
+            throw new AwsException("ResourceNotFoundException", "Hosted configuration version not found.", 404);
+        }
+        return getHostedConfigurationVersion(profile.getApplicationId(), profile.getId(), version);
+    }
+
+    private void validateProfile(ConfigurationProfile profile, HostedConfigurationVersion version) {
+        List<Validator> validators = profile.getValidators();
+        if (validators == null || validators.stream().noneMatch(validator -> "LAMBDA".equals(validator.type()))) {
+            AppConfigValidators.validate(validators, version.getContent());
+            return;
+        }
+        for (Validator validator : validators) {
+            if ("LAMBDA".equals(validator.type())) {
+                if (validationPaused || lambdaValidator == null) {
+                    throw new AwsException("BadRequestException", "Lambda validator execution is unavailable.", 400);
+                }
+                lambdaValidator.validate(validator.content(), profile, version);
+            } else {
+                AppConfigValidators.validate(List.of(validator), version.getContent());
+            }
+        }
+    }
+
+    @Override
+    public synchronized void beforeReset() {
+        // The same monitor covers validation and deployment publication, so storage cannot be
+        // cleared between a timely result and the writes it authorizes.
+        validationPaused = true;
+    }
+
+    @Override
+    public synchronized void clear() {
+        // StorageFactory owns the stores. The new runtime state is only the admission fence.
+    }
+
+    @Override
+    public synchronized void afterReset() {
+        validationPaused = false;
     }
 
     // ──────────────────────────── Hosted Configuration Version ────────────────────────────
@@ -416,12 +566,43 @@ public class AppConfigService {
                                                                          byte[] content,
                                                                          String contentType,
                                                                          String description) {
+        return createHostedConfigurationVersion(applicationIdentifier, profileIdentifier,
+                content, contentType, description, null, null);
+    }
+
+    public synchronized HostedConfigurationVersion createHostedConfigurationVersion(String applicationIdentifier,
+                                                                         String profileIdentifier,
+                                                                         byte[] content,
+                                                                         String contentType,
+                                                                         String description,
+                                                                         String versionLabel,
+                                                                         Integer latestVersionNumber) {
         String appId = resolveApplication(applicationIdentifier).getId();
         String profileId = resolveConfigurationProfile(appId, profileIdentifier).getId();
-        String prefix = appId + "::" + profileId + "::";
-        int nextVersion = versionStore.scan(k -> k.startsWith(prefix))
-                .stream().mapToInt(HostedConfigurationVersion::getVersionNumber).max().orElse(0) + 1;
-
+        String key = appId + "::" + profileId;
+        String prefix = key + "::";
+        List<HostedConfigurationVersion> stored = versionStore.scan(k -> k.startsWith(prefix));
+        int latest = stored.stream().mapToInt(HostedConfigurationVersion::getVersionNumber).max().orElse(0);
+        if (versionLabel != null) {
+            validateVersionLabel(versionLabel);
+            stored.stream().filter(version -> versionLabel.equals(version.getVersionLabel())).findFirst()
+                    .ifPresent(version -> {
+                        throw new AwsException("BadRequestException", "The version label '" + versionLabel
+                                + "' has already been assigned to hosted configuration version "
+                                + version.getVersionNumber() + ". Please provide a different version label "
+                                + "to create your hosted configuration version.", 400);
+                    });
+        }
+        if (latestVersionNumber != null && latestVersionNumber != latest) {
+            throw new AwsException("ConflictException", "Expected latest version " + latestVersionNumber
+                    + " does not match actual latest version " + latest, 409);
+        }
+        // The concurrency token follows remaining versions. Allocation must also remember deleted versions.
+        int previous = Math.max(latest, versionCounters.get(key).orElse(0));
+        if (previous == Integer.MAX_VALUE) {
+            throw new AwsException("ServiceQuotaExceededException", "Hosted configuration version limit reached.", 400);
+        }
+        int nextVersion = previous + 1;
         HostedConfigurationVersion version = new HostedConfigurationVersion();
         version.setApplicationId(appId);
         version.setConfigurationProfileId(profileId);
@@ -429,9 +610,21 @@ public class AppConfigService {
         version.setContent(content);
         version.setContentType(contentType);
         version.setDescription(description);
+        version.setVersionLabel(versionLabel);
 
+        versionCounters.put(key, nextVersion);
         versionStore.put(prefix + nextVersion, version);
         return version;
+    }
+
+    private static void validateVersionLabel(String label) {
+        if (label.isEmpty() || label.length() > 64) {
+            throw new AwsException("BadRequestException", "VersionLabel must contain 1 to 64 characters.", 400);
+        }
+        if (label.chars().allMatch(character -> character >= '0' && character <= '9')) {
+            throw new AwsException("BadRequestException",
+                    "VersionLabel must contain at least one non-numeric character.", 400);
+        }
     }
 
     public HostedConfigurationVersion getHostedConfigurationVersion(String applicationIdentifier,
@@ -458,6 +651,7 @@ public class AppConfigService {
                     s.setVersionNumber(v.getVersionNumber());
                     s.setDescription(v.getDescription());
                     s.setContentType(v.getContentType());
+                    s.setVersionLabel(v.getVersionLabel());
                     return s;
                 })
                 .toList();
@@ -465,13 +659,42 @@ public class AppConfigService {
 
     public PaginatedResult<HostedConfigurationVersionSummary> listHostedConfigurationVersionsPage(
             String applicationIdentifier, String profileIdentifier, Integer maxResults, String nextToken) {
+        return listHostedConfigurationVersionsPage(
+                applicationIdentifier, profileIdentifier, maxResults, nextToken, null);
+    }
+
+    public PaginatedResult<HostedConfigurationVersionSummary> listHostedConfigurationVersionsPage(
+            String applicationIdentifier, String profileIdentifier, Integer maxResults,
+            String nextToken, String versionLabel) {
+        if (versionLabel != null && (versionLabel.isEmpty() || versionLabel.length() > 64)) {
+            throw new AwsException("BadRequestException", "VersionLabel must contain 1 to 64 characters.", 400);
+        }
         String appId = resolveApplication(applicationIdentifier).getId();
         String profileId = resolveConfigurationProfile(appId, profileIdentifier).getId();
+        String filterScope = versionLabel == null ? "all"
+                : "label-" + Base64.getUrlEncoder().withoutPadding()
+                        .encodeToString(versionLabel.getBytes(StandardCharsets.UTF_8));
         String scope = "appconfig-hosted-versions:" + regions.getAccountId() + ":" + regions.getRegion()
-                + ":" + appId + ":" + profileId;
-        return pageAppConfigList(listHostedConfigurationVersions(appId, profileId),
+                + ":" + appId + ":" + profileId + ":" + filterScope;
+        List<HostedConfigurationVersionSummary> matching = listHostedConfigurationVersions(appId, profileId)
+                .stream().filter(version -> matchesVersionLabel(version.getVersionLabel(), versionLabel)).toList();
+        if (nextToken != null && nextToken.isEmpty()) {
+            throw new AwsException("BadRequestException", "Pagination token must contain 1 to 2048 characters.", 400);
+        }
+        return Pagination.paginate(matching,
                 version -> String.format(Locale.ROOT, "%010d", version.getVersionNumber()),
-                maxResults, nextToken, scope);
+                maxResults, nextToken, 50, 50, 2048, "BadRequestException", scope);
+    }
+
+    private static boolean matchesVersionLabel(String label, String filter) {
+        if (filter == null) {
+            return true;
+        }
+        if (label == null) {
+            return false;
+        }
+        return filter.endsWith("*") ? label.startsWith(filter.substring(0, filter.length() - 1))
+                : label.equals(filter);
     }
 
     public synchronized void deleteHostedConfigurationVersion(String applicationIdentifier,
@@ -479,7 +702,16 @@ public class AppConfigService {
                                                   int versionNumber) {
         String appId = resolveApplication(applicationIdentifier).getId();
         String profileId = resolveConfigurationProfile(appId, profileIdentifier).getId();
-        versionStore.delete(appId + "::" + profileId + "::" + versionNumber);
+        String counterKey = appId + "::" + profileId;
+        String versionKey = counterKey + "::" + versionNumber;
+        versionStore.get(versionKey).ifPresent(version -> {
+            // Legacy snapshots may predate counters. Preserve their high-water mark before deleting a row.
+            int previous = versionCounters.get(counterKey).orElse(0);
+            if (version.getVersionNumber() > previous) {
+                versionCounters.put(counterKey, version.getVersionNumber());
+            }
+        });
+        versionStore.delete(versionKey);
     }
 
     // ──────────────────────────── Deployment Strategy ────────────────────────────
@@ -494,8 +726,21 @@ public class AppConfigService {
         strategy.setFinalBakeTimeInMinutes((Integer) request.getOrDefault("FinalBakeTimeInMinutes", 0));
         strategy.setGrowthType((String) request.getOrDefault("GrowthType", "LINEAR"));
         strategy.setReplicateTo((String) request.getOrDefault("ReplicateTo", "NONE"));
+        validateDeploymentTiming(strategy);
         strategyStore.put(strategy.getId(), strategy);
         return strategy;
+    }
+
+    private static void validateDeploymentTiming(DeploymentStrategy strategy) {
+        if (strategy.getDeploymentDurationInMinutes() < 0 || strategy.getDeploymentDurationInMinutes() > 1440
+                || strategy.getFinalBakeTimeInMinutes() < 0 || strategy.getFinalBakeTimeInMinutes() > 1440
+                || !Float.isFinite(strategy.getGrowthFactor())
+                || strategy.getGrowthFactor() < 1 || strategy.getGrowthFactor() > 100
+                || !("LINEAR".equals(strategy.getGrowthType()) || "EXPONENTIAL".equals(strategy.getGrowthType()))) {
+            throw new AwsException("BadRequestException",
+                    "Deployment and bake durations must be 0 to 1440 minutes, growth factor 1 to 100, "
+                            + "and growth type LINEAR or EXPONENTIAL.", 400);
+        }
     }
 
     public DeploymentStrategy getDeploymentStrategy(String id) {
@@ -606,7 +851,8 @@ public class AppConfigService {
                                                     String environmentIdentifier,
                                                     Map<String, Object> request) {
         String appId = resolveApplication(applicationIdentifier).getId();
-        String envId = resolveEnvironment(appId, environmentIdentifier).getId();
+        Environment environment = resolveEnvironment(appId, environmentIdentifier);
+        String envId = environment.getId();
         ConfigurationProfile profile = resolveConfigurationProfile(
                 appId, (String) request.get("ConfigurationProfileId"));
         String profileId = profile.getId();
@@ -614,6 +860,20 @@ public class AppConfigService {
         String strategyId = (String) request.get("DeploymentStrategyId");
 
         DeploymentStrategy strategy = getDeploymentStrategy(strategyId);
+        validateDeploymentTiming(strategy);
+        if (alarms != null) {
+            alarms.rollbackCause(environment.getMonitors());
+        }
+
+        // Refuse invalid content before assigning a deployment number or changing the active version.
+        HostedConfigurationVersion selected = null;
+        if ("hosted".equals(profile.getLocationUri())) {
+            selected = validationVersion(profile, version);
+            validateProfile(profile, selected);
+            version = Integer.toString(selected.getVersionNumber());
+        } else if (profile.getValidators() != null && !profile.getValidators().isEmpty()) {
+            validateProfile(profile, validationVersion(profile, version));
+        }
 
         Deployment deployment = new Deployment();
         deployment.setApplicationId(appId);
@@ -622,6 +882,7 @@ public class AppConfigService {
         deployment.setConfigurationName(profile.getName());
         deployment.setConfigurationLocationUri(profile.getLocationUri());
         deployment.setConfigurationVersion(version);
+        deployment.setVersionLabel(selected == null ? null : selected.getVersionLabel());
         deployment.setDeploymentStrategyId(strategyId);
         deployment.setDeploymentDurationInMinutes(strategy.getDeploymentDurationInMinutes());
         deployment.setFinalBakeTimeInMinutes(strategy.getFinalBakeTimeInMinutes());
@@ -634,8 +895,10 @@ public class AppConfigService {
         deployment.setDeploymentNumber(nextDeploymentNumber);
         Instant started = clock.instant();
         deployment.setStartedAt(started.toString());
-        deployment.setPercentageComplete(100.0f);
-        deployment.setState(strategy.getFinalBakeTimeInMinutes() > 0 ? "BAKING" : "COMPLETE");
+        boolean gradual = strategy.getDeploymentDurationInMinutes() > 0;
+        deployment.setPercentageComplete(gradual ? 0.0f : 100.0f);
+        deployment.setState(gradual ? "DEPLOYING"
+                : strategy.getFinalBakeTimeInMinutes() > 0 ? "BAKING" : "COMPLETE");
         if ("COMPLETE".equals(deployment.getState())) {
             deployment.setCompletedAt(started.toString());
         }
@@ -663,7 +926,12 @@ public class AppConfigService {
 
     public synchronized Deployment stopDeployment(String applicationIdentifier, String environmentIdentifier,
                                                    int deploymentNumber, boolean allowRevert) {
-        Deployment deployment = copy(getDeployment(applicationIdentifier, environmentIdentifier, deploymentNumber));
+        String appId = resolveApplication(applicationIdentifier).getId();
+        String envId = resolveEnvironment(appId, environmentIdentifier).getId();
+        Deployment stored = deploymentStore.get(appId + "::" + envId + "::" + deploymentNumber)
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Deployment not found", 404));
+        // Explicit recovery remains available when the monitor or its role is unhealthy.
+        Deployment deployment = copy(refreshTiming(stored));
         String state = deployment.getState();
         boolean completed = "COMPLETE".equals(state);
         if (!"DEPLOYING".equals(state) && !(allowRevert && ("BAKING".equals(state) || completed))) {
@@ -674,10 +942,16 @@ public class AppConfigService {
             throw new AwsException("BadRequestException",
                     "A completed deployment can only be reverted within 72 hours of its recorded completion.", 400);
         }
+        return restoreConfiguration(deployment, completed, null);
+    }
+
+    private Deployment restoreConfiguration(Deployment deployment, boolean completed, String alarmCause) {
+        int deploymentNumber = deployment.getDeploymentNumber();
         List<Deployment> available = deploymentStore.scan(k -> true).stream()
                 .filter(row -> deployment.getApplicationId().equals(row.getApplicationId()))
                 .filter(row -> deployment.getEnvironmentId().equals(row.getEnvironmentId()))
                 .filter(row -> deployment.getConfigurationProfileId().equals(row.getConfigurationProfileId()))
+                .map(this::refreshTiming)
                 .filter(row -> List.of("BAKING", "COMPLETE", "DEPLOYING").contains(row.getState()))
                 .sorted(Comparator.comparingInt(Deployment::getDeploymentNumber).reversed())
                 .toList();
@@ -707,6 +981,15 @@ public class AppConfigService {
         deployment.setState(completed ? "REVERTED" : "ROLLED_BACK");
         deployment.setPercentageComplete(0.0f);
         deployment.setCompletedAt(clock.instant().toString());
+        if (alarmCause != null) {
+            List<DeploymentEvent> events = new ArrayList<>();
+            events.add(new DeploymentEvent("ROLLBACK_COMPLETED", alarmCause,
+                    deployment.getCompletedAt(), "CLOUDWATCH_ALARM"));
+            events.add(new DeploymentEvent("ROLLBACK_STARTED", alarmCause,
+                    deployment.getCompletedAt(), "CLOUDWATCH_ALARM"));
+            events.addAll(deployment.getEventLog());
+            deployment.setEventLog(events);
+        }
         deploymentStore.put(deployment.getApplicationId() + "::" + deployment.getEnvironmentId()
                 + "::" + deploymentNumber, deployment);
         return deployment;
@@ -725,19 +1008,101 @@ public class AppConfigService {
     }
 
     private Deployment refreshDeployment(Deployment deployment) {
-        if ("BAKING".equals(deployment.getState()) && deployment.getStartedAt() != null
-                && deployment.getFinalBakeTimeInMinutes() != null) {
-            Instant completed = Instant.parse(deployment.getStartedAt())
-                    .plus(Duration.ofMinutes(deployment.getFinalBakeTimeInMinutes()));
-            if (!clock.instant().isBefore(completed)) {
-                deployment = copy(deployment);
-                deployment.setState("COMPLETE");
-                deployment.setCompletedAt(completed.toString());
-                deploymentStore.put(deployment.getApplicationId() + "::" + deployment.getEnvironmentId()
-                        + "::" + deployment.getDeploymentNumber(), deployment);
+        Deployment current = refreshTiming(deployment);
+        if (alarms != null && active(current)) {
+            Environment environment = environmentStore.get(current.getEnvironmentId())
+                    .filter(value -> current.getApplicationId().equals(value.getApplicationId()))
+                    .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Environment not found", 404));
+            String cause = alarms.rollbackCause(environment.getMonitors());
+            if (cause != null) {
+                return restoreConfiguration(copy(current), false, cause);
             }
         }
-        return deployment;
+        return current;
+    }
+
+    private static boolean active(Deployment deployment) {
+        return "DEPLOYING".equals(deployment.getState()) || "BAKING".equals(deployment.getState());
+    }
+
+    void advanceDeployments() {
+        Set<AppConfigStorage.ScopedKey> owners = deploymentStore.scopedKeys(AppConfigService::active);
+        monitorFailures.keySet().retainAll(owners);
+        for (AppConfigStorage.ScopedKey owner : owners) {
+            try {
+                RequestScopes.runAs(owner.accountId(), owner.region(), () -> {
+                    synchronized (this) {
+                        deploymentStore.get(owner.key()).filter(AppConfigService::active)
+                                .ifPresent(deployment -> {
+                                    String key = deployment.getApplicationId() + "::" + deployment.getEnvironmentId()
+                                            + "::" + deployment.getDeploymentNumber();
+                                    if (!owner.key().equals(key)) {
+                                        throw new IllegalStateException("Deployment identity does not match its stored key");
+                                    }
+                                    refreshDeployment(deployment);
+                                });
+                    }
+                });
+                monitorFailures.remove(owner);
+            } catch (Exception failure) {
+                String message = failure.toString();
+                if (!message.equals(monitorFailures.put(owner, message))) {
+                    LOG.warnv("AppConfig deployment {0}/{1}/{2} could not progress: {3}",
+                            owner.accountId(), owner.region(), owner.key(), failure.getMessage());
+                }
+            }
+        }
+    }
+
+    private Deployment refreshTiming(Deployment deployment) {
+        if (!active(deployment) || deployment.getStartedAt() == null
+                || deployment.getFinalBakeTimeInMinutes() == null) {
+            return deployment;
+        }
+        Instant started = Instant.parse(deployment.getStartedAt());
+        int rolloutMinutes = deployment.getDeploymentDurationInMinutes() == null
+                ? 0 : deployment.getDeploymentDurationInMinutes();
+        Instant rolledOut = started.plus(Duration.ofMinutes(rolloutMinutes));
+        Instant completed = rolledOut.plus(Duration.ofMinutes(deployment.getFinalBakeTimeInMinutes()));
+        Instant now = clock.instant();
+        String state;
+        float percentage;
+        if ("DEPLOYING".equals(deployment.getState()) && now.isBefore(rolledOut)) {
+            state = "DEPLOYING";
+            percentage = rolloutPercentage(deployment, Duration.between(started, now).toMillis(),
+                    Duration.ofMinutes(rolloutMinutes).toMillis());
+            if (deployment.getPercentageComplete() != null) {
+                percentage = Math.max(percentage, deployment.getPercentageComplete());
+            }
+        } else {
+            state = now.isBefore(completed) ? "BAKING" : "COMPLETE";
+            percentage = 100.0f;
+        }
+        if (state.equals(deployment.getState()) && Objects.equals(percentage, deployment.getPercentageComplete())) {
+            return deployment;
+        }
+        Deployment refreshed = copy(deployment);
+        refreshed.setState(state);
+        refreshed.setPercentageComplete(percentage);
+        if ("COMPLETE".equals(state)) {
+            refreshed.setCompletedAt(completed.toString());
+        }
+        deploymentStore.put(refreshed.getApplicationId() + "::" + refreshed.getEnvironmentId()
+                + "::" + refreshed.getDeploymentNumber(), refreshed);
+        return refreshed;
+    }
+
+    /** Growth steps are evenly spaced across the rollout; bake begins after its full duration. */
+    private static float rolloutPercentage(Deployment deployment, long elapsedMillis, long durationMillis) {
+        float growth = deployment.getGrowthFactor() == null ? 100.0f : deployment.getGrowthFactor();
+        boolean exponential = "EXPONENTIAL".equals(deployment.getGrowthType());
+        int steps = exponential ? (int) Math.ceil(Math.log(100.0 / growth) / Math.log(2)) + 1
+                : (int) Math.ceil(100.0 / growth);
+        long step = Math.max(0, elapsedMillis) * steps / durationMillis;
+        if (step == 0) {
+            return 0.0f;
+        }
+        return (float) Math.min(100.0, exponential ? growth * Math.pow(2, step - 1) : growth * step);
     }
 
     public synchronized DeploymentPage listDeployments(String applicationIdentifier,
@@ -800,6 +1165,7 @@ public class AppConfigService {
         DeploymentSummary summary = new DeploymentSummary();
         summary.setConfigurationProfileId(deployment.getConfigurationProfileId());
         summary.setConfigurationVersion(deployment.getConfigurationVersion());
+        summary.setVersionLabel(deployment.getVersionLabel());
         summary.setDeploymentNumber(deployment.getDeploymentNumber());
         summary.setState(deployment.getState());
         summary.setConfigurationName(deployment.getConfigurationName());

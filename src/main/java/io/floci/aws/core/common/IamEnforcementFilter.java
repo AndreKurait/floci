@@ -1125,8 +1125,11 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                                              String credentialScope, List<String> resources,
                                              String region, String accountId, String akid) {
         // A create tags the resource it makes, not the parent it makes it in (see RequestResources.created).
+        String createdPartition = "appconfig:CreateApplication".equals(operation)
+                || "appconfig:CreateDeploymentStrategy".equals(operation)
+                ? requestPartition() : AwsRegions.partitionFor(region);
         List<String> created = RequestResources.created(operation, tagging.action(), ctx,
-                AwsRegions.partitionFor(region), region, accountId, IamActionRegistry.pathLabels(credentialScope, ctx));
+                createdPartition, region, accountId, IamActionRegistry.pathLabels(credentialScope, ctx));
         List<String> made = created.isEmpty() ? resources : created;
         for (TagOnCreate.TagSet set : tagging.checked()) {
             Map<String, List<String>> context = TagOnCreate.conditionContext(tagging, set, operation);

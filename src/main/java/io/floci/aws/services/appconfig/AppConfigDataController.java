@@ -3,7 +3,13 @@ package io.floci.aws.services.appconfig;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.services.appconfig.AppConfigDataService.ConfigurationData;
 import jakarta.inject.Inject;
-import jakarta.ws.rs.*;
+import jakarta.ws.rs.Consumes;
+import jakarta.ws.rs.GET;
+import jakarta.ws.rs.HeaderParam;
+import jakarta.ws.rs.POST;
+import jakarta.ws.rs.Path;
+import jakarta.ws.rs.Produces;
+import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
@@ -45,11 +51,13 @@ public class AppConfigDataController {
     public Response getLatestConfiguration(@QueryParam("configuration_token") String token,
                                            @HeaderParam("Accept") String accept) {
         ConfigurationData data = service.getLatestConfiguration(token, accept);
-        return Response.ok(data.content())
+        Response.ResponseBuilder response = Response.ok(data.content())
                 .header("Content-Type", data.contentType())
-                .header("Version-Label", data.configurationVersion())
                 .header("Next-Poll-Configuration-Token", data.nextPollConfigurationToken())
-                .header("Next-Poll-Interval-In-Seconds", data.nextPollIntervalInSeconds())
-                .build();
+                .header("Next-Poll-Interval-In-Seconds", data.nextPollIntervalInSeconds());
+        if (data.versionLabel() != null) {
+            response.header("Version-Label", data.versionLabel());
+        }
+        return response.build();
     }
 }
