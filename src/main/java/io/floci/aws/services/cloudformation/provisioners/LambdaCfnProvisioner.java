@@ -142,6 +142,7 @@ public class LambdaCfnProvisioner implements CfnResourceProvisioner {
 
         applyLambdaReservedConcurrency(region, func, desired);
         applyLambdaCodeSigningConfig(ctx, func, desired);
+        applyLambdaRecursionConfig(ctx, func, desired);
 
         r.setPhysicalId(desired.functionName());
         r.getAttributes().put("Arn", func.getFunctionArn());
@@ -286,6 +287,11 @@ public class LambdaCfnProvisioner implements CfnResourceProvisioner {
         if (codeSigningConfigArn != null) {
             createRequest.put("CodeSigningConfigArn", codeSigningConfigArn);
         }
+        JsonNode recursiveLoopNode = readTyped(types, FUNCTION, props, "RecursiveLoop");
+        String recursiveLoop = recursiveLoopNode == null ? null : recursiveLoopNode.asText();
+        if (recursiveLoop != null) {
+            LambdaService.validateRecursiveLoop(recursiveLoop);
+        }
         Integer reservedConcurrentExecutions = null;
         String reserved = ctx.resolveOptional(props, "ReservedConcurrentExecutions");
         if (reserved != null) {
@@ -300,7 +306,7 @@ public class LambdaCfnProvisioner implements CfnResourceProvisioner {
         types.finish();
         return new LambdaDesiredState(functionName, hasExplicitName, packageType, durableReplacement,
                 createRequest, code, configRequest, tags, props != null && props.has("ReservedConcurrentExecutions"),
-                reservedConcurrentExecutions);
+                reservedConcurrentExecutions, recursiveLoop);
     }
 
     /**
@@ -481,6 +487,20 @@ public class LambdaCfnProvisioner implements CfnResourceProvisioner {
         } else if (!codeSigningConfigArn.equals(fn.getCodeSigningConfigArn())) {
             lambdaService.attachFunctionCodeSigningConfig(ctx.region(), fn.getFunctionName(),
                     codeSigningConfigArn.toString());
+        }
+    }
+
+    /**
+     * Floci reconciles removal of a template-owned setting to the service default. A setting
+     * the template never declared remains under the control of direct Lambda API callers.
+     */
+    private void applyLambdaRecursionConfig(ProvisionContext ctx, LambdaFunction fn, LambdaDesiredState desired) {
+        String recursiveLoop = desired.recursiveLoop();
+        if (recursiveLoop == null && ctx.previouslyDeclared("RecursiveLoop")) {
+            recursiveLoop = "Terminate";
+        }
+        if (recursiveLoop != null && !recursiveLoop.equals(fn.getRecursiveLoop())) {
+            lambdaService.putFunctionRecursionConfig(ctx.region(), fn.getFunctionName(), recursiveLoop);
         }
     }
 
@@ -1034,7 +1054,8 @@ public class LambdaCfnProvisioner implements CfnResourceProvisioner {
                                       Map<String, Object> configRequest,
                                       Map<String, String> tags,
                                       boolean reservedConcurrentExecutionsPresent,
-                                      Integer reservedConcurrentExecutions) {}
+                                      Integer reservedConcurrentExecutions,
+                                      String recursiveLoop) {}
 
     private record LambdaCodeSpec(Map<String, Object> request, String identity) {}
 }

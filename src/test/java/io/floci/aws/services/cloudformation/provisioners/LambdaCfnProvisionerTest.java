@@ -116,6 +116,49 @@ class LambdaCfnProvisionerTest {
     }
 
     @Test
+    void recursionSettingIsAppliedByItsDedicatedApiAndNeverAddedToCreateOrConfiguration() {
+        when(lambda.createFunction(eq(REGION), anyMap())).thenReturn(lambdaFunction("my-fn"));
+        provisioner.provision(function(null), props("my-fn").put("RecursiveLoop", "Allow"), ctx());
+        assertFalse(capturedCreateRequest().containsKey("RecursiveLoop"));
+        verify(lambda).putFunctionRecursionConfig(REGION, "my-fn", "Allow");
+    }
+
+    @Test
+    void malformedRecursionSettingRejectsBeforeCreateReplacementCodeConfigurationOrTags() {
+        LambdaFunction existing = stubInPlaceUpdate("my-fn", Map.of("team", "original"));
+        existing.setRecursiveLoop("Allow");
+        for (JsonNode value : List.of(mapper.getNodeFactory().textNode("allow"),
+                mapper.getNodeFactory().textNode(""), mapper.getNodeFactory().numberNode(1),
+                mapper.getNodeFactory().booleanNode(true), mapper.createObjectNode(), mapper.createArrayNode())) {
+            ObjectNode properties = props("replacement", "team", "changed").put("Description", "changed");
+            properties.putObject("Code").put("ZipFile", "exports.handler = () => 'changed';");
+            properties.set("RecursiveLoop", value);
+            assertThrows(AwsException.class, () -> provisioner.provision(function("my-fn"), properties, updateCtx("my-fn")));
+            assertThrows(AwsException.class, () -> provisioner.provision(function(null), properties, ctx()));
+        }
+        assertEquals("Allow", existing.getRecursiveLoop());
+        verify(lambda, never()).createFunction(anyString(), anyMap());
+        verify(lambda, never()).deleteFunction(anyString(), anyString());
+        verify(lambda, never()).updateFunctionCode(anyString(), anyString(), anyMap());
+        verify(lambda, never()).updateFunctionConfiguration(anyString(), anyString(), anyMap());
+        verify(lambda, never()).tagResource(anyString(), anyMap());
+        verify(lambda, never()).untagResource(anyString(), any());
+        verify(lambda, never()).putFunctionRecursionConfig(anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void removingTemplateOwnedRecursionSettingResetsDefaultButNeverDeclaredSettingSurvives() {
+        stubInPlaceUpdate("my-fn", Map.of()).setRecursiveLoop("Allow");
+        provisioner.provision(function("my-fn"), props("my-fn"), updateCtx("my-fn"));
+        verify(lambda, never()).putFunctionRecursionConfig(anyString(), anyString(), anyString());
+        ProvisionContext current = ctx();
+        ProvisionContext prior = new ProvisionContext(current.engine(), REGION, "000000000000", "my-stack",
+                "my-fn", event -> {}, props("my-fn").put("RecursiveLoop", "Allow"));
+        provisioner.provision(function("my-fn"), props("my-fn"), prior);
+        verify(lambda).putFunctionRecursionConfig(REGION, "my-fn", "Terminate");
+    }
+
+    @Test
     void functionTagsFromTheTemplateReachCreateFunction() {
         when(lambda.createFunction(eq(REGION), anyMap())).thenReturn(lambdaFunction("my-fn"));
         StackResource r = function(null);
