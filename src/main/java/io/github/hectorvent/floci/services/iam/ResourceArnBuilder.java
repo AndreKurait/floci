@@ -12,8 +12,10 @@ import io.github.hectorvent.floci.core.common.ServicePrincipals;
 import io.github.hectorvent.floci.core.common.SigV4CredentialScope;
 import io.github.hectorvent.floci.core.common.StoredResourceArns;
 import io.github.hectorvent.floci.core.common.auth.SigV4Canonicalization;
+import io.github.hectorvent.floci.services.backup.BackupFrameworkResources;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.LogGroupTagTarget;
+import io.github.hectorvent.floci.services.cloudwatch.logs.LogTransformerTarget;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.eks.EksController;
 import io.github.hectorvent.floci.services.eks.EksService;
@@ -21,6 +23,7 @@ import io.github.hectorvent.floci.services.kms.KmsService;
 import io.github.hectorvent.floci.services.lambda.LambdaArnUtils;
 import io.github.hectorvent.floci.services.lambda.durable.DurableTokens;
 import io.github.hectorvent.floci.services.lambdamicrovms.LambdaMicrovmsService;
+import io.github.hectorvent.floci.services.neptune.NeptuneSnapshotResources;
 import io.github.hectorvent.floci.services.s3.S3ControlArnUtils;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
 import io.github.hectorvent.floci.services.sqs.SqsService;
@@ -116,6 +119,7 @@ public class ResourceArnBuilder {
     private final Instance<StoredResourceArns> storedResourceArns;
     private final Instance<StepFunctionsService> stepFunctionsService;
     private final Instance<Ec2Service> ec2Service;
+    private final Instance<NeptuneSnapshotResources> neptuneSnapshotResources;
 
     @Inject
     public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
@@ -125,7 +129,8 @@ public class ResourceArnBuilder {
                               Instance<KmsService> kmsService,
                               Instance<StoredResourceArns> storedResourceArns,
                               Instance<StepFunctionsService> stepFunctionsService,
-                              Instance<Ec2Service> ec2Service) {
+                              Instance<Ec2Service> ec2Service,
+                              Instance<NeptuneSnapshotResources> neptuneSnapshotResources) {
         this.objectMapper = objectMapper;
         this.iamService = iamService;
         this.secretsManagerService = secretsManagerService;
@@ -135,6 +140,17 @@ public class ResourceArnBuilder {
         this.storedResourceArns = storedResourceArns;
         this.stepFunctionsService = stepFunctionsService;
         this.ec2Service = ec2Service;
+        this.neptuneSnapshotResources = neptuneSnapshotResources;
+    }
+
+    public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
+                              Instance<SecretsManagerService> secretsManagerService,
+                              Instance<LambdaMicrovmsService> microvmsService,
+                              Instance<EksService> eksService, Instance<KmsService> kmsService,
+                              Instance<StoredResourceArns> storedResourceArns,
+                              Instance<StepFunctionsService> stepFunctionsService, Instance<Ec2Service> ec2Service) {
+        this(objectMapper, iamService, secretsManagerService, microvmsService, eksService, kmsService,
+                storedResourceArns, stepFunctionsService, ec2Service, null);
     }
 
     public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
@@ -226,6 +242,47 @@ public class ResourceArnBuilder {
                                        String region, String accountId, String partition) {
         if (credentialScope == null) {
             return List.of("*");
+        }
+        if ("iot".equals(credentialScope) && "iot:DeleteJob".equals(operation)) {
+            String jobId = ctx.getUriInfo().getPathParameters().getFirst("jobId");
+            return List.of(jobId == null ? "*"
+                    : AwsArnUtils.Arn.of("iot", region, accountId, "job/" + jobId).toString());
+        }
+        if ("cloudfront".equals(credentialScope) && operation != null && Set.of("cloudfront:GetFieldLevelEncryption",
+                "cloudfront:GetFieldLevelEncryptionConfig", "cloudfront:GetFieldLevelEncryptionProfile",
+                "cloudfront:GetFieldLevelEncryptionProfileConfig").contains(operation)) {
+            String id = ctx.getUriInfo().getPathParameters().getFirst("Id");
+            String type = operation.startsWith("cloudfront:GetFieldLevelEncryptionProfile")
+                    ? "field-level-encryption-profile/" : "field-level-encryption-config/";
+            return id == null ? List.of("*")
+                    : List.of(AwsArnUtils.Arn.global(partition, "cloudfront", accountId, type + id).toString());
+        }
+        if ("cloudfront".equals(credentialScope)
+                && "cloudfront:UpdateOriginAccessControl".equals(operation)) {
+            String id = ctx.getUriInfo().getPathParameters().getFirst("Id");
+            return List.of(id == null || id.isBlank() ? "*"
+                    : AwsArnUtils.Arn.global(partition, "cloudfront", accountId,
+                            "origin-access-control/" + id).toString());
+        }
+        if ("rds".equals(credentialScope) && NeptuneSnapshotResources.supports(operation) && neptuneSnapshotResources != null
+                && !neptuneSnapshotResources.isUnsatisfied()) {
+            Map<String, String> parameters = new LinkedHashMap<>();
+            for (String member : List.of("Engine", "DBClusterIdentifier", "DBClusterSnapshotIdentifier",
+                    "SnapshotIdentifier", "DBClusterParameterGroupName", "DBSubnetGroupName")) {
+                String value = firstFormParam(ctx, member);
+                if (value != null) {
+                    parameters.put(member, value);
+                }
+            }
+            Optional<List<String>> resources = neptuneSnapshotResources.get().resolve(operation,
+                    parameters, partition, region, accountId);
+            if (resources.isPresent()) {
+                return resources.get();
+            }
+        }
+        if ("backup".equals(credentialScope) && BackupFrameworkResources.matches(operation, ctx, readJsonBody(ctx))) {
+            return BackupFrameworkResources.arns(operation, ctx, readJsonBody(ctx), partition, region, accountId,
+                    storedResourceArns("backup"));
         }
         if ("s3tables".equals(credentialScope) && operation != null && S3TABLES_METRICS_ACTIONS.contains(operation)) {
             String bucketArn = ctx.getUriInfo().getPathParameters().getFirst("tableBucketARN");
@@ -349,6 +406,14 @@ public class ResourceArnBuilder {
     /** Uses the serving operation and the same raw names as the handler. */
     public List<String> buildLogResources(String action, ContainerRequestContext ctx,
                                           String region, String accountId, String partition) {
+        if (LogTransformerTarget.supports(action)) {
+            JsonNode body = readJsonBody(ctx);
+            String identifier = body == null ? null : body.path("logGroupIdentifier").asText(null);
+            return List.of(LogTransformerTarget.resolve(identifier, region, accountId, partition).arn());
+        }
+        if ("logs:TestTransformer".equals(action)) {
+            return List.of("*");
+        }
         // Operations the vendored table reads (the vended-log delivery family) take their resources from it.
         if (RequestResources.reads(action)) {
             return namedResources("logs", action, ctx, region, accountId, partition);
@@ -1018,6 +1083,9 @@ public class ResourceArnBuilder {
         if (path.endsWith("/code-signing-config")) {
             return codeSigningFunctionArn(name, region, accountId);
         }
+        if (path.startsWith("/2024-08-31/functions/") && path.endsWith("/recursion-config")) {
+            return recursionFunctionArn(name, region, accountId);
+        }
         boolean qualifiedTarget = path.endsWith("/functions/" + name + "/invocations")
                 || path.endsWith("/functions/" + name + "/response-streaming-invocations")
                 || path.endsWith("/functions/" + name + "/provisioned-concurrency");
@@ -1056,6 +1124,15 @@ public class ResourceArnBuilder {
         }
     }
 
+    private static String recursionFunctionArn(String name, String region, String accountId) {
+        try {
+            LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolveUnqualifiedFunctionName(name);
+            return AwsArnUtils.Arn.of("lambda", region, accountId, "function:" + ref.name()).toString();
+        } catch (AwsException e) {
+            // The handler rejects malformed references before reading or mutating a function.
+            return AwsArnUtils.Arn.of("lambda", region, accountId, "function:" + name).toString();
+        }
+    }
     /**
      * The function {@code CreateFunction} makes, which its body names, in the caller's account and Region, as
      * every route but an invoke acts there: the Service Reference gives it the {@code function} resource, so
