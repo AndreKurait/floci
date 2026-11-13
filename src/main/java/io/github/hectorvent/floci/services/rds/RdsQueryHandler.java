@@ -2830,6 +2830,9 @@ public class RdsQueryHandler {
             for (String row : docDbQueryHandler.clusterSnapshotRowsXml(clusterId, params.getFirst("SnapshotType"))) {
                 xml.start("DBClusterSnapshot").raw(row).end("DBClusterSnapshot");
             }
+            for (String row : neptuneQueryHandler.clusterSnapshotRowsXml(clusterId, params.getFirst("SnapshotType"))) {
+                xml.raw(row);
+            }
         }
         xml.end("DBClusterSnapshots");
         return Response.ok(AwsQueryResponse.envelope("DescribeDBClusterSnapshots", AwsNamespaces.RDS, xml.build())).build();
