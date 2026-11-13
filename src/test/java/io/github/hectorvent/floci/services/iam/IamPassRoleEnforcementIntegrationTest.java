@@ -839,7 +839,19 @@ class IamPassRoleEnforcementIntegrationTest {
     @Test
     void aScalableTargetNeedsPassRoleOnTheRoleItNamesForApplicationAutoScaling() {
         String role = role("scalable-target");
-        String table = "table/passrole-" + suffix();
+        String tableName = "passrole-" + suffix();
+        String table = "table/" + tableName;
+        cleanup.register(() -> given().header("Authorization", auth(ADMIN, "dynamodb"))
+                .header("X-Amz-Target", "DynamoDB_20120810.DeleteTable")
+                .contentType("application/x-amz-json-1.0")
+                .body("{\"TableName\":\"" + tableName + "\"}").post("/"));
+        given().header("Authorization", auth(ADMIN, "dynamodb"))
+                .header("X-Amz-Target", "DynamoDB_20120810.CreateTable")
+                .contentType("application/x-amz-json-1.0").body("""
+                        {"TableName":"%s","KeySchema":[{"AttributeName":"pk","KeyType":"HASH"}],
+                         "AttributeDefinitions":[{"AttributeName":"pk","AttributeType":"S"}],
+                         "ProvisionedThroughput":{"ReadCapacityUnits":3,"WriteCapacityUnits":3}}
+                        """.formatted(tableName)).post("/").then().statusCode(200);
         String target = "AnyScaleFrontendService.RegisterScalableTarget";
         String body = """
                 {"ServiceNamespace":"dynamodb","ResourceId":"%s","ScalableDimension":"dynamodb:table:ReadCapacityUnits",
