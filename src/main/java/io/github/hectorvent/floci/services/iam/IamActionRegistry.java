@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.core.common.RequestResources;
 import io.github.hectorvent.floci.core.common.WireProtocol;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayController;
 import io.github.hectorvent.floci.services.appconfig.AppConfigDataController;
+import io.github.hectorvent.floci.services.cloudfront.CloudFrontController;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbPartiQLParser;
 import io.github.hectorvent.floci.services.eks.EksController;
 import io.github.hectorvent.floci.services.iot.IotController;
@@ -699,6 +700,20 @@ public class IamActionRegistry {
                 && ("getModelTemplate".equals(resourceInfo.getResourceMethod().getName())
                 || "getV2ModelTemplate".equals(resourceInfo.getResourceMethod().getName()))) {
             return "apigateway:GET";
+        }
+        if ("cloudfront".equals(credentialScope) && resourceInfo != null
+                && CloudFrontController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            String action = switch (resourceInfo.getResourceMethod().getName()) {
+                case "getFieldLevelEncryption" -> "cloudfront:GetFieldLevelEncryption";
+                case "getFieldLevelEncryptionConfig" -> "cloudfront:GetFieldLevelEncryptionConfig";
+                case "getFieldLevelEncryptionProfile" -> "cloudfront:GetFieldLevelEncryptionProfile";
+                case "getFieldLevelEncryptionProfileConfig" -> "cloudfront:GetFieldLevelEncryptionProfileConfig";
+                default -> null;
+            };
+            if (action != null) {
+                return action;
+            }
         }
         if ("appconfig".equals(credentialScope) && resourceInfo != null
                 && AppConfigDataController.class.equals(resourceInfo.getResourceClass())
