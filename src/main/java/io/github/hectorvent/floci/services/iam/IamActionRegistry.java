@@ -686,6 +686,12 @@ public class IamActionRegistry {
                 && "deleteJob".equals(resourceInfo.getResourceMethod().getName())) {
             return "iot:DeleteJob";
         }
+        if ("eks".equals(credentialScope) && resourceInfo != null
+                && EksController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && "listAccessPolicies".equals(resourceInfo.getResourceMethod().getName())) {
+            return "eks:ListAccessPolicies";
+        }
         if ("appconfig".equals(credentialScope) && resourceInfo != null
                 && AppConfigDataController.class.equals(resourceInfo.getResourceClass())
                 && resourceInfo.getResourceMethod() != null) {
