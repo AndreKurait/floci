@@ -106,6 +106,57 @@ class AcmPcaServiceTest {
     }
 
     @Test
+    void absoluteValidityReplayRetainsCertificateUntilTokenExpires() {
+        AdjustableClock clock = new AdjustableClock();
+        InMemoryStorage<String, CertificateAuthority> store = new InMemoryStorage<>();
+        AcmPcaService service = service(store, clock);
+        String ca = create(service, null);
+        ObjectNode request = issueRequest(ca, store.get(ca).orElseThrow().csrPem(), true);
+        request.putObject("Validity").put("Type", "ABSOLUTE").put("Value", clock.instant().getEpochSecond() + 60);
+        String issued = service.issue(request, REGION).path("CertificateArn").asText();
+        CertificateAuthority before = store.get(ca).orElseThrow();
+        clock.advance(61);
+        assertEquals(issued, service.issue(request, REGION).path("CertificateArn").asText());
+        assertEquals(before, store.get(ca).orElseThrow());
+        error("InvalidArgsException", () -> service.issue(request.deepCopy().put("IdempotencyToken", "new-token"), REGION));
+        clock.advance(239);
+        error("InvalidArgsException", () -> service.issue(request, REGION));
+        assertEquals(before, store.get(ca).orElseThrow());
+    }
+
+    @Test
+    void unknownRegionRetainsDeploymentPartitionAcrossAuthorityLifecycle() {
+        AdjustableClock clock = new AdjustableClock();
+        InMemoryStorage<String, CertificateAuthority> store = new InMemoryStorage<>();
+        AcmPcaService service = new AcmPcaService(store, new RegionResolver("cn-north-1", ACCOUNT), MAPPER, clock);
+        String region = "future-1";
+        String ca = service.create(createRequest(null), region).path("CertificateAuthorityArn").asText();
+        assertTrue(ca.startsWith("arn:aws-cn:acm-pca:future-1:"));
+        assertEquals(ca, service.describe(arn(ca), region).path("CertificateAuthority").path("Arn").asText());
+        ObjectNode request = issueRequest(ca, store.get(ca).orElseThrow().csrPem(), true)
+                .put("TemplateArn", "arn:aws-cn:acm-pca:::template/RootCACertificate/V1");
+        String certificate = service.issue(request, region).path("CertificateArn").asText();
+        assertTrue(certificate.startsWith(ca + "/certificate/"));
+        assertFalse(service.certificate(arn(ca).put("CertificateArn", certificate), region)
+                .path("Certificate").asText().isEmpty());
+        service.create(createRequest(null), region);
+        AcmPcaService foreignPartition = new AcmPcaService(store, new RegionResolver(REGION, ACCOUNT), MAPPER, clock);
+        String foreign = foreignPartition.create(createRequest(null), region).path("CertificateAuthorityArn").asText();
+        assertEquals(1, foreignPartition.list(MAPPER.createObjectNode(), region).path("CertificateAuthorities").size());
+        assertEquals(foreign, foreignPartition.describe(arn(foreign), region)
+                .path("CertificateAuthority").path("Arn").asText());
+        assertEquals(2, service.list(MAPPER.createObjectNode(), region).path("CertificateAuthorities").size());
+        String token = service.list(MAPPER.createObjectNode().put("MaxResults", 1), region).path("NextToken").asText();
+        assertFalse(token.isEmpty());
+        assertEquals(1, service.list(MAPPER.createObjectNode().put("NextToken", token), region)
+                .path("CertificateAuthorities").size());
+        error("InvalidArnException", () -> service.describe(arn(ca.replace("arn:aws-cn:", "arn:aws:")), region));
+        error("ResourceNotFoundException", () -> service.describe(arn(ca), "future-2"));
+        service.delete(arn(ca).put("PermanentDeletionTimeInDays", 7), region);
+        assertEquals("DELETED", service.describe(arn(ca), region).path("CertificateAuthority").path("Status").asText());
+    }
+
+    @Test
     void deletionExpiresOnlyAtItsDeadlineAndTokensExpireAfterFiveMinutes() {
         AdjustableClock clock = new AdjustableClock();
         InMemoryStorage<String, CertificateAuthority> store = new InMemoryStorage<>();
