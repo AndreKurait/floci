@@ -11,6 +11,7 @@ import jakarta.ws.rs.core.UriInfo;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * The shared machinery behind floci's REST tag paths: resolve the owning service from the
@@ -82,8 +83,14 @@ public class TagDispatcher {
         String region = regionResolver.resolveRegion(headers);
         String effectiveBody = (body == null || body.isBlank()) ? "{}" : body;
         try {
-            JsonNode node = objectMapper.readTree(effectiveBody);
-            Map<String, String> tags = parseTags(handler, node);
+            Optional<Map<String, String>> parsed = handler.parseTagResourceBody(arn, body);
+            Map<String, String> tags;
+            if (parsed.isPresent()) {
+                tags = parsed.get();
+            } else {
+                JsonNode node = objectMapper.readTree(effectiveBody);
+                tags = parseTags(handler, node);
+            }
             handler.tagResource(region, arn, tags);
             return successResponse;
         } catch (AwsException e) {

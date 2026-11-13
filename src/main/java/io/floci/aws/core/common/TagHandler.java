@@ -2,6 +2,7 @@ package io.floci.aws.core.common;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * Per-service handler for the REST tag endpoints that share the {@code /tags/{resourceArn}}
@@ -137,6 +138,16 @@ public interface TagHandler {
     /** HTTP status for successful path-based UntagResource requests. */
     default int untagResourceSuccessStatus() {
         return 204;
+    }
+
+    /**
+     * Optionally parses the original TagResource body for this exact ARN before the shared
+     * parser changes its shape. Empty selects the existing parser; a present empty map is an
+     * accepted empty payload. Implementations must be read-only and throw AwsException for
+     * their own validation failures. Other resource kinds must return Optional.empty().
+     */
+    default Optional<Map<String, String>> parseTagResourceBody(String arn, String body) {
+        return Optional.empty();
     }
 
     Map<String, String> listTags(String region, String arn);

@@ -3,6 +3,8 @@ package io.floci.aws.core.common;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.services.batch.BatchSchedulingPolicyService;
+import io.floci.aws.services.batch.BatchSchedulingPolicyTarget;
 import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsCrossAccountService;
 import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
 import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsService;
@@ -109,12 +111,40 @@ public class IamConditionContextResolver {
     private final CurrentVertxRequest currentVertxRequest;
     private final Clock clock;
     private final ResolvedServiceCatalog serviceCatalog;
+    private final Instance<BatchSchedulingPolicyService> batchSchedulingPolicies;
 
     /**
      * The system clock, not the CDI one: Object Lock's remaining retention days has to count from the
      * same now as S3Service, which checks retention against {@code Instant.now()}.
      */
     @Inject
+    public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                       Instance<Ec2Service> ec2Service,
+                                       Instance<S3Service> s3Service,
+                                       Instance<CloudWatchLogsService> logsService,
+                                       Instance<CloudWatchLogsCrossAccountService> crossAccountService,
+                                       Instance<IamService> iamService,
+                                       Instance<LambdaWebService> lambdaWebService,
+                                       RequestContext requestContext,
+                                       EmulatorConfig config,
+                                       CurrentVertxRequest currentVertxRequest,
+                                       ResolvedServiceCatalog serviceCatalog,
+                                       Instance<BatchSchedulingPolicyService> batchSchedulingPolicies) {
+        this.dynamoDbFacade = dynamoDbFacade;
+        this.ec2Service = ec2Service;
+        this.s3Service = s3Service;
+        this.logsService = logsService;
+        this.crossAccountService = crossAccountService;
+        this.iamService = iamService;
+        this.lambdaWebService = lambdaWebService;
+        this.requestContext = requestContext;
+        this.config = config;
+        this.currentVertxRequest = currentVertxRequest;
+        this.clock = Clock.systemUTC();
+        this.serviceCatalog = serviceCatalog;
+        this.batchSchedulingPolicies = batchSchedulingPolicies;
+    }
+
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
                                        Instance<Ec2Service> ec2Service,
                                        Instance<S3Service> s3Service,
@@ -154,11 +184,13 @@ public class IamConditionContextResolver {
         this.currentVertxRequest = currentVertxRequest;
         this.clock = clock;
         this.serviceCatalog = serviceCatalog;
+        this.batchSchedulingPolicies = null;
     }
 
     public Map<String, List<String>> resolve(String credentialScope, String action,
                                              ContainerRequestContext ctx) {
         return switch (credentialScope) {
+            case "batch" -> batchSchedulingPolicyConditions(action, ctx);
             case "s3" -> s3ConditionContext(action, ctx);
             case "ec2" -> ec2ConditionContext(action, ctx);
             case "dynamodb" -> dynamoDbConditionContext(action, ctx);
@@ -169,6 +201,51 @@ public class IamConditionContextResolver {
                     : requestConditions(action, formParameters(ctx)::get);
             default -> null;
         };
+    }
+
+    private Map<String, List<String>> batchSchedulingPolicyConditions(String action, ContainerRequestContext ctx) {
+        boolean create = "batch:CreateSchedulingPolicy".equals(action);
+        boolean selected = "batch:UpdateSchedulingPolicy".equals(action) || "batch:DeleteSchedulingPolicy".equals(action);
+        boolean tag = "batch:TagResource".equals(action);
+        boolean untag = "batch:UntagResource".equals(action);
+        boolean listTags = "batch:ListTagsForResource".equals(action);
+        String arn = BatchSchedulingPolicyTarget.taggedArn(ctx);
+        if (!create && !selected && (!(tag || untag || listTags) || !BatchSchedulingPolicyTarget.isPolicySelector(arn))) {
+            return null;
+        }
+        JsonNode body = create || selected || tag ? PassedRoles.jsonBody(ctx) : null;
+        if (selected) {
+            arn = body != null && body.path("arn").isTextual() ? body.path("arn").textValue() : null;
+        }
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        if ((create || tag) && body != null && body.path("tags").isObject()) {
+            List<String> keys = new ArrayList<>();
+            body.path("tags").properties().forEach(entry -> {
+                if (entry.getValue().isTextual()) {
+                    keys.add(entry.getKey());
+                    conditions.put(REQUEST_TAG_PREFIX + entry.getKey(), List.of(entry.getValue().textValue()));
+                }
+            });
+            if (!keys.isEmpty()) {
+                conditions.put("aws:TagKeys", keys);
+            }
+        }
+        if (untag) {
+            List<String> keys = ctx.getUriInfo().getQueryParameters().get("tagKeys");
+            if (keys != null && !keys.isEmpty()) {
+                conditions.put("aws:TagKeys", List.copyOf(keys));
+            }
+        }
+        if (!create && batchSchedulingPolicies != null && batchSchedulingPolicies.isResolvable()) {
+            String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+            String account = requestContext.getAccountId() == null ? config.defaultAccountId() : requestContext.getAccountId();
+            String partition = requestContext.getPartition() == null
+                    ? RegionResolver.effectivePartition(config.defaultRegion(), config.partitions().id())
+                    : requestContext.getPartition();
+            batchSchedulingPolicies.get().iamTags(arn, partition, region, account).forEach((key, value) ->
+                    conditions.put(RESOURCE_TAG_PREFIX + key, List.of(value)));
+        }
+        return conditions.isEmpty() ? null : conditions;
     }
 
     /** Logs tag operations and group mutations use the handler's resource and request scope. */

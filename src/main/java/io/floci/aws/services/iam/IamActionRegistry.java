@@ -8,7 +8,10 @@ import io.floci.aws.core.common.ProtocolClaim;
 import io.floci.aws.core.common.RequestResources;
 import io.floci.aws.core.common.ResteasyRequests;
 import io.floci.aws.core.common.SignedServiceRoute;
+import io.floci.aws.core.common.V1TagsController;
 import io.floci.aws.core.common.WireProtocol;
+import io.floci.aws.services.batch.BatchController;
+import io.floci.aws.services.batch.BatchSchedulingPolicyTarget;
 import io.floci.aws.services.dynamodb.DynamoDbPartiQLParser;
 import io.floci.aws.services.eks.EksController;
 import io.floci.aws.services.s3.S3BucketSubresources;
@@ -42,6 +45,13 @@ import java.util.regex.Pattern;
  */
 @ApplicationScoped
 public class IamActionRegistry {
+
+    private static final Map<String, String> BATCH_POLICY_ACTIONS = Map.of(
+            "createSchedulingPolicy", "batch:CreateSchedulingPolicy",
+            "deleteSchedulingPolicy", "batch:DeleteSchedulingPolicy",
+            "describeSchedulingPolicies", "batch:DescribeSchedulingPolicies",
+            "listSchedulingPolicies", "batch:ListSchedulingPolicies",
+            "updateSchedulingPolicy", "batch:UpdateSchedulingPolicy");
 
     private static final Logger LOG = Logger.getLogger(IamActionRegistry.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -91,6 +101,11 @@ public class IamActionRegistry {
      * type, so IAM checks them against the wildcard rather than a bucket.
      */
     private static final List<ActionRule> RULES = List.of(
+        rule("batch", "POST", "^/v1/createschedulingpolicy$", "batch:CreateSchedulingPolicy"),
+        rule("batch", "POST", "^/v1/deleteschedulingpolicy$", "batch:DeleteSchedulingPolicy"),
+        rule("batch", "POST", "^/v1/describeschedulingpolicies$", "batch:DescribeSchedulingPolicies"),
+        rule("batch", "POST", "^/v1/listschedulingpolicies$", "batch:ListSchedulingPolicies"),
+        rule("batch", "POST", "^/v1/updateschedulingpolicy$", "batch:UpdateSchedulingPolicy"),
         // ── S3 Control ───────────────────────────────────────────────────────────
         s3ControlRule("GET",    "^/v20180820/tags/.+",        "s3:ListTagsForResource"),
         s3ControlRule("POST",   "^/v20180820/tags/.+",        "s3:TagResource"),
@@ -648,6 +663,27 @@ public class IamActionRegistry {
     }
 
     /** The serving method identifies these actions even when path encoding or matrix parameters vary. */
+    public String resolveMatchedRoute(String credentialScope, ResourceInfo resourceInfo,
+                                       ContainerRequestContext request) {
+        if ("batch".equals(credentialScope) && resourceInfo != null
+                && resourceInfo.getResourceClass() != null && resourceInfo.getResourceMethod() != null) {
+            if (BatchController.class.isAssignableFrom(resourceInfo.getResourceClass())) {
+                return BATCH_POLICY_ACTIONS.get(resourceInfo.getResourceMethod().getName());
+            }
+            if (V1TagsController.class.isAssignableFrom(resourceInfo.getResourceClass())
+                    && BatchSchedulingPolicyTarget.isPolicySelector(BatchSchedulingPolicyTarget.taggedArn(request))) {
+                return switch (resourceInfo.getResourceMethod().getName()) {
+                    case "listTags" -> "batch:ListTagsForResource";
+                    case "tagResourcePost" -> "batch:TagResource";
+                    case "untagResource" -> "batch:UntagResource";
+                    default -> null;
+                };
+            }
+        }
+        return resolveMatchedRoute(credentialScope, resourceInfo);
+    }
+
+    /** Compatibility entry for callers that do not have a routed request context. */
     public String resolveMatchedRoute(String credentialScope, ResourceInfo resourceInfo) {
         if (resourceInfo == null || resourceInfo.getResourceClass() == null) {
             return null;

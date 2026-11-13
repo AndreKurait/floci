@@ -2,6 +2,7 @@ package io.floci.aws.core.common;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.services.batch.BatchSchedulingPolicyTarget;
 import io.floci.aws.services.cloudtrail.CloudTrailService;
 import io.floci.aws.services.cloudwatch.metrics.OtlpMetricsController;
 import io.floci.aws.services.iam.AccessDeniedMessages;
@@ -997,7 +998,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
     }
 
     private String routeAction(String scope, ContainerRequestContext ctx) {
-        String matched = actionRegistry.resolveMatchedRoute(scope, resourceInfo);
+        String matched = actionRegistry.resolveMatchedRoute(scope, resourceInfo, ctx);
         return matched != null ? matched : actionRegistry.resolveRoute(scope, ctx);
     }
 
@@ -1804,7 +1805,9 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 || "apigateway".equals(credentialScope)) {
             return arnBuilder.buildResources(credentialScope, ctx, region, accountId, requestPartition());
         }
-        String partition = "route53".equals(credentialScope) ? requestPartition() : AwsRegions.partitionFor(region);
+        String partition = "route53".equals(credentialScope)
+                || "batch".equals(credentialScope) && BatchSchedulingPolicyTarget.operation(operation)
+                ? requestPartition() : AwsRegions.partitionFor(region);
         return arnBuilder.buildResources(credentialScope, operation, ctx, region, accountId, partition);
     }
 
