@@ -1,0 +1,501 @@
+package io.github.hectorvent.floci.services.codedeploy;
+
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.EpochSeconds;
+import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.services.autoscaling.AutoScalingService;
+import io.github.hectorvent.floci.services.autoscaling.model.AutoScalingGroup;
+import io.github.hectorvent.floci.services.codedeploy.model.Deployment;
+import io.github.hectorvent.floci.services.codedeploy.model.DeploymentGroup;
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.model.Instance;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import org.jboss.logging.Logger;
+
+import java.time.Clock;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
+
+/** Coordinates real host-agent commands; the agent owns bundle download, AppSpec and script execution. */
+@ApplicationScoped
+public class CodeDeployAgentDeployment {
+
+    private static final Logger LOG = Logger.getLogger(CodeDeployAgentDeployment.class);
+    private static final List<String> PHASES = List.of("ApplicationStop", "DownloadBundle", "BeforeInstall",
+            "Install", "AfterInstall", "ApplicationStart", "ValidateService");
+    private static final List<String> LAUNCH_PHASES = List.of("ApplicationStop", "DownloadBundle", "BeforeInstall",
+            "Install", "AfterInstall", "ApplicationStart", "ValidateService",
+            "BeforeAllowTraffic", "AllowTraffic", "AfterAllowTraffic");
+    private static final List<String> TRAFFIC_PHASES = List.of("BeforeBlockTraffic", "BlockTraffic", "AfterBlockTraffic",
+            "ApplicationStop", "DownloadBundle", "BeforeInstall", "Install", "AfterInstall",
+            "ApplicationStart", "ValidateService", "BeforeAllowTraffic", "AllowTraffic", "AfterAllowTraffic");
+    private static final String ONE_AT_A_TIME = "CodeDeployDefault.OneAtATime";
+    private static final String HALF_AT_A_TIME = "CodeDeployDefault.HalfAtATime";
+    private static final String ALL_AT_ONCE = "CodeDeployDefault.AllAtOnce";
+    private static final List<String> DIAGNOSTIC_CODES = List.of("Success", "ScriptMissing",
+            "ScriptNotExecutable", "ScriptTimedOut", "ScriptFailed", "UnknownError");
+
+    private final CodeDeployAgentCommands commands;
+    private final AutoScalingService autoScaling;
+    private final Ec2Service ec2;
+    private final RegionResolver regionResolver;
+    private final ObjectMapper mapper;
+    private final CodeDeployClassicTraffic traffic;
+    private final Duration startTimeout;
+    private final Duration phaseTimeout;
+    private final CodeDeployTimer timer;
+    private final Clock clock;
+
+    @Inject
+    public CodeDeployAgentDeployment(CodeDeployAgentCommands commands, AutoScalingService autoScaling,
+                                     Ec2Service ec2, RegionResolver regionResolver, ObjectMapper mapper,
+                                     CodeDeployClassicTraffic traffic) {
+        this(commands, autoScaling, ec2, regionResolver, mapper, traffic,
+                Duration.ofMinutes(5), Duration.ofHours(1));
+    }
+
+    CodeDeployAgentDeployment(CodeDeployAgentCommands commands, AutoScalingService autoScaling,
+                              Ec2Service ec2, RegionResolver regionResolver, ObjectMapper mapper,
+                               CodeDeployClassicTraffic traffic, Duration startTimeout, Duration phaseTimeout) {
+        this(commands, autoScaling, ec2, regionResolver, mapper, traffic, startTimeout, phaseTimeout,
+                CodeDeployTimer.SYSTEM);
+    }
+
+    CodeDeployAgentDeployment(CodeDeployAgentCommands commands, AutoScalingService autoScaling,
+                              Ec2Service ec2, RegionResolver regionResolver, ObjectMapper mapper,
+                              CodeDeployClassicTraffic traffic, Duration startTimeout, Duration phaseTimeout,
+                              CodeDeployTimer timer) {
+        this(commands, autoScaling, ec2, regionResolver, mapper, traffic, startTimeout, phaseTimeout, timer,
+                Clock.systemUTC());
+    }
+
+    /** With the clock every start, lifecycle event and completion time is read from. */
+    CodeDeployAgentDeployment(CodeDeployAgentCommands commands, AutoScalingService autoScaling,
+                              Ec2Service ec2, RegionResolver regionResolver, ObjectMapper mapper,
+                              CodeDeployClassicTraffic traffic, Duration startTimeout, Duration phaseTimeout,
+                              CodeDeployTimer timer, Clock clock) {
+        this.commands = commands;
+        this.autoScaling = autoScaling;
+        this.ec2 = ec2;
+        this.regionResolver = regionResolver;
+        this.mapper = mapper;
+        this.traffic = traffic;
+        this.startTimeout = startTimeout;
+        this.phaseTimeout = phaseTimeout;
+        this.timer = timer;
+        this.clock = clock;
+    }
+
+    /** Resolve account-scoped resources on the request thread before starting any worker. */
+    public Prepared prepare(String region, DeploymentGroup group, String config, Map<String, Object> revision) {
+        return prepare(region, group, config, revision, "DISALLOW");
+    }
+
+    public Prepared prepare(String region, DeploymentGroup group, String config, Map<String, Object> revision,
+                            String fileExistsBehavior) {
+        return prepare(region, group, config, revision, fileExistsBehavior, null);
+    }
+
+    Prepared prepareAutomatic(String region, DeploymentGroup group, String config, Map<String, Object> revision,
+                              String fileExistsBehavior, String instanceId) {
+        List<Instance> selected = ec2.describeInstances(region, List.of(instanceId), null).stream()
+                .flatMap(reservation -> reservation.getInstances().stream()).toList();
+        if (selected.size() != 1 || selected.getFirst().getState() == null
+                || !"running".equals(selected.getFirst().getState().getName())) {
+            throw new AwsException("InvalidInstanceStatusException", "The automatic deployment host is not running", 400);
+        }
+        return prepare(region, group, config, revision, fileExistsBehavior, instanceId);
+    }
+
+    private Prepared prepare(String region, DeploymentGroup group, String config, Map<String, Object> revision,
+                             String fileExistsBehavior, String automaticInstance) {
+        if (fileExistsBehavior == null || !Set.of("DISALLOW", "OVERWRITE", "RETAIN").contains(fileExistsBehavior)) {
+            throw new AwsException("InvalidFileExistsBehaviorException",
+                    "fileExistsBehavior must be DISALLOW, OVERWRITE or RETAIN", 400);
+        }
+        String effectiveConfig = config == null ? ONE_AT_A_TIME : config;
+        if (!Set.of(ONE_AT_A_TIME, HALF_AT_A_TIME, ALL_AT_ONCE).contains(effectiveConfig)) {
+            throw unsupported("S3 agent deployments require a predefined Server deployment configuration");
+        }
+        Map<String, Object> style = group.getDeploymentStyle();
+        Object option = style == null ? "WITHOUT_TRAFFIC_CONTROL"
+                : style.getOrDefault("deploymentOption", "WITHOUT_TRAFFIC_CONTROL");
+        if (style != null && (!"IN_PLACE".equals(style.getOrDefault("deploymentType", "IN_PLACE"))
+                || (!"WITHOUT_TRAFFIC_CONTROL".equals(option) && !"WITH_TRAFFIC_CONTROL".equals(option)))) {
+            throw unsupported("S3 agent deployments require IN_PLACE deployment");
+        }
+        if (group.getAlarmConfiguration() != null
+                && Boolean.TRUE.equals(group.getAlarmConfiguration().get("enabled"))) {
+            throw unsupported("Deployment alarm monitoring is not yet supported for S3 agent deployments");
+        }
+        if ((group.getOnPremisesInstanceTagFilters() != null && !group.getOnPremisesInstanceTagFilters().isEmpty())
+                || group.getOnPremisesTagSet() != null) {
+            throw unsupported("S3 agent deployments currently select EC2 instances");
+        }
+        JsonNode s3 = mapper.valueToTree(revision).path("s3Location");
+        if (!s3.isObject() || !s3.path("bucket").isTextual() || s3.path("bucket").asText().isBlank()
+                || !s3.path("key").isTextual() || s3.path("key").asText().isBlank()
+                || !Set.of("zip", "tar", "tgz").contains(s3.path("bundleType").asText(""))) {
+            throw new AwsException("InvalidRevisionException",
+                    "An S3 bucket, key and zip, tar or tgz bundle type are required", 400);
+        }
+        Map<String, Object> source = new LinkedHashMap<>();
+        source.put("Bucket", s3.path("bucket").asText());
+        source.put("Key", s3.path("key").asText());
+        source.put("BundleType", s3.path("bundleType").asText());
+        for (String optional : List.of("version", "eTag")) {
+            if (s3.hasNonNull(optional)
+                    && (!s3.path(optional).isTextual() || s3.path(optional).asText().isBlank())) {
+                throw new AwsException("InvalidRevisionException", optional + " must be nonempty text", 400);
+            }
+        }
+        if (s3.hasNonNull("version")) {
+            source.put("Version", s3.path("version").asText());
+        }
+        if (s3.hasNonNull("eTag")) {
+            source.put("ETag", s3.path("eTag").asText());
+        }
+
+        String account = regionResolver.getAccountId();
+        CodeDeployClassicTraffic.Plan trafficPlan = style != null
+                && "WITH_TRAFFIC_CONTROL".equals(style.get("deploymentOption"))
+                ? traffic.prepare(account, region, group) : null;
+        List<String> ids = automaticInstance == null ? selectInstances(region, group) : List.of(automaticInstance);
+        Map<String, String> hosts = new LinkedHashMap<>();
+        ids.forEach(id -> hosts.put(id, AwsArnUtils.Arn.of("ec2", region, account, "instance/" + id).toString()));
+        return new Prepared(account, region, group.getDeploymentGroupId(), effectiveConfig,
+                Map.copyOf(source), Map.copyOf(hosts), List.copyOf(ids), fileExistsBehavior, trafficPlan);
+    }
+
+    private List<String> selectInstances(String region, DeploymentGroup group) {
+        Set<String> ids = new LinkedHashSet<>();
+        if (group.getAutoScalingGroups() != null && !group.getAutoScalingGroups().isEmpty()) {
+            List<String> names = group.getAutoScalingGroups().stream()
+                    .map(value -> (String) value.get("name")).toList();
+            List<AutoScalingGroup> groups = autoScaling.describeAutoScalingGroups(region, names);
+            for (AutoScalingGroup selected : groups) {
+                selected.getInstances().stream().filter(instance -> "InService".equals(instance.getLifecycleState()))
+                        .forEach(instance -> ids.add(instance.getInstanceId()));
+            }
+        }
+        JsonNode filters = mapper.valueToTree(group.getEc2TagFilters());
+        JsonNode tagSet = mapper.valueToTree(group.getEc2TagSet());
+        if ((filters.isArray() && !filters.isEmpty()) || tagSet.isObject()) {
+            ec2.describeInstances(region, List.of(), Map.of()).stream()
+                    .flatMap(reservation -> reservation.getInstances().stream())
+                    .filter(instance -> instance.getState() == null
+                            || !Set.of("terminated", "shutting-down").contains(instance.getState().getName()))
+                    .filter(instance -> matches(instance, filters, tagSet))
+                    .forEach(instance -> ids.add(instance.getInstanceId()));
+        }
+        return List.copyOf(ids);
+    }
+
+    private static boolean matches(Instance instance, JsonNode filters, JsonNode tagSet) {
+        if (filters.isArray() && !filters.isEmpty() && !matchesAny(instance, filters)) {
+            return false;
+        }
+        if (tagSet.isObject()) {
+            JsonNode groups = tagSet.path("ec2TagSetList");
+            if (!groups.isArray() || groups.isEmpty()) {
+                return false;
+            }
+            for (JsonNode group : groups) {
+                if (!matchesAny(instance, group)) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    private static boolean matchesAny(Instance instance, JsonNode filters) {
+        for (JsonNode filter : filters) {
+            String type = filter.path("Type").asText("KEY_AND_VALUE");
+            boolean matched = instance.getTags().stream().anyMatch(tag -> switch (type) {
+                case "KEY_ONLY" -> tag.getKey().equals(filter.path("Key").asText());
+                case "VALUE_ONLY" -> tag.getValue().equals(filter.path("Value").asText());
+                case "KEY_AND_VALUE" -> tag.getKey().equals(filter.path("Key").asText())
+                        && tag.getValue().equals(filter.path("Value").asText());
+                default -> false;
+            });
+            if (matched) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    public CodeDeployAgentCommands.Session open(Prepared prepared, Deployment deployment) {
+        Map<String, Object> specification = Map.of(
+                "DeploymentId", deployment.getDeploymentId(),
+                "DeploymentGroupId", prepared.groupId(),
+                "DeploymentGroupName", deployment.getDeploymentGroupName(),
+                "ApplicationName", deployment.getApplicationName(),
+                "DeploymentCreator", deployment.getCreator() == null ? "user" : deployment.getCreator(),
+                "DeploymentType", "IN_PLACE",
+                "AgentActionOverrides", Map.of("AgentOverrides",
+                        Map.of("FileExistsBehavior", prepared.fileExistsBehavior())),
+                "Revision", Map.of("RevisionType", "S3", "S3Revision", prepared.source()));
+        return commands.open(prepared.account(), prepared.region(), deployment.getDeploymentId(), prepared.groupId(),
+                prepared.hosts().values(), specification, !"autoScaling".equals(deployment.getCreator()));
+    }
+
+    public void run(Prepared prepared, CodeDeployAgentCommands.Session session, Deployment deployment,
+                    List<Map<String, Object>> targets, AtomicBoolean stop) {
+        run(prepared, session, deployment, targets, stop, outcome -> outcome.publish(deployment, clock));
+    }
+
+    public void run(Prepared prepared, CodeDeployAgentCommands.Session session, Deployment deployment,
+                    List<Map<String, Object>> targets, AtomicBoolean stop, Consumer<Outcome> completion) {
+        List<CompletableFuture<Boolean>> workers = new ArrayList<>();
+        AtomicBoolean terminating = new AtomicBoolean();
+        BooleanSupplier cancelled = () -> stop.get() || terminating.get();
+        boolean launch = "autoScaling".equals(deployment.getCreator());
+        List<String> phases = launch ? LAUNCH_PHASES
+                : prepared.traffic() == null ? PHASES : TRAFFIC_PHASES;
+        Outcome outcome;
+        try {
+            deployment.setStartTime(now());
+            deployment.setStatus("InProgress");
+            int succeeded = 0;
+            if (!launch && !ONE_AT_A_TIME.equals(prepared.config())) {
+                int unavailableLimit = HALF_AT_A_TIME.equals(prepared.config()) ? targets.size() / 2 : targets.size();
+                int next = 0;
+                int failed = 0;
+                List<CompletableFuture<Boolean>> pending = new ArrayList<>();
+                while (next < targets.size() || !pending.isEmpty()) {
+                    while (next < targets.size() && pending.size() < unavailableLimit - failed
+                            && !cancelled.getAsBoolean()) {
+                        Map<String, Object> target = targets.get(next++);
+                        CompletableFuture<Boolean> result = new CompletableFuture<>();
+                        workers.add(result);
+                        pending.add(result);
+                        Thread.ofVirtual().name("codedeploy-agent-" + target.get("targetId")).start(() -> {
+                            try {
+                                result.complete(runHost(prepared, session, target, cancelled, phases));
+                            } catch (Throwable failure) {
+                                result.completeExceptionally(failure);
+                            }
+                        });
+                    }
+                    if (pending.isEmpty()) {
+                        break;
+                    }
+                    CompletableFuture.anyOf(pending.toArray(CompletableFuture[]::new)).get();
+                    for (CompletableFuture<Boolean> worker : List.copyOf(pending)) {
+                        if (worker.isDone()) {
+                            if (worker.get()) {
+                                succeeded++;
+                            } else {
+                                failed++;
+                            }
+                            pending.remove(worker);
+                        }
+                    }
+                }
+            } else {
+                for (Map<String, Object> target : targets) {
+                    if (!runHost(prepared, session, target, cancelled, phases)) {
+                        break;
+                    }
+                    succeeded++;
+                }
+            }
+            if (stop.get()) {
+                outcome = new Outcome("Stopped", null, null);
+            } else {
+                int required = switch (prepared.config()) {
+                    case ALL_AT_ONCE -> 1;
+                    case HALF_AT_A_TIME -> Math.max(1, targets.size() - targets.size() / 2);
+                    default -> Math.max(1, targets.size() - 1);
+                };
+                boolean complete = succeeded >= required
+                        && targets.stream().noneMatch(target -> "Pending".equals(target.get("status")));
+                outcome = new Outcome(complete ? "Succeeded" : "Failed",
+                        complete ? null : "HEALTH_CONSTRAINTS", null);
+            }
+        } catch (InterruptedException failure) {
+            Thread.currentThread().interrupt();
+            outcome = new Outcome("Stopped", null, null);
+        } catch (CancellationException failure) {
+            outcome = new Outcome("Stopped", null, null);
+        } catch (Exception failure) {
+            LOG.warnv("Agent deployment {0} failed: {1}", deployment.getDeploymentId(), failure.getMessage());
+            Throwable cause = failure instanceof ExecutionException ? failure.getCause() : failure;
+            String code = cause instanceof AwsException aws && "IAM_ROLE_PERMISSIONS".equals(aws.getErrorCode())
+                    ? aws.getErrorCode() : "DeploymentFailed";
+            outcome = new Outcome(stop.get() ? "Stopped" : "Failed", stop.get() ? null : code,
+                    "IAM_ROLE_PERMISSIONS".equals(code) ? cause.getMessage() : null);
+        } finally {
+            terminating.set(true);
+            for (CompletableFuture<Boolean> worker : workers) {
+                worker.handle((result, failure) -> null).join();
+            }
+            commands.close(session);
+            targets.stream().filter(target -> Set.of("Pending", "InProgress").contains(target.get("status")))
+                    .forEach(target -> update(target, "Skipped"));
+        }
+        completion.accept(outcome);
+    }
+
+    private boolean runHost(Prepared prepared, CodeDeployAgentCommands.Session session,
+                             Map<String, Object> target, BooleanSupplier cancelled, List<String> phases)
+            throws InterruptedException, ExecutionException {
+        String host = prepared.hosts().get(target.get("targetId"));
+        update(target, "InProgress");
+        for (String phase : phases) {
+            if (cancelled.getAsBoolean()) {
+                throw new CancellationException("Deployment was stopped");
+            }
+            Map<String, Object> event = new ConcurrentHashMap<>();
+            event.put("lifecycleEventName", phase);
+            event.put("status", "Pending");
+            events(target).add(event);
+            try {
+                if ("BlockTraffic".equals(phase) || "AllowTraffic".equals(phase)) {
+                    event.put("startTime", now());
+                    event.put("status", "InProgress");
+                    if (prepared.traffic() != null) {
+                        traffic.change(prepared.traffic(), (String) target.get("targetId"),
+                                "AllowTraffic".equals(phase), phaseTimeout, cancelled);
+                    }
+                    event.put("endTime", now());
+                    event.put("status", "Succeeded");
+                    continue;
+                }
+                CodeDeployAgentCommands.Ticket ticket = commands.enqueue(session, host, phase);
+                await(ticket.accepted(), startTimeout,
+                        () -> cancelled.getAsBoolean() && commands.cancelPending(session, host));
+                event.put("startTime", now());
+                event.put("status", "InProgress");
+                // Stop prevents subsequent events; an acknowledged event retains its completion deadline.
+                CompletableFuture<CodeDeployAgentCommands.Result> completion = ticket.result().toCompletableFuture();
+                if (!timer.awaitDone(completion, phaseTimeout.toNanos())) {
+                    throw new TimeoutException();
+                }
+                CodeDeployAgentCommands.Result result = completion.get();
+                if (result.diagnostics() != null) {
+                    event.put("diagnostics", diagnostics(result.diagnostics()));
+                }
+                event.put("endTime", now());
+                event.put("status", result.status());
+                if (!"Succeeded".equals(result.status())) {
+                    update(target, "Failed");
+                    return false;
+                }
+            } catch (TimeoutException failure) {
+                commands.cancel(session, host);
+                event.put("endTime", now());
+                event.put("diagnostics", Map.of("errorCode", "UnknownError",
+                        "message", phase + " did not " + ("Pending".equals(event.get("status")) ? "start" : "complete")
+                                + " within the CodeDeploy lifecycle limit"));
+                event.put("status", "Failed");
+                update(target, "Failed");
+                return false;
+            } catch (CancellationException failure) {
+                commands.cancel(session, host);
+                event.put("endTime", now());
+                event.put("status", "Skipped");
+                update(target, "Skipped");
+                throw failure;
+            } catch (RuntimeException failure) {
+                commands.cancel(session, host);
+                event.put("endTime", now());
+                event.put("diagnostics", Map.of("errorCode", "UnknownError",
+                        "message", failure.getMessage() == null ? phase + " failed" : failure.getMessage()));
+                event.put("status", "Failed");
+                update(target, "Failed");
+                throw failure;
+            }
+        }
+        update(target, "Succeeded");
+        return true;
+    }
+
+    private Map<String, String> diagnostics(String payload) {
+        try {
+            JsonNode body = mapper.readTree(payload);
+            int code = body.path("error_code").asInt(5);
+            return Map.of("errorCode", code >= 0 && code < DIAGNOSTIC_CODES.size()
+                            ? DIAGNOSTIC_CODES.get(code) : "UnknownError",
+                    "scriptName", body.path("script_name").asText(""),
+                    "message", body.path("message").asText(""), "logTail", body.path("log").asText(""));
+        } catch (JsonProcessingException failure) {
+            return Map.of("errorCode", "UnknownError", "message", payload);
+        }
+    }
+
+    private <T> T await(CompletionStage<T> stage, Duration timeout, BooleanSupplier cancelled)
+            throws InterruptedException, ExecutionException, TimeoutException {
+        CompletableFuture<T> future = stage.toCompletableFuture();
+        long deadline = timer.nanoTime() + timeout.toNanos();
+        while (!cancelled.getAsBoolean()) {
+            long remaining = deadline - timer.nanoTime();
+            if (remaining <= 0) {
+                throw new TimeoutException();
+            }
+            // Poll only to observe StopDeployment without changing the native lifecycle deadline.
+            if (timer.awaitDone(future, Math.min(remaining, TimeUnit.MILLISECONDS.toNanos(200)))) {
+                return future.get();
+            }
+        }
+        throw new CancellationException("Deployment was stopped");
+    }
+
+    @SuppressWarnings("unchecked")
+    private static List<Map<String, Object>> events(Map<String, Object> target) {
+        return (List<Map<String, Object>>) target.computeIfAbsent("lifecycleEvents",
+                ignored -> new CopyOnWriteArrayList<>());
+    }
+
+    private void update(Map<String, Object> target, String status) {
+        target.put("lastUpdatedAt", now());
+        target.put("status", status);
+    }
+
+    public record Outcome(String status, String error, String message) {
+        /** Ends the deployment at {@code clock}'s instant, the timeline its creation time was read from. */
+        void publish(Deployment deployment, Clock clock) {
+            if (error != null) {
+                deployment.setErrorInformation(Map.of("code", error, "message",
+                        message == null ? "A host-agent deployment failed" : message));
+            }
+            deployment.setCompleteTime(EpochSeconds.fromInstant(clock.instant()));
+            deployment.setStatus(status);
+        }
+    }
+
+    private double now() {
+        return EpochSeconds.fromInstant(clock.instant());
+    }
+
+    private static AwsException unsupported(String message) {
+        return new AwsException("InvalidDeploymentGroupException", message, 400);
+    }
+
+    public record Prepared(String account, String region, String groupId, String config,
+                           Map<String, Object> source, Map<String, String> hosts, List<String> instanceIds,
+                           String fileExistsBehavior, CodeDeployClassicTraffic.Plan traffic) {}
+}
