@@ -170,6 +170,7 @@ nav:
     - AppIntegrations: services/appintegrations.md
     - Amazon Data Lifecycle Manager: services/dlm.md
     - ACM: services/acm.md
+    - AWS Private CA: services/acm-pca.md
     - Payment Cryptography: services/payment-cryptography.md
     - ECS: services/ecs.md
     - ECR: services/ecr.md

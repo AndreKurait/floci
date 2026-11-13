@@ -2,6 +2,7 @@
 # package<TAB>reason. PartitionSmokeInventoryTest fails on a minting package missing from both,
 # and on a row whose package no longer mints or is now covered. Shrink this file, never grow it
 # without a reason.
+acmpca	covered by AcmPcaIntegrationTest root and leaf lifecycle in commercial, China and GovCloud partitions; CA deletion retains restoration state by API contract
 appconfig	internal IAM and S3 source ARNs are covered by AppConfigResourceArnsTest in commercial, China and GovCloud; AppConfigS3AccountIntegrationTest and iam/test_appconfig_permissions.py exercise IAM enforcement and signed China SDK requests
 appintegrations	no non-commercial partition publishes the service, so a case would be skipped in every partition
 cloudformation	covered by PartitionArnMintingIntegrationTest (all partitions)

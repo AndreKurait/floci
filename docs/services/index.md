@@ -88,6 +88,7 @@ Operation counts are exact. For dispatch-table services (Query and JSON 1.1) eac
 | [EFS](efs.md) | `/2015-02-01/...` | REST JSON | 26 |
 | [EC2](ec2.md) | `POST /` with `Action=` param | EC2 Query | 232 |
 | [Lightsail](lightsail.md) | `POST /` + `X-Amz-Target: Lightsail_20161128.*` | JSON 1.1 | 79 local responses; 161 recognized actions |
+| [AWS Private CA](acm-pca.md) | `POST /` + `X-Amz-Target: ACMPrivateCA.*` | JSON 1.1 | 11 |
 | [ACM](acm.md) | `POST /` + `X-Amz-Target: CertificateManager.*` | JSON 1.1 | 16 |
 | [ECR](ecr.md) | `POST /` + `X-Amz-Target: AmazonEC2ContainerRegistry_V20150921.*` (control plane) and `/v2/...` (data plane proxied to `registry:2`) | JSON 1.1 + OCI Distribution | 34 |
 | [AWS Resource Groups](resource-groups.md) | `/groups`, `/get-group`, `/delete-group`, `/group-resources`, `/list-group-resources`, `/groups-list` | REST JSON | 6 |
