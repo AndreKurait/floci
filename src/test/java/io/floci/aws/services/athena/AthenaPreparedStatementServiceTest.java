@@ -62,7 +62,7 @@ class AthenaPreparedStatementServiceTest {
         assertEquals("select ?", before.queryStatement());
         assertEquals("original", oldMap.get("first").description());
         assertEquals("select 3", after.queryStatement());
-        assertNull(after.description(), "Floci's documented update omission policy clears the description");
+        assertEquals("original", after.description(), "An omitted description preserves the stored value");
         assertFalse(after.lastModifiedTime().isBefore(before.lastModifiedTime()));
         assertEquals("select 2", f.service.get(REGION, "group", "second").queryStatement());
         assertFalse(f.athena.getWorkGroup("group", REGION).containsKey("PreparedStatements"));

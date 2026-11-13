@@ -75,19 +75,53 @@ class AthenaPreparedStatementIntegrationTest {
         assertFalse(saved.lastModifiedTime().isAfter(Instant.now().plusSeconds(1)));
         assertThrows(InvalidRequestException.class, () -> create(client, "owned", "first", "duplicate"));
         client.updatePreparedStatement(r -> r.workGroup("owned").statementName("second").queryStatement("updated"));
-        assertNull(get(client, "owned", "second").description(), "documented Floci replacement policy");
+        assertEquals("old description", get(client, "owned", "second").description());
         assertEquals(saved, get(client, "owned", "first"));
         BatchGetPreparedStatementResponse batch = client.batchGetPreparedStatement(r -> r.workGroup("owned")
                 .preparedStatementNames("first", "missing", "second"));
         assertEquals(List.of("first", "second"), batch.preparedStatements().stream().map(PreparedStatement::statementName).toList());
         assertEquals("missing", batch.unprocessedPreparedStatementNames().getFirst().statementName());
-        assertEquals("STATEMENT_NOT_FOUND", batch.unprocessedPreparedStatementNames().getFirst().errorCode());
+        assertEquals("STATEMENTNAME_NOT_FOUND", batch.unprocessedPreparedStatementNames().getFirst().errorCode());
         assertNotNull(batch.unprocessedPreparedStatementNames().getFirst().errorMessage());
         assertTrue(client.listQueryExecutions(r -> r.workGroup("owned")).queryExecutionIds().isEmpty());
         client.deletePreparedStatement(r -> r.workGroup("owned").statementName("first"));
         assertThrows(ResourceNotFoundException.class, () -> get(client, "owned", "first"));
         client.deletePreparedStatement(r -> r.workGroup("owned").statementName("second"));
         client.deleteWorkGroup(r -> r.workGroup("owned"));
+    }
+
+    @Test
+    void sdkUpdatePreservesOmittedDescriptionAndReplacesExplicitDescription() {
+        client.createWorkGroup(r -> r.name("description-scope"));
+        client.createPreparedStatement(r -> r.workGroup("description-scope").statementName("saved")
+                .queryStatement("SELECT 1").description("original description"));
+        client.updatePreparedStatement(r -> r.workGroup("description-scope").statementName("saved")
+                .queryStatement("SELECT 2"));
+        PreparedStatement updated = get(client, "description-scope", "saved");
+        assertEquals("SELECT 2", updated.queryStatement());
+        assertEquals("original description", updated.description());
+        client.updatePreparedStatement(r -> r.workGroup("description-scope").statementName("saved")
+                .queryStatement("SELECT 3").description("replacement description"));
+        assertEquals("replacement description", get(client, "description-scope", "saved").description());
+        client.updatePreparedStatement(r -> r.workGroup("description-scope").statementName("saved")
+                .queryStatement("SELECT 4"));
+        assertEquals("replacement description", get(client, "description-scope", "saved").description());
+        client.deleteWorkGroup(r -> r.workGroup("description-scope").recursiveDeleteOption(true));
+    }
+
+    @Test
+    void sdkBatchMissingStatementReturnsAwsErrorCodeAndMessage() {
+        client.createWorkGroup(r -> r.name("batch-scope"));
+        create(client, "batch-scope", "saved", "SELECT 1");
+        BatchGetPreparedStatementResponse batch = client.batchGetPreparedStatement(r -> r.workGroup("batch-scope")
+                .preparedStatementNames("saved", "missing_statement"));
+        assertEquals(List.of("saved"), batch.preparedStatements().stream().map(PreparedStatement::statementName).toList());
+        assertEquals(1, batch.unprocessedPreparedStatementNames().size());
+        assertEquals("missing_statement", batch.unprocessedPreparedStatementNames().getFirst().statementName());
+        assertEquals("STATEMENTNAME_NOT_FOUND", batch.unprocessedPreparedStatementNames().getFirst().errorCode());
+        assertEquals("PreparedStatement missing_statement was not found",
+                batch.unprocessedPreparedStatementNames().getFirst().errorMessage());
+        client.deleteWorkGroup(r -> r.workGroup("batch-scope").recursiveDeleteOption(true));
     }
 
     @Test

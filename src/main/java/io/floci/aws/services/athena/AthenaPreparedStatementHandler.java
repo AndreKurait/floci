@@ -57,8 +57,8 @@ final class AthenaPreparedStatementHandler {
                 yield Response.ok(Map.of("PreparedStatements", result.statements().stream()
                                 .map(AthenaPreparedStatementHandler::wire).toList(),
                         "UnprocessedPreparedStatementNames", result.missing().stream().map(name -> Map.of(
-                                "StatementName", name, "ErrorCode", "STATEMENT_NOT_FOUND",
-                                "ErrorMessage", "Prepared statement " + name + " was not found.")).toList())).build();
+                                "StatementName", name, "ErrorCode", "STATEMENTNAME_NOT_FOUND",
+                                "ErrorMessage", "PreparedStatement " + name + " was not found")).toList())).build();
             }
             default -> throw invalid("Unsupported prepared-statement operation.");
         };

@@ -58,9 +58,10 @@ public class AthenaPreparedStatementService {
         validate(workGroup, name, query, description);
         synchronized (athenaService.workGroupLock()) {
             WorkGroup group = athenaService.preparedStatementWorkGroup(region, workGroup);
-            requireStatement(group, name);
+            PreparedStatement current = requireStatement(group, name);
+            String updatedDescription = description == null ? current.description() : description;
             Map<String, PreparedStatement> updated = new LinkedHashMap<>(group.getPreparedStatements());
-            updated.put(name, new PreparedStatement(name, workGroup, query, description, Instant.now()));
+            updated.put(name, new PreparedStatement(name, workGroup, query, updatedDescription, Instant.now()));
             athenaService.savePreparedStatements(region, group, updated);
         }
     }
