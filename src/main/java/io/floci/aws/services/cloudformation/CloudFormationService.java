@@ -4795,6 +4795,7 @@ public class CloudFormationService implements ResourceProvider {
             stacks.put(stackKey(accountId, childStackName, region), childStack);
         } else {
             childStack.setStatus("UPDATE_IN_PROGRESS");
+            childStack.setClientRequestToken(null);
         }
         addEvent(childStack, childStack.getStackName(), childStack.getStackId(),
                 "AWS::CloudFormation::Stack", childCreate ? "CREATE_IN_PROGRESS" : "UPDATE_IN_PROGRESS", null);
