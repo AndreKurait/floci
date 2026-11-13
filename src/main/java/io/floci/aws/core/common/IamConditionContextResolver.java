@@ -13,6 +13,7 @@ import io.floci.aws.services.dynamodb.DynamoDbTableNames;
 import io.floci.aws.services.dynamodb.model.TableDefinition;
 import io.floci.aws.services.ec2.Ec2Service;
 import io.floci.aws.services.ec2.model.Tag;
+import io.floci.aws.services.ecr.EcrService;
 import io.floci.aws.services.iam.IamActionRegistry;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.iam.ResourceArnBuilder;
@@ -99,6 +100,7 @@ public class IamConditionContextResolver {
 
     private final Instance<DynamoDbFacade> dynamoDbFacade;
     private final Instance<Ec2Service> ec2Service;
+    private final Instance<EcrService> ecrService;
     private final Instance<S3Service> s3Service;
     private final Instance<CloudWatchLogsService> logsService;
     private final Instance<CloudWatchLogsCrossAccountService> crossAccountService;
@@ -115,6 +117,22 @@ public class IamConditionContextResolver {
      * same now as S3Service, which checks retention against {@code Instant.now()}.
      */
     @Inject
+    public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                       Instance<Ec2Service> ec2Service,
+                                       Instance<S3Service> s3Service,
+                                       Instance<CloudWatchLogsService> logsService,
+                                       Instance<CloudWatchLogsCrossAccountService> crossAccountService,
+                                       Instance<IamService> iamService,
+                                       Instance<LambdaWebService> lambdaWebService,
+                                       RequestContext requestContext,
+                                       EmulatorConfig config,
+                                       CurrentVertxRequest currentVertxRequest,
+                                       ResolvedServiceCatalog serviceCatalog, Instance<EcrService> ecrService) {
+        this(dynamoDbFacade, ec2Service, s3Service, logsService, crossAccountService, iamService,
+                lambdaWebService, requestContext,
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ecrService);
+    }
+
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
                                        Instance<Ec2Service> ec2Service,
                                        Instance<S3Service> s3Service,
@@ -142,8 +160,24 @@ public class IamConditionContextResolver {
                                 EmulatorConfig config,
                                 CurrentVertxRequest currentVertxRequest,
                                 ResolvedServiceCatalog serviceCatalog, Clock clock) {
+        this(dynamoDbFacade, ec2Service, s3Service, logsService, crossAccountService, iamService,
+                lambdaWebService, requestContext, config, currentVertxRequest, serviceCatalog, clock, null);
+    }
+
+    private IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                Instance<Ec2Service> ec2Service,
+                                Instance<S3Service> s3Service,
+                                Instance<CloudWatchLogsService> logsService,
+                                Instance<CloudWatchLogsCrossAccountService> crossAccountService,
+                                Instance<IamService> iamService,
+                                Instance<LambdaWebService> lambdaWebService,
+                                RequestContext requestContext,
+                                EmulatorConfig config,
+                                CurrentVertxRequest currentVertxRequest,
+                                ResolvedServiceCatalog serviceCatalog, Clock clock, Instance<EcrService> ecrService) {
         this.dynamoDbFacade = dynamoDbFacade;
         this.ec2Service = ec2Service;
+        this.ecrService = ecrService;
         this.s3Service = s3Service;
         this.logsService = logsService;
         this.crossAccountService = crossAccountService;
@@ -161,6 +195,7 @@ public class IamConditionContextResolver {
         return switch (credentialScope) {
             case "s3" -> s3ConditionContext(action, ctx);
             case "ec2" -> ec2ConditionContext(action, ctx);
+            case "ecr" -> ecrPreviewConditionContext(action, ctx);
             case "dynamodb" -> dynamoDbConditionContext(action, ctx);
             case "iam" -> iamConditionContext(action, ctx);
             case "logs" -> logsConditionContext(action, ctx);
@@ -169,6 +204,28 @@ public class IamConditionContextResolver {
                     : requestConditions(action, formParameters(ctx)::get);
             default -> null;
         };
+    }
+
+    private Map<String, List<String>> ecrPreviewConditionContext(String action, ContainerRequestContext ctx) {
+        if (!("ecr:StartLifecyclePolicyPreview".equals(action) || "ecr:GetLifecyclePolicyPreview".equals(action))
+                || ecrService == null || !ecrService.isResolvable()) {
+            return null;
+        }
+        JsonNode body = bufferedJsonBody(ctx);
+        if (body == null) {
+            return null;
+        }
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        Map<String, String> tags = ecrService.get().lifecyclePreviewTags(body.path("repositoryName").asText(null),
+                body.path("registryId").asText(null), region);
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        tags.forEach((key, value) -> {
+            if (key != null && value != null) {
+                conditions.put("aws:ResourceTag/" + key, List.of(value));
+                conditions.put("ecr:ResourceTag/" + key, List.of(value));
+            }
+        });
+        return conditions;
     }
 
     /** Logs tag operations and group mutations use the handler's resource and request scope. */
