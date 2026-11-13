@@ -154,6 +154,7 @@ import java.util.Set;
 import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -6099,9 +6100,24 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return terminateInstances(region, instanceIds, null);
     }
 
+    /**
+     * Internal completion notification after the request succeeds and native teardown is complete.
+     * A failed request, failed teardown, or already terminal instance produces no notification.
+     */
+    public List<Map<String, String>> terminateInstancesWithCompletion(String region, List<String> instanceIds,
+                                                                      Consumer<Instance> onTerminated) {
+        return terminateInstances(region, instanceIds, null, onTerminated);
+    }
+
     private List<Map<String, String>> terminateInstances(String region, List<String> instanceIds,
                                                          Runnable afterVolumeDetach) {
+        return terminateInstances(region, instanceIds, afterVolumeDetach, null);
+    }
+
+    private List<Map<String, String>> terminateInstances(String region, List<String> instanceIds,
+                                                         Runnable afterVolumeDetach, Consumer<Instance> onTerminated) {
         ensureDefaultResources(region);
+        CompletableFuture<Void> requestComplete = new CompletableFuture<>();
         List<Map<String, String>> result = new ArrayList<>();
         // Every instance named here is going away, so none of them counts as a live dependant of
         // a capture -- not the ones already processed, which linger as shutting-down while their
@@ -6129,6 +6145,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     inst.setState(InstanceState.running());
                 }
                 InstanceState prev = inst.getState();
+                CompletableFuture<Void> nativeComplete = new CompletableFuture<>();
+                observeTermination(onTerminated, inst, prev, nativeComplete, requestComplete);
                 reconcileCapacity = true;
                 if (config.services().ec2().mock()) {
                     // Under the instance's lock, so a concurrent Elastic IP write sees the new state.
@@ -6143,6 +6161,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     if (afterVolumeDetach != null) {
                         afterVolumeDetach.run();
                     }
+                    nativeComplete.complete(null);
                 } else {
                     // Docker still holds mounted volumes until asynchronous guest teardown completes.
                     containerManager.terminate(inst, () -> RequestScopes.runAs(owner, () -> {
@@ -6155,6 +6174,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         } finally {
                             reclaimCapturesPinnedBy(region, inst, terminating);
                         }
+                        nativeComplete.complete(null);
                     }));
                     // Termination releases the public address with a container too, under the lock a
                     // DescribeAddresses re-point holds, so one already under way cannot write it back.
@@ -6181,7 +6201,27 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 }
             }
         }
+        requestComplete.complete(null);
         return result;
+    }
+
+
+    private static void observeTermination(Consumer<Instance> observer, Instance instance, InstanceState previous,
+                                           CompletableFuture<Void> nativeComplete,
+                                           CompletableFuture<Void> requestComplete) {
+        if (observer == null || "terminated".equals(previous.getName()) || "shutting-down".equals(previous.getName())) {
+            return;
+        }
+        nativeComplete.thenCombine(requestComplete, (nativeDone, requestDone) -> instance).thenAccept(completed -> {
+            if (completed.getState() == null || !"terminated".equals(completed.getState().getName())) {
+                return;
+            }
+            try {
+                observer.accept(completed);
+            } catch (RuntimeException failure) {
+                LOG.warnv(failure, "EC2 termination completion observer failed for {0}", completed.getInstanceId());
+            }
+        });
     }
 
     /**
