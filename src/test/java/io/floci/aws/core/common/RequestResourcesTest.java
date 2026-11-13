@@ -8,6 +8,8 @@ import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.UriInfo;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -30,6 +32,28 @@ class RequestResourcesTest {
 
     private static final ObjectMapper CBOR = new ObjectMapper(new CBORFactory());
     private static final String MACHINE = "arn:aws:states:us-east-1:000000000000:stateMachine:orders";
+
+    @ParameterizedTest
+    @CsvSource({
+        "CreateApplication,application",
+        "CreateDeploymentStrategy,deploymentstrategy",
+        "CreateExtension,extension",
+        "CreateExtensionAssociation,extensionassociation"
+    })
+    void appConfigCreatesKeepWildcardActionScopeAndTagOnlyTheirMintedResource(String operation, String type) {
+        String action = "appconfig:" + operation;
+        for (Map.Entry<String, String> location : Map.of(
+                "aws", "us-east-1", "aws-cn", "cn-north-1", "aws-us-gov", "us-gov-west-1").entrySet()) {
+            ContainerRequestContext request = json("{\"Name\":\"schema-owned\",\"Tags\":{\"audit\":\"owned\"}}");
+            assertEquals(List.of(), RequestResources.of(action, request,
+                    location.getKey(), location.getValue(), "111122223333"));
+            // Extension ARNs include both the extension ID and version number.
+            assertEquals(List.of("arn:" + location.getKey() + ":appconfig:" + location.getValue()
+                    + ":111122223333:" + type + ("extension".equals(type) ? "/*/*" : "/*")),
+                    RequestResources.created(action, "appconfig:TagResource",
+                    request, location.getKey(), location.getValue(), "111122223333", Map.of()));
+        }
+    }
 
     @Test
     void inferredLandingZoneIdentifiersKeepRawContextAcrossOperations() {
