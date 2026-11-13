@@ -423,8 +423,9 @@ and described through the CloudFront control plane, and its keys are managed thr
 - Every key write needs the store's current data plane ETag in `If-Match`, and rotates it. `UpdateKeys`
   applies its puts and deletes together (at most 50 entries and 3 MB per request), and changes nothing when any
   entry is invalid, including a put without a `Value`. A stale or missing ETag on the
-  data plane is a `ValidationException` ("Pre-Condition failed during update of Key-Value-Store"), and on the
-  control plane an `InvalidIfMatchVersion`.
+  data plane is a `ValidationException` ("Pre-Condition failed during update of Key-Value-Store"). The control
+  plane returns `PreconditionFailed` (412) for a valid stale version, and `InvalidIfMatchVersion` (400)
+  for a missing or malformed version.
 - The control plane and the data plane keep independent ETags: a comment update rotates only the control plane
   ETag, and a key write only the data plane ETag.
 - An account can hold at most 200 stores (`EntityLimitExceeded`), and a store can be associated with at most 100
@@ -637,3 +638,12 @@ signatures must still return 403. Verify those cases through the proxy after con
 - Forwarding POST, PUT, PATCH and DELETE to S3 origins. AWS passes them to S3, which evaluates them
   against the bucket policy (OAC supports `PUT` and `DELETE`); Floci's in-process S3 origin answers
   them with 403 `Access Denied`, as S3 does for a request that holds no write grant.
+
+### Key value store version checks
+
+The control plane keeps an ETag separate from the data plane's ETag. Updating a comment changes only the
+control ETag; writing keys changes only the data ETag. `UpdateKeyValueStore` and `DeleteKeyValueStore`
+return `412 PreconditionFailed` for a valid but stale control ETag, and `400 InvalidIfMatchVersion` for a
+missing or malformed version. Rejected requests preserve the store and its current versions. Floci keeps
+accepting the UUID versions it issues and persists; it also recognizes the observed CloudFront `E` plus
+13 uppercase alphanumeric form. This is a bounded compatibility rule, not a published AWS format guarantee.
