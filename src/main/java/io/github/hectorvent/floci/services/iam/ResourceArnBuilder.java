@@ -12,6 +12,8 @@ import io.github.hectorvent.floci.core.common.ServicePrincipals;
 import io.github.hectorvent.floci.core.common.SigV4CredentialScope;
 import io.github.hectorvent.floci.core.common.StoredResourceArns;
 import io.github.hectorvent.floci.core.common.auth.SigV4Canonicalization;
+import io.github.hectorvent.floci.services.account.AccountRegionActions;
+import io.github.hectorvent.floci.services.account.AccountService;
 import io.github.hectorvent.floci.services.backup.BackupFrameworkResources;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationDriftService;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationDriftSnapshot;
@@ -127,6 +129,7 @@ public class ResourceArnBuilder {
     private final Instance<StepFunctionsService> stepFunctionsService;
     private final Instance<Ec2Service> ec2Service;
     private final Instance<NeptuneSnapshotResources> neptuneSnapshotResources;
+    private final Instance<AccountService> accountService;
 
     @Inject
     public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
@@ -137,7 +140,8 @@ public class ResourceArnBuilder {
                               Instance<StoredResourceArns> storedResourceArns,
                               Instance<StepFunctionsService> stepFunctionsService,
                               Instance<Ec2Service> ec2Service,
-                              Instance<NeptuneSnapshotResources> neptuneSnapshotResources) {
+                              Instance<NeptuneSnapshotResources> neptuneSnapshotResources,
+                              Instance<AccountService> accountService) {
         this.objectMapper = objectMapper;
         this.iamService = iamService;
         this.secretsManagerService = secretsManagerService;
@@ -148,6 +152,7 @@ public class ResourceArnBuilder {
         this.stepFunctionsService = stepFunctionsService;
         this.ec2Service = ec2Service;
         this.neptuneSnapshotResources = neptuneSnapshotResources;
+        this.accountService = accountService;
     }
 
     public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
@@ -157,7 +162,7 @@ public class ResourceArnBuilder {
                               Instance<StoredResourceArns> storedResourceArns,
                               Instance<StepFunctionsService> stepFunctionsService, Instance<Ec2Service> ec2Service) {
         this(objectMapper, iamService, secretsManagerService, microvmsService, eksService, kmsService,
-                storedResourceArns, stepFunctionsService, ec2Service, null);
+                storedResourceArns, stepFunctionsService, ec2Service, null, null);
     }
 
     public ResourceArnBuilder(ObjectMapper objectMapper, Instance<IamService> iamService,
@@ -306,6 +311,16 @@ public class ResourceArnBuilder {
         if ("cloudfront".equals(credentialScope) && "cloudfront:TestFunction".equals(operation)) {
             return List.of(AwsArnUtils.Arn.global(partition, "cloudfront", accountId,
                     "function/" + CloudFrontFunctionTestRoute.name(ctx)).toString());
+        }
+        if ("account".equals(credentialScope) && AccountRegionActions.supports(operation)) {
+            JsonNode body = readJsonBody(ctx);
+            JsonNode target = body == null ? null : body.get("AccountId");
+            if (target == null || target.isNull()) {
+                return List.of(AwsArnUtils.Arn.global(partition, "account", accountId, "account").toString());
+            }
+            String resource = target.isTextual() && accountService != null && accountService.isResolvable()
+                    ? accountService.get().regionMemberArn(accountId, target.textValue()).orElse("*") : "*";
+            return List.of(resource);
         }
         // Task tokens resolve their authorization resource from recorded workflow ownership.
         if ("states".equals(credentialScope) && operation != null && Set.of("states:SendTaskSuccess",

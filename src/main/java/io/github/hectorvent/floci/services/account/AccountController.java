@@ -5,7 +5,9 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.JsonErrorResponseUtils;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RequestContext;
+import io.github.hectorvent.floci.services.account.model.AccountRegion;
 import io.github.hectorvent.floci.services.account.model.AlternateContact;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
@@ -21,12 +23,15 @@ import jakarta.ws.rs.core.Response;
 @Consumes(MediaType.APPLICATION_JSON)
 public class AccountController {
     private final AccountService accountService;
+    private final AccountRegionService regionService;
     private final ObjectMapper objectMapper;
     private final RequestContext requestContext;
 
     @Inject
-    public AccountController(AccountService accountService, ObjectMapper objectMapper, RequestContext requestContext) {
+    public AccountController(AccountService accountService, AccountRegionService regionService,
+                             ObjectMapper objectMapper, RequestContext requestContext) {
         this.accountService = accountService;
+        this.regionService = regionService;
         this.objectMapper = objectMapper;
         this.requestContext = requestContext;
     }
@@ -51,6 +56,38 @@ public class AccountController {
     @Path("/deleteAlternateContact")
     public Response deleteAlternateContact(String body) {
         accountService.deleteAlternateContact(requestContext.getAccountId(), readTree(body));
+        return Response.ok().build();
+    }
+
+    @POST
+    @Path("/listRegions")
+    public Response listRegions(String body) {
+        PaginatedResult<AccountRegion> page = regionService.listRegions(requestContext.getAccountId(), readTree(body));
+        ObjectNode response = objectMapper.createObjectNode();
+        response.set("Regions", objectMapper.valueToTree(page.items()));
+        if (page.nextToken() != null) {
+            response.put("NextToken", page.nextToken());
+        }
+        return Response.ok(response).build();
+    }
+
+    @POST
+    @Path("/getRegionOptStatus")
+    public Response getRegionOptStatus(String body) {
+        return Response.ok(regionService.getRegionOptStatus(requestContext.getAccountId(), readTree(body))).build();
+    }
+
+    @POST
+    @Path("/enableRegion")
+    public Response enableRegion(String body) {
+        regionService.enableRegion(requestContext.getAccountId(), readTree(body));
+        return Response.ok().build();
+    }
+
+    @POST
+    @Path("/disableRegion")
+    public Response disableRegion(String body) {
+        regionService.disableRegion(requestContext.getAccountId(), readTree(body));
         return Response.ok().build();
     }
 

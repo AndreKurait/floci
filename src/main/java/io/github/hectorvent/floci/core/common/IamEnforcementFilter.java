@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.core.common;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.account.AccountRegionActions;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationDriftHandler;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationDriftService;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnDriftProjection;
@@ -2004,7 +2005,9 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 || "apigateway".equals(credentialScope)) {
             return arnBuilder.buildResources(credentialScope, ctx, region, accountId, requestPartition());
         }
-        String partition = "route53".equals(credentialScope) ? requestPartition() : AwsRegions.partitionFor(region);
+        String partition = "route53".equals(credentialScope)
+                || ("account".equals(credentialScope) && AccountRegionActions.supports(operation))
+                ? requestPartition() : AwsRegions.partitionFor(region);
         return arnBuilder.buildResources(credentialScope, operation, ctx, region, accountId, partition);
     }
 
