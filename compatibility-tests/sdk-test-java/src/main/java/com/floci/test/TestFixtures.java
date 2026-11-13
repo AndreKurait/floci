@@ -15,6 +15,7 @@ import software.amazon.awssdk.regions.RegionMetadata;
 import software.amazon.awssdk.services.accessanalyzer.AccessAnalyzerClient;
 import software.amazon.awssdk.services.account.AccountClient;
 import software.amazon.awssdk.services.acm.AcmClient;
+import software.amazon.awssdk.services.acmpca.AcmPcaClient;
 import software.amazon.awssdk.services.amp.AmpClient;
 import software.amazon.awssdk.services.apigateway.ApiGatewayClient;
 import software.amazon.awssdk.services.apigatewayv2.ApiGatewayV2Client;
@@ -1548,6 +1549,22 @@ public final class TestFixtures {
                 .region(REGION)
                 .credentialsProvider(StaticCredentialsProvider.create(
                         AwsBasicCredentials.create(accessKeyId, "test")))
+                .build();
+    }
+
+    public static AcmPcaClient acmPcaClient() {
+        return AcmPcaClient.builder()
+                .endpointOverride(ENDPOINT)
+                .region(REGION)
+                .credentialsProvider(CREDENTIALS)
+                .build();
+    }
+
+    public static AcmPcaClient acmPcaClient(String accountId) {
+        return AcmPcaClient.builder()
+                .endpointOverride(ENDPOINT)
+                .region(REGION)
+                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(accountId, "test")))
                 .build();
     }
 

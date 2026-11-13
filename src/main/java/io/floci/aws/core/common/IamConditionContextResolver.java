@@ -163,12 +163,32 @@ public class IamConditionContextResolver {
             case "ec2" -> ec2ConditionContext(action, ctx);
             case "dynamodb" -> dynamoDbConditionContext(action, ctx);
             case "iam" -> iamConditionContext(action, ctx);
+            case "acm-pca" -> privateCaConditionContext(action, ctx);
             case "logs" -> logsConditionContext(action, ctx);
             case "lambda" -> lambdaConditionContext(action, ctx);
             case "redshift" -> RequestConditionKeys.requestKeys(action).isEmpty() ? null
                     : requestConditions(action, formParameters(ctx)::get);
             default -> null;
         };
+    }
+
+    private Map<String, List<String>> privateCaConditionContext(String action, ContainerRequestContext ctx) {
+        if (!"acm-pca:IssueCertificate".equals(action)) {
+            return null;
+        }
+        JsonNode body = bufferedJsonBody(ctx);
+        if (body == null) {
+            return null;
+        }
+        JsonNode template = body.path("TemplateArn");
+        if (!template.isMissingNode() && !template.isNull() && !template.isTextual()) {
+            return null;
+        }
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        String value = template.isTextual() ? template.textValue()
+                : AwsArnUtils.Arn.global(AwsRegions.partitionFor(region), "acm-pca", "",
+                        "template/EndEntityCertificate/V1").toString();
+        return Map.of("acm-pca:TemplateArn", List.of(value));
     }
 
     /** Logs tag operations and group mutations use the handler's resource and request scope. */

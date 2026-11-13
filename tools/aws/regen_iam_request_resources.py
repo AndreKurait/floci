@@ -178,7 +178,7 @@ OUTPUT = REPO_ROOT / "src/main/resources/aws/iam-request-resources.json"
 
 # The namespaces read, in batches: each moves here from NOT_COVERED with the tests that show its ARNs
 # are the ones its handlers mint.
-NAMESPACES = ("access-analyzer", "account", "acm", "application-autoscaling", "athena", "bcm-data-exports",
+NAMESPACES = ("access-analyzer", "account", "acm", "acm-pca", "application-autoscaling", "athena", "bcm-data-exports",
               "bcm-pricing-calculator", "budgets", "ce", "cloudfront", "cloudfront-keyvaluestore", "cloudtrail",
               "codebuild", "codepipeline", "cognito-identity", "cognito-idp", "controlcatalog", "controltower", "cur",
               "datasync", "ec2", "ecr", "elasticloadbalancing", "elasticmapreduce", "emr-serverless", "es", "events",
@@ -312,6 +312,11 @@ NOT_COVERED: dict[str, str] = {
 # them apart (EventBridge's `events` and EventBridge V2's `eventsv2`): Floci applies it only to a request the service
 # of that endpoint serves, never by a member a caller could add to a request of the other.
 CORRECTIONS: dict[str, tuple[list[dict], str]] = {
+    "acm-pca:GetCertificate": ([
+        {"types": ["certificate-authority"], "arn": "CertificateAuthorityArn"},
+    ], "AWS's Service Reference authorizes GetCertificate on certificate-authority only. CertificateArn "
+       "identifies an issued certificate below the CA ARN, not another IAM resource; the generic format's "
+       "open id would otherwise also match that longer certificate ARN."),
     "quicksight:CreateDataSet": ([{"types": ["datasource"], "arn": f"PhysicalTableMap{{}}.{kind}.DataSourceArn"}
                                  for kind in ("S3Source", "RelationalTable", "CustomSql", "SaaSTable", "FileSource")],
                                 "CreateDataSet acts on each data source named by its physical tables; "
