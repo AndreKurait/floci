@@ -144,6 +144,38 @@ the path:
 | `DeleteKeyGroup` | DELETE | `/2020-05-31/key-group/{Id}` |
 | `ListKeyGroups` | GET | `/2020-05-31/key-group` |
 
+### Field-level encryption configuration and profile metadata
+
+| Operation | Method | Path |
+|---|---|---|
+| `CreateFieldLevelEncryptionConfig` | POST | `/2020-05-31/field-level-encryption` |
+| `GetFieldLevelEncryption` | GET | `/2020-05-31/field-level-encryption/{Id}` |
+| `GetFieldLevelEncryptionConfig` | GET | `/2020-05-31/field-level-encryption/{Id}/config` |
+| `UpdateFieldLevelEncryptionConfig` | PUT | `/2020-05-31/field-level-encryption/{Id}/config` |
+| `DeleteFieldLevelEncryptionConfig` | DELETE | `/2020-05-31/field-level-encryption/{Id}` |
+| `CreateFieldLevelEncryptionProfile` | POST | `/2020-05-31/field-level-encryption-profile` |
+| `GetFieldLevelEncryptionProfile` | GET | `/2020-05-31/field-level-encryption-profile/{Id}` |
+| `GetFieldLevelEncryptionProfileConfig` | GET | `/2020-05-31/field-level-encryption-profile/{Id}/config` |
+| `UpdateFieldLevelEncryptionProfile` | PUT | `/2020-05-31/field-level-encryption-profile/{Id}/config` |
+| `DeleteFieldLevelEncryptionProfile` | DELETE | `/2020-05-31/field-level-encryption-profile/{Id}` |
+
+Creation and replacement updates persist the query-argument and content-type profile mappings,
+including their forwarding flags, and profile encryption entities with public-key IDs, provider
+IDs and field patterns. Omitted optional blocks remain absent, and zero-count collections remain
+empty. Declared quantities must match the submitted items. Profile IDs and public-key IDs must
+resolve in the caller's account. Field patterns are case-sensitive and cannot overlap. Rejected
+requests preserve the prior configuration and ETag. Nested configuration and profile metadata
+survive persistent, hybrid, and WAL reloads. Older persisted profiles whose encryption entities
+were discarded remain readable, but their lost entities cannot be reconstructed.
+
+`GetFieldLevelEncryption` and `GetFieldLevelEncryptionProfile` return the stored ID,
+last-modified time and nested configuration; their `Config` getters return the configuration
+directly. All four return the current ETag and authorize their own IAM action against the global
+`arn:${Partition}:cloudfront::${Account}:field-level-encryption-config/${Id}` or
+`arn:${Partition}:cloudfront::${Account}:field-level-encryption-profile/${Id}` resource.
+Ownership follows the signing credential's account. These operations manage metadata;
+viewer field encryption and profile-reference deletion constraints are outside this implementation.
+
 ### Tagging
 
 | Operation | Method | Path |
@@ -620,7 +652,7 @@ signatures must still return 403. Verify those cases through the proxy after con
 - Continuous deployment policies (`CreateContinuousDeploymentPolicy`, etc.)
 - `CopyDistribution` (staging distributions)
 - Real-time log configs (`CreateRealtimeLogConfig`, etc.)
-- Field-level encryption (`CreateFieldLevelEncryptionConfig`, etc.)
+- Field-level encryption of viewer requests (configuration metadata is supported above).
 - `TestFunction` execution (function is stored, not executed)
 - Streaming distributions (RTMP — deprecated by AWS)
 - VPC origins, Anycast IP lists

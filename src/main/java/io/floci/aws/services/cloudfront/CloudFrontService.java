@@ -2572,6 +2572,7 @@ public class CloudFrontService implements ServerCertificateReferenceProvider {
 
     public synchronized FieldLevelEncryptionConfig createFieldLevelEncryptionConfig(
             FieldLevelEncryptionConfig cfg) {
+        FieldLevelEncryptionConfigCodec.profileIds(cfg).forEach(this::getFieldLevelEncryptionProfile);
         cfg.setId(UUID.randomUUID().toString());
         cfg.setLastModifiedTime(Instant.now());
         cfg.setEtag(UUID.randomUUID().toString());
@@ -2592,6 +2593,7 @@ public class CloudFrontService implements ServerCertificateReferenceProvider {
             throw new AwsException("InvalidIfMatchVersion",
                     "The If-Match version is missing or not valid for the resource.", 400);
         }
+        FieldLevelEncryptionConfigCodec.profileIds(updated).forEach(this::getFieldLevelEncryptionProfile);
         updated.setId(id);
         updated.setLastModifiedTime(Instant.now());
         updated.setEtag(UUID.randomUUID().toString());
@@ -2618,6 +2620,7 @@ public class CloudFrontService implements ServerCertificateReferenceProvider {
 
     public synchronized FieldLevelEncryptionProfile createFieldLevelEncryptionProfile(
             FieldLevelEncryptionProfile profile) {
+        FieldLevelEncryptionConfigCodec.publicKeyIds(profile).forEach(this::getPublicKey);
         profile.setId(UUID.randomUUID().toString());
         profile.setLastModifiedTime(Instant.now());
         profile.setEtag(UUID.randomUUID().toString());
@@ -2638,6 +2641,7 @@ public class CloudFrontService implements ServerCertificateReferenceProvider {
             throw new AwsException("InvalidIfMatchVersion",
                     "The If-Match version is missing or not valid for the resource.", 400);
         }
+        FieldLevelEncryptionConfigCodec.publicKeyIds(updated).forEach(this::getPublicKey);
         updated.setId(id);
         updated.setLastModifiedTime(Instant.now());
         updated.setEtag(UUID.randomUUID().toString());
