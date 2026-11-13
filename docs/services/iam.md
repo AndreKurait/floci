@@ -1899,8 +1899,14 @@ Region than the request's is checked as given and as each resource of that name 
 on instead, in the ARN's account or the caller's and in the ARN's Region or the request's (ECR's
 tag handlers keep the ARN's account in the request's Region), and the request is refused if any is
 denied; one of a type AWS owns, whose ARN's account is `aws` (an IAM Identity Center application
-provider), is checked in that account alone. Every other request is checked on `*`, as is an operation whose action acts on no
-resource type or whose request names none, where AWS checks `*` too. `make
+provider), is checked in that account alone, and so is one its service acts on in the account the ARN names
+(the sink an OAM `CreateLink` links to, a RAM invitation sent to the caller or a share another account owns). A
+request leaving out an optional member holding the ARN of a resource its service then uses one of its own for
+is checked on the one the service finds: Resource Explorer's `Search` and `ListResources` with no `ViewArn`
+on the Region's default view. A field of each value of a map of structures, named after a type the action acts
+on, names one resource for each: an FIS experiment template's create and update are checked on each action
+its `actions` map names by `actionId`, `action/<actionId>`. Every other request is checked on `*`, as is an
+operation whose action acts on no resource type or whose request names none, where AWS checks `*` too. `make
 iam-request-resources-check` re-derives the table from the pinned botocore, `make
 iam-request-resources-verify` checks it against AWS, and the namespaces it does not read yet are
 listed in it with their reason.
@@ -2313,7 +2319,12 @@ resource, so its tags are checked on that one, built from the parent's ARN with 
 listeners and rules, holds. A create that names another resource beside the one it makes tags the
 one it makes alone, the resource of the type it is named after: Cloud Map's `CreateService` is
 checked on its namespace and on `service/*`, and its tags on `service/*`; CodePipeline's
-`PutWebhook` on the webhook and the pipeline it connects to, and its tags on the webhook. Where the
+`PutWebhook` on the webhook and the pipeline it connects to, and its tags on the webhook. A create
+whose action acts on no resource type is checked on `*`, and its tags on the resource it makes, of the
+type it is named after with the ids its service mints open, where its tagging action acts on that type:
+Resource Explorer's `CreateView` on `view/<ViewName>/*`, OAM's `CreateSink` on `sink/*`, ACM's
+`RequestCertificate` on `certificate/*`; a Cloud Map namespace's tags, whose `TagResource` acts on no
+type, stay on `*`. Where the
 tagging action takes
 its namespace's `CreateAction` key, as `ec2:CreateTags`, `ecs:TagResource`, CloudFormation's
 `TagResource` and Elastic Load Balancing's `AddTags` do, the key is the operation's name:
