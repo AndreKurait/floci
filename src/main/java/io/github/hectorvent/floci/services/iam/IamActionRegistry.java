@@ -685,6 +685,12 @@ public class IamActionRegistry {
         if ("apigateway".equals(credentialScope) && resourceInfo != null
                 && ApiGatewayController.class.equals(resourceInfo.getResourceClass())
                 && resourceInfo.getResourceMethod() != null
+                && "importDocumentationParts".equals(resourceInfo.getResourceMethod().getName())) {
+            return "apigateway:PUT";
+        }
+        if ("apigateway".equals(credentialScope) && resourceInfo != null
+                && ApiGatewayController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
                 && "testInvokeMethod".equals(resourceInfo.getResourceMethod().getName())) {
             return "apigateway:POST";
         }
