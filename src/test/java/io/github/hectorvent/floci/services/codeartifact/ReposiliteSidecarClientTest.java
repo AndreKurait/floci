@@ -1,11 +1,11 @@
-package io.floci.aws.services.codeartifact;
+package io.github.hectorvent.floci.services.codeartifact;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
-import io.floci.aws.core.common.Digests;
-import io.floci.aws.core.common.XmlParser;
+import io.github.hectorvent.floci.core.common.Digests;
+import io.github.hectorvent.floci.core.common.XmlParser;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -1019,7 +1019,7 @@ class ReposiliteSidecarClientTest {
     }
 
     /**
-     * {@link io.floci.aws.services.codeartifact.ReposiliteSidecarClient#fetchArtifact}
+     * {@link io.github.hectorvent.floci.services.codeartifact.ReposiliteSidecarClient#fetchArtifact}
      * returns {@code empty()} for a transient server error too, not just a confirmed 404: a merge
      * that read the existing local metadata through that method could mistake the error for "no
      * local metadata yet" and silently replace a real, locally-published package's {@code latest}/
@@ -1184,7 +1184,7 @@ class ReposiliteSidecarClientTest {
     }
 
     /**
-     * {@link io.floci.aws.services.codeartifact.ReposiliteSidecarClient#recordVersionDisposed}'s
+     * {@link io.github.hectorvent.floci.services.codeartifact.ReposiliteSidecarClient#recordVersionDisposed}'s
      * dispose-time counterpart to {@link #recordVersionAvailableAppendsToExistingVersionsAndAdvancesReleaseForANonSnapshot}:
      * removing a non-latest version must leave {@code latest}/{@code release} exactly as they
      * were, since the metadata's own append-order list is untouched past the removed entry.
@@ -1304,7 +1304,7 @@ class ReposiliteSidecarClientTest {
     /**
      * Raised by Greptile's review: a real {@code mvn deploy} always also PUTs {@code
      * maven-metadata.xml.sha1}/{@code .md5}, so {@link
-     * io.floci.aws.services.codeartifact.ReposiliteSidecarClient#recordVersionDisposed}'s
+     * io.github.hectorvent.floci.services.codeartifact.ReposiliteSidecarClient#recordVersionDisposed}'s
      * own rewrite of the metadata must carry fresh checksums of whatever it just wrote, not leave
      * the pre-dispose checksums standing over content that no longer matches them.
      */
@@ -1364,7 +1364,7 @@ class ReposiliteSidecarClientTest {
 
     /**
      * Greptile's review again: {@link
-     * io.floci.aws.services.codeartifact.ReposiliteSidecarClient#recordVersionDisposed}
+     * io.github.hectorvent.floci.services.codeartifact.ReposiliteSidecarClient#recordVersionDisposed}
      * also removes the two checksum siblings when the metadata file itself is removed outright
      * (every version disposed), not just the metadata file.
      */

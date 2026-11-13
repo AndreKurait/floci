@@ -1,9 +1,9 @@
-package io.floci.aws.services.codeartifact;
+package io.github.hectorvent.floci.services.codeartifact;
 
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
-import io.floci.aws.core.common.AwsException;
-import io.floci.aws.services.codeartifact.CodeArtifactService.AuthorizationTokenScope;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.services.codeartifact.CodeArtifactService.AuthorizationTokenScope;
 import jakarta.ws.rs.NotAuthorizedException;
 import jakarta.ws.rs.NotFoundException;
 import jakarta.ws.rs.core.HttpHeaders;

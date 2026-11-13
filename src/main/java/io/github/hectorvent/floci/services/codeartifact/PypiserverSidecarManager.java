@@ -1,14 +1,14 @@
-package io.floci.aws.services.codeartifact;
+package io.github.hectorvent.floci.services.codeartifact;
 
-import io.floci.aws.config.EmulatorConfig;
-import io.floci.aws.core.common.ContainerTeardown;
-import io.floci.aws.core.common.docker.ContainerBuilder;
-import io.floci.aws.core.common.docker.ContainerLifecycleManager;
-import io.floci.aws.core.common.docker.ContainerLifecycleManager.ContainerInfo;
-import io.floci.aws.core.common.docker.ContainerLifecycleManager.EndpointInfo;
-import io.floci.aws.core.common.docker.ContainerSpec;
-import io.floci.aws.core.common.docker.ContainerStorageHelper;
-import io.floci.aws.core.common.docker.PerKeyContainerPool;
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.ContainerTeardown;
+import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
+import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
+import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.ContainerInfo;
+import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager.EndpointInfo;
+import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
+import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
+import io.github.hectorvent.floci.core.common.docker.PerKeyContainerPool;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
@@ -137,7 +137,7 @@ public class PypiserverSidecarManager implements ContainerTeardown {
             LOG.infov("pypiserver sidecar for pypi repository {0} is ready at {1}", pypiRepositoryId, url);
             return new PerKeyContainerPool.StartedContainer(containerId, url);
         } catch (RuntimeException e) {
-            lifecycleManager.stopAndRemove(containerId, null);
+            pool.removeFailedStart(pypiRepositoryId, containerId, e);
             throw e;
         }
     }

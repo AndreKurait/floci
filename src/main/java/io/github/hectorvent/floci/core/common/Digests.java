@@ -1,4 +1,4 @@
-package io.floci.aws.core.common;
+package io.github.hectorvent.floci.core.common;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;

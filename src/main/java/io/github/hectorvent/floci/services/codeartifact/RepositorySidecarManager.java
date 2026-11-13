@@ -1,4 +1,4 @@
-package io.floci.aws.services.codeartifact;
+package io.github.hectorvent.floci.services.codeartifact;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;

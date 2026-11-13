@@ -1,6 +1,6 @@
-package io.floci.aws.services.codeartifact;
+package io.github.hectorvent.floci.services.codeartifact;
 
-import io.floci.aws.core.common.XmlParser;
+import io.github.hectorvent.floci.core.common.XmlParser;
 import org.w3c.dom.Document;
 import org.w3c.dom.Element;
 import org.w3c.dom.NodeList;

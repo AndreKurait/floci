@@ -1,4 +1,4 @@
-package io.floci.aws.services.codeartifact;
+package io.github.hectorvent.floci.services.codeartifact;
 
 import org.junit.jupiter.api.Test;
 

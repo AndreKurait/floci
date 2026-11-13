@@ -1,9 +1,9 @@
-package io.floci.aws.services.codeartifact;
+package io.github.hectorvent.floci.services.codeartifact;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import io.floci.aws.core.common.AwsException;
-import io.floci.aws.services.codeartifact.model.ExternalConnection;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.services.codeartifact.model.ExternalConnection;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -294,7 +294,8 @@ public class CodeArtifactPypiExternalConnectionImporter {
                 importedRequested = importedAny;
                 return importedRequested;
             }
-            String importLockKey = repoId + "|" + packageName.get() + "|" + version.get();
+            String importLockKey = repoId + "|" + PypiserverSidecarClient.normalizePackageName(packageName.get())
+                    + "|" + version.get();
 
             // Splits the version's own files into the one filename actually requested (imported
             // synchronously below, so downloadFile's own proxy retry has real bytes to serve the

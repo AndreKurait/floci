@@ -1,7 +1,7 @@
-package io.floci.aws.services.s3;
+package io.github.hectorvent.floci.services.s3;
 
 import com.sun.management.ThreadMXBean;
-import io.floci.aws.core.storage.InMemoryStorage;
+import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 

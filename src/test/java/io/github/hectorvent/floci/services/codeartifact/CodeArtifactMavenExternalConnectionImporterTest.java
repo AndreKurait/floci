@@ -1,8 +1,8 @@
-package io.floci.aws.services.codeartifact;
+package io.github.hectorvent.floci.services.codeartifact;
 
-import io.floci.aws.core.common.AwsException;
-import io.floci.aws.services.codeartifact.model.CodeArtifactRepository;
-import io.floci.aws.services.codeartifact.model.ExternalConnection;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.services.codeartifact.model.CodeArtifactRepository;
+import io.github.hectorvent.floci.services.codeartifact.model.ExternalConnection;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
