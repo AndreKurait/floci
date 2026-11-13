@@ -147,13 +147,10 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     /**
      * The fewest Availability Zones an Application Load Balancer of the calling account takes in
      * {@code region}. The regional zone policy ({@link #requiresTwoAlbZones}) decides between one and
-     * two; Floci also lowers that to one for the accounts
-     * {@code floci.services.elbv2.single-zone-alb-accounts} lists. Nothing is listed by default.
+     * two. Explicit regional rules take precedence over the accounts listed by
+     * {@code floci.services.elbv2.single-zone-alb-accounts}. Nothing is listed by default.
      */
     private int minimumAlbZones(String region) {
-        if (!singleZoneAlbAccounts.isEmpty() && singleZoneAlbAccounts.contains(regionResolver.getAccountId())) {
-            return 1;
-        }
         return requiresTwoAlbZones(region) ? 2 : 1;
     }
 
@@ -173,6 +170,8 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
             EmulatorConfig.AlbZoneRule regional = regions == null ? null : regions.get(region);
             if (regional != null) {
                 rule = regional;
+            } else if (singleZoneAlbAccounts.contains(regionResolver.getAccountId())) {
+                return false;
             }
         }
         return switch (rule) {

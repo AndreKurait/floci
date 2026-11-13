@@ -16,6 +16,8 @@ public class LambdaFunction {
     private String functionName;
     private String functionArn;
     private String accountId;
+    /** Stable internal identity of a function's lifetime, separate from its mutable revision. */
+    private String runtimeManagementGeneration;
     private String runtime;
     private String role;
     private String handler;
@@ -50,6 +52,7 @@ public class LambdaFunction {
     private String version = "$LATEST";
     private LambdaUrlConfig urlConfig;
     private Integer reservedConcurrentExecutions;
+    private String recursiveLoop = "Terminate";
     private List<String> architectures;
     private int ephemeralStorageSize = 512;
     private String tracingMode = "PassThrough";
@@ -90,6 +93,9 @@ public class LambdaFunction {
 
     public String getAccountId() { return accountId; }
     public void setAccountId(String accountId) { this.accountId = accountId; }
+
+    public String getRuntimeManagementGeneration() { return runtimeManagementGeneration; }
+    public void setRuntimeManagementGeneration(String generation) { this.runtimeManagementGeneration = generation; }
 
     public String getFunctionArn() { return functionArn; }
     public void setFunctionArn(String functionArn) { this.functionArn = functionArn; }
@@ -173,6 +179,9 @@ public class LambdaFunction {
 
     public Integer getReservedConcurrentExecutions() { return reservedConcurrentExecutions; }
     public void setReservedConcurrentExecutions(Integer reservedConcurrentExecutions) { this.reservedConcurrentExecutions = reservedConcurrentExecutions; }
+
+    public String getRecursiveLoop() { return recursiveLoop == null ? "Terminate" : recursiveLoop; }
+    public void setRecursiveLoop(String recursiveLoop) { this.recursiveLoop = recursiveLoop; }
 
     public List<String> getArchitectures() { return architectures; }
     public void setArchitectures(List<String> architectures) { this.architectures = architectures; }

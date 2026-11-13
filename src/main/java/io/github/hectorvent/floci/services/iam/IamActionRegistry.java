@@ -5,14 +5,24 @@ import io.github.hectorvent.floci.core.common.AwsProtocolClaimFilter;
 import io.github.hectorvent.floci.core.common.AwsQueryServiceResolver;
 import io.github.hectorvent.floci.core.common.ProtocolClaim;
 import io.github.hectorvent.floci.core.common.RequestResources;
+import io.github.hectorvent.floci.core.common.SignedServiceRoute;
 import io.github.hectorvent.floci.core.common.WireProtocol;
 import io.github.hectorvent.floci.services.account.AccountController;
 import io.github.hectorvent.floci.services.account.AccountRegionActions;
+import io.github.hectorvent.floci.services.apigateway.ApiGatewayController;
 import io.github.hectorvent.floci.services.appconfig.AppConfigDataController;
+import io.github.hectorvent.floci.services.backup.BackupFrameworkController;
+import io.github.hectorvent.floci.services.backup.BackupFrameworkResources;
+import io.github.hectorvent.floci.services.cloudfront.CloudFrontController;
+import io.github.hectorvent.floci.services.cloudfront.CloudFrontFunctionTestController;
+import io.github.hectorvent.floci.services.cloudfront.CloudFrontFunctionTestRoute;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbPartiQLParser;
 import io.github.hectorvent.floci.services.eks.EksController;
+import io.github.hectorvent.floci.services.iot.IotController;
+import io.github.hectorvent.floci.services.lambda.LambdaRuntimeManagementController;
 import io.github.hectorvent.floci.services.route53.Route53Controller;
 import io.github.hectorvent.floci.services.s3.S3ObjectActions;
+import io.github.hectorvent.floci.services.s3tables.S3TablesController;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.container.ResourceInfo;
@@ -44,11 +54,17 @@ import java.util.regex.Pattern;
 @ApplicationScoped
 public class IamActionRegistry {
 
-    private static final Map<String, String> ROUTE53_DELEGATION_ACTIONS = Map.of(
+    private static final Map<String, String> ROUTE53_ACTIONS = Map.of(
+            "testDnsAnswer", "route53:TestDNSAnswer",
             "createReusableDelegationSet", "route53:CreateReusableDelegationSet",
             "getReusableDelegationSet", "route53:GetReusableDelegationSet",
             "listReusableDelegationSets", "route53:ListReusableDelegationSets",
             "deleteReusableDelegationSet", "route53:DeleteReusableDelegationSet");
+
+    private static final Map<String, String> S3TABLES_METRICS_ACTIONS = Map.of(
+            "putTableBucketMetricsConfiguration", "s3tables:PutTableBucketMetricsConfiguration",
+            "getTableBucketMetricsConfiguration", "s3tables:GetTableBucketMetricsConfiguration",
+            "deleteTableBucketMetricsConfiguration", "s3tables:DeleteTableBucketMetricsConfiguration");
 
     private static final Logger LOG = Logger.getLogger(IamActionRegistry.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -98,6 +114,8 @@ public class IamActionRegistry {
      * type, so IAM checks them against the wildcard rather than a bucket.
      */
     private static final List<ActionRule> RULES = List.of(
+        rule("iot", "DELETE", "^/jobs/[^/]+/?$", "iot:DeleteJob"),
+
         // ── S3 Control ───────────────────────────────────────────────────────────
         s3ControlRule("GET",    "^/v20180820/tags/.+",        "s3:ListTagsForResource"),
         s3ControlRule("POST",   "^/v20180820/tags/.+",        "s3:TagResource"),
@@ -290,22 +308,6 @@ public class IamActionRegistry {
         rule("rds-data", "POST", "^/CommitTransaction/?$",    "rds-data:CommitTransaction"),
         rule("rds-data", "POST", "^/RollbackTransaction/?$",  "rds-data:RollbackTransaction"),
 
-        // ── Amazon Inspector ───────────────────────────────────────────────────
-        rule("inspector2", "POST", "^/disable/?$", "inspector2:Disable"),
-
-        // ── API Gateway ────────────────────────────────────────────────────────
-        // The management API, v1 and v2, is authorized by HTTP method on the resource path:
-        // apigateway:GET, POST, PUT, PATCH or DELETE. Two operations have an action of their own. The
-        // others AWS authorizes only by an action of their own name, the v2 routing rules, portals and
-        // portal products, are not served by Floci and need their own rules when they are.
-        rule("apigateway", "POST",   "^/rejectdomainnameaccessassociations$",       "apigateway:RejectAccessAssociation"),
-        rule("apigateway", "PUT",    "^/v2/domainnames/[^/]+/routingrules/[^/]+$",  "apigateway:UpdateRoutingRule"),
-        rule("apigateway", "GET",    ".*",                                          "apigateway:GET"),
-        rule("apigateway", "POST",   ".*",                                          "apigateway:POST"),
-        rule("apigateway", "PUT",    ".*",                                          "apigateway:PUT"),
-        rule("apigateway", "PATCH",  ".*",                                          "apigateway:PATCH"),
-        rule("apigateway", "DELETE", ".*",                                          "apigateway:DELETE"),
-
         // ── EventBridge Scheduler ──────────────────────────────────────────────
         rule("scheduler", "GET",    "^/schedules/[^/]+$",       "scheduler:GetSchedule"),
         rule("scheduler", "POST",   "^/schedules/[^/]+$",       "scheduler:CreateSchedule"),
@@ -436,11 +438,6 @@ public class IamActionRegistry {
         rule("eks", "GET",    "^/tags(/.+)?$",                                           "eks:ListTagsForResource"),
         rule("eks", "POST",   "^/tags(/.+)?$",                                           "eks:TagResource"),
         rule("eks", "DELETE", "^/tags(/.+)?$",                                           "eks:UntagResource"),
-
-        // ── Control Tower ──────────────────────────────────────────────────────
-        rule("controltower", "GET",    "^/tags(/.+)?$", "controltower:ListTagsForResource"),
-        rule("controltower", "POST",   "^/tags(/.+)?$", "controltower:TagResource"),
-        rule("controltower", "DELETE", "^/tags(/.+)?$", "controltower:UntagResource"),
 
         // ── Bedrock ────────────────────────────────────────────────────────────
         rule("bedrock", "POST",   "^/resource-policy$",   "bedrock:PutResourcePolicy"),
@@ -678,6 +675,74 @@ public class IamActionRegistry {
 
     /** The serving method identifies these actions even when path encoding or matrix parameters vary. */
     public String resolveMatchedRoute(String credentialScope, ResourceInfo resourceInfo) {
+        if ("apigateway".equals(credentialScope) && resourceInfo != null
+                && ApiGatewayController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && "importDocumentationParts".equals(resourceInfo.getResourceMethod().getName())) {
+            return "apigateway:PUT";
+        }
+        if ("apigateway".equals(credentialScope) && resourceInfo != null
+                && ApiGatewayController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && "testInvokeMethod".equals(resourceInfo.getResourceMethod().getName())) {
+            return "apigateway:POST";
+        }
+        if ("iot".equals(credentialScope) && resourceInfo != null
+                && IotController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && "deleteJob".equals(resourceInfo.getResourceMethod().getName())) {
+            return "iot:DeleteJob";
+        }
+        if ("eks".equals(credentialScope) && resourceInfo != null
+                && EksController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && "listAccessPolicies".equals(resourceInfo.getResourceMethod().getName())) {
+            return "eks:ListAccessPolicies";
+        }
+        if ("apigateway".equals(credentialScope) && resourceInfo != null
+                && ApiGatewayController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && ("getModelTemplate".equals(resourceInfo.getResourceMethod().getName())
+                || "getV2ModelTemplate".equals(resourceInfo.getResourceMethod().getName()))) {
+            return "apigateway:GET";
+        }
+        if ("cloudfront".equals(credentialScope) && resourceInfo != null
+                && CloudFrontController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            String action = switch (resourceInfo.getResourceMethod().getName()) {
+                case "getFieldLevelEncryption" -> "cloudfront:GetFieldLevelEncryption";
+                case "getFieldLevelEncryptionConfig" -> "cloudfront:GetFieldLevelEncryptionConfig";
+                case "getFieldLevelEncryptionProfile" -> "cloudfront:GetFieldLevelEncryptionProfile";
+                case "getFieldLevelEncryptionProfileConfig" -> "cloudfront:GetFieldLevelEncryptionProfileConfig";
+                default -> null;
+            };
+            if (action != null) {
+                return action;
+            }
+        }
+        if ("backup".equals(credentialScope) && resourceInfo != null
+                && BackupFrameworkController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            return BackupFrameworkController.iamAction(resourceInfo.getResourceMethod().getName());
+        }
+        if ("s3tables".equals(credentialScope) && resourceInfo != null
+                && S3TablesController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            return S3TABLES_METRICS_ACTIONS.get(resourceInfo.getResourceMethod().getName());
+        }
+        if ("lambda".equals(credentialScope) && resourceInfo != null
+                && LambdaRuntimeManagementController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            return switch (resourceInfo.getResourceMethod().getName()) {
+                case "getRuntimeManagementConfig" -> "lambda:GetRuntimeManagementConfig";
+                case "putRuntimeManagementConfig" -> "lambda:PutRuntimeManagementConfig";
+                default -> null;
+            };
+        }
+        if ("cloudfront".equals(credentialScope) && resourceInfo != null
+                && CloudFrontFunctionTestController.class.equals(resourceInfo.getResourceClass())) {
+            return "cloudfront:TestFunction";
+        }
         if ("account".equals(credentialScope) && resourceInfo != null
                 && AccountController.class.equals(resourceInfo.getResourceClass())
                 && resourceInfo.getResourceMethod() != null) {
@@ -696,7 +761,13 @@ public class IamActionRegistry {
         if ("route53".equals(credentialScope) && resourceInfo != null
                 && Route53Controller.class.equals(resourceInfo.getResourceClass())
                 && resourceInfo.getResourceMethod() != null) {
-            return ROUTE53_DELEGATION_ACTIONS.get(resourceInfo.getResourceMethod().getName());
+            return ROUTE53_ACTIONS.get(resourceInfo.getResourceMethod().getName());
+        }
+        if ("cloudfront".equals(credentialScope) && resourceInfo != null
+                && CloudFrontController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && "updateOriginAccessControl".equals(resourceInfo.getResourceMethod().getName())) {
+            return "cloudfront:UpdateOriginAccessControl";
         }
         return null;
     }
@@ -711,18 +782,29 @@ public class IamActionRegistry {
      * from the request URI because RESTEasy Reactive does not serve {@code UriInfo.getPath(false)}.
      *
      * <p>A request no rule matches is the operation whose route, in botocore's model of its service, it
-     * matches, and is checked as that operation's action ({@link IamAuthorizedActions#actionFor}), as a
-     * request naming its operation is, when Floci can check it as AWS does ({@code checkedAsAws}). One it
-     * cannot is left unmapped rather than checked on {@code *}, which would refuse a grant scoped to the
-     * resource AWS checks it on. The scopes the vendored routes list as hand-routed, S3's and API Gateway's,
-     * have their rules alone. Returns {@code null} when nothing maps the request (caller treats this as
-     * ALLOW).
+     * matches, and is checked as that operation's action for the request's method
+     * ({@link IamAuthorizedActions#actionFor(String, String, String)}): the one a request naming the operation
+     * is checked as, or, for an operation AWS authorizes by method as it does API Gateway's management API,
+     * {@code apigateway:PUT} for a PUT. That is when Floci can check it as AWS does ({@code checkedAsAws}). One
+     * it cannot is left unmapped rather than checked on {@code *}, which would refuse a grant scoped to the
+     * resource AWS checks it on. S3, the scope the
+     * vendored routes list as hand-routed, has its rules alone. Returns {@code null} when nothing maps the
+     * request (caller treats this as ALLOW).
      */
     public String resolveRoute(String credentialScope, ContainerRequestContext ctx) {
+        if ("cloudfront".equals(credentialScope) && CloudFrontFunctionTestRoute.matches(ctx)) {
+            return "cloudfront:TestFunction";
+        }
         String method = ctx.getMethod().toUpperCase();
         // An S3 key may end in a slash, PUT /bucket// writes the key "/", and S3's rules already take a
         // bucket's one trailing slash, so an S3 path is matched as sent.
         String path = "s3".equals(credentialScope) ? sentPath(ctx.getUriInfo()) : routedPath(ctx);
+        if ("backup".equals(credentialScope)) {
+            String frameworkAction = BackupFrameworkResources.routeAction(method, decodedPath(ctx));
+            if (frameworkAction != null) {
+                return frameworkAction;
+            }
+        }
 
         if ("s3".equals(credentialScope)) {
             // An S3 Control route is matched before the query overrides below, which would read the
@@ -749,10 +831,10 @@ public class IamActionRegistry {
                 return rule.action();
             }
         }
-        Optional<String> operation = restRoutes.operation(credentialScope, method, path,
-                ctx.getUriInfo() == null ? null : ctx.getUriInfo().getQueryParameters());
+        Optional<String> operation = restRoutes.operation(credentialScope, method, withoutInternalPrefix(ctx, path),
+                ctx.getUriInfo() == null ? null : ctx.getUriInfo().getQueryParameters(), movedUnderPrefix(ctx));
         if (operation.isPresent()) {
-            String action = IamAuthorizedActions.actionFor(credentialScope, operation.get());
+            String action = IamAuthorizedActions.actionFor(credentialScope, operation.get(), method);
             if (checkedAsAws(credentialScope, operation.get(), action)) {
                 return action;
             }
@@ -760,6 +842,11 @@ public class IamActionRegistry {
 
         LOG.debugv("No action mapping for {0} {1} {2} — defaulting to ALLOW", credentialScope, method, path);
         return null;
+    }
+
+    /** A REST model's explicit denial status, retaining the protocol default when none is modelled. */
+    public static int accessDeniedStatus(String credentialScope, int fallback) {
+        return IamRestRoutes.vendored().accessDeniedStatus(credentialScope, fallback);
     }
 
     /**
@@ -772,9 +859,33 @@ public class IamActionRegistry {
         if (credentialScope == null || !routes.routes(credentialScope)) {
             return Map.of();
         }
-        return routes.match(credentialScope, ctx.getMethod().toUpperCase(), routedPath(ctx),
-                        ctx.getUriInfo() == null ? null : ctx.getUriInfo().getQueryParameters())
+        return routes.match(credentialScope, ctx.getMethod().toUpperCase(), withoutInternalPrefix(ctx, routedPath(ctx)),
+                        ctx.getUriInfo() == null ? null : ctx.getUriInfo().getQueryParameters(), movedUnderPrefix(ctx))
                 .map(IamRestRoutes.Match::labels).orElse(Map.of());
+    }
+
+    static String withoutInternalPrefix(ContainerRequestContext ctx, String path) {
+        return SignedServiceRoute.internalPrefix(ctx)
+                .filter(prefix -> path.equals(prefix) || path.startsWith(prefix + "/"))
+                .map(prefix -> path.length() == prefix.length() ? "/" : path.substring(prefix.length()))
+                .orElse(path);
+    }
+
+    private static boolean movedUnderPrefix(ContainerRequestContext ctx) {
+        return SignedServiceRoute.internalPrefix(ctx).isPresent();
+    }
+
+    /** Member locations of a generated alternative route; absent entries keep the operation's model locations. */
+    public static Map<String, String> routeMemberLocations(String operation, ContainerRequestContext ctx) {
+        int separator = operation.indexOf(':');
+        if (separator < 0 || ctx.getMethod() == null || ctx.getUriInfo() == null
+                || ctx.getUriInfo().getRequestUri() == null) {
+            return Map.of();
+        }
+        return IamRestRoutes.vendored().match(operation.substring(0, separator), ctx.getMethod().toUpperCase(),
+                        routedPath(ctx), ctx.getUriInfo().getQueryParameters())
+                .filter(match -> match.operation().equals(operation.substring(separator + 1)))
+                .map(IamRestRoutes.Match::located).orElse(Map.of());
     }
 
     /**
