@@ -1,0 +1,441 @@
+package io.github.hectorvent.floci.services.lambda;
+
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.services.lambda.model.LambdaFunction;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import org.jboss.logging.Logger;
+
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+
+/**
+ * Enforces Lambda concurrency limits at invocation time.
+ *
+ * <p>AWS Lambda concurrency is scoped to an account <b>per region</b>; a
+ * function's reserved value does not compete with functions in other accounts or regions.
+ * Accordingly this limiter partitions its state by account and region (extracted from the
+ * function ARN), and the configured {@code regionLimit}/{@code unreservedMin}
+ * apply independently to each account and region.
+ *
+ * <p>Two layers of enforcement:
+ * <ul>
+ *   <li><b>Reserved (per-function)</b>: when a function has a reserved value,
+ *       inflight invocations are counted against that value and do not consume
+ *       the region's unreserved pool.</li>
+ *   <li><b>Unreserved (account-and-region-shared)</b>: functions without a reserved value
+ *       share capacity left after reservations and unreserved provisioned allocations
+ *       within their account and region.</li>
+ * </ul>
+ */
+@ApplicationScoped
+public class LambdaConcurrencyLimiter implements Resettable {
+
+    private static final Logger LOG = Logger.getLogger(LambdaConcurrencyLimiter.class);
+    /** Tracks malformed ARNs already logged so the warn fires once per unique input. */
+    private static final Set<String> LOGGED_MALFORMED_ARNS =
+            Collections.newSetFromMap(new ConcurrentHashMap<>());
+
+    /**
+     * Inflight counts per function ARN (globally unique). Entries are
+     * retained even when the count drops to zero — see {@link #reset} for
+     * the race this avoids. The map therefore grows by one entry per
+     * distinct ARN the limiter has ever seen, including entries left over
+     * from functions that have been deleted and recreated under a new
+     * name. For a local emulator the resulting footprint is negligible.
+     */
+    private final ConcurrentHashMap<String, AtomicInteger> inflight = new ConcurrentHashMap<>();
+    /** Reserved values partitioned by account and region. */
+    private final ConcurrentHashMap<String, ConcurrentHashMap<String, Integer>> reservedByScope
+            = new ConcurrentHashMap<>();
+    /**
+     * Running sum of {@link #reservedByScope} values per account and region. Maintained
+     * under {@link #reservedLock} on every mutation for reservation reporting.
+     */
+    private final ConcurrentHashMap<String, AtomicInteger> scopeReservedTotal = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, Map<String, Integer>> provisionedByFunction = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, AtomicInteger> scopeCommittedTotal = new ConcurrentHashMap<>();
+    /** Unreserved inflight counters partitioned by account and region. */
+    private final ConcurrentHashMap<String, AtomicInteger> unreservedByScope = new ConcurrentHashMap<>();
+    /** Guards atomic validate-then-set and rollback operations on concurrency commitments. */
+    private final Object reservedLock = new Object();
+    private final int regionLimit;
+    private final int unreservedMin;
+
+    @Inject
+    public LambdaConcurrencyLimiter(EmulatorConfig config) {
+        this(config.services().lambda().regionConcurrencyLimit(),
+             config.services().lambda().unreservedConcurrencyMin());
+    }
+
+    /** Test-only constructor with explicit limits. */
+    LambdaConcurrencyLimiter(int regionLimit, int unreservedMin) {
+        this.regionLimit = regionLimit;
+        this.unreservedMin = unreservedMin;
+    }
+
+    /** Test-only no-arg constructor using AWS defaults (1000 / 100). */
+    LambdaConcurrencyLimiter() {
+        this(1000, 100);
+    }
+
+    public Permit acquire(LambdaFunction fn) {
+        Integer r = fn.getReservedConcurrentExecutions();
+        String scope = scopeOf(fn.getFunctionArn());
+        if (r == null) {
+            return acquireUnreserved(scope);
+        }
+        return acquireReserved(fn.getFunctionArn(), r);
+    }
+
+    Permit acquireProvisioned(LambdaFunction fn) {
+        return fn.getReservedConcurrentExecutions() == null ? () -> {} : acquire(fn);
+    }
+
+    private Permit acquireReserved(String key, int limit) {
+        AtomicInteger counter = inflight.computeIfAbsent(key, k -> new AtomicInteger());
+        while (true) {
+            int current = counter.get();
+            if (current >= limit) {
+                throw throttle();
+            }
+            if (counter.compareAndSet(current, current + 1)) {
+                return idempotentPermit(counter);
+            }
+        }
+    }
+
+    private Permit acquireUnreserved(String scope) {
+        AtomicInteger counter = unreservedByScope.computeIfAbsent(scope, k -> new AtomicInteger());
+        AtomicInteger committedTotal = committedTotal(scope);
+        while (true) {
+            int current = counter.get();
+            int cap = Math.max(0, regionLimit - committedTotal.get());
+            if (current >= cap) {
+                throw throttle();
+            }
+            if (counter.compareAndSet(current, current + 1)) {
+                return idempotentPermit(counter);
+            }
+        }
+    }
+
+    /**
+     * Wraps {@code counter.decrementAndGet()} in a close-once guard so a
+     * future caller that accidentally double-closes a permit cannot drive
+     * the inflight counter negative.
+     */
+    private static Permit idempotentPermit(AtomicInteger counter) {
+        AtomicBoolean closed = new AtomicBoolean(false);
+        return () -> {
+            if (closed.compareAndSet(false, true)) {
+                counter.decrementAndGet();
+            }
+        };
+    }
+
+    /**
+     * Register (or update) a function's reserved value without validation.
+     * Intended for startup rehydration from persisted state.
+     *
+     * @return the previous value, or {@code null} if none was set.
+     */
+    public Integer setReserved(String functionArn, int value) {
+        synchronized (reservedLock) {
+            return writeReserved(functionArn, value);
+        }
+    }
+
+    /**
+     * @return the cleared value, or {@code null} if no reservation was set.
+     */
+    public Integer clearReserved(String functionArn) {
+        synchronized (reservedLock) {
+            return writeReserved(functionArn, null);
+        }
+    }
+
+    /**
+     * Atomically validates and applies a reserved value within the function's
+     * region. Two concurrent Puts for different functions cannot each pass
+     * validation against stale totals and then collectively push the region's
+     * unreserved capacity below the minimum.
+     *
+     * @return the previous reserved value for this ARN, or {@code null} if none;
+     *         callers may use it with {@link #rollbackReservedIfExpected} on a
+     *         subsequent persistence failure.
+     * @throws AwsException {@code LimitExceededException} if the value would
+     *         drop unreserved below the minimum.
+     */
+    public Integer validateAndSetReserved(String functionArn, int target) {
+        String scope = scopeOf(functionArn);
+        synchronized (reservedLock) {
+            if (target < totalProvisioned(functionArn)) {
+                throw new AwsException("InvalidParameterValueException",
+                        "Reserved concurrency cannot be lower than provisioned concurrency", 400);
+            }
+            ConcurrentHashMap<String, Integer> scopeReserved = reservedOf(scope);
+            int currentForThis = scopeReserved.getOrDefault(functionArn, 0);
+            // A reduction (or no-op) cannot decrease unreserved capacity any
+            // further than it already is, so always allow it. This lets
+            // operators recover from an over-committed state — e.g. after
+            // lowering region-concurrency-limit at runtime — without first
+            // having to delete every reservation.
+            if (target > currentForThis) {
+                int otherReserved = committedTotal(scope).get() - currentForThis;
+                if (!scopeReserved.containsKey(functionArn)) {
+                    otherReserved -= totalProvisioned(functionArn);
+                }
+                int maxAllowed = regionLimit - unreservedMin - otherReserved;
+                if (target > maxAllowed) {
+                    LOG.warnv("Account/region {0} reservation pool exhausted: requested={1}, "
+                            + "alreadyReserved={2}, regionLimit={3}, unreservedMin={4}. "
+                            + "Raise FLOCI_SERVICES_LAMBDA_REGION_CONCURRENCY_LIMIT (e.g. 10000) "
+                            + "or lower the function's ReservedConcurrentExecutions.",
+                            scope, target, otherReserved, regionLimit, unreservedMin);
+                    throw new AwsException("LimitExceededException",
+                            "Specified ReservedConcurrentExecutions for function decreases account's "
+                            + "UnreservedConcurrentExecution below its minimum value of ["
+                            + unreservedMin + "].", 400);
+                }
+            }
+            return writeReserved(functionArn, target);
+        }
+    }
+
+    /**
+     * Conditionally restores a prior reserved value if the current value still
+     * matches {@code expectedCurrent}. Used by callers that updated the limiter
+     * before a persistence step and need to undo the change on failure without
+     * clobbering a concurrent successful write.
+     */
+    public void rollbackReservedIfExpected(String functionArn,
+                                           Integer expectedCurrent,
+                                           Integer rollbackTo) {
+        synchronized (reservedLock) {
+            Integer actual = reservedOf(scopeOf(functionArn)).get(functionArn);
+            if (!Objects.equals(actual, expectedCurrent)) {
+                // A newer update has superseded ours; leave it alone.
+                return;
+            }
+            writeReserved(functionArn, rollbackTo);
+        }
+    }
+
+    Integer validateAndSetProvisioned(String functionArn, String qualifier, int target) {
+        synchronized (reservedLock) {
+            String scope = scopeOf(functionArn);
+            Map<String, Integer> values = provisionedByFunction.getOrDefault(functionArn, Map.of());
+            int previous = values.getOrDefault(qualifier, 0);
+            Integer reserved = reservedOf(scope).get(functionArn);
+            if (reserved != null) {
+                if ((long) totalProvisioned(functionArn) - previous + target > reserved) {
+                    throw new AwsException("InvalidParameterValueException",
+                            "Requested Provisioned Concurrency should not be greater than "
+                                    + "the reservedConcurrentExecution for function", 400);
+                }
+            } else if (target > previous) {
+                int available = regionLimit - committedTotal(scope).get() + previous;
+                if (target > available) {
+                    throw new AwsException("InvalidParameterValueException",
+                            "Specified ConcurrentExecutions for function is greater than account's "
+                                    + "unreserved concurrency [" + available + "].", 400);
+                }
+                if (available - target < unreservedMin) {
+                    throw new AwsException("InvalidParameterValueException",
+                            "Specified ConcurrentExecutions for function decreases account's "
+                                    + "UnreservedConcurrentExecution below its minimum value of ["
+                                    + unreservedMin + "].", 400);
+                }
+            }
+            return writeProvisioned(functionArn, qualifier, target);
+        }
+    }
+
+    void setProvisioned(String functionArn, String qualifier, int value) {
+        synchronized (reservedLock) {
+            writeProvisioned(functionArn, qualifier, value);
+        }
+    }
+
+    void clearProvisioned(String functionArn, String qualifier) {
+        synchronized (reservedLock) {
+            writeProvisioned(functionArn, qualifier, null);
+        }
+    }
+
+    void rollbackProvisionedIfExpected(String functionArn, String qualifier, int expected, Integer previous) {
+        synchronized (reservedLock) {
+            if (Objects.equals(provisionedByFunction.getOrDefault(functionArn, Map.of()).get(qualifier), expected)) {
+                writeProvisioned(functionArn, qualifier, previous);
+            }
+        }
+    }
+
+    /**
+     * Clears the reserved entry for a deleted function. The inflight counter
+     * is intentionally retained — permits held by still-running invocations
+     * decrement into it on close, and an ARN recreated later reuses the same
+     * counter so new invocations correctly see any remaining inflight.
+     *
+     * <p>The counter is also retained even when it momentarily reads zero:
+     * conditionally removing it would race with a concurrent
+     * {@code acquireReserved} that has already obtained the {@code AtomicInteger}
+     * reference and is about to increment it. After such a race the next
+     * acquire would allocate a fresh counter and undercount the inflight
+     * permit, allowing reserved over-subscription. The trade-off is one
+     * {@code AtomicInteger} per historical function, which is bounded for an
+     * emulator workload.
+     */
+    public void reset(String functionArn) {
+        synchronized (reservedLock) {
+            writeReserved(functionArn, null);
+        }
+    }
+
+    public void clear() {
+        synchronized (reservedLock) {
+            inflight.clear();
+            reservedByScope.clear();
+            scopeReservedTotal.clear();
+            provisionedByFunction.clear();
+            scopeCommittedTotal.clear();
+            unreservedByScope.clear();
+        }
+    }
+
+    public int totalReserved(String accountId, String region) {
+        return scopeTotal(region + ":" + accountId).get();
+    }
+
+    public int availableUnreserved(String accountId, String region) {
+        AtomicInteger counter = unreservedByScope.get(region + ":" + accountId);
+        int inflightNow = counter == null ? 0 : counter.get();
+        return Math.max(0, unreservedCapacity(accountId, region) - inflightNow);
+    }
+
+    public int unreservedCapacity(String accountId, String region) {
+        return Math.max(0, regionLimit - committedTotal(region + ":" + accountId).get());
+    }
+
+    int inflightCount(String functionArn) {
+        AtomicInteger counter = inflight.get(functionArn);
+        return counter == null ? 0 : counter.get();
+    }
+
+    int unreservedInflightCount(String accountId, String region) {
+        AtomicInteger counter = unreservedByScope.get(region + ":" + accountId);
+        return counter == null ? 0 : counter.get();
+    }
+
+    /**
+     * Must be called with {@link #reservedLock} held. Updates the per-function
+     * reserved entry and the region's running total in one atomic step from the
+     * perspective of any code that also holds the lock.
+     */
+    private Integer writeReserved(String functionArn, Integer newValue) {
+        String scope = scopeOf(functionArn);
+        ConcurrentHashMap<String, Integer> scopeReserved = reservedOf(scope);
+        Integer previous = newValue == null
+                ? scopeReserved.remove(functionArn)
+                : scopeReserved.put(functionArn, newValue);
+        int delta = (newValue == null ? 0 : newValue) - (previous == null ? 0 : previous);
+        if (delta != 0) {
+            scopeTotal(scope).addAndGet(delta);
+        }
+        int provisioned = totalProvisioned(functionArn);
+        int previousUnreserved = previous == null ? provisioned : 0;
+        int nextUnreserved = newValue == null ? provisioned : 0;
+        committedTotal(scope).addAndGet(delta + nextUnreserved - previousUnreserved);
+        return previous;
+    }
+
+    private Integer writeProvisioned(String functionArn, String qualifier, Integer value) {
+        Map<String, Integer> values = new HashMap<>(provisionedByFunction.getOrDefault(functionArn, Map.of()));
+        Integer previous = value == null ? values.remove(qualifier) : values.put(qualifier, value);
+        if (values.isEmpty()) {
+            provisionedByFunction.remove(functionArn);
+        } else {
+            provisionedByFunction.put(functionArn, Map.copyOf(values));
+        }
+        String scope = scopeOf(functionArn);
+        if (!reservedOf(scope).containsKey(functionArn)) {
+            committedTotal(scope).addAndGet((value == null ? 0 : value) - (previous == null ? 0 : previous));
+        }
+        return previous;
+    }
+
+    private int totalProvisioned(String functionArn) {
+        return provisionedByFunction.getOrDefault(functionArn, Map.of()).values().stream()
+                .mapToInt(Integer::intValue).sum();
+    }
+
+    private ConcurrentHashMap<String, Integer> reservedOf(String scope) {
+        return reservedByScope.computeIfAbsent(scope, k -> new ConcurrentHashMap<>());
+    }
+
+    private AtomicInteger scopeTotal(String scope) {
+        return scopeReservedTotal.computeIfAbsent(scope, k -> new AtomicInteger());
+    }
+
+    private AtomicInteger committedTotal(String scope) {
+        return scopeCommittedTotal.computeIfAbsent(scope, ignored -> new AtomicInteger());
+    }
+
+    /**
+     * Extracts the region and account segments from a Lambda function ARN. Falls back to
+     * {@code "unknown"} if the ARN is malformed so state still partitions
+     * cleanly rather than mixing with another account and region's data.
+     *
+     * <p>This is called on every acquire/release, so the parse avoids the
+     * regex machinery and array allocation of {@code String.split(":")} by
+     * scanning to the fifth ':' delimiter in an ARN:
+     * {@code arn:aws:lambda:REGION:account:function:name}.
+     */
+    private static String scopeOf(String arn) {
+        if (arn == null) {
+            warnMalformed("<null>");
+            return "unknown";
+        }
+        int segmentStart = 0;
+        int delimiters = 0;
+        for (int i = 0; i < arn.length(); i++) {
+            if (arn.charAt(i) == ':') {
+                if (delimiters == 2) {
+                    segmentStart = i + 1;
+                } else if (delimiters == 4) {
+                    return arn.substring(segmentStart, i);
+                }
+                delimiters++;
+            }
+        }
+        warnMalformed(arn);
+        return "unknown";
+    }
+
+    private static void warnMalformed(String arn) {
+        if (LOGGED_MALFORMED_ARNS.add(arn)) {
+            LOG.warnv("Concurrency limiter received non-ARN function identifier "
+                    + "\"{0}\"; bucketing under account/region=\"unknown\". This likely "
+                    + "indicates a bare function name reached the limiter.", arn);
+        }
+    }
+
+    private static AwsException throttle() {
+        return new AwsException("TooManyRequestsException", "Rate Exceeded.", 429);
+    }
+
+    @FunctionalInterface
+    public interface Permit extends AutoCloseable {
+        @Override
+        void close();
+    }
+}
