@@ -107,6 +107,7 @@ public class AthenaNamedQueryService {
             if (!recursive && !contents.isEmpty()) {
                 throw invalid("WorkGroup contains named queries. Set RecursiveDeleteOption to true to delete it.");
             }
+            athenaService.removeWorkGroup(workGroup, region);
             for (NamedQuery query : contents) {
                 queries.delete(key(region, query.namedQueryId()));
             }
@@ -116,7 +117,6 @@ public class AthenaNamedQueryService {
                     requests.delete(requestKey);
                 }
             }
-            athenaService.removeWorkGroup(workGroup, region);
         }
     }
 

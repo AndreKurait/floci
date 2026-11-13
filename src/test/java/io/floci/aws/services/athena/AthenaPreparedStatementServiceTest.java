@@ -276,6 +276,28 @@ class AthenaPreparedStatementServiceTest {
     }
 
     @Test
+    void rejectedParentDeletionPreservesNamedQueriesAndRequestTokens() {
+        ControlledStore store = new ControlledStore();
+        Fixture f = new Fixture(store);
+        f.createGroup("group");
+        f.service.create(REGION, "group", "saved", "original", null);
+        AthenaNamedQueryService named = new AthenaNamedQueryService(f.factory, f.athena, f.resolver);
+        String id = named.createNamedQuery(REGION, "query", "database", "select 1", null, "group", "token");
+        store.failDelete = true;
+
+        assertThrows(IllegalStateException.class, () -> named.deleteWorkGroup(REGION, "group", true));
+        assertEquals("original", f.service.get(REGION, "group", "saved").queryStatement());
+        assertEquals(id, named.getNamedQuery(REGION, id).namedQueryId());
+        assertEquals(id, named.createNamedQuery(REGION, "query", "database", "select 1", null, "group", "token"));
+
+        store.failDelete = false;
+        named.deleteWorkGroup(REGION, "group", true);
+        assertThrows(AwsException.class, () -> named.getNamedQuery(REGION, id));
+        f.createGroup("group");
+        assertNotEquals(id, named.createNamedQuery(REGION, "query", "database", "select 1", null, "group", "token"));
+    }
+
+    @Test
     void aWriteQueuedBehindDeletionRereadsTheMissingParentInsteadOfResurrectingIt() throws Exception {
         ControlledStore store = new ControlledStore();
         Fixture f = new Fixture(store);
