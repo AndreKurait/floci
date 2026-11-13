@@ -215,8 +215,12 @@ documents on streams and registered consumers. Put replaces the document and Get
 its original string, including whitespace. Get on an existing resource without a policy
 returns `Policy: "{}"`; Delete without a policy returns `ResourceNotFoundException`.
 The document must contain statements with valid Allow/Deny effects, principals, and actions.
-Policies cannot exceed 20 KB in UTF-8, and action names cannot contain `*` wildcards.
-Rejected replacements preserve the previous document.
+The local size ceiling is 20,480 UTF-8 bytes, including submitted whitespace, as an
+implementation interpretation of AWS's documented 20 KB limit. Action and principal
+values cannot contain `*` wildcards, including `NotAction` and `NotPrincipal`.
+Principal objects support only `AWS` account, user or role values; service,
+federated, canonical-user and unknown principal types are rejected.
+Rejected replacements preserve the previous document and do not migrate legacy rows.
 This validates the supported policy structure, not the full IAM policy language or service
 action catalog.
 
@@ -228,9 +232,12 @@ updates, and are not inherited from the parent. Tag updates preserve the resourc
 Policies use the existing Kinesis storage mode. Memory, persistent, and WAL backends publish
 a detached policy replacement atomically; hybrid retains its asynchronous disk durability.
 
-Consumer registration requires an existing parent stream and checks it under the stream
-lifecycle lock before publishing the consumer. Legacy tag lookups use stored ownership
-without migrating data, including entries owned by nondefault accounts.
+Consumer registration validates the exact parent ARN, account and generation under the
+stream lifecycle lock before publishing the consumer. Refusal does not adopt a foreign
+legacy parent. Legacy tag lookups use stored ownership without migrating data, including
+entries owned by nondefault accounts. A present scoped row takes precedence over a legacy
+row even when ownership validation refuses it. This read boundary is not a transaction
+covering both IAM evaluation and the subsequent service operation.
 
 Deleting a stream removes its policies. Retained consumer records from an earlier stream
 generation cannot receive policies or resource tag operations after recreating the same stream name. Consumer
