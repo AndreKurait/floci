@@ -1,0 +1,176 @@
+package io.github.hectorvent.floci.services.ec2.model;
+
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import io.quarkus.runtime.annotations.RegisterForReflection;
+
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Set;
+import java.util.stream.Collectors;
+
+@RegisterForReflection
+@JsonIgnoreProperties(ignoreUnknown = true)
+public class Image {
+
+    private String imageId;
+    private String name;
+    private String description;
+    private String state = "available";
+    private String ownerId = "amazon";
+    private boolean isPublic = true;
+    private String architecture;
+    private String rootDeviceType = "ebs";
+    private String rootDeviceName = "/dev/xvda";
+    private String virtualizationType = "hvm";
+    private String hypervisor = "xen";
+    private String platform;
+    private String imageOwnerAlias = "amazon";
+    private String creationDate;
+    private String region;
+    /**
+     * For images produced by CreateImage or CopyImage: the launchable ancestor, the catalog or
+     * registered image the chain of sources ends at. Floci uses it to resolve the guest image to
+     * run, since a generated ami-* id is not in the catalog and would otherwise fall back to the
+     * default guest. This is not the SourceImageId EC2 reports, which is
+     * {@link #creationSourceImageId}.
+     */
+    private String sourceImageId;
+
+    /**
+     * What DescribeImages reports as SourceImageId, SourceImageRegion and SourceInstanceId: the AMI
+     * a CreateImage or CopyImage image was made from, that AMI's region, and the instance a
+     * CreateImage image captured. Null for RegisterImage and catalog images, and for images saved
+     * before Floci kept them.
+     */
+    private String creationSourceImageId;
+    private String creationSourceImageRegion;
+    private String creationSourceInstanceId;
+
+    /**
+     * For images produced by CreateImage: the Docker image the source container was committed
+     * to, which is what actually captures the instance's file system. Not an EC2 field. Null
+     * when no capture could be made (mock mode, or an instance with no container), in which
+     * case launching falls back to {@link #sourceImageId} and the AMI is only a metadata
+     * record of its ancestor.
+     */
+    private String dockerImage;
+    private List<BlockDeviceMapping> blockDeviceMappings = new ArrayList<>();
+    private List<Tag> tags = new ArrayList<>();
+    private Set<String> launchPermissionUserIds = new LinkedHashSet<>();
+
+    public Image() {}
+
+    public Image(Image source) {
+        this.imageId = source.imageId;
+        this.name = source.name;
+        this.description = source.description;
+        this.state = source.state;
+        this.ownerId = source.ownerId;
+        this.isPublic = source.isPublic;
+        this.architecture = source.architecture;
+        this.rootDeviceType = source.rootDeviceType;
+        this.rootDeviceName = source.rootDeviceName;
+        this.virtualizationType = source.virtualizationType;
+        this.hypervisor = source.hypervisor;
+        this.platform = source.platform;
+        this.imageOwnerAlias = source.imageOwnerAlias;
+        this.creationDate = source.creationDate;
+        this.region = source.region;
+        this.sourceImageId = source.sourceImageId;
+        this.creationSourceImageId = source.creationSourceImageId;
+        this.creationSourceImageRegion = source.creationSourceImageRegion;
+        this.creationSourceInstanceId = source.creationSourceInstanceId;
+        this.dockerImage = source.dockerImage;
+        this.blockDeviceMappings = source.blockDeviceMappings.stream().map(mapping -> {
+            BlockDeviceMapping copy = new BlockDeviceMapping();
+            copy.setDeviceName(mapping.getDeviceName());
+            if (mapping.getEbs() != null) {
+                EbsBlockDevice ebs = new EbsBlockDevice();
+                ebs.setSnapshotId(mapping.getEbs().getSnapshotId());
+                ebs.setVolumeSize(mapping.getEbs().getVolumeSize());
+                ebs.setVolumeType(mapping.getEbs().getVolumeType());
+                ebs.setIops(mapping.getEbs().getIops());
+                ebs.setThroughput(mapping.getEbs().getThroughput());
+                ebs.setDeleteOnTermination(mapping.getEbs().getDeleteOnTermination());
+                ebs.setEncrypted(mapping.getEbs().getEncrypted());
+                copy.setEbs(ebs);
+            }
+            return copy;
+        }).collect(Collectors.toCollection(ArrayList::new));
+        this.tags = source.tags.stream().map(tag -> new Tag(tag.getKey(), tag.getValue()))
+                .collect(Collectors.toCollection(ArrayList::new));
+        this.launchPermissionUserIds = new LinkedHashSet<>(source.launchPermissionUserIds);
+    }
+
+    public String getImageId() { return imageId; }
+    public void setImageId(String imageId) { this.imageId = imageId; }
+
+    public String getName() { return name; }
+    public void setName(String name) { this.name = name; }
+
+    public String getDescription() { return description; }
+    public void setDescription(String description) { this.description = description; }
+
+    public String getState() { return state; }
+    public void setState(String state) { this.state = state; }
+
+    public String getOwnerId() { return ownerId; }
+    public void setOwnerId(String ownerId) { this.ownerId = ownerId; }
+
+    public boolean isPublic() { return isPublic; }
+    public void setPublic(boolean aPublic) { isPublic = aPublic; }
+
+    public String getArchitecture() { return architecture; }
+    public void setArchitecture(String architecture) { this.architecture = architecture; }
+
+    public String getRootDeviceType() { return rootDeviceType; }
+    public void setRootDeviceType(String rootDeviceType) { this.rootDeviceType = rootDeviceType; }
+
+    public String getRootDeviceName() { return rootDeviceName; }
+    public void setRootDeviceName(String rootDeviceName) { this.rootDeviceName = rootDeviceName; }
+
+    public String getVirtualizationType() { return virtualizationType; }
+    public void setVirtualizationType(String virtualizationType) { this.virtualizationType = virtualizationType; }
+
+    public String getHypervisor() { return hypervisor; }
+    public void setHypervisor(String hypervisor) { this.hypervisor = hypervisor; }
+
+    public String getPlatform() { return platform; }
+    public void setPlatform(String platform) { this.platform = platform; }
+
+    public String getImageOwnerAlias() { return imageOwnerAlias; }
+    public void setImageOwnerAlias(String imageOwnerAlias) { this.imageOwnerAlias = imageOwnerAlias; }
+
+    public String getCreationDate() { return creationDate; }
+    public void setCreationDate(String creationDate) { this.creationDate = creationDate; }
+
+    public String getRegion() { return region; }
+    public void setRegion(String region) { this.region = region; }
+
+    public String getSourceImageId() { return sourceImageId; }
+    public void setSourceImageId(String sourceImageId) { this.sourceImageId = sourceImageId; }
+
+    public String getCreationSourceImageId() { return creationSourceImageId; }
+    public void setCreationSourceImageId(String creationSourceImageId) { this.creationSourceImageId = creationSourceImageId; }
+
+    public String getCreationSourceImageRegion() { return creationSourceImageRegion; }
+    public void setCreationSourceImageRegion(String creationSourceImageRegion) { this.creationSourceImageRegion = creationSourceImageRegion; }
+
+    public String getCreationSourceInstanceId() { return creationSourceInstanceId; }
+    public void setCreationSourceInstanceId(String creationSourceInstanceId) { this.creationSourceInstanceId = creationSourceInstanceId; }
+
+    public String getDockerImage() { return dockerImage; }
+    public void setDockerImage(String dockerImage) { this.dockerImage = dockerImage; }
+
+    public List<BlockDeviceMapping> getBlockDeviceMappings() { return blockDeviceMappings; }
+    public void setBlockDeviceMappings(List<BlockDeviceMapping> blockDeviceMappings) { this.blockDeviceMappings = blockDeviceMappings; }
+
+    public List<Tag> getTags() { return tags; }
+    public void setTags(List<Tag> tags) { this.tags = tags; }
+
+    public Set<String> getLaunchPermissionUserIds() { return launchPermissionUserIds; }
+    public void setLaunchPermissionUserIds(Set<String> userIds) {
+        this.launchPermissionUserIds = userIds == null ? new LinkedHashSet<>() : new LinkedHashSet<>(userIds);
+    }
+}
