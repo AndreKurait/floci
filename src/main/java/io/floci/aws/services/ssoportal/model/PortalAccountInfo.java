@@ -1,6 +1,0 @@
-package io.floci.aws.services.ssoportal.model;
-
-import io.quarkus.runtime.annotations.RegisterForReflection;
-
-@RegisterForReflection
-public record PortalAccountInfo(String accountId, String accountName, String emailAddress) {}
