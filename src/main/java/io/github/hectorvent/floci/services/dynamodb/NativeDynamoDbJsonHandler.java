@@ -73,10 +73,6 @@ public class NativeDynamoDbJsonHandler {
     private static final List<String> CONTRIBUTOR_INSIGHTS_ACTIONS = List.of("ENABLE", "DISABLE");
     // The order AWS prints the enum constraint in.
     private static final List<String> CONTRIBUTOR_INSIGHTS_MODES = List.of("THROTTLED_KEYS", "ACCESSED_AND_THROTTLED_KEYS");
-    // The warm throughput a new on-demand table or index starts with.
-    private static final long ON_DEMAND_WARM_READ_UNITS = 12000;
-    private static final long ON_DEMAND_WARM_WRITE_UNITS = 4000;
-
     private final DynamoDbService dynamoDbService;
     private final NativeDynamoDbTableService tableService;
     private final ObjectMapper objectMapper;
@@ -3802,8 +3798,8 @@ public class NativeDynamoDbJsonHandler {
 
         ObjectNode warmThroughput = objectMapper.createObjectNode();
         warmThroughput.put("Status", "ACTIVE");
-        warmThroughput.put("ReadUnitsPerSecond", 0);
-        warmThroughput.put("WriteUnitsPerSecond", 0);
+        warmThroughput.put("ReadUnitsPerSecond", table.getWarmReadUnitsPerSecond());
+        warmThroughput.put("WriteUnitsPerSecond", table.getWarmWriteUnitsPerSecond());
         node.set("WarmThroughput", warmThroughput);
 
         // Global-table replicas. In a single-process emulator every region is served by this same
@@ -3985,16 +3981,12 @@ public class NativeDynamoDbJsonHandler {
     }
 
     /**
-     * AWS reports a provisioned index's warm throughput as its provisioned capacity, and an on-demand
-     * one's as the values a new on-demand index starts with. An index is ACTIVE as soon as it exists here.
+     * Reports retained warm peaks with the current capacity floor. An index is ACTIVE as soon as it exists here.
      */
     private ObjectNode gsiWarmThroughput(TableDefinition table, GlobalSecondaryIndex gsi) {
-        boolean onDemand = "PAY_PER_REQUEST".equals(table.getBillingMode());
         ObjectNode warmThroughput = objectMapper.createObjectNode();
-        warmThroughput.put("ReadUnitsPerSecond",
-                onDemand ? ON_DEMAND_WARM_READ_UNITS : gsi.getProvisionedThroughput().getReadCapacityUnits());
-        warmThroughput.put("WriteUnitsPerSecond",
-                onDemand ? ON_DEMAND_WARM_WRITE_UNITS : gsi.getProvisionedThroughput().getWriteCapacityUnits());
+        warmThroughput.put("ReadUnitsPerSecond", gsi.getWarmReadUnitsPerSecond(table.getBillingMode()));
+        warmThroughput.put("WriteUnitsPerSecond", gsi.getWarmWriteUnitsPerSecond(table.getBillingMode()));
         warmThroughput.put("Status", "ACTIVE");
         return warmThroughput;
     }

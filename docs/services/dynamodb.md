@@ -179,6 +179,27 @@ A Lambda event source mapping or an EventBridge pipe that should see only TTL de
 it with the pattern
 `{"userIdentity": {"type": ["Service"], "principalId": ["dynamodb.amazonaws.com"]}}`.
 
+## Warm throughput
+
+The built-in backend reports warm throughput for tables and global secondary indexes
+with at least their current provisioned read/write capacity. A capacity increase
+raises that resource's persisted warm peak; a later decrease retains the peak.
+New on-demand resources start with 12,000 read units and 4,000 write units. Billing
+mode changes retain a higher recorded peak.
+
+`CreateTable`, `UpdateTable`, index creation and updates, and
+[Application Auto Scaling registration](applicationautoscaling.md#dynamodb-capacity-at-registration)
+share this behavior. Explicit prewarming requests are not implemented. A legacy
+stored table or index without peak fields uses its current capacity as a floor;
+peak history that was never stored cannot be recovered.
+
+Registration serializes capacity changes with table create, update and delete.
+If a storage operation reports failure before target replacement, it restores the
+selected capacity and decoded stored warm value and attempts to persist that
+restoration. The table and target stores do not share a transaction. Persistence
+errors hidden by a backend, compensation failures, intermediate reads and process
+loss retain their backend-specific limits.
+
 ## DynamoDB Local backend
 
 By default Floci stores tables in its own engine, the `native` backend. With

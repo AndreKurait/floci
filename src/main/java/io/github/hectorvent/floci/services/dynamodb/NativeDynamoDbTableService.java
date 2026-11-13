@@ -108,6 +108,13 @@ public class NativeDynamoDbTableService {
      *                      a table an ImportTable job is still loading
      */
     TableDefinition createTable(CreateTableRequest request, String initialStatus, String region) {
+        DynamoDbTableNames.requireShortName(request.tableName());
+        synchronized (dynamoDbService.tableControlLock(request.tableName(), region)) {
+            return createTableWithCapacityLock(request, initialStatus, region);
+        }
+    }
+
+    private TableDefinition createTableWithCapacityLock(CreateTableRequest request, String initialStatus, String region) {
         String tableName = request.tableName();
         TableSettings settings = request.settings();
         String billingMode = settings.billingMode();
@@ -176,6 +183,7 @@ public class NativeDynamoDbTableService {
         // backend serializes on write rather than holding the live object. Flush once so the
         // stream, billing, class, tag and SSE settings survive a restart: stream state
         // especially, since startup rebuilds streams from the persisted table.
+        table.initializeWarmThroughput();
         dynamoDbService.persistTable(tableName, table, region);
         return table;
     }
@@ -407,6 +415,12 @@ public class NativeDynamoDbTableService {
      * stay with the caller, which runs them while it parses so their error precedence holds.
      */
     TableDefinition updateTable(UpdateTableRequest request, String region) {
+        synchronized (dynamoDbService.tableControlLock(request.tableName(), region)) {
+            return applyUpdate(request, region);
+        }
+    }
+
+    private TableDefinition applyUpdate(UpdateTableRequest request, String region) {
         String tableName = request.tableName();
         TableSettings settings = request.settings();
         List<String> addRegions = request.replicaAdds();
@@ -437,6 +451,7 @@ public class NativeDynamoDbTableService {
                 request.vectorCreates(), request.vectorDeletes(),
                 settings.billingMode(), region);
 
+        table.retainWarmThroughput();
         for (GsiThroughputUpdate update : request.gsiUpdates()) {
             GlobalSecondaryIndex gsi = table.findGsi(update.indexName()).orElseThrow();
             Throughput gsiThroughput = update.provisionedThroughput();
@@ -509,6 +524,7 @@ public class NativeDynamoDbTableService {
         // the table from storage for its own persist. A persistent backend serializes on write
         // rather than holding the live object, so without this flush first, that re-fetch would
         // see neither the stream nor the SSE mutations above.
+        table.retainWarmThroughput();
         dynamoDbService.persistTable(tableName, table, region);
 
         if (replicaUpdates) {
