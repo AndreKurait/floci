@@ -15,13 +15,25 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import software.amazon.awssdk.core.SdkField;
+import software.amazon.awssdk.core.SdkPojo;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.cloudformation.CloudFormationClient;
+import software.amazon.awssdk.services.cloudwatch.CloudWatchClient;
+import software.amazon.awssdk.services.cloudwatch.model.CompositeAlarm;
+import software.amazon.awssdk.services.cloudwatch.model.DescribeAlarmsResponse;
+import software.amazon.awssdk.services.cloudwatch.model.MetricAlarm;
 
+import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 import static io.floci.aws.testing.CfnRequests.cfn;
 import static io.restassured.RestAssured.given;
@@ -29,6 +41,7 @@ import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasKey;
 import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.nullValue;
+import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -89,57 +102,60 @@ class CloudFormationAppConfigIntegrationTest {
 
     @Test
     void aStackCreatesTheFourTypesAndItsDeleteRemovesThemWithTheirVersionsAndDeployments() throws Exception {
-        String stack = unique("cfn-appconfig-create");
-        Map<String, Object> resources = first();
-        resources.put("Untyped", Map.of("Type", "AWS::AppConfig::ConfigurationProfile", "Properties",
-                Map.of("ApplicationId", ref("App"), "Name", "untyped", "LocationUri", "hosted")));
-        deploy("CreateStack", stack, template(resources, false));
-        assertStatus(stack, "CREATE_COMPLETE");
+        try (OwnedMonitorAlarm monitor = new OwnedMonitorAlarm()) {
+            String stack = unique("cfn-appconfig-create");
+            Map<String, Object> resources = first();
+            resources.put("Untyped", Map.of("Type", "AWS::AppConfig::ConfigurationProfile", "Properties",
+                    Map.of("ApplicationId", ref("App"), "Name", "untyped", "LocationUri", "hosted")));
+            deploy("CreateStack", stack, template(resources, false));
+            assertStatus(stack, "CREATE_COMPLETE");
 
-        Map<String, String> outputs = outputs(stack);
-        Map<String, String> physicalIds = physicalIds(stack);
-        for (String resource : RESOURCES) {
-            assertEquals(outputs.get(resource + "Ref"), outputs.get(resource + "Id"), resource);
-            assertEquals(physicalIds.get(resource), outputs.get(resource + "Ref"), resource);
+            Map<String, String> outputs = outputs(stack);
+            Map<String, String> physicalIds = physicalIds(stack);
+            for (String resource : RESOURCES) {
+                assertEquals(outputs.get(resource + "Ref"), outputs.get(resource + "Id"), resource);
+                assertEquals(physicalIds.get(resource), outputs.get(resource + "Ref"), resource);
+            }
+            String app = outputs.get("AppRef");
+            String env = outputs.get("EnvRef");
+            String profile = outputs.get("ProfileRef");
+            String strategy = outputs.get("StrategyRef");
+            String envPath = "/applications/" + app + "/environments/" + env;
+            String profilePath = "/applications/" + app + "/configurationprofiles/" + profile;
+
+            appconfig().get("/applications/" + app).then().statusCode(200)
+                    .body("Name", equalTo("orders"), "Description", equalTo("Order service"));
+            assertEquals(Map.of("team", "payments", "tier", "gold"), applicationTags(app));
+            appconfig().get(envPath).then().statusCode(200)
+                    .body("Name", equalTo("beta"), "Monitors[0].AlarmArn", equalTo(ALARM))
+                    .body("Monitors[0]", not(hasKey("AlarmRoleArn")));
+            appconfig().get(profilePath).then().statusCode(200)
+                    .body("Name", equalTo("settings"), "LocationUri", equalTo("hosted"), "Type", equalTo("AWS.Freeform"));
+            appconfig().get("/applications/" + app + "/configurationprofiles/" + physicalIds.get("Untyped"))
+                    .then().statusCode(200).body("Type", equalTo("AWS.Freeform"));
+            appconfig().get("/deploymentstrategies/" + strategy).then().statusCode(200)
+                    .body("Name", equalTo("gradual"), "DeploymentDurationInMinutes", equalTo(0),
+                            "FinalBakeTimeInMinutes", equalTo(0), "GrowthFactor", equalTo(100f),
+                            "GrowthType", equalTo("LINEAR"), "ReplicateTo", equalTo("NONE"));
+
+            // The stack's resources work together: a hosted version deploys with the stack's strategy.
+            appconfig().body("{\"enabled\":true}").post(profilePath + "/hostedconfigurationversions")
+                    .then().statusCode(201).header("Version-Number", equalTo("1"));
+            monitor.assertReady();
+            int deployment = appconfig().body(Map.of("ConfigurationProfileId", profile, "ConfigurationVersion", "1",
+                            "DeploymentStrategyId", strategy))
+                    .post(envPath + "/deployments").then().statusCode(201)
+                    .body("ConfigurationName", equalTo("settings"), "ConfigurationLocationUri", equalTo("hosted"))
+                    .extract().path("DeploymentNumber");
+
+            deleteStack(stack);
+            appconfig().get(envPath + "/deployments/" + deployment).then().statusCode(404);
+            appconfig().get(envPath).then().statusCode(404);
+            appconfig().get(profilePath + "/hostedconfigurationversions/1").then().statusCode(404);
+            appconfig().get(profilePath).then().statusCode(404);
+            appconfig().get("/deploymentstrategies/" + strategy).then().statusCode(404);
+            appconfig().get("/applications/" + app).then().statusCode(404);
         }
-        String app = outputs.get("AppRef");
-        String env = outputs.get("EnvRef");
-        String profile = outputs.get("ProfileRef");
-        String strategy = outputs.get("StrategyRef");
-        String envPath = "/applications/" + app + "/environments/" + env;
-        String profilePath = "/applications/" + app + "/configurationprofiles/" + profile;
-
-        appconfig().get("/applications/" + app).then().statusCode(200)
-                .body("Name", equalTo("orders"), "Description", equalTo("Order service"));
-        assertEquals(Map.of("team", "payments", "tier", "gold"), applicationTags(app));
-        appconfig().get(envPath).then().statusCode(200)
-                .body("Name", equalTo("beta"), "Monitors[0].AlarmArn", equalTo(ALARM))
-                .body("Monitors[0]", not(hasKey("AlarmRoleArn")));
-        appconfig().get(profilePath).then().statusCode(200)
-                .body("Name", equalTo("settings"), "LocationUri", equalTo("hosted"), "Type", equalTo("AWS.Freeform"));
-        appconfig().get("/applications/" + app + "/configurationprofiles/" + physicalIds.get("Untyped"))
-                .then().statusCode(200).body("Type", equalTo("AWS.Freeform"));
-        appconfig().get("/deploymentstrategies/" + strategy).then().statusCode(200)
-                .body("Name", equalTo("gradual"), "DeploymentDurationInMinutes", equalTo(0),
-                        "FinalBakeTimeInMinutes", equalTo(0), "GrowthFactor", equalTo(100f),
-                        "GrowthType", equalTo("LINEAR"), "ReplicateTo", equalTo("NONE"));
-
-        // The stack's resources work together: a hosted version deploys with the stack's strategy.
-        appconfig().body("{\"enabled\":true}").post(profilePath + "/hostedconfigurationversions")
-                .then().statusCode(201).header("Version-Number", equalTo("1"));
-        int deployment = appconfig().body(Map.of("ConfigurationProfileId", profile, "ConfigurationVersion", "1",
-                        "DeploymentStrategyId", strategy))
-                .post(envPath + "/deployments").then().statusCode(201)
-                .body("ConfigurationName", equalTo("settings"), "ConfigurationLocationUri", equalTo("hosted"))
-                .extract().path("DeploymentNumber");
-
-        deleteStack(stack);
-        appconfig().get(envPath + "/deployments/" + deployment).then().statusCode(404);
-        appconfig().get(envPath).then().statusCode(404);
-        appconfig().get(profilePath + "/hostedconfigurationversions/1").then().statusCode(404);
-        appconfig().get(profilePath).then().statusCode(404);
-        appconfig().get("/deploymentstrategies/" + strategy).then().statusCode(404);
-        appconfig().get("/applications/" + app).then().statusCode(404);
     }
 
     @Test
@@ -378,4 +394,150 @@ class CloudFormationAppConfigIntegrationTest {
                 .then().statusCode(200).extract().jsonPath();
         return body.getMap("Tags", String.class, String.class);
     }
+
+    private static final class OwnedMonitorAlarm implements AutoCloseable {
+        private static final String ALARM_NAME = "configuration-errors";
+        private final CloudWatchClient metrics = AwsTestClients.create(
+                CloudWatchClient.builder(), "test", Region.US_EAST_1);
+        private final String marker = "cfn-appconfig-monitor-" + UUID.randomUUID();
+        private AlarmInventory before;
+        private AlarmInventory after;
+        private MetricAlarm ready;
+        private boolean createAttempted;
+
+        private OwnedMonitorAlarm() {
+            try {
+                before = inventory();
+                assertTrue(before.metrics().stream().noneMatch(alarm -> ALARM_NAME.equals(alarm.alarmName())));
+                assertTrue(before.composites().stream().noneMatch(alarm -> ALARM_NAME.equals(alarm.alarmName())));
+                createAttempted = true;
+                metrics.putMetricAlarm(request -> request.alarmName(ALARM_NAME).alarmDescription(marker)
+                        .namespace("Floci/AppConfigCfnMonitor").metricName(marker).statistic("Sum")
+                        .period(60).evaluationPeriods(1).datapointsToAlarm(1).threshold(1.0)
+                        .comparisonOperator("GreaterThanThreshold").treatMissingData("notBreaching")
+                        .actionsEnabled(true));
+                metrics.setAlarmState(request -> request.alarmName(ALARM_NAME)
+                        .stateValue("OK").stateReason(marker));
+            } catch (RuntimeException | Error failure) {
+                try {
+                    close();
+                } catch (IOException | RuntimeException | Error cleanup) {
+                    failure.addSuppressed(cleanup);
+                }
+                throw failure;
+            }
+        }
+
+        private void assertReady() {
+            DescribeAlarmsResponse response = metrics.describeAlarms(request -> request.alarmNames(ALARM_NAME)
+                    .alarmTypesWithStrings("MetricAlarm", "CompositeAlarm"));
+            assertEquals(List.of(), response.compositeAlarms());
+            assertEquals(1, response.metricAlarms().size());
+            ready = response.metricAlarms().getFirst();
+            assertAll(() -> assertEquals(ALARM, ready.alarmArn()),
+                    () -> assertEquals(marker, ready.alarmDescription()),
+                    () -> assertEquals("OK", ready.stateValueAsString()),
+                    () -> assertEquals(Boolean.TRUE, ready.actionsEnabled()));
+        }
+
+        private AlarmInventory inventory() {
+            List<MetricAlarm> metricAlarms = new ArrayList<>();
+            List<CompositeAlarm> compositeAlarms = new ArrayList<>();
+            String next = null;
+            for (int page = 0; page < 100; page++) {
+                String token = next;
+                DescribeAlarmsResponse response = metrics.describeAlarms(request -> request.maxRecords(100)
+                        .alarmTypesWithStrings("MetricAlarm", "CompositeAlarm").nextToken(token));
+                metricAlarms.addAll(response.metricAlarms());
+                compositeAlarms.addAll(response.compositeAlarms());
+                next = response.nextToken();
+                if (next == null) {
+                    break;
+                }
+            }
+            assertEquals(null, next, "Complete bounded CloudWatch alarm inventory");
+            return new AlarmInventory(metricAlarms.stream().sorted(Comparator.comparing(MetricAlarm::alarmName)).toList(),
+                    compositeAlarms.stream().sorted(Comparator.comparing(CompositeAlarm::alarmName)).toList());
+        }
+
+        private void removeOwnedAlarm() {
+            if (!createAttempted) {
+                return;
+            }
+            DescribeAlarmsResponse response = metrics.describeAlarms(request -> request.alarmNames(ALARM_NAME)
+                    .alarmTypesWithStrings("MetricAlarm", "CompositeAlarm"));
+            assertEquals(List.of(), response.compositeAlarms());
+            if (!response.metricAlarms().isEmpty()) {
+                assertEquals(1, response.metricAlarms().size());
+                MetricAlarm alarm = response.metricAlarms().getFirst();
+                assertEquals(ALARM, alarm.alarmArn());
+                assertEquals(marker, alarm.alarmDescription());
+                metrics.deleteAlarms(request -> request.alarmNames(ALARM_NAME));
+                assertTrue(metrics.describeAlarms(request -> request.alarmNames(ALARM_NAME)
+                        .alarmTypesWithStrings("MetricAlarm", "CompositeAlarm")).metricAlarms().isEmpty());
+            }
+        }
+
+        @Override
+        public void close() throws IOException {
+            Throwable cleanupFailure = null;
+            try {
+                assertAll("Owned monitor teardown and complete inventory restoration",
+                        this::removeOwnedAlarm,
+                        () -> {
+                            after = inventory();
+                            if (before != null) {
+                                assertEquals(before, after);
+                            }
+                        });
+            } catch (RuntimeException | Error failure) {
+                cleanupFailure = failure;
+                throw failure;
+            } finally {
+                try {
+                    Path directory = Path.of("target/appconfig-cfn-monitor-contract");
+                    Files.createDirectories(directory);
+                    Map<String, Object> record = new LinkedHashMap<>();
+                    record.put("marker", marker);
+                    record.put("alarmArn", ALARM);
+                    record.put("createAttempted", createAttempted);
+                    record.put("before", alarmFields(before));
+                    record.put("ready", alarmFields(ready));
+                    record.put("after", alarmFields(after));
+                    record.put("cleanupFailure", cleanupFailure == null ? null : cleanupFailure.toString());
+                    MAPPER.writerWithDefaultPrettyPrinter().writeValue(directory.resolve(marker + ".json").toFile(), record);
+                } catch (IOException captureFailure) {
+                    if (cleanupFailure != null) {
+                        cleanupFailure.addSuppressed(captureFailure);
+                    } else {
+                        throw captureFailure;
+                    }
+                } finally {
+                    metrics.close();
+                }
+            }
+        }
+    }
+
+    private static Object alarmFields(Object value) {
+        if (value instanceof AlarmInventory inventory) {
+            return Map.of("metrics", alarmFields(inventory.metrics()), "composites", alarmFields(inventory.composites()));
+        }
+        if (value instanceof SdkPojo pojo) {
+            Map<String, Object> fields = new LinkedHashMap<>();
+            for (SdkField<?> field : pojo.sdkFields()) {
+                fields.put(field.memberName(), alarmFields(field.getValueOrDefault(pojo)));
+            }
+            return fields;
+        }
+        if (value instanceof List<?> values) {
+            return values.stream().map(CloudFormationAppConfigIntegrationTest::alarmFields).toList();
+        }
+        if (value instanceof Instant instant) {
+            return instant.toString();
+        }
+        return value;
+    }
+
+    private record AlarmInventory(List<MetricAlarm> metrics, List<CompositeAlarm> composites) {}
 }

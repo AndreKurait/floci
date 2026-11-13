@@ -5,6 +5,8 @@ import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
+import java.util.List;
+
 @RegisterForReflection
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class Deployment {
@@ -53,6 +55,9 @@ public class Deployment {
     @JsonProperty("PercentageComplete")
     @JsonInclude(JsonInclude.Include.NON_NULL)
     private Float percentageComplete;
+    @JsonProperty("EventLog")
+    @JsonInclude(JsonInclude.Include.NON_EMPTY)
+    private List<DeploymentEvent> eventLog = List.of();
 
     public Deployment() {}
 
@@ -106,4 +111,9 @@ public class Deployment {
 
     public Float getPercentageComplete() { return percentageComplete; }
     public void setPercentageComplete(Float percentageComplete) { this.percentageComplete = percentageComplete; }
+
+    public List<DeploymentEvent> getEventLog() { return eventLog; }
+    public void setEventLog(List<DeploymentEvent> eventLog) {
+        this.eventLog = eventLog == null ? List.of() : List.copyOf(eventLog);
+    }
 }
