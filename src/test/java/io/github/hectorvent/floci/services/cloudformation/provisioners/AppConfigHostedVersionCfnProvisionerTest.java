@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
 import io.github.hectorvent.floci.services.appconfig.AppConfigService;
 import io.github.hectorvent.floci.services.appconfig.model.HostedConfigurationVersion;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplateEngine;
@@ -13,6 +14,7 @@ import org.mockito.ArgumentCaptor;
 
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -31,10 +33,25 @@ import static org.mockito.Mockito.when;
 class AppConfigHostedVersionCfnProvisionerTest {
     private static final ObjectMapper JSON = new ObjectMapper();
     private final AppConfigService service = mock(AppConfigService.class);
-    private final AppConfigHostedVersionCfnProvisioner provisioner = new AppConfigHostedVersionCfnProvisioner(service);
+    private final ServiceConfigAccess serviceConfig = mock(ServiceConfigAccess.class);
+    private final AppConfigHostedVersionCfnProvisioner provisioner =
+            new AppConfigHostedVersionCfnProvisioner(service, serviceConfig);
     private final ProvisionContext context = new ProvisionContext(CloudFormationTemplateEngine.standalone(
             "000000000000", "us-east-1", "hosted", JSON, value -> value),
             "us-east-1", "000000000000", "hosted");
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void registryHonorsAppConfigEnablement(boolean enabled) {
+        when(serviceConfig.isEnabled("appconfig")).thenReturn(enabled);
+        CloudFormationResourceRegistry registry = new CloudFormationResourceRegistry(List.of(provisioner));
+
+        assertEquals(enabled, registry.forType("AWS::AppConfig::HostedConfigurationVersion").isPresent());
+        assertEquals(!enabled, registry.isServiceDisabled("AWS::AppConfig::HostedConfigurationVersion"));
+        assertEquals("floci.services.appconfig.enabled",
+                registry.serviceEnabledFlag("AWS::AppConfig::HostedConfigurationVersion"));
+        verifyNoInteractions(service);
+    }
 
     @Test
     void preservesContentAndSeparatesReferenceFromPhysicalIdentity() {

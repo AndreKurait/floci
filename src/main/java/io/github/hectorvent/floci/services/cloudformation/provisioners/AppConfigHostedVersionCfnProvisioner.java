@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
 import io.github.hectorvent.floci.services.appconfig.AppConfigService;
 import io.github.hectorvent.floci.services.appconfig.model.HostedConfigurationVersion;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
@@ -19,14 +20,26 @@ public class AppConfigHostedVersionCfnProvisioner implements CfnResourceProvisio
     private static final String PROPERTIES_ATTR = CfnRollback.USES_ATTR_PREFIX + "AppConfigHostedVersionProperties";
 
     private final AppConfigService service;
+    private final ServiceConfigAccess serviceConfig;
 
-    public AppConfigHostedVersionCfnProvisioner(AppConfigService service) {
+    public AppConfigHostedVersionCfnProvisioner(AppConfigService service, ServiceConfigAccess serviceConfig) {
         this.service = service;
+        this.serviceConfig = serviceConfig;
     }
 
     @Override
     public Set<String> resourceTypes() {
         return Set.of(TYPE);
+    }
+
+    @Override
+    public boolean serviceDisabled() {
+        return !serviceConfig.isEnabled("appconfig");
+    }
+
+    @Override
+    public String serviceEnabledFlag() {
+        return "floci.services.appconfig.enabled";
     }
 
     @Override
