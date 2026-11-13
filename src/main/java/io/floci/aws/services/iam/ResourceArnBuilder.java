@@ -220,6 +220,13 @@ public class ResourceArnBuilder {
         if (credentialScope == null) {
             return List.of("*");
         }
+        if ("cloudfront".equals(credentialScope)
+                && "cloudfront:UpdateOriginAccessControl".equals(operation)) {
+            String id = ctx.getUriInfo().getPathParameters().getFirst("Id");
+            return List.of(id == null || id.isBlank() ? "*"
+                    : AwsArnUtils.Arn.global(partition, "cloudfront", accountId,
+                            "origin-access-control/" + id).toString());
+        }
         if (operation != null && operation.startsWith(credentialScope + ":") && RequestResources.reads(operation)) {
             return namedResources(credentialScope, operation, ctx, region, accountId, partition);
         }
