@@ -620,7 +620,7 @@ class IamTest {
         iam.putRolePolicy(PutRolePolicyRequest.builder()
                 .roleName(ROLE_NAME)
                 .policyName("inline-exec")
-                .policyDocument(POLICY_DOCUMENT)
+                .policyDocument("{\"Version\":\"2012-10-17\"}")
                 .build());
     }
 
