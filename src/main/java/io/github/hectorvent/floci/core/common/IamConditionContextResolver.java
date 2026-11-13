@@ -8,6 +8,8 @@ import io.github.hectorvent.floci.services.athena.AthenaBatchQueryService;
 import io.github.hectorvent.floci.services.athena.AthenaPreparedStatementService;
 import io.github.hectorvent.floci.services.backup.BackupFrameworkResources;
 import io.github.hectorvent.floci.services.backup.BackupFrameworkService;
+import io.github.hectorvent.floci.services.cloudfront.CloudFrontFunctionTestRoute;
+import io.github.hectorvent.floci.services.cloudfront.CloudFrontFunctionTesting;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationDriftService;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationDriftSnapshot;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
@@ -125,6 +127,7 @@ public class IamConditionContextResolver {
     @Inject
     Instance<Ec2PlacementGroupService> placementGroupService;
     private final Instance<EcrService> ecrService;
+    private final Instance<CloudFrontFunctionTesting> cloudFrontFunctionTesting;
     private final Instance<S3Service> s3Service;
     private final Instance<CloudWatchLogsService> logsService;
     private final Instance<IamService> iamService;
@@ -166,9 +169,10 @@ public class IamConditionContextResolver {
                                        Instance<AthenaBatchQueryService> athenaBatchQueryService,
                                        Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates,
                                        Instance<LambdaRuntimeManagementService> runtimeManagement,
-                                       Instance<EcrService> ecrService) {
+                                       Instance<EcrService> ecrService,
+                                       Instance<CloudFrontFunctionTesting> cloudFrontFunctionTesting) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys, lambdaService, athenaPreparedStatements, kinesisService, athenaBatchQueryService, eksAccessEntryUpdates, runtimeManagement, ecrService);
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys, lambdaService, athenaPreparedStatements, kinesisService, athenaBatchQueryService, eksAccessEntryUpdates, runtimeManagement, ecrService, cloudFrontFunctionTesting);
     }
 
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -184,7 +188,7 @@ public class IamConditionContextResolver {
                                        Instance<SsmService> ssmService,
                                        Instance<ElbV2ConditionKeys> elbV2ConditionKeys) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys, null, null, null, null, null, null, null);
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys, null, null, null, null, null, null, null, null);
     }
 
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -198,7 +202,7 @@ public class IamConditionContextResolver {
                                        CurrentVertxRequest currentVertxRequest,
                                        ResolvedServiceCatalog serviceCatalog) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), null, null, null, null, null, null, null, null, null);
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), null, null, null, null, null, null, null, null, null, null);
     }
 
     IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -212,7 +216,7 @@ public class IamConditionContextResolver {
                                 CurrentVertxRequest currentVertxRequest,
                                 ResolvedServiceCatalog serviceCatalog, Clock clock) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, clock, null, null, null, null, null, null, null, null, null);
+                config, currentVertxRequest, serviceCatalog, clock, null, null, null, null, null, null, null, null, null, null);
     }
 
     private IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -229,7 +233,7 @@ public class IamConditionContextResolver {
                                         Instance<ElbV2ConditionKeys> elbV2ConditionKeys) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService,
                 requestContext, config, currentVertxRequest, serviceCatalog, clock,
-                ssmService, elbV2ConditionKeys, null, null, null, null, null, null, null);
+                ssmService, elbV2ConditionKeys, null, null, null, null, null, null, null, null);
     }
 
     private IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -250,10 +254,12 @@ public class IamConditionContextResolver {
                                        Instance<AthenaBatchQueryService> athenaBatchQueryService,
                                        Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates,
                                        Instance<LambdaRuntimeManagementService> runtimeManagement,
-                                       Instance<EcrService> ecrService) {
+                                       Instance<EcrService> ecrService,
+                                       Instance<CloudFrontFunctionTesting> cloudFrontFunctionTesting) {
         this.dynamoDbFacade = dynamoDbFacade;
         this.ec2Service = ec2Service;
         this.ecrService = ecrService;
+        this.cloudFrontFunctionTesting = cloudFrontFunctionTesting;
         this.s3Service = s3Service;
         this.logsService = logsService;
         this.iamService = iamService;
@@ -311,9 +317,21 @@ public class IamConditionContextResolver {
         return context;
     }
 
+    private Map<String, List<String>> cloudFrontTestConditionContext(String action, ContainerRequestContext ctx) {
+        if (!"cloudfront:TestFunction".equals(action) || cloudFrontFunctionTesting == null
+                || !cloudFrontFunctionTesting.isResolvable()) {
+            return null;
+        }
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        cloudFrontFunctionTesting.get().currentTags(CloudFrontFunctionTestRoute.name(ctx))
+                .forEach((key, value) -> conditions.put(RESOURCE_TAG_PREFIX + key, List.of(value)));
+        return conditions.isEmpty() ? null : conditions;
+    }
+
     public Map<String, List<String>> resolve(String credentialScope, String action,
                                              ContainerRequestContext ctx) {
         return switch (credentialScope) {
+            case "cloudfront" -> cloudFrontTestConditionContext(action, ctx);
             case "backup" -> backupFrameworkConditions(action, ctx);
             case "apigateway" -> documentationConditions != null && documentationConditions.isResolvable()
                     ? documentationConditions.get().resolve(action, ctx) : null;

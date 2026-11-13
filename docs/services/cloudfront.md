@@ -104,6 +104,7 @@ With IAM enforcement enabled, its permission can be scoped to the selected origi
 | `PublishFunction` | POST | `/2020-05-31/function/{Name}/publish` |
 | `DeleteFunction` | DELETE | `/2020-05-31/function/{Name}` |
 | `ListFunctions` | GET | `/2020-05-31/function` |
+| `TestFunction` | POST | `/2020-05-31/function/{Name}/test` |
 
 ### Key Value Stores
 
@@ -440,11 +441,53 @@ and described through the CloudFront control plane, and its keys are managed thr
 - Floci does not run CloudFront Functions. A function that reads the store with `cf.kvs()` is stored and
   associated, but nothing executes it, so the store is useful for testing the code that writes it.
 
+## Testing function code
+
+`TestFunction` executes a captured DEVELOPMENT or LIVE source version in a fresh disposable
+Node container. Supply its current `If-Match` version and a base64-encoded JSON event through
+the normal SDK request. The response contains the captured function summary, bounded console
+logs and request/response output, or a function execution error. Testing does not publish code
+or change its configuration. ComputeUtilization is omitted; no AWS utilization percentage is
+estimated. Viewer delivery constraints, including required headers, are not validated here.
+
+This local runtime supports synchronous JavaScript handlers. Modules, async handlers, KVS APIs,
+edge delivery, and complete CloudFront JavaScript runtime compatibility are not implemented.
+Each call uses a stock Node 22 image and Docker as its isolation boundary; Node VM contexts alone
+are not a security boundary. The container has no network, host mounts, Docker socket or caller
+credential environment. It runs as uid/gid 1000 with a read-only filesystem, all capabilities
+dropped, no new privileges, 128 MiB memory including swap, one CPU and a 64-task PID limit.
+The common manager may copy Floci's public CA certificate and public trust settings into it;
+no private CA key or credential is intentionally provided.
+
+Four calls may be admitted at once, with no waiting queue. Event input is limited to 40,960 UTF-8
+bytes, local source to 10 KiB, output to 40,960 bytes and logs to 100 lines / 8 KiB. Evaluation
+inside the VM has a two-second timeout. An independent five-second watchdog is armed before
+container start and requests strict removal even if the start response or output attachment is
+blocked. Docker image preparation and transport calls use the common manager's deadlines;
+Docker unavailability can delay HTTP completion and confirmed removal. Failed or uncertain
+cleanup retains the invocation and its capacity until a later strict cleanup confirms absence.
+A failed create with no returned container ID remains uncertain even if its unique name is initially
+absent; it is reconciled only after an owned container is observed and removed. This uncertainty
+can prevent reset from clearing storage.
+Reset closes admission and must drain these receipts before storage is cleared.
+
+The execution deadline stops once a complete, bounded result has been collected. Strict container
+cleanup then keeps its separate 30-second confirmation budget and retains the invocation's capacity
+until removal is confirmed. A genuine emulator reset still cancels the response during cleanup.
+
+IAM checks `cloudfront:TestFunction` on the function ARN and its current resource tags. Its new
+snapshot/tag reads do not migrate legacy rows. Source capture is synchronized with the existing
+function writers; a later update or publication cannot replace the captured result's version.
+IAM evaluation and later snapshot capture are separate operations. Function records retain the
+existing account/global storage semantics and do not persist independent partition provenance;
+the response ARN captures the request's partition. Existing tag rows remain ARN-scoped.
+
 ## Configuration
 
 | Property | Env var | Default | Description |
 |---|---|---|---|
 | `floci.services.cloudfront.enabled` | `FLOCI_SERVICES_CLOUDFRONT_ENABLED` | `true` | Enable or disable the service |
+| `floci.services.cloudfront.function-runtime-image` | `FLOCI_SERVICES_CLOUDFRONT_FUNCTION_RUNTIME_IMAGE` | `node:22-alpine` | Image for each disposable TestFunction process |
 | `floci.services.cloudfront.domain-suffix` | `FLOCI_SERVICES_CLOUDFRONT_DOMAIN_SUFFIX` | unset | Domain suffix for generated distribution domain names. Unset, it follows the request's partition: `cloudfront.net`, or `cloudfront.cn` in China. A configured suffix applies in every partition |
 | `floci.services.cloudfront.allowed-private-origin-hosts` | `FLOCI_SERVICES_CLOUDFRONT_ALLOWED_PRIVATE_ORIGIN_HOSTS` | `[]` | Exact custom-origin hosts permitted to resolve to private/non-routable addresses (comma-separated in the environment variable) |
 
@@ -625,6 +668,8 @@ signatures must still return 403. Verify those cases through the proxy after con
 - Real-time log configs (`CreateRealtimeLogConfig`, etc.)
 - Field-level encryption of viewer requests (configuration metadata is supported above).
 - `TestFunction` execution (function is stored, not executed)
+
+- Field-level encryption (`CreateFieldLevelEncryptionConfig`, etc.)
 - Streaming distributions (RTMP — deprecated by AWS)
 - VPC origins, Anycast IP lists
 - Importing keys into a key value store from S3: `CreateKeyValueStore` with an `ImportSource` is rejected with

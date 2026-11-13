@@ -27,6 +27,7 @@ import io.github.hectorvent.floci.services.bedrockagentcorecontrol.BedrockAgentC
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.BedrockAgentCoreToolsController;
 import io.github.hectorvent.floci.services.bedrockruntime.BedrockRuntimeController;
 import io.github.hectorvent.floci.services.cloudfront.CloudFrontController;
+import io.github.hectorvent.floci.services.cloudfront.CloudFrontFunctionTestController;
 import io.github.hectorvent.floci.services.cloudfront.CloudFrontKeyValueStoreController;
 import io.github.hectorvent.floci.services.cloudfront.CloudFrontServingController;
 import io.github.hectorvent.floci.services.codeartifact.CodeArtifactController;
@@ -756,8 +757,8 @@ public class ResolvedServiceCatalog {
                         5000L, AwsNamespaces.CLOUDFRONT, ServiceProtocol.REST_XML,
                         protocols(ServiceProtocol.REST_XML),
                         Set.of(), Set.of("cloudfront"), Set.of(),
-                        Set.of(CloudFrontController.class, CloudFrontServingController.class))
-                        .withRequiredRestAuthentication(Set.of(CloudFrontController.class)),
+                        Set.of(CloudFrontController.class, CloudFrontServingController.class, CloudFrontFunctionTestController.class))
+                        .withRequiredRestAuthentication(Set.of(CloudFrontController.class, CloudFrontFunctionTestController.class)),
                 descriptor("cloudfront-keyvaluestore", "cloudfront-keyvaluestore",
                         config.services().cloudfront().enabled(), true,
                         null, null, 5000L, null, ServiceProtocol.REST_JSON,
