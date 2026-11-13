@@ -1,0 +1,338 @@
+{
+  "scope": "Proposed metadata input, not production code or executed compatibility evidence",
+  "native_extraction_sha256": "55cd6cd88adc75dd9c750e9d6cfcee5612852847e058ddf6e79781f7a0ea53b4",
+  "changes": [
+    {
+      "name": "activerehashing",
+      "native": {
+        "name": "activerehashing",
+        "default_value": "yes",
+        "description": "Apply rehashing or not",
+        "domain": "ParameterDomain::Tokens(YES_NO)",
+        "since": "GENERATION_REDIS6",
+        "until": "None"
+      },
+      "proposed": {
+        "name": "activerehashing",
+        "defaultValue": "yes",
+        "description": "Apply rehashing or not",
+        "domain": {
+          "kind": "tokens",
+          "values": [
+            "yes",
+            "no"
+          ]
+        },
+        "families": [
+          "memorydb_redis6"
+        ],
+        "modifiable": true,
+        "minimumEngineVersions": {
+          "memorydb_redis6": "6.2.6"
+        },
+        "provenance": {
+          "defaultValue": "native32b",
+          "description": "native32b-unqualified-description",
+          "domain": "native32b",
+          "families": "current-engine-guide-hidden-in-Redis7-and-Valkey7",
+          "modifiable": "native32b-standalone-metadata",
+          "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+        }
+      }
+    },
+    {
+      "name": "slowlog-log-slower-than",
+      "native": {
+        "name": "slowlog-log-slower-than",
+        "default_value": "10000",
+        "description": "The execution time threshold (in microseconds) above which a command is logged in the slow log",
+        "domain": "ParameterDomain::Integer { min: 0, max: Some(1_000_000) }",
+        "since": "GENERATION_REDIS6",
+        "until": "None"
+      },
+      "proposed": {
+        "name": "slowlog-log-slower-than",
+        "defaultValue": "10000",
+        "description": "The execution time, in microseconds, to exceed in order for the command to get logged. Note that a negative number disables the slow log, while a value of zero forces the logging of every command",
+        "domain": {
+          "kind": "integer",
+          "ranges": [
+            [
+              null,
+              null
+            ]
+          ]
+        },
+        "families": [
+          "memorydb_redis6",
+          "memorydb_redis7",
+          "memorydb_valkey7"
+        ],
+        "modifiable": true,
+        "minimumEngineVersions": {
+          "memorydb_redis6": "6.2.6",
+          "memorydb_redis7": "7.0.7",
+          "memorydb_valkey7": "7.2.6"
+        },
+        "provenance": {
+          "defaultValue": "native32b",
+          "description": "recorded-catalog-20261102T084325Z",
+          "domain": "recorded-catalog-20261102T084325Z;negative-permission-in-current-guide",
+          "families": "native32b",
+          "modifiable": "native32b-standalone-metadata",
+          "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+        }
+      }
+    },
+    {
+      "name": "slowlog-max-len",
+      "native": {
+        "name": "slowlog-max-len",
+        "default_value": "128",
+        "description": "The maximum length of the slow log",
+        "domain": "ParameterDomain::Integer { min: 0, max: None }",
+        "since": "GENERATION_REDIS6",
+        "until": "None"
+      },
+      "proposed": {
+        "name": "slowlog-max-len",
+        "defaultValue": "128",
+        "description": "The length of the slow log. There is no limit to this length. Just be aware that it will consume memory. You can reclaim memory used by the slow log with SLOWLOG RESET.",
+        "domain": {
+          "kind": "integer",
+          "ranges": [
+            [
+              "0",
+              null
+            ]
+          ]
+        },
+        "families": [
+          "memorydb_redis6",
+          "memorydb_redis7",
+          "memorydb_valkey7"
+        ],
+        "modifiable": true,
+        "minimumEngineVersions": {
+          "memorydb_redis6": "6.2.6",
+          "memorydb_redis7": "7.0.7",
+          "memorydb_valkey7": "7.2.6"
+        },
+        "provenance": {
+          "defaultValue": "native32b",
+          "description": "recorded-catalog-20261102T084325Z",
+          "domain": "native32b",
+          "families": "native32b",
+          "modifiable": "native32b-standalone-metadata",
+          "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+        }
+      }
+    },
+    {
+      "name": "tracking-table-max-keys",
+      "native": {
+        "name": "tracking-table-max-keys",
+        "default_value": "1000000",
+        "description": "The maximum number of keys in the invalidation table",
+        "domain": "ParameterDomain::Integer { min: 1, max: Some(100_000_000) }",
+        "since": "GENERATION_REDIS6",
+        "until": "None"
+      },
+      "proposed": {
+        "name": "tracking-table-max-keys",
+        "defaultValue": "1000000",
+        "description": "The maximum number of keys allowed for the tracking table for client side caching",
+        "domain": {
+          "kind": "integer",
+          "ranges": [
+            [
+              "1",
+              "100000000"
+            ]
+          ]
+        },
+        "families": [
+          "memorydb_redis6",
+          "memorydb_redis7",
+          "memorydb_valkey7"
+        ],
+        "modifiable": true,
+        "minimumEngineVersions": {
+          "memorydb_redis6": "6.2.6",
+          "memorydb_redis7": "7.0.7",
+          "memorydb_valkey7": "7.2.6"
+        },
+        "provenance": {
+          "defaultValue": "native32b",
+          "description": "recorded-catalog-20261102T084325Z",
+          "domain": "native32b",
+          "families": "native32b",
+          "modifiable": "native32b-standalone-metadata",
+          "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+        }
+      }
+    },
+    {
+      "name": "search-enabled",
+      "native": {
+        "name": "search-enabled",
+        "default_value": "no",
+        "description": "Enables or disables search",
+        "domain": "ParameterDomain::Tokens(YES_NO)",
+        "since": "GENERATION_VALKEY",
+        "until": "None"
+      },
+      "proposed": {
+        "name": "search-enabled",
+        "defaultValue": "no",
+        "description": "When set to yes, it enables search capabilities.",
+        "domain": {
+          "kind": "tokens",
+          "values": [
+            "yes",
+            "no"
+          ]
+        },
+        "families": [
+          "memorydb_redis7",
+          "memorydb_valkey7"
+        ],
+        "modifiable": true,
+        "minimumEngineVersions": {
+          "memorydb_redis7": "7.1",
+          "memorydb_valkey7": "7.2.6"
+        },
+        "provenance": {
+          "defaultValue": "native32b",
+          "description": "recorded-catalog-20261102T084325Z",
+          "domain": "native32b",
+          "families": "current-engine-guide-and-redis7-search-workflow",
+          "modifiable": "native32b-standalone-metadata",
+          "minimumEngineVersions": "Redis7-current-guide7.1;Valkey-native-family-compatibility7.2.6"
+        }
+      }
+    },
+    {
+      "name": "search-query-timeout-ms",
+      "native": {
+        "name": "search-query-timeout-ms",
+        "default_value": "10000",
+        "description": "The timeout in milliseconds for search queries",
+        "domain": "ParameterDomain::Integer { min: 1, max: None }",
+        "since": "GENERATION_VALKEY",
+        "until": "None"
+      },
+      "proposed": {
+        "name": "search-query-timeout-ms",
+        "defaultValue": "10000",
+        "description": "The maximum amount of time in milliseconds that a search query is allowed to run.",
+        "domain": {
+          "kind": "integer",
+          "ranges": [
+            [
+              "1",
+              "60000"
+            ]
+          ]
+        },
+        "families": [
+          "memorydb_redis7",
+          "memorydb_valkey7"
+        ],
+        "modifiable": true,
+        "minimumEngineVersions": {
+          "memorydb_redis7": "7.1",
+          "memorydb_valkey7": "7.2.6"
+        },
+        "provenance": {
+          "defaultValue": "native32b",
+          "description": "recorded-catalog-20261102T084325Z",
+          "domain": "recorded-catalog-20261102T084325Z-and-current-engine-guide",
+          "families": "current-engine-guide-and-redis7-search-workflow",
+          "modifiable": "native32b-standalone-metadata",
+          "minimumEngineVersions": "Redis7-current-guide7.1;Valkey-native-family-compatibility7.2.6"
+        }
+      }
+    },
+    {
+      "name": "maxclients",
+      "native": null,
+      "proposed": {
+        "name": "maxclients",
+        "defaultValue": "65000",
+        "description": "The maximum number of clients that can be connected at one time. Non modifiable.",
+        "domain": {
+          "kind": "integer",
+          "ranges": [
+            [
+              "65000",
+              "65000"
+            ]
+          ]
+        },
+        "families": [
+          "memorydb_redis6",
+          "memorydb_redis7",
+          "memorydb_valkey7"
+        ],
+        "modifiable": false,
+        "minimumEngineVersions": {
+          "memorydb_redis6": "6.2.6",
+          "memorydb_redis7": "7.0.7",
+          "memorydb_valkey7": "7.2.6"
+        },
+        "provenance": {
+          "defaultValue": "current-engine-guide",
+          "description": "current-engine-guide",
+          "domain": "current-engine-guide",
+          "families": "current-engine-guide",
+          "modifiable": "current-engine-guide",
+          "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+        }
+      }
+    },
+    {
+      "name": "client-query-buffer-limit",
+      "native": null,
+      "proposed": {
+        "name": "client-query-buffer-limit",
+        "defaultValue": "1073741824",
+        "description": "Max size of a single client query buffer. Change takes place immediately.",
+        "domain": {
+          "kind": "integer",
+          "ranges": [
+            [
+              "1048576",
+              "1073741824"
+            ]
+          ]
+        },
+        "families": [
+          "memorydb_redis6",
+          "memorydb_redis7",
+          "memorydb_valkey7"
+        ],
+        "modifiable": true,
+        "minimumEngineVersions": {
+          "memorydb_redis6": "6.2.6",
+          "memorydb_redis7": "7.0.7",
+          "memorydb_valkey7": "7.2.6"
+        },
+        "provenance": {
+          "defaultValue": "current-engine-guide",
+          "description": "current-engine-guide",
+          "domain": "current-engine-guide",
+          "families": "current-engine-guide",
+          "modifiable": "current-engine-guide",
+          "minimumEngineVersions": "native32b-family-compatibility-not-AWS-recording"
+        }
+      }
+    }
+  ],
+  "familyCounts": {
+    "memorydb_redis6": 44,
+    "memorydb_redis7": 49,
+    "memorydb_valkey7": 49
+  },
+  "offlineChecks": "56 unique entries; exact family-version key sets; every default accepted by its declared domain"
+}
