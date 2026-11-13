@@ -1,0 +1,27 @@
+{
+  "QueryExecutionId": "baseline-query",
+  "Query": "SELECT 7",
+  "Status": {
+    "State": "SUCCEEDED",
+    "StateChangeReason": "baseline reason",
+    "SubmissionDateTime": 1794477600.123456,
+    "CompletionDateTime": 1794477601.654321
+  },
+  "WorkGroup": "existing-workgroup",
+  "StatementType": "DML",
+  "Statistics": {
+    "EngineExecutionTimeInMillis": 8,
+    "DataScannedInBytes": 27
+  },
+  "EngineVersion": {
+    "SelectedEngineVersion": "Athena engine version 3",
+    "EffectiveEngineVersion": "Athena engine version 3"
+  },
+  "ResultConfiguration": {
+    "OutputLocation": "s3://existing-results/baseline-query.csv"
+  },
+  "QueryExecutionContext": {
+    "Database": "warehouse",
+    "Catalog": "AwsDataCatalog"
+  }
+}

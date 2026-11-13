@@ -1,0 +1,478 @@
+package io.github.hectorvent.floci.services.stepfunctions;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.ecs.EcsJsonHandler;
+import io.github.hectorvent.floci.services.ecs.EcsService;
+import io.github.hectorvent.floci.services.ecs.container.HostVolumePolicy;
+import io.github.hectorvent.floci.services.ecs.model.Container;
+import io.github.hectorvent.floci.services.ecs.model.EcsTask;
+import io.github.hectorvent.floci.services.ecs.model.NetworkConfiguration;
+import io.github.hectorvent.floci.services.stepfunctions.model.Execution;
+import io.github.hectorvent.floci.services.stepfunctions.model.HistoryEvent;
+import io.github.hectorvent.floci.services.stepfunctions.model.StateMachine;
+import io.github.hectorvent.floci.testing.TestTime;
+import jakarta.enterprise.inject.Instance;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.timeout;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+/**
+ * Covers the ecs:runTask integration's mode-specific failure semantics and the threading of
+ * NetworkConfiguration through to {@link EcsService#runTask}:
+ * <ul>
+ *   <li>request-response never fails the state on a placement failure — it returns the
+ *       {@code {Tasks,Failures}} envelope, even with no launched tasks;</li>
+ *   <li>{@code .sync} (and {@code .waitForTaskToken}) fail the state on a placement failure,
+ *       using the AWS error name {@code AmazonECS.Unknown};</li>
+ *   <li>an awsvpc {@code NetworkConfiguration} in the parameters is parsed and passed to runTask
+ *       rather than dropped;</li>
+ *   <li>a {@code .sync} wait is bounded by the Task's {@code TimeoutSeconds} and by the execution's
+ *       budget, and by nothing else: no poll count of its own cuts a long-running task short.</li>
+ * </ul>
+ */
+class AslExecutorEcsRunTaskModeTest {
+
+    private static final String REGION = "us-east-2";
+    private static final String ACCOUNT = "000000000000";
+    private static final Duration ONE_NANOSECOND = Duration.ofNanos(1);
+    /** How often a {@code .sync} wait reads its tasks back, {@code AslExecutor.SYNC_POLL_INTERVAL_MS}. */
+    private static final Duration SYNC_POLL_INTERVAL = Duration.ofMillis(100);
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+    private final TestTime time = TestTime.create();
+    private EcsService ecsService;
+    private StepFunctionsService sfnService;
+    private AslExecutor executor;
+    private List<HistoryEvent> history;
+
+    @BeforeEach
+    void setUp() {
+        ecsService = mock(EcsService.class);
+        // The .sync wait reads the execution back to notice a StopExecution; RUNNING unless a test says otherwise.
+        sfnService = mock(StepFunctionsService.class);
+        when(sfnService.describeExecution(any())).thenAnswer(invocation -> parent(invocation.getArgument(0), "RUNNING"));
+        // A poll interval passes by itself: the worker moves the timeline on instead of waiting for it.
+        executor = newExecutor(nanos -> time.sleepAdvancing(Duration.ofNanos(nanos)));
+    }
+
+    private AslExecutor newExecutor(AslExecutor.Sleeper sleeper) {
+        return executorBuilder().sleeper(sleeper).build();
+    }
+
+    /** An executor whose {@code .sync} polls and Wait states pause on {@link #time}. */
+    private AslExecutor newTimelineExecutor() {
+        return executorBuilder()
+                .clock(time.clock())
+                .sleeper(time::sleepNanos)
+                .nanoTime(time::nanoTime)
+                .build();
+    }
+
+    @SuppressWarnings("unchecked")
+    private AslExecutorFixture.Builder executorBuilder() {
+        // A real handler so parseNetworkConfiguration / parseContainerOverrides actually run.
+        EcsJsonHandler ecsJsonHandler = new EcsJsonHandler(ecsService, objectMapper,
+                new HostVolumePolicy(mock(EmulatorConfig.class, RETURNS_DEEP_STUBS)));
+        Instance<StepFunctionsService> instance = mock(Instance.class);
+        when(instance.get()).thenReturn(sfnService);
+
+        return AslExecutorFixture.builder()
+                .ecsService(ecsService)
+                .ecsJsonHandler(ecsJsonHandler)
+                .objectMapper(objectMapper)
+                .sfnService(instance)
+                .customResourceLiveness(null)
+                .maxWaitSeconds(30);
+    }
+
+    @Test
+    void requestResponseDoesNotFailWhenNoTasksLaunched() throws Exception {
+        // No tasks could be placed (AWS: 200 with a non-empty Failures list). Request-response
+        // must return the envelope and let execution continue, not fail the state.
+        when(ecsService.runTask(any(), any(), anyInt(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(new ArrayList<>());
+
+        Execution execution = run("arn:aws:states:::ecs:runTask",
+                "{\"TaskDefinition\":\"my-task-def\"}");
+
+        assertEquals("SUCCEEDED", execution.getStatus());
+        JsonNode output = objectMapper.readTree(execution.getOutput());
+        assertTrue(output.path("Tasks").isArray(), "Tasks should be an array");
+        assertEquals(0, output.path("Tasks").size());
+        assertTrue(output.path("Failures").isArray(), "Failures should be an array");
+    }
+
+    @Test
+    void syncFailsWithAmazonEcsUnknownWhenNoTasksLaunched() throws Exception {
+        when(ecsService.runTask(any(), any(), anyInt(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(new ArrayList<>());
+
+        Execution execution = run("arn:aws:states:::ecs:runTask.sync",
+                "{\"TaskDefinition\":\"my-task-def\"}");
+
+        assertEquals("FAILED", execution.getStatus());
+        assertEquals("AmazonECS.Unknown", execution.getError());
+    }
+
+    @Test
+    void networkConfigurationIsThreadedThroughToRunTask() throws Exception {
+        when(ecsService.runTask(any(), any(), anyInt(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(new ArrayList<>());
+
+        run("arn:aws:states:::ecs:runTask", """
+                {
+                  "TaskDefinition": "my-task-def",
+                  "LaunchType": "FARGATE",
+                  "NetworkConfiguration": {
+                    "AwsvpcConfiguration": {
+                      "Subnets": ["subnet-123"],
+                      "SecurityGroups": ["sg-abc"],
+                      "AssignPublicIp": "ENABLED"
+                    }
+                  }
+                }
+                """);
+
+        ArgumentCaptor<NetworkConfiguration> captor = ArgumentCaptor.forClass(NetworkConfiguration.class);
+        verify(ecsService).runTask(
+                any(), any(), anyInt(), any(), any(), any(), any(), captor.capture(), any());
+
+        NetworkConfiguration passed = captor.getValue();
+        assertNotNull(passed, "NetworkConfiguration should be parsed and passed, not dropped");
+        assertNotNull(passed.getAwsvpcConfiguration());
+        assertEquals(List.of("subnet-123"), passed.getAwsvpcConfiguration().getSubnets());
+        assertEquals(List.of("sg-abc"), passed.getAwsvpcConfiguration().getSecurityGroups());
+        assertEquals("ENABLED", passed.getAwsvpcConfiguration().getAssignPublicIp());
+    }
+
+    @Test
+    void syncFailsWithStatesTimeoutWhenTheTaskOutlivesTimeoutSeconds() throws Exception {
+        launchOneTask();
+        when(ecsService.describeTasks(any(), any(), any())).thenReturn(List.of(task("RUNNING")));
+
+        Execution execution = runUntilTheSyncWaitIsCut(Duration.ofSeconds(1), """
+                {
+                  "StartAt": "RunTask",
+                  "States": {
+                    "RunTask": { "Type": "Task", "Resource": "arn:aws:states:::ecs:runTask.sync",
+                                 "TimeoutSeconds": 1, "End": true }
+                  }
+                }
+                """, "{\"TaskDefinition\":\"my-task-def\"}");
+
+        assertEquals("FAILED", execution.getStatus());
+        assertEquals("States.Timeout", execution.getError());
+        assertNull(execution.getCause(), "a timeout carries no cause");
+        HistoryEvent timedOut = history.stream()
+                .filter(event -> "TaskTimedOut".equals(event.getType()))
+                .findFirst().orElseThrow(() -> new AssertionError("no TaskTimedOut event in " + history));
+        assertEquals("ecs", timedOut.getDetails().get("resourceType"));
+        assertEquals("States.Timeout", timedOut.getDetails().get("error"));
+        // AWS stops the task it was waiting on, with this exact stoppedReason (measured).
+        verify(ecsService).stopTask(any(), eq(task("RUNNING").getTaskArn()),
+                eq("The Task state in AWS Step Functions execution [" + execution.getExecutionArn()
+                        + "] which was managing this resource was aborted"), eq(REGION));
+    }
+
+    /**
+     * AWS records TaskSubmitted once RunTask has returned and before it waits on the task (measured:
+     * resourceType ecs, resource runTask.sync, the response as Failures then Tasks in PascalCase,
+     * chained to TaskStarted).
+     */
+    @Test
+    void syncRecordsTaskSubmittedWithTheRunTaskResponse() throws Exception {
+        launchOneTask();
+        when(ecsService.describeTasks(any(), any(), any())).thenReturn(List.of(task("STOPPED")));
+
+        Execution execution = run("arn:aws:states:::ecs:runTask.sync", "{\"TaskDefinition\":\"my-task-def\"}");
+
+        assertEquals("SUCCEEDED", execution.getStatus(), execution.getCause());
+        List<String> types = history.stream().map(HistoryEvent::getType).toList();
+        assertEquals(List.of("TaskStateEntered", "TaskScheduled", "TaskStarted", "TaskSubmitted",
+                "TaskSucceeded", "TaskStateExited", "ExecutionSucceeded"), types);
+        HistoryEvent submitted = history.get(3);
+        assertEquals(history.get(2).getId(), submitted.getPreviousEventId().longValue());
+        assertEquals(submitted.getId(), history.get(4).getPreviousEventId().longValue());
+        assertEquals("ecs", submitted.getDetails().get("resourceType"));
+        assertEquals("runTask.sync", submitted.getDetails().get("resource"));
+        JsonNode output = objectMapper.readTree((String) submitted.getDetails().get("output"));
+        assertEquals(List.of("Failures", "Tasks"), fieldNames(output));
+        assertTrue(output.path("Failures").isArray() && output.path("Failures").isEmpty(), output.toString());
+        assertEquals(1, output.path("Tasks").size(), output.toString());
+        assertEquals(task("PENDING").getTaskArn(), output.path("Tasks").get(0).path("TaskArn").asText());
+        assertEquals("PENDING", output.path("Tasks").get(0).path("LastStatus").asText());
+        assertEquals(Map.of("truncated", false), submitted.getDetails().get("outputDetails"));
+    }
+
+    /**
+     * When TaskSubmitted is the event that hits the 25,000-event limit, the wait that would stop
+     * the launched task is never entered, so it is stopped on the way out instead of running on.
+     */
+    @Test
+    void aTaskWhoseTaskSubmittedHitsTheHistoryLimitIsStopped() throws Exception {
+        launchOneTask();
+        when(ecsService.describeTasks(any(), any(), any())).thenReturn(List.of(task("RUNNING")));
+        List<HistoryEvent> recorded = new ArrayList<>();
+        for (int i = 0; i < 24_996; i++) {
+            recorded.add(new HistoryEvent());
+        }
+
+        Execution execution = runDefinition("""
+                {
+                  "StartAt": "RunTask",
+                  "States": {
+                    "RunTask": { "Type": "Task", "Resource": "arn:aws:states:::ecs:runTask.sync", "End": true }
+                  }
+                }
+                """, "{\"TaskDefinition\":\"my-task-def\"}", recorded);
+
+        assertEquals("FAILED", execution.getStatus());
+        assertEquals("States.Runtime", execution.getError());
+        assertEquals("TaskStarted", history.get(24_998).getType());
+        assertTrue(history.stream().noneMatch(event -> "TaskSubmitted".equals(event.getType())));
+        verify(ecsService).stopTask(any(), eq(task("RUNNING").getTaskArn()),
+                eq("The Task state in AWS Step Functions execution [" + execution.getExecutionArn()
+                        + "] which was managing this resource was aborted"), eq(REGION));
+    }
+
+    @Test
+    void requestResponseRecordsNoTaskSubmitted() throws Exception {
+        launchOneTask();
+
+        Execution execution = run("arn:aws:states:::ecs:runTask", "{\"TaskDefinition\":\"my-task-def\"}");
+
+        assertEquals("SUCCEEDED", execution.getStatus(), execution.getCause());
+        assertTrue(history.stream().noneMatch(event -> "TaskSubmitted".equals(event.getType())),
+                history.stream().map(HistoryEvent::getType).toList().toString());
+    }
+
+    private static List<String> fieldNames(JsonNode node) {
+        List<String> names = new ArrayList<>();
+        node.fieldNames().forEachRemaining(names::add);
+        return names;
+    }
+
+    @Test
+    void syncIsNotCappedByAPollCountWhenNoTimeoutSecondsIsDeclared() throws Exception {
+        // The former loop gave up after 600 polls. A task that stops on the 700th read must still
+        // succeed: without a TimeoutSeconds only the emulator's default bound applies, and the
+        // no-op sleeper keeps that from being real time.
+        executor = newExecutor(nanos -> { });
+        launchOneTask();
+        AtomicInteger polls = new AtomicInteger();
+        when(ecsService.describeTasks(any(), any(), any()))
+                .thenAnswer(invocation -> List.of(task(polls.incrementAndGet() < 700 ? "RUNNING" : "STOPPED")));
+
+        Execution execution = run("arn:aws:states:::ecs:runTask.sync",
+                "{\"TaskDefinition\":\"my-task-def\"}");
+
+        assertEquals("SUCCEEDED", execution.getStatus(), execution.getCause());
+        assertEquals(700, polls.get());
+        assertEquals("STOPPED", objectMapper.readTree(execution.getOutput()).path("LastStatus").asText());
+    }
+
+    @Test
+    void executionBudgetCutsASyncWaitBeforeTheTasksOwnTimeoutAndStopsTheTask() throws Exception {
+        launchOneTask();
+        when(ecsService.describeTasks(any(), any(), any())).thenReturn(List.of(task("RUNNING")));
+
+        Execution execution = runUntilTheSyncWaitIsCut(Duration.ofSeconds(1), """
+                {
+                  "StartAt": "RunTask",
+                  "TimeoutSeconds": 1,
+                  "States": {
+                    "RunTask": { "Type": "Task", "Resource": "arn:aws:states:::ecs:runTask.sync",
+                                 "TimeoutSeconds": 60, "End": true }
+                  }
+                }
+                """, "{\"TaskDefinition\":\"my-task-def\"}");
+
+        assertEquals("TIMED_OUT", execution.getStatus());
+        assertNull(execution.getError());
+        // AWS stops the task on the execution's budget too (measured: UserInitiated, same reason).
+        verify(ecsService).stopTask(any(), eq(task("RUNNING").getTaskArn()),
+                eq("The Task state in AWS Step Functions execution [" + execution.getExecutionArn()
+                        + "] which was managing this resource was aborted"), eq(REGION));
+        assertTrue(history.stream().noneMatch(event -> "TaskTimedOut".equals(event.getType())),
+                "the execution's budget writes nothing about the state it cut");
+        assertTrue(history.stream().anyMatch(event -> "ExecutionTimedOut".equals(event.getType())));
+    }
+
+    @Test
+    void failureInASiblingParallelBranchStopsTheTask() throws Exception {
+        executor = newTimelineExecutor();
+        launchOneTask();
+        when(ecsService.describeTasks(any(), any(), any())).thenReturn(List.of(task("RUNNING")));
+
+        CompletableFuture<Execution> running = AslExecutorFixture.start(() -> runDefinition("""
+                {
+                  "StartAt": "P",
+                  "States": {
+                    "P": { "Type": "Parallel", "End": true, "Branches": [
+                      { "StartAt": "Pause", "States": {
+                          "Pause": { "Type": "Wait", "Seconds": 1, "Next": "Boom" },
+                          "Boom": { "Type": "Fail", "Error": "Boom" } } },
+                      { "StartAt": "RunTask", "States": {
+                          "RunTask": { "Type": "Task", "Resource": "arn:aws:states:::ecs:runTask.sync",
+                                       "Parameters": { "TaskDefinition": "my-task-def" }, "End": true } } }
+                    ] }
+                  }
+                }
+                """, "{}"));
+
+        // Both branches are pausing, the sibling in its Wait and this one between two polls, so the
+        // cut lands mid-wait: the task is left alone until the sibling's Wait is over.
+        time.awaitSleepers(2);
+        time.advance(Duration.ofSeconds(1).minus(ONE_NANOSECOND));
+        assertEquals(2, time.sleepers());
+        assertFalse(running.isDone());
+        verify(ecsService, never()).stopTask(any(), any(), any(), any());
+        time.advance(ONE_NANOSECOND);
+
+        Execution execution = AslExecutorFixture.finished(running);
+        assertEquals("FAILED", execution.getStatus());
+        assertEquals("Boom", execution.getError());
+        // The cut branch stops its task on its own thread, after the Parallel has already failed.
+        verify(ecsService, timeout(5_000)).stopTask(any(), eq(task("RUNNING").getTaskArn()),
+                eq("The Task state in AWS Step Functions execution [" + execution.getExecutionArn()
+                        + "] which was managing this resource was aborted"), eq(REGION));
+    }
+
+    @Test
+    void stopExecutionEndsTheSyncWaitAndStopsTheTask() throws Exception {
+        executor = newExecutor(nanos -> { });
+        launchOneTask();
+        AtomicInteger parentReads = new AtomicInteger();
+        when(sfnService.describeExecution(any()))
+                .thenAnswer(invocation -> parent(invocation.getArgument(0), parentReads.incrementAndGet() < 3 ? "RUNNING" : "ABORTED"));
+        AtomicInteger polls = new AtomicInteger();
+        when(ecsService.describeTasks(any(), any(), any())).thenAnswer(invocation -> {
+            polls.incrementAndGet();
+            return List.of(task("RUNNING"));
+        });
+
+        Execution execution = run("arn:aws:states:::ecs:runTask.sync",
+                "{\"TaskDefinition\":\"my-task-def\"}");
+
+        assertEquals(2, polls.get(), "polling stops as soon as the execution reads ABORTED");
+        verify(ecsService).stopTask(any(), eq(task("RUNNING").getTaskArn()),
+                eq("The Task state in AWS Step Functions execution [" + execution.getExecutionArn()
+                        + "] which was managing this resource was aborted"), eq(REGION));
+        List<String> types = history.stream().map(HistoryEvent::getType).toList();
+        assertTrue(types.stream().noneMatch(type -> type.equals("TaskTimedOut") || type.equals("TaskFailed")
+                || type.equals("ExecutionFailed") || type.equals("ExecutionSucceeded")),
+                "an aborted execution gets no terminal event from the worker: " + types);
+    }
+
+    private static Execution parent(String executionArn, String status) {
+        Execution parent = new Execution();
+        parent.setExecutionArn(executionArn);
+        parent.setStatus(status);
+        return parent;
+    }
+
+    private void launchOneTask() {
+        when(ecsService.runTask(any(), any(), anyInt(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(List.of(task("PENDING")));
+    }
+
+    private static EcsTask task(String lastStatus) {
+        EcsTask task = new EcsTask();
+        task.setTaskArn("arn:aws:ecs:%s:%s:task/default/0123456789abcdef".formatted(REGION, ACCOUNT));
+        task.setClusterArn("arn:aws:ecs:%s:%s:cluster/default".formatted(REGION, ACCOUNT));
+        task.setLastStatus(lastStatus);
+        Container container = new Container();
+        container.setName("runner");
+        if ("STOPPED".equals(lastStatus)) {
+            container.setExitCode(0);
+        }
+        task.setContainers(List.of(container));
+        return task;
+    }
+
+    /**
+     * Runs a definition whose {@code .sync} wait is cut at {@code bound}. One nanosecond earlier
+     * the wait is still between two polls, having read the task back once per poll interval, and
+     * the task has been left running.
+     */
+    private Execution runUntilTheSyncWaitIsCut(Duration bound, String definition, String input) {
+        executor = newTimelineExecutor();
+        CompletableFuture<Execution> running = AslExecutorFixture.start(() -> runDefinition(definition, input));
+        time.awaitSleepers(1);
+        int polls = Math.toIntExact(bound.dividedBy(SYNC_POLL_INTERVAL)) - 1;
+        for (int poll = 0; poll < polls; poll++) {
+            time.advance(SYNC_POLL_INTERVAL);
+            // A worker may briefly block inside a poll before registering its next sleep.
+            time.awaitSleepers(1);
+        }
+        time.advance(bound.minus(SYNC_POLL_INTERVAL.multipliedBy(polls)).minus(ONE_NANOSECOND));
+        assertEquals(1, time.sleepers());
+        assertFalse(running.isDone());
+        // The poll that would fall on the bound itself is never made: the bound ends the wait.
+        verify(ecsService, times(polls)).describeTasks(any(), any(), any());
+        verify(ecsService, never()).stopTask(any(), any(), any(), any());
+        time.advance(ONE_NANOSECOND);
+        Execution execution = AslExecutorFixture.finished(running);
+        verify(ecsService, times(polls)).describeTasks(any(), any(), any());
+        return execution;
+    }
+
+    private Execution run(String resource, String input) {
+        return runDefinition("""
+                {
+                  "StartAt": "RunTask",
+                  "States": {
+                    "RunTask": { "Type": "Task", "Resource": "%s", "End": true }
+                  }
+                }
+                """.formatted(resource), input);
+    }
+
+    private Execution runDefinition(String definition, String input) {
+        return runDefinition(definition, input, new ArrayList<>());
+    }
+
+    /** {@code recorded} is the history the execution starts with, counted towards the event limit. */
+    private Execution runDefinition(String definition, String input, List<HistoryEvent> recorded) {
+        StateMachine stateMachine = new StateMachine();
+        stateMachine.setName("ecs-runtask-test");
+        stateMachine.setStateMachineArn("arn:aws:states:%s:%s:stateMachine:ecs-runtask-test".formatted(REGION, ACCOUNT));
+        stateMachine.setRoleArn("arn:aws:iam::%s:role/test-role".formatted(ACCOUNT));
+        stateMachine.setDefinition(definition);
+
+        Execution execution = new Execution();
+        execution.setName("ecs-runtask-execution");
+        execution.setExecutionArn("arn:aws:states:%s:%s:execution:ecs-runtask-test:ecs-runtask-execution".formatted(REGION, ACCOUNT));
+        execution.setStateMachineArn(stateMachine.getStateMachineArn());
+        execution.setInput(input);
+
+        history = recorded;
+        executor.executeSync(stateMachine, execution, history, (updated, events) -> { });
+        return execution;
+    }
+}

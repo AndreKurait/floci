@@ -49,33 +49,38 @@ HAND_ROUTED: dict[str, str] = {
 # botocore model -> the credential scope Floci authorizes its requests under.
 MODELS: dict[str, str] = {
     "accessanalyzer": "access-analyzer",
+    "account": "account",
     "apigateway": "apigateway",
     "apigatewayv2": "apigateway",
+    "appconfig": "appconfig",
+    "appconfigdata": "appconfig",
     "cloudfront": "cloudfront",
     "cloudfront-keyvaluestore": "cloudfront-keyvaluestore",
+    "controlcatalog": "controlcatalog",
     "controltower": "controltower",
     "dsql": "dsql",
     "eks": "eks",
     "emr-serverless": "emr-serverless",
     "guardduty": "guardduty",
     "es": "es",
-    "inspector2": "inspector2",
-    "lakeformation": "lakeformation",
+    "fis": "fis",
     "lambda": "lambda",
     "lambda-core": "lambda",
     "lambda-microvms": "lambda",
+    "oam": "oam",
+    "inspector2": "inspector2",
+    "lakeformation": "lakeformation",
     "macie2": "macie2",
     "opensearch": "es",
-    # The data plane is signed for the service, which is one scope for both of its planes.
-    "payment-cryptography-data": "payment-cryptography",
     "pipes": "pipes",
     "quicksight": "quicksight",
+    "ram": "ram",
+    "resource-explorer-2": "resource-explorer-2",
     "s3": "s3",
     "s3control": "s3",
     "scheduler": "scheduler",
     "securityhub": "securityhub",
     "signer": "signer",
-    "xray": "xray",
 }
 
 # Operations a model does not serve itself. The shared tags controller serves /tags/{resourceArn} for every
@@ -87,15 +92,15 @@ SHARED_ROUTES: dict[str, frozenset[str]] = {
     "apigateway": frozenset({"TagResource", "UntagResource", "GetTags"}),
     "controltower": frozenset({"TagResource", "UntagResource", "ListTagsForResource"}),
     "signer": frozenset({"TagResource", "UntagResource", "ListTagsForResource"}),
+    "fis": frozenset({"TagResource", "UntagResource", "ListTagsForResource"}),
+    "resource-explorer-2": frozenset({"TagResource", "UntagResource", "ListTagsForResource"}),
 }
-
-# Operations whose ARN label a model gives one segment, where the controller serving them lets it span
-# the slashes the ARN holds: a request may send the ARN unencoded and still reach the operation, so its
-# route has to take that request too or it would go unchecked. API Gateway v2's tag routes are
-# `/v2/tags/{resourceArn: .+}` in its controller.
 ARN_SPANNING_ROUTES: dict[str, frozenset[str]] = {
     "apigatewayv2": frozenset({"TagResource", "UntagResource", "GetTags"}),
+    "oam": frozenset({"TagResource", "UntagResource", "ListTagsForResource"}),
 }
+
+ONLY_OPERATIONS: dict[str, tuple[str, ...]] = {}
 
 
 def access_denied_status(model: dict) -> int | None:
@@ -115,6 +120,15 @@ def access_denied_status(model: dict) -> int | None:
     return next(iter(statuses), None)
 
 
+def bare_tags_route(method: str) -> dict:
+    """The bare `/tags` route SharedTagsController also serves for a shared tags route of the method, with where it
+    reads the ARN: a tagging request is a POST whose body names it, whether the service tags with POST or with
+    PUT, and a GET or DELETE names it in its query. A route of another method than the operation's says so."""
+    bare = "POST" if method in ("POST", "PUT") else method
+    route = {"requestUri": "/tags", "located": {"resourceArn": "body" if bare == "POST" else "?resourceArn"}}
+    return route if bare == method else {"method": bare, **route}
+
+
 def build(models: dict[str, dict], provenance: str) -> dict:
     """The vendored document from each loaded model."""
     routes = {}
@@ -126,7 +140,7 @@ def build(models: dict[str, dict], provenance: str) -> dict:
         shared = SHARED_ROUTES.get(name, frozenset())
         spanning = ARN_SPANNING_ROUTES.get(name, frozenset())
         operations = {}
-        for operation in sorted(model["operations"]):
+        for operation in sorted(ONLY_OPERATIONS.get(name, model["operations"])):
             http = model["operations"][operation]["http"]
             request_uri = http["requestUri"]
             if operation in shared or operation in spanning:
@@ -164,13 +178,6 @@ def build(models: dict[str, dict], provenance: str) -> dict:
     }
 
 
-def bare_tags_route(method: str) -> dict:
-    """The bare `/tags` route SharedTagsController also serves for a shared tags route of the method, with where it
-    reads the ARN: a tagging request is a POST whose body names it, whether the service tags with POST or with
-    PUT, and a GET or DELETE names it in its query. A route of another method than the operation's says so."""
-    bare = "POST" if method in ("POST", "PUT") else method
-    route = {"requestUri": "/tags", "located": {"resourceArn": "body" if bare == "POST" else "?resourceArn"}}
-    return route if bare == method else {"method": bare, **route}
 
 
 def route_key(method: str, request_uri: str) -> tuple:

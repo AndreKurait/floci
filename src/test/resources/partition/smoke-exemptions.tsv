@@ -2,13 +2,14 @@
 # package<TAB>reason. PartitionSmokeInventoryTest fails on a minting package missing from both,
 # and on a row whose package no longer mints or is now covered. Shrink this file, never grow it
 # without a reason.
+account	Account member ARNs use stored organization identity; AccountRegionOrganizationIamIntegrationTest and AccountRegionUnknownPartitionIamIntegrationTest cover exact member and request-partition grants without a returned ARN.
 appintegrations	no non-commercial partition publishes the service, so a case would be skipped in every partition
+athena	internal workgroup authorization ARN covered by AthenaBatchQueryIamIntegrationTest in each offered non-commercial partition; query history has no delete API
 cloudformation	covered by PartitionArnMintingIntegrationTest (all partitions)
 cloudhsmv2	the only ARN on the wire is the automatic backup's, and a backup is never removed (DeleteBackup only marks it), so a case would leak state into the shared emulator
 cloudtrail	covered by CloudTrailSelfDeliveryTest (one partition)
 codeartifact	no non-commercial partition publishes the service, so a case would be skipped in every partition
 codegurureviewer	no non-commercial partition publishes the service, so a case would be skipped in every partition
-cognitoidentity	identity pool ARN is never returned and ARN lookup ignores the partition, nothing to assert
 detective	the graph exists only once an organization admin is designated, and nothing removes it, so a case would leak state into the shared emulator
 docdb	CreateDBCluster starts a container under the test config and the package has no lighter resource; its parameter and subnet groups are RDS's, covered there
 globalaccelerator	no non-commercial partition publishes the service, so a case would be skipped in every partition

@@ -128,3 +128,25 @@ def run_aggregate_gate(tmp_path, changed, fail):
         ["make", "--no-print-directory", "iam-data-verify", "CHANGED=" + changed,
          "MAKE=" + str(recursive_make)],
         cwd=OUTPUT.parents[4], capture_output=True, text=True, check=False)
+
+
+def test_account_region_conditions_match_all_three_named_operations_only():
+    document = json.loads(OUTPUT.read_text())
+    expected = {"account:" + operation: ["account:TargetRegion"]
+                for operation in ("EnableRegion", "DisableRegion", "GetRegionOptStatus")}
+    assert {action: keys for action, keys in document["actions"].items()
+            if action.startswith("account:")} == expected
+    assert {action: keys for action, keys in document["members"].items()
+            if action.startswith("account:")} == {
+        action: {"account:TargetRegion": ["RegionName"]} for action in expected}
+    assert "account:ListRegions" not in document["actions"]
+    assert "account:ListRegions" not in document["members"]
+
+
+def test_account_condition_member_cannot_silently_drift_to_a_different_field():
+    model = {"metadata": {"protocol": "rest-json"},
+             "operations": {"EnableRegion": {"input": {"shape": "Input"}}},
+             "shapes": {"Input": {"members": {"OtherRegion": {"shape": "String"}}},
+                        "String": {"type": "string"}}}
+    with pytest.raises(ValueError, match="no RegionName member"):
+        request_members("account", model, {"account:EnableRegion": ["account:TargetRegion"]})
