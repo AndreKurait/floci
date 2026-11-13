@@ -11,9 +11,22 @@ public record ExecutionConfiguration(String stateMachineArn, String name, String
                                      double updateDate, String revisionId, JsonNode loggingConfiguration,
                                      JsonNode tracingConfiguration, JsonNode encryptionConfiguration) {
     public static ExecutionConfiguration capture(StateMachine source, String baseArn) {
-        return new ExecutionConfiguration(baseArn, source.getName(), source.getDefinition(), source.getRoleArn(),
+        return capture(source, baseArn,
                 source.getUpdateDate() != null ? source.getUpdateDate() : source.getCreationDate(),
-                source.getRevisionId(), copy(source.getLoggingConfiguration()), copy(source.getTracingConfiguration()),
+                source.getUpdateDate() != null ? source.getRevisionId() : null);
+    }
+
+    public static ExecutionConfiguration captureVersion(
+            StateMachine source, String baseArn, StateMachineVersion version) {
+        boolean recorded = version.getConfigurationUpdateDate() != null;
+        return capture(source, baseArn,
+                recorded ? version.getConfigurationUpdateDate() : version.getCreationDate(),
+                recorded ? version.getConfigurationRevisionId() : source.getRevisionId());
+    }
+
+    private static ExecutionConfiguration capture(StateMachine source, String baseArn, double date, String revision) {
+        return new ExecutionConfiguration(baseArn, source.getName(), source.getDefinition(), source.getRoleArn(),
+                date, revision, copy(source.getLoggingConfiguration()), copy(source.getTracingConfiguration()),
                 copy(source.getEncryptionConfiguration()));
     }
 

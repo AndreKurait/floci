@@ -77,8 +77,8 @@ class StepFunctionsExecutionConfigurationIntegrationTest {
             cloud.completed(execution);
             cloud.completed(changedExecution);
             cloud.sfn.deleteStateMachine(request -> request.stateMachineArn(created.stateMachineArn()));
-            assertTrue(original.equalsBySdkFields(cloud.describe(execution)));
-            assertTrue(changed.equalsBySdkFields(cloud.describe(changedExecution)));
+            assertThrows(ExecutionDoesNotExistException.class, () -> cloud.describe(execution));
+            assertThrows(ExecutionDoesNotExistException.class, () -> cloud.describe(changedExecution));
         }
     }
 

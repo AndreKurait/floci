@@ -15,6 +15,7 @@ import java.util.Set;
 public class Execution {
     private String executionArn;
     private String stateMachineArn;
+    private String stateMachineIncarnationId;
     private String stateMachineVersionArn;
     private String stateMachineAliasArn;
     private ExecutionConfiguration stateMachineConfiguration;
@@ -39,6 +40,11 @@ public class Execution {
 
     public String getStateMachineArn() { return stateMachineArn; }
     public void setStateMachineArn(String stateMachineArn) { this.stateMachineArn = stateMachineArn; }
+
+    public String getStateMachineIncarnationId() { return stateMachineIncarnationId; }
+    public void setStateMachineIncarnationId(String incarnationId) {
+        this.stateMachineIncarnationId = incarnationId;
+    }
 
     public String getStateMachineVersionArn() { return stateMachineVersionArn; }
     public void setStateMachineVersionArn(String stateMachineVersionArn) {
