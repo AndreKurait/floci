@@ -1,0 +1,1592 @@
+package io.github.hectorvent.floci.core.common;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.apigateway.ApiGatewayDocumentationIamConditions;
+import io.github.hectorvent.floci.services.athena.AthenaBatchQueryService;
+import io.github.hectorvent.floci.services.athena.AthenaPreparedStatementService;
+import io.github.hectorvent.floci.services.backup.BackupFrameworkResources;
+import io.github.hectorvent.floci.services.backup.BackupFrameworkService;
+import io.github.hectorvent.floci.services.cloudformation.CloudFormationDriftService;
+import io.github.hectorvent.floci.services.cloudformation.CloudFormationDriftSnapshot;
+import io.github.hectorvent.floci.services.cloudfront.CloudFrontFunctionTestRoute;
+import io.github.hectorvent.floci.services.cloudfront.CloudFrontFunctionTesting;
+import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
+import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
+import io.github.hectorvent.floci.services.cloudwatch.logs.LogGroupTagTarget;
+import io.github.hectorvent.floci.services.cloudwatch.logs.LogTransformerTarget;
+import io.github.hectorvent.floci.services.dynamodb.DynamoDbConditionKeys;
+import io.github.hectorvent.floci.services.dynamodb.DynamoDbFacade;
+import io.github.hectorvent.floci.services.dynamodb.DynamoDbTableNames;
+import io.github.hectorvent.floci.services.dynamodb.model.TableDefinition;
+import io.github.hectorvent.floci.services.ec2.Ec2PlacementGroupService;
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.model.Ec2PlacementGroup;
+import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
+import io.github.hectorvent.floci.services.ec2.model.Tag;
+import io.github.hectorvent.floci.services.ecr.EcrService;
+import io.github.hectorvent.floci.services.eks.EksAccessEntryUpdateConditions;
+import io.github.hectorvent.floci.services.elbv2.ElbV2ConditionKeys;
+import io.github.hectorvent.floci.services.iam.IamActionRegistry;
+import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.iam.ResourceArnBuilder;
+import io.github.hectorvent.floci.services.iam.model.IamRole;
+import io.github.hectorvent.floci.services.iam.model.IamUser;
+import io.github.hectorvent.floci.services.kinesis.KinesisService;
+import io.github.hectorvent.floci.services.lambda.LambdaRuntimeManagementService;
+import io.github.hectorvent.floci.services.lambda.LambdaService;
+import io.github.hectorvent.floci.services.lambdaweb.LambdaWebService;
+import io.github.hectorvent.floci.services.s3.S3ControlTagConditionKeys;
+import io.github.hectorvent.floci.services.s3.S3ObjectActions;
+import io.github.hectorvent.floci.services.s3.S3ObjectKeys;
+import io.github.hectorvent.floci.services.s3.S3Service;
+import io.github.hectorvent.floci.services.s3.S3SignatureConditions;
+import io.github.hectorvent.floci.services.ssm.SsmService;
+import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
+import io.vertx.ext.web.RoutingContext;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Instance;
+import jakarta.inject.Inject;
+import jakarta.ws.rs.container.ContainerRequestContext;
+import jakarta.ws.rs.core.MediaType;
+import jakarta.ws.rs.core.MultivaluedMap;
+import org.jboss.logging.Logger;
+
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.URI;
+import java.net.URLDecoder;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.time.Clock;
+import java.time.Instant;
+import java.time.format.DateTimeParseException;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * Builds the IAM request context: the condition keys a policy's Condition block can match,
+ * for the request currently being enforced.
+ *
+ * <p>Two keys are generic across services and populated the same way wherever they apply:
+ * <ul>
+ *   <li>{@code aws:RequestTag/<key>}, a tag the caller asks to attach, read from the request
+ *       before the operation is applied.</li>
+ *   <li>{@code aws:ResourceTag/<key>}, a tag already on the target resource, read from current
+ *       state. {@link #resolve} carries the first target's tags and
+ *       {@link #resolveRemainingTargets} one context per further target, so the filter can
+ *       require the policy to hold for every resource the request names, as AWS does.</li>
+ * </ul>
+ */
+@ApplicationScoped
+public class IamConditionContextResolver {
+
+    private static final Logger LOG = Logger.getLogger(IamConditionContextResolver.class);
+
+    /** Set by {@code ResourceArnBuilder.readJsonBody}, which runs earlier in the same filter pass. */
+    static final String BUFFERED_JSON_BODY = "floci.bufferedJsonBody";
+    private static final String BUFFERED_FORM_BODY = "floci.bufferedFormBody";
+    private static final String REQUEST_TAG_PREFIX = "aws:RequestTag/";
+    private static final String RESOURCE_TAG_PREFIX = "aws:ResourceTag/";
+    /**
+     * The services that set {@code aws:SourceOwner} when they publish to an SNS topic, a deprecated key
+     * SNS keeps for the integrations that had it (SNS Developer Guide, "aws:SourceAccount versus
+     * aws:SourceOwner"). The guide lists more; these are the ones that call through
+     * {@link ServiceCallAuthorizer}.
+     */
+    private static final Set<String> SNS_SOURCE_OWNER_SERVICES = Set.of("ses");
+    public static final String EXISTING_OBJECT_TAG_PREFIX = "s3:ExistingObjectTag/";
+    public static final String REQUEST_OBJECT_TAG_PREFIX = "s3:RequestObjectTag/";
+    public static final String REQUEST_OBJECT_TAG_KEYS = "s3:RequestObjectTagKeys";
+    public static final String VERSION_ID = "s3:versionid";
+    public static final String OBJECT_LOCK_MODE = "s3:object-lock-mode";
+    public static final String OBJECT_LOCK_RETAIN_UNTIL_DATE = "s3:object-lock-retain-until-date";
+    public static final String OBJECT_LOCK_REMAINING_RETENTION_DAYS = "s3:object-lock-remaining-retention-days";
+    public static final String OBJECT_LOCK_LEGAL_HOLD = "s3:object-lock-legal-hold";
+    public static final String SERVER_SIDE_ENCRYPTION = "s3:x-amz-server-side-encryption";
+    public static final String SERVER_SIDE_ENCRYPTION_KMS_KEY_ID = "s3:x-amz-server-side-encryption-aws-kms-key-id";
+    static final String REQUEST_AUTH_TYPE = "lambda:Request/WebFunctionAuthType";
+    static final String RESOURCE_AUTH_TYPE = "lambda:Resource/WebFunctionAuthType";
+
+    @Inject
+    Instance<BackupFrameworkService> backupFrameworks;
+    @Inject
+    Instance<ApiGatewayDocumentationIamConditions> documentationConditions;
+    @Inject
+    Instance<CloudFormationDriftService> driftService;
+
+    private final Instance<DynamoDbFacade> dynamoDbFacade;
+    private final Instance<Ec2Service> ec2Service;
+    /** Lazy to keep the existing IAM construction graph independent of EC2 storage creation. */
+    @Inject
+    Instance<Ec2PlacementGroupService> placementGroupService;
+    private final Instance<EcrService> ecrService;
+    private final Instance<CloudFrontFunctionTesting> cloudFrontFunctionTesting;
+    private final Instance<S3Service> s3Service;
+    private final Instance<CloudWatchLogsService> logsService;
+    private final Instance<IamService> iamService;
+    private final Instance<LambdaWebService> lambdaWebService;
+    private final Instance<LambdaService> lambdaService;
+    private final Instance<KinesisService> kinesisService;
+    private final Instance<LambdaRuntimeManagementService> runtimeManagement;
+    private final Instance<SsmService> ssmService;
+    private final Instance<ElbV2ConditionKeys> elbV2ConditionKeys;
+    private final RequestContext requestContext;
+    private final Instance<AthenaPreparedStatementService> athenaPreparedStatements;
+    private final EmulatorConfig config;
+    private final CurrentVertxRequest currentVertxRequest;
+    private final Clock clock;
+    private final Instance<AthenaBatchQueryService> athenaBatchQueryService;
+    private final Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates;
+    private final ResolvedServiceCatalog serviceCatalog;
+
+    /**
+     * The system clock, not the CDI one: Object Lock's remaining retention days has to count from the
+     * same now as S3Service, which checks retention against {@code Instant.now()}.
+     */
+    @Inject
+    public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                       Instance<Ec2Service> ec2Service,
+                                       Instance<S3Service> s3Service,
+                                       Instance<CloudWatchLogsService> logsService,
+                                       Instance<IamService> iamService,
+                                       Instance<LambdaWebService> lambdaWebService,
+                                       RequestContext requestContext,
+                                       EmulatorConfig config,
+                                       CurrentVertxRequest currentVertxRequest,
+                                       ResolvedServiceCatalog serviceCatalog,
+                                       Instance<SsmService> ssmService,
+                                       Instance<ElbV2ConditionKeys> elbV2ConditionKeys,
+                                       Instance<LambdaService> lambdaService,
+                                       Instance<AthenaPreparedStatementService> athenaPreparedStatements,
+                                       Instance<KinesisService> kinesisService,
+                                       Instance<AthenaBatchQueryService> athenaBatchQueryService,
+                                       Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates,
+                                       Instance<LambdaRuntimeManagementService> runtimeManagement,
+                                       Instance<EcrService> ecrService,
+                                       Instance<CloudFrontFunctionTesting> cloudFrontFunctionTesting) {
+        this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys, lambdaService, athenaPreparedStatements, kinesisService, athenaBatchQueryService, eksAccessEntryUpdates, runtimeManagement, ecrService, cloudFrontFunctionTesting);
+    }
+
+    public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                       Instance<Ec2Service> ec2Service,
+                                       Instance<S3Service> s3Service,
+                                       Instance<CloudWatchLogsService> logsService,
+                                       Instance<IamService> iamService,
+                                       Instance<LambdaWebService> lambdaWebService,
+                                       RequestContext requestContext,
+                                       EmulatorConfig config,
+                                       CurrentVertxRequest currentVertxRequest,
+                                       ResolvedServiceCatalog serviceCatalog,
+                                       Instance<SsmService> ssmService,
+                                       Instance<ElbV2ConditionKeys> elbV2ConditionKeys) {
+        this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys, null, null, null, null, null, null, null, null);
+    }
+
+    public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                       Instance<Ec2Service> ec2Service,
+                                       Instance<S3Service> s3Service,
+                                       Instance<CloudWatchLogsService> logsService,
+                                       Instance<IamService> iamService,
+                                       Instance<LambdaWebService> lambdaWebService,
+                                       RequestContext requestContext,
+                                       EmulatorConfig config,
+                                       CurrentVertxRequest currentVertxRequest,
+                                       ResolvedServiceCatalog serviceCatalog) {
+        this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), null, null, null, null, null, null, null, null, null, null);
+    }
+
+    IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                Instance<Ec2Service> ec2Service,
+                                Instance<S3Service> s3Service,
+                                Instance<CloudWatchLogsService> logsService,
+                                Instance<IamService> iamService,
+                                Instance<LambdaWebService> lambdaWebService,
+                                RequestContext requestContext,
+                                EmulatorConfig config,
+                                CurrentVertxRequest currentVertxRequest,
+                                ResolvedServiceCatalog serviceCatalog, Clock clock) {
+        this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
+                config, currentVertxRequest, serviceCatalog, clock, null, null, null, null, null, null, null, null, null, null);
+    }
+
+    private IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                        Instance<Ec2Service> ec2Service,
+                                        Instance<S3Service> s3Service,
+                                        Instance<CloudWatchLogsService> logsService,
+                                        Instance<IamService> iamService,
+                                        Instance<LambdaWebService> lambdaWebService,
+                                        RequestContext requestContext,
+                                        EmulatorConfig config,
+                                        CurrentVertxRequest currentVertxRequest,
+                                        ResolvedServiceCatalog serviceCatalog, Clock clock,
+                                        Instance<SsmService> ssmService,
+                                        Instance<ElbV2ConditionKeys> elbV2ConditionKeys) {
+        this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService,
+                requestContext, config, currentVertxRequest, serviceCatalog, clock,
+                ssmService, elbV2ConditionKeys, null, null, null, null, null, null, null, null);
+    }
+
+    private IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                        Instance<Ec2Service> ec2Service,
+                                        Instance<S3Service> s3Service,
+                                        Instance<CloudWatchLogsService> logsService,
+                                        Instance<IamService> iamService,
+                                        Instance<LambdaWebService> lambdaWebService,
+                                        RequestContext requestContext,
+                                        EmulatorConfig config,
+                                        CurrentVertxRequest currentVertxRequest,
+                                        ResolvedServiceCatalog serviceCatalog, Clock clock,
+                                        Instance<SsmService> ssmService,
+                                        Instance<ElbV2ConditionKeys> elbV2ConditionKeys,
+                                       Instance<LambdaService> lambdaService,
+                                       Instance<AthenaPreparedStatementService> athenaPreparedStatements,
+                                       Instance<KinesisService> kinesisService,
+                                       Instance<AthenaBatchQueryService> athenaBatchQueryService,
+                                       Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates,
+                                       Instance<LambdaRuntimeManagementService> runtimeManagement,
+                                       Instance<EcrService> ecrService,
+                                       Instance<CloudFrontFunctionTesting> cloudFrontFunctionTesting) {
+        this.dynamoDbFacade = dynamoDbFacade;
+        this.ec2Service = ec2Service;
+        this.ecrService = ecrService;
+        this.cloudFrontFunctionTesting = cloudFrontFunctionTesting;
+        this.s3Service = s3Service;
+        this.logsService = logsService;
+        this.iamService = iamService;
+        this.lambdaWebService = lambdaWebService;
+        this.lambdaService = lambdaService;
+        this.kinesisService = kinesisService;
+        this.athenaPreparedStatements = athenaPreparedStatements;
+        this.runtimeManagement = runtimeManagement;
+        this.ssmService = ssmService;
+        this.elbV2ConditionKeys = elbV2ConditionKeys;
+        this.requestContext = requestContext;
+        this.config = config;
+        this.currentVertxRequest = currentVertxRequest;
+        this.clock = clock;
+        this.eksAccessEntryUpdates = eksAccessEntryUpdates;
+        this.serviceCatalog = serviceCatalog;
+        this.athenaBatchQueryService = athenaBatchQueryService;
+    }
+
+    private Map<String, List<String>> athenaPreparedStatementConditions(String action, ContainerRequestContext ctx) {
+        if (!AthenaPreparedStatementService.supportsAction(action)
+                || athenaPreparedStatements == null || !athenaPreparedStatements.isResolvable()) {
+            return null;
+        }
+        JsonNode body = bufferedJsonBody(ctx);
+        if (body == null || !body.path("WorkGroup").isTextual()) {
+            return null;
+        }
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        try {
+            return athenaPreparedStatements.get().resourceTagConditions(region, body.path("WorkGroup").textValue());
+        } catch (AwsException expected) {
+            // The handler validates the same selector; an absent workgroup has no resource tags.
+            return null;
+        }
+    }
+
+    private Map<String, List<String>> kinesisConditionContext(String action, ContainerRequestContext ctx) {
+        if (kinesisService == null || !kinesisService.isResolvable() || !Set.of("kinesis:GetResourcePolicy",
+                "kinesis:PutResourcePolicy", "kinesis:DeleteResourcePolicy").contains(action)) {
+            return null;
+        }
+        JsonNode body = bufferedJsonBody(ctx);
+        if (body == null || !body.path("ResourceARN").isTextual()) {
+            return null;
+        }
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        Map<String, List<String>> context = new LinkedHashMap<>();
+        try {
+            kinesisService.get().resourcePolicyTags(body.path("ResourceARN").textValue(), region)
+                    .forEach((key, value) -> context.put(RESOURCE_TAG_PREFIX + key, List.of(value)));
+        } catch (AwsException expected) {
+            // Missing or foreign resources provide no tags; the handler returns its resource error if authorized.
+        }
+        return context;
+    }
+
+    private Map<String, List<String>> cloudFrontTestConditionContext(String action, ContainerRequestContext ctx) {
+        if (!"cloudfront:TestFunction".equals(action) || cloudFrontFunctionTesting == null
+                || !cloudFrontFunctionTesting.isResolvable()) {
+            return null;
+        }
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        cloudFrontFunctionTesting.get().currentTags(CloudFrontFunctionTestRoute.name(ctx))
+                .forEach((key, value) -> conditions.put(RESOURCE_TAG_PREFIX + key, List.of(value)));
+        return conditions.isEmpty() ? null : conditions;
+    }
+
+    public Map<String, List<String>> resolve(String credentialScope, String action,
+                                             ContainerRequestContext ctx) {
+        return switch (credentialScope) {
+            case "cloudfront" -> cloudFrontTestConditionContext(action, ctx);
+            case "backup" -> backupFrameworkConditions(action, ctx);
+            case "apigateway" -> documentationConditions != null && documentationConditions.isResolvable()
+                    ? documentationConditions.get().resolve(action, ctx) : null;
+            case "cloudformation" -> driftConditionContext(action, ctx);
+            case "s3" -> s3ConditionContext(action, ctx);
+            case "ec2" -> ec2ConditionContext(action, ctx);
+            case "ecr" -> ecrPreviewConditionContext(action, ctx);
+            case "elasticloadbalancing" -> elbV2Contexts(action, ctx).stream().findFirst().orElse(null);
+            case "dynamodb" -> dynamoDbConditionContext(action, ctx);
+            case "iam" -> iamConditionContext(action, ctx);
+            case "logs" -> logsConditionContext(action, ctx);
+            case "lambda" -> lambdaConditionContext(action, ctx);
+            case "athena" -> athenaPreparedStatementConditions(action, ctx);
+            case "kinesis" -> kinesisConditionContext(action, ctx);
+            case "eks" -> "eks:UpdateAccessEntry".equals(action) && eksAccessEntryUpdates != null
+                    && eksAccessEntryUpdates.isResolvable() ? eksAccessEntryUpdates.get().resolve(ctx) : null;
+            case "redshift" -> redshiftConditionContext(action, ctx);
+            case "states" -> stepFunctionsConditionContext(action, ctx);
+            default -> null;
+        };
+    }
+
+    private List<Map<String, List<String>>> elbV2Contexts(String action, ContainerRequestContext ctx) {
+        return elbV2ConditionKeys != null && elbV2ConditionKeys.isResolvable()
+                ? elbV2ConditionKeys.get().resourceContexts(action, formParameters(ctx)) : List.of();
+    }
+
+    /**
+     * These calls authorize the base state-machine ARN. A version or alias in the
+     * request is a qualifier condition, including when an alias selects a version.
+     */
+    private Map<String, List<String>> stepFunctionsConditionContext(String action, ContainerRequestContext ctx) {
+        if (!("states:DescribeStateMachine".equals(action) || "states:StartExecution".equals(action))) {
+            return null;
+        }
+        JsonNode body = bufferedJsonBody(ctx);
+        String value = body == null ? null : body.path("stateMachineArn").asText(null);
+        if (value == null) {
+            return null;
+        }
+        try {
+            AwsArnUtils.Arn arn = AwsArnUtils.parse(value);
+            String[] resource = arn.resource().split(":", -1);
+            if ("states".equals(arn.service()) && resource.length == 3
+                    && "stateMachine".equals(resource[0]) && !resource[1].isBlank() && !resource[2].isBlank()) {
+                return Map.of("states:StateMachineQualifier", List.of(resource[2]));
+            }
+        } catch (IllegalArgumentException expected) {
+            // Leave malformed selectors to the ordinary authorization and API validation.
+        }
+        return null;
+    }
+
+    /** Run Command checks each document and target with that resource's own tags. */
+    public Map<String, List<String>> ssmCommandResourceContext(String resource,
+                                                              Map<String, List<String>> base,
+                                                              String region, String accountId) {
+        Map<String, List<String>> conditions = base == null ? new LinkedHashMap<>() : new LinkedHashMap<>(base);
+        conditions.keySet().removeIf(key -> key.startsWith(RESOURCE_TAG_PREFIX)
+                || key.startsWith("ssm:resourceTag/"));
+        AwsArnUtils.Arn arn = AwsArnUtils.parse(resource);
+        String partition = requestContext.getPartition() == null
+                ? AwsRegions.partitionFor(region) : requestContext.getPartition();
+        if (!region.equals(arn.region()) || !accountId.equals(arn.accountId())
+                || !partition.equals(arn.partition())) {
+            return conditions;
+        }
+        if ("ec2".equals(arn.service()) && arn.resource().startsWith("instance/")) {
+            String instance = arn.resource().substring("instance/".length());
+            addResourceTags(conditions, instance);
+            new LinkedHashMap<>(conditions).forEach((key, value) -> {
+                if (key.startsWith(RESOURCE_TAG_PREFIX)) {
+                    conditions.put("ssm:resourceTag/" + key.substring(RESOURCE_TAG_PREFIX.length()), value);
+                }
+            });
+        } else if ("ssm".equals(arn.service()) && arn.resource().startsWith("document/")
+                && ssmService != null && ssmService.isResolvable()) {
+            try {
+                ssmService.get().listDocumentTags(arn.resource().substring("document/".length()), region)
+                        .forEach((key, value) -> conditions.put(RESOURCE_TAG_PREFIX + key, List.of(value)));
+            } catch (AwsException expected) {
+                if (!"InvalidResourceId".equals(expected.getErrorCode())) {
+                    throw expected;
+                }
+                // Missing documents have no tags; the handler retains its normal not-found response.
+            }
+        }
+        return conditions;
+    }
+
+    private Map<String, List<String>> backupFrameworkConditions(String action, ContainerRequestContext ctx) {
+        if (!BackupFrameworkResources.supports(action) || backupFrameworks == null || !backupFrameworks.isResolvable()) {
+            return null;
+        }
+        JsonNode body = bufferedJsonBody(ctx);
+        if (!BackupFrameworkResources.matches(action, ctx, body)) {
+            return null;
+        }
+        String target = BackupFrameworkResources.target(action, ctx, body);
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        Map<String, List<String>> conditions = new LinkedHashMap<>(
+                backupFrameworks.get().resourceConditions(region, target));
+        if ("backup:TagResource".equals(action) && body != null && body.path("Tags").isObject()) {
+            List<String> keys = new ArrayList<>();
+            body.path("Tags").properties().forEach(entry -> {
+                keys.add(entry.getKey());
+                conditions.put("aws:RequestTag/" + entry.getKey(), List.of(entry.getValue().asText()));
+            });
+            conditions.put("aws:TagKeys", keys);
+        } else if ("backup:UntagResource".equals(action) && body != null && body.path("TagKeyList").isArray()) {
+            List<String> keys = new ArrayList<>();
+            body.path("TagKeyList").forEach(key -> keys.add(key.asText()));
+            conditions.put("aws:TagKeys", keys);
+        }
+        return conditions;
+    }
+
+    /** Group mutations and stream access use the handler's group and request scope. */
+    private Map<String, List<String>> ecrPreviewConditionContext(String action, ContainerRequestContext ctx) {
+        if (!("ecr:StartLifecyclePolicyPreview".equals(action) || "ecr:GetLifecyclePolicyPreview".equals(action))
+                || ecrService == null || !ecrService.isResolvable()) {
+            return null;
+        }
+        JsonNode body = bufferedJsonBody(ctx);
+        if (body == null) {
+            return null;
+        }
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        Map<String, String> tags = ecrService.get().lifecyclePreviewTags(body.path("repositoryName").asText(null),
+                body.path("registryId").asText(null), region);
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        tags.forEach((key, value) -> {
+            if (key != null && value != null) {
+                conditions.put("aws:ResourceTag/" + key, List.of(value));
+                conditions.put("ecr:ResourceTag/" + key, List.of(value));
+            }
+        });
+        return conditions;
+    }
+
+    private Map<String, List<String>> driftConditionContext(String action, ContainerRequestContext ctx) {
+        if (!CloudFormationDriftService.handles(action)
+                || "cloudformation:DescribeStackDriftDetectionStatus".equals(action)
+                || driftService == null || !driftService.isResolvable()) {
+            return null;
+        }
+        String account = requestContext.getAccountId() == null ? config.defaultAccountId() : requestContext.getAccountId();
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        CloudFormationDriftSnapshot stack = driftService.get().authorizationTarget(
+                formParameters(ctx).get("StackName"), region, account);
+        Map<String, List<String>> context = new LinkedHashMap<>();
+        stack.tags().forEach((key, value) -> context.put("aws:ResourceTag/" + key, List.of(value)));
+        return context;
+    }
+
+    private Map<String, List<String>> logsConditionContext(String action, ContainerRequestContext ctx) {
+        if (!("logs:CreateLogStream".equals(action) || "logs:DeleteLogStream".equals(action)
+                || "logs:PutLogEvents".equals(action)
+                || LogGroupTagTarget.supports(action) || LogTransformerTarget.supports(action)
+                || "logs:CreateLogGroup".equals(action) || "logs:DeleteLogGroup".equals(action)
+                || "logs:PutRetentionPolicy".equals(action) || "logs:DeleteRetentionPolicy".equals(action)
+                || "logs:CreateExportTask".equals(action))) {
+            return null;
+        }
+        JsonNode body = bufferedJsonBody(ctx);
+        if (body == null) {
+            return null;
+        }
+        if ("logs:CreateLogGroup".equals(action)) {
+            JsonNode tags = body.path("tags");
+            if (!tags.isObject() || tags.isEmpty()) {
+                return null;
+            }
+            Map<String, List<String>> conditions = new LinkedHashMap<>();
+            List<String> keys = new ArrayList<>();
+            tags.properties().forEach(entry -> {
+                keys.add(entry.getKey());
+                conditions.put("aws:RequestTag/" + entry.getKey(), List.of(entry.getValue().asText()));
+            });
+            conditions.put("aws:TagKeys", keys);
+            return conditions;
+        }
+        if (!logsService.isResolvable()) {
+            return null;
+        }
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        boolean direct = LogGroupTagTarget.supports(action);
+        if ("logs:TagResource".equals(action) && body.path("tags").isObject()) {
+            List<String> keys = new ArrayList<>();
+            body.path("tags").fields().forEachRemaining(entry -> {
+                keys.add(entry.getKey());
+                conditions.put(REQUEST_TAG_PREFIX + entry.getKey(), List.of(entry.getValue().asText()));
+            });
+            if (!keys.isEmpty()) {
+                conditions.put("aws:TagKeys", keys);
+            }
+        } else if ("logs:UntagResource".equals(action)) {
+            List<String> keys = new ArrayList<>();
+            body.path("tagKeys").forEach(key -> keys.add(key.asText()));
+            if (!keys.isEmpty()) {
+                conditions.put("aws:TagKeys", keys);
+            }
+        }
+        if (direct && CloudWatchLogsDeliveryService.isDeliveryResourceArn(body.path("resourceArn").asText())) {
+            // A delivery source, destination or delivery: its request tags apply, its own tags are not read.
+            return conditions.isEmpty() ? null : conditions;
+        }
+        String group = direct ? logsService.get().resolveTagTarget(body.path("resourceArn").asText(), region).name()
+                : body.path("logGroupName").asText();
+        if (LogTransformerTarget.supports(action)) {
+            group = logsService.get().resolveTransformerTarget(body.path("logGroupIdentifier").asText(), region).name();
+        }
+        Map<String, String> tags;
+        try {
+            tags = "logs:CreateExportTask".equals(action)
+                        ? logsService.get().readLogExportTags(requestContext.getAccountId() == null
+                                ? config.defaultAccountId() : requestContext.getAccountId(), region, group)
+                        : logsService.get().listTagsLogGroup(group, region);
+        } catch (AwsException e) {
+            if (!"ResourceNotFoundException".equals(e.getErrorCode())) {
+                throw e;
+            }
+            // Leave the handler to report a missing group; unexpected lookup errors must not hide a deny.
+            return conditions.isEmpty() ? null : conditions;
+        }
+        if (tags == null || tags.isEmpty()) {
+            return conditions.isEmpty() ? null : conditions;
+        }
+        tags.forEach((key, value) -> conditions.put(RESOURCE_TAG_PREFIX + key,
+                List.of(value == null ? "" : value)));
+        return conditions;
+    }
+
+    private Map<String, List<String>> iamConditionContext(String action, ContainerRequestContext ctx) {
+        Map<String, String> members = IamConditionKeys.members(action);
+        Map<String, String> targets = IamConditionKeys.targets(action);
+        if (members.isEmpty() && targets.isEmpty()) {
+            return null;
+        }
+        Map<String, String> form = formParameters(ctx);
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        members.forEach((key, member) -> {
+            String value = form.get(member);
+            if (value != null) {
+                conditions.put(key, List.of(value));
+            }
+        });
+        // iam:PermissionsBoundary on an existing role or user is the boundary stored on it, left off when it has none.
+        targets.forEach((key, target) -> {
+            String value = storedPermissionsBoundary(target, form.get(target));
+            if (value != null) {
+                conditions.put(key, List.of(value));
+            }
+        });
+        return conditions.isEmpty() ? null : conditions;
+    }
+
+    private String storedPermissionsBoundary(String target, String name) {
+        if (name == null || !iamService.isResolvable()) {
+            return null;
+        }
+        String account = requestContext.getAccountId();
+        return switch (target) {
+            case "RoleName" -> iamService.get().findRole(account, name).map(IamRole::getPermissionsBoundaryArn).orElse(null);
+            case "UserName" -> iamService.get().findUser(account, name).map(IamUser::getPermissionsBoundaryArn).orElse(null);
+            default -> throw new IllegalStateException("Unknown IAM condition key target: " + target);
+        };
+    }
+
+    /** The {@code redshift:} keys a Redshift request carries in its own members, such as its DbUser. */
+    private Map<String, List<String>> redshiftConditionContext(String action, ContainerRequestContext ctx) {
+        List<String> keys = RequestConditionKeys.requestKeys(action);
+        if (keys.isEmpty()) {
+            return null;
+        }
+        Map<String, String> form = formParameters(ctx);
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        for (String key : keys) {
+            for (String member : RequestConditionKeys.members(action, key)) {
+                putIfPresent(conditions, key, form.get(member));
+            }
+        }
+        return conditions.isEmpty() ? null : conditions;
+    }
+
+    public static Map<String, List<String>> withGlobalContext(Map<String, List<String>> serviceContext,
+                                                        String resourceArn, String region,
+                                                        String accountId, String resourceOwnerAccountId) {
+        return withGlobalContext(serviceContext, resourceArn, region, accountId, resourceOwnerAccountId, null);
+    }
+
+    public static Map<String, List<String>> withGlobalContext(Map<String, List<String>> serviceContext,
+                                                        String resourceArn, String region,
+                                                        String accountId, String resourceOwnerAccountId, String action) {
+        Map<String, List<String>> conditions = serviceContext == null
+                ? new LinkedHashMap<>()
+                : new LinkedHashMap<>(serviceContext);
+        putResourceAccount(conditions, resourceArn, resourceOwnerAccountId, action);
+        putIfPresent(conditions, "aws:PrincipalAccount", accountId);
+        putIfPresent(conditions, "aws:RequestedRegion", region);
+        conditions.putIfAbsent("aws:ViaAWSService", List.of("false"));
+        // This key exists for signed AWS credentials, not anonymous resource-policy callers.
+        if ("anonymous".equals(accountId)) {
+            conditions.remove("aws:PrincipalIsAWSService");
+        } else {
+            conditions.put("aws:PrincipalIsAWSService", List.of("false"));
+        }
+        return conditions;
+    }
+
+    private static void putResourceAccount(Map<String, List<String>> conditions, String resourceArn,
+                                           String resourceOwnerAccountId, String action) {
+        // S3 ARNs omit the owner account. Both condition keys must use the stored bucket owner,
+        // never the caller; leave them absent when neither the ARN nor service state knows it.
+        String account = AwsArnUtils.accountOrDefault(resourceArn, null);
+        if (account == null || account.isBlank()) {
+            account = resourceOwnerAccountId;
+        }
+        putIfPresent(conditions, "aws:ResourceAccount", account);
+        if (S3ControlTagConditionKeys.takes(action, "s3:ResourceAccount")) {
+            putIfPresent(conditions, "s3:ResourceAccount", account);
+        }
+    }
+
+    /**
+     * The request context of a call an AWS service makes on its own behalf, such as SES publishing to
+     * a topic, from the IAM User Guide's global condition keys: {@code aws:PrincipalIsAWSService} is
+     * {@code true}; {@code aws:PrincipalServiceName} and {@code aws:PrincipalServiceNamesList} name the
+     * service; {@code aws:SourceArn} and {@code aws:SourceAccount} name the resource whose
+     * configuration triggered the call, when it has them; and {@code aws:ResourceAccount} and
+     * {@code aws:RequestedRegion} describe the target. The keys that describe an IAM principal,
+     * {@code aws:PrincipalArn} and {@code aws:PrincipalAccount} among them, are left out: no IAM
+     * principal makes the call. A call to an SNS topic from a service SNS lists as setting it also
+     * carries {@code aws:SourceOwner}, the source account, which is what the default topic policy
+     * checks.
+     */
+    public static Map<String, List<String>> serviceCallContext(String servicePrincipal, String resourceArn,
+                                                               String resourceOwnerAccountId,
+                                                               String sourceArn, String sourceAccount) {
+        return serviceCallContext(servicePrincipal, resourceArn, resourceOwnerAccountId, sourceArn, sourceAccount, null);
+    }
+
+    public static Map<String, List<String>> serviceCallContext(String servicePrincipal, String resourceArn,
+                                                               String resourceOwnerAccountId,
+                                                               String sourceArn, String sourceAccount, String action) {
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        conditions.put("aws:PrincipalIsAWSService", List.of("true"));
+        conditions.put("aws:ViaAWSService", List.of("false"));
+        conditions.put("aws:PrincipalServiceName", List.of(servicePrincipal));
+        conditions.put("aws:PrincipalServiceNamesList", List.of(servicePrincipal));
+        putIfPresent(conditions, "aws:SourceArn", sourceArn);
+        putIfPresent(conditions, "aws:SourceAccount", sourceAccount);
+        if (SNS_SOURCE_OWNER_SERVICES.contains(ServicePrincipals.serviceName(servicePrincipal))
+                && AwsArnUtils.isArnFor(resourceArn, "sns")) {
+            putIfPresent(conditions, "aws:SourceOwner", sourceAccount);
+        }
+        putResourceAccount(conditions, resourceArn, resourceOwnerAccountId, action);
+        putIfPresent(conditions, "aws:RequestedRegion", AwsArnUtils.regionOrDefault(resourceArn, null));
+        return conditions;
+    }
+
+    private static void putIfPresent(Map<String, List<String>> conditions, String key, String value) {
+        if (value != null && !value.isBlank()) {
+            conditions.put(key, List.of(value));
+        }
+    }
+
+    // ── Lambda ──────────────────────────────────────────────────────────────────
+
+    /** The authType a web function endpoint request names, and the one the endpoint has before it. */
+    private Map<String, List<String>> lambdaConditionContext(String action, ContainerRequestContext ctx) {
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        if (("lambda:GetFunctionRecursionConfig".equals(action) || "lambda:PutFunctionRecursionConfig".equals(action))
+                && lambdaService != null && lambdaService.isResolvable()) {
+            String path = ctx.getUriInfo().getPath();
+            String prefix = "2024-08-31/functions/";
+            if (path.startsWith("/")) {
+                path = path.substring(1);
+            }
+            if (path.startsWith(prefix) && path.endsWith("/recursion-config")) {
+                String reference = path.substring(prefix.length(), path.length() - "/recursion-config".length());
+                String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+                try {
+                    lambdaService.get().recursionResourceTags(region, reference)
+                            .forEach((key, value) -> {
+                                if (key != null && value != null) {
+                                    conditions.put(RESOURCE_TAG_PREFIX + key, List.of(value));
+                                }
+                            });
+                } catch (AwsException expected) {
+                    // Invalid or missing targets have no resource tags; the handler rejects them.
+                }
+            }
+        }
+        if (("lambda:GetRuntimeManagementConfig".equals(action)
+                || "lambda:PutRuntimeManagementConfig".equals(action))
+                && runtimeManagement != null && runtimeManagement.isResolvable()) {
+            String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+            String account = requestContext.getAccountId() == null ? config.defaultAccountId()
+                    : requestContext.getAccountId();
+            runtimeManagement.get().authorizationTags(region, account,
+                    ctx.getUriInfo().getPathParameters().getFirst("functionName"),
+                    ctx.getUriInfo().getQueryParameters().getFirst("Qualifier"))
+                    .forEach((key, value) -> conditions.put(RESOURCE_TAG_PREFIX + key, List.of(value)));
+        }
+        for (String member : RequestConditionKeys.members(action, REQUEST_AUTH_TYPE)) {
+            PassedRoles.values(PassedRoles.jsonBody(ctx), member.split("\\."))
+                    .forEach(value -> putIfPresent(conditions, REQUEST_AUTH_TYPE, value));
+        }
+        if (RequestConditionKeys.takes(action, RESOURCE_AUTH_TYPE)) {
+            putIfPresent(conditions, RESOURCE_AUTH_TYPE, storedAuthType(ctx));
+        }
+        return conditions.isEmpty() ? null : conditions;
+    }
+
+    private String storedAuthType(ContainerRequestContext ctx) {
+        if (!lambdaWebService.isResolvable()) {
+            return null;
+        }
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        String endpointArn = ResourceArnBuilder.webFunctionArn(ctx.getUriInfo().getPath(), region,
+                requestContext.getAccountId());
+        int child = endpointArn.lastIndexOf("/endpoint/");
+        if (child < 0) {
+            return null;
+        }
+        try {
+            return lambdaWebService.get().getEndpoint(region, endpointArn.substring(0, child),
+                    endpointArn.substring(child + "/endpoint/".length())).authType;
+        } catch (AwsException expected) {
+            // The handler refuses the same names, so the key is only left out, as for a missing endpoint on AWS.
+            return null;
+        }
+    }
+
+    // ── S3 ──────────────────────────────────────────────────────────────────────
+
+    private Map<String, List<String>> s3ConditionContext(String action, ContainerRequestContext ctx) {
+        // S3 Control's request tag keys come from the generated table; S3's own below were measured
+        // against AWS, and do not all match the Service Reference.
+        if (IamActionRegistry.isS3ControlRequest("s3", ctx)) {
+            return S3ControlTagConditionKeys.conditions(action, () -> bodyText(ctx),
+                    ctx.getUriInfo().getQueryParameters());
+        }
+        Map<String, List<String>> conditions = s3ActionConditionContext(action, ctx);
+        Map<String, List<String>> signature = S3SignatureConditions.request(ctx.getHeaderString("Authorization"),
+                ctx.getUriInfo() == null ? null : ctx.getUriInfo().getQueryParameters());
+        if (!signature.isEmpty()) {
+            conditions = merge(conditions, signature);
+        }
+        // A version action is checked only for a request naming a version, and carries its id.
+        if (S3ObjectActions.isVersionAction(action) && ctx.getUriInfo() != null) {
+            String versionId = ctx.getUriInfo().getQueryParameters().getFirst("versionId");
+            if (versionId != null) {
+                conditions = merge(conditions, Map.of(VERSION_ID, List.of(versionId)));
+            }
+        }
+        return conditions;
+    }
+
+    private Map<String, List<String>> s3ActionConditionContext(String action, ContainerRequestContext ctx) {
+        return switch (action) {
+            case "s3:ListBucket" -> s3BucketListConditionContext(ctx.getUriInfo().getQueryParameters());
+            // DeleteBucketTagging is checked as s3:PutBucketTagging, and sends no tags of its own:
+            // what it has is the bucket's current tags, as GetBucketTagging does.
+            case "s3:PutBucketTagging" -> "DELETE".equalsIgnoreCase(ctx.getMethod())
+                    ? s3BucketResourceTagConditionContext(ctx)
+                    : s3PutBucketTaggingConditionContext(ctx);
+            case "s3:GetBucketTagging", "s3:DeleteBucket" -> s3BucketResourceTagConditionContext(ctx);
+            // Object tags. Which action is given which key is what real AWS was measured to do,
+            // not what reads naturally: s3:DeleteObject is given neither key, and s3:PutObject is
+            // given the tags of the REQUEST only, never those of an object it is about to
+            // overwrite. See S3ObjectTagConditionEnforcementIntegrationTest.
+            //
+            // The version actions IamActionRegistry checks for a request naming a versionId carry
+            // the key as their base actions do, per the Service Reference, as do the annotation
+            // actions, and the versionId picks whose tags are read.
+            case "s3:GetObject", "s3:GetObjectVersion", "s3:GetObjectTagging",
+                 "s3:GetObjectVersionTagging", "s3:GetObjectAcl", "s3:GetObjectVersionAcl",
+                 "s3:DeleteObjectTagging",
+                 "s3:DeleteObjectVersionTagging", "s3:GetObjectAnnotation", "s3:GetObjectVersionAnnotation",
+                 "s3:ListObjectAnnotations", "s3:ListObjectVersionAnnotations", "s3:PutObjectAnnotation",
+                 "s3:PutObjectVersionAnnotation", "s3:DeleteObjectAnnotation",
+                 "s3:DeleteObjectVersionAnnotation" -> s3ExistingObjectTagConditionContext(ctx);
+            case "s3:PutObjectAcl", "s3:PutObjectVersionAcl" -> merge(
+                    s3ExistingObjectTagConditionContext(ctx),
+                    S3ObjectActions.cannedAclConditions(ctx::getHeaderString));
+            // The Object Lock keys come from what the request sets: an object creation's headers, the
+            // retention and legal-hold bodies. A part or a completion creates nothing from its own
+            // headers, and is judged by the encryption its upload recorded.
+            case "s3:PutObject" -> isPartOrCompletion(ctx)
+                    ? s3UploadEncryptionConditionContext(ctx)
+                    : S3ObjectActions.objectCreationConditions(ctx::getHeaderString,
+                            s3RequestTagging(ctx), S3ObjectActions.isCopy(ctx.getMethod(), ctx::getHeaderString),
+                            clock.instant());
+            case "s3:PutObjectRetention" -> S3ObjectActions.retentionBodyConditions(bodyText(ctx), clock.instant());
+            case "s3:PutObjectLegalHold" -> S3ObjectActions.legalHoldBodyConditions(bodyText(ctx), clock.instant());
+            case "s3:PutObjectTagging", "s3:PutObjectVersionTagging" -> merge(
+                    s3ExistingObjectTagConditionContext(ctx), S3ObjectActions.taggingBodyConditions(bodyText(ctx)));
+            default -> null;
+        };
+    }
+
+    /**
+     * The encryption keys of a part or a completion: what its upload recorded when it was created, as
+     * measured on S3, since a part sends neither header. An upload not held offers neither.
+     */
+    private Map<String, List<String>> s3UploadEncryptionConditionContext(ContainerRequestContext ctx) {
+        if (!s3Service.isResolvable()) {
+            return null;
+        }
+        String bucket = s3BucketName(ctx.getUriInfo().getPath());
+        try {
+            return s3Service.get().multipartEncryptionConditions(bucket, s3RequestObjectKey(ctx, bucket),
+                    ctx.getUriInfo().getQueryParameters().getFirst("uploadId"));
+        } catch (AwsException expected) {
+            // The handler answers an upload not held as NoSuchUpload; here it offers no keys.
+            return null;
+        }
+    }
+
+    /**
+     * A part or a completion as S3Controller routes them: a PUT naming an upload and a part number, or a
+     * POST naming an upload and not asking for a new one. Any other PUT or POST naming an {@code uploadId}
+     * creates an object or an upload, whatever that parameter says, and is judged by its own headers.
+     */
+    private static boolean isPartOrCompletion(ContainerRequestContext ctx) {
+        MultivaluedMap<String, String> params = ctx.getUriInfo().getQueryParameters();
+        if (!params.containsKey("uploadId")) {
+            return false;
+        }
+        return "PUT".equalsIgnoreCase(ctx.getMethod())
+                ? params.containsKey("partNumber")
+                : "POST".equalsIgnoreCase(ctx.getMethod()) && !params.containsKey("uploads");
+    }
+
+    /**
+     * Whether a request checked as {@code s3:PutObject} is a part or a completion of an upload S3 does
+     * not hold. There is no encryption to judge it by, and S3 answers it {@code NoSuchUpload} under a
+     * policy on the encryption keys, as measured.
+     */
+    boolean namesUploadNotHeld(String action, ContainerRequestContext ctx) {
+        return "s3:PutObject".equals(action) && isPartOrCompletion(ctx)
+                && ctx.getHeaderString("x-amz-copy-source") == null
+                && s3UploadEncryptionConditionContext(ctx) == null && s3Service.isResolvable();
+    }
+
+    private static String bodyText(ContainerRequestContext ctx) {
+        byte[] body = bufferEntity(ctx);
+        return body == null ? null : new String(body, StandardCharsets.UTF_8);
+    }
+
+    /**
+     * Whether an S3 delete or retention change that sends {@code x-amz-bypass-governance-retention}
+     * overrides governance-mode retention, which is when AWS requires {@code s3:BypassGovernanceRetention}
+     * for it: a delete that removes a version under a governance lock, or a retention change that
+     * shortens or removes one (see {@link S3Service#deleteOverridesGovernanceRetention} and
+     * {@link S3Service#retentionChangeOverridesGovernance}). A retention date that does not parse
+     * overrides nothing, since the change is refused as malformed.
+     */
+    boolean s3OverridesGovernanceRetention(String action, ContainerRequestContext ctx) {
+        if (ctx.getUriInfo() == null || !s3Service.isResolvable()) {
+            return false;
+        }
+        String bucket = s3BucketName(ctx.getUriInfo().getPath());
+        String key = s3RequestObjectKey(ctx, bucket);
+        if (key == null) {
+            return false;
+        }
+        String versionId = ctx.getUriInfo().getQueryParameters().getFirst("versionId");
+        if (!"s3:PutObjectRetention".equals(action)) {
+            return s3Service.get().deleteOverridesGovernanceRetention(bucket, key, versionId);
+        }
+        String date = XmlParser.extractFirst(bodyText(ctx), "RetainUntilDate", null);
+        Instant retainUntil;
+        try {
+            retainUntil = date == null ? null : Instant.parse(date);
+        } catch (DateTimeParseException e) {
+            LOG.debugv("Retention date {0} does not parse, so the change overrides no lock", date);
+            return false;
+        }
+        return s3Service.get().retentionChangeOverridesGovernance(bucket, key, versionId, retainUntil);
+    }
+
+    /**
+     * {@code s3:ExistingObjectTag/<key>} from the tags of the version this request targets. An
+     * object that does not exist, or has no tags, offers no keys, so a {@code StringEquals} on one
+     * does not match and an allow conditioned on it does not apply.
+     *
+     * <p>The {@code versionId} query parameter decides which version is read. Falling back to the
+     * current version would authorize a read of an older version against tags it does not carry,
+     * which lets a request through that the policy refuses.
+     */
+    private Map<String, List<String>> s3ExistingObjectTagConditionContext(ContainerRequestContext ctx) {
+        if (ctx.getUriInfo() == null || !s3Service.isResolvable()) {
+            return null;
+        }
+        String bucket = s3BucketName(ctx.getUriInfo().getPath());
+        String key = s3RequestObjectKey(ctx, bucket);
+        if (key == null) {
+            return null;
+        }
+        String versionId = ctx.getUriInfo().getQueryParameters().getFirst("versionId");
+        Map<String, String> tags;
+        try {
+            tags = s3Service.get().getObjectTagging(bucket, key, versionId);
+        } catch (RuntimeException e) {
+            LOG.debugv(e, "Could not read object tags for the IAM condition context: {0}/{1} version {2}",
+                    bucket, key, versionId);
+            return null;
+        }
+        if (tags == null || tags.isEmpty()) {
+            return null;
+        }
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        tags.forEach((k, v) -> conditions.put(EXISTING_OBJECT_TAG_PREFIX + k, List.of(v)));
+        return conditions;
+    }
+
+    /**
+     * A PutObject's {@code x-amz-tagging}: the header, or the query parameter where a presigner may
+     * place it. The header takes precedence, including an empty header, matching the source the S3
+     * controller applies to the object.
+     */
+    private static String s3RequestTagging(ContainerRequestContext ctx) {
+        String header = ctx.getHeaderString("x-amz-tagging");
+        if (header == null && ctx.getUriInfo() != null) {
+            header = ctx.getUriInfo().getQueryParameters().getFirst("x-amz-tagging");
+        }
+        return header;
+    }
+
+    private static Map<String, List<String>> merge(Map<String, List<String>> a, Map<String, List<String>> b) {
+        if (a == null) {
+            return b;
+        }
+        if (b == null) {
+            return a;
+        }
+        Map<String, List<String>> merged = new LinkedHashMap<>(a);
+        merged.putAll(b);
+        return merged;
+    }
+
+    /**
+     * The object key an S3 request names, null for a bucket-level request. It is read from the path
+     * as it arrived, as {@code S3Controller} reads it, since the normalized path drops a key's
+     * leading slash and so names another object. Without a current Vert.x request, as in a unit
+     * test, the request URI's raw path stands in for it.
+     */
+    private String s3RequestObjectKey(ContainerRequestContext ctx, String bucket) {
+        if (bucket == null) {
+            return null;
+        }
+        URI requestUri = ctx.getUriInfo().getRequestUri();
+        RoutingContext current = currentVertxRequest == null ? null : currentVertxRequest.getCurrent();
+        String rawPath = current != null && current.request() != null ? current.request().path()
+                : requestUri == null ? null : requestUri.getRawPath();
+        String key = rawPath == null ? null
+                : S3ObjectKeys.fromRawPath(rawPath, requestUri == null ? null : requestUri.getPath(), bucket);
+        if (key == null) {
+            key = s3PathObjectKey(ctx.getUriInfo().getPath());
+        }
+        return key == null || key.isEmpty() ? null : key;
+    }
+
+    /** The object key of a path-style (or filter-rewritten) S3 path, null for a bucket-level one. */
+    private static String s3PathObjectKey(String path) {
+        String stripped = path.startsWith("/") ? path.substring(1) : path;
+        int slash = stripped.indexOf('/');
+        if (slash < 0 || slash == stripped.length() - 1) {
+            return null;
+        }
+        return stripped.substring(slash + 1);
+    }
+
+    Map<String, List<String>> s3BucketListConditionContext(MultivaluedMap<String, String> queryParameters) {
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        addQueryCondition(conditions, "s3:prefix", queryParameters, "prefix");
+        addQueryCondition(conditions, "s3:delimiter", queryParameters, "delimiter");
+        addQueryCondition(conditions, "s3:max-keys", queryParameters, "max-keys");
+        return conditions.isEmpty() ? null : conditions;
+    }
+
+    private static void addQueryCondition(Map<String, List<String>> conditions, String conditionKey,
+                                          MultivaluedMap<String, String> queryParameters, String queryParameter) {
+        String value = queryParameters.getFirst(queryParameter);
+        if (value != null) {
+            conditions.put(conditionKey, List.of(value));
+        }
+    }
+
+    /** {@code aws:RequestTag/<key>} from the {@code <Tagging><TagSet>} body of PutBucketTagging. */
+    private Map<String, List<String>> s3PutBucketTaggingConditionContext(ContainerRequestContext ctx) {
+        byte[] body = bufferEntity(ctx);
+        if (body == null || body.length == 0) {
+            return null;
+        }
+        Map<String, String> requested = XmlParser.extractPairs(
+                new String(body, StandardCharsets.UTF_8), "Tag", "Key", "Value");
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        requested.forEach((key, value) -> conditions.put(REQUEST_TAG_PREFIX + key, List.of(value)));
+        if (!requested.isEmpty()) {
+            conditions.put("aws:TagKeys", List.copyOf(requested.keySet()));
+        }
+        return conditions.isEmpty() ? null : conditions;
+    }
+
+    /** {@code aws:ResourceTag/<key>} from the target bucket's current tags. */
+    private Map<String, List<String>> s3BucketResourceTagConditionContext(ContainerRequestContext ctx) {
+        String bucket = s3BucketName(ctx.getUriInfo().getPath());
+        if (bucket == null || !s3Service.isResolvable()) {
+            return null;
+        }
+        Map<String, String> existing;
+        try {
+            existing = s3Service.get().getBucketTagging(bucket);
+        } catch (RuntimeException e) {
+            // A bucket that does not exist has no tags to offer; the request fails on its own later.
+            LOG.debugv(e, "Could not read bucket tags for the IAM condition context: {0}", bucket);
+            return null;
+        }
+        if (existing == null || existing.isEmpty()) {
+            return null;
+        }
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        existing.forEach((key, value) -> conditions.put(RESOURCE_TAG_PREFIX + key, List.of(value)));
+        return conditions;
+    }
+
+    /** Path-style bucket, the same reading {@code ResourceArnBuilder} applies to S3 paths. */
+    private static String s3BucketName(String path) {
+        String stripped = path.startsWith("/") ? path.substring(1) : path;
+        if (stripped.isEmpty()) {
+            return null;
+        }
+        int slash = stripped.indexOf('/');
+        return slash < 0 ? stripped : stripped.substring(0, slash);
+    }
+
+    // ── EC2 ─────────────────────────────────────────────────────────────────────
+
+    private Map<String, List<String>> ec2ConditionContext(String action, ContainerRequestContext ctx) {
+        return switch (action) {
+            case "ec2:CreatePlacementGroup", "ec2:DeletePlacementGroup", "ec2:DescribePlacementGroups" ->
+                    placementGroupConditionContext(action, ctx);
+            case "ec2:RunInstances" -> ec2RunInstancesConditionContext(ctx);
+            case "ec2:CreateTags" -> ec2CreateTagsConditionContext(ctx);
+            case "ec2:DeleteTags" -> ec2ResourceTagConditionContext(ctx, "ResourceId.1");
+            case "ec2:TerminateInstances", "ec2:DescribeInstances" ->
+                    ec2ResourceTagConditionContext(ctx, "InstanceId.1");
+            case "ec2:DeleteSecurityGroup", "ec2:AuthorizeSecurityGroupIngress", "ec2:AuthorizeSecurityGroupEgress",
+                    "ec2:RevokeSecurityGroupIngress", "ec2:RevokeSecurityGroupEgress" ->
+                    ec2ResourceTagConditionContext(ctx, "GroupId");
+            default -> null;
+        };
+    }
+
+    private Map<String, List<String>> placementGroupConditionContext(String action, ContainerRequestContext ctx) {
+        Map<String, String> form = formParameters(ctx);
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        conditions.put("ec2:Region", List.of(region));
+        if ("ec2:DescribePlacementGroups".equals(action)) {
+            return conditions;
+        }
+        String name = form.get("GroupName");
+        if (name != null) {
+            conditions.put("ec2:PlacementGroupName", List.of(name));
+        }
+        if ("ec2:CreatePlacementGroup".equals(action)) {
+            String strategy = form.get("Strategy");
+            if (strategy != null) {
+                conditions.put("ec2:PlacementGroupStrategy", List.of(strategy));
+            }
+            for (String prefix : List.of("TagSpecification.", "TagSpecifications.")) {
+                for (int spec = 1; form.containsKey(prefix + spec + ".ResourceType"); spec++) {
+                    if ("placement-group".equals(form.get(prefix + spec + ".ResourceType"))) {
+                        addRequestTags(conditions, form, prefix + spec + ".Tag.");
+                    }
+                }
+            }
+        } else if (placementGroupService != null && placementGroupService.isResolvable()) {
+            Ec2PlacementGroup group = placementGroupService.get().authorizationTarget(region, name);
+            if (group != null) {
+                conditions.put("ec2:PlacementGroupStrategy", List.of(group.strategy()));
+                group.tags().forEach((key, value) -> {
+                    conditions.put("aws:ResourceTag/" + key, List.of(value));
+                    conditions.put("ec2:ResourceTag/" + key, List.of(value));
+                });
+            }
+        }
+        return conditions;
+    }
+
+    /**
+     * {@code aws:RequestTag/<key>} from every {@code TagSpecification.N.Tag.M} pair. The instance
+     * does not exist yet, so there is no resource tag to offer.
+     */
+    private Map<String, List<String>> ec2RunInstancesConditionContext(ContainerRequestContext ctx) {
+        Map<String, String> form = formParameters(ctx);
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        for (int spec = 1; form.containsKey("TagSpecification." + spec + ".ResourceType"); spec++) {
+            addRequestTags(conditions, form, "TagSpecification." + spec + ".Tag.");
+        }
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        LaunchTemplate template = Ec2LaunchAuthorization.template(ctx,
+                ec2Service.isResolvable() ? ec2Service.get() : null, region);
+        if (template != null) {
+            String account = requestContext.getAccountId() == null ? config.defaultAccountId() : requestContext.getAccountId();
+            String partition = requestContext.getPartition() == null
+                    ? AwsRegions.partitionFor(region) : requestContext.getPartition();
+            conditions.put("ec2:LaunchTemplate", List.of(new AwsArnUtils.Arn(
+                    partition, "ec2", region, account, "launch-template/" + template.getLaunchTemplateId()).toString()));
+        }
+        return conditions.isEmpty() ? null : conditions;
+    }
+
+    /** A termination batch pairs each instance ARN with that instance's own tags. */
+    public Map<String, List<String>> ec2TerminationContext(String resource, Map<String, List<String>> base) {
+        Map<String, List<String>> conditions = base == null ? new LinkedHashMap<>() : new LinkedHashMap<>(base);
+        conditions.keySet().removeIf(key -> key.startsWith(RESOURCE_TAG_PREFIX));
+        if (AwsArnUtils.isArn(resource)) {
+            String id = AwsArnUtils.parse(resource).resource();
+            if (id.startsWith("instance/")) {
+                addResourceTags(conditions, id.substring("instance/".length()));
+            }
+        }
+        return conditions;
+    }
+
+    /**
+     * CreateTags both requests tags and targets existing resources, so both keys apply: the
+     * {@code Tag.N} pairs being requested, and each {@code ResourceId.N}'s tags as they are
+     * before this call. This context carries the first target; the rest come from
+     * {@link #resolveRemainingTargets}.
+     */
+    private Map<String, List<String>> ec2CreateTagsConditionContext(ContainerRequestContext ctx) {
+        Map<String, String> form = formParameters(ctx);
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        addRequestTags(conditions, form, "Tag.");
+        addResourceTags(conditions, form.get("ResourceId.1"));
+        return conditions.isEmpty() ? null : conditions;
+    }
+
+    private Map<String, List<String>> ec2ResourceTagConditionContext(ContainerRequestContext ctx,
+                                                                     String idParameter) {
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        addResourceTags(conditions, formParameters(ctx).get(idParameter));
+        return conditions.isEmpty() ? null : conditions;
+    }
+
+    /**
+     * One condition context per target after the first, for the EC2 actions that accept several
+     * resource ids in one request. An untagged target yields an empty context rather than none,
+     * so a policy scoped through {@code aws:ResourceTag} fails to match it. Requests naming a
+     * single target get an empty list. Single-item DynamoDB writes also use separate contexts
+     * for distinct return modes, so every requested output must be authorized on the same resource.
+     */
+    public List<Map<String, List<String>>> resolveRemainingTargets(String credentialScope, String action,
+                                                                   ContainerRequestContext ctx) {
+        if ("elasticloadbalancing".equals(credentialScope)) {
+            List<Map<String, List<String>>> contexts = elbV2Contexts(action, ctx);
+            return contexts.size() < 2 ? List.of() : contexts.subList(1, contexts.size());
+        }
+        if ("dynamodb".equals(credentialScope)) {
+            List<String> modes = singleItemReturnValues(action, bufferedJsonBody(ctx));
+            if (modes.size() < 2) {
+                return List.of();
+            }
+            Map<String, List<String>> primary = dynamoDbConditionContext(action, ctx);
+            List<Map<String, List<String>>> contexts = new ArrayList<>();
+            for (int i = 1; i < modes.size(); i++) {
+                Map<String, List<String>> context = new LinkedHashMap<>(primary);
+                context.put("dynamodb:ReturnValues", List.of(modes.get(i)));
+                contexts.add(context);
+            }
+            return contexts;
+        }
+        if (!"ec2".equals(credentialScope)) {
+            return List.of();
+        }
+        String idParameter = switch (action) {
+            case "ec2:CreateTags", "ec2:DeleteTags" -> "ResourceId.";
+            case "ec2:TerminateInstances", "ec2:DescribeInstances" -> "InstanceId.";
+            default -> null;
+        };
+        if (idParameter == null) {
+            return List.of();
+        }
+        Map<String, String> form = formParameters(ctx);
+        List<Map<String, List<String>>> targets = new ArrayList<>();
+        if (!form.containsKey(idParameter + 1)) {
+            // The handlers read numbered members from 1 up to the first gap, and so does this.
+            return targets;
+        }
+        for (int i = 2; form.containsKey(idParameter + i); i++) {
+            Map<String, List<String>> conditions = new LinkedHashMap<>();
+            if ("ec2:CreateTags".equals(action)) {
+                addRequestTags(conditions, form, "Tag.");
+            }
+            addResourceTags(conditions, form.get(idParameter + i));
+            targets.add(conditions);
+        }
+        return targets;
+    }
+
+    private static void addRequestTags(Map<String, List<String>> conditions, Map<String, String> form,
+                                       String prefix) {
+        for (int i = 1; form.containsKey(prefix + i + ".Key"); i++) {
+            String value = form.get(prefix + i + ".Value");
+            String key = form.get(prefix + i + ".Key");
+            List<String> keys = conditions.computeIfAbsent("aws:TagKeys", ignored -> new ArrayList<>());
+            if (!keys.contains(key)) {
+                keys.add(key);
+            }
+            conditions.put(REQUEST_TAG_PREFIX + key,
+                    List.of(value == null ? "" : value));
+        }
+    }
+
+    private void addResourceTags(Map<String, List<String>> conditions, String resourceId) {
+        if (resourceId == null || resourceId.isBlank() || !ec2Service.isResolvable()) {
+            return;
+        }
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        for (Tag tag : ec2Service.get().resourceTags(region, resourceId)) {
+            conditions.put(RESOURCE_TAG_PREFIX + tag.getKey(),
+                    List.of(tag.getValue() == null ? "" : tag.getValue()));
+        }
+    }
+
+    // ── Request body access ─────────────────────────────────────────────────────
+
+    /**
+     * The decoded form parameters of a Query-protocol request, buffered once per request and
+     * restored for the controller that reads the form next. A repeated key keeps its first
+     * value, which is the value the Query handlers read through {@code getFirst}, so the
+     * resource this context describes is the resource the handler acts on.
+     */
+    @SuppressWarnings("unchecked")
+    static Map<String, String> formParameters(ContainerRequestContext ctx) {
+        if ("GET".equalsIgnoreCase(ctx.getMethod()) && IamActionRegistry.isQueryRequest(ctx)) {
+            Map<String, String> parameters = new LinkedHashMap<>();
+            ctx.getUriInfo().getQueryParameters().forEach((key, values) -> {
+                if (!values.isEmpty()) {
+                    parameters.put(key, values.getFirst());
+                }
+            });
+            return parameters;
+        }
+        Object cached = ctx.getProperty(BUFFERED_FORM_BODY);
+        if (cached instanceof Map<?, ?> map) {
+            return (Map<String, String>) map;
+        }
+        MediaType mediaType = ctx.getMediaType();
+        if (mediaType == null
+                || !"application".equalsIgnoreCase(mediaType.getType())
+                || !"x-www-form-urlencoded".equalsIgnoreCase(mediaType.getSubtype())) {
+            return Map.of();
+        }
+        byte[] body = bufferEntity(ctx);
+        if (body == null || body.length == 0) {
+            return Map.of();
+        }
+        Charset charset = charsetOf(mediaType);
+        Map<String, String> parameters = new LinkedHashMap<>();
+        for (String pair : new String(body, charset).split("&")) {
+            if (pair.isEmpty()) {
+                continue;
+            }
+            int eq = pair.indexOf('=');
+            String key = eq < 0 ? pair : pair.substring(0, eq);
+            String value = eq < 0 ? "" : pair.substring(eq + 1);
+            parameters.putIfAbsent(URLDecoder.decode(key, charset), URLDecoder.decode(value, charset));
+        }
+        ctx.setProperty(BUFFERED_FORM_BODY, parameters);
+        return parameters;
+    }
+
+    /** Reads the entity fully and puts an equivalent stream back for downstream readers. */
+    static byte[] bufferEntity(ContainerRequestContext ctx) {
+        InputStream in = ctx.getEntityStream();
+        if (in == null) {
+            return null;
+        }
+        byte[] body;
+        try {
+            body = in.readAllBytes();
+        } catch (IOException e) {
+            LOG.debugv(e, "Failed to buffer the request body for the IAM condition context");
+            ctx.setEntityStream(new ByteArrayInputStream(new byte[0]));
+            return null;
+        }
+        ctx.setEntityStream(new ByteArrayInputStream(body));
+        return body;
+    }
+
+    private static Charset charsetOf(MediaType mediaType) {
+        String name = mediaType.getParameters().get("charset");
+        if (name == null || name.isBlank()) {
+            return StandardCharsets.UTF_8;
+        }
+        try {
+            return Charset.forName(name);
+        } catch (RuntimeException e) {
+            return StandardCharsets.UTF_8;
+        }
+    }
+
+    // ── DynamoDB ────────────────────────────────────────────────────────────────
+
+    /**
+     * Populates {@code dynamodb:LeadingKeys}, {@code dynamodb:Attributes} and
+     * {@code dynamodb:Select} and single-item write {@code dynamodb:ReturnValues} from the buffered request body.
+     *
+     * <p>A key that cannot be resolved (unknown table, a Key that omits the partition
+     * attribute, an unparseable KeyConditionExpression) is omitted rather than guessed.
+     * A {@code ForAllValues} condition matches an absent key; policies must pair it with
+     * {@code Null:false} to require a resolved key.
+     */
+    Map<String, List<String>> dynamoDbConditionContext(String action, ContainerRequestContext ctx) {
+        JsonNode body = bufferedJsonBody(ctx);
+        if (body == null || !body.isObject()) {
+            return null;
+        }
+        if (isDynamoDbBatch(action)) {
+            return dynamoDbBatchConditionContext(action, ctx, null);
+        }
+        TableDefinition table = describeTargetTable(targetTableName(body));
+        DynamoDbConditionKeys.Result keys = dynamoDbKeys(action, body, table, ctx);
+
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        if (!keys.leadingKeys().isEmpty()) {
+            conditions.put("dynamodb:LeadingKeys", keys.leadingKeys());
+        }
+        if (!keys.attributes().isEmpty()) {
+            conditions.put("dynamodb:Attributes", keys.attributes());
+        }
+        if (keys.select() != null) {
+            conditions.put("dynamodb:Select", List.of(keys.select()));
+        }
+        List<String> returnValues = singleItemReturnValues(action, body);
+        if (!returnValues.isEmpty()) {
+            conditions.put("dynamodb:ReturnValues", List.of(returnValues.getFirst()));
+        }
+        return conditions.isEmpty() ? null : conditions;
+    }
+
+    private static List<String> singleItemReturnValues(String action, JsonNode body) {
+        if (!("dynamodb:PutItem".equals(action) || "dynamodb:UpdateItem".equals(action)
+                || "dynamodb:DeleteItem".equals(action)) || body == null || !body.isObject()) {
+            return List.of();
+        }
+        Set<String> modes = new LinkedHashSet<>();
+        for (String field : List.of("ReturnValues", "ReturnValuesOnConditionCheckFailure")) {
+            String mode = body.path(field).asText("NONE");
+            if (!"NONE".equals(mode)) {
+                modes.add(mode);
+            }
+        }
+        return modes.isEmpty() ? List.of("NONE") : List.copyOf(modes);
+    }
+
+    record AthenaQueryTarget(String resource, Map<String, List<String>> context) {
+    }
+
+    static boolean athenaQueryAction(String action) {
+        if (action == null) {
+            return false;
+        }
+        return switch (action) {
+            case "athena:BatchGetQueryExecution", "athena:GetQueryExecution", "athena:GetQueryResults",
+                    "athena:StopQueryExecution", "athena:ListQueryExecutions" -> true;
+            default -> false;
+        };
+    }
+
+    List<AthenaQueryTarget> athenaQueryTargets(String action, JsonNode body,
+                                              String region, String account) {
+        if (!athenaQueryAction(action) || athenaBatchQueryService == null
+                || !athenaBatchQueryService.isResolvable()) {
+            return List.of();
+        }
+        return athenaBatchQueryService.get().authorizationTargets(action, region, account, body).stream()
+                .map(target -> new AthenaQueryTarget(target.resource(), target.context())).toList();
+    }
+
+    /** One transaction item keeps its action, table and condition keys together. */
+    record DynamoDbTransactionItem(String action, String resource, Map<String, List<String>> context) {
+    }
+
+    /**
+     * Resolves every recognized item before the handler can mutate anything. Unknown envelope fields
+     * cannot turn item checks back into a transaction-verb permission check.
+     */
+    List<DynamoDbTransactionItem> dynamoDbTransactionItems(String action, ContainerRequestContext ctx,
+                                                         String region, String accountId) {
+        boolean read = "dynamodb:TransactGetItems".equals(action);
+        if (!read && !"dynamodb:TransactWriteItems".equals(action)) {
+            return List.of();
+        }
+        JsonNode body = bufferedJsonBody(ctx);
+        JsonNode items = body == null ? null : body.get("TransactItems");
+        if (items == null || !items.isArray()) {
+            return List.of();
+        }
+        List<DynamoDbTransactionItem> checks = new ArrayList<>();
+        List<String> operations = read ? List.of("Get") : List.of("Put", "Delete", "Update", "ConditionCheck");
+        for (JsonNode item : items) {
+            for (String operation : operations) {
+                JsonNode request = item.get(operation);
+                if (request == null || !request.isObject()) {
+                    continue;
+                }
+                String tableName = targetTableName(request);
+                if (tableName == null) {
+                    continue;
+                }
+                // Execution resolves ARN inputs within the request account; authorize that same table.
+                String executionTable = DynamoDbTableNames.resolveWithRegion(tableName, region).name();
+                String itemAction = "dynamodb:" + operation + "Item";
+                TableDefinition table = describeTargetTable(executionTable);
+                DynamoDbConditionKeys.Result keys = read
+                        ? DynamoDbConditionKeys.extractTransactionGet(request, table)
+                        : DynamoDbConditionKeys.extract(itemAction, request, table);
+                Map<String, List<String>> context = new LinkedHashMap<>();
+                context.put("dynamodb:EnclosingOperation", List.of(read ? "TransactGetItems" : "TransactWriteItems"));
+                if (!keys.leadingKeys().isEmpty()) {
+                    context.put("dynamodb:LeadingKeys", keys.leadingKeys());
+                }
+                if (!keys.attributes().isEmpty()) {
+                    context.put("dynamodb:Attributes", keys.attributes());
+                }
+                if (keys.select() != null) {
+                    context.put("dynamodb:Select", List.of(keys.select()));
+                }
+                if (!read && request.hasNonNull("ReturnValuesOnConditionCheckFailure")) {
+                    context.put("dynamodb:ReturnValues",
+                            List.of(request.path("ReturnValuesOnConditionCheckFailure").asText()));
+                }
+                checks.add(new DynamoDbTransactionItem(itemAction,
+                        ResourceArnBuilder.toDynamoDbTableArn(executionTable, region, accountId), context));
+            }
+        }
+        return checks;
+    }
+
+    /** Request-wide context for callers that do not yet have a resolved resource. */
+    Map<String, List<String>> dynamoDbBatchConditionContext(String action, ContainerRequestContext ctx,
+                                                            String resourceArn) {
+        List<Map<String, List<String>>> entries = dynamoDbBatchConditionContexts(action, ctx, resourceArn);
+        if (entries == null) {
+            return null;
+        }
+        Map<String, List<String>> combined = new LinkedHashMap<>();
+        for (Map<String, List<String>> entry : entries) {
+            entry.forEach((key, values) -> combined.computeIfAbsent(key, ignored -> new ArrayList<>()).addAll(values));
+        }
+        return combined;
+    }
+
+    /** Each table reference retains its own scalar selection, even when name and ARN resolve alike. */
+    List<Map<String, List<String>>> dynamoDbBatchConditionContexts(String action, ContainerRequestContext ctx,
+                                                                  String resourceArn) {
+        if (!isDynamoDbBatch(action)) {
+            return null;
+        }
+        List<Map<String, List<String>>> contexts = new ArrayList<>();
+        JsonNode body = bufferedJsonBody(ctx);
+        JsonNode items = body == null ? null : body.get("RequestItems");
+        if (items == null || !items.isObject()) {
+            return List.of(Map.of());
+        }
+        items.properties().forEach(entry -> {
+            String reference = entry.getKey().trim();
+            if (resourceArn != null && !matchesTableResource(reference, resourceArn)) {
+                return;
+            }
+            ObjectNode single = ((ObjectNode) body).objectNode();
+            single.setAll((ObjectNode) body);
+            single.putObject("RequestItems").set(entry.getKey(), entry.getValue());
+            DynamoDbConditionKeys.Result keys = dynamoDbKeys(
+                    action, single, describeTargetTable(reference), ctx);
+            Map<String, List<String>> conditions = new LinkedHashMap<>();
+            if (!keys.leadingKeys().isEmpty()) {
+                conditions.put("dynamodb:LeadingKeys", keys.leadingKeys());
+            }
+            if (!keys.attributes().isEmpty()) {
+                conditions.put("dynamodb:Attributes", keys.attributes());
+            }
+            if (keys.select() != null) {
+                conditions.put("dynamodb:Select", List.of(keys.select()));
+            }
+            contexts.add(conditions);
+        });
+        return contexts.isEmpty() ? List.of(Map.of()) : contexts;
+    }
+
+    private static boolean isDynamoDbBatch(String action) {
+        return "dynamodb:BatchGetItem".equals(action) || "dynamodb:BatchWriteItem".equals(action);
+    }
+
+    private static boolean matchesTableResource(String reference, String resourceArn) {
+        if (AwsArnUtils.isArn(reference)) {
+            return reference.equals(resourceArn);
+        }
+        return AwsArnUtils.parse(resourceArn).resource().equals("table/" + reference);
+    }
+
+    private JsonNode bufferedJsonBody(ContainerRequestContext ctx) {
+        Object cached = ctx.getProperty(BUFFERED_JSON_BODY);
+        return cached instanceof JsonNode node ? node : null;
+    }
+
+    private DynamoDbConditionKeys.Result dynamoDbKeys(
+            String action, JsonNode body, TableDefinition table, ContainerRequestContext ctx) {
+        String target = ctx.getHeaderString("X-Amz-Target");
+        boolean legacy = action != null && action.startsWith("dynamodb:")
+                && serviceCatalog.matchTarget(target)
+                    .filter(ServiceCatalog.TargetMatch::jsonOnly)
+                    .filter(match -> "dynamodb".equals(match.descriptor().externalKey()))
+                    .filter(match -> match.action().equals(action.substring("dynamodb:".length())))
+                    .isPresent()
+                && ctx.getMediaType() != null
+                && ctx.getMediaType().isCompatible(MediaType.valueOf("application/x-amz-json-1.0"));
+        return legacy ? DynamoDbConditionKeys.extractLegacy(action, body, table)
+                : DynamoDbConditionKeys.extract(action, body, table);
+    }
+
+    /**
+     * Looks up the table whose key schema names the partition key. Resolved lazily through
+     * Instance so core.common keeps no hard dependency on the DynamoDB facade, and via
+     * {@code findTable} rather than {@code describeTable} so the O(items) item-count refresh
+     * never runs on the enforcement hot path.
+     */
+    private TableDefinition describeTargetTable(String tableName) {
+        if (tableName == null || !dynamoDbFacade.isResolvable()) {
+            return null;
+        }
+        String region = requestContext.getRegion() == null
+                ? config.defaultRegion() : requestContext.getRegion();
+        DynamoDbFacade dynamoDb = dynamoDbFacade.get();
+        return dynamoDb.tables().findTable(dynamoDb.scope(region), tableName).orElse(null);
+    }
+
+    /** The table targeted by a non-batch request. */
+    private String targetTableName(JsonNode body) {
+        if (body.hasNonNull("TableName")) {
+            String tableName = body.get("TableName").asText().trim();
+            if (!tableName.isEmpty()) {
+                return tableName;
+            }
+        }
+        return null;
+    }
+}
