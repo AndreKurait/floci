@@ -2,18 +2,23 @@
   "_source": {
     "generator": "tools/aws/regen_cfn_property_types.py",
     "schemas": "https://schema.cloudformation.us-east-1.amazonaws.com/CloudformationSchema.zip",
-    "retrieved": "2026-10-20",
+    "retrieved": "2026-11-04",
     "note": "make cfn-property-types-verify checks the file against AWS."
   },
   "operations": {
     "AWS::AutoScaling::LaunchConfiguration": "AWS::AutoScaling::LaunchConfiguration",
     "AWS::DSQL::Cluster": "AWS::DSQL::Cluster",
+    "AWS::DynamoDB::Table": "AWS::DynamoDB::Table",
     "AWS::EC2::Instance": "AWS::EC2::Instance",
     "AWS::EC2::LaunchTemplate": "AWS::EC2::LaunchTemplate",
     "AWS::ECS::TaskDefinition": "AWS::ECS::TaskDefinition",
+    "AWS::ElasticLoadBalancingV2::LoadBalancer": "AWS::ElasticLoadBalancingV2::LoadBalancer",
+    "AWS::ElasticLoadBalancingV2::TargetGroup": "AWS::ElasticLoadBalancingV2::TargetGroup",
     "AWS::Events::Rule": "AWS::Events::Rule",
     "AWS::Lambda::Function": "AWS::Lambda::Function",
-    "AWS::Lambda::LayerVersion": "AWS::Lambda::LayerVersion"
+    "AWS::Lambda::LayerVersion": "AWS::Lambda::LayerVersion",
+    "AWS::SSM::PatchBaseline": "AWS::SSM::PatchBaseline",
+    "AWS::SSM::ResourceDataSync": "AWS::SSM::ResourceDataSync"
   },
   "shapes": {
     "AWS::AutoScaling::LaunchConfiguration": {
@@ -140,6 +145,319 @@
         "Key",
         "Value"
       ]
+    },
+    "AWS::DynamoDB::Table": {
+      "type": "structure",
+      "members": {
+        "OnDemandThroughput": "AWS::DynamoDB::Table/OnDemandThroughput",
+        "SSESpecification": "AWS::DynamoDB::Table/SSESpecification",
+        "KinesisStreamSpecification": "AWS::DynamoDB::Table/KinesisStreamSpecification",
+        "StreamSpecification": "AWS::DynamoDB::Table/StreamSpecification",
+        "ContributorInsightsSpecification": "AWS::DynamoDB::Table/ContributorInsightsSpecification",
+        "ImportSourceSpecification": "AWS::DynamoDB::Table/ImportSourceSpecification",
+        "PointInTimeRecoverySpecification": "AWS::DynamoDB::Table/PointInTimeRecoverySpecification",
+        "ProvisionedThroughput": "AWS::DynamoDB::Table/ProvisionedThroughput",
+        "WarmThroughput": "AWS::DynamoDB::Table/WarmThroughput",
+        "VectorIndexes": "AWS::DynamoDB::Table.VectorIndexes",
+        "TableName": "String",
+        "AttributeDefinitions": "AWS::DynamoDB::Table.AttributeDefinitions",
+        "GlobalSecondaryIndexes": "AWS::DynamoDB::Table.GlobalSecondaryIndexes",
+        "BillingMode": "String",
+        "ResourcePolicy": "AWS::DynamoDB::Table/ResourcePolicy",
+        "LocalSecondaryIndexes": "AWS::DynamoDB::Table.LocalSecondaryIndexes",
+        "KeySchema": "Json",
+        "Arn": "String",
+        "StreamArn": "String",
+        "DeletionProtectionEnabled": "Boolean",
+        "TableClass": "String",
+        "Tags": "AWS::DynamoDB::Table.Tags",
+        "TimeToLiveSpecification": "AWS::DynamoDB::Table/TimeToLiveSpecification"
+      },
+      "required": [
+        "KeySchema"
+      ]
+    },
+    "AWS::DynamoDB::Table.AttributeDefinitions": {
+      "type": "list",
+      "member": "AWS::DynamoDB::Table/AttributeDefinition"
+    },
+    "AWS::DynamoDB::Table.GlobalSecondaryIndexes": {
+      "type": "list",
+      "member": "AWS::DynamoDB::Table/GlobalSecondaryIndex"
+    },
+    "AWS::DynamoDB::Table.LocalSecondaryIndexes": {
+      "type": "list",
+      "member": "AWS::DynamoDB::Table/LocalSecondaryIndex"
+    },
+    "AWS::DynamoDB::Table.Tags": {
+      "type": "list",
+      "member": "AWS::DynamoDB::Table/Tag"
+    },
+    "AWS::DynamoDB::Table.VectorIndexes": {
+      "type": "list",
+      "member": "AWS::DynamoDB::Table/VectorIndex"
+    },
+    "AWS::DynamoDB::Table/AttributeDefinition": {
+      "type": "structure",
+      "members": {
+        "AttributeType": "String",
+        "AttributeName": "String"
+      },
+      "required": [
+        "AttributeName",
+        "AttributeType"
+      ]
+    },
+    "AWS::DynamoDB::Table/ContributorInsightsSpecification": {
+      "type": "structure",
+      "members": {
+        "Mode": "String",
+        "Enabled": "Boolean"
+      },
+      "required": [
+        "Enabled"
+      ]
+    },
+    "AWS::DynamoDB::Table/Csv": {
+      "type": "structure",
+      "members": {
+        "Delimiter": "String",
+        "HeaderList": "AWS::DynamoDB::Table/Csv.HeaderList"
+      }
+    },
+    "AWS::DynamoDB::Table/Csv.HeaderList": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::DynamoDB::Table/GlobalSecondaryIndex": {
+      "type": "structure",
+      "members": {
+        "IndexName": "String",
+        "OnDemandThroughput": "AWS::DynamoDB::Table/OnDemandThroughput",
+        "ContributorInsightsSpecification": "AWS::DynamoDB::Table/ContributorInsightsSpecification",
+        "Projection": "AWS::DynamoDB::Table/Projection",
+        "ProvisionedThroughput": "AWS::DynamoDB::Table/ProvisionedThroughput",
+        "KeySchema": "AWS::DynamoDB::Table/GlobalSecondaryIndex.KeySchema",
+        "WarmThroughput": "AWS::DynamoDB::Table/WarmThroughput"
+      },
+      "required": [
+        "IndexName",
+        "Projection",
+        "KeySchema"
+      ]
+    },
+    "AWS::DynamoDB::Table/GlobalSecondaryIndex.KeySchema": {
+      "type": "list",
+      "member": "AWS::DynamoDB::Table/KeySchema"
+    },
+    "AWS::DynamoDB::Table/ImportSourceSpecification": {
+      "type": "structure",
+      "members": {
+        "S3BucketSource": "AWS::DynamoDB::Table/S3BucketSource",
+        "InputFormat": "String",
+        "InputFormatOptions": "AWS::DynamoDB::Table/InputFormatOptions",
+        "InputCompressionType": "String"
+      },
+      "required": [
+        "S3BucketSource",
+        "InputFormat"
+      ]
+    },
+    "AWS::DynamoDB::Table/InputFormatOptions": {
+      "type": "structure",
+      "members": {
+        "Csv": "AWS::DynamoDB::Table/Csv"
+      }
+    },
+    "AWS::DynamoDB::Table/KeySchema": {
+      "type": "structure",
+      "members": {
+        "KeyType": "String",
+        "AttributeName": "String"
+      },
+      "required": [
+        "KeyType",
+        "AttributeName"
+      ]
+    },
+    "AWS::DynamoDB::Table/KinesisStreamSpecification": {
+      "type": "structure",
+      "members": {
+        "ApproximateCreationDateTimePrecision": "String",
+        "StreamArn": "String"
+      },
+      "required": [
+        "StreamArn"
+      ]
+    },
+    "AWS::DynamoDB::Table/LocalSecondaryIndex": {
+      "type": "structure",
+      "members": {
+        "IndexName": "String",
+        "Projection": "AWS::DynamoDB::Table/Projection",
+        "KeySchema": "AWS::DynamoDB::Table/LocalSecondaryIndex.KeySchema"
+      },
+      "required": [
+        "IndexName",
+        "Projection",
+        "KeySchema"
+      ]
+    },
+    "AWS::DynamoDB::Table/LocalSecondaryIndex.KeySchema": {
+      "type": "list",
+      "member": "AWS::DynamoDB::Table/KeySchema"
+    },
+    "AWS::DynamoDB::Table/OnDemandThroughput": {
+      "type": "structure",
+      "members": {
+        "MaxReadRequestUnits": "Integer",
+        "MaxWriteRequestUnits": "Integer"
+      }
+    },
+    "AWS::DynamoDB::Table/PointInTimeRecoverySpecification": {
+      "type": "structure",
+      "members": {
+        "PointInTimeRecoveryEnabled": "Boolean",
+        "RecoveryPeriodInDays": "Integer"
+      }
+    },
+    "AWS::DynamoDB::Table/Projection": {
+      "type": "structure",
+      "members": {
+        "NonKeyAttributes": "AWS::DynamoDB::Table/Projection.NonKeyAttributes",
+        "ProjectionType": "String"
+      }
+    },
+    "AWS::DynamoDB::Table/Projection.NonKeyAttributes": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::DynamoDB::Table/ProvisionedThroughput": {
+      "type": "structure",
+      "members": {
+        "WriteCapacityUnits": "Integer",
+        "ReadCapacityUnits": "Integer"
+      },
+      "required": [
+        "WriteCapacityUnits",
+        "ReadCapacityUnits"
+      ]
+    },
+    "AWS::DynamoDB::Table/ResourcePolicy": {
+      "type": "structure",
+      "members": {
+        "PolicyDocument": "Json"
+      },
+      "required": [
+        "PolicyDocument"
+      ]
+    },
+    "AWS::DynamoDB::Table/S3BucketSource": {
+      "type": "structure",
+      "members": {
+        "S3Bucket": "String",
+        "S3KeyPrefix": "String",
+        "S3BucketOwner": "String"
+      },
+      "required": [
+        "S3Bucket"
+      ]
+    },
+    "AWS::DynamoDB::Table/SSESpecification": {
+      "type": "structure",
+      "members": {
+        "SSEEnabled": "Boolean",
+        "SSEType": "String",
+        "KMSMasterKeyId": "String"
+      },
+      "required": [
+        "SSEEnabled"
+      ]
+    },
+    "AWS::DynamoDB::Table/SearchSchemaElement": {
+      "type": "structure",
+      "members": {
+        "AttributeName": "String",
+        "SearchSchemaElementType": "String"
+      },
+      "required": [
+        "AttributeName",
+        "SearchSchemaElementType"
+      ]
+    },
+    "AWS::DynamoDB::Table/StreamSpecification": {
+      "type": "structure",
+      "members": {
+        "StreamViewType": "String",
+        "ResourcePolicy": "AWS::DynamoDB::Table/ResourcePolicy",
+        "Tags": "AWS::DynamoDB::Table/StreamSpecification.Tags"
+      },
+      "required": [
+        "StreamViewType"
+      ]
+    },
+    "AWS::DynamoDB::Table/StreamSpecification.Tags": {
+      "type": "list",
+      "member": "AWS::DynamoDB::Table/Tag"
+    },
+    "AWS::DynamoDB::Table/Tag": {
+      "type": "structure",
+      "members": {
+        "Value": "String",
+        "Key": "String"
+      },
+      "required": [
+        "Value",
+        "Key"
+      ]
+    },
+    "AWS::DynamoDB::Table/TimeToLiveSpecification": {
+      "type": "structure",
+      "members": {
+        "Enabled": "Boolean",
+        "AttributeName": "String"
+      },
+      "required": [
+        "Enabled"
+      ]
+    },
+    "AWS::DynamoDB::Table/VectorAttribute": {
+      "type": "structure",
+      "members": {
+        "AttributeName": "String"
+      },
+      "required": [
+        "AttributeName"
+      ]
+    },
+    "AWS::DynamoDB::Table/VectorIndex": {
+      "type": "structure",
+      "members": {
+        "IndexName": "String",
+        "VectorAttribute": "AWS::DynamoDB::Table/VectorAttribute",
+        "Projection": "AWS::DynamoDB::Table/Projection",
+        "Dimensions": "Integer",
+        "SearchSchema": "AWS::DynamoDB::Table/VectorIndex.SearchSchema",
+        "DistanceFunction": "String"
+      },
+      "required": [
+        "IndexName",
+        "VectorAttribute",
+        "Projection",
+        "Dimensions",
+        "DistanceFunction"
+      ]
+    },
+    "AWS::DynamoDB::Table/VectorIndex.SearchSchema": {
+      "type": "list",
+      "member": "AWS::DynamoDB::Table/SearchSchemaElement"
+    },
+    "AWS::DynamoDB::Table/WarmThroughput": {
+      "type": "structure",
+      "members": {
+        "ReadUnitsPerSecond": "Integer",
+        "WriteUnitsPerSecond": "Integer"
+      }
     },
     "AWS::EC2::Instance": {
       "type": "structure",
@@ -1520,6 +1838,171 @@
         "SourceContainer": "String"
       }
     },
+    "AWS::ElasticLoadBalancingV2::LoadBalancer": {
+      "type": "structure",
+      "members": {
+        "IpAddressType": "String",
+        "EnablePrefixForIpv6SourceNat": "String",
+        "SecurityGroups": "AWS::ElasticLoadBalancingV2::LoadBalancer.SecurityGroups",
+        "LoadBalancerAttributes": "AWS::ElasticLoadBalancingV2::LoadBalancer.LoadBalancerAttributes",
+        "MinimumLoadBalancerCapacity": "AWS::ElasticLoadBalancingV2::LoadBalancer/MinimumLoadBalancerCapacity",
+        "EnableCapacityReservationProvisionStabilize": "Boolean",
+        "Scheme": "String",
+        "DNSName": "String",
+        "Name": "String",
+        "LoadBalancerName": "String",
+        "LoadBalancerFullName": "String",
+        "Subnets": "AWS::ElasticLoadBalancingV2::LoadBalancer.Subnets",
+        "Type": "String",
+        "CanonicalHostedZoneID": "String",
+        "Tags": "AWS::ElasticLoadBalancingV2::LoadBalancer.Tags",
+        "LoadBalancerArn": "String",
+        "SubnetMappings": "AWS::ElasticLoadBalancingV2::LoadBalancer.SubnetMappings",
+        "EnforceSecurityGroupInboundRulesOnPrivateLinkTraffic": "String",
+        "Ipv4IpamPoolId": "String"
+      }
+    },
+    "AWS::ElasticLoadBalancingV2::LoadBalancer.LoadBalancerAttributes": {
+      "type": "list",
+      "member": "AWS::ElasticLoadBalancingV2::LoadBalancer/LoadBalancerAttribute"
+    },
+    "AWS::ElasticLoadBalancingV2::LoadBalancer.SecurityGroups": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::ElasticLoadBalancingV2::LoadBalancer.SubnetMappings": {
+      "type": "list",
+      "member": "AWS::ElasticLoadBalancingV2::LoadBalancer/SubnetMapping"
+    },
+    "AWS::ElasticLoadBalancingV2::LoadBalancer.Subnets": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::ElasticLoadBalancingV2::LoadBalancer.Tags": {
+      "type": "list",
+      "member": "AWS::ElasticLoadBalancingV2::LoadBalancer/Tag"
+    },
+    "AWS::ElasticLoadBalancingV2::LoadBalancer/LoadBalancerAttribute": {
+      "type": "structure",
+      "members": {
+        "Value": "String",
+        "Key": "String"
+      }
+    },
+    "AWS::ElasticLoadBalancingV2::LoadBalancer/MinimumLoadBalancerCapacity": {
+      "type": "structure",
+      "members": {
+        "CapacityUnits": "Integer"
+      },
+      "required": [
+        "CapacityUnits"
+      ]
+    },
+    "AWS::ElasticLoadBalancingV2::LoadBalancer/SubnetMapping": {
+      "type": "structure",
+      "members": {
+        "SubnetId": "String",
+        "AllocationId": "String",
+        "PrivateIPv4Address": "String",
+        "IPv6Address": "String",
+        "SourceNatIpv6Prefix": "String"
+      },
+      "required": [
+        "SubnetId"
+      ]
+    },
+    "AWS::ElasticLoadBalancingV2::LoadBalancer/Tag": {
+      "type": "structure",
+      "members": {
+        "Value": "String",
+        "Key": "String"
+      },
+      "required": [
+        "Key"
+      ]
+    },
+    "AWS::ElasticLoadBalancingV2::TargetGroup": {
+      "type": "structure",
+      "members": {
+        "IpAddressType": "String",
+        "HealthCheckIntervalSeconds": "Integer",
+        "LoadBalancerArns": "AWS::ElasticLoadBalancingV2::TargetGroup.LoadBalancerArns",
+        "Matcher": "AWS::ElasticLoadBalancingV2::TargetGroup/Matcher",
+        "HealthCheckPath": "String",
+        "Port": "Integer",
+        "Targets": "AWS::ElasticLoadBalancingV2::TargetGroup.Targets",
+        "HealthCheckEnabled": "Boolean",
+        "ProtocolVersion": "String",
+        "UnhealthyThresholdCount": "Integer",
+        "HealthCheckTimeoutSeconds": "Integer",
+        "Name": "String",
+        "VpcId": "String",
+        "TargetGroupFullName": "String",
+        "HealthyThresholdCount": "Integer",
+        "HealthCheckProtocol": "String",
+        "TargetGroupAttributes": "AWS::ElasticLoadBalancingV2::TargetGroup.TargetGroupAttributes",
+        "TargetType": "String",
+        "HealthCheckPort": "String",
+        "TargetGroupArn": "String",
+        "Protocol": "String",
+        "TargetGroupName": "String",
+        "Tags": "AWS::ElasticLoadBalancingV2::TargetGroup.Tags",
+        "TargetControlPort": "Integer"
+      }
+    },
+    "AWS::ElasticLoadBalancingV2::TargetGroup.LoadBalancerArns": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::ElasticLoadBalancingV2::TargetGroup.Tags": {
+      "type": "list",
+      "member": "AWS::ElasticLoadBalancingV2::TargetGroup/Tag"
+    },
+    "AWS::ElasticLoadBalancingV2::TargetGroup.TargetGroupAttributes": {
+      "type": "list",
+      "member": "AWS::ElasticLoadBalancingV2::TargetGroup/TargetGroupAttribute"
+    },
+    "AWS::ElasticLoadBalancingV2::TargetGroup.Targets": {
+      "type": "list",
+      "member": "AWS::ElasticLoadBalancingV2::TargetGroup/TargetDescription"
+    },
+    "AWS::ElasticLoadBalancingV2::TargetGroup/Matcher": {
+      "type": "structure",
+      "members": {
+        "GrpcCode": "String",
+        "HttpCode": "String"
+      }
+    },
+    "AWS::ElasticLoadBalancingV2::TargetGroup/Tag": {
+      "type": "structure",
+      "members": {
+        "Value": "String",
+        "Key": "String"
+      },
+      "required": [
+        "Value",
+        "Key"
+      ]
+    },
+    "AWS::ElasticLoadBalancingV2::TargetGroup/TargetDescription": {
+      "type": "structure",
+      "members": {
+        "AvailabilityZone": "String",
+        "Id": "String",
+        "Port": "Integer",
+        "QuicServerId": "String"
+      },
+      "required": [
+        "Id"
+      ]
+    },
+    "AWS::ElasticLoadBalancingV2::TargetGroup/TargetGroupAttribute": {
+      "type": "structure",
+      "members": {
+        "Value": "String",
+        "Key": "String"
+      }
+    },
     "AWS::Events::Rule": {
       "type": "structure",
       "members": {
@@ -2113,6 +2596,177 @@
         "S3Bucket",
         "S3Key"
       ]
+    },
+    "AWS::SSM::PatchBaseline": {
+      "type": "structure",
+      "members": {
+        "Id": "String",
+        "DefaultBaseline": "Boolean",
+        "OperatingSystem": "String",
+        "Description": "String",
+        "ApprovalRules": "AWS::SSM::PatchBaseline/RuleGroup",
+        "Sources": "AWS::SSM::PatchBaseline.Sources",
+        "Name": "String",
+        "RejectedPatches": "AWS::SSM::PatchBaseline.RejectedPatches",
+        "ApprovedPatches": "AWS::SSM::PatchBaseline.ApprovedPatches",
+        "RejectedPatchesAction": "String",
+        "PatchGroups": "AWS::SSM::PatchBaseline.PatchGroups",
+        "ApprovedPatchesComplianceLevel": "String",
+        "ApprovedPatchesEnableNonSecurity": "Boolean",
+        "GlobalFilters": "AWS::SSM::PatchBaseline/PatchFilterGroup",
+        "AvailableSecurityUpdatesComplianceStatus": "String",
+        "Tags": "AWS::SSM::PatchBaseline.Tags"
+      },
+      "required": [
+        "Name"
+      ]
+    },
+    "AWS::SSM::PatchBaseline.ApprovedPatches": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::SSM::PatchBaseline.PatchGroups": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::SSM::PatchBaseline.RejectedPatches": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::SSM::PatchBaseline.Sources": {
+      "type": "list",
+      "member": "AWS::SSM::PatchBaseline/PatchSource"
+    },
+    "AWS::SSM::PatchBaseline.Tags": {
+      "type": "list",
+      "member": "AWS::SSM::PatchBaseline/Tag"
+    },
+    "AWS::SSM::PatchBaseline/PatchFilter": {
+      "type": "structure",
+      "members": {
+        "Values": "AWS::SSM::PatchBaseline/PatchFilter.Values",
+        "Key": "String"
+      }
+    },
+    "AWS::SSM::PatchBaseline/PatchFilter.Values": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::SSM::PatchBaseline/PatchFilterGroup": {
+      "type": "structure",
+      "members": {
+        "PatchFilters": "AWS::SSM::PatchBaseline/PatchFilterGroup.PatchFilters"
+      }
+    },
+    "AWS::SSM::PatchBaseline/PatchFilterGroup.PatchFilters": {
+      "type": "list",
+      "member": "AWS::SSM::PatchBaseline/PatchFilter"
+    },
+    "AWS::SSM::PatchBaseline/PatchSource": {
+      "type": "structure",
+      "members": {
+        "Products": "AWS::SSM::PatchBaseline/PatchSource.Products",
+        "Configuration": "String",
+        "Name": "String"
+      }
+    },
+    "AWS::SSM::PatchBaseline/PatchSource.Products": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::SSM::PatchBaseline/Rule": {
+      "type": "structure",
+      "members": {
+        "ApproveUntilDate": "String",
+        "EnableNonSecurity": "Boolean",
+        "PatchFilterGroup": "AWS::SSM::PatchBaseline/PatchFilterGroup",
+        "ApproveAfterDays": "Integer",
+        "ComplianceLevel": "String"
+      }
+    },
+    "AWS::SSM::PatchBaseline/RuleGroup": {
+      "type": "structure",
+      "members": {
+        "PatchRules": "AWS::SSM::PatchBaseline/RuleGroup.PatchRules"
+      }
+    },
+    "AWS::SSM::PatchBaseline/RuleGroup.PatchRules": {
+      "type": "list",
+      "member": "AWS::SSM::PatchBaseline/Rule"
+    },
+    "AWS::SSM::PatchBaseline/Tag": {
+      "type": "structure",
+      "members": {
+        "Key": "String",
+        "Value": "String"
+      },
+      "required": [
+        "Value",
+        "Key"
+      ]
+    },
+    "AWS::SSM::ResourceDataSync": {
+      "type": "structure",
+      "members": {
+        "S3Destination": "AWS::SSM::ResourceDataSync/S3Destination",
+        "KMSKeyArn": "String",
+        "SyncSource": "AWS::SSM::ResourceDataSync/SyncSource",
+        "BucketName": "String",
+        "BucketRegion": "String",
+        "SyncFormat": "String",
+        "SyncName": "String",
+        "SyncType": "String",
+        "BucketPrefix": "String"
+      },
+      "required": [
+        "SyncName"
+      ]
+    },
+    "AWS::SSM::ResourceDataSync/AwsOrganizationsSource": {
+      "type": "structure",
+      "members": {
+        "OrganizationalUnits": "AWS::SSM::ResourceDataSync/AwsOrganizationsSource.OrganizationalUnits",
+        "OrganizationSourceType": "String"
+      },
+      "required": [
+        "OrganizationSourceType"
+      ]
+    },
+    "AWS::SSM::ResourceDataSync/AwsOrganizationsSource.OrganizationalUnits": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::SSM::ResourceDataSync/S3Destination": {
+      "type": "structure",
+      "members": {
+        "KMSKeyArn": "String",
+        "BucketPrefix": "String",
+        "BucketName": "String",
+        "BucketRegion": "String",
+        "SyncFormat": "String"
+      },
+      "required": [
+        "BucketName",
+        "BucketRegion",
+        "SyncFormat"
+      ]
+    },
+    "AWS::SSM::ResourceDataSync/SyncSource": {
+      "type": "structure",
+      "members": {
+        "IncludeFutureRegions": "Boolean",
+        "SourceRegions": "AWS::SSM::ResourceDataSync/SyncSource.SourceRegions",
+        "SourceType": "String",
+        "AwsOrganizationsSource": "AWS::SSM::ResourceDataSync/AwsOrganizationsSource"
+      },
+      "required": [
+        "SourceType",
+        "SourceRegions"
+      ]
+    },
+    "AWS::SSM::ResourceDataSync/SyncSource.SourceRegions": {
+      "type": "list",
+      "member": "String"
     },
     "Boolean": {
       "type": "boolean"
