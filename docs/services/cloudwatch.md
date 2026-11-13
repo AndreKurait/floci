@@ -52,6 +52,7 @@ Floci supports both CloudWatch Logs and CloudWatch Metrics.
 | `DeleteDestination` | Remove a logical destination without deleting its target |
 | `PutAccountPolicy` | Create or update an account-level Logs policy |
 | `DescribeAccountPolicies` | List account-level Logs policies by type and optional name |
+| `DeleteAccountPolicy` | Delete an account-level Logs policy by exact name and type |
 | `GetDataProtectionPolicy` | Return the resolved log group identifier (see note below) |
 | `StartQuery` | Start a Logs Insights query (see [Logs Insights](#logs-insights)) |
 | `GetQueryResults` | Get the status and results of a Logs Insights query |
@@ -140,6 +141,23 @@ criteria and fallback after deleting a group transformer are unsupported. This f
 transformation telemetry metrics or implement Contributor Insights, field indexes or additional
 processors. It does publish ordinary configured metric-filter metrics and delivers matching
 subscription events through the existing delivery implementation.
+
+### Account policies
+
+`DeleteAccountPolicy` removes only the named account policy of the requested type in the
+caller's account and Region. Missing policies return `ResourceNotFoundException`; group-level
+settings and other policy types remain intact. The existing five policy types are supported.
+`RETENTION_POLICY` and every non-null `dryRun` value, including `false`, are explicitly
+rejected before deletion. JSON null follows the existing optional-field omission convention.
+
+Authorization requires `logs:DeleteAccountPolicy` plus the documented delete action for data
+protection, subscription filters, transformers, or field indexes. Metric extraction has no
+additional documented delete action. This operation does not extend account-policy document
+validation or delivery behavior.
+
+Like `DescribeAccountPolicies`, deletion sees only keys scoped to the caller's account.
+Unprefixed legacy entries remain invisible and unchanged; this operation does not migrate
+them into an account or expand existing legacy visibility.
 
 ### Saved query definitions
 
