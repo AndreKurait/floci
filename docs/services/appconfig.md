@@ -49,6 +49,7 @@ Hosted deployment and validation requests still select configurations by numeric
 - `CreateEnvironment`
 - `GetEnvironment`
 - `ListEnvironments`
+- `UpdateEnvironment` (IDs only)
 - `DeleteEnvironment`
 - `CreateConfigurationProfile`
 - `GetConfigurationProfile`
@@ -63,6 +64,7 @@ Hosted deployment and validation requests still select configurations by numeric
 - `CreateDeploymentStrategy`
 - `GetDeploymentStrategy`
 - `ListDeploymentStrategies`
+- `UpdateDeploymentStrategy`
 - `DeleteDeploymentStrategy`
 - `StartDeployment`
 - `StopDeployment`
@@ -109,6 +111,24 @@ clear validators omitted from the template, and restore the prior schema on roll
 survive restart. External schema references and other inline schema drafts are refused. Lambda validator
 declarations are retained, but validation and deployment requiring them fail explicitly because invoking
 Lambda validators is not implemented. `UpdateConfigurationProfile` rejects `KmsKeyIdentifier`.
+
+`UpdateEnvironment` and `UpdateDeploymentStrategy` apply only the mutable fields present in a native
+PATCH request. Omitted fields retain their values; an empty description or monitor list clears that
+field, and a zero duration or final bake time is stored. The whole request is validated before the
+stored record is replaced. Persistent and WAL storage publish each replacement after the atomic write
+succeeds; hybrid storage retains asynchronous durability. Updates preserve resource IDs, environment state, strategy names and
+`ReplicateTo`, and survive storage reloads. Predefined strategies cannot be updated.
+
+`UpdateEnvironment` currently requires the application and environment IDs. AWS also documents name
+selectors; this PATCH implementation does not resolve them. Existing Get operations retain their
+name lookup behavior. The PATCH operations do not change rollout behavior or environment state spelling.
+CloudFormation continues to replace all mutable properties, including clearing omitted template fields.
+
+With IAM enforcement enabled, these PATCH requests check their own action and concrete resources:
+both the application and environment for `UpdateEnvironment`, and the custom strategy for
+`UpdateDeploymentStrategy`. Every supplied monitor `AlarmRoleArn` also needs `iam:PassRole` for
+AppConfig. Omitting monitors reuses stored roles without another PassRole check; an empty list passes
+no role. Environment and strategy resource-tag conditions are not implemented by this change.
 
 `CreateEnvironment` keeps up to five `Monitors`, each a CloudWatch `AlarmArn` with an optional IAM role
 `AlarmRoleArn`, and environment reads return them; an environment created without monitors returns none.
@@ -204,6 +224,9 @@ For the first four types, `Ref` returns the AppConfig ID, which `Fn::GetAtt` als
 `ConfigurationProfileId` and `Id`. A configuration profile's `KmsKeyArn` is not set.
 
 For a hosted version, `Ref` and `Fn::GetAtt VersionNumber` return the version number as a string.
+CFN resource descriptions, resource lists, events and change-set previews expose the version number as
+the public physical ID. Different profiles can both report `1` while their stored ownership remains distinct.
+Use `StackName` for resource reads; numeric hosted IDs are not resolved by `PhysicalResourceId`-only stack lookup.
 Its physical identity also includes its application and profile, so versions with the same
 number in different profiles remain separate resources. Hosted version numbers increase
 across concurrent creates, deletions and restarts. Older persisted data without a counter
@@ -235,8 +258,8 @@ configuration. This lifecycle does not add gradual per-client content delivery.
 
 An update that changes only mutable properties keeps the ID and changes the resource in place: the name and
 description of an application, environment or configuration profile, a profile's `RetrievalRoleArn` and `Validators`,
-an environment's `Monitors`, an application's
-`Tags`, and a deployment strategy's description, duration, final bake time, growth factor and growth type. A property
+an environment's `Monitors`, `Tags` on all four resource types, and a deployment strategy's description, duration, final bake time, growth factor
+and growth type. A property
 the template drops is cleared, or set back to its default (`FinalBakeTimeInMinutes` 0, `GrowthType` `LINEAR`). A
 change to a createOnly property (`ApplicationId` on an environment or configuration profile, `LocationUri` or `Type`
 on a configuration profile, `Name` or `ReplicateTo` on a deployment strategy) replaces the resource: the new one is
@@ -244,9 +267,12 @@ created and the old one is deleted once the stack update completes. A failed sta
 place and deletes what it created.
 
 Deleting an environment deletes its deployments, and deleting a configuration profile deletes its hosted configuration
-versions and admitted S3 content. Floci keeps tags on applications only, so `Tags` on the other three types are accepted
-and not stored, as `TagResource` treats them; so is a configuration profile's `KmsKeyIdentifier`,
-and `DeletionProtectionCheck`. `ReplicateTo: SSM_DOCUMENT` writes no SSM document.
+versions and admitted S3 content. Tags supplied at creation and through `TagResource` are stored on applications,
+environments, configuration profiles and custom deployment strategies. `TagResource` merges keys, `UntagResource`
+removes the named keys, and `ListTagsForResource` reads the remaining map. Tags persist with their resource and
+use the same account, region and parent-application identity. CloudFormation replaces the complete tag set on an
+in-place update and restores it on rollback. A configuration profile's `KmsKeyIdentifier`
+and `DeletionProtectionCheck` are accepted and not stored. `ReplicateTo: SSM_DOCUMENT` writes no SSM document.
 `AWS::AppConfig::Extension` and `ExtensionAssociation` are not provisioned.
 
 A stack created before Floci provisioned these types holds stubs for them, and an update creates the real resource in

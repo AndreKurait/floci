@@ -114,13 +114,15 @@ class CloudFormationAppConfigHostedLabelsIntegrationTest {
     }
 
     @Test
-    void independentProfilesHaveDistinctPhysicalIdsAndStringReferences() throws Exception {
+    void independentProfilesHaveNumericPublicIdsAndStringReferences() throws Exception {
         ObjectNode first = template(profile, null, null, "first");
         String firstStack = create(first);
         String secondStack = create(template(independent, null, null, "second"));
         assertVersion(firstStack, profile, 1, null, "first");
         assertVersion(secondStack, independent, 1, null, "second");
-        assertNotEquals(physicalId(firstStack), physicalId(secondStack));
+        assertNotEquals(profile, independent);
+        assertEquals("1", physicalId(firstStack));
+        assertEquals("1", physicalId(secondStack));
         assertEquals(2, activeStacks().size());
     }
 
