@@ -17,9 +17,22 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLParameters;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.TrustManagerFactory;
+import java.io.InputStream;
+import java.net.InetSocketAddress;
+import java.net.Socket;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.KeyStore;
+import java.security.cert.CertificateFactory;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -82,6 +95,45 @@ class TlsProxyFallbackServiceTest {
         assertFalse(selected != api && api.received().isDone());
         assertFalse(selected != nativeOwner && nativeOwner.received().isDone());
         assertFalse(selected != shared && shared.received().isDone());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void managedPublicApiKeepsItsVerifiedTlsOwnerWithAnExternalFallback(boolean registerNative) throws Exception {
+        Backend api = backend("api.fixture.local", true);
+        Backend nativeOwner = backend("native.fixture.local", true);
+        Backend shared = backend("shared.fixture.local", false);
+        int[] ports = FreePorts.anyInterfacePorts(2);
+        PublicApiProxySources sources = new PublicApiProxySources();
+        Object bridge = new Object();
+        sources.register(bridge, "127.0.0.1", Set.of("172.18.1.10"));
+        proxy = new TlsProxyServer(vertx, config(ports[0], ports[1], shared.server().actualPort()),
+                "127.0.0.1", api.server().actualPort(), api.server().actualPort(), sources);
+        if (registerNative) {
+            assertTrue(proxy.registerTlsRoute(ports[1], nativeOwner, name -> nativeOwner.server().actualPort()));
+        }
+        try (Socket connection = new Socket()) {
+            connection.connect(new InetSocketAddress("127.0.0.1", ports[1]), 5000);
+            connection.setSoTimeout(5000);
+            connection.getOutputStream().write(
+                    "PROXY TCP4 172.18.1.10 192.0.2.1 49152 443\r\n".getBytes(StandardCharsets.US_ASCII));
+            connection.getOutputStream().flush();
+            try (SSLSocket tls = (SSLSocket) trustedContext(api).getSocketFactory()
+                    .createSocket(connection, api.name(), ports[1], false)) {
+                SSLParameters parameters = tls.getSSLParameters();
+                parameters.setEndpointIdentificationAlgorithm("HTTPS");
+                tls.setSSLParameters(parameters);
+                tls.startHandshake();
+                tls.getOutputStream().write(PAYLOAD.getBytes(StandardCharsets.US_ASCII));
+                tls.getOutputStream().flush();
+                Received received = api.received().get(5, TimeUnit.SECONDS);
+                assertEquals(PAYLOAD, received.payload());
+                assertEquals("172.18.1.10", received.sourceAddress());
+                assertEquals(49152, received.sourcePort());
+                assertFalse(nativeOwner.received().isDone());
+                assertFalse(shared.received().isDone());
+            }
+        }
     }
 
     @ParameterizedTest
@@ -255,11 +307,25 @@ class TlsProxyFallbackServiceTest {
             socket.handler(bytes -> {
                 accumulated.appendBuffer(bytes);
                 if (accumulated.length() >= PAYLOAD.length()) {
-                    received.complete(new Received(accumulated.toString(), socket.remoteAddress().port()));
+                    received.complete(new Received(accumulated.toString(), socket.remoteAddress().port(),
+                            socket.remoteAddress().hostAddress()));
                 }
             });
         }).listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
         return new Backend(name, server, certificate, received);
+    }
+
+    private static SSLContext trustedContext(Backend backend) throws Exception {
+        KeyStore trust = KeyStore.getInstance(KeyStore.getDefaultType());
+        trust.load(null, null);
+        try (InputStream certificate = Files.newInputStream(Path.of(backend.certificate().certificatePath()))) {
+            trust.setCertificateEntry("api", CertificateFactory.getInstance("X.509").generateCertificate(certificate));
+        }
+        TrustManagerFactory managers = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm());
+        managers.init(trust);
+        SSLContext context = SSLContext.getInstance("TLS");
+        context.init(null, managers.getTrustManagers(), null);
+        return context;
     }
 
     private static EmulatorConfig config(int publicPort, int awsPort, int fallback) {
@@ -278,6 +344,6 @@ class TlsProxyFallbackServiceTest {
                            CompletableFuture<Received> received) {
     }
 
-    private record Received(String payload, int sourcePort) {
+    private record Received(String payload, int sourcePort, String sourceAddress) {
     }
 }
