@@ -41,16 +41,16 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 class PartitionCrossServiceSmokeIntegrationTest {
 
     static final Set<String> COVERED_PACKAGES = Set.of(
-            "accessanalyzer", "acm", "amazonmq", "apigateway", "apigatewayv2", "applicationautoscaling", "appsync",
+            "accessanalyzer", "acm", "amazonmq", "apigateway", "apigatewayv2", "appconfig", "applicationautoscaling", "appsync",
             "aps", "autoscaling", "backup", "batch", "bcmdataexports", "bedrock", "bedrockagentcorecontrol", "ce",
-            "cloudfront", "cloudmap", "cloudwatch", "codebuild", "codedeploy", "codepipeline", "cognito",
+            "cloudfront", "cloudmap", "cloudwatch", "codebuild", "codedeploy", "codepipeline", "cognito", "cognitoidentity",
             "configservice", "connect", "controlcatalog", "controltower", "datasync", "dlm", "dms", "dsql", "dynamodb", "ec2",
             "ecr", "ecs", "efs", "eks", "elasticache", "elasticbeanstalk", "elb", "elbv2", "emr", "emrserverless",
             "eventbridge", "eventbridgev2", "firehose", "fis", "glue", "guardduty", "iot", "kinesis", "kinesisanalytics", "lambda",
             "lambdamicrovms", "lambdaweb", "memorydb", "msk", "mwaa", "networkfirewall", "oam", "opensearch", "organizations",
-            "paymentcryptography", "pipes", "ram", "rds", "redshift", "redshiftserverless",
+            "paymentcryptography", "pipes", "quicksight", "ram", "rds", "redshift", "redshiftserverless",
             "resourceexplorer2", "resourcegroups", "route53resolver",
-            "s3tables", "s3vectors", "sagemaker", "scheduler", "secretsmanager", "servicequotas", "ses", "sns", "sqs",
+            "s3tables", "s3vectors", "sagemaker", "scheduler", "secretsmanager", "servicequotas", "ses", "signer", "sns", "sqs",
             "stepfunctions", "timestreaminfluxdb", "transfer", "verifiedpermissions", "wafv2");
 
     private static final String JSON_1_0 = "application/x-amz-json-1.0";
@@ -63,6 +63,41 @@ class PartitionCrossServiceSmokeIntegrationTest {
     @BeforeAll
     static void configureRestAssured() {
         RestAssuredJsonUtils.configureAwsContentTypes();
+    }
+
+    @ParameterizedTest
+    @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
+    void appConfigApplicationTagArn(PartitionCase partitionCase) {
+        String region = offered(partitionCase, "appconfig");
+        String id = signed(region, "appconfig").contentType(JSON)
+                .body("{\"Name\":\"" + unique("smoke-appconfig", partitionCase) + "\",\"Tags\":{\"created\":\"yes\"}}")
+                .post("/applications").then().statusCode(201).extract().path("Id");
+        cleanup.register(() -> signed(region, "appconfig").delete("/applications/" + id));
+        String resource = ":appconfig:" + region + ":" + PartitionMatrix.ACCOUNT + ":application/" + id;
+        String arn = "arn:" + partitionCase.partition() + resource;
+        // AppConfig returns an ID, not an ARN. Its tag handler checks the supplied ARN against
+        // one minted from the request context, so a successful read exercises that partition path.
+        assertEquals(Map.of("created", "yes"), signed(region, "appconfig")
+                .get("/tags/{arn}", arn).then().statusCode(200).extract().jsonPath().getMap("Tags"));
+        signed(region, "appconfig").contentType(JSON).body("{\"Tags\":{\"updated\":\"yes\"}}")
+                .post("/tags/{arn}", arn).then().statusCode(204);
+        signed(region, "appconfig").contentType(JSON).body("{\"Tags\":{\"foreign\":\"no\"}}")
+                .post("/tags/{arn}", "arn:aws" + resource).then().statusCode(404);
+        assertEquals(Map.of("created", "yes", "updated", "yes"), signed(region, "appconfig")
+                .get("/tags/{arn}", arn).then().statusCode(200).extract().jsonPath().getMap("Tags"));
+    }
+
+    @ParameterizedTest
+    @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
+    void quickSightDashboardArn(PartitionCase partitionCase) {
+        String region = offered(partitionCase, "quicksight");
+        String id = unique("smoke-dashboard", partitionCase);
+        String path = "/accounts/000000000000/dashboards/" + id;
+        String arn = signed(region, "quicksight").contentType(JSON)
+                .body("{\"Name\":\"Smoke dashboard\",\"Definition\":{}}")
+                .post(path).then().statusCode(202).extract().jsonPath().getString("Arn");
+        cleanup.register(() -> signed(region, "quicksight").delete(path));
+        PartitionMatrix.assertArnIn(partitionCase, arn);
     }
 
     @ParameterizedTest
@@ -591,6 +626,28 @@ class PartitionCrossServiceSmokeIntegrationTest {
 
     @ParameterizedTest
     @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
+    void cognitoIdentityTokenIssuer(PartitionCase partitionCase) throws Exception {
+        String region = offered(partitionCase, "cognito-identity");
+        String target = "AWSCognitoIdentityService.";
+        String body = "{\"IdentityPoolName\":\"" + unique("identity-token", partitionCase)
+                + "\",\"AllowUnauthenticatedIdentities\":true,\"AllowClassicFlow\":true}";
+        String pool = json11(region, "cognito-identity", target + "CreateIdentityPool", body)
+                .post("/").then().statusCode(200).extract().path("IdentityPoolId");
+        String poolBody = "{\"IdentityPoolId\":\"" + pool + "\"}";
+        cleanup.register(() -> json11(region, "cognito-identity", target + "DeleteIdentityPool", poolBody).post("/"));
+        String identity = json11(region, "cognito-identity", target + "GetId", poolBody)
+                .post("/").then().statusCode(200).extract().path("IdentityId");
+        String token = json11(region, "cognito-identity", target + "GetOpenIdToken",
+                "{\"IdentityId\":\"" + identity + "\"}")
+                .post("/").then().statusCode(200).extract().path("Token");
+        String issuer = new ObjectMapper().readTree(Base64.getUrlDecoder().decode(token.split("\\.")[1]))
+                .path("iss").asText();
+        PartitionMatrix.assertHostIn(partitionCase, issuer);
+        assertEquals("cognito-identity." + region + "." + partitionCase.dnsSuffix(), issuer);
+    }
+
+    @ParameterizedTest
+    @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
     void cognitoUserPoolArn(PartitionCase partitionCase) {
         String region = offered(partitionCase, "cognito-idp");
         String name = unique("smoke-pool", partitionCase);
@@ -760,6 +817,27 @@ class PartitionCrossServiceSmokeIntegrationTest {
 
     @ParameterizedTest
     @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
+    void cloudFrontKeyValueStoreArn(PartitionCase partitionCase) {
+        String region = offered(partitionCase, "cloudfront");
+        String name = unique("smoke-kvs", partitionCase);
+        String body = """
+                <CreateKeyValueStoreRequest xmlns="http://cloudfront.amazonaws.com/doc/2020-05-31/">
+                  <Name>%s</Name>
+                </CreateKeyValueStoreRequest>
+                """.formatted(name);
+        Response created = signed(region, "cloudfront")
+            .contentType("application/xml")
+            .body(body)
+        .when().post("/2020-05-31/key-value-store").then().statusCode(201).extract().response();
+        String etag = created.header("ETag");
+        cleanup.register(() -> signed(region, "cloudfront")
+            .header("If-Match", etag)
+        .when().delete("/2020-05-31/key-value-store/" + name));
+        PartitionMatrix.assertGlobalArnIn(partitionCase, created.xmlPath().getString("KeyValueStore.ARN"));
+    }
+
+    @ParameterizedTest
+    @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
     void ramResourceShareArn(PartitionCase partitionCase) {
         String region = offered(partitionCase, "ram");
         String arn = signed(region, "ram")
@@ -801,6 +879,25 @@ class PartitionCrossServiceSmokeIntegrationTest {
             .extract().jsonPath().getString("ScheduleGroupArn");
         cleanup.register(() -> signed(region, "scheduler").when().delete("/schedule-groups/" + name));
         PartitionMatrix.assertArnIn(partitionCase, arn);
+    }
+
+    @ParameterizedTest
+    @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
+    void backupFrameworkArnAndDefinition(PartitionCase partitionCase) {
+        String region = offered(partitionCase, "backup");
+        String name = unique("Framework", partitionCase).replace("-", "_");
+        String body = "{\"FrameworkName\":\"" + name + "\",\"FrameworkControls\":["
+                + "{\"ControlName\":\"BACKUP_RECOVERY_POINT_ENCRYPTED\"}]}";
+        String arn = signed(region, "backup").contentType(JSON).body(body)
+                .when().post("/audit/frameworks").then().statusCode(200)
+                .extract().jsonPath().getString("FrameworkArn");
+        cleanup.register(() -> signed(region, "backup").when().delete("/audit/frameworks/" + name));
+        PartitionMatrix.assertArnIn(partitionCase, arn);
+        Response described = signed(region, "backup").when().get("/audit/frameworks/" + name)
+                .then().statusCode(200).extract().response();
+        assertEquals(arn, described.jsonPath().getString("FrameworkArn"));
+        assertEquals("UNAVAILABLE", described.jsonPath().getString("FrameworkStatus"));
+        assertEquals("BACKUP_RECOVERY_POINT_ENCRYPTED", described.jsonPath().getString("FrameworkControls[0].ControlName"));
     }
 
     @ParameterizedTest
@@ -1012,6 +1109,23 @@ class PartitionCrossServiceSmokeIntegrationTest {
         cleanup.register(() -> signed(region, "dlm").when().delete("/policies/" + policyId));
         String arn = signed(region, "dlm").when().get("/policies/" + policyId)
             .then().statusCode(200).extract().jsonPath().getString("Policy.PolicyArn");
+        PartitionMatrix.assertArnIn(partitionCase, arn);
+    }
+
+    @ParameterizedTest
+    @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
+    void signerProfileArn(PartitionCase partitionCase) {
+        String region = offered(partitionCase, "signer");
+        String profileName = "Smoke" + Long.toString(System.nanoTime(), 36);
+        signed(region, "signer")
+            .contentType(JSON)
+            .body("{\"platformId\":\"AWSLambda-SHA384-ECDSA\"}")
+        .when().put("/signing-profiles/" + profileName).then().statusCode(200);
+        cleanup.register(() -> signed(region, "signer").when()
+                .delete("/signing-profiles/" + profileName));
+        String arn = signed(region, "signer").when()
+                .get("/signing-profiles/" + profileName)
+            .then().statusCode(200).extract().jsonPath().getString("arn");
         PartitionMatrix.assertArnIn(partitionCase, arn);
     }
 

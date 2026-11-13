@@ -72,6 +72,7 @@ public class StepFunctionsJsonHandler {
             case "UpdateStateMachineAlias" -> handleUpdateStateMachineAlias(request);
             case "DeleteStateMachineAlias" -> handleDeleteStateMachineAlias(request);
             case "ValidateStateMachineDefinition" -> handleValidateStateMachineDefinition(request);
+            case "TestState" -> Response.ok(service.testState(request)).build();
             case "StartExecution" -> handleStartExecution(request, region);
             case "StartSyncExecution" -> handleStartSyncExecution(request, region);
             case "DescribeExecution" -> handleDescribeExecution(request);
