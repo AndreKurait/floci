@@ -458,6 +458,7 @@ deferred_handlers:
   - { path: services/cloudwatch/logs/CloudWatchLogsTransformerHandler.java }  # multi-table doc (nested handler, reached through CloudWatchLogsHandler)
   - { path: services/cloudwatch/logs/CloudWatchLogsMetricFilterHandler.java }  # multi-table doc (nested handler, reached through CloudWatchLogsHandler)
   - { path: services/cloudwatch/logs/CloudWatchLogsDeliveryHandler.java }  # multi-table doc (nested handler, reached through CloudWatchLogsHandler)
+  - { path: services/cloudwatch/insights/CloudWatchInsightRulesHandler.java }  # multi-table doc (nested handler)
   - { path: services/cloudwatch/metrics/CloudWatchMetricsJsonHandler.java }  # multi-table doc (nested handler)
   - { path: services/cloudwatch/metrics/CloudWatchMetricsQueryHandler.java }  # multi-table doc (nested handler)
   - { path: services/codebuild/CodeBuildJsonHandler.java }  # non-tabular doc (grouped/inline)

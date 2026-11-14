@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.XmlBuilder;
 import io.github.hectorvent.floci.services.cloudwatch.dashboards.CloudWatchDashboardsService;
 import io.github.hectorvent.floci.services.cloudwatch.dashboards.model.Dashboard;
+import io.github.hectorvent.floci.services.cloudwatch.insights.CloudWatchInsightRulesHandler;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.Alarm;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.AlarmHistoryItem;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.AlarmMetricDataQuery;
@@ -45,14 +46,23 @@ public class CloudWatchMetricsQueryHandler {
     private CloudWatchMetricsService metricsService;
     private final CloudWatchDashboardsService dashboardsService;
     private final CloudWatchMetricStreamsService metricStreamsService;
+    private final CloudWatchInsightRulesHandler insightRules;
+
+    public CloudWatchMetricsQueryHandler(CloudWatchMetricsService metricsService,
+                                         CloudWatchDashboardsService dashboardsService,
+                                         CloudWatchMetricStreamsService metricStreamsService) {
+        this(metricsService, dashboardsService, metricStreamsService, null);
+    }
 
     @Inject
     public CloudWatchMetricsQueryHandler(CloudWatchMetricsService metricsService,
                                          CloudWatchDashboardsService dashboardsService,
-                                         CloudWatchMetricStreamsService metricStreamsService) {
+                                         CloudWatchMetricStreamsService metricStreamsService,
+                                         CloudWatchInsightRulesHandler insightRules) {
         this.metricsService = metricsService;
         this.dashboardsService = dashboardsService;
         this.metricStreamsService = metricStreamsService;
+        this.insightRules = insightRules;
     }
 
     public Response handle(String action, MultivaluedMap<String, String> params, String region) {
@@ -64,6 +74,9 @@ public class CloudWatchMetricsQueryHandler {
                                 + CloudWatchLegacyProtocol.VERSION + " is not implemented.", 400);
             }
             CloudWatchLegacyProtocol.validateQueryMembers(normalizedAction, params);
+        }
+        if (insightRules != null && insightRules.handles(normalizedAction, params.getFirst("ResourceARN"))) {
+            return insightRules.query(normalizedAction, params, region);
         }
         return switch (normalizedAction) {
             case "PutMetricData" -> handlePutMetricData(params, region);
