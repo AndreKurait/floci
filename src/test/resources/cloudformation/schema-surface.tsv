@@ -100,7 +100,7 @@ AWS::ECS::CapacityProvider		AutoScalingGroupProvider,ClusterName,ManagedInstance
 AWS::ECS::Cluster	Arn	CapacityProviders,ClusterName,ClusterSettings,Configuration,DefaultCapacityProviderStrategy,ServiceConnectDefaults,Tags
 AWS::ECS::ClusterCapacityProviderAssociations		CapacityProviders,Cluster,DefaultCapacityProviderStrategy
 AWS::ECS::Service	Name,ServiceArn	AvailabilityZoneRebalancing,CapacityProviderStrategy,Cluster,DeploymentConfiguration,DeploymentController,DesiredCount,EnableECSManagedTags,EnableExecuteCommand,ForceNewDeployment,GatewayConnectors,HealthCheckGracePeriodSeconds,LaunchType,LoadBalancers,Monitoring,NetworkConfiguration,PlacementConstraints,PlacementStrategies,PlatformVersion,PropagateTags,Role,SchedulingStrategy,ServiceConnectConfiguration,ServiceName,ServiceRegistries,Tags,TaskDefinition,VolumeConfigurations,VpcLatticeConfigurations
-AWS::ECS::TaskDefinition	TaskDefinitionArn	ContainerDefinitions,Cpu,EnableFaultInjection,EphemeralStorage,ExecutionRoleArn,Family,IpcMode,Memory,NetworkMode,PidMode,PlacementConstraints,ProxyConfiguration,RequiresCompatibilities,RuntimePlatform,Tags,TaskRoleArn,Volumes
+AWS::ECS::TaskDefinition	TaskDefinitionArn	ContainerDefinitions,Cpu,EnableFaultInjection,EphemeralStorage,ExecutionRoleArn,Family,IpcMode,Memory,NetworkMode,PidMode,PlacementConstraints,ProxyConfiguration,RequiresCompatibilities,RuntimePlatform,Tags,TaskRoleArn,TrustedExecutionConfiguration,Volumes
 AWS::EFS::AccessPoint	AccessPointId,Arn	AccessPointTags,ClientToken,FileSystemId,PosixUser,RootDirectory
 AWS::EFS::FileSystem	Arn,FileSystemId	AvailabilityZoneName,BackupPolicy,BypassPolicyLockoutSafetyCheck,Encrypted,FileSystemPolicy,FileSystemProtection,FileSystemTags,KmsKeyId,LifecyclePolicies,PerformanceMode,ProvisionedThroughputInMibps,ReplicationConfiguration,ThroughputMode
 AWS::EFS::MountTarget	Id	FileSystemId,IpAddress,IpAddressType,Ipv6Address,SecurityGroups,SubnetId
@@ -155,6 +155,7 @@ AWS::Lambda::WebFunctionRevision	CreatedAt,FunctionArn,RevisionArn,RevisionId,St
 AWS::Logs::LogGroup	Arn	BearerTokenAuthenticationEnabled,DataProtectionPolicy,DeletionProtectionEnabled,FieldIndexPolicies,KmsKeyId,LogGroupClass,LogGroupName,ResourcePolicyDocument,RetentionInDays,Tags
 AWS::Logs::LogStream		LogGroupName,LogStreamName
 AWS::Logs::MetricFilter		ApplyOnTransformedLogs,EmitSystemFieldDimensions,FieldSelectionCriteria,FilterName,FilterPattern,LogGroupName,MetricTransformations
+AWS::Logs::SubscriptionFilter		ApplyOnTransformedLogs,DestinationArn,Distribution,EmitSystemFields,FieldSelectionCriteria,FilterName,FilterPattern,LogGroupName,RoleArn
 AWS::Organizations::Account	AccountId,Arn,JoinedMethod,JoinedTimestamp,Paths,State,Status	AccountName,Email,ParentIds,RoleName,Tags
 AWS::Organizations::Organization	Arn,Id,ManagementAccountArn,ManagementAccountEmail,ManagementAccountId,RootId	FeatureSet
 AWS::Organizations::OrganizationalUnit	Arn,Id,Path	Name,ParentId,Tags

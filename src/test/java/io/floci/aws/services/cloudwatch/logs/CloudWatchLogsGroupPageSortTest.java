@@ -8,6 +8,7 @@ import io.floci.aws.services.cloudwatch.logs.model.LogGroup;
 import io.floci.aws.services.cloudwatch.metrics.CloudWatchMetricsService;
 import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -47,8 +48,10 @@ class CloudWatchLogsGroupPageSortTest {
                 10_000, resolver);
         ObjectMapper mapper = new ObjectMapper();
         CloudWatchLogsHandler handler = new CloudWatchLogsHandler(service,
-                new CloudWatchLogsCrossAccountService(new InMemoryStorage<>(), new InMemoryStorage<>(), resolver, mapper),
-                new CloudWatchLogsMetricFilterService(service, mock(CloudWatchMetricsService.class), resolver), mapper);
+                new CloudWatchLogsCrossAccountService(new InMemoryStorage<>(), new InMemoryStorage<>(), resolver, mapper,
+                        Mockito.mock(CloudWatchLogsDestinationTargetService.class)),
+                new CloudWatchLogsMetricFilterService(service, mock(CloudWatchMetricsService.class), resolver), mapper,
+                Mockito.mock(CloudWatchLogsSubscriptionAdmissionService.class));
         List<Integer> measurements = new ArrayList<>();
         for (int sample = 0; sample < 3; sample++) {
             nameReads.set(0);
