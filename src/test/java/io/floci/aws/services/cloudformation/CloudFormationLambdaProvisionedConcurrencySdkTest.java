@@ -3,6 +3,8 @@ package io.floci.aws.services.cloudformation;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.floci.aws.core.common.AwsArnUtils;
+import io.floci.aws.core.common.AwsArnUtils.Arn;
 import io.floci.aws.testing.AwsTestClients;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.Timeout;
@@ -103,19 +105,22 @@ class CloudFormationLambdaProvisionedConcurrencySdkTest {
                     && event.resourceStatusReason() != null
                     && event.resourceStatusReason().toLowerCase(Locale.ROOT).contains("initialization")));
             String logicalAlias = sam ? "FunctionAliasLive" : "Alias";
+            Arn stackArn = AwsArnUtils.parse(owned.stackId);
+            String aliasArn = new Arn(stackArn.partition(), "lambda", stackArn.region(),
+                    stackArn.accountId(), "function:" + owned.function + ":live").toString();
+            String versionArn = new Arn(stackArn.partition(), "lambda", stackArn.region(),
+                    stackArn.accountId(), "function:" + owned.function + ":1").toString();
             List<StackEvent> deletedAliases = events.stream().filter(event -> owned.stackId.equals(event.stackId())
                     && logicalAlias.equals(event.logicalResourceId())
                     && "AWS::Lambda::Alias".equals(event.resourceType())
                     && "DELETE_COMPLETE".equals(event.resourceStatusAsString())
-                    && ("arn:aws:lambda:us-east-1:" + ACCOUNT + ":function:" + owned.function + ":live")
-                            .equals(event.physicalResourceId())).toList();
+                    && aliasArn.equals(event.physicalResourceId())).toList();
             assertEquals(1, deletedAliases.size());
             if (!sam) {
                 List<StackEvent> versionDeletes = events.stream().filter(event -> owned.stackId.equals(event.stackId())
                         && "Version".equals(event.logicalResourceId())
                         && "AWS::Lambda::Version".equals(event.resourceType())
-                        && ("arn:aws:lambda:us-east-1:" + ACCOUNT + ":function:" + owned.function + ":1")
-                                .equals(event.physicalResourceId())
+                        && versionArn.equals(event.physicalResourceId())
                         && "DELETE_IN_PROGRESS".equals(event.resourceStatusAsString())).toList();
                 assertEquals(1, versionDeletes.size());
                 assertFalse(deletedAliases.getFirst().timestamp().isAfter(versionDeletes.getFirst().timestamp()));

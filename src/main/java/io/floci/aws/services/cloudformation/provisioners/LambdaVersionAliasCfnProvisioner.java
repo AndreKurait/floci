@@ -91,6 +91,11 @@ public class LambdaVersionAliasCfnProvisioner implements CfnResourceProvisioner 
     }
 
     @Override
+    public boolean rollbackUpdate(StackResource resource) {
+        return ReplacementCleanup.rollback(resource, this::delete);
+    }
+
+    @Override
     public void provision(StackResource r, JsonNode props, ProvisionContext ctx) {
         switch (r.getResourceType()) {
             case "AWS::Lambda::Version" -> provisionVersion(r, props, ctx);
@@ -190,6 +195,7 @@ public class LambdaVersionAliasCfnProvisioner implements CfnResourceProvisioner 
     }
 
     private void provisionAlias(StackResource r, JsonNode props, ProvisionContext ctx) {
+        Map<String, String> attributesBefore = new LinkedHashMap<>(r.getAttributes());
         String functionName = ctx.resolveOptional(props, "FunctionName");
         String aliasName = ctx.resolveOptional(props, "Name");
         if (functionName == null || functionName.isBlank() || aliasName == null || aliasName.isBlank()) {
@@ -240,6 +246,7 @@ public class LambdaVersionAliasCfnProvisioner implements CfnResourceProvisioner 
             CfnRollback.guarded(r, ctx, true,
                     () -> delete("AWS::Lambda::Alias", r.getPhysicalId(), ctx.region()),
                     () -> { }, reconcileCapacity);
+            ReplacementCleanup.record(r, ctx, attributesBefore);
         } else {
             reconcileCapacity.run();
         }
