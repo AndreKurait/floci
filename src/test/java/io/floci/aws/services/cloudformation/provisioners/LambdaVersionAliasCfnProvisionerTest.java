@@ -12,6 +12,7 @@ import io.floci.aws.services.lambda.LambdaConcurrencyLimiter;
 import io.floci.aws.services.lambda.LambdaFunctionStore;
 import io.floci.aws.services.lambda.LambdaService;
 import io.floci.aws.services.lambda.LambdaTargetResolver;
+import io.floci.aws.services.lambda.ProvisionedConcurrencyPool;
 import io.floci.aws.services.lambda.WarmPool;
 import io.floci.aws.services.lambda.model.LambdaAlias;
 import io.floci.aws.services.lambda.model.LambdaFunction;
@@ -46,7 +47,8 @@ class LambdaVersionAliasCfnProvisionerTest {
             "arn:aws:lambda:us-east-1:000000000000:function:my-fn:production";
 
     private final LambdaService lambda = mock(LambdaService.class);
-    private final LambdaVersionAliasCfnProvisioner provisioner = new LambdaVersionAliasCfnProvisioner(lambda);
+    private final ProvisionedConcurrencyPool concurrency = mock(ProvisionedConcurrencyPool.class);
+    private final LambdaVersionAliasCfnProvisioner provisioner = new LambdaVersionAliasCfnProvisioner(lambda, concurrency);
     private final ObjectMapper mapper = new ObjectMapper();
 
     private ProvisionContext ctx() {
@@ -177,10 +179,58 @@ class LambdaVersionAliasCfnProvisionerTest {
     }
 
     @Test
-    void deleteVersionIsANoOp() {
-        // Lambda exposes no DeleteVersion; deleting the function drops its versions with it.
-        provisioner.delete("AWS::Lambda::Version",
-                "arn:aws:lambda:us-east-1:000000000000:function:my-fn:3", "us-east-1");
+    void deleteVersionUsesTheQualifiedNativeDelete() {
+        String physical = "arn:aws:lambda:us-east-1:000000000000:function:my-fn:3";
+
+        provisioner.delete("AWS::Lambda::Version", physical, "us-east-1");
+
+        verify(lambda).deleteFunction("us-east-1", physical, "3");
+    }
+
+    @Test
+    void deleteVersionWhoseParentIsAlreadyAbsentIsIdempotent() {
+        String physical = "arn:aws:lambda:us-east-1:000000000000:function:my-fn:3";
+        Mockito.doThrow(new AwsException("ResourceNotFoundException", "Function not found", 404))
+                .when(lambda).deleteFunction("us-east-1", physical, "3");
+
+        provisioner.delete("AWS::Lambda::Version", physical, "us-east-1");
+
+        verify(lambda).deleteFunction("us-east-1", physical, "3");
+    }
+
+    @Test
+    void deleteVersionPropagatesAliasConflictAndOtherFailures() {
+        String physical = "arn:aws:lambda:us-east-1:000000000000:function:my-fn:3";
+        for (AwsException expected : new AwsException[] {
+                new AwsException("ResourceConflictException", "Alias references version", 409),
+                new AwsException("AccessDeniedException", "Denied", 403),
+                new AwsException("UnexpectedNotFound", "Unexpected missing response", 404)}) {
+            Mockito.doThrow(expected).when(lambda).deleteFunction("us-east-1", physical, "3");
+
+            assertEquals(expected, assertThrows(AwsException.class, () ->
+                    provisioner.delete("AWS::Lambda::Version", physical, "us-east-1")));
+        }
+    }
+
+    @Test
+    void deleteVersionNeverTurnsAnUnqualifiedOrAliasIdentityIntoAFunctionDelete() {
+        for (String physical : new String[] {
+                "LegacyVersion-1a2b3c4d",
+                "arn:aws:lambda:us-east-1:000000000000:function:my-fn",
+                "arn:aws:lambda:us-east-1:000000000000:function:my-fn:$LATEST",
+                "arn:aws:lambda:us-east-1:000000000000:function:my-fn:production"}) {
+            provisioner.delete("AWS::Lambda::Version", physical, "us-east-1");
+        }
+        verifyNoInteractions(lambda);
+    }
+
+    @Test
+    void deleteVersionRejectsAnArnFromAnotherRegionBeforeNativeDeletion() {
+        AwsException failure = assertThrows(AwsException.class, () ->
+                provisioner.delete("AWS::Lambda::Version",
+                        "arn:aws:lambda:us-west-2:000000000000:function:my-fn:3", "us-east-1"));
+
+        assertEquals("InvalidParameterValueException", failure.getErrorCode());
         verifyNoInteractions(lambda);
     }
 
@@ -223,12 +273,12 @@ class LambdaVersionAliasCfnProvisionerTest {
 
     private StackResource deployAlias(LambdaService real, String properties) throws Exception {
         StackResource r = resource("AWS::Lambda::Alias", "MyFuncAliasproduction");
-        new LambdaVersionAliasCfnProvisioner(real).provision(r, mapper.readTree(properties), ctx());
+        new LambdaVersionAliasCfnProvisioner(real, concurrency).provision(r, mapper.readTree(properties), ctx());
         return r;
     }
 
     private void updateAlias(LambdaService real, StackResource r, String previous, String current) throws Exception {
-        new LambdaVersionAliasCfnProvisioner(real).provision(r, mapper.readTree(current),
+        new LambdaVersionAliasCfnProvisioner(real, concurrency).provision(r, mapper.readTree(current),
                 ProvisionContexts.update("us-east-1", "000000000000", "my-stack",
                         r.getPhysicalId(), previous));
     }
