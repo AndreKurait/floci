@@ -296,6 +296,22 @@ public final class ReplacementCleanup {
         write(r, cleanup);
     }
 
+    /** Keeps failed-create orphans eligible for a later operation after this cleanup's bounded retries. */
+    static void retainExhaustedOrphansForRetry(StackResource r, String ownedResourceType) {
+        ObjectNode cleanup = read(r);
+        if (cleanup == null) {
+            return;
+        }
+        for (JsonNode node : cleanup.path("displaced")) {
+            if (ownedResourceType.equals(node.path("resourceType").asText(null))
+                    && !node.path("retainable").asBoolean(false)
+                    && node.path("cleanupAttempts").asInt(0) >= MAX_ATTEMPTS) {
+                ((ObjectNode) node).put("cleanupAttempts", 0);
+            }
+        }
+        write(r, cleanup);
+    }
+
     private static void drop(StackResource r) {
         r.getAttributes().remove(CfnRollback.REPLACEMENT_CLEANUP_ATTR);
     }

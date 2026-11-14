@@ -80,6 +80,23 @@ public class LambdaVersionAliasCfnProvisioner implements CfnResourceProvisioner 
     }
 
     @Override
+    public String updateCleanupPhysicalId(StackResource resource) {
+        return "AWS::Lambda::Alias".equals(resource.getResourceType())
+                ? ReplacementCleanup.cleanupPhysicalId(resource) : null;
+    }
+
+    @Override
+    public boolean hasReplacementUpdate(StackResource resource) {
+        return "AWS::Lambda::Alias".equals(resource.getResourceType()) && ReplacementCleanup.hasReplacement(resource);
+    }
+
+    @Override
+    public UpdateCleanupResult completeUpdate(StackResource resource) {
+        return "AWS::Lambda::Alias".equals(resource.getResourceType())
+                ? ReplacementCleanup.complete(resource, this::delete) : UpdateCleanupResult.notApplicable();
+    }
+
+    @Override
     public void provision(StackResource r, JsonNode props, ProvisionContext ctx) {
         switch (r.getResourceType()) {
             case "AWS::Lambda::Version" -> provisionVersion(r, props, ctx);
@@ -91,9 +108,25 @@ public class LambdaVersionAliasCfnProvisioner implements CfnResourceProvisioner 
 
     @Override
     public void delete(String resourceType, String physicalId, String region) {
+        if ("AWS::Lambda::Version".equals(resourceType)) {
+            LambdaArnUtils.ResolvedFunctionRef ref = LambdaArnUtils.resolveWithRegion(region, physicalId, null);
+            String version = ref.qualifier();
+            if (version == null || !version.chars().allMatch(value -> value >= '0' && value <= '9')) {
+                // Older stacks can carry a generic placeholder. Never turn that into a whole-function delete.
+                LOG.debugv("Not a published version ARN, nothing to delete: {0}", physicalId);
+                return;
+            }
+            try {
+                lambdaService.deleteFunction(region, physicalId, version);
+            } catch (AwsException failure) {
+                if (failure.getHttpStatus() != 404 || !"ResourceNotFoundException".equals(failure.getErrorCode())) {
+                    throw failure;
+                }
+                LOG.debugv("Version {0} already absent: {1}", physicalId, failure.getMessage());
+            }
+            return;
+        }
         if (!"AWS::Lambda::Alias".equals(resourceType)) {
-            // AWS::Lambda::Version has no backing delete: Lambda exposes no DeleteVersion, and
-            // deleting the function drops its versions with it.
             return;
         }
         // The physical id is the alias ARN (arn:…:function:<name>:<alias>), so the function name
@@ -106,6 +139,9 @@ public class LambdaVersionAliasCfnProvisioner implements CfnResourceProvisioner 
         try {
             lambdaService.deleteAlias(region, ref.name(), ref.qualifier());
         } catch (AwsException e) {
+            if (e.getHttpStatus() != 404 || !"ResourceNotFoundException".equals(e.getErrorCode())) {
+                throw e;
+            }
             // Already gone (function deleted first, or a partial rollback) — deleting a stack
             // must stay idempotent.
             LOG.debugv("Alias {0} already absent: {1}", physicalId, e.getMessage());
@@ -188,9 +224,12 @@ public class LambdaVersionAliasCfnProvisioner implements CfnResourceProvisioner 
         }
 
         LambdaAlias alias;
+        boolean created = false;
         try {
             alias = lambdaService.createAlias(ctx.region(), functionName, aliasName,
                     functionVersion, description, routingConfig);
+            created = true;
+            r.getAttributes().put(CfnRollback.ROLLBACK_OWNED_ATTR, "true");
         } catch (AwsException e) {
             // An alias surviving from a prior deploy makes create conflict; converge on it rather
             // than failing the stack, so a redeploy is idempotent.
@@ -206,7 +245,16 @@ public class LambdaVersionAliasCfnProvisioner implements CfnResourceProvisioner 
 
         r.setPhysicalId(alias.getAliasArn());
         r.getAttributes().put("AliasArn", alias.getAliasArn());
-        reconcileProvisionedConcurrency(functionName, aliasName, provisionedCount, ctx);
+        Runnable reconcileCapacity = () ->
+                reconcileProvisionedConcurrency(functionName, aliasName, provisionedCount, ctx);
+        if (created && ctx.isUpdate()) {
+            CfnRollback.guarded(r, ctx, true,
+                    () -> delete("AWS::Lambda::Alias", r.getPhysicalId(), ctx.region()),
+                    () -> { }, reconcileCapacity);
+        } else {
+            reconcileCapacity.run();
+        }
+        r.getAttributes().remove(CfnRollback.ROLLBACK_OWNED_ATTR);
     }
 
     private LambdaAlias currentAlias(ProvisionContext ctx, String functionName, String aliasName) {
@@ -269,6 +317,10 @@ public class LambdaVersionAliasCfnProvisioner implements CfnResourceProvisioner 
     public void clearUpdate(StackResource resource) {
         resource.getAttributes().remove(SNAPSHOT_ATTR);
         resource.getAttributes().remove(LambdaAliasDeployment.DEPLOYMENT_ATTR);
+        if ("AWS::Lambda::Alias".equals(resource.getResourceType())) {
+            ReplacementCleanup.retainExhaustedOrphansForRetry(resource, "AWS::Lambda::Alias");
+            ReplacementCleanup.clear(resource);
+        }
     }
 
     @Override

@@ -509,6 +509,13 @@ configuration deletes that allocation. SAM preserves the setting on the generate
 requires `AutoPublishAlias`. Function initialization dependencies must be ready before the alias
 is provisioned.
 
+Failed initial creation keeps the new alias's identity and ownership until stack rollback removes
+it. If an update creates an alias and initialization fails, it removes that new alias before
+returning the failure. Cleanup failures propagate and retain the created alias for later cleanup;
+each cleanup operation makes at most three attempts. Reused aliases retain their existing
+configuration snapshots and CodeDeploy rollback behavior. Alias deletion tolerates only a typed
+`ResourceNotFoundException` with HTTP 404.
+
 Published versions with `SnapStart.ApplyOn=PublishedVersions` reject provisioned concurrency
 with `ResourceConflictException`, including through an alias. A configured alias cannot
 retarget to such a version. Eligibility uses the published snapshot, so changing `$LATEST`
