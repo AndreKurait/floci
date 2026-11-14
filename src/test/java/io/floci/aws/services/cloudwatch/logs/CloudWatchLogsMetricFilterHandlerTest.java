@@ -10,6 +10,7 @@ import io.floci.aws.services.cloudwatch.metrics.CloudWatchMetricsService;
 import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -37,10 +38,11 @@ class CloudWatchLogsMetricFilterHandlerTest {
                 10_000, new RegionResolver(REGION, "000000000000"));
         handler = new CloudWatchLogsHandler(service,
                 new CloudWatchLogsCrossAccountService(new InMemoryStorage<>(), new InMemoryStorage<>(),
-                        new RegionResolver(REGION, "000000000000"), MAPPER),
+                        new RegionResolver(REGION, "000000000000"), MAPPER,
+                        Mockito.mock(CloudWatchLogsDestinationTargetService.class)),
                 new CloudWatchLogsMetricFilterService(service,
                         mock(CloudWatchMetricsService.class), new RegionResolver(REGION, "000000000000")),
-                MAPPER);
+                MAPPER, Mockito.mock(CloudWatchLogsSubscriptionAdmissionService.class));
         service.createLogGroup(GROUP, null, null, REGION);
     }
 

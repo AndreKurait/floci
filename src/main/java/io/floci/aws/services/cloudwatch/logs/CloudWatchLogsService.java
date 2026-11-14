@@ -1,6 +1,7 @@
 package io.floci.aws.services.cloudwatch.logs;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
@@ -23,6 +24,7 @@ import io.floci.aws.services.cloudwatch.logs.filter.FilterPatternException;
 import io.floci.aws.services.cloudwatch.logs.model.LogEvent;
 import io.floci.aws.services.cloudwatch.logs.model.LogGroup;
 import io.floci.aws.services.cloudwatch.logs.model.LogStream;
+import io.floci.aws.services.cloudwatch.logs.model.LogTransformer;
 import io.floci.aws.services.cloudwatch.logs.model.MetricFilter;
 import io.floci.aws.services.cloudwatch.logs.model.ResourcePolicy;
 import io.floci.aws.services.cloudwatch.logs.model.SubscriptionFilter;
@@ -75,6 +77,7 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
     private final StorageBackend<String, SubscriptionFilter> subscriptionFilterStore;
     private final StorageBackend<String, MetricFilter> metricFilterStore;
     private final StorageBackend<String, ResourcePolicy> resourcePolicyStore;
+    private final StorageBackend<String, LogTransformer> transformerStore;
     private final RegionResolver regionResolver;
     /**
      * What ingestion and group deletion tell the rest of the emulator, so features AWS drives from
@@ -141,7 +144,9 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
                 config.services().cloudwatchlogs().queryCompletionDelayMs(),
                 System::currentTimeMillis,
                 logEventsIngested,
-                logGroupDeleted
+                logGroupDeleted,
+                storageFactory.create("cloudwatchlogs", "cwlogs-transformers.json",
+                        new TypeReference<>() {})
         );
     }
 
@@ -209,12 +214,32 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
                            LongSupplier clock,
                            Event<LogEventsIngested> logEventsIngested,
                            Event<LogGroupDeleted> logGroupDeleted) {
+        this(groupStore, streamStore, eventStore, subscriptionFilterStore, metricFilterStore, resourcePolicyStore,
+                maxEventsPerQuery, maxStoredEvents, regionResolver, queryCompletionDelayMs, clock,
+                logEventsIngested, logGroupDeleted, new InMemoryStorage<>());
+    }
+
+    CloudWatchLogsService(StorageBackend<String, LogGroup> groupStore,
+                           StorageBackend<String, LogStream> streamStore,
+                           StorageBackend<String, LogEvent> eventStore,
+                           StorageBackend<String, SubscriptionFilter> subscriptionFilterStore,
+                           StorageBackend<String, MetricFilter> metricFilterStore,
+                           StorageBackend<String, ResourcePolicy> resourcePolicyStore,
+                           int maxEventsPerQuery,
+                           int maxStoredEvents,
+                           RegionResolver regionResolver,
+                           long queryCompletionDelayMs,
+                           LongSupplier clock,
+                           Event<LogEventsIngested> logEventsIngested,
+                           Event<LogGroupDeleted> logGroupDeleted,
+                           StorageBackend<String, LogTransformer> transformerStore) {
         this.groupStore = groupStore;
         this.streamStore = streamStore;
         this.eventStore = eventStore;
         this.subscriptionFilterStore = subscriptionFilterStore;
         this.metricFilterStore = metricFilterStore;
         this.resourcePolicyStore = resourcePolicyStore;
+        this.transformerStore = transformerStore;
         this.maxEventsPerQuery = maxEventsPerQuery;
         this.maxStoredEvents = maxStoredEvents;
         this.regionResolver = regionResolver;
@@ -359,6 +384,7 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
                                             && k.equals(subscriptionFilterKey(region, name, filter.getFilterName())))
                                     .orElse(false))
                     .toList().forEach(subscriptionFilterStore::delete);
+            transformerStore.delete(key);
             groupStore.delete(key);
             LOG.infov("Deleted log group: {0}", name);
             if (logGroupDeleted != null) {
@@ -369,6 +395,51 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
 
     public boolean logGroupExists(String name, String region) {
         return groupStore.get(groupKey(region, name)).isPresent();
+    }
+
+    public void putTransformer(String identifier, JsonNode configuration, String region) {
+        LogTransformer definition = ParseJsonTransformer.definition(configuration);
+        synchronized (metricFilterStore) {
+            String name = transformerGroupName(identifier, region);
+            LogGroup group = requireNamedLogGroup(region, name);
+            if (!"STANDARD".equals(group.getLogGroupClass())) {
+                throw invalid("Log transformers require a STANDARD log group.");
+            }
+            String key = groupKey(region, name);
+            LogTransformer before = transformerStore.get(key).orElse(null);
+            long now = clock.getAsLong();
+            transformerStore.put(key, new LogTransformer(definition.source(), definition.destination(),
+                    before == null ? now : before.creationTime(), now));
+        }
+    }
+
+    public LogTransformer getTransformer(String identifier, String region) {
+        synchronized (metricFilterStore) {
+            String name = transformerGroupName(identifier, region);
+            requireNamedLogGroup(region, name);
+            return transformerStore.get(groupKey(region, name)).orElse(null);
+        }
+    }
+
+    public void deleteTransformer(String identifier, String region) {
+        synchronized (metricFilterStore) {
+            String name = transformerGroupName(identifier, region);
+            requireNamedLogGroup(region, name);
+            transformerStore.delete(groupKey(region, name));
+        }
+    }
+
+    String transformerGroupArn(String identifier, String region) {
+        return buildArn(transformerGroupName(identifier, region), region);
+    }
+
+    public LogTransformerTarget resolveTransformerTarget(String identifier, String region) {
+        return LogTransformerTarget.resolve(identifier, region, regionResolver.getAccountId(),
+                regionResolver.partitionForRegion(region));
+    }
+
+    private String transformerGroupName(String identifier, String region) {
+        return resolveTransformerTarget(identifier, region).name();
     }
 
     public List<LogGroup> describeLogGroups(String prefix, String region) {
@@ -710,7 +781,24 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
     public String putLogEventsForAccount(
             String accountId, String groupName, String streamName,
             List<Map<String, Object>> events, String region) {
+        IngestedBatch batch;
+        synchronized (metricFilterStore) {
+            batch = putLogEventsBatch(accountId, groupName, streamName, events, region);
+        }
+        if (logEventsIngested != null && !batch.events().isEmpty()) {
+            logEventsIngested.fire(new LogEventsIngested(accountId, region, groupName, streamName, batch.events()));
+        }
+        return batch.nextToken();
+    }
+
+    private record IngestedBatch(String nextToken, List<LogEvent> events) {}
+
+    /** Uses the same metadata-then-event-index lock order as group deletion. */
+    private IngestedBatch putLogEventsBatch(
+            String accountId, String groupName, String streamName,
+            List<Map<String, Object>> events, String region) {
         requireLogGroupForAccount(accountId, region, groupName);
+        LogTransformer transformer = getForAccount(transformerStore, accountId, groupKey(region, groupName)).orElse(null);
         String streamKey = streamKey(region, groupName, streamName);
         getForAccount(streamStore, accountId, streamKey)
                 .orElseThrow(CloudWatchLogsService::logStreamNotFound);
@@ -730,6 +818,11 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
             logEvent.setEventId(UUID.randomUUID().toString());
             logEvent.setTimestamp(ts);
             logEvent.setMessage(msg);
+            if (transformer != null) {
+                ParseJsonTransformer.Outcome transformed = ParseJsonTransformer.transform(msg, transformer);
+                logEvent.setTransformedMessage(transformed.message());
+                logEvent.setTransformationError(transformed.error());
+            }
             logEvent.setIngestionTime(now);
             logEvent.setSequence(ingestionSequence.incrementAndGet());
 
@@ -777,10 +870,7 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
             putForAccount(streamStore, accountId, streamKey, stream);
         }
 
-        if (logEventsIngested != null && !stored.isEmpty()) {
-            logEventsIngested.fire(new LogEventsIngested(accountId, region, groupName, streamName, List.copyOf(stored)));
-        }
-        return nextToken;
+        return new IngestedBatch(nextToken, List.copyOf(stored));
     }
 
     /**
@@ -1301,6 +1391,12 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
 
     public void putSubscriptionFilter(String logGroupName, String filterName, String filterPattern,
                                        String destinationArn, String distribution, String region) {
+        putSubscriptionFilter(logGroupName, filterName, filterPattern, destinationArn, distribution, null, region);
+    }
+
+    public void putSubscriptionFilter(String logGroupName, String filterName, String filterPattern,
+                                       String destinationArn, String distribution, Boolean applyOnTransformedLogs,
+                                       String region) {
         synchronized (metricFilterStore) {
             requireLogGroup(region, logGroupName);
             String normalizedPattern = filterPattern != null ? filterPattern : "";
@@ -1313,9 +1409,10 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
             filter.setFilterPattern(normalizedPattern);
             filter.setDestinationArn(destinationArn);
             filter.setDistribution(distribution != null ? distribution : "ByLogStream");
-            filter.setCreationTime(System.currentTimeMillis());
-
+            filter.setApplyOnTransformedLogs(applyOnTransformedLogs);
             String filterKey = subscriptionFilterKey(region, logGroupName, filterName);
+            SubscriptionFilter previous = subscriptionFilterStore.get(filterKey).orElse(null);
+            filter.setCreationTime(previous == null ? System.currentTimeMillis() : previous.getCreationTime());
             subscriptionFilterStore.put(filterKey, filter);
             LOG.infov("Created subscription filter: {0} on log group: {1}", filterName, logGroupName);
         }
