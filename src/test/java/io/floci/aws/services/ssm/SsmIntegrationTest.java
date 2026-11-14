@@ -1974,6 +1974,11 @@ class SsmIntegrationTest {
     void putParameterRejectsANameOutsideTheParameterNameSyntaxAndStoresNothing() {
         for (String name : List.of("/name-syntax/db:secret", "/name-syntax/db secret", "/name-syntax/db\\t",
                 "\\u00a0/name-syntax/db")) {
+            String exactNameFilter = "{ \"ParameterFilters\": [{ \"Key\": \"Name\", \"Option\": \"Equals\", "
+                    + "\"Values\": [\"" + name + "\"] }] }";
+            describeParameters(exactNameFilter)
+                .body("Parameters", hasSize(0))
+                .body("NextToken", nullValue());
             given()
                 .header("X-Amz-Target", "AmazonSSM.PutParameter")
                 .contentType(SSM_CONTENT_TYPE)
@@ -1995,7 +2000,10 @@ class SsmIntegrationTest {
                 .post("/")
             .then()
                 .statusCode(400)
-                .body("__type", equalTo("ParameterNotFound"));
+                .body("__type", equalTo(name.contains(" ") ? "ValidationException" : "ParameterNotFound"));
+            describeParameters(exactNameFilter)
+                .body("Parameters", hasSize(0))
+                .body("NextToken", nullValue());
         }
     }
 
