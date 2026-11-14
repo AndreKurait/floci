@@ -14,6 +14,13 @@ polling against the application/environment/configuration ARN; a denied poll doe
 not consume its token. Passing retrieval or monitor roles also requires
 `iam:PassRole` for the AppConfig service. IAM enforcement remains disabled by default.
 
+Tagged `CreateApplication` and `CreateDeploymentStrategy` requests also require
+`appconfig:TagResource` on `application/*` or `deploymentstrategy/*` in the request's
+partition, account and Region. Both the create action and tagging action evaluate
+`aws:RequestTag` and `aws:TagKeys` conditions. An untagged create needs only its create
+permission. This tag-on-create admission currently covers these two operations;
+child-resource and deployment creation tags remain outside this admission scope.
+
 ## Management Plane (AppConfig)
 
 The management plane allows you to create and manage applications, environments, configuration profiles, and hosted configuration versions.
@@ -29,6 +36,20 @@ for supported types, updates, deletion and property limitations.
 The legacy `GetConfiguration` data-plane route accepts application, environment and profile names or IDs.
 It returns only the deployed version, its content type and `Configuration-Version`; a matching
 `ClientConfigurationVersion` returns HTTP 204 with no body. `ClientId` is required.
+
+Hosted versions accept a case-sensitive `VersionLabel` of 1–64 characters containing at least
+one non-numeric character. Labels are unique among versions still stored in the profile and
+are returned by create, get and list. Deleting a version releases its label.
+`LatestVersionNumber` checks the highest version currently stored (zero for an empty profile);
+a mismatch returns `ConflictException` without creating a version. Version numbers continue
+increasing after deletion and persist across restart. Lists support `MaxResults`, `NextToken`,
+and exact or trailing-asterisk prefix label filters. A label filter excludes unlabeled versions.
+Hosted deployment and validation requests accept a numeric version or an exact, case-sensitive
+label within the selected profile. An unknown label returns `ResourceNotFoundException` before
+assigning a deployment number or changing active content. Deployment start, get and list responses
+return the numeric `ConfigurationVersion` and the selected version's `VersionLabel` when it has one.
+Each deployment retains its captured label across restart, version deletion and later label reuse.
+Older stored deployments without a captured label continue to omit it.
 
 ### Supported Operations
 
@@ -50,6 +71,7 @@ It returns only the deployed version, its content type and `Configuration-Versio
 - `DeleteConfigurationProfile`
 - `CreateHostedConfigurationVersion`
 - `GetHostedConfigurationVersion`
+- `ListHostedConfigurationVersions`
 - `DeleteHostedConfigurationVersion`
 - `CreateDeploymentStrategy`
 - `GetDeploymentStrategy`
@@ -68,8 +90,11 @@ feature flags are resolved as on the [data plane](#data-plane), including Ion fo
 An exact resource ID takes precedence over another resource's name. If multiple resources in the
 selected scope share a name, name lookup returns `BadRequestException`; use the intended resource's ID.
 This also applies to the management operations and `StartConfigurationSession` that use these lookups.
-A `client_configuration_version` equal to the deployed version returns HTTP 204 with an empty body
-and `Configuration-Version`, without `Content-Type` or `Content-Length`. An empty configuration
+For hosted configurations, a `client_configuration_version` equal to the deployed version returns HTTP 204 with an empty body
+and `Configuration-Version`, without `Content-Type` or `Content-Length`.
+An unchanged retained S3 version returns HTTP 200 with an empty body and its stored content type,
+matching the observed S3 response. The AWS API reference documents HTTP 204 for matching versions generally.
+An empty configuration
 that the caller has not received still returns HTTP 200 and its stored content type.
 A missing or undeployed environment returns `BadRequestException`; an unknown application or configuration profile
 returns `ResourceNotFoundException`.
@@ -98,9 +123,26 @@ validates the retrieved hosted or S3 version before creating a deployment or cha
 `UpdateConfigurationProfile` changes only supplied fields. An empty `Validators` list clears validation;
 a schema update does not change already deployed bytes. CloudFormation updates replace mutable fields,
 clear validators omitted from the template, and restore the prior schema on rollback. Stored validators
-survive restart. External schema references and other inline schema drafts are refused. Lambda validator
-declarations are retained, but validation and deployment requiring them fail explicitly because invoking
-Lambda validators is not implemented. `UpdateConfigurationProfile` rejects `KmsKeyIdentifier`.
+survive restart. External schema references and other inline schema drafts are refused.
+`UpdateConfigurationProfile` rejects `KmsKeyIdentifier`.
+
+Clearing `Description` with an empty string returns `Description: ""` in the update response.
+The following `GetConfigurationProfile` response omits `Description`; other fields retain their values.
+
+Hosted profiles also support `LAMBDA` validators naming a function ARN. Both validation and deployment
+invoke the function with five string fields: `applicationId`, `configurationProfileId`,
+`configurationVersion`, base64-encoded `content`, and `uri` set to `hosted`. The event uses the resolved
+resource IDs and numeric hosted version. An ordinary return value, including `false` or an error-shaped
+JSON object, succeeds; a Lambda function error refuses validation with `BadRequestException`.
+With IAM enforcement enabled, the function's resource policy must allow `appconfig.amazonaws.com`
+to invoke it. Source conditions receive the exact configuration-profile ARN and the calling account.
+
+The validation wait has a 15-second budget, including invocation startup. A function already running
+when that budget expires may finish later; its result cannot publish a deployment or active content.
+Floci tracks at most 32 outstanding validator invocations per process and refuses reset while any remain.
+Explicit process shutdown requests worker interruption and waits up to five seconds for them to drain;
+that shutdown behavior is separate from an ordinary validation timeout. Lambda validation of external
+configuration sources is not supported.
 
 `UpdateEnvironment` and `UpdateDeploymentStrategy` apply only the mutable fields present in a native
 PATCH request. Omitted fields retain their values; an empty description or monitor list clears that
@@ -174,9 +216,21 @@ with `BadRequestException` before changing the active version or stopping the de
 Older persisted deployments without completion timestamps cannot be reverted because
 that window cannot be verified.
 
+Completed reverts preserve `StartedAt` and `CompletedAt`. They prepend a
+`REVERT_COMPLETED` event with `TriggeredBy: USER` and the revert time, retaining all
+recorded event history. Environment state aggregation, ordinary deployment start
+and completion events, and event `ActionInvocations` fields remain unimplemented.
+
+S3 configuration responses do not use a hosted `VersionLabel`; their opaque VersionId remains
+the deployment and legacy configuration version.
+
 ## Data Plane (AppConfigData) {#data-plane}
 
 The data plane is used by applications to retrieve the active configuration for an environment and profile.
+
+Newly delivered hosted content includes `Version-Label` only when its version has a label.
+An empty hosted payload still carries its label when it is new to the session. An unchanged
+poll returns an empty payload without that header and retains the resolved `Content-Type`.
 
 ### Supported Operations
 

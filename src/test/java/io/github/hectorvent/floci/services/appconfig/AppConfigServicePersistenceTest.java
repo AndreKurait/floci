@@ -184,6 +184,8 @@ class AppConfigServicePersistenceTest {
         String environmentId = service.createEnvironment(appId, Map.of("Name", "restarted-env")).getId();
         String profileId = service.createConfigurationProfile(appId, Map.of(
                 "Name", "service-settings", "LocationUri", "hosted")).getId();
+        service.createHostedConfigurationVersion(appId, profileId,
+                "{}".getBytes(StandardCharsets.UTF_8), "application/json", null);
         String strategyId = service.createDeploymentStrategy(Map.of(
                 "Name", "gradual", "DeploymentDurationInMinutes", 15, "FinalBakeTimeInMinutes", 5,
                 "GrowthFactor", 25, "GrowthType", "EXPONENTIAL")).getId();

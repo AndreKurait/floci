@@ -3,6 +3,8 @@ package io.github.hectorvent.floci.services.appconfig;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.services.appconfig.AppConfigDataService.LegacyConfiguration;
 import io.github.hectorvent.floci.services.appconfig.model.Application;
@@ -24,6 +26,7 @@ import jakarta.ws.rs.PathParam;
 import jakarta.ws.rs.Produces;
 import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.core.Context;
+import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.UriInfo;
@@ -146,7 +149,13 @@ public class AppConfigController {
     @GET
     @Path("/applications/{appId}/configurationprofiles/{profileId}")
     public Response getConfigurationProfile(@PathParam("appId") String appId, @PathParam("profileId") String profileId) {
-        return Response.ok(service.getConfigurationProfile(appId, profileId)).build();
+        ConfigurationProfile profile = service.getConfigurationProfile(appId, profileId);
+        if ("".equals(profile.getDescription())) {
+            ObjectNode response = objectMapper.valueToTree(profile);
+            response.remove("Description");
+            return Response.ok(response).build();
+        }
+        return Response.ok(profile).build();
     }
 
     @PATCH
@@ -191,12 +200,14 @@ public class AppConfigController {
     @GET
     @Path("/applications/{appId}/configurationprofiles/{profileId}/hostedconfigurationversions")
     public Response listHostedConfigurationVersions(@PathParam("appId") String appId,
-                                                    @PathParam("profileId") String profileId) {
-        List<HostedConfigurationVersionSummary> items = service.listHostedConfigurationVersions(appId, profileId);
-        ObjectNode root = objectMapper.createObjectNode();
-        ArrayNode arr = root.putArray("Items");
-        items.forEach(arr::addPOJO);
-        return Response.ok(root).build();
+                                                    @PathParam("profileId") String profileId,
+                                                    @QueryParam("max_results") String maxResults,
+                                                    @QueryParam("next_token") String nextToken,
+                                                    @Context UriInfo uriInfo) {
+        PaginatedResult<HostedConfigurationVersionSummary> page = service.listHostedConfigurationVersionsPage(
+                appId, profileId, parseListMaxResults(maxResults, uriInfo),
+                rawNextToken(nextToken, uriInfo), uriInfo.getQueryParameters().getFirst("version_label"));
+        return listResponse(page.items(), page.nextToken());
     }
 
     @POST
@@ -206,8 +217,12 @@ public class AppConfigController {
                                                      @PathParam("profileId") String profileId,
                                                      @HeaderParam("Content-Type") String contentType,
                                                      @HeaderParam("Description") String description,
+                                                     @Context HttpHeaders headers,
                                                      byte[] content) {
-        HostedConfigurationVersion version = service.createHostedConfigurationVersion(appId, profileId, content, contentType, description);
+        HostedConfigurationVersion version = service.createHostedConfigurationVersion(
+                appId, profileId, content, contentType, description,
+                headers.getHeaderString("VersionLabel"),
+                parseLatestVersionNumber(headers.getHeaderString("Latest-Version-Number")));
         return versionResponse(version, 201);
     }
 
@@ -236,6 +251,9 @@ public class AppConfigController {
         rb.header("Version-Number", v.getVersionNumber());
         rb.header("Content-Type", v.getContentType());
         if (v.getDescription() != null) rb.header("Description", v.getDescription());
+        if (v.getVersionLabel() != null) {
+            rb.header("VersionLabel", v.getVersionLabel());
+        }
         return rb.build();
     }
 
@@ -345,7 +363,7 @@ public class AppConfigController {
         String clientVersion = uriInfo.getQueryParameters().getFirst("client_configuration_version");
         LegacyConfiguration data = dataService.getConfiguration(
                 appId, envId, configuration, clientId, clientVersion, accept);
-        if (data.configurationVersion().equals(clientVersion)) {
+        if (data.configurationVersion().equals(clientVersion) && !data.s3Source()) {
             return Response.noContent()
                     .header("Configuration-Version", data.configurationVersion())
                     .build();
@@ -356,5 +374,39 @@ public class AppConfigController {
                 .header("Content-Type", contentType)
                 .header("Configuration-Version", data.configurationVersion())
                 .build();
+    }
+
+    private Response listResponse(List<?> items, String nextToken) {
+        ObjectNode root = objectMapper.createObjectNode();
+        ArrayNode itemArray = root.putArray("Items");
+        items.forEach(itemArray::addPOJO);
+        if (nextToken != null) {
+            root.put("NextToken", nextToken);
+        }
+        return Response.ok(root).build();
+    }
+
+    private static String rawNextToken(String nextToken, UriInfo uriInfo) {
+        return nextToken == null && uriInfo.getQueryParameters().containsKey("next_token")
+                ? "" : nextToken;
+    }
+
+    private static Integer parseListMaxResults(String maxResults, UriInfo uriInfo) {
+        if (uriInfo.getQueryParameters().containsKey("max_results")
+                && (maxResults == null || maxResults.isBlank())) {
+            throw new AwsException("BadRequestException", "max_results must be an integer.", 400);
+        }
+        return Pagination.parseMaxResults(maxResults, "BadRequestException");
+    }
+
+    private static Integer parseLatestVersionNumber(String value) {
+        if (value == null) {
+            return null;
+        }
+        try {
+            return Integer.valueOf(value);
+        } catch (NumberFormatException e) {
+            throw new AwsException("BadRequestException", "LatestVersionNumber must be an integer.", 400);
+        }
     }
 }
