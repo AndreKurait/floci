@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.core.common.dns.DnsAnswer;
 import io.github.hectorvent.floci.core.common.dns.DnsClientVpcSource.ClientVpc;
 import io.github.hectorvent.floci.core.common.dns.DnsRecordSource;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
+import io.github.hectorvent.floci.services.elbv2.model.Listener;
 import io.github.hectorvent.floci.services.elbv2.model.LoadBalancer;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -60,11 +61,31 @@ public class ElbV2DnsRecordSource implements DnsRecordSource {
         boolean publicHttps = config != null && "internet-facing".equals(target.getScheme())
                 && config.network().vpcRouting().enabled()
                 && config.network().vpcRouting().publicAwsApi()
-                && config.network().vpcRouting().publicAwsApiNativeHttps()
                 && config.tls().enabled() && config.tls().awsHttpsPort() == 443;
-        Optional<String> selectedAddress = publicHttps ? dns.publicApiAddress(origin) : dns.getServerIp();
+        Optional<String> selectedAddress = dns.getServerIp();
+        if (publicHttps && config.network().vpcRouting().publicAwsApiNativeHttps()) {
+            selectedAddress = dns.publicApiAddress(origin);
+        } else if (publicHttps && config.network().vpcRouting().publicAwsApiUpstreamHost().isPresent()
+                && servesNativeHttpPorts(target)) {
+            selectedAddress = dns.publicAlbHttpsAddress(origin);
+        }
         return Optional.of(selectedAddress
                 .map(address -> DnsAnswer.records(List.of(address), 60))
                 .orElseGet(DnsAnswer::noData));
+    }
+
+    private boolean servesNativeHttpPorts(LoadBalancer loadBalancer) {
+        List<Listener> listeners = service.findListenersForLoadBalancer(loadBalancer.getLoadBalancerArn());
+        if (listeners.isEmpty()) {
+            return false;
+        }
+        for (Listener listener : listeners) {
+            boolean http = "HTTP".equals(listener.getProtocol()) && Integer.valueOf(80).equals(listener.getPort());
+            boolean https = "HTTPS".equals(listener.getProtocol()) && Integer.valueOf(443).equals(listener.getPort());
+            if (!http && !https) {
+                return false;
+            }
+        }
+        return true;
     }
 }

@@ -17,6 +17,8 @@ import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.http.apache5.Apache5HttpClient;
 import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.acm.AcmClient;
+import software.amazon.awssdk.services.acm.model.DeleteCertificateRequest;
 import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.elasticloadbalancingv2.ElasticLoadBalancingV2Client;
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.DeleteLoadBalancerRequest;
@@ -63,22 +65,28 @@ class ElbV2AliasDnsIntegrationTest {
     URI endpoint;
 
     @ParameterizedTest
-    @CsvSource({"internal,false,false,false,true", "internet-facing,false,false,false,true",
-            "internal,true,false,false,true", "internet-facing,true,false,false,true",
-            "internal,false,true,false,true", "internet-facing,false,true,false,true",
-            "internal,true,true,false,true", "internet-facing,true,true,false,true",
-            "internal,false,false,true,true", "internet-facing,false,false,true,true",
-            "internal,false,true,true,true", "internet-facing,false,true,true,true",
-            "internal,false,false,true,false", "internet-facing,false,false,true,false",
-            "internal,false,true,true,false", "internet-facing,false,true,true,false"})
+    @CsvSource({"internal,false,false,false,true,false", "internet-facing,false,false,false,true,false",
+            "internal,true,false,false,true,false", "internet-facing,true,false,false,true,false",
+            "internal,false,true,false,true,false", "internet-facing,false,true,false,true,false",
+            "internal,true,true,false,true,false", "internet-facing,true,true,false,true,false",
+            "internal,false,false,true,true,false", "internet-facing,false,false,true,true,false",
+            "internal,false,true,true,true,false", "internet-facing,false,true,true,true,false",
+            "internal,false,false,true,false,false", "internet-facing,false,false,true,false,false",
+            "internal,false,true,true,false,false", "internet-facing,false,true,true,false,false",
+            "internal,false,false,false,true,true", "internet-facing,false,false,false,true,true",
+            "internet-facing,false,true,false,true,true", "internet-facing,false,false,false,false,true",
+            "internet-facing,true,false,false,true,true", "internet-facing,true,true,false,true,true"})
     void publicAliasFindsItsNativeAlbAcrossAccounts(String scheme, boolean declaredPublicRoute,
-                                                   boolean weighted, boolean nativeHttps, boolean knownVpc)
+                                                   boolean weighted, boolean nativeHttps, boolean knownVpc,
+                                                   boolean externalApi)
             throws Exception {
         StaticCredentialsProvider owner =
                 StaticCredentialsProvider.create(AwsBasicCredentials.create("730000000001", "test"));
         StaticCredentialsProvider zoneOwner =
                 StaticCredentialsProvider.create(AwsBasicCredentials.create("730000000002", "test"));
         try (Ec2Client ec2 = Ec2Client.builder().endpointOverride(endpoint).region(Region.EU_WEST_1)
+                     .credentialsProvider(owner).httpClientBuilder(Apache5HttpClient.builder()).build();
+             AcmClient acm = AcmClient.builder().endpointOverride(endpoint).region(Region.EU_WEST_1)
                      .credentialsProvider(owner).httpClientBuilder(Apache5HttpClient.builder()).build();
              ElasticLoadBalancingV2Client elb = ElasticLoadBalancingV2Client.builder().endpointOverride(endpoint)
                      .region(Region.EU_WEST_1).credentialsProvider(owner)
@@ -93,6 +101,7 @@ class ElbV2AliasDnsIntegrationTest {
             List<String> subnets = new ArrayList<>();
             String zone = null;
             String arn = null;
+            String certificate = null;
             ResourceRecordSet installed = null;
             DatagramSocket listener = vertx.createDatagramSocket(new DatagramSocketOptions().setIpV6(false));
             try {
@@ -103,6 +112,8 @@ class ElbV2AliasDnsIntegrationTest {
                 LoadBalancer target = elb.createLoadBalancer(r -> r.name("dns-" + UUID.randomUUID().toString().substring(0, 20))
                         .type("application").scheme(scheme).subnets(subnets)).loadBalancers().getFirst();
                 arn = target.loadBalancerArn();
+                certificate = acm.requestCertificate(r -> r.domainName(name).validationMethod("DNS")).certificateArn();
+                String https = createHttpsListener(elb, arn, certificate);
                 assertTrue(arn.contains(":730000000001:"));
                 assertTrue(other.describeLoadBalancers().loadBalancers().stream()
                         .noneMatch(lb -> lb.loadBalancerArn().equals(target.loadBalancerArn())));
@@ -111,16 +122,19 @@ class ElbV2AliasDnsIntegrationTest {
                 List<DnsRecordSource> sources = new ArrayList<>();
                 DnsClientVpcSource clients = address -> knownVpc ? Optional.of(
                         new DnsClientVpcSource.ClientVpc("730000000001", "eu-west-1", vpc)) : Optional.empty();
+                boolean publicTransport = nativeHttps || externalApi;
                 EmbeddedDnsServer dns = spy(new EmbeddedDnsServer(
-                        List.of(), sources, List.of(), List.of(clients), declaredPublicRoute || nativeHttps,
+                        List.of(), sources, List.of(), List.of(clients), declaredPublicRoute || publicTransport,
                         declaredPublicRoute ? List.of(name) : List.of()));
                 doReturn(Optional.of("127.0.0.1")).when(dns).getServerIp();
                 sources.add(new Route53DnsRecordSource(zones, config, new DnsLookupHelper(), dns));
                 EmulatorConfig transportConfig = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
-                when(transportConfig.network().vpcRouting().enabled()).thenReturn(nativeHttps);
-                when(transportConfig.network().vpcRouting().publicAwsApi()).thenReturn(nativeHttps);
+                when(transportConfig.network().vpcRouting().enabled()).thenReturn(publicTransport);
+                when(transportConfig.network().vpcRouting().publicAwsApi()).thenReturn(publicTransport);
                 when(transportConfig.network().vpcRouting().publicAwsApiNativeHttps()).thenReturn(nativeHttps);
-                when(transportConfig.tls().enabled()).thenReturn(nativeHttps);
+                when(transportConfig.network().vpcRouting().publicAwsApiUpstreamHost())
+                        .thenReturn(externalApi ? Optional.of("172.18.0.20") : Optional.empty());
+                when(transportConfig.tls().enabled()).thenReturn(publicTransport);
                 when(transportConfig.tls().awsHttpsPort()).thenReturn(443);
                 sources.add(new ElbV2DnsRecordSource(loadBalancers, dns, transportConfig));
                 listener.listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
@@ -133,13 +147,24 @@ class ElbV2AliasDnsIntegrationTest {
                 byte[] response = query(listener, name, 1);
                 assertEquals(0, rcode(response));
                 assertEquals(1, ByteBuffer.wrap(response).getShort(6));
-                String expectedAddress = declaredPublicRoute
-                        || nativeHttps && knownVpc && "internet-facing".equals(scheme)
-                        ? EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS : "127.0.0.1";
+                String expectedAddress = "127.0.0.1";
+                if (declaredPublicRoute) {
+                    expectedAddress = EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS;
+                } else if (externalApi && knownVpc && "internet-facing".equals(scheme)) {
+                    expectedAddress = EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS;
+                } else if (nativeHttps && knownVpc && "internet-facing".equals(scheme)) {
+                    expectedAddress = EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS;
+                }
                 assertArrayEquals(InetAddress.getByName(expectedAddress).getAddress(), address(response));
                 assertTrue((ByteBuffer.wrap(response).getShort(2) & 0x0400) != 0);
                 assertEquals(0, rcode(query(listener, name, 28)));
                 assertEquals(0, ByteBuffer.wrap(query(listener, name, 28)).getShort(6));
+
+                if (externalApi && knownVpc && !declaredPublicRoute && !weighted
+                        && "internet-facing".equals(scheme)) {
+                    verifyListenerChangesPreserveOtherPorts(elb, listener, name, target.loadBalancerArn(),
+                            certificate, https);
+                }
 
                 installed = withRouting(ResourceRecordSet.builder().name(name).type("A").ttl(60L)
                         .resourceRecords(record -> record.value("127.0.0.1")).build(), weighted);
@@ -174,12 +199,47 @@ class ElbV2AliasDnsIntegrationTest {
                 if (arn != null) {
                     elb.deleteLoadBalancer(DeleteLoadBalancerRequest.builder().loadBalancerArn(arn).build());
                 }
+                if (certificate != null) {
+                    acm.deleteCertificate(DeleteCertificateRequest.builder().certificateArn(certificate).build());
+                }
                 for (String subnet : subnets) {
                     ec2.deleteSubnet(r -> r.subnetId(subnet));
                 }
                 ec2.deleteVpc(r -> r.vpcId(vpc));
             }
         }
+    }
+
+    private static String createHttpsListener(ElasticLoadBalancingV2Client elb, String arn, String certificate) {
+        return elb.createListener(r -> r.loadBalancerArn(arn).protocol("HTTPS").port(443)
+                .certificates(c -> c.certificateArn(certificate)).defaultActions(a -> a.type("fixed-response")
+                        .fixedResponseConfig(f -> f.statusCode("200").contentType("text/plain").messageBody("owned"))))
+                .listeners().getFirst().listenerArn();
+    }
+
+    private static void verifyListenerChangesPreserveOtherPorts(ElasticLoadBalancingV2Client elb,
+                                                                DatagramSocket dns, String name, String arn,
+                                                                String certificate, String https) throws Exception {
+        String http = elb.createListener(r -> r.loadBalancerArn(arn).protocol("HTTP").port(80)
+                .defaultActions(a -> a.type("redirect").redirectConfig(c -> c.protocol("HTTPS").port("443")
+                        .statusCode("HTTP_301")))).listeners().getFirst().listenerArn();
+        byte[] isolatedAddress = InetAddress.getByName(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS)
+                .getAddress();
+        assertArrayEquals(isolatedAddress, address(query(dns, name, 1)),
+                "A mixed HTTP/HTTPS ALB retains its isolated route for both listeners");
+        elb.deleteListener(r -> r.listenerArn(https));
+        assertArrayEquals(isolatedAddress, address(query(dns, name, 1)),
+                "An HTTP-only ALB uses the isolated route");
+        elb.deleteListener(r -> r.listenerArn(http));
+        assertArrayEquals(InetAddress.getByName("127.0.0.1").getAddress(), address(query(dns, name, 1)),
+                "An ALB without listeners is not advertised on the isolated ALB destination");
+        String restored = createHttpsListener(elb, arn, certificate);
+        assertArrayEquals(InetAddress.getByName(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS).getAddress(),
+                address(query(dns, name, 1)), "The only HTTPS443 listener restores the dedicated destination");
+        elb.modifyListener(r -> r.listenerArn(restored).port(8443));
+        assertArrayEquals(InetAddress.getByName("127.0.0.1").getAddress(), address(query(dns, name, 1)),
+                "A custom HTTPS port retains its existing address");
+        elb.modifyListener(r -> r.listenerArn(restored).port(443));
     }
 
     private static ResourceRecordSet withRouting(ResourceRecordSet record, boolean weighted) {

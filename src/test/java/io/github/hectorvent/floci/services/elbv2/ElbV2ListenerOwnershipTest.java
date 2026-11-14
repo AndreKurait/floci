@@ -21,6 +21,7 @@ import io.vertx.core.http.HttpServerResponse;
 import io.vertx.core.net.NetServer;
 import io.vertx.core.net.NetServerOptions;
 import io.vertx.core.net.SSLOptions;
+import io.vertx.core.net.SocketAddress;
 import io.vertx.ext.web.Route;
 import io.vertx.ext.web.Router;
 import io.vertx.ext.web.RoutingContext;
@@ -779,6 +780,7 @@ class ElbV2ListenerOwnershipTest {
             HttpServerRequest request = mock(HttpServerRequest.class);
             HttpServerResponse response = mock(HttpServerResponse.class);
             when(request.host()).thenReturn(HOST);
+            when(request.localAddress()).thenReturn(SocketAddress.inetSocketAddress(port, "127.0.0.1"));
             when(request.response()).thenReturn(response);
             when(response.setStatusCode(anyInt())).thenReturn(response);
             handlers.get(port).handle(request);

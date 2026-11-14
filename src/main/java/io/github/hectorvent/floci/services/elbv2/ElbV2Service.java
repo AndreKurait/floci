@@ -546,6 +546,15 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                 .toList();
     }
 
+    /** DNS inspects the selected load balancer's listeners across management accounts. */
+    List<Listener> findListenersForLoadBalancer(String loadBalancerArn) {
+        Collection<Map<String, Listener>> regions =
+                listenersStore != null ? listenersStore.scanAllAccounts() : listeners.values();
+        return regions.stream().flatMap(region -> region.values().stream())
+                .filter(listener -> loadBalancerArn.equals(listener.getLoadBalancerArn()))
+                .toList();
+    }
+
     public List<LoadBalancer> describeLoadBalancers(String region, List<String> arns, List<String> names,
                                                      String marker, Integer pageSize) {
         Map<String, LoadBalancer> regionLbs = loadBalancers.getOrDefault(region, Map.of());

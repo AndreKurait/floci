@@ -5,6 +5,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.HashSet;
+import java.util.Map;
 import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -52,6 +53,41 @@ class PublicApiProxySourcesServiceTest {
         sources.register(new Object(), PEER, Set.of(CALLER));
         assertThrows(IllegalArgumentException.class, () -> sources.decode(current, PREFACE));
         assertDoesNotThrow(() -> sources.decode(sources.ticket(PEER), PREFACE));
+    }
+
+    @Test
+    void nativeAlbAndApiKeepIndependentCallerAdmissionAndWithdrawal() {
+        String albPreface = PREFACE.replace("192.0.2.1", "192.0.2.2");
+        sources.register(owner, PEER, Map.of("192.0.2.1", Set.of("172.18.1.11"), "192.0.2.2", Set.of(CALLER)));
+        PublicApiProxySources.Ticket ticket = sources.ticket(PEER);
+        assertEquals("192.0.2.2", sources.decode(ticket, albPreface).destination().hostAddress());
+        assertThrows(IllegalArgumentException.class, () -> sources.decode(ticket, PREFACE));
+        assertThrows(IllegalArgumentException.class,
+                () -> sources.decode(ticket, albPreface.replace(CALLER, "172.18.1.11")));
+
+        sources.register(owner, PEER, Map.of("192.0.2.1", Set.of(CALLER), "192.0.2.2", Set.of()));
+        assertThrows(IllegalArgumentException.class, () -> sources.decode(ticket, albPreface));
+        assertThrows(IllegalArgumentException.class, () -> sources.decode(sources.ticket(PEER), albPreface));
+        assertEquals(CALLER, sources.decode(sources.ticket(PEER), PREFACE).source().hostAddress());
+        assertThrows(IllegalArgumentException.class,
+                () -> sources.register(owner, PEER, Map.of("192.0.2.3", Set.of(CALLER))));
+    }
+
+    @Test
+    void nativeAlbHttpRetainsItsDestinationPortWithoutAdmittingApiHttpOrCustomPorts() {
+        sources.register(owner, PEER, Map.of("192.0.2.1", Set.of(CALLER), "192.0.2.2", Set.of(CALLER)));
+        PublicApiProxySources.Ticket ticket = sources.ticket(PEER);
+        String alb = PREFACE.replace("192.0.2.1", "192.0.2.2");
+        PublicApiProxySources.Addresses http = sources.decode(ticket, alb.replace("443\r\n", "80\r\n"));
+        assertEquals("192.0.2.2", http.destination().hostAddress());
+        assertEquals(80, http.destination().port());
+        assertEquals(443, sources.decode(ticket, alb).destination().port());
+        for (String port : Set.of("0", "080", "81", "8080", "8443", "65536")) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> sources.decode(ticket, alb.replace("443\r\n", port + "\r\n")));
+        }
+        assertThrows(IllegalArgumentException.class,
+                () -> sources.decode(ticket, PREFACE.replace("443\r\n", "80\r\n")));
     }
 
     @ParameterizedTest

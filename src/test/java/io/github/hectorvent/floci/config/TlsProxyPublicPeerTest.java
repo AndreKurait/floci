@@ -14,10 +14,12 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
@@ -31,6 +33,7 @@ class TlsProxyPublicPeerTest {
     private final PublicApiProxySources sources = new PublicApiProxySources();
     private final Object owner = new Object();
     private final BlockingQueue<Observed> received = new LinkedBlockingQueue<>();
+    private final AtomicInteger backendConnections = new AtomicInteger();
     private static final byte[] PAYLOAD = {0x16, 3, 3, 0, 6, 0, 1, (byte) 255, 4, 5, 6};
 
     @BeforeEach
@@ -38,12 +41,14 @@ class TlsProxyPublicPeerTest {
         vertx = Vertx.vertx();
         NetServer backend = vertx.createNetServer(new NetServerOptions().setUseProxyProtocol(true))
                 .connectHandler(socket -> {
+                    backendConnections.incrementAndGet();
                     Buffer payload = Buffer.buffer();
                     socket.handler(bytes -> {
                         payload.appendBuffer(bytes);
                         if (payload.length() >= expectedLength) {
                             received.add(new Observed(socket.remoteAddress().hostAddress(),
-                                    socket.remoteAddress().port(), payload.getBytes()));
+                                    socket.remoteAddress().port(), socket.localAddress().hostAddress(),
+                                    socket.localAddress().port(), payload.getBytes()));
                             socket.write(payload).onSuccess(ignored -> socket.close());
                         }
                     });
@@ -93,6 +98,43 @@ class TlsProxyPublicPeerTest {
             socket.getOutputStream().flush();
             assertEquals(-1, socket.getInputStream().read());
             assertTrue(received.isEmpty());
+        }
+    }
+
+    @Test
+    void nativeAlbHttpPreservesTheOriginalDestinationOverTheBackendSocket() throws Exception {
+        sources.register(owner, "127.0.0.1", Map.of("192.0.2.2", Set.of("172.18.1.10")));
+        byte[] request = "GET / HTTP/1.1\r\nHost: owned.example.test\r\n\r\n".getBytes(StandardCharsets.US_ASCII);
+        expectedLength = request.length;
+        try (Socket socket = connect()) {
+            socket.getOutputStream().write(
+                    "PROXY TCP4 172.18.1.10 192.0.2.2 49152 80\r\n".getBytes(StandardCharsets.US_ASCII));
+            socket.getOutputStream().write(request);
+            socket.getOutputStream().flush();
+            Observed observation = received.poll(5, TimeUnit.SECONDS);
+            assertNotNull(observation, "The admitted HTTP request must reach the loopback backend");
+            assertEquals("192.0.2.2", observation.destination());
+            assertEquals(80, observation.destinationPort());
+            assertEquals("172.18.1.10", observation.address());
+            assertArrayEquals(request, observation.payload());
+            assertArrayEquals(request, socket.getInputStream().readNBytes(request.length));
+        }
+    }
+
+    @Test
+    void nativeAlbRejectsTlsOnHttpAndPlaintextOnHttpsBeforeContactingAnyBackend() throws Exception {
+        sources.register(owner, "127.0.0.1", Map.of("192.0.2.2", Set.of("172.18.1.10")));
+        for (int destination : Set.of(80, 443)) {
+            try (Socket socket = connect()) {
+                socket.getOutputStream().write(("PROXY TCP4 172.18.1.10 192.0.2.2 49152 "
+                        + destination + "\r\n").getBytes(StandardCharsets.US_ASCII));
+                socket.getOutputStream().write(destination == 80 ? PAYLOAD
+                        : "GET / HTTP/1.1\r\nHost: owned.example.test\r\n\r\n".getBytes(StandardCharsets.US_ASCII));
+                socket.getOutputStream().flush();
+                assertEquals(-1, socket.getInputStream().read());
+                assertTrue(received.isEmpty());
+                assertEquals(0, backendConnections.get(), "Wrong-protocol traffic must not contact the backend");
+            }
         }
     }
 
@@ -147,5 +189,5 @@ class TlsProxyPublicPeerTest {
         return "PROXY TCP4 " + address + " 192.0.2.1 49152 443\r\n";
     }
 
-    private record Observed(String address, int port, byte[] payload) {}
+    private record Observed(String address, int port, String destination, int destinationPort, byte[] payload) {}
 }

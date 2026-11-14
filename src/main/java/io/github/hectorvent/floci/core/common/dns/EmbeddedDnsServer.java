@@ -467,8 +467,11 @@ public class EmbeddedDnsServer {
             return resolved;
         }
         return resolved.map(answer -> {
-            boolean ownedListener = answer.responseCode() == 0 && getServerIp().map(address ->
+            boolean localListener = getServerIp().map(address ->
                     answer.records().equals(List.of(new DnsRecord.Address(1, address)))).orElse(false);
+            boolean nativeAlb = answer.records().equals(List.of(
+                    new DnsRecord.Address(1, EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS)));
+            boolean ownedListener = answer.responseCode() == 0 && (localListener || nativeAlb);
             if (ownedListener && origin == null) {
                 return answer.viaUpstream();
             }
@@ -482,6 +485,12 @@ public class EmbeddedDnsServer {
     public Optional<String> publicApiAddress(DnsClientVpcSource.ClientVpc origin) {
         return publicAwsApi && origin != null && isUsableOrigin(origin)
                 ? Optional.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS) : getServerIp();
+    }
+
+    /** A native public ALB keeps its own TLS transport when API traffic uses an external front door. */
+    public Optional<String> publicAlbHttpsAddress(DnsClientVpcSource.ClientVpc origin) {
+        return publicAwsApi && origin != null && isUsableOrigin(origin)
+                ? Optional.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS) : getServerIp();
     }
 
     private Optional<DnsAnswer> resolveRecordWithOwnership(String name, String myIp, int type) {

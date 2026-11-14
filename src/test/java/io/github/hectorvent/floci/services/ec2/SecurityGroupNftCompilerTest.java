@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.ec2;
 
 import io.github.hectorvent.floci.services.ec2.model.IpPermission;
 import io.github.hectorvent.floci.services.ec2.model.IpRange;
+import io.github.hectorvent.floci.services.ec2.model.PrefixListId;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.model.UserIdGroupPair;
 import org.junit.jupiter.api.Test;
@@ -10,11 +11,82 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class SecurityGroupNftCompilerTest {
+
+    @Test
+    void translatedPublicApiUsesTheOriginalPortAndAddressBeforePhysicalCidrPermissions() {
+        SecurityGroup group = new SecurityGroup();
+        group.getIpPermissionsEgress().add(tcpEgress("192.0.2.1/32", 443));
+        group.getIpPermissionsEgress().add(tcpEgress("172.17.0.0/16", 80));
+        String rules = publicApiRules(group, Map.of());
+
+        String original = "ct direction original ct status dnat ct original ip daddr 192.0.2.1";
+        assertTrue(rules.contains(original + " ct original proto-dst 443 counter accept"));
+        assertTrue(rules.contains(original + " ct original proto-dst 80 counter drop"));
+        assertTrue(rules.indexOf(original + " ct original proto-dst 80 counter drop")
+                < rules.indexOf("ip daddr 172.17.0.0/16 tcp dport 80 accept"));
+        assertTrue(rules.indexOf("ct state established,related accept") < rules.indexOf(original),
+                "Existing security-group connection tracking semantics stay intact");
+    }
+
+    @Test
+    void translatedPublicApiRefreshesTheExistingManagedPrefixListPolicy() {
+        SecurityGroup group = new SecurityGroup();
+        IpPermission permission = tcpEgress("172.17.0.0/16", 443);
+        PrefixListId reference = new PrefixListId();
+        reference.setPrefixListId("pl-api");
+        permission.getPrefixListIds().add(reference);
+        group.getIpPermissionsEgress().add(permission);
+        String original = "ct original ip daddr 192.0.2.1 ct original proto-dst 443";
+
+        assertTrue(publicApiRules(group, Map.of("pl-api", List.of("192.0.2.1/32")))
+                .contains(original + " counter accept"));
+        assertTrue(publicApiRules(group, Map.of("pl-api", List.of("203.0.113.0/24")))
+                .contains(original + " counter drop"),
+                "The translated frontdoor CIDR must not override withdrawal of the original API destination");
+    }
+
+    @Test
+    void translatedPublicApiPolicyIsInstalledBeforePublicAddressPublication() {
+        SecurityGroup group = new SecurityGroup();
+        group.getIpPermissionsEgress().add(tcpEgress("172.17.0.20/32", 8443));
+        String rules = SecurityGroupNftCompiler.compile(
+                endpoint("eni-a", "10.0.0.2", "172.17.0.2", group), List.of(), Map.of());
+
+        String original = "ct direction original ct status dnat ct original ip daddr 192.0.2.1";
+        String denyHttps = original + " ct original proto-dst 443 counter drop";
+        String upstream = "ip daddr 172.17.0.20/32 tcp dport 8443 accept";
+        assertTrue(rules.contains(denyHttps),
+                "The initial policy must deny translated API traffic before a public address is published");
+        assertTrue(rules.contains(original + " ct original proto-dst 80 counter drop"));
+        assertTrue(rules.contains(upstream), "Untranslated traffic keeps its physical-tuple permission");
+        assertTrue(rules.indexOf(denyHttps) < rules.indexOf(upstream),
+                "An allowed upstream must not bypass the denied original API destination");
+        assertEquals(rules, publicApiRules(group, Map.of()),
+                "Publishing the address must not be needed to install the translated API policy");
+    }
+
+    private static String publicApiRules(SecurityGroup group, Map<String, List<String>> prefixLists) {
+        return SecurityGroupNftCompiler.compile(endpoint("eni-a", "10.0.0.2", "172.17.0.2", group),
+                List.of(), prefixLists, List.of(), false, peer -> true, List.of(), List.of(),
+                Set.of("172.17.0.2"));
+    }
+
+    private static IpPermission tcpEgress(String cidr, int port) {
+        IpPermission permission = new IpPermission();
+        permission.setIpProtocol("6");
+        permission.setFromPort(port);
+        permission.setToPort(port);
+        IpRange range = new IpRange();
+        range.setCidrIp(cidr);
+        permission.getIpRanges().add(range);
+        return permission;
+    }
 
     @Test
     void isolatedVpcPoliciesDoNotImportAnotherVpcPrivateAddresses() {

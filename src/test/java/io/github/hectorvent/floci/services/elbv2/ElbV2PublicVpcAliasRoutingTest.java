@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.dns.DnsAnswer;
 import io.github.hectorvent.floci.core.common.dns.DnsClientVpcSource;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
+import io.github.hectorvent.floci.services.elbv2.model.Listener;
 import io.github.hectorvent.floci.services.elbv2.model.LoadBalancer;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -48,6 +49,45 @@ class ElbV2PublicVpcAliasRoutingTest {
         }
     }
 
+    @Test
+    void externalApiFrontDoorUsesTheDistinctNativeAlbDestination() {
+        ElbV2DnsRecordSource source = source(true, true, false, true, 443, true, true);
+        DnsAnswer answer = source.resolveAliasTarget(NAME, "ZOWNED", 1, VPC).orElseThrow();
+        assertEquals(List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS), answer.addresses());
+        assertEquals(60, answer.ttlSeconds());
+        assertEquals(List.of(CONTROL), source.resolveAliasTarget(NAME, "ZOWNED", 1, null)
+                .orElseThrow().addresses());
+        assertEquals(DnsAnswer.refused(), source.resolveAliasTarget(NAME, "OTHER", 1, VPC).orElseThrow());
+        assertEquals(DnsAnswer.noData(), source.resolveAliasTarget(NAME, "ZOWNED", 28, VPC).orElseThrow());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"HTTP,443", "HTTPS,80", "HTTPS,8443", "HTTP,8080", "TCP,80"})
+    void otherListenerProtocolsAndPortsRetainTheExistingAddress(String protocol, int port) {
+        ElbV2DnsRecordSource source = source(true, true, false, true, 443, true, true,
+                List.of(listener(protocol, port)));
+        assertEquals(List.of(CONTROL), source.resolveAliasTarget(NAME, "ZOWNED", 1, VPC).orElseThrow().addresses());
+    }
+
+    @Test
+    void emptyAndCustomPortListenerSetsRetainTheExistingAddress() {
+        for (List<Listener> listeners : List.of(List.<Listener>of(),
+                List.of(listener("HTTPS", 443), listener("HTTPS", 8443)))) {
+            ElbV2DnsRecordSource source = source(true, true, false, true, 443, true, true, listeners);
+            assertEquals(List.of(CONTROL), source.resolveAliasTarget(NAME, "ZOWNED", 1, VPC).orElseThrow().addresses());
+        }
+    }
+
+    @Test
+    void commonHttpAndHttpsListenerSetsUseTheSameIsolatedAddress() {
+        for (List<Listener> listeners : List.of(List.of(listener("HTTP", 80)),
+                List.of(listener("HTTPS", 443)), List.of(listener("HTTP", 80), listener("HTTPS", 443)))) {
+            ElbV2DnsRecordSource source = source(true, true, false, true, 443, true, true, listeners);
+            assertEquals(List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS),
+                    source.resolveAliasTarget(NAME, "ZOWNED", 1, VPC).orElseThrow().addresses());
+        }
+    }
+
     private static ElbV2DnsRecordSource source(boolean routing, boolean publicApi, boolean nativeHttps,
                                                boolean tls, int port) {
         return source(routing, publicApi, nativeHttps, tls, port, true);
@@ -55,22 +95,48 @@ class ElbV2PublicVpcAliasRoutingTest {
 
     private static ElbV2DnsRecordSource source(boolean routing, boolean publicApi, boolean nativeHttps,
                                                boolean tls, int port, boolean addressAvailable) {
+        return source(routing, publicApi, nativeHttps, tls, port, addressAvailable, false);
+    }
+
+    private static ElbV2DnsRecordSource source(boolean routing, boolean publicApi, boolean nativeHttps,
+                                               boolean tls, int port, boolean addressAvailable, boolean externalApi) {
+        return source(routing, publicApi, nativeHttps, tls, port, addressAvailable, externalApi,
+                List.of(listener("HTTPS", 443)));
+    }
+
+    private static ElbV2DnsRecordSource source(boolean routing, boolean publicApi, boolean nativeHttps,
+                                                boolean tls, int port, boolean addressAvailable, boolean externalApi,
+                                                List<Listener> listeners) {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.network().vpcRouting().enabled()).thenReturn(routing);
         when(config.network().vpcRouting().publicAwsApi()).thenReturn(publicApi);
         when(config.network().vpcRouting().publicAwsApiNativeHttps()).thenReturn(nativeHttps);
+        when(config.network().vpcRouting().publicAwsApiUpstreamHost())
+                .thenReturn(externalApi ? Optional.of("172.18.0.20") : Optional.empty());
         when(config.tls().enabled()).thenReturn(tls);
         when(config.tls().awsHttpsPort()).thenReturn(port);
         EmbeddedDnsServer dns = mock(EmbeddedDnsServer.class);
         when(dns.getServerIp()).thenReturn(addressAvailable ? Optional.of(CONTROL) : Optional.empty());
         when(dns.publicApiAddress(VPC)).thenReturn(addressAvailable
                 ? Optional.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS) : Optional.empty());
+        when(dns.publicAlbHttpsAddress(VPC)).thenReturn(addressAvailable
+                ? Optional.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS) : Optional.empty());
+        when(dns.publicAlbHttpsAddress(null)).thenReturn(addressAvailable ? Optional.of(CONTROL) : Optional.empty());
         LoadBalancer balancer = new LoadBalancer();
+        balancer.setLoadBalancerArn("owned-balancer");
         balancer.setType("application");
         balancer.setScheme("internet-facing");
         balancer.setCanonicalHostedZoneId("ZOWNED");
         ElbV2Service service = mock(ElbV2Service.class);
         when(service.findByDnsName(NAME)).thenReturn(List.of(balancer));
+        when(service.findListenersForLoadBalancer("owned-balancer")).thenReturn(listeners);
         return new ElbV2DnsRecordSource(service, dns, config);
+    }
+
+    private static Listener listener(String protocol, int port) {
+        Listener listener = new Listener();
+        listener.setProtocol(protocol);
+        listener.setPort(port);
+        return listener;
     }
 }
