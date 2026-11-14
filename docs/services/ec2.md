@@ -894,7 +894,7 @@ unscoped evaluation.
 | RevokeSecurityGroupEgress | Removes outbound permissions, matched the same way as the inbound call. |
 | GetSecurityGroupsForVpc | Lists the security groups belonging to one VPC, with the same filters as the describe call. |
 | DescribeSecurityGroupRules | Lists stored security group rules. |
-| ModifySecurityGroupRules | Updates supported fields on security group rules. |
+| ModifySecurityGroupRules | Updates supported fields on security group rules. Description updates are serialized with group deletion so an in-flight update cannot restore a deleted rule. |
 | UpdateSecurityGroupRuleDescriptionsIngress | Updates or clears descriptions by rule ID or permission source, keeping rule IDs and tags. Updates both describe views. The selected group, direction, account and region must match. Supports default-VPC group names and `DryRun`. |
 | UpdateSecurityGroupRuleDescriptionsEgress | Updates outbound rule descriptions with the same selectors and validation as the inbound call. |
 
