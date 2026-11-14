@@ -640,10 +640,10 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             }
         }
 
-        // PutAccountPolicy also needs the action for the type of policy it creates, and
-        // DescribeAccountPolicies the one for the type it lists, as their API references say. An
-        // unknown type needs nothing more: the handler refuses it.
-        if ("logs:PutAccountPolicy".equals(action) || "logs:DescribeAccountPolicies".equals(action)) {
+        // Account-policy operations also require the documented action for that policy type.
+        // An unknown type needs nothing more: the handler refuses it.
+        if ("logs:PutAccountPolicy".equals(action) || "logs:DescribeAccountPolicies".equals(action)
+                || "logs:DeleteAccountPolicy".equals(action)) {
             String typeAction = accountPolicyTypeAction(action, arnBuilder.readJsonBody(ctx));
             if (typeAction != null && abortIfDenied(ctx, caller, principal, typeAction, action, credentialScope,
                     resources, targetContexts, region, accountId, akid)) {
@@ -734,6 +734,16 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             return null;
         }
         String policyType = body.path("policyType").asText();
+        if ("logs:DeleteAccountPolicy".equals(action)) {
+            // The reference names no additional delete action for metric extraction policies.
+            return switch (policyType) {
+                case "DATA_PROTECTION_POLICY" -> "logs:DeleteDataProtectionPolicy";
+                case "SUBSCRIPTION_FILTER_POLICY" -> "logs:DeleteSubscriptionFilter";
+                case "TRANSFORMER_POLICY" -> "logs:DeleteTransformer";
+                case "FIELD_INDEX_POLICY" -> "logs:DeleteIndexPolicy";
+                default -> null;
+            };
+        }
         if ("logs:DescribeAccountPolicies".equals(action)) {
             // The reference names no read action for metric extraction policies.
             return switch (policyType) {

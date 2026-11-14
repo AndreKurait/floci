@@ -7,6 +7,7 @@ import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsCrossAccountService;
 import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
 import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsService;
 import io.floci.aws.services.cloudwatch.logs.LogGroupTagTarget;
+import io.floci.aws.services.cloudwatch.logs.LogTransformerTarget;
 import io.floci.aws.services.dynamodb.DynamoDbConditionKeys;
 import io.floci.aws.services.dynamodb.DynamoDbFacade;
 import io.floci.aws.services.dynamodb.DynamoDbTableNames;
@@ -173,7 +174,8 @@ public class IamConditionContextResolver {
     /** Logs tag operations and group mutations use the handler's resource and request scope. */
     private Map<String, List<String>> logsConditionContext(String action, ContainerRequestContext ctx) {
         if (!("logs:CreateLogStream".equals(action) || "logs:DeleteLogStream".equals(action)
-                || LogGroupTagTarget.supports(action) || "logs:CreateLogGroup".equals(action) || "logs:DeleteLogGroup".equals(action)
+                || LogGroupTagTarget.supports(action) || LogTransformerTarget.supports(action)
+                || "logs:CreateLogGroup".equals(action) || "logs:DeleteLogGroup".equals(action)
                 || "logs:PutRetentionPolicy".equals(action) || "logs:DeleteRetentionPolicy".equals(action))) {
             return null;
         }
@@ -230,6 +232,9 @@ public class IamConditionContextResolver {
             } else {
                 String group = direct ? logsService.get().resolveTagTarget(body.path("resourceArn").asText(), region).name()
                         : body.path("logGroupName").asText();
+                if (LogTransformerTarget.supports(action)) {
+                    group = logsService.get().resolveTransformerTarget(body.path("logGroupIdentifier").asText(), region).name();
+                }
                 tags = logsService.get().listTagsLogGroup(group, region);
             }
         } catch (AwsException e) {

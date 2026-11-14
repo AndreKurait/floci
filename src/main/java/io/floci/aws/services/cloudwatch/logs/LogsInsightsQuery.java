@@ -308,7 +308,8 @@ final class LogsInsightsQuery {
     List<LinkedHashMap<String, String>> evaluate(List<LogEvent> events, int defaultLimit) {
         List<Row> rows = new ArrayList<>(events.size());
         for (LogEvent e : events) {
-            rows.add(new Row(e, tryParse(e.getMessage())));
+            rows.add(new Row(e, tryParse(e.getTransformedMessage() == null
+                    ? e.getMessage() : e.getTransformedMessage())));
         }
 
         // filter (logical AND across filter stages, OR within one)
@@ -419,6 +420,8 @@ final class LogsInsightsQuery {
                 return TS_FORMAT.format(Instant.ofEpochMilli(row.event.getIngestionTime()));
             case "@message":
                 return row.event.getMessage();
+            case "@transformationError":
+                return row.event.getTransformationError();
             case "@ptr":
                 return row.event.getEventId();
             default:

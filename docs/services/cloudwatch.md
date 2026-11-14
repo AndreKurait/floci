@@ -23,6 +23,10 @@ Floci supports both CloudWatch Logs and CloudWatch Metrics.
 | `PutLogEvents` | Write log events to a stream |
 | `GetLogEvents` | Read log events from a stream |
 | `FilterLogEvents` | Search log events with a filter pattern |
+| `PutTransformer` | Create or replace a supported group parseJSON transformer |
+| `GetTransformer` | Read a group transformer with its ARN and timestamps |
+| `DeleteTransformer` | Remove a group transformer for future ingestion |
+| `TestTransformer` | Preview the supported parseJSON processor without storing events |
 | `PutRetentionPolicy` | Set log retention (days) |
 | `DeleteRetentionPolicy` | Remove log retention policy |
 | `AssociateKmsKey` | Associate a KMS key with a log group (`logGroupName` or `resourceIdentifier`) |
@@ -44,8 +48,11 @@ Floci supports both CloudWatch Logs and CloudWatch Metrics.
 | `DescribeResourcePolicies` | List account-level resource policies |
 | `PutDestination` | Create or update a cross-account subscription destination, with optional tags on creation |
 | `PutDestinationPolicy` | Create or update the access policy for a destination |
+| `DescribeDestinations` | List logical destinations in the current account and Region, with prefix and pagination |
+| `DeleteDestination` | Remove a logical destination without deleting its target |
 | `PutAccountPolicy` | Create or update an account-level Logs policy |
 | `DescribeAccountPolicies` | List account-level Logs policies by type and optional name |
+| `DeleteAccountPolicy` | Delete an account-level Logs policy by exact name and type |
 | `GetDataProtectionPolicy` | Return the resolved log group identifier (see note below) |
 | `StartQuery` | Start a Logs Insights query (see [Logs Insights](#logs-insights)) |
 | `GetQueryResults` | Get the status and results of a Logs Insights query |
@@ -92,6 +99,65 @@ metric filters and subscription filters use: terms, quoted phrases, `?` alternat
 exclusions, JSON and space-delimited patterns. An invalid pattern is refused with
 `InvalidParameterException`, and so is a request that names no log group by `logGroupName` or
 `logGroupIdentifier`.
+
+### Group log transformers
+
+`PutTransformer`, `GetTransformer` and `DeleteTransformer` manage a persistent transformer on an
+owned Standard log group, selected by its name or canonical ARN. A transformer contains exactly one
+`parseJSON` processor. Its source is omitted or `@message`; its optional destination is a dotted
+identifier path of at most three components and 128 characters. Omitting the destination places the
+parsed fields at the JSON root. Other processors, processor chains and unsupported source or
+destination expressions are rejected before changing the stored definition. Get preserves omitted
+optional members, the original creation time and the last replacement time.
+
+`TestTransformer` runs the same parser without storing events. It accepts up to 50 nonempty messages
+and returns each original message with its transformed JSON. The optional event number is omitted.
+The supported input is a JSON object smaller than 512 KiB, with at most 64 nesting levels and 200
+extracted fields. This subset counts JSON object members throughout the parsed tree, including
+objects inside arrays; destination wrapper keys are not extracted input fields. Preview rejects
+malformed, non-object, oversized and over-limit input with `InvalidParameterException`. This is a
+bounded local subset, not a claim of exact AWS malformed-input diagnostics or every processor limit.
+
+Transformation runs during ingestion. Each event keeps its original message and a separate
+transformed view. Replacing or deleting a transformer affects future ingestion only. Stored event
+views survive restart and remain subject to the group's ordinary retention and deletion behavior.
+`GetLogEvents` and `FilterLogEvents` return originals. Logs Insights reads transformed fields while
+`@message` remains the original input. Failed parsing retains the original event, exposes
+`@transformationError` to field projection and filters, and creates no transformed result.
+
+Metric and subscription filters with `applyOnTransformedLogs=true` select transformed messages when
+available. Subscription delivery uses the selected message through its existing destination path.
+Filters using false or omission select originals. An event whose transformation failed is skipped by
+transformed filters, while ordinary filters can still process the original. Without a configured
+transformation the original view remains available. Configuration changes and event publication use
+the same metadata-before-event-index lock order as group deletion, so each batch uses one definition.
+
+The three lifecycle IAM actions use the exact log-group ARN and stored resource-tag conditions.
+`TestTransformer` is authorized against `*`. Foreign-account or foreign-region ARNs cannot select a
+local group. External monitoring-account links are unsupported.
+
+Account-level transformer policies remain stored metadata only: their processor execution, selection
+criteria and fallback after deleting a group transformer are unsupported. This feature does not emit
+transformation telemetry metrics or implement Contributor Insights, field indexes or additional
+processors. It does publish ordinary configured metric-filter metrics and delivers matching
+subscription events through the existing delivery implementation.
+
+### Account policies
+
+`DeleteAccountPolicy` removes only the named account policy of the requested type in the
+caller's account and Region. Missing policies return `ResourceNotFoundException`; group-level
+settings and other policy types remain intact. The existing five policy types are supported.
+`RETENTION_POLICY` and every non-null `dryRun` value, including `false`, are explicitly
+rejected before deletion. JSON null follows the existing optional-field omission convention.
+
+Authorization requires `logs:DeleteAccountPolicy` plus the documented delete action for data
+protection, subscription filters, transformers, or field indexes. Metric extraction has no
+additional documented delete action. This operation does not extend account-policy document
+validation or delivery behavior.
+
+Like `DescribeAccountPolicies`, deletion sees only keys scoped to the caller's account.
+Unprefixed legacy entries remain invisible and unchanged; this operation does not migrate
+them into an account or expand existing legacy visibility.
 
 ### Saved query definitions
 
@@ -169,9 +235,33 @@ and `logEvents` (an array of `{id, timestamp, message}`). Lambda receives the pa
 under `awslogs.data`. Kinesis and Firehose receive the gzip-compressed JSON bytes directly as record data.
 
 For Kinesis destinations, `distribution` controls the partition key: `ByLogStream` uses the log stream
-name, while `Random` assigns a randomized UUID partition key. Cross-account Logs destinations
-(`PutDestination`), IAM role permission checks, and the `CONTROL_MESSAGE` ping on filter creation
-are deferred.
+name, while `Random` assigns a randomized UUID partition key.
+
+Logical Logs destinations support recipient-owned Kinesis streams, including streams in another Region
+of the same partition. `PutDestination` requires an existing role and active stream, checks the Logs
+service trust and `kinesis:PutRecord` permission, and writes a gzip `CONTROL_MESSAGE` before saving the
+destination. Control delivery uses the recipient account; subscription data uses the source account
+with the recipient's role. The control trust context supports the documented recipient-account Logs
+ARN wildcard; the exact AWS control source-resource identity is not modeled. Logical Firehose targets
+are explicitly unsupported: AWS's subscription API lists them, while its destination API documents
+Kinesis targets.
+
+Cross-account subscriptions require a destination access-policy grant to the source account. Data
+delivery resolves the destination in its owning account and rechecks that policy, role trust and target
+permission for each batch. Account IDs, account root ARNs and wildcard principals are supported, with
+`aws:PrincipalAccount`, `aws:ResourceAccount` and `aws:RequestedRegion` conditions. Identity and
+organization conditions, IAM user or role principals, `NotPrincipal`, policy variables and unsupported
+or malformed condition forms are refused. Shared IAM enforcement-off mode retains its existing
+permission bypass; destination, role and target existence checks still apply.
+
+`DescribeDestinations` lists only the current account and Region, sorts names, and scopes its 24-hour
+pagination tokens to the account, Region and prefix. `DeleteDestination` removes the logical metadata
+and stops later delivery without deleting the stream. Same-account Lambda subscription admission
+checks function existence and its resource permission for the source log group. Mutable filter updates
+preserve `creationTime`; replacing the group/name identity creates a new timestamp. The existing
+regex quotas remain enforced; a total subscription count quota and Lambda filter-creation control
+messages are not implemented. Existing direct Kinesis/Firehose role handling remains outside this
+logical-destination implementation.
 
 ### Metric filters {#metric-filters}
 
@@ -281,11 +371,12 @@ rejected when the filter is stored.
 `emitSystemFieldDimensions` adds `@aws.account` and `@aws.region` on matching contributions as
 described above. They count toward the same combined limit of three dimensions.
 
-`applyOnTransformedLogs` is stored and returned unchanged. Request acceptance was verified on AWS,
-including `true` on the tested group without a group-level transformer. Floci does not execute
-group-level or account-level log transformations, including stored `TRANSFORMER_POLICY`
-configuration. Accepting the flag therefore does not establish transformed-log processing or
-full compatibility with an AWS group that has an active transformer.
+`applyOnTransformedLogs` is stored and returned unchanged. With the supported group transformer,
+`true` selects the stored transformed message for matching and metric extraction; false or omission
+selects the original. An event whose transformation failed contributes no transformed-filter metric,
+including a default value. Without a configured transformation, filters retain the original view.
+Request acceptance of `true` without a group transformer was verified on AWS. Account-level
+`TRANSFORMER_POLICY` execution remains unsupported.
 
 See [Metric-filter contract verification](cloudwatch-metric-filters-verification.md) for the
 scenarios tagged **Verified on Live AWS**, the recorded fixtures and their evidence boundaries.
