@@ -311,15 +311,31 @@ public class StepFunctionsJsonHandler {
             response.put("revisionId", configuration.revisionId());
         }
         if (configuration.loggingConfiguration() != null) {
-            response.set("loggingConfiguration", configuration.loggingConfiguration());
+            JsonNode logging = executionConfigurationResponse(configuration.loggingConfiguration(),
+                    "LoggingConfiguration");
+            if (logging instanceof ObjectNode object && object.path("destinations").isArray()
+                    && object.path("destinations").isEmpty()) {
+                object.remove("destinations");
+            }
+            response.set("loggingConfiguration", logging);
         }
         if (configuration.tracingConfiguration() != null) {
-            response.set("tracingConfiguration", configuration.tracingConfiguration());
+            response.set("tracingConfiguration", executionConfigurationResponse(
+                    configuration.tracingConfiguration(), "TracingConfiguration"));
         }
         if (configuration.encryptionConfiguration() != null) {
-            response.set("encryptionConfiguration", configuration.encryptionConfiguration());
+            response.set("encryptionConfiguration", executionConfigurationResponse(
+                    configuration.encryptionConfiguration(), "EncryptionConfiguration"));
         }
         return Response.ok(response).build();
+    }
+
+    private JsonNode executionConfigurationResponse(JsonNode source, String type) {
+        JsonNode copy = source.deepCopy();
+        if (copy instanceof ObjectNode object) {
+            object.put("__type", "com.amazonaws.swf.base.model#" + type);
+        }
+        return copy;
     }
 
     private Response handleListStateMachines(JsonNode request, String region) {
@@ -436,7 +452,7 @@ public class StepFunctionsJsonHandler {
     }
 
     private Response handleDescribeExecution(JsonNode request) {
-        Execution exec = service.describeExecution(request.path("executionArn").asText());
+        Execution exec = service.describeExecutionForApi(request.path("executionArn").asText());
         ObjectNode response = objectMapper.createObjectNode();
         response.put("executionArn", exec.getExecutionArn());
         response.put("stateMachineArn", exec.getStateMachineArn());
