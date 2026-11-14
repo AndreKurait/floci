@@ -147,6 +147,7 @@ AWS::Lambda::Alias	Description	clear
 AWS::Lambda::Alias	FunctionName	create-only	a drop fails: the provisioner requires it
 AWS::Lambda::Alias	FunctionVersion	keep:the update skips a null, so the stored version stays
 AWS::Lambda::Alias	Name	create-only	a drop fails: the provisioner requires it
+AWS::Lambda::Alias	ProvisionedConcurrencyConfig	clear	remove previously declared alias capacity when the property is dropped
 AWS::Lambda::Alias	RoutingConfig	clear	an empty map removes the weights, also when the template never declared it, so weights set outside the stack go
 AWS::SecretsManager::Secret	Description	clear
 AWS::SecretsManager::Secret	GenerateSecretString	keep:a dropped configuration adds no version, so the stored value stays
