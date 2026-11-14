@@ -4886,10 +4886,11 @@ public class Ec2QueryHandler {
                 getList(p, "SecondaryAllocationId"),
                 getList(p, "SecondaryPrivateIpAddress"),
                 p.getFirst("SecondaryPrivateIpAddressCount"),
-                parseTagsForResource(p, "natgateway"));
+                parseTagsForResource(p, "natgateway"), p.getFirst("ClientToken"));
         XmlBuilder xml = new XmlBuilder()
                 .start("CreateNatGatewayResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
+                .elem("clientToken", natGateway.getClientToken())
                 .start("natGateway").raw(natGatewayXml(natGateway)).end("natGateway")
                 .end("CreateNatGatewayResponse");
         return xmlResponse(xml.build());

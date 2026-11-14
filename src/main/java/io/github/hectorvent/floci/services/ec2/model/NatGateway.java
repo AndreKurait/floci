@@ -5,12 +5,18 @@ import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 @RegisterForReflection
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class NatGateway {
 
+    private String clientToken;
+    private String creationAccountId;
+    private String creationAvailabilityZone;
+    private Map<String, List<String>> creationParameters = new LinkedHashMap<>();
     private String natGatewayId;
     private String subnetId;
     private String vpcId;
@@ -25,6 +31,51 @@ public class NatGateway {
     private List<Tag> tags = new ArrayList<>();
 
     public NatGateway() {}
+
+    public NatGateway(NatGateway source) {
+        natGatewayId = source.natGatewayId;
+        subnetId = source.subnetId;
+        vpcId = source.vpcId;
+        allocationId = source.allocationId;
+        state = source.state;
+        connectivityType = source.connectivityType;
+        failureCode = source.failureCode;
+        failureMessage = source.failureMessage;
+        createTime = source.createTime;
+        region = source.region;
+        clientToken = source.clientToken;
+        creationAccountId = source.creationAccountId;
+        creationAvailabilityZone = source.creationAvailabilityZone;
+        source.creationParameters.forEach((name, values) ->
+                creationParameters.put(name, new ArrayList<>(values)));
+        for (NatGatewayAddress original : source.natGatewayAddresses) {
+            NatGatewayAddress address = new NatGatewayAddress();
+            address.setAllocationId(original.getAllocationId());
+            address.setAssociationId(original.getAssociationId());
+            address.setNetworkInterfaceId(original.getNetworkInterfaceId());
+            address.setPrivateIp(original.getPrivateIp());
+            address.setPublicIp(original.getPublicIp());
+            address.setPrimary(original.isPrimary());
+            address.setStatus(original.getStatus());
+            natGatewayAddresses.add(address);
+        }
+        source.tags.forEach(tag -> tags.add(new Tag(tag.getKey(), tag.getValue())));
+    }
+
+    public String getClientToken() { return clientToken; }
+    public void setClientToken(String clientToken) { this.clientToken = clientToken; }
+
+    public String getCreationAccountId() { return creationAccountId; }
+    public void setCreationAccountId(String creationAccountId) { this.creationAccountId = creationAccountId; }
+
+    public String getCreationAvailabilityZone() { return creationAvailabilityZone; }
+    public void setCreationAvailabilityZone(String zone) { this.creationAvailabilityZone = zone; }
+
+    public Map<String, List<String>> getCreationParameters() { return creationParameters; }
+    public void setCreationParameters(Map<String, List<String>> parameters) {
+        creationParameters = new LinkedHashMap<>();
+        parameters.forEach((name, values) -> creationParameters.put(name, new ArrayList<>(values)));
+    }
 
     public String getNatGatewayId() { return natGatewayId; }
     public void setNatGatewayId(String natGatewayId) { this.natGatewayId = natGatewayId; }
