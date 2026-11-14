@@ -12,6 +12,7 @@ public class StackEvent {
     private String eventId = UUID.randomUUID().toString();
     private String stackId;
     private String stackName;
+    private String clientRequestToken;
     private String logicalResourceId;
     private String physicalResourceId;
     private String resourceType;
@@ -25,6 +26,8 @@ public class StackEvent {
     public void setStackId(String stackId) { this.stackId = stackId; }
     public String getStackName() { return stackName; }
     public void setStackName(String stackName) { this.stackName = stackName; }
+    public String getClientRequestToken() { return clientRequestToken; }
+    public void setClientRequestToken(String clientRequestToken) { this.clientRequestToken = clientRequestToken; }
     public String getLogicalResourceId() { return logicalResourceId; }
     public void setLogicalResourceId(String logicalResourceId) { this.logicalResourceId = logicalResourceId; }
     public String getPhysicalResourceId() { return physicalResourceId; }

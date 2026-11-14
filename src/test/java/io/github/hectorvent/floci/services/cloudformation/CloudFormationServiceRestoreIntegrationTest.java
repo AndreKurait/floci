@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.cloudformation.model.ChangeSet;
 import io.github.hectorvent.floci.services.cloudformation.model.Stack;
+import io.github.hectorvent.floci.services.cloudformation.model.StackEvent;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnResourceDispatcher;
 import io.github.hectorvent.floci.testing.CfnStackWaits;
@@ -98,11 +99,14 @@ class CloudFormationServiceRestoreIntegrationTest {
         List<Future<?>> runningOperations = fillExecutor();
         try {
             AwsException rejected = assertThrows(AwsException.class,
-                    () -> service.executeCreateChangeSet(targetStack, "initial", REGION, disableRollback));
+                    () -> service.executeCreateChangeSet(targetStack, "initial", REGION, disableRollback,
+                            "rejected-create-token"));
             assertEquals("LimitExceededException", rejected.getErrorCode());
 
             Stack restored = service.describeStacks(targetStack, REGION).getFirst();
             assertEquals("REVIEW_IN_PROGRESS", restored.getStatus());
+            assertNull(restored.getClientRequestToken());
+            assertTrue(restored.eventsSnapshot().stream().allMatch(event -> event.getClientRequestToken() == null));
             assertFalse(restored.isDisableRollback(), "A rejected execution must restore its prior creation policy");
             assertNull(restored.getStackPolicyBody());
             ChangeSet restoredChangeSet = service.describeChangeSet(targetStack, "initial", REGION);
@@ -112,13 +116,17 @@ class CloudFormationServiceRestoreIntegrationTest {
             release(runningOperations);
         }
 
-        Future<?> retry = service.executeCreateChangeSet(targetStack, "initial", REGION, disableRollback);
+        Future<?> retry = service.executeCreateChangeSet(targetStack, "initial", REGION, disableRollback,
+                "accepted-create-token");
         retry.get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
         assertEquals("CREATE_COMPLETE", service.describeStacks(targetStack, REGION).getFirst().getStatus());
         assertEquals(disableRollback, service.describeStacks(targetStack, REGION).getFirst().isDisableRollback());
         assertEquals(policy, service.describeStacks(targetStack, REGION).getFirst().getStackPolicyBody());
         assertEquals("EXECUTE_COMPLETE",
                 service.describeChangeSet(targetStack, "initial", REGION).getExecutionStatus());
+        assertTrue(service.describeStackEvents(targetStack, REGION).stream()
+                .filter(event -> !"REVIEW_IN_PROGRESS".equals(event.getResourceStatus()))
+                .allMatch(event -> "accepted-create-token".equals(event.getClientRequestToken())));
     }
 
     @Test
@@ -126,22 +134,30 @@ class CloudFormationServiceRestoreIntegrationTest {
         // Outside STACK_PREFIX, so its own create is not held by the blocking provisioner.
         String targetStack = "restore-delete-target-" + System.nanoTime();
         createChangeSet(targetStack);
-        service.executeChangeSet(targetStack, "initial", REGION).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        service.executeChangeSetWithToken(targetStack, "initial", REGION, "before-delete-token")
+                .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
         Stack stack = service.describeStacks(targetStack, REGION).getFirst();
         assertEquals("CREATE_COMPLETE", stack.getStatus());
 
         List<Future<?>> runningOperations = fillExecutor();
         try {
             AwsException rejected = assertThrows(AwsException.class,
-                    () -> service.deleteStack(targetStack, List.of(), REGION));
+                    () -> service.deleteStackWithRole(targetStack, List.of(), REGION, null, "rejected-delete-token"));
             assertEquals("LimitExceededException", rejected.getErrorCode());
             assertEquals("CREATE_COMPLETE", service.describeStacks(targetStack, REGION).getFirst().getStatus());
+            assertEquals("before-delete-token", stack.getClientRequestToken());
+            assertTrue(stack.eventsSnapshot().stream()
+                    .noneMatch(event -> "rejected-delete-token".equals(event.getClientRequestToken())));
         } finally {
             release(runningOperations);
         }
 
         service.deleteStack(targetStack, REGION, regionResolver.getAccountId()).get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
         assertEquals("DELETE_COMPLETE", stack.getStatus());
+        assertNull(stack.getClientRequestToken());
+        assertTrue(stack.eventsSnapshot().stream()
+                .filter(event -> event.getResourceStatus().startsWith("DELETE_"))
+                .allMatch(event -> event.getClientRequestToken() == null));
     }
 
     @Test
@@ -231,6 +247,48 @@ class CloudFormationServiceRestoreIntegrationTest {
             service.deleteStack(targetStack, REGION, regionResolver.getAccountId())
                     .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
         }
+    }
+
+    @Test
+    void rejectedContinuedRollbackRestoresTokenAndReleasesItsExecutionClaim() throws Exception {
+        String targetStack = uniqueStackName("continue-target");
+        createChangeSet(targetStack);
+        Stack stack = service.describeStacks(targetStack, REGION).getFirst();
+        // A legacy failed rollback with no saved resource snapshot isolates submission restoration.
+        stack.setStatus("UPDATE_ROLLBACK_FAILED");
+        stack.setClientRequestToken("prior-rollback-token");
+        List<StackEvent> previousEvents = stack.eventsSnapshot();
+        try {
+            List<Future<?>> runningOperations = fillExecutor();
+            try {
+                AwsException rejected = assertThrows(AwsException.class,
+                        () -> service.continueUpdateRollback(targetStack, List.of(), false, REGION,
+                                null, "rejected-rollback-token"));
+                assertEquals("LimitExceededException", rejected.getErrorCode());
+                assertEquals("UPDATE_ROLLBACK_FAILED", stack.getStatus());
+                assertEquals("prior-rollback-token", stack.getClientRequestToken());
+                assertEquals(previousEvents, stack.eventsSnapshot());
+                // A leaked completion future would incorrectly accept this delete as deferred.
+                Response rejectedDelete = cfn("DeleteStack", targetStack)
+                        .formParam("ClientRequestToken", "rejected-delete-token").when().post("/");
+                assertEquals(400, rejectedDelete.statusCode(), rejectedDelete.asString());
+                assertTrue(rejectedDelete.asString().contains("LimitExceededException"), rejectedDelete.asString());
+                assertEquals("prior-rollback-token", stack.getClientRequestToken());
+                assertEquals(previousEvents, stack.eventsSnapshot());
+            } finally {
+                release(runningOperations);
+            }
+            service.continueUpdateRollback(targetStack, List.of(), false, REGION)
+                    .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            assertEquals("UPDATE_ROLLBACK_COMPLETE", stack.getStatus());
+            assertNull(stack.getClientRequestToken());
+            assertTrue(stack.eventsSnapshot().stream().filter(event -> !previousEvents.contains(event))
+                    .allMatch(event -> event.getClientRequestToken() == null));
+        } finally {
+            service.deleteStack(targetStack, REGION, regionResolver.getAccountId())
+                    .get(TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        }
+        assertEquals("DELETE_COMPLETE", stack.getStatus());
     }
 
     /** Starts change set executions that block in provisioning until every thread and queue slot is taken. */

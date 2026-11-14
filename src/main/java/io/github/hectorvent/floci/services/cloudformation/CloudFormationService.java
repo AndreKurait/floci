@@ -1576,8 +1576,13 @@ public class CloudFormationService implements ResourceProvider {
     /** Executes CreateStack's initial change set with its creation rollback policy. */
     public Future<?> executeCreateChangeSet(String stackName, String changeSetName, String region,
                                             boolean disableRollback) {
+        return executeCreateChangeSet(stackName, changeSetName, region, disableRollback, null);
+    }
+
+    public Future<?> executeCreateChangeSet(String stackName, String changeSetName, String region,
+                                            boolean disableRollback, String clientRequestToken) {
         return claimAndSubmitExecution(stackName, changeSetName, region, regionResolver.getAccountId(),
-                false, disableRollback);
+                false, disableRollback, clientRequestToken);
     }
 
     /**
@@ -1594,7 +1599,20 @@ public class CloudFormationService implements ResourceProvider {
      * that failure surfaces on those paths, and floci must still expose it there.
      */
     public Future<?> executeChangeSetForRequest(String stackName, String changeSetName, String region) {
-        return claimAndSubmitExecution(stackName, changeSetName, region, regionResolver.getAccountId(), true, false);
+        return executeChangeSetForRequest(stackName, changeSetName, region, null);
+    }
+
+    public Future<?> executeChangeSetForRequest(String stackName, String changeSetName, String region,
+                                                String clientRequestToken) {
+        return claimAndSubmitExecution(stackName, changeSetName, region, regionResolver.getAccountId(),
+                true, false, clientRequestToken);
+    }
+
+    /** Executes UpdateStack's internal change set with the operation's optional request token. */
+    public Future<?> executeChangeSetWithToken(String stackName, String changeSetName, String region,
+                                               String clientRequestToken) {
+        return claimAndSubmitExecution(stackName, changeSetName, region, regionResolver.getAccountId(),
+                false, false, clientRequestToken);
     }
 
     /**
@@ -1612,17 +1630,18 @@ public class CloudFormationService implements ResourceProvider {
      * refuses one that is already executing or has already executed.
      */
     public Future<?> executeChangeSet(String stackName, String changeSetName, String region, String accountId) {
-        return claimAndSubmitExecution(stackName, changeSetName, region, accountId, false, false);
+        return claimAndSubmitExecution(stackName, changeSetName, region, accountId, false, false, null);
     }
 
     private record ClaimedExecution(ChangeSet changeSet, boolean isCreate, ExecutionIdentity identity,
                                     CompletableFuture<Void> done) {}
 
-    private record DeferredDelete(List<String> retain, String roleArn) {}
+    private record DeferredDelete(List<String> retain, String roleArn, String clientRequestToken) {}
 
     private record ChangeSetState(String status, String executionStatus) {}
 
     private record StackMutationSnapshot(String status, Instant lastUpdatedTime, boolean disableRollback, String roleArn,
+                                         String clientRequestToken,
                                          List<StackEvent> events,
                                          Map<String, ChangeSet> changeSets,
                                          Map<ChangeSet, ChangeSetState> changeSetStates,
@@ -1630,7 +1649,8 @@ public class CloudFormationService implements ResourceProvider {
 
     // compute() holds the stack's per-key lock for the whole claim, so only one racing execution can win.
     private Future<?> claimAndSubmitExecution(String stackNameOrArn, String changeSetName, String region,
-                                              String accountId, boolean requireAvailable, boolean disableCreateRollback) {
+                                              String accountId, boolean requireAvailable, boolean disableCreateRollback,
+                                              String clientRequestToken) {
         String canonicalStackName = getStackForChangeSet(stackNameOrArn, changeSetName, region,
                 accountId).getStackName();
         String partition = AwsRegions.partitionFor(region);
@@ -1687,6 +1707,7 @@ public class CloudFormationService implements ResourceProvider {
             }
             String status = "IMPORT".equalsIgnoreCase(cs.getChangeSetType()) ? "IMPORT_IN_PROGRESS"
                     : isCreate ? "CREATE_IN_PROGRESS" : "UPDATE_IN_PROGRESS";
+            existing.setClientRequestToken(clientRequestToken);
             existing.setStatus(status);
             existing.setLastUpdatedTime(now());
             addEvent(existing, existing.getStackName(), existing.getStackId(),
@@ -1768,6 +1789,7 @@ public class CloudFormationService implements ResourceProvider {
                 DeferredDelete deletion = deferredDeletes.remove(stackId);
                 if (deletion != null && existing != null && stackId.equals(existing.getStackId())) {
                     existing.setRoleArn(deletion.roleArn());
+                    existing.setClientRequestToken(deletion.clientRequestToken());
                     startDelete(existing, deletion.retain());
                     deferred.add(deletion.retain());
                 }
@@ -1819,7 +1841,12 @@ public class CloudFormationService implements ResourceProvider {
     }
 
     public Future<?> deleteStackWithRole(String stackName, List<String> retainResources, String region, String roleArn) {
-        return deleteStack(stackName, retainResources, region, currentAccount(), roleArn);
+        return deleteStackWithRole(stackName, retainResources, region, roleArn, null);
+    }
+
+    public Future<?> deleteStackWithRole(String stackName, List<String> retainResources, String region,
+                                         String roleArn, String clientRequestToken) {
+        return deleteStack(stackName, retainResources, region, currentAccount(), roleArn, clientRequestToken);
     }
 
     public Future<?> deleteStack(String stackName, String region, String accountId) {
@@ -1838,11 +1865,11 @@ public class CloudFormationService implements ResourceProvider {
      *         removal) can await it.
      */
     public Future<?> deleteStack(String stackName, List<String> retainResources, String region, String accountId) {
-        return deleteStack(stackName, retainResources, region, accountId, null);
+        return deleteStack(stackName, retainResources, region, accountId, null, null);
     }
 
     private Future<?> deleteStack(String stackName, List<String> retainResources, String region, String accountId,
-                                   String roleArn) {
+                                   String roleArn, String clientRequestToken) {
         validateRetainResources(retainResources);
         purgeExpiredDeletedStacks();
         Stack stack = resolveStack(stackName, region, accountId);
@@ -1903,13 +1930,15 @@ public class CloudFormationService implements ResourceProvider {
                     selectedRole, accountId, existing.getStackId(), AwsRegions.partitionFor(region));
             CompletableFuture<Void> running = runningExecutions.get(existing.getStackId());
             if (running != null) {
-                // A deferred delete must not change the role of the execution still running.
-                deferredDeletes.putIfAbsent(existing.getStackId(), new DeferredDelete(retain, selectedRole));
+                // The deferred delete keeps its role and token separate from the execution still running.
+                deferredDeletes.putIfAbsent(existing.getStackId(),
+                        new DeferredDelete(retain, selectedRole, clientRequestToken));
                 submitted[0] = running;
                 return existing;
             }
             StackMutationSnapshot snapshot = snapshot(existing);
             existing.setRoleArn(selectedRole);
+            existing.setClientRequestToken(clientRequestToken);
             startDelete(existing, retain);
             try {
                 submitted[0] = submitOperation(() -> RequestScopes.runAs(accountId, region,
@@ -1956,6 +1985,12 @@ public class CloudFormationService implements ResourceProvider {
 
     public Future<?> continueUpdateRollback(
             String stackNameOrArn, List<String> resourcesToSkip, boolean forceRollback, String region, String roleArn) {
+        return continueUpdateRollback(stackNameOrArn, resourcesToSkip, forceRollback, region, roleArn, null);
+    }
+
+    public Future<?> continueUpdateRollback(
+            String stackNameOrArn, List<String> resourcesToSkip, boolean forceRollback, String region, String roleArn,
+            String clientRequestToken) {
         validateContinueUpdateRollback(stackNameOrArn, resourcesToSkip);
         if (forceRollback && !resourcesToSkip.isEmpty()) {
             throw new AwsException("ValidationError", FORCE_WITH_SKIPS, 400);
@@ -1968,11 +2003,13 @@ public class CloudFormationService implements ResourceProvider {
         String stackName = found.getStackName();
         List<String> skips = List.copyOf(resourcesToSkip);
         StackMutationSnapshot[] snapshot = new StackMutationSnapshot[1];
+        CompletableFuture<Void> done = new CompletableFuture<>();
         Stack stack = stacks.compute(stackKey(accountId, stackName, region), (k, existing) -> {
             if (existing == null) {
                 throw new AwsException("ValidationError", CONTINUE_STACK_MISSING.formatted(stackNameOrArn), 400);
             }
-            if (!"UPDATE_ROLLBACK_FAILED".equals(existing.getStatus())) {
+            if (!"UPDATE_ROLLBACK_FAILED".equals(existing.getStatus())
+                    || deferredDeletes.containsKey(existing.getStackId())) {
                 throw new AwsException("ValidationError", CONTINUE_ROLLBACK_REFUSED, 400);
             }
             String selectedRole = roleArn != null ? roleArn : existing.getRoleArn();
@@ -1980,21 +2017,32 @@ public class CloudFormationService implements ResourceProvider {
                     selectedRole, accountId, existing.getStackId(), AwsRegions.partitionFor(region));
             snapshot[0] = snapshot(existing);
             existing.setRoleArn(selectedRole);
+            existing.setClientRequestToken(clientRequestToken);
             existing.setStatus("UPDATE_ROLLBACK_IN_PROGRESS");
+            runningExecutions.put(existing.getStackId(), done);
             addEvent(existing, existing.getStackName(), existing.getStackId(),
                     "AWS::CloudFormation::Stack", "UPDATE_ROLLBACK_IN_PROGRESS", "User Initiated");
             return existing;
         });
         try {
             persistStack(stack);
-            return submitOperation(() -> RequestScopes.runAs(accountId, region,
-                    () -> resumeUpdateRollback(stack, skips, forceRollback, region)));
-        } catch (AwsException e) {
-            if ("LimitExceededException".equals(e.getErrorCode())) {
-                Stack restored = restoreStack(accountId, stackName, region, snapshot[0]);
-                if (restored != null) {
-                    persistStack(restored);
+            return submitOperation(() -> RequestScopes.runAs(accountId, region, () -> {
+                try {
+                    resumeUpdateRollback(stack, skips, forceRollback, region);
+                } finally {
+                    endExecution(stack, done, region, accountId);
                 }
+            }));
+        } catch (RuntimeException e) {
+            try {
+                if (e instanceof AwsException aws && "LimitExceededException".equals(aws.getErrorCode())) {
+                    Stack restored = restoreStack(accountId, stackName, region, snapshot[0]);
+                    if (restored != null) {
+                        persistStack(restored);
+                    }
+                }
+            } finally {
+                endExecution(stack, done, region, accountId);
             }
             throw e;
         }
@@ -2048,7 +2096,7 @@ public class CloudFormationService implements ResourceProvider {
             states.put(changeSet, new ChangeSetState(changeSet.getStatus(), changeSet.getExecutionStatus()));
         }
         return new StackMutationSnapshot(stack.getStatus(), stack.getLastUpdatedTime(), stack.isDisableRollback(),
-                stack.getRoleArn(),
+                stack.getRoleArn(), stack.getClientRequestToken(),
                 stack.eventsSnapshot(), stack.changeSetsSnapshot(), states, stack.getStackPolicyBody());
     }
 
@@ -2058,6 +2106,7 @@ public class CloudFormationService implements ResourceProvider {
         }
         stack.setDisableRollback(snapshot.disableRollback());
         stack.setRoleArn(snapshot.roleArn());
+        stack.setClientRequestToken(snapshot.clientRequestToken());
         stack.setStatus(snapshot.status());
         stack.setLastUpdatedTime(snapshot.lastUpdatedTime());
         stack.setStackPolicyBody(snapshot.stackPolicyBody());
@@ -4708,12 +4757,9 @@ public class CloudFormationService implements ResourceProvider {
             if (!failedResources.isEmpty()) {
                 String reason = "The following resource(s) failed to delete: ["
                         + String.join(", ", failedResources) + "].";
-                stack.setStatus("DELETE_FAILED");
-                stack.setStatusReason(reason);
+                // Keep retry admission closed until this operation has captured and published its token.
                 addEvent(stack, stack.getStackName(), stack.getStackId(),
                         "AWS::CloudFormation::Stack", "DELETE_FAILED", reason);
-                persistStack(stack);
-                LOG.errorv("Stack {0} delete failed: {1}", stack.getStackName(), reason);
                 throw new IllegalStateException(reason);
             }
 
@@ -4741,9 +4787,12 @@ public class CloudFormationService implements ResourceProvider {
 
         } catch (Exception e) {
             LOG.errorv("Stack {0} delete failed: {1}", stack.getStackName(), e.getMessage());
-            stack.setStatus("DELETE_FAILED");
-            stack.setStatusReason(e.getMessage());
-            persistStack(stack);
+            stacks.compute(stackKey(ownerAccount(stack), stack.getStackName(), region), (key, existing) -> {
+                stack.setStatusReason(e.getMessage());
+                stack.setStatus("DELETE_FAILED");
+                persistStack(stack);
+                return existing;
+            });
             throw (e instanceof RuntimeException re ? re : new RuntimeException(e));
         }
     }
@@ -5372,6 +5421,7 @@ public class CloudFormationService implements ResourceProvider {
         }
 
         if (!childCreate) {
+            childStack.setClientRequestToken(null);
             resource.getAttributes().put(CfnRollback.NESTED_STACK_UPDATE_SNAPSHOT_ATTR,
                     savedChildDeployment(childStack, region, accountId).toString());
         }
@@ -5535,6 +5585,7 @@ public class CloudFormationService implements ResourceProvider {
         event.setTimestamp(now());
         event.setStackId(stack.getStackId());
         event.setStackName(stack.getStackName());
+        event.setClientRequestToken(stack.getClientRequestToken());
         event.setLogicalResourceId(logicalId);
         event.setPhysicalResourceId(physicalId);
         event.setResourceType(resourceType);
