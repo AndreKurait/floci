@@ -468,6 +468,7 @@ floci:
       worker-poll-interval-ms: 1
     autoscaling:
       enabled: true
+      cloudwatch-metrics-enabled: true
       multiple-capacity-reservation-scopes: ""
       max-capacity-reservation-ids: 1
     applicationautoscaling:

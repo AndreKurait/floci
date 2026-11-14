@@ -992,6 +992,7 @@ floci:
       worker-poll-interval-ms: ${FLOCI_SERVICES_CODEPIPELINE_WORKER_POLL_INTERVAL_MS:100}
     autoscaling:
       enabled: true
+      cloudwatch-metrics-enabled: true
       multiple-capacity-reservation-scopes: ${FLOCI_SERVICES_AUTOSCALING_MULTIPLE_CAPACITY_RESERVATION_SCOPES:}
       max-capacity-reservation-ids: ${FLOCI_SERVICES_AUTOSCALING_MAX_CAPACITY_RESERVATION_IDS:1}
     applicationautoscaling:

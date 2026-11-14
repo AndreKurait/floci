@@ -1351,6 +1351,9 @@ public interface EmulatorConfig {
         int maxCapacityReservationIds();
 
         Optional<List<String>> multipleCapacityReservationScopes();
+
+        @WithDefault("true")
+        boolean cloudwatchMetricsEnabled();
     }
 
     interface ApplicationAutoScalingServiceConfig {
