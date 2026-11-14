@@ -73,6 +73,23 @@ class PublicApiProxySourcesServiceTest {
                 () -> sources.register(owner, PEER, Map.of("192.0.2.3", Set.of(CALLER))));
     }
 
+    @Test
+    void nativeAlbHttpRetainsItsDestinationPortWithoutAdmittingApiHttpOrCustomPorts() {
+        sources.register(owner, PEER, Map.of("192.0.2.1", Set.of(CALLER), "192.0.2.2", Set.of(CALLER)));
+        PublicApiProxySources.Ticket ticket = sources.ticket(PEER);
+        String alb = PREFACE.replace("192.0.2.1", "192.0.2.2");
+        PublicApiProxySources.Addresses http = sources.decode(ticket, alb.replace("443\r\n", "80\r\n"));
+        assertEquals("192.0.2.2", http.destination().hostAddress());
+        assertEquals(80, http.destination().port());
+        assertEquals(443, sources.decode(ticket, alb).destination().port());
+        for (String port : Set.of("0", "080", "81", "8080", "8443", "65536")) {
+            assertThrows(IllegalArgumentException.class,
+                    () -> sources.decode(ticket, alb.replace("443\r\n", port + "\r\n")));
+        }
+        assertThrows(IllegalArgumentException.class,
+                () -> sources.decode(ticket, PREFACE.replace("443\r\n", "80\r\n")));
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {
         "PROXY UNKNOWN\r\n", "PROXY TCP6 ::1 ::1 49152 443\r\n",

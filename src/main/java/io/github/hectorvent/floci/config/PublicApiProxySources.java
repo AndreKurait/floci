@@ -71,10 +71,15 @@ public class PublicApiProxySources {
         }
         String[] fields = preface.substring(0, preface.length() - 2).split(" ", -1);
         if (fields.length != 6 || !"PROXY".equals(fields[0]) || !"TCP4".equals(fields[1])
-                || !admission.callers().getOrDefault(fields[3], Set.of()).contains(fields[2])
-                || !"443".equals(fields[5])) {
+                || !admission.callers().getOrDefault(fields[3], Set.of()).contains(fields[2])) {
             throw invalid();
         }
+        boolean albHttp = EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS.equals(fields[3])
+                && "80".equals(fields[5]);
+        if (!"443".equals(fields[5]) && !albHttp) {
+            throw invalid();
+        }
+        int destinationPort = albHttp ? 80 : 443;
         String source = ipv4(fields[2]);
         if (!fields[4].matches("[1-9][0-9]{0,4}")) {
             throw invalid();
@@ -84,7 +89,7 @@ public class PublicApiProxySources {
             throw invalid();
         }
         return new Addresses(SocketAddress.inetSocketAddress(port, source),
-                SocketAddress.inetSocketAddress(443, fields[3]));
+                SocketAddress.inetSocketAddress(destinationPort, fields[3]));
     }
 
     private static String ipv4(String value) {

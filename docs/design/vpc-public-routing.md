@@ -85,23 +85,26 @@ HTTPS listener; it does not open arbitrary load-balancer ports on the bridge.
 
 When an explicit API upstream is configured and native API HTTPS routing is
 disabled, undeclared validated public ALB aliases use `192.0.2.2` for known VPC
-callers only when the ALB has a single HTTPS listener on port 443. HTTP, mixed
-protocol and custom-port ALBs retain their existing DNS address. Listener changes
+callers when every listener uses HTTP port 80 or HTTPS port 443. An ALB with no
+listeners or a custom-port listener retains its existing DNS address. Listener changes
 take effect on the next DNS lookup. Explicit `FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API_HOSTS` declarations
 retain their selected API front door and `192.0.2.1` destination after alias
-validation. The existing bridge serves only TLS port 443 on the separate ALB
-destination and forwards to Floci's enabled port 443 listener. API requests
+validation. The existing bridge serves HTTP port 80 and TLS port 443 on the separate ALB
+destination and forwards both through Floci's guarded port 443 proxy. API requests
 retain their configured upstream and `192.0.2.1` route. Each destination follows
 its own longest-prefix route, NAT and internet-gateway admission; security groups
-continue to check the original destination.
+continue to check the caller's original destination.
 
-The separate ALB transport accepts only an SNI name backed by a current public
-Route 53 alias to an owned internet-facing application load balancer. Every HTTP
-request also validates its Host against a current owned alias. The transport
+The separate ALB transport requires HTTP on port 80 and TLS on port 443. HTTPS
+accepts only an SNI name backed by a current public Route 53 alias to an owned
+internet-facing application load balancer. Every HTTP request, including
+plaintext requests, validates its Host against a current owned alias and matching
+listener. Plaintext ALB admission runs before Classic load balancer and API handlers. The transport
 identity comes from the owned bridge's socket preface, never an HTTP header.
-Unknown names, internal load balancers, non-TLS bytes and retired aliases cannot
+Unknown names, internal load balancers, wrong protocols and retired aliases cannot
 fall through to an API listener or configured TLS fallback. Clients retain the
-ALB certificate and hostname verification.
+ALB certificate and hostname verification. This path preserves workload egress
+and ALB backend policy; it does not implement client-to-ALB frontend security-group ingress.
 
 ### Declared public endpoint handoff
 

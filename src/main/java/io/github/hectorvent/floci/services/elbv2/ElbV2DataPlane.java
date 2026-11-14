@@ -1140,7 +1140,30 @@ public class ElbV2DataPlane {
     }
 
     void register(@Observes Router router) {
+        router.route().order(-101).handler(this::handlePublicAlbHttp);
         router.route().order(-99).handler(this::handleSharedEdge);
+    }
+
+    private void handlePublicAlbHttp(RoutingContext context) {
+        HttpServerRequest request = context.request();
+        if (!EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS.equals(request.localAddress().hostAddress())) {
+            context.next();
+            return;
+        }
+        RoutedListener listener = null;
+        if (request.localAddress().port() == 80 && !request.isSSL()
+                && config.services().elbv2().enabled() && !config.services().elbv2().mock()) {
+            String aliasHost = publicAliasHost(request.host());
+            PortState state = portStates.get(80);
+            if (aliasHost != null && state != null) {
+                listener = publicAlbListener(state.routing, aliasHost, false);
+            }
+        }
+        if (listener == null) {
+            request.response().setStatusCode(502).end("No listener for host");
+            return;
+        }
+        handleListener(request, listener);
     }
 
     private void handleSharedEdge(RoutingContext context) {
@@ -1204,6 +1227,10 @@ public class ElbV2DataPlane {
     }
 
     private RoutedListener publicAlbListener(RoutingView routing, String host) {
+        return publicAlbListener(routing, host, true);
+    }
+
+    private RoutedListener publicAlbListener(RoutingView routing, String host, boolean secure) {
         Route53Service.PublicAlias alias = publicAlias(normalizeHost(host));
         if (alias == null || alias.hostedZoneId() == null) {
             return null;
@@ -1213,13 +1240,31 @@ public class ElbV2DataPlane {
             return null;
         }
         ListenerBinding binding = listenerBindings.get(listener.arn());
-        if (binding == null || !binding.secure() || binding.tcp()) {
+        if (binding == null || binding.secure() != secure || binding.tcp()) {
             return null;
         }
         LoadBalancer balancer = elbV2Service.getLoadBalancerForListener(
                 listener.region(), listener.arn(), binding.loadBalancerArn());
         return balancer != null && "application".equals(balancer.getType())
                 && "internet-facing".equals(balancer.getScheme()) ? listener : null;
+    }
+
+    private static String publicAliasHost(String host) {
+        if (host == null) {
+            return null;
+        }
+        try {
+            URI authority = URI.create("http://" + host);
+            if (authority.getHost() == null || authority.getUserInfo() != null
+                    || !authority.getRawPath().isEmpty() || authority.getRawQuery() != null
+                    || authority.getRawFragment() != null || authority.getPort() > 65535) {
+                return null;
+            }
+            return normalizeHost(authority.getHost());
+        } catch (IllegalArgumentException ignored) {
+            // Native ALB traffic cannot fall through to another service for an invalid authority.
+            return null;
+        }
     }
 
     /** Selects the load balancer before evaluating rules against the original request Host. */

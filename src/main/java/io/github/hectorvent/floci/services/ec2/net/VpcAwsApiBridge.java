@@ -248,7 +248,7 @@ final class VpcAwsApiBridge {
                         httpsConnector(httpsBackend, httpsBackendPort).getBytes(StandardCharsets.UTF_8), 0600);
             }
             if (albBackend != null) {
-                RetryingTarCopier.copyBytes(docker, namespace.id(), "/tmp", "floci-alb-https.sh",
+                RetryingTarCopier.copyBytes(docker, namespace.id(), "/tmp", "floci-alb-proxy.sh",
                         httpsConnector(albBackend, 443).getBytes(StandardCharsets.UTF_8), 0600);
             }
             String start = listenerScript(address, backend, httpBackendPort, nativeHttps
@@ -269,10 +269,13 @@ final class VpcAwsApiBridge {
     static String listenerScript(String address, String backend, int httpPort, String httpsTarget, boolean publicAlb) {
         // Connection subprocesses may outlive their parent; Docker init owns their reaping.
         // Supervise every listener explicitly, independent of the helper shell's wait -n behavior.
-        String nativeListener = publicAlb ? """
-                socat -d -d TCP4-LISTEN:443,bind=%s,reuseaddr,fork EXEC:'sh /tmp/floci-alb-https.sh',pipes &
+        String nativeListeners = publicAlb ? """
+                socat -d -d TCP4-LISTEN:443,bind=%s,reuseaddr,fork EXEC:'sh /tmp/floci-alb-proxy.sh',pipes &
                 third=$!
-                """.formatted(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS) : "third=\n";
+                socat -d -d TCP4-LISTEN:80,bind=%s,reuseaddr,fork EXEC:'sh /tmp/floci-alb-proxy.sh',pipes &
+                fourth=$!
+                """.formatted(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS,
+                EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS) : "third=\nfourth=\n";
         return """
                 set -eu
                 socat -d -d TCP4-LISTEN:80,bind=%s,reuseaddr,fork TCP4:%s:%d &
@@ -280,13 +283,14 @@ final class VpcAwsApiBridge {
                 socat -d -d TCP4-LISTEN:443,bind=%s,reuseaddr,fork %s &
                 second=$!
                 %s\
-                trap 'kill "$first" "$second" ${third:+"$third"} 2>/dev/null || true' EXIT TERM INT
+                trap 'kill "$first" "$second" ${third:+"$third"} ${fourth:+"$fourth"} 2>/dev/null || true' EXIT TERM INT
                 while kill -0 "$first" 2>/dev/null && kill -0 "$second" 2>/dev/null \
-                && { [ -z "$third" ] || kill -0 "$third" 2>/dev/null; }; do
+                && { [ -z "$third" ] || kill -0 "$third" 2>/dev/null; } \
+                && { [ -z "$fourth" ] || kill -0 "$fourth" 2>/dev/null; }; do
                     sleep 0.1
                 done
                 exit 1
-                """.formatted(address, backend, httpPort, address, httpsTarget, nativeListener);
+                """.formatted(address, backend, httpPort, address, httpsTarget, nativeListeners);
     }
 
     static String httpsConnector(String backend, int port) {
@@ -327,7 +331,8 @@ final class VpcAwsApiBridge {
         while (System.nanoTime() < deadline) {
             String listeners = execute("ss", "-H", "-lnt").stdout();
             boolean albReady = albBackend == null
-                    || listeners.contains(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS + ":443 ");
+                    || (listeners.contains(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS + ":443 ")
+                    && listeners.contains(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS + ":80 "));
             if (listeners.contains(address + ":80 ") && listeners.contains(address + ":443 ") && albReady) {
                 return;
             }

@@ -223,14 +223,16 @@ class ElbV2AliasDnsIntegrationTest {
         String http = elb.createListener(r -> r.loadBalancerArn(arn).protocol("HTTP").port(80)
                 .defaultActions(a -> a.type("redirect").redirectConfig(c -> c.protocol("HTTPS").port("443")
                         .statusCode("HTTP_301")))).listeners().getFirst().listenerArn();
-        assertArrayEquals(InetAddress.getByName("127.0.0.1").getAddress(), address(query(dns, name, 1)),
-                "A mixed HTTP/HTTPS ALB retains the address serving its redirect listener");
+        byte[] isolatedAddress = InetAddress.getByName(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS)
+                .getAddress();
+        assertArrayEquals(isolatedAddress, address(query(dns, name, 1)),
+                "A mixed HTTP/HTTPS ALB retains its isolated route for both listeners");
         elb.deleteListener(r -> r.listenerArn(https));
-        assertArrayEquals(InetAddress.getByName("127.0.0.1").getAddress(), address(query(dns, name, 1)),
-                "An HTTP-only ALB retains its existing address");
+        assertArrayEquals(isolatedAddress, address(query(dns, name, 1)),
+                "An HTTP-only ALB uses the isolated route");
         elb.deleteListener(r -> r.listenerArn(http));
         assertArrayEquals(InetAddress.getByName("127.0.0.1").getAddress(), address(query(dns, name, 1)),
-                "An ALB without listeners is not advertised on the dedicated HTTPS destination");
+                "An ALB without listeners is not advertised on the isolated ALB destination");
         String restored = createHttpsListener(elb, arn, certificate);
         assertArrayEquals(InetAddress.getByName(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS).getAddress(),
                 address(query(dns, name, 1)), "The only HTTPS443 listener restores the dedicated destination");

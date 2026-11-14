@@ -387,7 +387,7 @@ final class VpcRoutingCommands {
                     .append(" src ").append(external).append(" proto 186\n");
         }
         publicCallerRules(rules, callers, external, "{ 80, 443 }");
-        publicCallerRules(rules, albCallers, albPublic, "443");
+        publicCallerRules(rules, albCallers, albPublic, "{ 80, 443 }");
         return script.append(nft(rules.toString())).toString();
     }
 

@@ -546,7 +546,8 @@ class VpcPublicPeerRoutingTest {
                         Map.of("ifname", "eth0", "addr_info", List.of(Map.of("local", "172.18.0.254"))),
                         Map.of("ifname", "eth1", "addr_info", List.of(Map.of("local", "240.0.0.1")))));
                 case "ss" -> "LISTEN 0 128 192.0.2.1:80 *:*\nLISTEN 0 128 192.0.2.1:443 *:*"
-                        + "\nLISTEN 0 128 192.0.2.2:443 *:*";
+                        + "\nLISTEN 0 128 192.0.2.2:443 *:*"
+                        + "\nLISTEN 0 128 192.0.2.2:80 *:*";
                 default -> "";
             };
             callback.onNext(new Frame(StreamType.STDOUT, output.getBytes(StandardCharsets.UTF_8)));

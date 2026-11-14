@@ -140,7 +140,7 @@ class VpcPublicApiCommandsTest {
     }
 
     @Test
-    void nativeAlbListenerKeepsItsOwn443OnlyCallersAndBackend() {
+    void nativeAlbListenersKeepTheirOwnHttpAndHttpsCallersAndGuardedBackend() {
         VpcRoutingCommands.Hop apiCaller = new VpcRoutingCommands.Hop("172.18.1.10", "240.0.0.10", "eth1", true);
         VpcRoutingCommands.Hop albCaller = new VpcRoutingCommands.Hop("172.18.1.11", "240.0.0.11", "eth1", true);
         String script = VpcRoutingCommands.publicApi("192.0.2.1", "172.20.0.5", 80, "172.20.0.5", 443,
@@ -148,10 +148,11 @@ class VpcPublicApiCommandsTest {
 
         assertTrue(script.contains("ip -4 address replace 192.0.2.2/32 dev lo"));
         assertTrue(script.contains("ip saddr 172.18.1.10 ip daddr 192.0.2.1 tcp dport { 80, 443 }"));
-        assertTrue(script.contains("ip saddr 172.18.1.11 ip daddr 192.0.2.2 tcp dport 443"));
+        assertTrue(script.contains("ip saddr 172.18.1.11 ip daddr 192.0.2.2 tcp dport { 80, 443 }"));
         assertFalse(script.contains("ip saddr 172.18.1.10 ip daddr 192.0.2.2"));
         assertFalse(script.contains("ip saddr 172.18.1.11 ip daddr 192.0.2.1"));
-        assertFalse(script.contains("ip daddr 192.0.2.2 tcp dport {"));
+        assertTrue(script.contains("ip saddr 192.0.2.2 ip daddr 172.18.1.11"
+                + " tcp sport { 80, 443 } ct state established,related"));
         assertTrue(script.contains("egress ip daddr 172.20.0.6 tcp dport 443 counter accept"));
         assertFalse(script.contains("egress ip daddr 172.20.0.6 tcp dport 80"));
 

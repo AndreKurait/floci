@@ -137,6 +137,24 @@ class VpcAwsApiBridgeRecoveryTest {
         verifyNoInteractions(docker, lifecycle, containers);
     }
 
+    @Test
+    void bothNativeAlbListenersUseTheGuardedProxyAndParticipateInSupervision() {
+        String script = VpcAwsApiBridge.listenerScript(
+                "192.0.2.1", "172.18.0.3", 8080, "TCP4:172.18.0.3:8443", true);
+        for (int port : List.of(80, 443)) {
+            assertTrue(script.contains("TCP4-LISTEN:" + port
+                    + ",bind=192.0.2.2,reuseaddr,fork EXEC:'sh /tmp/floci-alb-proxy.sh',pipes"));
+        }
+        assertTrue(script.contains("kill -0 \"$third\""));
+        assertTrue(script.contains("kill -0 \"$fourth\""));
+        assertTrue(script.contains("${third:+\"$third\"} ${fourth:+\"$fourth\"}"));
+        String connector = VpcAwsApiBridge.httpsConnector("172.18.0.2", 443);
+        assertTrue(connector.contains("\"$SOCAT_SOCKADDR\""));
+        assertTrue(connector.contains("\"$SOCAT_SOCKPORT\""));
+        assertTrue(connector.contains("socat - TCP4:172.18.0.2:443"));
+        assertFalse(script.contains("TCP4:172.18.0.2:80"));
+    }
+
     private String owner() {
         return ContainerStorageHelper.ownerIdentity(config);
     }

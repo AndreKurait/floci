@@ -378,8 +378,15 @@ public class TlsProxyServer {
         socket.pause();
         boolean tls = buffer.length() > 0 && buffer.getByte(0) == TLS_HANDSHAKE;
         int port = socket.localAddress().port();
-        if (publicAlbTransport(addresses) && (!tls || !sharedTlsRoutes.containsKey(port))) {
-            socket.close();
+        if (publicAlbTransport(addresses)) {
+            int destinationPort = addresses.destination().port();
+            if (destinationPort == 80 && !tls) {
+                connectBackend(socket, buffer, httpBackendPort, addresses);
+            } else if (destinationPort == 443 && tls && sharedTlsRoutes.containsKey(port)) {
+                readClientHello(socket, buffer, port, addresses);
+            } else {
+                socket.close();
+            }
             return;
         }
         if (tls && sharedTlsRoutes.containsKey(port)) {

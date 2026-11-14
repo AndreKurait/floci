@@ -66,7 +66,7 @@ public class ElbV2DnsRecordSource implements DnsRecordSource {
         if (publicHttps && config.network().vpcRouting().publicAwsApiNativeHttps()) {
             selectedAddress = dns.publicApiAddress(origin);
         } else if (publicHttps && config.network().vpcRouting().publicAwsApiUpstreamHost().isPresent()
-                && servesOnlyHttps443(target)) {
+                && servesNativeHttpPorts(target)) {
             selectedAddress = dns.publicAlbHttpsAddress(origin);
         }
         return Optional.of(selectedAddress
@@ -74,12 +74,18 @@ public class ElbV2DnsRecordSource implements DnsRecordSource {
                 .orElseGet(DnsAnswer::noData));
     }
 
-    private boolean servesOnlyHttps443(LoadBalancer loadBalancer) {
+    private boolean servesNativeHttpPorts(LoadBalancer loadBalancer) {
         List<Listener> listeners = service.findListenersForLoadBalancer(loadBalancer.getLoadBalancerArn());
-        if (listeners.size() != 1) {
+        if (listeners.isEmpty()) {
             return false;
         }
-        Listener listener = listeners.getFirst();
-        return "HTTPS".equals(listener.getProtocol()) && Integer.valueOf(443).equals(listener.getPort());
+        for (Listener listener : listeners) {
+            boolean http = "HTTP".equals(listener.getProtocol()) && Integer.valueOf(80).equals(listener.getPort());
+            boolean https = "HTTPS".equals(listener.getProtocol()) && Integer.valueOf(443).equals(listener.getPort());
+            if (!http && !https) {
+                return false;
+            }
+        }
+        return true;
     }
 }

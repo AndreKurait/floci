@@ -62,7 +62,7 @@ class ElbV2PublicVpcAliasRoutingTest {
     }
 
     @ParameterizedTest
-    @CsvSource({"HTTP,80", "HTTP,443", "HTTPS,8443"})
+    @CsvSource({"HTTP,443", "HTTPS,80", "HTTPS,8443", "HTTP,8080", "TCP,80"})
     void otherListenerProtocolsAndPortsRetainTheExistingAddress(String protocol, int port) {
         ElbV2DnsRecordSource source = source(true, true, false, true, 443, true, true,
                 List.of(listener(protocol, port)));
@@ -70,12 +70,21 @@ class ElbV2PublicVpcAliasRoutingTest {
     }
 
     @Test
-    void emptyAndMixedListenerSetsRetainTheExistingAddress() {
+    void emptyAndCustomPortListenerSetsRetainTheExistingAddress() {
         for (List<Listener> listeners : List.of(List.<Listener>of(),
-                List.of(listener("HTTP", 80), listener("HTTPS", 443)),
                 List.of(listener("HTTPS", 443), listener("HTTPS", 8443)))) {
             ElbV2DnsRecordSource source = source(true, true, false, true, 443, true, true, listeners);
             assertEquals(List.of(CONTROL), source.resolveAliasTarget(NAME, "ZOWNED", 1, VPC).orElseThrow().addresses());
+        }
+    }
+
+    @Test
+    void commonHttpAndHttpsListenerSetsUseTheSameIsolatedAddress() {
+        for (List<Listener> listeners : List.of(List.of(listener("HTTP", 80)),
+                List.of(listener("HTTPS", 443)), List.of(listener("HTTP", 80), listener("HTTPS", 443)))) {
+            ElbV2DnsRecordSource source = source(true, true, false, true, 443, true, true, listeners);
+            assertEquals(List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS),
+                    source.resolveAliasTarget(NAME, "ZOWNED", 1, VPC).orElseThrow().addresses());
         }
     }
 
