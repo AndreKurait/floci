@@ -2362,8 +2362,12 @@ public class CloudFormationService implements ResourceProvider {
         // A physical id names the stack, it does not narrow it: AWS returns "the associated
         // resources of the stack that the resource belongs to", which is the whole stack.
         Stack stack = hasStackName
-                ? getStackOrThrow(stackName, region)
+                ? resolveStackForDescribe(stackName, region)
                 : stackContaining(physicalResourceId, region);
+        if (stack == null) {
+            throw new AwsException("ValidationError",
+                    "Stack with id " + stackName + " does not exist", 400);
+        }
         List<StackResource> resources = new ArrayList<>(stack.resourcesSnapshot().values());
 
         // Only a filter on the result. The reference documents no error for a logical id the
