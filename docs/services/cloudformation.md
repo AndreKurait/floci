@@ -641,6 +641,15 @@ target has no port and is its function ARN alone.
   first update that changes the group registers the declared targets and deregisters nothing.
 - `QuicServerId` is accepted and ignored, as Floci's `RegisterTargets` has no QUIC support.
 
+## S3 access logging configuration
+
+`AWS::S3::Bucket.LoggingConfiguration` reaches the S3 bucket logging API, including the
+destination, log prefix and simple or date-partitioned object key format. An omitted
+destination means the source bucket. Updates preserve the bucket, removing a previously
+declared configuration disables logging, and failed updates restore the previous setting.
+Configurations set outside a template remain intact while that property is undeclared.
+This covers configuration state; it does not add S3 server access log delivery.
+
 ## S3 ownership controls
 
 `AWS::S3::Bucket` applies `OwnershipControls` through the same S3 call as

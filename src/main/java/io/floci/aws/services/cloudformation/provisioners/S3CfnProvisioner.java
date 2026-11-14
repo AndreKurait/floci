@@ -31,17 +31,18 @@ import java.util.Set;
  * <p>A property this class covers is translated into the XML its own S3 API call takes and handed
  * to the same S3 service method used by a direct {@code PutBucket*} request. Ownership controls
  * are validated here before the service stores their XML. A property the template does not declare is left alone, except that
- * an update removing {@code NotificationConfiguration} or {@code OwnershipControls} clears it.
+ * an update removing {@code NotificationConfiguration}, {@code LoggingConfiguration} or
+ * {@code OwnershipControls} clears it.
  *
  * <p>Covered on {@code AWS::S3::Bucket}: {@code BucketName}, {@code CorsConfiguration},
  * {@code VersioningConfiguration}, {@code PublicAccessBlockConfiguration},
- * {@code BucketEncryption}, {@code LifecycleConfiguration},
+ * {@code BucketEncryption}, {@code LifecycleConfiguration}, {@code LoggingConfiguration},
  * {@code OwnershipControls}, {@code NotificationConfiguration} and
  * {@code Tags}. {@code NotificationConfiguration} is the exception to the XML translation: its
  * service method takes the parsed model, so the provisioner builds that model instead.
  *
  * <p><b>Silently dropped</b>, each of which has a service method waiting for it:
- * {@code WebsiteConfiguration}, {@code LoggingConfiguration},
+ * {@code WebsiteConfiguration},
  * {@code ObjectLockConfiguration}, {@code ReplicationConfiguration},
  * {@code AccelerateConfiguration}, {@code AccessControl}, and the four numbered configuration
  * lists ({@code AnalyticsConfigurations}, {@code IntelligentTieringConfigurations},
@@ -104,6 +105,7 @@ public class S3CfnProvisioner implements CfnResourceProvisioner {
             // Built before anything is created, so a configuration that fails validation creates nothing.
             NotificationConfiguration notifications = notificationConfiguration(props, ctx);
             String ownershipControlsXml = ownershipControlsXml(props, ctx);
+            String loggingXml = bucketLoggingXml(bucketName, props, ctx);
             if (ctx.reusesPriorEntity(bucketName)) {
                 r.getAttributes().put(CfnRollback.S3_BUCKET_UPDATE_SNAPSHOT_ATTR,
                         s3Service.snapshotBucketConfiguration(bucketName));
@@ -133,6 +135,7 @@ public class S3CfnProvisioner implements CfnResourceProvisioner {
             applyLifecycleConfiguration(bucketName, props, ctx);
             applyBucketTags(bucketName, props, ctx);
             applyBucketOwnershipControls(bucketName, ownershipControlsXml, ctx);
+            applyBucketLoggingConfiguration(bucketName, loggingXml, ctx);
         } catch (RuntimeException failure) {
             unwind(r, bucketName, unwind, ctx, failure);
             throw failure;
@@ -252,6 +255,63 @@ public class S3CfnProvisioner implements CfnResourceProvisioner {
             return;
         }
         s3Service.putBucketLifecycle(bucketName, lifecycleXml(lifecycle.get("Rules"), ctx), null);
+    }
+
+    private String bucketLoggingXml(String bucketName, JsonNode props, ProvisionContext ctx) {
+        JsonNode node = declared(props, "LoggingConfiguration");
+        if (node == null) {
+            return null;
+        }
+        JsonNode logging = ctx.engine().resolveNodeOmittingNoValue(node);
+        if (logging == null || logging.isMissingNode() || logging.isNull()) {
+            return null;
+        }
+        String path = "#/LoggingConfiguration";
+        requireOnly(requireObject(logging, path), path,
+                "DestinationBucketName", "LogFilePrefix", "TargetObjectKeyFormat");
+        String destination = declared(logging, "DestinationBucketName") == null
+                ? bucketName : required(logging, "DestinationBucketName", path);
+        String prefix = declared(logging, "LogFilePrefix") == null ? "" : required(logging, "LogFilePrefix", path);
+        XmlBuilder xml = new XmlBuilder().start("BucketLoggingStatus", AwsNamespaces.S3)
+                .start("LoggingEnabled").elem("TargetBucket", destination).elem("TargetPrefix", prefix);
+        JsonNode format = declared(logging, "TargetObjectKeyFormat");
+        if (format != null) {
+            String formatPath = path + "/TargetObjectKeyFormat";
+            requireOnly(requireObject(format, formatPath), formatPath, "SimplePrefix", "PartitionedPrefix");
+            JsonNode simple = declared(format, "SimplePrefix");
+            JsonNode partitioned = declared(format, "PartitionedPrefix");
+            if (simple != null && partitioned != null) {
+                throw new AwsException("InvalidRequest",
+                        "Only one of SimplePrefix or PartitionedPrefix is allowed.", 400);
+            }
+            if (simple != null) {
+                requireOnly(requireObject(simple, formatPath + "/SimplePrefix"), formatPath + "/SimplePrefix");
+                xml.start("TargetObjectKeyFormat").start("SimplePrefix").end("SimplePrefix")
+                        .end("TargetObjectKeyFormat");
+            } else if (partitioned != null) {
+                String partitionPath = formatPath + "/PartitionedPrefix";
+                requireOnly(requireObject(partitioned, partitionPath), partitionPath, "PartitionDateSource");
+                String dateSource = declared(partitioned, "PartitionDateSource") == null
+                        ? "EventTime" : required(partitioned, "PartitionDateSource", partitionPath);
+                if (!Set.of("EventTime", "DeliveryTime").contains(dateSource)) {
+                    throw new AwsException("InvalidRequest",
+                            "PartitionDateSource must be EventTime or DeliveryTime.", 400);
+                }
+                xml.start("TargetObjectKeyFormat").start("PartitionedPrefix")
+                        .elem("PartitionDateSource", dateSource).end("PartitionedPrefix")
+                        .end("TargetObjectKeyFormat");
+            }
+        }
+        return xml.end("LoggingEnabled").end("BucketLoggingStatus").build();
+    }
+
+    private void applyBucketLoggingConfiguration(String bucketName, String loggingXml, ProvisionContext ctx) {
+        if (loggingXml != null) {
+            s3Service.putBucketLogging(bucketName, loggingXml);
+        } else if (ctx.reusesPriorEntity(bucketName) && ctx.previouslyDeclared("LoggingConfiguration")) {
+            s3Service.putBucketLogging(bucketName, new XmlBuilder()
+                    .start("BucketLoggingStatus", AwsNamespaces.S3).end("BucketLoggingStatus").build());
+        }
     }
 
     /**
