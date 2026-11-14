@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.appconfig;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
@@ -54,6 +55,7 @@ public class AppConfigService {
     private final StorageBackend<String, ConfigurationContent> sourceContentStore;
     private final StorageBackend<String, String> activeConfigStore; // envId::profileId -> versionNumber
     private final Clock clock;
+    private final double deploymentTimeScale;
     private final RegionResolver regions;
     private final AppConfigAlarmMonitor alarms;
     private final AppConfigS3Source s3Source;
@@ -73,8 +75,24 @@ public class AppConfigService {
     @Inject
     AppConfigService(StorageFactory storageFactory, RegionResolver regions,
                      @Identifier("appconfig") Clock clock, AppConfigAlarmMonitor alarms,
-                     AppConfigS3Source s3Source) {
+                     AppConfigS3Source s3Source, EmulatorConfig config) {
+        this(storageFactory, regions, clock, alarms, s3Source,
+                config.services().appconfig().deploymentTimeScale());
+    }
+
+    AppConfigService(StorageFactory storageFactory, RegionResolver regions, Clock clock,
+                     AppConfigAlarmMonitor alarms, AppConfigS3Source s3Source) {
+        this(storageFactory, regions, clock, alarms, s3Source, 1.0);
+    }
+
+    AppConfigService(StorageFactory storageFactory, RegionResolver regions, Clock clock,
+                     AppConfigAlarmMonitor alarms, AppConfigS3Source s3Source, double deploymentTimeScale) {
+        if (!Double.isFinite(deploymentTimeScale) || deploymentTimeScale <= 0 || deploymentTimeScale > 1) {
+            throw new IllegalArgumentException(
+                    "floci.services.appconfig.deployment-time-scale must be greater than zero and at most one");
+        }
         this.clock = clock;
+        this.deploymentTimeScale = deploymentTimeScale;
         this.regions = regions;
         this.alarms = alarms;
         this.s3Source = s3Source;
@@ -945,15 +963,16 @@ public class AppConfigService {
                 ? 0 : deployment.getDeploymentDurationInMinutes();
         int bakeMinutes = deployment.getFinalBakeTimeInMinutes() == null
                 ? 0 : deployment.getFinalBakeTimeInMinutes();
-        Instant rolledOut = started.plus(Duration.ofMinutes(rolloutMinutes));
-        Instant completed = rolledOut.plus(Duration.ofMinutes(bakeMinutes));
+        Duration rolloutDuration = deploymentDuration(rolloutMinutes);
+        Instant rolledOut = started.plus(rolloutDuration);
+        Instant completed = rolledOut.plus(deploymentDuration(bakeMinutes));
         Instant now = clock.instant();
         String state;
         float percentage;
         if ("DEPLOYING".equals(deployment.getState()) && now.isBefore(rolledOut)) {
             state = "DEPLOYING";
             percentage = rolloutPercentage(deployment, Duration.between(started, now).toMillis(),
-                    Duration.ofMinutes(rolloutMinutes).toMillis());
+                    rolloutDuration.toMillis());
             if (deployment.getPercentageComplete() != null) {
                 percentage = Math.max(percentage, deployment.getPercentageComplete());
             }
@@ -973,6 +992,11 @@ public class AppConfigService {
         deploymentStore.put(refreshed.getApplicationId() + "::" + refreshed.getEnvironmentId()
                 + "::" + refreshed.getDeploymentNumber(), refreshed);
         return refreshed;
+    }
+
+    private Duration deploymentDuration(int minutes) {
+        return minutes == 0 ? Duration.ZERO
+                : Duration.ofMillis(Math.max(1L, Math.round(Duration.ofMinutes(minutes).toMillis() * deploymentTimeScale)));
     }
 
     /** Growth steps are evenly spaced across the rollout; final bake begins after its full duration. */

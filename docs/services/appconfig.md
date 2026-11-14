@@ -23,6 +23,15 @@ These definitions are returned by environment reads and monitored during rollout
 Deployment creation captures the selected profile's configuration name and location URI for subsequent deployment reads.
 Hosted and S3 profiles default an omitted `Type` to `AWS.Freeform`. Other sources keep an omitted type unset.
 
+Local runs can opt into faster deployment timing with
+`FLOCI_SERVICES_APPCONFIG_DEPLOYMENT_TIME_SCALE`. The default `1.0` preserves the requested
+rollout and bake durations. A value greater than zero and at most one multiplies both durations:
+`0.001` runs a 30-minute rollout and 30-minute bake in 3.6 seconds.
+Strategy and deployment responses retain their requested minute values; progress and completion
+timestamps follow the scaled wall time. Alarm checks remain active during both phases.
+A positive phase lasts at least one millisecond. Keep this setting fixed when resuming a persisted
+run, since the configured scale also applies to its active deployments.
+
 CloudFormation creates backing AppConfig resources. See [CloudFormation](#cloudformation)
 for supported types, updates, deletion and property limitations.
 
