@@ -472,6 +472,7 @@ floci:
       max-capacity-reservation-ids: 1
     applicationautoscaling:
       enabled: true
+      scheduled-action-interval-seconds: 1
     elasticbeanstalk:
       enabled: true
     transfer:

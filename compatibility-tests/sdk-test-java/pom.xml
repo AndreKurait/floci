@@ -529,6 +529,10 @@
         <!-- Auto Scaling client -->
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
+            <artifactId>applicationautoscaling</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
             <artifactId>autoscaling</artifactId>
         </dependency>
         <!-- CloudFormation client -->

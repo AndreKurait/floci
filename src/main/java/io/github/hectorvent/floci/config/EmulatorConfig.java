@@ -1356,6 +1356,9 @@ public interface EmulatorConfig {
     interface ApplicationAutoScalingServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        @WithDefault("1")
+        long scheduledActionIntervalSeconds();
     }
 
     interface ElasticBeanstalkServiceConfig {
