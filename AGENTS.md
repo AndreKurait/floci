@@ -344,6 +344,8 @@ the registry and stubs what nothing serves; never add type-specific code to it.
    - `resource.setPhysicalId(...)` stores the durable resource identity and normally backs `Ref`.
      When AWS returns only part of a compound identity, override `referenceValue(physicalId)`.
      Keep the complete physical ID so deletion and rollback can still identify the resource.
+     Override `publicPhysicalId(physicalId)` separately when CFN resource/event/change-set responses
+     expose part of that identity; the default keeps the complete ID in public responses.
    - `resource.getAttributes().put(...)` backs `Fn::GetAtt`, one entry per attribute
    Omitting an attribute does not fail; `Fn::GetAtt` resolves to the literal
    `"LogicalId.Attr"`. Source the attribute names from the type's registry schema in

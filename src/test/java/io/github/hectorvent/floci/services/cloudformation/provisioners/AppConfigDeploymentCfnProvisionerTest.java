@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
 import io.github.hectorvent.floci.services.appconfig.AppConfigService;
 import io.github.hectorvent.floci.services.appconfig.DeploymentStopException;
 import io.github.hectorvent.floci.services.appconfig.model.Deployment;
@@ -40,11 +41,12 @@ import static org.mockito.Mockito.when;
 class AppConfigDeploymentCfnProvisionerTest {
     private static final ObjectMapper JSON = new ObjectMapper();
     private final AppConfigService service = mock(AppConfigService.class);
+    private final ServiceConfigAccess serviceConfig = mock(ServiceConfigAccess.class);
     private final TestTime time = TestTime.create();
     private final List<Duration> waits = new ArrayList<>();
     private final List<StackEvent> events = new ArrayList<>();
     private final AppConfigDeploymentCfnProvisioner provisioner = new AppConfigDeploymentCfnProvisioner(
-            service, time::nanoTime, delay -> {
+            service, serviceConfig, time::nanoTime, delay -> {
                 waits.add(delay);
                 time.sleepAdvancing(delay);
             });
@@ -62,7 +64,8 @@ class AppConfigDeploymentCfnProvisionerTest {
         provisioner.provision(resource, JSON.valueToTree(properties()), context);
 
         assertEquals("app0001|env0001|7", resource.getPhysicalId());
-        assertEquals("app0001|env0001|7", provisioner.referenceValue(resource.getPhysicalId()));
+        assertEquals("7", provisioner.referenceValue(resource.getPhysicalId()));
+        assertEquals("7", provisioner.publicPhysicalId(resource.getPhysicalId()));
         assertEquals("7", resource.getAttributes().get("DeploymentNumber"));
         assertEquals("COMPLETE", resource.getAttributes().get("State"));
         assertEquals(List.of(Duration.ofSeconds(1), Duration.ofSeconds(1)), waits);
@@ -70,6 +73,20 @@ class AppConfigDeploymentCfnProvisionerTest {
                 events.stream().map(StackEvent::getResourceStatusReason).toList());
         assertTrue(events.stream().allMatch(event -> "CREATE_IN_PROGRESS".equals(event.getResourceStatus())));
         verify(service, never()).stopDeployment("app0001", "env0001", 7, true);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"Deployment-1234abcd", "7", "app0001|env0001"})
+    void nonCompoundPublicIdentitiesRemainUnchanged(String physicalId) {
+        assertEquals(physicalId, provisioner.referenceValue(physicalId));
+        assertEquals(physicalId, provisioner.publicPhysicalId(physicalId));
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    void publicPhysicalIdPreservesMissingIdentity() {
+        assertNull(provisioner.publicPhysicalId(null));
+        verifyNoInteractions(service);
     }
 
     @Test
@@ -192,7 +209,7 @@ class AppConfigDeploymentCfnProvisionerTest {
         startReturns("DEPLOYING");
         when(service.getDeployment("app0001", "env0001", 7)).thenReturn(deployment("DEPLOYING"));
         AppConfigDeploymentCfnProvisioner interrupted = new AppConfigDeploymentCfnProvisioner(
-                service, time::nanoTime, delay -> {
+                service, serviceConfig, time::nanoTime, delay -> {
                     throw new InterruptedException("stop test");
                 });
         try {

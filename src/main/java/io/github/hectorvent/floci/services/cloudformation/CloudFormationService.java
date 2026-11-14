@@ -2318,6 +2318,11 @@ public class CloudFormationService implements ResourceProvider {
 
     // ── DescribeStackResources ────────────────────────────────────────────────
 
+    /** Public response projection leaves stored resources and lifecycle identities unchanged. */
+    public String publicPhysicalId(String resourceType, String physicalId) {
+        return dispatcher.publicPhysicalId(resourceType, physicalId);
+    }
+
     public List<StackResource> describeStackResources(String stackName, String region) {
         return describeStackResources(stackName, null, null, region);
     }

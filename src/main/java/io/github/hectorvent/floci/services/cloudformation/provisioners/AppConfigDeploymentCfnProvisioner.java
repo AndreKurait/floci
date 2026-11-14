@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
 import io.github.hectorvent.floci.services.appconfig.AppConfigService;
 import io.github.hectorvent.floci.services.appconfig.DeploymentStopException;
 import io.github.hectorvent.floci.services.appconfig.model.Deployment;
@@ -26,16 +27,19 @@ public class AppConfigDeploymentCfnProvisioner implements CfnResourceProvisioner
     private static final Duration TIMEOUT = Duration.ofHours(24);
 
     private final AppConfigService service;
+    private final ServiceConfigAccess serviceConfig;
     private final LongSupplier nanoTime;
     private final Sleeper sleeper;
 
     @Inject
-    public AppConfigDeploymentCfnProvisioner(AppConfigService service) {
-        this(service, System::nanoTime, Thread::sleep);
+    public AppConfigDeploymentCfnProvisioner(AppConfigService service, ServiceConfigAccess serviceConfig) {
+        this(service, serviceConfig, System::nanoTime, Thread::sleep);
     }
 
-    AppConfigDeploymentCfnProvisioner(AppConfigService service, LongSupplier nanoTime, Sleeper sleeper) {
+    AppConfigDeploymentCfnProvisioner(AppConfigService service, ServiceConfigAccess serviceConfig,
+                                    LongSupplier nanoTime, Sleeper sleeper) {
         this.service = service;
+        this.serviceConfig = serviceConfig;
         this.nanoTime = nanoTime;
         this.sleeper = sleeper;
     }
@@ -48,6 +52,28 @@ public class AppConfigDeploymentCfnProvisioner implements CfnResourceProvisioner
     @Override
     public Set<String> resourceTypes() {
         return Set.of(TYPE);
+    }
+
+    @Override
+    public boolean serviceDisabled() {
+        return !serviceConfig.isEnabled("appconfig");
+    }
+
+    @Override
+    public String serviceEnabledFlag() {
+        return "floci.services.appconfig.enabled";
+    }
+
+    @Override
+    public String referenceValue(String physicalId) {
+        String[] parts = physicalId.split("\\|", -1);
+        // An older stack can still carry a dispatcher stub until it replaces this resource.
+        return parts.length == 3 ? parts[2] : physicalId;
+    }
+
+    @Override
+    public String publicPhysicalId(String physicalId) {
+        return physicalId == null ? null : referenceValue(physicalId);
     }
 
     @Override
