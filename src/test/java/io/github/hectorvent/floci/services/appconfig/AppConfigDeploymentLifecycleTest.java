@@ -1,5 +1,7 @@
 package io.github.hectorvent.floci.services.appconfig;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
@@ -449,7 +451,7 @@ class AppConfigDeploymentLifecycleTest {
         StorageFactory storage = factory();
         AppConfigService service = service(storage, START);
         Scope scope = scope(service);
-        deploy(service, scope, previousVersion, scope.fast());
+        seedPreviousVersion(storage, service, scope, previousVersion);
         Deployment current = deploy(service, scope, "2", scope.fast());
 
         Deployment reverted = service.stopDeployment(scope.app(), scope.env(), current.getDeploymentNumber(), true);
@@ -471,7 +473,7 @@ class AppConfigDeploymentLifecycleTest {
         StorageFactory storage = factory();
         AppConfigService service = service(storage, START);
         Scope scope = scope(service);
-        deploy(service, scope, previousVersion, scope.fast());
+        seedPreviousVersion(storage, service, scope, previousVersion);
         Deployment current = deploy(service, scope, "2", scope.fast());
 
         AwsException failure = assertThrows(AwsException.class, () -> service.stopDeployment(
@@ -481,6 +483,19 @@ class AppConfigDeploymentLifecycleTest {
         assertEquals("COMPLETE", service.getDeployment(scope.app(), scope.env(),
                 current.getDeploymentNumber()).getState());
         assertEquals("COMPLETE", current.getState());
+    }
+
+    private void seedPreviousVersion(StorageFactory storage, AppConfigService service, Scope scope,
+                                     String version) {
+        // These controls exercise history written before hosted selector admission was enforced.
+        Deployment previous = new ObjectMapper().convertValue(
+                deploy(service, scope, "1", scope.fast()), Deployment.class);
+        previous.setConfigurationVersion(version);
+        new AppConfigStorage<Deployment>(storage, new RegionResolver("us-east-1", "000000000000"),
+                "appconfig", "appconfig-deployments.json", new TypeReference<>() {})
+                .put(scope.app() + "::" + scope.env() + "::" + previous.getDeploymentNumber(), previous);
+        assertEquals(version, service.getDeployment(scope.app(), scope.env(),
+                previous.getDeploymentNumber()).getConfigurationVersion());
     }
 
     private Scope scope(AppConfigService service) {
