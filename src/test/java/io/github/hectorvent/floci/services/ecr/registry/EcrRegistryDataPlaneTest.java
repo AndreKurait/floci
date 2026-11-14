@@ -100,6 +100,57 @@ class EcrRegistryDataPlaneTest {
         assertEquals("/v2/123456789012/eu-west-1/team/app/tags/list", requestNoPort.backendUri());
     }
 
+    @ParameterizedTest
+    @CsvSource({
+            "us-east-1,amazonaws.com",
+            "eu-west-1,amazonaws.com",
+            "us-gov-west-1,amazonaws.com",
+            "cn-north-1,amazonaws.com.cn",
+            "us-iso-east-1,c2s.ic.gov",
+            "us-isob-east-1,sc2s.sgov.gov",
+            "eu-isoe-west-1,cloud.adc-e.uk",
+            "us-isof-south-1,csp.hci.ic.gov",
+            "eusc-de-east-1,amazonaws.eu"
+    })
+    void nativeRegistryHostPreservesAccountRegionAndUploadContinuation(String region, String suffix) {
+        String host = "123456789012.dkr.ecr." + region + "." + suffix;
+        EcrRegistryDataPlane.RegistryRequest request = EcrRegistryDataPlane.requestFor(
+                host, "/v2/team/app/blobs/uploads/", "mount=sha256:abc", "hostname").orElseThrow();
+
+        assertEquals("123456789012", request.accountId());
+        assertEquals(region, request.region());
+        assertEquals("team/app", request.repositoryName());
+        assertEquals("/v2/123456789012/" + region + "/team/app/blobs/uploads/?mount=sha256:abc",
+                request.backendUri());
+        assertEquals("/v2/team/app/blobs/uploads/upload-id",
+                EcrRegistryDataPlane.externalLocation(
+                        "/v2/123456789012/" + region + "/team/app/blobs/uploads/upload-id", request));
+        assertEquals("/v2/", EcrRegistryDataPlane.requestFor(
+                host + ":443", "/v2/", null, "hostname").orElseThrow().backendUri());
+        assertEquals(request.backendUri(), EcrRegistryDataPlane.requestFor(
+                "floci:4566", "/v2/team/app/blobs/uploads/",
+                "ns=" + host + "&mount=sha256:abc", "hostname").orElseThrow().backendUri());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "12345.dkr.ecr.us-east-1.amazonaws.com",
+            "abcdefghijkl.dkr.ecr.us-east-1.amazonaws.com",
+            "123456789012.dkr.ecr.cn-north-1.amazonaws.com",
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com.cn",
+            "123456789012.dkr.ecr.us-isob-east-1.c2s.ic.gov",
+            "123456789012.dkr.ecr.not-a-region.amazonaws.com",
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com.example.com",
+            "123456789012.api.ecr.us-east-1.amazonaws.com",
+            "123456789012.dkr.ecr.us-east-1.amazonaws.com:invalid"
+    })
+    void invalidNativeRegistryHostCannotSelectAnAccountNamespace(String host) {
+        assertTrue(EcrRegistryDataPlane.requestFor(
+                host, "/v2/team/app/manifests/v1", null, "hostname").isEmpty());
+        assertTrue(EcrRegistryDataPlane.requestFor(
+                "floci:4566", "/v2/team/app/manifests/v1", "ns=" + host, "hostname").isEmpty());
+    }
+
     @Test
     void malformedAccountOrNonEcrHostIsRejected() {
         // Less than 12 digits
@@ -232,8 +283,13 @@ class EcrRegistryDataPlaneTest {
                         "/v2/000000000000/us-east-1/platform/api/blobs/uploads/upload-id", request));
     }
 
-    @Test
-    void immutableTagRejectsReplacementBeforeItReachesTheRegistry() throws Exception {
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "000000000000.dkr.ecr.us-east-1.localhost:4566",
+            "000000000000.dkr.ecr.us-east-1.amazonaws.com",
+            "000000000000.dkr.ecr.us-east-1.amazonaws.com:443"
+    })
+    void immutableTagRejectsReplacementBeforeItReachesTheRegistry(String host) throws Exception {
         AtomicBoolean tagExists = new AtomicBoolean();
         AtomicInteger manifestWrites = new AtomicInteger();
         AtomicReference<String> headPath = new AtomicReference<>();
@@ -265,9 +321,9 @@ class EcrRegistryDataPlaneTest {
         try {
             dataPlane = dataPlane(registry, true);
 
-            assertEquals(201, putManifest(dataPlane.actualPort()).statusCode());
+            assertEquals(201, putManifest(dataPlane.actualPort(), host).statusCode());
 
-            ManifestResponse rejected = putManifest(dataPlane.actualPort());
+            ManifestResponse rejected = putManifest(dataPlane.actualPort(), host);
             assertEquals(400, rejected.statusCode());
             JsonObject json = new JsonObject(rejected.body());
             JsonArray errors = json.getJsonArray("errors");
