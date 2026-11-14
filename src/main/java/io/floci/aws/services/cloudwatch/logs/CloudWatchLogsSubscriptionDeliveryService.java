@@ -5,8 +5,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
-import io.floci.aws.core.storage.AccountAwareStorageBackend;
-import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.services.cloudwatch.logs.filter.FilterPattern;
 import io.floci.aws.services.cloudwatch.logs.model.LogEvent;
 import io.floci.aws.services.cloudwatch.logs.model.SubscriptionFilter;
@@ -53,7 +51,6 @@ public class CloudWatchLogsSubscriptionDeliveryService {
     /** Max compressed record size for Kinesis and Firehose delivery (1 MB). */
     private static final int MAX_RECORD_PAYLOAD_BYTES = 1_000_000;
 
-    private final StorageBackend<String, SubscriptionFilter> store;
     private final LambdaService lambdaService;
     private final KinesisService kinesisService;
     private final FirehoseService firehoseService;
@@ -62,14 +59,12 @@ public class CloudWatchLogsSubscriptionDeliveryService {
     private final CloudWatchLogsSubscriptionAdmissionService admission;
 
     @Inject
-    public CloudWatchLogsSubscriptionDeliveryService(CloudWatchLogsService logsService,
-                                                     LambdaService lambdaService,
+    public CloudWatchLogsSubscriptionDeliveryService(LambdaService lambdaService,
                                                      KinesisService kinesisService,
                                                      FirehoseService firehoseService,
                                                      RegionResolver regionResolver,
                                                      ObjectMapper objectMapper,
                                                      CloudWatchLogsSubscriptionAdmissionService admission) {
-        this.store = logsService.subscriptionFilterStore();
         this.lambdaService = lambdaService;
         this.kinesisService = kinesisService;
         this.firehoseService = firehoseService;
@@ -102,7 +97,7 @@ public class CloudWatchLogsSubscriptionDeliveryService {
         String account = event.accountId() == null || event.accountId().isBlank()
                 ? regionResolver.getAccountId() : event.accountId();
         try {
-            List<SubscriptionFilter> filters = filtersOf(event.logGroupName(), event.region(), account);
+            List<SubscriptionFilter> filters = event.subscriptionFilters();
             for (SubscriptionFilter filter : filters) {
                 try {
                     deliver(filter, event, account);
@@ -115,17 +110,6 @@ public class CloudWatchLogsSubscriptionDeliveryService {
             LOG.errorv(e, "Cannot load subscription filters; delivery skipped: account={0}, region={1}, group={2}",
                     account, event.region(), event.logGroupName());
         }
-    }
-
-    private List<SubscriptionFilter> filtersOf(String logGroupName, String region, String accountId) {
-        String prefix = CloudWatchLogsService.subscriptionFilterKeyPrefix(region, logGroupName);
-        if (accountId != null && store instanceof AccountAwareStorageBackend<?> rawAware) {
-            @SuppressWarnings("unchecked")
-            AccountAwareStorageBackend<SubscriptionFilter> aware =
-                    (AccountAwareStorageBackend<SubscriptionFilter>) rawAware;
-            return aware.scanForAccount(accountId, key -> key.startsWith(prefix));
-        }
-        return store.scan(key -> key.startsWith(prefix));
     }
 
     private void deliver(SubscriptionFilter filter, LogEventsIngested event, String account) throws IOException {

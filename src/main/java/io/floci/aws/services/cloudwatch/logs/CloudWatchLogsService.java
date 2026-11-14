@@ -782,16 +782,39 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
             String accountId, String groupName, String streamName,
             List<Map<String, Object>> events, String region) {
         IngestedBatch batch;
+        List<SubscriptionFilter> filters;
         synchronized (metricFilterStore) {
             batch = putLogEventsBatch(accountId, groupName, streamName, events, region);
+            filters = logEventsIngested == null || batch.events().isEmpty() ? List.of()
+                    : subscriptionSnapshot(accountId, region, groupName);
         }
         if (logEventsIngested != null && !batch.events().isEmpty()) {
-            logEventsIngested.fire(new LogEventsIngested(accountId, region, groupName, streamName, batch.events()));
+            logEventsIngested.fire(new LogEventsIngested(accountId, region, groupName, streamName, batch.events(), filters));
         }
         return batch.nextToken();
     }
 
     private record IngestedBatch(String nextToken, List<LogEvent> events) {}
+
+    private List<SubscriptionFilter> subscriptionSnapshot(String accountId, String region, String groupName) {
+        try {
+            String prefix = subscriptionFilterKeyPrefix(region, groupName);
+            List<SubscriptionFilter> filters;
+            if (accountId != null && subscriptionFilterStore instanceof AccountAwareStorageBackend<?> rawAware) {
+                @SuppressWarnings("unchecked")
+                AccountAwareStorageBackend<SubscriptionFilter> aware =
+                        (AccountAwareStorageBackend<SubscriptionFilter>) rawAware;
+                filters = aware.scanForAccount(accountId, key -> key.startsWith(prefix));
+            } else {
+                filters = subscriptionFilterStore.scan(key -> key.startsWith(prefix));
+            }
+            return filters.stream().map(SubscriptionFilter::new).toList();
+        } catch (RuntimeException e) {
+            LOG.errorv(e, "Cannot snapshot subscription filters; delivery skipped: account={0}, region={1}, group={2}",
+                    accountId, region, groupName);
+            return List.of();
+        }
+    }
 
     /** Uses the same metadata-then-event-index lock order as group deletion. */
     private IngestedBatch putLogEventsBatch(

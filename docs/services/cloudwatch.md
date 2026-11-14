@@ -205,6 +205,10 @@ record field defaults for sources other than an EventBridge event bus.
 
 ### Subscription filters {#subscription-filters}
 
+Subscription selection is captured with ingestion under the log metadata lock. An accepted batch
+keeps its original destination snapshot if filters change or the group is recreated before
+notification delivery. External delivery runs after releasing that lock.
+
 Subscription filters deliver newly ingested log events to a downstream destination. Floci delivers
 matching events to Lambda functions, Kinesis data streams, and Firehose delivery streams. Delivery
 happens synchronously on the calling thread when `PutLogEvents` persists events. A destination error,
