@@ -49,6 +49,9 @@ import java.util.stream.Collectors;
 /**
  * Application Auto Scaling control plane.
  *
+ * <p>ECS desired count and Lambda provisioned concurrency use real capacity adapters.
+ * Other dimensions retain their control-plane records without changing capacity.</p>
+ *
  * @see <a href="https://docs.aws.amazon.com/autoscaling/application/APIReference/Welcome.html">Application Auto Scaling API Reference</a>
  */
 @ApplicationScoped
@@ -100,13 +103,15 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
     private final Object[] targetLocks = new Object[256];
     private final RegionResolver regionResolver;
     private final CloudWatchMetricsService cloudWatchMetricsService;
+    private final LambdaCapacityAdjuster lambdaCapacity;
     private final SignedMarkers pageTokens = new SignedMarkers();
 
     @Inject
     public ApplicationAutoScalingService(StorageFactory factory,
                                          RegionResolver regionResolver,
                                          CloudWatchMetricsService cloudWatchMetricsService,
-                                         EcsCapacityAdjuster ecsCapacityAdjuster) {
+                                         EcsCapacityAdjuster ecsCapacityAdjuster,
+                                         LambdaCapacityAdjuster lambdaCapacity) {
         this(factory.create("applicationautoscaling", "application-autoscaling-targets.json",
                         new TypeReference<Map<String, ScalableTarget>>() {}),
                 factory.create("applicationautoscaling", "application-autoscaling-policies.json",
@@ -115,7 +120,7 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
                         new TypeReference<Map<String, ScalingActivity>>() {}),
                 factory.create("applicationautoscaling", "application-autoscaling-scheduled-actions.json",
                         new TypeReference<Map<String, ScheduledAction>>() {}),
-                regionResolver, cloudWatchMetricsService, ecsCapacityAdjuster);
+                regionResolver, cloudWatchMetricsService, ecsCapacityAdjuster, lambdaCapacity);
     }
 
     ApplicationAutoScalingService(StorageBackend<String, ScalableTarget> targets,
@@ -124,7 +129,8 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
                                   StorageBackend<String, ScheduledAction> scheduledActions,
                                   RegionResolver regionResolver,
                                   CloudWatchMetricsService cloudWatchMetricsService,
-                                  EcsCapacityAdjuster ecsCapacityAdjuster) {
+                                  EcsCapacityAdjuster ecsCapacityAdjuster,
+                                  LambdaCapacityAdjuster lambdaCapacity) {
         this.scheduledActions = scheduledActions;
         this.ecsCapacityAdjuster = ecsCapacityAdjuster;
         for (int i = 0; i < targetLocks.length; i++) {
@@ -135,6 +141,7 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
         this.activities = activities;
         this.regionResolver = regionResolver;
         this.cloudWatchMetricsService = cloudWatchMetricsService;
+        this.lambdaCapacity = lambdaCapacity;
     }
 
     // ---------------------------------------------------------------- scalable targets
@@ -154,6 +161,9 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
                 if (minCapacity == null || maxCapacity == null) {
                     throw new AwsException("ValidationException",
                             "Min and max capacity are required when registering a new scalable target.", 400);
+                }
+                if (lambdaCapacity.supports(scalableDimension)) {
+                    lambdaCapacity.reconcileRegistration(resourceId, minCapacity, maxCapacity, region);
                 }
                 ScalableTarget target = new ScalableTarget();
                 target.setServiceNamespace(serviceNamespace);
@@ -180,6 +190,11 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
                 existing = new ScalableTarget(targets.get(key).orElseThrow());
             }
             // Update semantics: only supplied parameters change.
+            if (lambdaCapacity.supports(scalableDimension)) {
+                lambdaCapacity.reconcileRegistration(resourceId,
+                        minCapacity != null ? minCapacity : existing.getMinCapacity(),
+                        maxCapacity != null ? maxCapacity : existing.getMaxCapacity(), region);
+            }
             if (minCapacity != null) {
                 existing.setMinCapacity(minCapacity);
             }
@@ -269,10 +284,8 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
                                        String schedule, boolean actionSupplied, Integer min, Integer max,
                                        String timezone, String region, Instant now) {
         validateTriple(namespace, resourceId, dimension);
-        validateActionName(name);
-        if (!"ecs".equals(namespace) || !"ecs:service:DesiredCount".equals(dimension)) {
-            throw new AwsException("ValidationException", "Scheduled actions support ECS desired count only.", 400);
-        }
+        validatePutActionName(name);
+        scheduledCapacityAdjuster(namespace, dimension);
         if (timezone != null && !"UTC".equals(timezone)) {
             throw new AwsException("ValidationException", "Only UTC is supported for Timezone.", 400);
         }
@@ -318,7 +331,7 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
 
     public void deleteScheduledAction(String namespace, String resourceId, String dimension, String name, String region) {
         validateTriple(namespace, resourceId, dimension);
-        validateActionName(name);
+        validateDeleteActionName(name);
         synchronized (targetLock(region, namespace, resourceId, dimension)) {
             String key = policyKey(region, namespace, resourceId, dimension, name);
             if (scheduledActions.get(key).isEmpty()) {
@@ -358,11 +371,32 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
         return action.getScheduledActionName() + "\u0000" + action.getResourceId() + "\u0000" + action.getScalableDimension();
     }
 
-    private static void validateActionName(String name) {
-        if (name == null || name.isBlank() || name.length() > 256
+    private static void validatePutActionName(String name) {
+        if (name == null || name.isEmpty() || name.codePointCount(0, name.length()) > 256
+                || name.startsWith(" ") || name.endsWith(" ")
                 || name.chars().anyMatch(c -> c == ':' || c == '/' || c == '|' || Character.isISOControl(c))) {
             throw new AwsException("ValidationException", "Invalid ScheduledActionName.", 400);
         }
+    }
+
+    private static void validateDeleteActionName(String name) {
+        if (name == null || name.isEmpty() || name.codePointCount(0, name.length()) > 1600
+                || name.codePoints().anyMatch(c -> !(c == '\t' || c == '\n' || c == '\r'
+                        || c >= 0x20 && c <= 0xd7ff || c >= 0xe000 && c <= 0xfffd
+                        || c >= 0x10000 && c <= 0x10ffff))) {
+            throw new AwsException("ValidationException", "Invalid ScheduledActionName.", 400);
+        }
+    }
+
+    private CapacityAdjuster scheduledCapacityAdjuster(String namespace, String dimension) {
+        if ("ecs".equals(namespace) && "ecs:service:DesiredCount".equals(dimension)) {
+            return ecsCapacityAdjuster;
+        }
+        if ("lambda".equals(namespace) && "lambda:function:ProvisionedConcurrency".equals(dimension)) {
+            return lambdaCapacity;
+        }
+        throw new AwsException("ValidationException",
+                "Scheduled actions support ECS desired count and Lambda provisioned concurrency.", 400);
     }
 
     private static Instant parseSchedule(String schedule) {
@@ -483,10 +517,12 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
             target.setMaxCapacity(max);
             targets.putAllAtomically(Map.of(targetKey(region, target.getServiceNamespace(), target.getResourceId(),
                     target.getScalableDimension()), target));
-            int current = ecsCapacityAdjuster.getCurrentCapacity(target.getResourceId(), region);
+            CapacityAdjuster adjuster = scheduledCapacityAdjuster(
+                    target.getServiceNamespace(), target.getScalableDimension());
+            int current = adjuster.getCurrentCapacity(target.getResourceId(), region);
             int desired = Math.max(min, Math.min(max, current));
             if (desired != current) {
-                ecsCapacityAdjuster.setCapacity(target.getResourceId(), desired, region);
+                adjuster.setCapacity(target.getResourceId(), desired, region);
             }
             description = "Setting capacity bounds to " + min + " and " + max;
             action.setState(State.SUCCEEDED);
@@ -518,6 +554,10 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
         if (policyType != null && !POLICY_TYPES.contains(policyType)) {
             throw new AwsException("ValidationException",
                     "Unsupported policy type: " + policyType, 400);
+        }
+        if ("lambda".equals(serviceNamespace) && !"TargetTrackingScaling".equals(policyType)) {
+            throw new AwsException("ValidationException",
+                    "Lambda provisioned concurrency supports TargetTrackingScaling policies.", 400);
         }
         String targetKey = targetKey(region, serviceNamespace, resourceId, scalableDimension);
         if (targets.get(targetKey).isEmpty()) {
@@ -664,7 +704,7 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
     /**
      * Creates the pair of CloudWatch alarms that AWS provisions on behalf of a target
      * tracking policy. The alarms are real: they show up in DescribeAlarms exactly as they
-     * would in AWS, even though nothing evaluates them here.
+     * would in AWS. The background evaluator dispatches their supported capacity adapters.
      */
     private List<Alarm> createTargetTrackingAlarms(ScalingPolicy policy, String region) {
         List<Alarm> alarms = new ArrayList<>();
@@ -678,8 +718,11 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
                     + policy.getPolicyArn() + ".");
             applyMetricSpecification(alarm, policy);
             alarm.setPeriod(60);
-            alarm.setEvaluationPeriods("AlarmHigh".equals(suffix) ? 3 : 15);
-            alarm.setThreshold(targetValue(policy));
+            alarm.setEvaluationPeriods("lambda".equals(policy.getServiceNamespace())
+                    || "AlarmHigh".equals(suffix) ? 3 : 15);
+            double target = targetValue(policy);
+            alarm.setThreshold("lambda".equals(policy.getServiceNamespace()) && "AlarmLow".equals(suffix)
+                    ? target * 0.9 : target);
             alarm.setComparisonOperator("AlarmHigh".equals(suffix)
                     ? "GreaterThanThreshold" : "LessThanThreshold");
             alarm.setAlarmActions(List.of(policy.getPolicyArn()));
@@ -707,8 +750,8 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
     /**
      * The alarm needs the same dimensions AWS attaches to the real metric, or the evaluator
      * will never find data an operator pushes in the real ECS shape. Real AWS keys ECS
-     * service metrics by {@code ClusterName} + {@code ServiceName}; other namespaces are left
-     * without dimensions, matching their existing "stored but inert" behavior.
+     * service metrics by {@code ClusterName} + {@code ServiceName}. Lambda's alias metrics
+     * use {@code FunctionName} + {@code Resource}.
      */
     private static List<Dimension> resolveDimensions(ScalingPolicy policy) {
         if ("ecs".equals(policy.getServiceNamespace()) && policy.getResourceId() != null) {
@@ -716,6 +759,11 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
             if (parts.length == 3 && "service".equals(parts[0])) {
                 return List.of(new Dimension("ClusterName", parts[1]), new Dimension("ServiceName", parts[2]));
             }
+        }
+        if ("lambda".equals(policy.getServiceNamespace())) {
+            LambdaCapacityAdjuster.FunctionTarget target = LambdaCapacityAdjuster.parse(policy.getResourceId());
+            return List.of(new Dimension("FunctionName", target.name()),
+                    new Dimension("Resource", target.name() + ":" + target.qualifier()));
         }
         return List.of();
     }
@@ -773,7 +821,9 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
      * {@code ECSServiceAverageMemoryUtilization} read the AWS/ECS service-level metrics
      * keyed by {@code ClusterName}/{@code ServiceName}, and {@code ALBRequestCountPerTarget}
      * reads the AWS/ApplicationELB per-target request count keyed by the load balancer and
-     * target group inside {@code ResourceLabel}. RequestCountPerTarget's only valid
+     * target group inside {@code ResourceLabel}. Lambda provisioned concurrency uses
+     * {@code AWS/Lambda} and the alias's {@code FunctionName}/{@code Resource} dimensions.
+     * RequestCountPerTarget's only valid
      * CloudWatch statistic is Sum (the value is already the per-minute average across
      * targets), so each mapping carries the statistic the alarm must read. Types without a
      * mapping Floci is certain of
@@ -783,7 +833,9 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
     private static final Map<String, PredefinedMetric> PREDEFINED_METRICS = Map.of(
             "ECSServiceAverageCPUUtilization", new PredefinedMetric("AWS/ECS", "CPUUtilization", "Average"),
             "ECSServiceAverageMemoryUtilization", new PredefinedMetric("AWS/ECS", "MemoryUtilization", "Average"),
-            "ALBRequestCountPerTarget", new PredefinedMetric("AWS/ApplicationELB", "RequestCountPerTarget", "Sum"));
+            "ALBRequestCountPerTarget", new PredefinedMetric("AWS/ApplicationELB", "RequestCountPerTarget", "Sum"),
+            "LambdaProvisionedConcurrencyUtilization",
+            new PredefinedMetric("AWS/Lambda", "ProvisionedConcurrencyUtilization", "Average"));
 
     private record PredefinedMetric(String namespace, String metricName, String statistic) {
     }
@@ -852,6 +904,10 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
             throw new AwsException("ValidationException",
                     "Value '" + scalableDimension + "' at 'scalableDimension' failed to satisfy constraint: "
                             + "Member must satisfy enum value set.", 400);
+        }
+        if (!scalableDimension.startsWith(serviceNamespace + ":")) {
+            throw new AwsException("ValidationException",
+                    "ScalableDimension must belong to ServiceNamespace.", 400);
         }
     }
 
