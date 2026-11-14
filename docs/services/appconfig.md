@@ -243,8 +243,8 @@ configuration. This lifecycle does not add gradual per-client content delivery.
 
 An update that changes only mutable properties keeps the ID and changes the resource in place: the name and
 description of an application, environment or configuration profile, a profile's `RetrievalRoleArn` and `Validators`,
-an environment's `Monitors`, an application's
-`Tags`, and a deployment strategy's description, duration, final bake time, growth factor and growth type. A property
+an environment's `Monitors`, `Tags` on all four resource types, and a deployment strategy's description, duration, final bake time, growth factor
+and growth type. A property
 the template drops is cleared, or set back to its default (`FinalBakeTimeInMinutes` 0, `GrowthType` `LINEAR`). A
 change to a createOnly property (`ApplicationId` on an environment or configuration profile, `LocationUri` or `Type`
 on a configuration profile, `Name` or `ReplicateTo` on a deployment strategy) replaces the resource: the new one is
@@ -252,9 +252,12 @@ created and the old one is deleted once the stack update completes. A failed sta
 place and deletes what it created.
 
 Deleting an environment deletes its deployments, and deleting a configuration profile deletes its hosted configuration
-versions and admitted S3 content. Floci keeps tags on applications only, so `Tags` on the other three types are accepted
-and not stored, as `TagResource` treats them; so is a configuration profile's `KmsKeyIdentifier`,
-and `DeletionProtectionCheck`. `ReplicateTo: SSM_DOCUMENT` writes no SSM document.
+versions and admitted S3 content. Tags supplied at creation and through `TagResource` are stored on applications,
+environments, configuration profiles and custom deployment strategies. `TagResource` merges keys, `UntagResource`
+removes the named keys, and `ListTagsForResource` reads the remaining map. Tags persist with their resource and
+use the same account, region and parent-application identity. CloudFormation replaces the complete tag set on an
+in-place update and restores it on rollback. A configuration profile's `KmsKeyIdentifier`
+and `DeletionProtectionCheck` are accepted and not stored. `ReplicateTo: SSM_DOCUMENT` writes no SSM document.
 `AWS::AppConfig::Extension` and `ExtensionAssociation` are not provisioned.
 
 A stack created before Floci provisioned these types holds stubs for them, and an update creates the real resource in

@@ -30,5 +30,5 @@ public class Application {
     public void setDescription(String description) { this.description = description; }
 
     public Map<String, String> getTags() { return tags; }
-    public void setTags(Map<String, String> tags) { this.tags = tags != null ? tags : new HashMap<>(); }
+    public void setTags(Map<String, String> tags) { this.tags = tags != null ? new HashMap<>(tags) : new HashMap<>(); }
 }
