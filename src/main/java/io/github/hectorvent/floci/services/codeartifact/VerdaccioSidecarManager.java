@@ -76,7 +76,7 @@ public class VerdaccioSidecarManager implements ContainerTeardown {
      * returns point back through Floci's proxy.
      */
     public String ensureReady(String npmRepositoryId, String publicUrl) {
-        return pool.ensureReady(npmRepositoryId, () -> startContainer(npmRepositoryId, publicUrl));
+        return lease.ensureReady(npmRepositoryId, () -> startContainer(npmRepositoryId, publicUrl));
     }
 
     /** Stops and removes the container for one npm repository, if one was ever started. */

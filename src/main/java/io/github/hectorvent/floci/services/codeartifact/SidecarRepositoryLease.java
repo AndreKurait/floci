@@ -20,6 +20,7 @@ final class SidecarRepositoryLease {
         private boolean releasing;
         private boolean stopping;
         private boolean stopped;
+        private boolean repairPending;
     }
 
     SidecarRepositoryLease(String sidecarName, PerKeyContainerPool pool) {
@@ -41,7 +42,35 @@ final class SidecarRepositoryLease {
                 throw new IllegalStateException(sidecarName + " sidecar is being released for repository "
                         + repositoryId);
             }
+            repairIfUnused(repositoryId, use);
             use.active++;
+        }
+    }
+
+    String ensureReady(String repositoryId, PerKeyContainerPool.Starter starter) {
+        UseState use = uses.computeIfAbsent(repositoryId, key -> new UseState());
+        synchronized (use) {
+            if (use.releasing && use.active == 0) {
+                throw new IllegalStateException(sidecarName + " sidecar is being released for repository "
+                        + repositoryId);
+            }
+            repairIfUnused(repositoryId, use);
+            try {
+                String ready = pool.ensureReady(repositoryId, starter, use.active == 0);
+                use.repairPending = false;
+                return ready;
+            } catch (RuntimeException e) {
+                use.repairPending = true;
+                throw e;
+            }
+        }
+    }
+
+    /** Called with the use lock held so a new admission cannot race retirement. */
+    private void repairIfUnused(String repositoryId, UseState use) {
+        if (use.repairPending && use.active == 0 && !use.releasing) {
+            pool.stopContainerStrict(repositoryId);
+            use.repairPending = false;
         }
     }
 
@@ -56,6 +85,12 @@ final class SidecarRepositoryLease {
                         + repositoryId);
             }
             use.active--;
+            try {
+                repairIfUnused(repositoryId, use);
+            } catch (RuntimeException e) {
+                LOG.warnv(e, "Could not retire unhealthy {0} sidecar for repository {1}; "
+                        + "the next admission will retry cleanup.", sidecarName, repositoryId);
+            }
         }
         try {
             stopIfUnused(repositoryId, use);
