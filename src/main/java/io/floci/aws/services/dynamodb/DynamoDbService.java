@@ -2310,7 +2310,8 @@ public class DynamoDbService {
         try {
             validateTransactItem(transactItem, region, staged);
             return null;
-        } catch (KeySchemaMismatchException | ItemNestingExceededException | UpdatedItemTooLargeException e) {
+        } catch (KeySchemaMismatchException | ItemNestingExceededException | UpdatedItemTooLargeException
+                 | UpdateOperandException e) {
             return new TransactionCanceledException.CancellationReason("ValidationError", null, e.getMessage());
         }
     }
@@ -3635,12 +3636,8 @@ public class DynamoDbService {
                 String leftExpr = valuePart.substring(0, arithmeticIdx).trim();
                 char operator = valuePart.charAt(arithmeticIdx);
                 String rightExpr = valuePart.substring(arithmeticIdx + 1).trim();
-                JsonNode leftVal = evaluateSetExpr(snapshot, leftExpr, exprAttrNames, exprAttrValues);
-                JsonNode rightVal = evaluateSetExpr(snapshot, rightExpr, exprAttrNames, exprAttrValues);
-                if (leftVal == null || rightVal == null || !leftVal.has("N") || !rightVal.has("N")) {
-                    throw new AwsException("ValidationException",
-                            "Invalid UpdateExpression: Incorrect operand type for operator or function", 400);
-                }
+                JsonNode leftVal = typedOperand(snapshot, leftExpr, "N", exprAttrNames, exprAttrValues);
+                JsonNode rightVal = typedOperand(snapshot, rightExpr, "N", exprAttrNames, exprAttrValues);
                 try {
                     BigDecimal left = new BigDecimal(leftVal.get("N").asText());
                     BigDecimal right = new BigDecimal(rightVal.get("N").asText());
@@ -3654,27 +3651,9 @@ public class DynamoDbService {
                             "The parameter cannot be converted to a numeric value", 400);
                 }
             } else if (startsWithFunctionCall(valuePart, "if_not_exists")) {
-                // if_not_exists(attrRef, fallbackExpr) evaluates to:
-                //   attrRef's current value  — when attrRef exists in the item
-                //   fallbackExpr             — otherwise
-                // The result is always assigned to attrPath.
-                String[] args = extractFunctionArgs(valuePart);
-                if (args.length == 2) {
-                    String checkAttr = resolveAttributeName(args[0].trim(), exprAttrNames);
-                    String fallbackExpr = args[1].trim();
-                    JsonNode resolved;
-                    if (hasValueAtPath(snapshot, checkAttr, exprAttrNames)) {
-                        // attrRef exists — evaluate to its current value
-                        resolved = getValueAtPath(snapshot, checkAttr, exprAttrNames);
-                    } else if (fallbackExpr.startsWith(":") && exprAttrValues != null) {
-                        resolved = exprAttrValues.get(fallbackExpr);
-                    } else {
-                        // fallback is itself an attribute reference
-                        resolved = getValueAtPath(snapshot, resolveAttributeName(fallbackExpr, exprAttrNames), exprAttrNames);
-                    }
-                    if (resolved != null) {
-                        setValueAtPath(item, attrPath, resolved, exprAttrNames);
-                    }
+                JsonNode resolved = evaluateSetExpr(snapshot, valuePart, exprAttrNames, exprAttrValues);
+                if (resolved != null) {
+                    setValueAtPath(item, attrPath, resolved, exprAttrNames);
                 }
             } else if (startsWithFunctionCall(valuePart.toLowerCase(), "list_append")) {
                 int open = valuePart.indexOf('(');
@@ -3685,16 +3664,8 @@ public class DynamoDbService {
                     if (commaPos >= 0) {
                         String arg1 = inner.substring(0, commaPos).trim();
                         String arg2 = inner.substring(commaPos + 1).trim();
-                        JsonNode list1 = evaluateSetExpr(snapshot, arg1, exprAttrNames, exprAttrValues);
-                        JsonNode list2 = evaluateSetExpr(snapshot, arg2, exprAttrNames, exprAttrValues);
-                        if (list1 == null || list2 == null) {
-                            throw new AwsException("ValidationException",
-                                    "The provided expression refers to an attribute that does not exist in the item", 400);
-                        }
-                        if (!list1.has("L") || !list2.has("L")) {
-                            throw new AwsException("ValidationException",
-                                    "An operand in the update expression has an incorrect data type", 400);
-                        }
+                        JsonNode list1 = typedOperand(snapshot, arg1, "L", exprAttrNames, exprAttrValues);
+                        JsonNode list2 = typedOperand(snapshot, arg2, "L", exprAttrNames, exprAttrValues);
                         ArrayNode merged =
                                 JsonNodeFactory.instance.arrayNode();
                         list1.get("L").forEach(merged::add);
@@ -3716,12 +3687,8 @@ public class DynamoDbService {
                     LOG.debugv("applySetClause: value was null for valuePart={0}, NOT setting attribute", valuePart);
                 }
             } else if (!valuePart.isEmpty()) {
-                // Plain attribute reference: SET a = b  or  SET a = #alias
-                String refAttr = resolveAttributeName(valuePart, exprAttrNames);
-                JsonNode refValue = getValueAtPath(snapshot, refAttr, exprAttrNames);
-                if (refValue != null) {
-                    setValueAtPath(item, attrPath, refValue, exprAttrNames);
-                }
+                setValueAtPath(item, attrPath, evaluateSetExpr(snapshot, valuePart, exprAttrNames, exprAttrValues),
+                        exprAttrNames);
             }
 
             clause = rest;
@@ -3729,13 +3696,7 @@ public class DynamoDbService {
         return clause;
     }
 
-    /**
-     * Strip balanced outer parentheses from a SET-action RHS expression, repeatedly,
-     * so that producers wrapping arithmetic or function calls in parens (e.g.
-     * "(c - :v)" or "((if_not_exists(c, :d) - :v))") parse identically to the
-     * unwrapped form. Rejects forms like "(a) - (b)" where the outer parens do
-     * not actually enclose the whole expression.
-     */
+    /** Removes parentheses around the whole operand, so "(c - :v)" reads as "c - :v" and "(a) - (b)" stays. */
     static String stripOuterParens(String expr) {
         String s = expr.trim();
         while (s.length() >= 2 && s.charAt(0) == '(' && s.charAt(s.length() - 1) == ')') {
@@ -3752,27 +3713,36 @@ public class DynamoDbService {
         return s;
     }
 
-    private JsonNode evaluateSetExpr(ObjectNode item, String expr,
+    private JsonNode evaluateSetExpr(ObjectNode item, String operand,
                                      JsonNode exprAttrNames, JsonNode exprAttrValues) {
+        String expr = stripOuterParens(operand);
         if (startsWithFunctionCall(expr.toLowerCase(), "if_not_exists")) {
             String[] args = extractFunctionArgs(expr);
             if (args.length == 2) {
-                String checkAttr = resolveAttributeName(args[0].trim(), exprAttrNames);
-                String fallbackExpr = args[1].trim();
+                String checkAttr = resolveAttributeName(stripOuterParens(args[0]), exprAttrNames);
                 if (hasValueAtPath(item, checkAttr, exprAttrNames)) {
                     return getValueAtPath(item, checkAttr, exprAttrNames);
-                } else if (fallbackExpr.startsWith(":") && exprAttrValues != null) {
-                    return exprAttrValues.get(fallbackExpr);
-                } else {
-                    return getValueAtPath(item, resolveAttributeName(fallbackExpr, exprAttrNames), exprAttrNames);
                 }
+                return evaluateSetExpr(item, args[1], exprAttrNames, exprAttrValues);
             }
             return null;
         } else if (expr.startsWith(":") && exprAttrValues != null) {
             return exprAttrValues.get(expr);
-        } else {
-            return getValueAtPath(item, resolveAttributeName(expr, exprAttrNames), exprAttrNames);
         }
+        JsonNode value = getValueAtPath(item, resolveAttributeName(expr, exprAttrNames), exprAttrNames);
+        if (value == null) {
+            throw UpdateOperandException.absentAttribute();
+        }
+        return value;
+    }
+
+    private JsonNode typedOperand(ObjectNode item, String operand, String type,
+                                  JsonNode exprAttrNames, JsonNode exprAttrValues) {
+        JsonNode value = evaluateSetExpr(item, operand, exprAttrNames, exprAttrValues);
+        if (value == null || !value.has(type)) {
+            throw UpdateOperandException.incorrectType();
+        }
+        return value;
     }
 
     private String applyRemoveClause(ObjectNode item, String clause, JsonNode exprAttrNames,
@@ -3999,8 +3969,7 @@ public class DynamoDbService {
     private static void requireSameTypeAsOperand(JsonNode existingValue, JsonNode operand, List<String> types) {
         for (String type : types) {
             if (operand.has(type) && existingValue != null && !existingValue.has(type)) {
-                throw new AwsException("ValidationException",
-                        "An operand in the update expression has an incorrect data type", 400);
+                throw UpdateOperandException.incorrectType();
             }
         }
     }

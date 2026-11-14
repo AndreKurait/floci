@@ -218,6 +218,7 @@ cross-resource references.
 | Secrets Manager | `Secret`, `SecretTargetAttachment` |
 | ECR | `Repository` |
 | ECS | `Cluster`, `TaskDefinition`, `Service`, `CapacityProvider`, `ClusterCapacityProviderAssociations` |
+| EFS | `FileSystem` (metadata only, there is no NFS data plane), `MountTarget` (`SecurityGroups` update in place, every other property replaces), `AccessPoint` (`AccessPointTags` update in place, every other property replaces) |
 | EKS | `Cluster`, `Nodegroup` |
 | RDS | `DBInstance` (starts a real container), `DBCluster` (starts a real container), `DBSubnetGroup`, `DBParameterGroup`, `DBClusterParameterGroup`, `DBProxy`, `DBProxyTargetGroup` |
 | Aurora DSQL | `Cluster` |
@@ -461,6 +462,17 @@ What each dynamic reference resolved to is kept on the stack when an operation c
 HMAC-SHA256 under a random key of the stack's own, so no resolved value is stored. An update that
 fails and rolls back keeps the values of the last deployment. A stack set instance whose stack has
 nothing to change is left as it is and succeeds, and the change set that found it so is not kept.
+
+For a resource type in the create-only table, the `Replacement` of a modified resource comes from
+the resolved values, not the template text. A dynamic reference on either side is compared through
+its digest, and a plain value on the other side is digested the same way, so
+`{{resolve:ssm:/p}}` holding `hosted` and the literal `hosted` are one value. A reference whose old
+value the stack never recorded (a stack persisted before digests were kept) gives no evidence about
+the old value: its `Replacement` follows the template text, while the update still converges the
+stack and records the digests. A resource whose create-only property reads an attribute that changes
+in place gets `Replacement: Conditional`, as on AWS, and `ExecuteChangeSet` replaces it only if
+the resolved value changed. A property that cannot be resolved is logged at `WARN` with its
+logical id, and the preview falls back to the template text.
 
 A `CreateChangeSet` for such an update is created `FAILED`, `UNAVAILABLE`, with `The submitted
 information didn't contain changes. Submit different information to create a change set.`, which is
@@ -1039,6 +1051,12 @@ Lambda. floci supports two shapes:
 
 The handler's `Data` keys resolve through `Fn::GetAtt`, except keys that begin with `__Floci`. Floci
 reserves that prefix for its own resource state and ignores such keys.
+
+An update whose handler returned a new `PhysicalResourceId` replaced the resource. Once the update
+commits, the stack enters `UPDATE_COMPLETE_CLEANUP_IN_PROGRESS` and the id it replaced gets a
+`Delete` carrying the properties it had, with no `OldResourceProperties`, as on AWS. A `Delete` the
+handler fails is tried three times, then reported as `DELETE_FAILED`, and the update still completes.
+Under `UpdateReplacePolicy: Retain` the replaced id gets no `Delete`.
 
 A failed stack update rolls back a custom resource whose handler was sent an `Update`, as
 CloudFormation does. This holds whether the handler applied the update and a later resource failed,
