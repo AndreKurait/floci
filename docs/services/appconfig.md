@@ -14,6 +14,13 @@ polling against the application/environment/configuration ARN; a denied poll doe
 not consume its token. Passing retrieval or monitor roles also requires
 `iam:PassRole` for the AppConfig service. IAM enforcement remains disabled by default.
 
+Tagged `CreateApplication` and `CreateDeploymentStrategy` requests also require
+`appconfig:TagResource` on `application/*` or `deploymentstrategy/*` in the request's
+partition, account and Region. Both the create action and tagging action evaluate
+`aws:RequestTag` and `aws:TagKeys` conditions. An untagged create needs only its create
+permission. This tag-on-create admission currently covers these two operations;
+child-resource and deployment creation tags remain outside this admission scope.
+
 ## Management Plane (AppConfig)
 
 The management plane allows you to create and manage applications, environments, configuration profiles, and hosted configuration versions.
@@ -98,9 +105,23 @@ validates the retrieved hosted or S3 version before creating a deployment or cha
 `UpdateConfigurationProfile` changes only supplied fields. An empty `Validators` list clears validation;
 a schema update does not change already deployed bytes. CloudFormation updates replace mutable fields,
 clear validators omitted from the template, and restore the prior schema on rollback. Stored validators
-survive restart. External schema references and other inline schema drafts are refused. Lambda validator
-declarations are retained, but validation and deployment requiring them fail explicitly because invoking
-Lambda validators is not implemented. `UpdateConfigurationProfile` rejects `KmsKeyIdentifier`.
+survive restart. External schema references and other inline schema drafts are refused.
+`UpdateConfigurationProfile` rejects `KmsKeyIdentifier`.
+
+Hosted profiles also support `LAMBDA` validators naming a function ARN. Both validation and deployment
+invoke the function with five string fields: `applicationId`, `configurationProfileId`,
+`configurationVersion`, base64-encoded `content`, and `uri` set to `hosted`. The event uses the resolved
+resource IDs and numeric hosted version. An ordinary return value, including `false` or an error-shaped
+JSON object, succeeds; a Lambda function error refuses validation with `BadRequestException`.
+With IAM enforcement enabled, the function's resource policy must allow `appconfig.amazonaws.com`
+to invoke it. Source conditions receive the exact configuration-profile ARN and the calling account.
+
+The validation wait has a 15-second budget, including invocation startup. A function already running
+when that budget expires may finish later; its result cannot publish a deployment or active content.
+Floci tracks at most 32 outstanding validator invocations per process and refuses reset while any remain.
+Explicit process shutdown requests worker interruption and waits up to five seconds for them to drain;
+that shutdown behavior is separate from an ordinary validation timeout. Lambda validation of external
+configuration sources is not supported.
 
 `UpdateEnvironment` and `UpdateDeploymentStrategy` apply only the mutable fields present in a native
 PATCH request. Omitted fields retain their values; an empty description or monitor list clears that
