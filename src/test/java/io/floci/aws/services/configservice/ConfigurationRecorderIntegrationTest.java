@@ -80,6 +80,31 @@ class ConfigurationRecorderIntegrationTest {
 
     @Test
     @Order(3)
+    void startWithoutDeliveryChannelFailsWithoutChangingStatus() {
+        given()
+            .header("X-Amz-Target", TARGET_PREFIX + "StartConfigurationRecorder")
+            .contentType(CONTENT_TYPE)
+            .body("{\"ConfigurationRecorderName\": \"default\"}")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("NoAvailableDeliveryChannelException"));
+
+        given()
+            .header("X-Amz-Target", TARGET_PREFIX + "DescribeConfigurationRecorderStatus")
+            .contentType(CONTENT_TYPE)
+            .body("{\"ConfigurationRecorderNames\": [\"default\"]}")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("ConfigurationRecordersStatus[0].recording", equalTo(false))
+            .body("ConfigurationRecordersStatus[0].lastStartTime", nullValue());
+    }
+
+    @Test
+    @Order(5)
     void startConfigurationRecorder() {
         given()
             .header("X-Amz-Target", TARGET_PREFIX + "StartConfigurationRecorder")
@@ -94,7 +119,7 @@ class ConfigurationRecorderIntegrationTest {
     }
 
     @Test
-    @Order(4)
+    @Order(6)
     void describeConfigurationRecorderStatusAfterStart() {
         given()
             .header("X-Amz-Target", TARGET_PREFIX + "DescribeConfigurationRecorderStatus")
@@ -114,7 +139,7 @@ class ConfigurationRecorderIntegrationTest {
     }
 
     @Test
-    @Order(5)
+    @Order(7)
     void stopConfigurationRecorder() {
         given()
             .header("X-Amz-Target", TARGET_PREFIX + "StopConfigurationRecorder")
@@ -129,7 +154,7 @@ class ConfigurationRecorderIntegrationTest {
     }
 
     @Test
-    @Order(6)
+    @Order(8)
     void describeConfigurationRecorderStatusAfterStop() {
         given()
             .header("X-Amz-Target", TARGET_PREFIX + "DescribeConfigurationRecorderStatus")
@@ -146,7 +171,7 @@ class ConfigurationRecorderIntegrationTest {
     }
 
     @Test
-    @Order(7)
+    @Order(9)
     void startNonexistentConfigurationRecorder() {
         given()
             .header("X-Amz-Target", TARGET_PREFIX + "StartConfigurationRecorder")
@@ -164,7 +189,7 @@ class ConfigurationRecorderIntegrationTest {
     // --- Delivery Channel ---
 
     @Test
-    @Order(8)
+    @Order(4)
     void putDeliveryChannel() {
         given()
             .header("X-Amz-Target", TARGET_PREFIX + "PutDeliveryChannel")
@@ -188,7 +213,7 @@ class ConfigurationRecorderIntegrationTest {
     }
 
     @Test
-    @Order(9)
+    @Order(10)
     void describeDeliveryChannels() {
         given()
             .header("X-Amz-Target", TARGET_PREFIX + "DescribeDeliveryChannels")
@@ -220,7 +245,7 @@ class ConfigurationRecorderIntegrationTest {
     // --- Deletes ---
 
     @Test
-    @Order(10)
+    @Order(11)
     void deleteDeliveryChannelWhileRecorderRunning() {
         given()
             .header("X-Amz-Target", TARGET_PREFIX + "StartConfigurationRecorder")
@@ -247,7 +272,7 @@ class ConfigurationRecorderIntegrationTest {
     }
 
     @Test
-    @Order(11)
+    @Order(12)
     void deleteDeliveryChannelAfterRecorderStopped() {
         given()
             .header("X-Amz-Target", TARGET_PREFIX + "StopConfigurationRecorder")
@@ -273,7 +298,7 @@ class ConfigurationRecorderIntegrationTest {
     }
 
     @Test
-    @Order(12)
+    @Order(13)
     void deleteDeliveryChannelAgain() {
         given()
             .header("X-Amz-Target", TARGET_PREFIX + "DeleteDeliveryChannel")
@@ -289,7 +314,7 @@ class ConfigurationRecorderIntegrationTest {
     }
 
     @Test
-    @Order(13)
+    @Order(14)
     void deleteConfigurationRecorder() {
         given()
             .header("X-Amz-Target", TARGET_PREFIX + "DeleteConfigurationRecorder")
@@ -304,7 +329,7 @@ class ConfigurationRecorderIntegrationTest {
     }
 
     @Test
-    @Order(14)
+    @Order(15)
     void describeConfigurationRecordersAfterDelete() {
         given()
             .header("X-Amz-Target", TARGET_PREFIX + "DescribeConfigurationRecorders")
@@ -318,7 +343,7 @@ class ConfigurationRecorderIntegrationTest {
     }
 
     @Test
-    @Order(15)
+    @Order(16)
     void deleteConfigurationRecorderAgain() {
         given()
             .header("X-Amz-Target", TARGET_PREFIX + "DeleteConfigurationRecorder")
@@ -334,7 +359,7 @@ class ConfigurationRecorderIntegrationTest {
     }
 
     @Test
-    @Order(16)
+    @Order(17)
     void recordingStrategyRoundTrips() {
         given()
             .header("X-Amz-Target", TARGET_PREFIX + "PutConfigurationRecorder")
@@ -363,7 +388,7 @@ class ConfigurationRecorderIntegrationTest {
     }
 
     @Test
-    @Order(17)
+    @Order(18)
     void exclusionsAndRecordingModeRoundTrip() {
         given()
             .header("X-Amz-Target", TARGET_PREFIX + "PutConfigurationRecorder")
@@ -405,7 +430,7 @@ class ConfigurationRecorderIntegrationTest {
     }
 
     @Test
-    @Order(18)
+    @Order(19)
     void absentFieldsAreNotSynthesized() {
         given()
             .header("X-Amz-Target", TARGET_PREFIX + "PutConfigurationRecorder")
