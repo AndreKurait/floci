@@ -2,6 +2,8 @@ package io.floci.aws.services.applicationautoscaling;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.floci.aws.core.common.AwsArnUtils.Arn;
+import io.floci.aws.core.common.AwsRegions;
 import io.floci.aws.testing.AwsTestClients;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.Timeout;
@@ -225,8 +227,14 @@ class LambdaScheduledActionSdkTest {
             assertFunctionIdentity();
         }
 
-        private String roleArn() { return "arn:aws:iam::" + account + ":role/" + marker + "/" + role; }
-        private String functionArn() { return "arn:aws:lambda:" + region.id() + ":" + account + ":function:" + function; }
+        private String roleArn() {
+            return Arn.global(AwsRegions.partitionFor(region.id()), "iam", account,
+                    "role/" + marker + "/" + role).toString();
+        }
+
+        private String functionArn() {
+            return Arn.of("lambda", region.id(), account, "function:" + function).toString();
+        }
 
         private void assertFunctionIdentity() {
             assertEquals(functionArn(), lambda.getFunction(b -> b.functionName(function)).configuration().functionArn());

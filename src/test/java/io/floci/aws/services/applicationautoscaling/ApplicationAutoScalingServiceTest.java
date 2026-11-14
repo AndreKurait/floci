@@ -112,9 +112,15 @@ class ApplicationAutoScalingServiceTest {
 
     @Test
     void lambdaRejectsUnsupportedStepScalingBeforeCreatingAPolicy() {
-        assertThrows(AwsException.class, () -> service.putScalingPolicy("unsupported", "StepScaling",
-                "lambda", "function:worker:live", "lambda:function:ProvisionedConcurrency",
-                null, null, REGION));
+        String dimension = "lambda:function:ProvisionedConcurrency";
+        when(lambdaCapacity.supports(dimension)).thenReturn(true);
+        service.registerScalableTarget("lambda", "function:worker:live", dimension, 0, 3,
+                null, null, null, REGION);
+        AwsException error = assertThrows(AwsException.class, () -> service.putScalingPolicy(
+                "unsupported", "StepScaling", "lambda", "function:worker:live", dimension, null, null, REGION));
+        assertEquals("ValidationException", error.getErrorCode());
+        assertTrue(service.describeScalingPolicies("lambda", "function:worker:live", dimension,
+                null, REGION).isEmpty());
     }
 
     private TargetTrackingConfiguration targetTracking(double value, String metricType, String resourceLabel) {
