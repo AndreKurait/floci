@@ -60,6 +60,14 @@ class ResourceArnBuilderTest {
 
     @ParameterizedTest
     @CsvSource({"aws,us-east-1", "aws-us-gov,us-gov-west-1", "aws-cn,cn-north-1"})
+    void missingRoleLookupKeepsItsNameAccountAndPartition(String partition, String region) {
+        setFormBody("Action=GetRole&RoleName=bootstrap-role&Path=%2Funrelated%2F");
+        assertEquals(List.of("arn:" + partition + ":iam::" + ACCOUNT + ":role/bootstrap-role"),
+                builder.buildResources("iam", "iam:GetRole", ctx, region, ACCOUNT, partition));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"aws,us-east-1", "aws-us-gov,us-gov-west-1", "aws-cn,cn-north-1"})
     void delegationSetResourcesAreGlobalAndUseTheDecodedId(String partition, String region) {
         for (String id : List.of("N1", "%2Fdelegationset%2FN1")) {
             when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost/2013-04-01/delegationset/" + id));
