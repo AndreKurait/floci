@@ -360,7 +360,7 @@ class SsmCommandServiceDirectExecutionTest {
         SsmCommandService commandService = new SsmCommandService(
                 new SingleCommandStoreFactory(commandStore), objectMapper, regionResolver, executor, null, true);
         SsmJsonHandler jsonHandler = new SsmJsonHandler(mock(SsmService.class), commandService, null, objectMapper, null,
-                mock(SsmPatchBaselineService.class), null, null, null);
+                mock(SsmPatchBaselineService.class), null, null, null, null);
 
         Command command = commandService.sendCommand(objectMapper.readTree("""
                 {
