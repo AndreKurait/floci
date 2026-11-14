@@ -679,7 +679,9 @@ public class ElbV2DataPlane {
             }
             if (sharedTls && !tlsProxyServer.registerTlsRoute(port, server, host ->
                     !stopping && servers.get(port) == server
-                            && resolveListener(state.routing, host, false) != null ? server.actualPort() : 0)) {
+                            && resolveListener(state.routing, host, false) != null ? server.actualPort() : 0,
+                    host -> !stopping && servers.get(port) == server
+                            && publicAlbListener(state.routing, host) != null ? server.actualPort() : 0)) {
                 restartPortServer(port);
                 return;
             }
@@ -1109,7 +1111,12 @@ public class ElbV2DataPlane {
     private void handleRequest(HttpServerRequest req, int port) {
         PortState state = portStates.get(port);
         RoutingView routing = state == null ? null : state.routing;
-        RoutedListener listener = routing == null ? null : resolveListener(routing, req.host());
+        RoutedListener listener = null;
+        if (routing != null) {
+            boolean publicAlb = EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS
+                    .equals(req.localAddress().hostAddress());
+            listener = publicAlb ? publicAlbListener(routing, req.host()) : resolveListener(routing, req.host());
+        }
         if (listener == null) {
             req.response().setStatusCode(502).end("No listener for host");
             return;
@@ -1194,6 +1201,25 @@ public class ElbV2DataPlane {
         }
         return alias.hostedZoneId() == null
                 || alias.hostedZoneId().equals(listener.canonicalHostedZoneId()) ? listener : null;
+    }
+
+    private RoutedListener publicAlbListener(RoutingView routing, String host) {
+        Route53Service.PublicAlias alias = publicAlias(normalizeHost(host));
+        if (alias == null || alias.hostedZoneId() == null) {
+            return null;
+        }
+        RoutedListener listener = resolveAlias(routing, alias);
+        if (listener == null) {
+            return null;
+        }
+        ListenerBinding binding = listenerBindings.get(listener.arn());
+        if (binding == null || !binding.secure() || binding.tcp()) {
+            return null;
+        }
+        LoadBalancer balancer = elbV2Service.getLoadBalancerForListener(
+                listener.region(), listener.arn(), binding.loadBalancerArn());
+        return balancer != null && "application".equals(balancer.getType())
+                && "internet-facing".equals(balancer.getScheme()) ? listener : null;
     }
 
     /** Selects the load balancer before evaluating rules against the original request Host. */

@@ -4,12 +4,17 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler.ControlConnection;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler.ControlListener;
 
+import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 import java.util.Objects;
 
 /** Linux commands for owned namespaces; no command addresses the Docker host. */
 final class VpcRoutingCommands {
+    private static final String NATIVE_API_TRANSLATION =
+            "meta l4proto tcp ct direction original ct status dnat ct original ip daddr "
+                    + EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS;
+
     private VpcRoutingCommands() {}
 
     record Hop(String destination, String gateway, String device, boolean replyOnly) {
@@ -21,6 +26,20 @@ final class VpcRoutingCommands {
     }
 
     record LocalRoute(Cidr4 destination, boolean allowed) {}
+
+    record NativeApi(String upstreamAddress, int httpPort, int httpsPort, String publicDevice) {
+        NativeApi {
+            upstreamAddress = VpcRouteSelection.ipv4(upstreamAddress);
+            publicDevice = device(publicDevice);
+            if (EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS.equals(upstreamAddress)
+                    || EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS.equals(upstreamAddress)) {
+                throw new IllegalArgumentException("Native public AWS APIs require a distinct upstream address");
+            }
+            if (httpPort < 1 || httpPort > 65535 || httpsPort < 1 || httpsPort > 65535) {
+                throw new IllegalArgumentException("Native public AWS APIs require valid upstream TCP ports");
+            }
+        }
+    }
 
     static String endpointGuard() {
         return endpointGuard(List.of());
@@ -71,6 +90,14 @@ final class VpcRoutingCommands {
                            List<String> deniedDestinations, List<String> resolvers, List<ControlConnection> controls,
                            boolean instanceMetadataAllowed, String publicDevice, List<String> inboundPublicSources,
                            List<ControlListener> listeners) {
+        return endpoint(privateAddress, privateDevice, localRoutes, hops, deniedDestinations, resolvers,
+                controls, instanceMetadataAllowed, publicDevice, inboundPublicSources, listeners, null);
+    }
+
+    static String endpoint(String privateAddress, String privateDevice, List<LocalRoute> localRoutes, List<Hop> hops,
+                           List<String> deniedDestinations, List<String> resolvers, List<ControlConnection> controls,
+                           boolean instanceMetadataAllowed, String publicDevice, List<String> inboundPublicSources,
+                           List<ControlListener> listeners, NativeApi nativeApi) {
         String source = VpcRouteSelection.ipv4(privateAddress);
         StringBuilder script = new StringBuilder("set -eu\nip -4 route flush proto 186\n");
         for (Hop hop : hops) {
@@ -103,6 +130,7 @@ final class VpcRoutingCommands {
             rules.append("add rule inet floci_vpc_routes egress meta l4proto tcp"
                     + " ct original ip daddr 169.254.169.254 ct original proto-dst 80 counter accept\n");
         }
+        appendNativeApiRoute(rules, nativeApi);
         appendResolverEgress(rules, resolvers);
         for (ControlConnection control : controls) {
             if (!control.address().contains(":")) {
@@ -137,6 +165,20 @@ final class VpcRoutingCommands {
         }
         rules.append("add rule inet floci_vpc_routes egress counter drop\n");
         return script.append(nft(rules.toString())).toString();
+    }
+
+    private static void appendNativeApiRoute(StringBuilder rules, NativeApi api) {
+        if (api != null) {
+            for (int port : List.of(80, 443)) {
+                int upstreamPort = port == 80 ? api.httpPort() : api.httpsPort();
+                rules.append("add rule inet floci_vpc_routes egress ").append(NATIVE_API_TRANSLATION)
+                        .append(" ct original proto-dst ").append(port)
+                        .append(" ip daddr ").append(api.upstreamAddress())
+                        .append(" tcp dport ").append(upstreamPort).append(" counter accept\n");
+            }
+        }
+        // A retired route also denies existing translations before physical-address exceptions.
+        rules.append("add rule inet floci_vpc_routes egress ").append(NATIVE_API_TRANSLATION).append(" counter drop\n");
     }
 
     static String publicAddress(String publicAddress, String privateAddress, String publicDevice) {
@@ -184,6 +226,44 @@ final class VpcRoutingCommands {
             }
         }
         return nft(rules);
+    }
+
+    /** Keep both translation directions in the caller namespace; filters inspect the original API tuple. */
+    static String nativePublicApi(String privateAddress, String publicAddress, NativeApi api) {
+        StringBuilder rules = new StringBuilder("""
+                add table ip floci_native_api
+                add chain ip floci_native_api destination { type nat hook output priority dstnat; }
+                add chain ip floci_native_api egress { type filter hook postrouting priority filter; }
+                add chain ip floci_native_api source { type nat hook postrouting priority srcnat; }
+                flush chain ip floci_native_api destination
+                flush chain ip floci_native_api egress
+                flush chain ip floci_native_api source
+                """);
+        if (api != null) {
+            String original = EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS;
+            String logical = VpcRouteSelection.ipv4(privateAddress);
+            String external = VpcRouteSelection.ipv4(publicAddress);
+            for (int port : List.of(80, 443)) {
+                int upstreamPort = port == 80 ? api.httpPort() : api.httpsPort();
+                rules.append("add rule ip floci_native_api destination ip daddr ").append(original)
+                        .append(" tcp dport ").append(port).append(" dnat to ")
+                        .append(api.upstreamAddress()).append(':').append(upstreamPort).append('\n');
+                // OUTPUT retains the original route's device after DNAT; POSTROUTING has the actual device.
+                rules.append("add rule ip floci_native_api egress ").append(NATIVE_API_TRANSLATION)
+                        .append(" ct original proto-dst ").append(port)
+                        .append(" ip daddr ").append(api.upstreamAddress())
+                        .append(" tcp dport ").append(upstreamPort)
+                        .append(" oifname \"").append(api.publicDevice()).append("\" counter accept\n");
+                rules.append("add rule ip floci_native_api source oifname \"").append(api.publicDevice())
+                        .append("\" ip saddr ").append(logical).append(" ip daddr ").append(api.upstreamAddress())
+                        .append(" tcp dport ").append(upstreamPort)
+                        .append(" ct original ip daddr ").append(original)
+                        .append(" ct original proto-dst ").append(port)
+                        .append(" snat to ").append(external).append('\n');
+            }
+        }
+        rules.append("add rule ip floci_native_api egress ").append(NATIVE_API_TRANSLATION).append(" counter drop\n");
+        return nft(rules.toString());
     }
 
     static String natGuard() {
@@ -241,17 +321,41 @@ final class VpcRoutingCommands {
 
     static String publicApi(String publicAddress, String httpAddress, int httpPort, String httpsAddress, int httpsPort,
                             String publicDevice, List<Hop> callers) {
+        return publicApi(publicAddress, httpAddress, httpPort, httpsAddress, httpsPort, publicDevice, callers,
+                null, List.of());
+    }
+
+    static String publicApi(String publicAddress, String httpAddress, int httpPort, String httpsAddress, int httpsPort,
+                            String publicDevice, List<Hop> callers, String albAddress, List<Hop> albCallers) {
         String external = VpcRouteSelection.ipv4(publicAddress);
         String httpBackend = VpcRouteSelection.ipv4(httpAddress);
         String httpsBackend = VpcRouteSelection.ipv4(httpsAddress);
         String outside = device(publicDevice);
-        if (httpPort < 1 || httpPort > 65535 || httpsPort < 1 || httpsPort > 65535
-                || external.equals(httpBackend) || external.equals(httpsBackend)) {
-            throw new IllegalArgumentException("Public AWS APIs require a distinct backend and valid TCP ports");
+        String albBackend = albAddress == null ? null : VpcRouteSelection.ipv4(albAddress);
+        String albPublic = EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS;
+        if (httpPort < 1 || httpPort > 65535 || httpsPort < 1 || httpsPort > 65535) {
+            throw new IllegalArgumentException("Public AWS APIs require valid upstream TCP ports");
+        }
+        if (albPublic.equals(external)) {
+            throw new IllegalArgumentException("Public AWS API and native ALB destinations must be distinct");
+        }
+        for (String upstream : List.of(httpBackend, httpsBackend)) {
+            if (external.equals(upstream) || albPublic.equals(upstream)) {
+                throw new IllegalArgumentException("Public AWS API upstream must differ from public destinations");
+            }
+        }
+        if (albBackend != null && (albPublic.equals(albBackend) || external.equals(albBackend))) {
+            throw new IllegalArgumentException("Native ALB upstream must differ from public destinations");
+        }
+        if (albBackend == null && !albCallers.isEmpty()) {
+            throw new IllegalArgumentException("Native ALB callers require their own upstream");
         }
         StringBuilder script = new StringBuilder("set -eu\nip -4 route flush default dev ")
                 .append(outside).append("\nip -4 route flush proto 186\n")
                 .append("ip -4 address replace ").append(external).append("/32 dev lo\n");
+        if (albBackend != null) {
+            script.append("ip -4 address replace ").append(albPublic).append("/32 dev lo\n");
+        }
         StringBuilder rules = new StringBuilder("""
                 add table inet floci_public_api
                 add chain inet floci_public_api ingress { type filter hook input priority -5; policy drop; }
@@ -261,28 +365,41 @@ final class VpcRoutingCommands {
                 add rule inet floci_public_api ingress iifname lo counter accept
                 add rule inet floci_public_api egress oifname lo counter accept
                 """);
-        for (Backend backend : List.of(new Backend(httpBackend, httpPort), new Backend(httpsBackend, httpsPort))
-                .stream().distinct().toList()) {
+        List<Backend> backends = new ArrayList<>(List.of(
+                new Backend(httpBackend, httpPort), new Backend(httpsBackend, httpsPort)));
+        if (albBackend != null) {
+            backends.add(new Backend(albBackend, 443));
+        }
+        for (Backend backend : backends.stream().distinct().toList()) {
             rules.append("add rule inet floci_public_api ingress ip saddr ").append(backend.address())
                     .append(" tcp sport ").append(backend.port()).append(" ct state established,related counter accept\n")
                     .append("add rule inet floci_public_api egress ip daddr ").append(backend.address())
                     .append(" tcp dport ").append(backend.port()).append(" counter accept\n");
         }
-        for (Hop caller : callers) {
+        List<Hop> replies = new ArrayList<>(callers);
+        replies.addAll(albCallers);
+        for (Hop caller : replies.stream().distinct().toList()) {
             if (!caller.replyOnly()) {
                 throw new IllegalArgumentException("Public API routes must only permit replies");
             }
             script.append("ip -4 route replace ").append(caller.destination()).append("/32 via ")
                     .append(caller.gateway()).append(" dev ").append(caller.device())
                     .append(" src ").append(external).append(" proto 186\n");
-            rules.append("add rule inet floci_public_api ingress iifname \"").append(caller.device())
-                    .append("\" ip saddr ").append(caller.destination()).append(" ip daddr ").append(external)
-                    .append(" tcp dport { 80, 443 } counter accept\n")
-                    .append("add rule inet floci_public_api egress oifname \"").append(caller.device())
-                    .append("\" ip saddr ").append(external).append(" ip daddr ").append(caller.destination())
-                    .append(" tcp sport { 80, 443 } ct state established,related counter accept\n");
         }
+        publicCallerRules(rules, callers, external, "{ 80, 443 }");
+        publicCallerRules(rules, albCallers, albPublic, "443");
         return script.append(nft(rules.toString())).toString();
+    }
+
+    private static void publicCallerRules(StringBuilder rules, List<Hop> callers, String address, String ports) {
+        for (Hop caller : callers) {
+            rules.append("add rule inet floci_public_api ingress iifname \"").append(caller.device())
+                    .append("\" ip saddr ").append(caller.destination()).append(" ip daddr ").append(address)
+                    .append(" tcp dport ").append(ports).append(" counter accept\n")
+                    .append("add rule inet floci_public_api egress oifname \"").append(caller.device())
+                    .append("\" ip saddr ").append(address).append(" ip daddr ").append(caller.destination())
+                    .append(" tcp sport ").append(ports).append(" ct state established,related counter accept\n");
+        }
     }
 
     private record Backend(String address, int port) {}

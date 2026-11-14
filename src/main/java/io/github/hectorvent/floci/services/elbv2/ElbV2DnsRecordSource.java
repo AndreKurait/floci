@@ -60,9 +60,13 @@ public class ElbV2DnsRecordSource implements DnsRecordSource {
         boolean publicHttps = config != null && "internet-facing".equals(target.getScheme())
                 && config.network().vpcRouting().enabled()
                 && config.network().vpcRouting().publicAwsApi()
-                && config.network().vpcRouting().publicAwsApiNativeHttps()
                 && config.tls().enabled() && config.tls().awsHttpsPort() == 443;
-        Optional<String> selectedAddress = publicHttps ? dns.publicApiAddress(origin) : dns.getServerIp();
+        Optional<String> selectedAddress = dns.getServerIp();
+        if (publicHttps && config.network().vpcRouting().publicAwsApiNativeHttps()) {
+            selectedAddress = dns.publicApiAddress(origin);
+        } else if (publicHttps && config.network().vpcRouting().publicAwsApiUpstreamHost().isPresent()) {
+            selectedAddress = dns.publicAlbHttpsAddress(origin);
+        }
         return Optional.of(selectedAddress
                 .map(address -> DnsAnswer.records(List.of(address), 60))
                 .orElseGet(DnsAnswer::noData));

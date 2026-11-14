@@ -252,6 +252,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
             run(endpoint.helper, VpcRoutingCommands.endpointGuard());
             endpoint.applied = null;
             run(endpoint.helper, VpcRoutingCommands.publicInstanceSource(null, null, null));
+            run(endpoint.helper, VpcRoutingCommands.nativePublicApi(null, null, null));
             boolean connected = docker.inspectContainerCmd(endpoint.helper).exec().getNetworkSettings()
                     .getNetworks().values().stream().anyMatch(value -> address.network().equals(value.getNetworkID()));
             if (connected) {
@@ -450,9 +451,10 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
     private void configureNat(NatRuntime nat, Topology topology) {
         List<VpcRouteSelection.Entry> routes = routes(nat.region, nat.vpc, nat.subnet, topology);
         List<VpcRoutingCommands.Hop> destinations = new ArrayList<>();
-        String apiAddress = EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS;
-        if (awsApi.transport() != null && internet(apiAddress, routes, nat.vpc, topology)) {
-            destinations.add(new VpcRoutingCommands.Hop(apiAddress, awsApi.transport(), nat.publicDevice, false));
+        for (String apiAddress : awsApi.destinations()) {
+            if (awsApi.transport() != null && internet(apiAddress, routes, nat.vpc, topology)) {
+                destinations.add(new VpcRoutingCommands.Hop(apiAddress, awsApi.transport(), nat.publicDevice, false));
+            }
         }
         for (PublicAddress address : publicAddresses.values()) {
             if (!missingNamespaces.contains(address.namespace.id())
@@ -528,18 +530,19 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
             }
         }
         if (awsApi.enabled()) {
-            String apiAddress = EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS;
-            int previous = hops.size();
-            if (awsApi.transport() != null && endpoint.publicAddress != null
-                    && internet(apiAddress, routes, vpc, topology)) {
-                NativePublicAddress address = endpoint.publicAddress;
-                VpcAwsApiBridge.NetworkEndpoint api = awsApi.onNetwork(address.apiNetwork());
-                hops.add(new VpcRoutingCommands.Hop(apiAddress, api.address(), address.apiDevice(), false));
-            } else if (awsApi.transport() != null) {
-                addDestination(endpoint, topology, routes, null, apiAddress, awsApi.transport(), hops);
-            }
-            if (hops.size() == previous) {
-                denied.add(apiAddress);
+            for (String apiAddress : awsApi.destinations()) {
+                int previous = hops.size();
+                if (awsApi.transport() != null && endpoint.publicAddress != null
+                        && internet(apiAddress, routes, vpc, topology)) {
+                    NativePublicAddress address = endpoint.publicAddress;
+                    VpcAwsApiBridge.NetworkEndpoint api = awsApi.onNetwork(address.apiNetwork());
+                    hops.add(new VpcRoutingCommands.Hop(apiAddress, api.address(), address.apiDevice(), false));
+                } else if (awsApi.transport() != null) {
+                    addDestination(endpoint, topology, routes, null, apiAddress, awsApi.transport(), hops);
+                }
+                if (hops.size() == previous) {
+                    denied.add(apiAddress);
+                }
             }
         }
         List<String> inbound = new ArrayList<>();
@@ -556,16 +559,24 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         List<VpcRoutingCommands.LocalRoute> local = routes.stream().map(route -> new VpcRoutingCommands.LocalRoute(
                 route.destination(), VpcRouteSelection.local(route.route()) && vpcCidr.contains(route.destination())))
                 .toList();
+        VpcRoutingCommands.NativeApi directApi = null;
+        if (nativeAddress != null && awsApi.enabled()
+                && internet(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS, routes, vpc, topology)) {
+            directApi = nativePublicApi(endpoint);
+        }
         String script = VpcRoutingCommands.endpoint(identity.logicalAddress(), endpoint.privateDevice,
                 local, hops, denied, endpoint.resolvers, identity.controlConnections(),
                 identity.instanceMetadataAllowed(), own == null ? null : own.device, inbound,
-                identity.controlListeners());
+                identity.controlListeners(), directApi);
         if (endpoint.publicAddress != null && endpoint.publicAddress.separateTransport()) {
             NativePublicAddress address = endpoint.publicAddress;
             script += VpcRoutingCommands.publicInstanceSources(identity.logicalAddress(), address.address(),
                     hops.stream().filter(hop -> address.device().equals(hop.device())
                                     || address.apiDevice().equals(hop.device()))
                             .filter(hop -> !hop.replyOnly()).toList());
+        }
+        if (nativeAddress != null) {
+            script += VpcRoutingCommands.nativePublicApi(identity.logicalAddress(), nativeAddress.address(), directApi);
         }
         if (!script.equals(endpoint.applied)) {
             // Resolver access is independent of VPC routes. Keep it available while
@@ -575,6 +586,44 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
             run(endpoint.helper, script);
             endpoint.applied = script;
         }
+    }
+
+    private VpcRoutingCommands.NativeApi nativePublicApi(Endpoint endpoint) {
+        EmulatorConfig.VpcRoutingConfig routing = config.network().vpcRouting();
+        String upstream = routing.publicAwsApiUpstreamHost().orElse(null);
+        if (routing.publicAwsApiNativeHttps() || upstream == null) {
+            return null;
+        }
+        String networkName = containers.resolveDockerNetwork(Optional.empty()).orElse(null);
+        if (networkName == null) {
+            return null;
+        }
+        String publicAddress = endpoint.publicAddress.address();
+        List<ContainerNetwork> attachments = docker.inspectContainerCmd(endpoint.helper).exec()
+                .getNetworkSettings().getNetworks().values().stream()
+                .filter(network -> publicAddress.equals(network.getIpAddress())).toList();
+        if (attachments.size() != 1) {
+            throw new IllegalStateException("Native public API caller lost its unique public interface");
+        }
+        Network network = docker.inspectNetworkCmd().withNetworkId(networkName).exec();
+        if (!"bridge".equals(network.getDriver()) || !network.getId().equals(attachments.getFirst().getNetworkID())) {
+            return null;
+        }
+        Map<String, Network.ContainerNetworkConfig> members = network.getContainers();
+        if (members == null) {
+            return null;
+        }
+        String address = VpcRouteSelection.ipv4(upstream);
+        long matches = members.values().stream().map(Network.ContainerNetworkConfig::getIpv4Address)
+                .filter(value -> value != null && value.startsWith(address + "/")).count();
+        if (matches == 0) {
+            return null;
+        }
+        if (matches != 1 || address.equals(publicAddress)) {
+            throw new IllegalStateException("Native public API upstream must identify one distinct bridge endpoint");
+        }
+        return new VpcRoutingCommands.NativeApi(address, routing.publicAwsApiUpstreamHttpPort(),
+                routing.publicAwsApiUpstreamHttpsPort(), deviceFor(endpoint.helper, publicAddress));
     }
 
     private void addDestination(Endpoint endpoint, Topology topology, List<VpcRouteSelection.Entry> routes,
@@ -602,12 +651,19 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
             return;
         }
         awsApi.ensure(publicNetwork());
+        List<VpcRoutingCommands.Hop> apiCallers = publicApiCallers(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS);
+        List<VpcRoutingCommands.Hop> albCallers = awsApi.publicAlbHttps()
+                ? publicApiCallers(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS) : List.of();
+        awsApi.configure(apiCallers, albCallers);
+    }
+
+    private List<VpcRoutingCommands.Hop> publicApiCallers(String destination) {
         List<VpcRoutingCommands.Hop> callers = new ArrayList<>();
         for (NatRuntime nat : nats.values()) {
             if (!nat.retiring && nat.transport != null) {
                 RequestScopes.runAs(nat.account, nat.region, () -> {
                     Topology topology = topology(nat.region);
-                    if (internet(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS,
+                    if (internet(destination,
                             routes(nat.region, nat.vpc, nat.subnet, topology), nat.vpc, topology)) {
                         callers.add(new VpcRoutingCommands.Hop(nat.publicIp, nat.transport, awsApi.device(), true));
                     }
@@ -623,7 +679,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
                 SecurityGroupNftCompiler.Endpoint identity = endpoint.identity;
                 RequestScopes.runAs(identity.accountId(), identity.region(), () -> {
                     Topology topology = topology(identity.region());
-                    if (internet(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS,
+                    if (internet(destination,
                             routes(identity.region(), identity.vpcId(), endpoint.subnet, topology),
                             identity.vpcId(), topology)) {
                         VpcAwsApiBridge.NetworkEndpoint api = awsApi.onNetwork(address.apiNetwork());
@@ -635,7 +691,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
                 });
             }
         }
-        awsApi.configure(callers);
+        return callers;
     }
 
     private boolean hasPublicInstances() {

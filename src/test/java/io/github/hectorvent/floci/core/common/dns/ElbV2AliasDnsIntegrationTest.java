@@ -63,16 +63,20 @@ class ElbV2AliasDnsIntegrationTest {
     URI endpoint;
 
     @ParameterizedTest
-    @CsvSource({"internal,false,false,false,true", "internet-facing,false,false,false,true",
-            "internal,true,false,false,true", "internet-facing,true,false,false,true",
-            "internal,false,true,false,true", "internet-facing,false,true,false,true",
-            "internal,true,true,false,true", "internet-facing,true,true,false,true",
-            "internal,false,false,true,true", "internet-facing,false,false,true,true",
-            "internal,false,true,true,true", "internet-facing,false,true,true,true",
-            "internal,false,false,true,false", "internet-facing,false,false,true,false",
-            "internal,false,true,true,false", "internet-facing,false,true,true,false"})
+    @CsvSource({"internal,false,false,false,true,false", "internet-facing,false,false,false,true,false",
+            "internal,true,false,false,true,false", "internet-facing,true,false,false,true,false",
+            "internal,false,true,false,true,false", "internet-facing,false,true,false,true,false",
+            "internal,true,true,false,true,false", "internet-facing,true,true,false,true,false",
+            "internal,false,false,true,true,false", "internet-facing,false,false,true,true,false",
+            "internal,false,true,true,true,false", "internet-facing,false,true,true,true,false",
+            "internal,false,false,true,false,false", "internet-facing,false,false,true,false,false",
+            "internal,false,true,true,false,false", "internet-facing,false,true,true,false,false",
+            "internal,false,false,false,true,true", "internet-facing,false,false,false,true,true",
+            "internet-facing,false,true,false,true,true", "internet-facing,false,false,false,false,true",
+            "internet-facing,true,false,false,true,true", "internet-facing,true,true,false,true,true"})
     void publicAliasFindsItsNativeAlbAcrossAccounts(String scheme, boolean declaredPublicRoute,
-                                                   boolean weighted, boolean nativeHttps, boolean knownVpc)
+                                                   boolean weighted, boolean nativeHttps, boolean knownVpc,
+                                                   boolean externalApi)
             throws Exception {
         StaticCredentialsProvider owner =
                 StaticCredentialsProvider.create(AwsBasicCredentials.create("730000000001", "test"));
@@ -111,16 +115,19 @@ class ElbV2AliasDnsIntegrationTest {
                 List<DnsRecordSource> sources = new ArrayList<>();
                 DnsClientVpcSource clients = address -> knownVpc ? Optional.of(
                         new DnsClientVpcSource.ClientVpc("730000000001", "eu-west-1", vpc)) : Optional.empty();
+                boolean publicTransport = nativeHttps || externalApi;
                 EmbeddedDnsServer dns = spy(new EmbeddedDnsServer(
-                        List.of(), sources, List.of(), List.of(clients), declaredPublicRoute || nativeHttps,
+                        List.of(), sources, List.of(), List.of(clients), declaredPublicRoute || publicTransport,
                         declaredPublicRoute ? List.of(name) : List.of()));
                 doReturn(Optional.of("127.0.0.1")).when(dns).getServerIp();
                 sources.add(new Route53DnsRecordSource(zones, config, new DnsLookupHelper(), dns));
                 EmulatorConfig transportConfig = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
-                when(transportConfig.network().vpcRouting().enabled()).thenReturn(nativeHttps);
-                when(transportConfig.network().vpcRouting().publicAwsApi()).thenReturn(nativeHttps);
+                when(transportConfig.network().vpcRouting().enabled()).thenReturn(publicTransport);
+                when(transportConfig.network().vpcRouting().publicAwsApi()).thenReturn(publicTransport);
                 when(transportConfig.network().vpcRouting().publicAwsApiNativeHttps()).thenReturn(nativeHttps);
-                when(transportConfig.tls().enabled()).thenReturn(nativeHttps);
+                when(transportConfig.network().vpcRouting().publicAwsApiUpstreamHost())
+                        .thenReturn(externalApi ? Optional.of("172.18.0.20") : Optional.empty());
+                when(transportConfig.tls().enabled()).thenReturn(publicTransport);
                 when(transportConfig.tls().awsHttpsPort()).thenReturn(443);
                 sources.add(new ElbV2DnsRecordSource(loadBalancers, dns, transportConfig));
                 listener.listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
@@ -133,9 +140,14 @@ class ElbV2AliasDnsIntegrationTest {
                 byte[] response = query(listener, name, 1);
                 assertEquals(0, rcode(response));
                 assertEquals(1, ByteBuffer.wrap(response).getShort(6));
-                String expectedAddress = declaredPublicRoute
-                        || nativeHttps && knownVpc && "internet-facing".equals(scheme)
-                        ? EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS : "127.0.0.1";
+                String expectedAddress = "127.0.0.1";
+                if (declaredPublicRoute) {
+                    expectedAddress = EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS;
+                } else if (externalApi && knownVpc && "internet-facing".equals(scheme)) {
+                    expectedAddress = EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS;
+                } else if (nativeHttps && knownVpc && "internet-facing".equals(scheme)) {
+                    expectedAddress = EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS;
+                }
                 assertArrayEquals(InetAddress.getByName(expectedAddress).getAddress(), address(response));
                 assertTrue((ByteBuffer.wrap(response).getShort(2) & 0x0400) != 0);
                 assertEquals(0, rcode(query(listener, name, 28)));

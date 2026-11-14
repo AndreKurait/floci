@@ -41,6 +41,7 @@ final class VpcAwsApiBridge {
     private String device;
     private String backend;
     private String httpsBackend;
+    private String albBackend;
     private int httpBackendPort;
     private int httpsBackendPort;
     private String applied;
@@ -66,6 +67,18 @@ final class VpcAwsApiBridge {
 
     boolean enabled() {
         return config.network().vpcRouting().publicAwsApi();
+    }
+
+    boolean publicAlbHttps() {
+        return enabled() && !config.network().vpcRouting().publicAwsApiNativeHttps()
+                && config.network().vpcRouting().publicAwsApiUpstreamHost().isPresent()
+                && config.tls().enabled() && config.tls().awsHttpsPort() == 443;
+    }
+
+    List<String> destinations() {
+        return publicAlbHttps() ? List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS,
+                EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS)
+                : List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS);
     }
 
     String transport() {
@@ -120,7 +133,8 @@ final class VpcAwsApiBridge {
             validateTarget(httpsTarget);
         }
         if (httpsBackendPort < 1 || httpsBackendPort > 65535
-                || EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS.equals(selectedHost)) {
+                || EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS.equals(selectedHost)
+                || EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS.equals(selectedHost)) {
             throw new IllegalStateException("Invalid public endpoint upstream address or HTTPS port");
         }
         retireOrphans();
@@ -144,6 +158,11 @@ final class VpcAwsApiBridge {
             namespace = new NetworkNamespaceLease(id, inspection.getName());
             backend = resolveBackend(target);
             httpsBackend = httpsTarget.equals(target) ? backend : resolveBackend(httpsTarget);
+            if (publicAlbHttps()) {
+                URI nativeTarget = URI.create(endpoint.baseUrl(false));
+                validateTarget(nativeTarget);
+                albBackend = resolveBackend(nativeTarget);
+            }
             docker.connectToNetworkCmd().withNetworkId(network).withContainerId(id).exec();
             transport = docker.inspectContainerCmd(id).exec().getNetworkSettings().getNetworks().values().stream()
                     .filter(value -> network.equals(value.getNetworkID())).map(ContainerNetwork::getIpAddress)
@@ -151,6 +170,8 @@ final class VpcAwsApiBridge {
             device = deviceFor(transport);
             if (config.network().vpcRouting().publicAwsApiNativeHttps()) {
                 sourcePeer = sourceAddressFor(httpsBackend);
+            } else if (albBackend != null) {
+                sourcePeer = sourceAddressFor(albBackend);
             }
             configure(List.of());
         } catch (RuntimeException failure) {
@@ -197,9 +218,14 @@ final class VpcAwsApiBridge {
     }
 
     void configure(List<VpcRoutingCommands.Hop> callers) {
+        configure(callers, List.of());
+    }
+
+    void configure(List<VpcRoutingCommands.Hop> callers, List<VpcRoutingCommands.Hop> albCallers) {
         String address = EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS;
         String script = VpcRoutingCommands.publicApi(
-                address, backend, httpBackendPort, httpsBackend, httpsBackendPort, device, callers);
+                address, backend, httpBackendPort, httpsBackend, httpsBackendPort, device, callers,
+                albBackend, albCallers);
         if (!script.equals(applied)) {
             publicSources.revoke(this);
             applied = null;
@@ -208,6 +234,11 @@ final class VpcAwsApiBridge {
             if (config.network().vpcRouting().publicAwsApiNativeHttps()) {
                 publicSources.register(this, sourcePeer, callers.stream().map(VpcRoutingCommands.Hop::destination)
                         .collect(Collectors.toUnmodifiableSet()));
+            } else if (albBackend != null) {
+                publicSources.register(this, sourcePeer, Map.of(
+                        EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS,
+                        albCallers.stream().map(VpcRoutingCommands.Hop::destination)
+                                .collect(Collectors.toUnmodifiableSet())));
             }
         }
         if (!listenersStarted) {
@@ -216,8 +247,13 @@ final class VpcAwsApiBridge {
                 RetryingTarCopier.copyBytes(docker, namespace.id(), "/tmp", "floci-api-https.sh",
                         httpsConnector(httpsBackend, httpsBackendPort).getBytes(StandardCharsets.UTF_8), 0600);
             }
+            if (albBackend != null) {
+                RetryingTarCopier.copyBytes(docker, namespace.id(), "/tmp", "floci-alb-https.sh",
+                        httpsConnector(albBackend, 443).getBytes(StandardCharsets.UTF_8), 0600);
+            }
             String start = listenerScript(address, backend, httpBackendPort, nativeHttps
-                    ? "EXEC:'sh /tmp/floci-api-https.sh',pipes" : "TCP4:" + httpsBackend + ":" + httpsBackendPort);
+                    ? "EXEC:'sh /tmp/floci-api-https.sh',pipes" : "TCP4:" + httpsBackend + ":" + httpsBackendPort,
+                    albBackend != null);
             RetryingTarCopier.copyBytes(docker, namespace.id(), "/tmp", "floci-api-start.sh",
                     start.getBytes(StandardCharsets.UTF_8), 0600);
             execute("touch", "/tmp/floci-api-ready");
@@ -227,20 +263,30 @@ final class VpcAwsApiBridge {
     }
 
     static String listenerScript(String address, String backend, int httpPort, String httpsTarget) {
+        return listenerScript(address, backend, httpPort, httpsTarget, false);
+    }
+
+    static String listenerScript(String address, String backend, int httpPort, String httpsTarget, boolean publicAlb) {
         // Connection subprocesses may outlive their parent; Docker init owns their reaping.
-        // Supervise both listeners explicitly, independent of the helper shell's wait -n behavior.
+        // Supervise every listener explicitly, independent of the helper shell's wait -n behavior.
+        String nativeListener = publicAlb ? """
+                socat -d -d TCP4-LISTEN:443,bind=%s,reuseaddr,fork EXEC:'sh /tmp/floci-alb-https.sh',pipes &
+                third=$!
+                """.formatted(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS) : "third=\n";
         return """
                 set -eu
                 socat -d -d TCP4-LISTEN:80,bind=%s,reuseaddr,fork TCP4:%s:%d &
                 first=$!
                 socat -d -d TCP4-LISTEN:443,bind=%s,reuseaddr,fork %s &
                 second=$!
-                trap 'kill "$first" "$second" 2>/dev/null || true' EXIT TERM INT
-                while kill -0 "$first" 2>/dev/null && kill -0 "$second" 2>/dev/null; do
+                %s\
+                trap 'kill "$first" "$second" ${third:+"$third"} 2>/dev/null || true' EXIT TERM INT
+                while kill -0 "$first" 2>/dev/null && kill -0 "$second" 2>/dev/null \
+                && { [ -z "$third" ] || kill -0 "$third" 2>/dev/null; }; do
                     sleep 0.1
                 done
                 exit 1
-                """.formatted(address, backend, httpPort, address, httpsTarget);
+                """.formatted(address, backend, httpPort, address, httpsTarget, nativeListener);
     }
 
     static String httpsConnector(String backend, int port) {
@@ -280,7 +326,9 @@ final class VpcAwsApiBridge {
         long deadline = System.nanoTime() + 5_000_000_000L;
         while (System.nanoTime() < deadline) {
             String listeners = execute("ss", "-H", "-lnt").stdout();
-            if (listeners.contains(address + ":80 ") && listeners.contains(address + ":443 ")) {
+            boolean albReady = albBackend == null
+                    || listeners.contains(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS + ":443 ");
+            if (listeners.contains(address + ":80 ") && listeners.contains(address + ":443 ") && albReady) {
                 return;
             }
             try {
@@ -304,6 +352,7 @@ final class VpcAwsApiBridge {
         device = null;
         backend = null;
         httpsBackend = null;
+        albBackend = null;
         applied = null;
         listenersStarted = false;
         sourcePeer = null;

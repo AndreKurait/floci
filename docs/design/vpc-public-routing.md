@@ -77,10 +77,28 @@ With the native public HTTPS bridge enabled on port 443, public Route 53 A
 aliases to owned internet-facing Application Load Balancers use `192.0.2.1`
 for known VPC callers. This includes weighted aliases and does not require
 listing generated alias names in configuration. The stored load balancer and
-canonical hosted-zone ID must validate first. Internal load balancers, callers
-outside a known VPC and disabled native HTTPS routing retain their existing
-address selection. Literal DNS records are unchanged. This serves the shared
+canonical hosted-zone ID must validate first. Internal load balancers and callers
+outside a known VPC retain their existing address selection. Literal DNS records
+are unchanged. This serves the shared
 HTTPS listener; it does not open arbitrary load-balancer ports on the bridge.
+
+When an explicit API upstream is configured and native API HTTPS routing is
+disabled, undeclared validated public ALB aliases instead use `192.0.2.2` for known
+VPC callers. Explicit `FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API_HOSTS` declarations
+retain their selected API front door and `192.0.2.1` destination after alias
+validation. The existing bridge serves only TLS port 443 on the separate ALB
+destination and forwards to Floci's enabled port 443 listener. API requests
+retain their configured upstream and `192.0.2.1` route. Each destination follows
+its own longest-prefix route, NAT and internet-gateway admission; security groups
+continue to check the original destination.
+
+The separate ALB transport accepts only an SNI name backed by a current public
+Route 53 alias to an owned internet-facing application load balancer. Every HTTP
+request also validates its Host against a current owned alias. The transport
+identity comes from the owned bridge's socket preface, never an HTTP header.
+Unknown names, internal load balancers, non-TLS bytes and retired aliases cannot
+fall through to an API listener or configured TLS fallback. Clients retain the
+ALB certificate and hostname verification.
 
 ### Declared public endpoint handoff
 
@@ -106,6 +124,17 @@ The bridge still admits only ports 80 and 443 through the caller's native NAT,
 internet-gateway route and security-group policy. Its outbound connections are
 limited to the selected address and ports. It does not give guests a route to
 the upstream's Docker address or a general internet route.
+
+For a native public EC2 instance, an explicit upstream on the same configured
+Docker bridge receives the instance's public source address. The caller's
+namespace translates only the public API's HTTP and HTTPS destinations.
+Security-group and internet-gateway route checks evaluate the original API
+destination and current upstream address. The actual outgoing interface is
+checked on every packet in POSTROUTING before source NAT; OUTPUT still reports
+the original route's interface after destination translation. Reply translation
+uses that same namespace's connection tracking. Direct requests to the upstream's Docker
+address receive no additional permission. Upstreams on other bridges, private
+callers and native HTTPS listener routing retain the TCP bridge path.
 
 Additional explicitly named public hosts may use this same destination for
 known VPC clients. Exact names may contain underscores or a single label;

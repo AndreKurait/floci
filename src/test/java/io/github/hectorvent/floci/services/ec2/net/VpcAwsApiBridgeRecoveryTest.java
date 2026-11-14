@@ -123,6 +123,20 @@ class VpcAwsApiBridgeRecoveryTest {
         verify(endpoint).baseUrl(false);
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"192.0.2.1", "192.0.2.2"})
+    void publicDestinationCannotBeConfiguredAsAnUpstream(String address) {
+        when(config.network().vpcRouting().publicAwsApiUpstreamHost()).thenReturn(Optional.of(address));
+        when(config.network().vpcRouting().publicAwsApiUpstreamHttpPort()).thenReturn(80);
+        when(config.network().vpcRouting().publicAwsApiUpstreamHttpsPort()).thenReturn(443);
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> bridge.ensure("public-network"));
+
+        assertTrue(failure.getMessage().contains("Invalid public endpoint upstream address"));
+        verifyNoInteractions(docker, lifecycle, containers);
+    }
+
     private String owner() {
         return ContainerStorageHelper.ownerIdentity(config);
     }

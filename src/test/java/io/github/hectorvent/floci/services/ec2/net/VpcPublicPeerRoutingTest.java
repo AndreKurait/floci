@@ -102,6 +102,131 @@ class VpcPublicPeerRoutingTest {
         when(publicNetwork.getContainers()).thenReturn(Map.of());
     }
 
+    @Test
+    void sharedUpstreamRetainsSyntheticRoutePolicyAndNativeCallerSource() {
+        prepareSharedUpstream();
+        admit("first", 2, true);
+        admit("second", 3, true);
+
+        for (String helper : List.of("first", "second")) {
+            String script = latest(helper);
+            assertTrue(script.contains("192.0.2.1/32 via 240.0.0.1 dev eth2"));
+            assertTrue(script.contains("egress ip daddr 192.0.2.1 oifname \"eth2\" counter accept"));
+            assertTrue(script.contains("ip daddr 192.0.2.1 tcp dport 443 dnat to 172.18.0.20:8443"));
+            assertTrue(script.contains("type filter hook postrouting priority filter;"));
+            assertTrue(script.contains("ct original proto-dst 443 ip daddr 172.18.0.20"
+                    + " tcp dport 8443 oifname \"eth0\" counter accept"));
+            assertFalse(script.contains("egress ip daddr 172.18.0.20"),
+                    "Direct upstream access must not gain a route-policy exception");
+        }
+        assertTrue(latest("first").contains("ct original proto-dst 443 snat to 172.18.0.2"));
+        assertTrue(latest("second").contains("ct original proto-dst 443 snat to 172.18.0.3"));
+    }
+
+    @Test
+    void apiBlackholeWithdrawsTranslationAndRestoringTheRouteReinstatesIt() {
+        prepareSharedUpstream();
+        admit("first", 2, true);
+        routes.add(0, route("192.0.2.1/32", "igw", "blackhole"));
+
+        manager.reconcile();
+
+        assertTrue(latest("first").contains("egress ip daddr 192.0.2.1 counter drop"));
+        assertTrue(latest("first").contains("flush chain ip floci_native_api destination"));
+        assertTrue(latest("first").contains("add rule ip floci_native_api egress meta l4proto tcp"
+                + " ct direction original ct status dnat ct original ip daddr 192.0.2.1 counter drop"));
+        assertFalse(latest("first").contains("dnat to 172.18.0.20"));
+        routes.removeFirst();
+        manager.reconcile();
+        assertTrue(latest("first").contains("dnat to 172.18.0.20:8443"));
+        gateway.setAttachments(List.of());
+        manager.reconcile();
+        assertFalse(latest("first").contains("dnat to 172.18.0.20"));
+    }
+
+    @Test
+    void nativeAlbAndApiRoutesWithdrawIndependentlyWithoutDirectParentAccess() {
+        prepareSharedUpstream();
+        when(config.tls().enabled()).thenReturn(true);
+        when(config.tls().awsHttpsPort()).thenReturn(443);
+        admit("first", 2, true);
+        assertTrue(latest("first").contains("192.0.2.2/32 via 240.0.0.1 dev eth2"));
+        assertTrue(latest("first").contains("dnat to 172.18.0.20:8443"));
+
+        routes.addFirst(route("192.0.2.2/32", "igw", "blackhole"));
+        manager.reconcile();
+        assertTrue(latest("first").contains("egress ip daddr 192.0.2.2 counter drop"));
+        assertTrue(latest("first").contains("dnat to 172.18.0.20:8443"));
+        routes.removeFirst();
+        routes.addFirst(route("192.0.2.1/32", "igw", "blackhole"));
+        manager.reconcile();
+        assertTrue(latest("first").contains("192.0.2.2/32 via 240.0.0.1 dev eth2"));
+        assertFalse(latest("first").contains("dnat to 172.18.0.20"));
+        assertFalse(latest("first").contains("egress ip daddr 172.18.0.20"));
+
+        gateway.setAttachments(List.of());
+        manager.reconcile();
+        assertTrue(latest("first").contains("egress ip daddr 192.0.2.2 counter drop"));
+        assertFalse(latest("first").contains("192.0.2.2/32 via"));
+    }
+
+    @Test
+    void nativeHttpsKeepsItsOwnedSniListenerPath() {
+        prepareSharedUpstream();
+        when(config.network().vpcRouting().publicAwsApiNativeHttps()).thenReturn(true);
+        when(config.tls().enabled()).thenReturn(true);
+        when(config.tls().awsHttpsPort()).thenReturn(443);
+        admit("first", 2, true);
+
+        assertTrue(latest("first").contains("192.0.2.1/32 via 240.0.0.1 dev eth2"));
+        assertFalse(latest("first").contains("dnat to 172.18.0.20"));
+    }
+
+    @Test
+    void upstreamOnAnotherBridgeKeepsTheExistingRelay() {
+        prepareSharedUpstream();
+        when(containers.resolveDockerNetwork(any())).thenReturn(Optional.of("other-network"));
+        Network other = mock(Network.class);
+        when(other.getId()).thenReturn("other-network");
+        when(other.getDriver()).thenReturn("bridge");
+        when(docker.inspectNetworkCmd().withNetworkId("other-network").exec()).thenReturn(other);
+        admit("first", 2, true);
+
+        assertTrue(latest("first").contains("192.0.2.1/32 via 240.0.0.1 dev eth2"));
+        assertFalse(latest("first").contains("dnat to 172.18.0.20"));
+    }
+
+    @Test
+    void removedUpstreamMembershipWithdrawsDirectTranslation() {
+        prepareSharedUpstream();
+        admit("first", 2, true);
+        when(docker.inspectNetworkCmd().withNetworkId("control-network").exec().getContainers())
+                .thenReturn(Map.of());
+
+        manager.reconcile();
+
+        assertFalse(latest("first").contains("dnat to 172.18.0.20"));
+        assertTrue(latest("first").contains("flush chain ip floci_native_api destination"));
+    }
+
+    @Test
+    void privateCallerDoesNotReceiveDirectPublicApiTranslation() {
+        prepareSharedUpstream();
+        prepareNamespace("first", 2, true);
+        manager.register(identity("first", 2), "first", List.of());
+
+        assertFalse(latest("first").contains("floci_native_api"));
+        assertTrue(latest("first").contains("egress ip daddr 192.0.2.1 counter drop"));
+    }
+
+    private void prepareSharedUpstream() {
+        enablePublicApi();
+        when(config.network().vpcRouting().publicAwsApiUpstreamHost()).thenReturn(Optional.of("172.18.0.20"));
+        when(config.network().vpcRouting().publicAwsApiUpstreamHttpPort()).thenReturn(8080);
+        when(config.network().vpcRouting().publicAwsApiUpstreamHttpsPort()).thenReturn(8443);
+        when(containers.resolveDockerNetwork(any())).thenReturn(Optional.of("control-network"));
+    }
+
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void publicPeersFollowInternetRoutesWithTheirOwnSourceIdentity(boolean internalControlNetwork) {
@@ -412,12 +537,16 @@ class VpcPublicPeerRoutingTest {
         when(docker.inspectExecCmd("api-exec").exec().getExitCodeLong()).thenReturn(0L);
         when(docker.execStartCmd("api-exec").exec(any())).thenAnswer(invocation -> {
             ResultCallback.Adapter<Frame> callback = invocation.getArgument(0);
-            String output = switch (command.get()[0]) {
-                case "getent" -> "172.18.0.1 STREAM backend";
-                case "ip" -> JSON.writeValueAsString(List.of(
+            String[] argv = command.get();
+            String output = switch (argv[0]) {
+                case "getent" -> argv[2] + " STREAM backend";
+                case "ip" -> List.of(argv).contains("route")
+                        ? JSON.writeValueAsString(List.of(Map.of("prefsrc", "172.18.0.254")))
+                        : JSON.writeValueAsString(List.of(
                         Map.of("ifname", "eth0", "addr_info", List.of(Map.of("local", "172.18.0.254"))),
                         Map.of("ifname", "eth1", "addr_info", List.of(Map.of("local", "240.0.0.1")))));
-                case "ss" -> "LISTEN 0 128 192.0.2.1:80 *:*\nLISTEN 0 128 192.0.2.1:443 *:*";
+                case "ss" -> "LISTEN 0 128 192.0.2.1:80 *:*\nLISTEN 0 128 192.0.2.1:443 *:*"
+                        + "\nLISTEN 0 128 192.0.2.2:443 *:*";
                 default -> "";
             };
             callback.onNext(new Frame(StreamType.STDOUT, output.getBytes(StandardCharsets.UTF_8)));
@@ -458,6 +587,11 @@ class VpcPublicPeerRoutingTest {
         when(docker.inspectContainerCmd(helper).exec().getName()).thenReturn("/" + helper);
         Network control = mock(Network.class);
         when(control.getInternal()).thenReturn(internal);
+        when(control.getId()).thenReturn("control-network");
+        when(control.getDriver()).thenReturn("bridge");
+        Network.ContainerNetworkConfig upstream = JSON.convertValue(
+                Map.of("IPv4Address", "172.18.0.20/16"), Network.ContainerNetworkConfig.class);
+        when(control.getContainers()).thenReturn(Map.of("frontdoor", upstream));
         when(docker.inspectNetworkCmd().withNetworkId("control-network").exec()).thenReturn(control);
         ExecCreateCmd create = mock(ExecCreateCmd.class, RETURNS_SELF);
         ExecCreateCmdResponse created = mock(ExecCreateCmdResponse.class);

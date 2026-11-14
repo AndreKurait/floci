@@ -14,7 +14,7 @@ import java.util.stream.Collectors;
 public class PublicApiProxySources {
     private final Map<String, Admission> admissions = new HashMap<>();
 
-    private record Admission(Object owner, Set<String> callers) {}
+    private record Admission(Object owner, Map<String, Set<String>> callers) {}
 
     public record Addresses(SocketAddress source, SocketAddress destination) {}
 
@@ -29,16 +29,29 @@ public class PublicApiProxySources {
     }
 
     public synchronized void register(Object owner, String peer, Set<String> callers) {
+        register(owner, peer, Map.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS, callers));
+    }
+
+    /** Each routed destination retains its own admitted caller set. */
+    public synchronized void register(Object owner, String peer, Map<String, Set<String>> callers) {
         if (owner == null) {
             throw new IllegalArgumentException("A public bridge requires its lifecycle owner");
         }
         String address = ipv4(peer);
-        Set<String> checked = callers.stream().map(PublicApiProxySources::ipv4).collect(Collectors.toUnmodifiableSet());
+        Map<String, Set<String>> checked = new HashMap<>();
+        for (Map.Entry<String, Set<String>> destination : callers.entrySet()) {
+            if (!EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS.equals(destination.getKey())
+                    && !EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS.equals(destination.getKey())) {
+                throw invalid();
+            }
+            checked.put(destination.getKey(), destination.getValue().stream().map(PublicApiProxySources::ipv4)
+                    .collect(Collectors.toUnmodifiableSet()));
+        }
         Admission existing = admissions.get(address);
         if (existing != null && existing.owner() != owner) {
             throw new IllegalStateException("Another public bridge owns this source socket address");
         }
-        admissions.put(address, new Admission(owner, checked));
+        admissions.put(address, new Admission(owner, Map.copyOf(checked)));
     }
 
     public synchronized void revoke(Object owner) {
@@ -58,8 +71,7 @@ public class PublicApiProxySources {
         }
         String[] fields = preface.substring(0, preface.length() - 2).split(" ", -1);
         if (fields.length != 6 || !"PROXY".equals(fields[0]) || !"TCP4".equals(fields[1])
-                || !admission.callers().contains(fields[2])
-                || !EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS.equals(fields[3])
+                || !admission.callers().getOrDefault(fields[3], Set.of()).contains(fields[2])
                 || !"443".equals(fields[5])) {
             throw invalid();
         }

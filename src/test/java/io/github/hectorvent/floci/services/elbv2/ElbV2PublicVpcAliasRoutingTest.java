@@ -48,6 +48,18 @@ class ElbV2PublicVpcAliasRoutingTest {
         }
     }
 
+    @Test
+    void externalApiFrontDoorUsesTheDistinctNativeAlbDestination() {
+        ElbV2DnsRecordSource source = source(true, true, false, true, 443, true, true);
+        DnsAnswer answer = source.resolveAliasTarget(NAME, "ZOWNED", 1, VPC).orElseThrow();
+        assertEquals(List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS), answer.addresses());
+        assertEquals(60, answer.ttlSeconds());
+        assertEquals(List.of(CONTROL), source.resolveAliasTarget(NAME, "ZOWNED", 1, null)
+                .orElseThrow().addresses());
+        assertEquals(DnsAnswer.refused(), source.resolveAliasTarget(NAME, "OTHER", 1, VPC).orElseThrow());
+        assertEquals(DnsAnswer.noData(), source.resolveAliasTarget(NAME, "ZOWNED", 28, VPC).orElseThrow());
+    }
+
     private static ElbV2DnsRecordSource source(boolean routing, boolean publicApi, boolean nativeHttps,
                                                boolean tls, int port) {
         return source(routing, publicApi, nativeHttps, tls, port, true);
@@ -55,16 +67,26 @@ class ElbV2PublicVpcAliasRoutingTest {
 
     private static ElbV2DnsRecordSource source(boolean routing, boolean publicApi, boolean nativeHttps,
                                                boolean tls, int port, boolean addressAvailable) {
+        return source(routing, publicApi, nativeHttps, tls, port, addressAvailable, false);
+    }
+
+    private static ElbV2DnsRecordSource source(boolean routing, boolean publicApi, boolean nativeHttps,
+                                               boolean tls, int port, boolean addressAvailable, boolean externalApi) {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.network().vpcRouting().enabled()).thenReturn(routing);
         when(config.network().vpcRouting().publicAwsApi()).thenReturn(publicApi);
         when(config.network().vpcRouting().publicAwsApiNativeHttps()).thenReturn(nativeHttps);
+        when(config.network().vpcRouting().publicAwsApiUpstreamHost())
+                .thenReturn(externalApi ? Optional.of("172.18.0.20") : Optional.empty());
         when(config.tls().enabled()).thenReturn(tls);
         when(config.tls().awsHttpsPort()).thenReturn(port);
         EmbeddedDnsServer dns = mock(EmbeddedDnsServer.class);
         when(dns.getServerIp()).thenReturn(addressAvailable ? Optional.of(CONTROL) : Optional.empty());
         when(dns.publicApiAddress(VPC)).thenReturn(addressAvailable
                 ? Optional.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS) : Optional.empty());
+        when(dns.publicAlbHttpsAddress(VPC)).thenReturn(addressAvailable
+                ? Optional.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS) : Optional.empty());
+        when(dns.publicAlbHttpsAddress(null)).thenReturn(addressAvailable ? Optional.of(CONTROL) : Optional.empty());
         LoadBalancer balancer = new LoadBalancer();
         balancer.setType("application");
         balancer.setScheme("internet-facing");

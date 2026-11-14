@@ -133,6 +133,7 @@ public interface EmulatorConfig {
 
     interface VpcRoutingConfig {
         String PUBLIC_AWS_API_ADDRESS = "192.0.2.1";
+        String PUBLIC_ALB_HTTPS_ADDRESS = "192.0.2.2";
 
         @WithDefault("false")
         boolean enabled();
