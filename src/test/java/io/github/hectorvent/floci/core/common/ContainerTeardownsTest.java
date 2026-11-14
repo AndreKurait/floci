@@ -1,5 +1,9 @@
 package io.github.hectorvent.floci.core.common;
 
+import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.net.VpcRoutingManager;
+import io.github.hectorvent.floci.services.ecs.EcsService;
+import io.github.hectorvent.floci.services.lambda.WarmPool;
 import io.github.hectorvent.floci.testing.TestTime;
 import io.github.hectorvent.floci.testing.TimelineDeadlineWaits;
 import jakarta.enterprise.inject.Instance;
@@ -23,6 +27,8 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doCallRealMethod;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -87,6 +93,47 @@ class ContainerTeardownsTest {
         verify(failed).stopManagedContainers();
         verify(following).beginTeardown();
         verify(following).stopManagedContainers();
+    }
+
+    @Test
+    void workloadsRetireBeforeEc2AndVpcNetworkCleanup() {
+        Ec2Service ec2 = mock(Ec2Service.class);
+        VpcRoutingManager network = mock(VpcRoutingManager.class);
+        EcsService ecs = mock(EcsService.class);
+        WarmPool lambda = mock(WarmPool.class);
+        List<String> stopped = new ArrayList<>();
+        for (ContainerTeardown teardown : List.of(ec2, network, lambda, ecs)) {
+            doCallRealMethod().when(teardown).teardownOrder();
+        }
+        doAnswer(ignored -> {
+            stopped.add("lambda");
+            return null;
+        }).when(lambda).stopManagedContainers();
+        doAnswer(ignored -> {
+            assertTrue(stopped.contains("lambda"),
+                    "The Lambda namespace batch must drain before per-task ECS retirement");
+            stopped.add("ecs");
+            return null;
+        }).when(ecs).stopManagedContainers();
+        doAnswer(ignored -> {
+            assertTrue(stopped.containsAll(List.of("lambda", "ecs")),
+                    "EC2 retirement must not reconcile the firewall of live Lambda and ECS workloads");
+            stopped.add("ec2");
+            return null;
+        }).when(ec2).stopManagedContainers();
+        doAnswer(ignored -> {
+            assertTrue(stopped.containsAll(List.of("lambda", "ecs", "ec2")),
+                    "VPC routes must remain available until their workloads retire");
+            stopped.add("network");
+            return null;
+        }).when(network).stopManagedContainers();
+        @SuppressWarnings("unchecked")
+        Instance<ContainerTeardown> teardowns = mock(Instance.class);
+        when(teardowns.iterator()).thenAnswer(ignored -> List.of(ec2, network, ecs, lambda).iterator());
+
+        ContainerTeardowns.stopAll(teardowns, LOG);
+
+        assertEquals(List.of("lambda", "ecs", "ec2", "network"), stopped);
     }
 
     @Test
