@@ -72,7 +72,8 @@ def test_hosted_versions_keep_profile_identity_across_replacement(
             assert _content(client, outputs["App"], outputs[label + "Profile"], 1) == f"  café-{label}\n".encode()
             physical[label] = cfn.describe_stack_resource(
                 StackName=stack, LogicalResourceId=label)["StackResourceDetail"]["PhysicalResourceId"]
-        assert physical["First"] != physical["Second"]
+        assert outputs["FirstProfile"] != outputs["SecondProfile"]
+        assert physical["First"] == physical["Second"] == "1"
 
         template["Resources"]["First"]["Properties"]["Content"] = "replacement\n"
         cfn.create_change_set(StackName=stack, ChangeSetName="content", ChangeSetType="UPDATE",
