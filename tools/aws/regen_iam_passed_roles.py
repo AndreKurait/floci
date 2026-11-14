@@ -224,6 +224,7 @@ BY_HAND = {
     "scheduler:CreateSchedule": "the target's role",
     "scheduler:UpdateSchedule": "the target's role",
     "states:CreateStateMachine": "the state machine's role",
+    "states:TestState": "the test state execution role",
     "states:UpdateStateMachine": "the state machine's role",
 }
 
