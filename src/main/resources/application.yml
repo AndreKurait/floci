@@ -860,6 +860,7 @@ floci:
         proxy-image: floci/network-helper:local
     appconfig:
       enabled: true
+      deployment-time-scale: 1.0           # FLOCI_SERVICES_APPCONFIG_DEPLOYMENT_TIME_SCALE: opt-in local acceleration
     appconfigdata:
       enabled: true
     ecr:
