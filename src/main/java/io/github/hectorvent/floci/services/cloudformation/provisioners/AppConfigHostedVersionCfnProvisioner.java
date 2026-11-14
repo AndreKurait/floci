@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.services.appconfig.model.HostedConfigurationVe
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import jakarta.enterprise.context.ApplicationScoped;
 
+import java.math.BigInteger;
 import java.nio.charset.StandardCharsets;
 import java.util.Map;
 import java.util.Set;
@@ -36,6 +37,11 @@ public class AppConfigHostedVersionCfnProvisioner implements CfnResourceProvisio
     }
 
     @Override
+    public String publicPhysicalId(String physicalId) {
+        return physicalId == null ? null : referenceValue(physicalId);
+    }
+
+    @Override
     public void provision(StackResource resource, JsonNode properties, ProvisionContext ctx) {
         if (ctx.isUpdate()) {
             ReplacementCleanup.endRollbackRetry(resource);
@@ -44,17 +50,13 @@ public class AppConfigHostedVersionCfnProvisioner implements CfnResourceProvisio
         if (resolved == null || !resolved.isObject()) {
             throw new AwsException("ValidationError", TYPE + " requires Properties.", 400);
         }
-        for (String unsupported : Set.of("LatestVersionNumber", "VersionLabel")) {
-            if (resolved.hasNonNull(unsupported)) {
-                throw new AwsException("ValidationError",
-                        TYPE + " does not yet support " + unsupported + ".", 400);
-            }
-        }
         String app = requiredText(resolved, "ApplicationId", false);
         String profile = requiredText(resolved, "ConfigurationProfileId", false);
         String content = requiredText(resolved, "Content", true);
         String contentType = requiredText(resolved, "ContentType", false);
         String description = resolved.hasNonNull("Description") ? requiredText(resolved, "Description", true) : null;
+        String label = resolved.hasNonNull("VersionLabel") ? requiredText(resolved, "VersionLabel", true) : null;
+        Integer latest = optionalInteger(resolved, "LatestVersionNumber");
         if (contentType.length() > 255 || (description != null && description.length() > 1024)) {
             throw new AwsException("ValidationError", TYPE + " ContentType or Description exceeds its length limit.", 400);
         }
@@ -63,8 +65,10 @@ public class AppConfigHostedVersionCfnProvisioner implements CfnResourceProvisio
             return;
         }
         Map<String, String> before = Map.copyOf(resource.getAttributes());
+        // Empty CFN labels create unlabeled versions; keep the original properties for replacement detection.
         HostedConfigurationVersion version = service.createHostedConfigurationVersion(
-                app, profile, content.getBytes(StandardCharsets.UTF_8), contentType, description);
+                app, profile, content.getBytes(StandardCharsets.UTF_8), contentType, description,
+                label == null || label.isEmpty() ? null : label, latest);
         resource.setPhysicalId(version.getApplicationId() + "|" + version.getConfigurationProfileId()
                 + "|" + version.getVersionNumber());
         resource.getAttributes().put("VersionNumber", Integer.toString(version.getVersionNumber()));
@@ -78,6 +82,22 @@ public class AppConfigHostedVersionCfnProvisioner implements CfnResourceProvisio
             throw new AwsException("ValidationError", TYPE + " requires a string " + name + ".", 400);
         }
         return value.asText();
+    }
+
+    private static Integer optionalInteger(JsonNode properties, String name) {
+        JsonNode value = properties.get(name);
+        if (value == null || value.isNull()) {
+            return null;
+        }
+        String text = value.asText();
+        if ((!value.isIntegralNumber() && !value.isTextual()) || !text.matches("-?\\d+")) {
+            throw new AwsException("ValidationError", TYPE + " requires an integer " + name + ".", 400);
+        }
+        BigInteger number = new BigInteger(text);
+        if (number.bitLength() > 31) {
+            throw new AwsException("ValidationError", TYPE + " " + name + " exceeds the signed 32-bit integer range.", 400);
+        }
+        return number.intValue();
     }
 
     @Override
