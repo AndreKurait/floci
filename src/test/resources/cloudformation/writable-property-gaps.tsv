@@ -288,6 +288,7 @@ AWS::ECS::TaskDefinition	PidMode	accepted and ignored
 AWS::ECS::TaskDefinition	PlacementConstraints	accepted and ignored
 AWS::ECS::TaskDefinition	ProxyConfiguration	accepted and ignored
 AWS::ECS::TaskDefinition	Tags	accepted and ignored
+AWS::ECS::TaskDefinition	TrustedExecutionConfiguration	accepted and ignored; trusted execution is not modeled
 AWS::ECS::TaskDefinition	Volumes	accepted and ignored
 AWS::EKS::Cluster	AccessConfig	accepted and ignored
 AWS::EKS::Cluster	ActiveCertificateAuthorityId	accepted and ignored
