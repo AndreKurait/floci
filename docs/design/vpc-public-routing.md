@@ -79,12 +79,15 @@ for known VPC callers. This includes weighted aliases and does not require
 listing generated alias names in configuration. The stored load balancer and
 canonical hosted-zone ID must validate first. Internal load balancers and callers
 outside a known VPC retain their existing address selection. Literal DNS records
-are unchanged. This serves the shared
+are unchanged. Shared listener admission requires a hostname's aliases to agree
+on one target; weighted aliases to different targets remain ambiguous. This serves the shared
 HTTPS listener; it does not open arbitrary load-balancer ports on the bridge.
 
 When an explicit API upstream is configured and native API HTTPS routing is
-disabled, undeclared validated public ALB aliases instead use `192.0.2.2` for known
-VPC callers. Explicit `FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API_HOSTS` declarations
+disabled, undeclared validated public ALB aliases use `192.0.2.2` for known VPC
+callers only when the ALB has a single HTTPS listener on port 443. HTTP, mixed
+protocol and custom-port ALBs retain their existing DNS address. Listener changes
+take effect on the next DNS lookup. Explicit `FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API_HOSTS` declarations
 retain their selected API front door and `192.0.2.1` destination after alias
 validation. The existing bridge serves only TLS port 443 on the separate ALB
 destination and forwards to Floci's enabled port 443 listener. API requests

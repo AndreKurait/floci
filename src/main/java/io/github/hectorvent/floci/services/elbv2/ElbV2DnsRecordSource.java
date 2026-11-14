@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.core.common.dns.DnsAnswer;
 import io.github.hectorvent.floci.core.common.dns.DnsClientVpcSource.ClientVpc;
 import io.github.hectorvent.floci.core.common.dns.DnsRecordSource;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
+import io.github.hectorvent.floci.services.elbv2.model.Listener;
 import io.github.hectorvent.floci.services.elbv2.model.LoadBalancer;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -64,11 +65,21 @@ public class ElbV2DnsRecordSource implements DnsRecordSource {
         Optional<String> selectedAddress = dns.getServerIp();
         if (publicHttps && config.network().vpcRouting().publicAwsApiNativeHttps()) {
             selectedAddress = dns.publicApiAddress(origin);
-        } else if (publicHttps && config.network().vpcRouting().publicAwsApiUpstreamHost().isPresent()) {
+        } else if (publicHttps && config.network().vpcRouting().publicAwsApiUpstreamHost().isPresent()
+                && servesOnlyHttps443(target)) {
             selectedAddress = dns.publicAlbHttpsAddress(origin);
         }
         return Optional.of(selectedAddress
                 .map(address -> DnsAnswer.records(List.of(address), 60))
                 .orElseGet(DnsAnswer::noData));
+    }
+
+    private boolean servesOnlyHttps443(LoadBalancer loadBalancer) {
+        List<Listener> listeners = service.findListenersForLoadBalancer(loadBalancer.getLoadBalancerArn());
+        if (listeners.size() != 1) {
+            return false;
+        }
+        Listener listener = listeners.getFirst();
+        return "HTTPS".equals(listener.getProtocol()) && Integer.valueOf(443).equals(listener.getPort());
     }
 }

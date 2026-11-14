@@ -179,9 +179,9 @@ public final class SecurityGroupNftCompiler {
                 .append("add rule inet floci_sg ingress ct state established,related accept\n")
                 .append("add rule inet floci_sg egress ct state established,related accept\n");
 
-        if (target.transportAddresses().stream().anyMatch(routedPublicAddresses::contains)) {
-            appendTranslatedPublicApiPolicy(rules, target, prefixLists);
-        }
+        // A running endpoint can gain public routing before its next policy refresh.
+        // Keep the original-tuple policy installed before that routing enables DNAT.
+        appendTranslatedPublicApiPolicy(rules, target, prefixLists);
 
         // Docker's embedded DNS listens on loopback but forwards from this namespace. Security
         // groups never filter the VPC resolver on AWS. Only DNS is exempt, because the resolver

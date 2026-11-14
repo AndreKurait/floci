@@ -17,6 +17,8 @@ import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.http.apache5.Apache5HttpClient;
 import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.acm.AcmClient;
+import software.amazon.awssdk.services.acm.model.DeleteCertificateRequest;
 import software.amazon.awssdk.services.ec2.Ec2Client;
 import software.amazon.awssdk.services.elasticloadbalancingv2.ElasticLoadBalancingV2Client;
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.DeleteLoadBalancerRequest;
@@ -84,6 +86,8 @@ class ElbV2AliasDnsIntegrationTest {
                 StaticCredentialsProvider.create(AwsBasicCredentials.create("730000000002", "test"));
         try (Ec2Client ec2 = Ec2Client.builder().endpointOverride(endpoint).region(Region.EU_WEST_1)
                      .credentialsProvider(owner).httpClientBuilder(Apache5HttpClient.builder()).build();
+             AcmClient acm = AcmClient.builder().endpointOverride(endpoint).region(Region.EU_WEST_1)
+                     .credentialsProvider(owner).httpClientBuilder(Apache5HttpClient.builder()).build();
              ElasticLoadBalancingV2Client elb = ElasticLoadBalancingV2Client.builder().endpointOverride(endpoint)
                      .region(Region.EU_WEST_1).credentialsProvider(owner)
                      .httpClientBuilder(Apache5HttpClient.builder()).build();
@@ -97,6 +101,7 @@ class ElbV2AliasDnsIntegrationTest {
             List<String> subnets = new ArrayList<>();
             String zone = null;
             String arn = null;
+            String certificate = null;
             ResourceRecordSet installed = null;
             DatagramSocket listener = vertx.createDatagramSocket(new DatagramSocketOptions().setIpV6(false));
             try {
@@ -107,6 +112,8 @@ class ElbV2AliasDnsIntegrationTest {
                 LoadBalancer target = elb.createLoadBalancer(r -> r.name("dns-" + UUID.randomUUID().toString().substring(0, 20))
                         .type("application").scheme(scheme).subnets(subnets)).loadBalancers().getFirst();
                 arn = target.loadBalancerArn();
+                certificate = acm.requestCertificate(r -> r.domainName(name).validationMethod("DNS")).certificateArn();
+                String https = createHttpsListener(elb, arn, certificate);
                 assertTrue(arn.contains(":730000000001:"));
                 assertTrue(other.describeLoadBalancers().loadBalancers().stream()
                         .noneMatch(lb -> lb.loadBalancerArn().equals(target.loadBalancerArn())));
@@ -153,6 +160,12 @@ class ElbV2AliasDnsIntegrationTest {
                 assertEquals(0, rcode(query(listener, name, 28)));
                 assertEquals(0, ByteBuffer.wrap(query(listener, name, 28)).getShort(6));
 
+                if (externalApi && knownVpc && !declaredPublicRoute && !weighted
+                        && "internet-facing".equals(scheme)) {
+                    verifyListenerChangesPreserveOtherPorts(elb, listener, name, target.loadBalancerArn(),
+                            certificate, https);
+                }
+
                 installed = withRouting(ResourceRecordSet.builder().name(name).type("A").ttl(60L)
                         .resourceRecords(record -> record.value("127.0.0.1")).build(), weighted);
                 change(route53, zone, ChangeAction.UPSERT, installed);
@@ -186,12 +199,45 @@ class ElbV2AliasDnsIntegrationTest {
                 if (arn != null) {
                     elb.deleteLoadBalancer(DeleteLoadBalancerRequest.builder().loadBalancerArn(arn).build());
                 }
+                if (certificate != null) {
+                    acm.deleteCertificate(DeleteCertificateRequest.builder().certificateArn(certificate).build());
+                }
                 for (String subnet : subnets) {
                     ec2.deleteSubnet(r -> r.subnetId(subnet));
                 }
                 ec2.deleteVpc(r -> r.vpcId(vpc));
             }
         }
+    }
+
+    private static String createHttpsListener(ElasticLoadBalancingV2Client elb, String arn, String certificate) {
+        return elb.createListener(r -> r.loadBalancerArn(arn).protocol("HTTPS").port(443)
+                .certificates(c -> c.certificateArn(certificate)).defaultActions(a -> a.type("fixed-response")
+                        .fixedResponseConfig(f -> f.statusCode("200").contentType("text/plain").messageBody("owned"))))
+                .listeners().getFirst().listenerArn();
+    }
+
+    private static void verifyListenerChangesPreserveOtherPorts(ElasticLoadBalancingV2Client elb,
+                                                                DatagramSocket dns, String name, String arn,
+                                                                String certificate, String https) throws Exception {
+        String http = elb.createListener(r -> r.loadBalancerArn(arn).protocol("HTTP").port(80)
+                .defaultActions(a -> a.type("redirect").redirectConfig(c -> c.protocol("HTTPS").port("443")
+                        .statusCode("HTTP_301")))).listeners().getFirst().listenerArn();
+        assertArrayEquals(InetAddress.getByName("127.0.0.1").getAddress(), address(query(dns, name, 1)),
+                "A mixed HTTP/HTTPS ALB retains the address serving its redirect listener");
+        elb.deleteListener(r -> r.listenerArn(https));
+        assertArrayEquals(InetAddress.getByName("127.0.0.1").getAddress(), address(query(dns, name, 1)),
+                "An HTTP-only ALB retains its existing address");
+        elb.deleteListener(r -> r.listenerArn(http));
+        assertArrayEquals(InetAddress.getByName("127.0.0.1").getAddress(), address(query(dns, name, 1)),
+                "An ALB without listeners is not advertised on the dedicated HTTPS destination");
+        String restored = createHttpsListener(elb, arn, certificate);
+        assertArrayEquals(InetAddress.getByName(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS).getAddress(),
+                address(query(dns, name, 1)), "The only HTTPS443 listener restores the dedicated destination");
+        elb.modifyListener(r -> r.listenerArn(restored).port(8443));
+        assertArrayEquals(InetAddress.getByName("127.0.0.1").getAddress(), address(query(dns, name, 1)),
+                "A custom HTTPS port retains its existing address");
+        elb.modifyListener(r -> r.listenerArn(restored).port(443));
     }
 
     private static ResourceRecordSet withRouting(ResourceRecordSet record, boolean weighted) {

@@ -11,6 +11,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -51,14 +52,23 @@ class SecurityGroupNftCompilerTest {
     }
 
     @Test
-    void unpublishedPrivateEndpointsKeepTheirExistingTuplePolicy() {
+    void translatedPublicApiPolicyIsInstalledBeforePublicAddressPublication() {
         SecurityGroup group = new SecurityGroup();
-        group.getIpPermissionsEgress().add(tcpEgress("0.0.0.0/0", 443));
+        group.getIpPermissionsEgress().add(tcpEgress("172.17.0.20/32", 8443));
         String rules = SecurityGroupNftCompiler.compile(
                 endpoint("eni-a", "10.0.0.2", "172.17.0.2", group), List.of(), Map.of());
 
-        assertFalse(rules.contains("ct original ip daddr 192.0.2.1"));
-        assertTrue(rules.contains("ip daddr 0.0.0.0/0 tcp dport 443 accept"));
+        String original = "ct direction original ct status dnat ct original ip daddr 192.0.2.1";
+        String denyHttps = original + " ct original proto-dst 443 counter drop";
+        String upstream = "ip daddr 172.17.0.20/32 tcp dport 8443 accept";
+        assertTrue(rules.contains(denyHttps),
+                "The initial policy must deny translated API traffic before a public address is published");
+        assertTrue(rules.contains(original + " ct original proto-dst 80 counter drop"));
+        assertTrue(rules.contains(upstream), "Untranslated traffic keeps its physical-tuple permission");
+        assertTrue(rules.indexOf(denyHttps) < rules.indexOf(upstream),
+                "An allowed upstream must not bypass the denied original API destination");
+        assertEquals(rules, publicApiRules(group, Map.of()),
+                "Publishing the address must not be needed to install the translated API policy");
     }
 
     private static String publicApiRules(SecurityGroup group, Map<String, List<String>> prefixLists) {

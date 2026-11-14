@@ -82,6 +82,25 @@ class Route53PublicAliasTest {
         assertUnresolved("api.example.test.");
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void weightedAliasesRequireTheSameTargetForListenerAdmission(boolean sameTarget) {
+        ResourceRecordSet first = alias("api.example.test.", "A", TARGET, TARGET_ZONE);
+        first.setSetIdentifier("first");
+        first.setWeight(1L);
+        ResourceRecordSet second = alias("api.example.test.", "A",
+                sameTarget ? TARGET : "two.elb.example.net.", TARGET_ZONE);
+        second.setSetIdentifier("second");
+        second.setWeight(1L);
+        put(first, second);
+        if (sameTarget) {
+            assertEquals(new Route53Service.PublicAlias(TARGET, TARGET_ZONE),
+                    service.lookupPublicAlias("api.example.test."));
+        } else {
+            assertUnresolved("api.example.test.");
+        }
+    }
+
     @Test
     void aliasesWithinTheSameZoneAcceptAPrefixedZoneId() {
         put(alias("api.example.test.", "A", "next.example.test.", "/hostedzone/" + zone),

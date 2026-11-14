@@ -24,11 +24,13 @@ import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLException;
 import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSocket;
+import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -38,6 +40,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
@@ -276,8 +279,8 @@ class TlsProxyFallbackServiceTest {
     @ParameterizedTest
     @ValueSource(strings = {"unknown", "api", "plain", "no-sni"})
     void publicAlbTransportCannotFallBackToAnApiOrNonTlsListener(String request) throws Exception {
-        Backend nativeOwner = backend("native.fixture.local", true);
-        Backend shared = backend("shared.fixture.local", false);
+        ConnectionProbe nativeOwner = connectionProbe();
+        ConnectionProbe shared = connectionProbe();
         int[] ports = FreePorts.anyInterfacePorts(2);
         PublicApiProxySources sources = new PublicApiProxySources();
         sources.register(this, "127.0.0.1", Map.of("192.0.2.2", Set.of("172.18.1.10")));
@@ -290,16 +293,19 @@ class TlsProxyFallbackServiceTest {
                 tcp.getOutputStream().write(PAYLOAD.getBytes(StandardCharsets.US_ASCII));
                 assertEquals(-1, tcp.getInputStream().read());
             } else {
-                Backend attempted = "api".equals(request) ? shared : nativeOwner;
+                String hostname = "api".equals(request) ? "shared.fixture.local" : "native.fixture.local";
                 assertThrows(SSLException.class,
-                        () -> publicAlbTls(tcp, ports[1], attempted, !"no-sni".equals(request)));
+                        () -> publicAlbTls(tcp, ports[1], hostname, !"no-sni".equals(request),
+                                SSLContext.getDefault()));
             }
-            assertFalse(nativeOwner.received().isDone());
-            assertFalse(shared.received().isDone());
+            assertFalse(nativeOwner.contacted().isDone(), "Rejected traffic contacted the native/API backend");
+            assertFalse(shared.contacted().isDone(), "Rejected traffic contacted the shared fallback backend");
         }
     }
 
     private static Socket publicAlbSocket(int port) throws Exception {
+        await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(Duration.ofSeconds(5))
+                .until(() -> portAccepts(port));
         Socket tcp = new Socket();
         tcp.connect(new InetSocketAddress("127.0.0.1", port), 2000);
         tcp.setSoTimeout(5000);
@@ -309,17 +315,28 @@ class TlsProxyFallbackServiceTest {
         return tcp;
     }
 
-    private static SSLSocket publicAlbTls(Socket tcp, int port, Backend backend) throws Exception {
-        return publicAlbTls(tcp, port, backend, true);
+    private static boolean portAccepts(int port) {
+        try (Socket probe = new Socket()) {
+            probe.connect(new InetSocketAddress("127.0.0.1", port), 200);
+            return true;
+        } catch (IOException expected) {
+            // The extra HTTPS listener binds asynchronously after the primary port.
+            return false;
+        }
     }
 
-    private static SSLSocket publicAlbTls(Socket tcp, int port, Backend backend, boolean sni) throws Exception {
+    private static SSLSocket publicAlbTls(Socket tcp, int port, Backend backend) throws Exception {
         SSLContext trust = TlsTrust.trusting(Pem.parseCertificate(
                 Files.readString(Path.of(backend.certificate().certificatePath()))));
-        SSLSocket socket = (SSLSocket) trust.getSocketFactory().createSocket(tcp, backend.name(), port, false);
+        return publicAlbTls(tcp, port, backend.name(), true, trust);
+    }
+
+    private static SSLSocket publicAlbTls(Socket tcp, int port, String hostname, boolean sni, SSLContext trust)
+            throws Exception {
+        SSLSocket socket = (SSLSocket) trust.getSocketFactory().createSocket(tcp, hostname, port, false);
         SSLParameters parameters = socket.getSSLParameters();
         parameters.setEndpointIdentificationAlgorithm("HTTPS");
-        parameters.setServerNames(sni ? List.of(new SNIHostName(backend.name())) : List.of());
+        parameters.setServerNames(sni ? List.of(new SNIHostName(hostname)) : List.of());
         socket.setSSLParameters(parameters);
         try {
             socket.startHandshake();
@@ -357,6 +374,15 @@ class TlsProxyFallbackServiceTest {
         return new Backend(name, server, certificate, received);
     }
 
+    private ConnectionProbe connectionProbe() throws Exception {
+        CompletableFuture<Void> contacted = new CompletableFuture<>();
+        NetServer server = vertx.createNetServer().connectHandler(socket -> {
+            contacted.complete(null);
+            socket.close();
+        }).listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+        return new ConnectionProbe(server, contacted);
+    }
+
     private static EmulatorConfig config(int publicPort, int awsPort, int fallback) {
         EmulatorConfig config = mock(EmulatorConfig.class);
         EmulatorConfig.TlsConfig tls = mock(EmulatorConfig.TlsConfig.class);
@@ -371,6 +397,9 @@ class TlsProxyFallbackServiceTest {
 
     private record Backend(String name, NetServer server, SelfSignedCertificate certificate,
                            CompletableFuture<Received> received) {
+    }
+
+    private record ConnectionProbe(NetServer server, CompletableFuture<Void> contacted) {
     }
 
     private record Received(String payload, int sourcePort, String sourceAddress, String destinationAddress) {

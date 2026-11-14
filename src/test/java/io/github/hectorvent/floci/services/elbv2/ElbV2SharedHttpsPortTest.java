@@ -6,6 +6,8 @@ import io.github.hectorvent.floci.config.TlsProxyServer;
 import io.github.hectorvent.floci.core.common.CertificateReferenceResolver;
 import io.github.hectorvent.floci.core.common.CertificateReferenceResolver.CertificateMaterial;
 import io.github.hectorvent.floci.core.common.Pem;
+import io.github.hectorvent.floci.core.common.dns.DnsClientVpcSource.ClientVpc;
+import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.services.acm.CertificateGenerator;
 import io.github.hectorvent.floci.services.acm.CertificateGenerator.GeneratedCertificate;
 import io.github.hectorvent.floci.services.acm.model.KeyAlgorithm;
@@ -44,6 +46,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
 import java.time.Duration;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.function.ToIntFunction;
 
@@ -54,6 +57,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.RETURNS_SELF;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -111,6 +115,7 @@ class ElbV2SharedHttpsPortTest {
                 .thenReturn(new Route53Service.PublicAlias("alb.example.test", "OWNED"));
         Listener listener = listener(443);
         LoadBalancer loadBalancer = new LoadBalancer();
+        loadBalancer.setLoadBalancerArn(listener.getLoadBalancerArn());
         loadBalancer.setDnsName("alb.example.test");
         loadBalancer.setCanonicalHostedZoneId("OWNED");
         loadBalancer.setType("application");
@@ -130,7 +135,9 @@ class ElbV2SharedHttpsPortTest {
             verify(server).requestHandler(requests.capture());
 
             assertEquals(44444, publicAlb.getValue().applyAsInt("service.example.test"));
-            HttpServerRequest admitted = nativeRequest("service.example.test");
+            String dnsAddress = nativeAliasAddress(plane.elbV2Service, loadBalancer, listener);
+            assertEquals(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS, dnsAddress);
+            HttpServerRequest admitted = nativeRequest("service.example.test", dnsAddress);
             requests.getValue().handle(admitted);
             verify(admitted.response()).setStatusCode(200);
             verify(admitted.response()).end("native-alb");
@@ -286,11 +293,34 @@ class ElbV2SharedHttpsPortTest {
     }
 
     private static HttpServerRequest nativeRequest(String host) {
+        return nativeRequest(host, EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS);
+    }
+
+    private static HttpServerRequest nativeRequest(String host, String address) {
         HttpServerRequest request = mock(HttpServerRequest.class);
         when(request.host()).thenReturn(host);
-        when(request.localAddress()).thenReturn(SocketAddress.inetSocketAddress(443, "192.0.2.2"));
+        when(request.localAddress()).thenReturn(SocketAddress.inetSocketAddress(443, address));
         when(request.response()).thenReturn(mock(HttpServerResponse.class, RETURNS_SELF));
         return request;
+    }
+
+    private static String nativeAliasAddress(ElbV2Service service, LoadBalancer loadBalancer, Listener listener) {
+        when(service.findByDnsName(loadBalancer.getDnsName())).thenReturn(List.of(loadBalancer));
+        when(service.findListenersForLoadBalancer(loadBalancer.getLoadBalancerArn())).thenReturn(List.of(listener));
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.network().vpcRouting().enabled()).thenReturn(true);
+        when(config.network().vpcRouting().publicAwsApi()).thenReturn(true);
+        when(config.network().vpcRouting().publicAwsApiUpstreamHost()).thenReturn(Optional.of("172.18.0.20"));
+        when(config.tls().enabled()).thenReturn(true);
+        when(config.tls().awsHttpsPort()).thenReturn(443);
+        EmbeddedDnsServer dns = mock(EmbeddedDnsServer.class);
+        ClientVpc origin = new ClientVpc("000000000000", "us-west-2", "vpc-caller");
+        when(dns.getServerIp()).thenReturn(Optional.of("172.18.0.2"));
+        when(dns.publicAlbHttpsAddress(origin))
+                .thenReturn(Optional.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS));
+        return new ElbV2DnsRecordSource(service, dns, config)
+                .resolveAliasTarget(loadBalancer.getDnsName(), loadBalancer.getCanonicalHostedZoneId(), 1, origin)
+                .orElseThrow().addresses().getFirst();
     }
 
     private static EmulatorConfig configuration(int publicPort, int sharedPort) {
