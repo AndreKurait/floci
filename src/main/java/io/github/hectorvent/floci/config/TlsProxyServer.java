@@ -102,10 +102,16 @@ public class TlsProxyServer {
     private final List<IntConsumer> portReleasedHandlers = new CopyOnWriteArrayList<>();
     private final Map<Integer, SharedTlsRoute> sharedTlsRoutes = new ConcurrentHashMap<>();
 
-    private record SharedTlsRoute(Object owner, ToIntFunction<String> backend) {}
+    private record SharedTlsRoute(Object owner, ToIntFunction<String> backend, ToIntFunction<String> publicAlb) {}
 
     /** Registers a loopback TLS backend while this proxy retains the public socket. */
     public boolean registerTlsRoute(int port, Object owner, ToIntFunction<String> backend) {
+        return registerTlsRoute(port, owner, backend, ignored -> 0);
+    }
+
+    /** The ALB selector admits only an owned internet-facing alias to the isolated public ALB transport. */
+    public boolean registerTlsRoute(int port, Object owner, ToIntFunction<String> backend,
+                                    ToIntFunction<String> publicAlb) {
         if (port == config.port() || !reservesPort(port)) {
             return false;
         }
@@ -113,7 +119,7 @@ public class TlsProxyServer {
             if (existing != null && existing.owner() != owner) {
                 throw new IllegalStateException("Another listener owns the shared TLS route");
             }
-            return new SharedTlsRoute(owner, backend);
+            return new SharedTlsRoute(owner, backend, publicAlb);
         });
         if (!reservesPort(port)) {
             unregisterTlsRoute(port, owner);
@@ -372,6 +378,17 @@ public class TlsProxyServer {
         socket.pause();
         boolean tls = buffer.length() > 0 && buffer.getByte(0) == TLS_HANDSHAKE;
         int port = socket.localAddress().port();
+        if (publicAlbTransport(addresses)) {
+            int destinationPort = addresses.destination().port();
+            if (destinationPort == 80 && !tls) {
+                connectBackend(socket, buffer, httpBackendPort, addresses);
+            } else if (destinationPort == 443 && tls && sharedTlsRoutes.containsKey(port)) {
+                readClientHello(socket, buffer, port, addresses);
+            } else {
+                socket.close();
+            }
+            return;
+        }
         if (tls && sharedTlsRoutes.containsKey(port)) {
             readClientHello(socket, buffer, port, addresses);
         } else if (tls) {
@@ -406,8 +423,14 @@ public class TlsProxyServer {
                 SharedTlsRoute route = sharedTlsRoutes.get(port);
                 boolean shared = port == config.tls().awsHttpsPort() && port != config.port()
                         && fallbackNames.contains(normalizeHostname(hello.hostname()));
-                int selected = shared || route == null || hello.hostname() == null
-                        ? 0 : route.backend().applyAsInt(hello.hostname());
+                int selected = 0;
+                if (route != null && hello.hostname() != null) {
+                    if (publicAlbTransport(addresses)) {
+                        selected = route.publicAlb().applyAsInt(hello.hostname());
+                    } else if (!shared) {
+                        selected = route.backend().applyAsInt(hello.hostname());
+                    }
+                }
                 hello.close();
                 connectTlsBackend(socket, pending, port, selected, addresses);
             } catch (RuntimeException failure) {
@@ -423,12 +446,18 @@ public class TlsProxyServer {
                                    PublicApiProxySources.Addresses addresses) {
         if (nativePort > 0) {
             connectBackend(socket, buffer, nativePort, addresses);
+        } else if (publicAlbTransport(addresses)) {
+            socket.close();
         } else if (fallbackHost != null && port == config.tls().awsHttpsPort() && port != config.port()) {
             connectBackend(socket, buffer, fallbackHost, config.tls().awsHttpsFallbackPort(),
                     config.tls().awsHttpsFallbackProxyProtocol(), addresses);
         } else {
             connectBackend(socket, buffer, httpsBackendPort, addresses);
         }
+    }
+
+    private static boolean publicAlbTransport(PublicApiProxySources.Addresses addresses) {
+        return EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS.equals(addresses.destination().hostAddress());
     }
 
     private void connectBackend(NetSocket frontSocket, Buffer buffer, int backendPort,

@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.ec2;
 
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.ec2.model.IpPermission;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 
@@ -178,6 +179,10 @@ public final class SecurityGroupNftCompiler {
                 .append("add rule inet floci_sg ingress ct state established,related accept\n")
                 .append("add rule inet floci_sg egress ct state established,related accept\n");
 
+        // A running endpoint can gain public routing before its next policy refresh.
+        // Keep the original-tuple policy installed before that routing enables DNAT.
+        appendTranslatedPublicApiPolicy(rules, target, prefixLists);
+
         // Docker's embedded DNS listens on loopback but forwards from this namespace. Security
         // groups never filter the VPC resolver on AWS. Only DNS is exempt, because the resolver
         // address also serves Floci's API. DHCP and the link-local metadata endpoint are the
@@ -305,6 +310,19 @@ public final class SecurityGroupNftCompiler {
             }
         }
         return rules.toString();
+    }
+
+    private static void appendTranslatedPublicApiPolicy(StringBuilder rules, Endpoint target,
+                                                         Map<String, List<String>> prefixLists) {
+        String address = EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS;
+        SecurityGroupPolicy.Peer destination = new SecurityGroupPolicy.Peer(address, null, null, Set.of());
+        for (int port : List.of(80, 443)) {
+            boolean allowed = SecurityGroupPolicy.allows(target.groups(), true, "tcp", port, -1,
+                    destination, prefixLists);
+            rules.append("add rule inet floci_sg egress meta l4proto tcp ct direction original ct status dnat")
+                    .append(" ct original ip daddr ").append(address).append(" ct original proto-dst ").append(port)
+                    .append(allowed ? " counter accept\n" : " counter drop\n");
+        }
     }
 
     private static boolean admitsEmulatorOrigin(Endpoint target, SecurityGroup group, IpPermission permission,

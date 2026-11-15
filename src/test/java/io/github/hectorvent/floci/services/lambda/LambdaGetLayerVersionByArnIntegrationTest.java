@@ -85,6 +85,7 @@ class LambdaGetLayerVersionByArnIntegrationTest {
     }
 
     @Test
+    @Order(11)
     void getLayerVersionAcceptsTheUnversionedLayerArn() throws Exception {
         String versionArn = publishLayer();
         String layerArn = versionArn.substring(0, versionArn.lastIndexOf(':'));
@@ -312,7 +313,7 @@ class LambdaGetLayerVersionByArnIntegrationTest {
     // ── cleanup ───────────────────────────────────────────────────────────────
 
     @Test
-    @Order(11)
+    @Order(12)
     void cleanup_deletePublishedVersions() {
         List<Integer> versions = given()
         .when()
