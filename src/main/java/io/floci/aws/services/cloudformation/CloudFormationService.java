@@ -135,7 +135,8 @@ public class CloudFormationService implements ResourceProvider {
     private final ConcurrentHashMap<String, DeferredDelete> deferredDeletes = new ConcurrentHashMap<>();
 
     /** A DeleteStack accepted while an execution runs: what it retains, and the token its statuses carry. */
-    private record DeferredDelete(List<String> retain, String clientRequestToken) {}
+    private record DeferredDelete(List<String> retain, String clientRequestToken,
+                                  CloudFormationExecutionScope.Identity identity) {}
     private final ExecutorService executor = newOperationExecutor();
 
     static ThreadPoolExecutor newOperationExecutor() {
@@ -2107,7 +2108,7 @@ public class CloudFormationService implements ResourceProvider {
      */
     private void endExecution(Stack stack, CompletableFuture<Void> done, String region, String accountId) {
         String stackId = stack.getStackId();
-        List<List<String>> deferred = new ArrayList<>(1);
+        List<DeferredDelete> deferred = new ArrayList<>(1);
         try {
             stacks.compute(stackKey(accountId, stack.getStackName(), region), (k, existing) -> {
                 if (!runningExecutions.remove(stackId, done)) {
@@ -2118,13 +2119,14 @@ public class CloudFormationService implements ResourceProvider {
                     // The delete's own token, not the execution's, from its first status on.
                     existing.setClientRequestToken(delete.clientRequestToken());
                     startDelete(existing, delete.retain());
-                    deferred.add(delete.retain());
+                    deferred.add(delete);
                 }
                 return existing;
             });
             if (!deferred.isEmpty()) {
                 publishStackStatus(stack, "DELETE_IN_PROGRESS", null);
-                deleteStackResources(stack, deferred.getFirst(), region, accountId);
+                CloudFormationExecutionScope.run(deferred.getFirst().identity(),
+                        () -> deleteStackResources(stack, deferred.getFirst().retain(), region, accountId));
             }
             done.complete(null);
         } catch (RuntimeException e) {
@@ -2255,7 +2257,8 @@ public class CloudFormationService implements ResourceProvider {
             if (running != null) {
                 // The execution deletes the stack once it ends: a create stops before its next
                 // resource, an update finishes, and the delete then removes all that was built.
-                deferredDeletes.putIfAbsent(existing.getStackId(), new DeferredDelete(retain, clientRequestToken));
+                deferredDeletes.putIfAbsent(existing.getStackId(), new DeferredDelete(
+                        retain, clientRequestToken, stackOutputRoles.captureCaller()));
                 submitted[0] = running;
                 return existing;
             }
@@ -2432,8 +2435,9 @@ public class CloudFormationService implements ResourceProvider {
     }
 
     private Future<?> submitOperation(Runnable operation) {
+        CloudFormationExecutionScope.Identity identity = stackOutputRoles.captureCaller();
         try {
-            return executor.submit(operation);
+            return executor.submit(() -> CloudFormationExecutionScope.run(identity, operation));
         } catch (RejectedExecutionException e) {
             throw operationLimitExceeded();
         }
