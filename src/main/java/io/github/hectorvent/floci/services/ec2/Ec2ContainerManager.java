@@ -764,10 +764,12 @@ public class Ec2ContainerManager {
 
                 refreshServiceNetworkIp(instance);
 
-                // Set public-facing addresses only for instances due one, by the rule mock instances
-                // follow too, or holding an Elastic IP their interface carries, which RunInstances
-                // recorded. Private-subnet instances have no public IP/DNS, matching real EC2.
-                if (instance.getPublicIpAddress() != null || AutomaticPublicAddress.isDue(instance, false)) {
+                // The helper's public routes were published before guest startup. Only a changed
+                // address needs to re-enter shared routing before the instance can report running.
+                boolean publicAddressDue = instance.getPublicIpAddress() != null
+                        || AutomaticPublicAddress.isDue(instance, false);
+                if (publicAddressDue
+                        && !Objects.equals(started.publishedPublicAddress(), reachablePublicAddress(instance))) {
                     exposeReachablePublicAddress(instance);
                 }
 
@@ -918,8 +920,9 @@ public class Ec2ContainerManager {
                 refreshMetadataAddresses(instance, helperId);
                 configureLinkLocalMetadataEndpoint(helperId, instance, flociHost, imdsPort);
                 preparePublicAddressRouting(helperId, instance);
+                String publishedPublicAddress = null;
                 if (instance.getPublicIpAddress() != null || AutomaticPublicAddress.isDue(instance, false)) {
-                    exposeReachablePublicAddress(instance);
+                    publishedPublicAddress = exposeReachablePublicAddress(instance);
                 }
                 if (isLaunchCancelled(instance)) {
                     throw new IllegalStateException("EC2 launch was canceled before guest startup");
@@ -953,7 +956,7 @@ public class Ec2ContainerManager {
                     nativeReleaseStarted = true;
                     releaseNativeGuest(instance, containerId);
                 }
-                return new StartedContainer(containerId, sshHostPort);
+                return new StartedContainer(containerId, sshHostPort, publishedPublicAddress);
             } catch (Exception e) {
                 if (nativeReleaseStarted) {
                     synchronized (instance) {
@@ -1392,7 +1395,7 @@ public class Ec2ContainerManager {
         return "shutting-down".equals(state) || "terminated".equals(state);
     }
 
-    private record StartedContainer(String containerId, int sshHostPort) {
+    private record StartedContainer(String containerId, int sshHostPort, String publishedPublicAddress) {
     }
 
     private void removeNetworkHelper(Instance instance) {
@@ -2094,15 +2097,18 @@ public class Ec2ContainerManager {
      * The DNS name is set to the same literal rather than an AWS-shaped
      * {@code ec2-…​.compute-1.amazonaws.com} hostname, because that hostname resolves nowhere
      * and callers that prefer PublicDnsName over PublicIpAddress would be handed a dead name.
+     *
+     * @return the published address, or null when none is reachable
      */
-    void exposeReachablePublicAddress(Instance instance) {
+    String exposeReachablePublicAddress(Instance instance) {
         String publicAddress = reachablePublicAddress(instance);
         if (publicAddress == null) {
-            return;
+            return null;
         }
         instance.setPublicIpAddress(publicAddress);
         instance.setPublicDnsName("127.0.0.1".equals(publicAddress) ? "localhost" : publicAddress);
-        refreshPublicRouting(instance);
+        refreshPublicRouting(instance, publicAddress);
+        return publicAddress;
     }
 
     void refreshPublicRouting(Instance instance) {
