@@ -8,6 +8,7 @@ import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.RestAssured;
 import io.restassured.config.EncoderConfig;
 import io.restassured.http.ContentType;
+import io.restassured.parsing.Parser;
 import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.Test;
@@ -81,7 +82,7 @@ class CloudWatchListMetricsPaginationIntegrationTest {
             }
             assertEquals(501, hosts.size());
             listRequest.put("NextToken", 123);
-            json(target + "ListMetrics", listRequest, ACCOUNT, REGION).then().statusCode(400)
+            json(target + "ListMetrics", listRequest, ACCOUNT, REGION).then().defaultParser(Parser.JSON).statusCode(400)
                     .body("__type", equalTo("InvalidParameterValueException"));
         }
 
