@@ -2,6 +2,7 @@ package io.floci.aws.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.services.cloudformation.CloudFormationExecutionScope;
 import io.floci.aws.services.cloudformation.CloudFormationTemplateEngine;
 import io.floci.aws.services.cloudformation.model.StackEvent;
 
@@ -9,6 +10,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Consumer;
@@ -33,6 +35,11 @@ public record ProvisionContext(CloudFormationTemplateEngine engine, String regio
     public ProvisionContext(CloudFormationTemplateEngine engine, String region,
                             String accountId, String stackName, String priorPhysicalId) {
         this(engine, region, accountId, stackName, priorPhysicalId, event -> {}, null, null);
+    }
+
+    /** Verified operation caller when available; never infer authority from accountId. */
+    public Optional<CloudFormationExecutionScope.Identity> executionIdentity() {
+        return CloudFormationExecutionScope.current();
     }
 
     /**
