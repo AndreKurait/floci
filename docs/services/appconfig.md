@@ -53,7 +53,12 @@ are returned by create, get and list. Deleting a version releases its label.
 a mismatch returns `ConflictException` without creating a version. Version numbers continue
 increasing after deletion and persist across restart. Lists support `MaxResults`, `NextToken`,
 and exact or trailing-asterisk prefix label filters. A label filter excludes unlabeled versions.
-Hosted deployment and validation requests still select configurations by numeric version.
+Hosted deployment and validation requests accept a numeric version or an exact, case-sensitive
+label within the selected profile. An unknown label returns `ResourceNotFoundException` before
+assigning a deployment number or changing active content. Deployment start, get and list responses
+return the numeric `ConfigurationVersion` and the selected version's `VersionLabel` when it has one.
+Each deployment retains its captured label across restart, version deletion and later label reuse.
+Older stored deployments without a captured label continue to omit it.
 
 ### Supported Operations
 
@@ -217,6 +222,10 @@ that window cannot be verified.
 ## Data Plane (AppConfigData) {#data-plane}
 
 The data plane is used by applications to retrieve the active configuration for an environment and profile.
+
+Newly delivered hosted content includes `Version-Label` only when its version has a label.
+An empty hosted payload still carries its label when it is new to the session. An unchanged
+poll returns an empty payload without that header and retains the resolved `Content-Type`.
 
 ### Supported Operations
 
