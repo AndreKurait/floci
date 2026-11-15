@@ -277,6 +277,7 @@ AWS::ECS::TaskDefinition	PlacementConstraints	accepted and ignored
 AWS::ECS::TaskDefinition	ProxyConfiguration	accepted and ignored
 AWS::ECS::TaskDefinition	RuntimePlatform	accepted and ignored
 AWS::ECS::TaskDefinition	Tags	accepted and ignored
+AWS::ECS::TaskDefinition	TrustedExecutionConfiguration	accepted and ignored; task isolation and attestation settings are not passed to the ECS service
 AWS::ECS::TaskDefinition	Volumes	accepted and ignored
 AWS::EKS::Cluster	AccessConfig	accepted and ignored
 AWS::EKS::Cluster	ActiveCertificateAuthorityId	accepted and ignored
@@ -394,10 +395,12 @@ AWS::Lambda::EventSourceMapping	Queues	accepted and ignored
 AWS::Lambda::EventSourceMapping	SelfManagedKafkaEventSourceConfig	accepted and ignored
 AWS::Lambda::EventSourceMapping	Tags	accepted and ignored
 AWS::Lambda::EventSourceMapping	TumblingWindowInSeconds	documented as ignored (docs/services/cloudformation.md, Lambda)
+AWS::Lambda::Function	AcceleratorConfig	accepted and ignored; accelerator memory settings are not passed to the Lambda service
 AWS::Lambda::Function	CapacityProviderConfig	accepted and ignored
 AWS::Lambda::Function	FunctionScalingConfig	accepted and ignored
 AWS::Lambda::Function	KmsKeyArn	accepted and ignored
 AWS::Lambda::Function	PublishToLatestPublished	accepted and ignored
+AWS::Lambda::Function	RuntimeConfig	accepted and ignored; runtime ARN and alias settings are not passed to the Lambda service
 AWS::Lambda::Function	RuntimeManagementConfig	accepted and ignored
 AWS::Lambda::Function	SnapStart	accepted and ignored
 AWS::Lambda::Function	TenancyConfig	accepted and ignored
