@@ -907,13 +907,14 @@ class LambdaServiceTest {
         service.putFunctionConcurrency(REGION, "persisted-b", 200);
 
         // Build a second service over the same store with a fresh limiter.
-        LambdaFunctionStore store = new LambdaFunctionStore(new InMemoryStorage<>());
-        // Copy the two persisted functions into the new store to emulate a
-        // restart with the same disk state.
+        InMemoryStorage<String, LambdaFunction> persisted = new InMemoryStorage<>();
+        // Seed the persisted rows before construction, as a restart loads existing state
+        // without issuing a guarded update or assigning a new function lifetime.
         for (LambdaFunction fn : new ArrayList<>(
                 service.listFunctions(REGION))) {
-            store.save(REGION, fn);
+            persisted.put("lambda::" + REGION + "::" + fn.getFunctionName() + "::" + fn.getVersion(), fn);
         }
+        LambdaFunctionStore store = new LambdaFunctionStore(persisted);
         LambdaService rebooted = new LambdaService(store, new WarmPool(),
                 new CodeStore(Path.of("target/test-data/lambda-code")),
                 new ZipExtractor(), new RegionResolver(REGION, "000000000000"));

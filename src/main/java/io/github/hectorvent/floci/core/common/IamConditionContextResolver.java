@@ -29,6 +29,7 @@ import io.github.hectorvent.floci.services.iam.ResourceArnBuilder;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.iam.model.IamUser;
 import io.github.hectorvent.floci.services.kinesis.KinesisService;
+import io.github.hectorvent.floci.services.lambda.LambdaRuntimeManagementService;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambdaweb.LambdaWebService;
 import io.github.hectorvent.floci.services.s3.S3ControlTagConditionKeys;
@@ -124,6 +125,7 @@ public class IamConditionContextResolver {
     private final Instance<LambdaWebService> lambdaWebService;
     private final Instance<LambdaService> lambdaService;
     private final Instance<KinesisService> kinesisService;
+    private final Instance<LambdaRuntimeManagementService> runtimeManagement;
     private final Instance<SsmService> ssmService;
     private final Instance<ElbV2ConditionKeys> elbV2ConditionKeys;
     private final RequestContext requestContext;
@@ -157,13 +159,15 @@ public class IamConditionContextResolver {
                                        Instance<AthenaPreparedStatementService> athenaPreparedStatements,
                                        Instance<KinesisService> kinesisService,
                                        Instance<AthenaBatchQueryService> athenaBatchQueryService,
-                                       Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates) {
+                                       Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates,
+                                       Instance<LambdaRuntimeManagementService> runtimeManagement) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
                 config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService,
                 elbV2ConditionKeys, mqConfigurations, lambdaService, athenaPreparedStatements,
                 kinesisService,
                 athenaBatchQueryService,
-                eksAccessEntryUpdates);
+                eksAccessEntryUpdates,
+                runtimeManagement);
     }
 
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -180,6 +184,7 @@ public class IamConditionContextResolver {
                                        Instance<ElbV2ConditionKeys> elbV2ConditionKeys) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
                 config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys, null, null, null,
+                null,
                 null,
                 null,
                 null);
@@ -199,6 +204,7 @@ public class IamConditionContextResolver {
                 config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), null, null, null, null, null,
                 null,
                 null,
+                null,
                 null);
     }
 
@@ -214,6 +220,7 @@ public class IamConditionContextResolver {
                                 ResolvedServiceCatalog serviceCatalog, Clock clock) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
                 config, currentVertxRequest, serviceCatalog, clock, null, null, null, null, null,
+                null,
                 null,
                 null,
                 null);
@@ -236,7 +243,8 @@ public class IamConditionContextResolver {
                                         Instance<AthenaPreparedStatementService> athenaPreparedStatements,
                                         Instance<KinesisService> kinesisService,
                                         Instance<AthenaBatchQueryService> athenaBatchQueryService,
-                                        Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates) {
+                                        Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates,
+                                        Instance<LambdaRuntimeManagementService> runtimeManagement) {
         this.mqConfigurations = mqConfigurations;
         this.lambdaService = lambdaService;
         this.athenaPreparedStatements = athenaPreparedStatements;
@@ -256,6 +264,7 @@ public class IamConditionContextResolver {
         this.kinesisService = kinesisService;
         this.athenaBatchQueryService = athenaBatchQueryService;
         this.eksAccessEntryUpdates = eksAccessEntryUpdates;
+        this.runtimeManagement = runtimeManagement;
     }
 
     private Map<String, List<String>> athenaPreparedStatementConditions(String action, ContainerRequestContext ctx) {
@@ -689,6 +698,17 @@ public class IamConditionContextResolver {
                     // Invalid or missing targets have no resource tags; the handler rejects them.
                 }
             }
+        }
+        if (("lambda:GetRuntimeManagementConfig".equals(action)
+                || "lambda:PutRuntimeManagementConfig".equals(action))
+                && runtimeManagement != null && runtimeManagement.isResolvable()) {
+            String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+            String account = requestContext.getAccountId() == null ? config.defaultAccountId()
+                    : requestContext.getAccountId();
+            runtimeManagement.get().authorizationTags(region, account,
+                    ctx.getUriInfo().getPathParameters().getFirst("functionName"),
+                    ctx.getUriInfo().getQueryParameters().getFirst("Qualifier"))
+                    .forEach((key, value) -> conditions.put(RESOURCE_TAG_PREFIX + key, List.of(value)));
         }
         for (String member : RequestConditionKeys.members(action, REQUEST_AUTH_TYPE)) {
             PassedRoles.values(PassedRoles.jsonBody(ctx), member.split("\\."))
