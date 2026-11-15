@@ -23,10 +23,12 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
@@ -47,6 +49,7 @@ public class AppConfigService {
     private final StorageBackend<String, ConfigurationProfile> profileStore;
     private final StorageBackend<String, DeploymentStrategy> strategyStore;
     private final StorageBackend<String, HostedConfigurationVersion> versionStore;
+    private final StorageBackend<String, Integer> versionCounters;
     private final StorageBackend<String, Deployment> deploymentStore;
     private final StorageBackend<String, String> activeConfigStore; // envId::profileId -> versionNumber
     private final Clock clock;
@@ -76,6 +79,8 @@ public class AppConfigService {
                 "appconfig", "appconfig-strategies.json", new TypeReference<>() {});
         this.versionStore = new AppConfigStorage<>(storageFactory, regions,
                 "appconfig", "appconfig-versions.json", new TypeReference<>() {});
+        this.versionCounters = new AppConfigStorage<>(storageFactory, regions,
+                "appconfig", "appconfig-version-counters.json", new TypeReference<>() {});
         this.deploymentStore = new AppConfigStorage<>(storageFactory, regions,
                 "appconfig", "appconfig-deployments.json", new TypeReference<>() {});
         this.activeConfigStore = new AppConfigStorage<>(storageFactory, regions,
@@ -406,6 +411,7 @@ public class AppConfigService {
         // lifecycle - cascade the delete so a caller can't still fetch versions for a profile
         // that's supposedly gone.
         StorageOperations.deleteByPrefix(versionStore, appId + "::" + profileId + "::");
+        versionCounters.delete(appId + "::" + profileId);
         profileStore.delete(profileId);
     }
 
@@ -416,12 +422,43 @@ public class AppConfigService {
                                                                          byte[] content,
                                                                          String contentType,
                                                                          String description) {
+        return createHostedConfigurationVersion(applicationIdentifier, profileIdentifier,
+                content, contentType, description, null, null);
+    }
+
+    public synchronized HostedConfigurationVersion createHostedConfigurationVersion(String applicationIdentifier,
+                                                                         String profileIdentifier,
+                                                                         byte[] content,
+                                                                         String contentType,
+                                                                         String description,
+                                                                         String versionLabel,
+                                                                         Integer latestVersionNumber) {
         String appId = resolveApplication(applicationIdentifier).getId();
         String profileId = resolveConfigurationProfile(appId, profileIdentifier).getId();
-        String prefix = appId + "::" + profileId + "::";
-        int nextVersion = versionStore.scan(k -> k.startsWith(prefix))
-                .stream().mapToInt(HostedConfigurationVersion::getVersionNumber).max().orElse(0) + 1;
-
+        String key = appId + "::" + profileId;
+        String prefix = key + "::";
+        List<HostedConfigurationVersion> stored = versionStore.scan(k -> k.startsWith(prefix));
+        int latest = stored.stream().mapToInt(HostedConfigurationVersion::getVersionNumber).max().orElse(0);
+        if (versionLabel != null) {
+            validateVersionLabel(versionLabel);
+            stored.stream().filter(version -> versionLabel.equals(version.getVersionLabel())).findFirst()
+                    .ifPresent(version -> {
+                        throw new AwsException("BadRequestException", "The version label '" + versionLabel
+                                + "' has already been assigned to hosted configuration version "
+                                + version.getVersionNumber() + ". Please provide a different version label "
+                                + "to create your hosted configuration version.", 400);
+                    });
+        }
+        if (latestVersionNumber != null && latestVersionNumber != latest) {
+            throw new AwsException("ConflictException", "Expected latest version " + latestVersionNumber
+                    + " does not match actual latest version " + latest, 409);
+        }
+        // The concurrency token follows remaining versions. Allocation must also remember deleted versions.
+        int previous = Math.max(latest, versionCounters.get(key).orElse(0));
+        if (previous == Integer.MAX_VALUE) {
+            throw new AwsException("ServiceQuotaExceededException", "Hosted configuration version limit reached.", 400);
+        }
+        int nextVersion = previous + 1;
         HostedConfigurationVersion version = new HostedConfigurationVersion();
         version.setApplicationId(appId);
         version.setConfigurationProfileId(profileId);
@@ -429,9 +466,21 @@ public class AppConfigService {
         version.setContent(content);
         version.setContentType(contentType);
         version.setDescription(description);
+        version.setVersionLabel(versionLabel);
 
+        versionCounters.put(key, nextVersion);
         versionStore.put(prefix + nextVersion, version);
         return version;
+    }
+
+    private static void validateVersionLabel(String label) {
+        if (label.isEmpty() || label.length() > 64) {
+            throw new AwsException("BadRequestException", "VersionLabel must contain 1 to 64 characters.", 400);
+        }
+        if (label.chars().allMatch(character -> character >= '0' && character <= '9')) {
+            throw new AwsException("BadRequestException",
+                    "VersionLabel must contain at least one non-numeric character.", 400);
+        }
     }
 
     public HostedConfigurationVersion getHostedConfigurationVersion(String applicationIdentifier,
@@ -458,6 +507,7 @@ public class AppConfigService {
                     s.setVersionNumber(v.getVersionNumber());
                     s.setDescription(v.getDescription());
                     s.setContentType(v.getContentType());
+                    s.setVersionLabel(v.getVersionLabel());
                     return s;
                 })
                 .toList();
@@ -465,13 +515,42 @@ public class AppConfigService {
 
     public PaginatedResult<HostedConfigurationVersionSummary> listHostedConfigurationVersionsPage(
             String applicationIdentifier, String profileIdentifier, Integer maxResults, String nextToken) {
+        return listHostedConfigurationVersionsPage(
+                applicationIdentifier, profileIdentifier, maxResults, nextToken, null);
+    }
+
+    public PaginatedResult<HostedConfigurationVersionSummary> listHostedConfigurationVersionsPage(
+            String applicationIdentifier, String profileIdentifier, Integer maxResults,
+            String nextToken, String versionLabel) {
+        if (versionLabel != null && (versionLabel.isEmpty() || versionLabel.length() > 64)) {
+            throw new AwsException("BadRequestException", "VersionLabel must contain 1 to 64 characters.", 400);
+        }
         String appId = resolveApplication(applicationIdentifier).getId();
         String profileId = resolveConfigurationProfile(appId, profileIdentifier).getId();
+        String filterScope = versionLabel == null ? "all"
+                : "label-" + Base64.getUrlEncoder().withoutPadding()
+                        .encodeToString(versionLabel.getBytes(StandardCharsets.UTF_8));
         String scope = "appconfig-hosted-versions:" + regions.getAccountId() + ":" + regions.getRegion()
-                + ":" + appId + ":" + profileId;
-        return pageAppConfigList(listHostedConfigurationVersions(appId, profileId),
+                + ":" + appId + ":" + profileId + ":" + filterScope;
+        List<HostedConfigurationVersionSummary> matching = listHostedConfigurationVersions(appId, profileId)
+                .stream().filter(version -> matchesVersionLabel(version.getVersionLabel(), versionLabel)).toList();
+        if (nextToken != null && nextToken.isEmpty()) {
+            throw new AwsException("BadRequestException", "Pagination token must contain 1 to 2048 characters.", 400);
+        }
+        return Pagination.paginate(matching,
                 version -> String.format(Locale.ROOT, "%010d", version.getVersionNumber()),
-                maxResults, nextToken, scope);
+                maxResults, nextToken, 50, 50, 2048, "BadRequestException", scope);
+    }
+
+    private static boolean matchesVersionLabel(String label, String filter) {
+        if (filter == null) {
+            return true;
+        }
+        if (label == null) {
+            return false;
+        }
+        return filter.endsWith("*") ? label.startsWith(filter.substring(0, filter.length() - 1))
+                : label.equals(filter);
     }
 
     public synchronized void deleteHostedConfigurationVersion(String applicationIdentifier,
@@ -479,7 +558,16 @@ public class AppConfigService {
                                                   int versionNumber) {
         String appId = resolveApplication(applicationIdentifier).getId();
         String profileId = resolveConfigurationProfile(appId, profileIdentifier).getId();
-        versionStore.delete(appId + "::" + profileId + "::" + versionNumber);
+        String counterKey = appId + "::" + profileId;
+        String versionKey = counterKey + "::" + versionNumber;
+        versionStore.get(versionKey).ifPresent(version -> {
+            // Legacy snapshots may predate counters. Preserve their high-water mark before deleting a row.
+            int previous = versionCounters.get(counterKey).orElse(0);
+            if (version.getVersionNumber() > previous) {
+                versionCounters.put(counterKey, version.getVersionNumber());
+            }
+        });
+        versionStore.delete(versionKey);
     }
 
     // ──────────────────────────── Deployment Strategy ────────────────────────────
