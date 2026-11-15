@@ -50,6 +50,10 @@ class CloudWatchMetricsJsonHandlerTest {
     static Stream<Arguments> invalidMetricValues() {
         return Stream.of(
                 Arguments.of("\"Value\":[1,2]", "InvalidParameterValue"),
+                Arguments.of("\"Value\":1e109", "InvalidParameterValue"),
+                Arguments.of("\"Value\":-1e109", "InvalidParameterValue"),
+                Arguments.of("\"StatisticValues\":{\"SampleCount\":2,\"Sum\":1e109,\"Minimum\":2,\"Maximum\":4}",
+                        "InvalidParameterValue"),
                 Arguments.of("\"Value\":\"not-a-number\"", "InvalidParameterValue"),
                 Arguments.of("\"StatisticValues\":[]", "InvalidParameterValue"),
                 Arguments.of("\"StatisticValues\":{\"Sum\":6,\"Minimum\":2,\"Maximum\":4}", "MissingParameter"),
@@ -61,7 +65,7 @@ class CloudWatchMetricsJsonHandlerTest {
                 Arguments.of("\"StatisticValues\":{\"SampleCount\":2,\"Sum\":\"six\",\"Minimum\":2,\"Maximum\":4}",
                         "InvalidParameterValue"),
                 Arguments.of("\"Value\":7,\"StatisticValues\":{\"SampleCount\":2,\"Sum\":6,\"Minimum\":2,\"Maximum\":4}",
-                        "InvalidParameterValue"));
+                        "InvalidParameterCombination"));
     }
 
     @ParameterizedTest
@@ -80,8 +84,11 @@ class CloudWatchMetricsJsonHandlerTest {
                     () -> handler.handle("PutMetricData", request, REGION));
 
             assertEquals(errorCode, error.getErrorCode());
-            assertEquals(errorCode.equals("MissingParameter")
-                    ? "MissingRequiredParameterException" : "InvalidParameterValueException", error.jsonType());
+            assertEquals(switch (errorCode) {
+                case "MissingParameter" -> "MissingRequiredParameterException";
+                case "InvalidParameterCombination" -> "InvalidParameterCombinationException";
+                default -> "InvalidParameterValueException";
+            }, error.jsonType());
             assertEquals(400, error.getHttpStatus());
             assertTrue(error.getMessage().contains(entity
                     ? "EntityMetricData.member.1.MetricData.member.1" : "MetricData.member.2"));

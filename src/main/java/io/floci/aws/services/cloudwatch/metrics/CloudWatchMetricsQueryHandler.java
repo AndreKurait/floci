@@ -764,7 +764,7 @@ public class CloudWatchMetricsQueryHandler {
             String statsPrefix = memberPrefix + "StatisticValues.";
             if (statisticPrefixes.contains(memberPrefix)) {
                 if (valueStr != null) {
-                    throw CloudWatchMetricsException.invalidParameterValue(
+                    throw CloudWatchMetricsException.invalidParameterCombination(
                             memberPrefix + "StatisticValues cannot be combined with Value.");
                 }
                 datum.setSampleCount(MetricNumberValidation.parse(params.getFirst(statsPrefix + "SampleCount"), statsPrefix + "SampleCount"));

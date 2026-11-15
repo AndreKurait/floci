@@ -5,6 +5,8 @@ import io.floci.aws.core.common.AwsException;
 
 /** Numeric validation shared by the JSON and Query metric publication protocols. */
 final class MetricNumberValidation {
+    private static final double MAX_ABSOLUTE_VALUE = Math.scalb(1.0, 360);
+
     private MetricNumberValidation() {
     }
 
@@ -31,14 +33,22 @@ final class MetricNumberValidation {
         }
     }
 
+    static boolean isValid(JsonNode value) {
+        return value != null && value.isNumber() && isValid(value.doubleValue());
+    }
+
+    private static boolean isValid(double value) {
+        return Double.isFinite(value) && Math.abs(value) <= MAX_ABSOLUTE_VALUE;
+    }
+
     private static double finite(double value, String path) {
-        if (!Double.isFinite(value)) {
+        if (!isValid(value)) {
             throw invalid(path);
         }
         return value;
     }
 
     private static AwsException invalid(String path) {
-        return CloudWatchMetricsException.invalidParameterValue(path + " must be a finite number.");
+        return CloudWatchMetricsException.invalidParameterValue(path + " must be a finite number between -2^360 and 2^360.");
     }
 }

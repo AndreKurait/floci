@@ -115,7 +115,7 @@ class CloudWatchMetricsQueryHandlerTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"[]", "not-a-number", "NaN", "Infinity"})
+    @ValueSource(strings = {"[]", "not-a-number", "NaN", "Infinity", "1e109", "-1e109"})
     void malformedNumericValuesAreNotStoredAsZero(String value) {
         MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
         params.putSingle("Namespace", "InvalidValues");
@@ -137,7 +137,8 @@ class CloudWatchMetricsQueryHandlerTest {
         AwsException error = assertThrows(AwsException.class,
                 () -> handler.handle("PutMetricData", params, REGION));
 
-        assertEquals("InvalidParameterValue", error.getErrorCode());
+        assertEquals("InvalidParameterCombination", error.getErrorCode());
+        assertEquals("InvalidParameterCombinationException", error.jsonType());
         verify(metricsService, never()).putMetricData(anyString(), any(), anyString());
     }
 

@@ -236,7 +236,7 @@ public class CloudWatchMetricsJsonHandler {
     }
 
     private static boolean isConsoleNumber(JsonNode node) {
-        return node.isNumber() && Double.isFinite(node.doubleValue());
+        return MetricNumberValidation.isValid(node);
     }
 
     private static Response unsupportedWithConsoleTarget(String subject) {
@@ -938,9 +938,12 @@ public class CloudWatchMetricsJsonHandler {
             JsonNode statsValues = item.path("StatisticValues");
             if (!statsValues.isMissingNode() && !statsValues.isNull()) {
                 String statsPath = memberPath + ".StatisticValues";
-                if (item.hasNonNull("Value") || !statsValues.isObject()) {
-                    throw CloudWatchMetricsException.invalidParameterValue(
-                            statsPath + " must be an object and cannot be combined with Value.");
+                if (!statsValues.isObject()) {
+                    throw CloudWatchMetricsException.invalidParameterValue(statsPath + " must be an object.");
+                }
+                if (item.hasNonNull("Value")) {
+                    throw CloudWatchMetricsException.invalidParameterCombination(
+                            statsPath + " cannot be combined with Value.");
                 }
                 datum.setSampleCount(MetricNumberValidation.parse(statsValues.path("SampleCount"), statsPath + ".SampleCount"));
                 datum.setSum(MetricNumberValidation.parse(statsValues.path("Sum"), statsPath + ".Sum"));
