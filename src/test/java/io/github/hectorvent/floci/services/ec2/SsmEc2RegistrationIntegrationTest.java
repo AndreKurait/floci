@@ -110,6 +110,18 @@ class SsmEc2RegistrationIntegrationTest {
     }
 
     @Test
+    void stockAgentRsaKeyTypeRegistersWithoutRelaxingKeyValidation() throws Exception {
+        String body = mapper.writeValueAsString(Map.of("Fingerprint", instance.getInstanceId(),
+                "PublicKey", publicKey, "PublicKeyType", "Rsa"));
+        signed("RegisterManagedInstance", REGION, body, body, false).then().defaultParser(Parser.JSON)
+                .statusCode(200).body("InstanceId", equalTo(instance.getInstanceId()));
+        String invalid = mapper.writeValueAsString(Map.of("Fingerprint", instance.getInstanceId(),
+                "PublicKey", "not-a-public-key", "PublicKeyType", "Rsa"));
+        signed("RegisterManagedInstance", REGION, invalid, invalid, false).then().defaultParser(Parser.JSON)
+                .statusCode(400).body("__type", equalTo("ValidationException"));
+    }
+
+    @Test
     void registrationDoesNotReportTheAgentOnlineBeforeItsHeartbeat() throws Exception {
         String body = registration(instance.getInstanceId(), publicKey);
         signed("RegisterManagedInstance", REGION, body, body, false).then().statusCode(200);
