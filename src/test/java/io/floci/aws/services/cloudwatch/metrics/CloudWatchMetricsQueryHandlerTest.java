@@ -8,6 +8,8 @@ import io.floci.aws.services.cloudwatch.metricstreams.CloudWatchMetricStreamsSer
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.MultivaluedMap;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 
 import java.util.List;
@@ -42,6 +44,61 @@ class CloudWatchMetricsQueryHandlerTest {
     private final CloudWatchMetricsQueryHandler handler = new CloudWatchMetricsQueryHandler(
             metricsService, mock(CloudWatchDashboardsService.class),
             mock(CloudWatchMetricStreamsService.class));
+
+    private static MultivaluedMap<String, String> statisticRequest() {
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("Namespace", "InvalidValues");
+        params.putSingle("MetricData.member.1.MetricName", "First");
+        params.putSingle("MetricData.member.1.Value", "1");
+        params.putSingle("MetricData.member.2.MetricName", "Invalid");
+        params.putSingle("MetricData.member.2.StatisticValues.SampleCount", "2");
+        params.putSingle("MetricData.member.2.StatisticValues.Sum", "6");
+        params.putSingle("MetricData.member.2.StatisticValues.Minimum", "2");
+        params.putSingle("MetricData.member.2.StatisticValues.Maximum", "4");
+        return params;
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"SampleCount", "Sum", "Minimum", "Maximum"})
+    void incompleteStatisticsRejectTheWholeBatch(String missing) {
+        MultivaluedMap<String, String> params = statisticRequest();
+        String path = "MetricData.member.2.StatisticValues." + missing;
+        params.remove(path);
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> handler.handle("PutMetricData", params, REGION));
+
+        assertEquals("MissingParameter", error.getErrorCode());
+        assertEquals("The parameter " + path + " is required.", error.getMessage());
+        verify(metricsService, never()).putMetricData(anyString(), any(), anyString());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"[]", "not-a-number", "NaN", "Infinity"})
+    void malformedNumericValuesAreNotStoredAsZero(String value) {
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("Namespace", "InvalidValues");
+        params.putSingle("MetricData.member.1.MetricName", "Invalid");
+        params.putSingle("MetricData.member.1.Value", value);
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> handler.handle("PutMetricData", params, REGION));
+
+        assertEquals("InvalidParameterValue", error.getErrorCode());
+        verify(metricsService, never()).putMetricData(anyString(), any(), anyString());
+    }
+
+    @Test
+    void scalarAndStatisticsAreNotSilentlyReducedToStatistics() {
+        MultivaluedMap<String, String> params = statisticRequest();
+        params.putSingle("MetricData.member.2.Value", "7");
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> handler.handle("PutMetricData", params, REGION));
+
+        assertEquals("InvalidParameterValue", error.getErrorCode());
+        verify(metricsService, never()).putMetricData(anyString(), any(), anyString());
+    }
 
     @Test
     void putMetricAlarmDefaultsActionsEnabledToTrueWhenOmitted() {

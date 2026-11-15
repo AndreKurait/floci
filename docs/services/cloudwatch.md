@@ -472,6 +472,11 @@ decompressed body is limited to 5 MiB: a larger one returns HTTP 413
 `InvalidRequestException`, and an empty body reads as no input. Other JSON operations do not
 decompress their body.
 
+JSON and Query metric publication reject malformed or non-finite numeric values, incomplete
+`StatisticValues` sets, and datums combining `Value` with `StatisticValues` before storing any
+part of the batch. Missing statistics return `MissingParameter`; invalid values return
+`InvalidParameterValue`. JSON bodies use the corresponding SDK exception shape names.
+
 **Endpoint:** `http://localhost:4566/`. Query: GET or POST; JSON: POST.
 
 JSON 1.0 requests name their operation in `X-Amz-Target` with the `GraniteServiceVersion20100801.`

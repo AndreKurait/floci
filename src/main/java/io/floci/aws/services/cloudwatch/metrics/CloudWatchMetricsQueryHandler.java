@@ -734,7 +734,7 @@ public class CloudWatchMetricsQueryHandler {
 
             String valueStr = params.getFirst(listPrefix + ".member." + i + ".Value");
             if (valueStr != null) {
-                datum.setValue(parseDouble(valueStr, 0));
+                datum.setValue(metricNumber(valueStr, memberPrefix + "Value"));
             }
 
             String tsStr = params.getFirst(listPrefix + ".member." + i + ".Timestamp");
@@ -744,12 +744,16 @@ public class CloudWatchMetricsQueryHandler {
             }
 
             // StatisticValues
-            String sc = params.getFirst(listPrefix + ".member." + i + ".StatisticValues.SampleCount");
-            if (sc != null) {
-                datum.setSampleCount(parseDouble(sc, 0));
-                datum.setSum(parseDouble(params.getFirst(listPrefix + ".member." + i + ".StatisticValues.Sum"), 0));
-                datum.setMinimum(parseDouble(params.getFirst(listPrefix + ".member." + i + ".StatisticValues.Minimum"), 0));
-                datum.setMaximum(parseDouble(params.getFirst(listPrefix + ".member." + i + ".StatisticValues.Maximum"), 0));
+            String statsPrefix = memberPrefix + "StatisticValues.";
+            if (params.keySet().stream().anyMatch(key -> key.startsWith(statsPrefix))) {
+                if (valueStr != null) {
+                    throw CloudWatchMetricsException.invalidParameterValue(
+                            memberPrefix + "StatisticValues cannot be combined with Value.");
+                }
+                datum.setSampleCount(metricNumber(params.getFirst(statsPrefix + "SampleCount"), statsPrefix + "SampleCount"));
+                datum.setSum(metricNumber(params.getFirst(statsPrefix + "Sum"), statsPrefix + "Sum"));
+                datum.setMinimum(metricNumber(params.getFirst(statsPrefix + "Minimum"), statsPrefix + "Minimum"));
+                datum.setMaximum(metricNumber(params.getFirst(statsPrefix + "Maximum"), statsPrefix + "Maximum"));
             }
 
             // Dimensions
@@ -767,6 +771,21 @@ public class CloudWatchMetricsQueryHandler {
             datums.add(datum);
         }
         return datums;
+    }
+
+    private static double metricNumber(String value, String path) {
+        if (value == null) {
+            throw CloudWatchMetricsException.missingParameter(path);
+        }
+        try {
+            double parsed = Double.parseDouble(value);
+            if (Double.isFinite(parsed)) {
+                return parsed;
+            }
+        } catch (NumberFormatException ignored) {
+            // A malformed wire value gets the same error as a non-finite number.
+        }
+        throw CloudWatchMetricsException.invalidParameterValue(path + " must be a finite number.");
     }
 
     private List<Dimension> parseDimensionFilters(MultivaluedMap<String, String> params) {
