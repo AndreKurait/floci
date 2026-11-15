@@ -30,6 +30,9 @@ public final class LambdaArnUtils {
             "^(arn:(aws[a-zA-Z-]*)?:lambda:)?(?<region>(eusc-)?[a-z]{2}((-gov)|(-iso([a-z]?)))?-[a-z]+-\\d{1}:)?"
                     + "(?<account>\\d{12}:)?(function:)?(?<name>[a-zA-Z0-9-_\\.]+)"
                     + "(?::(?<qualifier>\\$LATEST(\\.PUBLISHED)?|[a-zA-Z0-9-_]+))?$");
+    private static final Pattern UNQUALIFIED_FUNCTION_NAME_PATTERN = Pattern.compile(
+            "^(arn:(aws[a-zA-Z-]*)?:lambda:)?(?<region>(eusc-)?[a-z]{2}((-gov)|(-iso([a-z]?)))?-[a-z]+-\\d{1}:)?"
+                    + "(?<account>\\d{12}:)?(function:)?(?<name>[a-zA-Z0-9-_]+)$");
     /** The model's {@code FunctionName} pattern, quoted in the ValidationException a bad name gets. */
     private static final String NAME_REGEX = "(arn:(aws[a-zA-Z-]*)?:lambda:)?"
             + "((eusc-)?[a-z]{2}((-gov)|(-iso([a-z]?)))?-[a-z]+-\\d{1}:)?"
@@ -96,6 +99,34 @@ public final class LambdaArnUtils {
      * @param account   account named by a full or partial ARN, or null for a bare name
      */
     public record ResolvedFunctionRef(String name, String qualifier, String region, String account) {}
+
+    /** The recursion settings APIs accept the model's unqualified, non-dotted function names. */
+    public static ResolvedFunctionRef resolveUnqualifiedFunctionName(String input) {
+        if (input == null || input.isEmpty() || input.length() > MAX_TOTAL_LENGTH
+                || (!input.contains(":") && input.length() > MAX_NAME_LENGTH)) {
+            throw unqualifiedValidationFailure(input);
+        }
+        Matcher matcher = UNQUALIFIED_FUNCTION_NAME_PATTERN.matcher(input);
+        if (!matcher.matches()) {
+            throw unqualifiedValidationFailure(input);
+        }
+        if (matcher.group(1) != null) {
+            if (!AwsArnUtils.isArn(input)) {
+                throw unqualifiedValidationFailure(input);
+            }
+            AwsArnUtils.Arn arn = AwsArnUtils.parse(input);
+            return new ResolvedFunctionRef(matcher.group("name"), null, arn.region(), arn.accountId());
+        }
+        return new ResolvedFunctionRef(matcher.group("name"), null,
+                stripTrailingColon(matcher.group("region")), stripTrailingColon(matcher.group("account")));
+    }
+
+    private static AwsException unqualifiedValidationFailure(String input) {
+        return SmithyValidationErrors.validationException(
+                "Value '" + input + "' at 'functionName' failed to satisfy constraint: "
+                        + "Member must satisfy unqualified function name pattern: "
+                        + UNQUALIFIED_FUNCTION_NAME_PATTERN.pattern());
+    }
 
     /**
      * Parses Lambda's broader {@code NamespacedFunctionName} shape. Unlike {@link #resolve}, this
