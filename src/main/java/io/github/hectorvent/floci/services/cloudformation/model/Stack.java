@@ -46,6 +46,8 @@ public class Stack {
      */
     private volatile String status = "CREATE_IN_PROGRESS";
     private String statusReason;
+    /** The current operation's token, published to its worker and copied into each stored event. */
+    private volatile String clientRequestToken;
     private Instant creationTime = Instant.now();
     private Instant lastUpdatedTime;
     /** Set once the stack reaches DELETE_COMPLETE; null for every stack that is still there. */
@@ -106,6 +108,10 @@ public class Stack {
     public void setDisableRollback(boolean disableRollback) { this.disableRollback = disableRollback; }
     public String getStatusReason() { return statusReason; }
     public void setStatusReason(String statusReason) { this.statusReason = statusReason; }
+    @JsonIgnore
+    public String getClientRequestToken() { return clientRequestToken; }
+    @JsonIgnore
+    public void setClientRequestToken(String clientRequestToken) { this.clientRequestToken = clientRequestToken; }
     public Instant getCreationTime() { return creationTime; }
     public void setCreationTime(Instant creationTime) { this.creationTime = creationTime; }
     public Instant getLastUpdatedTime() { return lastUpdatedTime; }
