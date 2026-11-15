@@ -55,13 +55,15 @@ public class SsmJsonHandler {
     private final SsmResourceDataSyncService resourceDataSyncs;
     private final SsmAgentAssociationService agentAssociations;
     private final SsmManagedNodeDiscovery managedNodeDiscovery;
+    private final SsmEc2RegistrationService ec2Registrations;
 
     @Inject
     public SsmJsonHandler(SsmService ssmService, SsmCommandService commandService,
                           SsmInventoryService inventoryService, ObjectMapper objectMapper,
                           IamEnforcementFilter iamEnforcementFilter, SsmPatchBaselineService patchBaselines,
                           SsmResourceDataSyncService resourceDataSyncs,
-                          SsmAgentAssociationService agentAssociations, SsmManagedNodeDiscovery managedNodeDiscovery) {
+                          SsmAgentAssociationService agentAssociations, SsmManagedNodeDiscovery managedNodeDiscovery,
+                          SsmEc2RegistrationService ec2Registrations) {
         this.ssmService = ssmService;
         this.commandService = commandService;
         this.inventoryService = inventoryService;
@@ -71,10 +73,12 @@ public class SsmJsonHandler {
         this.resourceDataSyncs = resourceDataSyncs;
         this.agentAssociations = agentAssociations;
         this.managedNodeDiscovery = managedNodeDiscovery;
+        this.ec2Registrations = ec2Registrations;
     }
 
     public Response handle(String action, JsonNode request, String region, String authorization) {
         return switch (action) {
+            case "RegisterManagedInstance" -> Response.ok(ec2Registrations.register(request, region)).build();
             // Parameter Store
             case "PutParameter" -> handlePutParameter(request, region);
             case "GetParameter" -> handleGetParameter(request, region, authorization);

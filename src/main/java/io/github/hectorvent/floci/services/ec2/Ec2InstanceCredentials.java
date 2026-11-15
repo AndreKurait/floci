@@ -82,6 +82,10 @@ final class Ec2InstanceCredentials {
                 roleArn, now.plusSeconds(3600), null, accountId);
         session.setRoleSessionName(instance.getInstanceId());
         session.setEc2InstanceId(instance.getInstanceId());
+        if (instance.getRegion() != null && !instance.getRegion().isBlank()) {
+            session.setEc2InstanceArn(AwsArnUtils.Arn.of(
+                    "ec2", instance.getRegion(), accountId, "instance/" + instance.getInstanceId()).toString());
+        }
         session.setAssumedRoleId(accountId + ":" + IDENTITY_ROLE_NAME + ":" + instance.getInstanceId());
         iam.registerEc2InstanceSession(session);
         history.add(session);

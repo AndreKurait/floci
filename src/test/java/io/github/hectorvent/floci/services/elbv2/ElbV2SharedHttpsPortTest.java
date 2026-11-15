@@ -6,6 +6,8 @@ import io.github.hectorvent.floci.config.TlsProxyServer;
 import io.github.hectorvent.floci.core.common.CertificateReferenceResolver;
 import io.github.hectorvent.floci.core.common.CertificateReferenceResolver.CertificateMaterial;
 import io.github.hectorvent.floci.core.common.Pem;
+import io.github.hectorvent.floci.core.common.dns.DnsClientVpcSource.ClientVpc;
+import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.services.acm.CertificateGenerator;
 import io.github.hectorvent.floci.services.acm.CertificateGenerator.GeneratedCertificate;
 import io.github.hectorvent.floci.services.acm.model.KeyAlgorithm;
@@ -13,14 +15,19 @@ import io.github.hectorvent.floci.services.elbv2.model.Action;
 import io.github.hectorvent.floci.services.elbv2.model.Listener;
 import io.github.hectorvent.floci.services.elbv2.model.LoadBalancer;
 import io.github.hectorvent.floci.services.elbv2.model.Rule;
+import io.github.hectorvent.floci.services.route53.Route53Service;
 import io.github.hectorvent.floci.testutil.FreePorts;
 import io.vertx.core.Future;
+import io.vertx.core.Handler;
 import io.vertx.core.Promise;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpServer;
 import io.vertx.core.http.HttpServerOptions;
+import io.vertx.core.http.HttpServerRequest;
+import io.vertx.core.http.HttpServerResponse;
 import io.vertx.core.net.PemKeyCertOptions;
+import io.vertx.core.net.SocketAddress;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -39,6 +46,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.KeyStore;
 import java.time.Duration;
 import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 import java.util.function.ToIntFunction;
 
@@ -49,6 +57,8 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.RETURNS_SELF;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -59,25 +69,10 @@ class ElbV2SharedHttpsPortTest {
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void latePrivateBindClosesWithoutReplacingTheCurrentRoute(boolean shutdown) {
-        ElbV2DataPlane plane = new ElbV2DataPlane();
-        plane.config = configuration(4566, 443);
-        plane.vertx = mock(Vertx.class);
-        plane.tlsProxyServer = mock(TlsProxyServer.class);
-        when(plane.tlsProxyServer.reservesPort(443)).thenReturn(true);
-        when(plane.tlsProxyServer.registerTlsRoute(eq(443), any(), any())).thenReturn(true);
-        plane.elbV2Service = mock(ElbV2Service.class);
-        plane.certificateResolver = mock(CertificateReferenceResolver.class);
         Listener listener = listener(443);
         LoadBalancer loadBalancer = new LoadBalancer();
         loadBalancer.setDnsName("alb.example.test");
-        when(plane.elbV2Service.getLoadBalancerForListener(
-                        "us-west-2", listener.getListenerArn(), listener.getLoadBalancerArn())).thenReturn(loadBalancer);
-        GeneratedCertificate certificate = new CertificateGenerator().generateSelfSignedCertificate(
-                "service.example.test", List.of(), KeyAlgorithm.RSA_2048);
-        when(plane.certificateResolver.publishedMaterial(
-                listener.getListenerArn(), "us-west-2", listener.getCertificates().getFirst()))
-                .thenReturn(new CertificateMaterial(listener.getCertificates().getFirst(),
-                        certificate.certificatePem(), certificate.privateKeyPem(), null));
+        ElbV2DataPlane plane = mockSharedPlane(null, listener, loadBalancer);
         HttpServer pendingServer = mock(HttpServer.class);
         HttpServer replacement = mock(HttpServer.class);
         Promise<HttpServer> pendingBind = Promise.promise();
@@ -99,14 +94,73 @@ class ElbV2SharedHttpsPortTest {
             }
             pendingBind.complete(pendingServer);
             verify(pendingServer, times(2)).close();
-            verify(plane.tlsProxyServer, never()).registerTlsRoute(eq(443), eq(pendingServer), any());
+            verify(plane.tlsProxyServer, never()).registerTlsRoute(eq(443), eq(pendingServer), any(), any());
             if (!shutdown) {
                 ArgumentCaptor<ToIntFunction<String>> route = ArgumentCaptor.captor();
-                verify(plane.tlsProxyServer).registerTlsRoute(eq(443), eq(replacement), route.capture());
+                verify(plane.tlsProxyServer).registerTlsRoute(
+                        eq(443), eq(replacement), route.capture(), any());
                 assertEquals(44444, route.getValue().applyAsInt("service.example.test"));
                 assertEquals(0, route.getValue().applyAsInt("callbacks.example.test"));
                 verify(plane.tlsProxyServer, never()).unregisterTlsRoute(443, replacement);
             }
+        } finally {
+            plane.shutdown();
+        }
+    }
+
+    @Test
+    void nativePublicAliasAdmissionChecksCurrentOwnershipForSniAndEveryRequest() {
+        Route53Service route53 = mock(Route53Service.class);
+        when(route53.lookupPublicAlias("service.example.test"))
+                .thenReturn(new Route53Service.PublicAlias("alb.example.test", "OWNED"));
+        Listener listener = listener(443);
+        LoadBalancer loadBalancer = new LoadBalancer();
+        loadBalancer.setLoadBalancerArn(listener.getLoadBalancerArn());
+        loadBalancer.setDnsName("alb.example.test");
+        loadBalancer.setCanonicalHostedZoneId("OWNED");
+        loadBalancer.setType("application");
+        loadBalancer.setScheme("internet-facing");
+        ElbV2DataPlane plane = mockSharedPlane(route53, listener, loadBalancer);
+        HttpServer server = mock(HttpServer.class);
+        when(server.requestHandler(any())).thenReturn(server);
+        when(server.close()).thenReturn(Future.succeededFuture());
+        when(server.listen()).thenReturn(Future.succeededFuture(server));
+        when(server.actualPort()).thenReturn(44444);
+        when(plane.vertx.createHttpServer(any(HttpServerOptions.class))).thenReturn(server);
+        try {
+            publishRuntime(plane, listener, "us-west-2", 443, List.of(fixedResponse("native-alb")));
+            ArgumentCaptor<ToIntFunction<String>> publicAlb = ArgumentCaptor.captor();
+            verify(plane.tlsProxyServer).registerTlsRoute(eq(443), eq(server), any(), publicAlb.capture());
+            ArgumentCaptor<Handler<HttpServerRequest>> requests = ArgumentCaptor.captor();
+            verify(server).requestHandler(requests.capture());
+
+            assertEquals(44444, publicAlb.getValue().applyAsInt("service.example.test"));
+            String dnsAddress = nativeAliasAddress(plane.elbV2Service, loadBalancer, listener);
+            assertEquals(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS, dnsAddress);
+            HttpServerRequest admitted = nativeRequest("service.example.test", dnsAddress);
+            requests.getValue().handle(admitted);
+            verify(admitted.response()).setStatusCode(200);
+            verify(admitted.response()).end("native-alb");
+            for (String host : List.of("alb.example.test", "callbacks.example.test")) {
+                assertEquals(0, publicAlb.getValue().applyAsInt(host),
+                        "Direct listener and API names are not owned public aliases");
+                HttpServerRequest alteredHost = nativeRequest(host);
+                requests.getValue().handle(alteredHost);
+                verify(alteredHost.response()).end("No listener for host");
+            }
+
+            loadBalancer.setScheme("internal");
+            assertEquals(0, publicAlb.getValue().applyAsInt("service.example.test"));
+            loadBalancer.setScheme("internet-facing");
+            when(route53.lookupPublicAlias("service.example.test"))
+                    .thenReturn(new Route53Service.PublicAlias("alb.example.test", "FOREIGN"));
+            assertEquals(0, publicAlb.getValue().applyAsInt("service.example.test"));
+            when(route53.lookupPublicAlias("service.example.test")).thenReturn(null);
+            assertEquals(0, publicAlb.getValue().applyAsInt("service.example.test"),
+                    "Alias removal withdraws admission despite the remaining certificate");
+            HttpServerRequest retiredAlias = nativeRequest("service.example.test");
+            requests.getValue().handle(retiredAlias);
+            verify(retiredAlias.response()).end("No listener for host");
         } finally {
             plane.shutdown();
         }
@@ -156,14 +210,7 @@ class ElbV2SharedHttpsPortTest {
                         listener.getListenerArn(), "us-west-2", listener.getCertificates().getFirst()))
                         .thenReturn(new CertificateMaterial(listener.getCertificates().getFirst(),
                                 albCertificate.certificatePem(), albCertificate.privateKeyPem(), null));
-                Action response = new Action();
-                response.setType("fixed-response");
-                response.setFixedResponseStatusCode("200");
-                response.setFixedResponseContentType("text/plain");
-                response.setFixedResponseMessageBody("load-balancer");
-                Rule rule = new Rule();
-                rule.setPriority("default");
-                rule.setActions(List.of(response));
+                Rule rule = fixedResponse("load-balancer");
                 publishRuntime(plane, listener, "us-west-2", sharedPort, List.of(rule));
 
                 ElbV2TlsReadiness.await(Duration.ofSeconds(5), () ->
@@ -211,6 +258,69 @@ class ElbV2SharedHttpsPortTest {
         listener.setProtocol("HTTPS");
         listener.setCertificates(List.of("arn:aws:acm:us-west-2:000000000000:certificate/alb"));
         return listener;
+    }
+
+    private static ElbV2DataPlane mockSharedPlane(Route53Service route53, Listener listener, LoadBalancer loadBalancer) {
+        ElbV2DataPlane plane = new ElbV2DataPlane(route53);
+        plane.config = configuration(4566, 443);
+        plane.vertx = mock(Vertx.class);
+        plane.tlsProxyServer = mock(TlsProxyServer.class);
+        when(plane.tlsProxyServer.reservesPort(443)).thenReturn(true);
+        when(plane.tlsProxyServer.registerTlsRoute(eq(443), any(), any(), any())).thenReturn(true);
+        plane.elbV2Service = mock(ElbV2Service.class);
+        plane.certificateResolver = mock(CertificateReferenceResolver.class);
+        when(plane.elbV2Service.getLoadBalancerForListener(
+                        "us-west-2", listener.getListenerArn(), listener.getLoadBalancerArn())).thenReturn(loadBalancer);
+        GeneratedCertificate certificate = new CertificateGenerator().generateSelfSignedCertificate(
+                "service.example.test", List.of(), KeyAlgorithm.RSA_2048);
+        when(plane.certificateResolver.publishedMaterial(
+                listener.getListenerArn(), "us-west-2", listener.getCertificates().getFirst()))
+                .thenReturn(new CertificateMaterial(listener.getCertificates().getFirst(),
+                        certificate.certificatePem(), certificate.privateKeyPem(), null));
+        return plane;
+    }
+
+    private static Rule fixedResponse(String body) {
+        Action response = new Action();
+        response.setType("fixed-response");
+        response.setFixedResponseStatusCode("200");
+        response.setFixedResponseContentType("text/plain");
+        response.setFixedResponseMessageBody(body);
+        Rule rule = new Rule();
+        rule.setPriority("default");
+        rule.setActions(List.of(response));
+        return rule;
+    }
+
+    private static HttpServerRequest nativeRequest(String host) {
+        return nativeRequest(host, EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS);
+    }
+
+    private static HttpServerRequest nativeRequest(String host, String address) {
+        HttpServerRequest request = mock(HttpServerRequest.class);
+        when(request.host()).thenReturn(host);
+        when(request.localAddress()).thenReturn(SocketAddress.inetSocketAddress(443, address));
+        when(request.response()).thenReturn(mock(HttpServerResponse.class, RETURNS_SELF));
+        return request;
+    }
+
+    private static String nativeAliasAddress(ElbV2Service service, LoadBalancer loadBalancer, Listener listener) {
+        when(service.findByDnsName(loadBalancer.getDnsName())).thenReturn(List.of(loadBalancer));
+        when(service.findListenersForLoadBalancer(loadBalancer.getLoadBalancerArn())).thenReturn(List.of(listener));
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.network().vpcRouting().enabled()).thenReturn(true);
+        when(config.network().vpcRouting().publicAwsApi()).thenReturn(true);
+        when(config.network().vpcRouting().publicAwsApiUpstreamHost()).thenReturn(Optional.of("172.18.0.20"));
+        when(config.tls().enabled()).thenReturn(true);
+        when(config.tls().awsHttpsPort()).thenReturn(443);
+        EmbeddedDnsServer dns = mock(EmbeddedDnsServer.class);
+        ClientVpc origin = new ClientVpc("000000000000", "us-west-2", "vpc-caller");
+        when(dns.getServerIp()).thenReturn(Optional.of("172.18.0.2"));
+        when(dns.publicAlbHttpsAddress(origin))
+                .thenReturn(Optional.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS));
+        return new ElbV2DnsRecordSource(service, dns, config)
+                .resolveAliasTarget(loadBalancer.getDnsName(), loadBalancer.getCanonicalHostedZoneId(), 1, origin)
+                .orElseThrow().addresses().getFirst();
     }
 
     private static EmulatorConfig configuration(int publicPort, int sharedPort) {

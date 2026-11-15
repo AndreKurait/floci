@@ -254,7 +254,13 @@ Gateway Load Balancer listeners require omitted `Port` and `Protocol` fields on 
   [ALB Host header rules](https://docs.aws.amazon.com/elasticloadbalancing/latest/application/edit-load-balancer-attributes.html#host-header-preservation);
   the backend address is never substituted for the client authority.
 - `routing.http.xff_header_processing.mode` (default `append`) controls `X-Forwarded-For` for HTTP, WebSocket and Lambda targets. `append` adds the client address to any value the client sent, `preserve` forwards the client's header unchanged, and `remove` drops it. `routing.http.xff_client_port.enabled` (default `false`) adds the client port as `ip:port` or `[ipv6]:port`, in `append` mode only. `ModifyLoadBalancerAttributes` answers `InvalidConfigurationRequest` for any other value of either attribute.
-- `X-Forwarded-Proto` and `X-Forwarded-Port` are always set from the client's connection to the listener, replacing any value the client sent.
+- ALB HTTP and HTTPS listeners use the same `quarkus.http.proxy.*` forwarding policy as
+  the shared API endpoint, including HTTPS listeners sharing the TLS proxy. With forwarding
+  enabled and `trusted-proxies` configured, an admitted proxy's accepted `Forwarded` client
+  address is the address appended to `X-Forwarded-For`; untrusted headers cannot replace
+  the connection's client address.
+- `X-Forwarded-Proto` uses the effective client connection after configured proxy handling.
+  `X-Forwarded-Port` uses the original listener port. Both replace any value the client sent.
 - `RegisterTargets` rejects link-local and cloud instance-metadata addresses (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`) with `InvalidTarget`, and the load balancer and its health checks refuse to connect to them. Loopback and private addresses stay reachable so a load balancer can front a neighbouring container.
 - Requests forwarded to a target carry `X-Amzn-Trace-Id`. A request without the header gets a new `Root` field, a request with a `Root` field gets a new `Self` field, and an existing `Self` field is updated. Other fields are kept. Above 7 KB of request headers the header is rewritten to a new `Root` field. Floci does not send these traces to X-Ray.
 

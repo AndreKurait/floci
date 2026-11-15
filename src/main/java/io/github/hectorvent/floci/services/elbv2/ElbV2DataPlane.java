@@ -28,10 +28,15 @@ import io.github.hectorvent.floci.services.lambda.model.InvokeResult;
 import io.github.hectorvent.floci.services.route53.Route53Service;
 import io.netty.channel.ConnectTimeoutException;
 import io.netty.handler.ssl.SslHandshakeTimeoutException;
+import io.quarkus.vertx.http.runtime.ProxyConfig;
+import io.quarkus.vertx.http.runtime.VertxHttpConfig;
+import io.quarkus.vertx.http.runtime.options.HttpServerCommonHandlers;
 import io.vertx.core.Future;
+import io.vertx.core.Handler;
 import io.vertx.core.MultiMap;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
+import io.vertx.core.http.ClientAuth;
 import io.vertx.core.http.HttpClient;
 import io.vertx.core.http.HttpClientOptions;
 import io.vertx.core.http.HttpServer;
@@ -79,6 +84,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -229,6 +235,7 @@ public class ElbV2DataPlane {
     private final ConcurrentMap<String, ListenerBinding> listenerBindings;
     private final Route53Service route53;
     private final ElbV2VpcNetworkManager vpcNetworks;
+    private final ProxyConfig proxyConfig;
     private final Map<String, AtomicReference<List<CompiledRule>>> ruleChains = new ConcurrentHashMap<>();
     private final Map<String, AtomicInteger> rrCounters = new ConcurrentHashMap<>();
     private final Map<String, String> listenerRegions = new ConcurrentHashMap<>();
@@ -245,9 +252,13 @@ public class ElbV2DataPlane {
         this(new ConcurrentHashMap<>(), route53);
     }
 
-    @Inject
     public ElbV2DataPlane(Route53Service route53, ElbV2VpcNetworkManager vpcNetworks) {
         this(new ConcurrentHashMap<>(), route53, vpcNetworks);
+    }
+
+    @Inject
+    public ElbV2DataPlane(Route53Service route53, ElbV2VpcNetworkManager vpcNetworks, VertxHttpConfig httpConfig) {
+        this(new ConcurrentHashMap<>(), route53, vpcNetworks, httpConfig.proxy());
     }
 
     ElbV2DataPlane(ConcurrentMap<String, ListenerBinding> listenerBindings) {
@@ -260,9 +271,15 @@ public class ElbV2DataPlane {
 
     ElbV2DataPlane(ConcurrentMap<String, ListenerBinding> listenerBindings, Route53Service route53,
                   ElbV2VpcNetworkManager vpcNetworks) {
+        this(listenerBindings, route53, vpcNetworks, null);
+    }
+
+    private ElbV2DataPlane(ConcurrentMap<String, ListenerBinding> listenerBindings, Route53Service route53,
+                          ElbV2VpcNetworkManager vpcNetworks, ProxyConfig proxyConfig) {
         this.listenerBindings = listenerBindings;
         this.route53 = route53;
         this.vpcNetworks = vpcNetworks;
+        this.proxyConfig = proxyConfig;
     }
 
     record ListenerBinding(int port, String host, String loadBalancerArn, String canonicalHostedZoneId,
@@ -642,7 +659,7 @@ public class ElbV2DataPlane {
             sharedTlsServers.put(port, server);
         }
         try {
-            server.requestHandler(req -> handleRequest(req, port));
+            server.requestHandler(standaloneRequestHandler(port));
             server.listen()
                     .onSuccess(s -> httpPortStarted(port, state, generation, server, sharedTls, secure))
                     .onFailure(err -> onCurrentPort(port, state, () -> {
@@ -668,6 +685,15 @@ public class ElbV2DataPlane {
         }
     }
 
+    private Handler<HttpServerRequest> standaloneRequestHandler(int port) {
+        Handler<HttpServerRequest> handler = request -> handleRequest(request, port);
+        if (proxyConfig == null) {
+            return handler;
+        }
+        return HttpServerCommonHandlers.applyProxy(proxyConfig, handler, () -> vertx,
+                ClientAuth.NONE, Optional.empty(), "quarkus.http");
+    }
+
     private void httpPortStarted(int port, PortState state, long generation,
                                  HttpServer server, boolean sharedTls, boolean secure) {
         synchronized (state) {
@@ -679,7 +705,9 @@ public class ElbV2DataPlane {
             }
             if (sharedTls && !tlsProxyServer.registerTlsRoute(port, server, host ->
                     !stopping && servers.get(port) == server
-                            && resolveListener(state.routing, host, false) != null ? server.actualPort() : 0)) {
+                            && resolveListener(state.routing, host, false) != null ? server.actualPort() : 0,
+                    host -> !stopping && servers.get(port) == server
+                            && publicAlbListener(state.routing, host) != null ? server.actualPort() : 0)) {
                 restartPortServer(port);
                 return;
             }
@@ -1109,7 +1137,12 @@ public class ElbV2DataPlane {
     private void handleRequest(HttpServerRequest req, int port) {
         PortState state = portStates.get(port);
         RoutingView routing = state == null ? null : state.routing;
-        RoutedListener listener = routing == null ? null : resolveListener(routing, req.host());
+        RoutedListener listener = null;
+        if (routing != null) {
+            boolean publicAlb = EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS
+                    .equals(req.localAddress().hostAddress());
+            listener = publicAlb ? publicAlbListener(routing, req.host()) : resolveListener(routing, req.host());
+        }
         if (listener == null) {
             req.response().setStatusCode(502).end("No listener for host");
             return;
@@ -1133,7 +1166,30 @@ public class ElbV2DataPlane {
     }
 
     void register(@Observes Router router) {
+        router.route().order(-101).handler(this::handlePublicAlbHttp);
         router.route().order(-99).handler(this::handleSharedEdge);
+    }
+
+    private void handlePublicAlbHttp(RoutingContext context) {
+        HttpServerRequest request = context.request();
+        if (!EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS.equals(request.localAddress().hostAddress())) {
+            context.next();
+            return;
+        }
+        RoutedListener listener = null;
+        if (request.localAddress().port() == 80 && !request.isSSL()
+                && config.services().elbv2().enabled() && !config.services().elbv2().mock()) {
+            String aliasHost = publicAliasHost(request.host());
+            PortState state = portStates.get(80);
+            if (aliasHost != null && state != null) {
+                listener = publicAlbListener(state.routing, aliasHost, false);
+            }
+        }
+        if (listener == null) {
+            request.response().setStatusCode(502).end("No listener for host");
+            return;
+        }
+        handleListener(request, listener);
     }
 
     private void handleSharedEdge(RoutingContext context) {
@@ -1194,6 +1250,47 @@ public class ElbV2DataPlane {
         }
         return alias.hostedZoneId() == null
                 || alias.hostedZoneId().equals(listener.canonicalHostedZoneId()) ? listener : null;
+    }
+
+    private RoutedListener publicAlbListener(RoutingView routing, String host) {
+        return publicAlbListener(routing, host, true);
+    }
+
+    private RoutedListener publicAlbListener(RoutingView routing, String host, boolean secure) {
+        Route53Service.PublicAlias alias = publicAlias(normalizeHost(host));
+        if (alias == null || alias.hostedZoneId() == null) {
+            return null;
+        }
+        RoutedListener listener = resolveAlias(routing, alias);
+        if (listener == null) {
+            return null;
+        }
+        ListenerBinding binding = listenerBindings.get(listener.arn());
+        if (binding == null || binding.secure() != secure || binding.tcp()) {
+            return null;
+        }
+        LoadBalancer balancer = elbV2Service.getLoadBalancerForListener(
+                listener.region(), listener.arn(), binding.loadBalancerArn());
+        return balancer != null && "application".equals(balancer.getType())
+                && "internet-facing".equals(balancer.getScheme()) ? listener : null;
+    }
+
+    private static String publicAliasHost(String host) {
+        if (host == null) {
+            return null;
+        }
+        try {
+            URI authority = URI.create("http://" + host);
+            if (authority.getHost() == null || authority.getUserInfo() != null
+                    || !authority.getRawPath().isEmpty() || authority.getRawQuery() != null
+                    || authority.getRawFragment() != null || authority.getPort() > 65535) {
+                return null;
+            }
+            return normalizeHost(authority.getHost());
+        } catch (IllegalArgumentException ignored) {
+            // Native ALB traffic cannot fall through to another service for an invalid authority.
+            return null;
+        }
     }
 
     /** Selects the load balancer before evaluating rules against the original request Host. */

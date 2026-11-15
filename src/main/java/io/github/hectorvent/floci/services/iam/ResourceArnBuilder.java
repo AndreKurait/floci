@@ -668,6 +668,13 @@ public class ResourceArnBuilder {
         // resource has and leave a deny on the real one unmatched.
         Optional<StoredEntity> stored = storedIamEntity(resourceType, name, accountId);
         if (stored.isEmpty()) {
+            if ("GetRole".equals(action)) {
+                // A check-before-create still names a role. Keep scoped allows and denies
+                // effective before the handler returns NoSuchEntity. GetRole has no Path
+                // parameter; an unrelated caller-supplied Path must not select its resource.
+                return List.of(AwsArnUtils.Arn.global(AwsRegions.partitionFor(region), "iam",
+                        accountId, "role/" + name).toString());
+            }
             return List.of("*");
         }
         String storedArn = stored.get().arn();

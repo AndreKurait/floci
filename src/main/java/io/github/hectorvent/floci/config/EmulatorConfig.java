@@ -133,6 +133,7 @@ public interface EmulatorConfig {
 
     interface VpcRoutingConfig {
         String PUBLIC_AWS_API_ADDRESS = "192.0.2.1";
+        String PUBLIC_ALB_HTTPS_ADDRESS = "192.0.2.2";
 
         @WithDefault("false")
         boolean enabled();
@@ -3889,6 +3890,10 @@ public interface EmulatorConfig {
     interface AppConfigServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        /** Local rollout and bake duration multiplier, greater than zero and at most one. */
+        @WithDefault("1.0")
+        double deploymentTimeScale();
     }
 
     interface AppConfigDataServiceConfig {

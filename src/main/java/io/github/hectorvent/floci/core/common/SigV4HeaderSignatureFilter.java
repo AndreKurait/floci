@@ -174,12 +174,14 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
         boolean validateAll = config.auth().validateSignatures();
         boolean lambdaIdentity = config.services().iam().lambdaIdentityVerificationEnabled();
         boolean iamEnforcement = config.services().iam().enforcementEnabled();
-        if (!validateAll && !lambdaIdentity && !iamEnforcement) {
+        Class<?> resource = resourceInfo != null ? resourceInfo.getResourceClass() : null;
+        boolean ec2Registration = resource == AwsJson11Controller.class
+                && "AmazonSSM.RegisterManagedInstance".equals(ctx.getHeaderString("X-Amz-Target"));
+        if (!validateAll && !lambdaIdentity && !iamEnforcement && !ec2Registration) {
             return;
         }
-        Class<?> resource = resourceInfo != null ? resourceInfo.getResourceClass() : null;
         boolean defaultAgent = iamEnforcement && defaultCodeDeployAgent(ctx, resource);
-        if (!validateAll && !lambdaIdentity && !defaultAgent) {
+        if (!validateAll && !lambdaIdentity && !defaultAgent && !ec2Registration) {
             return;
         }
         if (resource != null && VERIFIED_ELSEWHERE.contains(resource)) {
@@ -203,8 +205,8 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
             }
             signed = SigV4AuthorizationHeader.parse(authorization);
             if (signed == null) {
-                if (defaultAgent) {
-                    incompleteSignature(ctx, resource, "The CodeDeploy agent requires a signed instance request.");
+                if (defaultAgent || ec2Registration) {
+                    incompleteSignature(ctx, resource, "The agent requires a signed instance request.");
                 }
                 return;
             }
@@ -213,13 +215,15 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
         CredentialScope scope = CredentialScope.parse(signed.credential());
         SessionCredential nativeSession = null;
         if (scope != null) {
-            if (defaultAgent) {
+            if (ec2Registration) {
+                nativeSession = iamService.ec2InstanceIdentitySession(scope.accessKeyId()).orElse(null);
+            } else if (defaultAgent) {
                 nativeSession = iamService.ec2InstanceProfileSession(scope.accessKeyId()).orElse(null);
             } else if (lambdaIdentity) {
                 nativeSession = iamService.lambdaIdentitySession(scope.accessKeyId()).orElse(null);
             }
         }
-        if (!validateAll && !defaultAgent && nativeSession == null) {
+        if (!validateAll && !defaultAgent && !ec2Registration && nativeSession == null) {
             return;
         }
         if (scope == null || isBlank(signed.signedHeaders()) || isBlank(signed.signature())) {
@@ -231,6 +235,10 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
         if (defaultAgent && !"codedeploy-commands".equals(scope.service())) {
             signatureDoesNotMatch(ctx, resource, "Credential should be scoped to correct service: "
                     + "'codedeploy-commands'");
+            return;
+        }
+        if (ec2Registration && !"ssm".equals(scope.service())) {
+            signatureDoesNotMatch(ctx, resource, "Credential should be scoped to correct service: 'ssm'");
             return;
         }
         if (!SigV4RequestValidator.containsHeader(signed.signedHeaders(), "host")) {

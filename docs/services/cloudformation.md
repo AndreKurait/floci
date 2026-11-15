@@ -1285,6 +1285,10 @@ window AWS's asymmetry is reproduced:
 
 - `DescribeStacks` **by stack id** (the ARN) answers with the stack, its `DELETE_COMPLETE` status
   and its `DeletionTime`. `DescribeStackEvents` by stack id answers likewise.
+- `ListStackResources`, `DescribeStackResources`, and `DescribeStackResource` by stack id return
+  the deleted stack's resource history, including `DELETE_SKIPPED` for retained resources.
+  These lookups remain scoped to the requesting account and region. A deleted stack's name does
+  not resolve its history; if the name is reused, it resolves only the replacement stack.
 - `DescribeStacks` **by name** returns `ValidationError`, as it does on AWS. The CDK CLI depends on
   the pair: it monitors a delete by stack id, and a stack id that stops resolving ends the rest of
   a `cdk destroy --all` run.
@@ -1347,8 +1351,6 @@ Deviations from AWS to be aware of:
 - Every resource defaults to `Delete`. AWS instead defaults `AWS::RDS::DBCluster`, and
   `AWS::RDS::DBInstance` without a `DBClusterIdentifier`, to `Snapshot`.
 - Unrecognized values are treated as `Delete`.
-- After `DeleteStack` completes, a retained resource's `DELETE_SKIPPED` record is only visible
-  through `DescribeStackEvents` for the deleted stack, not `DescribeStackResources`.
 - `UpdateReplacePolicy` is honored only by the resource types that delete a displaced resource once
   the update commits, such as an SSM parameter or a log stream; other types keep the displaced
   resource, or delete it during the update, whatever the policy. The `RetainExceptOnCreate` request
