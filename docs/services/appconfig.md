@@ -288,6 +288,9 @@ An empty CloudFormation label creates an unlabeled version and remains an empty 
 The locking token checks the highest currently stored version before creation. Failed creates consume no number;
 a version created and then removed by rollback leaves an allocation gap. Outputs-only updates retain the version.
 
+Deployment `Ref` and public physical IDs return the deployment number as a string. Resource descriptions,
+lists, events and change-set previews use that number; deletion and rollback retain the full stored identity.
+
 Deployment creation waits for AppConfig's `COMPLETE` state, preserving the strategy's
 rollout and final bake durations. `Fn::GetAtt DeploymentNumber` is a string and `State`
 reports completion. The physical identity and `Ref` include application, environment

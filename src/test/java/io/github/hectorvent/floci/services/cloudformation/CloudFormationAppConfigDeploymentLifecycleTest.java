@@ -69,7 +69,7 @@ class CloudFormationAppConfigDeploymentLifecycleTest {
         String physical = stack().getResources().get("Deployment").getPhysicalId();
         String number = stack().getOutputs().get("Number");
         assertEquals(app + "|" + environment + "|" + number, physical);
-        assertEquals(physical, stack().getOutputs().get("Reference"));
+        assertEquals(number, stack().getOutputs().get("Reference"));
         assertEquals("COMPLETE", stack().getOutputs().get("State"));
         assertEquals("2", appconfig.getActiveVersion(environment, profile));
 
