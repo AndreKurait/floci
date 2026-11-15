@@ -60,7 +60,7 @@ class SsmEc2RegistrationStorageTest {
         keys.initialize(2048);
         String key = Base64.getEncoder().encodeToString(keys.generateKeyPair().getPublic().getEncoded());
         JsonNode request = new ObjectMapper().valueToTree(
-                Map.of("InstanceId", INSTANCE_ID, "PublicKey", key, "KeyType", "rsa"));
+                Map.of("Fingerprint", INSTANCE_ID, "PublicKey", key, "PublicKeyType", "rsa"));
 
         StorageFactory factory = StorageFactories.open(directory, mode, ACCOUNT);
         SsmEc2RegistrationService.Registration registered;

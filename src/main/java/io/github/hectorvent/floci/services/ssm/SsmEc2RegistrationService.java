@@ -50,7 +50,7 @@ public class SsmEc2RegistrationService {
             throw denied();
         }
         AwsArnUtils.Arn identity = AwsArnUtils.parse(verified.getEc2InstanceArn());
-        String instanceId = request.path("InstanceId").asText("");
+        String instanceId = request.path("Fingerprint").asText("");
         if (!identity.region().equals(region) || !identity.accountId().equals(context.getAccountId())
                 || !verified.getEc2InstanceId().equals(instanceId)) {
             throw denied();
@@ -63,10 +63,11 @@ public class SsmEc2RegistrationService {
         if (request.hasNonNull("ActivationId") || request.hasNonNull("ActivationCode")) {
             throw new AwsException("ValidationException", "EC2 identity registration does not use an activation.", 400);
         }
-        String keyType = request.path("KeyType").asText("");
+        String keyType = request.path("PublicKeyType").asText("");
         String publicKey = request.path("PublicKey").asText("");
         if (!"rsa".equals(keyType) || !validPublicKey(publicKey)) {
-            throw new AwsException("ValidationException", "PublicKey must be an RSA public key and KeyType must be rsa.", 400);
+            throw new AwsException("ValidationException",
+                    "PublicKey must be an RSA public key and PublicKeyType must be rsa.", 400);
         }
         if (iam.ec2InstanceIdentitySession(verified.getAccessKeyId()).orElse(null) != verified
                 || context.getVerifiedSession() != verified) {

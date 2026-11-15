@@ -177,8 +177,34 @@ class SsmEc2RegistrationIntegrationTest {
                 .body("__type", equalTo("AccessDeniedException"));
     }
 
+    @Test
+    void legacyFieldNamesCannotReplaceTheAgentsAuthenticatedFingerprint() throws Exception {
+        String legacy = mapper.writeValueAsString(
+                Map.of("InstanceId", instance.getInstanceId(), "PublicKey", publicKey, "KeyType", "rsa"));
+        signed("RegisterManagedInstance", REGION, legacy, legacy, false).then().defaultParser(Parser.JSON)
+                .statusCode(400).body("__type", equalTo("AccessDeniedException"));
+        String conflict = mapper.writeValueAsString(Map.of("Fingerprint", "i-00000000000000001",
+                "InstanceId", instance.getInstanceId(), "PublicKey", publicKey, "PublicKeyType", "rsa"));
+        signed("RegisterManagedInstance", REGION, conflict, conflict, false).then().defaultParser(Parser.JSON)
+                .statusCode(400).body("__type", equalTo("AccessDeniedException"));
+    }
+
+    @Test
+    void theAgentsPublicKeyTypeIsRequiredAndMustBeRsa() throws Exception {
+        for (Map<String, String> fields : List.of(
+                Map.of("Fingerprint", instance.getInstanceId(), "PublicKey", publicKey),
+                Map.of("Fingerprint", instance.getInstanceId(), "PublicKey", publicKey, "KeyType", "rsa"),
+                Map.of("Fingerprint", instance.getInstanceId(), "PublicKey", publicKey, "PublicKeyType", "ecc"))) {
+            String body = mapper.writeValueAsString(fields);
+            signed("RegisterManagedInstance", REGION, body, body, false).then().defaultParser(Parser.JSON)
+                    .statusCode(400).body("__type", equalTo("ValidationException"));
+        }
+    }
+
     private String registration(String instanceId, String key) throws Exception {
-        return mapper.writeValueAsString(Map.of("InstanceId", instanceId, "PublicKey", key, "KeyType", "rsa"));
+        // amazon-ssm-agent authregister_client.go sends the EC2 instance ID as Fingerprint.
+        // Source: aws/amazon-ssm-agent@2f0fe3497d95ca586b61e973448eca116cd12987.
+        return mapper.writeValueAsString(Map.of("Fingerprint", instanceId, "PublicKey", key, "PublicKeyType", "rsa"));
     }
 
     private Response signed(String operation, String region, String signedBody, String sentBody, boolean forged) {
