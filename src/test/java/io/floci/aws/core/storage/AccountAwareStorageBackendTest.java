@@ -33,6 +33,28 @@ import static org.mockito.Mockito.when;
 class AccountAwareStorageBackendTest {
 
     @Test
+    void boundedAccountPagePreservesOwnersAndCursorWithoutLoadingUnselectedValues() {
+        InMemoryStorage<String, String> raw = spy(new InMemoryStorage<>());
+        raw.put("111111111111/b", "first");
+        raw.put("222222222222/a", "second");
+        raw.put("legacy", "legacy-value");
+        AccountAwareStorageBackend<String> storage = new AccountAwareStorageBackend<>(raw, null, "111111111111");
+        clearInvocations(raw);
+        Map<String, AccountAwareStorageBackend.AccountEntry<String>> first = storage.scanAllAccountEntriesAfter(null, 1);
+        assertEquals(Set.of("111111111111/b"), first.keySet());
+        assertEquals("111111111111", first.get("111111111111/b").accountId());
+        verify(raw).get("111111111111/b");
+        verify(raw, never()).get("222222222222/a");
+        verify(raw, never()).get("legacy");
+        Map<String, AccountAwareStorageBackend.AccountEntry<String>> second =
+                storage.scanAllAccountEntriesAfter("111111111111/b", 2);
+        assertEquals("222222222222", second.get("222222222222/a").accountId());
+        assertEquals("legacy", second.get("legacy").key());
+        assertEquals("111111111111", second.get("legacy").accountId());
+        assertThrows(IllegalArgumentException.class, () -> storage.scanAllAccountEntriesAfter(null, 0));
+    }
+
+    @Test
     void accountIdReturnsDefaultOutsideRequestScope() {
         AccountAwareStorageBackend<String> storage =
                 new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, "111111111111");

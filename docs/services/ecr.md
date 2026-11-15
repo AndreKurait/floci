@@ -326,3 +326,15 @@ See [Docker's bridge network documentation](https://docs.docker.com/engine/netwo
 **Disk not reclaimed after deleting images.** Deleting the last tag of an image, or deleting by digest, removes its manifest, but blobs remain on disk until garbage collection runs. Trigger it with `curl -X POST http://localhost:4566/_floci/ecr/gc`. The endpoint runs `registry garbage-collect` inside the backing container and returns the reclaimed blob list. The operation is serialized: ECR API calls block for its duration (typically a few seconds).
 
 **`*.localhost` does not resolve to loopback on this platform.** Set `floci.services.ecr.uri-style: path` to fall back to `localhost:<port>/<account>/<region>/<repo>` URIs. On Docker Desktop the rewrite of AWS-shaped Lambda, ECS and EMR Serverless images keeps `<account>.dkr.ecr.<region>.localhost`; there, build the image under the AWS-shaped URI the function or task definition names, and Floci uses it as-is (`FLOCI_SERVICES_ECR_PREFER_LOCAL_IMAGES`).
+
+### Registry authentication and IAM enforcement
+
+For authenticated operation, set both `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED=true` and `FLOCI_AUTH_VALIDATE_SIGNATURES=true` (configuration keys `floci.services.iam.enforcement-enabled` and `floci.auth.validate-signatures`). Token issuance refuses an unverified caller even when global signature verification is disabled.
+
+With IAM enforcement enabled, every Distribution request requires a native ECR password obtained by a verified IAM caller through `GetAuthorizationToken`. Passwords are opaque, stored only as digests, expire within twelve hours and no later than the verified issuing session, and retain their issuing principal. Repository operations evaluate current identity policies, session policies, permissions boundaries, organization policies, and repository grants. Requesting another `registryId` does not grant access to that account. Client passwords are never forwarded to the backing registry.
+
+Explicitly disabling IAM enforcement retains the existing unauthenticated emulator mode. Tokens issued in that mode are not accepted after enforcement is enabled. Internal image consumers in enforced mode must supply native issued credentials too; loopback addressing is not an authentication exemption.
+
+Upload-status queries and cancellation (`GET`, `HEAD`, or `DELETE` on `/blobs/uploads/`) are explicitly unsupported in enforced mode; ordinary layer upload `POST`, `PATCH`, and `PUT` are supported.
+
+The underlying-session expiry cap is a conservative emulator constraint; it has not been validated against AWS in a differential test. Main retains its existing registry endpoint format and API behavior.
