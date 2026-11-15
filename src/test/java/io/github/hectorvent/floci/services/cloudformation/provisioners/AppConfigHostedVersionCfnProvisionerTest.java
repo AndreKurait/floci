@@ -69,6 +69,7 @@ class AppConfigHostedVersionCfnProvisionerTest {
 
         assertEquals("app0001|prof001|7", resource.getPhysicalId());
         assertEquals("7", provisioner.referenceValue(resource.getPhysicalId()));
+        assertEquals("7", provisioner.publicPhysicalId(resource.getPhysicalId()));
         assertEquals("7", resource.getAttributes().get("VersionNumber"));
         ArgumentCaptor<byte[]> bytes = ArgumentCaptor.forClass(byte[].class);
         verify(service).createHostedConfigurationVersion(
@@ -111,6 +112,7 @@ class AppConfigHostedVersionCfnProvisionerTest {
         verify(service).createHostedConfigurationVersion(eq("application-name"), eq("profile-name"),
                 any(byte[].class), eq("application/json"), isNull(), eq(serviceLabel), eq(0));
         assertEquals("7", provisioner.referenceValue(resource.getPhysicalId()));
+        assertEquals("7", provisioner.publicPhysicalId(resource.getPhysicalId()));
         assertEquals("7", resource.getAttributes().get("VersionNumber"));
         assertEquals(JSON.valueToTree(properties).toString(), resource.getAttributes().get(
                 CfnRollback.USES_ATTR_PREFIX + "AppConfigHostedVersionProperties"));
@@ -170,6 +172,14 @@ class AppConfigHostedVersionCfnProvisionerTest {
         resource.getAttributes().put("Arn", CfnResourceDispatcher.STUB_ARN_PREFIX + "Config");
         assertEquals("Config-1234abcd", provisioner.referenceValue(resource.getPhysicalId()));
         provisioner.delete(resource, "us-east-1");
+        verifyNoInteractions(service);
+    }
+
+    @Test
+    void publicProjectionKeepsNullAndOldStubIdsWithoutCallingTheService() {
+        assertNull(provisioner.publicPhysicalId(null));
+        assertEquals("Config-1234abcd", provisioner.publicPhysicalId("Config-1234abcd"));
+        assertEquals("7", provisioner.publicPhysicalId("app0001|prof001|7"));
         verifyNoInteractions(service);
     }
 
