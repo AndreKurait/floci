@@ -53,6 +53,7 @@ final class DynamoDbAccessPathValidator {
         }
         validateFilterExpression(accessPath, filterExpression, expressionAttributeNames);
         validateLegacyQueryFilter(accessPath, queryFilter);
+        validateLsiFilterProjection(table, accessPath, filterExpression, queryFilter, expressionAttributeNames);
         return partitionKeyValuePlaceholder;
     }
 
@@ -101,6 +102,33 @@ final class DynamoDbAccessPathValidator {
         if (!requestedAttributes.isEmpty()) {
             throw unprojectedGsiAttributes(accessPath.indexName(), requestedAttributes);
         }
+    }
+
+    private static void validateLsiFilterProjection(TableDefinition table, DynamoDbAccessPath accessPath,
+                                                 String filterExpression, JsonNode legacyFilter,
+                                                 JsonNode expressionAttributeNames) {
+        if (accessPath.kind() != DynamoDbAccessPath.Kind.LOCAL_SECONDARY_INDEX
+                || "ALL".equals(accessPath.projectionType())) {
+            return;
+        }
+        Set<String> filterAttributes = new LinkedHashSet<>();
+        if (filterExpression != null) {
+            collectAttributes(parseExpression(filterExpression, "FilterExpression"),
+                    expressionAttributeNames, filterAttributes);
+        }
+        if (legacyFilter != null) {
+            legacyFilter.fieldNames().forEachRemaining(filterAttributes::add);
+        }
+        filterAttributes.removeAll(accessPath.projectedAttributeNames(table));
+        if (!filterAttributes.isEmpty()) {
+            throw unprojectedFilterAttributes(accessPath.indexName(), filterAttributes);
+        }
+    }
+
+    static AwsException unprojectedFilterAttributes(String indexName, Collection<String> attributes) {
+        return validationException("One or more parameter values were invalid: Secondary index "
+                + indexName + " does not project one or more filter attributes: ["
+                + String.join(", ", attributes) + "]");
     }
 
     static AwsException unprojectedGsiAttributes(String indexName, Collection<String> attributes) {
