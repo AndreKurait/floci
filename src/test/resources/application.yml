@@ -407,6 +407,8 @@ floci:
       deployment-time-scale: 1.0
     appconfigdata:
       enabled: true
+    # Immutable lifecycle preview snapshots share the ECR repository metadata store.
+    # Their durability follows the configured storage mode, including asynchronous hybrid flushes.
     ecr:
       enabled: true
       tls-uri: false

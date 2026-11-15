@@ -864,6 +864,8 @@ floci:
       deployment-time-scale: 1.0           # FLOCI_SERVICES_APPCONFIG_DEPLOYMENT_TIME_SCALE: opt-in local acceleration
     appconfigdata:
       enabled: true
+    # Immutable lifecycle preview snapshots share the ECR repository metadata store.
+    # Their durability follows the configured storage mode, including asynchronous hybrid flushes.
     ecr:
       enabled: true
       registry-image: "registry:2"

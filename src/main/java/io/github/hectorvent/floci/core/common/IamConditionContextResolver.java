@@ -21,6 +21,7 @@ import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Ec2PlacementGroup;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
+import io.github.hectorvent.floci.services.ecr.EcrService;
 import io.github.hectorvent.floci.services.eks.EksAccessEntryUpdateConditions;
 import io.github.hectorvent.floci.services.elbv2.ElbV2ConditionKeys;
 import io.github.hectorvent.floci.services.iam.IamActionRegistry;
@@ -119,6 +120,7 @@ public class IamConditionContextResolver {
     /** Lazy to keep the existing IAM construction graph independent of EC2 storage creation. */
     @Inject
     Instance<Ec2PlacementGroupService> placementGroupService;
+    private final Instance<EcrService> ecrService;
     private final Instance<S3Service> s3Service;
     private final Instance<CloudWatchLogsService> logsService;
     private final Instance<IamService> iamService;
@@ -160,14 +162,16 @@ public class IamConditionContextResolver {
                                        Instance<KinesisService> kinesisService,
                                        Instance<AthenaBatchQueryService> athenaBatchQueryService,
                                        Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates,
-                                       Instance<LambdaRuntimeManagementService> runtimeManagement) {
+                                       Instance<LambdaRuntimeManagementService> runtimeManagement,
+                                       Instance<EcrService> ecrService) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
                 config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService,
                 elbV2ConditionKeys, mqConfigurations, lambdaService, athenaPreparedStatements,
                 kinesisService,
                 athenaBatchQueryService,
                 eksAccessEntryUpdates,
-                runtimeManagement);
+                runtimeManagement,
+                ecrService);
     }
 
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -184,6 +188,7 @@ public class IamConditionContextResolver {
                                        Instance<ElbV2ConditionKeys> elbV2ConditionKeys) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
                 config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys, null, null, null,
+                null,
                 null,
                 null,
                 null,
@@ -205,6 +210,7 @@ public class IamConditionContextResolver {
                 null,
                 null,
                 null,
+                null,
                 null);
     }
 
@@ -220,6 +226,7 @@ public class IamConditionContextResolver {
                                 ResolvedServiceCatalog serviceCatalog, Clock clock) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
                 config, currentVertxRequest, serviceCatalog, clock, null, null, null, null, null,
+                null,
                 null,
                 null,
                 null,
@@ -244,7 +251,8 @@ public class IamConditionContextResolver {
                                         Instance<KinesisService> kinesisService,
                                         Instance<AthenaBatchQueryService> athenaBatchQueryService,
                                         Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates,
-                                        Instance<LambdaRuntimeManagementService> runtimeManagement) {
+                                        Instance<LambdaRuntimeManagementService> runtimeManagement,
+                                        Instance<EcrService> ecrService) {
         this.mqConfigurations = mqConfigurations;
         this.lambdaService = lambdaService;
         this.athenaPreparedStatements = athenaPreparedStatements;
@@ -265,6 +273,7 @@ public class IamConditionContextResolver {
         this.athenaBatchQueryService = athenaBatchQueryService;
         this.eksAccessEntryUpdates = eksAccessEntryUpdates;
         this.runtimeManagement = runtimeManagement;
+        this.ecrService = ecrService;
     }
 
     private Map<String, List<String>> athenaPreparedStatementConditions(String action, ContainerRequestContext ctx) {
@@ -311,6 +320,7 @@ public class IamConditionContextResolver {
             case "backup" -> backupFrameworkConditions(action, ctx);
             case "s3" -> s3ConditionContext(action, ctx);
             case "ec2" -> ec2ConditionContext(action, ctx);
+            case "ecr" -> ecrPreviewConditionContext(action, ctx);
             case "elasticloadbalancing" -> elbV2Contexts(action, ctx).stream().findFirst().orElse(null);
             case "dynamodb" -> dynamoDbConditionContext(action, ctx);
             case "iam" -> iamConditionContext(action, ctx);
@@ -441,6 +451,28 @@ public class IamConditionContextResolver {
         Map<String, List<String>> conditions = new LinkedHashMap<>();
         mqConfigurations.get().tagsForAuthorization(id).forEach((key, value) ->
                 conditions.put(RESOURCE_TAG_PREFIX + key, List.of(value)));
+        return conditions;
+    }
+
+    private Map<String, List<String>> ecrPreviewConditionContext(String action, ContainerRequestContext ctx) {
+        if (!("ecr:StartLifecyclePolicyPreview".equals(action) || "ecr:GetLifecyclePolicyPreview".equals(action))
+                || ecrService == null || !ecrService.isResolvable()) {
+            return null;
+        }
+        JsonNode body = bufferedJsonBody(ctx);
+        if (body == null) {
+            return null;
+        }
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        Map<String, String> tags = ecrService.get().lifecyclePreviewTags(body.path("repositoryName").asText(null),
+                body.path("registryId").asText(null), region);
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        tags.forEach((key, value) -> {
+            if (key != null && value != null) {
+                conditions.put("aws:ResourceTag/" + key, List.of(value));
+                conditions.put("ecr:ResourceTag/" + key, List.of(value));
+            }
+        });
         return conditions;
     }
 

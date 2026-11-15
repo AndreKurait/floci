@@ -48,6 +48,8 @@ class EcrLifecyclePolicyValidationIntegrationTest {
     void keepRepositoryMetadataIndependentOfDocker() {
         when(registry.getRepositoryUri(anyString(), anyString(), anyString()))
                 .thenReturn("registry.invalid/lifecycle-validation");
+        when(registry.internalRepoName(anyString(), anyString(), anyString()))
+                .thenAnswer(call -> call.getArgument(0) + "/" + call.getArgument(1) + "/" + call.getArgument(2));
     }
 
     @Test
