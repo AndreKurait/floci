@@ -5420,7 +5420,8 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     private void reconcileTasks() {
-        for (String taskArn : taskHandles.keySet()) {
+        // Cleanup can reinsert a retained handle: retry it on the next pass, not in this traversal.
+        for (String taskArn : new ArrayList<>(taskHandles.keySet())) {
             RequestScopes.runAs(taskAccountId(taskArn), () -> {
                 try {
                     reconcileTask(taskArn);

@@ -23,6 +23,7 @@ import io.github.hectorvent.floci.testing.TestTime;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
+import java.lang.reflect.Field;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -33,6 +34,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Consumer;
 
@@ -67,6 +69,44 @@ class EcsServiceAwaitStableTest {
     @AfterEach
     void stopReconcilers() {
         created.forEach(EcsService::stopManagedContainers);
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void reconcilePendingCleanup_visitsCollidingHandlesOncePerPass() throws Exception {
+        EcsContainerManager manager = dockerContainerManager(task -> { });
+        EcsService service = dockerModeService(manager);
+        String firstArn = "arn:aws:ecs:us-east-1:000000000000:task/cleanup/Aa";
+        String secondArn = "arn:aws:ecs:us-east-1:000000000000:task/cleanup/BB";
+        assertEquals(firstArn.hashCode(), secondArn.hashCode());
+        // Seed retained handles without live tasks, reproducing cleanup after task-state removal.
+        Field field = EcsService.class.getDeclaredField("taskHandles");
+        field.setAccessible(true);
+        Map<String, EcsTaskHandle> handles = (Map<String, EcsTaskHandle>) field.get(service);
+        EcsTaskHandle first = new EcsTaskHandle(firstArn, Map.of("app", "first"), Map.of());
+        EcsTaskHandle second = new EcsTaskHandle(secondArn, Map.of("app", "second"), Map.of());
+        handles.put(firstArn, first);
+        handles.put(secondArn, second);
+        AtomicInteger attempts = new AtomicInteger();
+        AtomicBoolean removeContainers = new AtomicBoolean();
+        when(manager.stopTaskAndCollectExitCodes(any())).thenAnswer(invocation -> {
+            assertTrue(attempts.incrementAndGet() <= 2, "a pass must not retry a retained handle");
+            EcsTaskHandle handle = invocation.getArgument(0);
+            if (removeContainers.get()) {
+                handle.recordContainerRemoved("app");
+            }
+            return Map.of();
+        });
+
+        service.reconcile();
+
+        assertEquals(2, attempts.get());
+        assertEquals(Map.of(firstArn, first, secondArn, second), handles);
+        attempts.set(0);
+        removeContainers.set(true);
+        service.reconcile();
+        assertEquals(2, attempts.get());
+        assertTrue(handles.isEmpty(), "the next pass must retry and release both handles");
     }
 
     @Test
