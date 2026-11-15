@@ -137,6 +137,18 @@ the previous native display name only for literal `TopicName`/`DisplayName` upda
 on the same topic. Broader SNS rollback and concurrent delete/recreate atomicity
 are outside that bounded support.
 
+## Stack event request tokens
+
+`DescribeStackEvents` returns the supplied `ClientRequestToken` captured when each
+stack or resource event was recorded. Later operations keep their own tokens, and
+historical event tokens survive storage reloads. This includes progress, rollback,
+and deletion events produced by the operation.
+
+`CreateChangeSet` uses a separate `ClientToken`. The existing internal
+`REVIEW_IN_PROGRESS` placeholder has no operation token. An omitted
+`ClientRequestToken` remains absent, including on legacy stored events. This
+support does not add token generation, request deduplication, or token expiry.
+
 ## Supported Actions
 
 <!-- floci:actions:start -->
