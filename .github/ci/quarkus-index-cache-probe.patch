@@ -1,0 +1,66 @@
+--- a/TestClassIndexer.java
++++ b/TestClassIndexer.java
+@@ -18,0 +19,5 @@
++import java.nio.file.attribute.FileTime;
++import java.lang.ref.SoftReference;
++import java.util.Objects;
++import java.util.concurrent.ConcurrentHashMap;
++import java.util.concurrent.ConcurrentMap;
+@@ -30,0 +36,12 @@
++
++    private static final ConcurrentMap<Path, CachedIndex> READ_CACHE = new ConcurrentHashMap<>();
++
++    private record FileStamp(long size, FileTime modified, Object fileKey) {
++        static FileStamp of(Path path) throws IOException {
++            BasicFileAttributes attrs = Files.readAttributes(path, BasicFileAttributes.class);
++            return new FileStamp(attrs.size(), attrs.lastModifiedTime(), attrs.fileKey());
++        }
++    }
++
++    private record CachedIndex(FileStamp stamp, SoftReference<Index> index) {
++    }
+@@ -64 +81,2 @@
+-        Path target = indexPath(testClassLocation);
++        Path target = indexPath(testClassLocation).toAbsolutePath().normalize();
++        READ_CACHE.remove(target);
+@@ -82,0 +101 @@
++            READ_CACHE.remove(target);
+@@ -109 +128 @@
+-        final Path path = indexPath(testClassLocation);
++        final Path path = indexPath(testClassLocation).toAbsolutePath().normalize();
+@@ -111,2 +130,17 @@
+-            try (FileInputStream fis = new FileInputStream(path.toFile())) {
+-                return new IndexReader(fis).read();
++            try {
++                FileStamp stamp = FileStamp.of(path);
++                CachedIndex cached = READ_CACHE.get(path);
++                if (cached != null && Objects.equals(cached.stamp(), stamp)) {
++                    Index index = cached.index().get();
++                    if (index != null) {
++                        return index;
++                    }
++                }
++                Index index;
++                try (FileInputStream fis = new FileInputStream(path.toFile())) {
++                    index = new IndexReader(fis).read();
++                }
++                if (Objects.equals(stamp, FileStamp.of(path))) {
++                    READ_CACHE.put(path, new CachedIndex(stamp, new SoftReference<>(index)));
++                }
++                return index;
+@@ -113,0 +148 @@
++                READ_CACHE.remove(path);
+@@ -116,3 +151 @@
+-                // be lenient since the error is recoverable; IllegalArgumentException covers
+-                // "Not a jandex index" when the file was left corrupt by a JVM crash mid-write,
+-                // an external process, or a downgrade (see https://github.com/quarkusio/quarkus/issues/54579)
++                READ_CACHE.remove(path);
+@@ -121,0 +155 @@
++            READ_CACHE.remove(path);
+@@ -124 +157,0 @@
+-
+@@ -177 +210,3 @@
+-            Files.deleteIfExists(indexPath(requiredTestClass));
++            Path path = indexPath(requiredTestClass).toAbsolutePath().normalize();
++            READ_CACHE.remove(path);
++            Files.deleteIfExists(path);

@@ -113,6 +113,12 @@ jobs:
       - name: Compile
         run: ./mvnw test-compile -B
 
+      - name: Prepare optional index-cache test dependency
+        if: github.repository == 'AndreKurait/floci' && startsWith(github.head_ref, 'ci/profile-test-startup-cache-')
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+        run: python3 .github/ci/prepare-index-cache-probe.py
+
       # all-classes.txt is derived from file names, so a test class whose name
       # differs from its file would drop out of both it and the shard union
       # without the completeness check noticing. The compiled classes are the
@@ -133,8 +139,11 @@ jobs:
       # including deadlocks or blocking I/O that ignore JUnit's interrupt. The 35-minute job
       # ceiling also covers compilation, test startup, and report upload.
       - name: Run tests
+        env:
+          FLOCI_CI_PROFILE: ${{ github.repository == 'AndreKurait/floci' && startsWith(github.head_ref, 'ci/profile-test-startup-') }}
+          SHARD_INDEX: ${{ matrix.shard }}
         run: >
-          ./mvnw surefire:test -B
+          bash .github/ci/profile-tests.sh ./mvnw surefire:test -B
           -Dsurefire.includesFile="$GITHUB_WORKSPACE/shard.txt"
           -Dsurefire.failIfNoTests=true
           -Dsurefire.timeout=1500
@@ -185,6 +194,24 @@ jobs:
             all-classes.txt
             prefetch-images.log
             target/surefire-reports/
+          if-no-files-found: error
+
+      - name: Upload optional startup profiles
+        if: always() && github.repository == 'AndreKurait/floci' && startsWith(github.head_ref, 'ci/profile-test-startup-')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: startup-profile-${{ matrix.shard }}
+          path: ${{ runner.temp }}/floci-ci-profile-${{ matrix.shard }}/*.jfr
+          retention-days: 3
+          if-no-files-found: error
+
+      - name: Upload optional index-cache preparation proof
+        if: always() && github.repository == 'AndreKurait/floci' && startsWith(github.head_ref, 'ci/profile-test-startup-cache-')
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: index-cache-probe-${{ matrix.shard }}
+          path: ${{ runner.temp }}/floci-index-cache-${{ matrix.shard }}/proof.json
+          retention-days: 3
           if-no-files-found: error
 
   # The enforced completeness gate: fails on any shard failure, any class assigned
