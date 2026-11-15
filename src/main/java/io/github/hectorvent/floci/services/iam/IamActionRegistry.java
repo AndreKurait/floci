@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.common.ProtocolClaim;
 import io.github.hectorvent.floci.core.common.RequestResources;
 import io.github.hectorvent.floci.core.common.WireProtocol;
 import io.github.hectorvent.floci.services.amazonmq.AmazonMqConfigurationController;
+import io.github.hectorvent.floci.services.apigateway.ApiGatewayController;
 import io.github.hectorvent.floci.services.appconfig.AppConfigDataController;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbPartiQLParser;
 import io.github.hectorvent.floci.services.eks.EksController;
@@ -706,6 +707,13 @@ public class IamActionRegistry {
                 && resourceInfo.getResourceMethod() != null
                 && "listAccessPolicies".equals(resourceInfo.getResourceMethod().getName())) {
             return "eks:ListAccessPolicies";
+        }
+        if ("apigateway".equals(credentialScope) && resourceInfo != null
+                && ApiGatewayController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && ("getModelTemplate".equals(resourceInfo.getResourceMethod().getName())
+                || "getV2ModelTemplate".equals(resourceInfo.getResourceMethod().getName()))) {
+            return "apigateway:GET";
         }
         if ("appconfig".equals(credentialScope) && resourceInfo != null
                 && AppConfigDataController.class.equals(resourceInfo.getResourceClass())

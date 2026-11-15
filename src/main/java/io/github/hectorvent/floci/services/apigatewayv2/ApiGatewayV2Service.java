@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsEndpoints;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.ModelTemplateGenerator;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ReservedTags;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
@@ -1186,6 +1187,15 @@ public class ApiGatewayV2Service {
     public Model getModel(String region, String apiId, String modelId) {
         return modelStore.get(modelKey(region, apiId, modelId))
                 .orElseThrow(() -> new AwsException("NotFoundException", "Model not found", 404));
+    }
+
+    public String getModelTemplate(String region, String apiId, String modelId) {
+        Api api = getApi(region, apiId);
+        if (!"WEBSOCKET".equals(api.getProtocolType())) {
+            throw new AwsException("BadRequestException", "Model templates are supported only for WebSocket APIs.", 400);
+        }
+        Model model = getModel(region, apiId, modelId);
+        return ModelTemplateGenerator.generate(model.getSchema(), model.getContentType(), true);
     }
 
     public List<Model> getModels(String region, String apiId) {
