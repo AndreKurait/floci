@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.services.applicationautoscaling.model.TargetTr
 import io.github.hectorvent.floci.services.cloudwatch.metrics.CloudWatchMetricsService;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.Dimension;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricAlarm;
+import io.github.hectorvent.floci.services.dynamodb.DynamoDbService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
@@ -30,6 +31,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
@@ -75,7 +77,16 @@ class ApplicationAutoScalingServiceTest {
 
         service = new ApplicationAutoScalingService(
                 new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
-                regionResolver, cloudWatch, lambdaCapacity);
+                regionResolver, cloudWatch, lambdaCapacity, registrationDynamoDb());
+    }
+
+    private DynamoDbService registrationDynamoDb() {
+        DynamoDbService dynamoDb = mock(DynamoDbService.class);
+        doAnswer(call -> {
+            call.<DynamoDbRegistrationTarget>getArgument(5).publish();
+            return null;
+        }).when(dynamoDb).reconcileScalableTarget(anyString(), anyString(), anyInt(), anyInt(), anyString(), any());
+        return dynamoDb;
     }
 
     private ScalableTarget register() {

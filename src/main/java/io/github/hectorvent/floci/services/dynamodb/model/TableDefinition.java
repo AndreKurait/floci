@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.dynamodb.model;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonProperty;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
@@ -28,6 +29,10 @@ public class TableDefinition {
     private long itemCount;
     private long tableSizeBytes;
     private ProvisionedThroughput provisionedThroughput;
+    @JsonProperty("warmReadUnitsPerSecond")
+    private long warmReadUnitsPerSecond;
+    @JsonProperty("warmWriteUnitsPerSecond")
+    private long warmWriteUnitsPerSecond;
     private String tableArn;
     private Map<String, String> tags;
     private List<GlobalSecondaryIndex> globalSecondaryIndexes;
@@ -104,6 +109,24 @@ public class TableDefinition {
         this.replicaRegions = new ArrayList<>();
     }
 
+    /** Baseline warm read units for a table given its billing mode and provisioned capacity. */
+    public static long defaultWarmReadUnits(String billingMode, ProvisionedThroughput pt) {
+        if ("PAY_PER_REQUEST".equals(billingMode)) {
+            return 12000;
+        }
+        long rcu = pt != null ? pt.getReadCapacityUnits() : 0;
+        return rcu > 0 ? rcu : 5;
+    }
+
+    /** Baseline warm write units for a table given its billing mode and provisioned capacity. */
+    public static long defaultWarmWriteUnits(String billingMode, ProvisionedThroughput pt) {
+        if ("PAY_PER_REQUEST".equals(billingMode)) {
+            return 4000;
+        }
+        long wcu = pt != null ? pt.getWriteCapacityUnits() : 0;
+        return wcu > 0 ? wcu : 5;
+    }
+
     public String getTableName() { return tableName; }
     public void setTableName(String tableName) { this.tableName = tableName; }
 
@@ -127,6 +150,39 @@ public class TableDefinition {
 
     public ProvisionedThroughput getProvisionedThroughput() { return provisionedThroughput; }
     public void setProvisionedThroughput(ProvisionedThroughput provisionedThroughput) { this.provisionedThroughput = provisionedThroughput; }
+
+    @JsonIgnore
+    public long getWarmReadUnitsPerSecond() {
+        return Math.max(warmReadUnitsPerSecond, defaultWarmReadUnits(billingMode, provisionedThroughput));
+    }
+    public void setWarmReadUnitsPerSecond(long value) { warmReadUnitsPerSecond = value; }
+
+    @JsonIgnore
+    public long getWarmWriteUnitsPerSecond() {
+        return Math.max(warmWriteUnitsPerSecond, defaultWarmWriteUnits(billingMode, provisionedThroughput));
+    }
+    public void setWarmWriteUnitsPerSecond(long value) { warmWriteUnitsPerSecond = value; }
+
+    public long rawWarmReadUnitsPerSecond() { return warmReadUnitsPerSecond; }
+    public long rawWarmWriteUnitsPerSecond() { return warmWriteUnitsPerSecond; }
+
+    /** Initialize a new resource from its final requested capacity, without constructor defaults. */
+    public void initializeWarmThroughput() {
+        warmReadUnitsPerSecond = defaultWarmReadUnits(billingMode, provisionedThroughput);
+        warmWriteUnitsPerSecond = defaultWarmWriteUnits(billingMode, provisionedThroughput);
+        for (GlobalSecondaryIndex index : getGlobalSecondaryIndexes()) {
+            index.initializeWarmThroughput(billingMode);
+        }
+    }
+
+    /** Retain the current effective peaks before and after a successful capacity or billing change. */
+    public void retainWarmThroughput() {
+        warmReadUnitsPerSecond = getWarmReadUnitsPerSecond();
+        warmWriteUnitsPerSecond = getWarmWriteUnitsPerSecond();
+        for (GlobalSecondaryIndex index : getGlobalSecondaryIndexes()) {
+            index.retainWarmThroughput(billingMode);
+        }
+    }
 
     public String getTableArn() { return tableArn; }
     public void setTableArn(String tableArn) { this.tableArn = tableArn; }
