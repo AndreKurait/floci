@@ -99,6 +99,12 @@ class EcrServiceTest {
                 registryManager,
                 config,
                 regionResolver);
+        service.registryAuthorization = Mockito.mock(
+                io.github.hectorvent.floci.services.ecr.registry.EcrRegistryAuthorization.class);
+        when(service.registryAuthorization.issue()).thenReturn(
+                new io.github.hectorvent.floci.services.ecr.registry.EcrRegistryAuthorization.IssuedToken(
+                        Base64.getEncoder().encodeToString("AWS:issued-test-token".getBytes(StandardCharsets.UTF_8)),
+                        Instant.now().plusSeconds(43200)));
     }
 
     // ------------------------------------------------------------

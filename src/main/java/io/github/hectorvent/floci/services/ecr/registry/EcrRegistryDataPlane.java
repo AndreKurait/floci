@@ -2,8 +2,11 @@ package io.github.hectorvent.floci.services.ecr.registry;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.NetworkExposureGuard;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsPartitions;
 import io.github.hectorvent.floci.services.ecr.EcrService;
+import io.github.hectorvent.floci.services.ecr.model.Repository;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
 import io.vertx.core.http.HttpClient;
@@ -22,7 +25,12 @@ import jakarta.inject.Inject;
 
 import java.net.URI;
 import java.net.URLDecoder;
+import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -59,6 +67,9 @@ public class EcrRegistryDataPlane {
     private final Vertx vertx;
 
     @Inject
+    EcrRegistryAuthorization authorization;
+
+    @Inject
     public EcrRegistryDataPlane(EcrRegistryManager registryManager,
                                 EcrService ecrService,
                                 EmulatorConfig config,
@@ -83,9 +94,24 @@ public class EcrRegistryDataPlane {
             return;
         }
 
+        RegistryRequest selected = request.get();
+        try {
+            if (config.services().iam().enforcementEnabled()) {
+                EcrRegistryAuthorization.Identity identity = authorization.authenticate(context.request().getHeader("Authorization"));
+                selected = requireRepositoryActions(context, selected, identity);
+            }
+        } catch (AwsException denied) {
+            context.response().putHeader("Docker-Distribution-API-Version", "registry/2.0");
+            if (denied.getHttpStatus() == 401) {
+                context.response().putHeader("WWW-Authenticate", "Basic realm=\"Amazon ECR\"");
+            }
+            registryError(context, denied.getHttpStatus(), denied.getErrorCode(), denied.getMessage());
+            return;
+        }
+
         context.request().pause();
 
-        RegistryRequest registryRequest = request.get();
+        RegistryRequest registryRequest = selected;
         if (!registryRequest.repositoryName().isEmpty()) {
             registryRequest = registryRequest.withStorageRepositoryName(
                     ecrService.registryRepositoryName(
@@ -296,7 +322,8 @@ public class EcrRegistryDataPlane {
     private static void copyRequestHeaders(RoutingContext context, HttpClientRequest upstream) {
         context.request().headers().forEach(header -> {
             if (!HOP_BY_HOP_HEADERS.contains(header.getKey().toLowerCase())
-                    && !"host".equalsIgnoreCase(header.getKey())) {
+                    && !"host".equalsIgnoreCase(header.getKey())
+                    && !"authorization".equalsIgnoreCase(header.getKey())) {
                 upstream.headers().add(header.getKey(), header.getValue());
             }
         });
@@ -455,6 +482,118 @@ public class EcrRegistryDataPlane {
         }
     }
 
+    private RegistryRequest requireRepositoryActions(RoutingContext context, RegistryRequest request,
+                                                     EcrRegistryAuthorization.Identity identity) {
+        String path = context.request().path();
+        String method = context.request().method().name();
+        if (("/v2/".equals(path) || "/v2".equals(path)) && "GET".equals(method)) {
+            return request;
+        }
+        for (String action : actions(method, request.backendUri(), request.storageRepositoryName())) {
+            permit(context, identity, request, request.repositoryName(), action);
+        }
+        String mount = queryParameter(context.request().query(), "mount");
+        if (!"POST".equals(method) || mount.isBlank()) {
+            return request;
+        }
+        String from = queryParameter(context.request().query(), "from");
+        String storageFrom = null;
+        if (!from.isBlank()) {
+            Optional<RegistryRequest> source = requestFor(context.request().host(), "/v2/" + from + "/manifests/mount",
+                    context.request().query(), config.services().ecr().uriStyle());
+            if (source.isPresent() && source.get().accountId().equals(request.accountId())
+                    && source.get().region().equals(request.region())) {
+                try {
+                    permit(context, identity, source.get(), source.get().repositoryName(), "ecr:GetDownloadUrlForLayer");
+                    storageFrom = ecrService.registryRepositoryName(source.get().repositoryName(),
+                            source.get().accountId(), source.get().region());
+                } catch (AwsException unavailable) {
+                    if (unavailable.getHttpStatus() != 403 && unavailable.getHttpStatus() != 404) {
+                        throw unavailable;
+                    }
+                    // Distribution mount is optional: retain the authorized ordinary-upload path.
+                }
+            }
+        }
+        return request.withBackendUri(mountQuery(request.backendUri(), storageFrom, mount));
+    }
+
+    private static String mountQuery(String uri, String storageFrom, String mount) {
+        String[] parts = uri.split("\\?", 2);
+        List<String> parameters = new ArrayList<>();
+        if (parts.length == 2) {
+            for (String parameter : parts[1].split("&")) {
+                String name = URLDecoder.decode(parameter.split("=", 2)[0], StandardCharsets.UTF_8);
+                if (!name.equals("from") && !name.equals("mount")) {
+                    parameters.add(parameter);
+                }
+            }
+        }
+        if (storageFrom != null) {
+            parameters.add("from=" + URLEncoder.encode(storageFrom, StandardCharsets.UTF_8));
+            parameters.add("mount=" + URLEncoder.encode(mount, StandardCharsets.UTF_8));
+        }
+        return parts[0] + (parameters.isEmpty() ? "" : "?" + String.join("&", parameters));
+    }
+
+    private void permit(RoutingContext context, EcrRegistryAuthorization.Identity identity, RegistryRequest request,
+                        String repository, String action) {
+        if (!repository.matches("[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*")) {
+            throw new AwsException("DENIED", "Invalid repository name", 403);
+        }
+        Repository metadata = ecrService.registryRepository(repository, request.accountId(), request.region())
+                .orElseThrow(() -> new AwsException(
+                        "NAME_UNKNOWN", "Repository does not exist", 404));
+        String arn = AwsArnUtils.Arn.of(
+                "ecr", request.region(), request.accountId(), "repository/" + repository).toString();
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        conditions.put("aws:SecureTransport", List.of(Boolean.toString(context.request().isSSL())));
+        if (context.request().remoteAddress() != null) {
+            conditions.put("aws:SourceIp", List.of(context.request().remoteAddress().hostAddress()));
+        }
+        metadata.getTags().forEach((key, value) -> {
+            conditions.put("aws:ResourceTag/" + key, List.of(value));
+            conditions.put("ecr:ResourceTag/" + key, List.of(value));
+        });
+        authorization.requirePermission(identity, action, arn, metadata.getRepositoryPolicyText(), conditions);
+    }
+
+    static List<String> actions(String method, String backendUri, String storageRepository) {
+        String prefix = "/v2/" + storageRepository;
+        String path = backendUri.split("\\?", 2)[0];
+        if (storageRepository.isEmpty() || !path.startsWith(prefix + "/")) {
+            throw new AwsException("DENIED", "Unsupported registry operation", 403);
+        }
+        String operation = path.substring(prefix.length());
+        String action = null;
+        if (operation.startsWith("/manifests/")) {
+            action = switch (method) {
+                case "GET", "HEAD" -> "ecr:BatchGetImage";
+                case "PUT" -> "ecr:PutImage";
+                default -> null;
+            };
+        } else if (operation.startsWith("/blobs/uploads/")) {
+            action = switch (method) {
+                case "POST" -> "ecr:InitiateLayerUpload";
+                case "PATCH" -> "ecr:UploadLayerPart";
+                case "PUT" -> "ecr:CompleteLayerUpload";
+                default -> null;
+            };
+        } else if (operation.startsWith("/blobs/")) {
+            action = switch (method) {
+                case "GET" -> "ecr:GetDownloadUrlForLayer";
+                case "HEAD" -> "ecr:BatchCheckLayerAvailability";
+                default -> null;
+            };
+        } else if ("/tags/list".equals(operation) && "GET".equals(method)) {
+            action = "ecr:ListImages";
+        }
+        if (action == null) {
+            throw new AwsException("DENIED", "Unsupported registry operation", 403);
+        }
+        return List.of(action);
+    }
+
     private static Matcher registryHost(String host) {
         String value = host == null ? "" : host;
         Matcher nativeHost = NATIVE_ECR_HOST.matcher(value);
@@ -536,7 +675,7 @@ public class EcrRegistryDataPlane {
         }
         for (String parameter : query.split("&")) {
             int separator = parameter.indexOf('=');
-            if (separator > 0 && name.equals(parameter.substring(0, separator))) {
+            if (separator > 0 && name.equals(URLDecoder.decode(parameter.substring(0, separator), StandardCharsets.UTF_8))) {
                 return URLDecoder.decode(parameter.substring(separator + 1), StandardCharsets.UTF_8);
             }
         }
@@ -572,6 +711,11 @@ public class EcrRegistryDataPlane {
                            String clientRepositoryName,
                            String backendUri,
                            String tag) {
+        RegistryRequest withBackendUri(String uri) {
+            return new RegistryRequest(accountId, region, repositoryName, storageRepositoryName,
+                    clientRepositoryName, uri, tag);
+        }
+
         RegistryRequest withStorageRepositoryName(String storageRepositoryName) {
             return new RegistryRequest(accountId, region, repositoryName, storageRepositoryName,
                     clientRepositoryName,

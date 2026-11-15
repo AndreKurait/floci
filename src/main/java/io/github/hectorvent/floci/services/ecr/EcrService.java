@@ -33,6 +33,7 @@ import io.github.hectorvent.floci.services.ecr.model.PullThroughCacheRule;
 import io.github.hectorvent.floci.services.ecr.model.RegistrySettings;
 import io.github.hectorvent.floci.services.ecr.model.Repository;
 import io.github.hectorvent.floci.services.ecr.model.RepositoryCreationTemplate;
+import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryAuthorization;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.ecr.registry.RegistryHttpClient;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -43,7 +44,6 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -94,6 +94,9 @@ public class EcrService implements ResourceProvider {
     private static final int MAX_PULL_THROUGH_CACHE_PREFIX_LENGTH = 30;
     private static final Map<String, String> ACCOUNT_SETTING_DEFAULTS = Map.of(
             "BASIC_SCAN_TYPE_VERSION", "AWS_NATIVE", "REGISTRY_POLICY_SCOPE", "V2", "BLOB_MOUNTING", "DISABLED");
+
+    @Inject
+    EcrRegistryAuthorization registryAuthorization;
 
     private final StorageBackend<String, Repository> repoStore;
     private final StorageBackend<String, ImageMetadata> imageMetaStore;
@@ -717,8 +720,9 @@ public class EcrService implements ResourceProvider {
                 || registryIds.stream().anyMatch(id -> id == null || !id.matches("[0-9]{12}"))) {
             throw new AwsException("InvalidParameterException", "registryIds must contain 1 to 10 twelve-digit account IDs", 400);
         }
-        String token = Base64.getEncoder().encodeToString("AWS:floci".getBytes(StandardCharsets.UTF_8));
-        Instant expires = Instant.now().plusSeconds(12 * 60 * 60);
+        EcrRegistryAuthorization.IssuedToken issued = registryAuthorization.issue();
+        String token = issued.authorizationToken();
+        Instant expires = issued.expiresAt();
         return registryIds.stream().map(account -> new AuthorizationData(token, expires,
                 registryManager.getProxyEndpoint(account, regionResolver.getRegion()))).toList();
     }
@@ -727,9 +731,9 @@ public class EcrService implements ResourceProvider {
         // Deliberately not gated on the backing registry: AWS answers this call from the
         // control plane, and both values here are computed without Docker. Gating it made
         // every SDK client retry a 500 before its first repository call.
-        String token = Base64.getEncoder()
-                .encodeToString("AWS:floci".getBytes(StandardCharsets.UTF_8));
-        Instant expires = Instant.now().plusSeconds(12 * 60 * 60);
+        EcrRegistryAuthorization.IssuedToken issued = registryAuthorization.issue();
+        String token = issued.authorizationToken();
+        Instant expires = issued.expiresAt();
         String proxy = registryManager.getProxyEndpoint();
         return new AuthorizationData(token, expires, proxy);
     }
@@ -2080,6 +2084,15 @@ public class EcrService implements ResourceProvider {
     // ============================================================
     // Helpers
     // ============================================================
+
+    /** Read the selected registry owner without trusting the HTTP caller's account namespace. */
+    public Optional<Repository> registryRepository(String name, String account, String region) {
+        String repositoryKey = key(region, account, name);
+        if (repoStore instanceof AccountAwareStorageBackend<Repository> aware) {
+            return aware.getForAccount(account, repositoryKey);
+        }
+        return repoStore.get(repositoryKey);
+    }
 
     private Repository requireRepo(String name, String registryId, String region) {
         String account = effectiveAccount(registryId);
