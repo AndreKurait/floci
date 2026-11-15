@@ -49,8 +49,11 @@ final class PolicyApplyBatch {
                 }
             }
         }
-        if (interrupted) {
+        // Joining a completed worker need not observe a pending caller interrupt.
+        if (interrupted || Thread.currentThread().isInterrupted()) {
             Thread.currentThread().interrupt();
+            failure.compareAndSet(null,
+                    new InterruptedException("Interrupted while applying security-group policies"));
         }
         Throwable error = failure.get();
         if (error instanceof RuntimeException runtime) {

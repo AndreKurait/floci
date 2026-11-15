@@ -14,6 +14,27 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class PolicyApplyBatchTest {
     @Test
+    void pendingInterruptionFailsEvenWithoutOutstandingWriters() throws Exception {
+        AtomicBoolean restoredInterrupt = new AtomicBoolean();
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread caller = Thread.ofPlatform().start(() -> {
+            Thread.currentThread().interrupt();
+            try {
+                PolicyApplyBatch.run(List.of());
+            } catch (Throwable error) {
+                failure.set(error);
+            } finally {
+                restoredInterrupt.set(Thread.currentThread().isInterrupted());
+            }
+        });
+        caller.join(10000);
+        assertFalse(caller.isAlive());
+        assertTrue(restoredInterrupt.get());
+        IllegalStateException error = assertInstanceOf(IllegalStateException.class, failure.get());
+        assertInstanceOf(InterruptedException.class, error.getCause());
+    }
+
+    @Test
     void interruptionDrainsTheWriterBeforeReturningFailure() throws Exception {
         CountDownLatch writing = new CountDownLatch(1);
         CountDownLatch release = new CountDownLatch(1);
