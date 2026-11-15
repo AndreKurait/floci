@@ -114,6 +114,17 @@ final class VpcRoutingCommands {
                            List<String> deniedDestinations, List<String> resolvers, List<ControlConnection> controls,
                            boolean instanceMetadataAllowed, String publicDevice, List<String> inboundPublicSources,
                            List<ControlListener> listeners, NativeApi nativeApi, VpcFrontendIngress frontend) {
+        return endpointWithFrontends(privateAddress, privateDevice, localRoutes, hops, deniedDestinations, resolvers,
+                controls, instanceMetadataAllowed, publicDevice, inboundPublicSources, listeners, nativeApi,
+                frontend == null ? List.of() : List.of(frontend));
+    }
+
+    static String endpointWithFrontends(String privateAddress, String privateDevice, List<LocalRoute> localRoutes,
+                                        List<Hop> hops, List<String> deniedDestinations, List<String> resolvers,
+                                        List<ControlConnection> controls, boolean instanceMetadataAllowed,
+                                        String publicDevice, List<String> inboundPublicSources,
+                                        List<ControlListener> listeners, NativeApi nativeApi,
+                                        List<VpcFrontendIngress> frontends) {
         String source = VpcRouteSelection.ipv4(privateAddress);
         StringBuilder script = new StringBuilder("set -eu\nip -4 route flush proto 186\n");
         // A retained namespace can cache the retired MAC of a recreated next hop.
@@ -136,7 +147,10 @@ final class VpcRoutingCommands {
         StringBuilder rules = new StringBuilder("flush chain inet floci_vpc_routes ingress\n")
                 .append("flush chain inet floci_vpc_routes egress\n")
                 .append("add rule inet floci_vpc_routes egress oifname lo counter accept\n");
-        if (frontend != null) {
+        if (frontends.size() > 1) {
+            appendFrontendControls(rules, resolvers, controls, listeners);
+        }
+        for (VpcFrontendIngress frontend : frontends) {
             frontend.appendIngress(rules);
             frontend.appendReply(rules);
         }
@@ -191,6 +205,41 @@ final class VpcRoutingCommands {
         }
         rules.append("add rule inet floci_vpc_routes egress counter drop\n");
         return script.append(nft(rules.toString())).toString();
+    }
+
+    private static void appendFrontendControls(StringBuilder rules, List<String> resolvers,
+                                                List<ControlConnection> controls, List<ControlListener> listeners) {
+        // These are the protected service's exact control tuples, not client-supplied identities.
+        // A frontend on its control interface must still receive replies to its own connections.
+        for (ControlConnection control : controls) {
+            if (!control.address().contains(":")) {
+                rules.append("add rule inet floci_vpc_routes ingress ip saddr ").append(control.address())
+                        .append(" tcp sport ").append(control.port())
+                        .append(" ct direction reply ct original ip daddr ").append(control.address())
+                        .append(" ct original proto-dst ").append(control.port()).append(" counter accept\n");
+            }
+        }
+        for (String resolver : resolvers) {
+            if (!resolver.contains(":")) {
+                String address = VpcRouteSelection.ipv4(resolver);
+                for (String protocol : List.of("udp", "tcp")) {
+                    rules.append("add rule inet floci_vpc_routes ingress ip saddr ").append(address)
+                            .append(' ').append(protocol).append(" sport 53 ct direction reply")
+                            .append(" ct original ip daddr ").append(address)
+                            .append(" ct original proto-dst 53 counter accept\n");
+                }
+            }
+        }
+        for (ControlListener listener : listeners) {
+            if (!listener.controllerAddress().contains(":")) {
+                rules.append("add rule inet floci_vpc_routes ingress ip saddr ").append(listener.controllerAddress())
+                        .append(" tcp dport ").append(listener.port()).append(" counter accept\n")
+                        .append("add rule inet floci_vpc_routes egress ip daddr ").append(listener.controllerAddress())
+                        .append(" tcp sport ").append(listener.port())
+                        .append(" ct direction reply ct original ip saddr ").append(listener.controllerAddress())
+                        .append(" ct original proto-dst ").append(listener.port()).append(" counter accept\n");
+            }
+        }
     }
 
     private static void appendNativeApiRoute(StringBuilder rules, NativeApi api) {

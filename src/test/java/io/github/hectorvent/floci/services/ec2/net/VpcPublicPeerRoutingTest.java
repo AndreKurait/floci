@@ -648,6 +648,26 @@ class VpcPublicPeerRoutingTest {
                 () -> manager.publishFrontendListeners(ACCOUNT, REGION, "frontend", "frontend", Set.of(443)));
     }
 
+    @Test
+    void existingControlBridgeFrontendRequiresItsOwnInterfaceAndTheSameNativeRoutes() {
+        prepareNamespace("frontend", 2, true);
+        manager.register(identity("frontend", 2), "frontend", List.of());
+        manager.attachPublicFrontend(ACCOUNT, REGION, interfaceFor("frontend", 2), "frontend");
+        assertThrows(IllegalArgumentException.class, () -> manager.publishFrontendListeners(
+                ACCOUNT, REGION, "frontend", "frontend", Set.of(443), "172.18.0.3"));
+        manager.publishFrontendListeners(ACCOUNT, REGION, "frontend", "frontend", Set.of(443), "172.18.0.2");
+        assertEquals(Optional.of("172.18.0.2"), manager.publicFrontendTransport(ACCOUNT, REGION, "frontend"));
+        String applied = latest("frontend");
+        assertTrue(applied.contains("ip daddr 172.18.0.2 tcp dport { 443 } ip saddr 0.0.0.0/0 counter accept"));
+        assertTrue(applied.contains("ip daddr 240.0.0.2 tcp dport { 443 } ip saddr 0.0.0.0/0 counter accept"));
+        gateway.setAttachments(List.of());
+        manager.reconcile();
+        assertFalse(latest("frontend").contains("ip saddr 0.0.0.0/0 counter accept"));
+        manager.publishFrontendListeners(ACCOUNT, REGION, "frontend", "frontend", Set.of(), "172.18.0.2");
+        assertFalse(latest("frontend").contains("tcp dport { 443 }"));
+        assertTrue(latest("frontend").contains("ip daddr 172.18.0.2 counter drop"));
+    }
+
     private void missing(String helper) {
         InspectContainerCmd inspect = docker.inspectContainerCmd(helper);
         when(inspect.exec()).thenThrow(new NotFoundException("namespace absent"));

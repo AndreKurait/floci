@@ -19,21 +19,58 @@ public class ElbV2DnsRecordSource implements DnsRecordSource {
     private final ElbV2Service service;
     private final EmbeddedDnsServer dns;
     private final EmulatorConfig config;
+    private final ElbV2VpcNetworkManager networks;
 
     public ElbV2DnsRecordSource(ElbV2Service service, EmbeddedDnsServer dns) {
         this(service, dns, null);
     }
 
-    @Inject
     public ElbV2DnsRecordSource(ElbV2Service service, EmbeddedDnsServer dns, EmulatorConfig config) {
+        this(service, dns, config, null);
+    }
+
+    @Inject
+    public ElbV2DnsRecordSource(ElbV2Service service, EmbeddedDnsServer dns, EmulatorConfig config,
+                              ElbV2VpcNetworkManager networks) {
         this.service = service;
         this.dns = dns;
         this.config = config;
+        this.networks = networks;
     }
 
     @Override
     public Optional<DnsAnswer> resolveIpv4(String name) {
-        return Optional.empty();
+        return resolve(name, 1, null);
+    }
+
+    @Override
+    public Optional<DnsAnswer> resolve(String name, int type, ClientVpc origin) {
+        if (networks == null || !networks.frontendsEnabled()) {
+            return Optional.empty();
+        }
+        List<LoadBalancer> matches = service.findByDnsName(name);
+        if (matches.isEmpty()) {
+            return Optional.empty();
+        }
+        if (matches.size() != 1) {
+            return Optional.of(DnsAnswer.refused());
+        }
+        LoadBalancer target = matches.getFirst();
+        return "application".equals(target.getType())
+                ? Optional.of(frontendAnswer(target, type, origin)) : Optional.empty();
+    }
+
+    @Override
+    public Optional<DnsAnswer> resolveAuthoritative(String name, int type, ClientVpc origin) {
+        return resolve(name, type, origin);
+    }
+
+    private DnsAnswer frontendAnswer(LoadBalancer target, int type, ClientVpc origin) {
+        if (networks.usesSharedFrontend(target.getLoadBalancerArn())) {
+            return type == 1 ? sharedAnswer(target, origin) : DnsAnswer.noData();
+        }
+        List<String> addresses = type == 1 ? networks.frontendAddresses(target, origin) : List.of();
+        return addresses.isEmpty() ? DnsAnswer.noData() : DnsAnswer.records(addresses, 60);
     }
 
     @Override
@@ -58,6 +95,13 @@ public class ElbV2DnsRecordSource implements DnsRecordSource {
         if (type == 28) {
             return Optional.of(DnsAnswer.noData());
         }
+        if (networks != null && networks.frontendsEnabled()) {
+            return Optional.of(frontendAnswer(target, type, origin));
+        }
+        return Optional.of(sharedAnswer(target, origin));
+    }
+
+    private DnsAnswer sharedAnswer(LoadBalancer target, ClientVpc origin) {
         boolean publicHttps = config != null && "internet-facing".equals(target.getScheme())
                 && config.network().vpcRouting().enabled()
                 && config.network().vpcRouting().publicAwsApi()
@@ -69,9 +113,9 @@ public class ElbV2DnsRecordSource implements DnsRecordSource {
                 && servesNativeHttpPorts(target)) {
             selectedAddress = dns.publicAlbHttpsAddress(origin);
         }
-        return Optional.of(selectedAddress
+        return selectedAddress
                 .map(address -> DnsAnswer.records(List.of(address), 60))
-                .orElseGet(DnsAnswer::noData));
+                .orElseGet(DnsAnswer::noData);
     }
 
     private boolean servesNativeHttpPorts(LoadBalancer loadBalancer) {

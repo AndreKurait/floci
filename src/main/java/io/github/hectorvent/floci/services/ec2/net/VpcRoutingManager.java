@@ -307,12 +307,23 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
     public synchronized Optional<String> publicFrontendTransport(String account, String region, String eni) {
         PublicAddress address = publicAddresses.get(key(account, region, eni));
         return address == null || unavailableNamespaces.contains(address.namespace.id()) || namespaceUnavailable(address.namespace.id())
-                ? Optional.empty() : Optional.ofNullable(address.transport);
+                ? Optional.empty() : Optional.ofNullable(
+                        address.externalTransport == null ? address.transport : address.externalTransport);
     }
 
     /** Publishes only an exact owner's listening ports; native subnet routes and security groups still apply. */
     public synchronized void publishFrontendListeners(String account, String region, String eni, String helper,
                                                        Set<Integer> ports) {
+        publishFrontendListeners(account, region, eni, helper, ports, null);
+    }
+
+    /**
+     * An external caller can share an existing internal Docker bridge with the protected helper.
+     * Admit only that helper's observed control address, with the same native return-route checks.
+     * The separate public transport still carries logical public addresses for VPC callers.
+     */
+    public synchronized void publishFrontendListeners(String account, String region, String eni, String helper,
+                                                        Set<Integer> ports, String externalTransport) {
         requireActive();
         String identity = key(account, region, eni);
         PublicAddress address = publicAddresses.get(identity);
@@ -321,7 +332,24 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
                 || !helper.equals(endpoint.helper) || unavailableNamespaces.contains(helper) || namespaceUnavailable(helper)) {
             throw new IllegalStateException("Public listeners have no matching protected frontend");
         }
+        String externalDevice = null;
+        if (externalTransport != null) {
+            String literal = VpcRouteSelection.ipv4(externalTransport);
+            if (!literal.equals(endpoint.identity.transportAddress())
+                    || literal.equals(endpoint.identity.logicalAddress()) || literal.equals(address.address)
+                    || literal.equals(address.transport)) {
+                throw new IllegalArgumentException("External frontend must use its own observed control transport");
+            }
+            long matches = docker.inspectContainerCmd(helper).exec().getNetworkSettings().getNetworks().values()
+                    .stream().filter(network -> literal.equals(network.getIpAddress())).count();
+            if (matches != 1) {
+                throw new IllegalStateException("External frontend transport does not identify one owned interface");
+            }
+            externalDevice = deviceFor(helper, literal);
+        }
         address.listeners = VpcFrontendIngress.checkedPorts(ports);
+        address.externalTransport = externalTransport;
+        address.externalDevice = externalDevice;
         reconcile();
     }
 
@@ -621,12 +649,18 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
                 && internet(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS, routes, vpc, topology)) {
             directApi = nativePublicApi(endpoint);
         }
-        VpcFrontendIngress frontend = own == null ? null : new VpcFrontendIngress(own.transport, own.device,
-                own.listeners, VpcFrontendIngress.decisions(vpc, routes, topology.gateways));
-        String script = VpcRoutingCommands.endpoint(identity.logicalAddress(), endpoint.privateDevice,
+        List<VpcFrontendIngress> frontends = new ArrayList<>();
+        if (own != null) {
+            List<VpcFrontendIngress.Decision> decisions = VpcFrontendIngress.decisions(vpc, routes, topology.gateways);
+            frontends.add(new VpcFrontendIngress(own.transport, own.device, own.listeners, decisions));
+            if (own.externalTransport != null) {
+                frontends.add(new VpcFrontendIngress(own.externalTransport, own.externalDevice, own.listeners, decisions));
+            }
+        }
+        String script = VpcRoutingCommands.endpointWithFrontends(identity.logicalAddress(), endpoint.privateDevice,
                 local, hops, denied, endpoint.resolvers, identity.controlConnections(),
                 identity.instanceMetadataAllowed(), own == null ? null : own.device, inbound,
-                identity.controlListeners(), directApi, frontend);
+                identity.controlListeners(), directApi, frontends);
         if (endpoint.publicAddress != null && endpoint.publicAddress.separateTransport()) {
             NativePublicAddress address = endpoint.publicAddress;
             script += VpcRoutingCommands.publicInstanceSources(identity.logicalAddress(), address.address(),
@@ -1020,6 +1054,8 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         final NetworkNamespaceLease namespace;
         String transport;
         String device;
+        String externalTransport;
+        String externalDevice;
         Set<Integer> listeners = Set.of();
 
         PublicAddress(String address, NetworkNamespaceLease namespace) {
