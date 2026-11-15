@@ -8,6 +8,9 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
+import io.github.hectorvent.floci.services.dynamodb.DynamoDbReplicaAutoScalingService.Description;
+import io.github.hectorvent.floci.services.dynamodb.DynamoDbReplicaAutoScalingService.IndexDescription;
+import io.github.hectorvent.floci.services.dynamodb.DynamoDbReplicaAutoScalingService.ReplicaDescription;
 import io.github.hectorvent.floci.services.dynamodb.NativeDynamoDbTableService.CreateTableRequest;
 import io.github.hectorvent.floci.services.dynamodb.NativeDynamoDbTableService.GsiThroughputUpdate;
 import io.github.hectorvent.floci.services.dynamodb.NativeDynamoDbTableService.IndexOverride;
@@ -28,6 +31,9 @@ import io.github.hectorvent.floci.services.dynamodb.model.ImportTableDescription
 import io.github.hectorvent.floci.services.dynamodb.model.KeySchemaElement;
 import io.github.hectorvent.floci.services.dynamodb.model.KinesisStreamingDestination;
 import io.github.hectorvent.floci.services.dynamodb.model.LocalSecondaryIndex;
+import io.github.hectorvent.floci.services.dynamodb.model.ReplicaAutoScalingState.Policy;
+import io.github.hectorvent.floci.services.dynamodb.model.ReplicaAutoScalingState.Settings;
+import io.github.hectorvent.floci.services.dynamodb.model.ReplicaAutoScalingState.TargetTracking;
 import io.github.hectorvent.floci.services.dynamodb.model.SearchSchemaElement;
 import io.github.hectorvent.floci.services.dynamodb.model.TableBackup;
 import io.github.hectorvent.floci.services.dynamodb.model.TableDefinition;
@@ -79,17 +85,25 @@ public class NativeDynamoDbJsonHandler {
 
     private final DynamoDbService dynamoDbService;
     private final NativeDynamoDbTableService tableService;
+    private final DynamoDbReplicaAutoScalingService replicaAutoScalingService;
     private final ObjectMapper objectMapper;
     private final DynamoDbPartiQLHandler partiQLHandler;
     private final Object importLock = new Object();
 
     @Inject
     public NativeDynamoDbJsonHandler(DynamoDbService dynamoDbService, NativeDynamoDbTableService tableService,
-                                     ObjectMapper objectMapper) {
+                                     ObjectMapper objectMapper,
+                                     DynamoDbReplicaAutoScalingService replicaAutoScalingService) {
         this.dynamoDbService = dynamoDbService;
         this.tableService = tableService;
+        this.replicaAutoScalingService = replicaAutoScalingService;
         this.objectMapper = objectMapper;
         this.partiQLHandler = new DynamoDbPartiQLHandler(dynamoDbService, objectMapper);
+    }
+
+    public NativeDynamoDbJsonHandler(DynamoDbService dynamoDbService, NativeDynamoDbTableService tableService,
+                                     ObjectMapper objectMapper) {
+        this(dynamoDbService, tableService, objectMapper, new DynamoDbReplicaAutoScalingService(dynamoDbService));
     }
 
     /** Package-private constructor for testing. */
@@ -101,6 +115,10 @@ public class NativeDynamoDbJsonHandler {
 
     public Response handle(String action, JsonNode request, String region) throws Exception {
         return switch (action) {
+            case "UpdateTableReplicaAutoScaling" -> Response.ok(replicaAutoScalingResponse(
+                    replicaAutoScalingService.update(ReplicaAutoScalingRequest.parse(request), region))).build();
+            case "DescribeTableReplicaAutoScaling" -> Response.ok(replicaAutoScalingResponse(
+                    replicaAutoScalingService.describe(ReplicaAutoScalingRequest.tableName(request), region))).build();
             case "CreateTable" -> handleCreateTable(request, region);
             case "DeleteTable" -> handleDeleteTable(request, region);
             case "DescribeTable" -> handleDescribeTable(request, region);
@@ -3339,6 +3357,68 @@ public class NativeDynamoDbJsonHandler {
 
         return Response.ok(kinesisDestinationResponse(
                 tableService.disableKinesisStreamingDestination(tableName, streamArn, region))).build();
+    }
+
+    private ObjectNode replicaAutoScalingResponse(Description value) {
+        ObjectNode response = objectMapper.createObjectNode();
+        ObjectNode description = response.putObject("TableAutoScalingDescription");
+        description.put("TableName", value.tableName());
+        description.put("TableStatus", value.tableStatus());
+        ArrayNode replicas = description.putArray("Replicas");
+        for (ReplicaDescription replica : value.replicas()) {
+            ObjectNode node = replicas.addObject();
+            node.put("RegionName", replica.region());
+            node.put("ReplicaStatus", replica.status());
+            autoScalingSettings(node, "ReplicaProvisionedReadCapacityAutoScalingSettings", replica.read());
+            autoScalingSettings(node, "ReplicaProvisionedWriteCapacityAutoScalingSettings", replica.write());
+            ArrayNode indexes = node.putArray("GlobalSecondaryIndexes");
+            for (IndexDescription index : replica.indexes()) {
+                ObjectNode indexNode = indexes.addObject();
+                indexNode.put("IndexName", index.name());
+                indexNode.put("IndexStatus", index.status());
+                autoScalingSettings(indexNode, "ProvisionedReadCapacityAutoScalingSettings", index.read());
+                autoScalingSettings(indexNode, "ProvisionedWriteCapacityAutoScalingSettings", index.write());
+            }
+        }
+        return response;
+    }
+
+    private static void autoScalingSettings(ObjectNode parent, String member, Settings settings) {
+        if (settings == null) {
+            return;
+        }
+        ObjectNode node = parent.putObject(member);
+        if (settings.minimumUnits() != null) {
+            node.put("MinimumUnits", settings.minimumUnits());
+        }
+        if (settings.maximumUnits() != null) {
+            node.put("MaximumUnits", settings.maximumUnits());
+        }
+        if (settings.disabled() != null) {
+            node.put("AutoScalingDisabled", settings.disabled());
+        }
+        if (settings.roleArn() != null) {
+            node.put("AutoScalingRoleArn", settings.roleArn());
+        }
+        Policy policy = settings.policy();
+        if (policy != null) {
+            ObjectNode policyNode = node.putArray("ScalingPolicies").addObject();
+            if (policy.name() != null) {
+                policyNode.put("PolicyName", policy.name());
+            }
+            TargetTracking target = policy.targetTracking();
+            ObjectNode targetNode = policyNode.putObject("TargetTrackingScalingPolicyConfiguration");
+            targetNode.put("TargetValue", target.targetValue());
+            if (target.disableScaleIn() != null) {
+                targetNode.put("DisableScaleIn", target.disableScaleIn());
+            }
+            if (target.scaleInCooldown() != null) {
+                targetNode.put("ScaleInCooldown", target.scaleInCooldown());
+            }
+            if (target.scaleOutCooldown() != null) {
+                targetNode.put("ScaleOutCooldown", target.scaleOutCooldown());
+            }
+        }
     }
 
     private Response handleUpdateKinesisStreamingDestination(JsonNode request, String region) {
