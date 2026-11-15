@@ -7,6 +7,8 @@ import io.github.hectorvent.floci.core.common.ProtocolClaim;
 import io.github.hectorvent.floci.core.common.RequestResources;
 import io.github.hectorvent.floci.core.common.V1TagsController;
 import io.github.hectorvent.floci.core.common.WireProtocol;
+import io.github.hectorvent.floci.services.account.AccountController;
+import io.github.hectorvent.floci.services.account.AccountRegionActions;
 import io.github.hectorvent.floci.services.amazonmq.AmazonMqConfigurationController;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayController;
 import io.github.hectorvent.floci.services.appconfig.AppConfigDataController;
@@ -811,6 +813,11 @@ public class IamActionRegistry {
         if ("cloudfront".equals(credentialScope) && resourceInfo != null
                 && CloudFrontFunctionTestController.class.equals(resourceInfo.getResourceClass())) {
             return "cloudfront:TestFunction";
+        }
+        if ("account".equals(credentialScope) && resourceInfo != null
+                && AccountController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            return AccountRegionActions.forMethod(resourceInfo.getResourceMethod().getName());
         }
         if ("appconfig".equals(credentialScope) && resourceInfo != null
                 && AppConfigDataController.class.equals(resourceInfo.getResourceClass())
