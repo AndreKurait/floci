@@ -14,6 +14,7 @@ import io.floci.aws.services.ecr.model.Image;
 import io.floci.aws.services.ecr.model.ImageDetail;
 import io.floci.aws.services.ecr.model.ImageFailure;
 import io.floci.aws.services.ecr.model.ImageIdentifier;
+import io.floci.aws.services.ecr.model.LifecyclePolicyPreview;
 import io.floci.aws.services.ecr.model.PullThroughCacheRule;
 import io.floci.aws.services.ecr.model.RegistrySettings;
 import io.floci.aws.services.ecr.model.Repository;
@@ -48,6 +49,7 @@ public class EcrJsonHandler {
 
     /** The actions whose requests are checked against the vendored model constraints first. */
     private static final Set<String> MODEL_CHECKED = Set.of(
+            "StartLifecyclePolicyPreview", "GetLifecyclePolicyPreview",
             "GetAccountSetting", "PutAccountSetting",
             "RegisterPullTimeUpdateExclusion", "DeregisterPullTimeUpdateExclusion", "ListPullTimeUpdateExclusions",
             "PutRegistryPolicy", "GetRegistryPolicy", "DeleteRegistryPolicy",
@@ -94,6 +96,8 @@ public class EcrJsonHandler {
             case "TagResource" -> handleTagResource(request, region);
             case "UntagResource" -> handleUntagResource(request, region);
             case "ListTagsForResource" -> handleListTagsForResource(request, region);
+            case "StartLifecyclePolicyPreview" -> handleStartLifecyclePolicyPreview(request, region);
+            case "GetLifecyclePolicyPreview" -> handleGetLifecyclePolicyPreview(request, region);
             case "PutLifecyclePolicy" -> handlePutLifecyclePolicy(request, region);
             case "GetLifecyclePolicy" -> handleGetLifecyclePolicy(request, region);
             case "DeleteLifecyclePolicy" -> handleDeleteLifecyclePolicy(request, region);
@@ -598,6 +602,47 @@ public class EcrJsonHandler {
     // ============================================================
     // Lifecycle + repository policies
     // ============================================================
+
+    private Response handleStartLifecyclePolicyPreview(JsonNode request, String region) {
+        EcrLifecyclePreviews.View result = service.startLifecyclePolicyPreview(
+                request.path("repositoryName").asText(null), request.path("registryId").asText(null),
+                request.path("lifecyclePolicyText").asText(null), region);
+        return Response.ok(previewResponse(result, false)).build();
+    }
+
+    private Response handleGetLifecyclePolicyPreview(JsonNode request, String region) {
+        EcrLifecyclePreviews.View result = service.getLifecyclePolicyPreview(
+                request.path("repositoryName").asText(null), request.path("registryId").asText(null),
+                parseImageIds(request.path("imageIds")), request.path("filter").path("tagStatus").asText(null),
+                request.path("maxResults").isIntegralNumber() ? request.path("maxResults").intValue() : null,
+                request.path("nextToken").asText(null), region);
+        return Response.ok(previewResponse(result, true)).build();
+    }
+
+    private ObjectNode previewResponse(EcrLifecyclePreviews.View result, boolean includeResults) {
+        ObjectNode response = objectMapper.createObjectNode();
+        response.put("registryId", result.registryId());
+        response.put("repositoryName", result.repositoryName());
+        response.put("lifecyclePolicyText", result.policy());
+        response.put("status", result.status());
+        if (includeResults) {
+            ArrayNode rows = response.putArray("previewResults");
+            for (LifecyclePolicyPreview.Result row : result.results()) {
+                ObjectNode value = rows.addObject();
+                value.put("imageDigest", row.imageDigest());
+                value.put("imagePushedAt", EpochSeconds.fromInstant(row.imagePushedAt()));
+                value.put("appliedRulePriority", row.appliedRulePriority());
+                ArrayNode tags = value.putArray("imageTags");
+                row.imageTags().forEach(tags::add);
+                value.putObject("action").put("type", "EXPIRE");
+            }
+            response.putObject("summary").put("expiringImageTotalCount", result.expiringCount());
+            if (result.nextToken() != null) {
+                response.put("nextToken", result.nextToken());
+            }
+        }
+        return response;
+    }
 
     private Response handlePutLifecyclePolicy(JsonNode request, String region) {
         String repo = request.path("repositoryName").asText(null);
