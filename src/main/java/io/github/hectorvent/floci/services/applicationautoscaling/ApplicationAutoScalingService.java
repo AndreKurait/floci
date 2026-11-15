@@ -5,9 +5,12 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.ServicePrincipals;
 import io.github.hectorvent.floci.core.common.SignedMarkers;
 import io.github.hectorvent.floci.core.common.StoredResourceArns;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend.AccountEntry;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.applicationautoscaling.model.Alarm;
@@ -27,6 +30,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -91,6 +95,7 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
     private final StorageBackend<String, ScalingActivity> activities;
     private final Object[] targetLocks = new Object[256];
     private final DynamoDbService dynamoDbService;
+    private final DynamoDbTargetTracking dynamoDbTargetTracking;
     private final RegionResolver regionResolver;
     private final CloudWatchMetricsService cloudWatchMetricsService;
     private final LambdaCapacityAdjuster lambdaCapacity;
@@ -126,6 +131,7 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
         }
         this.regionResolver = regionResolver;
         this.cloudWatchMetricsService = cloudWatchMetricsService;
+        this.dynamoDbTargetTracking = new DynamoDbTargetTracking(this, dynamoDbService, cloudWatchMetricsService, Clock.systemUTC());
         this.lambdaCapacity = lambdaCapacity;
     }
 
@@ -322,6 +328,20 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
                                           String resourceId, String scalableDimension,
                                           TargetTrackingConfiguration targetTracking,
                                           StepScalingConfiguration stepScaling, String region) {
+        if (DynamoDbRegistrationTarget.supports(serviceNamespace, scalableDimension)) {
+            synchronized (targetLock(region, serviceNamespace, resourceId, scalableDimension)) {
+                return putScalingPolicyCurrent(policyName, policyType, serviceNamespace, resourceId,
+                        scalableDimension, targetTracking, stepScaling, region);
+            }
+        }
+        return putScalingPolicyCurrent(policyName, policyType, serviceNamespace, resourceId,
+                scalableDimension, targetTracking, stepScaling, region);
+    }
+
+    private ScalingPolicy putScalingPolicyCurrent(String policyName, String policyType, String serviceNamespace,
+                                          String resourceId, String scalableDimension,
+                                          TargetTrackingConfiguration targetTracking,
+                                          StepScalingConfiguration stepScaling, String region) {
         validateTriple(serviceNamespace, resourceId, scalableDimension);
         if (policyName == null || policyName.isBlank()) {
             throw new AwsException("ValidationException", "PolicyName is required.", 400);
@@ -345,7 +365,19 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
         String key = policyKey(region, serviceNamespace, resourceId, scalableDimension, policyName);
         ScalingPolicy existing = policies.get(key).orElse(null);
 
-        ScalingPolicy policy = existing != null ? existing : new ScalingPolicy();
+        boolean dynamoPolicy = DynamoDbRegistrationTarget.supports(serviceNamespace, scalableDimension);
+        if (dynamoPolicy) {
+            if (policyType == null) {
+                if (existing == null) {
+                    throw new AwsException("ValidationException", "Scaling policy type must be specified", 400);
+                }
+                policyType = existing.getPolicyType();
+            }
+            targetTracking = DynamoDbTargetTracking.resolveConfiguration(targetTracking,
+                    existing == null ? null : existing.getTargetTrackingConfiguration());
+        }
+        ScalingPolicy policy = existing == null ? new ScalingPolicy()
+                : dynamoPolicy ? DynamoDbTargetTracking.copyPolicy(existing) : existing;
         policy.setPolicyName(policyName);
         policy.setPolicyType(policyType != null ? policyType : "StepScaling");
         policy.setServiceNamespace(serviceNamespace);
@@ -358,16 +390,58 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
             policy.setPolicyArn(buildPolicyArn(region, serviceNamespace, resourceId, policyName));
         }
 
-        if (existing != null) {
-            deleteAlarms(existing, region);
-        }
-        if ("TargetTrackingScaling".equals(policy.getPolicyType())) {
-            policy.setAlarms(createTargetTrackingAlarms(policy, region));
-        } else {
-            policy.setAlarms(new ArrayList<>());
+        if (dynamoPolicy) {
+            DynamoDbTargetTracking.validateAdmission(policy);
+            if (existing != null && DynamoDbTargetTracking.supports(existing)
+                    && DynamoDbTargetTracking.sameTargetTrackingConfiguration(
+                            existing.getTargetTrackingConfiguration(), policy.getTargetTrackingConfiguration())) {
+                return DynamoDbTargetTracking.copyPolicy(existing);
+            }
         }
 
-        policies.put(key, policy);
+        try {
+            if (DynamoDbTargetTracking.supports(policy)) {
+                policy.setAlarms(dynamoDbTargetTracking.createAlarms(policy, existing, region));
+            } else {
+                if (existing != null) {
+                    deleteAlarms(existing, region);
+                }
+                if ("TargetTrackingScaling".equals(policy.getPolicyType())) {
+                    policy.setAlarms(createTargetTrackingAlarms(policy, region));
+                } else {
+                    policy.setAlarms(new ArrayList<>());
+                }
+            }
+            policies.put(key, policy);
+        } catch (RuntimeException failure) {
+            if (dynamoPolicy) {
+                try {
+                    if (existing == null) {
+                        policies.delete(key);
+                    } else {
+                        policies.put(key, existing);
+                    }
+                } catch (RuntimeException restorationFailure) {
+                    failure.addSuppressed(restorationFailure);
+                }
+                dynamoDbTargetTracking.deleteNewAlarms(policy, existing, region, failure);
+                if (existing != null && DynamoDbTargetTracking.supports(existing)) {
+                    try {
+                        dynamoDbTargetTracking.reconcile(existing, region);
+                    } catch (RuntimeException restorationFailure) {
+                        failure.addSuppressed(restorationFailure);
+                    }
+                }
+            }
+            throw failure;
+        }
+        if (dynamoPolicy && existing != null && DynamoDbTargetTracking.supports(policy)) {
+            List<String> retained = policy.getAlarms().stream().map(Alarm::getAlarmName).toList();
+            ScalingPolicy obsolete = DynamoDbTargetTracking.copyPolicy(existing);
+            obsolete.setAlarms(existing.getAlarms().stream()
+                    .filter(alarm -> !retained.contains(alarm.getAlarmName())).toList());
+            deleteAlarms(obsolete, region);
+        }
         LOG.infov("PutScalingPolicy: {0} ({1}) for {2} {3} in {4}",
                 policyName, policy.getPolicyType(), serviceNamespace, resourceId, region);
         return policy;
@@ -404,6 +478,17 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
     }
 
     public void deleteScalingPolicy(String policyName, String serviceNamespace, String resourceId,
+                                    String scalableDimension, String region) {
+        if (DynamoDbRegistrationTarget.supports(serviceNamespace, scalableDimension)) {
+            synchronized (targetLock(region, serviceNamespace, resourceId, scalableDimension)) {
+                deleteScalingPolicyCurrent(policyName, serviceNamespace, resourceId, scalableDimension, region);
+            }
+            return;
+        }
+        deleteScalingPolicyCurrent(policyName, serviceNamespace, resourceId, scalableDimension, region);
+    }
+
+    private void deleteScalingPolicyCurrent(String policyName, String serviceNamespace, String resourceId,
                                     String scalableDimension, String region) {
         validateTriple(serviceNamespace, resourceId, scalableDimension);
         if (policyName == null || policyName.isBlank()) {
@@ -857,6 +942,61 @@ public class ApplicationAutoScalingService implements StoredResourceArns {
         return policies.scan(k -> k.startsWith(prefix)).stream()
                 .filter(p -> policyArn.equals(p.getPolicyArn()))
                 .findFirst();
+    }
+
+    void executeDynamoDbPolicy(ScalingPolicy policy, ScalableTarget target, MetricAlarm alarm,
+                              double metricValue, String region) {
+        synchronized (targetLock(region, policy.getServiceNamespace(), policy.getResourceId(),
+                policy.getScalableDimension())) {
+            ScalingPolicy current = findPolicyByArn(policy.getPolicyArn(), region).orElse(null);
+            if (current == null || !DynamoDbTargetTracking.supports(current)) {
+                return;
+            }
+            ScalableTarget currentTarget = findTarget(region, current.getServiceNamespace(),
+                    current.getResourceId(), current.getScalableDimension()).orElse(null);
+            if (currentTarget != null) {
+                dynamoDbTargetTracking.execute(current, currentTarget, alarm, metricValue, region);
+            }
+        }
+    }
+
+    /** Each candidate is re-read under its owner and target lock before any alarm publication. */
+    public void reconcileDynamoDbPolicies(Instant ignored) {
+        List<AccountEntry<ScalingPolicy>> entries;
+        if (policies instanceof AccountAwareStorageBackend<ScalingPolicy> accountAware) {
+            entries = accountAware.scanAllAccountEntries(key -> true);
+        } else {
+            entries = policies.keys().stream().map(key -> new AccountEntry<>(regionResolver.getAccountId(), key,
+                    policies.get(key).orElseThrow())).toList();
+        }
+        for (AccountEntry<ScalingPolicy> entry : entries) {
+            ScalingPolicy candidate = entry.value();
+            if (!DynamoDbTargetTracking.supports(candidate)) {
+                continue;
+            }
+            int separator = entry.key().indexOf("::");
+            if (separator <= 0) {
+                continue;
+            }
+            String region = entry.key().substring(0, separator);
+            try {
+                RequestScopes.runAs(entry.accountId(), region, () -> {
+                    synchronized (targetLock(region, candidate.getServiceNamespace(), candidate.getResourceId(),
+                            candidate.getScalableDimension())) {
+                        ScalingPolicy current = policies.get(entry.key()).orElse(null);
+                        if (current == null || !candidate.getPolicyArn().equals(current.getPolicyArn())
+                                || !DynamoDbTargetTracking.supports(current)
+                                || findTarget(region, current.getServiceNamespace(), current.getResourceId(),
+                                        current.getScalableDimension()).isEmpty()) {
+                            return;
+                        }
+                        dynamoDbTargetTracking.reconcile(current, region);
+                    }
+                });
+            } catch (RuntimeException failure) {
+                LOG.warnv(failure, "Could not reconcile DynamoDB scaling policy {0}", candidate.getPolicyArn());
+            }
+        }
     }
 
     /** Persists a policy after the control loop stamps a cooldown timestamp on it. */

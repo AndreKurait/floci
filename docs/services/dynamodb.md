@@ -249,8 +249,8 @@ reconstructing an exact time-weighted history.
 
 This covers the eight native item APIs. Transactions, PartiQL, TTL, imports,
 DynamoDB Local and vector-specific metrics are separate paths. It supplies metrics
-for local workloads; DynamoDB policy-driven Application Auto Scaling adjustment
-is not implemented by this producer.
+for local workloads. Matching predefined policies use those real metrics through
+[Application Auto Scaling target tracking](applicationautoscaling.md#native-dynamodb-target-tracking).
 
 ## DynamoDB Local backend
 
