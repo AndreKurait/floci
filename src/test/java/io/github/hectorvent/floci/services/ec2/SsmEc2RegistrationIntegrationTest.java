@@ -122,6 +122,26 @@ class SsmEc2RegistrationIntegrationTest {
     }
 
     @Test
+    void lowercasePublicKeyTypeRemainsCompatible() throws Exception {
+        String body = mapper.writeValueAsString(Map.of("Fingerprint", instance.getInstanceId(),
+                "PublicKey", publicKey, "PublicKeyType", "rsa"));
+        signed("RegisterManagedInstance", REGION, body, body, false).then().defaultParser(Parser.JSON)
+                .statusCode(200).body("InstanceId", equalTo(instance.getInstanceId()));
+    }
+
+    @Test
+    void officialKeyTypeStillRejectsWeakAndNonRsaPublicKeys() throws Exception {
+        for (String algorithm : List.of("RSA", "EC")) {
+            KeyPairGenerator keys = KeyPairGenerator.getInstance(algorithm);
+            keys.initialize("RSA".equals(algorithm) ? 1024 : 256);
+            String key = Base64.getEncoder().encodeToString(keys.generateKeyPair().getPublic().getEncoded());
+            String body = registration(instance.getInstanceId(), key);
+            signed("RegisterManagedInstance", REGION, body, body, false).then().defaultParser(Parser.JSON)
+                    .statusCode(400).body("__type", equalTo("ValidationException"));
+        }
+    }
+
+    @Test
     void registrationDoesNotReportTheAgentOnlineBeforeItsHeartbeat() throws Exception {
         String body = registration(instance.getInstanceId(), publicKey);
         signed("RegisterManagedInstance", REGION, body, body, false).then().statusCode(200);
@@ -206,7 +226,9 @@ class SsmEc2RegistrationIntegrationTest {
         for (Map<String, String> fields : List.of(
                 Map.of("Fingerprint", instance.getInstanceId(), "PublicKey", publicKey),
                 Map.of("Fingerprint", instance.getInstanceId(), "PublicKey", publicKey, "KeyType", "rsa"),
-                Map.of("Fingerprint", instance.getInstanceId(), "PublicKey", publicKey, "PublicKeyType", "ecc"))) {
+                Map.of("Fingerprint", instance.getInstanceId(), "PublicKey", publicKey, "PublicKeyType", "ecc"),
+                Map.of("Fingerprint", instance.getInstanceId(), "PublicKey", publicKey, "PublicKeyType", "RSA"),
+                Map.of("Fingerprint", instance.getInstanceId(), "PublicKey", publicKey, "PublicKeyType", "rSa"))) {
             String body = mapper.writeValueAsString(fields);
             signed("RegisterManagedInstance", REGION, body, body, false).then().defaultParser(Parser.JSON)
                     .statusCode(400).body("__type", equalTo("ValidationException"));
@@ -214,9 +236,9 @@ class SsmEc2RegistrationIntegrationTest {
     }
 
     private String registration(String instanceId, String key) throws Exception {
-        // amazon-ssm-agent authregister_client.go sends the EC2 instance ID as Fingerprint.
-        // Source: aws/amazon-ssm-agent@2f0fe3497d95ca586b61e973448eca116cd12987.
-        return mapper.writeValueAsString(Map.of("Fingerprint", instanceId, "PublicKey", key, "PublicKeyType", "rsa"));
+        // amazon-ssm-agent 3.3.5700.0 sends Fingerprint and auth.KeyType = "Rsa" unchanged.
+        // Its auth/rsa_key.go encodes the RSA public key as base64 X.509 SubjectPublicKeyInfo.
+        return mapper.writeValueAsString(Map.of("Fingerprint", instanceId, "PublicKey", key, "PublicKeyType", "Rsa"));
     }
 
     private Response signed(String operation, String region, String signedBody, String sentBody, boolean forged) {

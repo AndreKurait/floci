@@ -67,7 +67,7 @@ public class SsmEc2RegistrationService {
         String publicKey = request.path("PublicKey").asText("");
         if ((!"Rsa".equals(keyType) && !"rsa".equals(keyType)) || !validPublicKey(publicKey)) {
             throw new AwsException("ValidationException",
-                    "PublicKey must be an RSA public key and PublicKeyType must be Rsa.", 400);
+                    "PublicKey must be an RSA public key and PublicKeyType must be Rsa or rsa.", 400);
         }
         if (iam.ec2InstanceIdentitySession(verified.getAccessKeyId()).orElse(null) != verified
                 || context.getVerifiedSession() != verified) {

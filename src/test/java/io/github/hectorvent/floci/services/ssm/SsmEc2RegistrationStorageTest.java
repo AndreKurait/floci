@@ -60,7 +60,7 @@ class SsmEc2RegistrationStorageTest {
         keys.initialize(2048);
         String key = Base64.getEncoder().encodeToString(keys.generateKeyPair().getPublic().getEncoded());
         JsonNode request = new ObjectMapper().valueToTree(
-                Map.of("Fingerprint", INSTANCE_ID, "PublicKey", key, "PublicKeyType", "rsa"));
+                Map.of("Fingerprint", INSTANCE_ID, "PublicKey", key, "PublicKeyType", "Rsa"));
 
         StorageFactory factory = StorageFactories.open(directory, mode, ACCOUNT);
         SsmEc2RegistrationService.Registration registered;
@@ -69,6 +69,7 @@ class SsmEc2RegistrationStorageTest {
             assertEquals(Map.of("InstanceId", INSTANCE_ID), service.register(request, REGION));
             AccountAwareStorageBackend<SsmEc2RegistrationService.Registration> store = registrations(factory);
             registered = store.getForAccount(ACCOUNT, REGION + "::" + INSTANCE_ID).orElseThrow();
+            assertEquals("Rsa", registered.keyType());
             service.register(request, REGION);
             assertEquals(registered, store.getForAccount(ACCOUNT, REGION + "::" + INSTANCE_ID).orElseThrow());
             assertTrue(store.getForAccount("111111111111", REGION + "::" + INSTANCE_ID).isEmpty());

@@ -116,8 +116,9 @@ running instance in the request's account and region. Signature verification
 applies even when global signature validation is disabled. These credentials
 receive no general IAM or SSM permissions.
 
-The EC2 agent supplies its instance ID as `Fingerprint`, `PublicKeyType=rsa` and an RSA `PublicKey` of at
-least 2048 bits, encoded as base64 X.509 DER or a `PUBLIC KEY` PEM block.
+The EC2 agent supplies its instance ID as `Fingerprint`, `PublicKeyType=Rsa` and an RSA `PublicKey` of at
+least 2048 bits, encoded as base64 X.509 DER or a `PUBLIC KEY` PEM block. The existing lowercase
+`rsa` key type remains supported; other spellings and key algorithms are rejected.
 Registration uses the existing SSM storage mode, and an identical retry preserves
 the registration time. It does not mark the agent online; that requires its
 subsequent `UpdateInstanceInformation` heartbeat. Activation-based hybrid
