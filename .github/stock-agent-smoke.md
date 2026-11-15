@@ -16,11 +16,19 @@ verification calls with local test credentials and the generated CA, so the
 Floci image does not need to contain AWS CLI. The Docker endpoint is read from
 the active Docker context and must be a local socket.
 
-Success requires the agent to register, discover a tag-targeted State Manager
+Success requires fresh EC2 identity-key registration in the current guest boot,
+then the agent to report Online, discover a tag-targeted State Manager
 association, execute it, report success, and publish inventory containing its
 installed agent package. The driver never registers a managed node or submits
 inventory on the agent's behalf. API teardown and the original Docker
 container/network/volume footprint must also pass.
+
+The registration gate requires the pinned agent's `EC2 registration was successful.`
+event after its fresh-registration event in the same container boot. The agent emits
+this only after the native API call succeeds and local registration is persisted.
+Instance-profile Online heartbeats and inventory alone do not qualify this gate;
+the agent can continue those operations while registration retries in the background.
+The receipt records `ec2_identity_registration_verified` separately.
 
 Run it on a dedicated Linux x86_64 Docker daemon with Python 3:
 
