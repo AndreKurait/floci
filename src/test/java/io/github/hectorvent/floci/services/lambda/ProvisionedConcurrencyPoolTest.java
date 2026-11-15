@@ -1687,7 +1687,7 @@ class ProvisionedConcurrencyPoolTest {
         Environment failed = launched();
         held.initialized.complete(null);
         failed.initialized.complete(null);
-        ready();
+        awaitAvailable(2);
         held.stopGate = new CompletableFuture<>();
         launcher.stopFailures.set(1);
         CompletableFuture<Void> drained = CompletableFuture.runAsync(pool::stopManagedContainers);
