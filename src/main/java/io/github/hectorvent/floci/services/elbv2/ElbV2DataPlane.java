@@ -1873,10 +1873,14 @@ public class ElbV2DataPlane {
         if (template == null) {
             return "";
         }
+        String pathComponent = path != null ? path : "";
+        if (pathComponent.startsWith("/")) {
+            pathComponent = pathComponent.substring(1);
+        }
         String result = template
                 .replace("#{host}", host != null ? host : "")
                 .replace("#{port}", port != null ? port : "")
-                .replace("#{path}", path != null ? path : "/")
+                .replace("#{path}", pathComponent)
                 .replace("#{protocol}", protocol != null ? protocol : "HTTP");
         if (query != null && !query.isEmpty()) {
             result = result.replace("#{query}", query);
