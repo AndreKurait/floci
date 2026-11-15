@@ -259,6 +259,10 @@ final class S3PublicAccessEvaluator {
             while (entries.hasNext()) {
                 Map.Entry<String, JsonNode> entry = entries.next();
                 String key = entry.getKey().toLowerCase(Locale.ROOT);
+                if ("aws:principalarn".equals(key)
+                        && principalArnEqualityPinsAccess(operatorName, entry.getValue())) {
+                    return true;
+                }
                 if (DATA_ACCESS_POINT_ARN_CONDITION_KEY.equals(key)
                         && allValuesFixed(entry.getValue(), S3PublicAccessEvaluator::isFixedAccountAccessPointArn)) {
                     return true;
@@ -276,6 +280,19 @@ final class S3PublicAccessEvaluator {
             }
         }
         return false;
+    }
+
+    private static boolean principalArnEqualityPinsAccess(String operator, JsonNode value) {
+        if (!"StringEquals".equalsIgnoreCase(operator) && !"ArnEquals".equalsIgnoreCase(operator)) {
+            return false;
+        }
+        // A signed principal has a non-empty ARN; anonymous requests omit the key, which cannot
+        // satisfy positive equality. Empty alternatives therefore grant nobody, including the
+        // empty default principal list in a bootstrap policy. Optional/negated operators cannot
+        // use this rule, and a wildcard or variable in another alternative still makes it public.
+        return value != null && (value.isArray() && value.isEmpty()
+                || allValuesFixed(value, candidate ->
+                        candidate.isEmpty() || PublicAccessConditions.isFixedValue(candidate)));
     }
 
     private static boolean operatorNarrowsAccess(String operator) {
