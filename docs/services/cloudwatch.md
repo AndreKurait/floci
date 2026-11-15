@@ -274,6 +274,13 @@ regex quotas remain enforced; a total subscription count quota and Lambda filter
 messages are not implemented. Existing direct Kinesis/Firehose role handling remains outside this
 logical-destination implementation.
 
+`AWS::Logs::SubscriptionFilter` manages these native filter definitions through CloudFormation.
+Its name and log group form the stored identity; `Ref` returns the name. Mutable updates retain
+creation time. Replacement deletes the old filter first, even with `UpdateReplacePolicy: Retain`,
+and failed updates retain the full prior definition for rollback. The provider uses the same
+validated same-account Lambda and logical Logs destination admission as the native API.
+Direct role-backed destinations, `RoleArn`, and the three advanced CFN properties remain unsupported.
+
 ### Metric filters {#metric-filters}
 
 A metric filter turns newly ingested log events into CloudWatch metric samples. Each matching
