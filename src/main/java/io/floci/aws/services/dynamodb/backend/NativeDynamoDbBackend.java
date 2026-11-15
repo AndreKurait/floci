@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.core.common.RequestScopes;
 import io.floci.aws.core.resource.ExplorerResource;
+import io.floci.aws.services.dynamodb.DynamoDbCapacityMetrics;
 import io.floci.aws.services.dynamodb.DynamoDbService;
 import io.floci.aws.services.dynamodb.DynamoDbStreamService;
 import io.floci.aws.services.dynamodb.DynamoDbTtlService;
@@ -40,13 +41,25 @@ public class NativeDynamoDbBackend implements DynamoDbBackend {
     private final DynamoDbStreamService streamService;
     private final DynamoDbTtlService ttlService;
     private final ObjectMapper objectMapper;
+    private final DynamoDbCapacityMetrics capacityMetrics;
+
+    public NativeDynamoDbBackend(NativeDynamoDbJsonHandler jsonHandler,
+                                 NativeDynamoDbStreamsJsonHandler streamsHandler,
+                                 NativeDynamoDbTableService tableService,
+                                 DynamoDbService dynamoDbService, DynamoDbStreamService streamService,
+                                 DynamoDbTtlService ttlService, ObjectMapper objectMapper) {
+        this(jsonHandler, streamsHandler, tableService, dynamoDbService, streamService,
+                ttlService, objectMapper, null);
+    }
 
     @Inject
     public NativeDynamoDbBackend(NativeDynamoDbJsonHandler jsonHandler,
                                  NativeDynamoDbStreamsJsonHandler streamsHandler,
                                  NativeDynamoDbTableService tableService,
                                  DynamoDbService dynamoDbService, DynamoDbStreamService streamService,
-                                 DynamoDbTtlService ttlService, ObjectMapper objectMapper) {
+                                 DynamoDbTtlService ttlService, ObjectMapper objectMapper,
+                                 DynamoDbCapacityMetrics capacityMetrics) {
+        this.capacityMetrics = capacityMetrics;
         this.jsonHandler = jsonHandler;
         this.streamsHandler = streamsHandler;
         this.tableService = tableService;
@@ -65,6 +78,9 @@ public class NativeDynamoDbBackend implements DynamoDbBackend {
         ClientProxy.unwrap(dynamoDbService);
         ClientProxy.unwrap(streamService);
         ttlService.start();
+        if (capacityMetrics != null) {
+            capacityMetrics.start();
+        }
     }
 
     /** A native reset is always allowed. */
@@ -89,6 +105,9 @@ public class NativeDynamoDbBackend implements DynamoDbBackend {
 
     @Override
     public void stop() {
+        if (capacityMetrics != null) {
+            capacityMetrics.stop();
+        }
         ttlService.stop();
         dynamoDbService.stopKinesisForwarding();
     }

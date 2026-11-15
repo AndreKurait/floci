@@ -70,9 +70,11 @@ class DynamoDbNativeBackendTest {
             stores.add(store);
             return store;
         });
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().dynamodb().backend()).thenReturn("native");
         DynamoDbStreamService streams = new DynamoDbStreamService(mapper, storageFactory);
         DynamoDbService service = new DynamoDbService(storageFactory, new RegionResolver(REGION, ACCOUNT), streams,
-                forwarder, null, mapper, mock(EmulatorConfig.class, RETURNS_DEEP_STUBS));
+                forwarder, null, mapper, config);
         NativeDynamoDbTableService tables = new NativeDynamoDbTableService(service, streams, mock(KinesisService.class));
         backend = new NativeDynamoDbBackend(new NativeDynamoDbJsonHandler(service, tables, mapper, mock(EmulatorConfig.class)),
                 new NativeDynamoDbStreamsJsonHandler(streams, service, new RegionResolver(REGION, ACCOUNT), mapper),
