@@ -327,14 +327,29 @@ public class EcrJsonHandler {
     }
 
     private Response handleGetAuthorizationToken(JsonNode request) {
-        AuthorizationData data = service.getAuthorizationToken();
+        JsonNode ids = request.get("registryIds");
+        List<String> registryIds = null;
+        if (ids != null && !ids.isNull()) {
+            if (!ids.isArray()) {
+                throw new AwsException("InvalidParameterException", "registryIds must be an array", 400);
+            }
+            registryIds = new ArrayList<>();
+            for (JsonNode id : ids) {
+                if (!id.isTextual()) {
+                    throw new AwsException("InvalidParameterException", "registryIds must contain account ID strings", 400);
+                }
+                registryIds.add(id.asText());
+            }
+        }
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode arr = objectMapper.createArrayNode();
-        ObjectNode entry = objectMapper.createObjectNode();
-        entry.put("authorizationToken", data.getAuthorizationToken());
-        entry.put("expiresAt", data.getExpiresAt().getEpochSecond());
-        entry.put("proxyEndpoint", data.getProxyEndpoint());
-        arr.add(entry);
+        for (AuthorizationData data : service.getAuthorizationToken(registryIds)) {
+            ObjectNode entry = objectMapper.createObjectNode();
+            entry.put("authorizationToken", data.getAuthorizationToken());
+            entry.put("expiresAt", data.getExpiresAt().getEpochSecond());
+            entry.put("proxyEndpoint", data.getProxyEndpoint());
+            arr.add(entry);
+        }
         response.set("authorizationData", arr);
         return Response.ok(response).build();
     }

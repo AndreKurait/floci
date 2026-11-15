@@ -977,4 +977,23 @@ class EcrRegistryDataPlaneTest {
     }
 
     private record RegistryResponse(int status, String contentType, String apiVersion, String body) {}
+    @Test
+    void nativeRegistryHostAndMirrorNamespaceKeepAccountRegionRouting() {
+        EcrRegistryDataPlane.RegistryRequest request = EcrRegistryDataPlane.requestFor("123456789012.dkr.ecr.cn-north-1.amazonaws.com.cn",
+                "/v2/team/image/manifests/latest", null, "hostname").orElseThrow();
+        assertEquals("/v2/123456789012/cn-north-1/team/image/manifests/latest", request.backendUri());
+        EcrRegistryDataPlane.RegistryRequest mirror = EcrRegistryDataPlane.requestFor("localhost:4566", "/v2/team/image/manifests/latest",
+                "ns=123456789012.dkr.ecr.us-east-1.amazonaws.com", "hostname").orElseThrow();
+        assertEquals("/v2/123456789012/us-east-1/team/image/manifests/latest", mirror.backendUri());
+    }
+
+    @Test
+    void nativeRegistryRoutingRejectsForeignSuffixAndWrongPartition() {
+        for (String host : List.of("123456789012.dkr.ecr.cn-north-1.amazonaws.com",
+                "123456789012.dkr.ecr.us-east-1.amazonaws.com.evil.example",
+                "123456789012.dkr.ecr.us-east-1.amazonaws.com:1234")) {
+            assertTrue(EcrRegistryDataPlane.requestFor(host, "/v2/team/image/manifests/latest", null, "hostname").isEmpty());
+        }
+    }
+
 }

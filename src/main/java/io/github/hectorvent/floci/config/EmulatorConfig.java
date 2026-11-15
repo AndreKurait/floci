@@ -3258,6 +3258,10 @@ public interface EmulatorConfig {
         @WithDefault("hostname")
         String uriStyle();
 
+        /** Advertise AWS registry hostnames over HTTPS/443; the caller supplies private DNS and trusted TLS routing. */
+        @WithDefault("false")
+        boolean nativeUri();
+
         /** Advertise TLS registry hostnames when Floci's global TLS listener is enabled. */
         @WithDefault("false")
         boolean tlsUri();
