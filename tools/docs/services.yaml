@@ -37,6 +37,7 @@ services:
     doc: docs/services/athena.md
     sources:
       - { path: services/athena/AthenaJsonHandler.java, mode: switch }
+      - { path: services/athena/AthenaPreparedStatementHandler.java, mode: switch }
   - service: bedrock
     doc: docs/services/bedrock.md
     sources:
