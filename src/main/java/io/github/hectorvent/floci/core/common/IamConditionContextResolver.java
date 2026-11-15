@@ -19,6 +19,7 @@ import io.github.hectorvent.floci.services.dynamodb.model.TableDefinition;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.LaunchTemplate;
 import io.github.hectorvent.floci.services.ec2.model.Tag;
+import io.github.hectorvent.floci.services.eks.EksAccessEntryUpdateConditions;
 import io.github.hectorvent.floci.services.elbv2.ElbV2ConditionKeys;
 import io.github.hectorvent.floci.services.iam.IamActionRegistry;
 import io.github.hectorvent.floci.services.iam.IamService;
@@ -126,6 +127,7 @@ public class IamConditionContextResolver {
     private final CurrentVertxRequest currentVertxRequest;
     private final Clock clock;
     private final Instance<AthenaBatchQueryService> athenaBatchQueryService;
+    private final Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates;
     private final ResolvedServiceCatalog serviceCatalog;
 
     /**
@@ -149,12 +151,14 @@ public class IamConditionContextResolver {
                                        Instance<LambdaService> lambdaService,
                                        Instance<AthenaPreparedStatementService> athenaPreparedStatements,
                                        Instance<KinesisService> kinesisService,
-                                       Instance<AthenaBatchQueryService> athenaBatchQueryService) {
+                                       Instance<AthenaBatchQueryService> athenaBatchQueryService,
+                                       Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
                 config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService,
                 elbV2ConditionKeys, mqConfigurations, lambdaService, athenaPreparedStatements,
                 kinesisService,
-                athenaBatchQueryService);
+                athenaBatchQueryService,
+                eksAccessEntryUpdates);
     }
 
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -172,6 +176,7 @@ public class IamConditionContextResolver {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
                 config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys, null, null, null,
                 null,
+                null,
                 null);
     }
 
@@ -188,6 +193,7 @@ public class IamConditionContextResolver {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
                 config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), null, null, null, null, null,
                 null,
+                null,
                 null);
     }
 
@@ -203,6 +209,7 @@ public class IamConditionContextResolver {
                                 ResolvedServiceCatalog serviceCatalog, Clock clock) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
                 config, currentVertxRequest, serviceCatalog, clock, null, null, null, null, null,
+                null,
                 null,
                 null);
     }
@@ -223,7 +230,8 @@ public class IamConditionContextResolver {
                                         Instance<LambdaService> lambdaService,
                                         Instance<AthenaPreparedStatementService> athenaPreparedStatements,
                                         Instance<KinesisService> kinesisService,
-                                        Instance<AthenaBatchQueryService> athenaBatchQueryService) {
+                                        Instance<AthenaBatchQueryService> athenaBatchQueryService,
+                                        Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates) {
         this.mqConfigurations = mqConfigurations;
         this.lambdaService = lambdaService;
         this.athenaPreparedStatements = athenaPreparedStatements;
@@ -242,6 +250,7 @@ public class IamConditionContextResolver {
         this.serviceCatalog = serviceCatalog;
         this.kinesisService = kinesisService;
         this.athenaBatchQueryService = athenaBatchQueryService;
+        this.eksAccessEntryUpdates = eksAccessEntryUpdates;
     }
 
     private Map<String, List<String>> athenaPreparedStatementConditions(String action, ContainerRequestContext ctx) {
@@ -297,6 +306,8 @@ public class IamConditionContextResolver {
             case "ssm" -> ssmSyncConditionContext(action, ctx);
             case "athena" -> athenaPreparedStatementConditions(action, ctx);
             case "kinesis" -> kinesisConditionContext(action, ctx);
+            case "eks" -> "eks:UpdateAccessEntry".equals(action) && eksAccessEntryUpdates != null
+                    && eksAccessEntryUpdates.isResolvable() ? eksAccessEntryUpdates.get().resolve(ctx) : null;
             case "redshift" -> redshiftConditionContext(action, ctx);
             case "states" -> stepFunctionsConditionContext(action, ctx);
             default -> null;
