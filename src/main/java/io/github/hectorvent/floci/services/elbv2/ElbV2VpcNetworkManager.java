@@ -102,8 +102,8 @@ public class ElbV2VpcNetworkManager implements ContainerTeardown, Resettable {
                     throw failure;
                 }
                 // A previous deletion can finish before its updated owner record is saved.
-                removeSavedHelpers(arn, eniId);
                 firewall.unregister(eniId);
+                removeSavedHelpers(arn, eniId);
                 balancer.getBackendNetworkInterfaceIds().remove(eniId);
                 persist.run();
             }
@@ -129,6 +129,7 @@ public class ElbV2VpcNetworkManager implements ContainerTeardown, Resettable {
                 ec2.setNetworkInterfaceGroupsForService(region, eni.getNetworkInterfaceId(), groups);
                 Attachment attachment = live.remove(eni.getNetworkInterfaceId());
                 if (attachment == null) {
+                    firewall.unregister(eni.getNetworkInterfaceId());
                     removeSavedHelpers(arn, eni.getNetworkInterfaceId());
                     attachment = prepare(account, region, arn, eni, groups);
                 } else {
@@ -176,8 +177,8 @@ public class ElbV2VpcNetworkManager implements ContainerTeardown, Resettable {
             return attachment;
         } catch (RuntimeException failure) {
             try {
-                lifecycle.removeIfExistsStrict(namespace.helperId());
                 firewall.unregister(eni.getNetworkInterfaceId());
+                lifecycle.removeIfExistsStrict(namespace.helperId());
             } catch (RuntimeException cleanupFailure) {
                 failure.addSuppressed(cleanupFailure);
             }
@@ -218,8 +219,8 @@ public class ElbV2VpcNetworkManager implements ContainerTeardown, Resettable {
     }
 
     private void releaseInterface(LoadBalancer balancer, String eniId, Runnable persist) {
-        removeSavedHelpers(balancer.getLoadBalancerArn(), eniId);
         firewall.unregister(eniId);
+        removeSavedHelpers(balancer.getLoadBalancerArn(), eniId);
         ec2.releaseNetworkInterfaceFromService(balancer.getRegion(), eniId);
         try {
             ec2.deleteNetworkInterface(balancer.getRegion(), eniId);

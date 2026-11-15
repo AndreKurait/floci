@@ -14,9 +14,11 @@ import org.junit.jupiter.api.Test;
 import org.mockito.InOrder;
 
 import java.net.Proxy;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -26,6 +28,7 @@ import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
@@ -91,6 +94,59 @@ class ElbV2VpcNetworkManagerTest {
             assertThrows(IllegalArgumentException.class,
                     () -> ElbV2VpcNetworkManager.proxyConfiguration("172.18.0.2", "172.18.0.3", input));
         }
+    }
+
+    @Test
+    void policyRetirementCanStillWriteToTheHelperNamespace() {
+        DockerClient docker = nativeDocker();
+        Container helper = helper("first", "this-run/4566", "elbv2");
+        when(docker.listContainersCmd().withShowAll(true).withLabelFilter(anyMap()).exec())
+                .thenReturn(List.of(helper));
+        LoadBalancer balancer = storedLoadBalancer();
+        AtomicBoolean helperExists = new AtomicBoolean(true);
+        AtomicBoolean persisted = new AtomicBoolean();
+        doAnswer(invocation -> {
+            helperExists.set(false);
+            return null;
+        }).when(lifecycle).removeIfExistsStrict("first");
+        doAnswer(invocation -> {
+            assertTrue(helperExists.get(), "Policy retirement needs the helper until its writers finish");
+            return null;
+        }).when(firewall).unregister("eni-first");
+
+        manager.release(balancer, () -> persisted.set(true));
+
+        assertFalse(helperExists.get());
+        assertTrue(persisted.get());
+        assertTrue(balancer.getBackendNetworkInterfaceIds().isEmpty());
+        verify(ec2).releaseNetworkInterfaceFromService("us-east-1", "eni-first");
+        verify(ec2).deleteNetworkInterface("us-east-1", "eni-first");
+    }
+
+    @Test
+    void failedPolicyRetirementKeepsTheNamespaceAndInterfaceForRetry() {
+        DockerClient docker = nativeDocker();
+        Container helper = helper("first", "this-run/4566", "elbv2");
+        when(docker.listContainersCmd().withShowAll(true).withLabelFilter(anyMap()).exec())
+                .thenReturn(List.of(helper));
+        LoadBalancer balancer = storedLoadBalancer();
+        AtomicBoolean persisted = new AtomicBoolean();
+        doThrow(new IllegalStateException("Policy writer not drained")).doNothing()
+                .when(firewall).unregister("eni-first");
+
+        assertThrows(IllegalStateException.class, () -> manager.release(balancer, () -> persisted.set(true)));
+        assertEquals(List.of("eni-first"), balancer.getBackendNetworkInterfaceIds());
+        assertFalse(persisted.get());
+        verify(lifecycle, never()).removeIfExistsStrict("first");
+        verifyNoInteractions(ec2);
+
+        manager.release(balancer, () -> persisted.set(true));
+
+        assertTrue(balancer.getBackendNetworkInterfaceIds().isEmpty());
+        assertTrue(persisted.get());
+        verify(lifecycle).removeIfExistsStrict("first");
+        verify(ec2).releaseNetworkInterfaceFromService("us-east-1", "eni-first");
+        verify(ec2).deleteNetworkInterface("us-east-1", "eni-first");
     }
 
     @Test
@@ -205,6 +261,15 @@ class ElbV2VpcNetworkManagerTest {
         DockerClient docker = mock(DockerClient.class, RETURNS_DEEP_STUBS);
         when(lifecycle.getDockerClient()).thenReturn(docker);
         return docker;
+    }
+
+    private LoadBalancer storedLoadBalancer() {
+        LoadBalancer balancer = new LoadBalancer();
+        balancer.setType("application");
+        balancer.setLoadBalancerArn("arn:aws:elasticloadbalancing:us-east-1:111111111111:loadbalancer/app/api/123");
+        balancer.setRegion("us-east-1");
+        balancer.setBackendNetworkInterfaceIds(new ArrayList<>(List.of("eni-first")));
+        return balancer;
     }
 
     private Container helper(String id, String owner, String service) {

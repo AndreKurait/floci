@@ -489,8 +489,8 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
         }
         if (frontend.helper() != null) {
             frontend.namespace().requireUnused(docker);
-            lifecycle.removeIfExistsStrict(frontend.helper());
             firewall.unregister(frontend.eni());
+            lifecycle.removeIfExistsStrict(frontend.helper());
             routing.unregister(frontend.account(), frontend.region(), frontend.eni());
         }
         ec2.releaseNetworkInterfaceFromService(frontend.region(), frontend.eni());

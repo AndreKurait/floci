@@ -1661,11 +1661,11 @@ public class EcsContainerManager {
         terminatedContainerIds.forEach(dockerId -> finalizeLogStream(handle, dockerId));
         try {
             if (handle.allContainersRemoved()) {
-                // Confirm the helper released its host ports before unregister forgets its identity.
+                // Finish retirement writes before removing the namespace or releasing its leases.
+                cleanupProtectedNetwork(handle);
                 if (firewallManager != null && handle.getNetworkInterfaceId() != null) {
                     firewallManager.removeNamespaceStrict(handle.getNetworkInterfaceId());
                 }
-                cleanupProtectedNetwork(handle);
                 removeTaskVolumes(handle);
                 // Only now: a container that survived a failed removal still holds its address.
                 releaseTaskLinkLocalAddresses(handle.getTaskArn());

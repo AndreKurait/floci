@@ -42,6 +42,7 @@ class ElbClassicFrontendRetirementTest {
     private final DockerClient docker = mock(DockerClient.class);
     private final ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
     private final Ec2Service ec2 = mock(Ec2Service.class);
+    private final SecurityGroupFirewallManager firewall = mock(SecurityGroupFirewallManager.class);
     private final ElbClassicFrontendManager manager;
     private final Map<String, ElbClassicFrontendManager.Frontends> frontends;
 
@@ -53,7 +54,7 @@ class ElbClassicFrontendRetirementTest {
         when(listContainers.withShowAll(true)).thenReturn(listContainers);
         when(listContainers.exec()).thenReturn(List.of());
         manager = new ElbClassicFrontendManager(mock(EmulatorConfig.class), ec2,
-                mock(SecurityGroupFirewallManager.class), mock(VpcNetworkManager.class),
+                firewall, mock(VpcNetworkManager.class),
                 mock(ContainerBuilder.class), lifecycle, new ObjectMapper(), mock(IamService.class),
                 mock(AcmService.class), mock(VpcRoutingManager.class));
         Field field = ElbClassicFrontendManager.class.getDeclaredField("frontends");
@@ -130,6 +131,48 @@ class ElbClassicFrontendRetirementTest {
         verifyNoInteractions(ec2);
         manager.remove(loadBalancer);
         assertFalse(manager.current(loadBalancer, probe));
+        verify(ec2).releaseNetworkInterfaceFromService(REGION, "eni");
+        verify(ec2).deleteNetworkInterface(REGION, "eni");
+    }
+
+    @Test
+    void policyRetirementCanStillWriteToTheHelperNamespace() {
+        ClassicLoadBalancer loadBalancer = loadBalancer("policy-writer");
+        install(loadBalancer);
+        AtomicBoolean helperExists = new AtomicBoolean(true);
+        doAnswer(invocation -> {
+            helperExists.set(false);
+            return null;
+        }).when(lifecycle).removeIfExistsStrict("helper");
+        doAnswer(invocation -> {
+            assertTrue(helperExists.get(), "Policy retirement needs the helper until its writers finish");
+            return null;
+        }).when(firewall).unregister("eni");
+
+        manager.remove(loadBalancer);
+
+        assertFalse(helperExists.get());
+        assertTrue(frontends.isEmpty());
+        verify(ec2).releaseNetworkInterfaceFromService(REGION, "eni");
+        verify(ec2).deleteNetworkInterface(REGION, "eni");
+    }
+
+    @Test
+    void failedPolicyRetirementKeepsTheNamespaceAndInterfaceForRetry() {
+        ClassicLoadBalancer loadBalancer = loadBalancer("policy-retry");
+        install(loadBalancer);
+        doThrow(new IllegalStateException("Policy writer not drained")).doNothing()
+                .when(firewall).unregister("eni");
+
+        assertThrows(IllegalStateException.class, () -> manager.remove(loadBalancer));
+        assertFalse(frontends.isEmpty());
+        verify(lifecycle, never()).removeIfExistsStrict("helper");
+        verifyNoInteractions(ec2);
+
+        manager.remove(loadBalancer);
+
+        assertTrue(frontends.isEmpty());
+        verify(lifecycle).removeIfExistsStrict("helper");
         verify(ec2).releaseNetworkInterfaceFromService(REGION, "eni");
         verify(ec2).deleteNetworkInterface(REGION, "eni");
     }

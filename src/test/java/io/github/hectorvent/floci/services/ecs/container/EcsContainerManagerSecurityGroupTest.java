@@ -46,12 +46,14 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -59,6 +61,8 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.RETURNS_SELF;
 import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -364,6 +368,40 @@ class EcsContainerManagerSecurityGroupTest {
 
         manager.releaseTaskNetwork(task, "us-east-1");
         verify(ec2Service).deleteNetworkInterface("us-east-1", "eni-1");
+    }
+
+    @Test
+    void policyRetirementCanStillWriteToTheHelperNamespace() {
+        EcsTaskHandle handle = new EcsTaskHandle("task-arn", Map.of(), Map.of(), null, "eni-1", "us-east-1");
+        AtomicBoolean helperExists = new AtomicBoolean(true);
+        doAnswer(invocation -> {
+            helperExists.set(false);
+            return null;
+        }).when(firewallManager).removeNamespaceStrict("eni-1");
+        doAnswer(invocation -> {
+            assertTrue(helperExists.get(), "Policy retirement needs the helper until its writers finish");
+            return null;
+        }).when(firewallManager).unregister("eni-1");
+
+        assertTrue(manager.stopTaskAndCollectExitCodes(handle).isEmpty());
+
+        assertFalse(helperExists.get());
+        verify(ec2Service, never()).deleteNetworkInterface(any(), any());
+    }
+
+    @Test
+    void failedPolicyRetirementKeepsTheNamespaceForRetry() {
+        EcsTaskHandle handle = new EcsTaskHandle("task-arn", Map.of(), Map.of(), null, "eni-1", "us-east-1");
+        doThrow(new IllegalStateException("Policy writer not drained")).doNothing()
+                .when(firewallManager).unregister("eni-1");
+
+        assertThrows(IllegalStateException.class, () -> manager.stopTaskAndCollectExitCodes(handle));
+        verify(firewallManager, never()).removeNamespaceStrict("eni-1");
+        verify(ec2Service, never()).deleteNetworkInterface(any(), any());
+
+        assertTrue(manager.stopTaskAndCollectExitCodes(handle).isEmpty());
+
+        verify(firewallManager).removeNamespaceStrict("eni-1");
     }
 
     @Test
