@@ -3,7 +3,6 @@ package io.github.hectorvent.floci.services.ecr.registry;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.NetworkExposureGuard;
 import io.github.hectorvent.floci.core.common.AwsPartitions;
-import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.services.ecr.EcrService;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
@@ -459,7 +458,8 @@ public class EcrRegistryDataPlane {
     private static Matcher registryHost(String host) {
         String value = host == null ? "" : host;
         Matcher nativeHost = NATIVE_ECR_HOST.matcher(value);
-        if (nativeHost.matches() && AwsRegions.dnsSuffixFor(nativeHost.group(2)).equals(nativeHost.group(3))) {
+        if (nativeHost.matches() && AwsPartitions.forRegion(nativeHost.group(2))
+                .filter(partition -> partition.dnsSuffix().equals(nativeHost.group(3))).isPresent()) {
             return nativeHost;
         }
         return ECR_HOST.matcher(value);
