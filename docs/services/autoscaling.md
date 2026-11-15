@@ -406,3 +406,21 @@ aws autoscaling set-desired-capacity \
 Launch configurations accept an IAM instance profile name or ARN. Unknown and foreign profiles fail creation with `ValidationError`. At launch, the reconciler resolves a stored name to its ARN in the owning account. `CreateAutoScalingGroup` and `UpdateAutoScalingGroup` refuse, with `ValidationError`, a launch template that names both an instance profile name and an ARN, directly or through the mixed instances policy.
 
 Launch-configuration metadata options (`HttpTokens`, `HttpEndpoint`, and `HttpPutResponseHopLimit`) round-trip through Query and CloudFormation and reach EC2 launches. CloudFormation resolves intrinsics inside the block, so `Fn::If` and `AWS::NoValue` can select or omit the block or any of its members. When the structure is omitted it stays absent from `DescribeLaunchConfigurations`; a supplied partial structure reports defaults for unspecified fields. Launch templates, mixed-instance templates and EC2 Fleet launches likewise forward their existing metadata options.
+
+### Group metrics
+
+`EnableMetricsCollection` publishes the eight basic group metrics to CloudWatch once per minute in
+`AWS/AutoScaling`, with the `AutoScalingGroupName` dimension and unit `None`. Collection starts disabled.
+An omitted metric list enables all collection settings; only the selected basic metrics produce samples:
+`GroupMinSize`, `GroupMaxSize`, `GroupDesiredCapacity`, `GroupInServiceInstances`, `GroupPendingInstances`,
+`GroupStandbyInstances`, `GroupTerminatingInstances`, and `GroupTotalInstances`. Pending and terminating
+lifecycle-hook wait/proceed states are included in their respective counts. The total is in-service plus
+pending plus terminating instances; standby instances have their own metric.
+
+Disabling collection or deleting the group stops future samples and preserves existing CloudWatch history.
+Samples remain isolated by account and Region, include zero values, and are available through the
+CloudWatch metric APIs. Missed collection intervals are not backfilled. Capacity-unit and warm-pool
+collection settings retain their metadata behavior without synthesized datapoints.
+
+Set `floci.services.autoscaling.cloudwatch-metrics-enabled=false` to disable the background publisher.
+The publisher also requires Auto Scaling and CloudWatch metrics to be enabled.
