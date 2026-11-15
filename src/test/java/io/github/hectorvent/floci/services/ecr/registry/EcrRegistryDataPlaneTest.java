@@ -978,6 +978,23 @@ class EcrRegistryDataPlaneTest {
 
     private record RegistryResponse(int status, String contentType, String apiVersion, String body) {}
     @Test
+    void nativeRegistryPortRestrictionPreservesLocalPortsAndNamespaceFallback() {
+        String path = "/v2/team/image/manifests/latest";
+        assertTrue(EcrRegistryDataPlane.requestFor("123456789012.dkr.ecr.us-east-1.amazonaws.com:443",
+                path, null, "hostname").isPresent());
+        assertTrue(EcrRegistryDataPlane.requestFor("123456789012.dkr.ecr.us-east-1.amazonaws.com:4566",
+                path, null, "hostname").isEmpty());
+        assertTrue(EcrRegistryDataPlane.requestFor("123456789012.dkr.ecr.us-east-1.localhost:4566",
+                path, null, "hostname").isPresent());
+        assertTrue(EcrRegistryDataPlane.requestFor("123456789012.dkr.ecr.us-east-1.localhost.floci.io:4566",
+                path, null, "hostname").isPresent());
+        EcrRegistryDataPlane.RegistryRequest request = EcrRegistryDataPlane.requestFor(
+                "123456789012.dkr.ecr.us-east-1.amazonaws.com:4566", path,
+                "ns=123456789012.dkr.ecr.cn-north-1.amazonaws.com.cn:443", "hostname").orElseThrow();
+        assertEquals("cn-north-1", request.region());
+    }
+
+    @Test
     void nativeRegistryHostAndMirrorNamespaceKeepAccountRegionRouting() {
         EcrRegistryDataPlane.RegistryRequest request = EcrRegistryDataPlane.requestFor("123456789012.dkr.ecr.cn-north-1.amazonaws.com.cn",
                 "/v2/team/image/manifests/latest", null, "hostname").orElseThrow();
