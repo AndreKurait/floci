@@ -18465,7 +18465,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 boolean attachedElsewhere = vol.getAttachments().stream()
                         .anyMatch(other -> !inst.getInstanceId().equals(other.getInstanceId()));
                 if (att.isDeleteOnTermination() && !attachedElsewhere) {
-                    deleteVolumeRecord(region, storeKey, vol);
+                    deleteVolumeRecord(region, storeKey, vol, root);
                     return;
                 }
                 vol.getAttachments().remove(att);
@@ -18480,12 +18480,16 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     /** Deletes a volume, its block device and its tags. Called under the volume's lock. */
     private void deleteVolumeRecord(String region, String storeKey, Volume vol) {
+        deleteVolumeRecord(region, storeKey, vol, false);
+    }
+
+    private void deleteVolumeRecord(String region, String storeKey, Volume vol, boolean logicalRoot) {
         if (vol.getManagedFilesystem() != null) {
             if (volumeBlockDeviceManager == null) {
                 throw new AwsException("InternalError", "Managed volume storage is unavailable", 500);
             }
             volumeBlockDeviceManager.deleteManagedVolume(vol, callerAccountId());
-        } else if (volumeBlockDeviceManager != null && volumeBlockDeviceManager.isAvailable()
+        } else if (!logicalRoot && volumeBlockDeviceManager != null && volumeBlockDeviceManager.isAvailable()
                 && !volumeBlockDeviceManager.deleteVolume(vol.getVolumeId())) {
             throw new AwsException("InternalError",
                     "Failed to delete backing storage for volume " + vol.getVolumeId(), 500);

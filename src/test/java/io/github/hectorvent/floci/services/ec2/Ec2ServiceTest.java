@@ -730,6 +730,56 @@ class Ec2ServiceTest {
 
     @ParameterizedTest
     @ValueSource(strings = {"terminate", "settle", "rollback"})
+    void logicalRootDeletionDoesNotRequireABlockDeviceHelper(String operation) {
+        Ec2VolumeBlockDeviceManager devices = mock(Ec2VolumeBlockDeviceManager.class);
+        when(devices.isAvailable()).thenReturn(true);
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(),
+                null, null, null, null, devices);
+        Reservation launch = service.runInstances("us-east-1", "ami-test", "t3.micro", 1, 1,
+                null, List.of(), null, null, List.of(), null, null);
+        Instance instance = launch.getInstances().getFirst();
+        String rootId = instance.getRootVolumeId();
+        service.createTags("us-east-1", List.of(rootId), List.of(new Tag("Owner", "root")));
+
+        switch (operation) {
+            case "terminate" -> service.terminateInstances("us-east-1", List.of(instance.getInstanceId()));
+            case "rollback" -> service.rollBackLaunch("us-east-1", launch);
+            case "settle" -> instance.setState(InstanceState.terminated());
+            default -> throw new IllegalArgumentException(operation);
+        }
+
+        assertTrue(service.describeVolumes("us-east-1", List.of(), Map.of()).isEmpty());
+        assertTrue(service.describeTags("us-east-1", Map.of("resource-id", List.of(rootId))).isEmpty());
+        verify(devices, never()).deleteVolume(anyString());
+    }
+
+    @Test
+    void aManagedRootStillRequiresBackingStorageDeletion() {
+        Ec2VolumeBlockDeviceManager devices = mock(Ec2VolumeBlockDeviceManager.class);
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory(),
+                null, null, null, null, devices);
+        Instance instance = service.runInstances("us-east-1", "ami-test", "t3.micro", 1, 1,
+                null, List.of(), null, null, List.of(), null, null).getInstances().getFirst();
+        Volume root = service.describeVolumes("us-east-1", List.of(instance.getRootVolumeId()),
+                Map.of()).getFirst();
+        root.setManagedFilesystem("ext4");
+        doThrow(new AwsException("InternalError", "managed backing unavailable", 500))
+                .when(devices).deleteManagedVolume(eq(root), anyString());
+
+        AwsException failure = assertThrows(AwsException.class,
+                () -> service.terminateInstances("us-east-1", List.of(instance.getInstanceId())));
+
+        assertEquals("managed backing unavailable", failure.getMessage());
+        verify(devices).deleteManagedVolume(eq(root), anyString());
+        verify(devices, never()).deleteVolume(anyString());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"terminate", "settle", "rollback"})
     void failedBackingDeletionKeepsVolumeAndTagsForCleanupRetry(String operation) {
         AccountAwareStorageBackend<Volume> volumeStore = AccountAwareStorageBackend.inMemory("000000000000");
         Ec2VolumeBlockDeviceManager devices = mock(Ec2VolumeBlockDeviceManager.class);
