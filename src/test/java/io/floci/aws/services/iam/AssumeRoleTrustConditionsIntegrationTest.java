@@ -1,5 +1,6 @@
 package io.floci.aws.services.iam;
 
+import io.floci.aws.core.common.RequestScopes;
 import io.floci.aws.testing.EnforcementFixtures;
 import io.floci.aws.testing.EnforcementFixtures.Session;
 import io.floci.aws.testing.IamEnforcementProfile;
@@ -9,6 +10,7 @@ import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
+import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 
@@ -30,6 +32,9 @@ import static org.hamcrest.Matchers.containsString;
 @QuarkusTest
 @TestProfile(IamEnforcementProfile.class)
 class AssumeRoleTrustConditionsIntegrationTest {
+
+    @Inject
+    IamService iamService;
 
     @TestHTTPResource("/")
     static URI baseUri;
@@ -172,7 +177,10 @@ class AssumeRoleTrustConditionsIntegrationTest {
                   "Principal":{"AWS":"arn:aws:iam::%s:root"},"Action":"sts:AssumeRole",
                   "Condition":{"ArnEquals":{"aws:PrincipalArn":"%s"}}}]}""";
         String namesRole = createRole(trustPrincipal(roleArn));
-        String namesPathlessRole = createRole(trustPrincipal(pathlessArn));
+        String namesPathlessRole = createRole(trustAccountRoot(TRUSTED_ACCOUNT));
+        // Preserve this historical ARN-row matcher control; new public saves reject the nonexistent path.
+        RequestScopes.runAs(ROLE_ACCOUNT, () -> iamService.restoreAssumeRolePolicy(
+                namesPathlessRole, trustPrincipal(pathlessArn), iamService.getRole(namesPathlessRole).getRoleId()));
         String conditionOnRole = createRole(condition.formatted(TRUSTED_ACCOUNT, roleArn));
         String conditionOnPathlessRole = createRole(condition.formatted(TRUSTED_ACCOUNT, pathlessArn));
 

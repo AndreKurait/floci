@@ -58,7 +58,8 @@ public class GetStackOutputRoleAuthorizer {
     public String assume(String roleArn, String consumerAccount, String partition) {
         Optional<IamRole> role = role(roleArn, partition);
         if (role.isEmpty() || (enforced() && !trustEvaluator.allowsAnyPrincipalOf(
-                role.get().getAssumeRolePolicyDocument(), consumerAccount, partition))) {
+                iamService.renderAssumeRolePolicy(role.get().getAssumeRolePolicyDocument()),
+                consumerAccount, partition))) {
             throw new AwsException("AccessDenied", CloudFormationTemplateEngine.sdkErrorMessage(
                     AccessDeniedMessages.notAuthorized(
                             AwsArnUtils.Arn.global(partition, "iam", consumerAccount, "root").toString(),

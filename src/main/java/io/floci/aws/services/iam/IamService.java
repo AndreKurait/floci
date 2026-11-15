@@ -26,6 +26,7 @@ import io.floci.aws.core.resource.ExplorerResource;
 import io.floci.aws.core.resource.ResourceProvider;
 import io.floci.aws.core.resource.SupportedResourceType;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
+import io.floci.aws.core.storage.AccountAwareStorageBackend.AccountEntry;
 import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
@@ -1194,10 +1195,11 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 throw new AwsException("EntityAlreadyExists",
                         "Role with name " + roleName + " already exists.", 409);
             }
+            String boundTrust = bindTrustPolicy(assumeRolePolicyDocument, regionResolver.getPartition());
             String roleId = "AROA" + randomId(16);
             String normalizedPath = normalizePath(path);
             String arn = iamArn("role", normalizedPath, roleName);
-            IamRole role = new IamRole(roleId, roleName, normalizedPath, arn, assumeRolePolicyDocument);
+            IamRole role = new IamRole(roleId, roleName, normalizedPath, arn, boundTrust);
             role.setDescription(description);
             role.setPermissionsBoundaryArn(permissionsBoundaryArn);
             if (maxSessionDuration > 0) {
@@ -1221,6 +1223,128 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     public IamRole getValidatedRole(String roleName) {
         validateRoleName(roleName);
         return getRole(roleName);
+    }
+
+    /**
+     * Resolves live role/user IDs for an IAM response without rewriting the stored policy.
+     * Deleted identities remain IDs; legacy ARN entries retain their historical semantics.
+     */
+    public String renderAssumeRolePolicy(String document) {
+        Supplier<Map<String, String>> principals = trustPrincipalLookup();
+        return TrustPolicyPrincipalIds.rewrite(document, principal -> TrustPolicyPrincipalIds.isIdentityId(principal)
+                ? principals.get().getOrDefault(principal, principal) : principal);
+    }
+
+    private String bindTrustPolicy(String document, String partition) {
+        Supplier<Map<String, String>> principals = trustPrincipalLookup();
+        return TrustPolicyPrincipalIds.rewrite(document, principal -> {
+            if (TrustPolicyPrincipalIds.isIdentityId(principal)) {
+                String heldArn = principals.get().get(principal);
+                if (heldArn != null && partition.equals(AwsArnUtils.parse(heldArn).partition())) {
+                    return principal;
+                }
+                throw invalidTrustPrincipal(principal);
+            }
+            if (!AwsArnUtils.isArn(principal)) {
+                return principal;
+            }
+            AwsArnUtils.Arn requested = AwsArnUtils.parse(principal);
+            if (!"iam".equals(requested.service())
+                    || !(requested.resource().startsWith("role/") || requested.resource().startsWith("user/"))) {
+                return principal;
+            }
+            if (requested.region().isEmpty() && requested.partition().equals(partition)) {
+                for (Map.Entry<String, String> entry : principals.get().entrySet()) {
+                    AwsArnUtils.Arn held = AwsArnUtils.parse(entry.getValue());
+                    if (requested.partition().equals(held.partition())
+                            && requested.accountId().equals(held.accountId())
+                            && requested.resource().equals(held.resource())) {
+                        return entry.getKey();
+                    }
+                }
+            }
+            throw invalidTrustPrincipal(principal);
+        });
+    }
+
+    private static AwsException invalidTrustPrincipal(String principal) {
+        return new AwsException("MalformedPolicyDocument", "Invalid principal in policy: \"AWS\":\""
+                + principal + "\"", 400);
+    }
+
+    /** One identity view per document; account/root policies do not need a storage scan. */
+    private Supplier<Map<String, String>> trustPrincipalLookup() {
+        return new Supplier<>() {
+            private Map<String, String> value;
+
+            @Override
+            public Map<String, String> get() {
+                if (value == null) {
+                    value = trustPrincipalArns();
+                }
+                return value;
+            }
+        };
+    }
+
+    /** Capture identities under the same monitor used by role/user create, delete and rename. */
+    private Map<String, String> trustPrincipalArns() {
+        synchronized (resourceNameLock) {
+            Map<String, String> principals = new LinkedHashMap<>();
+            Set<String> ambiguous = new HashSet<>();
+            for (AccountEntry<IamRole> entry : currentTrustEntries(roles)) {
+                IamRole role = entry.value();
+                addTrustPrincipal(principals, ambiguous, entry.accountId(), entry.key(),
+                        role.getRoleName(), role.getPath(), role.getArn(), role.getRoleId(), "role", "AROA");
+            }
+            for (AccountEntry<IamUser> entry : currentTrustEntries(users)) {
+                IamUser user = entry.value();
+                addTrustPrincipal(principals, ambiguous, entry.accountId(), entry.key(),
+                        user.getUserName(), user.getPath(), user.getArn(), user.getUserId(), "user", "AIDA");
+            }
+            ambiguous.forEach(principals::remove);
+            return principals;
+        }
+    }
+
+    private <T> Collection<AccountEntry<T>> currentTrustEntries(StorageBackend<String, T> storage) {
+        if (storage instanceof AccountAwareStorageBackend<T> aware) {
+            Map<String, AccountEntry<T>> entries = new LinkedHashMap<>();
+            for (AccountEntry<T> entry : aware.scanAllAccountEntries(key -> true)) {
+                // Explicit rows shadow legacy rows. Neither lookup migrates another account's data.
+                aware.getForAccount(entry.accountId(), entry.key())
+                        .or(() -> aware.getLegacyForAccount(entry.accountId(), entry.key()))
+                        .ifPresent(value -> entries.put(entry.accountId() + "/" + entry.key(),
+                                new AccountEntry<>(entry.accountId(), entry.key(), value)));
+            }
+            return entries.values();
+        }
+        List<AccountEntry<T>> entries = new ArrayList<>();
+        for (String key : storage.keys()) {
+            storage.get(key).ifPresent(value -> entries.add(
+                    new AccountEntry<>(regionResolver.getAccountId(), key, value)));
+        }
+        return entries;
+    }
+
+    private static void addTrustPrincipal(Map<String, String> principals, Set<String> ambiguous,
+                                          String account, String key, String name, String path,
+                                          String arn, String id, String kind, String idPrefix) {
+        if (!key.equals(name) || !TrustPolicyPrincipalIds.isIdentityId(id) || !id.startsWith(idPrefix)
+                || !AwsArnUtils.isArn(arn)) {
+            return;
+        }
+        AwsArnUtils.Arn held = AwsArnUtils.parse(arn);
+        if (!"iam".equals(held.service()) || !held.region().isEmpty()
+                || !AwsPartitions.ids().contains(held.partition())
+                || !account.equals(held.accountId())
+                || !held.resource().equals(kind + normalizePath(path) + name)) {
+            return;
+        }
+        String previous = principals.putIfAbsent(id, arn);
+        if (previous != null && !previous.equals(arn)) {
+            ambiguous.add(id);
+        }
     }
 
     /**
@@ -1580,10 +1704,14 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     public void updateAssumeRolePolicy(String roleName, String policyDocument) {
         validateRoleName(roleName);
         IamPolicyDocuments.checkTrustPolicy(policyDocument);
-        IamRole role = getRole(roleName);
-        requireNotServiceLinked(role, roleName);
-        role.setAssumeRolePolicyDocument(policyDocument);
-        roles.put(roleName, role);
+        synchronized (resourceNameLock) {
+            IamRole role = getRole(roleName);
+            requireNotServiceLinked(role, roleName);
+            String boundTrust = bindTrustPolicy(policyDocument,
+                    AwsArnUtils.partitionOrDefault(role.getArn(), regionResolver.getPartition()));
+            role.setAssumeRolePolicyDocument(boundTrust);
+            roles.put(roleName, role);
+        }
     }
 
     /**
@@ -1618,7 +1746,11 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         synchronized (resourceNameLock) {
             IamRole role = getRole(roleName);
             requireSameRole(role, roleName, expectedRoleId);
-            role.setAssumeRolePolicyDocument(policyDocument);
+            String boundTrust = heldToBeingAPolicy
+                    ? bindTrustPolicy(policyDocument,
+                            AwsArnUtils.partitionOrDefault(role.getArn(), regionResolver.getPartition()))
+                    : policyDocument;
+            role.setAssumeRolePolicyDocument(boundTrust);
             roles.put(roleName, role);
         }
     }
