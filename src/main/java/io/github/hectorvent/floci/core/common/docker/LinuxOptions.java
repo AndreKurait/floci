@@ -24,6 +24,8 @@ import java.util.Map;
  * @param pidMode Docker PID namespace mode (null = private namespace)
  * @param apparmorProfile Docker AppArmor profile (null = daemon default)
  * @param stopSignal signal Docker sends before its stop deadline (null = image default)
+ * @param pidsLimit maximum processes and threads (null = daemon default)
+ * @param noNewPrivileges prevent exec from granting additional privileges
  */
 public record LinuxOptions(
         List<String> capAdd,
@@ -36,9 +38,14 @@ public record LinuxOptions(
         Map<String, String> networkSysctls,
         String pidMode,
         String apparmorProfile,
-        String stopSignal
+        String stopSignal,
+        Long pidsLimit,
+        boolean noNewPrivileges
 ) {
     public LinuxOptions {
+        if (pidsLimit != null && pidsLimit < 1) {
+            throw new IllegalArgumentException("The PID limit must be positive");
+        }
         if (apparmorProfile != null && apparmorProfile.isBlank()) {
             throw new IllegalArgumentException("Expected an AppArmor profile name");
         }
@@ -76,6 +83,14 @@ public record LinuxOptions(
                         Long shmSizeBytes, Map<String, String> tmpfs,
                         Long memorySwapBytes, Long memorySwappiness) {
         this(capAdd, capDrop, devices, shmSizeBytes, tmpfs, memorySwapBytes, memorySwappiness, Map.of());
+    }
+
+    public LinuxOptions(List<String> capAdd, List<String> capDrop, List<Device> devices,
+                        Long shmSizeBytes, Map<String, String> tmpfs, Long memorySwapBytes,
+                        Long memorySwappiness, Map<String, String> networkSysctls, String pidMode,
+                        String apparmorProfile, String stopSignal) {
+        this(capAdd, capDrop, devices, shmSizeBytes, tmpfs, memorySwapBytes, memorySwappiness,
+                networkSysctls, pidMode, apparmorProfile, stopSignal, null, false);
     }
 
     public static final LinuxOptions NONE =

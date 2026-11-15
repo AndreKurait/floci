@@ -11,6 +11,8 @@ import io.github.hectorvent.floci.services.backup.BackupFrameworkResources;
 import io.github.hectorvent.floci.services.backup.BackupFrameworkService;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationDriftService;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationDriftSnapshot;
+import io.github.hectorvent.floci.services.cloudfront.CloudFrontFunctionTestRoute;
+import io.github.hectorvent.floci.services.cloudfront.CloudFrontFunctionTesting;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.LogGroupTagTarget;
@@ -146,13 +148,13 @@ public class IamConditionContextResolver {
     private final Clock clock;
     private final Instance<AthenaBatchQueryService> athenaBatchQueryService;
     private final Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates;
+    private final Instance<CloudFrontFunctionTesting> cloudFrontFunctionTesting;
     private final ResolvedServiceCatalog serviceCatalog;
 
     /**
      * The system clock, not the CDI one: Object Lock's remaining retention days has to count from the
      * same now as S3Service, which checks retention against {@code Instant.now()}.
      */
-    @Inject
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
                                        Instance<Ec2Service> ec2Service,
                                        Instance<S3Service> s3Service,
@@ -172,7 +174,8 @@ public class IamConditionContextResolver {
                                        Instance<AthenaBatchQueryService> athenaBatchQueryService,
                                        Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates,
                                        Instance<LambdaRuntimeManagementService> runtimeManagement,
-                                       Instance<EcrService> ecrService) {
+                                       Instance<EcrService> ecrService,
+                                       Instance<CloudFrontFunctionTesting> cloudFrontFunctionTesting) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
                 config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService,
                 elbV2ConditionKeys, mqConfigurations, lambdaService, athenaPreparedStatements,
@@ -180,7 +183,8 @@ public class IamConditionContextResolver {
                 athenaBatchQueryService,
                 eksAccessEntryUpdates,
                 runtimeManagement,
-                ecrService);
+                ecrService,
+                cloudFrontFunctionTesting);
     }
 
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -197,6 +201,7 @@ public class IamConditionContextResolver {
                                        Instance<ElbV2ConditionKeys> elbV2ConditionKeys) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
                 config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys, null, null, null,
+                null,
                 null,
                 null,
                 null,
@@ -220,6 +225,7 @@ public class IamConditionContextResolver {
                 null,
                 null,
                 null,
+                null,
                 null);
     }
 
@@ -235,6 +241,7 @@ public class IamConditionContextResolver {
                                 ResolvedServiceCatalog serviceCatalog, Clock clock) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
                 config, currentVertxRequest, serviceCatalog, clock, null, null, null, null, null,
+                null,
                 null,
                 null,
                 null,
@@ -261,7 +268,8 @@ public class IamConditionContextResolver {
                                         Instance<AthenaBatchQueryService> athenaBatchQueryService,
                                         Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates,
                                         Instance<LambdaRuntimeManagementService> runtimeManagement,
-                                        Instance<EcrService> ecrService) {
+                                        Instance<EcrService> ecrService,
+                                        Instance<CloudFrontFunctionTesting> cloudFrontFunctionTesting) {
         this.mqConfigurations = mqConfigurations;
         this.lambdaService = lambdaService;
         this.athenaPreparedStatements = athenaPreparedStatements;
@@ -283,6 +291,7 @@ public class IamConditionContextResolver {
         this.eksAccessEntryUpdates = eksAccessEntryUpdates;
         this.runtimeManagement = runtimeManagement;
         this.ecrService = ecrService;
+        this.cloudFrontFunctionTesting = cloudFrontFunctionTesting;
     }
 
     private Map<String, List<String>> athenaPreparedStatementConditions(String action, ContainerRequestContext ctx) {
@@ -323,6 +332,17 @@ public class IamConditionContextResolver {
         return context;
     }
 
+    private Map<String, List<String>> cloudFrontTestConditionContext(String action, ContainerRequestContext ctx) {
+        if (!"cloudfront:TestFunction".equals(action) || cloudFrontFunctionTesting == null
+                || !cloudFrontFunctionTesting.isResolvable()) {
+            return null;
+        }
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        cloudFrontFunctionTesting.get().currentTags(CloudFrontFunctionTestRoute.name(ctx))
+                .forEach((key, value) -> conditions.put(RESOURCE_TAG_PREFIX + key, List.of(value)));
+        return conditions.isEmpty() ? null : conditions;
+    }
+
     public Map<String, List<String>> resolve(String credentialScope, String action,
                                              ContainerRequestContext ctx) {
         return switch (credentialScope) {
@@ -331,6 +351,7 @@ public class IamConditionContextResolver {
                     ? documentationConditions.get().resolve(action, ctx) : null;
             case "cloudformation" -> driftConditionContext(action, ctx);
             case "s3" -> s3ConditionContext(action, ctx);
+            case "cloudfront" -> cloudFrontTestConditionContext(action, ctx);
             case "ec2" -> ec2ConditionContext(action, ctx);
             case "ecr" -> ecrPreviewConditionContext(action, ctx);
             case "elasticloadbalancing" -> elbV2Contexts(action, ctx).stream().findFirst().orElse(null);
