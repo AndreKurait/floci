@@ -155,7 +155,12 @@ public class AppConfigController {
     @GET
     @Path("/applications/{appId}/configurationprofiles/{profileId}")
     public Response getConfigurationProfile(@PathParam("appId") String appId, @PathParam("profileId") String profileId) {
-        return Response.ok(resourceResponse(service.getConfigurationProfile(appId, profileId))).build();
+        ConfigurationProfile profile = service.getConfigurationProfile(appId, profileId);
+        ObjectNode response = resourceResponse(profile);
+        if ("".equals(profile.getDescription())) {
+            response.remove("Description");
+        }
+        return Response.ok(response).build();
     }
 
     @PATCH

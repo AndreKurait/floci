@@ -132,6 +132,9 @@ clear validators omitted from the template, and restore the prior schema on roll
 survive restart. External schema references and other inline schema drafts are refused.
 `UpdateConfigurationProfile` rejects `KmsKeyIdentifier`.
 
+Clearing `Description` with an empty string returns `Description: ""` in the update response.
+The following `GetConfigurationProfile` response omits `Description`; other fields retain their values.
+
 Hosted profiles also support `LAMBDA` validators naming a function ARN. Both validation and deployment
 invoke the function with five string fields: `applicationId`, `configurationProfileId`,
 `configurationVersion`, base64-encoded `content`, and `uri` set to `hosted`. The event uses the resolved
