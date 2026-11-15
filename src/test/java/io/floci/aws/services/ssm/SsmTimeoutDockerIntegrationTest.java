@@ -162,7 +162,8 @@ class SsmTimeoutDockerIntegrationTest {
             ContainerExec.Result state = descendantState(container.containerId());
             assertEquals(0, state.exitCode(), "The descendant must have started: " + state.summary());
             if (parentExits) {
-                assertEquals("Success", result.status(), "Early parent exit must not become a host attach timeout");
+                assertEquals("Success", result.status(), () -> "Early parent exit must not become a host attach timeout: "
+                        + result + "; descendant=" + state.summary());
                 assertEquals(0, result.responseCode());
                 assertEquals("parent-done", result.standardOutput());
                 assertTrue(Set.of("R", "S", "D").contains(state.stdout()), state.summary());

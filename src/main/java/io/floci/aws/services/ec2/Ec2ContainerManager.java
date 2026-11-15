@@ -454,6 +454,12 @@ public class Ec2ContainerManager {
     public void launch(Instance instance, ResolvedAmiImage image, String publicKey, String region,
                        Set<Integer> appPorts, List<SecurityGroup> groups,
                        Map<String, List<String>> prefixLists) {
+        launch(instance, image, publicKey, region, appPorts, groups, prefixLists, null);
+    }
+
+    public void launch(Instance instance, ResolvedAmiImage image, String publicKey, String region,
+                       Set<Integer> appPorts, List<SecurityGroup> groups,
+                       Map<String, List<String>> prefixLists, Runnable postLaunch) {
         instance.setState(InstanceState.pending());
 
         // An instance record is metadata: id, addresses, tags and lifecycle state are all
@@ -573,6 +579,9 @@ public class Ec2ContainerManager {
                 if (!markRunning(instance)) {
                     failLaunch(instance, leasedPrivateIp);
                     return;
+                }
+                if (postLaunch != null) {
+                    postLaunch.run();
                 }
 
                 LOG.infov("EC2 instance {0} running in container {1} (SSH host port {2})",
@@ -1098,37 +1107,7 @@ public class Ec2ContainerManager {
                         Thread.sleep(500);
                     }
                 }
-                String instanceId = instance.getInstanceId();
-                // A protected workload shares the helper's namespace, so it has no Docker network
-                // attachment of its own to rediscover: the helper keeps the transport address
-                // across the workload's stop/start, exactly as launch used it.
-                ProtectedNamespace namespace = protectedNamespace(instance);
-                String containerIp = namespace == null
-                        ? waitForContainerBridgeIp(containerId, instanceId)
-                        : namespace.transportAddress();
-                if (containerIp != null && !containerIp.isBlank()) {
-                    instance.setContainerBridgeIp(containerIp);
-                    refreshServiceNetworkIp(instance);
-                    if (namespace == null) {
-                        exposeReachablePrivateAddress(instance, containerIp,
-                                config.services().ec2().awsFaithfulPrivateIp());
-                    }
-                    // Docker hands out a new bridge IP on restart, so the previously reported
-                    // public address can now point at another container entirely. An address the
-                    // stop left in place is an Elastic IP's; a released automatic one is replaced
-                    // only when the shared rule allows it.
-                    if (instance.getPublicIpAddress() != null || AutomaticPublicAddress.isDue(instance, true)) {
-                        exposeReachablePublicAddress(instance);
-                    }
-                    metadataServer.registerContainer(containerIp, instanceId, instance);
-                    refreshImdsSourceRegistration(instance, containerId, containerIp);
-                    refreshMetadataAddresses(instance, containerId);
-                    // A restarted container has a new network namespace: the link-local IMDS
-                    // address launch configured is gone, and without it the guest cannot reach
-                    // 169.254.169.254 (instance credentials, user data, EC2 Instance Connect keys).
-                    // A protected instance's helper kept its namespace, and the address with it.
-                    setUpMetadataEndpoint = namespace == null;
-                }
+                setUpMetadataEndpoint = refreshStartedContainerAddresses(instance, containerId);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 instance.compareAndSetState(pending, InstanceState.stopped());
@@ -1272,6 +1251,37 @@ public class Ec2ContainerManager {
             LOG.warnv("Could not refresh IMDS addresses for EC2 instance {0}, keeping existing registrations: {1}",
                     instance.getInstanceId(), e.getMessage());
         }
+    }
+
+    private boolean refreshStartedContainerAddresses(Instance instance, String containerId) throws InterruptedException {
+        String instanceId = instance.getInstanceId();
+        // A protected workload shares the helper's namespace, so it has no Docker network
+        // attachment of its own to rediscover: the helper keeps the transport address
+        // across the workload's stop/start, exactly as launch used it.
+        ProtectedNamespace namespace = protectedNamespace(instance);
+        String containerIp = namespace == null
+                ? waitForContainerBridgeIp(containerId, instanceId)
+                : namespace.transportAddress();
+        if (containerIp != null && !containerIp.isBlank()) {
+            instance.setContainerBridgeIp(containerIp);
+            refreshServiceNetworkIp(instance);
+            if (namespace == null) {
+                exposeReachablePrivateAddress(instance, containerIp,
+                        config.services().ec2().awsFaithfulPrivateIp());
+            }
+            // Docker hands out a new bridge IP on restart, so the previously reported
+            // public address can now point at another container entirely. An address the
+            // stop left in place is an Elastic IP's; a released automatic one is replaced
+            // only when the shared rule allows it.
+            if (instance.getPublicIpAddress() != null || AutomaticPublicAddress.isDue(instance, true)) {
+                exposeReachablePublicAddress(instance);
+            }
+            metadataServer.registerContainer(containerIp, instanceId, instance);
+            refreshImdsSourceRegistration(instance, containerId, containerIp);
+            refreshMetadataAddresses(instance, containerId);
+            return namespace == null;
+        }
+        return false;
     }
 
     boolean restoreMetadataRegistration(Instance instance) {
@@ -1556,10 +1566,12 @@ public class Ec2ContainerManager {
         instance.setPrivateIpAddress(privateIp);
         instance.setPrivateDnsName(privateDnsName);
         if (instance.getNetworkInterfaces() != null) {
-            instance.getNetworkInterfaces().forEach(networkInterface -> {
-                networkInterface.setPrivateIpAddress(privateIp);
-                networkInterface.setPrivateDnsName(privateDnsName);
-            });
+            instance.getNetworkInterfaces().stream()
+                    .filter(networkInterface -> networkInterface.getDeviceIndex() == 0)
+                    .forEach(networkInterface -> {
+                        networkInterface.setPrivateIpAddress(privateIp);
+                        networkInterface.setPrivateDnsName(privateDnsName);
+                    });
         }
     }
 
@@ -1673,16 +1685,27 @@ public class Ec2ContainerManager {
      * Reboots an instance via docker restart.
      */
     public void reboot(Instance instance) {
+        reboot(instance, null);
+    }
+
+    public void reboot(Instance instance, Runnable postReboot) {
         String containerId = instance.getDockerContainerId();
         if (containerId == null) {
             return;
         }
-        executor.submit(() -> {
+        submitLifecycleOperation(containerId, () -> {
             try {
                 dockerClient.restartContainerCmd(containerId).exec();
+                refreshStartedContainerAddresses(instance, containerId);
+                if (postReboot != null) {
+                    postReboot.run();
+                }
                 LOG.infov("Rebooted EC2 container {0}", containerId);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                LOG.debugv(e, "Interrupted address refresh after rebooting EC2 container {0}", containerId);
             } catch (Exception e) {
-                LOG.warnv("Error rebooting EC2 container {0}: {1}", containerId, e.getMessage());
+                LOG.warnv(e, "Error rebooting EC2 container {0}", containerId);
             }
         });
     }
