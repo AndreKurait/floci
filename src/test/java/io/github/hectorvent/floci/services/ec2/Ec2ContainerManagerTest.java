@@ -2736,6 +2736,53 @@ class Ec2ContainerManagerTest {
         awaitUntil(() -> "127.0.0.1".equals(instance.getPublicIpAddress()), Duration.ofSeconds(2));
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void launchRefreshesPublicRoutingAfterGuestStartupOnlyForAChangedAddress(boolean addressChanges)
+            throws Exception {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
+        Ec2ContainerManager manager = spy(harness.manager);
+        Instance instance = instance("i-publication");
+        instance.setAssociatePublicIp(true);
+        when(harness.config.services().ec2().publicIpFromServiceNetwork()).thenReturn(true);
+        List<String> publishedAddresses = new CopyOnWriteArrayList<>();
+        doAnswer(invocation -> {
+            assertEquals("pending", instance.getState().getName(),
+                    "routes must be published before EC2 reports running");
+            publishedAddresses.add(instance.getPublicIpAddress());
+            return null;
+        }).when(manager).refreshPublicRouting(instance);
+        doAnswer(invocation -> {
+            if (addressChanges) {
+                instance.setServiceNetworkIp("192.0.2.10");
+            }
+            return null;
+        }).when(manager).refreshServiceNetworkIp(instance);
+
+        try {
+            manager.launch(instance,
+                    new ResolvedAmiImage("test/native-guest:1", ResolvedAmiImage.IMAGE_RUNTIME, true, null),
+                    null, "us-west-2");
+            executor.shutdown();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS), "launch worker should finish");
+            assertEquals("running", instance.getState().getName());
+            List<String> expectedAddresses = addressChanges
+                    ? List.of("127.0.0.1", "192.0.2.10") : List.of("127.0.0.1");
+            assertEquals(expectedAddresses, publishedAddresses,
+                    "an unchanged address must not re-enter shared routing after guest startup");
+            assertEquals(expectedAddresses.getLast(), instance.getPublicIpAddress());
+            InOrder order = inOrder(manager, harness.lifecycleManager);
+            order.verify(manager).refreshPublicRouting(instance);
+            order.verify(harness.lifecycleManager).startCreated(eq(TEST_CONTAINER_ID), any(ContainerSpec.class));
+            if (addressChanges) {
+                order.verify(manager).refreshPublicRouting(instance);
+            }
+        } finally {
+            manager.stop();
+        }
+    }
+
     @Test
     void launchWaitsForContainerBridgeIpBeforeRegisteringImds() throws Exception {
         LaunchHarness harness = launchHarness();

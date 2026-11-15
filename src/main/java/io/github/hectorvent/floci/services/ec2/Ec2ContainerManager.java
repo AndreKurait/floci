@@ -764,10 +764,12 @@ public class Ec2ContainerManager {
 
                 refreshServiceNetworkIp(instance);
 
-                // Set public-facing addresses only for instances due one, by the rule mock instances
-                // follow too, or holding an Elastic IP their interface carries, which RunInstances
-                // recorded. Private-subnet instances have no public IP/DNS, matching real EC2.
-                if (instance.getPublicIpAddress() != null || AutomaticPublicAddress.isDue(instance, false)) {
+                // The helper's public routes were published before guest startup. Only a changed
+                // address needs to re-enter shared routing before the instance can report running.
+                boolean publicAddressDue = instance.getPublicIpAddress() != null
+                        || AutomaticPublicAddress.isDue(instance, false);
+                if (publicAddressDue
+                        && !Objects.equals(instance.getPublicIpAddress(), reachablePublicAddress(instance))) {
                     exposeReachablePublicAddress(instance);
                 }
 
