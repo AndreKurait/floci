@@ -2,6 +2,7 @@
 # package<TAB>reason. PartitionSmokeInventoryTest fails on a minting package missing from both,
 # and on a row whose package no longer mints or is now covered. Shrink this file, never grow it
 # without a reason.
+acmpca	covered by AcmPcaIntegrationTest root and leaf lifecycle in commercial, China and GovCloud partitions; CA deletion retains restoration state by API contract
 account	Account member ARNs use stored organization identity; AccountRegionOrganizationIamIntegrationTest and AccountRegionUnknownPartitionIamIntegrationTest cover exact member and request-partition grants without a returned ARN.
 appintegrations	no non-commercial partition publishes the service, so a case would be skipped in every partition
 athena	internal workgroup authorization ARN covered by AthenaBatchQueryIamIntegrationTest in each offered non-commercial partition; query history has no delete API

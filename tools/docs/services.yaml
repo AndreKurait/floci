@@ -21,6 +21,10 @@ services:
     doc: docs/services/access-analyzer.md
     sources:
       - { path: services/accessanalyzer/AccessAnalyzerController.java, mode: rest }
+  - service: acm-pca
+    doc: docs/services/acm-pca.md
+    sources:
+      - { path: services/acmpca/AcmPcaJsonHandler.java, mode: switch }
   - service: acm
     doc: docs/services/acm.md
     sources:
