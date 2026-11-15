@@ -64,6 +64,27 @@ def wait_for(description, observe, seconds=120):
         time.sleep(1)
 
 
+def successful_identity_registration(log, started_at):
+    """Require this boot's fresh registration, not the independent profile heartbeat."""
+    boot = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+    fresh = None
+    for line in log.splitlines():
+        stamp, separator, message = line.partition(" INFO [EC2Identity] ")
+        if not separator:
+            continue
+        try:
+            observed = datetime.fromisoformat(stamp).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        if observed < boot:
+            continue
+        if message == "No registration info found for ec2 instance, attempting registration":
+            fresh = observed
+        if fresh is not None and observed >= fresh and message == "EC2 registration was successful.":
+            return line
+    return None
+
+
 class Smoke:
     def __init__(self, image, helper, output, work):
         self.image, self.helper, self.output, self.work = image, helper, output, work
@@ -80,6 +101,7 @@ class Smoke:
             "status": "running", "image": image, "network_helper": helper,
             "agent_version": AGENT_VERSION, "started_at": datetime.now(timezone.utc).isoformat(),
             "agent_executed": False, "association_executed": False,
+            "ec2_identity_registration_verified": False,
             "sdk_registration_or_inventory_injection": False,
             "full_vm_boot_qualified": False, "command_transport_qualified": False,
             "cleanup_errors": [],
@@ -115,6 +137,17 @@ class Smoke:
                 or nodes[0].get("AgentVersion") != AGENT_VERSION):
             raise ValueError("SSM did not observe the expected stock agent")
         return nodes[0] if nodes[0].get("PingStatus") == "Online" else None
+
+    def identity_registration(self):
+        current = inspect(self.guest)
+        if (current["Id"] != self.guest_boot["Id"]
+                or current["State"]["StartedAt"] != self.guest_boot["StartedAt"]
+                or not current["State"]["Running"]):
+            raise ValueError("The registration guest identity or boot changed")
+        observed = docker("exec", self.guest, "/bin/sh", "-ec",
+                          "if [ -f /var/log/amazon/ssm/amazon-ssm-agent.log ]; then "
+                          "cat /var/log/amazon/ssm/amazon-ssm-agent.log; fi")
+        return successful_identity_registration(observed.stdout, self.guest_boot["StartedAt"])
 
     def prepare(self):
         print("Preparing the pinned stock-agent guest", flush=True)
@@ -341,7 +374,7 @@ class Smoke:
             + ca.rstrip() + "\nFLOCI_CA\nupdate-ca-trust\n"
             "nohup env -u AWS_ACCESS_KEY_ID -u AWS_SECRET_ACCESS_KEY -u AWS_SESSION_TOKEN "
             "-u AWS_ENDPOINT_URL -u AWS_REGION -u AWS_DEFAULT_REGION -u AWS_CA_BUNDLE -u SSL_CERT_FILE "
-            "/usr/bin/amazon-ssm-agent </dev/null >/var/log/amazon/ssm/launch.log 2>&1 &\n"
+            "TZ=UTC /usr/bin/amazon-ssm-agent </dev/null >/var/log/amazon/ssm/launch.log 2>&1 &\n"
         )
         began = time.monotonic()
         instance = self.aws(
@@ -358,8 +391,14 @@ class Smoke:
         print("Waiting for the stock agent to register and execute its association", flush=True)
         self.guest = wait_for("EC2 did not launch the agent guest", lambda: docker(
             "ps", "-q", "--filter", "ancestor=" + self.guest_image).stdout.strip())
-        if inspect(self.guest)["Image"] != self.record["guest_image_id"]:
+        guest = inspect(self.guest)
+        if guest["Image"] != self.record["guest_image_id"]:
             raise ValueError("EC2 launched a different guest image")
+        self.guest_boot = {"Id": guest["Id"], "StartedAt": guest["State"]["StartedAt"]}
+        registration = wait_for("The stock agent did not complete native EC2 identity registration",
+                                self.identity_registration, seconds=180)
+        self.record.update(ec2_identity_registration_verified=True,
+                           ec2_identity_registration={**self.guest_boot, "success_log": registration})
         wait_for("The stock agent did not register",
                  lambda: self.registered_agent(instance), seconds=180)
         self.record["agent_executed"] = True
