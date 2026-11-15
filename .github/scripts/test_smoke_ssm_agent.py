@@ -77,6 +77,64 @@ class AgentReadinessTest(unittest.TestCase):
             self.subject.registered_agent(self.instance)
 
 
+class IdentityRegistrationTest(unittest.TestCase):
+    boot = "2026-11-15T05:11:50.000000000Z"
+    fresh = ("2026-11-15 05:11:50.8173 INFO [EC2Identity] "
+             "No registration info found for ec2 instance, attempting registration")
+    success = "2026-11-15 05:11:51.0000 INFO [EC2Identity] EC2 registration was successful."
+
+    def test_fresh_current_boot_success_is_qualified(self):
+        self.assertEqual(self.success, smoke.successful_identity_registration(
+            self.fresh + "\n" + self.success, self.boot))
+
+    def test_passing_old_smoke_profile_connection_is_not_registration(self):
+        log = self.fresh + "\n" + (
+            "2026-11-15 05:11:50.9844 ERROR [Registrar] failed to register identity: "
+            "AccessDeniedException: The request must identify its running EC2 instance.\n"
+            "2026-11-15 05:11:50.9844 INFO [amazon-ssm-agent] "
+            "Registration attempted. Resuming core agent startup.\n"
+            "2026-11-15 05:11:51.1058 INFO EC2RoleProvider "
+            "Successfully connected with instance profile role credentials")
+        self.assertIsNone(smoke.successful_identity_registration(log, self.boot))
+
+    def test_cached_old_or_unattributed_success_is_rejected(self):
+        for log in (self.success, self.success + "\n" + self.fresh,
+                    self.fresh.replace("05:11", "04:11") + "\n" + self.success,
+                    self.fresh + "\n" + self.success.replace("05:11", "04:11"),
+                    self.fresh + "\n" + self.success.replace("[EC2Identity]", "[Other]"),
+                    self.fresh + "\n" + self.success + " unexpected suffix"):
+            with self.subTest(log=log):
+                self.assertIsNone(smoke.successful_identity_registration(log, self.boot))
+
+    def test_success_timestamp_must_follow_fresh_event(self):
+        success_before_fresh = self.success.replace("05:11:51.0000", "05:11:50.8000")
+        self.assertIsNone(smoke.successful_identity_registration(
+            self.fresh + "\n" + success_before_fresh, self.boot))
+
+    def test_guest_replacement_restart_or_stop_is_rejected_before_read(self):
+        subject = smoke.Smoke.__new__(smoke.Smoke)
+        subject.guest = "owned-guest"
+        subject.guest_boot = {"Id": "exact-id", "StartedAt": self.boot}
+        for current in (
+                {"Id": "other", "State": {"StartedAt": self.boot, "Running": True}},
+                {"Id": "exact-id", "State": {"StartedAt": "new-boot", "Running": True}},
+                {"Id": "exact-id", "State": {"StartedAt": self.boot, "Running": False}}):
+            with patch.object(smoke, "inspect", return_value=current), patch.object(smoke, "docker") as run:
+                with self.assertRaises(ValueError):
+                    subject.identity_registration()
+                run.assert_not_called()
+
+    def test_log_read_failure_propagates(self):
+        subject = smoke.Smoke.__new__(smoke.Smoke)
+        subject.guest = "owned-guest"
+        subject.guest_boot = {"Id": "exact-id", "StartedAt": self.boot}
+        current = {"Id": "exact-id", "State": {"StartedAt": self.boot, "Running": True}}
+        with patch.object(smoke, "inspect", return_value=current), patch.object(
+                smoke, "docker", side_effect=subprocess.CalledProcessError(1, ["docker", "exec"])):
+            with self.assertRaises(subprocess.CalledProcessError):
+                subject.identity_registration()
+
+
 class NativeImageCliTest(unittest.TestCase):
     def setUp(self):
         self.subject = smoke.Smoke.__new__(smoke.Smoke)
