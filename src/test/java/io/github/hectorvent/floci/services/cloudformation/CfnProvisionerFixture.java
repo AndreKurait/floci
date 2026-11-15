@@ -47,6 +47,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.CloudTrai
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CloudWatchCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CloudWatchCompositeAlarmCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CloudWatchDashboardCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.CloudWatchInsightRuleCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CodeDeployCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CognitoCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CognitoIdentityProviderCfnProvisioner;
@@ -140,6 +141,7 @@ import io.github.hectorvent.floci.services.cloudfront.CloudFrontService;
 import io.github.hectorvent.floci.services.cloudmap.CloudMapService;
 import io.github.hectorvent.floci.services.cloudtrail.CloudTrailService;
 import io.github.hectorvent.floci.services.cloudwatch.dashboards.CloudWatchDashboardsService;
+import io.github.hectorvent.floci.services.cloudwatch.insights.CloudWatchInsightRulesService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsMetricFilterService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsSubscriptionAdmissionService;
@@ -290,6 +292,7 @@ final class CfnProvisionerFixture {
         // dispatcher. They exist only so inferredProvisioners() can wire their provisioner.
         private FlowLogService flowLogService;
         private CloudWatchDashboardsService cloudWatchDashboardsService;
+        private CloudWatchInsightRulesService cloudWatchInsightRulesService;
         private CloudWatchLogsMetricFilterService logsMetricFilterService;
         private IotAuthorizerService iotAuthorizerService;
         private IotDomainConfigurationService iotDomainConfigurationService;
@@ -460,6 +463,9 @@ final class CfnProvisionerFixture {
             }
             if (cloudWatchDashboardsService != null) {
                 discovered.add(new CloudWatchDashboardCfnProvisioner(cloudWatchDashboardsService));
+            }
+            if (cloudWatchInsightRulesService != null) {
+                discovered.add(new CloudWatchInsightRuleCfnProvisioner(cloudWatchInsightRulesService));
             }
             if (iamService != null) {
                 discovered.add(new IamRoleCfnProvisioner(iamService));
@@ -884,6 +890,11 @@ final class CfnProvisionerFixture {
 
         public Builder cloudWatchDashboards(CloudWatchDashboardsService v) {
             this.cloudWatchDashboardsService = v;
+            return this;
+        }
+
+        public Builder cloudWatchInsightRules(CloudWatchInsightRulesService v) {
+            this.cloudWatchInsightRulesService = v;
             return this;
         }
 
