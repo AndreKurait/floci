@@ -3,6 +3,7 @@ package io.floci.aws.services.cloudformation;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.RequestContext;
 import io.floci.aws.services.iam.AccessDeniedMessages;
 import io.floci.aws.services.iam.AccessDeniedMessages.PolicyType;
 import io.floci.aws.services.iam.AssumeRolePolicyEvaluator;
@@ -12,6 +13,7 @@ import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.iam.model.CallerContext;
 import io.floci.aws.services.iam.model.IamRole;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.context.ContextNotActiveException;
 import jakarta.inject.Inject;
 
 import java.util.List;
@@ -23,8 +25,9 @@ import java.util.Optional;
  * {@code Fn::GetStackOutput} names. On AWS CloudFormation assumes the role as the stack's
  * execution role, or without one as the caller of the stack operation, and reads the outputs with
  * DescribeStacks in a session named {@code GetStackOutput} (measured, eu-west-1, 2026-10-16).
- * Floci runs stack operations under no execution role and keeps no caller for them, so the role
- * has to exist, and with IAM enforcement on, its trust policy has to allow a principal in the
+ * Floci preserves its account-based output-role checks independently of the verified caller
+ * snapshot exposed to resource providers. The role has to exist, and with IAM enforcement on,
+ * its trust policy has to allow a principal in the
  * consuming account and its policies have to allow DescribeStacks on the stack, as
  * {@code AssumeRole} and {@code AppSyncDataSourceAuthorizer} evaluate a role.
  */
@@ -38,14 +41,22 @@ public class GetStackOutputRoleAuthorizer {
     private final AssumeRolePolicyEvaluator trustEvaluator;
     private final IamPolicyEvaluator policyEvaluator;
     private final EmulatorConfig config;
+    private final RequestContext requestContext;
+
+    public GetStackOutputRoleAuthorizer(IamService iamService, AssumeRolePolicyEvaluator trustEvaluator,
+                                        IamPolicyEvaluator policyEvaluator, EmulatorConfig config) {
+        this(iamService, trustEvaluator, policyEvaluator, config, null);
+    }
 
     @Inject
     public GetStackOutputRoleAuthorizer(IamService iamService, AssumeRolePolicyEvaluator trustEvaluator,
-                                        IamPolicyEvaluator policyEvaluator, EmulatorConfig config) {
+                                        IamPolicyEvaluator policyEvaluator, EmulatorConfig config,
+                                        RequestContext requestContext) {
         this.iamService = iamService;
         this.trustEvaluator = trustEvaluator;
         this.policyEvaluator = policyEvaluator;
         this.config = config;
+        this.requestContext = requestContext;
     }
 
     /**
@@ -92,6 +103,32 @@ public class GetStackOutputRoleAuthorizer {
                 AccessDeniedMessages.notAuthorized(session, DESCRIBE_STACKS, stackId,
                         PolicyType.IDENTITY_BASED_POLICY.refusal(decision, DESCRIBE_STACKS, null)),
                 "AmazonCloudFormation", 403, "AccessDenied"), 403);
+    }
+
+    /** Capture only an authenticated caller; legacy and account-only scopes have no authority. */
+    CloudFormationExecutionScope.Identity captureCaller() {
+        if (requestContext == null) {
+            return null;
+        }
+        try {
+            String key = requestContext.getAccessKeyId();
+            if (!requestContext.isSignatureVerifiedFor(key)) {
+                return null;
+            }
+            Optional<IamService.CallerArns> caller = iamService.resolveCallerArns(key);
+            CallerContext policies = iamService.resolveCallerContext(key);
+            if (caller.isEmpty() || policies == null
+                    || !AwsArnUtils.parse(caller.get().callerArn()).accountId()
+                            .equals(requestContext.getAccountId())) {
+                return null;
+            }
+            String account = AwsArnUtils.parse(caller.get().callerArn()).accountId();
+            policies = policies.withScpLevels(iamService.effectiveScpLevels(account));
+            return new CloudFormationExecutionScope.Identity(caller.get(), policies);
+        } catch (ContextNotActiveException ignored) {
+            // Pollers and internal operations outside an HTTP request have no caller authority.
+            return null;
+        }
     }
 
     private boolean enforced() {

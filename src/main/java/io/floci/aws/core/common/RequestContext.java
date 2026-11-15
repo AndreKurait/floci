@@ -14,6 +14,7 @@ public class RequestContext {
     private String region;
     private String partition;
     private String accessKeyId;
+    private String signatureVerifiedAccessKeyId;
     private String sessionToken;
     private Boolean iamGovernanceBypass;
     /**
@@ -22,6 +23,15 @@ public class RequestContext {
      * authenticates, so the two have to read one answer rather than each take their own.
      */
     private RequestMfaClaim mfaClaim;
+
+    /** Authentication provenance, never established by an account-only internal scope. */
+    public boolean isSignatureVerifiedFor(String accessKey) {
+        return accessKey != null && accessKey.equals(signatureVerifiedAccessKeyId);
+    }
+
+    void recordVerifiedSignature(String accessKey) {
+        signatureVerifiedAccessKeyId = accessKey;
+    }
 
     public String getAccountId() {
         return accountId;
