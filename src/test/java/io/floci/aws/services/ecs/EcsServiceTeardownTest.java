@@ -42,6 +42,7 @@ import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -532,6 +533,10 @@ class EcsServiceTeardownTest {
                 null, null, List.of(), REGION);
         service.runTask(null, "teardown-fam", 1, LaunchType.FARGATE, null, null,
                 List.of(), null, REGION);
+
+        service.beginTeardown();
+        assertTrue(service.isReconcilerShutdown());
+        verify(containerManager, never()).stopTask(handle);
 
         service.stopManagedContainers();
         verify(containerManager, times(1)).stopTask(handle);
