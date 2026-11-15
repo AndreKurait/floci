@@ -44,6 +44,9 @@ public class CloudWatchLogsHandler {
     private final CloudWatchLogsTransformerHandler transformerHandler;
 
     @Inject
+    CloudWatchLogsExportHandler exportHandler;
+
+    @Inject
     public CloudWatchLogsHandler(CloudWatchLogsService logsService,
                                  CloudWatchLogsCrossAccountService crossAccountService,
                                  CloudWatchLogsMetricFilterService metricFilterService,
@@ -68,7 +71,13 @@ public class CloudWatchLogsHandler {
     }
 
     public Response handle(String action, JsonNode request, String region) {
+        return handle(action, request, region, null);
+    }
+
+    public Response handle(String action, JsonNode request, String region, String authorization) {
         return switch (action) {
+            case "CreateExportTask", "DescribeExportTasks", "CancelExportTask" ->
+                    exportHandler.handle(action, request, region, authorization);
             case "CreateLogGroup" -> handleCreateLogGroup(request, region);
             case "DeleteLogGroup" -> handleDeleteLogGroup(request, region);
             case "DescribeLogGroups" -> handleDescribeLogGroups(request, region);

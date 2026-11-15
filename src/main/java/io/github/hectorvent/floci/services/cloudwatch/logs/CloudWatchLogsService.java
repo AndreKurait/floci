@@ -38,6 +38,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -746,6 +747,74 @@ public class CloudWatchLogsService implements ResourceProvider, Resettable {
 
     static AwsException invalidNextToken() {
         return new AwsException("InvalidParameterException", "The specified nextToken is invalid.", 400);
+    }
+
+
+    /** Reads IAM tags without migrating a default-account legacy group or creating export state. */
+    public Map<String, String> readLogExportTags(String account, String region, String name) {
+        synchronized (metricFilterStore) {
+            Optional<LogGroup> found = getForAccount(groupStore, account, groupKey(region, name));
+            if (found.isEmpty() && groupStore instanceof AccountAwareStorageBackend<?> raw) {
+                @SuppressWarnings("unchecked")
+                AccountAwareStorageBackend<LogGroup> aware = (AccountAwareStorageBackend<LogGroup>) raw;
+                found = aware.getLegacyForAccount(account, groupKey(region, name));
+            }
+            return found.filter(group -> name.equals(group.getLogGroupName()))
+                    .map(group -> group.getTags() == null ? Map.<String, String>of()
+                            : new LinkedHashMap<>(group.getTags())).orElseGet(Map::of);
+        }
+    }
+
+    /** Captures every matching native event under the existing source writer monitors, with no query cap. */
+    List<LogExportPlan.Event> captureExport(String account, String region, String name,
+                                           String streamPrefix, long from, long to) {
+        synchronized (metricFilterStore) {
+            synchronized (eventIndex(indexAccount(account))) {
+                if (resetting) {
+                    throw new AwsException("ServiceUnavailableException", "Logs is resetting.", 500);
+                }
+                LogGroup group = requireLogGroupForAccount(account, region, name);
+                if (!"STANDARD".equals(group.getLogGroupClass()) || group.getKmsKeyId() != null) {
+                    throw CloudWatchLogsExportService.invalid("Local exports require an unencrypted STANDARD log group.");
+                }
+                if (to < group.getCreatedTime()) {
+                    throw CloudWatchLogsExportService.invalid("The end time precedes log group creation.");
+                }
+                String prefix = streamKeyPrefix(region, name);
+                Set<String> streams = new HashSet<>();
+                for (String key : keysForAccount(streamStore, account)) {
+                    if (key.startsWith(prefix)) {
+                        LogStream stream = getForAccount(streamStore, account, key).orElseThrow(() ->
+                                CloudWatchLogsExportService.invalid("The source stream inventory is incomplete."));
+                        String streamName = stream.getLogStreamName();
+                        if (streamName == null || !name.equals(stream.getLogGroupName())
+                                || !key.equals(streamKey(region, name, streamName))) {
+                            throw CloudWatchLogsExportService.invalid("The source stream inventory is invalid.");
+                        }
+                        streams.add(streamName);
+                    }
+                }
+                List<LogExportPlan.Event> events = new ArrayList<>();
+                for (String key : keysForAccount(eventStore, account)) {
+                    if (key.startsWith(prefix)) {
+                        LogEvent event = getForAccount(eventStore, account, key).orElseThrow(() ->
+                                CloudWatchLogsExportService.invalid("The source event inventory is incomplete."));
+                        String stream = streamNameFromEventKey(key, prefix);
+                        if (event.getEventId() == null || event.getMessage() == null || !streams.contains(stream)
+                                || !key.equals(eventKey(region, name, stream, event.getTimestamp(), event.getEventId()))) {
+                            throw CloudWatchLogsExportService.invalid("The source event inventory is invalid.");
+                        }
+                        if ((streamPrefix == null || stream.startsWith(streamPrefix))
+                                && event.getTimestamp() >= from && event.getTimestamp() <= to) {
+                            events.add(new LogExportPlan.Event(stream, event.getTimestamp(), event.getMessage()));
+                        }
+                    }
+                }
+                events.sort(Comparator.comparing(LogExportPlan.Event::stream)
+                        .thenComparingLong(LogExportPlan.Event::timestamp).thenComparing(LogExportPlan.Event::message));
+                return List.copyOf(events);
+            }
+        }
     }
 
     private LogGroup requireLogGroup(String region, String name) {
