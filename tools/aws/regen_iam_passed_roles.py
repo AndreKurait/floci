@@ -276,8 +276,6 @@ NOT_READ = {
     "s3:PutBucketReplication": XML_BODY,
     "redshift:ModifyLakehouseConfiguration": NO_ROLE_MEMBER,
     "redshift-serverless:UpdateLakehouseConfiguration": NO_ROLE_MEMBER,
-    "sagemaker:CreateTrainingSession": "the reference passes the role to sagemaker or training-session.sagemaker "
-                                       "and nothing says which",
     "sagemaker:CreateTransformJob": NO_ROLE_MEMBER,
     "sagemaker:ImportHubContent": NO_ROLE_MEMBER,
     "ssm:CreateDocument": NO_ROLE_MEMBER,
@@ -397,9 +395,6 @@ MEMBER_SERVICES = {
         "taskRoleArn": ECS_TASKS,
         "infrastructureRoleArn": ECS_INFRASTRUCTURE,
     },
-    # "Amazon EMR uses this role" for the session. The reference also lists
-    # managed-compute.elasticmapreduce, but the request cannot say which compute it runs on.
-    "elasticmapreduce:StartSession": {"ExecutionRoleArn": "elasticmapreduce"},
     # rds-preview is the principal of RDS's preview environment; PassedRoles' RDS cases pass to rds.
     "rds:*": {"*": "rds"},
 }

@@ -239,7 +239,7 @@ public class DynamoDbService {
                     StorageBackend<String, ReplicaAutoScalingState> replicaAutoScalingStore) {
         this(tableStore, itemStore, null, null, new InMemoryStorage<>(), new InMemoryStorage<>(),
                 regionResolver, streamService, kinesisForwarder, null, null, 0, 0, 0, Clock.systemUTC(),
-                Runnable::run, replicaAutoScalingStore);
+                Runnable::run, replicaAutoScalingStore, true);
     }
 
     /** Explicit stores for replica-settings persistence and refused-write tests. */
@@ -247,7 +247,7 @@ public class DynamoDbService {
                     StorageBackend<String, ReplicaAutoScalingState> replicaAutoScalingStore) {
         this(tableStore, null, null, null, new InMemoryStorage<>(), new InMemoryStorage<>(),
                 regionResolver, null, null, null, null, 0, 0, 0, Clock.systemUTC(),
-                Runnable::run, replicaAutoScalingStore);
+                Runnable::run, replicaAutoScalingStore, true);
     }
 
     DynamoDbService(StorageBackend<String, TableDefinition> tableStore,

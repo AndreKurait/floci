@@ -60,6 +60,18 @@ def test_a_pass_role_with_no_service_passes_to_none():
     assert r.passed_role_operations([document])["svc:CreateGroup"]["passedTo"] == []
 
 
+@pytest.mark.parametrize(("namespace", "operation", "member", "principal"), [
+    ("elasticmapreduce", "StartSession", "ExecutionRoleArn", "managed-compute.elasticmapreduce"),
+    ("sagemaker", "CreateTrainingSession", "RoleArn", "training-session.sagemaker"),
+])
+def test_session_roles_follow_the_unambiguous_reference_principal(namespace, operation, member, principal):
+    upstream = r.passed_role_operations([reference(namespace, {operation: [principal]})])
+    sdk = model({operation: "Input"}, {"Input": structure(**{member: "String"})})
+    entry = r.entry_for(namespace + ":" + operation, upstream[namespace + ":" + operation]["passedTo"],
+                        {namespace: sdk})
+    assert entry == {"passedTo": [principal], "roles": [{"member": member, "passedTo": principal}]}
+
+
 def test_a_passed_to_service_that_is_no_principal_is_a_malformed_response():
     document = reference("svc", {"CreateThing": ["svc"]})
     document["Operations"][0]["AuthorizedActions"][1]["Context"]["iam:PassedToService"] = ["svc"]
