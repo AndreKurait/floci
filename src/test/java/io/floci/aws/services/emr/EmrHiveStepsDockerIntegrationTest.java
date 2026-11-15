@@ -135,13 +135,17 @@ class EmrHiveStepsDockerIntegrationTest {
         // Keep the first session open until the second has completed, even on a slow runner.
         String marker = "FLOCI_HIVE_SESSION_READY_" + UUID.randomUUID().toString().replace("-", "");
         String gate = "/mnt/" + marker;
-        String waitForRelease = "mkfifo " + gate + "; printf '%s\\n' " + marker
-                + "; timeout 120 bash -c 'read -r release < " + gate + "'";
+        String script = gate + ".sh";
+        // Hive's shell escape splits arguments without shell quoting. Invoke a script with no arguments.
+        String waitForRelease = "#!/bin/bash\nset -eu\nmkfifo " + gate + "\nprintf '%s\\n' " + marker
+                + "\ntimeout 120 bash -c 'read -r release < " + gate + "'\n";
+        String setup = addStep("command-runner.jar", "bash", "-c",
+                "printf '%s' \"$1\" > \"$2\" && chmod +x \"$2\"", "setup", waitForRelease, script);
+        assertEquals("COMPLETED", state(setup));
         String slow = LogCapture.awaitRecord(ContainerLogStreamer.class, Duration.ofMinutes(2),
                 record -> LogCapture.formatted(record).endsWith("] " + marker),
                 () -> addStep("command-runner.jar", "hive-script", "--run-hive-script", "--args",
-                        "-e", "create table slow (k string); !bash -c \"" + waitForRelease
-                                + "\"; insert into slow values ('s');"));
+                        "-e", "create table slow (k string); !" + script + "; insert into slow values ('s');"));
         try {
             String quick = addStep("command-runner.jar", "hive-script", "--run-hive-script", "--args",
                     "-e", "create table quick as select 'q' as k;");
