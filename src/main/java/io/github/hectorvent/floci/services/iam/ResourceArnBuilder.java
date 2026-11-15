@@ -29,6 +29,7 @@ import io.github.hectorvent.floci.services.lambda.LambdaArnUtils;
 import io.github.hectorvent.floci.services.lambda.LambdaRuntimeManagementReference;
 import io.github.hectorvent.floci.services.lambda.durable.DurableTokens;
 import io.github.hectorvent.floci.services.lambdamicrovms.LambdaMicrovmsService;
+import io.github.hectorvent.floci.services.memorydb.MemoryDbParameterGroupTarget;
 import io.github.hectorvent.floci.services.neptune.NeptuneSnapshotResources;
 import io.github.hectorvent.floci.services.s3.S3ControlArnUtils;
 import io.github.hectorvent.floci.services.secretsmanager.SecretsManagerService;
@@ -308,6 +309,12 @@ public class ResourceArnBuilder {
         if ("cloudfront".equals(credentialScope) && "cloudfront:TestFunction".equals(operation)) {
             return List.of(AwsArnUtils.Arn.global(partition, "cloudfront", accountId,
                     "function/" + CloudFrontFunctionTestRoute.name(ctx)).toString());
+        }
+        if ("memorydb".equals(credentialScope)) {
+            JsonNode body = readJsonBody(ctx);
+            if (MemoryDbParameterGroupTarget.claims(operation, body)) {
+                return List.of(MemoryDbParameterGroupTarget.resourceArn(operation, body, partition, region, accountId));
+            }
         }
         // Task tokens resolve their authorization resource from recorded workflow ownership.
         if ("states".equals(credentialScope) && operation != null && Set.of("states:SendTaskSuccess",

@@ -38,6 +38,8 @@ import io.github.hectorvent.floci.services.kinesis.KinesisService;
 import io.github.hectorvent.floci.services.lambda.LambdaRuntimeManagementService;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambdaweb.LambdaWebService;
+import io.github.hectorvent.floci.services.memorydb.MemoryDbParameterGroupService;
+import io.github.hectorvent.floci.services.memorydb.MemoryDbParameterGroupTarget;
 import io.github.hectorvent.floci.services.s3.S3ControlTagConditionKeys;
 import io.github.hectorvent.floci.services.s3.S3ObjectActions;
 import io.github.hectorvent.floci.services.s3.S3ObjectKeys;
@@ -151,10 +153,13 @@ public class IamConditionContextResolver {
     private final Instance<CloudFrontFunctionTesting> cloudFrontFunctionTesting;
     private final ResolvedServiceCatalog serviceCatalog;
 
+    private final Instance<MemoryDbParameterGroupService> memoryDbParameterGroups;
+
     /**
      * The system clock, not the CDI one: Object Lock's remaining retention days has to count from the
      * same now as S3Service, which checks retention against {@code Instant.now()}.
      */
+    @Inject
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
                                        Instance<Ec2Service> ec2Service,
                                        Instance<S3Service> s3Service,
@@ -175,7 +180,8 @@ public class IamConditionContextResolver {
                                        Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates,
                                        Instance<LambdaRuntimeManagementService> runtimeManagement,
                                        Instance<EcrService> ecrService,
-                                       Instance<CloudFrontFunctionTesting> cloudFrontFunctionTesting) {
+                                       Instance<CloudFrontFunctionTesting> cloudFrontFunctionTesting,
+                                       Instance<MemoryDbParameterGroupService> memoryDbParameterGroups) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
                 config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService,
                 elbV2ConditionKeys, mqConfigurations, lambdaService, athenaPreparedStatements,
@@ -184,7 +190,8 @@ public class IamConditionContextResolver {
                 eksAccessEntryUpdates,
                 runtimeManagement,
                 ecrService,
-                cloudFrontFunctionTesting);
+                cloudFrontFunctionTesting,
+                memoryDbParameterGroups);
     }
 
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -201,6 +208,7 @@ public class IamConditionContextResolver {
                                        Instance<ElbV2ConditionKeys> elbV2ConditionKeys) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
                 config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys, null, null, null,
+                null,
                 null,
                 null,
                 null,
@@ -226,6 +234,7 @@ public class IamConditionContextResolver {
                 null,
                 null,
                 null,
+                null,
                 null);
     }
 
@@ -241,6 +250,7 @@ public class IamConditionContextResolver {
                                 ResolvedServiceCatalog serviceCatalog, Clock clock) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
                 config, currentVertxRequest, serviceCatalog, clock, null, null, null, null, null,
+                null,
                 null,
                 null,
                 null,
@@ -269,7 +279,8 @@ public class IamConditionContextResolver {
                                         Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates,
                                         Instance<LambdaRuntimeManagementService> runtimeManagement,
                                         Instance<EcrService> ecrService,
-                                        Instance<CloudFrontFunctionTesting> cloudFrontFunctionTesting) {
+                                        Instance<CloudFrontFunctionTesting> cloudFrontFunctionTesting,
+                                        Instance<MemoryDbParameterGroupService> memoryDbParameterGroups) {
         this.mqConfigurations = mqConfigurations;
         this.lambdaService = lambdaService;
         this.athenaPreparedStatements = athenaPreparedStatements;
@@ -292,6 +303,7 @@ public class IamConditionContextResolver {
         this.runtimeManagement = runtimeManagement;
         this.ecrService = ecrService;
         this.cloudFrontFunctionTesting = cloudFrontFunctionTesting;
+        this.memoryDbParameterGroups = memoryDbParameterGroups;
     }
 
     private Map<String, List<String>> athenaPreparedStatementConditions(String action, ContainerRequestContext ctx) {
@@ -365,10 +377,56 @@ public class IamConditionContextResolver {
             case "kinesis" -> kinesisConditionContext(action, ctx);
             case "eks" -> "eks:UpdateAccessEntry".equals(action) && eksAccessEntryUpdates != null
                     && eksAccessEntryUpdates.isResolvable() ? eksAccessEntryUpdates.get().resolve(ctx) : null;
+            case "memorydb" -> memoryDbParameterGroupConditions(action, ctx);
             case "redshift" -> redshiftConditionContext(action, ctx);
             case "states" -> stepFunctionsConditionContext(action, ctx);
             default -> null;
         };
+    }
+
+    private Map<String, List<String>> memoryDbParameterGroupConditions(String action, ContainerRequestContext ctx) {
+        JsonNode body = bufferedJsonBody(ctx);
+        if (body == null || !body.isObject() || !MemoryDbParameterGroupTarget.claims(action, body)) {
+            return null;
+        }
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        if (("memorydb:CreateParameterGroup".equals(action) || "memorydb:TagResource".equals(action))
+                && body.path("Tags").isArray()) {
+            Set<String> keys = new LinkedHashSet<>();
+            for (JsonNode tag : body.path("Tags")) {
+                if (tag.path("Key").isTextual()
+                        && (tag.path("Value").isTextual() || tag.path("Value").isNull() || !tag.has("Value"))) {
+                    String key = tag.path("Key").textValue();
+                    keys.add(key);
+                    conditions.put(REQUEST_TAG_PREFIX + key, List.of(tag.path("Value").isTextual()
+                            ? tag.path("Value").textValue() : ""));
+                }
+            }
+            if (!keys.isEmpty()) {
+                conditions.put("aws:TagKeys", List.copyOf(keys));
+            }
+        } else if ("memorydb:UntagResource".equals(action) && body.path("TagKeys").isArray()) {
+            List<String> keys = new ArrayList<>();
+            body.path("TagKeys").forEach(key -> {
+                if (key.isTextual()) {
+                    keys.add(key.textValue());
+                }
+            });
+            if (!keys.isEmpty()) {
+                conditions.put("aws:TagKeys", keys);
+            }
+        }
+        if (!"memorydb:CreateParameterGroup".equals(action)
+                && memoryDbParameterGroups != null && memoryDbParameterGroups.isResolvable()) {
+            String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+            String account = requestContext.getAccountId() == null ? config.defaultAccountId() : requestContext.getAccountId();
+            String partition = requestContext.getPartition() == null
+                    ? AwsRegions.partitionFor(region) : requestContext.getPartition();
+            String arn = MemoryDbParameterGroupTarget.resourceArn(action, body, partition, region, account);
+            memoryDbParameterGroups.get().iamTags(arn, partition, region, account).forEach((key, value) ->
+                    conditions.put(RESOURCE_TAG_PREFIX + key, List.of(value)));
+        }
+        return conditions.isEmpty() ? null : conditions;
     }
 
     private List<Map<String, List<String>>> elbV2Contexts(String action, ContainerRequestContext ctx) {

@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.core.common;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.services.memorydb.MemoryDbParameterGroupTarget;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.MultivaluedMap;
 
@@ -151,6 +152,9 @@ public final class RequestResources {
      */
     public static List<String> created(String operation, ContainerRequestContext ctx, String partition, String region,
                                        String accountId, Map<String, String> labels) {
+        if ("memorydb:CreateParameterGroup".equals(operation)) {
+            return List.of(MemoryDbParameterGroupTarget.createdArn(PassedRoles.jsonBody(ctx), partition, region, accountId));
+        }
         RequestResourceMembers.Table table = RequestResourceMembers.table();
         List<RequestResourceMembers.Created> creates = operation == null ? null : table.creates().get(operation);
         List<RequestResourceMembers.Resource> made = operation == null || creates != null ? List.of()
