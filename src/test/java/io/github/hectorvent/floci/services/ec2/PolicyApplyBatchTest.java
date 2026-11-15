@@ -1,8 +1,11 @@
 package io.github.hectorvent.floci.services.ec2;
 
+import io.github.hectorvent.floci.testing.ThreadStates;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -38,6 +41,8 @@ class PolicyApplyBatchTest {
         });
         try {
             assertTrue(writing.await(5, TimeUnit.SECONDS));
+            ThreadStates.awaitState(caller, Set.of(Thread.State.WAITING), Duration.ofSeconds(5),
+                    "policy batch caller joining its worker");
             caller.interrupt();
             assertTrue(caller.isAlive());
             assertFalse(written.get());
