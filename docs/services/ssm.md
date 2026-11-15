@@ -95,6 +95,7 @@ conditions and shared cross-account command documents remain unsupported.
 
 | Action | Description |
 |---|---|
+| `RegisterManagedInstance` | Register an EC2 agent's RSA public key using that running instance's IMDS identity credentials |
 | `UpdateInstanceInformation` | Register or update an SSM agent record for an instance. Does not create an EC2 instance or register the container with IMDS (see [Run Command Execution](#run-command-execution)) |
 | `DescribeInstanceInformation` | Filter and paginate registered managed nodes in the caller's account and region |
 | `SendCommand` | Create command invocations for target instances |
@@ -102,6 +103,19 @@ conditions and shared cross-account command documents remain unsupported.
 | `ListCommands` | List command records |
 | `ListCommandInvocations` | List command invocation records |
 | `CancelCommand` | Cancel pending or in-progress command invocations |
+
+EC2 `RegisterManagedInstance` requires a valid SigV4 request signed with the
+instance identity role credentials from IMDS. The credentials must identify the
+running instance in the request's account and region. Signature verification
+applies even when global signature validation is disabled. These credentials
+receive no general IAM or SSM permissions.
+
+The request supplies `InstanceId`, `KeyType=rsa` and an RSA `PublicKey` of at
+least 2048 bits, encoded as base64 X.509 DER or a `PUBLIC KEY` PEM block.
+Registration uses the existing SSM storage mode, and an identical retry preserves
+the registration time. It does not mark the agent online; that requires its
+subsequent `UpdateInstanceInformation` heartbeat. Activation-based hybrid
+registration and managed-instance role token issuance are not implemented here.
 
 ### Inventory
 

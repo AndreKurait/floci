@@ -4655,6 +4655,34 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 .filter(session -> session.getEc2InstanceArn() != null);
     }
 
+    /** Live IMDS instance-identity credentials, without an IAM policy grant. */
+    public Optional<SessionCredential> ec2InstanceIdentitySession(String accessKeyId) {
+        return currentSession(accessKeyId).filter(session -> {
+            if (session.getEc2InstanceArn() == null || session.getEc2InstanceId() == null
+                    || !session.getEc2InstanceId().matches("i-(?:[0-9a-f]{8}|[0-9a-f]{17})")
+                    || session.getEc2RoleId() != null || session.getExpiration() == null
+                    || session.isAssumeRoleIssued() || session.isLambdaExecutionRole()
+                    || session.getEcsTaskArn() != null || session.getSessionPolicyDocument() != null
+                    || session.isManagedSessionPolicyPresent()) {
+                return false;
+            }
+            try {
+                AwsArnUtils.Arn instance = AwsArnUtils.parse(session.getEc2InstanceArn());
+                return instance.service().equals("ec2") && !instance.region().isEmpty()
+                        && instance.resource().equals("instance/" + session.getEc2InstanceId())
+                        && instance.accountId().equals(session.getOriginAccountId())
+                        && session.getEc2InstanceId().equals(session.getRoleSessionName())
+                        && (instance.accountId() + ":aws:ec2-instance:" + session.getEc2InstanceId())
+                        .equals(session.getAssumedRoleId())
+                        && AwsArnUtils.Arn.global(instance.partition(), "iam", instance.accountId(),
+                        "role/aws:ec2-instance").toString().equals(session.getRoleArn());
+            } catch (IllegalArgumentException invalidIdentity) {
+                LOG.debug("Refusing an invalid EC2 instance-identity credential record");
+                return false;
+            }
+        });
+    }
+
     /** Whether an access key ID identifies Floci's documented public deployer credential. */
     public boolean isSeededDeployerAccessKey(String accessKeyId) {
         return DEFAULT_DEPLOYER_ACCESS_KEY_ID.equals(accessKeyId);

@@ -93,6 +93,21 @@ class Ec2InstanceCredentialsTest {
         verify(fixture.iam, never()).registerEc2InstanceSession(any());
     }
 
+    @ParameterizedTest
+    @CsvSource({
+            "us-east-1, aws", "cn-north-1, aws-cn", "us-gov-west-1, aws-us-gov",
+            "us-iso-east-1, aws-iso", "us-isob-east-1, aws-iso-b"
+    })
+    void identityCredentialsBindTheInstanceRegionAndPartition(String region, String partition) {
+        Fixture fixture = fixture();
+        fixture.instance.setRegion(region);
+        SessionCredential identity = fixture.credentials.identity(fixture.instance, ACCOUNT, NOW).orElseThrow();
+        assertEquals("arn:" + partition + ":ec2:" + region + ":" + ACCOUNT + ":instance/i-first",
+                identity.getEc2InstanceArn());
+        assertEquals("arn:" + partition + ":iam::" + ACCOUNT + ":role/aws:ec2-instance", identity.getRoleArn());
+        assertEquals(ACCOUNT + ":aws:ec2-instance:i-first", identity.getAssumedRoleId());
+    }
+
     @Test
     void unregisterRevokesEveryGenerationAndPreventsLateIssuance() {
         Fixture fixture = fixture();
