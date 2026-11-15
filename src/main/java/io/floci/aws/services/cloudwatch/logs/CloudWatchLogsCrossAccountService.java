@@ -5,7 +5,11 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.PaginatedResult;
+import io.floci.aws.core.common.Pagination;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.SignedMarkers;
+import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.cloudwatch.logs.model.AccountPolicy;
@@ -14,10 +18,14 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 
 import java.nio.charset.StandardCharsets;
+import java.time.Clock;
+import java.time.Duration;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -41,25 +49,39 @@ public class CloudWatchLogsCrossAccountService {
     private final StorageBackend<String, AccountPolicy> accountPolicies;
     private final RegionResolver regionResolver;
     private final ObjectMapper objectMapper;
+    private final CloudWatchLogsDestinationTargetService targets;
+    private final Clock clock;
+    private final SignedMarkers destinationMarkers = new SignedMarkers();
 
     @Inject
     public CloudWatchLogsCrossAccountService(StorageFactory storageFactory, RegionResolver regionResolver,
-                                             ObjectMapper objectMapper) {
+                                             ObjectMapper objectMapper,
+                                             CloudWatchLogsDestinationTargetService targets) {
         this(
                 storageFactory.create("cloudwatchlogs", "cwlogs-destinations.json",
                         new TypeReference<Map<String, LogDestination>>() {}),
                 storageFactory.create("cloudwatchlogs", "cwlogs-account-policies.json",
                         new TypeReference<Map<String, AccountPolicy>>() {}),
-                regionResolver, objectMapper);
+                regionResolver, objectMapper, targets);
     }
 
     CloudWatchLogsCrossAccountService(StorageBackend<String, LogDestination> destinations,
                                       StorageBackend<String, AccountPolicy> accountPolicies,
-                                      RegionResolver regionResolver, ObjectMapper objectMapper) {
+                                      RegionResolver regionResolver, ObjectMapper objectMapper,
+                                      CloudWatchLogsDestinationTargetService targets) {
+        this(destinations, accountPolicies, regionResolver, objectMapper, targets, Clock.systemUTC());
+    }
+
+    CloudWatchLogsCrossAccountService(StorageBackend<String, LogDestination> destinations,
+                                      StorageBackend<String, AccountPolicy> accountPolicies,
+                                      RegionResolver regionResolver, ObjectMapper objectMapper,
+                                      CloudWatchLogsDestinationTargetService targets, Clock clock) {
         this.destinations = destinations;
         this.accountPolicies = accountPolicies;
         this.regionResolver = regionResolver;
         this.objectMapper = objectMapper;
+        this.targets = Objects.requireNonNull(targets);
+        this.clock = Objects.requireNonNull(clock);
     }
 
     public synchronized LogDestination putDestination(String destinationName, String targetArn,
@@ -68,7 +90,8 @@ public class CloudWatchLogsCrossAccountService {
         requireArn(targetArn, "targetArn");
         requireArn(roleArn, "roleArn");
         String key = destinationKey(region, destinationName);
-        LogDestination destination = destinations.get(key).orElseGet(LogDestination::new);
+        LogDestination destination = destinations.get(key).map(CloudWatchLogsCrossAccountService::copyDestination)
+                .orElseGet(LogDestination::new);
         destination.setDestinationName(destinationName);
         destination.setTargetArn(targetArn);
         destination.setRoleArn(roleArn);
@@ -77,8 +100,9 @@ public class CloudWatchLogsCrossAccountService {
             destination.setCreationTime(System.currentTimeMillis());
             destination.setTags(tags);
         }
+        targets.admit(destination);
         destinations.put(key, destination);
-        return destination;
+        return copyDestination(destination);
     }
 
     public static boolean isCrossAccountDestinationArn(String arn) {
@@ -128,10 +152,85 @@ public class CloudWatchLogsCrossAccountService {
         validateDestinationName(destinationName);
         requireJsonObject(accessPolicy, "accessPolicy", DESTINATION_POLICY_MAX_BYTES);
         String key = destinationKey(region, destinationName);
-        LogDestination destination = destinations.get(key)
+        LogDestination destination = destinations.get(key).map(CloudWatchLogsCrossAccountService::copyDestination)
                 .orElseThrow(() -> invalid("The specified destination does not exist."));
         destination.setAccessPolicy(accessPolicy);
         destinations.put(key, destination);
+    }
+
+    /** Explicit account lookup never resolves through the ambient request account. */
+    public synchronized LogDestination resolveDestination(String arn, String region) {
+        if (!isCrossAccountDestinationArn(arn)) {
+            throw destinationNotFound();
+        }
+        AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+        String name = parsed.resource().substring("destination:".length());
+        if (!region.equals(parsed.region()) || !parsed.accountId().matches("[0-9]{12}")
+                || !regionResolver.partitionForRegion(region).equals(parsed.partition())
+                || !DESTINATION_NAME.matcher(name).matches()) {
+            throw destinationNotFound();
+        }
+        String key = destinationKey(region, name);
+        Optional<LogDestination> found;
+        if (destinations instanceof AccountAwareStorageBackend<?> raw) {
+            @SuppressWarnings("unchecked")
+            AccountAwareStorageBackend<LogDestination> aware = (AccountAwareStorageBackend<LogDestination>) raw;
+            found = aware.getForAccount(parsed.accountId(), key);
+            if (found.isEmpty()) {
+                found = aware.getLegacyForAccount(parsed.accountId(), key);
+            }
+        } else {
+            found = destinations.get(key);
+        }
+        return found.filter(value -> arn.equals(value.getArn()) && name.equals(value.getDestinationName()))
+                .map(CloudWatchLogsCrossAccountService::copyDestination)
+                .orElseThrow(CloudWatchLogsCrossAccountService::destinationNotFound);
+    }
+
+    public synchronized PaginatedResult<LogDestination> describeDestinations(
+            String prefix, Integer limit, String nextToken, String region) {
+        if (prefix != null) {
+            validateDestinationName(prefix);
+        }
+        if (limit != null && (limit < 1 || limit > 50)) {
+            throw invalid("limit must be between 1 and 50.");
+        }
+        String account = regionResolver.getAccountId();
+        List<LogDestination> values = destinations.scan(key -> key.startsWith(region + "::")).stream()
+                .filter(value -> prefix == null || value.getDestinationName().startsWith(prefix))
+                .filter(value -> regionResolver.buildArn("logs", region, account,
+                        "destination:" + value.getDestinationName()).equals(value.getArn()))
+                .map(CloudWatchLogsCrossAccountService::copyDestination).toList();
+        String scope = "logs-destinations\n" + account + "\n" + region + "\n" + (prefix == null ? "" : prefix);
+        return Pagination.paginateExpiring(values, LogDestination::getDestinationName,
+                limit == null ? 50 : limit, nextToken, scope, clock, Duration.ofHours(24), destinationMarkers,
+                ignored -> invalid("Invalid nextToken."));
+    }
+
+    public synchronized void deleteDestination(String name, String region) {
+        validateDestinationName(name);
+        String arn = regionResolver.buildArn("logs", region, "destination:" + name);
+        resolveDestination(arn, region);
+        if (destinations instanceof AccountAwareStorageBackend<?> raw) {
+            @SuppressWarnings("unchecked")
+            AccountAwareStorageBackend<LogDestination> aware = (AccountAwareStorageBackend<LogDestination>) raw;
+            aware.deleteMatchingIncludingLegacyAtomically(destination -> arn.equals(destination.getArn())
+                    && name.equals(destination.getDestinationName()));
+        } else {
+            destinations.delete(destinationKey(region, name));
+        }
+    }
+
+    private static LogDestination copyDestination(LogDestination original) {
+        LogDestination copy = new LogDestination();
+        copy.setDestinationName(original.getDestinationName());
+        copy.setTargetArn(original.getTargetArn());
+        copy.setRoleArn(original.getRoleArn());
+        copy.setAccessPolicy(original.getAccessPolicy());
+        copy.setArn(original.getArn());
+        copy.setCreationTime(original.getCreationTime());
+        copy.setTags(original.getTags());
+        return copy;
     }
 
     public synchronized AccountPolicy putAccountPolicy(String policyName, String policyDocument,

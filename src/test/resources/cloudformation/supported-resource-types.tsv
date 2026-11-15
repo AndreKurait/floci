@@ -156,6 +156,7 @@ AWS::Lambda::WebFunctionRevision	LambdaWebCfnProvisioner
 AWS::Logs::LogGroup	LogsCfnProvisioner
 AWS::Logs::LogStream	LogsLogStreamCfnProvisioner
 AWS::Logs::MetricFilter	LogsMetricFilterCfnProvisioner
+AWS::Logs::SubscriptionFilter	LogsSubscriptionFilterCfnProvisioner
 AWS::Organizations::Account	OrganizationsCfnProvisioner
 AWS::Organizations::Organization	OrganizationsCfnProvisioner
 AWS::Organizations::OrganizationalUnit	OrganizationsCfnProvisioner

@@ -5,8 +5,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
-import io.floci.aws.core.storage.AccountAwareStorageBackend;
-import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.services.cloudwatch.logs.filter.FilterPattern;
 import io.floci.aws.services.cloudwatch.logs.model.LogEvent;
 import io.floci.aws.services.cloudwatch.logs.model.SubscriptionFilter;
@@ -30,6 +28,7 @@ import java.util.ArrayList;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.UUID;
 import java.util.zip.GZIPOutputStream;
 
@@ -52,26 +51,26 @@ public class CloudWatchLogsSubscriptionDeliveryService {
     /** Max compressed record size for Kinesis and Firehose delivery (1 MB). */
     private static final int MAX_RECORD_PAYLOAD_BYTES = 1_000_000;
 
-    private final StorageBackend<String, SubscriptionFilter> store;
     private final LambdaService lambdaService;
     private final KinesisService kinesisService;
     private final FirehoseService firehoseService;
     private final RegionResolver regionResolver;
     private final ObjectMapper objectMapper;
+    private final CloudWatchLogsSubscriptionAdmissionService admission;
 
     @Inject
-    public CloudWatchLogsSubscriptionDeliveryService(CloudWatchLogsService logsService,
-                                                     LambdaService lambdaService,
+    public CloudWatchLogsSubscriptionDeliveryService(LambdaService lambdaService,
                                                      KinesisService kinesisService,
                                                      FirehoseService firehoseService,
                                                      RegionResolver regionResolver,
-                                                     ObjectMapper objectMapper) {
-        this.store = logsService.subscriptionFilterStore();
+                                                     ObjectMapper objectMapper,
+                                                     CloudWatchLogsSubscriptionAdmissionService admission) {
         this.lambdaService = lambdaService;
         this.kinesisService = kinesisService;
         this.firehoseService = firehoseService;
         this.regionResolver = regionResolver;
         this.objectMapper = objectMapper;
+        this.admission = Objects.requireNonNull(admission);
     }
 
     @RegisterForReflection
@@ -98,7 +97,7 @@ public class CloudWatchLogsSubscriptionDeliveryService {
         String account = event.accountId() == null || event.accountId().isBlank()
                 ? regionResolver.getAccountId() : event.accountId();
         try {
-            List<SubscriptionFilter> filters = filtersOf(event.logGroupName(), event.region(), account);
+            List<SubscriptionFilter> filters = event.subscriptionFilters();
             for (SubscriptionFilter filter : filters) {
                 try {
                     deliver(filter, event, account);
@@ -113,26 +112,16 @@ public class CloudWatchLogsSubscriptionDeliveryService {
         }
     }
 
-    private List<SubscriptionFilter> filtersOf(String logGroupName, String region, String accountId) {
-        String prefix = CloudWatchLogsService.subscriptionFilterKeyPrefix(region, logGroupName);
-        if (accountId != null && store instanceof AccountAwareStorageBackend<?> rawAware) {
-            @SuppressWarnings("unchecked")
-            AccountAwareStorageBackend<SubscriptionFilter> aware =
-                    (AccountAwareStorageBackend<SubscriptionFilter>) rawAware;
-            return aware.scanForAccount(accountId, key -> key.startsWith(prefix));
-        }
-        return store.scan(key -> key.startsWith(prefix));
-    }
-
     private void deliver(SubscriptionFilter filter, LogEventsIngested event, String account) throws IOException {
         FilterPattern pattern = FilterPattern.parse(filter.getFilterPattern());
         List<SubscriptionLogEvent> matching = new ArrayList<>();
         for (LogEvent logEvent : event.events()) {
-            if (pattern.match(logEvent.getMessage()).matched()) {
+            String message = logEvent.messageForFilter(Boolean.TRUE.equals(filter.getApplyOnTransformedLogs()));
+            if (message != null && pattern.match(message).matched()) {
                 matching.add(new SubscriptionLogEvent(
                         logEvent.getEventId(),
                         logEvent.getTimestamp(),
-                        logEvent.getMessage()));
+                        message));
             }
         }
         if (matching.isEmpty()) {
@@ -153,6 +142,13 @@ public class CloudWatchLogsSubscriptionDeliveryService {
             return;
         }
 
+        if (CloudWatchLogsCrossAccountService.isCrossAccountDestinationArn(destinationArn)) {
+            deliverChunks(filter, event, account, matching, gzipped -> admission.deliverLogical(destinationArn,
+                    event.logGroupName(), event.region(), account, gzipped,
+                    "Random".equals(filter.getDistribution()) ? UUID.randomUUID().toString() : event.logStreamName()));
+            return;
+        }
+
         // Direct cross-account delivery without a Logs Destination (PutDestination) is unauthorized in AWS
         if (!arn.accountId().isBlank() && !arn.accountId().equals(account)) {
             LOG.warnv("Cross-account subscription delivery is unauthorized without a Logs destination: destinationAccount={0}, groupAccount={1}",
@@ -170,6 +166,7 @@ public class CloudWatchLogsSubscriptionDeliveryService {
                         destinationArn, event.logStreamName(), event.logGroupName());
                 return;
             }
+            admission.validate(destinationArn, event.logGroupName(), event.region(), account);
             deliverChunks(filter, event, account, matching, gzipped -> deliverToLambda(destinationArn, gzipped));
         } else if ("kinesis".equals(service)) {
             deliverChunks(filter, event, account, matching, gzipped ->

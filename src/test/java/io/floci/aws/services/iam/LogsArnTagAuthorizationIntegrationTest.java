@@ -6,6 +6,7 @@ import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsService;
 import io.floci.aws.services.cloudwatch.logs.model.LogDestination;
+import io.floci.aws.testing.AwsTestClients;
 import io.floci.aws.testing.IamEnforcementProfile;
 import io.floci.aws.testing.LogsAuthorizationFixtures;
 import io.floci.aws.testing.PartitionCleanup;
@@ -21,17 +22,25 @@ import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.iam.IamClient;
+import software.amazon.awssdk.services.iam.model.NoSuchEntityException;
+import software.amazon.awssdk.services.kinesis.KinesisClient;
+import software.amazon.awssdk.services.kinesis.model.ResourceNotFoundException;
 
 import java.net.URI;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
 import static io.floci.aws.testing.LogsAuthorizationFixtures.expectedTags;
+import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @QuarkusTest
@@ -239,8 +248,6 @@ class LogsArnTagAuthorizationIntegrationTest {
     void destinationCreationChecksTheNamedResourceArn() {
         String selected = "logs-destination-tag-" + UUID.randomUUID();
         String other = "logs-destination-tag-" + UUID.randomUUID();
-        registerDestinationCleanup(selected);
-        registerDestinationCleanup(other);
         String caller = user(statement("Allow", "PutDestination", destinationArn(selected)) + ","
                 + statement("Allow", "TagResource", "*") + ","
                 + "{\"Effect\":\"Allow\",\"Action\":\"iam:PassRole\",\"Resource\":\"*\"}");
@@ -257,8 +264,6 @@ class LogsArnTagAuthorizationIntegrationTest {
     void taggedDestinationCreationAcceptsResourceScopedTagPermission() {
         String selected = "logs-destination-tag-" + UUID.randomUUID();
         String other = "logs-destination-tag-" + UUID.randomUUID();
-        registerDestinationCleanup(selected);
-        registerDestinationCleanup(other);
         String caller = user(statement("Allow", "PutDestination", "*") + ","
                 + statement("Allow", "TagResource", destinationArn(selected)) + ","
                 + "{\"Effect\":\"Allow\",\"Action\":\"iam:PassRole\",\"Resource\":\"*\"}");
@@ -273,8 +278,6 @@ class LogsArnTagAuthorizationIntegrationTest {
     void taggedDestinationCreationHonorsResourceScopedExplicitDeny() {
         String selected = "logs-destination-tag-" + UUID.randomUUID();
         String other = "logs-destination-tag-" + UUID.randomUUID();
-        registerDestinationCleanup(selected);
-        registerDestinationCleanup(other);
         String caller = user(statement("Allow", "PutDestination", "*") + ","
                 + statement("Allow", "TagResource", "*") + ","
                 + statement("Deny", "TagResource", destinationArn(selected)) + ","
@@ -319,12 +322,7 @@ class LogsArnTagAuthorizationIntegrationTest {
 
     private String destination(String team) {
         String name = "logs-destination-tag-" + UUID.randomUUID();
-        registerDestinationCleanup(name);
-        call(endpoint.getPort(), ACCOUNT, "PutDestination", Map.of(
-                "destinationName", name,
-                "targetArn", "arn:aws:kinesis:us-east-1:" + ACCOUNT + ":stream/logs",
-                "roleArn", "arn:aws:iam::" + ACCOUNT + ":role/logs",
-                "tags", Map.of("team", team))).statusCode(200);
+        putDestination(ACCOUNT, name, team).statusCode(200);
         return destinationArn(name);
     }
 
@@ -336,11 +334,59 @@ class LogsArnTagAuthorizationIntegrationTest {
     }
 
     private ValidatableResponse putTaggedDestination(String caller, String name) {
+        return putDestination(caller, name, "blue");
+    }
+
+    private ValidatableResponse putDestination(String caller, String name, String team) {
+        String marker = "logs-tag-target-" + UUID.randomUUID();
+        IamClient iam = AwsTestClients.create(IamClient.builder(), ACCOUNT, Region.US_EAST_1, endpoint);
+        cleanup.register(iam::close);
+        KinesisClient kinesis = AwsTestClients.create(KinesisClient.builder(), ACCOUNT, Region.US_EAST_1, endpoint);
+        cleanup.register(kinesis::close);
+        cleanup.register(() -> {
+            try {
+                iam.deleteRole(request -> request.roleName(marker));
+            } catch (NoSuchEntityException expected) {
+                // A rejected role creation leaves no owned role to delete.
+            }
+            assertThrows(NoSuchEntityException.class, () -> iam.getRole(request -> request.roleName(marker)));
+        });
+        String roleArn = iam.createRole(request -> request.roleName(marker).assumeRolePolicyDocument("""
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+                "Principal":{"Service":"logs.amazonaws.com"},"Action":"sts:AssumeRole",
+                "Condition":{"StringEquals":{"aws:SourceAccount":"%s"},
+                "ArnLike":{"aws:SourceArn":"arn:aws:logs:%s:%s:*"}}}]}
+                """.formatted(ACCOUNT, REGION, ACCOUNT))).role().arn();
+        cleanup.register(() -> {
+            try {
+                kinesis.deleteStream(request -> request.streamName(marker));
+            } catch (ResourceNotFoundException expected) {
+                // A rejected stream creation leaves no owned stream to delete.
+            }
+            assertThrows(ResourceNotFoundException.class,
+                    () -> kinesis.describeStream(request -> request.streamName(marker)));
+        });
+        kinesis.createStream(request -> request.streamName(marker).shardCount(1));
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> assertEquals("ACTIVE",
+                kinesis.describeStream(request -> request.streamName(marker))
+                        .streamDescription().streamStatusAsString()));
+        String targetArn = kinesis.describeStream(request -> request.streamName(marker))
+                .streamDescription().streamARN();
+        cleanup.register(() -> {
+            try {
+                iam.deleteRolePolicy(request -> request.roleName(marker).policyName("delivery"));
+            } catch (NoSuchEntityException expected) {
+                // A rejected inline policy creation leaves no owned policy to delete.
+            }
+        });
+        iam.putRolePolicy(request -> request.roleName(marker).policyName("delivery").policyDocument("""
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+                "Action":"kinesis:PutRecord","Resource":"%s"}]}
+                """.formatted(targetArn)));
+        registerDestinationCleanup(name);
         return call(endpoint.getPort(), caller, "PutDestination", Map.of(
-                "destinationName", name,
-                "targetArn", "arn:aws:kinesis:us-east-1:" + ACCOUNT + ":stream/logs",
-                "roleArn", "arn:aws:iam::" + ACCOUNT + ":role/logs",
-                "tags", Map.of("team", "blue")));
+                "destinationName", name, "targetArn", targetArn, "roleArn", roleArn,
+                "tags", Map.of("team", team)));
     }
 
     private static String destinationArn(String name) {
