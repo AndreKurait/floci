@@ -1,11 +1,12 @@
 {
   "_source": {
     "generator": "tools/aws/regen_apigateway_documentation_shapes.py",
-    "botocore": "botocore 1.43.118 (installed package)"
+    "botocore": "botocore 1.43.108 (installed package)"
   },
   "operations": {
     "CreateDocumentationPart": "CreateDocumentationPartRequest",
-    "GetDocumentationParts": "GetDocumentationPartsRequest"
+    "GetDocumentationParts": "GetDocumentationPartsRequest",
+    "CreateDocumentationVersion": "CreateDocumentationVersionRequest"
   },
   "shapes": {
     "CreateDocumentationPartRequest": {
@@ -19,6 +20,19 @@
         "restApiId": "String",
         "location": "DocumentationPartLocation",
         "properties": "String"
+      }
+    },
+    "CreateDocumentationVersionRequest": {
+      "type": "structure",
+      "required": [
+        "restApiId",
+        "documentationVersion"
+      ],
+      "members": {
+        "restApiId": "String",
+        "documentationVersion": "String",
+        "stageName": "String",
+        "description": "String"
       }
     },
     "DocumentationPartLocation": {

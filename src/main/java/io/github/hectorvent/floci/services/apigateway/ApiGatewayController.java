@@ -19,6 +19,7 @@ import io.github.hectorvent.floci.services.apigateway.model.ApiKey;
 import io.github.hectorvent.floci.services.apigateway.model.BasePathMapping;
 import io.github.hectorvent.floci.services.apigateway.model.CustomDomain;
 import io.github.hectorvent.floci.services.apigateway.model.DocumentationPart;
+import io.github.hectorvent.floci.services.apigateway.model.DocumentationVersion;
 import io.github.hectorvent.floci.services.apigateway.model.EndpointConfiguration;
 import io.github.hectorvent.floci.services.apigateway.model.EndpointType;
 import io.github.hectorvent.floci.services.apigateway.model.GatewayResponse;
@@ -1249,6 +1250,73 @@ public class ApiGatewayController {
     }
 
     // ──────────────────────────── Documentation Parts (v1) ────────────────────────────
+
+    @POST
+    @Path("/restapis/{apiId}/documentation/versions")
+    public Response createDocumentationVersion(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
+                                                 String body) {
+        try {
+            Map<String, Object> request = objectMapper.readerFor(JSON_OBJECT)
+                    .with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS).readValue(body);
+            DocumentationVersion version = service.createDocumentationVersion(
+                    regionResolver.resolveRegion(headers), apiId, request);
+            return Response.status(201).entity(toDocumentationVersionNode(version).toString())
+                    .type(MediaType.APPLICATION_JSON).build();
+        } catch (IOException failure) {
+            throw new AwsException("BadRequestException", "Invalid documentation version request", 400);
+        }
+    }
+
+    @GET
+    @Path("/restapis/{apiId}/documentation/versions")
+    public Response getDocumentationVersions(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
+                                              @QueryParam("limit") Integer limit,
+                                              @QueryParam("position") String position) {
+        ApiGatewayService.DocumentationVersionPage page = service.getDocumentationVersions(
+                regionResolver.resolveRegion(headers), apiId, limit, position);
+        ObjectNode response = objectMapper.createObjectNode();
+        ArrayNode items = response.putArray("item");
+        page.items().forEach(version -> items.add(toDocumentationVersionNode(version)));
+        if (page.position() != null) {
+            response.put("position", page.position());
+        }
+        return Response.ok(response.toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @GET
+    @Path("/restapis/{apiId}/documentation/versions/{version}")
+    public Response getDocumentationVersion(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
+                                             @PathParam("version") String version) {
+        DocumentationVersion snapshot = service.getDocumentationVersion(
+                regionResolver.resolveRegion(headers), apiId, version);
+        return Response.ok(toDocumentationVersionNode(snapshot).toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @PATCH
+    @Path("/restapis/{apiId}/documentation/versions/{version}")
+    public Response updateDocumentationVersion(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
+                                                @PathParam("version") String version, String body) {
+        DocumentationVersion snapshot = service.updateDocumentationVersion(
+                regionResolver.resolveRegion(headers), apiId, version, parsePatchOperations(body));
+        return Response.ok(toDocumentationVersionNode(snapshot).toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @DELETE
+    @Path("/restapis/{apiId}/documentation/versions/{version}")
+    public Response deleteDocumentationVersion(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
+                                                @PathParam("version") String version) {
+        service.deleteDocumentationVersion(regionResolver.resolveRegion(headers), apiId, version);
+        return Response.accepted().build();
+    }
+
+    private ObjectNode toDocumentationVersionNode(DocumentationVersion version) {
+        ObjectNode node = objectMapper.createObjectNode().put("version", version.version())
+                .put("createdDate", version.createdDate());
+        if (version.description() != null) {
+            node.put("description", version.description());
+        }
+        return node;
+    }
 
     @PUT
     @Path("/restapis/{apiId}/documentation/parts")
@@ -2535,6 +2603,9 @@ public class ApiGatewayController {
     private ObjectNode toStageNode(io.github.hectorvent.floci.services.apigateway.model.Stage s) {
         ObjectNode node = objectMapper.createObjectNode();
         node.put("stageName", s.getStageName());
+        if (s.getDocumentationVersion() != null) {
+            node.put("documentationVersion", s.getDocumentationVersion());
+        }
         node.put("deploymentId", s.getDeploymentId());
         if (s.getDescription() != null) node.put("description", s.getDescription());
         node.put("createdDate", s.getCreatedDate());
