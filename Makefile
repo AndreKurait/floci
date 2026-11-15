@@ -290,6 +290,7 @@ aws-data-sync-botocore: ## Regenerate only the AWS data derived from botocore, s
 	$(PYTHON) tools/aws/regen_apigateway_types.py
 	$(PYTHON) tools/aws/regen_sesv2_shapes.py
 	$(PYTHON) tools/aws/regen_apigateway_shapes.py
+	$(PYTHON) tools/aws/regen_apigateway_documentation_shapes.py
 	$(PYTHON) tools/aws/regen_ecs_shapes.py
 	$(PYTHON) tools/aws/regen_emr_serverless_shapes.py
 	$(PYTHON) tools/aws/regen_stepfunctions_compute_shapes.py
@@ -403,6 +404,12 @@ aws-data-check-botocore: ## The AWS data derived from botocore must match a fres
 	@$(PYTHON) tools/aws/regen_sesv2_shapes.py --check || { \
 		echo ""; \
 		echo "error: src/main/resources/aws/sesv2-request-shapes.json is out of date."; \
+		echo "       Run 'make aws-data-sync' and commit the result."; \
+		exit 1; \
+	}
+	@$(PYTHON) tools/aws/regen_apigateway_documentation_shapes.py --check || { \
+		echo ""; \
+		echo "error: src/main/resources/aws/apigateway-documentation-request-shapes.json is out of date."; \
 		echo "       Run 'make aws-data-sync' and commit the result."; \
 		exit 1; \
 	}

@@ -59,6 +59,16 @@ public interface StorageBackend<K, V> {
     }
 
     /**
+     * Replace values and remove keys as one storage commit. Deletion wins when a key
+     * occurs in both arguments. Values must not be mutated after publication. This has
+     * the same durability guarantees as atomic puts, including asynchronous hybrid writes.
+     * Unsupported backends reject the operation without changing any entries.
+     */
+    default void applyAtomically(Map<K, V> entries, Set<K> keys) {
+        throw new UnsupportedOperationException("Mixed atomic batches are not supported by this backend");
+    }
+
+    /**
      * Return a new mutable list of values whose keys pass the filter. Callers may sort,
      * filter, or otherwise mutate the returned list without affecting the underlying store.
      */
