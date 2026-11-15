@@ -9,6 +9,8 @@ import io.github.hectorvent.floci.services.athena.AthenaBatchQueryService;
 import io.github.hectorvent.floci.services.athena.AthenaPreparedStatementService;
 import io.github.hectorvent.floci.services.backup.BackupFrameworkResources;
 import io.github.hectorvent.floci.services.backup.BackupFrameworkService;
+import io.github.hectorvent.floci.services.batch.BatchSchedulingPolicyService;
+import io.github.hectorvent.floci.services.batch.BatchSchedulingPolicyTarget;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationDriftService;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationDriftSnapshot;
 import io.github.hectorvent.floci.services.cloudfront.CloudFrontFunctionTestRoute;
@@ -152,6 +154,7 @@ public class IamConditionContextResolver {
     private final Instance<EksAccessEntryUpdateConditions> eksAccessEntryUpdates;
     private final Instance<CloudFrontFunctionTesting> cloudFrontFunctionTesting;
     private final ResolvedServiceCatalog serviceCatalog;
+    private final Instance<BatchSchedulingPolicyService> batchSchedulingPolicies;
 
     private final Instance<MemoryDbParameterGroupService> memoryDbParameterGroups;
 
@@ -181,7 +184,8 @@ public class IamConditionContextResolver {
                                        Instance<LambdaRuntimeManagementService> runtimeManagement,
                                        Instance<EcrService> ecrService,
                                        Instance<CloudFrontFunctionTesting> cloudFrontFunctionTesting,
-                                       Instance<MemoryDbParameterGroupService> memoryDbParameterGroups) {
+                                       Instance<MemoryDbParameterGroupService> memoryDbParameterGroups,
+                                       Instance<BatchSchedulingPolicyService> batchSchedulingPolicies) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
                 config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService,
                 elbV2ConditionKeys, mqConfigurations, lambdaService, athenaPreparedStatements,
@@ -191,7 +195,8 @@ public class IamConditionContextResolver {
                 runtimeManagement,
                 ecrService,
                 cloudFrontFunctionTesting,
-                memoryDbParameterGroups);
+                memoryDbParameterGroups,
+                batchSchedulingPolicies);
     }
 
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -208,6 +213,7 @@ public class IamConditionContextResolver {
                                        Instance<ElbV2ConditionKeys> elbV2ConditionKeys) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
                 config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys, null, null, null,
+                null,
                 null,
                 null,
                 null,
@@ -235,6 +241,7 @@ public class IamConditionContextResolver {
                 null,
                 null,
                 null,
+                null,
                 null);
     }
 
@@ -250,6 +257,7 @@ public class IamConditionContextResolver {
                                 ResolvedServiceCatalog serviceCatalog, Clock clock) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
                 config, currentVertxRequest, serviceCatalog, clock, null, null, null, null, null,
+                null,
                 null,
                 null,
                 null,
@@ -280,7 +288,8 @@ public class IamConditionContextResolver {
                                         Instance<LambdaRuntimeManagementService> runtimeManagement,
                                         Instance<EcrService> ecrService,
                                         Instance<CloudFrontFunctionTesting> cloudFrontFunctionTesting,
-                                        Instance<MemoryDbParameterGroupService> memoryDbParameterGroups) {
+                                        Instance<MemoryDbParameterGroupService> memoryDbParameterGroups,
+                                        Instance<BatchSchedulingPolicyService> batchSchedulingPolicies) {
         this.mqConfigurations = mqConfigurations;
         this.lambdaService = lambdaService;
         this.athenaPreparedStatements = athenaPreparedStatements;
@@ -304,6 +313,7 @@ public class IamConditionContextResolver {
         this.ecrService = ecrService;
         this.cloudFrontFunctionTesting = cloudFrontFunctionTesting;
         this.memoryDbParameterGroups = memoryDbParameterGroups;
+        this.batchSchedulingPolicies = batchSchedulingPolicies;
     }
 
     private Map<String, List<String>> athenaPreparedStatementConditions(String action, ContainerRequestContext ctx) {
@@ -362,6 +372,7 @@ public class IamConditionContextResolver {
             case "apigateway" -> documentationConditions != null && documentationConditions.isResolvable()
                     ? documentationConditions.get().resolve(action, ctx) : null;
             case "cloudformation" -> driftConditionContext(action, ctx);
+            case "batch" -> batchSchedulingPolicyConditions(action, ctx);
             case "s3" -> s3ConditionContext(action, ctx);
             case "cloudfront" -> cloudFrontTestConditionContext(action, ctx);
             case "ec2" -> ec2ConditionContext(action, ctx);
@@ -424,6 +435,51 @@ public class IamConditionContextResolver {
                     ? AwsRegions.partitionFor(region) : requestContext.getPartition();
             String arn = MemoryDbParameterGroupTarget.resourceArn(action, body, partition, region, account);
             memoryDbParameterGroups.get().iamTags(arn, partition, region, account).forEach((key, value) ->
+                    conditions.put(RESOURCE_TAG_PREFIX + key, List.of(value)));
+        }
+        return conditions.isEmpty() ? null : conditions;
+    }
+
+    private Map<String, List<String>> batchSchedulingPolicyConditions(String action, ContainerRequestContext ctx) {
+        boolean create = "batch:CreateSchedulingPolicy".equals(action);
+        boolean selected = "batch:UpdateSchedulingPolicy".equals(action) || "batch:DeleteSchedulingPolicy".equals(action);
+        boolean tag = "batch:TagResource".equals(action);
+        boolean untag = "batch:UntagResource".equals(action);
+        boolean listTags = "batch:ListTagsForResource".equals(action);
+        String arn = BatchSchedulingPolicyTarget.taggedArn(ctx);
+        if (!create && !selected && (!(tag || untag || listTags) || !BatchSchedulingPolicyTarget.isPolicySelector(arn))) {
+            return null;
+        }
+        JsonNode body = create || selected || tag ? PassedRoles.jsonBody(ctx) : null;
+        if (selected) {
+            arn = body != null && body.path("arn").isTextual() ? body.path("arn").textValue() : null;
+        }
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        if ((create || tag) && body != null && body.path("tags").isObject()) {
+            List<String> keys = new ArrayList<>();
+            body.path("tags").properties().forEach(entry -> {
+                if (entry.getValue().isTextual()) {
+                    keys.add(entry.getKey());
+                    conditions.put(REQUEST_TAG_PREFIX + entry.getKey(), List.of(entry.getValue().textValue()));
+                }
+            });
+            if (!keys.isEmpty()) {
+                conditions.put("aws:TagKeys", keys);
+            }
+        }
+        if (untag) {
+            List<String> keys = ctx.getUriInfo().getQueryParameters().get("tagKeys");
+            if (keys != null && !keys.isEmpty()) {
+                conditions.put("aws:TagKeys", List.copyOf(keys));
+            }
+        }
+        if (!create && batchSchedulingPolicies != null && batchSchedulingPolicies.isResolvable()) {
+            String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+            String account = requestContext.getAccountId() == null ? config.defaultAccountId() : requestContext.getAccountId();
+            String partition = requestContext.getPartition() == null
+                    ? RegionResolver.effectivePartition(config.defaultRegion(), config.partitions().id())
+                    : requestContext.getPartition();
+            batchSchedulingPolicies.get().iamTags(arn, partition, region, account).forEach((key, value) ->
                     conditions.put(RESOURCE_TAG_PREFIX + key, List.of(value)));
         }
         return conditions.isEmpty() ? null : conditions;

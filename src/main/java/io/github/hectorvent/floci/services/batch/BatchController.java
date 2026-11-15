@@ -27,12 +27,63 @@ public class BatchController {
     private final BatchService service;
     private final RegionResolver regionResolver;
     private final ObjectMapper objectMapper;
+    private final BatchSchedulingPolicyService schedulingPolicies;
+    private final BatchSchedulingPolicyReader schedulingPolicyReader;
 
     @Inject
-    public BatchController(BatchService service, RegionResolver regionResolver, ObjectMapper objectMapper) {
+    public BatchController(BatchService service, RegionResolver regionResolver, ObjectMapper objectMapper,
+                           BatchSchedulingPolicyService schedulingPolicies,
+                           BatchSchedulingPolicyReader schedulingPolicyReader) {
         this.service = service;
         this.regionResolver = regionResolver;
         this.objectMapper = objectMapper;
+        this.schedulingPolicies = schedulingPolicies;
+        this.schedulingPolicyReader = schedulingPolicyReader;
+    }
+
+    public BatchController(BatchService service, RegionResolver regionResolver, ObjectMapper objectMapper) {
+        this(service, regionResolver, objectMapper, null, null);
+    }
+
+    @POST
+    @Path("/v1/createschedulingpolicy")
+    public Response createSchedulingPolicy(String body) {
+        return handleSchedulingPolicy(body, schedulingPolicies::create);
+    }
+
+    @POST
+    @Path("/v1/deleteschedulingpolicy")
+    public Response deleteSchedulingPolicy(String body) {
+        return handleSchedulingPolicy(body, schedulingPolicies::delete);
+    }
+
+    @POST
+    @Path("/v1/describeschedulingpolicies")
+    public Response describeSchedulingPolicies(String body) {
+        return handleSchedulingPolicy(body, schedulingPolicies::describe);
+    }
+
+    @POST
+    @Path("/v1/listschedulingpolicies")
+    public Response listSchedulingPolicies(String body) {
+        return handleSchedulingPolicy(body, schedulingPolicies::list);
+    }
+
+    @POST
+    @Path("/v1/updateschedulingpolicy")
+    public Response updateSchedulingPolicy(String body) {
+        return handleSchedulingPolicy(body, schedulingPolicies::update);
+    }
+
+    private Response handleSchedulingPolicy(String body, PolicyHandler handler) {
+        try {
+            return Response.ok(handler.handle(schedulingPolicyReader.object(body))).build();
+        } catch (AwsException failure) {
+            return error(failure.getHttpStatus(), failure.getErrorCode(), failure.getMessage());
+        } catch (Exception failure) {
+            LOG.error("Error processing Batch scheduling policy request", failure);
+            return error(500, "ServerException", "Unable to process scheduling policy request.");
+        }
     }
 
     @POST
@@ -174,5 +225,10 @@ public class BatchController {
     @FunctionalInterface
     private interface Handler {
         Response handle(JsonNode request, String region);
+    }
+
+    @FunctionalInterface
+    private interface PolicyHandler {
+        Object handle(JsonNode request);
     }
 }

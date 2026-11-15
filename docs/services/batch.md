@@ -9,6 +9,11 @@ Floci Batch implements the AWS Batch control plane for local integration tests. 
 
 | Operation | Endpoint | Description |
 |---|---|---|
+| `CreateSchedulingPolicy` | `POST /v1/createschedulingpolicy` | Create a standalone scheduling policy and return its name and ARN |
+| `DeleteSchedulingPolicy` | `POST /v1/deleteschedulingpolicy` | Delete a policy by its exact ARN; an absent policy is a no-op |
+| `DescribeSchedulingPolicies` | `POST /v1/describeschedulingpolicies` | Describe 1–100 exact policy ARNs; omit unknown policies |
+| `ListSchedulingPolicies` | `POST /v1/listschedulingpolicies` | List current account/Region policy ARNs with continuation tokens |
+| `UpdateSchedulingPolicy` | `POST /v1/updateschedulingpolicy` | Replace the configuration of an existing policy without changing its kind |
 | `CreateComputeEnvironment` | `POST /v1/createcomputeenvironment` | Store a local compute environment and return its ARN |
 | `DescribeComputeEnvironments` | `POST /v1/describecomputeenvironments` | Describe all or selected compute environments |
 | `UpdateComputeEnvironment` | `POST /v1/updatecomputeenvironment` | Update a compute environment's state, service role, and compute resources |
@@ -25,9 +30,43 @@ Floci Batch implements the AWS Batch control plane for local integration tests. 
 | `TerminateJob` | `POST /v1/terminatejob` | Terminate a nonterminal job and stop its running container or nodes |
 | `DescribeJobs` | `POST /v1/describejobs` | Describe jobs by job ID |
 | `ListJobs` | `POST /v1/listjobs` | List jobs by queue, status, AWS `filters`, and pagination |
-| `ListTagsForResource` | `GET /v1/tags/{resourceArn}` | List the tags of a compute environment, job queue, job definition, or job |
+| `ListTagsForResource` | `GET /v1/tags/{resourceArn}` | List the tags of a scheduling policy, compute environment, job queue, job definition, or job |
 | `TagResource` | `POST /v1/tags/{resourceArn}` | Add or overwrite tags on a resource; tags the request omits are kept |
 | `UntagResource` | `DELETE /v1/tags/{resourceArn}?tagKeys=...` | Remove the named tag keys from a resource |
+
+## Standalone scheduling policies
+
+Scheduling policies store `fairsharePolicy` configuration or `quotaSharePolicy` metadata independently
+of job queues and runners. A policy's kind cannot change after it is set. An omitted policy starts
+unset; Describe projects an empty fair-share policy with zero decay, zero reservation, and no shares.
+An update with no policy is a no-op. A supplied policy replaces the entire configuration, so omitted
+fair-share members return to their documented defaults. Quota metadata accepts the documented `FIFO`
+idle-resource assignment strategy. These APIs do not implement fair-share or quota-share scheduling,
+job-queue association, usage accounting, or capacity allocation. `AWS::Batch::SchedulingPolicy`
+provisioning is not implemented.
+
+Names are case-sensitive ASCII letters, digits, hyphens, and underscores, from 1 to 128 characters.
+Update, Delete, Describe, and tag operations require exact scheduling-policy ARNs in the request's
+partition, account, and Region. Fair-share validation covers decay (0–604800), reservation (0–99),
+finite weights (0.0001–999.9999), and unique, nonoverlapping share prefixes. An omitted weight is 1.
+The local distribution bound is 500 entries. Policies support up to 50 string tags; empty tag values
+are accepted. Tag mutations and Describe use the same stored tags.
+
+Each policy generation is an immutable, atomically published scoped record in the configured Batch
+storage backend. Reset drains in-flight policy operations and refuses new operations until reset
+finishes. Unsupported stored schema versions or inconsistent identities are refused without migration.
+Resource Explorer lists current-scope policies. List uses 1–100 results (default 100) and opaque tokens
+bound to the account, partition, Region, page size, and current inventory. Creation, deletion,
+delete/recreate, process restart, or reset invalidates old tokens; configuration and tag changes do not.
+Clients must follow tokens to an omitted token at EOF.
+
+When IAM enforcement is enabled, the five policy operations and their scheduling-policy tag routes
+use the actual dispatched action. Create, Update, Delete, and tags use the exact policy ARN;
+Describe and List require wildcard resource permission. Tagged creation additionally requires
+`batch:TagResource` on the exact new ARN. Request tags, tag keys, current resource tags, session
+policies, and permissions boundaries use the same resolved caller. Only `CreateSchedulingPolicy`
+is included in Batch's partial tag-on-create metadata; other Batch create operations remain outside
+that metadata coverage. Strict raw tag parsing is limited to scheduling-policy ARNs.
 
 ## Runner Modes
 
@@ -149,7 +188,7 @@ IAM roles, VPC fields, Fargate declarations, log configuration, storage, and res
 
 ## Limitations
 
-- No IAM enforcement.
+- IAM coverage added here is limited to the five scheduling-policy operations and their tag routes; other Batch operations retain their existing coverage.
 - No VPC/subnet/security-group simulation.
 - No AWS-faithful capacity scheduling.
 - No job dependencies (`dependsOn`).

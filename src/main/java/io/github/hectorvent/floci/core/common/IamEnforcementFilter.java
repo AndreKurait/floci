@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.core.common;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.batch.BatchSchedulingPolicyTarget;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationDriftHandler;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationDriftService;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.CfnDriftProjection;
@@ -1089,7 +1090,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
     }
 
     private String routeAction(String scope, ContainerRequestContext ctx) {
-        String matched = actionRegistry.resolveMatchedRoute(scope, resourceInfo);
+        String matched = actionRegistry.resolveMatchedRoute(scope, resourceInfo, ctx);
         return matched != null ? matched : actionRegistry.resolveRoute(scope, ctx);
     }
 
@@ -2020,6 +2021,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 && Set.of("ssm:CreateResourceDataSync", "ssm:ListResourceDataSync",
                         "ssm:UpdateResourceDataSync", "ssm:DeleteResourceDataSync").contains(operation);
         String partition = "route53".equals(credentialScope) || syncOperation
+                || "batch".equals(credentialScope) && BatchSchedulingPolicyTarget.operation(operation)
                 ? requestPartition() : AwsRegions.partitionFor(region);
         return arnBuilder.buildResources(credentialScope, operation, ctx, region, accountId, partition);
     }
