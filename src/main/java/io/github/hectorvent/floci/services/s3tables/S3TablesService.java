@@ -4,7 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
-import io.github.hectorvent.floci.core.storage.StorageBackend;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.s3tables.model.Namespace;
 import io.github.hectorvent.floci.services.s3tables.model.S3Table;
@@ -20,13 +20,14 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
+import java.util.function.Predicate;
 
 @ApplicationScoped
 public class S3TablesService {
     private static final Logger LOG = Logger.getLogger(S3TablesService.class);
     private static final String BUCKET_PREFIX = "bucket/";
 
-    private final StorageBackend<String, TableBucket> store;
+    private final AccountAwareStorageBackend<TableBucket> store;
     private final RegionResolver regionResolver;
 
     @Inject
@@ -232,6 +233,56 @@ public class S3TablesService {
         TableBucket bucket = getTableBucket(tableBucketArn, region);
         bucket.setResourcePolicy(resourcePolicy);
         persist(bucket, region);
+    }
+
+    public synchronized void putTableBucketMetricsConfiguration(String tableBucketArn, String region) {
+        setTableBucketMetricsConfiguration(tableBucketArn, region, true);
+    }
+
+    public synchronized Map<String, String> getTableBucketMetricsConfiguration(String tableBucketArn, String region) {
+        TableBucket bucket = getMetricsTableBucket(tableBucketArn, region);
+        if (!bucket.isMetricsConfigurationEnabled()) {
+            throw notFound("No such metric configuration exists");
+        }
+        return Map.of("tableBucketARN", bucket.getArn(), "id", "EntireBucket");
+    }
+
+    public synchronized void deleteTableBucketMetricsConfiguration(String tableBucketArn, String region) {
+        setTableBucketMetricsConfiguration(tableBucketArn, region, false);
+    }
+
+    private void setTableBucketMetricsConfiguration(String tableBucketArn, String region, boolean enabled) {
+        TableBucket bucket = getMetricsTableBucket(tableBucketArn, region);
+        if (bucket.isMetricsConfigurationEnabled() == enabled) {
+            return;
+        }
+        TableBucket replacement = new TableBucket(bucket.getName(), bucket.getArn(), bucket.getCreatedAt(),
+                bucket.getOwnerAccountId(), bucket.getEncryptionConfiguration(),
+                bucket.getStorageClassConfiguration(), bucket.getTags());
+        replacement.setResourcePolicy(bucket.getResourcePolicy());
+        replacement.setMaintenanceConfigurations(bucket.getMaintenanceConfigurations());
+        replacement.setNamespaces(bucket.getNamespaces());
+        replacement.setMetricsConfigurationEnabled(enabled);
+        store.putAllAtomically(Map.of(storageKey(region, bucket.getName()), replacement));
+    }
+
+    private TableBucket getMetricsTableBucket(String tableBucketArn, String region) {
+        if (!AwsArnUtils.isArnFor(tableBucketArn, "s3tables")) {
+            throw notFound("The table bucket does not exist.");
+        }
+        AwsArnUtils.Arn arn = AwsArnUtils.parse(tableBucketArn);
+        String accountId = regionResolver.getAccountId();
+        if (!accountId.equals(arn.accountId()) || !region.equals(arn.region())
+                || !regionResolver.partitionForRegion(region).equals(arn.partition())
+                || !arn.resource().startsWith(BUCKET_PREFIX)) {
+            throw notFound("The table bucket does not exist.");
+        }
+        String name = arn.resource().substring(BUCKET_PREFIX.length());
+        Predicate<TableBucket> ownedBucket = bucket -> tableBucketArn.equals(bucket.getArn())
+                && accountId.equals(bucket.getOwnerAccountId()) && name.equals(bucket.getName());
+        return store.getForAccountMigratingLegacy(accountId, storageKey(region, name), ownedBucket)
+                .filter(ownedBucket)
+                .orElseThrow(() -> notFound("The table bucket does not exist."));
     }
 
     public synchronized String getTableBucketPolicy(String tableBucketArn, String region) {
