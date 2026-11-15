@@ -38,6 +38,15 @@ public interface DnsRecordSource {
     }
 
     /**
+     * Validates an owned alias when its public name has an explicitly declared transport.
+     * Resource ownership, canonical-zone and query-type checks still apply.
+     */
+    default Optional<DnsAnswer> resolveAliasTargetForDeclaredRoute(String name, String hostedZoneId, int type,
+                                                                   DnsClientVpcSource.ClientVpc origin) {
+        return resolveAliasTarget(name, hostedZoneId, type, origin);
+    }
+
+    /**
      * Resolves a query name to IPv4 addresses and their TTL. An empty optional means this
      * source does not own the name. The name arrives without a trailing dot and in the case the client sent.
      */

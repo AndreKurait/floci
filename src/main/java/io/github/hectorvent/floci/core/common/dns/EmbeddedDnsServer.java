@@ -436,11 +436,18 @@ public class EmbeddedDnsServer {
 
     public Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type,
                                                  DnsClientVpcSource.ClientVpc origin) {
+        return resolveAliasTarget(name, hostedZoneId, type, origin, false);
+    }
+
+    private Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type,
+                                                   DnsClientVpcSource.ClientVpc origin, boolean declaredRoute) {
         DnsAnswer resolved = null;
         if (recordSources != null) {
             for (DnsRecordSource source : recordSources) {
                 try {
-                    Optional<DnsAnswer> candidate = source.resolveAliasTarget(name, hostedZoneId, type, origin);
+                    Optional<DnsAnswer> candidate = declaredRoute
+                            ? source.resolveAliasTargetForDeclaredRoute(name, hostedZoneId, type, origin)
+                            : source.resolveAliasTarget(name, hostedZoneId, type, origin);
                     if (candidate.isPresent()) {
                         if (resolved != null) {
                             return Optional.of(DnsAnswer.refused());
@@ -460,13 +467,14 @@ public class EmbeddedDnsServer {
     /** A declared public front door keeps its routed transport after validating its owned alias. */
     public Optional<DnsAnswer> resolvePublicAliasTarget(String publicName, String target, String hostedZoneId,
                                                         int type, DnsClientVpcSource.ClientVpc origin) {
-        Optional<DnsAnswer> resolved = resolveAliasTarget(target, hostedZoneId, type, origin);
         String normalized = publicName.toLowerCase(Locale.ROOT);
         if (normalized.endsWith(".")) {
             normalized = normalized.substring(0, normalized.length() - 1);
         }
-        if (!publicAwsApi || origin != null && !isUsableOrigin(origin) || type != 1
-                || !publicApiHosts.contains(normalized)) {
+        boolean declaredRoute = publicAwsApi && (origin == null || isUsableOrigin(origin)) && type == 1
+                && publicApiHosts.contains(normalized);
+        Optional<DnsAnswer> resolved = resolveAliasTarget(target, hostedZoneId, type, origin, declaredRoute);
+        if (!declaredRoute) {
             return resolved;
         }
         return resolved.map(answer -> {

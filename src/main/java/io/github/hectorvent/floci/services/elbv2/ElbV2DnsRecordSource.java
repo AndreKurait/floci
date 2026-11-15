@@ -80,6 +80,17 @@ public class ElbV2DnsRecordSource implements DnsRecordSource {
 
     @Override
     public Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type, ClientVpc origin) {
+        return resolveAliasTarget(name, hostedZoneId, type, origin, false);
+    }
+
+    @Override
+    public Optional<DnsAnswer> resolveAliasTargetForDeclaredRoute(String name, String hostedZoneId, int type,
+                                                                 ClientVpc origin) {
+        return resolveAliasTarget(name, hostedZoneId, type, origin, true);
+    }
+
+    private Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type, ClientVpc origin,
+                                                   boolean declaredRoute) {
         List<LoadBalancer> matches = service.findByDnsName(name);
         if (matches.isEmpty()) {
             return Optional.empty();
@@ -95,7 +106,7 @@ public class ElbV2DnsRecordSource implements DnsRecordSource {
         if (type == 28) {
             return Optional.of(DnsAnswer.noData());
         }
-        if (networks != null && networks.frontendsEnabled()) {
+        if (!declaredRoute && networks != null && networks.frontendsEnabled()) {
             return Optional.of(frontendAnswer(target, type, origin));
         }
         return Optional.of(sharedAnswer(target, origin));
