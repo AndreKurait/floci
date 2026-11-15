@@ -397,6 +397,24 @@ public class SsmService implements ResourceProvider {
         }
     }
 
+    /**
+     * Removes leading and trailing ASCII spaces. Other whitespace is preserved for the operation's validation.
+     */
+    public static String withoutSurroundingSpaces(String name) {
+        if (name == null) {
+            return null;
+        }
+        int start = 0;
+        int end = name.length();
+        while (start < end && name.charAt(start) == ' ') {
+            start++;
+        }
+        while (end > start && name.charAt(end - 1) == ' ') {
+            end--;
+        }
+        return name.substring(start, end);
+    }
+
     /** AWS's form is {@code parameter/<name>} whether or not the name starts with a slash. */
     public static String parameterResource(String name) {
         return "parameter" + (name.startsWith("/") ? name : "/" + name);
