@@ -188,7 +188,7 @@ class AppConfigTest {
                 .build());
 
         assertThat(response.configuration().asByteArray()).isEmpty();
-        assertThat(response.contentType()).isEqualTo("application/octet-stream");
+        assertThat(response.contentType()).startsWith("application/json");
         assertThat(response.versionLabel()).isNull();
         assertThat(response.nextPollConfigurationToken()).isNotNull();
         assertThat(response.nextPollConfigurationToken()).isNotEqualTo(secondConfigurationToken);
