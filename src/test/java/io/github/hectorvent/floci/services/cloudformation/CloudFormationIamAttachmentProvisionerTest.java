@@ -144,7 +144,10 @@ class CloudFormationIamAttachmentProvisionerTest {
         // Both the primary write and the failure-triggered restore use the ID-verified overload,
         // guarding against a role replaced under the same name mid-attempt in either direction.
         ArgumentCaptor<String> docCaptor = ArgumentCaptor.forClass(String.class);
-        verify(iamService, times(2)).updateAssumeRolePolicy(
+        InOrder trustWrites = inOrder(iamService);
+        trustWrites.verify(iamService).updateAssumeRolePolicy(
+                eq("existing-role"), docCaptor.capture(), eq(role.getRoleId()));
+        trustWrites.verify(iamService).restoreAssumeRolePolicy(
                 eq("existing-role"), docCaptor.capture(), eq(role.getRoleId()));
         List<String> calls = docCaptor.getAllValues();
         assertEquals(mapper.readTree(newTrustPolicyJson), mapper.readTree(calls.get(0)),
