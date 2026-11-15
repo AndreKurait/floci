@@ -88,7 +88,8 @@ class VpcPublicAwsApiPacketIntegrationTest extends ElbClassicPublicNatPacketInte
     @Override
     @BeforeEach
     void prepare() throws Exception {
-        endpoint = URI.create("http://127.0.0.1:" + config.port());
+        endpoint = URI.create(System.getProperty("audit.packet.control-endpoint",
+                "http://127.0.0.1:" + config.port()));
         super.prepare();
     }
 
