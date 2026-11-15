@@ -86,6 +86,80 @@ class CloudWatchMetricsQueryHandlerTest {
         verify(metricsService, never()).putMetricData(anyString(), any(), anyString());
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"MetricData", "EntityMetricData.member.2.MetricData"})
+    void sparseValidMembersAreParsedInNumericOrder(String list) {
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("Namespace", "SparseBatch");
+        for (int index : new int[]{999999999, 3, 1}) {
+            params.putSingle(list + ".member." + index + ".MetricName", "Metric" + index);
+            params.putSingle(list + ".member." + index + ".Value", "1");
+        }
+
+        handler.handle("PutMetricData", params, REGION);
+
+        ArgumentCaptor<List<MetricDatum>> datums = ArgumentCaptor.forClass(List.class);
+        verify(metricsService).putMetricData(eq("SparseBatch"), datums.capture(), eq(REGION));
+        assertEquals(List.of("Metric1", "Metric3", "Metric999999999"),
+                datums.getValue().stream().map(MetricDatum::getMetricName).toList());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"MetricData", "EntityMetricData.member.2.MetricData"})
+    void invalidStatisticsAfterAGapRejectTheWholeBatch(String list) {
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("Namespace", "SparseBatch");
+        params.putSingle(list + ".member.1.MetricName", "Good");
+        params.putSingle(list + ".member.1.Value", "1");
+        String prefix = list + ".member.3.";
+        params.putSingle(prefix + "MetricName", "Invalid");
+        params.putSingle(prefix + "StatisticValues.SampleCount", "2");
+        params.putSingle(prefix + "StatisticValues.Sum", "six");
+        params.putSingle(prefix + "StatisticValues.Minimum", "1");
+        params.putSingle(prefix + "StatisticValues.Maximum", "2");
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> handler.handle("PutMetricData", params, REGION));
+
+        assertEquals("InvalidParameterValue", error.getErrorCode());
+        verify(metricsService, never()).putMetricData(anyString(), any(), anyString());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"MetricData", "EntityMetricData.member.2.MetricData"})
+    void aMissingMetricNameAfterAGapRejectsTheWholeBatch(String list) {
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("Namespace", "SparseBatch");
+        params.putSingle(list + ".member.1.MetricName", "Good");
+        params.putSingle(list + ".member.1.Value", "1");
+        params.putSingle(list + ".member.3.Value", "2");
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> handler.handle("PutMetricData", params, REGION));
+
+        assertEquals("MissingParameter", error.getErrorCode());
+        assertEquals("The parameter " + list + ".member.3.MetricName is required.", error.getMessage());
+        verify(metricsService, never()).putMetricData(anyString(), any(), anyString());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"MetricData.member.9999999999", "EntityMetricData.member.2.MetricData.member.9999999999",
+            "EntityMetricData.member.9999999999.MetricData.member.1"})
+    void oversizedMemberIndexesRejectTheWholeBatchWithoutIntegerOverflow(String prefix) {
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        params.putSingle("Namespace", "SparseBatch");
+        params.putSingle("MetricData.member.1.MetricName", "Good");
+        params.putSingle("MetricData.member.1.Value", "1");
+        params.putSingle(prefix + ".MetricName", "TooLarge");
+        params.putSingle(prefix + ".Value", "2");
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> handler.handle("PutMetricData", params, REGION));
+
+        assertEquals("InvalidParameterValue", error.getErrorCode());
+        verify(metricsService, never()).putMetricData(anyString(), any(), anyString());
+    }
+
     private static MultivaluedMap<String, String> statisticRequest() {
         MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
         params.putSingle("Namespace", "InvalidValues");
