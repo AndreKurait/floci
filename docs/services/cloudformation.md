@@ -4,6 +4,15 @@
 Provisioning runs in the existing background executor. Use stack status and events to observe completion or failure.
 Request validation and concurrent-operation checks still run before the operation is accepted.
 
+Resource provisioners can read `ProvisionContext.executionIdentity()` during an operation.
+It contains the verified API caller, or the validated stack execution role, with the
+captured session policies and permissions boundary. It contains no credentials.
+The same identity is available through `CloudFormationExecutionScope.current()` for
+delete and rollback handlers. Account-only internal requests and requests whose
+signatures were not verified provide no identity through this interface. An extension
+that requires authenticated authority must reject an absent identity. Executor reuse
+and nested operations restore the preceding scope, including after a handler fails.
+
 **Protocol:** Query (XML) — `POST http://localhost:4566/` with `Action=` parameter
 **Endpoint:** `POST http://localhost:4566/`
 

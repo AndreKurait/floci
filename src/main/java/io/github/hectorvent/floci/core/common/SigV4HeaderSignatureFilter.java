@@ -171,6 +171,7 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
     @Override
     public void filter(ContainerRequestContext ctx) throws IOException {
         if (verifiedRequest != null) {
+            verifiedRequest.recordVerifiedSignature(null);
             verifiedRequest.setVerifiedSession(null, null, null);
         }
         EmulatorConfig config = configProvider.get();
@@ -361,6 +362,7 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
                     scope.service(), SigV4RequestValidator.sanitizeForLog(scope.accessKeyId()));
             signatureDoesNotMatch(ctx, resource, MISMATCH_MESSAGE);
         } else if (verifiedRequest != null) {
+            verifiedRequest.recordVerifiedSignature(scope.accessKeyId());
             verifiedRequest.setVerifiedSession(nativeSession, secretKey.get(), token);
         }
     }

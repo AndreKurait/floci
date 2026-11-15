@@ -2,7 +2,9 @@ package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.services.cloudformation.CloudFormationExecutionScope;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplateEngine;
+import io.github.hectorvent.floci.services.cloudformation.GetStackOutputRoleAuthorizer.ExecutionIdentity;
 import io.github.hectorvent.floci.services.cloudformation.model.StackEvent;
 
 import java.util.ArrayList;
@@ -10,6 +12,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
 import java.util.function.Consumer;
@@ -27,6 +30,11 @@ public record ProvisionContext(CloudFormationTemplateEngine engine, String regio
                                String accountId, String stackName, String priorPhysicalId,
                                Consumer<StackEvent> progress, JsonNode priorProperties, JsonNode updatePolicy,
                                JsonNode priorUpdatePolicy) {
+
+    /** Authenticated caller or validated execution role, available only during this operation. */
+    public Optional<ExecutionIdentity> executionIdentity() {
+        return CloudFormationExecutionScope.current();
+    }
 
     public ProvisionContext(CloudFormationTemplateEngine engine, String region,
                             String accountId, String stackName, String priorPhysicalId,

@@ -18,7 +18,9 @@ public class RequestContext {
     private String region;
     private String partition;
     private String accessKeyId;
+    private String signatureVerifiedAccessKeyId;
     private String sessionToken;
+
     private Boolean iamGovernanceBypass;
     /** Dispatch must keep the launch template snapshot that passed this request's permission checks. */
     private LaunchTemplate authorizedEc2LaunchTemplate;
@@ -26,6 +28,16 @@ public class RequestContext {
     private SessionCredential verifiedSession;
     private String verifiedSecret;
     private String verifiedToken;
+
+    /** Authentication provenance, distinct from an account-scoped internal request. */
+    public boolean isSignatureVerifiedFor(String accessKey) {
+        return accessKey != null && accessKey.equals(signatureVerifiedAccessKeyId);
+    }
+
+    /** Only the signature filter in this package records a successful verification. */
+    void recordVerifiedSignature(String accessKey) {
+        signatureVerifiedAccessKeyId = accessKey;
+    }
 
     public SessionCredential getVerifiedSession() {
         return verifiedSession != null && Objects.equals(verifiedSecret, verifiedSession.getSecretAccessKey())

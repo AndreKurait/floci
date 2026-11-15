@@ -1636,7 +1636,8 @@ public class CloudFormationService implements ResourceProvider {
     private record ClaimedExecution(ChangeSet changeSet, boolean isCreate, ExecutionIdentity identity,
                                     CompletableFuture<Void> done) {}
 
-    private record DeferredDelete(List<String> retain, String roleArn, String clientRequestToken) {}
+    private record DeferredDelete(List<String> retain, String roleArn, String clientRequestToken,
+                                  ExecutionIdentity identity) {}
 
     private record ChangeSetState(String status, String executionStatus) {}
 
@@ -1748,7 +1749,7 @@ public class CloudFormationService implements ResourceProvider {
         String templateBody = cs.getTemplateBody();
         Map<String, String> params = cs.getParameters() != null ? cs.getParameters() : Map.of();
 
-        return submitOperation(() -> RequestScopes.runAs(accountId, region, () -> {
+        return submitOperation(claimed.identity(), () -> RequestScopes.runAs(accountId, region, () -> {
             try {
                 if ("IMPORT".equalsIgnoreCase(cs.getChangeSetType())) {
                     synchronized (importOwnershipLock) {
@@ -1780,7 +1781,7 @@ public class CloudFormationService implements ResourceProvider {
      */
     private void endExecution(Stack stack, CompletableFuture<Void> done, String region, String accountId) {
         String stackId = stack.getStackId();
-        List<List<String>> deferred = new ArrayList<>(1);
+        List<DeferredDelete> deferred = new ArrayList<>(1);
         try {
             stacks.compute(stackKey(accountId, stack.getStackName(), region), (k, existing) -> {
                 if (!runningExecutions.remove(stackId, done)) {
@@ -1791,12 +1792,14 @@ public class CloudFormationService implements ResourceProvider {
                     existing.setRoleArn(deletion.roleArn());
                     existing.setClientRequestToken(deletion.clientRequestToken());
                     startDelete(existing, deletion.retain());
-                    deferred.add(deletion.retain());
+                    deferred.add(deletion);
                 }
                 return existing;
             });
             if (!deferred.isEmpty()) {
-                deleteStackResources(stack, deferred.getFirst(), region, accountId);
+                DeferredDelete deletion = deferred.getFirst();
+                CloudFormationExecutionScope.run(deletion.identity(),
+                        () -> deleteStackResources(stack, deletion.retain(), region, accountId));
             }
             done.complete(null);
         } catch (RuntimeException e) {
@@ -1930,9 +1933,12 @@ public class CloudFormationService implements ResourceProvider {
                     selectedRole, accountId, existing.getStackId(), AwsRegions.partitionFor(region));
             CompletableFuture<Void> running = runningExecutions.get(existing.getStackId());
             if (running != null) {
-                // The deferred delete keeps its role and token separate from the execution still running.
+                // Keep the deferred request's role, token and identity separate from the running execution.
+                ExecutionIdentity identity = stackOutputRoles.executionIdentity(
+                        selectedRole, accountId, existing.getStackId(), AwsRegions.partitionFor(region),
+                        stackOutputRoles.captureCaller(accountId, AwsRegions.partitionFor(region)));
                 deferredDeletes.putIfAbsent(existing.getStackId(),
-                        new DeferredDelete(retain, selectedRole, clientRequestToken));
+                        new DeferredDelete(retain, selectedRole, clientRequestToken, identity));
                 submitted[0] = running;
                 return existing;
             }
@@ -1941,7 +1947,10 @@ public class CloudFormationService implements ResourceProvider {
             existing.setClientRequestToken(clientRequestToken);
             startDelete(existing, retain);
             try {
-                submitted[0] = submitOperation(() -> RequestScopes.runAs(accountId, region,
+                ExecutionIdentity identity = stackOutputRoles.executionIdentity(
+                        selectedRole, accountId, existing.getStackId(), AwsRegions.partitionFor(region),
+                        stackOutputRoles.captureCaller(accountId, AwsRegions.partitionFor(region)));
+                submitted[0] = submitOperation(identity, () -> RequestScopes.runAs(accountId, region,
                         () -> deleteStackResources(existing, retain, region, accountId)));
             } catch (AwsException e) {
                 restore(existing, snapshot);
@@ -2026,7 +2035,10 @@ public class CloudFormationService implements ResourceProvider {
         });
         try {
             persistStack(stack);
-            return submitOperation(() -> RequestScopes.runAs(accountId, region, () -> {
+            ExecutionIdentity identity = stackOutputRoles.executionIdentity(
+                    stack.getRoleArn(), accountId, stack.getStackId(), AwsRegions.partitionFor(region),
+                    stackOutputRoles.captureCaller(accountId, AwsRegions.partitionFor(region)));
+            return submitOperation(identity, () -> RequestScopes.runAs(accountId, region, () -> {
                 try {
                     resumeUpdateRollback(stack, skips, forceRollback, region);
                 } finally {
@@ -2128,9 +2140,9 @@ public class CloudFormationService implements ResourceProvider {
         });
     }
 
-    private Future<?> submitOperation(Runnable operation) {
+    private Future<?> submitOperation(ExecutionIdentity identity, Runnable operation) {
         try {
-            return executor.submit(operation);
+            return executor.submit(() -> CloudFormationExecutionScope.run(identity, operation));
         } catch (RejectedExecutionException e) {
             throw operationLimitExceeded();
         }

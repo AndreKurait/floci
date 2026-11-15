@@ -46,7 +46,22 @@ public class GetStackOutputRoleAuthorizer {
             "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"*\",\"Resource\":\"*\"}}";
 
     /** An operation carries its principal and permission ceilings, never the request's credentials. */
-    public record ExecutionIdentity(CallerArns caller, CallerContext policies) {}
+    public record ExecutionIdentity(CallerArns caller, CallerContext policies, boolean signatureVerified) {
+        public ExecutionIdentity {
+            if (policies != null) {
+                policies = new CallerContext(
+                        policies.identityPolicies() == null ? null : List.copyOf(policies.identityPolicies()),
+                        policies.sessionPolicyDocument(), policies.boundaryPolicyDocument(),
+                        policies.scpLevels() == null ? null
+                                : policies.scpLevels().stream().map(List::copyOf).toList(),
+                        policies.principalArn(), policies.managedSessionPolicyDocuments());
+            }
+        }
+
+        public ExecutionIdentity(CallerArns caller, CallerContext policies) {
+            this(caller, policies, false);
+        }
+    }
 
     private final IamService iamService;
     private final AssumeRolePolicyEvaluator trustEvaluator;
@@ -80,6 +95,8 @@ public class GetStackOutputRoleAuthorizer {
         }
         CallerArns caller = accessKey == null ? null : iamService.resolveCallerArns(accessKey).orElse(null);
         CallerContext policies = accessKey == null ? null : iamService.resolveCallerContext(accessKey);
+        boolean signatureVerified = caller != null && policies != null
+                && requestContext.isSignatureVerifiedFor(accessKey);
         if (caller == null) {
             caller = CallerArns.accountRoot(
                     AwsArnUtils.Arn.global(partition, "iam", accountId, "root").toString(), accountId);
@@ -88,7 +105,11 @@ public class GetStackOutputRoleAuthorizer {
             policies = CallerContext.of(accessKey == null || accountId.equals(accessKey)
                     ? List.of(ROOT_ALLOW) : List.of());
         }
-        return new ExecutionIdentity(caller, policies);
+        if (signatureVerified) {
+            policies = policies.withScpLevels(iamService.effectiveScpLevels(
+                    AwsArnUtils.parse(caller.principalArn()).accountId()));
+        }
+        return new ExecutionIdentity(caller, policies, signatureVerified);
     }
 
     /** RoleARN belongs to this stack's account and must be assumable by CloudFormation. */
@@ -117,7 +138,9 @@ public class GetStackOutputRoleAuthorizer {
             return caller;
         }
         validateExecutionRole(roleArn, accountId, stackId, partition);
-        return roleSession(roleArn, "AWSCloudFormation", partition);
+        ExecutionIdentity role = roleSession(roleArn, "AWSCloudFormation", partition);
+        CallerContext policies = role.policies().withScpLevels(iamService.effectiveScpLevels(accountId));
+        return new ExecutionIdentity(role.caller(), policies, caller != null && caller.signatureVerified());
     }
 
     /** Returns the reader's account after evaluating the actual executing principal's AssumeRole. */
