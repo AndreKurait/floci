@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.ecr.registry;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.NetworkExposureGuard;
 import io.github.hectorvent.floci.core.common.AwsPartitions;
+import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.services.ecr.EcrService;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
@@ -37,8 +38,9 @@ import java.util.regex.Pattern;
 public class EcrRegistryDataPlane {
 
     private static final Pattern ECR_HOST = Pattern.compile(
-            "^([0-9]{12})\\.dkr\\.ecr\\.([a-z0-9-]+)\\.(localhost(?:\\.floci\\.io)?|"
-                    + AwsPartitions.dnsSuffixRegex() + ")(?::[0-9]+)?$");
+            "^([0-9]{12})\\.dkr\\.ecr\\.([a-z0-9-]+)\\.localhost(?:\\.floci\\.io)?(?::[0-9]+)?$");
+    private static final Pattern NATIVE_ECR_HOST = Pattern.compile(
+            "^([0-9]{12})\\.dkr\\.ecr\\.([a-z0-9-]+)\\.(" + AwsPartitions.dnsSuffixRegex() + ")(?::443)?$");
     private static final String MANIFESTS_PATH = "/manifests/";
     private static final long REPOSITORY_LOCK_POLL_MILLIS = 5;
     /**
@@ -454,16 +456,25 @@ public class EcrRegistryDataPlane {
         }
     }
 
+    private static Matcher registryHost(String host) {
+        String value = host == null ? "" : host;
+        Matcher nativeHost = NATIVE_ECR_HOST.matcher(value);
+        if (nativeHost.matches() && AwsRegions.dnsSuffixFor(nativeHost.group(2)).equals(nativeHost.group(3))) {
+            return nativeHost;
+        }
+        return ECR_HOST.matcher(value);
+    }
+
     static Optional<RegistryRequest> requestFor(String host, String path, String query, String uriStyle) {
         String registryPath = "/v2".equals(path) ? "/v2/" : path;
         if (!registryPath.startsWith("/v2/")) {
             return Optional.empty();
         }
-        Matcher hostMatch = ECR_HOST.matcher(host == null ? "" : host);
-        if (!matchesRegistryHost(hostMatch)) {
-            hostMatch = ECR_HOST.matcher(queryParameter(query, "ns"));
+        Matcher hostMatch = registryHost(host);
+        if (!hostMatch.matches()) {
+            hostMatch = registryHost(queryParameter(query, "ns"));
         }
-        if (matchesRegistryHost(hostMatch)) {
+        if (hostMatch.matches()) {
             String repository = "/v2/".equals(registryPath) ? "" : repositoryName(registryPath.substring("/v2/".length()));
             String storageRepositoryName = hostMatch.group(1) + "/" + hostMatch.group(2) + "/" + repository;
             String backendUri = repository.isEmpty()
@@ -500,16 +511,6 @@ public class EcrRegistryDataPlane {
     private static boolean isLoopbackHost(String host) {
         HostAndPort authority = host == null ? null : HostAndPort.parseAuthority(host, -1);
         return authority != null && NetworkExposureGuard.isLoopback(authority.host());
-    }
-
-    private static boolean matchesRegistryHost(Matcher candidate) {
-        if (!candidate.matches()) {
-            return false;
-        }
-        String suffix = candidate.group(3);
-        return "localhost".equals(suffix) || "localhost.floci.io".equals(suffix)
-                || AwsPartitions.forRegion(candidate.group(2))
-                        .filter(partition -> partition.dnsSuffix().equals(suffix)).isPresent();
     }
 
     private static String querySuffix(String query, boolean removeNamespace) {
