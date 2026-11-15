@@ -12,6 +12,7 @@ import io.floci.aws.services.iam.IamPolicyEvaluator;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.iam.RequestPrincipal;
 import io.floci.aws.services.iam.model.CallerContext;
+import io.quarkus.runtime.annotations.RegisterForReflection;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.context.control.ActivateRequestContext;
 import jakarta.inject.Inject;
@@ -31,6 +32,7 @@ import java.util.Objects;
 /** Native ECR passwords identify their issuing caller; registryIds never grant permissions. */
 @ApplicationScoped
 public class EcrRegistryAuthorization {
+    @RegisterForReflection
     public record TokenRecord(String accessKeyId, String accountId, String principalArn, String userId,
                               Instant expiresAt, boolean enforcementDisabled) {}
     public record IssuedToken(String authorizationToken, Instant expiresAt) {}
