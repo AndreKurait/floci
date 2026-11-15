@@ -481,6 +481,14 @@ public class AppConfigService implements Resettable {
     }
 
     private void validateProfile(ConfigurationProfile profile, String version, ConfigurationContent source) {
+        if ("hosted".equals(profile.getLocationUri())) {
+            validateProfile(profile, validationVersion(profile, version));
+            return;
+        }
+        validateProfile(profile, version, source);
+    }
+
+    private void validateProfile(ConfigurationProfile profile, String version, ConfigurationContent source) {
         if (!"hosted".equals(profile.getLocationUri()) || profile.getValidators() == null
                 || profile.getValidators().stream().noneMatch(validator -> "LAMBDA".equals(validator.type()))) {
             AppConfigValidators.validate(profile.getValidators(), validationContent(profile, version, source));
@@ -496,6 +504,26 @@ public class AppConfigService implements Resettable {
             throw new AwsException("BadRequestException", "Hosted ConfigurationVersion must be a version number.", 400);
         }
         validateProfile(profile, getHostedConfigurationVersion(profile.getApplicationId(), profile.getId(), number));
+    }
+
+    private HostedConfigurationVersion validationVersion(ConfigurationProfile profile, String version) {
+        if (version == null || version.isEmpty() || version.length() > 1024) {
+            throw new AwsException("BadRequestException", "ConfigurationVersion must contain 1 to 1024 characters.", 400);
+        }
+        String prefix = profile.getApplicationId() + "::" + profile.getId() + "::";
+        HostedConfigurationVersion labeled = versionStore.scan(key -> key.startsWith(prefix)).stream()
+                .filter(candidate -> version.equals(candidate.getVersionLabel()))
+                .findFirst().orElse(null);
+        if (labeled != null) {
+            return labeled;
+        }
+        int number;
+        try {
+            number = Integer.parseInt(version);
+        } catch (NumberFormatException e) {
+            throw new AwsException("ResourceNotFoundException", "Hosted configuration version not found.", 404);
+        }
+        return getHostedConfigurationVersion(profile.getApplicationId(), profile.getId(), number);
     }
 
     private HostedConfigurationVersion validationVersion(ConfigurationProfile profile, String version) {
