@@ -27,6 +27,7 @@ floci:
   dns:
     # Host DNS remains opt-in; listener tests use their own addresses and ephemeral ports.
     # listen-address: 127.0.0.1                    # FLOCI_DNS_LISTEN_ADDRESS
+    # authoritative-suffixes:                     # FLOCI_DNS_AUTHORITATIVE_SUFFIXES
     container-fallback-enabled: true
   partitions:
     strict: false

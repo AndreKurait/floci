@@ -327,6 +327,8 @@ class EventBridgeSchedulerIntegrationTest {
                     @Override
                     public Optional<List<String>> extraSuffixes() { return Optional.empty(); }
                     @Override
+                    public Optional<List<String>> authoritativeSuffixes() { return Optional.empty(); }
+                    @Override
                     public boolean containerFallbackEnabled() { return true; }
                     @Override
                     public List<String> containerFallbackServers() { return List.of("8.8.8.8", "8.8.4.4"); }
