@@ -306,7 +306,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
 
     public synchronized Optional<String> publicFrontendTransport(String account, String region, String eni) {
         PublicAddress address = publicAddresses.get(key(account, region, eni));
-        return address == null || missingNamespaces.contains(address.namespace.id()) || !exists(address.namespace.id())
+        return address == null || unavailableNamespaces.contains(address.namespace.id()) || namespaceUnavailable(address.namespace.id())
                 ? Optional.empty() : Optional.ofNullable(address.transport);
     }
 
@@ -318,7 +318,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         PublicAddress address = publicAddresses.get(identity);
         Endpoint endpoint = endpoints.get(identity);
         if (address == null || endpoint == null || !helper.equals(address.namespace.id())
-                || !helper.equals(endpoint.helper) || missingNamespaces.contains(helper) || !exists(helper)) {
+                || !helper.equals(endpoint.helper) || unavailableNamespaces.contains(helper) || namespaceUnavailable(helper)) {
             throw new IllegalStateException("Public listeners have no matching protected frontend");
         }
         address.listeners = VpcFrontendIngress.checkedPorts(ports);

@@ -27,7 +27,7 @@ def partial_document(monkeypatch, tmp_path):
 
 def test_only_the_two_appconfig_operations_are_generated(partial_document):
     document, public = partial_document
-    assert r.PARTIAL_NAMESPACES == {"appconfig": NAMES}
+    assert r.PARTIAL_NAMESPACES["appconfig"] == NAMES
     assert document["partialNamespaces"] == {"appconfig": NAMES}
     assert set(document["operations"]) == {"appconfig:" + name for name in NAMES}
     assert document["notCovered"]["appconfig"].endswith("other creation tags remain uncovered")

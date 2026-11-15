@@ -74,5 +74,8 @@ def test_regeneration_preserves_every_existing_namespace_operation_set(monkeypat
     assert {name: value for name, value in generated["operations"].items()
             if not name.startswith("batch:")} == original
     assert {name for name in generated["operations"] if name.startswith("batch:")} == {"batch:CreateSchedulingPolicy"}
-    assert generated["partialNamespaces"] == {"batch": ["CreateSchedulingPolicy"]}
+    assert generated["partialNamespaces"] == {
+        "appconfig": ["CreateApplication", "CreateDeploymentStrategy"],
+        "batch": ["CreateSchedulingPolicy"],
+    }
     assert json.loads(r.render(generated)) == generated

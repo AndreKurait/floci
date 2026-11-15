@@ -1041,20 +1041,20 @@ class PartitionCrossServiceSmokeIntegrationTest {
         String scheduledResourceId = "service/" + unique("smoke-cluster", partitionCase) + "/service";
         try (ApplicationAutoScalingClient client = AwsTestClients.create(ApplicationAutoScalingClient.builder(),
                 "000000000000", Region.of(region))) {
-            String scheduledTargetArn = client.registerScalableTarget(b -> b.serviceNamespace("ecs").scheduledResourceId(scheduledResourceId)
+            String scheduledTargetArn = client.registerScalableTarget(b -> b.serviceNamespace("ecs").resourceId(scheduledResourceId)
                     .scalableDimension("ecs:service:DesiredCount").minCapacity(1).maxCapacity(5)).scalableTargetARN();
             try {
                 PartitionMatrix.assertArnIn(partitionCase, scheduledTargetArn);
-                client.putScheduledAction(b -> b.serviceNamespace("ecs").scheduledResourceId(scheduledResourceId)
+                client.putScheduledAction(b -> b.serviceNamespace("ecs").resourceId(scheduledResourceId)
                         .scalableDimension("ecs:service:DesiredCount").scheduledActionName("partition-action")
                         .schedule("at(2099-01-01T00:00:00)")
                         .scalableTargetAction(ScalableTargetAction.builder().minCapacity(0).build()));
-                String actionArn = client.describeScheduledActions(b -> b.serviceNamespace("ecs").scheduledResourceId(scheduledResourceId))
+                String actionArn = client.describeScheduledActions(b -> b.serviceNamespace("ecs").resourceId(scheduledResourceId))
                         .scheduledActions().getFirst().scheduledActionARN();
                 PartitionMatrix.assertArnIn(partitionCase, actionArn);
                 assertTrue(actionArn.contains(":autoscaling:" + region + ":000000000000:scheduledAction:"));
             } finally {
-                client.deregisterScalableTarget(b -> b.serviceNamespace("ecs").scheduledResourceId(scheduledResourceId)
+                client.deregisterScalableTarget(b -> b.serviceNamespace("ecs").resourceId(scheduledResourceId)
                         .scalableDimension("ecs:service:DesiredCount"));
             }
         }
