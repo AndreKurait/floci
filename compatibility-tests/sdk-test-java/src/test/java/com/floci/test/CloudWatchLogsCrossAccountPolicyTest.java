@@ -12,6 +12,7 @@ import software.amazon.awssdk.services.cloudwatchlogs.model.PutAccountPolicyResp
 import software.amazon.awssdk.services.cloudwatchlogs.model.PutDestinationResponse;
 import software.amazon.awssdk.services.iam.IamClient;
 import software.amazon.awssdk.services.kinesis.KinesisClient;
+import software.amazon.awssdk.services.kinesis.model.StreamDescriptionSummary;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -101,7 +102,8 @@ class CloudWatchLogsCrossAccountPolicyTest {
         String name = TestFixtures.uniqueName("floci-sdk-logs");
         kinesis.createStream(request -> request.streamName(name).shardCount(1));
         cleanup.add(0, () -> kinesis.deleteStream(request -> request.streamName(name).enforceConsumerDeletion(true)));
-        var stream = kinesis.describeStreamSummary(request -> request.streamName(name)).streamDescriptionSummary();
+        StreamDescriptionSummary stream = kinesis.describeStreamSummary(request -> request.streamName(name))
+                .streamDescriptionSummary();
         assertThat(stream.streamStatusAsString()).isEqualTo("ACTIVE");
         String streamArn = stream.streamARN();
         String accountId = streamArn.split(":")[4];
