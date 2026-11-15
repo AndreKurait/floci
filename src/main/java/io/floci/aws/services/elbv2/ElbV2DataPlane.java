@@ -3,6 +3,7 @@ package io.floci.aws.services.elbv2;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.config.LoadBalancerProxySources.Backend;
 import io.floci.aws.config.TlsProxyServer;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.CertificateReferenceResolver;
@@ -73,6 +74,7 @@ import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
@@ -145,7 +147,10 @@ public class ElbV2DataPlane {
     private final Map<Integer, HttpServer> servers = new ConcurrentHashMap<>();
     private final Map<Integer, NetServer> tcpServers = new ConcurrentHashMap<>();
     private final Map<Integer, PortState> portStates = new ConcurrentHashMap<>();
+    private final Map<String, OwnedListener> ownedListeners = new ConcurrentHashMap<>();
     private volatile boolean stopping;
+
+    private record OwnedListener(int port, boolean secure, HttpServer server, ReloadingKeyManager keyManager) {}
 
     private static final class PortState {
         private int depth;
@@ -215,6 +220,7 @@ public class ElbV2DataPlane {
             new AtomicBoolean();
     private final Map<Integer, Map<String, String>> listenersByHostAndPort = new ConcurrentHashMap<>();
     private final ConcurrentMap<String, ListenerBinding> listenerBindings;
+    private final ElbV2VpcNetworkManager vpcNetworks;
     private final Map<String, AtomicReference<List<CompiledRule>>> ruleChains = new ConcurrentHashMap<>();
     private final Map<String, AtomicInteger> rrCounters = new ConcurrentHashMap<>();
     private final Map<String, String> listenerRegions = new ConcurrentHashMap<>();
@@ -224,11 +230,22 @@ public class ElbV2DataPlane {
     private NetClient tcpClient;
 
     public ElbV2DataPlane() {
-        this(new ConcurrentHashMap<>());
+        this(new ConcurrentHashMap<>(), null);
+    }
+
+    @Inject
+    public ElbV2DataPlane(ElbV2VpcNetworkManager vpcNetworks) {
+        this(new ConcurrentHashMap<>(), vpcNetworks);
     }
 
     ElbV2DataPlane(ConcurrentMap<String, ListenerBinding> listenerBindings) {
+        this(listenerBindings, null);
+    }
+
+    private ElbV2DataPlane(ConcurrentMap<String, ListenerBinding> listenerBindings,
+                          ElbV2VpcNetworkManager vpcNetworks) {
         this.listenerBindings = listenerBindings;
+        this.vpcNetworks = vpcNetworks;
     }
 
     record ListenerBinding(int port, String host, String loadBalancerArn,
@@ -259,6 +276,9 @@ public class ElbV2DataPlane {
     @PreDestroy
     void shutdown() {
         stopping = true;
+        for (String arn : Set.copyOf(ownedListeners.keySet())) {
+            closeOwnedListener(arn);
+        }
         for (Map.Entry<Integer, PortState> entry : portStates.entrySet()) {
             synchronized (entry.getValue()) {
                 cancelBindRetry(entry.getValue());
@@ -342,6 +362,8 @@ public class ElbV2DataPlane {
                 return false;
             }
             if (expected != null) {
+                forgetFrontendSelection(arn);
+                closeOwnedListener(arn);
                 ruleChains.remove(arn);
                 listenerRegions.remove(arn);
                 listenerBindings.remove(arn, expected);
@@ -389,6 +411,10 @@ public class ElbV2DataPlane {
             ruleChains.put(arn, new AtomicReference<>(compiled.get()));
         }
         listenerRegions.put(arn, region);
+        selectFrontend(arn, prepared);
+        if (prepared.tcp()) {
+            closeOwnedListener(arn);
+        }
         if (conflictsWithServedListener(prepared.port(), prepared.tcp(), arn)) {
             LOG.warnv("ELBv2 listener {0} on port {1} is registered but serves no traffic: a TCP listener "
                     + "needs a dedicated local port and another listener already serves it. It takes over "
@@ -399,6 +425,7 @@ public class ElbV2DataPlane {
                 prepared.port(), ignored -> new ConcurrentHashMap<>());
         warnOnSharedPort(prepared, peers);
         addHostBindings(arn, prepared);
+        ensureOwnedListener(arn, prepared);
         promoteParkedListeners(prepared.port());
         if (expected != null && expected.port() == prepared.port()
                 && (expected.secure() != prepared.secure() || expected.tcp() != prepared.tcp())) {
@@ -524,6 +551,7 @@ public class ElbV2DataPlane {
             ListenerBinding binding = listenerBindings.get(parkedArn);
             if (binding != null && !conflictsWithServedListener(port, binding.tcp(), parkedArn)) {
                 addHostBindings(parkedArn, binding);
+                ensureOwnedListener(parkedArn, binding);
                 LOG.infov("ELBv2 listener {0} now serves port {1}", parkedArn, String.valueOf(port));
                 promoted = true;
             }
@@ -629,6 +657,133 @@ public class ElbV2DataPlane {
             }
             throw failure;
         }
+    }
+
+    private void ensureOwnedListener(String arn, ListenerBinding binding) {
+        if (stopping || vpcNetworks == null || !vpcNetworks.frontendsEnabled() || binding.tcp()
+                || !AwsArnUtils.parse(binding.loadBalancerArn()).resource().startsWith("loadbalancer/app/")) {
+            return;
+        }
+        if (binding.port() == ElbV2VpcNetworkManager.PROXY_PORT) {
+            // The accepted listener continues on the existing shared server. Its whole ALB
+            // uses that route while the helper's control socket occupies this port.
+            closeOwnedListener(arn);
+            return;
+        }
+        OwnedListener existing = ownedListeners.get(arn);
+        if (existing != null && existing.port() == binding.port() && existing.secure() == binding.secure()) {
+            if (existing.keyManager() != null) {
+                existing.keyManager().reload(new ElbV2TlsKeyManager(vertx,
+                        tlsKeyCertOptions(binding.port(), List.of(binding))));
+            }
+            return;
+        }
+        closeOwnedListener(arn);
+        HttpServerOptions options = new HttpServerOptions()
+                .setHost("127.0.0.1").setPort(0).setUseProxyProtocol(true)
+                .setMaxHeaderSize(MAX_REQUEST_HEADER_SIZE).setMaxInitialLineLength(MAX_REQUEST_LINE_LENGTH);
+        ReloadingKeyManager keyManager = null;
+        if (binding.secure()) {
+            keyManager = new ReloadingKeyManager(new ElbV2TlsKeyManager(vertx,
+                    tlsKeyCertOptions(binding.port(), List.of(binding))));
+            options.setSsl(true).setSslEngineOptions(new JdkSSLEngineOptions())
+                    .setKeyCertOptions(KeyCertOptions.wrap(keyManager));
+        }
+        HttpServer server = vertx.createHttpServer(options);
+        OwnedListener selected = new OwnedListener(binding.port(), binding.secure(), server, keyManager);
+        ownedListeners.put(arn, selected);
+        // This path already carries the protected helper's kernel-observed client tuple.
+        // Forwarded headers cannot select another listener or replace that socket identity.
+        server.requestHandler(request -> handleOwnedRequest(request, arn, selected));
+        server.listen().onSuccess(ignored -> frontendTask(() -> {
+            vpcNetworks.publishFrontend(arn, binding.loadBalancerArn(), binding.port(), selected,
+                    new Backend(server.actualPort(), binding.secure(),
+                            () -> !stopping && ownedListeners.get(arn) == selected));
+        }).whenComplete((completed, failure) -> {
+            if (failure != null) {
+                ownedListenerFailed(arn, selected, failure);
+            }
+        }))
+                .onFailure(failure -> ownedListenerFailed(arn, selected, failure));
+    }
+
+    private void selectFrontend(String arn, ListenerBinding binding) {
+        if (vpcNetworks != null && vpcNetworks.frontendsEnabled() && !binding.tcp()
+                && AwsArnUtils.parse(binding.loadBalancerArn()).resource().startsWith("loadbalancer/app/")
+                && vpcNetworks.selectFrontend(arn, binding.loadBalancerArn(), binding.port())) {
+            reconcileFrontends(binding.loadBalancerArn());
+        }
+    }
+
+    private void forgetFrontendSelection(String arn) {
+        if (vpcNetworks != null) {
+            String balancer = vpcNetworks.forgetFrontend(arn);
+            if (balancer != null) {
+                reconcileFrontends(balancer);
+            }
+        }
+    }
+
+    private void reconcileFrontends(String balancer) {
+        frontendTask(() -> vpcNetworks.reconcileFrontends(balancer)).whenComplete((completed, failure) -> {
+            if (failure != null) {
+                LOG.warnv(failure, "ELBv2 frontend selection failed for {0}", balancer);
+            }
+        });
+    }
+
+    /** Resource owners supply their account and region; an expiring HTTP scope must not follow this work. */
+    static CompletableFuture<Void> frontendTask(Runnable operation) {
+        return CompletableFuture.runAsync(operation, command -> Thread.ofVirtual()
+                .name("floci-alb-frontend").inheritInheritableThreadLocals(false).start(command));
+    }
+
+    private void handleOwnedRequest(HttpServerRequest request, String arn, OwnedListener selected) {
+        PortState state = portStates.get(selected.port());
+        RoutedListener listener = state == null ? null : state.routing.listeners().get(arn);
+        if (stopping || ownedListeners.get(arn) != selected || listener == null) {
+            request.response().setStatusCode(502).end("Listener is unavailable");
+            return;
+        }
+        handleListener(request, listener);
+    }
+
+    private void ownedListenerFailed(String arn, OwnedListener selected, Throwable failure) {
+        LOG.warnv(failure, "ELBv2 owned frontend failed for listener {0}", arn);
+        if (ownedListeners.remove(arn, selected)) {
+            withdrawOwnedListener(arn, selected);
+            if (!stopping) {
+                vertx.setTimer(1000, ignored -> {
+                    ListenerBinding current = listenerBindings.get(arn);
+                    if (current != null && !stopping) {
+                        onPort(current.port(), state -> {
+                            if (listenerBindings.get(arn) == current) {
+                                ensureOwnedListener(arn, current);
+                            }
+                            return null;
+                        });
+                    }
+                });
+            }
+        } else {
+            selected.server().close();
+        }
+    }
+
+    private void closeOwnedListener(String arn) {
+        OwnedListener selected = ownedListeners.remove(arn);
+        if (selected != null) {
+            withdrawOwnedListener(arn, selected);
+        }
+    }
+
+    private void withdrawOwnedListener(String arn, OwnedListener selected) {
+        selected.server().close();
+        frontendTask(() -> vpcNetworks.withdrawFrontend(arn, selected)).whenComplete((completed, failure) -> {
+            if (failure != null) {
+                LOG.warnv(failure, "ELBv2 frontend retirement failed for listener {0}", arn);
+            }
+        });
     }
 
     private void startTcpServer(int port, PortState state) {
@@ -944,8 +1099,12 @@ public class ElbV2DataPlane {
     }
 
     private PemKeyCertOptions tlsKeyCertOptions(int port) {
+        return tlsKeyCertOptions(port, servedBindings(port).filter(ListenerBinding::secure).toList());
+    }
+
+    private PemKeyCertOptions tlsKeyCertOptions(int port, List<ListenerBinding> bindings) {
         Map<String, CertificateMaterial> certificates = new LinkedHashMap<>();
-        for (ListenerBinding binding : servedBindings(port).filter(ListenerBinding::secure).toList()) {
+        for (ListenerBinding binding : bindings) {
             for (CertificateMaterial certificate : binding.certificates()) {
                 certificates.putIfAbsent(certificate.arn(), certificate);
             }
@@ -1042,6 +1201,15 @@ public class ElbV2DataPlane {
             req.response().setStatusCode(502).end("No listener for host");
             return;
         }
+        dispatchListener(req, listener);
+    }
+
+    private void handleListener(HttpServerRequest req, RoutedListener listener) {
+        RequestScopes.runAs(AwsArnUtils.parse(listener.arn()).accountId(), listener.region(),
+                () -> dispatchListener(req, listener));
+    }
+
+    private void dispatchListener(HttpServerRequest req, RoutedListener listener) {
         for (CompiledRule compiled : listener.chain()) {
             if (compiled.matches(req)) {
                 executeAction(req, compiled.action, listener.region(), listener.arn());
