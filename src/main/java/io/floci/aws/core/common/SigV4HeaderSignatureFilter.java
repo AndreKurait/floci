@@ -12,6 +12,7 @@ import io.floci.aws.services.apigateway.ApiGatewayUserRequestController;
 import io.floci.aws.services.appsync.graphql.AppSyncExecutionController;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.iam.RequestBodyReader;
+import io.floci.aws.services.iam.model.SessionCredential;
 import io.floci.aws.services.s3.S3ControlController;
 import io.floci.aws.services.s3.S3Controller;
 import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
@@ -94,7 +95,7 @@ import java.util.function.UnaryOperator;
  * that does not verify, exceeds its query expiry or falls outside the header clock-skew window.
  * EC2 uses {@code RequestExpired} for expiry and clock skew, including expired temporary credentials.
  *
- * <p>Nothing here runs with the flag off: the filter returns before reading a single header.
+ * <p>EC2 agent registration always requires a valid signature, even with the global flag off.
  */
 @Provider
 @Priority(Priorities.AUTHENTICATION)
@@ -131,6 +132,7 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
     private final IamService iamService;
     private final ResolvedServiceCatalog catalog;
     private final CurrentVertxRequest currentVertxRequest;
+    private final RequestContext verifiedRequest;
 
     @Context
     ResourceInfo resourceInfo;
@@ -138,11 +140,12 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
     @Inject
     public SigV4HeaderSignatureFilter(jakarta.inject.Provider<EmulatorConfig> configProvider,
                                       IamService iamService, ResolvedServiceCatalog catalog,
-                                      CurrentVertxRequest currentVertxRequest) {
+                                      CurrentVertxRequest currentVertxRequest, RequestContext verifiedRequest) {
         this.config = new MemoizedSupplier<>(configProvider::get);
         this.iamService = iamService;
         this.catalog = catalog;
         this.currentVertxRequest = currentVertxRequest;
+        this.verifiedRequest = verifiedRequest;
     }
 
     private EmulatorConfig config() {
@@ -151,10 +154,15 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
 
     @Override
     public void filter(ContainerRequestContext ctx) throws IOException {
-        if (!config().auth().validateSignatures()) {
-            return;
+        if (verifiedRequest != null) {
+            verifiedRequest.setVerifiedSession(null, null, null);
         }
         Class<?> resource = resourceInfo != null ? resourceInfo.getResourceClass() : null;
+        boolean ec2Registration = resource == AwsJson11Controller.class
+                && "AmazonSSM.RegisterManagedInstance".equals(ctx.getHeaderString("X-Amz-Target"));
+        if (!config().auth().validateSignatures() && !ec2Registration) {
+            return;
+        }
         if (resource != null && VERIFIED_ELSEWHERE.contains(resource)) {
             return;
         }
@@ -176,6 +184,9 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
             }
             signed = SigV4AuthorizationHeader.parse(authorization);
             if (signed == null) {
+                if (ec2Registration) {
+                    incompleteSignature(ctx, resource, "The agent requires a signed instance request.");
+                }
                 return;
             }
         }
@@ -187,6 +198,12 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
                     + "'Signature' parameters.");
             return;
         }
+        if (ec2Registration && !"ssm".equals(scope.service())) {
+            signatureDoesNotMatch(ctx, resource, "Credential should be scoped to correct service: 'ssm'");
+            return;
+        }
+        SessionCredential nativeSession = ec2Registration
+                ? iamService.ec2InstanceIdentitySession(scope.accessKeyId()).orElse(null) : null;
         if (!SigV4RequestValidator.containsHeader(signed.signedHeaders(), "host")) {
             incompleteSignature(ctx, resource,
                     "'Host' or ':authority' must be a 'SignedHeader' in the AWS Authorization.");
@@ -290,6 +307,8 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
             LOG.debugv("Refusing {0} request: signature mismatch for accessKey={1}",
                     scope.service(), SigV4RequestValidator.sanitizeForLog(scope.accessKeyId()));
             signatureDoesNotMatch(ctx, resource, MISMATCH_MESSAGE);
+        } else if (verifiedRequest != null && ec2Registration) {
+            verifiedRequest.setVerifiedSession(nativeSession, secretKey.get(), token);
         }
     }
 

@@ -443,6 +443,11 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         if (action == null) {
             return; // unknown action → ALLOW for ordinary credentials (permissive)
         }
+        if ("ssm:RegisterManagedInstance".equals(action)
+                && iamService.ec2InstanceIdentitySession(akid).isPresent()) {
+            // Registration separately binds the signed request to this live EC2 instance.
+            return;
+        }
         if ("sts:GetCallerIdentity".equals(action)) {
             return; // AWS returns caller identity even when an identity policy explicitly denies it
         }

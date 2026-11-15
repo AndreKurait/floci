@@ -4749,6 +4749,34 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 session.getOriginAccountId(), session.getRoleArn(), session.getEc2RoleId(), session.getEc2InstanceId()));
     }
 
+    /** Live IMDS instance-identity credentials, without an IAM policy grant. */
+    public Optional<SessionCredential> ec2InstanceIdentitySession(String accessKeyId) {
+        return currentSession(accessKeyId).filter(session -> {
+            if (session.getEc2InstanceArn() == null || session.getEc2InstanceId() == null
+                    || !session.getEc2InstanceId().matches("i-(?:[0-9a-f]{8}|[0-9a-f]{17})")
+                    || session.getEc2RoleId() != null || session.getExpiration() == null
+                    || session.isLambdaExecutionRole()
+                    || session.getEcsTaskArn() != null || session.getSessionPolicyDocument() != null
+                    || session.getIssuerArn() != null || session.getDelegatedApproverArn() != null) {
+                return false;
+            }
+            try {
+                AwsArnUtils.Arn instance = AwsArnUtils.parse(session.getEc2InstanceArn());
+                return instance.service().equals("ec2") && !instance.region().isEmpty()
+                        && instance.resource().equals("instance/" + session.getEc2InstanceId())
+                        && instance.accountId().equals(session.getOriginAccountId())
+                        && session.getEc2InstanceId().equals(session.getRoleSessionName())
+                        && (instance.accountId() + ":aws:ec2-instance:" + session.getEc2InstanceId())
+                        .equals(session.getAssumedRoleId())
+                        && AwsArnUtils.Arn.global(instance.partition(), "iam", instance.accountId(),
+                        "role/aws:ec2-instance").toString().equals(session.getRoleArn());
+            } catch (IllegalArgumentException invalidIdentity) {
+                LOG.debug("Refusing an invalid EC2 instance-identity credential record");
+                return false;
+            }
+        });
+    }
+
     private Optional<SessionCredential> currentSession(String accessKeyId) {
         return findSessionAnyAccount(accessKeyId).filter(session -> !isExpired(session, clock.instant()));
     }
