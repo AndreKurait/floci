@@ -253,7 +253,7 @@ Floci provisions these resource types:
 For the first four types, `Ref` returns the AppConfig ID, which `Fn::GetAtt` also returns as `ApplicationId`, `EnvironmentId`,
 `ConfigurationProfileId` and `Id`. A configuration profile's `KmsKeyArn` is not set.
 
-For a hosted version, `Ref` and `Fn::GetAtt VersionNumber` return the version number.
+For a hosted version, `Ref` and `Fn::GetAtt VersionNumber` return the version number as a string.
 Its physical identity also includes its application and profile, so versions with the same
 number in different profiles remain separate resources. Hosted version numbers increase
 across concurrent creates, deletions and restarts. Older persisted data without a counter
@@ -263,8 +263,10 @@ Changing hosted content, content type, description or parent creates a new versi
 Successful replacement deletes the old version unless `UpdateReplacePolicy: Retain`
 keeps it; rollback deletes the new version and restores the original resource.
 `DeletionPolicy: Retain` keeps a version when its stack removes it.
-`LatestVersionNumber` and `VersionLabel` are rejected before creation because the
-management service does not implement them.
+The hosted provider accepts `VersionLabel` and `LatestVersionNumber`; each is a replacement property.
+An empty CloudFormation label creates an unlabeled version and remains an empty property in the stack template.
+The locking token checks the highest currently stored version before creation. Failed creates consume no number;
+a version created and then removed by rollback leaves an allocation gap. Outputs-only updates retain the version.
 
 Deployment creation waits for AppConfig's `COMPLETE` state, preserving the strategy's
 rollout and final bake durations. `Fn::GetAtt DeploymentNumber` is a string and `State`
