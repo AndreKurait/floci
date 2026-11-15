@@ -99,6 +99,11 @@ public class ScalingPolicyAlarmActionHandler implements AlarmActionHandler {
             return;
         }
 
+        if (DynamoDbTargetTracking.supports(policy)) {
+            service.executeDynamoDbPolicy(policy, target, alarm, metricValue, region);
+            return;
+        }
+
         CapacityAdjuster adjuster = findAdjuster(target.getScalableDimension());
         if (adjuster == null) {
             LOG.debugv("No capacity adjuster registered for dimension {0}; policy {1} stays inert",
