@@ -123,7 +123,7 @@ Operation counts are exact. For dispatch-table services (Query and JSON 1.1) eac
 | [AWS Marketplace](marketplace.md) | Marketplace Catalog API | REST JSON | 56 |
 | [Control Tower](controltower.md) | `/list-landingzones`, `/get-landingzone`, `/create-landingzone`, `/*-baseline*` | REST JSON | 15 |
 | [Managed Prometheus (AMP)](managed-prometheus.md) | `/workspaces/*`, `/workspaces/*/rulegroupsnamespaces/*`, `/tags/*` | REST JSON | 13 |
-| [AWS Backup](backup.md) | `/backup-vaults/*`, `/logically-air-gapped-backup-vaults/*`, `/backup/plans/*`, `/backup-jobs/*`, `/supported-resource-types` | REST JSON | 35 |
+| [AWS Backup](backup.md) | `/backup-vaults/*`, `/logically-air-gapped-backup-vaults/*`, `/backup/plans/*`, `/backup-jobs/*`, `/supported-resource-types`, `/audit/frameworks*` | REST JSON | 40 |
 | [AWS FIS](fis.md) | `/experimentTemplates/*`, `/experiments/*`, `/actions/*`, `/targetResourceTypes/*`, `/safetyLevers/*`, `/tags/*` | REST JSON | 26 |
 | [CodeGuru Reviewer](codegurureviewer.md) | `/associations`, `/associations/{associationArn}`, `/tags/*` | REST JSON | 7 |
 | [CodeArtifact](codeartifact.md) | `/v1/domain*`, `/v1/repository*`, `/v1/package`, `/v1/package/version*`, `/v1/tag*`, `/v1/authorization-token`, `/codeartifact/maven/*`, `/codeartifact/npm/*`, `/codeartifact/pypi/*` | REST JSON | 37 |

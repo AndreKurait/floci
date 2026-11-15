@@ -14,6 +14,7 @@ import io.github.hectorvent.floci.core.common.StoredResourceArns;
 import io.github.hectorvent.floci.core.common.auth.SigV4Canonicalization;
 import io.github.hectorvent.floci.services.amazonmq.AmazonMqConfigurationService;
 import io.github.hectorvent.floci.services.amazonmq.model.ConfigurationState.Scope;
+import io.github.hectorvent.floci.services.backup.BackupFrameworkResources;
 import io.github.hectorvent.floci.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
 import io.github.hectorvent.floci.services.cloudwatch.logs.LogGroupTagTarget;
 import io.github.hectorvent.floci.services.cloudwatch.logs.LogTransformerTarget;
@@ -275,6 +276,10 @@ public class ResourceArnBuilder {
             return List.of(id == null || id.isBlank() ? "*"
                     : AwsArnUtils.Arn.global(partition, "cloudfront", accountId,
                             "origin-access-control/" + id).toString());
+        }
+        if ("backup".equals(credentialScope) && BackupFrameworkResources.matches(operation, ctx, readJsonBody(ctx))) {
+            return BackupFrameworkResources.arns(operation, ctx, readJsonBody(ctx), partition, region, accountId,
+                    storedResourceArns("backup"));
         }
         // Task tokens resolve their authorization resource from recorded workflow ownership.
         if ("states".equals(credentialScope) && operation != null && Set.of("states:SendTaskSuccess",
