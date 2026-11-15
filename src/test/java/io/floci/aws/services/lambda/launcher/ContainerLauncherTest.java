@@ -1,7 +1,9 @@
 package io.floci.aws.services.lambda.launcher;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
+import com.github.dockerjava.api.command.ConnectToNetworkCmd;
 import com.github.dockerjava.api.command.CopyArchiveFromContainerCmd;
 import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
 import com.github.dockerjava.api.command.ExecCreateCmd;
@@ -9,13 +11,18 @@ import com.github.dockerjava.api.command.ExecCreateCmdResponse;
 import com.github.dockerjava.api.command.ExecStartCmd;
 import com.github.dockerjava.api.command.InspectContainerCmd;
 import com.github.dockerjava.api.command.InspectContainerResponse;
+import com.github.dockerjava.api.command.InspectNetworkCmd;
+import com.github.dockerjava.api.command.InspectVolumeCmd;
 import com.github.dockerjava.api.command.ListContainersCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.AccessMode;
 import com.github.dockerjava.api.model.ContainerConfig;
+import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.Mount;
 import com.github.dockerjava.api.model.MountType;
+import com.github.dockerjava.api.model.Network;
+import com.github.dockerjava.api.model.NetworkSettings;
 import com.github.dockerjava.api.model.StreamType;
 import com.github.dockerjava.api.model.VersionComponent;
 import io.floci.aws.config.EmulatorConfig;
@@ -27,6 +34,7 @@ import io.floci.aws.core.common.docker.ContainerLifecycleManager;
 import io.floci.aws.core.common.docker.ContainerLogStreamer;
 import io.floci.aws.core.common.docker.ContainerReachableEndpoint;
 import io.floci.aws.core.common.docker.ContainerSpec;
+import io.floci.aws.core.common.docker.ContainerStorageHelper;
 import io.floci.aws.core.common.docker.CurrentContainerNetworkResolver;
 import io.floci.aws.core.common.docker.DockerHostResolver;
 import io.floci.aws.core.common.docker.LaunchedContainerAwsEnv;
@@ -41,6 +49,9 @@ import io.floci.aws.services.lambda.model.LambdaFunction;
 import io.floci.aws.services.lambda.model.LambdaLayerVersion;
 import io.floci.aws.services.lambda.runtime.RuntimeApiServer;
 import io.floci.aws.services.lambda.runtime.RuntimeApiServerFactory;
+import io.smallrye.config.EnvConfigSource;
+import io.smallrye.config.SmallRyeConfig;
+import io.smallrye.config.SmallRyeConfigBuilder;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
@@ -78,6 +89,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 import java.util.stream.Stream;
 
@@ -112,6 +124,7 @@ class ContainerLauncherTest {
     @Mock LambdaExecutionRoleCredentials executionRoleCredentials;
     @Mock LambdaLayerService layerService;
     @Mock Ec2Service ec2Service;
+    @Mock LambdaVpcNetworkManager vpcNetworkManager;
 
     @TempDir
     Path tempDir;
@@ -171,6 +184,8 @@ class ContainerLauncherTest {
         lenient().when(runtimeApiServer.close()).thenReturn(CompletableFuture.completedFuture(null));
         when(dockerHostResolver.resolve()).thenReturn("127.0.0.1");
         lenient().when(executionRoleCredentials.forFunction(any())).thenReturn(Optional.empty());
+        lenient().when(vpcNetworkManager.prepare(any(), anyString(), anyString(), anyInt(), any()))
+                .thenReturn(Optional.empty());
 
         // lenient: the failure-path test (populate fails before any container is created) never
         // reaches these, but every success-path test does — they must not trip strict-stubs.
@@ -512,7 +527,132 @@ class ContainerLauncherTest {
         return new ContainerLauncher(builder, lifecycleManager, logStreamer, selectedResolver,
                 runtimeApiServerFactory, dockerHostResolver, config, ecrRegistryManager,
                 layerService, new LaunchedContainerAwsEnv(endpoint),
-                executionRoleCredentials, ec2Service);
+                executionRoleCredentials, ec2Service, vpcNetworkManager);
+    }
+
+    @Test
+    void resolverRemovalFailureDoesNotLeakRuntimeApiPort() {
+        ContainerHandle handle = launcher.launch(imageFunction());
+        handle.setDnsResolverVolume("owned-resolver");
+        doThrow(new IllegalStateException("volume removal failed"))
+                .when(lifecycleManager).removeVolumeStrict("owned-resolver");
+
+        assertThrows(IllegalStateException.class, () -> launcher.stop(handle));
+
+        InOrder order = inOrder(lifecycleManager, runtimeApiServer, runtimeApiServerFactory);
+        order.verify(lifecycleManager).stopAndRemoveStrict(eq("container-123"), any(), eq(1));
+        order.verify(runtimeApiServer).close();
+        order.verify(runtimeApiServerFactory).release(runtimeApiServer);
+        order.verify(lifecycleManager).removeVolumeStrict("owned-resolver");
+        doNothing().when(lifecycleManager).removeVolumeStrict("owned-resolver");
+        launcher.stop(handle);
+        launcher.stop(handle);
+        verify(runtimeApiServerFactory, times(1)).release(runtimeApiServer);
+        verify(runtimeApiServer, times(1)).close();
+        verify(lifecycleManager, times(2)).removeVolumeStrict("owned-resolver");
+        assertNull(handle.getDnsResolverVolume());
+    }
+
+    @Test
+    void protectedNetworkDoesNotAlsoJoinTheOrdinaryVpcNetwork() throws Exception {
+        protectedNetwork();
+        LambdaFunction function = protectedFunction();
+        function.setVpcId("vpc-protected");
+        function.setVpcConfig(Map.of("SubnetIds", List.of("subnet-protected"),
+                "SecurityGroupIds", List.of("sg-protected")));
+
+        launcher.launch(function);
+
+        assertEquals("container:sg-helper", captureRealContainerSpec().networkMode());
+        verify(ec2Service, never()).allocateVpcPrivateIp(anyString(), anyString());
+        verify(ec2Service, never()).attachContainerToVpc(anyString(), anyString(), anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void protectedNetworkIsReleasedAfterItsWorkload() throws Exception {
+        LambdaVpcNetworkManager.Attachment attachment = protectedNetwork();
+        ContainerHandle handle = launcher.launch(protectedFunction());
+        ContainerSpec spec = captureRealContainerSpec();
+        assertEquals("container:sg-helper", spec.networkMode());
+        assertEquals("true", spec.labels().get(ContainerStorageHelper.SECURITY_GROUP_WORKLOAD_LABEL));
+
+        launcher.stop(handle);
+
+        InOrder order = inOrder(lifecycleManager, vpcNetworkManager, runtimeApiServer);
+        order.verify(lifecycleManager).stopAndRemoveStrict(eq("container-123"), any(), eq(1));
+        order.verify(vpcNetworkManager).release(attachment);
+        order.verify(runtimeApiServer).close();
+    }
+
+    @Test
+    void failedProtectedContainerRemovalKeepsNetworkAndRuntimeLease() throws Exception {
+        protectedNetwork();
+        ContainerHandle handle = launcher.launch(protectedFunction());
+        doThrow(new IllegalStateException("Docker removal failed"))
+                .when(lifecycleManager).stopAndRemoveStrict(eq("container-123"), any(), eq(1));
+
+        assertThrows(IllegalStateException.class, () -> launcher.stop(handle));
+
+        verify(vpcNetworkManager, never()).release(any());
+        verify(runtimeApiServer, never()).close();
+        verify(runtimeApiServerFactory, never()).release(any());
+    }
+
+    @Test
+    void failedDnsOnlyLaunchKeepsExistingRemovalBudget() throws Exception {
+        when(config.services().lambda().dockerNetwork()).thenReturn(Optional.of("dns-isolated"));
+        when(config.dns()).thenReturn(mock(EmulatorConfig.DnsConfig.class));
+        when(embeddedDnsServer.getServerIp()).thenReturn(Optional.of("192.0.2.53"));
+        Network network = mock(Network.class);
+        when(network.getInternal()).thenReturn(true);
+        InspectNetworkCmd inspectNetwork = mock(InspectNetworkCmd.class, RETURNS_SELF);
+        when(dockerClient.inspectNetworkCmd()).thenReturn(inspectNetwork);
+        when(inspectNetwork.exec()).thenReturn(network);
+        InspectVolumeCmd inspectVolume = mock(InspectVolumeCmd.class, RETURNS_DEEP_STUBS);
+        when(dockerClient.inspectVolumeCmd(anyString())).thenReturn(inspectVolume);
+        when(inspectVolume.exec().getMountpoint()).thenReturn("/daemon/volumes/resolver");
+        doThrow(new IllegalStateException("Docker start failed"))
+                .when(lifecycleManager).startCreated(eq("container-123"), any());
+        LambdaFunction function = protectedFunction();
+
+        assertThrows(IllegalStateException.class, () -> launcher.launch(function));
+
+        InOrder order = inOrder(lifecycleManager);
+        order.verify(lifecycleManager).stopAndRemoveStrict(eq("container-123"), any());
+        order.verify(lifecycleManager).removeIfExistsStrict("container-123", true);
+        order.verify(lifecycleManager).removeVolumeStrict(anyString());
+        verify(lifecycleManager, never()).stopAndRemoveStrict(anyString(), any(), eq(1));
+        verify(runtimeApiServerFactory).release(runtimeApiServer);
+    }
+
+    @Test
+    void failedLaunchReleasesItsPreparedNetwork() throws Exception {
+        LambdaVpcNetworkManager.Attachment attachment = protectedNetwork();
+        when(lifecycleManager.create(any())).thenThrow(new IllegalStateException("Docker create failed"));
+        LambdaFunction function = protectedFunction();
+
+        assertThrows(IllegalStateException.class, () -> launcher.launch(function));
+
+        verify(vpcNetworkManager).release(attachment);
+        verify(runtimeApiServerFactory).release(runtimeApiServer);
+    }
+
+    private LambdaVpcNetworkManager.Attachment protectedNetwork() {
+        LambdaVpcNetworkManager.Attachment attachment = new LambdaVpcNetworkManager.Attachment(
+                "111111111111", "us-east-1", "eni-protected", "sg-helper");
+        when(vpcNetworkManager.prepare(any(), anyString(), anyString(), anyInt(), any()))
+                .thenReturn(Optional.of(attachment));
+        return attachment;
+    }
+
+    private LambdaFunction protectedFunction() throws IOException {
+        LambdaFunction function = new LambdaFunction();
+        function.setFunctionName("protected-function");
+        function.setFunctionArn("arn:aws:lambda:us-east-1:111111111111:function:protected-function");
+        function.setRuntime("nodejs20.x");
+        function.setHandler("index.handler");
+        function.setCodeLocalPath(Files.createDirectory(tempDir.resolve("protected-code")).toString());
+        return function;
     }
 
     @ParameterizedTest
@@ -813,6 +953,11 @@ class ContainerLauncherTest {
 
     @Test
     void launchFunction_appliesConfiguredDockerFlagsToRealContainer() throws Exception {
+        InspectNetworkCmd inspectNetwork = mock(InspectNetworkCmd.class, RETURNS_SELF);
+        when(dockerClient.inspectNetworkCmd()).thenReturn(inspectNetwork);
+        Network network = mock(Network.class);
+        when(network.getInternal()).thenReturn(false);
+        when(inspectNetwork.exec()).thenReturn(network);
         lenient().when(embeddedDnsServer.getServerIp()).thenReturn(Optional.of("172.18.0.4"));
         when(dockerHostResolver.resolve()).thenReturn("172.18.0.9");
         when(config.services().lambda().dockerFlags()).thenReturn(Optional.of(
@@ -1004,6 +1149,176 @@ class ContainerLauncherTest {
         CopyArchiveFromContainerCmd copy = mock(CopyArchiveFromContainerCmd.class);
         lenient().when(copy.exec()).thenReturn(new ByteArrayInputStream(bos.toByteArray()));
         lenient().when(dockerClient.copyArchiveFromContainerCmd("container-123", path)).thenReturn(copy);
+    }
+
+    @Test
+    void additionalNetworksAreConnectedBeforeTheFunctionStarts() {
+        LambdaFunction fn = networkFunction();
+        SmallRyeConfig mapped = new SmallRyeConfigBuilder()
+                .withSources(new EnvConfigSource(Map.of(
+                        "FLOCI_SERVICES_LAMBDA_ADDITIONAL_DOCKER_NETWORKS",
+                        "primary-net,metadata-net,peer-net"), 300))
+                .withMapping(EmulatorConfig.class)
+                .build();
+        when(config.services().lambda().dockerNetwork()).thenReturn(Optional.of("primary-net"));
+        when(config.services().lambda().additionalDockerNetworks())
+                .thenReturn(mapped.getConfigMapping(EmulatorConfig.class).services().lambda().additionalDockerNetworks());
+        stubNetworkLookups("primary-net", "", Map.of(
+                "primary-net", "primary-id", "metadata-net", "metadata-id", "peer-net", "peer-id"));
+        ConnectToNetworkCmd metadata = mock(ConnectToNetworkCmd.class, RETURNS_SELF);
+        ConnectToNetworkCmd peer = mock(ConnectToNetworkCmd.class, RETURNS_SELF);
+        when(dockerClient.connectToNetworkCmd()).thenReturn(metadata, peer);
+
+        launcher.launch(fn);
+
+        assertEquals("primary-net", captureRealContainerSpec().networkMode());
+        InOrder order = inOrder(lifecycleManager, metadata, peer);
+        order.verify(lifecycleManager).create(any());
+        order.verify(metadata).withNetworkId("metadata-id");
+        order.verify(metadata).withContainerId("container-123");
+        order.verify(metadata).exec();
+        order.verify(peer).withNetworkId("peer-id");
+        order.verify(peer).withContainerId("container-123");
+        order.verify(peer).exec();
+        order.verify(lifecycleManager).startCreated(eq("container-123"), any());
+        verify(dockerClient, times(2)).connectToNetworkCmd();
+        ArgumentCaptor<ContainerNetwork> endpoint = ArgumentCaptor.forClass(ContainerNetwork.class);
+        verify(metadata).withContainerNetwork(endpoint.capture());
+        assertEquals(-1, new ObjectMapper().valueToTree(endpoint.getValue()).path("GwPriority").asInt());
+    }
+
+    @Test
+    void additionalNetworkAliasesDoNotReconnectThePrimaryOrDuplicateAnEndpoint() {
+        when(config.services().lambda().additionalDockerNetworks())
+                .thenReturn(Optional.of(List.of("primary-id", "metadata-net", "metadata-id")));
+        stubNetworkLookups("primary-net", "primary-id", Map.of(
+                "primary-id", "primary-id", "metadata-net", "metadata-id", "metadata-id", "metadata-id"));
+        ConnectToNetworkCmd metadata = mock(ConnectToNetworkCmd.class, RETURNS_SELF);
+        when(dockerClient.connectToNetworkCmd()).thenReturn(metadata);
+
+        launcher.launch(networkFunction());
+
+        verify(dockerClient, times(1)).connectToNetworkCmd();
+        verify(metadata).withNetworkId("metadata-id");
+        verify(metadata).exec();
+        verify(lifecycleManager).startCreated(eq("container-123"), any());
+    }
+
+    @Test
+    void missingNetworkLookupReleasesTheCreatedContainer() {
+        when(config.services().lambda().additionalDockerNetworks())
+                .thenReturn(Optional.of(List.of("missing-net")));
+        stubNetworkLookups("primary-net", "primary-id", Map.of());
+
+        assertThrows(NotFoundException.class, () -> launcher.launch(networkFunction()));
+
+        verify(dockerClient, never()).connectToNetworkCmd();
+        verify(lifecycleManager, never()).startCreated(any(), any());
+        verify(lifecycleManager).stopAndRemoveStrict("container-123", null);
+        verify(runtimeApiServerFactory).release(runtimeApiServer);
+    }
+
+    @Test
+    void absentAdditionalNetworksPreserveTheDefaultLaunch() {
+        SmallRyeConfig mapped = new SmallRyeConfigBuilder()
+                .withSources(new EnvConfigSource(Map.of(), 300))
+                .withMapping(EmulatorConfig.class)
+                .build();
+        Optional<List<String>> networks = mapped.getConfigMapping(EmulatorConfig.class)
+                .services().lambda().additionalDockerNetworks();
+        assertTrue(networks.isEmpty());
+        when(config.services().lambda().additionalDockerNetworks()).thenReturn(networks);
+
+        launcher.launch(networkFunction());
+
+        verify(lifecycleManager).create(any());
+        verify(lifecycleManager).startCreated(eq("container-123"), any());
+        verify(dockerClient, never()).connectToNetworkCmd();
+    }
+
+    @Test
+    void failedAdditionalNetworkAttachmentReleasesTheContainerAndRoleSession() {
+        LambdaFunction fn = networkFunction();
+        when(config.services().lambda().additionalDockerNetworks())
+                .thenReturn(Optional.of(List.of("metadata-net", "missing-net")));
+        stubNetworkLookups("primary-net", "primary-id", Map.of(
+                "metadata-net", "metadata-id", "missing-net", "missing-id"));
+        when(executionRoleCredentials.forFunction(fn)).thenReturn(Optional.of(
+                new SessionCreds("ASIANETWORKFAIL", "role-secret", "role-token")));
+        ConnectToNetworkCmd metadata = mock(ConnectToNetworkCmd.class, RETURNS_SELF);
+        ConnectToNetworkCmd missing = mock(ConnectToNetworkCmd.class, RETURNS_SELF);
+        when(dockerClient.connectToNetworkCmd()).thenReturn(metadata, missing);
+        doThrow(new IllegalStateException("network disappeared")).when(missing).exec();
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class, () -> launcher.launch(fn));
+
+        assertEquals("network disappeared", failure.getMessage());
+        verify(metadata).exec();
+        verify(lifecycleManager, never()).startCreated(any(), any());
+        verify(lifecycleManager).stopAndRemoveStrict("container-123", null);
+        verify(executionRoleCredentials).unregister("222233334444", "ASIANETWORKFAIL");
+        verify(runtimeApiServerFactory).release(runtimeApiServer);
+    }
+
+    @ParameterizedTest
+    @MethodSource("invalidAdditionalNetworks")
+    void invalidAdditionalNetworksFailBeforeContainerCreation(List<String> networks) {
+        when(config.services().lambda().additionalDockerNetworks()).thenReturn(Optional.of(networks));
+
+        assertThrows(IllegalArgumentException.class, () -> launcher.launch(networkFunction()));
+
+        verify(lifecycleManager, never()).create(any());
+        verify(lifecycleManager, never()).startCreated(any(), any());
+        verify(dockerClient, never()).connectToNetworkCmd();
+        verify(runtimeApiServerFactory).release(runtimeApiServer);
+    }
+
+    private static Stream<List<String>> invalidAdditionalNetworks() {
+        return Stream.of(List.of(""), List.of("same", "same"), List.of("../outside"), List.of("two names"));
+    }
+
+    private void stubNetworkLookups(String primaryName, String primaryId, Map<String, String> ids) {
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        InspectContainerResponse container = mock(InspectContainerResponse.class);
+        ContainerConfig containerConfig = mock(ContainerConfig.class);
+        lenient().when(container.getConfig()).thenReturn(containerConfig);
+        lenient().when(containerConfig.getWorkingDir()).thenReturn("");
+        NetworkSettings settings = mock(NetworkSettings.class);
+        when(dockerClient.inspectContainerCmd("container-123")).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(container);
+        when(container.getNetworkSettings()).thenReturn(settings);
+        when(settings.getNetworks()).thenReturn(Map.of(
+                primaryName, new ContainerNetwork().withNetworkID(primaryId)));
+        InspectNetworkCmd networkLookup = mock(InspectNetworkCmd.class);
+        when(dockerClient.inspectNetworkCmd()).thenReturn(networkLookup);
+        AtomicReference<String> requested = new AtomicReference<>();
+        when(networkLookup.withNetworkId(anyString())).thenAnswer(call -> {
+            requested.set(call.getArgument(0));
+            return networkLookup;
+        });
+        Map<String, Network> resolved = new LinkedHashMap<>();
+        ids.forEach((name, id) -> {
+            Network network = mock(Network.class);
+            when(network.getId()).thenReturn(id);
+            resolved.put(name, network);
+        });
+        when(networkLookup.exec()).thenAnswer(call -> {
+            Network network = resolved.get(requested.get());
+            if (network == null) {
+                throw new NotFoundException("Network not found");
+            }
+            return network;
+        });
+    }
+
+    private static LambdaFunction networkFunction() {
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("network-function");
+        fn.setAccountId("222233334444");
+        fn.setFunctionArn("arn:aws:lambda:us-east-1:222233334444:function:network-function");
+        fn.setPackageType("Image");
+        fn.setImageUri("unit-lambda:latest");
+        return fn;
     }
 
     private static LambdaFunction imageFunction() {
