@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.core.common.AwsProtocolClaimFilter;
 import io.github.hectorvent.floci.core.common.ProtocolClaim;
 import io.github.hectorvent.floci.core.common.WireProtocol;
 import io.github.hectorvent.floci.services.appconfig.AppConfigDataController;
+import io.github.hectorvent.floci.services.iot.IotController;
 import io.github.hectorvent.floci.services.route53.Route53Controller;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.container.ResourceInfo;
@@ -45,6 +46,21 @@ import static org.mockito.Mockito.when;
 class IamActionRegistryTest {
 
     private final IamActionRegistry registry = new IamActionRegistry();
+
+    @Test
+    void iotJobDeletionFollowsItsMatchedRouteAndIgnoresActionSpoofing() {
+        ResourceInfo info = Mockito.mock(ResourceInfo.class);
+        Mockito.doReturn(IotController.class).when(info).getResourceClass();
+        when(info.getResourceMethod()).thenReturn(Arrays.stream(IotController.class.getMethods())
+                .filter(method -> method.getName().equals("deleteJob")).findFirst().orElseThrow());
+        assertEquals("iot:DeleteJob", registry.resolveMatchedRoute("iot", info));
+        assertNull(registry.resolveMatchedRoute("other", info));
+        MultivaluedMap<String, String> query = new MultivaluedHashMap<>();
+        query.putSingle("Action", "ListJobs");
+        ContainerRequestContext context = mockCtx("DELETE", "/jobs/owned%5Fjob", query, null, "");
+        when(context.getHeaderString("X-Amz-Target")).thenReturn("IoT.ListJobs");
+        assertEquals("iot:DeleteJob", registry.resolveRoute("iot", context));
+    }
 
     /**
      * A REST request no rule maps is checked as the operation whose vendored route it matches, as that operation's

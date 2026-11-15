@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.services.amazonmq.AmazonMqConfigurationControl
 import io.github.hectorvent.floci.services.appconfig.AppConfigDataController;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbPartiQLParser;
 import io.github.hectorvent.floci.services.eks.EksController;
+import io.github.hectorvent.floci.services.iot.IotController;
 import io.github.hectorvent.floci.services.route53.Route53Controller;
 import io.github.hectorvent.floci.services.s3.S3ObjectActions;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -107,6 +108,8 @@ public class IamActionRegistry {
      * type, so IAM checks them against the wildcard rather than a bucket.
      */
     private static final List<ActionRule> RULES = List.of(
+        rule("iot", "DELETE", "^/jobs/[^/]+/?$", "iot:DeleteJob"),
+
         // ── S3 Control ───────────────────────────────────────────────────────────
         s3ControlRule("GET",    "^/v20180820/tags/.+",        "s3:ListTagsForResource"),
         s3ControlRule("POST",   "^/v20180820/tags/.+",        "s3:TagResource"),
@@ -691,6 +694,12 @@ public class IamActionRegistry {
                 && AmazonMqConfigurationController.class.equals(resourceInfo.getResourceClass())
                 && resourceInfo.getResourceMethod() != null) {
             return MQ_CONFIGURATION_ACTIONS.get(resourceInfo.getResourceMethod().getName());
+        }
+        if ("iot".equals(credentialScope) && resourceInfo != null
+                && IotController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && "deleteJob".equals(resourceInfo.getResourceMethod().getName())) {
+            return "iot:DeleteJob";
         }
         if ("appconfig".equals(credentialScope) && resourceInfo != null
                 && AppConfigDataController.class.equals(resourceInfo.getResourceClass())
