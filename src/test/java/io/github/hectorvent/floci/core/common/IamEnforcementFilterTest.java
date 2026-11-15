@@ -2407,6 +2407,21 @@ class IamEnforcementFilterTest {
     }
 
     @Test
+    void kmsJsonAccessDeniedUsesForbiddenStatus() {
+        for (String action : List.of("kms:Sign", "kms:GetPublicKey", "kms:Decrypt")) {
+            Response response = IamEnforcementFilter.accessDeniedResponse(
+                    action, "kms", MediaType.valueOf("application/x-amz-json-1.1"),
+                    null, WireProtocol.AWS_JSON_1_1);
+
+            assertEquals(403, response.getStatus());
+            assertEquals(MediaType.APPLICATION_JSON_TYPE, response.getMediaType());
+            String body = entityString(response);
+            assertTrue(body.contains("\"__type\":\"AccessDeniedException\""), body);
+            assertTrue(body.contains("User is not authorized to perform: " + action), body);
+        }
+    }
+
+    @Test
     void restJsonProtocolGetsJsonErrorResponse() {
         // Lambda / API Gateway — REST-JSON.
         Response r = IamEnforcementFilter.accessDeniedResponse(
