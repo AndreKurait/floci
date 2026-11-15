@@ -1,0 +1,45 @@
+name: Floci Retirement and SSM Diagnostic
+on:
+  push:
+    branches: [diagnose/floci-retirement-and-ssm-20261115]
+permissions:
+  contents: read
+jobs:
+  reproduce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad
+        with:
+          java-version: '25'
+          distribution: temurin
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('pom.xml') }}
+          restore-keys: |
+            maven-${{ runner.os }}-
+      - name: Compile the unchanged integration source and tests
+        run: ./mvnw -B -ntp test-compile
+      - name: Run Classic retirement and authenticated SSM and KMS APIs
+        run: |
+          dns_address="$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')"
+          test -n "$dns_address"
+          port_floor="$(sysctl -n net.ipv4.ip_unprivileged_port_start)"
+          trap 'sudo sysctl -w "net.ipv4.ip_unprivileged_port_start=$port_floor" >/dev/null' EXIT
+          sudo sysctl -w net.ipv4.ip_unprivileged_port_start=0
+          FLOCI_TEST_HOST_DNS_ADDRESS="$dns_address" ./mvnw -B -ntp surefire:test             -Dtest=ElbClassicMultiAzPacketIntegrationTest,SsmEc2RegistrationIntegrationTest,KmsIamSigningIntegrationTest             -Dsurefire.failIfNoTests=true -Dsurefire.timeout=900
+      - name: Record owned runner container state
+        if: always()
+        run: |
+          mkdir -p diagnostic-evidence
+          docker ps -a --format '{{.ID}} {{.Names}} {{.Status}}' > diagnostic-evidence/containers.txt
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: floci-retirement-and-ssm-diagnostic
+          path: |
+            diagnostic-evidence/
+            target/surefire-reports/
+          if-no-files-found: error
