@@ -8,6 +8,7 @@ import com.github.dockerjava.api.model.Container;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.ec2.AmiImageResolver;
 import io.github.hectorvent.floci.services.ec2.ResolvedAmiImage;
+import io.github.hectorvent.floci.services.lambda.launcher.ImageCacheService;
 import io.quarkus.test.InjectMock;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.QuarkusTestProfile;
@@ -53,6 +54,9 @@ class AutoScalingNativeEventSdkTest {
 
     @Inject
     EmulatorConfig config;
+
+    @Inject
+    ImageCacheService imageCache;
 
     @InjectMock
     AmiImageResolver images;
@@ -121,7 +125,9 @@ class AutoScalingNativeEventSdkTest {
         private void build() throws IOException {
             docker.pingCmd().exec();
             assertThrows(NotFoundException.class, () -> docker.inspectImageCmd(tag).exec());
-            InspectImageResponse base = docker.inspectImageCmd(config.services().ec2().volumeHelperImage()).exec();
+            String baseImage = config.services().ec2().volumeHelperImage();
+            imageCache.ensureImageExists(baseImage);
+            InspectImageResponse base = docker.inspectImageCmd(baseImage).exec();
             baseId = base.getId();
             record("inspect-base-image", base);
             dockerfile = """
