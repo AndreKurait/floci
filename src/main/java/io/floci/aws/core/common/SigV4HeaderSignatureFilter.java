@@ -290,6 +290,11 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
         }
 
         byte[] body = signedBody(ctx);
+        String declaredHash = ctx.getHeaderString("x-amz-content-sha256");
+        if (ec2Registration && declaredHash != null && !Digests.sha256Hex(body).equals(declaredHash.trim())) {
+            signatureDoesNotMatch(ctx, resource, MISMATCH_MESSAGE);
+            return;
+        }
         UnaryOperator<String> headers = name -> "content-length".equals(name)
                 && ctx.getProperty(SqsQueueUrlRouterFilter.APPENDED_BODY_BYTES_PROPERTY) != null
                 ? String.valueOf(body.length)
