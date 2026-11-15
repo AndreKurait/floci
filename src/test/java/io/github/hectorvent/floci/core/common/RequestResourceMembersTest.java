@@ -60,7 +60,14 @@ class RequestResourceMembersTest {
                 .filter(operation -> table.handBuilt().contains(operation.substring(0, operation.indexOf(':'))))
                 .collect(Collectors.toSet()),
                 "only explicit corrections and the operations listed to read override hand-built operations");
-        assertTrue(table.namespaces().stream().noneMatch(table.notCovered()::contains));
+        assertEquals(Set.of("cloudfront"), table.namespaces().stream().filter(table.notCovered()::contains)
+                .collect(Collectors.toSet()));
+        Set<String> cloudFrontKeyValueStores = Stream.of("CreateKeyValueStore", "DeleteKeyValueStore",
+                "DescribeKeyValueStore", "ListKeyValueStores", "UpdateKeyValueStore")
+                .map(operation -> "cloudfront:" + operation).collect(Collectors.toSet());
+        assertEquals(cloudFrontKeyValueStores, table.operations().keySet().stream()
+                .filter(operation -> operation.startsWith("cloudfront:")).collect(Collectors.toSet()),
+                "only the five explicit KeyValueStore controls are read from CloudFront");
         assertTrue(table.otherNamespaces().stream().noneMatch(table.notCovered()::contains));
         table.operations().forEach((operation, resources) -> {
             Map<String, ArnFormat> formats = table.formats().get(operation.substring(0, operation.indexOf(':')));

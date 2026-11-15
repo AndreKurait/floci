@@ -213,6 +213,8 @@ def corrections(monkeypatch):
     monkeypatch.setattr(r, "NOT_COVERED", {"later": "a later batch"})
     monkeypatch.setattr(r, "CORRECTIONS", {})
     monkeypatch.setattr(r, "READ_IN_HAND_BUILT", {})
+    monkeypatch.setattr(r, "READ_IN_NOT_COVERED", {})
+    monkeypatch.setattr(r, "REST_ONLY_OPERATIONS", {})
     monkeypatch.setattr(r, "UNQUALIFIED", {})
     monkeypatch.setattr(r, "MINTED_IDS", {})
     monkeypatch.setattr(r, "FOUND_BY", {})
@@ -889,3 +891,46 @@ def test_verify_reports_a_rest_models_operation_whose_action_aws_no_longer_has(c
     gone["Actions"] = [action for action in gone["Actions"] if action["Name"] != "DescribeThing"]
     (sources / "svc.json").write_text(json.dumps(gone), encoding="utf-8")
     assert r.main(["--verify", "--source-dir", str(sources), "--output", str(output)]) == 1
+
+
+def test_cloudfront_partial_resource_coverage_does_not_promote_other_operations():
+    assert r.reads("cloudfront:DescribeKeyValueStore")
+    assert r.reads("cloudfront:DeleteKeyValueStore")
+    assert not r.reads("cloudfront:DescribeFunction")
+    assert not r.reads("cloudfront:ListDistributions")
+    assert "cloudfront" in r.NOT_COVERED
+
+
+def test_partial_namespace_rejects_an_operation_outside_its_explicit_allowlist():
+    document = json.loads(r.OUTPUT.read_text(encoding="utf-8"))
+    document["operations"]["cloudfront:DescribeFunction"] = {
+        "action": "cloudfront:DescribeFunction", "types": [], "resources": []}
+    document["operations"] = dict(sorted(document["operations"].items()))
+    assert "cloudfront is in both namespaces and notCovered" in r.validate(document)
+
+
+def test_partial_namespace_requires_at_least_one_qualified_operation():
+    document = json.loads(r.OUTPUT.read_text(encoding="utf-8"))
+    document["operations"] = {operation: entry for operation, entry in document["operations"].items()
+                              if not operation.startswith("cloudfront:")}
+    assert "cloudfront is in both namespaces and notCovered" in r.validate(document)
+
+
+@pytest.mark.parametrize("section", ["handBuilt", "otherNamespaces"])
+def test_partial_namespace_does_not_allow_other_classification_overlap(section):
+    document = json.loads(r.OUTPUT.read_text(encoding="utf-8"))
+    document[section].append("cloudfront")
+    assert f"cloudfront is in both {section} and notCovered" in r.validate(document)
+
+
+def test_only_qualified_cloudfront_xml_operations_read_name_path_labels():
+    sample = rest_model({"DescribeKeyValueStore": {"Name": "String"}, "DescribeFunction": {"Name": "String"}},
+                        {"DescribeKeyValueStore": {"Name": "uri:Name"}, "DescribeFunction": {"Name": "uri:Name"}})
+    sample["metadata"].update(protocol="rest-xml", endpointPrefix="cloudfront")
+    assert r.request_members({"cloudfront": sample}, "DescribeKeyValueStore") == {"Name": "Name"}
+    assert r.located_members({"cloudfront": sample}, "DescribeKeyValueStore") == {"Name": "{Name}"}
+    assert r.request_members({"cloudfront": sample}, "DescribeFunction") == {}
+    assert r.located_members({"cloudfront": sample}, "DescribeFunction") == {}
+    sample["metadata"]["endpointPrefix"] = "another-service"
+    assert r.request_members({"other": sample}, "DescribeKeyValueStore") == {}
+    assert r.located_members({"other": sample}, "DescribeKeyValueStore") == {}

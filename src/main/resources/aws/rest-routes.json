@@ -359,6 +359,29 @@
         "StartConfigurationSession": {"method": "POST", "requestUri": "/configurationsessions"}
       }
     },
+    "cloudfront": {
+      "credentialScope": "cloudfront",
+      "apiVersion": "2020-05-31",
+      "operations": {
+        "CreateKeyValueStore": {"method": "POST", "requestUri": "/2020-05-31/key-value-store"},
+        "DeleteKeyValueStore": {"method": "DELETE", "requestUri": "/2020-05-31/key-value-store/{Name}"},
+        "DescribeKeyValueStore": {"method": "GET", "requestUri": "/2020-05-31/key-value-store/{Name}"},
+        "ListKeyValueStores": {"method": "GET", "requestUri": "/2020-05-31/key-value-store"},
+        "UpdateKeyValueStore": {"method": "PUT", "requestUri": "/2020-05-31/key-value-store/{Name}"}
+      }
+    },
+    "cloudfront-keyvaluestore": {
+      "credentialScope": "cloudfront-keyvaluestore",
+      "apiVersion": "2022-07-26",
+      "operations": {
+        "DeleteKey": {"method": "DELETE", "requestUri": "/key-value-stores/{KvsARN}/keys/{Key}"},
+        "DescribeKeyValueStore": {"method": "GET", "requestUri": "/key-value-stores/{KvsARN}"},
+        "GetKey": {"method": "GET", "requestUri": "/key-value-stores/{KvsARN}/keys/{Key}"},
+        "ListKeys": {"method": "GET", "requestUri": "/key-value-stores/{KvsARN}/keys"},
+        "PutKey": {"method": "PUT", "requestUri": "/key-value-stores/{KvsARN}/keys/{Key}"},
+        "UpdateKeys": {"method": "POST", "requestUri": "/key-value-stores/{KvsARN}/keys"}
+      }
+    },
     "dsql": {
       "credentialScope": "dsql",
       "apiVersion": "2018-05-10",

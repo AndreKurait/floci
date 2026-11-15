@@ -69,7 +69,9 @@ of its own name with that action's resource types when the reference has that ac
 the reference lists one client's operations per namespace, and
 OpenSearch Service's are the `es` client's alone, while the `opensearch` client's are named after `es` actions.
 
-Every operation in `NAMESPACES` is read, whether Floci serves it or not. Explicit `CORRECTIONS`
+Every operation in `NAMESPACES` is read, whether Floci serves it or not. `READ_IN_NOT_COVERED`
+reads only explicitly qualified operations of a namespace whose other operations remain not covered;
+the CloudFront KVS family also reads its REST-XML path labels without enabling other XML models. Explicit `CORRECTIONS`
 in `HAND_BUILT` are also read, overriding only those operations while the remaining operations
 keep their existing resource builders, and so are the operations `READ_IN_HAND_BUILT` lists, which
 follow the rule unchanged: a family of a hand-built namespace whose requests name their resources the
@@ -151,6 +153,7 @@ from regen_iam_passed_roles import (
 )
 from regen_partitions import resolve_botocore_data
 from regen_rest_routes import MODELS as REST_MODELS
+from regen_rest_routes import ONLY_OPERATIONS as REST_ONLY_OPERATIONS
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 OUTPUT = REPO_ROOT / "src/main/resources/aws/iam-request-resources.json"
@@ -158,7 +161,7 @@ OUTPUT = REPO_ROOT / "src/main/resources/aws/iam-request-resources.json"
 # The namespaces read, in batches: each moves here from NOT_COVERED with the tests that show its ARNs
 # are the ones its handlers mint.
 NAMESPACES = ("access-analyzer", "acm", "appconfig", "application-autoscaling", "athena", "bcm-data-exports",
-              "bcm-pricing-calculator", "budgets", "ce", "cloudtrail", "codebuild", "codepipeline", "cognito-identity",
+              "bcm-pricing-calculator", "budgets", "ce", "cloudfront-keyvaluestore", "cloudtrail", "codebuild", "codepipeline", "cognito-identity",
               "cognito-idp", "cur", "datasync", "ecr", "elasticloadbalancing", "elasticmapreduce", "es", "events",
               "firehose", "globalaccelerator", "kinesisanalytics", "payment-cryptography", "redshift",
               "redshift-data", "rekognition", "servicediscovery", "servicequotas", "sso", "states", "swf", "textract",
@@ -191,6 +194,13 @@ READ_IN_HAND_BUILT: dict[str, str] = {
                       "DeleteDelivery", "DescribeDeliveries")
 }
 
+# Bounded families of a namespace whose other operations remain explicitly not covered.
+READ_IN_NOT_COVERED = {
+    f"cloudfront:{operation}": "KVS control-plane IAM checks only; other CloudFront operations remain unchanged"
+    for operation in REST_ONLY_OPERATIONS["cloudfront"]
+}
+
+
 _LATER = "not read yet: a later batch, with the tests that show its ARNs are the ones its handlers mint"
 _REST = ("REST: its requests name their resources in the path, which RequestResources reads from the route a request "
          "matched in the vendored REST routes (regen_rest_routes.MODELS), which do not have its model yet")
@@ -210,7 +220,8 @@ NOT_COVERED: dict[str, str] = {
     "batch": _REST,
     "bedrock-agentcore": _REST,
     "cloudformation": _LATER,
-    "cloudfront": _REST,
+    "cloudfront": "Only the five KeyValueStore control operations are read; other CloudFront management "
+                  "operations still await their own route and resource qualification",
     "cloudhsm": "not read yet: its ARN formats end in ${CloudHsmClusterInstanceName} and "
                 "${CloudHsmBackupInstanceName}, names, while its requests give ClusterId and BackupId, ids, which the "
                 "rule does not fill a name from, so nearly every operation needs a correction",
@@ -747,6 +758,12 @@ def _protocols(model: dict) -> set[str]:
     return set(metadata.get("protocols") or [metadata.get("protocol")])
 
 
+def _cloudfront_kvs_xml(model: dict, operation: str) -> bool:
+    """The partial CloudFront KVS family reads REST-XML path labels; other XML models stay unchanged."""
+    return ("rest-xml" in _protocols(model) and model["metadata"].get("endpointPrefix") == "cloudfront"
+            and f"cloudfront:{operation}" in READ_IN_NOT_COVERED)
+
+
 def request_members(models: dict[str, dict], operation: str) -> dict[str, str]:
     """The top-level members of the operation's request that hold a string (`Name`) or a list of
     strings (`Name[]`), by name, and the ARN members one level inside one (`Name.FieldArn`,
@@ -755,7 +772,8 @@ def request_members(models: dict[str, dict], operation: str) -> dict[str, str]:
     found: dict[str, str] = {}
     for model in models.values():
         spec = model["operations"].get(operation)
-        if spec is None or "input" not in spec or not READ_PROTOCOLS & _protocols(model):
+        if spec is None or "input" not in spec or not (READ_PROTOCOLS & _protocols(model)
+                                                        or _cloudfront_kvs_xml(model, operation)):
             continue
         root = model["shapes"][spec["input"]["shape"]]
         for name, member in root.get("members", {}).items():
@@ -779,7 +797,8 @@ def located_members(models: dict[str, dict], operation: str) -> dict[str, str]:
     found: dict[str, str] = {}
     for client, model in sorted(models.items()):
         spec = model["operations"].get(operation)
-        if spec is None or "input" not in spec or "rest-json" not in _protocols(model):
+        if spec is None or "input" not in spec or not ("rest-json" in _protocols(model)
+                                                        or _cloudfront_kvs_xml(model, operation)):
             continue
         for name, member in model["shapes"][spec["input"]["shape"]].get("members", {}).items():
             where = _located(member)
@@ -1153,9 +1172,9 @@ def with_through(resources: list[dict], namespace: str, types: list[str], member
 
 def rest_operations(data: Path) -> dict[str, set[str]]:
     """The operation names of each botocore model whose REST routes Floci reads under a namespace the file reads."""
-    return {client: set(model["operations"])
+    return {client: set(REST_ONLY_OPERATIONS.get(client, model["operations"]))
             for client, model in load_models(data, {client for client, namespace in REST_MODELS.items()
-                                                    if namespace in NAMESPACES}).items()}
+                                                    if namespace in NAMESPACES or client in REST_ONLY_OPERATIONS}).items()}
 
 
 def with_rest_operations(upstream: dict[str, dict], documents: list[dict],
@@ -1277,7 +1296,7 @@ def reads(operation: str) -> bool:
     """Read whole namespaces, and in a namespace otherwise built by hand its explicit corrections and the
     operations `READ_IN_HAND_BUILT` lists."""
     namespace = namespace_of(operation)
-    return namespace in NAMESPACES or namespace in HAND_BUILT and (operation in CORRECTIONS
+    return operation in READ_IN_NOT_COVERED or namespace in NAMESPACES or namespace in HAND_BUILT and (operation in CORRECTIONS
                                                                      or operation in READ_IN_HAND_BUILT)
 
 
@@ -1289,6 +1308,9 @@ def _check_overrides(covered: dict[str, dict]) -> None:
               if operation not in covered]
     stale += [f"READ_IN_HAND_BUILT names {operation}, outside HAND_BUILT" for operation in READ_IN_HAND_BUILT
               if namespace_of(operation) not in HAND_BUILT]
+    stale += [f"READ_IN_NOT_COVERED names {operation}, outside NOT_COVERED or not listed by the reference"
+              for operation in READ_IN_NOT_COVERED
+              if namespace_of(operation) not in NOT_COVERED or operation not in covered]
     for left, right in (("NAMESPACES", "HAND_BUILT"), ("NAMESPACES", "NOT_COVERED"), ("HAND_BUILT", "NOT_COVERED")):
         stale += [f"{namespace} is in both {left} and {right}"
                   for namespace in sorted(set(globals()[left]) & set(globals()[right]))]
@@ -1365,8 +1387,13 @@ def validate(document: dict) -> list[str]:
     if isinstance(document.get("notCovered"), dict):
         for key in ("namespaces", "handBuilt", "otherNamespaces"):
             if isinstance(document.get(key), (dict, list)) and all(isinstance(n, str) for n in document[key]):
-                problems.extend(f"{namespace} is in both {key} and notCovered"
-                                for namespace in sorted(set(document[key]) & set(document["notCovered"])))
+                for namespace in sorted(set(document[key]) & set(document["notCovered"])):
+                    namespace_operations = {operation for operation in operations
+                                            if namespace_of(operation) == namespace}
+                    if key == "namespaces" and namespace_operations \
+                            and namespace_operations <= set(READ_IN_NOT_COVERED):
+                        continue
+                    problems.append(f"{namespace} is in both {key} and notCovered")
     for operation, entry in operations.items():
         namespace = namespace_of(operation)
         if not OPERATION_RE.match(operation) or namespace not in namespaces:
@@ -1532,6 +1559,7 @@ def verify_against(vendored: dict, upstream: dict[str, dict], formats: dict[str,
             untrue.append(f"AWS no longer gives {namespace}'s {', '.join(changed)} the ARN format the file does")
     added = sorted(operation for operation in upstream
                    if namespace_of(operation) in vendored["namespaces"]
+                   and (namespace_of(operation) not in NOT_COVERED or operation in READ_IN_NOT_COVERED)
                    and (namespace_of(operation) not in vendored["handBuilt"] or operation in CORRECTIONS)
                    and operation not in vendored["operations"])
     return untrue, added
