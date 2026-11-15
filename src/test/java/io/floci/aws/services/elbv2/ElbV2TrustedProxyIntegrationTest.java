@@ -66,11 +66,14 @@ class ElbV2TrustedProxyIntegrationTest {
 
     private final List<Executable> cleanup = new ArrayList<>();
     private final AtomicReference<ReceivedRequest> received = new AtomicReference<>();
+    private final AtomicReference<String> receivedHost = new AtomicReference<>();
     private ElasticLoadBalancingV2Client elb;
     private List<String> subnets;
     private String targetGroupArn;
     private String certificateArn;
     private String dns;
+    private String primaryListenerArn;
+    private String lastResponse;
     private int listenerPort;
     private SSLContext tlsContext;
 
@@ -136,6 +139,50 @@ class ElbV2TrustedProxyIntegrationTest {
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
+    void trustedForwardedHostCannotSelectAnotherListener(boolean tls) throws Exception {
+        startListener(tls);
+        String otherDns = addSecondLoadBalancer(tls);
+        assertEquals(200, request(tls, TRUSTED_PROXY, dns,
+                "Forwarded: for=" + GUEST + ";proto=https;host=" + otherDns + "\r\n"));
+        assertEquals(new ReceivedRequest(GUEST, "POST", REQUEST_URI, AUTHORIZATION, BODY), received.get());
+        assertEquals(dns + ":" + listenerPort, receivedHost.get());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void trustedForwardedHostCannotChangeHostRuleMatching(boolean tls) throws Exception {
+        startListener(tls);
+        elb.modifyListener(r -> r.listenerArn(primaryListenerArn).defaultActions(Action.builder()
+                .type("fixed-response").fixedResponseConfig(c -> c.statusCode("403")).build()));
+        String ruleArn = elb.createRule(r -> r.listenerArn(primaryListenerArn).priority(1)
+                .conditions(c -> c.field("host-header").values(dns))
+                .actions(Action.builder().type("forward").targetGroupArn(targetGroupArn).build()))
+                .rules().getFirst().ruleArn();
+        cleanup.add(() -> elb.deleteRule(r -> r.ruleArn(ruleArn)));
+
+        assertEquals(200, request(tls, TRUSTED_PROXY, dns,
+                "Forwarded: for=" + GUEST + ";proto=https;host=other.example.test\r\n"));
+        assertEquals(dns + ":" + listenerPort, receivedHost.get());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void trustedForwardedHostCannotChangeRedirectAuthority(boolean tls) throws Exception {
+        startListener(tls);
+        elb.modifyListener(r -> r.listenerArn(primaryListenerArn).defaultActions(Action.builder()
+                .type("redirect").redirectConfig(c -> c.protocol("HTTPS").host("#{host}").port("443")
+                        .path("/redirect#{path}").query("#{query}").statusCode("HTTP_302")).build()));
+
+        assertEquals(302, request(tls, TRUSTED_PROXY, dns,
+                "Forwarded: for=" + GUEST + ";proto=https;host=other.example.test\r\n"));
+        assertEquals("https://" + dns + ":443/redirect/packages/prepare?version=3%2E0",
+                lastResponse.lines().filter(line -> line.regionMatches(true, 0, "Location:", 0, 9))
+                        .map(line -> line.substring(9).trim()).findFirst().orElse(null));
+        assertNull(received.get());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
     void malformedTrustedForwardedIsRejectedBeforeTheTarget(boolean tls) throws Exception {
         startListener(tls);
         assertEquals(400, request(tls, TRUSTED_PROXY, dns,
@@ -150,6 +197,7 @@ class ElbV2TrustedProxyIntegrationTest {
                 return;
             }
             request.body().onSuccess(body -> {
+                receivedHost.set(request.getHeader("Host"));
                 received.set(new ReceivedRequest(request.getHeader("X-Forwarded-For"),
                         request.method().name(), request.uri(), request.getHeader("Authorization"), body.toString()));
                 request.response().end("target");
@@ -191,6 +239,7 @@ class ElbV2TrustedProxyIntegrationTest {
             listener.certificates(r -> r.certificateArn(certificateArn));
         }
         String listenerArn = elb.createListener(listener.build()).listeners().getFirst().listenerArn();
+        primaryListenerArn = listenerArn;
         cleanup.add(() -> elb.deleteListener(r -> r.listenerArn(listenerArn)));
         elb.registerTargets(r -> r.targetGroupArn(targetGroupArn)
                 .targets(TargetDescription.builder().id("127.0.0.1").port(backend.actualPort()).build()));
@@ -206,10 +255,11 @@ class ElbV2TrustedProxyIntegrationTest {
                         .targetHealthDescriptions().getFirst().targetHealth().stateAsString()));
     }
 
-    private void addSecondLoadBalancer(boolean tls) {
+    private String addSecondLoadBalancer(boolean tls) {
         String name = "alb-other-" + UUID.randomUUID().toString().substring(0, 8);
-        String arn = elb.createLoadBalancer(r -> r.name(name).type("application")
-                .subnets(subnets)).loadBalancers().getFirst().loadBalancerArn();
+        LoadBalancer other = elb.createLoadBalancer(r -> r.name(name).type("application")
+                .subnets(subnets)).loadBalancers().getFirst();
+        String arn = other.loadBalancerArn();
         cleanup.add(() -> elb.deleteLoadBalancer(r -> r.loadBalancerArn(arn)));
         CreateListenerRequest.Builder listener = CreateListenerRequest.builder()
                 .loadBalancerArn(arn).protocol(tls ? "HTTPS" : "HTTP").port(listenerPort)
@@ -221,6 +271,7 @@ class ElbV2TrustedProxyIntegrationTest {
         }
         String listenerArn = elb.createListener(listener.build()).listeners().getFirst().listenerArn();
         cleanup.add(() -> elb.deleteListener(r -> r.listenerArn(listenerArn)));
+        return other.dnsName();
     }
 
     private String importTrustedCertificate() throws Exception {
@@ -279,13 +330,14 @@ class ElbV2TrustedProxyIntegrationTest {
         }
     }
 
-    private static int exchange(Socket socket, String host, String headers) throws Exception {
+    private int exchange(Socket socket, String host, String headers) throws Exception {
         socket.getOutputStream().write(("POST " + REQUEST_URI + " HTTP/1.1\r\nHost: " + host + "\r\n"
                 + headers + "Authorization: " + AUTHORIZATION + "\r\nContent-Type: application/json\r\n"
                 + "Content-Length: " + BODY.length() + "\r\nConnection: close\r\n\r\n" + BODY)
                 .getBytes(StandardCharsets.US_ASCII));
         socket.getOutputStream().flush();
         String response = new String(socket.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+        lastResponse = response;
         assertTrue(response.contains("\r\n\r\n"), "Expected a complete HTTP response: " + response);
         return Integer.parseInt(response.substring(0, response.indexOf("\r\n")).split(" ", 3)[1]);
     }

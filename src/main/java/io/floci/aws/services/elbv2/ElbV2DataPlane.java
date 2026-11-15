@@ -27,13 +27,11 @@ import io.netty.channel.ConnectTimeoutException;
 import io.netty.handler.ssl.SslHandshakeTimeoutException;
 import io.quarkus.vertx.http.runtime.ProxyConfig;
 import io.quarkus.vertx.http.runtime.VertxHttpConfig;
-import io.quarkus.vertx.http.runtime.options.HttpServerCommonHandlers;
 import io.vertx.core.Future;
 import io.vertx.core.Handler;
 import io.vertx.core.MultiMap;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
-import io.vertx.core.http.ClientAuth;
 import io.vertx.core.http.HttpClient;
 import io.vertx.core.http.HttpClientOptions;
 import io.vertx.core.http.HttpServer;
@@ -77,7 +75,6 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -653,8 +650,7 @@ public class ElbV2DataPlane {
         if (proxyConfig == null) {
             return handler;
         }
-        return HttpServerCommonHandlers.applyProxy(proxyConfig, handler, () -> vertx,
-                ClientAuth.NONE, Optional.empty(), "quarkus.http");
+        return ElbV2ProxyHandler.create(proxyConfig, vertx, handler);
     }
 
     private void startTcpServer(int port, PortState state) {
