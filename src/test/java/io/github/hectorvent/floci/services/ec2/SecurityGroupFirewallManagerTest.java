@@ -65,7 +65,7 @@ class SecurityGroupFirewallManagerTest {
         when(config.port()).thenReturn(4650);
         when(config.docker().resourceNamespace()).thenReturn(Optional.empty());
         DockerClient docker = mock(DockerClient.class, RETURNS_DEEP_STUBS);
-        SecurityGroupFirewallManager manager = spy(new SecurityGroupFirewallManager(SecurityGroupDnsFixture.policyDocker(docker),
+        SecurityGroupFirewallManager manager = spy(SecurityGroupDnsFixture.rawManager(SecurityGroupDnsFixture.policyDocker(docker),
                 mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class), config,
                 mock(EmbeddedDnsServer.class)));
         doNothing().when(manager).reconcileAll();
@@ -286,7 +286,7 @@ class SecurityGroupFirewallManagerTest {
     @Test
     void unregisterRetiresDnsBeforeDockerRemovalCompletes() {
         ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
-        SecurityGroupFirewallManager manager = spy(new SecurityGroupFirewallManager(SecurityGroupDnsFixture.policyDocker(mock(DockerClient.class)),
+        SecurityGroupFirewallManager manager = spy(SecurityGroupDnsFixture.rawManager(SecurityGroupDnsFixture.policyDocker(mock(DockerClient.class)),
                 mock(ContainerBuilder.class), lifecycle, mock(EmulatorConfig.class, RETURNS_DEEP_STUBS), mock(EmbeddedDnsServer.class)));
         doNothing().when(manager).reconcileAll();
         doNothing().when(manager).admit(anyString(), anyBoolean());
@@ -308,7 +308,7 @@ class SecurityGroupFirewallManagerTest {
         when(dockerClient.listContainersCmd()).thenReturn(listing);
         when(listing.exec()).thenReturn(List.of());
         ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
-        SecurityGroupFirewallManager manager = spy(new SecurityGroupFirewallManager(SecurityGroupDnsFixture.policyDocker(dockerClient),
+        SecurityGroupFirewallManager manager = spy(SecurityGroupDnsFixture.rawManager(SecurityGroupDnsFixture.policyDocker(dockerClient),
                 mock(ContainerBuilder.class), lifecycle, mock(EmulatorConfig.class, RETURNS_DEEP_STUBS), mock(EmbeddedDnsServer.class)));
         doNothing().when(manager).reconcileAll();
         doNothing().when(manager).admit(anyString(), anyBoolean());
@@ -332,7 +332,7 @@ class SecurityGroupFirewallManagerTest {
         when(dockerClient.listContainersCmd()).thenReturn(listing);
         when(listing.exec()).thenReturn(List.of());
         ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
-        SecurityGroupFirewallManager manager = spy(new SecurityGroupFirewallManager(SecurityGroupDnsFixture.policyDocker(dockerClient),
+        SecurityGroupFirewallManager manager = spy(SecurityGroupDnsFixture.rawManager(SecurityGroupDnsFixture.policyDocker(dockerClient),
                 mock(ContainerBuilder.class), lifecycle, mock(EmulatorConfig.class, RETURNS_DEEP_STUBS), mock(EmbeddedDnsServer.class)));
         doNothing().when(manager).reconcileAll();
         doNothing().when(manager).admit(anyString(), anyBoolean());
@@ -533,7 +533,7 @@ class SecurityGroupFirewallManagerTest {
 
     private static SecurityGroupFirewallManager cleanupManager(DockerClient dockerClient,
                                                                ContainerLifecycleManager lifecycle) {
-        SecurityGroupFirewallManager manager = spy(new SecurityGroupFirewallManager(SecurityGroupDnsFixture.policyDocker(dockerClient),
+        SecurityGroupFirewallManager manager = spy(SecurityGroupDnsFixture.rawManager(SecurityGroupDnsFixture.policyDocker(dockerClient),
                 mock(ContainerBuilder.class), lifecycle, mock(EmulatorConfig.class, RETURNS_DEEP_STUBS),
                 mock(EmbeddedDnsServer.class)));
         doNothing().when(manager).reconcileAll();
@@ -574,7 +574,7 @@ class SecurityGroupFirewallManagerTest {
 
     @Test
     void dnsOriginsUseRegisteredTransportAddressesAndTheirCompleteVpcScope() {
-        SecurityGroupFirewallManager manager = spy(new SecurityGroupFirewallManager(SecurityGroupDnsFixture.policyDocker(mock(DockerClient.class)),
+        SecurityGroupFirewallManager manager = spy(SecurityGroupDnsFixture.rawManager(SecurityGroupDnsFixture.policyDocker(mock(DockerClient.class)),
                 mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class), mock(EmulatorConfig.class, RETURNS_DEEP_STUBS),
                 mock(EmbeddedDnsServer.class)));
         doNothing().when(manager).reconcileAll();
@@ -686,7 +686,7 @@ class SecurityGroupFirewallManagerTest {
         when(embeddedDnsServer.getServerIp()).thenReturn(Optional.of("172.18.0.2"));
         ContainerLifecycleManager lifecycleManager = mock(ContainerLifecycleManager.class);
         when(lifecycleManager.createAndStart(any())).thenThrow(new IllegalStateException("stop after the spec"));
-        SecurityGroupFirewallManager manager = new SecurityGroupFirewallManager(dockerClient,
+        SecurityGroupFirewallManager manager = SecurityGroupDnsFixture.rawManager(dockerClient,
                 new ContainerBuilder(config, dockerHostResolver, embeddedDnsServer), lifecycleManager, config,
                 embeddedDnsServer);
 
@@ -724,7 +724,7 @@ class SecurityGroupFirewallManagerTest {
         when(embeddedDnsServer.getServerIp()).thenReturn(Optional.of("172.18.0.2"));
         ContainerLifecycleManager lifecycleManager = mock(ContainerLifecycleManager.class);
         when(lifecycleManager.createAndStart(any())).thenThrow(new IllegalStateException("stop after the spec"));
-        SecurityGroupFirewallManager manager = new SecurityGroupFirewallManager(dockerClient,
+        SecurityGroupFirewallManager manager = SecurityGroupDnsFixture.rawManager(dockerClient,
                 new ContainerBuilder(config, dockerHostResolver, embeddedDnsServer), lifecycleManager, config,
                 embeddedDnsServer);
 
@@ -744,7 +744,7 @@ class SecurityGroupFirewallManagerTest {
         when(embeddedDnsServer.getServerIp()).thenReturn(Optional.of("172.18.0.2"));
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.dns().containerFallbackServers()).thenReturn(List.of("8.8.8.8", "8.8.4.4"));
-        SecurityGroupFirewallManager manager = new SecurityGroupFirewallManager(mock(DockerClient.class),
+        SecurityGroupFirewallManager manager = SecurityGroupDnsFixture.rawManager(mock(DockerClient.class),
                 mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class), config, embeddedDnsServer);
 
         assertEquals(List.of("172.18.0.2"), manager.vpcResolvers());
@@ -779,7 +779,7 @@ class SecurityGroupFirewallManagerTest {
         when(byNewKeys.exec()).thenReturn(List.of(newOnly, both, disagreeing));
         when(byLegacyKeys.exec()).thenReturn(List.of(legacyOnly, both, disagreeing));
         ContainerLifecycleManager lifecycleManager = mock(ContainerLifecycleManager.class);
-        SecurityGroupFirewallManager manager = new SecurityGroupFirewallManager(dockerClient,
+        SecurityGroupFirewallManager manager = SecurityGroupDnsFixture.rawManager(dockerClient,
                 mock(ContainerBuilder.class), lifecycleManager, config, mock(EmbeddedDnsServer.class));
 
         manager.quarantineSurvivingNamespaces();

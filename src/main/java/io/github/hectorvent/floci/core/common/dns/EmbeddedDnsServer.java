@@ -528,6 +528,10 @@ public class EmbeddedDnsServer {
     }
 
     /**
+     * Deployment-owned native dependencies answer only the exact currently admitted endpoint.
+     * These explicit pins are authoritative over stored records and resolver forwarding rules.
+     *
+     * <p>
      * Stored public authority answers take precedence over broad emulator suffix spoofing.
      * Other names the emulator itself owns come first, whatever the rules say. Route 53 Resolver does
      * the same for the AWS-internal domains it autodefines system rules for, so that a rule for a
@@ -543,6 +547,19 @@ public class EmbeddedDnsServer {
      * hosted zone that matches the same name.
      */
     QueryPlan planQuery(String name, String clientAddress, String myIp, int type) {
+        Optional<DnsAnswer> control = Optional.empty();
+        for (DnsClientVpcSource source : clientVpcSources) {
+            Optional<DnsAnswer> answer = source.controlDependency(name, type, clientAddress);
+            if (answer.isPresent()) {
+                if (control.isPresent() && !control.equals(answer)) {
+                    return QueryPlan.answering(DnsAnswer.refused());
+                }
+                control = answer;
+            }
+        }
+        if (control.isPresent()) {
+            return QueryPlan.answering(control.orElseThrow());
+        }
         DnsClientVpcSource.ClientVpc origin = vpcForClient(clientAddress).orElse(null);
         Optional<DnsAnswer> stored = resolveFromRecordSources(name, type, true, origin);
         boolean awsEndpointName = isAwsEndpointName(name);

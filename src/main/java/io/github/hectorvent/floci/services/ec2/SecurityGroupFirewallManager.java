@@ -11,6 +11,7 @@ import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.Info;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.SweepWorker;
+import io.github.hectorvent.floci.core.common.dns.DnsAnswer;
 import io.github.hectorvent.floci.core.common.dns.DnsClientVpcSource;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
@@ -68,6 +69,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
 
     private static final Logger LOG = Logger.getLogger(SecurityGroupFirewallManager.class);
     private final DockerClient dockerClient;
+    private final PolicyWriterJournal policyWriters;
     /** Never reuse a namespace whose remote policy writer has no proven terminal result. */
     private final Set<String> uncertainPolicyWriters = ConcurrentHashMap.newKeySet();
     private final ContainerBuilder containerBuilder;
@@ -119,7 +121,14 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     public SecurityGroupFirewallManager(DockerClient dockerClient, ContainerBuilder containerBuilder,
                                         ContainerLifecycleManager lifecycleManager, EmulatorConfig config,
                                         EmbeddedDnsServer embeddedDnsServer) {
+        this(dockerClient, containerBuilder, lifecycleManager, config, embeddedDnsServer, new PolicyWriterJournal(config));
+    }
+
+    SecurityGroupFirewallManager(DockerClient dockerClient, ContainerBuilder containerBuilder,
+                                 ContainerLifecycleManager lifecycleManager, EmulatorConfig config,
+                                 EmbeddedDnsServer embeddedDnsServer, PolicyWriterJournal policyWriters) {
         this.dockerClient = dockerClient;
+        this.policyWriters = policyWriters;
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.config = config;
@@ -137,6 +146,21 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             return Optional.empty();
         }
         return Optional.ofNullable(dnsOrigins.get(clientAddress)).map(DnsOrigin::vpc);
+    }
+
+    @Override
+    public Optional<DnsAnswer> controlDependency(String name, int type, String clientAddress) {
+        DnsOrigin origin = clientAddress == null ? null : dnsOrigins.get(clientAddress);
+        ProtectedEndpoint current = origin == null ? null : endpoints.get(origin.eniId());
+        if (current == null || current.dnsOrigin() != origin || name == null) {
+            return Optional.empty();
+        }
+        SecurityGroupNftCompiler.ControlConnection connection =
+                current.endpoint().nativePeerDependencies().get(name.toLowerCase(Locale.ROOT));
+        if (connection == null || !current.endpoint().controlConnections().contains(connection)) {
+            return Optional.empty();
+        }
+        return Optional.of(type == 1 ? DnsAnswer.records(List.of(connection.address()), 5) : DnsAnswer.noData());
     }
 
     void startDnsOriginObserver(@Observes StartupEvent event) {
@@ -289,6 +313,8 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         }
         try {
             lifecycleManager.removeIfExistsStrict(helper);
+            policyWriters.forget(helper);
+            uncertainPolicyWriters.remove(helper);
             synchronized (this) {
                 forgetHelperCleanup(helper);
             }
@@ -435,25 +461,70 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         try {
             String owner = ContainerStorageHelper.ownerIdentity(config);
             ContainerStorageHelper.LabelAliases aliases = ContainerStorageHelper.CONTAINER_LABEL_ALIASES;
-            aliases.listByLabels(Map.of(ContainerStorageHelper.SECURITY_GROUP_HELPER_LABEL, "true"),
+            List<Container> survivors = aliases.listByLabels(Map.of(ContainerStorageHelper.SECURITY_GROUP_HELPER_LABEL, "true"),
                             filter -> dockerClient.listContainersCmd().withShowAll(true)
                                     .withLabelFilter(filter).exec(),
                             Container::getId).stream()
                     .filter(container -> aliases.consistent(container.getId(), container.getLabels())
                             && aliases.matches(container.getLabels(), ContainerStorageHelper.OWNER_LABEL, owner))
-                    .forEach(container -> {
-                        if ("running".equals(container.getState())) {
-                            quarantine(container.getId());
-                        } else {
-                            stopNamespaceWorkloads(container.getId());
-                        }
-                        if ("ecs".equals(container.getLabels().get(ContainerStorageHelper.SERVICE_LABEL))) {
-                            removeNamespaceWorkloads(container.getId());
-                            lifecycleManager.removeIfExists(container.getId());
-                        }
-                    });
+                    .toList();
+            RuntimeException failure = null;
+            for (Container container : survivors) {
+                try {
+                    recoverPolicyWriter(container.getId());
+                    if ("running".equals(container.getState())) {
+                        quarantine(container.getId());
+                    } else {
+                        stopNamespaceWorkloads(container.getId());
+                    }
+                    if ("ecs".equals(container.getLabels().get(ContainerStorageHelper.SERVICE_LABEL))) {
+                        removeNamespaceWorkloads(container.getId());
+                        lifecycleManager.removeIfExists(container.getId());
+                    }
+                } catch (RuntimeException retirementFailure) {
+                    if (failure == null) {
+                        failure = retirementFailure;
+                    } else {
+                        failure.addSuppressed(retirementFailure);
+                    }
+                }
+            }
+            if (failure != null) {
+                throw failure;
+            }
+            forgetRemovedPolicyWriters();
         } catch (Exception e) {
-            LOG.warnv("Could not inspect surviving security-group namespaces: {0}", e.getMessage());
+            throw new IllegalStateException("Could not safely recover surviving security-group namespaces", e);
+        }
+    }
+
+    private void recoverPolicyWriter(String helperId) {
+        try (PolicyWriterJournal.Lease lease = policyWriters.acquire(helperId)) {
+            String pending = lease.pendingExecId();
+            if (pending != null) {
+                terminalPolicyWriter(helperId, pending);
+                lease.completed(pending);
+            }
+        } catch (RuntimeException failure) {
+            // Neither an absent record nor a missing exec means that the previous writer exited.
+            uncertainPolicyWriters.add(helperId);
+            LOG.errorv(failure, "Cannot resolve the previous policy writer for {0}; retiring its namespace", helperId);
+        }
+    }
+
+    private void forgetRemovedPolicyWriters() {
+        for (String helperId : policyWriters.helpers()) {
+            forgetPolicyWriterIfAbsent(helperId);
+        }
+    }
+
+    private void forgetPolicyWriterIfAbsent(String helperId) {
+        try {
+            dockerClient.inspectContainerCmd(helperId).exec();
+        } catch (NotFoundException expected) {
+            // Only the daemon's absence of this exact helper releases its durable writer record.
+            policyWriters.forget(helperId);
+            uncertainPolicyWriters.remove(helperId);
         }
     }
 
@@ -536,6 +607,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             if (ip == null || ip.isBlank()) {
                 throw new IllegalStateException("Firewall helper has no Docker IP");
             }
+            policyWriters.initialize(helperId);
             apply(helperId, SecurityGroupNftCompiler.initialRuleset());
             String resolver = embeddedDnsServer.getServerIp().orElse(null);
             if (resolver != null) {
@@ -556,7 +628,12 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             return new Namespace(helperId, ip);
         } catch (Exception e) {
             if (helperId != null) {
-                lifecycleManager.removeIfExists(helperId);
+                try {
+                    lifecycleManager.removeIfExists(helperId);
+                    forgetPolicyWriterIfAbsent(helperId);
+                } catch (RuntimeException cleanupFailure) {
+                    e.addSuppressed(cleanupFailure);
+                }
             }
             throw new IllegalStateException("Cannot prepare protected network namespace for " + resourceId, e);
         }
@@ -992,7 +1069,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 identity.accountId(), identity.region(), identity.vpcId(), identity.eniId(),
                 identity.logicalAddress(), identity.transportAddress(), Set.copyOf(groupIds), attached,
                 identity.controlConnections(), identity.instanceMetadataAllowed(),
-                identity.additionalTransportAddresses(), identity.controlListeners());
+                identity.additionalTransportAddresses(), identity.controlListeners(), identity.nativePeerDependencies());
         endpoints.put(eniId, new ProtectedEndpoint(updated, current.helperId(), Map.copyOf(prefixLists),
                 current.dnsOrigin()));
         reconcileAll();
@@ -1224,7 +1301,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                     identity.accountId(), identity.region(), identity.vpcId(), identity.eniId(),
                     identity.logicalAddress(), identity.transportAddress(), identity.groupIds(), attached,
                     identity.controlConnections(), identity.instanceMetadataAllowed(),
-                    identity.additionalTransportAddresses(), identity.controlListeners());
+                    identity.additionalTransportAddresses(), identity.controlListeners(), identity.nativePeerDependencies());
             endpoints.put(entry.getKey(), new ProtectedEndpoint(updated, current.helperId(),
                     Map.copyOf(prefixLists), current.dnsOrigin()));
         }
@@ -1444,6 +1521,33 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         if (uncertainPolicyWriters.contains(helperId)) {
             throw new IllegalStateException("Unresolved remote policy writer for " + helperId);
         }
+        try (PolicyWriterJournal.Lease lease = ownedPolicyWriter(helperId)) {
+            applyOwned(helperId, script, lease);
+        }
+    }
+
+    private PolicyWriterJournal.Lease ownedPolicyWriter(String helperId) {
+        PolicyWriterJournal.Lease lease = null;
+        try {
+            lease = policyWriters.acquire(helperId);
+            if (lease.pendingExecId() != null) {
+                throw new IllegalStateException("Unresolved durable policy writer for " + helperId);
+            }
+            return lease;
+        } catch (RuntimeException failure) {
+            uncertainPolicyWriters.add(helperId);
+            if (lease != null) {
+                try {
+                    lease.close();
+                } catch (RuntimeException closeFailure) {
+                    failure.addSuppressed(closeFailure);
+                }
+            }
+            throw failure;
+        }
+    }
+
+    private void applyOwned(String helperId, String script, PolicyWriterJournal.Lease lease) {
         for (int attempt = 0; attempt < 120; attempt++) {
             try {
                 byte[] content = script.getBytes(StandardCharsets.UTF_8);
@@ -1462,6 +1566,8 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 String execId = dockerClient.execCreateCmd(helperId)
                         .withAttachStdout(true).withAttachStderr(true)
                         .withCmd("nft", "-f", "/tmp/floci-sg.nft").exec().getId();
+                // This must be durable before exec-start can make the policy writer live.
+                lease.started(execId);
                 StringBuilder output = new StringBuilder();
                 Exception streamFailure = null;
                 try (ResultCallback.Adapter<Frame> callback = new ResultCallback.Adapter<Frame>() {
@@ -1482,12 +1588,12 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 }
                 Long exit;
                 try {
-                    InspectExecResponse result = dockerClient.inspectExecCmd(execId).exec();
-                    exit = result.getExitCodeLong();
-                    if (!Boolean.FALSE.equals(result.isRunning()) || exit == null) {
-                        throw new IllegalStateException("Remote nft command has no terminal result", streamFailure);
-                    }
+                    exit = terminalPolicyWriter(helperId, execId);
+                    lease.completed(execId);
                 } catch (RuntimeException unresolved) {
+                    if (streamFailure != null) {
+                        unresolved.addSuppressed(streamFailure);
+                    }
                     uncertainPolicyWriters.add(helperId);
                     throw new IllegalStateException("Unresolved remote policy writer for " + helperId, unresolved);
                 }
@@ -1506,6 +1612,15 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 throw new IllegalStateException("Failed to install security-group policy", e);
             }
         }
+    }
+
+    private Long terminalPolicyWriter(String helperId, String execId) {
+        InspectExecResponse result = dockerClient.inspectExecCmd(execId).exec();
+        if (result == null || !execId.equals(result.getId()) || !helperId.equals(result.getContainerID())
+                || !Boolean.FALSE.equals(result.isRunning()) || result.getExitCodeLong() == null) {
+            throw new IllegalStateException("Remote nft command has no exact terminal result");
+        }
+        return result.getExitCodeLong();
     }
 
     public record Namespace(String helperId, String transportAddress) {}

@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.core.common.ServiceRegistry;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.lifecycle.inithook.InitializationHook;
 import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbBackendSelector;
+import io.github.hectorvent.floci.services.ec2.Ec2NativePeerDependencies;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.GET;
@@ -47,6 +48,19 @@ public class EmulatorInfoController {
     private final FlociCertificateAuthority certificateAuthority;
     private final EmulatorConfig config;
     private final DynamoDbBackendSelector dynamoDbBackendSelector;
+    private final Ec2NativePeerDependencies nativePeerDependencies;
+
+    public EmulatorInfoController(ServiceRegistry serviceRegistry,
+                                  InitLifecycleState initLifecycleState,
+                                  StorageFactory storageFactory,
+                                  Instance<Resettable> resettables,
+                                  Instance<ContainerTeardown> containerTeardowns,
+                                  FlociCertificateAuthority certificateAuthority,
+                                  EmulatorConfig config,
+                                  DynamoDbBackendSelector dynamoDbBackendSelector) {
+        this(serviceRegistry, initLifecycleState, storageFactory, resettables, containerTeardowns,
+                certificateAuthority, config, dynamoDbBackendSelector, new Ec2NativePeerDependencies("[]"));
+    }
 
     @Inject
     public EmulatorInfoController(ServiceRegistry serviceRegistry,
@@ -56,7 +70,8 @@ public class EmulatorInfoController {
                                   Instance<ContainerTeardown> containerTeardowns,
                                   FlociCertificateAuthority certificateAuthority,
                                   EmulatorConfig config,
-                                  DynamoDbBackendSelector dynamoDbBackendSelector) {
+                                  DynamoDbBackendSelector dynamoDbBackendSelector,
+                                  Ec2NativePeerDependencies nativePeerDependencies) {
         this.serviceRegistry = serviceRegistry;
         this.initLifecycleState = initLifecycleState;
         this.storageFactory = storageFactory;
@@ -65,6 +80,7 @@ public class EmulatorInfoController {
         this.certificateAuthority = certificateAuthority;
         this.config = config;
         this.dynamoDbBackendSelector = dynamoDbBackendSelector;
+        this.nativePeerDependencies = nativePeerDependencies;
         this.version = FlociVersion.current();
     }
 
@@ -75,7 +91,7 @@ public class EmulatorInfoController {
                 "services", serviceRegistry.getServices(),
                 "edition", "community",
                 "original_edition", "floci-always-free",
-                "features", Map.of("lambda_container_readiness", 1),
+                "features", Map.of("lambda_container_readiness", 1, "ec2_native_peer_dependencies", 1),
                 "version", version)).build();
     }
 
@@ -118,6 +134,7 @@ public class EmulatorInfoController {
         body.put("edition", "community");
         body.put("original_edition", "floci-always-free");
         body.put("dynamodb_backend", dynamoDbBackendSelector.selected());
+        body.put("ec2_native_peer_dependencies", nativePeerDependencies.attestation());
         body.put("endpoint", config.effectiveBaseUrl());
         body.put("health_url", "/_floci/health");
         body.put("tls", Map.of("enabled", config.tls().enabled()));
