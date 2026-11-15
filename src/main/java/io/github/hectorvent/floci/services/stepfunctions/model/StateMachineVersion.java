@@ -18,6 +18,8 @@ public class StateMachineVersion {
     private String type;
     private String status;
     private String revisionId;
+    private Double configurationUpdateDate;
+    private String configurationRevisionId;
     private JsonNode loggingConfiguration;
     private JsonNode tracingConfiguration;
     private JsonNode encryptionConfiguration;
@@ -60,6 +62,12 @@ public class StateMachineVersion {
 
     public String getRevisionId() { return revisionId; }
     public void setRevisionId(String revisionId) { this.revisionId = revisionId; }
+
+    public Double getConfigurationUpdateDate() { return configurationUpdateDate; }
+    public void setConfigurationUpdateDate(Double date) { this.configurationUpdateDate = date; }
+
+    public String getConfigurationRevisionId() { return configurationRevisionId; }
+    public void setConfigurationRevisionId(String revision) { this.configurationRevisionId = revision; }
 
     public JsonNode getLoggingConfiguration() { return loggingConfiguration; }
     public void setLoggingConfiguration(JsonNode loggingConfiguration) { this.loggingConfiguration = loggingConfiguration; }
