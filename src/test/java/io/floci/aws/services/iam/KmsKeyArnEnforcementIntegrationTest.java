@@ -72,7 +72,7 @@ class KmsKeyArnEnforcementIntegrationTest {
         keyCall(session, "ListKeyRotations", "{\"KeyId\":\"" + allowedArn + "\"}")
                 .then().statusCode(200).body("Truncated", equalTo(false));
         keyCall(session, "ListKeyRotations", "{\"KeyId\":\"" + otherArn + "\"}")
-                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"));
     }
 
     @Test
@@ -89,9 +89,9 @@ class KmsKeyArnEnforcementIntegrationTest {
         keyCall(session, "DescribeKey", "{\"KeyId\": \"" + allowedArn + "\"}")
                 .then().statusCode(200).body("KeyMetadata.Arn", equalTo(allowedArn));
         keyCall(session, "Encrypt", encryptBody(otherArn))
-                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"));
         keyCall(session, "DescribeKey", "{\"KeyId\": \"" + otherArn + "\"}")
-                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"));
     }
 
     @Test
@@ -107,7 +107,7 @@ class KmsKeyArnEnforcementIntegrationTest {
         keyCall(session, "Encrypt", encryptBody(keptArn))
                 .then().statusCode(200).body("KeyId", equalTo(keptArn));
         keyCall(session, "Encrypt", encryptBody(deniedArn))
-                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"));
     }
 
     @Test
@@ -140,7 +140,7 @@ class KmsKeyArnEnforcementIntegrationTest {
                 .then().statusCode(200)
                 .body("Plaintext", equalTo(PLAINTEXT)).body("KeyId", equalTo(keyArn));
         keyCall(onAnotherKey, "Decrypt", "{\"CiphertextBlob\": \"" + ciphertext + "\"}")
-                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"));
     }
 
     @Test
@@ -179,7 +179,7 @@ class KmsKeyArnEnforcementIntegrationTest {
         keyCall(session, "ReEncrypt",
                 "{\"CiphertextBlob\": \"" + deniedCiphertext + "\", \"KeyId\": \"" + allowedArn
                         + "\", \"DestinationKeyId\": \"" + allowedArn + "\"}")
-                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"));
 
         keyCall(session, "ReEncrypt",
                 "{\"CiphertextBlob\": \"" + allowedCiphertext + "\", \"DestinationKeyId\": \""
@@ -202,7 +202,7 @@ class KmsKeyArnEnforcementIntegrationTest {
         Session onAnotherKey = assumeRoleWith(grantOperationOn("kms:RetireGrant", otherArn));
 
         keyCall(onAnotherKey, "RetireGrant", "{\"GrantToken\": \"" + grant.token() + "\"}")
-                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"));
         keyCall(onTheGrantsKey, "RetireGrant", "{\"GrantToken\": \"" + grant.token() + "\"}")
                 .then().statusCode(200);
         accountCall("ListGrants", "{\"KeyId\": \"" + keyArn + "\"}")
@@ -221,7 +221,7 @@ class KmsKeyArnEnforcementIntegrationTest {
                 .formatted(KEY_ARN_PREFIX, keyArn));
 
         keyCall(session, "RetireGrant", "{\"GrantToken\": \"" + grant.token() + "\"}")
-                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"));
         accountCall("ListGrants", "{\"KeyId\": \"" + keyArn + "\"}")
                 .then().statusCode(200).body("Grants.size()", equalTo(1));
     }
@@ -239,7 +239,7 @@ class KmsKeyArnEnforcementIntegrationTest {
 
         keyCall(onTheNamedKey, "RevokeGrant",
                 "{\"KeyId\": \"" + otherArn + "\", \"GrantId\": \"" + grant.id() + "\"}")
-                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+                .then().statusCode(403).body("__type", equalTo("AccessDeniedException"));
         accountCall("ListGrants", "{\"KeyId\": \"" + grantKeyArn + "\"}")
                 .then().statusCode(200).body("Grants.size()", equalTo(1));
 
