@@ -2,11 +2,13 @@ package io.github.hectorvent.floci.services.elbv2;
 
 import com.github.dockerjava.api.model.Container;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.config.LoadBalancerProxySources.Backend;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.ContainerTeardown;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.Resettable;
+import io.github.hectorvent.floci.core.common.dns.DnsClientVpcSource.ClientVpc;
 import io.github.hectorvent.floci.core.common.docker.ContainerExec;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
@@ -24,6 +26,7 @@ import io.github.hectorvent.floci.services.elbv2.model.TargetGroup;
 import io.vertx.core.net.ProxyOptions;
 import io.vertx.core.net.ProxyType;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
 
 import java.io.IOException;
 import java.net.DatagramSocket;
@@ -51,6 +54,7 @@ public class ElbV2VpcNetworkManager implements ContainerTeardown, Resettable {
     private final SecurityGroupFirewallManager firewall;
     private final ContainerLifecycleManager lifecycle;
     private final VpcNetworkManager vpcNetworks;
+    private final ElbV2FrontendManager frontends;
     private final Map<String, List<Attachment>> attachments = new ConcurrentHashMap<>();
     private final AtomicInteger selection = new AtomicInteger();
     private boolean draining;
@@ -58,15 +62,67 @@ public class ElbV2VpcNetworkManager implements ContainerTeardown, Resettable {
     public ElbV2VpcNetworkManager(EmulatorConfig config, Ec2Service ec2,
                                 SecurityGroupFirewallManager firewall, ContainerLifecycleManager lifecycle,
                                 VpcNetworkManager vpcNetworks) {
+        this(config, ec2, firewall, lifecycle, vpcNetworks, null);
+    }
+
+    @Inject
+    public ElbV2VpcNetworkManager(EmulatorConfig config, Ec2Service ec2,
+                                 SecurityGroupFirewallManager firewall, ContainerLifecycleManager lifecycle,
+                                 VpcNetworkManager vpcNetworks, ElbV2FrontendManager frontends) {
         this.config = config;
         this.ec2 = ec2;
         this.firewall = firewall;
         this.lifecycle = lifecycle;
         this.vpcNetworks = vpcNetworks;
+        this.frontends = frontends;
     }
 
     boolean enabled() {
         return firewall.enabled() && vpcNetworks.enabled() && !config.services().elbv2().mock();
+    }
+
+    boolean frontendsEnabled() {
+        return enabled() && frontends != null && frontends.enabled();
+    }
+
+    void publishFrontend(String arn, String balancer, int port, Object owner, Backend backend) {
+        if (frontendsEnabled()) {
+            frontends.publish(arn, balancer, port, owner, backend);
+        }
+    }
+
+    boolean selectFrontend(String arn, String balancer, int port) {
+        return frontendsEnabled() && frontends.select(arn, balancer, port);
+    }
+
+    String forgetFrontend(String arn) {
+        return frontends == null ? null : frontends.forget(arn);
+    }
+
+    void reconcileFrontends(String balancer) {
+        if (frontendsEnabled()) {
+            frontends.reconcileBalancer(balancer);
+        }
+    }
+
+    boolean usesSharedFrontend(String balancer) {
+        return frontends != null && frontends.usesSharedListener(balancer);
+    }
+
+    void withdrawFrontend(String arn, Object owner) {
+        if (frontends != null) {
+            frontends.withdraw(arn, owner);
+        }
+    }
+
+    List<String> frontendAddresses(LoadBalancer balancer, ClientVpc origin) {
+        return frontendsEnabled() ? frontends.addresses(balancer, origin) : List.of();
+    }
+
+    private void retireFrontend(String eni) {
+        if (frontends != null) {
+            frontends.retire(eni);
+        }
     }
 
     /** The owner persists ENI identities before starting their network processes. */
@@ -102,6 +158,7 @@ public class ElbV2VpcNetworkManager implements ContainerTeardown, Resettable {
                     throw failure;
                 }
                 // A previous deletion can finish before its updated owner record is saved.
+                retireFrontend(eniId);
                 firewall.unregister(eniId);
                 removeSavedHelpers(arn, eniId);
                 balancer.getBackendNetworkInterfaceIds().remove(eniId);
@@ -129,11 +186,15 @@ public class ElbV2VpcNetworkManager implements ContainerTeardown, Resettable {
                 ec2.setNetworkInterfaceGroupsForService(region, eni.getNetworkInterfaceId(), groups);
                 Attachment attachment = live.remove(eni.getNetworkInterfaceId());
                 if (attachment == null) {
+                    retireFrontend(eni.getNetworkInterfaceId());
                     firewall.unregister(eni.getNetworkInterfaceId());
                     removeSavedHelpers(arn, eni.getNetworkInterfaceId());
-                    attachment = prepare(account, region, arn, eni, groups);
+                    attachment = prepare(balancer, account, region, arn, eni, groups);
                 } else {
                     register(account, region, eni, groups, attachment);
+                    if (frontendsEnabled()) {
+                        frontends.reconcile(eni.getNetworkInterfaceId());
+                    }
                 }
                 ready.add(attachment);
             }
@@ -147,7 +208,7 @@ public class ElbV2VpcNetworkManager implements ContainerTeardown, Resettable {
         }
     }
 
-    private Attachment prepare(String account, String region, String arn, NetworkInterface eni,
+    private Attachment prepare(LoadBalancer balancer, String account, String region, String arn, NetworkInterface eni,
                                List<String> groups) {
         SecurityGroupFirewallManager.Namespace namespace = firewall.createNamespace("elbv2",
                 "alb-" + eni.getNetworkInterfaceId(), account, region, config.services().dockerNetwork(), Map.of(),
@@ -160,6 +221,9 @@ public class ElbV2VpcNetworkManager implements ContainerTeardown, Resettable {
             String controller = controllerAddress(namespace.transportAddress());
             Attachment attachment = new Attachment(eni.getNetworkInterfaceId(), namespace.helperId(),
                     namespace.transportAddress(), controller);
+            if (frontendsEnabled()) {
+                frontends.prepare(balancer, eni, attachment);
+            }
             register(account, region, eni, groups, attachment);
             String contents = proxyConfiguration(controller, namespace.transportAddress(), eni.getPrivateIpAddress());
             ContainerExec.Result configured = ContainerExec.run(lifecycle.getDockerClient(), namespace.helperId(),
@@ -174,11 +238,18 @@ public class ElbV2VpcNetworkManager implements ContainerTeardown, Resettable {
                             "for i in $(seq 1 50); do ss -ltnH 'sport = :1080' | grep -q . && exit 0;"
                                     + " sleep 0.1; done; exit 1"}, 6)
                     .throwIfTimedOut(namespace.helperId()), "wait for ALB backend proxy");
+            if (frontendsEnabled()) {
+                frontends.reconcile(eni.getNetworkInterfaceId());
+            }
             return attachment;
         } catch (RuntimeException failure) {
             try {
+                retireFrontend(eni.getNetworkInterfaceId());
                 firewall.unregister(eni.getNetworkInterfaceId());
                 lifecycle.removeIfExistsStrict(namespace.helperId());
+                if (frontends != null) {
+                    frontends.releaseRoute(account, region, eni.getNetworkInterfaceId());
+                }
             } catch (RuntimeException cleanupFailure) {
                 failure.addSuppressed(cleanupFailure);
             }
@@ -202,7 +273,9 @@ public class ElbV2VpcNetworkManager implements ContainerTeardown, Resettable {
         }
         firewall.register(new SecurityGroupNftCompiler.Endpoint(account, region, eni.getVpcId(),
                 eni.getNetworkInterfaceId(), eni.getPrivateIpAddress(), attachment.transportAddress(),
-                Set.copyOf(groupIds), groups, List.of(), false, Set.of(eni.getPrivateIpAddress()),
+                Set.copyOf(groupIds), groups, frontendsEnabled() ? List.of(
+                        new SecurityGroupNftCompiler.ControlConnection(attachment.controllerAddress(),
+                                config.tls().awsHttpsPort())) : List.of(), false, Set.of(eni.getPrivateIpAddress()),
                 List.of(new SecurityGroupNftCompiler.ControlListener(attachment.controllerAddress(), PROXY_PORT))),
                 attachment.helperId(), prefixLists);
     }
@@ -219,6 +292,7 @@ public class ElbV2VpcNetworkManager implements ContainerTeardown, Resettable {
     }
 
     private void releaseInterface(LoadBalancer balancer, String eniId, Runnable persist) {
+        retireFrontend(eniId);
         firewall.unregister(eniId);
         removeSavedHelpers(balancer.getLoadBalancerArn(), eniId);
         ec2.releaseNetworkInterfaceFromService(balancer.getRegion(), eniId);
@@ -241,6 +315,9 @@ public class ElbV2VpcNetworkManager implements ContainerTeardown, Resettable {
                 .withLabelFilter(labels).exec()) {
             lifecycle.removeIfExistsStrict(helper.getId());
         }
+        if (frontends != null) {
+            frontends.releaseRoute(AwsArnUtils.parse(arn).accountId(), AwsArnUtils.parse(arn).region(), eniId);
+        }
     }
 
     /** Retire runtime helpers while preserving the stored load balancers and their ENIs for restart. */
@@ -261,12 +338,24 @@ public class ElbV2VpcNetworkManager implements ContainerTeardown, Resettable {
             return;
         }
         RuntimeException failure = null;
+        for (Container helper : helpers) {
+            try {
+                retireFrontend(retirementEni(helper));
+            } catch (RuntimeException error) {
+                if (failure == null) {
+                    failure = new IllegalStateException("ALB frontend helpers remain pending retirement");
+                }
+                failure.addSuppressed(error);
+            }
+        }
         boolean batchRetired = false;
         try {
             firewall.unregisterAll(helpers.stream().map(ElbV2VpcNetworkManager::retirementEni).toList());
             batchRetired = true;
         } catch (RuntimeException error) {
-            failure = new IllegalStateException("ALB backend helpers remain pending retirement");
+            if (failure == null) {
+                failure = new IllegalStateException("ALB backend helpers remain pending retirement");
+            }
             failure.addSuppressed(error);
         }
         for (Container helper : helpers) {

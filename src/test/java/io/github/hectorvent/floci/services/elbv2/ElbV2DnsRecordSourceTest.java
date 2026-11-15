@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.elbv2;
 
 import io.github.hectorvent.floci.core.common.dns.DnsAnswer;
+import io.github.hectorvent.floci.core.common.dns.DnsClientVpcSource.ClientVpc;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.services.elbv2.model.LoadBalancer;
 import org.junit.jupiter.api.BeforeEach;
@@ -62,6 +63,30 @@ class ElbV2DnsRecordSourceTest {
     }
 
     @Test
+    void sharedFallbackAppliesToEveryListenerAndStillRequiresTheExactAliasOwner() {
+        target.setLoadBalancerArn("owned-alb");
+        ElbV2VpcNetworkManager networks = mock(ElbV2VpcNetworkManager.class);
+        when(networks.frontendsEnabled()).thenReturn(true);
+        when(networks.usesSharedFrontend("owned-alb")).thenReturn(true);
+        when(networks.frontendAddresses(target, null)).thenReturn(List.of("192.0.2.99"));
+        when(dns.getServerIp()).thenReturn(Optional.of("192.0.2.8"));
+        ElbV2DnsRecordSource nativeSource = new ElbV2DnsRecordSource(service, dns, null, networks);
+        assertEquals(List.of("192.0.2.8"), nativeSource.resolveAliasTarget(
+                "owned.elb.example", "OWNED", 1).orElseThrow().addresses());
+        assertEquals(List.of("192.0.2.8"), nativeSource.resolve(
+                "owned.elb.example", 1, null).orElseThrow().addresses());
+        assertEquals(5, nativeSource.resolveAliasTarget(
+                "owned.elb.example", "OTHER", 1).orElseThrow().responseCode());
+        when(networks.usesSharedFrontend("owned-alb")).thenReturn(false);
+        when(networks.frontendAddresses(target, null)).thenReturn(List.of());
+        assertTrue(nativeSource.resolveAliasTarget("owned.elb.example", "OWNED", 1)
+                .orElseThrow().isEmpty(), "Restoring owned frontends must wait for complete readiness");
+        when(networks.frontendAddresses(target, null)).thenReturn(List.of("192.0.2.99"));
+        assertEquals(List.of("192.0.2.99"), nativeSource.resolveAliasTarget(
+                "owned.elb.example", "OWNED", 1).orElseThrow().addresses());
+    }
+
+    @Test
     void absentRuntimeAddressAndIpv6ProduceNoInventedAddress() {
         when(dns.getServerIp()).thenReturn(Optional.empty());
         assertTrue(source.resolveAliasTarget("owned.elb.example", "OWNED", 1).orElseThrow().isEmpty());
@@ -73,6 +98,29 @@ class ElbV2DnsRecordSourceTest {
     @Test
     void nonAddressAliasQueriesAreRefused() {
         assertEquals(5, source.resolveAliasTarget("owned.elb.example", "OWNED", 16).orElseThrow().responseCode());
+        verifyNoInteractions(dns);
+    }
+
+    @Test
+    void nativeFrontendAnswersRetainOwnershipAndTheOriginalCallerVpc() {
+        ElbV2VpcNetworkManager networks = mock(ElbV2VpcNetworkManager.class);
+        when(networks.frontendsEnabled()).thenReturn(true);
+        ElbV2DnsRecordSource nativeSource = new ElbV2DnsRecordSource(service, dns, null, networks);
+        ClientVpc origin = new ClientVpc("111111111111", "us-west-2", "vpc-caller");
+        when(networks.frontendAddresses(target, null)).thenReturn(List.of("172.16.0.10"));
+        when(networks.frontendAddresses(target, origin)).thenReturn(List.of("198.51.100.1"));
+
+        assertEquals(List.of("172.16.0.10"), nativeSource.resolveAliasTarget(
+                "owned.elb.example", "OWNED", 1).orElseThrow().addresses());
+        assertEquals(List.of("198.51.100.1"), nativeSource.resolveAliasTarget(
+                "owned.elb.example", "OWNED", 1, origin).orElseThrow().addresses());
+        assertEquals(List.of("198.51.100.1"), nativeSource.resolve(
+                "owned.elb.example", 1, origin).orElseThrow().addresses());
+        assertEquals(5, nativeSource.resolveAliasTarget(
+                "owned.elb.example", "FOREIGN", 1, origin).orElseThrow().responseCode());
+        when(networks.frontendAddresses(target, origin)).thenReturn(List.of());
+        assertTrue(nativeSource.resolveAliasTarget(
+                "owned.elb.example", "OWNED", 1, origin).orElseThrow().isEmpty());
         verifyNoInteractions(dns);
     }
 }
