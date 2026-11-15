@@ -164,9 +164,7 @@ public class AppConfigDataService {
                 profile = appConfigService.getConfigurationProfile(
                         session.getApplicationId(), session.getConfigurationProfileId());
                 if (AppConfigS3Source.matches(profile)) {
-                    if (changed) {
-                        version = configurationContent(profile, activeVersion);
-                    }
+                    version = configurationContent(profile, activeVersion);
                 } else {
                     hosted = appConfigService.getHostedConfigurationVersion(
                             profile.getApplicationId(), profile.getId(), hostedVersionNumber(activeVersion));
@@ -199,7 +197,8 @@ public class AppConfigDataService {
         if (hosted != null && changed) {
             configurationVersion = Integer.toString(hosted.getVersionNumber());
         }
-        String versionLabel = configurationVersion;
+        String versionLabel = profile != null && AppConfigS3Source.matches(profile)
+                ? null : configurationVersion;
         if (hosted != null) {
             versionLabel = changed ? hosted.getVersionLabel() : null;
         }
@@ -238,10 +237,10 @@ public class AppConfigDataService {
         }
         ConfigurationContent version = configurationContent(profile, active);
         if (active.equals(clientVersion)) {
-            return new LegacyConfiguration(new byte[0], version.contentType(), active);
+            return new LegacyConfiguration(new byte[0], version.contentType(), active, AppConfigS3Source.matches(profile));
         }
         ResolvedContent content = resolveContent(profile, version, accept);
-        return new LegacyConfiguration(content.bytes(), content.contentType(), active);
+        return new LegacyConfiguration(content.bytes(), content.contentType(), active, AppConfigS3Source.matches(profile));
     }
 
     /** A deployed version that is not a version number names no hosted configuration version. */
@@ -398,7 +397,12 @@ public class AppConfigDataService {
 
     private record ResolvedContent(byte[] bytes, String contentType) {}
 
-    public record LegacyConfiguration(byte[] content, String contentType, String configurationVersion) {}
+    public record LegacyConfiguration(byte[] content, String contentType, String configurationVersion,
+                                      boolean s3Source) {
+        public LegacyConfiguration(byte[] content, String contentType, String configurationVersion) {
+            this(content, contentType, configurationVersion, false);
+        }
+    }
 
     public record ConfigurationData(byte[] content, String contentType, String configurationVersion, String versionLabel,
                                     String nextPollConfigurationToken, int nextPollIntervalInSeconds) {}
