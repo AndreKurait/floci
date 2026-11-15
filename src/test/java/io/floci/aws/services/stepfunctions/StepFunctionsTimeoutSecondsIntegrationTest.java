@@ -11,20 +11,19 @@ import org.junit.jupiter.api.Test;
 import java.util.ArrayList;
 import java.util.List;
 
+import static io.floci.aws.testing.StepFunctionsExecutions.waitForTerminalState;
 import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 
 /**
- * The two {@code TimeoutSeconds} fields of ASL, each enforced on its own clock: the state
- * machine's total budget and a {@code Task}'s wait for its task token, the second one bounded a
- * second time by {@code HeartbeatSeconds}.
+ * The two {@code TimeoutSeconds} fields of ASL over HTTP and in real time: one case for each way
+ * the shipped executor waits (its sleep, the Parallel and Map joins, a nested execution's status,
+ * a task token under the service's heartbeat clock), with bounds of one second.
  *
- * <p>The bounds here are one to ten seconds where the report that measured them against us-east-1
- * used three and five; the shape of the terminal execution is what the assertions pin, not the
- * duration.
+ * <p>{@link StepFunctionsTimeoutSecondsTest} asserts every bound at its exact instant, with the
+ * durations measured against us-east-1, on a controlled timeline.
  */
 @QuarkusTest
 class StepFunctionsTimeoutSecondsIntegrationTest {
@@ -50,39 +49,13 @@ class StepFunctionsTimeoutSecondsIntegrationTest {
                 }
                 """);
 
-        Response timedOut = waitForTerminalExecution(startExecution(smArn, "{}"));
+        Response timedOut = waitForTerminalState(startExecution(smArn, "{}"));
 
         assertEquals("TIMED_OUT", timedOut.jsonPath().getString("status"));
         JsonNode body = mapper.readTree(timedOut.body().asString());
         assertTrue(body.has("stopDate"), "stopDate must be set on a timed out execution");
         assertFalse(body.has("error"), "TIMED_OUT carries no error key: " + body);
         assertFalse(body.has("cause"), "TIMED_OUT carries no cause key: " + body);
-    }
-
-    @Test
-    void timedOutExecutionEmitsExecutionTimedOutAndNoStateExitedForTheCutState() throws Exception {
-        String smArn = createStateMachine("top-level-timeout-history", """
-                {
-                    "StartAt": "Linger",
-                    "TimeoutSeconds": 1,
-                    "States": {
-                        "Linger": {"Type": "Wait", "Seconds": 3, "End": true}
-                    }
-                }
-                """);
-
-        String execArn = startExecution(smArn, "{}");
-        waitForTerminalExecution(execArn);
-        JsonNode events = mapper.readTree(getExecutionHistory(execArn).body().asString()).path("events");
-
-        assertEquals(List.of("ExecutionStarted", "WaitStateEntered", "ExecutionTimedOut"),
-                eventTypes(events), "history was " + events);
-        JsonNode timedOut = events.get(events.size() - 1);
-        assertEquals(0, timedOut.path("previousEventId").asLong());
-        assertEquals("States.Timeout",
-                timedOut.path("executionTimedOutEventDetails").path("error").asText());
-        assertFalse(timedOut.path("executionTimedOutEventDetails").has("cause"),
-                "ExecutionTimedOut carries only the error: " + timedOut);
     }
 
     @Test
@@ -110,7 +83,7 @@ class StepFunctionsTimeoutSecondsIntegrationTest {
 
         String execArn = startExecution(smArn, "{}");
         long startedAt = System.currentTimeMillis();
-        Response timedOut = waitForTerminalExecution(execArn);
+        Response timedOut = waitForTerminalState(execArn);
         long elapsedMillis = System.currentTimeMillis() - startedAt;
 
         assertEquals("TIMED_OUT", timedOut.jsonPath().getString("status"));
@@ -121,40 +94,6 @@ class StepFunctionsTimeoutSecondsIntegrationTest {
         assertEquals(List.of("ExecutionStarted", "ParallelStateEntered", "ParallelStateStarted",
                         "WaitStateEntered", "ExecutionTimedOut"),
                 eventTypes(events), "history was " + events);
-    }
-
-    @Test
-    void stateMachineTimeoutSecondsCutsTheWaitForATaskToken() throws Exception {
-        // Measured against us-east-1: a state machine whose budget is shorter than the Task's own
-        // TimeoutSeconds ends TIMED_OUT the instant the budget runs out, and writes nothing about
-        // the task it cut. No ActivityTimedOut, no TaskFailed, no ExecutionFailed.
-        String activityArn = createActivity("top-level-timeout-token");
-        String smArn = createStateMachine("top-level-timeout-token", """
-                {
-                    "StartAt": "Await",
-                    "TimeoutSeconds": 1,
-                    "States": {
-                        "Await": {
-                            "Type": "Task",
-                            "Resource": "%s",
-                            "TimeoutSeconds": 60,
-                            "End": true
-                        }
-                    }
-                }
-                """.formatted(activityArn));
-
-        String execArn = startExecution(smArn, "{}");
-        long startedAt = System.currentTimeMillis();
-        Response timedOut = waitForTerminalExecution(execArn);
-        long elapsedMillis = System.currentTimeMillis() - startedAt;
-
-        assertEquals("TIMED_OUT", timedOut.jsonPath().getString("status"), timedOut.body().asString());
-        assertTrue(elapsedMillis < 5_000,
-                "the task's 60-second wait outlasted the 1-second budget: " + elapsedMillis + " ms");
-        JsonNode events = mapper.readTree(getExecutionHistory(execArn).body().asString()).path("events");
-        assertEquals(List.of("ExecutionStarted", "TaskStateEntered", "ActivityScheduled",
-                "ActivityStarted", "ExecutionTimedOut"), eventTypes(events), "history was " + events);
     }
 
     @Test
@@ -184,7 +123,7 @@ class StepFunctionsTimeoutSecondsIntegrationTest {
 
         String execArn = startExecution(parentArn, "{}");
         long startedAt = System.currentTimeMillis();
-        Response timedOut = waitForTerminalExecution(execArn);
+        Response timedOut = waitForTerminalState(execArn);
         long elapsedMillis = System.currentTimeMillis() - startedAt;
 
         assertEquals("TIMED_OUT", timedOut.jsonPath().getString("status"), timedOut.body().asString());
@@ -229,7 +168,7 @@ class StepFunctionsTimeoutSecondsIntegrationTest {
 
         String execArn = startExecution(smArn, "{\"items\": [1, 2]}");
         long startedAt = System.currentTimeMillis();
-        Response timedOut = waitForTerminalExecution(execArn);
+        Response timedOut = waitForTerminalState(execArn);
         long elapsedMillis = System.currentTimeMillis() - startedAt;
 
         assertEquals("TIMED_OUT", timedOut.jsonPath().getString("status"), timedOut.body().asString());
@@ -247,91 +186,6 @@ class StepFunctionsTimeoutSecondsIntegrationTest {
     }
 
     @Test
-    void stateMachineTimeoutSecondsCutsTheWaitForASingleMapIteration() throws Exception {
-        // A single item runs the Map state's serial path rather than the concurrent one; the
-        // budget must cut it the same way it cuts a concurrent iteration above.
-        String smArn = createStateMachine("top-level-timeout-map-single-item", """
-                {
-                    "StartAt": "OverItems",
-                    "TimeoutSeconds": 1,
-                    "States": {
-                        "OverItems": {
-                            "Type": "Map",
-                            "ItemsPath": "$.items",
-                            "ItemProcessor": {
-                                "StartAt": "Linger",
-                                "States": {"Linger": {"Type": "Wait", "Seconds": 10, "End": true}}
-                            },
-                            "End": true
-                        }
-                    }
-                }
-                """);
-
-        String execArn = startExecution(smArn, "{\"items\": [1]}");
-        long startedAt = System.currentTimeMillis();
-        Response timedOut = waitForTerminalExecution(execArn);
-        long elapsedMillis = System.currentTimeMillis() - startedAt;
-
-        assertEquals("TIMED_OUT", timedOut.jsonPath().getString("status"), timedOut.body().asString());
-        assertTrue(elapsedMillis < 5_000,
-                "the single iteration's 10-second Wait outlasted the 1-second budget: " + elapsedMillis + " ms");
-        JsonNode events = mapper.readTree(getExecutionHistory(execArn).body().asString()).path("events");
-        assertEquals(List.of("ExecutionStarted", "MapStateEntered", "MapStateStarted", "MapIterationStarted",
-                        "WaitStateEntered", "ExecutionTimedOut"),
-                eventTypes(events), "history was " + events);
-    }
-
-    @Test
-    void stateMachineTimeoutSecondsCutsARetryBackoffLongerThanTheRemainingBudget() throws Exception {
-        // The Lambda does not exist, so every attempt fails immediately and the only thing this
-        // state spends time on is the backoff between attempts. AWS ends the execution when the
-        // budget runs out, mid-backoff; before this the backoff ran in full and the state failed
-        // on its own error afterwards, so the execution ended FAILED past its budget.
-        String smArn = createStateMachine("top-level-timeout-retry", """
-                {
-                    "StartAt": "Flaky",
-                    "TimeoutSeconds": 1,
-                    "States": {
-                        "Flaky": {
-                            "Type": "Task",
-                            "Resource": "arn:aws:states:::lambda:invoke",
-                            "Parameters": {"FunctionName": "absent-function"},
-                            "Retry": [{"ErrorEquals": ["States.ALL"], "IntervalSeconds": 10, "MaxAttempts": 1}],
-                            "End": true
-                        }
-                    }
-                }
-                """);
-
-        String execArn = startExecution(smArn, "{}");
-        long startedAt = System.currentTimeMillis();
-        Response timedOut = waitForTerminalExecution(execArn);
-        long elapsedMillis = System.currentTimeMillis() - startedAt;
-
-        assertEquals("TIMED_OUT", timedOut.jsonPath().getString("status"), timedOut.body().asString());
-        assertTrue(elapsedMillis < 5_000,
-                "the 10-second backoff outlasted the 1-second budget: " + elapsedMillis + " ms");
-        JsonNode events = mapper.readTree(getExecutionHistory(execArn).body().asString()).path("events");
-        assertEquals("ExecutionTimedOut", events.get(events.size() - 1).path("type").asText(),
-                "history was " + events);
-    }
-
-    @Test
-    void taskTimeoutSecondsBoundsTheWholeWaitForTheTaskToken() throws Exception {
-        String activityArn = createActivity("timeout-seconds-total");
-        String smArn = createStateMachine("task-timeout-seconds", activityTask(activityArn, 1, 0));
-
-        Response failed = waitForTerminalExecution(startExecution(smArn, "{}"));
-
-        assertEquals("FAILED", failed.jsonPath().getString("status"));
-        assertEquals("States.Timeout", failed.jsonPath().getString("error"));
-        JsonNode body = mapper.readTree(failed.body().asString());
-        assertFalse(body.has("cause"),
-                "a task that ran out of time carries no cause key: " + body);
-    }
-
-    @Test
     void taskHeartbeatSecondsBoundsTheGapBetweenHeartbeats() throws Exception {
         String activityArn = createActivity("heartbeat-seconds-gap");
         String smArn = createStateMachine("task-heartbeat-gap", activityTask(activityArn, 10, 1));
@@ -340,7 +194,7 @@ class StepFunctionsTimeoutSecondsIntegrationTest {
         // A worker picks the task up and then goes silent, so the gap HeartbeatSeconds allows runs
         // out long before the state's TimeoutSeconds does.
         getActivityTask(activityArn);
-        Response failed = waitForTerminalExecution(execArn);
+        Response failed = waitForTerminalState(execArn);
 
         assertEquals("FAILED", failed.jsonPath().getString("status"));
         assertEquals("States.Timeout", failed.jsonPath().getString("error"));
@@ -359,46 +213,6 @@ class StepFunctionsTimeoutSecondsIntegrationTest {
                 "ActivityTimedOut carries only the error: " + timedOut);
     }
 
-    @Test
-    void aCatchMatchesAHeartbeatExpiryUnderEitherErrorName() throws Exception {
-        for (String errorEquals : List.of("States.HeartbeatTimeout", "States.Timeout")) {
-            String activityArn = createActivity("heartbeat-seconds-catch");
-            String smArn = createStateMachine("task-heartbeat-catch",
-                    caughtActivityTask(activityArn, errorEquals));
-            String execArn = startExecution(smArn, "{}");
-
-            getActivityTask(activityArn);
-            Response caught = waitForTerminalExecution(execArn);
-
-            assertEquals("SUCCEEDED", caught.jsonPath().getString("status"),
-                    "Catch on " + errorEquals + " left the execution " + caught.body().asString());
-            assertEquals("States.Timeout",
-                    mapper.readTree(caught.jsonPath().getString("output")).path("Error").asText(),
-                    "Catch on " + errorEquals + " reported the wrong error");
-        }
-    }
-
-    @Test
-    void heartbeatsKeepATaskAliveUntilItsTimeoutSecondsRunOut() throws Exception {
-        String activityArn = createActivity("heartbeat-seconds-reset");
-        String smArn = createStateMachine("task-heartbeat-reset", activityTask(activityArn, 12, 3));
-        String execArn = startExecution(smArn, "{}");
-
-        String taskToken = getActivityTask(activityArn);
-        // Five seconds of work reported every 500 ms: nearly twice the heartbeat gap, so the task
-        // survives only if each heartbeat pushes that gap's deadline forward.
-        for (int beat = 0; beat < 10; beat++) {
-            Thread.sleep(500);
-            sendTaskHeartbeat(taskToken);
-        }
-        sendTaskSuccess(taskToken, "{\"answered\":true}");
-
-        Response succeeded = waitForTerminalExecution(execArn);
-        assertEquals("SUCCEEDED", succeeded.jsonPath().getString("status"),
-                "execution was " + succeeded.body().asString());
-        assertTrue(mapper.readTree(succeeded.jsonPath().getString("output")).path("answered").asBoolean());
-    }
-
     private static String activityTask(String activityArn, int timeoutSeconds, int heartbeatSeconds) {
         String heartbeat = heartbeatSeconds > 0 ? ",\"HeartbeatSeconds\": " + heartbeatSeconds : "";
         return """
@@ -414,25 +228,6 @@ class StepFunctionsTimeoutSecondsIntegrationTest {
                     }
                 }
                 """.formatted(activityArn, timeoutSeconds, heartbeat);
-    }
-
-    private static String caughtActivityTask(String activityArn, String errorEquals) {
-        return """
-                {
-                    "StartAt": "Await",
-                    "States": {
-                        "Await": {
-                            "Type": "Task",
-                            "Resource": "%s",
-                            "TimeoutSeconds": 10,
-                            "HeartbeatSeconds": 1,
-                            "Catch": [{"ErrorEquals": ["%s"], "Next": "Recovered"}],
-                            "End": true
-                        },
-                        "Recovered": {"Type": "Pass", "End": true}
-                    }
-                }
-                """.formatted(activityArn, errorEquals);
     }
 
     private static List<String> eventTypes(JsonNode events) {
@@ -469,32 +264,6 @@ class StepFunctionsTimeoutSecondsIntegrationTest {
         return taskToken;
     }
 
-    private static void sendTaskHeartbeat(String taskToken) {
-        given()
-                .header("X-Amz-Target", "AWSStepFunctions.SendTaskHeartbeat")
-                .contentType(SFN_CONTENT_TYPE)
-                .body("""
-                        {"taskToken": %s}
-                        """.formatted(quote(taskToken)))
-                .when()
-                .post("/")
-                .then()
-                .statusCode(200);
-    }
-
-    private static void sendTaskSuccess(String taskToken, String output) {
-        given()
-                .header("X-Amz-Target", "AWSStepFunctions.SendTaskSuccess")
-                .contentType(SFN_CONTENT_TYPE)
-                .body("""
-                        {"taskToken": %s, "output": %s}
-                        """.formatted(quote(taskToken), quote(output)))
-                .when()
-                .post("/")
-                .then()
-                .statusCode(200);
-    }
-
     private static String createStateMachine(String name, String definition) {
         Response resp = given()
                 .header("X-Amz-Target", "AWSStepFunctions.CreateStateMachine")
@@ -521,17 +290,6 @@ class StepFunctionsTimeoutSecondsIntegrationTest {
         return resp.jsonPath().getString("executionArn");
     }
 
-    private static Response describeExecution(String execArn) {
-        return given()
-                .header("X-Amz-Target", "AWSStepFunctions.DescribeExecution")
-                .contentType(SFN_CONTENT_TYPE)
-                .body("""
-                        {"executionArn": "%s"}
-                        """.formatted(execArn))
-                .when()
-                .post("/");
-    }
-
     private static Response getExecutionHistory(String execArn) {
         return given()
                 .header("X-Amz-Target", "AWSStepFunctions.GetExecutionHistory")
@@ -541,23 +299,6 @@ class StepFunctionsTimeoutSecondsIntegrationTest {
                         """.formatted(execArn))
                 .when()
                 .post("/");
-    }
-
-    /**
-     * Polls for 20 seconds: twice the longest bound any definition here declares, and far short of
-     * the 300-second default a task that ignores TimeoutSeconds falls back on.
-     */
-    private static Response waitForTerminalExecution(String execArn) throws InterruptedException {
-        for (int poll = 0; poll < 200; poll++) {
-            Response resp = describeExecution(execArn);
-            String status = resp.jsonPath().getString("status");
-            if (!"RUNNING".equals(status)) {
-                return resp;
-            }
-            Thread.sleep(100);
-        }
-        fail("Execution " + execArn + " was still RUNNING after 20 seconds");
-        return null;
     }
 
     private static String quote(String raw) {

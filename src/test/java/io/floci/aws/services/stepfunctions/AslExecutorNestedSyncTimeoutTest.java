@@ -6,6 +6,8 @@ import io.floci.aws.services.stepfunctions.model.Execution;
 import io.floci.aws.services.stepfunctions.model.ExecutionStatusSubscription;
 import io.floci.aws.services.stepfunctions.model.HistoryEvent;
 import io.floci.aws.services.stepfunctions.model.StateMachine;
+import io.floci.aws.testing.TestTime;
+import io.floci.aws.testing.ThreadStates;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -14,7 +16,9 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Duration;
+import java.util.EnumSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -24,8 +28,8 @@ import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
 
-import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -44,6 +48,10 @@ import static org.mockito.Mockito.when;
  * way AWS bounds it, and no longer by a fixed poll count of its own. The timeout aborts the child,
  * a {@code Catch} on {@code States.Timeout} takes it, and the parent's own budget and a
  * StopExecution on the parent each end the wait and abort the child alike.
+ *
+ * <p>The waits that a timeout ends run on a {@link TestTime} timeline, so the child is asserted
+ * still awaited one nanosecond before the bound and aborted at it. The waits that something else
+ * ends (the child completing, a reset) keep the executor's real waiter.
  */
 class AslExecutorNestedSyncTimeoutTest {
 
@@ -58,8 +66,13 @@ class AslExecutorNestedSyncTimeoutTest {
     private static final String ABORT_CAUSE =
             "The Task state in AWS Step Functions execution [" + PARENT_ARN
                     + "] which was managing this resource was aborted";
+    private static final Set<Thread.State> TIMED_WAITING = EnumSet.of(Thread.State.TIMED_WAITING);
+    private static final Duration PARKED_TIMEOUT = Duration.ofSeconds(2);
+    private static final long ENDED_TIMEOUT_SECONDS = 10;
 
     private final ObjectMapper objectMapper = new ObjectMapper();
+    private final TestTime time = TestTime.create();
+    private final TimelineWaits timeline = new TimelineWaits(time);
     private StepFunctionsService sfnService;
     private List<HistoryEvent> history;
     private AslExecutor.NestedWaiter nestedWaiter;
@@ -75,7 +88,7 @@ class AslExecutorNestedSyncTimeoutTest {
     void syncFailsWithStatesTimeoutWhenTheChildOutlivesTimeoutSeconds() {
         when(sfnService.describeExecution(CHILD_ARN)).thenReturn(child("RUNNING"));
 
-        Execution execution = run(newExecutor(TimeUnit.NANOSECONDS::sleep), ".sync", 1, false);
+        Execution execution = runUntilTheWaitIsCut(".sync", 1, false, 0, Duration.ofSeconds(1));
 
         assertEquals("FAILED", execution.getStatus());
         assertEquals("States.Timeout", execution.getError());
@@ -92,7 +105,7 @@ class AslExecutorNestedSyncTimeoutTest {
     void sync2TimeoutIsCaughtUnderStatesTimeout() throws Exception {
         when(sfnService.describeExecution(CHILD_ARN)).thenReturn(child("RUNNING"));
 
-        Execution execution = run(newExecutor(TimeUnit.NANOSECONDS::sleep), ".sync:2", 1, true);
+        Execution execution = runUntilTheWaitIsCut(".sync:2", 1, true, 0, Duration.ofSeconds(1));
 
         assertEquals("SUCCEEDED", execution.getStatus(), execution.getCause());
         JsonNode output = objectMapper.readTree(execution.getOutput());
@@ -126,7 +139,7 @@ class AslExecutorNestedSyncTimeoutTest {
     void executionBudgetEndsTheParentTimedOutAndAbortsTheChild() {
         when(sfnService.describeExecution(CHILD_ARN)).thenReturn(child("RUNNING"));
 
-        Execution execution = run(newExecutor(TimeUnit.NANOSECONDS::sleep), ".sync:2", 60, false, 1);
+        Execution execution = runUntilTheWaitIsCut(".sync:2", 60, false, 1, Duration.ofSeconds(1));
 
         assertEquals("TIMED_OUT", execution.getStatus());
         assertTrue(history.stream().noneMatch(event -> "TaskTimedOut".equals(event.getType())));
@@ -175,8 +188,7 @@ class AslExecutorNestedSyncTimeoutTest {
                 () -> run(executor, mode, 60, false));
         try {
             assertTrue(firstRead.await(2, TimeUnit.SECONDS));
-            await().atMost(Duration.ofSeconds(2))
-                    .until(() -> waitingThread.get().getState() == Thread.State.TIMED_WAITING);
+            ThreadStates.awaitState(waitingThread.get(), TIMED_WAITING, PARKED_TIMEOUT, "the parent's worker");
             verify(sfnService, times(1)).describeExecution(CHILD_ARN);
             synchronized (live) {
                 live.setOutput("{\"answer\":42}");
@@ -307,9 +319,11 @@ class AslExecutorNestedSyncTimeoutTest {
         AtomicLong nanos = new AtomicLong();
         AtomicReference<ExecutionStatusSubscription> parked = new AtomicReference<>();
         AtomicReference<Thread> waiter = new AtomicReference<>();
+        CountDownLatch waiting = new CountDownLatch(1);
         nestedWaiter = (subscription, observed, remaining) -> {
             parked.set(subscription);
             waiter.set(Thread.currentThread());
+            waiting.countDown();
             subscription.awaitChange(observed, remaining);
         };
         when(sfnService.describeExecution(CHILD_ARN)).thenReturn(child("RUNNING"));
@@ -319,8 +333,8 @@ class AslExecutorNestedSyncTimeoutTest {
         CompletableFuture<Execution> result = CompletableFuture.supplyAsync(
                 () -> run(executor, mode, 60, true));
         try {
-            await().atMost(Duration.ofSeconds(2)).until(() -> waiter.get() != null
-                    && waiter.get().getState() == Thread.State.TIMED_WAITING);
+            assertTrue(waiting.await(2, TimeUnit.SECONDS));
+            ThreadStates.awaitState(waiter.get(), TIMED_WAITING, PARKED_TIMEOUT, "the parent's worker");
             ExecutionStatusSubscription subscription = parked.get();
             synchronized (subscription) {
                 nanos.set(TimeUnit.SECONDS.toNanos(60));
@@ -361,18 +375,52 @@ class AslExecutorNestedSyncTimeoutTest {
         return newExecutor(sleeper, nanoTime, objectMapper);
     }
 
-    @SuppressWarnings("unchecked")
     private AslExecutor newExecutor(AslExecutor.Sleeper sleeper, LongSupplier nanoTime, ObjectMapper mapper) {
-        Instance<StepFunctionsService> instance = mock(Instance.class);
-        when(instance.get()).thenReturn(sfnService);
         return AslExecutorFixture.builder()
                 .objectMapper(mapper)
-                .sfnService(instance)
+                .sfnService(serviceInstance())
                 .customResourceLiveness(null)
                 .sleeper(sleeper)
                 .nanoTime(nanoTime)
                 .nestedWaiter(nestedWaiter)
                 .build();
+    }
+
+    /**
+     * Runs the parent on the timeline until its wait for the child is cut at {@code bound}: one
+     * nanosecond earlier the synchronous caller and the worker are both still waiting and the child
+     * has not been touched.
+     */
+    private Execution runUntilTheWaitIsCut(String mode, int timeoutSeconds, boolean catchTimeout,
+                                           int executionTimeoutSeconds, Duration bound) {
+        AslExecutor executor = AslExecutorFixture.builder()
+                .objectMapper(objectMapper)
+                .sfnService(serviceInstance())
+                .customResourceLiveness(null)
+                .clock(time.clock())
+                .sleeper(nanos -> {
+                    throw new AssertionError("Nested waits must not poll through the sleeper");
+                })
+                .nanoTime(time::nanoTime)
+                .nestedWaiter(timeline)
+                .waits(timeline)
+                .build();
+        CompletableFuture<Execution> running = AslExecutorFixture.start(
+                () -> run(executor, mode, timeoutSeconds, catchTimeout, executionTimeoutSeconds));
+        timeline.awaitWaiting(2);
+        time.advance(bound.minusNanos(1));
+        assertEquals(2, timeline.waiting());
+        assertFalse(running.isDone());
+        verify(sfnService, never()).stopExecution(any(), any(), any());
+        time.advance(Duration.ofNanos(1));
+        return AslExecutorFixture.finished(running);
+    }
+
+    @SuppressWarnings("unchecked")
+    private Instance<StepFunctionsService> serviceInstance() {
+        Instance<StepFunctionsService> instance = mock(Instance.class);
+        when(instance.get()).thenReturn(sfnService);
+        return instance;
     }
 
     private Execution run(AslExecutor executor, String mode, int timeoutSeconds, boolean catchTimeout) {
@@ -430,13 +478,24 @@ class AslExecutorNestedSyncTimeoutTest {
 
         history = new CopyOnWriteArrayList<>();
         if (asynchronous) {
-            executor.executeAsync(stateMachine, execution, history, (updated, events) -> { });
-            await().atMost(Duration.ofSeconds(10))
-                    .until(() -> history.stream().anyMatch(event -> event.getType().startsWith("Execution")
-                            && !event.getType().equals("ExecutionStarted")));
+            // The worker hands the execution back once, when it has ended and its last event is in.
+            CountDownLatch ended = new CountDownLatch(1);
+            executor.executeAsync(stateMachine, execution, history, (updated, events) -> ended.countDown());
+            awaitEnded(ended);
+            assertTrue(history.stream().anyMatch(event -> event.getType().startsWith("Execution")
+                    && !event.getType().equals("ExecutionStarted")), "no terminal event in " + history);
         } else {
             executor.executeSync(stateMachine, execution, history, (updated, events) -> { });
         }
         return execution;
+    }
+
+    private static void awaitEnded(CountDownLatch ended) {
+        try {
+            assertTrue(ended.await(ENDED_TIMEOUT_SECONDS, TimeUnit.SECONDS), "the execution never ended");
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new AssertionError("interrupted waiting for the execution to end", e);
+        }
     }
 }

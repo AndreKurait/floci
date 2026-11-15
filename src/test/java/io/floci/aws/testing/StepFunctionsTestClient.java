@@ -4,16 +4,16 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.services.sqs.SqsService;
 import io.restassured.response.Response;
+import org.awaitility.Awaitility;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.TimeUnit;
 
 import static io.floci.aws.testing.EnforcementFixtures.auth;
 import static io.restassured.RestAssured.given;
-import static org.junit.jupiter.api.Assertions.fail;
 
 /** Step Functions calls a test makes as one account, and the state machines it leaves to {@code cleanup}. */
 public final class StepFunctionsTestClient {
@@ -30,7 +30,7 @@ public final class StepFunctionsTestClient {
             """;
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
-    private static final long POLL_MILLIS = 25;
+    private static final Duration POLL_INTERVAL = Duration.ofMillis(25);
 
     private final int port;
     private final PartitionCleanup cleanup;
@@ -104,30 +104,25 @@ public final class StepFunctionsTestClient {
     }
 
     /** Polls until the execution ends: nothing in the API waits for a standard workflow. */
-    public Response terminal(String account, String execution, int seconds) throws InterruptedException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(seconds);
-        do {
-            Response response = request(account, "DescribeExecution", Map.of("executionArn", execution));
-            response.then().statusCode(200);
-            if (!"RUNNING".equals(response.jsonPath().getString("status"))) {
-                return response;
-            }
-            Thread.sleep(POLL_MILLIS);
-        } while (System.nanoTime() < deadline);
-        fail("Execution did not terminate: " + execution);
-        return null;
+    public Response terminal(String account, String execution, int seconds) {
+        return Awaitility.await("execution " + execution + " to leave RUNNING")
+                .atMost(Duration.ofSeconds(seconds))
+                .pollDelay(Duration.ZERO)
+                .pollInterval(POLL_INTERVAL)
+                .until(() -> {
+                    Response response = request(account, "DescribeExecution", Map.of("executionArn", execution));
+                    response.then().statusCode(200);
+                    return response;
+                }, response -> !"RUNNING".equals(response.jsonPath().getString("status")));
     }
 
     /** Polls until the execution's history holds an event of {@code eventType}. */
-    public void await(String account, String execution, String eventType, int seconds) throws Exception {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(seconds);
-        do {
-            if (!eventsOfType(account, execution, eventType).isEmpty()) {
-                return;
-            }
-            Thread.sleep(POLL_MILLIS);
-        } while (System.nanoTime() < deadline);
-        fail("No " + eventType + " event in " + execution);
+    public void await(String account, String execution, String eventType, int seconds) {
+        Awaitility.await(eventType + " event in " + execution)
+                .atMost(Duration.ofSeconds(seconds))
+                .pollDelay(Duration.ZERO)
+                .pollInterval(POLL_INTERVAL)
+                .until(() -> !eventsOfType(account, execution, eventType).isEmpty());
     }
 
     public List<JsonNode> eventsOfType(String account, String execution, String type) throws Exception {

@@ -5,6 +5,7 @@ import io.floci.aws.core.common.RequestScopes;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.iam.model.AccessKey;
 import io.floci.aws.services.sqs.SqsService;
+import io.floci.aws.services.sqs.model.Message;
 import io.floci.aws.testing.PartitionCleanup;
 import io.floci.aws.testing.SignedIamEnforcementProfile;
 import io.floci.aws.testing.SignedIamUsers;
@@ -35,18 +36,20 @@ import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.TimeUnit;
 
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.junit.jupiter.api.Assertions.fail;
 
 @QuarkusTest
 @TestProfile(SignedIamEnforcementProfile.class)
 class StepFunctionsCallbackIamIntegrationTest {
     private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final int TOKEN_WAIT_SECONDS = 10;
+    /** Longer than the test, so a received token never comes back to the queue. */
+    private static final int TOKEN_VISIBILITY_TIMEOUT_SECONDS = 300;
 
     @TestHTTPResource
     URI endpoint;
@@ -130,7 +133,7 @@ class StepFunctionsCallbackIamIntegrationTest {
             });
             String token = isActivity
                     ? admin.getActivityTask(request -> request.activityArn(activity)).taskToken()
-                    : queue.awaitJson(Duration.ofSeconds(10)).path("token").asText();
+                    : sentToken(queue);
             if (allowed) {
                 callback(actor, action, token);
                 if (!"heartbeat".equals(action)) {
@@ -288,15 +291,23 @@ class StepFunctionsCallbackIamIntegrationTest {
         }
     }
 
-    private static String terminal(SfnClient admin, String execution) throws InterruptedException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-        while (System.nanoTime() < deadline) {
-            String status = admin.describeExecution(request -> request.executionArn(execution)).statusAsString();
-            if (!"RUNNING".equals(status)) {
-                return status;
-            }
-            Thread.sleep(10);
-        }
-        return fail("callback did not finish its execution");
+    /**
+     * The task token the state sent to its queue, received with a long poll of the queue itself:
+     * the receive returns when the message arrives, however soon that is.
+     */
+    private String sentToken(SqsTestQueue queue) throws Exception {
+        List<Message> messages = RequestScopes.callAs("000000000000", () -> sqsService.receiveMessage(
+                queue.url(), 1, TOKEN_VISIBILITY_TIMEOUT_SECONDS, TOKEN_WAIT_SECONDS, "us-east-1"));
+        assertEquals(1, messages.size(), "the task sent no token in " + TOKEN_WAIT_SECONDS + " seconds");
+        return MAPPER.readTree(messages.getFirst().getBody()).path("token").asText();
+    }
+
+    private static String terminal(SfnClient admin, String execution) {
+        return await("the callback to finish " + execution)
+                .atMost(Duration.ofSeconds(10))
+                .pollDelay(Duration.ZERO)
+                .pollInterval(Duration.ofMillis(10))
+                .until(() -> admin.describeExecution(request -> request.executionArn(execution)).statusAsString(),
+                        status -> !"RUNNING".equals(status));
     }
 }

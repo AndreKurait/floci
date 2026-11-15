@@ -14,12 +14,13 @@ import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
-import java.util.concurrent.TimeUnit;
 
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -156,16 +157,15 @@ class StepFunctionsApiGatewayIntegrationTest {
     private static Response execute(String machine) throws Exception {
         String arn = sfn("StartExecution", Map.of("stateMachineArn", machine, "input", "{}"))
                 .then().statusCode(200).extract().path("executionArn");
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(10);
-        while (true) {
-            Response response = sfn("DescribeExecution", Map.of("executionArn", arn));
-            response.then().statusCode(200);
-            if (!"RUNNING".equals(response.jsonPath().getString("status"))) {
-                return response;
-            }
-            assertTrue(System.nanoTime() < deadline, "API workflow did not terminate");
-            Thread.sleep(25);
-        }
+        return await("API workflow " + arn + " to terminate")
+                .atMost(Duration.ofSeconds(10))
+                .pollDelay(Duration.ZERO)
+                .pollInterval(Duration.ofMillis(10))
+                .until(() -> {
+                    Response response = sfn("DescribeExecution", Map.of("executionArn", arn));
+                    response.then().statusCode(200);
+                    return response;
+                }, response -> !"RUNNING".equals(response.jsonPath().getString("status")));
     }
 
     private static Response sfn(String action, Map<String, String> body) throws Exception {
