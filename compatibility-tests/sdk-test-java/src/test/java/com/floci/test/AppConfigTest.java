@@ -156,7 +156,7 @@ class AppConfigTest {
 
         assertThat(response.configuration().asString(StandardCharsets.UTF_8)).isEqualTo("{\"key\": \"value\"}");
         assertThat(response.contentType()).startsWith("application/json");
-        assertThat(response.versionLabel()).isEqualTo("1");
+        assertThat(response.versionLabel()).isNull();
         assertThat(response.nextPollConfigurationToken()).isNotNull();
         assertThat(response.nextPollConfigurationToken()).isNotEqualTo(configurationToken);
         secondConfigurationToken = response.nextPollConfigurationToken();
@@ -220,7 +220,7 @@ class AppConfigTest {
                 .build());
 
         assertThat(response.configuration().asString(StandardCharsets.UTF_8)).isEqualTo("{\"key\": \"value-2\"}");
-        assertThat(response.versionLabel()).isEqualTo("2");
+        assertThat(response.versionLabel()).isNull();
         assertThat(response.nextPollConfigurationToken()).isNotNull();
         assertThat(response.nextPollConfigurationToken()).isNotEqualTo(unchangedConfigurationToken);
     }
@@ -543,7 +543,7 @@ class AppConfigTest {
                 .isEqualTo("{\"enabled\":{\"enabled\":true,\"number\":0,\"beta\":false},"
                         + "\"disabled\":{\"enabled\":false}}");
         assertThat(response.contentType()).startsWith("application/json");
-        assertThat(response.versionLabel()).isEqualTo("1");
+        assertThat(response.versionLabel()).isNull();
         assertThat(response.nextPollConfigurationToken()).isNotBlank();
     }
 
