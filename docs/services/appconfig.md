@@ -219,6 +219,11 @@ with `BadRequestException` before changing the active version or stopping the de
 Older persisted deployments without completion timestamps cannot be reverted because
 that window cannot be verified.
 
+Completed reverts preserve `StartedAt` and `CompletedAt`. They prepend a
+`REVERT_COMPLETED` event with `TriggeredBy: USER` and the revert time, retaining all
+recorded event history. Environment state aggregation, ordinary deployment start
+and completion events, and event `ActionInvocations` fields remain unimplemented.
+
 ## Data Plane (AppConfigData) {#data-plane}
 
 The data plane is used by applications to retrieve the active configuration for an environment and profile.

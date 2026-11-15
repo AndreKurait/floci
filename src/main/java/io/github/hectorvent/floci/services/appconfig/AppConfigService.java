@@ -653,6 +653,17 @@ public class AppConfigService implements Resettable {
                 content, contentType, description, null, null);
     }
 
+    public HostedConfigurationVersion createHostedConfigurationVersion(String applicationIdentifier,
+                                                                         String profileIdentifier,
+                                                                         byte[] content,
+                                                                         String contentType,
+                                                                         String description,
+                                                                         String versionLabel,
+                                                                         Integer latestVersionNumber) {
+        return createHostedConfigurationVersion(applicationIdentifier, profileIdentifier,
+                content, contentType, description, null, null);
+    }
+
     public synchronized HostedConfigurationVersion createHostedConfigurationVersion(String applicationIdentifier,
                                                                          String profileIdentifier,
                                                                          byte[] content,
@@ -1099,7 +1110,15 @@ public class AppConfigService implements Resettable {
         }
         deployment.setState(completed ? "REVERTED" : "ROLLED_BACK");
         deployment.setPercentageComplete(0.0f);
-        deployment.setCompletedAt(clock.instant().toString());
+        if (completed) {
+            List<DeploymentEvent> events = new ArrayList<>();
+            events.add(new DeploymentEvent("REVERT_COMPLETED", "Deployment reverted by user request",
+                    clock.instant().toString(), "USER"));
+            events.addAll(deployment.getEventLog());
+            deployment.setEventLog(events);
+        } else {
+            deployment.setCompletedAt(clock.instant().toString());
+        }
         if (alarmCause != null) {
             List<DeploymentEvent> events = new ArrayList<>(deployment.getEventLog());
             events.add(new DeploymentEvent("ROLLBACK_STARTED", alarmCause,
