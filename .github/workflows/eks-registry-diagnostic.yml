@@ -7,7 +7,7 @@ permissions:
 jobs:
   reproduce:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
       - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad
@@ -22,14 +22,14 @@ jobs:
             maven-${{ runner.os }}-
       - name: Compile the unchanged integration source and diagnostic test
         run: ./mvnw -B -ntp test-compile
-      - name: Reproduce the registry-hosts lifecycle
+      - name: Run EKS cohort and native Auto Scaling regressions
         run: |
           dns_address="$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')"
           test -n "$dns_address"
           port_floor="$(sysctl -n net.ipv4.ip_unprivileged_port_start)"
           trap 'sudo sysctl -w "net.ipv4.ip_unprivileged_port_start=$port_floor" >/dev/null' EXIT
           sudo sysctl -w net.ipv4.ip_unprivileged_port_start=0
-          FLOCI_TEST_HOST_DNS_ADDRESS="$dns_address" ./mvnw -B -ntp surefire:test             -Dtest=EksRegistryHostsDockerIntegrationTest -Dsurefire.failIfNoTests=true             -Dsurefire.timeout=900
+          FLOCI_TEST_HOST_DNS_ADDRESS="$dns_address" ./mvnw -B -ntp surefire:test             -Dtest=EksRegistryHostsDockerIntegrationTest,EksStorageClassDockerIntegrationTest,AutoScalingNativeEventSdkTest,LambdaTasksBucketTest -Dsurefire.failIfNoTests=true             -Dsurefire.timeout=900
       - name: Capture stopped test container evidence
         if: always()
         run: |
