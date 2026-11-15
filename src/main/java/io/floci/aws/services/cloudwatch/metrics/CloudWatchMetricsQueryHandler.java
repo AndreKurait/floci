@@ -29,9 +29,11 @@ import org.jboss.logging.Logger;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.SortedSet;
 import java.util.TreeSet;
 import java.util.regex.Matcher;
@@ -42,6 +44,9 @@ public class CloudWatchMetricsQueryHandler {
 
     private static final Logger LOG = Logger.getLogger(CloudWatchMetricsQueryHandler.class);
     private static final Pattern ENTITY_METRIC_DATA_MEMBER = Pattern.compile("EntityMetricData\\.member\\.(\\d{1,9})\\.");
+
+    private static final Pattern METRIC_DATA_MEMBER = Pattern.compile(
+            "(?:MetricData|EntityMetricData\\.member\\.\\d+\\.MetricData)\\.member\\.\\d+\\.");
 
     private CloudWatchMetricsService metricsService;
     private final CloudWatchDashboardsService dashboardsService;
@@ -700,30 +705,42 @@ public class CloudWatchMetricsQueryHandler {
     // ──────────────────────────── Parsing Helpers ────────────────────────────
 
     private List<MetricDatum> parseMetricData(MultivaluedMap<String, String> params) {
-        List<MetricDatum> datums = parseMetricData(params, "MetricData");
+        Set<String> memberPrefixes = new HashSet<>();
+        Set<String> statisticPrefixes = new HashSet<>();
         // An empty EntityMetricData entry serializes to no keys, so its index is absent
         // while later entries keep theirs: iterate the indexes present, not 1..first gap.
         SortedSet<Integer> entityIndexes = new TreeSet<>();
         for (String key : params.keySet()) {
+            Matcher member = METRIC_DATA_MEMBER.matcher(key);
+            if (member.lookingAt()) {
+                String prefix = member.group();
+                memberPrefixes.add(prefix);
+                if (key.startsWith(prefix + "StatisticValues.")) {
+                    statisticPrefixes.add(prefix);
+                }
+            }
             Matcher matcher = ENTITY_METRIC_DATA_MEMBER.matcher(key);
             if (matcher.lookingAt()) {
                 entityIndexes.add(Integer.parseInt(matcher.group(1)));
             }
         }
+        List<MetricDatum> datums = parseMetricData(params, "MetricData", memberPrefixes, statisticPrefixes);
         for (int index : entityIndexes) {
-            datums.addAll(parseMetricData(params, "EntityMetricData.member." + index + ".MetricData"));
+            datums.addAll(parseMetricData(params, "EntityMetricData.member." + index + ".MetricData",
+                    memberPrefixes, statisticPrefixes));
         }
         LOG.debugv("Query PutMetricData parsed {0} datums", datums.size());
         return datums;
     }
 
-    private List<MetricDatum> parseMetricData(MultivaluedMap<String, String> params, String listPrefix) {
+    private List<MetricDatum> parseMetricData(MultivaluedMap<String, String> params, String listPrefix,
+                                             Set<String> memberPrefixes, Set<String> statisticPrefixes) {
         List<MetricDatum> datums = new ArrayList<>();
         for (int i = 1; ; i++) {
             String memberPrefix = listPrefix + ".member." + i + ".";
             String metricName = params.getFirst(memberPrefix + "MetricName");
             if (metricName == null || metricName.isEmpty()) {
-                if (metricName == null && params.keySet().stream().noneMatch(key -> key.startsWith(memberPrefix))) {
+                if (metricName == null && !memberPrefixes.contains(memberPrefix)) {
                     break;
                 }
                 throw CloudWatchMetricsException.missingParameter(memberPrefix + "MetricName");
@@ -734,7 +751,7 @@ public class CloudWatchMetricsQueryHandler {
 
             String valueStr = params.getFirst(listPrefix + ".member." + i + ".Value");
             if (valueStr != null) {
-                datum.setValue(metricNumber(valueStr, memberPrefix + "Value"));
+                datum.setValue(MetricNumberValidation.parse(valueStr, memberPrefix + "Value"));
             }
 
             String tsStr = params.getFirst(listPrefix + ".member." + i + ".Timestamp");
@@ -745,15 +762,15 @@ public class CloudWatchMetricsQueryHandler {
 
             // StatisticValues
             String statsPrefix = memberPrefix + "StatisticValues.";
-            if (params.keySet().stream().anyMatch(key -> key.startsWith(statsPrefix))) {
+            if (statisticPrefixes.contains(memberPrefix)) {
                 if (valueStr != null) {
                     throw CloudWatchMetricsException.invalidParameterValue(
                             memberPrefix + "StatisticValues cannot be combined with Value.");
                 }
-                datum.setSampleCount(metricNumber(params.getFirst(statsPrefix + "SampleCount"), statsPrefix + "SampleCount"));
-                datum.setSum(metricNumber(params.getFirst(statsPrefix + "Sum"), statsPrefix + "Sum"));
-                datum.setMinimum(metricNumber(params.getFirst(statsPrefix + "Minimum"), statsPrefix + "Minimum"));
-                datum.setMaximum(metricNumber(params.getFirst(statsPrefix + "Maximum"), statsPrefix + "Maximum"));
+                datum.setSampleCount(MetricNumberValidation.parse(params.getFirst(statsPrefix + "SampleCount"), statsPrefix + "SampleCount"));
+                datum.setSum(MetricNumberValidation.parse(params.getFirst(statsPrefix + "Sum"), statsPrefix + "Sum"));
+                datum.setMinimum(MetricNumberValidation.parse(params.getFirst(statsPrefix + "Minimum"), statsPrefix + "Minimum"));
+                datum.setMaximum(MetricNumberValidation.parse(params.getFirst(statsPrefix + "Maximum"), statsPrefix + "Maximum"));
             }
 
             // Dimensions
@@ -771,21 +788,6 @@ public class CloudWatchMetricsQueryHandler {
             datums.add(datum);
         }
         return datums;
-    }
-
-    private static double metricNumber(String value, String path) {
-        if (value == null) {
-            throw CloudWatchMetricsException.missingParameter(path);
-        }
-        try {
-            double parsed = Double.parseDouble(value);
-            if (Double.isFinite(parsed)) {
-                return parsed;
-            }
-        } catch (NumberFormatException ignored) {
-            // A malformed wire value gets the same error as a non-finite number.
-        }
-        throw CloudWatchMetricsException.invalidParameterValue(path + " must be a finite number.");
     }
 
     private List<Dimension> parseDimensionFilters(MultivaluedMap<String, String> params) {

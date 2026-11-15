@@ -925,7 +925,7 @@ public class CloudWatchMetricsJsonHandler {
             datum.setMetricName(metricName.asText());
             String memberPath = listPath + ".member." + index;
             if (item.hasNonNull("Value")) {
-                datum.setValue(metricNumber(item.get("Value"), memberPath + ".Value"));
+                datum.setValue(MetricNumberValidation.parse(item.get("Value"), memberPath + ".Value"));
             }
             datum.setUnit(item.path("Unit").asText(null));
             JsonNode ts = item.path("Timestamp");
@@ -942,25 +942,15 @@ public class CloudWatchMetricsJsonHandler {
                     throw CloudWatchMetricsException.invalidParameterValue(
                             statsPath + " must be an object and cannot be combined with Value.");
                 }
-                datum.setSampleCount(metricNumber(statsValues.path("SampleCount"), statsPath + ".SampleCount"));
-                datum.setSum(metricNumber(statsValues.path("Sum"), statsPath + ".Sum"));
-                datum.setMinimum(metricNumber(statsValues.path("Minimum"), statsPath + ".Minimum"));
-                datum.setMaximum(metricNumber(statsValues.path("Maximum"), statsPath + ".Maximum"));
+                datum.setSampleCount(MetricNumberValidation.parse(statsValues.path("SampleCount"), statsPath + ".SampleCount"));
+                datum.setSum(MetricNumberValidation.parse(statsValues.path("Sum"), statsPath + ".Sum"));
+                datum.setMinimum(MetricNumberValidation.parse(statsValues.path("Minimum"), statsPath + ".Minimum"));
+                datum.setMaximum(MetricNumberValidation.parse(statsValues.path("Maximum"), statsPath + ".Maximum"));
             }
 
             datums.add(datum);
         }
         return datums;
-    }
-
-    private static double metricNumber(JsonNode node, String path) {
-        if (node.isMissingNode() || node.isNull()) {
-            throw CloudWatchMetricsException.missingParameter(path);
-        }
-        if (!node.isNumber() || !Double.isFinite(node.doubleValue())) {
-            throw CloudWatchMetricsException.invalidParameterValue(path + " must be a finite number.");
-        }
-        return node.doubleValue();
     }
 
     private List<Dimension> parseDimensionsJson(JsonNode node) {

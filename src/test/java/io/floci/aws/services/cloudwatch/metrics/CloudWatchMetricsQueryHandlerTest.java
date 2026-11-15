@@ -23,8 +23,10 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.atMost;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -44,6 +46,45 @@ class CloudWatchMetricsQueryHandlerTest {
     private final CloudWatchMetricsQueryHandler handler = new CloudWatchMetricsQueryHandler(
             metricsService, mock(CloudWatchDashboardsService.class),
             mock(CloudWatchMetricStreamsService.class));
+
+    @Test
+    void aLargeMixedBatchDoesNotRescanEveryFormFieldForEachDatum() {
+        MultivaluedMap<String, String> params = spy(new MultivaluedHashMap<String, String>());
+        params.putSingle("Namespace", "LargeBatch");
+        for (String list : List.of("MetricData", "EntityMetricData.member.2.MetricData")) {
+            for (int index = 1; index <= 500; index++) {
+                String prefix = list + ".member." + index + ".";
+                params.putSingle(prefix + "MetricName", "Metric" + index);
+                params.putSingle(prefix + "Value", Integer.toString(index));
+            }
+        }
+
+        handler.handle("PutMetricData", params, REGION);
+
+        ArgumentCaptor<List<MetricDatum>> datums = ArgumentCaptor.forClass(List.class);
+        verify(metricsService).putMetricData(eq("LargeBatch"), datums.capture(), eq(REGION));
+        assertEquals(1000, datums.getValue().size());
+        assertEquals(500.0, datums.getValue().getLast().getValue());
+        // Bound whole-map scans independently of the number of datums; no timing assertion.
+        verify(params, atMost(3)).keySet();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"MetricData", "EntityMetricData.member.2.MetricData"})
+    void anUnknownStatisticMemberStillRequiresTheCompleteStatisticSet(String list) {
+        MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
+        String prefix = list + ".member.1.";
+        params.putSingle("Namespace", "InvalidValues");
+        params.putSingle(prefix + "MetricName", "Partial");
+        params.putSingle(prefix + "StatisticValues.Unknown", "1");
+
+        AwsException error = assertThrows(AwsException.class,
+                () -> handler.handle("PutMetricData", params, REGION));
+
+        assertEquals("MissingParameter", error.getErrorCode());
+        assertEquals("The parameter " + prefix + "StatisticValues.SampleCount is required.", error.getMessage());
+        verify(metricsService, never()).putMetricData(anyString(), any(), anyString());
+    }
 
     private static MultivaluedMap<String, String> statisticRequest() {
         MultivaluedMap<String, String> params = new MultivaluedHashMap<>();
