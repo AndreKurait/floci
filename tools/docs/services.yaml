@@ -373,6 +373,7 @@ services:
       ListVpcAssociationAuthorizations: ListVPCAssociationAuthorizations
       ListHostedZonesByVpc: ListHostedZonesByVPC
       GetDnssec: GetDNSSEC
+      TestDnsAnswer: TestDNSAnswer
   - service: route53resolver
     doc: docs/services/route53resolver.md
     sources:
