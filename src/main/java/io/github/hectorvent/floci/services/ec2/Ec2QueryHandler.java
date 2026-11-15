@@ -64,13 +64,15 @@ public class Ec2QueryHandler {
     private final Ec2IpamService ipamService;
     private final RegionResolver regionResolver;
     private final Ec2ClientVpnHandler clientVpnHandler;
+    private final Ec2PlacementGroupHandler placementGroupHandler;
 
     @Inject
     public Ec2QueryHandler(Ec2Service service, EmulatorConfig config, FlowLogService flowLogService,
                            Ec2EbsEncryptionService ebsEncryptionService,
                            Ec2BlockPublicAccessService blockPublicAccessService,
                            Ec2IpamService ipamService, RegionResolver regionResolver,
-                           Ec2ClientVpnService clientVpnService) {
+                           Ec2ClientVpnService clientVpnService,
+                           Ec2PlacementGroupService placementGroupService) {
         this.service = service;
         this.config = config;
         this.flowLogService = flowLogService;
@@ -79,6 +81,17 @@ public class Ec2QueryHandler {
         this.ipamService = ipamService;
         this.regionResolver = regionResolver;
         this.clientVpnHandler = clientVpnService == null ? null : new Ec2ClientVpnHandler(clientVpnService, service);
+        this.placementGroupHandler = new Ec2PlacementGroupHandler(placementGroupService);
+    }
+
+    /** For callers that exercise no placement-group operation. */
+    public Ec2QueryHandler(Ec2Service service, EmulatorConfig config, FlowLogService flowLogService,
+                           Ec2EbsEncryptionService ebsEncryptionService,
+                           Ec2BlockPublicAccessService blockPublicAccessService,
+                           Ec2IpamService ipamService, RegionResolver regionResolver,
+                           Ec2ClientVpnService clientVpnService) {
+        this(service, config, flowLogService, ebsEncryptionService, blockPublicAccessService, ipamService,
+                regionResolver, clientVpnService, null);
     }
 
     /** For unit tests that exercise no Client VPN operation. */
@@ -94,6 +107,10 @@ public class Ec2QueryHandler {
         LOG.debugv("EC2 action: {0}", action);
         try {
             return switch (action) {
+                case "CreatePlacementGroup" -> placementGroupHandler.create(params, region,
+                        parseTagsForResource(params, "placement-group", Set.of("placement-group")));
+                case "DescribePlacementGroups" -> placementGroupHandler.describe(params, region);
+                case "DeletePlacementGroup" -> placementGroupHandler.delete(params, region);
                 // Instances
                 case "RunInstances" -> handleRunInstances(params, region);
                 case "CreateFleet" -> handleCreateFleet(params, region);

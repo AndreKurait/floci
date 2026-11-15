@@ -542,7 +542,8 @@ final class TagOnCreate {
      */
     static List<String> resources(String operation, TagSet set, String partition, String region, String accountId,
                                   List<String> resources) {
-        if (set.resourceType() == null) {
+        if (set.resourceType() == null
+                || ("ec2:CreatePlacementGroup".equals(operation) && "placement-group".equals(set.resourceType()))) {
             return resources;
         }
         String arn = TagOnCreateMembers.table().resourceArns()
