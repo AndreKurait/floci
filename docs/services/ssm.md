@@ -378,6 +378,11 @@ stores a managed-node record; it does not create an EC2 instance or install IMDS
 Launch an instance with EC2 `RunInstances`, an instance profile and an image that
 starts the agent to exercise the normal credential and network paths.
 
+EC2 `RegisterManagedInstance` requests must bind the request body to their SigV4 signature.
+An explicit payload hash must match the body; `UNSIGNED-PAYLOAD` is rejected for this
+registration path. Sequential or concurrent identical retries preserve the first stored
+registration and its timestamp.
+
 ### Image promotion check
 
 The development image workflow runs `.github/scripts/smoke-ssm-agent.py` before
