@@ -3,12 +3,14 @@ package io.floci.aws.services.emr;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.floci.aws.core.common.docker.ContainerLogStreamer;
 import io.floci.aws.testing.AwsTestClients;
 import io.floci.aws.testing.ContainerDataPlaneProfile;
 import io.floci.aws.testing.DockerAvailability;
 import io.floci.aws.testing.PartitionCleanup;
 import io.floci.aws.testing.RestAssuredJsonUtils;
 import io.floci.aws.testing.S3TestClients;
+import io.floci.aws.testutil.LogCapture;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.Response;
@@ -26,6 +28,7 @@ import software.amazon.awssdk.services.s3.model.S3Object;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
@@ -129,12 +132,26 @@ class EmrHiveStepsDockerIntegrationTest {
     void hiveStepsRunningAtOnceShareTheClustersMetastoreService() {
         startCluster(HIVE_AND_SPARK, "[]", null, 2);
 
-        // The first holds its session past the second's, which an embedded Derby database would refuse.
-        String slow = addStep("command-runner.jar", "hive-script", "--run-hive-script", "--args",
-                "-e", "create table slow (k string); !sleep 20; insert into slow values ('s');");
-        String quick = addStep("command-runner.jar", "hive-script", "--run-hive-script", "--args",
-                "-e", "create table quick as select 'q' as k;");
-        assertEquals("COMPLETED", state(quick));
+        // Keep the first session open until the second has completed, even on a slow runner.
+        String marker = "FLOCI_HIVE_SESSION_READY_" + UUID.randomUUID().toString().replace("-", "");
+        String gate = "/mnt/" + marker;
+        String waitForRelease = "mkfifo " + gate + "; printf '%s\\n' " + marker
+                + "; timeout 120 bash -c 'read -r release < " + gate + "'";
+        String slow = LogCapture.awaitRecord(ContainerLogStreamer.class, Duration.ofMinutes(2),
+                record -> LogCapture.formatted(record).endsWith("] " + marker),
+                () -> addStep("command-runner.jar", "hive-script", "--run-hive-script", "--args",
+                        "-e", "create table slow (k string); !bash -c \"" + waitForRelease
+                                + "\"; insert into slow values ('s');"));
+        try {
+            String quick = addStep("command-runner.jar", "hive-script", "--run-hive-script", "--args",
+                    "-e", "create table quick as select 'q' as k;");
+            assertEquals("COMPLETED", state(quick));
+        } finally {
+            // Release the blocked session even when the second step fails its assertion.
+            String release = addStep("command-runner.jar", "bash", "-c",
+                    "timeout 20 bash -c 'echo release > " + gate + "'");
+            assertEquals("COMPLETED", state(release));
+        }
         assertEquals("COMPLETED", state(slow));
         String both = addStep("command-runner.jar", "hive-script", "--run-hive-script", "--args",
                 "-e", "select k from slow union all select k from quick order by k;");

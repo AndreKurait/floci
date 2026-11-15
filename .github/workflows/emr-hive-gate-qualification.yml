@@ -1,0 +1,89 @@
+name: EMR Hive gate qualification
+
+on:
+  push:
+    branches: [validate/emr-hive-gate-20261115]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: emr-hive-gate-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  qualify:
+    if: github.repository == 'AndreKurait/floci'
+    name: Hive Docker (${{ matrix.variant }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: baseline
+            source: 065d7194b05dd8a71c7f17de3c9ddab3a1fbe30d
+          - variant: candidate
+            source: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.source }}
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          java-version: '25'
+          distribution: temurin
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.m2/repository
+          key: maven-${{ runner.os }}-${{ hashFiles('pom.xml') }}
+          restore-keys: |
+            maven-${{ runner.os }}-
+      - name: Record source, runner and Docker availability
+        run: |
+          git rev-parse HEAD > qualification-source.txt
+          lscpu > qualification-runner.txt
+          free -b >> qualification-runner.txt
+          docker info > qualification-docker.txt
+          printf '%s\n' 'io/floci/aws/services/emr/EmrHiveStepsDockerIntegrationTest' > hive-includes.txt
+      - name: Prefetch Hive test images
+        run: .github/ci/prefetch-images.sh hive-includes.txt || true
+      - name: Compile unchanged repository sources and tests
+        run: ./mvnw -B -ntp test-compile
+      - name: Run all six original Hive Docker scenarios
+        run: >
+          ./mvnw -B -ntp surefire:test
+          -Dtest=EmrHiveStepsDockerIntegrationTest
+          -Dsurefire.failIfNoTests=true
+          -Dsurefire.timeout=1500
+          -Dquarkus.http.test-port=0
+          -Dquarkus.management.test-port=0
+      - name: Require actual execution without skipped cases
+        if: always()
+        run: |
+          python3 - <<'PYTEST'
+          import json
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          report = Path('target/surefire-reports/TEST-io.floci.aws.services.emr.EmrHiveStepsDockerIntegrationTest.xml')
+          root = ET.parse(report).getroot()
+          result = {key: int(root.attrib[key]) for key in ('tests', 'failures', 'errors', 'skipped')}
+          result['classSeconds'] = float(root.attrib['time'])
+          result['cases'] = [{'name': case.attrib['name'], 'seconds': float(case.attrib['time'])}
+                             for case in root.findall('testcase')]
+          result['source'] = Path('qualification-source.txt').read_text().strip()
+          Path('qualification-result.json').write_text(json.dumps(result, indent=2))
+          if result['tests'] != 6 or any(result[key] for key in ('failures', 'errors', 'skipped')):
+              raise SystemExit('Six real Hive cases must pass without skips')
+          PYTEST
+      - name: Upload qualification evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: hive-${{ matrix.variant }}
+          path: |
+            qualification-*.txt
+            qualification-result.json
+            prefetch-images.log
+            target/surefire-reports/
+          if-no-files-found: error
