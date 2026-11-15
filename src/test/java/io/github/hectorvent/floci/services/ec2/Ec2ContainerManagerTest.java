@@ -2736,6 +2736,57 @@ class Ec2ContainerManagerTest {
         awaitUntil(() -> "127.0.0.1".equals(instance.getPublicIpAddress()), Duration.ofSeconds(2));
     }
 
+    @ParameterizedTest
+    @CsvSource({"false, false", "true, false", "true, true"})
+    void launchRefreshesPublicRoutingAfterGuestStartupOnlyForAChangedAddress(
+            boolean addressChanges, boolean metadataAlreadyUpdated) throws Exception {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
+        Ec2ContainerManager manager = spy(harness.manager);
+        Instance instance = instance("i-publication");
+        instance.setAssociatePublicIp(true);
+        when(harness.config.services().ec2().publicIpFromServiceNetwork()).thenReturn(true);
+        List<String> publishedAddresses = new CopyOnWriteArrayList<>();
+        doAnswer(invocation -> {
+            assertEquals("pending", instance.getState().getName(),
+                    "routes must be published before EC2 reports running");
+            publishedAddresses.add(invocation.getArgument(1, String.class));
+            return null;
+        }).when(manager).refreshPublicRouting(eq(instance), anyString());
+        doAnswer(invocation -> {
+            if (addressChanges) {
+                instance.setServiceNetworkIp("192.0.2.10");
+            }
+            if (metadataAlreadyUpdated) {
+                instance.setPublicIpAddress("192.0.2.10");
+                instance.setPublicDnsName("192.0.2.10");
+            }
+            return null;
+        }).when(manager).refreshServiceNetworkIp(instance);
+
+        try {
+            manager.launch(instance,
+                    new ResolvedAmiImage("test/native-guest:1", ResolvedAmiImage.IMAGE_RUNTIME, true, null),
+                    null, "us-west-2");
+            executor.shutdown();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS), "launch worker should finish");
+            assertEquals("running", instance.getState().getName());
+            List<String> expectedAddresses = addressChanges
+                    ? List.of("127.0.0.1", "192.0.2.10") : List.of("127.0.0.1");
+            assertEquals(expectedAddresses, publishedAddresses,
+                    "only addresses not yet routed should be published before EC2 reports running");
+            assertEquals(expectedAddresses.getLast(), instance.getPublicIpAddress());
+            InOrder order = inOrder(manager, harness.lifecycleManager);
+            order.verify(manager).refreshPublicRouting(instance, "127.0.0.1");
+            order.verify(harness.lifecycleManager).startCreated(eq(TEST_CONTAINER_ID), any(ContainerSpec.class));
+            if (addressChanges) {
+                order.verify(manager).refreshPublicRouting(instance, "192.0.2.10");
+            }
+        } finally {
+            manager.stop();
+        }
+    }
+
     @Test
     void launchWaitsForContainerBridgeIpBeforeRegisteringImds() throws Exception {
         LaunchHarness harness = launchHarness();
