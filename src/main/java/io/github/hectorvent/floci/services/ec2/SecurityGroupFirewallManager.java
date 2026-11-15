@@ -100,7 +100,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     /** A registration burst waits at most this long for its own policies before peers refresh. */
     private static final long COALESCE_NANOS = TimeUnit.SECONDS.toNanos(2);
     private static final long ADMISSION_TIMEOUT_NANOS = TimeUnit.MINUTES.toNanos(5);
-    private Executor peerRefresh = task -> Thread.ofVirtual().name("security-group-peer-refresh").start(task);
+    private final Executor peerRefresh;
     @Inject
     Instance<VpcRoutingManager> vpcRouting;
     @Inject
@@ -127,7 +127,16 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     SecurityGroupFirewallManager(DockerClient dockerClient, ContainerBuilder containerBuilder,
                                  ContainerLifecycleManager lifecycleManager, EmulatorConfig config,
                                  EmbeddedDnsServer embeddedDnsServer, PolicyWriterJournal policyWriters) {
+        this(dockerClient, containerBuilder, lifecycleManager, config, embeddedDnsServer, policyWriters,
+                task -> Thread.ofVirtual().name("security-group-peer-refresh").start(task));
+    }
+
+    SecurityGroupFirewallManager(DockerClient dockerClient, ContainerBuilder containerBuilder,
+                                 ContainerLifecycleManager lifecycleManager, EmulatorConfig config,
+                                 EmbeddedDnsServer embeddedDnsServer, PolicyWriterJournal policyWriters,
+                                 Executor peerRefresh) {
         this.dockerClient = dockerClient;
+        this.peerRefresh = peerRefresh;
         this.policyWriters = policyWriters;
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;

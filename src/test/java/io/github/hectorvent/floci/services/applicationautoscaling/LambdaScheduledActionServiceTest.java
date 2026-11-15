@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.services.applicationautoscaling.model.Schedule
 import io.github.hectorvent.floci.services.applicationautoscaling.model.ScheduledAction.State;
 import io.github.hectorvent.floci.services.applicationautoscaling.model.SuspendedState;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.CloudWatchMetricsService;
+import io.github.hectorvent.floci.services.dynamodb.DynamoDbService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -44,9 +45,14 @@ class LambdaScheduledActionServiceTest {
             capacity.set(call.getArgument(1));
             return null;
         }).when(lambda).setCapacity(eq(RESOURCE), anyInt(), eq(REGION));
+        DynamoDbService dynamoDb = mock(DynamoDbService.class);
+        doAnswer(call -> {
+            call.<DynamoDbRegistrationTarget>getArgument(5).publish();
+            return null;
+        }).when(dynamoDb).reconcileScalableTarget(anyString(), anyString(), anyInt(), anyInt(), anyString(), any());
         service = new ApplicationAutoScalingService(new InMemoryStorage<>(), new InMemoryStorage<>(),
                 new InMemoryStorage<>(), new InMemoryStorage<>(), new RegionResolver(REGION, "000000000000"),
-                mock(CloudWatchMetricsService.class), ecs, lambda);
+                mock(CloudWatchMetricsService.class), ecs, lambda, dynamoDb);
         service.registerScalableTarget("lambda", RESOURCE, DIMENSION, 0, 3, null, null, null, REGION);
         clearInvocations(lambda);
     }

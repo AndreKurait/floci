@@ -360,9 +360,9 @@ public class TlsProxyServer {
                         PublicApiProxySources.Addresses addresses = publicSources.decode(ticket, header.toString());
                         vertx.cancelTimer(timer);
                         if (index + 1 < buffer.length()) {
-                            dispatchPublicApi(socket, buffer.getBuffer(index + 1, buffer.length()), addresses);
+                            dispatchPublicPeer(socket, buffer.getBuffer(index + 1, buffer.length()), addresses);
                         } else {
-                            socket.handler(bytes -> dispatchPublicApi(socket, bytes, addresses));
+                            socket.handler(bytes -> dispatchPublicPeer(socket, bytes, addresses));
                         }
                         return;
                     }
@@ -374,7 +374,11 @@ public class TlsProxyServer {
         });
     }
 
-    private void dispatchPublicApi(NetSocket socket, Buffer buffer, PublicApiProxySources.Addresses addresses) {
+    private void dispatchPublicPeer(NetSocket socket, Buffer buffer, PublicApiProxySources.Addresses addresses) {
+        if (publicAlbTransport(addresses)) {
+            dispatch(socket, buffer, addresses);
+            return;
+        }
         socket.handler(null);
         socket.pause();
         boolean tls = buffer.length() > 0 && buffer.getByte(0) == TLS_HANDSHAKE;
