@@ -41,6 +41,7 @@ import java.io.ByteArrayOutputStream;
 import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -322,9 +323,10 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         }
         try {
             lifecycleManager.removeIfExistsStrict(helper);
-            policyWriters.forget(helper);
-            uncertainPolicyWriters.remove(helper);
             synchronized (this) {
+                // Wait for policy batches and observer quarantine to release their writer leases.
+                policyWriters.forget(helper);
+                uncertainPolicyWriters.remove(helper);
                 forgetHelperCleanup(helper);
             }
             removal.complete(null);
@@ -889,15 +891,19 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     }
 
     /**
-     * Retires a selected batch behind one peer-policy refresh. A failed batch retains per-ENI
+     * Retires a selected batch behind shared peer-policy refreshes. A failed batch retains per-ENI
      * cleanup state so its owner can retry individual retirements.
      */
     public void unregisterAll(List<String> eniIds) {
         retire(retirement -> {
             Set<String> helpers = new LinkedHashSet<>();
+            Map<String, ProtectedEndpoint> capturedEndpoints = new LinkedHashMap<>();
+            Set<String> previousPublicAddresses;
             synchronized (this) {
+                previousPublicAddresses = publicInstanceAddresses();
                 for (String eniId : List.copyOf(eniIds)) {
                     ProtectedEndpoint captured = endpoints.get(eniId);
+                    capturedEndpoints.put(eniId, captured);
                     Set<String> capturedHelpers = new HashSet<>(pendingHelperCleanup.getOrDefault(eniId, Set.of()));
                     if (captured != null) {
                         capturedHelpers.add(captured.helperId());
@@ -907,9 +913,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 retirementPrepared(retirement);
                 reconcileRetirements();
             }
-            for (String helper : helpers) {
-                removeRequestedHelper(helper);
-            }
+            completeUnregister(helpers, capturedEndpoints, previousPublicAddresses);
         });
     }
 
@@ -1006,24 +1010,55 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     private void unregisterCaptured(String eniId, ProtectedEndpoint captured, Set<String> capturedHelpers,
                                     Retirement retirement) {
         Set<String> helpers;
+        Set<String> previousPublicAddresses;
         synchronized (this) {
+            previousPublicAddresses = publicInstanceAddresses();
             helpers = prepareUnregister(eniId, captured, capturedHelpers);
             retirementPrepared(retirement);
             reconcileRetirements();
         }
-        for (String helper : helpers) {
-            removeRequestedHelper(helper);
+        completeUnregister(helpers, Collections.singletonMap(eniId, captured), previousPublicAddresses);
+    }
+
+    private void completeUnregister(Set<String> helpers, Map<String, ProtectedEndpoint> capturedEndpoints,
+                                    Set<String> previousPublicAddresses) {
+        try {
+            for (String helper : helpers) {
+                removeRequestedHelper(helper);
+            }
+            synchronized (this) {
+                capturedEndpoints.forEach(this::unregisterRouting);
+                if (!previousPublicAddresses.equals(publicInstanceAddresses())) {
+                    peerPoliciesNeedRefresh = true;
+                }
+                reconcileRetirements();
+            }
+        } catch (RuntimeException | Error failure) {
+            synchronized (this) {
+                peerPoliciesNeedRefresh = true;
+            }
+            throw failure;
         }
+    }
+
+    private void unregisterRouting(String eniId, ProtectedEndpoint captured) {
+        ProtectedEndpoint current = endpoints.get(eniId);
+        boolean owned = captured != null && current != null && current.dnsOrigin() == captured.dnsOrigin();
+        if ((current == null || owned) && vpcRouting != null && !vpcRouting.isUnsatisfied()) {
+            // A replacement registered while Docker removed the captured helper keeps its routes.
+            vpcRouting.get().unregister(eniId);
+        }
+    }
+
+    private Set<String> publicInstanceAddresses() {
+        return vpcRouting == null || vpcRouting.isUnsatisfied()
+                ? Set.of() : vpcRouting.get().publicInstanceAddresses();
     }
 
     private synchronized Set<String> prepareUnregister(String eniId, ProtectedEndpoint captured,
                                                         Set<String> capturedHelpers) {
         ProtectedEndpoint current = endpoints.get(eniId);
         boolean owned = captured != null && current != null && current.dnsOrigin() == captured.dnsOrigin();
-        if ((current == null || owned) && vpcRouting != null && !vpcRouting.isUnsatisfied()) {
-            // A replacement registered on this ENI after the capture keeps its routes.
-            vpcRouting.get().unregister(eniId);
-        }
         if (owned) {
             endpoints.remove(eniId);
             applied.remove(eniId);

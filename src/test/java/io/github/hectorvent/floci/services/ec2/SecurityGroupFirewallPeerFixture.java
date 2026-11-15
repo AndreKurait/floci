@@ -46,6 +46,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
+import java.util.function.Consumer;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -101,6 +102,7 @@ class SecurityGroupFirewallPeerFixture {
     final List<String> violations = Collections.synchronizedList(new ArrayList<>());
     final ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
     BiConsumer<String, String> beforeInstall = (helper, script) -> {};
+    Consumer<String> beforeStop = helper -> {};
 
     void assertFinal(int count) {
         List<SecurityGroupNftCompiler.Endpoint> all = new ArrayList<>();
@@ -225,6 +227,7 @@ class SecurityGroupFirewallPeerFixture {
                 if (missingHelpers.contains(helper)) {
                     throw new NotFoundException("No such container: " + helper);
                 }
+                beforeStop.accept(helper);
                 stoppedHelpers.add(helper);
                 return null;
             });

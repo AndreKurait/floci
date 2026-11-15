@@ -5,9 +5,7 @@ import com.github.dockerjava.api.model.Container;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.services.ec2.net.VpcNetworkManager;
-import io.github.hectorvent.floci.services.ec2.net.VpcRoutingManager;
 import io.github.hectorvent.floci.services.elbv2.ElbV2VpcNetworkManager;
-import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -20,6 +18,7 @@ import java.util.Optional;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -29,7 +28,6 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -204,15 +202,16 @@ class SecurityGroupFirewallRetirementTest {
             manager.register(fixture.endpoint(index), fixture.helper(index), Map.of());
         }
         fixture.assertFinal(3);
-        VpcRoutingManager routing = mock(VpcRoutingManager.class);
-        @SuppressWarnings("unchecked")
-        Instance<VpcRoutingManager> routingInstance = mock(Instance.class);
-        when(routingInstance.get()).thenReturn(routing);
-        manager.vpcRouting = routingInstance;
-        doThrow(new IllegalStateException("Route retirement failed")).doNothing()
-                .when(routing).unregister("eni-1");
-
-        assertThrows(IllegalStateException.class, () -> manager.unregisterAll(List.of("eni-0", "eni-1")));
+        synchronized (manager) {
+            fixture.failNextInstall.add(fixture.helper(1));
+            AtomicBoolean failStop = new AtomicBoolean(true);
+            fixture.beforeStop = helper -> {
+                if (helper.equals(fixture.helper(1)) && failStop.getAndSet(false)) {
+                    throw new IllegalStateException("Namespace retirement failed");
+                }
+            };
+            assertThrows(IllegalStateException.class, () -> manager.unregisterAll(List.of("eni-0", "eni-1")));
+        }
 
         verifyNoInteractions(fixture.lifecycle);
         manager.unregister("eni-0");
