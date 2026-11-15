@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
+import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -261,5 +262,6 @@ class PolicyWriterJournal {
         }
     }
 
+    @RegisterForReflection
     private record Entry(int version, String owner, String helperId, String state, String execId) {}
 }

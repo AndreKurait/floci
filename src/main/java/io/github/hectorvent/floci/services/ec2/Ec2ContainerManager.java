@@ -827,7 +827,7 @@ public class Ec2ContainerManager {
                     Thread.currentThread().interrupt();
                     failLaunch(instance, leasedPrivateIp);
                 } catch (Exception e) {
-                    LOG.warnv("Failed to launch EC2 instance {0}: {1}", instance.getInstanceId(), e.getMessage());
+                    LOG.warnv(e, "Failed to launch EC2 instance {0}: {1}", instance.getInstanceId(), e.getMessage());
                     // The daemon can disappear between the probe above and any of the calls in
                     // this block. Losing Docker is not the instance's fault, so degrade to a
                     // metadata-only instance; a genuine container failure still fails the launch.
