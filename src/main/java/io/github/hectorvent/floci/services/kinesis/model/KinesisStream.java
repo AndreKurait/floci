@@ -10,6 +10,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 
 @RegisterForReflection
@@ -19,6 +20,8 @@ public class KinesisStream {
     private String streamArn;
     private String accountId;
     private String streamStatus;
+    private String resourcePolicyGeneration;
+    private Map<String, String> resourcePolicies = Map.of();
     private volatile List<KinesisShard> shards = new CopyOnWriteArrayList<>();
     private int retentionPeriodHours = 24;
     private Instant streamCreationTimestamp;
@@ -38,10 +41,41 @@ public class KinesisStream {
     public KinesisStream() {}
 
     public KinesisStream(String streamName, String streamArn) {
+        this.resourcePolicyGeneration = UUID.randomUUID().toString();
         this.streamName = streamName;
         this.streamArn = streamArn;
         this.streamStatus = "ACTIVE";
         this.streamCreationTimestamp = Instant.now();
+    }
+
+    public String getResourcePolicyGeneration() { return resourcePolicyGeneration; }
+    public void setResourcePolicyGeneration(String generation) { this.resourcePolicyGeneration = generation; }
+
+    public Map<String, String> getResourcePolicies() { return resourcePolicies; }
+    public void setResourcePolicies(Map<String, String> policies) {
+        this.resourcePolicies = policies == null ? Map.of() : Map.copyOf(policies);
+    }
+
+    /** Detached policy replacement; callers hold the stream lock shared by all metadata writers. */
+    public KinesisStream withResourcePolicies(Map<String, String> policies) {
+        KinesisStream copy = new KinesisStream();
+        copy.streamName = streamName;
+        copy.streamArn = streamArn;
+        copy.accountId = accountId;
+        copy.streamStatus = streamStatus;
+        copy.resourcePolicyGeneration = resourcePolicyGeneration;
+        copy.setResourcePolicies(policies);
+        copy.shards = shards;
+        copy.retentionPeriodHours = retentionPeriodHours;
+        copy.streamCreationTimestamp = streamCreationTimestamp;
+        copy.tags = tags;
+        copy.encryptionType = encryptionType;
+        copy.keyId = keyId;
+        copy.streamMode = streamMode;
+        copy.enhancedMonitoringMetrics = enhancedMonitoringMetrics;
+        copy.maxRecordSizeInKiB = maxRecordSizeInKiB;
+        copy.shardCountUpdateTimestamps = shardCountUpdateTimestamps;
+        return copy;
     }
 
     public String getStreamName() { return streamName; }

@@ -24,6 +24,7 @@ import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.ResourceArnBuilder;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.iam.model.IamUser;
+import io.github.hectorvent.floci.services.kinesis.KinesisService;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambdaweb.LambdaWebService;
 import io.github.hectorvent.floci.services.s3.S3ControlTagConditionKeys;
@@ -115,6 +116,7 @@ public class IamConditionContextResolver {
     private final Instance<IamService> iamService;
     private final Instance<LambdaWebService> lambdaWebService;
     private final Instance<LambdaService> lambdaService;
+    private final Instance<KinesisService> kinesisService;
     private final Instance<SsmService> ssmService;
     private final Instance<ElbV2ConditionKeys> elbV2ConditionKeys;
     private final RequestContext requestContext;
@@ -143,10 +145,12 @@ public class IamConditionContextResolver {
                                        Instance<ElbV2ConditionKeys> elbV2ConditionKeys,
                                        Instance<AmazonMqConfigurationService> mqConfigurations,
                                        Instance<LambdaService> lambdaService,
-                                       Instance<AthenaPreparedStatementService> athenaPreparedStatements) {
+                                       Instance<AthenaPreparedStatementService> athenaPreparedStatements,
+                                       Instance<KinesisService> kinesisService) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
                 config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService,
-                elbV2ConditionKeys, mqConfigurations, lambdaService, athenaPreparedStatements);
+                elbV2ConditionKeys, mqConfigurations, lambdaService, athenaPreparedStatements,
+                kinesisService);
     }
 
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -162,7 +166,8 @@ public class IamConditionContextResolver {
                                        Instance<SsmService> ssmService,
                                        Instance<ElbV2ConditionKeys> elbV2ConditionKeys) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys, null, null, null);
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), ssmService, elbV2ConditionKeys, null, null, null,
+                null);
     }
 
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -176,7 +181,8 @@ public class IamConditionContextResolver {
                                        CurrentVertxRequest currentVertxRequest,
                                        ResolvedServiceCatalog serviceCatalog) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), null, null, null, null, null);
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), null, null, null, null, null,
+                null);
     }
 
     IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -190,7 +196,8 @@ public class IamConditionContextResolver {
                                 CurrentVertxRequest currentVertxRequest,
                                 ResolvedServiceCatalog serviceCatalog, Clock clock) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, iamService, lambdaWebService, requestContext,
-                config, currentVertxRequest, serviceCatalog, clock, null, null, null, null, null);
+                config, currentVertxRequest, serviceCatalog, clock, null, null, null, null, null,
+                null);
     }
 
     private IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
@@ -207,7 +214,8 @@ public class IamConditionContextResolver {
                                         Instance<ElbV2ConditionKeys> elbV2ConditionKeys,
                                         Instance<AmazonMqConfigurationService> mqConfigurations,
                                         Instance<LambdaService> lambdaService,
-                                        Instance<AthenaPreparedStatementService> athenaPreparedStatements) {
+                                        Instance<AthenaPreparedStatementService> athenaPreparedStatements,
+                                        Instance<KinesisService> kinesisService) {
         this.mqConfigurations = mqConfigurations;
         this.lambdaService = lambdaService;
         this.athenaPreparedStatements = athenaPreparedStatements;
@@ -224,6 +232,7 @@ public class IamConditionContextResolver {
         this.currentVertxRequest = currentVertxRequest;
         this.clock = clock;
         this.serviceCatalog = serviceCatalog;
+        this.kinesisService = kinesisService;
     }
 
     private Map<String, List<String>> athenaPreparedStatementConditions(String action, ContainerRequestContext ctx) {
@@ -244,6 +253,26 @@ public class IamConditionContextResolver {
         }
     }
 
+    private Map<String, List<String>> kinesisConditionContext(String action, ContainerRequestContext ctx) {
+        if (kinesisService == null || !kinesisService.isResolvable() || !Set.of("kinesis:GetResourcePolicy",
+                "kinesis:PutResourcePolicy", "kinesis:DeleteResourcePolicy").contains(action)) {
+            return null;
+        }
+        JsonNode body = bufferedJsonBody(ctx);
+        if (body == null || !body.path("ResourceARN").isTextual()) {
+            return null;
+        }
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        Map<String, List<String>> context = new LinkedHashMap<>();
+        try {
+            kinesisService.get().resourcePolicyTags(body.path("ResourceARN").textValue(), region)
+                    .forEach((key, value) -> context.put(RESOURCE_TAG_PREFIX + key, List.of(value)));
+        } catch (AwsException expected) {
+            // Missing or foreign resources provide no tags; the handler returns its resource error if authorized.
+        }
+        return context;
+    }
+
     public Map<String, List<String>> resolve(String credentialScope, String action,
                                              ContainerRequestContext ctx) {
         return switch (credentialScope) {
@@ -258,6 +287,7 @@ public class IamConditionContextResolver {
             case "lambda" -> lambdaConditionContext(action, ctx);
             case "ssm" -> ssmSyncConditionContext(action, ctx);
             case "athena" -> athenaPreparedStatementConditions(action, ctx);
+            case "kinesis" -> kinesisConditionContext(action, ctx);
             case "redshift" -> redshiftConditionContext(action, ctx);
             case "states" -> stepFunctionsConditionContext(action, ctx);
             default -> null;
