@@ -8,7 +8,6 @@ import io.quarkus.test.junit.TestProfile;
 import io.restassured.http.ContentType;
 import io.restassured.response.Response;
 import org.junit.jupiter.api.AfterAll;
-import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
@@ -22,8 +21,11 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 
 import static io.restassured.RestAssured.given;
+import static org.awaitility.Awaitility.await;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.*;
 
 /** End-to-end: HTTP API → ALB listener ARN → ELBv2 data plane → registered stub target. */
@@ -37,6 +39,9 @@ class ApiGatewayV2AlbIntegrationTest {
 
     /** Fixed listener port. Distinct from {@code ElbV2LambdaTargetIntegrationTest} (7780). */
     private static final int LISTENER_PORT = 7792;
+    /** The listener socket opens asynchronously after the control-plane call returns. */
+    private static final Duration LISTENER_READY_TIMEOUT = Duration.ofSeconds(15);
+    private static final Duration LISTENER_POLL_INTERVAL = Duration.ofMillis(25);
 
     private static HttpServer stub;
     private static int stubPort;
@@ -246,25 +251,20 @@ class ApiGatewayV2AlbIntegrationTest {
 
     @Test
     @Order(10)
-    void listenerForwardsDirectlyToStub() throws Exception {
+    void listenerForwardsDirectlyToStub() {
         // Verifies the ALB data plane independently of the API Gateway path: hit the
         // listener directly. Polls because server.listen() is async — if the listener
         // never accepts a connection we get a fast ConnectException and retry.
-        long deadline = System.currentTimeMillis() + 15_000;
-        Exception lastErr = null;
-        while (System.currentTimeMillis() < deadline) {
-            try {
-                RawHttpResponse resp = rawGetWithHost("/health", lbDnsName);
-                if (resp.statusCode() == 200 && resp.body().contains("\"status\":\"ok\"")) {
-                    return;
-                }
-                lastErr = new IllegalStateException("status=" + resp.statusCode() + " body=" + resp.body());
-            } catch (Exception e) {
-                lastErr = e;
-            }
-            Thread.sleep(250);
-        }
-        Assertions.fail("listener direct probe never succeeded: " + lastErr);
+        await().alias("listener direct probe")
+                .atMost(LISTENER_READY_TIMEOUT)
+                .pollDelay(Duration.ZERO)
+                .pollInterval(LISTENER_POLL_INTERVAL)
+                .ignoreExceptionsInstanceOf(IOException.class)
+                .untilAsserted(() -> {
+                    RawHttpResponse resp = rawGetWithHost("/health", lbDnsName);
+                    assertThat(resp.statusCode(), equalTo(200));
+                    assertThat(resp.body(), containsString("\"status\":\"ok\""));
+                });
     }
 
     private static RawHttpResponse rawGetWithHost(String path, String host) throws IOException {
@@ -314,21 +314,15 @@ class ApiGatewayV2AlbIntegrationTest {
     void executeApiReachesStubViaAlb() {
         // Now go through the actual HttpAlbIntegration path: dispatchHttpProxyV2 must
         // detect the listener ARN, resolve it to the bound port, and forward to it.
-        Response last = null;
-        long deadline = System.currentTimeMillis() + 15_000;
-        while (System.currentTimeMillis() < deadline) {
-            last = given().when().get("/execute-api/" + apiId + "/$default/health");
-            if (last.statusCode() == 200) {
-                last.then()
+        await().alias("execute-api → ALB → stub")
+                .atMost(LISTENER_READY_TIMEOUT)
+                .pollDelay(Duration.ZERO)
+                .pollInterval(LISTENER_POLL_INTERVAL)
+                .untilAsserted(() -> given().when().get("/execute-api/" + apiId + "/$default/health")
+                        .then()
+                        .statusCode(200)
                         .body("status", equalTo("ok"))
-                        .body("path", equalTo("/health"));
-                return;
-            }
-            try { Thread.sleep(200); } catch (InterruptedException e) { Thread.currentThread().interrupt(); break; }
-        }
-        Assertions.fail("execute-api → ALB → stub never returned 200; last status="
-                + (last != null ? last.statusCode() : "n/a")
-                + " body=" + (last != null ? last.body().asString() : "n/a"));
+                        .body("path", equalTo("/health")));
     }
 
     @Test
