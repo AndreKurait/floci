@@ -210,9 +210,10 @@ public class WebIdentityTrustPolicyEvaluator {
         }
 
         return switch (operator) {
-            case "StringEquals" -> actual.stream().anyMatch(expectedValues::contains);
+            case "StringEquals", "ForAnyValue:StringEquals" -> actual.stream().anyMatch(expectedValues::contains);
+            case "ForAllValues:StringEquals" -> actual.stream().allMatch(expectedValues::contains);
             case "StringNotEquals" -> actual.stream().noneMatch(expectedValues::contains);
-            case "StringLike" -> actual.stream().anyMatch(
+            case "StringLike", "ForAnyValue:StringLike" -> actual.stream().anyMatch(
                     a -> expectedValues.stream().anyMatch(e -> IamPolicyEvaluator.caseSensitiveGlobMatches(e, a)));
             case "StringNotLike" -> actual.stream().noneMatch(
                     a -> expectedValues.stream().anyMatch(e -> IamPolicyEvaluator.caseSensitiveGlobMatches(e, a)));

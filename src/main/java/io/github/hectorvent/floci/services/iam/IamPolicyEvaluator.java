@@ -161,6 +161,7 @@ public class IamPolicyEvaluator {
                              String action,
                              String resource,
                              Map<String, List<String>> conditionCtx) {
+        conditionCtx = verifiedContext(caller, conditionCtx);
         String principalArn = caller != null ? caller.principalArn() : null;
         ResourcePolicyDecision resourceDecision = evaluateResourcePolicy(
                 resourcePolicies, principalArn, action, resource, conditionCtx);
@@ -201,7 +202,7 @@ public class IamPolicyEvaluator {
             String action,
             String resource,
             Map<String, List<String>> conditionCtx) {
-        Map<String, List<String>> ctx = normalizeConditionContext(conditionCtx);
+        Map<String, List<String>> ctx = normalizeConditionContext(verifiedContext(caller, conditionCtx));
         List<PolicyStatement> identityStmts = parseAll(caller.identityPolicies());
         List<PolicyStatement> sessionStmts = caller.sessionPolicyDocuments().isEmpty()
                 ? null : parseAll(caller.sessionPolicyDocuments());
@@ -261,6 +262,9 @@ public class IamPolicyEvaluator {
             Map<String, List<String>> conditionCtx) {
         if (resourcePolicies == null || resourcePolicies.isEmpty()) {
             return ResourcePolicyDecision.NEUTRAL;
+        }
+        if (principal != null && principal.verifiedIdentityContext() != null) {
+            conditionCtx = principal.verifiedIdentityContext().mergeInto(conditionCtx);
         }
         Map<String, List<String>> ctx = normalizeConditionContext(conditionCtx);
         String loweredAction = lowercase(action);
@@ -375,7 +379,7 @@ public class IamPolicyEvaluator {
                                                       String action,
                                                       String resource,
                                                       Map<String, List<String>> conditionCtx) {
-        Map<String, List<String>> ctx = normalizeConditionContext(conditionCtx);
+        Map<String, List<String>> ctx = normalizeConditionContext(verifiedContext(caller, conditionCtx));
         String loweredAction = lowercase(action);
         List<PolicyStatement> identityStmts = parseAll(caller.identityPolicies());
         List<PolicyStatement> sessionStmts = caller.sessionPolicyDocuments().isEmpty()
@@ -1851,5 +1855,11 @@ public class IamPolicyEvaluator {
             }
         }
         return list;
+    }
+
+    private static Map<String, List<String>> verifiedContext(CallerContext caller,
+                                                             Map<String, List<String>> supplied) {
+        return caller == null || caller.verifiedIdentityContext() == null ? supplied
+                : caller.verifiedIdentityContext().mergeInto(supplied);
     }
 }

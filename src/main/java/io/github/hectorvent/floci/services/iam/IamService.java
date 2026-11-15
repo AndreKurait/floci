@@ -49,6 +49,7 @@ import io.github.hectorvent.floci.services.iam.model.ServiceSpecificCredential;
 import io.github.hectorvent.floci.services.iam.model.SessionCredential;
 import io.github.hectorvent.floci.services.iam.model.SigningCertificate;
 import io.github.hectorvent.floci.services.iam.model.SshPublicKey;
+import io.github.hectorvent.floci.services.iam.model.VerifiedIdentityContext;
 import io.github.hectorvent.floci.services.iam.model.VirtualMfaDevice;
 import io.quarkus.runtime.Startup;
 import jakarta.annotation.PostConstruct;
@@ -5189,6 +5190,31 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         putSessionForAccount(accountId, accessKeyId, session);
     }
 
+    /** Registers a verified Cognito identity with the same real credential and policy path as STS. */
+    public void registerCognitoIdentitySession(String ownerAccountId, String accessKeyId, String secretKey,
+                                               String sessionToken, String roleArn, Instant expiration,
+                                               String policy, String originAccountId, String sessionName,
+                                               String assumedRoleId, Map<String, List<String>> claims) {
+        SessionCredential session = new SessionCredential(accessKeyId, secretKey, sessionToken, roleArn,
+                expiration, policy, originAccountId);
+        session.setRoleSessionName(sessionName);
+        session.setAssumedRoleId(assumedRoleId);
+        session.setCognitoIdentityClaims(claims);
+        putSessionForAccount(ownerAccountId, accessKeyId, session);
+    }
+
+    public Map<String, List<String>> cognitoIdentityContext(String accessKeyId) {
+        if (accessKeyId == null) {
+            return Map.of();
+        }
+        return currentSession(accessKeyId).map(session -> {
+            Map<String, List<String>> context = new LinkedHashMap<>();
+            session.getCognitoIdentityClaims().forEach((key, value) ->
+                    context.put(ServicePrincipals.of("cognito-identity") + ":" + key, value));
+            return Map.copyOf(context);
+        }).orElse(Map.of());
+    }
+
     private void putSessionForAccount(String accountId, String sessionAccessKeyId, SessionCredential session) {
         recordSessionIssueTime(session);
         if (sessions instanceof AccountAwareStorageBackend<SessionCredential> aware) {
@@ -5694,7 +5720,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             String userName = akOpt.get().getUserName();
             List<String> identityPolicies = userIdentityPolicies(userName);
             String boundaryDoc = resolveUserBoundaryDocument(userName);
-            return new CallerContext(identityPolicies, null, boundaryDoc);
+            return new CallerContext(identityPolicies, null, boundaryDoc)
+                    .withVerifiedIdentityContext(new VerifiedIdentityContext(Map.of()));
         }
 
         // Check assumed-role sessions. These can be stored under the account that minted the
@@ -5707,42 +5734,48 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 return null; // expired — unknown key → bypass
             }
 
-            if (session.getDelegatedApproverArn() != null) {
-                return delegatedApproverContext(session);
-            }
-            if (isFederatedUserSession(session)) {
-                return withFederatedUserLimits(federatedUserContext(session))
-                        .withManagedSessionPolicies(managedSessionPolicyDocuments(session));
-            }
-            if (session.getRoleArn() == null) {
-                if (session.getPresignedAction() != null) {
-                    // A locally minted identity session can carry a restrictive session policy.
-                    return session.getSessionPolicyDocument() == null ? null
-                            : new CallerContext(List.of(SCOPED_IDENTITY_SESSION_BASE_POLICY),
-                                    session.getSessionPolicyDocument(), null);
-                }
-                return sessionTokenContext(session);
-            }
-            if (isAccountRootArn(session.getRoleArn())) {
-                // A privileged session (AssumeRoot) acts as the member account's root user, which
-                // no identity policy grants and none denies: collecting role policies for a root
-                // ARN finds none, which would refuse everything. What scopes it is its task
-                // policy, and the five AWS publishes for the purpose carry Deny statements only,
-                // so it is read beside the root's own allow-all rather than as a session policy,
-                // where an intersection with nothing to allow would refuse everything too.
-                return new CallerContext(session.getSessionPolicyDocument() == null
-                        ? List.of(SCOPED_IDENTITY_SESSION_BASE_POLICY)
-                        : List.of(SCOPED_IDENTITY_SESSION_BASE_POLICY, session.getSessionPolicyDocument()),
-                        null, null);
-            }
-            List<String> identityPolicies = collectRolePolicies(session.getRoleArn());
-            String boundaryDoc = resolveRoleBoundaryDocument(session.getRoleArn());
-            return new CallerContext(identityPolicies, session.getSessionPolicyDocument(), boundaryDoc)
-                    .withManagedSessionPolicies(managedSessionPolicyDocuments(session));
+            CallerContext caller = sessionCallerContext(session);
+            return caller == null ? null : caller.withVerifiedIdentityContext(
+                    new VerifiedIdentityContext(session.getCognitoIdentityClaims()));
         }
 
         // Unknown key — bypass
         return null;
+    }
+
+    private CallerContext sessionCallerContext(SessionCredential session) {
+        if (session.getDelegatedApproverArn() != null) {
+            return delegatedApproverContext(session);
+        }
+        if (isFederatedUserSession(session)) {
+            return withFederatedUserLimits(federatedUserContext(session))
+                    .withManagedSessionPolicies(managedSessionPolicyDocuments(session));
+        }
+        if (session.getRoleArn() == null) {
+            if (session.getPresignedAction() != null) {
+                // A locally minted identity session can carry a restrictive session policy.
+                return session.getSessionPolicyDocument() == null ? null
+                        : new CallerContext(List.of(SCOPED_IDENTITY_SESSION_BASE_POLICY),
+                                session.getSessionPolicyDocument(), null);
+            }
+            return sessionTokenContext(session);
+        }
+        if (isAccountRootArn(session.getRoleArn())) {
+            // A privileged session (AssumeRoot) acts as the member account's root user, which
+            // no identity policy grants and none denies: collecting role policies for a root
+            // ARN finds none, which would refuse everything. What scopes it is its task
+            // policy, and the five AWS publishes for the purpose carry Deny statements only,
+            // so it is read beside the root's own allow-all rather than as a session policy,
+            // where an intersection with nothing to allow would refuse everything too.
+            return new CallerContext(session.getSessionPolicyDocument() == null
+                    ? List.of(SCOPED_IDENTITY_SESSION_BASE_POLICY)
+                    : List.of(SCOPED_IDENTITY_SESSION_BASE_POLICY, session.getSessionPolicyDocument()),
+                    null, null);
+        }
+        List<String> identityPolicies = collectRolePolicies(session.getRoleArn());
+        String boundaryDoc = resolveRoleBoundaryDocument(session.getRoleArn());
+        return new CallerContext(identityPolicies, session.getSessionPolicyDocument(), boundaryDoc)
+                .withManagedSessionPolicies(managedSessionPolicyDocuments(session));
     }
 
     /**
@@ -5860,7 +5893,15 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     public record CallerArns(String callerArn, String principalArn, String principalType,
                              String userId, String userName, boolean permissionsBoundary, Instant tokenIssueTime,
                              Map<String, String> principalTags, Boolean multiFactorAuthPresent, Long multiFactorAuthAge,
-                             String sourceIdentity) {
+                             String sourceIdentity, VerifiedIdentityContext verifiedIdentityContext) {
+
+        public CallerArns(String callerArn, String principalArn, String principalType,
+                          String userId, String userName, boolean permissionsBoundary, Instant tokenIssueTime,
+                          Map<String, String> principalTags, Boolean multiFactorAuthPresent, Long multiFactorAuthAge,
+                          String sourceIdentity) {
+            this(callerArn, principalArn, principalType, userId, userName, permissionsBoundary, tokenIssueTime,
+                    principalTags, multiFactorAuthPresent, multiFactorAuthAge, sourceIdentity, null);
+        }
 
         public CallerArns(String callerArn, String principalArn, String principalType,
                           String userId, String userName, boolean permissionsBoundary, Instant tokenIssueTime,
@@ -5872,7 +5913,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         public CallerArns withSourceIdentity(String value) {
             return new CallerArns(callerArn, principalArn, principalType, userId, userName,
                     permissionsBoundary, tokenIssueTime, principalTags, multiFactorAuthPresent,
-                    multiFactorAuthAge, value);
+                    multiFactorAuthAge, value, verifiedIdentityContext);
         }
 
         public CallerArns(String callerArn, String principalArn, String principalType,
@@ -5896,7 +5937,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         public CallerArns withMultiFactorAuthPresent(Boolean present) {
             return new CallerArns(callerArn, principalArn, principalType, userId, userName,
                     permissionsBoundary, tokenIssueTime, principalTags, present,
-                    Boolean.TRUE.equals(present) ? multiFactorAuthAge : null, sourceIdentity);
+                    Boolean.TRUE.equals(present) ? multiFactorAuthAge : null, sourceIdentity, verifiedIdentityContext);
         }
 
         public CallerArns(String callerArn, String principalArn, String principalType, String userId,
@@ -5907,7 +5948,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
 
         public CallerArns withPrincipalTags(Map<String, String> tags) {
             return new CallerArns(callerArn, principalArn, principalType, userId, userName,
-                    permissionsBoundary, tokenIssueTime, tags, multiFactorAuthPresent, multiFactorAuthAge, sourceIdentity);
+                    permissionsBoundary, tokenIssueTime, tags, multiFactorAuthPresent, multiFactorAuthAge, sourceIdentity, verifiedIdentityContext);
         }
 
         /**
@@ -5945,12 +5986,12 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
 
         public CallerArns withTokenIssueTime(Instant issuedAt) {
             return new CallerArns(callerArn, principalArn, principalType, userId, userName,
-                    permissionsBoundary, issuedAt, principalTags, multiFactorAuthPresent, multiFactorAuthAge, sourceIdentity);
+                    permissionsBoundary, issuedAt, principalTags, multiFactorAuthPresent, multiFactorAuthAge, sourceIdentity, verifiedIdentityContext);
         }
 
         public CallerArns withMultiFactorAuthAge(Long age) {
             return new CallerArns(callerArn, principalArn, principalType, userId, userName,
-                    permissionsBoundary, tokenIssueTime, principalTags, multiFactorAuthPresent, age, sourceIdentity);
+                    permissionsBoundary, tokenIssueTime, principalTags, multiFactorAuthPresent, age, sourceIdentity, verifiedIdentityContext);
         }
 
         /** A caller with no permissions boundary attached. */
@@ -5998,6 +6039,17 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             if (userName != null) {
                 context.put("aws:username", List.of(userName));
             }
+            if (verifiedIdentityContext != null) {
+                Map<String, List<String>> verified = verifiedIdentityContext.mergeInto(context);
+                context.clear();
+                context.putAll(verified);
+            }
+        }
+
+        public CallerArns withVerifiedIdentityContext(VerifiedIdentityContext context) {
+            return new CallerArns(callerArn, principalArn, principalType, userId, userName,
+                    permissionsBoundary, tokenIssueTime, principalTags, multiFactorAuthPresent, multiFactorAuthAge,
+                    sourceIdentity, context);
         }
     }
 
@@ -6053,7 +6105,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
 
         Optional<AccessKey> akOpt = accessKeys.get(accessKeyId);
         if (akOpt.isPresent()) {
-            return users.get(akOpt.get().getUserName()).map(IamService::callerForUser);
+            return users.get(akOpt.get().getUserName()).map(IamService::callerForUser)
+                    .map(arns -> arns.withVerifiedIdentityContext(new VerifiedIdentityContext(Map.of())));
         }
 
         Optional<SessionCredential> sessionOpt = findSessionForCallerContext(accessKeyId);
@@ -6064,7 +6117,9 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 deleteSession(accessKeyId, session);
                 return Optional.empty();
             }
-            return sessionCallerArns(session).map(arns -> arns.withSourceIdentity(session.getSourceIdentity())
+            return sessionCallerArns(session).map(arns -> arns
+                    .withVerifiedIdentityContext(new VerifiedIdentityContext(session.getCognitoIdentityClaims()))
+                    .withSourceIdentity(session.getSourceIdentity())
                     .withTokenIssueTime(session.getIssuedAt())
                     .withMultiFactorAuthPresent(session.getMultiFactorAuthPresent())
                     .withMultiFactorAuthAge(Boolean.TRUE.equals(session.getMultiFactorAuthPresent())

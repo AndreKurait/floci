@@ -1,5 +1,7 @@
 package io.github.hectorvent.floci.services.iam;
 
+import io.github.hectorvent.floci.services.iam.model.VerifiedIdentityContext;
+
 /**
  * Who a request comes from, as a resource policy's {@code Principal} element sees it. Each kind is
  * matched only by the principal types that can name it (IAM User Guide, "AWS JSON policy elements:
@@ -18,7 +20,12 @@ package io.github.hectorvent.floci.services.iam;
  *                         Deny's {@code NotPrincipal} never spares
  */
 public record RequestPrincipal(Type type, String arn, String roleArn, String servicePrincipal,
-                               boolean permissionsBoundary) {
+                               boolean permissionsBoundary, VerifiedIdentityContext verifiedIdentityContext) {
+
+    public RequestPrincipal(Type type, String arn, String roleArn, String servicePrincipal,
+                            boolean permissionsBoundary) {
+        this(type, arn, roleArn, servicePrincipal, permissionsBoundary, null);
+    }
 
     public enum Type { IAM, SERVICE, ANONYMOUS }
 
@@ -44,7 +51,7 @@ public record RequestPrincipal(Type type, String arn, String roleArn, String ser
         }
         return new RequestPrincipal(Type.IAM, callerArns.callerArn(),
                 callerArns.callerArn().equals(callerArns.principalArn()) ? null : callerArns.principalArn(),
-                null, callerArns.permissionsBoundary());
+                null, callerArns.permissionsBoundary(), callerArns.verifiedIdentityContext());
     }
 
     /** An AWS service acting on its own behalf, such as SNS delivering to a queue. */
