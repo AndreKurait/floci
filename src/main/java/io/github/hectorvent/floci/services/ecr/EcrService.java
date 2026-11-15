@@ -688,6 +688,20 @@ public class EcrService implements ResourceProvider {
     // GetAuthorizationToken
     // ============================================================
 
+    public List<AuthorizationData> getAuthorizationToken(List<String> registryIds) {
+        if (registryIds == null) {
+            return List.of(getAuthorizationToken());
+        }
+        if (registryIds.isEmpty() || registryIds.size() > 10
+                || registryIds.stream().anyMatch(id -> id == null || !id.matches("[0-9]{12}"))) {
+            throw new AwsException("InvalidParameterException", "registryIds must contain 1 to 10 twelve-digit account IDs", 400);
+        }
+        String token = Base64.getEncoder().encodeToString("AWS:floci".getBytes(StandardCharsets.UTF_8));
+        Instant expires = Instant.now().plusSeconds(12 * 60 * 60);
+        return registryIds.stream().map(account -> new AuthorizationData(token, expires,
+                registryManager.getProxyEndpoint(account, regionResolver.getRegion()))).toList();
+    }
+
     public AuthorizationData getAuthorizationToken() {
         // Deliberately not gated on the backing registry: AWS answers this call from the
         // control plane, and both values here are computed without Docker. Gating it made

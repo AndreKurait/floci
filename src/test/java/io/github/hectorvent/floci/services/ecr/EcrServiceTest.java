@@ -2419,4 +2419,24 @@ class EcrServiceTest {
                 new InMemoryStorage<>(), store, registryManager, Mockito.mock(EmulatorConfig.class),
                 new RegionResolver(REGION, ACCOUNT));
     }
+    @Test
+    void requestedRegistryIdsEachReceiveTheirOwnEndpointWithoutStartingRegistry() {
+        when(registryManager.getProxyEndpoint("111111111111", REGION)).thenReturn("https://111111111111.dkr.ecr.us-east-1.amazonaws.com");
+        when(registryManager.getProxyEndpoint("222222222222", REGION)).thenReturn("https://222222222222.dkr.ecr.us-east-1.amazonaws.com");
+        List<AuthorizationData> tokens = service.getAuthorizationToken(List.of("111111111111", "222222222222"));
+        assertEquals(2, tokens.size());
+        assertTrue(tokens.get(0).getProxyEndpoint().contains("111111111111"));
+        assertTrue(tokens.get(1).getProxyEndpoint().contains("222222222222"));
+        Mockito.verify(registryManager, Mockito.never()).ensureStarted();
+    }
+
+    @Test
+    void invalidRegistryIdListsFailBeforeRegistryAccess() {
+        for (List<String> ids : List.of(List.<String>of(), List.of("bad"), List.of("12345678901"),
+                Collections.nCopies(11, "111111111111"))) {
+            assertThrows(AwsException.class, () -> service.getAuthorizationToken(ids));
+        }
+        Mockito.verify(registryManager, Mockito.never()).getProxyEndpoint(anyString(), anyString());
+    }
+
 }

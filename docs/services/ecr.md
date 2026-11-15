@@ -327,3 +327,15 @@ See [Docker's bridge network documentation](https://docs.docker.com/engine/netwo
 **Disk not reclaimed after deleting images.** Deleting the last tag of an image, or deleting by digest, removes its manifest, but blobs remain on disk until garbage collection runs. Trigger it with `curl -X POST http://localhost:4566/_floci/ecr/gc`. The endpoint runs `registry garbage-collect` inside the backing container and returns the reclaimed blob list. The operation is serialized: ECR API calls block for its duration (typically a few seconds).
 
 **`*.localhost` does not resolve to loopback on this platform.** Set `floci.services.ecr.uri-style: path` to fall back to `localhost:<port>/<account>/<region>/<repo>` URIs.
+
+### Native registry addresses
+
+Set `FLOCI_SERVICES_ECR_NATIVE_URI=true` to return partition-aware AWS registry
+hostnames for repository URIs and authorization proxy endpoints. The endpoint uses
+HTTPS on port 443, matching native container-image references. This option changes
+advertised addresses only: supply private DNS and a trusted TLS route from every
+Docker client/daemon to Floci. It does not publish ports, install certificates,
+change public DNS, or disable TLS verification. The default remains the existing
+localhost registry addresses; native addresses take precedence over URI style.
+`GetAuthorizationToken` returns an endpoint for each requested `registryIds` account
+in the request region; omitting the list selects the caller's registry.
