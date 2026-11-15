@@ -19,7 +19,7 @@ class SecurityGroupFirewallRetirementRaceTest extends SecurityGroupFirewallPeerF
         beforeInstall = (helper, script) -> {
             if (helper.equals(helper(0))) {
                 missingHelpers.add(helper);
-                installed.remove(helper);
+                // Joined workloads retain the namespace and its last nft policy after helper removal.
             }
         };
 
@@ -37,7 +37,7 @@ class SecurityGroupFirewallRetirementRaceTest extends SecurityGroupFirewallPeerF
         beforeInstall = (helper, script) -> {
             if (script.contains("add rule") && !helper.equals(helper(2))) {
                 missingHelpers.add(helper);
-                installed.remove(helper);
+                // Joined workloads retain the namespace and its last nft policy after helper removal.
             }
         };
 

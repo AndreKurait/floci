@@ -129,7 +129,7 @@ class SecurityGroupFirewallPeerFixture {
                 lifecycle, config, dns);
     }
 
-    private DockerClient docker() {
+    DockerClient docker() {
         DockerClient docker = mock(DockerClient.class);
         when(docker.copyArchiveToContainerCmd(anyString())).thenAnswer(invocation -> {
             String helper = invocation.getArgument(0);
@@ -162,12 +162,14 @@ class SecurityGroupFirewallPeerFixture {
         InspectExecCmd inspectExec = mock(InspectExecCmd.class);
         InspectExecResponse exited = mock(InspectExecResponse.class);
         when(exited.getExitCodeLong()).thenReturn(0L);
+        when(exited.isRunning()).thenReturn(false);
         when(inspectExec.exec()).thenReturn(exited);
         when(docker.inspectExecCmd("exec")).thenReturn(inspectExec);
         when(docker.inspectContainerCmd(anyString())).thenAnswer(invocation -> {
             String helper = invocation.getArgument(0);
             InspectContainerCmd inspect = mock(InspectContainerCmd.class);
             InspectContainerResponse response = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
+            when(response.getId()).thenReturn(helper);
             when(response.getState().getRunning()).thenReturn(!stoppedHelpers.contains(helper));
             Map<String, ContainerNetwork> networks = containerNetworks.get(helper);
             if (networks != null) {
