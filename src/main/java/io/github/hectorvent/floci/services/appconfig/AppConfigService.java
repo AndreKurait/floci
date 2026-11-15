@@ -692,6 +692,17 @@ public class AppConfigService implements Resettable {
                 content, contentType, description, null, null);
     }
 
+    public HostedConfigurationVersion createHostedConfigurationVersion(String applicationIdentifier,
+                                                                         String profileIdentifier,
+                                                                         byte[] content,
+                                                                         String contentType,
+                                                                         String description,
+                                                                         String versionLabel,
+                                                                         Integer latestVersionNumber) {
+        return createHostedConfigurationVersion(applicationIdentifier, profileIdentifier,
+                content, contentType, description, null, null);
+    }
+
     public synchronized HostedConfigurationVersion createHostedConfigurationVersion(String applicationIdentifier,
                                                                          String profileIdentifier,
                                                                          byte[] content,
