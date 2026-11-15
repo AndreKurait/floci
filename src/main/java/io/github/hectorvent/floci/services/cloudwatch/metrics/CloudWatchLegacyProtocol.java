@@ -28,6 +28,7 @@ final class CloudWatchLegacyProtocol {
      * console's API is known to give them the same shapes.
      */
     private static final Map<String, Set<String>> MEMBERS = Map.of(
+            "PutMetricData", Set.of("Namespace", "MetricData"),
             "ListMetrics", Set.of("Namespace", "MetricName", "Dimensions", "NextToken"),
             "DescribeAlarms", Set.of("AlarmNames", "AlarmNamePrefix", "MaxRecords", "NextToken"),
             "GetMetricStatistics", Set.of("Namespace", "MetricName", "Dimensions", "StartTime", "EndTime",
