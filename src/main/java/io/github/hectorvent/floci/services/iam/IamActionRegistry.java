@@ -697,6 +697,12 @@ public class IamActionRegistry {
                 && resourceInfo.getResourceMethod() != null) {
             return MQ_CONFIGURATION_ACTIONS.get(resourceInfo.getResourceMethod().getName());
         }
+        if ("apigateway".equals(credentialScope) && resourceInfo != null
+                && ApiGatewayController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && "testInvokeMethod".equals(resourceInfo.getResourceMethod().getName())) {
+            return "apigateway:POST";
+        }
         if ("iot".equals(credentialScope) && resourceInfo != null
                 && IotController.class.equals(resourceInfo.getResourceClass())
                 && resourceInfo.getResourceMethod() != null
