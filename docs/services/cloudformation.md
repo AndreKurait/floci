@@ -408,6 +408,10 @@ configuration requires a new `LaunchConfigurationName`. The old configuration re
 until dependent groups switch and the stack update commits. A failed update restores the prior
 configuration. `BlockDeviceMappings` and `MetadataOptions` are passed to Auto Scaling.
 
+For legacy configurations without saved input properties, an unchanged literal `InstanceId`
+template can be recovered from the prior stack template. Missing prior inputs or an unresolved
+prior instance reference cannot establish equality and still require replacement.
+
 ## Auto Scaling Launch Template Resolution
 
 `AWS::AutoScaling::AutoScalingGroup` resolves its launch template through any of the shapes AWS
