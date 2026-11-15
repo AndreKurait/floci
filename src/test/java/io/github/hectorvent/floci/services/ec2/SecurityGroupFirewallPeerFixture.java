@@ -23,6 +23,7 @@ import io.github.hectorvent.floci.services.ec2.model.IpRange;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.model.UserIdGroupPair;
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -40,6 +41,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
@@ -64,6 +67,7 @@ class SecurityGroupFirewallPeerFixture {
     @TempDir
     Path writerDirectory;
     private final Set<String> createdHelpers = ConcurrentHashMap.newKeySet();
+    private final ExecutorService peerRefresh = Executors.newVirtualThreadPerTaskExecutor();
     private PolicyWriterJournal fixtureWriters;
 
     @BeforeEach
@@ -71,6 +75,13 @@ class SecurityGroupFirewallPeerFixture {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.storage().persistentPath()).thenReturn(writerDirectory.toString());
         fixtureWriters = new PolicyWriterJournal(config);
+    }
+
+    @AfterEach
+    void finishPeerRefreshBeforeDeletingWriterJournal() throws InterruptedException {
+        peerRefresh.shutdown();
+        assertTrue(peerRefresh.awaitTermination(10, TimeUnit.SECONDS),
+                "Peer policy work must finish before its writer journal is deleted");
     }
     private static final String ACCOUNT = "111111111111";
     private static final String REGION = "us-east-1";
@@ -141,7 +152,7 @@ class SecurityGroupFirewallPeerFixture {
         EmbeddedDnsServer dns = mock(EmbeddedDnsServer.class);
         when(dns.getServerIp()).thenReturn(flociAddress);
         return new SecurityGroupFirewallManager(docker(), mock(ContainerBuilder.class),
-                lifecycle, config, dns);
+                lifecycle, config, dns, new PolicyWriterJournal(config), peerRefresh);
     }
 
     DockerClient docker() {
