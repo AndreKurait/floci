@@ -26,6 +26,7 @@ import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.stepfunctions.model.Activity;
 import io.floci.aws.services.stepfunctions.model.ActivityTask;
 import io.floci.aws.services.stepfunctions.model.Execution;
+import io.floci.aws.services.stepfunctions.model.ExecutionConfiguration;
 import io.floci.aws.services.stepfunctions.model.HistoryEvent;
 import io.floci.aws.services.stepfunctions.model.MapRun;
 import io.floci.aws.services.stepfunctions.model.MockedTestCase;
@@ -395,6 +396,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
 
         StateMachine sm = new StateMachine();
         sm.setStateMachineArn(arn);
+        sm.setIncarnationId(UUID.randomUUID().toString());
         sm.setName(name);
         sm.setDefinition(definition);
         sm.setRoleArn(roleArn);
@@ -841,6 +843,10 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
             exec.setStateMachineArn(resolved.baseArn());
             exec.setStateMachineVersionArn(resolved.versionArn());
             exec.setStateMachineAliasArn(resolved.aliasArn());
+            if (!express) {
+                exec.setStateMachineIncarnationId(sm.getIncarnationId());
+                exec.setStateMachineConfiguration(resolved.configuration());
+            }
             exec.setName(execName);
             exec.setInput(input);
             exec.setStatus("RUNNING");
@@ -937,17 +943,20 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
     }
 
     private record ResolvedStateMachine(
-            StateMachine stateMachine, String baseArn, String versionArn, String aliasArn) {
+            StateMachine stateMachine, String baseArn, String versionArn, String aliasArn,
+            ExecutionConfiguration configuration) {
     }
 
     private ResolvedStateMachine resolveStateMachineForExecution(String arn) {
         QualifiedStateMachineArn qualifiedArn = parseQualifiedStateMachineArn(arn);
         if (qualifiedArn == null) {
-            return new ResolvedStateMachine(describeStateMachine(arn), arn, null, null);
+            StateMachine stateMachine = describeStateMachine(arn);
+            return new ResolvedStateMachine(stateMachine, arn, null, null,
+                    ExecutionConfiguration.capture(stateMachine, arn));
         }
         if (qualifiedArn.isVersion()) {
-            return new ResolvedStateMachine(
-                    describeStateMachine(arn), qualifiedArn.baseArn(), arn, null);
+            validateDescribeStateMachineArn(arn);
+            return resolveVersionForExecution(qualifiedArn.baseArn(), arn, null);
         }
 
         StateMachineAlias alias = stateMachineAliasStore.get(arn)
@@ -965,9 +974,22 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
             }
         }
         String versionArn = selected.getStateMachineVersionArn();
-        return new ResolvedStateMachine(
-                describeStateMachineVersion(alias.getStateMachineArn(), versionArn),
-                alias.getStateMachineArn(), versionArn, arn);
+        return resolveVersionForExecution(alias.getStateMachineArn(), versionArn, arn);
+    }
+
+    private ResolvedStateMachine resolveVersionForExecution(
+            String baseArn, String versionArn, String aliasArn) {
+        StateMachine owner = stateMachineStore.get(baseArn)
+                .orElseThrow(() -> new AwsException(
+                        "StateMachineDoesNotExist", "State machine does not exist", 400));
+        StateMachineVersion version = owner.getVersions().stream()
+                .filter(candidate -> versionArn.equals(candidate.getStateMachineVersionArn()))
+                .findFirst()
+                .orElseThrow(() -> new AwsException(
+                        "StateMachineDoesNotExist", "State machine does not exist", 400));
+        StateMachine described = stateMachineFromVersion(owner, version);
+        ExecutionConfiguration configuration = ExecutionConfiguration.captureVersion(described, baseArn, version);
+        return new ResolvedStateMachine(described, baseArn, versionArn, aliasArn, configuration);
     }
 
     /**
@@ -1025,6 +1047,57 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
     public Execution describeExecution(String arn) {
         return executionStore.get(arn)
                 .orElseThrow(() -> new AwsException("ExecutionDoesNotExist", "Execution does not exist", 400));
+    }
+
+    public Execution describeExecutionForApi(String arn) {
+        validateExecutionScope(arn);
+        return visibleExecution(arn);
+    }
+
+    private Execution visibleExecution(String arn) {
+        Execution execution = describeExecution(arn);
+        if (StepFunctionsEventPublisher.isStandard(execution)) {
+            StateMachine owner = stateMachineStore.get(execution.getStateMachineArn())
+                    .orElseThrow(() -> new AwsException("ExecutionDoesNotExist", "Execution does not exist", 400));
+            if (!Objects.equals(owner.getIncarnationId(), execution.getStateMachineIncarnationId())) {
+                throw new AwsException("ExecutionDoesNotExist", "Execution does not exist", 400);
+            }
+        }
+        return execution;
+    }
+
+    private AwsArnUtils.Arn validateExecutionScope(String arn) {
+        if (arn == null || arn.isBlank() || arn.length() > MAX_ARN_LENGTH) {
+            throw new AwsException("InvalidArn", "Invalid Arn: '" + arn + "'", 400);
+        }
+        try {
+            AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+            if (!"states".equals(parsed.service()) || parsed.accountId().isBlank()
+                    || !regionResolver.getRegion().equals(parsed.region())
+                    || !regionResolver.getPartition().equals(parsed.partition())) {
+                throw new IllegalArgumentException("Execution ARN is outside the request scope");
+            }
+            if (!regionResolver.getAccountId().equals(parsed.accountId())) {
+                throw new AwsException("ExecutionDoesNotExist", "Execution does not exist", 400);
+            }
+            return parsed;
+        } catch (IllegalArgumentException error) {
+            throw new AwsException("InvalidArn", "Invalid Arn: '" + arn + "'", 400);
+        }
+    }
+
+    public ExecutionConfiguration describeStateMachineForExecution(String arn) {
+        AwsArnUtils.Arn parsed = validateExecutionScope(arn);
+        if (!parsed.resource().matches("execution:[^:\\s]+:[^:\\s]+")) {
+            throw new AwsException("InvalidArn", "Invalid Arn: '" + arn + "'", 400);
+        }
+        Execution execution = visibleExecution(arn);
+        ExecutionConfiguration configuration = execution.getStateMachineConfiguration();
+        if (configuration == null) {
+            throw new AwsException("UnsupportedOperation",
+                    "This execution predates configuration capture; its original definition is unavailable.", 400);
+        }
+        return configuration.copy();
     }
 
     public List<Execution> listExecutions(String stateMachineArn) {
@@ -1575,6 +1648,10 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         version.setType(stateMachine.getType());
         version.setStatus(stateMachine.getStatus());
         version.setRevisionId(stateMachine.getRevisionId());
+        version.setConfigurationUpdateDate(stateMachine.getUpdateDate() != null
+                ? stateMachine.getUpdateDate() : stateMachine.getCreationDate());
+        version.setConfigurationRevisionId(stateMachine.getUpdateDate() != null
+                ? stateMachine.getRevisionId() : null);
         version.setLoggingConfiguration(copyNode(stateMachine.getLoggingConfiguration()));
         version.setTracingConfiguration(copyNode(stateMachine.getTracingConfiguration()));
         version.setEncryptionConfiguration(copyNode(stateMachine.getEncryptionConfiguration()));
@@ -1585,6 +1662,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
     private StateMachine copyStateMachine(StateMachine source) {
         StateMachine copy = new StateMachine();
         copy.setStateMachineArn(source.getStateMachineArn());
+        copy.setIncarnationId(source.getIncarnationId());
         copy.setName(source.getName());
         copy.setDefinition(source.getDefinition());
         copy.setRoleArn(source.getRoleArn());
@@ -1653,6 +1731,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
             StateMachine current, StateMachineVersion version) {
         StateMachine described = new StateMachine();
         described.setStateMachineArn(version.getStateMachineVersionArn());
+        described.setIncarnationId(current.getIncarnationId());
         described.setName(version.getName() != null ? version.getName() : current.getName());
         described.setDefinition(version.getDefinition() != null
                 ? version.getDefinition() : current.getDefinition());
@@ -1689,6 +1768,8 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         copy.setType(source.getType());
         copy.setStatus(source.getStatus());
         copy.setRevisionId(source.getRevisionId());
+        copy.setConfigurationUpdateDate(source.getConfigurationUpdateDate());
+        copy.setConfigurationRevisionId(source.getConfigurationRevisionId());
         copy.setLoggingConfiguration(copyNode(source.getLoggingConfiguration()));
         copy.setTracingConfiguration(copyNode(source.getTracingConfiguration()));
         copy.setEncryptionConfiguration(copyNode(source.getEncryptionConfiguration()));

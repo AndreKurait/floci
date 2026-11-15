@@ -14,6 +14,7 @@ import java.util.Map;
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class StateMachine {
     private String stateMachineArn;
+    private String incarnationId;
     private String name;
     private String definition;
     private String roleArn;
@@ -38,6 +39,9 @@ public class StateMachine {
 
     public String getStateMachineArn() { return stateMachineArn; }
     public void setStateMachineArn(String stateMachineArn) { this.stateMachineArn = stateMachineArn; }
+
+    public String getIncarnationId() { return incarnationId; }
+    public void setIncarnationId(String incarnationId) { this.incarnationId = incarnationId; }
 
     public String getName() { return name; }
     public void setName(String name) { this.name = name; }
