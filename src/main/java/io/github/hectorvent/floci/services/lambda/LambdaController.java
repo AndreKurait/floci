@@ -695,9 +695,11 @@ public class LambdaController {
     private Map<String, Double> extractRoutingConfig(Map<String, Object> rc) {
         if (rc == null) return null;
         Object weights = rc.get("AdditionalVersionWeights");
-        if (!(weights instanceof Map)) return null;
-        Map<String, Object> raw = (Map<String, Object>) weights;
-        if (raw.isEmpty()) return null;
+        if (weights != null && !(weights instanceof Map)) {
+            throw new AwsException("InvalidParameterValueException", "AdditionalVersionWeights must be an object.", 400);
+        }
+        // A present RoutingConfig without weights is the SDK's spelling of "clear": it skips a nil map.
+        Map<String, Object> raw = weights instanceof Map ? (Map<String, Object>) weights : Map.of();
         Map<String, Double> result = new HashMap<>();
         raw.forEach((k, v) -> result.put(k, ((Number) v).doubleValue()));
         return result;
