@@ -121,6 +121,44 @@ class DeclaredPublicAliasRoutingTest {
         }
     }
 
+    @Test
+    void onlyAnExactDeclaredPublicPeerUsesTheOwnersDeclaredTransportAdmission() {
+        DnsAnswer ordinary = DnsAnswer.records(List.of("10.174.1.8"), 60);
+        DnsRecordSource owner = new DnsRecordSource() {
+            @Override
+            public Optional<DnsAnswer> resolveIpv4(String name) {
+                return Optional.empty();
+            }
+
+            @Override
+            public Optional<DnsAnswer> resolveAliasTarget(String name, String zone, int type) {
+                return Optional.of(type == 1 ? ordinary : DnsAnswer.noData());
+            }
+
+            @Override
+            public Optional<DnsAnswer> resolveDeclaredPublicAliasTarget(String name, String zone, int type,
+                                                                         DnsClientVpcSource.ClientVpc origin) {
+                return Optional.of(DnsAnswer.records(List.of(CONTROL), 45));
+            }
+        };
+        EmbeddedDnsServer dns = spy(new EmbeddedDnsServer(
+                List.of(), List.of(owner), List.of(), List.of(), true, List.of(HOST)));
+        doReturn(Optional.of(CONTROL)).when(dns).getServerIp();
+        DnsAnswer routed = dns.resolvePublicAliasTarget(HOST, "lb.example", "ZOWNED", 1, VPC).orElseThrow();
+        assertEquals(List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS), routed.addresses());
+        assertEquals(45, routed.ttlSeconds());
+        assertTrue(dns.resolvePublicAliasTarget(HOST, "lb.example", "ZOWNED", 1, null).orElseThrow().upstream());
+        assertEquals(ordinary, dns.resolveAliasTarget("lb.example", "ZOWNED", 1, VPC).orElseThrow());
+        for (String name : List.of("child." + HOST, "not" + HOST, "other.example")) {
+            assertEquals(ordinary, dns.resolvePublicAliasTarget(name, "lb.example", "ZOWNED", 1, VPC).orElseThrow());
+        }
+        assertEquals(DnsAnswer.noData(), dns.resolvePublicAliasTarget(HOST, "lb.example", "ZOWNED", 28, VPC)
+                .orElseThrow());
+        EmbeddedDnsServer disabled = new EmbeddedDnsServer(
+                List.of(), List.of(owner), List.of(), List.of(), false, List.of(HOST));
+        assertEquals(ordinary, disabled.resolvePublicAliasTarget(HOST, "lb.example", "ZOWNED", 1, VPC).orElseThrow());
+    }
+
     private static EmbeddedDnsServer server(boolean enabled, DnsAnswer answer) {
         DnsRecordSource owner = new DnsRecordSource() {
             @Override
