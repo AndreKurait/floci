@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.elbv2;
 
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.model.Subnet;
@@ -23,6 +24,7 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -126,6 +128,55 @@ class ElbV2VpcLifecycleTest {
                 () -> service.setSubnets(REGION, balancer.getLoadBalancerArn(), List.of("subnet-a", "subnet-c")));
         assertEquals(List.of("subnet-a", "subnet-b"), balancer.getAvailabilityZones().stream()
                 .map(AvailabilityZone::getSubnetId).toList());
+    }
+
+    @Test
+    void identicalActiveCreateDoesNotReconcileOrLoseExistingBackend() {
+        LoadBalancer first = create();
+        first.getBackendNetworkInterfaceIds().add("eni-ready");
+        doThrow(new IllegalStateException("unrelated firewall reconciliation blocked"))
+                .when(networks).reconcile(eq(first), any());
+        assertSame(first, create());
+        assertEquals("active", first.getState());
+        assertEquals(List.of("eni-ready"), first.getBackendNetworkInterfaceIds());
+        verify(networks, times(1)).reconcile(eq(first), any());
+    }
+
+    @Test
+    void runtimeRestoreReconcilesBeforeReturningToActive() {
+        LoadBalancer first = create();
+        doAnswer(call -> {
+            assertEquals("provisioning", first.getState());
+            return null;
+        }).when(networks).reconcile(eq(first), any());
+
+        service.restorePersistedRuntime();
+
+        assertEquals("active", first.getState());
+        assertSame(first, create());
+        verify(networks, times(2)).reconcile(eq(first), any());
+    }
+
+    @Test
+    void failedRuntimeRestoreDoesNotLeaveAnActiveRetryFastPath() {
+        LoadBalancer first = create();
+        doThrow(new IllegalStateException("restore unavailable")).when(networks).reconcile(eq(first), any());
+        service.restorePersistedRuntime();
+        assertEquals("failed", first.getState());
+        doNothing().when(networks).reconcile(eq(first), any());
+        assertSame(first, create());
+        assertEquals("active", first.getState());
+        verify(networks, times(3)).reconcile(eq(first), any());
+    }
+
+    @Test
+    void changedCreateStillFailsBeforeRuntimeReconciliation() {
+        LoadBalancer first = create();
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.createLoadBalancer(REGION, "native-alb", "internal", "application", "ipv4",
+                        List.of("subnet-a", "subnet-b"), List.of("sg-other"), Map.of()));
+        assertEquals("DuplicateLoadBalancerName", error.getErrorCode());
+        verify(networks, times(1)).reconcile(eq(first), any());
     }
 
     private LoadBalancer create() {

@@ -324,12 +324,20 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
                 Runnable persist = () -> persistStoredLoadBalancers(stored);
                 for (LoadBalancer balancer : stored.resources().values()) {
                     try {
+                        if (vpcNetworks.enabled() && "application".equals(balancer.getType())) {
+                            balancer.setState("provisioning");
+                            persist.run();
+                        }
                         vpcNetworks.reconcile(balancer, persist);
                         if (vpcNetworks.enabled() && "application".equals(balancer.getType())) {
                             balancer.setState("active");
                             persist.run();
                         }
                     } catch (RuntimeException failure) {
+                        if (vpcNetworks.enabled() && "application".equals(balancer.getType())) {
+                            balancer.setState("failed");
+                            persist.run();
+                        }
                         LOG.warnv(failure, "ELBv2 backend network could not be restored for {0}",
                                 balancer.getLoadBalancerArn());
                     }
@@ -396,6 +404,9 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
             synchronized (balancer) {
                 if (loadBalancers.getOrDefault(region, Map.of()).get(balancer.getLoadBalancerArn()) != balancer) {
                     throw new AwsException("LoadBalancerNotFound", "The load balancer was deleted.", 400);
+                }
+                if ("active".equals(balancer.getState())) {
+                    return balancer;
                 }
                 try {
                     vpcNetworks.reconcile(balancer, () -> persistRegion(loadBalancers, region));
