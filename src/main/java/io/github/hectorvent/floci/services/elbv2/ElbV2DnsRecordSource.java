@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.elbv2;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.dns.DnsAnswer;
 import io.github.hectorvent.floci.core.common.dns.DnsClientVpcSource.ClientVpc;
 import io.github.hectorvent.floci.core.common.dns.DnsRecordSource;
@@ -80,6 +81,17 @@ public class ElbV2DnsRecordSource implements DnsRecordSource {
 
     @Override
     public Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type, ClientVpc origin) {
+        return resolveAliasTarget(name, hostedZoneId, type, origin, false);
+    }
+
+    @Override
+    public Optional<DnsAnswer> resolveDeclaredPublicAliasTarget(String name, String hostedZoneId, int type,
+                                                                ClientVpc origin) {
+        return resolveAliasTarget(name, hostedZoneId, type, origin, true);
+    }
+
+    private Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type, ClientVpc origin,
+                                                   boolean declaredPublicPeer) {
         List<LoadBalancer> matches = service.findByDnsName(name);
         if (matches.isEmpty()) {
             return Optional.empty();
@@ -96,6 +108,13 @@ public class ElbV2DnsRecordSource implements DnsRecordSource {
             return Optional.of(DnsAnswer.noData());
         }
         if (networks != null && networks.frontendsEnabled()) {
+            if (declaredPublicPeer) {
+                ClientVpc owner = new ClientVpc(AwsArnUtils.parse(target.getLoadBalancerArn()).accountId(),
+                        target.getRegion(), target.getVpcId());
+                if (!networks.frontendAddresses(target, owner).isEmpty()) {
+                    return Optional.of(sharedAnswer(target, origin));
+                }
+            }
             return Optional.of(frontendAnswer(target, type, origin));
         }
         return Optional.of(sharedAnswer(target, origin));

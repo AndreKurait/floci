@@ -49,6 +49,7 @@ Route53 emulation supporting hosted zones, reusable delegation sets, resource re
 - `ChangeResourceRecordSets` validates all changes atomically before applying any.
 - Supported change actions: `CREATE`, `UPSERT`, `DELETE`.
 - Alias deletion treats target DNS names without regard to ASCII letter case and accepts an optional trailing dot. The target hosted-zone ID, health-evaluation setting, and other record values must still match; a rejected change batch does not apply its other changes.
+- With public AWS API routing enabled, an exact peer in `FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API_HOSTS` retains its configured public transport when its alias names a ready native ALB, including an internal ALB in another VPC. Floci validates the unique existing target, canonical hosted-zone ID, and native frontend readiness before selecting that transport. Ordinary aliases retain caller-scoped DNS resolution.
 - Hosted zone IDs are returned with the `/hostedzone/` prefix in XML responses (e.g. `/hostedzone/Z1PA6795UKMFR9`). The AWS SDK strips this prefix client-side.
 - Health check IDs are plain UUIDs without a prefix.
 - `CreateHealthCheck` with a `CallerReference` already in use returns that health check when the settings match, so an SDK retry succeeds, and fails with `HealthCheckAlreadyExists` when they differ. A deleted health check's reference can be reused at once; AWS keeps refusing it for some days.
