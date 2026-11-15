@@ -49,7 +49,9 @@ class CloudFormationExecutionIdentityIntegrationTest {
         String policy = "{\"Version\":\"2012-10-17\",\"Statement\":["
                 + "{\"Effect\":\"Allow\",\"Action\":[\"cloudformation:*\",\"s3:*\"],\"Resource\":\"*\"}]}";
         try (SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "cfn-verified-", "stack", policy);
+             SignedIamUsers.User deleter = SignedIamUsers.createUser(endpoint, "cfn-delete-", "stack", policy);
              CloudFormationClient client = client(user.accessKeyId(), user.secretAccessKey());
+             CloudFormationClient deleteClient = client(deleter.accessKeyId(), deleter.secretAccessKey());
              CloudFormationClient forged = client(user.accessKeyId(), "wrong-secret")) {
             String template = "{\"Resources\":{\"Bucket\":{\"Type\":\"AWS::S3::Bucket\"}}}";
             assertThrows(CloudFormationException.class, () ->
@@ -63,10 +65,11 @@ class CloudFormationExecutionIdentityIntegrationTest {
             assertTrue(identity.caller().principalArn().endsWith(":user/" + user.name()));
             assertNotNull(identity.policies());
             assertTrue(CloudFormationExecutionScope.current().isEmpty());
-            client.deleteStack(r -> r.stackName(stack));
-            client.waiter().waitUntilStackDeleteComplete(r -> r.stackName(stack));
+            deleteClient.deleteStack(r -> r.stackName(stack));
+            deleteClient.waiter().waitUntilStackDeleteComplete(r -> r.stackName(stack));
             assertEquals(1, deleted.size());
-            assertEquals(identity.caller(), deleted.getFirst().caller());
+            assertTrue(deleted.getFirst().caller().principalArn().endsWith(":user/" + deleter.name()));
+            assertNotEquals(identity.caller(), deleted.getFirst().caller());
         }
     }
 
