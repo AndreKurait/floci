@@ -35,12 +35,12 @@ import java.util.regex.Pattern;
  * for every IAM user, and an {@code sts:AssumeRole} request is no exception, so a trust policy
  * condition reads the same principal as an identity or resource policy would.
  *
- * <p>AWS principals are modeled (account-root, bare account id, exact principal ARN, and
+ * <p>AWS principals are modeled (account-root, bare account id, immutable role/user ID, principal ARN, and
  * {@code "*"}). A {@code Service} principal can also name a SigV4 caller's account through the
  * optional local service-principal memberships; {@code Federated} entries do not match.
  * A caller using assumed-role temporary credentials matches a trust policy that names its
- * session ARN or its role: IAM stores a {@code Principal} naming a role as the role's unique ID, so
- * the session matches through the role's own ARN, path included, which the caller passes in.
+ * session ARN or its role: new role/user principals are stored as immutable IDs and match the
+ * caller's identity. Historical ARN entries retain ARN matching, including the role's path.
  */
 @ApplicationScoped
 public class AssumeRolePolicyEvaluator {
@@ -93,8 +93,9 @@ public class AssumeRolePolicyEvaluator {
      *
      * <p>{@code caller} carries both ARNs: the identity it acts as, which for a role session is
      * its {@code assumed-role} session ARN, and its principal ARN, which for that session is the
-     * role's own ARN, path included. A {@code Principal} naming a role is matched against the
-     * second. It also carries the keys that say who is calling, which it writes onto the context
+     * role's own ARN, path included. Historical ARN principals match those ARNs; bound role/user
+     * principals match the immutable identity carried by the typed caller. It also carries the
+     * keys that say who is calling, which it writes onto the context
      * through {@link IamService.CallerArns#putPrincipalKeys}, the same writer every other context
      * a request is evaluated against uses: a trust policy sees the caller it would see anywhere
      * else. {@code requestContext} holds the keys the request itself carries, such as
@@ -112,6 +113,22 @@ public class AssumeRolePolicyEvaluator {
     /** Evaluates a permissions-only session action through the same trust principal and condition rules. */
     public TrustDecision decide(String trustPolicyDocument, IamService.CallerArns caller,
                                 String callerAccount, Map<String, List<String>> requestContext, String action) {
+        return decide(trustPolicyDocument, caller, callerAccount, requestContext, action, principalId(caller));
+    }
+
+    /**
+     * Matches an explicitly known immutable identity without adding condition keys. Service
+     * execution paths can know the role ID without minting a session name for {@code aws:userid}.
+     */
+    public TrustDecision decideWithPrincipalId(String trustPolicyDocument, IamService.CallerArns caller,
+                                               String callerAccount, Map<String, List<String>> requestContext,
+                                               String principalId) {
+        return decide(trustPolicyDocument, caller, callerAccount, requestContext, ASSUME_ROLE_ACTION, principalId);
+    }
+
+    private TrustDecision decide(String trustPolicyDocument, IamService.CallerArns caller,
+                                 String callerAccount, Map<String, List<String>> requestContext,
+                                 String action, String principalId) {
         if (trustPolicyDocument == null || trustPolicyDocument.isBlank()) {
             return TrustDecision.NEUTRAL;
         }
@@ -137,7 +154,8 @@ public class AssumeRolePolicyEvaluator {
         TrustDecision decision = TrustDecision.NEUTRAL;
         for (JsonNode stmt : statementList) {
             TrustDecision match =
-                    evaluateStatement(stmt, callerArn, principalArn, callerAccount, context, version, action);
+                    evaluateStatement(stmt, callerArn, principalArn, principalId,
+                            callerAccount, context, version, action);
             if (match == TrustDecision.EXPLICIT_DENY) {
                 return TrustDecision.EXPLICIT_DENY;
             }
@@ -146,6 +164,20 @@ public class AssumeRolePolicyEvaluator {
             }
         }
         return decision;
+    }
+
+    private static String principalId(IamService.CallerArns caller) {
+        if (caller == null || caller.userId() == null) {
+            return null;
+        }
+        String id = caller.userId();
+        if (IamService.CallerArns.TYPE_ASSUMED_ROLE.equals(caller.principalType())) {
+            int separator = id.indexOf(':');
+            id = separator < 0 ? id : id.substring(0, separator);
+            return id.startsWith("AROA") && TrustPolicyPrincipalIds.isIdentityId(id) ? id : null;
+        }
+        return IamService.CallerArns.TYPE_USER.equals(caller.principalType())
+                && id.startsWith("AIDA") && TrustPolicyPrincipalIds.isIdentityId(id) ? id : null;
     }
 
     /**
@@ -276,13 +308,14 @@ public class AssumeRolePolicyEvaluator {
         return true;
     }
 
-    private TrustDecision evaluateStatement(JsonNode stmt, String callerArn, String principalArn,
+    private TrustDecision evaluateStatement(JsonNode stmt, String callerArn, String principalArn, String principalId,
                                             String callerAccount, Map<String, List<String>> context,
                                             String policyVersion, String action) {
         if (!actionApplies(stmt, action)) {
             return TrustDecision.NEUTRAL;
         }
-        PrincipalMatch principal = matchPrincipal(stmt.get("Principal"), callerArn, principalArn, callerAccount);
+        PrincipalMatch principal = matchPrincipal(stmt.get("Principal"), callerArn, principalArn,
+                principalId, callerAccount);
         if (principal == PrincipalMatch.NONE) {
             return TrustDecision.NEUTRAL;
         }
@@ -400,6 +433,7 @@ public class AssumeRolePolicyEvaluator {
 
     /** The narrowest of the statement's principals that matches the caller wins: the caller over its account. */
     private PrincipalMatch matchPrincipal(JsonNode principalNode, String callerArn, String principalArn,
+                                          String principalId,
                                           String callerAccount) {
         if (principalNode == null) {
             return PrincipalMatch.NONE;
@@ -419,13 +453,13 @@ public class AssumeRolePolicyEvaluator {
             return match;
         }
         if (aws.isTextual()) {
-            PrincipalMatch awsMatch = matchAwsPrincipal(aws.asText(), callerArn, principalArn, callerAccount);
+            PrincipalMatch awsMatch = matchAwsPrincipal(aws.asText(), callerArn, principalArn, principalId, callerAccount);
             return awsMatch == PrincipalMatch.NONE ? match : awsMatch;
         }
         if (aws.isArray()) {
             for (JsonNode entry : aws) {
                 PrincipalMatch entryMatch = entry.isTextual()
-                        ? matchAwsPrincipal(entry.asText(), callerArn, principalArn, callerAccount)
+                        ? matchAwsPrincipal(entry.asText(), callerArn, principalArn, principalId, callerAccount)
                         : PrincipalMatch.NONE;
                 if (entryMatch == PrincipalMatch.CALLER) {
                     return PrincipalMatch.CALLER;
@@ -438,13 +472,16 @@ public class AssumeRolePolicyEvaluator {
         return match;
     }
 
-    private PrincipalMatch matchAwsPrincipal(String principal, String callerArn, String principalArn,
+    private PrincipalMatch matchAwsPrincipal(String principal, String callerArn, String principalArn, String principalId,
                                              String callerAccount) {
         if (principal == null) {
             return PrincipalMatch.NONE;
         }
         if ("*".equals(principal)) {
             return PrincipalMatch.CALLER;
+        }
+        if (TrustPolicyPrincipalIds.isIdentityId(principal)) {
+            return principal.equals(principalId) ? PrincipalMatch.CALLER : PrincipalMatch.NONE;
         }
         // Bare 12-digit account id, or an account-root ARN → matches any principal in that account.
         if (principal.matches("\\d{12}")) {
