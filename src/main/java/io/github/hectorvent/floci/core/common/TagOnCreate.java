@@ -560,6 +560,15 @@ final class TagOnCreate {
             return List.of(new AwsArnUtils.Arn(partition, "appconfig", region, accountId,
                     createdType + "/*").toString());
         }
+        String createdType = switch (operation) {
+            case "appconfig:CreateApplication" -> "application";
+            case "appconfig:CreateDeploymentStrategy" -> "deploymentstrategy";
+            case null, default -> null;
+        };
+        if (createdType != null) {
+            return List.of(new AwsArnUtils.Arn(partition, "appconfig", region, accountId,
+                    createdType + "/*").toString());
+        }
         if (set.resourceType() == null
                 || ("ec2:CreatePlacementGroup".equals(operation) && "placement-group".equals(set.resourceType()))) {
             return resources;

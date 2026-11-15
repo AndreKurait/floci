@@ -473,6 +473,14 @@ public class AppConfigService implements Resettable {
     }
 
     private void validateProfile(ConfigurationProfile profile, String version, ConfigurationContent source) {
+        if ("hosted".equals(profile.getLocationUri())) {
+            validateProfile(profile, validationVersion(profile, version));
+            return;
+        }
+        validateProfile(profile, version, source);
+    }
+
+    private void validateProfile(ConfigurationProfile profile, String version, ConfigurationContent source) {
         if (!"hosted".equals(profile.getLocationUri()) || profile.getValidators() == null
                 || profile.getValidators().stream().noneMatch(validator -> "LAMBDA".equals(validator.type()))) {
             AppConfigValidators.validate(profile.getValidators(), validationContent(profile, version, source));
@@ -490,21 +498,32 @@ public class AppConfigService implements Resettable {
         validateProfile(profile, getHostedConfigurationVersion(profile.getApplicationId(), profile.getId(), number));
     }
 
+    private HostedConfigurationVersion validationVersion(ConfigurationProfile profile, String version) {
+        if (version == null || version.isEmpty() || version.length() > 1024) {
+            throw new AwsException("BadRequestException", "ConfigurationVersion must contain 1 to 1024 characters.", 400);
+        }
+        String prefix = profile.getApplicationId() + "::" + profile.getId() + "::";
+        HostedConfigurationVersion labeled = versionStore.scan(key -> key.startsWith(prefix)).stream()
+                .filter(candidate -> version.equals(candidate.getVersionLabel()))
+                .findFirst().orElse(null);
+        if (labeled != null) {
+            return labeled;
+        }
+        int number;
+        try {
+            number = Integer.parseInt(version);
+        } catch (NumberFormatException e) {
+            throw new AwsException("ResourceNotFoundException", "Hosted configuration version not found.", 404);
+        }
+        return getHostedConfigurationVersion(profile.getApplicationId(), profile.getId(), number);
+    }
+
     private byte[] validationContent(ConfigurationProfile profile, String version, ConfigurationContent source) {
         if (version == null || version.isEmpty() || version.length() > 1024) {
             throw new AwsException("BadRequestException", "ConfigurationVersion must contain 1 to 1024 characters.", 400);
         }
         if (source != null) {
             return source.content();
-        }
-        if ("hosted".equals(profile.getLocationUri())) {
-            int number;
-            try {
-                number = Integer.parseInt(version);
-            } catch (NumberFormatException e) {
-                throw new AwsException("BadRequestException", "Hosted ConfigurationVersion must be a version number.", 400);
-            }
-            return getHostedConfigurationVersion(profile.getApplicationId(), profile.getId(), number).getContent();
         }
         throw new AwsException("BadRequestException", "This configuration source cannot currently be validated.", 400);
     }
@@ -930,6 +949,9 @@ public class AppConfigService implements Resettable {
     public synchronized Deployment startDeployment(String applicationIdentifier,
                                                     String environmentIdentifier,
                                                     Map<String, Object> request) {
+        if (validationPaused) {
+            throw new AwsException("BadRequestException", "Deployments are unavailable while a reset is in progress.", 400);
+        }
         String appId = resolveApplication(applicationIdentifier).getId();
         Environment environment = resolveEnvironment(appId, environmentIdentifier);
         String envId = environment.getId();
@@ -941,10 +963,15 @@ public class AppConfigService implements Resettable {
 
         DeploymentStrategy strategy = getDeploymentStrategy(strategyId);
         validateDeploymentTiming(strategy);
-        alarms.rollbackCause(environment.getMonitors());
+        alarms.validateMonitors(environment.getMonitors());
         ConfigurationContent sourceContent = AppConfigS3Source.matches(profile)
                 ? Objects.requireNonNull(s3Source.retrieve(profile, version)) : null;
-        if (profile.getValidators() != null && !profile.getValidators().isEmpty()) {
+        HostedConfigurationVersion selected = null;
+        if ("hosted".equals(profile.getLocationUri())) {
+            selected = validationVersion(profile, version);
+            validateProfile(profile, selected);
+            version = Integer.toString(selected.getVersionNumber());
+        } else if (profile.getValidators() != null && !profile.getValidators().isEmpty()) {
             validateProfile(profile, version, sourceContent);
         }
 
@@ -955,6 +982,7 @@ public class AppConfigService implements Resettable {
         deployment.setConfigurationName(profile.getName());
         deployment.setConfigurationLocationUri(profile.getLocationUri());
         deployment.setConfigurationVersion(version);
+        deployment.setVersionLabel(selected == null ? null : selected.getVersionLabel());
         deployment.setDeploymentStrategyId(strategyId);
         deployment.setDeploymentDurationInMinutes(strategy.getDeploymentDurationInMinutes());
         deployment.setFinalBakeTimeInMinutes(strategy.getFinalBakeTimeInMinutes());
@@ -1121,6 +1149,9 @@ public class AppConfigService implements Resettable {
             try {
                 RequestScopes.runAs(owner.accountId(), owner.region(), () -> {
                     synchronized (this) {
+                        if (validationPaused) {
+                            return;
+                        }
                         deploymentStore.get(owner.key()).filter(AppConfigService::active)
                                 .ifPresent(deployment -> {
                                     String key = deployment.getApplicationId() + "::" + deployment.getEnvironmentId()
@@ -1262,6 +1293,7 @@ public class AppConfigService implements Resettable {
         DeploymentSummary summary = new DeploymentSummary();
         summary.setConfigurationProfileId(deployment.getConfigurationProfileId());
         summary.setConfigurationVersion(deployment.getConfigurationVersion());
+        summary.setVersionLabel(deployment.getVersionLabel());
         summary.setDeploymentNumber(deployment.getDeploymentNumber());
         summary.setState(deployment.getState());
         summary.setConfigurationName(deployment.getConfigurationName());
