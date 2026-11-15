@@ -188,7 +188,7 @@ public class AthenaService {
             // Athena rejects a query that leaves an injected partition column unconstrained. It fails
             // the query rather than the submission, which is what throwing here produces.
             PartitionProjection.assertInjectedColumnsFiltered(query, tablesForProjectionCheck(database));
-            String setupDdl = ddlBuilder.build(database);
+            String setupDdl = ddlBuilder.build(database, query);
             if (outputLocation != null) {
                 ensureOutputBucket(outputLocation);
             }
