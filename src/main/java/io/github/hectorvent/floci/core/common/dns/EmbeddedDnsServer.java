@@ -474,7 +474,10 @@ public class EmbeddedDnsServer {
                     answer.records().equals(List.of(new DnsRecord.Address(1, address)))).orElse(false);
             boolean nativeAlb = answer.records().equals(List.of(
                     new DnsRecord.Address(1, EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS)));
-            boolean ownedListener = answer.responseCode() == 0 && (localListener || nativeAlb);
+            boolean nativeListener = answer.records().size() == 1 && answer.addresses().size() == 1
+                    && answer.records().getFirst().equals(new DnsRecord.Address(1, answer.addresses().getFirst()))
+                    && ownsListenerAddress(answer.addresses().getFirst());
+            boolean ownedListener = answer.responseCode() == 0 && (localListener || nativeAlb || nativeListener);
             if (ownedListener && origin == null) {
                 return answer.viaUpstream();
             }
@@ -482,6 +485,17 @@ public class EmbeddedDnsServer {
                     List.of(new DnsRecord.Address(1, EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS)),
                     answer.ttlSeconds(), answer.nameExists(), answer.authority(), answer.responseCode()) : answer;
         });
+    }
+
+    private boolean ownsListenerAddress(String address) {
+        if (recordSources != null) {
+            for (DnsRecordSource source : recordSources) {
+                if (source.ownsListenerAddress(address)) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     /** The owned API listener remains subject to the caller's ordinary public routing. */

@@ -26,6 +26,7 @@ import io.vertx.ext.web.Route;
 import io.vertx.ext.web.Router;
 import io.vertx.ext.web.RoutingContext;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.function.Executable;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -50,6 +51,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import static io.github.hectorvent.floci.services.elbv2.ElbV2PublicationTestSupport.publishRuntime;
 import static io.github.hectorvent.floci.services.elbv2.ElbV2PublicationTestSupport.removeRuntime;
 import static org.awaitility.Awaitility.await;
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -64,6 +66,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -74,6 +77,130 @@ class ElbV2ListenerOwnershipTest {
     private static final String REGION = "us-west-2";
     private static final String HOST = "shared.example.test";
     private static final String CERTIFICATE = "arn:aws:acm:us-west-2:000000000000:certificate/shared";
+
+    @ParameterizedTest
+    @CsvSource({"false,false", "false,true", "true,false", "true,true"})
+    void refusedPublicationRestoresOrRemovesTheNativeFrontend(boolean existing, boolean throwsFailure) {
+        ElbV2FrontendManager frontends = mock(ElbV2FrontendManager.class);
+        when(frontends.enabled()).thenReturn(true);
+        Map<String, Integer> ports = new ConcurrentHashMap<>();
+        doAnswer(call -> {
+            ports.put(call.getArgument(1), call.getArgument(2));
+            return null;
+        }).when(frontends).putListener(anyString(), anyString(), anyInt(), any(), any());
+        doAnswer(call -> {
+            ports.remove(call.<String>getArgument(1));
+            return null;
+        }).when(frontends).removeListener(anyString(), anyString());
+        Registry registry = new Registry();
+        Fixture fixture = new Fixture(registry, frontends);
+        Listener first = listener("native-publication", 8443, false);
+        Listener next = listener("native-publication", 9443, false);
+        try {
+            if (existing) {
+                publishRuntime(fixture.plane, first, REGION, first.getPort(), List.of(rule("old")));
+            }
+            ElbV2DataPlane.ListenerBinding expected = registry.get(first.getListenerArn());
+            AtomicInteger publications = new AtomicInteger();
+            Executable refused = () -> assertFalse(fixture.plane.publishListener(next, REGION, 8443, () -> {
+                assertEquals(9443, ports.get(next.getListenerArn()));
+                publications.incrementAndGet();
+                if (throwsFailure) {
+                    throw new IllegalArgumentException("refused native publication");
+                }
+                return false;
+            }, () -> List.of(rule("new")), admitted -> admitted.get()));
+            if (throwsFailure) {
+                assertThrows(IllegalArgumentException.class, refused);
+            } else {
+                assertDoesNotThrow(refused);
+            }
+            assertEquals(1, publications.get());
+            assertSame(expected, registry.get(first.getListenerArn()));
+            assertEquals(existing ? Map.of(first.getListenerArn(), 8443) : Map.of(), ports);
+            if (existing) {
+                fixture.serves(8443, "old");
+            }
+        } finally {
+            fixture.plane.shutdown();
+        }
+    }
+
+    @Test
+    void nativeFrontendFailurePreventsControlPublication() {
+        ElbV2FrontendManager frontends = mock(ElbV2FrontendManager.class);
+        when(frontends.enabled()).thenReturn(true);
+        doThrow(new IllegalStateException("native bind failed")).when(frontends)
+                .putListener(anyString(), anyString(), anyInt(), any(), any());
+        Registry registry = new Registry();
+        Fixture fixture = new Fixture(registry, frontends);
+        Listener listener = listener("native-failure", 8443, false);
+        AtomicInteger publications = new AtomicInteger();
+        try {
+            assertThrows(IllegalStateException.class, () -> fixture.plane.publishListener(listener, REGION, null,
+                    () -> { publications.incrementAndGet(); return true; },
+                    () -> List.of(rule("new")), admitted -> admitted.get()));
+            assertEquals(0, publications.get());
+            assertTrue(registry.isEmpty());
+            verify(frontends).removeListener(listener.getLoadBalancerArn(), listener.getListenerArn());
+        } finally {
+            fixture.plane.shutdown();
+        }
+    }
+
+    @Test
+    void nativeCleanupFailureKeepsTheControlAndRuntimeOwner() {
+        ElbV2FrontendManager frontends = mock(ElbV2FrontendManager.class);
+        when(frontends.enabled()).thenReturn(true);
+        Registry registry = new Registry();
+        Fixture fixture = new Fixture(registry, frontends);
+        Listener listener = listener("native-delete-failure", 8443, false);
+        AtomicInteger publications = new AtomicInteger();
+        try {
+            publishRuntime(fixture.plane, listener, REGION, null, List.of(rule("old")));
+            ElbV2DataPlane.ListenerBinding expected = registry.get(listener.getListenerArn());
+            doThrow(new IllegalStateException("namespace is still in use")).when(frontends)
+                    .removeListener(listener.getLoadBalancerArn(), listener.getListenerArn());
+            assertThrows(IllegalStateException.class, () -> fixture.plane.removeListener(
+                    listener.getListenerArn(), listener.getPort(),
+                    () -> { publications.incrementAndGet(); return true; }));
+            assertEquals(0, publications.get());
+            assertSame(expected, registry.get(listener.getListenerArn()));
+            fixture.serves(8443, "old");
+        } finally {
+            fixture.plane.shutdown();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void refusedDeletionRestoresTheNativeFrontend(boolean throwsFailure) {
+        ElbV2FrontendManager frontends = mock(ElbV2FrontendManager.class);
+        when(frontends.enabled()).thenReturn(true);
+        Fixture fixture = new Fixture(new Registry(), frontends);
+        Listener listener = listener("native-delete-refused", 8443, false);
+        try {
+            publishRuntime(fixture.plane, listener, REGION, null, List.of(rule("old")));
+            Executable refused = () -> assertFalse(fixture.plane.removeListener(
+                    listener.getListenerArn(), listener.getPort(), () -> {
+                        if (throwsFailure) {
+                            throw new IllegalArgumentException("storage refused deletion");
+                        }
+                        return false;
+                    }));
+            if (throwsFailure) {
+                assertThrows(IllegalArgumentException.class, refused);
+            } else {
+                assertDoesNotThrow(refused);
+            }
+            verify(frontends).removeListener(listener.getLoadBalancerArn(), listener.getListenerArn());
+            verify(frontends, times(2)).putListener(eq(listener.getLoadBalancerArn()),
+                    eq(listener.getListenerArn()), eq(8443), any(), any());
+            fixture.serves(8443, "old");
+        } finally {
+            fixture.plane.shutdown();
+        }
+    }
 
     @ParameterizedTest
     @CsvSource({"HTTP,true", "HTTPS,false", "TCP,false"})
@@ -669,7 +796,11 @@ class ElbV2ListenerOwnershipTest {
         private volatile int failNextListenPort = -1;
 
         private Fixture(Registry registry) {
-            plane = new ElbV2DataPlane(registry);
+            this(registry, null);
+        }
+
+        private Fixture(Registry registry, ElbV2FrontendManager frontends) {
+            plane = new ElbV2DataPlane(registry, null, null, null, frontends);
             plane.config = mock(EmulatorConfig.class);
             EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
             EmulatorConfig.ElbV2ServiceConfig config = mock(EmulatorConfig.ElbV2ServiceConfig.class);
@@ -682,6 +813,7 @@ class ElbV2ListenerOwnershipTest {
             when(plane.tlsProxyServer.reservesPort(anyInt())).thenReturn(false);
             plane.elbV2Service = mock(ElbV2Service.class);
             LoadBalancer balancer = new LoadBalancer();
+            balancer.setType("application");
             balancer.setDnsName(HOST);
             when(plane.elbV2Service.getLoadBalancerForListener(eq(REGION), anyString(), anyString()))
                     .thenReturn(balancer);

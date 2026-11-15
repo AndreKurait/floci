@@ -19,16 +19,28 @@ public class ElbV2DnsRecordSource implements DnsRecordSource {
     private final ElbV2Service service;
     private final EmbeddedDnsServer dns;
     private final EmulatorConfig config;
+    private final ElbV2FrontendManager frontends;
 
     public ElbV2DnsRecordSource(ElbV2Service service, EmbeddedDnsServer dns) {
         this(service, dns, null);
     }
 
-    @Inject
     public ElbV2DnsRecordSource(ElbV2Service service, EmbeddedDnsServer dns, EmulatorConfig config) {
+        this(service, dns, config, null);
+    }
+
+    @Inject
+    public ElbV2DnsRecordSource(ElbV2Service service, EmbeddedDnsServer dns, EmulatorConfig config,
+                               ElbV2FrontendManager frontends) {
         this.service = service;
         this.dns = dns;
         this.config = config;
+        this.frontends = frontends;
+    }
+
+    @Override
+    public boolean ownsListenerAddress(String address) {
+        return frontends != null && frontends.enabled() && frontends.ownsAddress(address);
     }
 
     @Override
@@ -57,6 +69,10 @@ public class ElbV2DnsRecordSource implements DnsRecordSource {
         }
         if (type == 28) {
             return Optional.of(DnsAnswer.noData());
+        }
+        if (origin == null && frontends != null && frontends.enabled()) {
+            List<String> addresses = frontends.addresses(target.getLoadBalancerArn());
+            return Optional.of(addresses.isEmpty() ? DnsAnswer.noData() : DnsAnswer.records(addresses, 60));
         }
         boolean publicHttps = config != null && "internet-facing".equals(target.getScheme())
                 && config.network().vpcRouting().enabled()

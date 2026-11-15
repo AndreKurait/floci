@@ -5,6 +5,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.Optional;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -121,8 +122,47 @@ class DeclaredPublicAliasRoutingTest {
         }
     }
 
+    @Test
+    void anOwnedDedicatedFrontendPreservesTheDeclaredApiRoute() {
+        DnsAnswer answer = DnsAnswer.records(List.of("172.18.0.9"), 37);
+        EmbeddedDnsServer dns = server(true, answer, Set.of("172.18.0.9"));
+        DnsAnswer external = dns.resolvePublicAliasTarget(HOST, "lb.example", "ZOWNED", 1, null).orElseThrow();
+        assertTrue(external.upstream());
+        assertEquals(answer.records(), external.records());
+        assertEquals(37, external.ttlSeconds());
+        assertEquals(List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS),
+                dns.resolvePublicAliasTarget(HOST, "lb.example", "ZOWNED", 1, VPC).orElseThrow().addresses());
+        assertEquals(answer,
+                dns.resolvePublicAliasTarget("search.example", "lb.example", "ZOWNED", 1, null).orElseThrow());
+    }
+
+    @Test
+    void foreignRetiredAndMixedFrontendAnswersCannotClaimTheApiRoute() {
+        for (DnsAnswer answer : List.of(
+                DnsAnswer.records(List.of("172.18.0.8"), 30),
+                DnsAnswer.records(List.of("172.18.0.9", "172.18.0.8"), 30),
+                DnsAnswer.typedRecords(List.of(new DnsRecord.Address(1, "172.18.0.9"),
+                        new DnsRecord.Cname("foreign.example")), 30),
+                DnsAnswer.noData(), DnsAnswer.refused())) {
+            assertEquals(answer, server(true, answer, Set.of("172.18.0.9"))
+                    .resolvePublicAliasTarget(HOST, "lb.example", "ZOWNED", 1, null).orElseThrow());
+        }
+        DnsAnswer retired = DnsAnswer.records(List.of("172.18.0.9"), 30);
+        assertEquals(retired, server(true, retired, Set.of())
+                .resolvePublicAliasTarget(HOST, "lb.example", "ZOWNED", 1, null).orElseThrow());
+    }
+
     private static EmbeddedDnsServer server(boolean enabled, DnsAnswer answer) {
+        return server(enabled, answer, Set.of());
+    }
+
+    private static EmbeddedDnsServer server(boolean enabled, DnsAnswer answer, Set<String> ownedAddresses) {
         DnsRecordSource owner = new DnsRecordSource() {
+            @Override
+            public boolean ownsListenerAddress(String address) {
+                return ownedAddresses.contains(address);
+            }
+
             @Override
             public Optional<DnsAnswer> resolveIpv4(String name) {
                 return Optional.empty();

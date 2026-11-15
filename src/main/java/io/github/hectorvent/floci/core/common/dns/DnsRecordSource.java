@@ -13,6 +13,11 @@ import java.util.Optional;
  */
 public interface DnsRecordSource {
 
+    /** A currently owned native listener address, without DNS or upstream resolution. */
+    default boolean ownsListenerAddress(String address) {
+        return false;
+    }
+
     /** Stored public authority data only; this lookup must not perform recursive resolution. */
     default Optional<DnsAnswer> resolveAuthoritative(String name, int type) {
         return Optional.empty();

@@ -81,12 +81,29 @@ or the ALB's append/preserve/remove attribute. Shared-port TLS routing retains i
 HTTPS listeners require a default certificate. Supply one when creating a listener or changing an HTTP listener to HTTPS; an omitted certificate list on an existing HTTPS listener keeps its default.
 
 With Floci TLS enabled, an ALB HTTPS listener on the AWS HTTPS proxy port
-(normally `443`) shares that socket with AWS API callbacks. TLS SNI must uniquely
-identify a listener by its load-balancer DNS name, host rules or certificate
+(normally `443`) can share that socket with AWS API callbacks. Clients connecting
+to this shared emulator socket must send TLS SNI that uniquely
+identifies a listener by its load-balancer DNS name, host rules or certificate
 hostnames. The selected ALB serves its own certificate and configured actions;
 unmatched names and clients without SNI continue to the API backend. The public
 Floci API port and non-HTTPS proxy-port collisions remain reserved. See
 [TLS shared-port routing](../configuration/tls.md) for limits.
+
+With native VPC networking and security-group enforcement enabled, each ALB also
+gets an owned address on Floci's configured Docker network. Resource-backed DNS
+aliases queried by clients outside a known VPC return this address once a listener
+is ready. The destination identifies the ALB before TLS negotiation, so clients
+without SNI receive that listener's default ACM or IAM certificate. SNI can select
+additional certificates on the same listener. HTTP Host rules remain scoped to
+the selected ALB; another load balancer's Host cannot change the destination.
+
+These frontends use the existing network-helper image and preserve the client's
+socket address through a checked, private PROXY-protocol connection. Deleting
+the last listener removes its owned address. Cleanup refuses to remove a
+namespace while another container still uses it. Known VPC clients retain their
+existing routed transport, and declared public API aliases retain their API
+front door. These Docker addresses do not implement public VPC frontend routing
+or frontend security-group ingress enforcement.
 
 Listener responses omit `Certificates` when the listener has none. Configured certificates
 remain present in create, describe and modify responses.
@@ -180,8 +197,9 @@ Gateway Load Balancer listeners require omitted `Port` and `Protocol` fields on 
   Only the emulator's control address may connect to that listener. Its return-route exception
   matches replies to that connection; target traffic follows the normal VPC rules.
   Custom network-helper images must include `sockd`, supplied by Alpine's `dante-server` package.
-- ALB frontend listeners still share the emulator's network address. This backend transport
-  does not enforce frontend security-group ingress or provide a native public ALB address.
+- ALB frontends outside native VPC mode still share the emulator's network address.
+  Native mode provides the Docker destinations described above; the backend transport
+  does not enforce frontend security-group ingress or provide a native public VPC ALB address.
   NLB TCP listeners retain their existing transport. Native ALB backend networking currently
   follows the native VPC implementation's IPv4 boundary.
 - TCP listeners relay bytes bidirectionally without parsing HTTP or terminating TLS. TLS passthrough requires a TCP listener, with certificates configured at the target, not at the listener. Targets are selected per connection using round-robin among healthy targets, falling back to registered targets when none are healthy. The default TCP idle timeout is 350 seconds, configurable via the `tcp.idle_timeout.seconds` listener attribute (60 to 6000 seconds).
@@ -190,7 +208,7 @@ Gateway Load Balancer listeners require omitted `Port` and `Protocol` fields on 
   remain configured. Retry delays grow from 100 milliseconds to five seconds; a successful
   bind resets the delay. Deleting the last listener or stopping Floci cancels its retry.
   An external process holding the port must still release it before Floci can serve traffic.
-- HTTPS listeners terminate TLS using the configured ACM or IAM server certificates, with SNI certificate selection. When several load balancers share one local HTTPS port, clients must send SNI to identify the certificate they need; a connection without SNI cannot identify a particular load balancer before the TLS handshake.
+- HTTPS listeners terminate TLS using the configured ACM or IAM server certificates, with SNI certificate selection. When several load balancers share one local address and HTTPS port, clients must send SNI to identify the certificate they need. A dedicated native Docker frontend serves its listener's default certificate without SNI.
 - ACM certificates must be issued before attaching them. Reimporting an attached ACM certificate refreshes subsequent full TLS handshakes; existing connections keep their negotiated certificate. Reload does not invalidate TLS session caches: a resumed session can retain its previously authenticated certificate after replacement or removal until the session expires or is invalidated. ACM deletion and revocation are refused while a listener still references the certificate.
 - Certificate replacement keeps the previous key material available to new handshakes while the replacement loads. A failed reload leaves the previous certificate active.
 - Unusable saved listeners are retained for correction and logged individually so other saved listeners can start.

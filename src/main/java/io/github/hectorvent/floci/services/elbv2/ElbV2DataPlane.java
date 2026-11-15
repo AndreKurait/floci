@@ -233,6 +233,7 @@ public class ElbV2DataPlane {
     private final Route53Service route53;
     private final ElbV2VpcNetworkManager vpcNetworks;
     private final ProxyConfig proxyConfig;
+    private final ElbV2FrontendManager frontends;
     private final Map<String, AtomicReference<List<CompiledRule>>> ruleChains = new ConcurrentHashMap<>();
     private final Map<String, AtomicInteger> rrCounters = new ConcurrentHashMap<>();
     private final Map<String, String> listenerRegions = new ConcurrentHashMap<>();
@@ -253,9 +254,14 @@ public class ElbV2DataPlane {
         this(new ConcurrentHashMap<>(), route53, vpcNetworks);
     }
 
-    @Inject
     public ElbV2DataPlane(Route53Service route53, ElbV2VpcNetworkManager vpcNetworks, VertxHttpConfig httpConfig) {
         this(new ConcurrentHashMap<>(), route53, vpcNetworks, httpConfig.proxy());
+    }
+
+    @Inject
+    public ElbV2DataPlane(Route53Service route53, ElbV2VpcNetworkManager vpcNetworks,
+                          VertxHttpConfig httpConfig, ElbV2FrontendManager frontends) {
+        this(new ConcurrentHashMap<>(), route53, vpcNetworks, httpConfig.proxy(), frontends);
     }
 
     ElbV2DataPlane(ConcurrentMap<String, ListenerBinding> listenerBindings) {
@@ -273,10 +279,16 @@ public class ElbV2DataPlane {
 
     private ElbV2DataPlane(ConcurrentMap<String, ListenerBinding> listenerBindings, Route53Service route53,
                           ElbV2VpcNetworkManager vpcNetworks, ProxyConfig proxyConfig) {
+        this(listenerBindings, route53, vpcNetworks, proxyConfig, null);
+    }
+
+    ElbV2DataPlane(ConcurrentMap<String, ListenerBinding> listenerBindings, Route53Service route53,
+                   ElbV2VpcNetworkManager vpcNetworks, ProxyConfig proxyConfig, ElbV2FrontendManager frontends) {
         this.listenerBindings = listenerBindings;
         this.route53 = route53;
         this.vpcNetworks = vpcNetworks;
         this.proxyConfig = proxyConfig;
+        this.frontends = frontends;
     }
 
     record ListenerBinding(int port, String host, String loadBalancerArn, String canonicalHostedZoneId,
@@ -381,7 +393,25 @@ public class ElbV2DataPlane {
         Integer runtimePort = expected == null ? storedPort : Integer.valueOf(expected.port());
         List<Integer> ports = Stream.of(storedPort, runtimePort).filter(Objects::nonNull).distinct().sorted().toList();
         return onPorts(ports, 0, () -> {
-            if (listenerBindings.get(arn) != expected || !publication.getAsBoolean()) {
+            if (listenerBindings.get(arn) != expected) {
+                return false;
+            }
+            if (expected != null && frontends != null) {
+                frontends.removeListener(expected.loadBalancerArn(), arn);
+            }
+            boolean published;
+            try {
+                published = publication.getAsBoolean();
+            } catch (RuntimeException failure) {
+                try {
+                    restoreFrontend(arn, expected);
+                } catch (RuntimeException cleanup) {
+                    failure.addSuppressed(cleanup);
+                }
+                throw failure;
+            }
+            if (!published) {
+                restoreFrontend(arn, expected);
                 return false;
             }
             if (expected != null) {
@@ -410,14 +440,23 @@ public class ElbV2DataPlane {
         if (!claimed) {
             return false;
         }
+        boolean published;
         try {
-            if (!publication.getAsBoolean()) {
-                restoreReservation(arn, expected, prepared);
-                return false;
-            }
+            publishFrontend(arn, prepared, region);
+            published = publication.getAsBoolean();
         } catch (RuntimeException failure) {
             restoreReservation(arn, expected, prepared);
+            try {
+                restoreFrontendReservation(arn, expected, prepared, region);
+            } catch (RuntimeException cleanup) {
+                failure.addSuppressed(cleanup);
+            }
             throw failure;
+        }
+        if (!published) {
+            restoreReservation(arn, expected, prepared);
+            restoreFrontendReservation(arn, expected, prepared, region);
+            return false;
         }
         if (expected != null) {
             removeHostBindings(arn, expected);
@@ -455,6 +494,41 @@ public class ElbV2DataPlane {
             }
         }
         return true;
+    }
+
+    private void restoreFrontendReservation(String arn, ListenerBinding expected,
+                                             ListenerBinding prepared, String region) {
+        if (frontends == null || !frontends.enabled()) {
+            return;
+        }
+        if (expected == null) {
+            frontends.removeListener(prepared.loadBalancerArn(), arn);
+        } else {
+            publishFrontend(arn, expected, region);
+        }
+    }
+
+    private void restoreFrontend(String arn, ListenerBinding binding) {
+        if (binding != null) {
+            publishFrontend(arn, binding, listenerRegions.get(arn));
+        }
+    }
+
+    private void publishFrontend(String arn, ListenerBinding binding, String region) {
+        if (frontends == null || !frontends.enabled() || binding.tcp()) {
+            return;
+        }
+        LoadBalancer balancer = elbV2Service.getLoadBalancerForListener(region, arn, binding.loadBalancerArn());
+        if (balancer == null || !"application".equals(balancer.getType())) {
+            return;
+        }
+        Handler<HttpServerRequest> handler = request -> handleBoundListener(
+                request, arn, binding.port(), binding.secure());
+        if (proxyConfig != null) {
+            handler = ElbV2ProxyHandler.create(proxyConfig, vertx, handler);
+        }
+        frontends.putListener(binding.loadBalancerArn(), arn, binding.port(),
+                binding.secure() ? tlsKeyCertOptions(binding.certificates()) : null, handler);
     }
 
     private void restoreReservation(String arn, ListenerBinding expected, ListenerBinding prepared) {
@@ -1047,8 +1121,12 @@ public class ElbV2DataPlane {
         if (certificates.isEmpty()) {
             throw new IllegalStateException("HTTPS listener port " + port + " has no certificate");
         }
+        return tlsKeyCertOptions(List.copyOf(certificates.values()));
+    }
+
+    private static PemKeyCertOptions tlsKeyCertOptions(List<CertificateMaterial> certificates) {
         PemKeyCertOptions options = new PemKeyCertOptions();
-        for (CertificateMaterial certificate : certificates.values()) {
+        for (CertificateMaterial certificate : certificates) {
             if (certificate.privateKey() == null || certificate.privateKey().isBlank()
                     || certificate.certificateBody() == null || certificate.certificateBody().isBlank()) {
                 throw new IllegalStateException("Certificate " + certificate.arn()
@@ -1144,6 +1222,18 @@ public class ElbV2DataPlane {
             return;
         }
         handleListener(req, listener);
+    }
+
+    private void handleBoundListener(HttpServerRequest request, String arn, int port, boolean secure) {
+        ListenerBinding binding = listenerBindings.get(arn);
+        PortState state = portStates.get(port);
+        RoutedListener listener = state == null ? null : state.routing.listeners().get(arn);
+        if (stopping || binding == null || binding.port() != port || binding.secure() != secure
+                || listener == null) {
+            request.response().setStatusCode(503).end("Listener is unavailable");
+            return;
+        }
+        handleListener(request, listener);
     }
 
     private void handleListener(HttpServerRequest req, RoutedListener listener) {
