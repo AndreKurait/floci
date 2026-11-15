@@ -45,6 +45,7 @@ class ScalingPolicyAlarmActionHandlerTest {
 
     @BeforeEach
     void setUp() {
+        when(service.targetLock(anyString(), anyString(), anyString(), anyString())).thenReturn(new Object());
         when(adjusters.iterator()).thenAnswer(inv -> List.of(adjuster).iterator());
         when(adjuster.supports("ecs:service:DesiredCount")).thenReturn(true);
         handler = new ScalingPolicyAlarmActionHandler(service, adjusters, time.clock());

@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.core.common;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.cbor.CBORFactory;
+import io.github.hectorvent.floci.testing.AwsTestClients;
 import io.github.hectorvent.floci.testing.PartitionCleanup;
 import io.github.hectorvent.floci.testing.PartitionMatrix;
 import io.github.hectorvent.floci.testing.PartitionMatrix.PartitionCase;
@@ -14,6 +15,9 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.MethodSource;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.applicationautoscaling.ApplicationAutoScalingClient;
+import software.amazon.awssdk.services.applicationautoscaling.model.ScalableTargetAction;
 
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
@@ -1034,6 +1038,26 @@ class PartitionCrossServiceSmokeIntegrationTest {
                 "AnyScaleFrontendService.DeregisterScalableTarget", "{" + target + "}")
                 .when().post("/").then().statusCode(200));
         PartitionMatrix.assertArnIn(partitionCase, arn);
+        String scheduledResourceId = "service/" + unique("smoke-cluster", partitionCase) + "/service";
+        try (ApplicationAutoScalingClient client = AwsTestClients.create(ApplicationAutoScalingClient.builder(),
+                "000000000000", Region.of(region))) {
+            String scheduledTargetArn = client.registerScalableTarget(b -> b.serviceNamespace("ecs").scheduledResourceId(scheduledResourceId)
+                    .scalableDimension("ecs:service:DesiredCount").minCapacity(1).maxCapacity(5)).scalableTargetARN();
+            try {
+                PartitionMatrix.assertArnIn(partitionCase, scheduledTargetArn);
+                client.putScheduledAction(b -> b.serviceNamespace("ecs").scheduledResourceId(scheduledResourceId)
+                        .scalableDimension("ecs:service:DesiredCount").scheduledActionName("partition-action")
+                        .schedule("at(2099-01-01T00:00:00)")
+                        .scalableTargetAction(ScalableTargetAction.builder().minCapacity(0).build()));
+                String actionArn = client.describeScheduledActions(b -> b.serviceNamespace("ecs").scheduledResourceId(scheduledResourceId))
+                        .scheduledActions().getFirst().scheduledActionARN();
+                PartitionMatrix.assertArnIn(partitionCase, actionArn);
+                assertTrue(actionArn.contains(":autoscaling:" + region + ":000000000000:scheduledAction:"));
+            } finally {
+                client.deregisterScalableTarget(b -> b.serviceNamespace("ecs").scheduledResourceId(scheduledResourceId)
+                        .scalableDimension("ecs:service:DesiredCount"));
+            }
+        }
     }
 
     @ParameterizedTest
