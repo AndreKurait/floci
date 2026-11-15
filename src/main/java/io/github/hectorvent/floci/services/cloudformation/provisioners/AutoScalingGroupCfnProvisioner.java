@@ -261,8 +261,14 @@ public class AutoScalingGroupCfnProvisioner implements CfnResourceProvisioner {
     private boolean legacyLaunchConfigurationMatches(LaunchConfiguration prior, JsonNode props,
             ProvisionContext ctx, List<LaunchConfigurationBlockDeviceMapping> mappings,
             LaunchTemplateData.MetadataOptions metadata) {
-        if (prior == null || ctx.resolveOptional(props, "InstanceId") != null) {
+        if (prior == null) {
             return false;
+        }
+        if (ctx.resolveOptional(props, "InstanceId") != null) {
+            JsonNode previous = ctx.priorProperties();
+            // A prior literal template proves the source without resolving old references using new parameters.
+            return previous != null && previous.path("InstanceId").isTextual()
+                    && previous.equals(ctx.engine().resolveNode(props));
         }
         String publicIp = ctx.resolveOptional(props, "AssociatePublicIpAddress");
         Boolean associatePublicIp = publicIp == null || publicIp.isBlank() ? null : Boolean.parseBoolean(publicIp);
