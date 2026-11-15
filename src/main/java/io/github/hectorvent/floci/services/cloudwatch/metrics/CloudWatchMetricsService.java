@@ -1211,10 +1211,8 @@ public class CloudWatchMetricsService {
      * so the tag path uses the longer one rather than the code used elsewhere in this service.
      *
      * <p>The message names the ARN rather than asserting it was an alarm, because both tag
-     * handlers route every ARN that is not a dashboard and not a metric stream here. That
-     * includes kinds AWS considers taggable and Floci does not serve, a Contributor Insights
-     * {@code insight-rule/} ARN being the one AWS documents; reporting that no resource
-     * matches the ARN is true of those, where "alarm not found" would not be.
+     * handlers route ARNs here after their dashboard, metric stream and insight rule routes.
+     * Reporting that no resource matches the ARN also describes an unknown resource kind.
      */
     private Alarm requireAlarm(String resourceArn, String region) {
         return alarmStore.scan(k -> k.startsWith(region + "::"))
