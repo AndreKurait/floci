@@ -41,7 +41,7 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 class PartitionCrossServiceSmokeIntegrationTest {
 
     static final Set<String> COVERED_PACKAGES = Set.of(
-            "accessanalyzer", "acm", "amazonmq", "apigateway", "apigatewayv2", "applicationautoscaling", "appsync",
+            "accessanalyzer", "acm", "amazonmq", "apigateway", "apigatewayv2", "appconfig", "applicationautoscaling", "appsync",
             "aps", "autoscaling", "backup", "batch", "bcmdataexports", "bedrock", "bedrockagentcorecontrol", "ce",
             "cloudfront", "cloudmap", "cloudwatch", "codebuild", "codedeploy", "codepipeline", "cognito",
             "configservice", "connect", "controlcatalog", "controltower", "datasync", "dlm", "dms", "dsql", "dynamodb", "ec2",
@@ -63,6 +63,28 @@ class PartitionCrossServiceSmokeIntegrationTest {
     @BeforeAll
     static void configureRestAssured() {
         RestAssuredJsonUtils.configureAwsContentTypes();
+    }
+
+    @ParameterizedTest
+    @MethodSource(PartitionMatrix.NON_COMMERCIAL_CASES)
+    void appConfigApplicationTagArn(PartitionCase partitionCase) {
+        String region = offered(partitionCase, "appconfig");
+        String id = signed(region, "appconfig").contentType(JSON)
+                .body("{\"Name\":\"" + unique("smoke-appconfig", partitionCase) + "\",\"Tags\":{\"created\":\"yes\"}}")
+                .post("/applications").then().statusCode(201).extract().path("Id");
+        cleanup.register(() -> signed(region, "appconfig").delete("/applications/" + id));
+        String resource = ":appconfig:" + region + ":" + PartitionMatrix.ACCOUNT + ":application/" + id;
+        String arn = "arn:" + partitionCase.partition() + resource;
+        // AppConfig returns an ID, not an ARN. Its tag handler checks the supplied ARN against
+        // one minted from the request context, so a successful read exercises that partition path.
+        assertEquals(Map.of("created", "yes"), signed(region, "appconfig")
+                .get("/tags/{arn}", arn).then().statusCode(200).extract().jsonPath().getMap("Tags"));
+        signed(region, "appconfig").contentType(JSON).body("{\"Tags\":{\"updated\":\"yes\"}}")
+                .post("/tags/{arn}", arn).then().statusCode(204);
+        signed(region, "appconfig").contentType(JSON).body("{\"Tags\":{\"foreign\":\"no\"}}")
+                .post("/tags/{arn}", "arn:aws" + resource).then().statusCode(404);
+        assertEquals(Map.of("created", "yes", "updated", "yes"), signed(region, "appconfig")
+                .get("/tags/{arn}", arn).then().statusCode(200).extract().jsonPath().getMap("Tags"));
     }
 
     @ParameterizedTest

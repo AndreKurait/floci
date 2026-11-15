@@ -10,26 +10,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-/**
- * {@link TagHandler} implementation for AppConfig.
- *
- * <p>Supported ARN formats:
- * <ul>
- *   <li>{@code arn:aws:appconfig:<region>:<account>:application/<appId>}
- *   <li>{@code arn:aws:appconfig:<region>:<account>:application/<appId>/environment/<envId>}
- *   <li>{@code arn:aws:appconfig:<region>:<account>:application/<appId>/configurationprofile/<profileId>}
- *   <li>{@code arn:aws:appconfig:<region>:<account>:deploymentstrategy/<strategyId>}
- *   <li>{@code arn:aws:appconfig:<region>:<account>:extension/<extensionId>}
- *   <li>{@code arn:aws:appconfig:<region>:<account>:extensionassociation/<associationId>}
- * </ul>
- * Only application-level tags are actually stored; every other recognized ARN shape above is
- * accepted (not rejected with a 400) but the tag call itself is a no-op - this satisfies callers
- * (e.g. Terraform's AWS provider) that read tags back after a write without erroring on a resource
- * type Floci doesn't yet persist tags for.
- */
+/** Tags stored applications, environments, configuration profiles and deployment strategies. */
 @ApplicationScoped
 public class AppConfigTagHandler implements TagHandler {
-
+    private static final Set<String> STORED_TYPES = Set.of(
+            "application", "environment", "configurationprofile", "deploymentstrategy");
+    private static final Set<String> TOP_LEVEL_TYPES = Set.of(
+            "deploymentstrategy", "extension", "extensionassociation");
     private final AppConfigService service;
 
     @Inject
@@ -48,60 +35,81 @@ public class AppConfigTagHandler implements TagHandler {
     }
 
     @Override
+    public boolean strictTagValidation() {
+        return true;
+    }
+
+    @Override
+    public String tagValidationErrorCode() {
+        return "BadRequestException";
+    }
+
+    @Override
+    public boolean allowEmptyTagKeys() {
+        return true;
+    }
+
+    @Override
     public Map<String, String> listTags(String region, String arn) {
-        ResourceRef ref = parseArn(arn);
-        return switch (ref.type()) {
-            case "application" -> service.getApplicationTags(ref.id());
-            default -> Map.of();
-        };
+        ResourceRef ref = parseArn(region, arn);
+        return STORED_TYPES.contains(ref.type())
+                ? service.getResourceTags(ref.type(), ref.applicationId(), ref.id()) : Map.of();
     }
 
     @Override
     public void tagResource(String region, String arn, Map<String, String> tags) {
-        ResourceRef ref = parseArn(arn);
-        if ("application".equals(ref.type())) {
-            service.tagApplication(ref.id(), tags);
+        ResourceRef ref = parseArn(region, arn);
+        if (STORED_TYPES.contains(ref.type())) {
+            service.tagResource(ref.type(), ref.applicationId(), ref.id(), tags);
         }
     }
 
     @Override
     public void untagResource(String region, String arn, List<String> tagKeys) {
-        ResourceRef ref = parseArn(arn);
-        if ("application".equals(ref.type())) {
-            service.untagApplication(ref.id(), tagKeys);
+        ResourceRef ref = parseArn(region, arn);
+        if (STORED_TYPES.contains(ref.type())) {
+            service.untagResource(ref.type(), ref.applicationId(), ref.id(), tagKeys);
         }
     }
 
-    private record ResourceRef(String type, String id) {}
+    private record ResourceRef(String type, String applicationId, String id) {}
 
-    // The AppConfig resource types AWS documents as taggable that are NOT nested under
-    // application/... (see e.g. the Tags property on AWS::AppConfig::DeploymentStrategy,
-    // AWS::AppConfig::Extension, and AWS::AppConfig::ExtensionAssociation) - every other
-    // taggable type (application, environment, configurationprofile) already nests under
-    // application/ and is handled by the branch below.
-    private static final Set<String> TOP_LEVEL_TYPES = Set.of("deploymentstrategy", "extension", "extensionassociation");
-
-    private static ResourceRef parseArn(String arn) {
-        // arn:aws:appconfig:<region>:<account>:<resource>
+    private ResourceRef parseArn(String region, String arn) {
         String resource;
         try {
             resource = AwsArnUtils.parse(arn).resource();
         } catch (IllegalArgumentException e) {
             throw new AwsException("BadRequestException", "Invalid resource ARN: " + arn, 400);
         }
-        String[] parts = resource.split("/");
-        if (parts.length == 2 && TOP_LEVEL_TYPES.contains(parts[0])) {
-            return new ResourceRef(parts[0], parts[1]);
+        String[] parts = resource.split("/", -1);
+        ResourceRef ref;
+        if (parts.length == 2 && TOP_LEVEL_TYPES.contains(parts[0]) && !parts[1].isEmpty()) {
+            ref = new ResourceRef(parts[0], null, parts[1]);
+        } else if (parts.length >= 2 && "application".equals(parts[0]) && !parts[1].isEmpty()) {
+            ref = switch (parts.length) {
+                case 2 -> new ResourceRef("application", null, parts[1]);
+                case 4 -> {
+                    if ((!"environment".equals(parts[2]) && !"configurationprofile".equals(parts[2]))
+                            || parts[3].isEmpty()) {
+                        throw new AwsException("BadRequestException", "Invalid resource ARN: " + arn, 400);
+                    }
+                    yield new ResourceRef(parts[2], parts[1], parts[3]);
+                }
+                case 6 -> {
+                    if (!"environment".equals(parts[2]) || !"deployment".equals(parts[4])
+                            || parts[3].isEmpty() || parts[5].isEmpty()) {
+                        throw new AwsException("BadRequestException", "Invalid resource ARN: " + arn, 400);
+                    }
+                    yield new ResourceRef("deployment", parts[1], parts[5]);
+                }
+                default -> throw new AwsException("BadRequestException", "Invalid resource ARN: " + arn, 400);
+            };
+        } else {
+            throw new AwsException("BadRequestException", "Invalid resource ARN: " + arn, 400);
         }
-        if (parts.length >= 2 && "application".equals(parts[0])) {
-            // application/<appId>
-            if (parts.length == 2) return new ResourceRef("application", parts[1]);
-            // application/<appId>/environment/<envId>
-            // application/<appId>/configurationprofile/<profileId>
-            if (parts.length == 4) return new ResourceRef(parts[2], parts[3]);
-            // application/<appId>/environment/<envId>/deployment/<num>
-            if (parts.length == 6) return new ResourceRef(parts[4], parts[5]);
+        if (STORED_TYPES.contains(ref.type()) && !arn.equals(service.tagResourceArn(region, resource))) {
+            throw new AwsException("ResourceNotFoundException", "The AppConfig resource does not exist.", 404);
         }
-        throw new AwsException("BadRequestException", "Invalid resource ARN: " + arn, 400);
+        return ref;
     }
 }

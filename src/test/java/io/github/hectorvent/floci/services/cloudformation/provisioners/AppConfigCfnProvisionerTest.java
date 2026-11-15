@@ -19,6 +19,8 @@ import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.testing.InMemoryStorageFactory;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -708,6 +710,73 @@ class AppConfigCfnProvisionerTest {
                 () -> update(env, props("ApplicationId", appId, "Name", "gamma")));
 
         assertEquals("ResourceNotFoundException", failure.getErrorCode());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {ENVIRONMENT, PROFILE, STRATEGY})
+    void childAndStrategyTagsFollowCreateUpdateRemovalAndRollback(String type) {
+        StackResource application = create(APPLICATION, props("Name", "parent"));
+        Map<String, Object> properties = tagProperties(type, application.getPhysicalId());
+        properties.put("Tags", List.of(tag("team", "first"), tag("remove", "yes")));
+        StackResource target = create(type, properties);
+        String id = target.getPhysicalId();
+        assertEquals(Map.of("team", "first", "remove", "yes"), resourceTags(target));
+
+        properties.put("Tags", List.of(tag("team", "second"), tag("empty", "")));
+        update(target, properties);
+        assertEquals(id, target.getPhysicalId());
+        assertEquals(Map.of("team", "second", "empty", ""), resourceTags(target));
+        assertTrue(provisioner.rollbackUpdate(target));
+        assertEquals(Map.of("team", "first", "remove", "yes"), resourceTags(target));
+
+        properties.remove("Tags");
+        update(target, properties);
+        assertEquals(id, target.getPhysicalId());
+        assertTrue(resourceTags(target).isEmpty());
+        assertTrue(provisioner.rollbackUpdate(target));
+        assertEquals(Map.of("team", "first", "remove", "yes"), resourceTags(target));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {ENVIRONMENT, PROFILE, STRATEGY})
+    void failedTagMutationRestoresMetadataAndTags(String type) {
+        StackResource application = create(APPLICATION, props("Name", "parent"));
+        Map<String, Object> properties = tagProperties(type, application.getPhysicalId());
+        properties.put("Description", "original");
+        properties.put("Tags", List.of(tag("team", "first")));
+        StackResource target = create(type, properties);
+        doThrow(new AwsException("InternalServerException", "tagging failed", 500)).doCallRealMethod()
+                .when(service).setResourceTags(anyString(), any(), anyString(), any());
+        properties.put("Description", "changed");
+        properties.put("Tags", List.of(tag("team", "second")));
+        assertThrows(AwsException.class, () -> update(target, properties));
+        assertEquals(Map.of("team", "first"), resourceTags(target));
+        String description = switch (type) {
+            case ENVIRONMENT -> service.findEnvironment(target.getPhysicalId()).orElseThrow().getDescription();
+            case PROFILE -> service.findConfigurationProfile(target.getPhysicalId()).orElseThrow().getDescription();
+            case STRATEGY -> service.getDeploymentStrategy(target.getPhysicalId()).getDescription();
+            default -> throw new IllegalArgumentException(type);
+        };
+        assertEquals("original", description);
+    }
+
+    private Map<String, String> resourceTags(StackResource resource) {
+        return switch (resource.getResourceType()) {
+            case ENVIRONMENT -> service.findEnvironment(resource.getPhysicalId()).orElseThrow().getTags();
+            case PROFILE -> service.findConfigurationProfile(resource.getPhysicalId()).orElseThrow().getTags();
+            case STRATEGY -> service.getDeploymentStrategy(resource.getPhysicalId()).getTags();
+            default -> throw new IllegalArgumentException(resource.getResourceType());
+        };
+    }
+
+    private static Map<String, Object> tagProperties(String type, String parent) {
+        return switch (type) {
+            case ENVIRONMENT -> props("ApplicationId", parent, "Name", "tagged");
+            case PROFILE -> props("ApplicationId", parent, "Name", "tagged", "LocationUri", "hosted");
+            case STRATEGY -> props("Name", "tagged", "ReplicateTo", "NONE",
+                    "DeploymentDurationInMinutes", 0, "GrowthFactor", 100);
+            default -> throw new IllegalArgumentException(type);
+        };
     }
 
     private StackResource create(String type, Map<String, Object> properties) {
