@@ -98,6 +98,48 @@ membership recovery. Tokens and protected instance tombstones currently have no 
 expiry. CreateFleet does not pass its token to independent member launches.
 CreateFleet request replay remains unsupported.
 
+## Native peer dependencies
+
+`FLOCI_EC2_NATIVE_PEER_DEPENDENCIES` declares deployment-owned TCP dependencies for
+protected EC2 guests. It defaults to an empty JSON array. The deployment must
+verify ownership of each destination and provision its TLS trust separately:
+
+```json
+[{"hostname":"api.peer.example","address":"172.18.0.2","port":443}]
+```
+
+Each entry requires an exact lowercase DNS hostname with at least two labels,
+a canonical RFC1918 IPv4 address, and an integer TCP port from 1 through 65535.
+Wildcards, duplicate hostnames, unknown fields, ambiguous addresses, and invalid
+JSON fail startup. Different names may share the same destination and port.
+This is immutable parent configuration, not an EC2 request or guest override.
+
+The EC2 launch and retained-instance restore paths install the exact destination
+and port through the existing security-group and VPC control-connection rules.
+Other destinations and ports keep their ordinary policies. The route retains
+the guest's existing public source identity; it does not add HTTP forwarding
+headers or alter service authentication.
+
+Only the current registered EC2 namespace carrying that dependency receives its
+DNS answer, with a five-second TTL. The explicit deployment pin takes precedence
+over stored public and private records, Resolver forwarding rules, and synthetic
+public API routing for that exact hostname. Other callers, including Lambda
+namespaces and unregistered guests, retain normal DNS resolution. Non-A queries
+for an admitted peer return NODATA. Namespace retirement removes the DNS
+authority; security-group reconciliation retains the declared dependency.
+
+The existing `/_floci/info` response reports
+`ec2_native_peer_dependencies` with `contract: 1`, the hostname `count`, and
+`sha256`. The digest covers the parsed array sorted by hostname, with each
+object's keys sorted and JSON encoded without whitespace. Admission tooling
+must verify this response against its declaration; checking an environment
+variable alone cannot establish that an older image supports the contract.
+
+Changing or removing the declaration requires normal parent recreation and
+guest admission. Persistent-state restoration applies the new declaration,
+including withdrawing removed permissions. Memory storage remains volatile;
+restarting a memory-mode parent does not preserve its control-plane state.
+
 ## Instance Resource Limits
 
 By default, Docker containers launched for EC2 instances are bounded to the CPU and memory limits defined in the instance type catalog (`src/main/resources/ec2/instance-type-catalog.yaml`).
@@ -576,6 +618,24 @@ Losing either registered interface withdraws both addresses, including a survivi
 Detection is asynchronous; failed policy updates quarantine peers and are retried.
 The owning workload retains responsibility for removing its retired helper; failed
 Docker removal is reported and remains retryable.
+
+Policy writes keep a durable record under
+`{floci.storage.persistent-path}/security-group-writers`, scoped to the Floci
+owner and exact helper container ID. Before starting nft, Floci atomically
+persists and flushes its exec ID. A stream timeout alone does not prove success
+or termination: the daemon must report that exact exec and helper, a stopped
+exec, and a non-null exit code. Independent stable helpers use at most four
+parallel writers; each helper permits only one writer.
+
+On parent restart, completed records preserve the existing helpers and guests.
+A pending record is resolved through the daemon before another policy is
+copied or started, including when the helper is already stopped. Missing,
+corrupt, mismatched, or still-running state fences new writes and retires the
+owned namespace; failed retirement prevents startup from reporting success.
+Helpers created by versions without this journal cannot be assumed clean and
+must be recreated through their owning resource lifecycle. Keep the existing
+persistent data volume across parent restarts, even when other service state
+uses memory mode. Confirmed helper removal also removes its journal files.
 
 VPC-connected Docker Lambda environments use the same policy engine. Their Runtime API
 has an exact IP and TCP-port exception, while their application traffic remains filtered.

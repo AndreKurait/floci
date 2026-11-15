@@ -9,7 +9,9 @@ import io.github.hectorvent.floci.services.ec2.net.VpcRoutingManager;
 import io.github.hectorvent.floci.services.elbv2.ElbV2VpcNetworkManager;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -36,6 +38,16 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 class SecurityGroupFirewallRetirementTest {
+    @TempDir
+    Path writerDirectory;
+
+    private SecurityGroupFirewallPeerFixture fixture() {
+        SecurityGroupFirewallPeerFixture fixture = new SecurityGroupFirewallPeerFixture();
+        fixture.writerDirectory = writerDirectory;
+        fixture.prepareWriterJournal();
+        return fixture;
+    }
+
     private static final String QUARANTINE = """
             flush chain inet floci_sg ingress
             flush chain inet floci_sg egress
@@ -43,7 +55,7 @@ class SecurityGroupFirewallRetirementTest {
 
     @Test
     void albShutdownRefreshesSurvivingPeerPoliciesOnceForTheWholeOwnedBatch() {
-        SecurityGroupFirewallPeerFixture fixture = new SecurityGroupFirewallPeerFixture();
+        SecurityGroupFirewallPeerFixture fixture = fixture();
         SecurityGroupFirewallManager firewall = fixture.manager();
         for (int index = 0; index < 8; index++) {
             firewall.register(fixture.endpoint(index), fixture.helper(index), Map.of());
@@ -97,7 +109,7 @@ class SecurityGroupFirewallRetirementTest {
     @Test
     void retiringTogetherDoesNotReinstallPoliciesOnOtherRetiringHelpers() throws Exception {
         int count = 8;
-        SecurityGroupFirewallPeerFixture fixture = new SecurityGroupFirewallPeerFixture();
+        SecurityGroupFirewallPeerFixture fixture = fixture();
         SecurityGroupFirewallManager manager = fixture.manager();
         for (int index = 0; index < count; index++) {
             manager.register(fixture.endpoint(index), fixture.helper(index), Map.of());
@@ -120,7 +132,7 @@ class SecurityGroupFirewallRetirementTest {
 
     @Test
     void survivingPeerLosesTheRetiredAddressBeforeItsHelperIsRemoved() {
-        SecurityGroupFirewallPeerFixture fixture = new SecurityGroupFirewallPeerFixture();
+        SecurityGroupFirewallPeerFixture fixture = fixture();
         SecurityGroupFirewallManager manager = fixture.manager();
         manager.register(fixture.endpoint(0), fixture.helper(0), Map.of());
         manager.register(fixture.endpoint(1), fixture.helper(1), Map.of());
@@ -138,7 +150,7 @@ class SecurityGroupFirewallRetirementTest {
 
     @Test
     void failedBatchQuarantinesTheSurvivorAndRetainsEveryRequestedCleanup() throws Exception {
-        SecurityGroupFirewallPeerFixture fixture = new SecurityGroupFirewallPeerFixture();
+        SecurityGroupFirewallPeerFixture fixture = fixture();
         SecurityGroupFirewallManager manager = fixture.manager();
         for (int index = 0; index < 3; index++) {
             manager.register(fixture.endpoint(index), fixture.helper(index), Map.of());
@@ -164,7 +176,7 @@ class SecurityGroupFirewallRetirementTest {
 
     @Test
     void failedExplicitBatchRefreshRetainsEveryCleanupForIndividualRetry() {
-        SecurityGroupFirewallPeerFixture fixture = new SecurityGroupFirewallPeerFixture();
+        SecurityGroupFirewallPeerFixture fixture = fixture();
         SecurityGroupFirewallManager manager = fixture.manager();
         for (int index = 0; index < 3; index++) {
             manager.register(fixture.endpoint(index), fixture.helper(index), Map.of());
@@ -186,7 +198,7 @@ class SecurityGroupFirewallRetirementTest {
 
     @Test
     void failedExplicitBatchPreparationKeepsEarlierAndFailedCleanupForRetry() {
-        SecurityGroupFirewallPeerFixture fixture = new SecurityGroupFirewallPeerFixture();
+        SecurityGroupFirewallPeerFixture fixture = fixture();
         SecurityGroupFirewallManager manager = fixture.manager();
         for (int index = 0; index < 3; index++) {
             manager.register(fixture.endpoint(index), fixture.helper(index), Map.of());

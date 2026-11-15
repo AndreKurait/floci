@@ -3586,6 +3586,14 @@ public interface EmulatorConfig {
     }
 
     interface Ec2ServiceConfig {
+        /**
+         * Immutable deployment-owned peer dependencies for protected EC2 guests.
+         * A JSON array of exact hostname, private IPv4 address and TCP port objects.
+         * Env: {@code FLOCI_EC2_NATIVE_PEER_DEPENDENCIES}.
+         */
+        @WithDefault("[]")
+        String nativePeerDependencies();
+
         /** Trusted network helper that prepares IMDS before the guest image starts. */
         @WithDefault("floci/network-helper:local")
         String metadataHelperImage();

@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.ec2;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.InspectContainerResponse;
+import com.github.dockerjava.api.command.InspectExecResponse;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.Container;
 import com.github.dockerjava.api.model.ContainerNetwork;
@@ -10,6 +11,7 @@ import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.Info;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.SweepWorker;
+import io.github.hectorvent.floci.core.common.dns.DnsAnswer;
 import io.github.hectorvent.floci.core.common.dns.DnsClientVpcSource;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
@@ -42,6 +44,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -66,6 +69,9 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
 
     private static final Logger LOG = Logger.getLogger(SecurityGroupFirewallManager.class);
     private final DockerClient dockerClient;
+    private final PolicyWriterJournal policyWriters;
+    /** Never reuse a namespace whose remote policy writer has no proven terminal result. */
+    private final Set<String> uncertainPolicyWriters = ConcurrentHashMap.newKeySet();
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
     private final EmulatorConfig config;
@@ -115,7 +121,14 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     public SecurityGroupFirewallManager(DockerClient dockerClient, ContainerBuilder containerBuilder,
                                         ContainerLifecycleManager lifecycleManager, EmulatorConfig config,
                                         EmbeddedDnsServer embeddedDnsServer) {
+        this(dockerClient, containerBuilder, lifecycleManager, config, embeddedDnsServer, new PolicyWriterJournal(config));
+    }
+
+    SecurityGroupFirewallManager(DockerClient dockerClient, ContainerBuilder containerBuilder,
+                                 ContainerLifecycleManager lifecycleManager, EmulatorConfig config,
+                                 EmbeddedDnsServer embeddedDnsServer, PolicyWriterJournal policyWriters) {
         this.dockerClient = dockerClient;
+        this.policyWriters = policyWriters;
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.config = config;
@@ -133,6 +146,21 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             return Optional.empty();
         }
         return Optional.ofNullable(dnsOrigins.get(clientAddress)).map(DnsOrigin::vpc);
+    }
+
+    @Override
+    public Optional<DnsAnswer> controlDependency(String name, int type, String clientAddress) {
+        DnsOrigin origin = clientAddress == null ? null : dnsOrigins.get(clientAddress);
+        ProtectedEndpoint current = origin == null ? null : endpoints.get(origin.eniId());
+        if (current == null || current.dnsOrigin() != origin || name == null) {
+            return Optional.empty();
+        }
+        SecurityGroupNftCompiler.ControlConnection connection =
+                current.endpoint().nativePeerDependencies().get(name.toLowerCase(Locale.ROOT));
+        if (connection == null || !current.endpoint().controlConnections().contains(connection)) {
+            return Optional.empty();
+        }
+        return Optional.of(type == 1 ? DnsAnswer.records(List.of(connection.address()), 5) : DnsAnswer.noData());
     }
 
     void startDnsOriginObserver(@Observes StartupEvent event) {
@@ -198,6 +226,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     }
 
     private synchronized void retireEndpoints(List<DnsOrigin> retired) {
+        List<String> helpers = new ArrayList<>();
         for (DnsOrigin origin : retired) {
             ProtectedEndpoint current = endpoints.get(origin.eniId());
             if (current != null && current.dnsOrigin() == origin) {
@@ -206,17 +235,34 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 pendingHelperCleanup.computeIfAbsent(origin.eniId(), ignored -> new HashSet<>())
                         .add(current.helperId());
                 peerPoliciesNeedRefresh = true;
-                quarantine(current.helperId());
+                helpers.add(current.helperId());
             } else if (endpoints.values().stream()
                     .noneMatch(endpoint -> endpoint.helperId().equals(origin.helperId()))) {
                 // The observer may lose the monitor to a replacement, but still owns the old helper.
                 pendingHelperCleanup.computeIfAbsent(origin.eniId(), ignored -> new HashSet<>())
                         .add(origin.helperId());
-                quarantine(origin.helperId());
+                helpers.add(origin.helperId());
             }
         }
-        // A failed installation quarantines peers. Retry even when the last DNS origin is gone.
-        reconcileRetirements();
+        RuntimeException failure = null;
+        try {
+            quarantineAll(helpers);
+        } catch (RuntimeException quarantineFailure) {
+            failure = quarantineFailure;
+        }
+        // Retry peer cleanup even when namespace retirement failed or the last DNS origin is gone.
+        try {
+            reconcileRetirements();
+        } catch (RuntimeException refreshFailure) {
+            if (failure == null) {
+                failure = refreshFailure;
+            } else {
+                failure.addSuppressed(refreshFailure);
+            }
+        }
+        if (failure != null) {
+            throw failure;
+        }
     }
 
     /** The observer retries removals an owning service requested but Docker has not completed. */
@@ -267,6 +313,8 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         }
         try {
             lifecycleManager.removeIfExistsStrict(helper);
+            policyWriters.forget(helper);
+            uncertainPolicyWriters.remove(helper);
             synchronized (this) {
                 forgetHelperCleanup(helper);
             }
@@ -413,25 +461,70 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         try {
             String owner = ContainerStorageHelper.ownerIdentity(config);
             ContainerStorageHelper.LabelAliases aliases = ContainerStorageHelper.CONTAINER_LABEL_ALIASES;
-            aliases.listByLabels(Map.of(ContainerStorageHelper.SECURITY_GROUP_HELPER_LABEL, "true"),
+            List<Container> survivors = aliases.listByLabels(Map.of(ContainerStorageHelper.SECURITY_GROUP_HELPER_LABEL, "true"),
                             filter -> dockerClient.listContainersCmd().withShowAll(true)
                                     .withLabelFilter(filter).exec(),
                             Container::getId).stream()
                     .filter(container -> aliases.consistent(container.getId(), container.getLabels())
                             && aliases.matches(container.getLabels(), ContainerStorageHelper.OWNER_LABEL, owner))
-                    .forEach(container -> {
-                        if ("running".equals(container.getState())) {
-                            quarantine(container.getId());
-                        } else {
-                            stopNamespaceWorkloads(container.getId());
-                        }
-                        if ("ecs".equals(container.getLabels().get(ContainerStorageHelper.SERVICE_LABEL))) {
-                            removeNamespaceWorkloads(container.getId());
-                            lifecycleManager.removeIfExists(container.getId());
-                        }
-                    });
+                    .toList();
+            RuntimeException failure = null;
+            for (Container container : survivors) {
+                try {
+                    recoverPolicyWriter(container.getId());
+                    if ("running".equals(container.getState())) {
+                        quarantine(container.getId());
+                    } else {
+                        stopNamespaceWorkloads(container.getId());
+                    }
+                    if ("ecs".equals(container.getLabels().get(ContainerStorageHelper.SERVICE_LABEL))) {
+                        removeNamespaceWorkloads(container.getId());
+                        lifecycleManager.removeIfExists(container.getId());
+                    }
+                } catch (RuntimeException retirementFailure) {
+                    if (failure == null) {
+                        failure = retirementFailure;
+                    } else {
+                        failure.addSuppressed(retirementFailure);
+                    }
+                }
+            }
+            if (failure != null) {
+                throw failure;
+            }
+            forgetRemovedPolicyWriters();
         } catch (Exception e) {
-            LOG.warnv("Could not inspect surviving security-group namespaces: {0}", e.getMessage());
+            throw new IllegalStateException("Could not safely recover surviving security-group namespaces", e);
+        }
+    }
+
+    private void recoverPolicyWriter(String helperId) {
+        try (PolicyWriterJournal.Lease lease = policyWriters.acquire(helperId)) {
+            String pending = lease.pendingExecId();
+            if (pending != null) {
+                terminalPolicyWriter(helperId, pending);
+                lease.completed(pending);
+            }
+        } catch (RuntimeException failure) {
+            // Neither an absent record nor a missing exec means that the previous writer exited.
+            uncertainPolicyWriters.add(helperId);
+            LOG.errorv(failure, "Cannot resolve the previous policy writer for {0}; retiring its namespace", helperId);
+        }
+    }
+
+    private void forgetRemovedPolicyWriters() {
+        for (String helperId : policyWriters.helpers()) {
+            forgetPolicyWriterIfAbsent(helperId);
+        }
+    }
+
+    private void forgetPolicyWriterIfAbsent(String helperId) {
+        try {
+            dockerClient.inspectContainerCmd(helperId).exec();
+        } catch (NotFoundException expected) {
+            // Only the daemon's absence of this exact helper releases its durable writer record.
+            policyWriters.forget(helperId);
+            uncertainPolicyWriters.remove(helperId);
         }
     }
 
@@ -514,6 +607,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             if (ip == null || ip.isBlank()) {
                 throw new IllegalStateException("Firewall helper has no Docker IP");
             }
+            policyWriters.initialize(helperId);
             apply(helperId, SecurityGroupNftCompiler.initialRuleset());
             String resolver = embeddedDnsServer.getServerIp().orElse(null);
             if (resolver != null) {
@@ -534,7 +628,12 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             return new Namespace(helperId, ip);
         } catch (Exception e) {
             if (helperId != null) {
-                lifecycleManager.removeIfExists(helperId);
+                try {
+                    lifecycleManager.removeIfExists(helperId);
+                    forgetPolicyWriterIfAbsent(helperId);
+                } catch (RuntimeException cleanupFailure) {
+                    e.addSuppressed(cleanupFailure);
+                }
             }
             throw new IllegalStateException("Cannot prepare protected network namespace for " + resourceId, e);
         }
@@ -659,10 +758,12 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                     endpoints.put(endpoint.eniId(), previous);
                 }
             }
-            quarantine(helperId);
-            // Peers may still enforce rules for the reverted identity, and a restored previous
-            // registration on this helper was just flushed: converge them again.
-            schedulePeerRefresh();
+            try {
+                quarantine(helperId);
+            } finally {
+                // Peers may still enforce the reverted identity; refresh even when retirement failed.
+                schedulePeerRefresh();
+            }
             throw e;
         }
     }
@@ -920,7 +1021,6 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             removeDnsOrigin(current);
             pendingHelperCleanup.computeIfAbsent(eniId, ignored -> new HashSet<>()).add(current.helperId());
             peerPoliciesNeedRefresh = true;
-            quarantine(current.helperId());
         }
         // Retiring peer permissions must not discard the owning service's later cleanup obligation.
         Set<String> helpers = new HashSet<>(capturedHelpers);
@@ -928,6 +1028,9 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 .anyMatch(endpoint -> endpoint.helperId().equals(helper)));
         helpers.retainAll(pendingHelperCleanup.getOrDefault(eniId, Set.of()));
         requestedHelperCleanup.addAll(helpers);
+        if (owned) {
+            quarantine(current.helperId());
+        }
         return helpers;
     }
 
@@ -966,7 +1069,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 identity.accountId(), identity.region(), identity.vpcId(), identity.eniId(),
                 identity.logicalAddress(), identity.transportAddress(), Set.copyOf(groupIds), attached,
                 identity.controlConnections(), identity.instanceMetadataAllowed(),
-                identity.additionalTransportAddresses(), identity.controlListeners());
+                identity.additionalTransportAddresses(), identity.controlListeners(), identity.nativePeerDependencies());
         endpoints.put(eniId, new ProtectedEndpoint(updated, current.helperId(), Map.copyOf(prefixLists),
                 current.dnsOrigin()));
         reconcileAll();
@@ -978,6 +1081,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     }
 
     private void retireStoppedHelpers() {
+        List<String> helpers = new ArrayList<>();
         for (Map.Entry<String, ProtectedEndpoint> entry : new ArrayList<>(endpoints.entrySet())) {
             boolean running;
             try {
@@ -992,9 +1096,10 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 pendingHelperCleanup.computeIfAbsent(entry.getKey(), ignored -> new HashSet<>())
                         .add(entry.getValue().helperId());
                 peerPoliciesNeedRefresh = true;
-                quarantine(entry.getValue().helperId());
+                helpers.add(entry.getValue().helperId());
             }
         }
+        quarantineAll(helpers);
     }
 
     /**
@@ -1009,7 +1114,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 convergePolicies(force);
                 return;
             } catch (RuntimeException failure) {
-                endpoints.values().forEach(endpoint -> quarantine(endpoint.helperId()));
+                quarantineAll(endpoints.values().stream().map(ProtectedEndpoint::helperId).toList());
                 if (!(failure.getCause() instanceof NotFoundException)) {
                     throw failure;
                 }
@@ -1033,9 +1138,35 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             List<ProtectedEndpoint> order = new ArrayList<>(endpoints.values());
             order.sort(Comparator.comparing((ProtectedEndpoint target) -> knownByAllPeers(target))
                     .thenComparing(target -> target.endpoint().eniId()));
+            // Freeze the partition before any install can teach a peer another identity.
+            List<ProtectedEndpoint> unknown = order.stream().filter(target -> !knownByAllPeers(target)).toList();
+            List<ProtectedEndpoint> stable = order.stream().filter(this::knownByAllPeers).toList();
             boolean changed = false;
-            for (ProtectedEndpoint target : order) {
+            for (ProtectedEndpoint target : unknown) {
+                // Withdraw old accepts before any peer learns a changed identity.
                 changed |= install(target, peers, vpcResolvers, origins, self, force && round == 0);
+            }
+            List<Installation> plans = new ArrayList<>();
+            for (ProtectedEndpoint target : stable) {
+                plans.add(plan(target, peers, vpcResolvers, origins, self, force && round == 0));
+            }
+            Map<String, List<Installation>> byHelper = new LinkedHashMap<>();
+            for (Installation plan : plans) {
+                if (plan.changed()) {
+                    applied.remove(plan.eniId());
+                    byHelper.computeIfAbsent(plan.state().helperId(), ignored -> new ArrayList<>()).add(plan);
+                }
+            }
+            // Only Docker I/O runs concurrently. The monitor keeps identities fixed, and every
+            // worker finishes before publication or quarantine can write to any helper again.
+            PolicyApplyBatch.run(byHelper.values().stream().<Runnable>map(batch -> () -> {
+                for (Installation plan : batch) {
+                    apply(plan.state().helperId(), plan.state().rules());
+                }
+            }).toList());
+            for (Installation plan : plans) {
+                applied.put(plan.eniId(), plan.state());
+                changed |= plan.changed();
             }
             if (!changed && endpoints.values().stream().allMatch(this::complete)) {
                 return;
@@ -1054,6 +1185,18 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     private boolean install(ProtectedEndpoint target, List<SecurityGroupNftCompiler.Endpoint> peers,
                             List<String> vpcResolvers, List<SecurityGroupNftCompiler.EmulatorOrigin> origins,
                             List<SelfAddress> self, boolean force) {
+        Installation plan = plan(target, peers, vpcResolvers, origins, self, force);
+        if (plan.changed()) {
+            applied.remove(plan.eniId());
+            apply(plan.state().helperId(), plan.state().rules());
+        }
+        applied.put(plan.eniId(), plan.state());
+        return plan.changed();
+    }
+
+    private Installation plan(ProtectedEndpoint target, List<SecurityGroupNftCompiler.Endpoint> peers,
+                              List<String> vpcResolvers, List<SecurityGroupNftCompiler.EmulatorOrigin> origins,
+                              List<SelfAddress> self, boolean force) {
         String eniId = target.endpoint().eniId();
         Set<String> admitted = endpoints.values().stream()
                 .filter(peer -> peer != target && knows(peer, target))
@@ -1070,13 +1213,11 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         Applied current = applied.get(eniId);
         boolean unchanged = current != null && current.helperId().equals(target.helperId())
                 && current.rules().equals(rules);
-        if (!unchanged || force) {
-            applied.remove(eniId);
-            apply(target.helperId(), rules);
-        }
-        applied.put(eniId, new Applied(target.helperId(), rules, Map.copyOf(known), Set.copyOf(admitted)));
-        return !unchanged || force;
+        return new Installation(eniId,
+                new Applied(target.helperId(), rules, Map.copyOf(known), Set.copyOf(admitted)), !unchanged || force);
     }
+
+    private record Installation(String eniId, Applied state, boolean changed) {}
 
     /** Whether {@code holder}'s installed table enforces {@code subject}'s current identity. */
     private boolean knows(ProtectedEndpoint holder, ProtectedEndpoint subject) {
@@ -1150,17 +1291,17 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             }
             List<SecurityGroup> attached = identity.groupIds().stream().map(groups::get).toList();
             if (attached.stream().anyMatch(group -> group == null)) {
-                endpoints.values().stream()
+                quarantineAll(endpoints.values().stream()
                         .filter(endpoint -> accountId.equals(endpoint.endpoint().accountId())
                                 && region.equals(endpoint.endpoint().region()))
-                        .forEach(endpoint -> quarantine(endpoint.helperId()));
+                        .map(ProtectedEndpoint::helperId).toList());
                 throw new IllegalStateException("A protected endpoint's security group disappeared");
             }
             SecurityGroupNftCompiler.Endpoint updated = new SecurityGroupNftCompiler.Endpoint(
                     identity.accountId(), identity.region(), identity.vpcId(), identity.eniId(),
                     identity.logicalAddress(), identity.transportAddress(), identity.groupIds(), attached,
                     identity.controlConnections(), identity.instanceMetadataAllowed(),
-                    identity.additionalTransportAddresses(), identity.controlListeners());
+                    identity.additionalTransportAddresses(), identity.controlListeners(), identity.nativePeerDependencies());
             endpoints.put(entry.getKey(), new ProtectedEndpoint(updated, current.helperId(),
                     Map.copyOf(prefixLists), current.dnsOrigin()));
         }
@@ -1277,28 +1418,92 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         return embeddedDnsServer.getServerIp().map(List::of).orElse(List.of());
     }
 
+    private void quarantineAll(List<String> helperIds) {
+        RuntimeException failure = null;
+        for (String helperId : helperIds) {
+            try {
+                quarantine(helperId);
+            } catch (RuntimeException stopFailure) {
+                if (failure == null) {
+                    failure = stopFailure;
+                } else {
+                    failure.addSuppressed(stopFailure);
+                }
+            }
+        }
+        if (failure != null) {
+            throw failure;
+        }
+    }
+
     private void quarantine(String helperId) {
         applied.values().removeIf(state -> state.helperId().equals(helperId));
         try {
             apply(helperId, "flush chain inet floci_sg ingress\nflush chain inet floci_sg egress\n");
         } catch (Exception e) {
             LOG.errorv(e, "Failed to quarantine security-group helper {0}", helperId);
+            RuntimeException failure = null;
             try {
                 stopNamespaceWorkloads(helperId);
-                dockerClient.stopContainerCmd(helperId).withTimeout(0).exec();
-            } catch (Exception stopFailure) {
-                LOG.errorv(stopFailure, "Failed to stop workloads after quarantine failure for {0}", helperId);
+            } catch (RuntimeException stopFailure) {
+                failure = stopFailure;
+            }
+            try {
+                stopExactContainer(helperId);
+            } catch (RuntimeException stopFailure) {
+                if (failure == null) {
+                    failure = stopFailure;
+                } else {
+                    failure.addSuppressed(stopFailure);
+                }
+            }
+            if (failure != null) {
+                throw new IllegalStateException("Could not retire security-group namespace " + helperId, failure);
             }
         }
     }
 
     private void stopNamespaceWorkloads(String helperId) {
+        RuntimeException failure = null;
         for (Container container : dockerClient.listContainersCmd().exec()) {
-            InspectContainerResponse inspect = dockerClient.inspectContainerCmd(container.getId()).exec();
-            if (inspect.getHostConfig() != null && ("container:" + helperId)
-                    .equals(inspect.getHostConfig().getNetworkMode())) {
-                dockerClient.stopContainerCmd(container.getId()).withTimeout(0).exec();
+            try {
+                InspectContainerResponse inspect = dockerClient.inspectContainerCmd(container.getId()).exec();
+                if (inspect.getHostConfig() != null && ("container:" + helperId)
+                        .equals(inspect.getHostConfig().getNetworkMode())) {
+                    stopExactContainer(container.getId());
+                }
+            } catch (NotFoundException expected) {
+                // A concurrently removed workload no longer retains the namespace.
+            } catch (RuntimeException stopFailure) {
+                if (failure == null) {
+                    failure = stopFailure;
+                } else {
+                    failure.addSuppressed(stopFailure);
+                }
             }
+        }
+        if (failure != null) {
+            throw failure;
+        }
+    }
+
+    private void stopExactContainer(String containerId) {
+        try {
+            InspectContainerResponse before = dockerClient.inspectContainerCmd(containerId).exec();
+            if (!containerId.equals(before.getId())) {
+                throw new IllegalStateException("Container identity changed before namespace retirement");
+            }
+            if (before.getState() != null && Boolean.FALSE.equals(before.getState().getRunning())) {
+                return;
+            }
+            dockerClient.stopContainerCmd(containerId).withTimeout(0).exec();
+            InspectContainerResponse after = dockerClient.inspectContainerCmd(containerId).exec();
+            if (!containerId.equals(after.getId()) || after.getState() == null
+                    || !Boolean.FALSE.equals(after.getState().getRunning())) {
+                throw new IllegalStateException("Container retirement is not confirmed: " + containerId);
+            }
+        } catch (NotFoundException expected) {
+            // An absent exact container cannot retain or write this namespace.
         }
     }
 
@@ -1313,6 +1518,36 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     }
 
     private void apply(String helperId, String script) {
+        if (uncertainPolicyWriters.contains(helperId)) {
+            throw new IllegalStateException("Unresolved remote policy writer for " + helperId);
+        }
+        try (PolicyWriterJournal.Lease lease = ownedPolicyWriter(helperId)) {
+            applyOwned(helperId, script, lease);
+        }
+    }
+
+    private PolicyWriterJournal.Lease ownedPolicyWriter(String helperId) {
+        PolicyWriterJournal.Lease lease = null;
+        try {
+            lease = policyWriters.acquire(helperId);
+            if (lease.pendingExecId() != null) {
+                throw new IllegalStateException("Unresolved durable policy writer for " + helperId);
+            }
+            return lease;
+        } catch (RuntimeException failure) {
+            uncertainPolicyWriters.add(helperId);
+            if (lease != null) {
+                try {
+                    lease.close();
+                } catch (RuntimeException closeFailure) {
+                    failure.addSuppressed(closeFailure);
+                }
+            }
+            throw failure;
+        }
+    }
+
+    private void applyOwned(String helperId, String script, PolicyWriterJournal.Lease lease) {
         for (int attempt = 0; attempt < 120; attempt++) {
             try {
                 byte[] content = script.getBytes(StandardCharsets.UTF_8);
@@ -1331,7 +1566,10 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 String execId = dockerClient.execCreateCmd(helperId)
                         .withAttachStdout(true).withAttachStderr(true)
                         .withCmd("nft", "-f", "/tmp/floci-sg.nft").exec().getId();
+                // This must be durable before exec-start can make the policy writer live.
+                lease.started(execId);
                 StringBuilder output = new StringBuilder();
+                Exception streamFailure = null;
                 try (ResultCallback.Adapter<Frame> callback = new ResultCallback.Adapter<Frame>() {
                     @Override public void onNext(Frame frame) {
                         output.append(new String(frame.getPayload(), StandardCharsets.UTF_8));
@@ -1340,10 +1578,25 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                     boolean completed = dockerClient.execStartCmd(execId)
                             .exec(callback).awaitCompletion(15, TimeUnit.SECONDS);
                     if (!completed) {
-                        throw new IllegalStateException("nft command timed out");
+                        streamFailure = new IllegalStateException("nft command timed out");
+                    }
+                } catch (Exception failure) {
+                    streamFailure = failure;
+                    if (failure instanceof InterruptedException) {
+                        Thread.currentThread().interrupt();
                     }
                 }
-                Long exit = dockerClient.inspectExecCmd(execId).exec().getExitCodeLong();
+                Long exit;
+                try {
+                    exit = terminalPolicyWriter(helperId, execId);
+                    lease.completed(execId);
+                } catch (RuntimeException unresolved) {
+                    if (streamFailure != null) {
+                        unresolved.addSuppressed(streamFailure);
+                    }
+                    uncertainPolicyWriters.add(helperId);
+                    throw new IllegalStateException("Unresolved remote policy writer for " + helperId, unresolved);
+                }
                 if (exit != null && exit == 0) {
                     return;
                 }
@@ -1359,6 +1612,15 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 throw new IllegalStateException("Failed to install security-group policy", e);
             }
         }
+    }
+
+    private Long terminalPolicyWriter(String helperId, String execId) {
+        InspectExecResponse result = dockerClient.inspectExecCmd(execId).exec();
+        if (result == null || !execId.equals(result.getId()) || !helperId.equals(result.getContainerID())
+                || !Boolean.FALSE.equals(result.isRunning()) || result.getExitCodeLong() == null) {
+            throw new IllegalStateException("Remote nft command has no exact terminal result");
+        }
+        return result.getExitCodeLong();
     }
 
     public record Namespace(String helperId, String transportAddress) {}

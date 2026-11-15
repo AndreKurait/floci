@@ -23,11 +23,14 @@ import io.github.hectorvent.floci.services.ec2.model.IpRange;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.model.UserIdGroupPair;
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
@@ -58,6 +61,17 @@ import static org.mockito.Mockito.when;
 /** A real firewall manager whose Docker copy and nft exec calls are recorded and checked. */
 class SecurityGroupFirewallPeerFixture {
 
+    @TempDir
+    Path writerDirectory;
+    private final Set<String> createdHelpers = ConcurrentHashMap.newKeySet();
+    private PolicyWriterJournal fixtureWriters;
+
+    @BeforeEach
+    void prepareWriterJournal() {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.storage().persistentPath()).thenReturn(writerDirectory.toString());
+        fixtureWriters = new PolicyWriterJournal(config);
+    }
     private static final String ACCOUNT = "111111111111";
     private static final String REGION = "us-east-1";
     private static final String VPC = "vpc-a";
@@ -121,6 +135,7 @@ class SecurityGroupFirewallPeerFixture {
     /** A manager in a Floci whose own container address, where its DNS listens, is {@code flociAddress}. */
     SecurityGroupFirewallManager manager(Optional<String> flociAddress) {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.storage().persistentPath()).thenReturn(writerDirectory.toString());
         when(config.services().ec2().vpcNetworks().isolateAddressSpaces()).thenReturn(false);
         when(config.network().securityGroupEnforcement().enabled()).thenReturn(true);
         EmbeddedDnsServer dns = mock(EmbeddedDnsServer.class);
@@ -129,7 +144,7 @@ class SecurityGroupFirewallPeerFixture {
                 lifecycle, config, dns);
     }
 
-    private DockerClient docker() {
+    DockerClient docker() {
         DockerClient docker = mock(DockerClient.class);
         when(docker.copyArchiveToContainerCmd(anyString())).thenAnswer(invocation -> {
             String helper = invocation.getArgument(0);
@@ -148,26 +163,34 @@ class SecurityGroupFirewallPeerFixture {
         when(docker.execCreateCmd(anyString())).thenAnswer(invocation -> {
             ExecCreateCmd create = mock(ExecCreateCmd.class, RETURNS_SELF);
             ExecCreateCmdResponse response = mock(ExecCreateCmdResponse.class);
-            when(response.getId()).thenReturn("exec");
+            when(response.getId()).thenReturn("exec-" + invocation.<String>getArgument(0));
             when(create.exec()).thenReturn(response);
             return create;
         });
         ExecStartCmd start = mock(ExecStartCmd.class);
-        when(docker.execStartCmd("exec")).thenReturn(start);
+        when(docker.execStartCmd(anyString())).thenReturn(start);
         when(start.exec(any())).thenAnswer(invocation -> {
             ResultCallback.Adapter<?> callback = invocation.getArgument(0);
             callback.onComplete();
             return callback;
         });
-        InspectExecCmd inspectExec = mock(InspectExecCmd.class);
-        InspectExecResponse exited = mock(InspectExecResponse.class);
-        when(exited.getExitCodeLong()).thenReturn(0L);
-        when(inspectExec.exec()).thenReturn(exited);
-        when(docker.inspectExecCmd("exec")).thenReturn(inspectExec);
+        Map<String, InspectExecCmd> execInspections = new ConcurrentHashMap<>();
+        when(docker.inspectExecCmd(anyString())).thenAnswer(invocation -> execInspections.computeIfAbsent(
+                invocation.getArgument(0), execId -> {
+            InspectExecCmd inspectExec = mock(InspectExecCmd.class);
+            InspectExecResponse exited = mock(InspectExecResponse.class);
+            when(exited.getId()).thenReturn(execId);
+            when(exited.getContainerID()).thenReturn(execId.substring("exec-".length()));
+            when(exited.getExitCodeLong()).thenReturn(0L);
+            when(exited.isRunning()).thenReturn(false);
+            when(inspectExec.exec()).thenReturn(exited);
+            return inspectExec;
+                }));
         when(docker.inspectContainerCmd(anyString())).thenAnswer(invocation -> {
             String helper = invocation.getArgument(0);
             InspectContainerCmd inspect = mock(InspectContainerCmd.class);
             InspectContainerResponse response = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
+            when(response.getId()).thenReturn(helper);
             when(response.getState().getRunning()).thenReturn(!stoppedHelpers.contains(helper));
             Map<String, ContainerNetwork> networks = containerNetworks.get(helper);
             if (networks != null) {
@@ -244,9 +267,17 @@ class SecurityGroupFirewallPeerFixture {
         return "helper-" + index;
     }
 
+    String freshHelper(String helperId) {
+        if (createdHelpers.add(helperId)) {
+            fixtureWriters.initialize(helperId);
+        }
+        return helperId;
+    }
+
     SecurityGroupNftCompiler.Endpoint endpoint(int index) {
         String transport = "172.18.0." + (2 + index);
         transportByHelper.put(helper(index), transport);
+        freshHelper(helper(index));
         return new SecurityGroupNftCompiler.Endpoint(ACCOUNT, REGION, VPC, "eni-" + index,
                 "10.0.1." + (10 + index), transport, Set.of("sg-a"), List.of(group()));
     }

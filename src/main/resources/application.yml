@@ -767,6 +767,7 @@ floci:
       proxy-max-port: 9499
       keep-running-on-shutdown: false
     ec2:
+      native-peer-dependencies: '${FLOCI_EC2_NATIVE_PEER_DEPENDENCIES:[]}'
       # Opt-in Standard On-Demand vCPU admission. FLOCI_SERVICES_EC2_ENFORCE_VCPU_QUOTAS
       enforce-vcpu-quotas: false
       # Optional external catalog; includeDefaultImages in the file retains bundled images.

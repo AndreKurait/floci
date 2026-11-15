@@ -70,6 +70,9 @@ public final class ContainerExecStubs {
 
         InspectExecCmd inspectCmd = mock(InspectExecCmd.class);
         InspectExecResponse inspectResponse = mock(InspectExecResponse.class);
+        when(inspectResponse.getId()).thenReturn(execId);
+        when(inspectResponse.getContainerID()).thenReturn(containerId);
+        when(inspectResponse.isRunning()).thenReturn(false);
         when(inspectResponse.getExitCodeLong())
                 .thenReturn(exitCodes.getFirst(), exitCodes.subList(1, exitCodes.size()).toArray(Long[]::new));
         when(inspectCmd.exec()).thenReturn(inspectResponse);

@@ -148,11 +148,11 @@ final class NativeVpcAddressSpace {
                 ip -6 address flush dev %1$s
                 ip -4 address flush dev %1$s
                 ip -4 route flush dev %1$s
-                nft add table inet floci_vpc_address_space
-                nft 'add chain inet floci_vpc_address_space ingress { type filter hook input priority -20; policy accept; }'
-                nft 'add chain inet floci_vpc_address_space egress { type filter hook output priority -20; policy accept; }'
-                nft 'add chain inet floci_vpc_address_space forwarding { type filter hook forward priority -20; policy accept; }'
                 nft -f - <<'FLOCI_RULES'
+                add table inet floci_vpc_address_space
+                add chain inet floci_vpc_address_space ingress { type filter hook input priority -20; policy accept; }
+                add chain inet floci_vpc_address_space egress { type filter hook output priority -20; policy accept; }
+                add chain inet floci_vpc_address_space forwarding { type filter hook forward priority -20; policy accept; }
                 flush chain inet floci_vpc_address_space ingress
                 flush chain inet floci_vpc_address_space egress
                 flush chain inet floci_vpc_address_space forwarding

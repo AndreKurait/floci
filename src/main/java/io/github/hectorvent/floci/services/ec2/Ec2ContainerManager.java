@@ -181,6 +181,7 @@ public class Ec2ContainerManager {
     private final DockerClient dockerClient;
     private final PortAllocator portAllocator;
     private final EmulatorConfig config;
+    private final Ec2NativePeerDependencies nativePeerDependencies;
     private final Ec2MetadataServer metadataServer;
     private final Ec2PortForwardManager portForwardManager;
     private final RegionResolver regionResolver;
@@ -299,8 +300,9 @@ public class Ec2ContainerManager {
         firewallManager.register(new SecurityGroupNftCompiler.Endpoint(regionResolver.getAccountId(), region,
                 instance.getVpcId(), eni.getNetworkInterfaceId(), logical, address,
                 instance.getSecurityGroups().stream().map(GroupIdentifier::getGroupId)
-                        .collect(Collectors.toSet()), groups,
-                address.equals(namespace.privateAddress()) ? Set.of() : Set.of(namespace.privateAddress())),
+                        .collect(Collectors.toSet()), groups, nativePeerDependencies.connections(), true,
+                address.equals(namespace.privateAddress()) ? Set.of() : Set.of(namespace.privateAddress()),
+                List.of(), nativePeerDependencies.dependencies()),
                 helperId, prefixLists);
     }
 
@@ -558,6 +560,7 @@ public class Ec2ContainerManager {
         this.dockerClient = dockerClient;
         this.portAllocator = portAllocator;
         this.config = config;
+        this.nativePeerDependencies = new Ec2NativePeerDependencies(config);
         this.regionResolver = regionResolver;
         this.metadataServer = metadataServer;
         this.portForwardManager = portForwardManager;
@@ -908,8 +911,9 @@ public class Ec2ContainerManager {
                             region, instance.getVpcId(), eniId, instance.getLogicalPrivateIpAddress(),
                             namespace.transportAddress(),
                             instance.getSecurityGroups().stream().map(GroupIdentifier::getGroupId)
-                                    .collect(Collectors.toSet()), groups,
-                            vpcAddress == null ? Set.of() : Set.of(vpcAddress)),
+                                    .collect(Collectors.toSet()), groups, nativePeerDependencies.connections(), true,
+                            vpcAddress == null ? Set.of() : Set.of(vpcAddress),
+                            List.of(), nativePeerDependencies.dependencies()),
                             helperId, prefixLists);
                 }
                 instance.setContainerBridgeIp(containerIp);

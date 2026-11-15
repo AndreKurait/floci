@@ -47,7 +47,7 @@ class SecurityGroupFirewallEmulatorOriginTest extends SecurityGroupFirewallPeerF
     void aTargetAdmittingOnlyTheLoadBalancersGroupAcceptsFlociWhileThatLoadBalancerExists() {
         SecurityGroupFirewallManager manager = managerWithLoadBalancers();
         loadBalancers.add(nlb("vpc-a", "sg-nlb"));
-        manager.register(target("eni-target", "172.18.0.50", "sg-nlb"), "helper-target", Map.of());
+        manager.register(target("eni-target", "172.18.0.50", "sg-nlb"), freshHelper("helper-target"), Map.of());
 
         assertTrue(installed.get("helper-target").contains(ACCEPT_FLOCI), installed.get("helper-target"));
 
@@ -59,7 +59,7 @@ class SecurityGroupFirewallEmulatorOriginTest extends SecurityGroupFirewallPeerF
     @Test
     void aLoadBalancerCreatedAfterItsTargetOpensTheTargetOnNotification() {
         SecurityGroupFirewallManager manager = managerWithLoadBalancers();
-        manager.register(target("eni-target", "172.18.0.50", "sg-nlb"), "helper-target", Map.of());
+        manager.register(target("eni-target", "172.18.0.50", "sg-nlb"), freshHelper("helper-target"), Map.of());
         assertFalse(installed.get("helper-target").contains(FROM_FLOCI));
 
         loadBalancers.add(nlb("vpc-a", "sg-nlb"));
@@ -73,7 +73,7 @@ class SecurityGroupFirewallEmulatorOriginTest extends SecurityGroupFirewallPeerF
         SecurityGroupFirewallManager manager = managerWithLoadBalancers();
         loadBalancers.add(nlb("vpc-a", "sg-nlb"));
         loadBalancers.add(nlb("vpc-b", "sg-other"));
-        manager.register(target("eni-target", "172.18.0.50", "sg-other"), "helper-target", Map.of());
+        manager.register(target("eni-target", "172.18.0.50", "sg-other"), freshHelper("helper-target"), Map.of());
 
         assertFalse(installed.get("helper-target").contains(FROM_FLOCI), installed.get("helper-target"));
     }
@@ -86,7 +86,7 @@ class SecurityGroupFirewallEmulatorOriginTest extends SecurityGroupFirewallPeerF
     @Test
     void loadBalancerTrafficDialsAProtectedTargetOfItsVpcAtTheAddressNamed() {
         SecurityGroupFirewallManager manager = managerWithLoadBalancers();
-        manager.register(attachedTarget("eni-target", "172.18.0.50", "10.0.1.50"), "helper-target", Map.of());
+        manager.register(attachedTarget("eni-target", "172.18.0.50", "10.0.1.50"), freshHelper("helper-target"), Map.of());
 
         assertEquals("10.0.1.50", manager.emulatorRoute("111111111111", "us-east-1", "vpc-a", "10.0.1.50"));
         assertEquals("172.18.0.50", manager.emulatorRoute("111111111111", "us-east-1", "vpc-a", "172.18.0.50"));
@@ -102,7 +102,7 @@ class SecurityGroupFirewallEmulatorOriginTest extends SecurityGroupFirewallPeerF
     @Test
     void aProtectedEndpointOfAnotherVpcOrAccountIsUnreachableForALoadBalancer() {
         SecurityGroupFirewallManager manager = managerWithLoadBalancers();
-        manager.register(attachedTarget("eni-target", "172.18.0.50", "10.0.1.50"), "helper-target", Map.of());
+        manager.register(attachedTarget("eni-target", "172.18.0.50", "10.0.1.50"), freshHelper("helper-target"), Map.of());
 
         assertNull(manager.emulatorRoute("222222222222", "us-east-1", "vpc-a", "10.0.1.50"));
         assertNull(manager.emulatorRoute("111111111111", "us-east-1", "vpc-b", "172.18.0.50"));
@@ -119,7 +119,7 @@ class SecurityGroupFirewallEmulatorOriginTest extends SecurityGroupFirewallPeerF
     @Test
     void aPaperOnlyPrivateAddressIsNotReserved() {
         SecurityGroupFirewallManager manager = managerWithLoadBalancers();
-        manager.register(target("eni-target", "172.18.0.50", "sg-nlb"), "helper-target", Map.of());
+        manager.register(target("eni-target", "172.18.0.50", "sg-nlb"), freshHelper("helper-target"), Map.of());
 
         assertEquals("10.0.1.50", manager.emulatorRoute("111111111111", "us-east-1", "vpc-b", "10.0.1.50"));
     }
@@ -138,9 +138,9 @@ class SecurityGroupFirewallEmulatorOriginTest extends SecurityGroupFirewallPeerF
                 "main", network("172.18.0.1", 16), "vpc-a-network", network("10.0.1.2", 24)));
         loadBalancers.add(nlb("vpc-a", "sg-nlb"));
 
-        manager.register(attachedTarget("eni-attached", "172.18.0.50", "10.0.1.50"), "helper-attached", Map.of());
-        manager.register(target("eni-task", "172.18.0.60", "sg-nlb"), "helper-task", Map.of());
-        manager.register(target("eni-elsewhere", "192.168.5.5", "sg-nlb"), "helper-elsewhere", Map.of());
+        manager.register(attachedTarget("eni-attached", "172.18.0.50", "10.0.1.50"), freshHelper("helper-attached"), Map.of());
+        manager.register(target("eni-task", "172.18.0.60", "sg-nlb"), freshHelper("helper-task"), Map.of());
+        manager.register(target("eni-elsewhere", "192.168.5.5", "sg-nlb"), freshHelper("helper-elsewhere"), Map.of());
 
         String attached = installed.get("helper-attached");
         assertTrue(attached.contains("ingress ip saddr 10.0.1.2 tcp dport 8080 accept"), attached);
@@ -160,7 +160,7 @@ class SecurityGroupFirewallEmulatorOriginTest extends SecurityGroupFirewallPeerF
         containerNetworks.put("floci-self", Map.of(
                 "main", network("172.18.0.1", 16), "vpc-a-network", network("10.0.1.2", 24)));
         loadBalancers.add(nlb("vpc-a", "sg-nlb"));
-        manager.register(attachedTarget("eni-attached", "172.18.0.50", "10.0.1.50"), "helper-attached", Map.of());
+        manager.register(attachedTarget("eni-attached", "172.18.0.50", "10.0.1.50"), freshHelper("helper-attached"), Map.of());
 
         when(self.resolveContainerId()).thenThrow(new IllegalStateException("docker unavailable"));
         manager.reconcileAll();
@@ -180,7 +180,7 @@ class SecurityGroupFirewallEmulatorOriginTest extends SecurityGroupFirewallPeerF
         SecurityGroupFirewallManager manager = managerWithLoadBalancers();
         loadBalancers.add(nlb("vpc-a", "sg-nlb"));
         loadBalancers.add(nlb("vpc-a", "sg-second"));
-        manager.register(attachedTarget("eni-target", "172.18.0.50", "10.0.1.50"), "helper-target", Map.of());
+        manager.register(attachedTarget("eni-target", "172.18.0.50", "10.0.1.50"), freshHelper("helper-target"), Map.of());
 
         assertEquals("10.0.1.50", manager.emulatorRoute("111111111111", "us-east-1", "vpc-a", "10.0.1.50",
                 8080, Set.of("sg-nlb")));
@@ -193,7 +193,7 @@ class SecurityGroupFirewallEmulatorOriginTest extends SecurityGroupFirewallPeerF
         assertEquals("192.0.2.7", manager.emulatorRoute("111111111111", "us-east-1", "vpc-a", "192.0.2.7",
                 8080, Set.of()), "an unprotected address is dialled as before");
 
-        manager.register(cidrTarget("eni-open", "172.18.0.70", "10.0.1.70", "172.18.0.0/16"), "helper-open",
+        manager.register(cidrTarget("eni-open", "172.18.0.70", "10.0.1.70", "172.18.0.0/16"), freshHelper("helper-open"),
                 Map.of());
         assertEquals("10.0.1.70", manager.emulatorRoute("111111111111", "us-east-1", "vpc-a", "10.0.1.70",
                 8080, Set.of()), "a CIDR rule covering Floci's address admits any load balancer");
@@ -219,7 +219,7 @@ class SecurityGroupFirewallEmulatorOriginTest extends SecurityGroupFirewallPeerF
     @Test
     void noVpcReachesNoProtectedEndpoint() {
         SecurityGroupFirewallManager manager = managerWithLoadBalancers();
-        manager.register(attachedTarget("eni-target", "172.18.0.50", "10.0.1.50"), "helper-target", Map.of());
+        manager.register(attachedTarget("eni-target", "172.18.0.50", "10.0.1.50"), freshHelper("helper-target"), Map.of());
 
         assertNull(manager.emulatorRoute("111111111111", "us-east-1", null, "10.0.1.50"));
         assertEquals("192.0.2.7", manager.emulatorRoute("111111111111", "us-east-1", null, "192.0.2.7"));
@@ -240,7 +240,7 @@ class SecurityGroupFirewallEmulatorOriginTest extends SecurityGroupFirewallPeerF
         when(host.isRunningInContainer()).thenReturn(false);
         manager.containerDetector = host;
         loadBalancers.add(nlb("vpc-a", "sg-nlb"));
-        manager.register(target("eni-target", "172.18.0.50", "sg-nlb"), "helper-target", Map.of());
+        manager.register(target("eni-target", "172.18.0.50", "sg-nlb"), freshHelper("helper-target"), Map.of());
 
         assertFalse(installed.get("helper-target").contains(FROM_FLOCI), installed.get("helper-target"));
     }
@@ -258,7 +258,7 @@ class SecurityGroupFirewallEmulatorOriginTest extends SecurityGroupFirewallPeerF
         when(sources.stream()).thenAnswer(ignored -> Stream.of(broken));
         manager.emulatorOriginSources = sources;
 
-        manager.register(target("eni-target", "172.18.0.50", "sg-nlb"), "helper-target", Map.of());
+        manager.register(target("eni-target", "172.18.0.50", "sg-nlb"), freshHelper("helper-target"), Map.of());
 
         String policy = installed.get("helper-target");
         assertFalse(policy.contains(FROM_FLOCI), policy);
@@ -281,7 +281,7 @@ class SecurityGroupFirewallEmulatorOriginTest extends SecurityGroupFirewallPeerF
         when(sources.isUnsatisfied()).thenReturn(false);
         when(sources.stream()).thenAnswer(ignored -> Stream.of(flaky));
         manager.emulatorOriginSources = sources;
-        manager.register(target("eni-target", "172.18.0.50", "sg-nlb"), "helper-target", Map.of());
+        manager.register(target("eni-target", "172.18.0.50", "sg-nlb"), freshHelper("helper-target"), Map.of());
         assertTrue(installed.get("helper-target").contains(ACCEPT_FLOCI));
 
         failing.set(true);

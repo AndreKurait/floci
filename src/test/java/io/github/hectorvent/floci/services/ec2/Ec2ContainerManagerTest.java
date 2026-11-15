@@ -278,8 +278,9 @@ class Ec2ContainerManagerTest {
     void terminationCannotRemoveAReplacementRegisteredBeforeDockerCleanup(boolean replace) throws Exception {
         DockerClient docker = mock(DockerClient.class);
         ContainerLifecycleManager firewallLifecycle = mock(ContainerLifecycleManager.class);
-        SecurityGroupFirewallManager firewall = spy(new SecurityGroupFirewallManager(
-                mock(DockerClient.class, RETURNS_DEEP_STUBS), mock(ContainerBuilder.class), firewallLifecycle,
+        SecurityGroupFirewallManager firewall = spy(SecurityGroupDnsFixture.rawManager(
+                SecurityGroupDnsFixture.policyDocker(mock(DockerClient.class, RETURNS_DEEP_STUBS)),
+                mock(ContainerBuilder.class), firewallLifecycle,
                 mock(EmulatorConfig.class, RETURNS_DEEP_STUBS), mock(EmbeddedDnsServer.class)));
         doNothing().when(firewall).reconcileAll();
         doNothing().when(firewall).admit(anyString(), anyBoolean());
@@ -345,7 +346,7 @@ class Ec2ContainerManagerTest {
         Ec2ContainerManager manager = new Ec2ContainerManager(
                 mock(ContainerBuilder.class), lifecycle, mock(ContainerLogStreamer.class),
                 mock(ContainerDetector.class), mock(DockerHostResolver.class), mock(DockerClient.class),
-                ports, mock(EmulatorConfig.class), metadata, mock(Ec2PortForwardManager.class),
+                ports, mock(EmulatorConfig.class, RETURNS_DEEP_STUBS), metadata, mock(Ec2PortForwardManager.class),
                 mock(RegionResolver.class), mock(ContainerNetworkReachability.class), network,
                 mock(ContainerReachableEndpoint.class), firewall);
         Instance instance = instance("i-failed-launch-retirement");
