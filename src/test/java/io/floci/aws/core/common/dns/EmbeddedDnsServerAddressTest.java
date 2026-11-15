@@ -6,6 +6,7 @@ import io.floci.aws.core.common.docker.CurrentContainerNetworkResolver;
 import io.vertx.core.Future;
 import io.vertx.core.Vertx;
 import io.vertx.core.datagram.DatagramSocket;
+import io.vertx.core.net.NetServer;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.Test;
 
@@ -53,6 +54,10 @@ class EmbeddedDnsServerAddressTest {
         when(config.dns().containerFallbackServers()).thenReturn(List.of());
         when(config.dns().spoofAwsEndpoints()).thenReturn(false);
         Vertx vertx = mock(Vertx.class);
+        NetServer tcp = mock(NetServer.class);
+        when(vertx.createNetServer(any())).thenReturn(tcp);
+        when(tcp.listen(53, "172.19.0.2")).thenReturn(Future.succeededFuture(tcp));
+        when(tcp.actualPort()).thenReturn(53);
         DatagramSocket socket = mock(DatagramSocket.class);
         when(vertx.createDatagramSocket(any())).thenReturn(socket);
         when(socket.listen(53, "172.19.0.2")).thenReturn(Future.succeededFuture(socket));
@@ -61,6 +66,7 @@ class EmbeddedDnsServerAddressTest {
                 mock(Instance.class), mock(Instance.class), currentContainer);
 
         assertEquals(Optional.of("172.19.0.2"), server.getServerIp());
+        verify(tcp).listen(53, "172.19.0.2");
         verify(socket).listen(53, "172.19.0.2");
     }
 }

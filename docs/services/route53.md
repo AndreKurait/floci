@@ -73,13 +73,15 @@ Floci resolves private hosted zone DNS records directly through its embedded DNS
 
 ## Public Authoritative DNS
 
-The same embedded UDP server serves stored public `TXT`, `NS`, and `SOA` records with authoritative answers and their configured TTLs. DNS clients must be able to reach Floci on UDP port 53. The HTTP endpoint published by Testcontainers wrappers does not publish this UDP listener. Host clients need an explicit UDP port mapping; containers on the same network can query Floci's container address directly.
+The same embedded UDP and TCP server serves stored public `TXT`, `NS`, and `SOA` records with authoritative answers and their configured TTLs. DNS clients must be able to reach Floci on UDP and TCP port 53. The HTTP endpoint published by Testcontainers wrappers does not publish these DNS listeners. Host clients need explicit port mappings; containers on the same network can query Floci's container address directly.
 
-For a Docker host client, publish UDP separately from HTTP, for example `-p 5353:53/udp`, then query `dig @127.0.0.1 -p 5353 example.com TXT`. Configure the equivalent UDP binding explicitly when using a Testcontainers wrapper; its standard HTTP port mapping is insufficient.
+
+For a Docker host client, publish DNS separately from HTTP, for example `-p 5353:53/udp -p 5353:53/tcp`, then query `dig @127.0.0.1 -p 5353 example.com TXT`. Add `+tcp` to select TCP explicitly. Configure both bindings when using a Testcontainers wrapper; its standard HTTP port mapping is insufficient.
 
 The longest matching public zone answers. Missing names return NXDOMAIN; existing names without the requested supported type return NOERROR with no answers. Both include the zone SOA with the smaller of its TTL and minimum field for negative caching. Changes and deletes affect DNS through the same stored record sets as the Route 53 API.
 
-Public address routing, aliases, CNAME chasing, health-based or weighted record selection, and delegation referrals are not implemented. Queries for supported types that require these features, ambiguous duplicate public zones, or malformed stored records return REFUSED without claiming authority. Other query types retain the existing emulator-name and upstream resolution paths. Private-zone and VPC forwarding-rule precedence remains unchanged. UDP responses honor legacy/EDNS size limits and set truncation when necessary; TCP fallback is not implemented.
+Public address routing, aliases, CNAME chasing, health-based or weighted record selection, and delegation referrals are not implemented. Queries for supported types that require these features, ambiguous duplicate public zones, or malformed stored records return REFUSED without claiming authority. Other query types retain the existing emulator-name and upstream resolution paths. Private-zone and VPC forwarding-rule precedence remains unchanged. UDP responses honor legacy/EDNS size limits and set truncation when necessary. Clients can retry over TCP, which supports messages up to 65,535 bytes, fragmented input, pipelining and connection reuse. TCP admission is bounded to 128 connections and 16 pending queries per connection; idle connections expire after 30 seconds.
+
 
 ## Default Nameservers
 
