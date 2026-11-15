@@ -6,6 +6,7 @@ import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.ExecCreateCmd;
 import com.github.dockerjava.api.command.ExecCreateCmdResponse;
 import com.github.dockerjava.api.command.InspectContainerCmd;
+import com.github.dockerjava.api.exception.ConflictException;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.Container;
 import com.github.dockerjava.api.model.ContainerNetwork;
@@ -17,10 +18,12 @@ import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
+import io.github.hectorvent.floci.core.common.docker.NetworkNamespaceLease;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler;
 import io.github.hectorvent.floci.services.ec2.model.InternetGateway;
 import io.github.hectorvent.floci.services.ec2.model.InternetGatewayAttachment;
+import io.github.hectorvent.floci.services.ec2.model.NatGateway;
 import io.github.hectorvent.floci.services.ec2.model.NetworkInterface;
 import io.github.hectorvent.floci.services.ec2.model.NetworkInterfaceListResult;
 import io.github.hectorvent.floci.services.ec2.model.Route;
@@ -31,6 +34,8 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.lang.reflect.Constructor;
+import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -443,6 +448,119 @@ class VpcPublicPeerRoutingTest {
     }
 
     @Test
+    void conflictForARunningNamespaceStillFailsAndQuarantinesSurvivors() {
+        admit("first", 2, true);
+        admit("second", 3, true);
+        gateway.setAttachments(List.of());
+        ExecCreateCmd ordinary = docker.execCreateCmd("second");
+        AtomicBoolean once = new AtomicBoolean();
+        ConflictException failure = new ConflictException("exec conflicts, namespace still running");
+        when(docker.execCreateCmd("second")).thenAnswer(invocation -> {
+            if (once.compareAndSet(false, true)) {
+                throw failure;
+            }
+            return ordinary;
+        });
+
+        assertSame(failure, assertThrows(ConflictException.class, manager::reconcile));
+
+        assertEquals(Set.of("172.18.0.2", "172.18.0.3"), manager.publicInstanceAddresses());
+        assertFalse(latest("first").contains("accept"));
+        assertFalse(latest("second").contains("accept"));
+    }
+
+    @Test
+    void stoppedFrontendDoesNotPoisonNewRegistrationOrReleaseItsPublicAddress() {
+        prepareNamespace("frontend", 2, true);
+        manager.register(identity("frontend", 2), "frontend", List.of());
+        String address = manager.attachPublicFrontend(ACCOUNT, REGION, interfaceFor("frontend", 2), "frontend");
+        admit("first", 3, true);
+        stopped("frontend");
+
+        assertDoesNotThrow(() -> admit("second", 4, true));
+
+        assertEquals(Set.of("172.18.0.3", "172.18.0.4"), manager.publicInstanceAddresses());
+        assertEquals(Optional.of(address), manager.publicAddress(ACCOUNT, REGION, "frontend"));
+        assertTrue(latest("first").contains("egress ip daddr " + address + " counter drop"));
+        assertTrue(latest("second").contains("egress ip daddr " + address + " counter drop"));
+        assertThrows(IllegalStateException.class, () -> manager.unregister(ACCOUNT, REGION, "frontend"),
+                "A stopped namespace and its allocation still belong to the frontend owner");
+        verify(docker, never()).startContainerCmd("frontend");
+        verify(docker, never()).removeContainerCmd("frontend");
+        verify(docker, never()).stopContainerCmd("first");
+        verify(docker, never()).stopContainerCmd("second");
+
+        // Even an external restart does not restore admission without owner retirement.
+        when(docker.inspectContainerCmd("frontend").exec().getState().getRunning()).thenReturn(true);
+        clearInvocations(docker);
+        assertDoesNotThrow(manager::reconcile);
+        verify(docker, never()).execCreateCmd("frontend");
+        assertTrue(latest("second").contains("egress ip daddr " + address + " counter drop"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void unavailableNatDoesNotPoisonNewRegistrationOrLoseItsReservation(boolean stopped) throws Exception {
+        admit("first", 2, true);
+        NatGateway nat = installUnrelatedNat();
+        manager.reconcile();
+        assertTrue(latest("first").contains("via 240.0.0.9"));
+        if (stopped) {
+            stopped("nat-helper");
+        } else {
+            missing("nat-helper");
+        }
+
+        assertDoesNotThrow(() -> admit("second", 3, true));
+
+        assertEquals(Set.of("172.18.0.2", "172.18.0.3"), manager.publicInstanceAddresses());
+        assertFalse(latest("first").contains("via 240.0.0.9"));
+        assertFalse(latest("second").contains("via 240.0.0.9"));
+        verify(docker, never()).stopContainerCmd("first");
+        verify(docker, never()).stopContainerCmd("second");
+        verify(docker, never()).startContainerCmd("nat-helper");
+        verify(docker, never()).removeContainerCmd("nat-helper");
+
+        // Unregistering another owner must not discard the NAT's withdrawal marker.
+        manager.unregister(ACCOUNT, REGION, "first");
+        clearInvocations(docker);
+        assertDoesNotThrow(() -> admit("third", 4, true));
+        assertDoesNotThrow(() -> manager.createNat("222222222222", REGION, nat));
+        verify(docker, never()).execCreateCmd("nat-helper");
+        verify(docker, never()).startContainerCmd("nat-helper");
+        assertFalse(latest("third").contains("via 240.0.0.9"));
+        manager.unregister(ACCOUNT, REGION, "second");
+        manager.unregister(ACCOUNT, REGION, "third");
+        assertThrows(IllegalStateException.class, manager::clear,
+                "The stopped or absent NAT retains owner cleanup and its native allocation");
+    }
+
+    @Test
+    void unknownNatInspectionFailurePreservesQuarantineAndTheOriginalConflict() throws Exception {
+        admit("first", 2, true);
+        installUnrelatedNat();
+        manager.reconcile();
+        ConflictException original = new ConflictException("NAT exec unavailable");
+        IllegalStateException inspectionFailure = new IllegalStateException("Docker inspection unavailable");
+        ExecCreateCmd ordinary = docker.execCreateCmd("nat-helper");
+        AtomicBoolean once = new AtomicBoolean();
+        when(docker.execCreateCmd("nat-helper")).thenAnswer(invocation -> {
+            if (once.compareAndSet(false, true)) {
+                throw original;
+            }
+            return ordinary;
+        });
+        when(docker.inspectContainerCmd("nat-helper").exec()).thenThrow(inspectionFailure);
+        ec2.describeInternetGateways(REGION, List.of(), Map.of()).getLast().setAttachments(List.of());
+
+        assertSame(original, assertThrows(ConflictException.class, manager::reconcile));
+
+        assertTrue(List.of(original.getSuppressed()).contains(inspectionFailure));
+        assertFalse(latest("first").contains("accept"));
+        assertEquals(Set.of("172.18.0.2"), manager.publicInstanceAddresses());
+    }
+
+    @Test
     void inabilityToInspectAnAffectedNamespacePreservesTheOriginalFailure() {
         admit("first", 2, true);
         admit("second", 3, true);
@@ -587,6 +705,61 @@ class VpcPublicPeerRoutingTest {
         });
     }
 
+    private void stopped(String helper) {
+        when(docker.inspectContainerCmd(helper).exec().getState().getRunning()).thenReturn(false);
+        when(docker.execCreateCmd(helper)).thenThrow(new ConflictException("container is not running"));
+    }
+
+    @SuppressWarnings("unchecked")
+    private NatGateway installUnrelatedNat() throws Exception {
+        prepareNamespace("nat-helper", 9, true);
+        when(vpcs.effectiveVpcCidr(REGION, "nat-vpc")).thenReturn(Optional.of("10.1.0.0/16"));
+        RouteTable table = new RouteTable();
+        table.setVpcId("nat-vpc");
+        table.setRoutes(List.of(route("10.1.0.0/16", "local", "active"),
+                route("0.0.0.0/0", "nat-igw", "active")));
+        RouteTableAssociation main = new RouteTableAssociation();
+        main.setMain(true);
+        main.setAssociationState("associated");
+        table.setAssociations(List.of(main));
+        List<RouteTable> tables = new ArrayList<>(ec2.describeRouteTables(REGION, List.of(), Map.of()));
+        tables.add(table);
+        when(ec2.describeRouteTables(REGION, List.of(), Map.of())).thenReturn(tables);
+        InternetGateway natGateway = new InternetGateway();
+        natGateway.setInternetGatewayId("nat-igw");
+        InternetGatewayAttachment attached = new InternetGatewayAttachment();
+        attached.setVpcId("nat-vpc");
+        attached.setState("available");
+        natGateway.setAttachments(List.of(attached));
+        when(ec2.describeInternetGateways(REGION, List.of(), Map.of())).thenReturn(List.of(gateway, natGateway));
+        NatGateway nat = new NatGateway();
+        nat.setNatGatewayId("nat");
+        nat.setVpcId("nat-vpc");
+        nat.setSubnetId("nat-subnet");
+        nat.setState("available");
+        nat.setConnectivityType("public");
+        when(ec2.describeNatGateways(REGION, List.of(), Map.of())).thenReturn(List.of(nat));
+
+        Class<?> runtimeType = Class.forName(VpcRoutingManager.class.getName() + "$NatRuntime");
+        Constructor<?> constructor = runtimeType.getDeclaredConstructor(
+                String.class, String.class, String.class, String.class, String.class, String.class);
+        constructor.setAccessible(true);
+        Object runtime = constructor.newInstance("222222222222", REGION, "nat-vpc", "nat-subnet",
+                "10.1.1.20", "198.51.100.20");
+        for (Map.Entry<String, Object> entry : Map.<String, Object>of(
+                "namespace", new NetworkNamespaceLease("nat-helper", "/nat-helper"),
+                "transport", "240.0.0.9", "privateDevice", "eth1", "publicDevice", "eth2").entrySet()) {
+            Field field = runtimeType.getDeclaredField(entry.getKey());
+            field.setAccessible(true);
+            field.set(runtime, entry.getValue());
+        }
+        Field field = VpcRoutingManager.class.getDeclaredField("nats");
+        field.setAccessible(true);
+        Map<String, Object> nats = (Map<String, Object>) field.get(manager);
+        nats.put("222222222222/" + REGION + "/nat", runtime);
+        return nat;
+    }
+
     private static NetworkInterface interfaceFor(String helper, int host) {
         NetworkInterface eni = new NetworkInterface();
         eni.setNetworkInterfaceId(helper);
@@ -617,6 +790,7 @@ class VpcPublicPeerRoutingTest {
                 "public", attachment("public-network", "240.0.0." + host));
         when(docker.inspectContainerCmd(helper).exec().getNetworkSettings().getNetworks()).thenReturn(attachments);
         when(docker.inspectContainerCmd(helper).exec().getName()).thenReturn("/" + helper);
+        when(docker.inspectContainerCmd(helper).exec().getState().getRunning()).thenReturn(true);
         Network control = mock(Network.class);
         when(control.getInternal()).thenReturn(internal);
         when(control.getId()).thenReturn("control-network");

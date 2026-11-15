@@ -116,6 +116,12 @@ final class VpcRoutingCommands {
                            List<ControlListener> listeners, NativeApi nativeApi, VpcFrontendIngress frontend) {
         String source = VpcRouteSelection.ipv4(privateAddress);
         StringBuilder script = new StringBuilder("set -eu\nip -4 route flush proto 186\n");
+        // A retained namespace can cache the retired MAC of a recreated next hop.
+        List<String> nextHops = hops.stream()
+                .map(hop -> hop.gateway() + "/32 dev " + hop.device()).distinct().toList();
+        for (String nextHop : nextHops) {
+            script.append("ip -4 neigh flush to ").append(nextHop).append('\n');
+        }
         for (Hop hop : hops) {
             script.append("ip -4 route replace ").append(hop.destination()).append("/32 via ")
                     .append(hop.gateway()).append(" dev ").append(hop.device())
@@ -289,12 +295,12 @@ final class VpcRoutingCommands {
     static String natGuard() {
         return """
                 set -eu
-                nft add table inet floci_public_nat
-                nft 'add chain inet floci_public_nat forwarding { type filter hook forward priority -5; policy drop; }'
-                nft 'add chain inet floci_public_nat incoming { type filter hook input priority -5; policy drop; }'
-                nft 'add chain inet floci_public_nat local_output { type filter hook output priority -5; policy drop; }'
-                nft 'add chain inet floci_public_nat outgoing { type nat hook postrouting priority srcnat; }'
                 nft -f - <<'FLOCI_RULES'
+                add table inet floci_public_nat
+                add chain inet floci_public_nat forwarding { type filter hook forward priority -5; policy drop; }
+                add chain inet floci_public_nat incoming { type filter hook input priority -5; policy drop; }
+                add chain inet floci_public_nat local_output { type filter hook output priority -5; policy drop; }
+                add chain inet floci_public_nat outgoing { type nat hook postrouting priority srcnat; }
                 flush chain inet floci_public_nat forwarding
                 flush chain inet floci_public_nat outgoing
                 FLOCI_RULES

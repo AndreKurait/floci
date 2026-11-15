@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.common.docker.ContainerExecStubs;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
+import io.github.hectorvent.floci.services.ec2.SecurityGroupDnsFixture;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
@@ -407,7 +408,7 @@ class EcsStablePortRolloutServiceTest {
         DockerClient docker = mock(DockerClient.class, RETURNS_DEEP_STUBS);
         when(lifecycle.getDockerClient()).thenReturn(docker);
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
-        SecurityGroupFirewallManager firewall = new SecurityGroupFirewallManager(docker, null, lifecycle,
+        SecurityGroupFirewallManager firewall = SecurityGroupDnsFixture.rawManager(docker, null, lifecycle,
                 config, mock(EmbeddedDnsServer.class));
         NamespaceStops namespaces = new NamespaceStops(docker, firewall);
         namespaces.register("eni-web", "helper", "172.18.0.2");
@@ -425,6 +426,7 @@ class EcsStablePortRolloutServiceTest {
 
     private record NamespaceStops(DockerClient docker, SecurityGroupFirewallManager firewall) {
         private void register(String eniId, String helperId, String address) {
+            when(docker.inspectContainerCmd(helperId).exec().getId()).thenReturn(helperId);
             when(docker.inspectContainerCmd(helperId).exec().getState().getRunning()).thenReturn(true);
             ContainerExecStubs.completeEveryExec(docker, helperId, 0, "", "");
             SecurityGroup group = new SecurityGroup();

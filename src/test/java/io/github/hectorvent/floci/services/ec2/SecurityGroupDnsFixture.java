@@ -13,6 +13,8 @@ import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
 
+import java.util.List;
+
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -29,35 +31,54 @@ public final class SecurityGroupDnsFixture {
     }
 
     public static SecurityGroupFirewallManager manager(DockerClient dockerClient, EmulatorConfig config) {
-        SecurityGroupFirewallManager manager = spy(new SecurityGroupFirewallManager(policyDocker(dockerClient),
+        SecurityGroupFirewallManager manager = spy(rawManager(policyDocker(dockerClient),
                 mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class), config,
                 mock(EmbeddedDnsServer.class)));
         doNothing().when(manager).reconcileAll();
         doNothing().when(manager).admit(anyString(), anyBoolean());
         return manager;
     }
+
+    /** DNS/lifecycle-only suites model clean writer records; policy suites use the real durable journal. */
+    public static SecurityGroupFirewallManager rawManager(
+            DockerClient docker, ContainerBuilder builder, ContainerLifecycleManager lifecycle,
+            EmulatorConfig config, EmbeddedDnsServer dns) {
+        PolicyWriterJournal journal = mock(PolicyWriterJournal.class);
+        when(journal.acquire(anyString())).thenAnswer(ignored -> mock(PolicyWriterJournal.Lease.class));
+        when(journal.helpers()).thenReturn(List.of());
+        return new SecurityGroupFirewallManager(docker, builder, lifecycle, config, dns, journal);
+    }
+
     /** DNS-only spies still execute quarantine; model a confirmed successful nft command. */
     static DockerClient policyDocker(DockerClient dockerClient) {
         CopyArchiveToContainerCmd copy = mock(CopyArchiveToContainerCmd.class, RETURNS_SELF);
         when(dockerClient.copyArchiveToContainerCmd(anyString())).thenReturn(copy);
-        ExecCreateCmd create = mock(ExecCreateCmd.class, RETURNS_SELF);
-        ExecCreateCmdResponse created = mock(ExecCreateCmdResponse.class);
-        when(created.getId()).thenReturn("dns-policy-exec");
-        when(create.exec()).thenReturn(created);
-        when(dockerClient.execCreateCmd(anyString())).thenReturn(create);
+        when(dockerClient.execCreateCmd(anyString())).thenAnswer(invocation -> {
+            String helper = invocation.getArgument(0);
+            ExecCreateCmd create = mock(ExecCreateCmd.class, RETURNS_SELF);
+            ExecCreateCmdResponse created = mock(ExecCreateCmdResponse.class);
+            when(created.getId()).thenReturn("dns-policy-" + helper);
+            when(create.exec()).thenReturn(created);
+            return create;
+        });
         ExecStartCmd start = mock(ExecStartCmd.class);
         when(start.exec(any())).thenAnswer(invocation -> {
             ResultCallback.Adapter<?> callback = invocation.getArgument(0);
             callback.onComplete();
             return callback;
         });
-        when(dockerClient.execStartCmd("dns-policy-exec")).thenReturn(start);
-        InspectExecCmd inspect = mock(InspectExecCmd.class);
-        InspectExecResponse result = mock(InspectExecResponse.class);
-        when(result.isRunning()).thenReturn(false);
-        when(result.getExitCodeLong()).thenReturn(0L);
-        when(inspect.exec()).thenReturn(result);
-        when(dockerClient.inspectExecCmd("dns-policy-exec")).thenReturn(inspect);
+        when(dockerClient.execStartCmd(anyString())).thenReturn(start);
+        when(dockerClient.inspectExecCmd(anyString())).thenAnswer(invocation -> {
+            String execId = invocation.getArgument(0);
+            InspectExecCmd inspect = mock(InspectExecCmd.class);
+            InspectExecResponse result = mock(InspectExecResponse.class);
+            when(result.getId()).thenReturn(execId);
+            when(result.getContainerID()).thenReturn(execId.substring("dns-policy-".length()));
+            when(result.isRunning()).thenReturn(false);
+            when(result.getExitCodeLong()).thenReturn(0L);
+            when(inspect.exec()).thenReturn(result);
+            return inspect;
+        });
         return dockerClient;
     }
 

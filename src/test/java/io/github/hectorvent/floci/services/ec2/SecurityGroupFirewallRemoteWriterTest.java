@@ -81,7 +81,7 @@ class SecurityGroupFirewallRemoteWriterTest extends SecurityGroupFirewallPeerFix
         timedOut(new AtomicBoolean(true));
         ExecStartCmd start = mock(ExecStartCmd.class);
         when(start.exec(any())).thenThrow(new IllegalStateException("lost exec-start response"));
-        when(client.execStartCmd("exec")).thenReturn(start);
+        when(client.execStartCmd("exec-" + helper(0))).thenReturn(start);
         assertThrows(IllegalStateException.class, manager::reconcileAll);
         assertTrue(stoppedHelpers.contains(helper(0)));
         assertEquals(1, installs.size());
@@ -91,7 +91,7 @@ class SecurityGroupFirewallRemoteWriterTest extends SecurityGroupFirewallPeerFix
     void failedExecInspectionCannotBeTreatedAsCompleted() throws Exception {
         SecurityGroupFirewallManager manager = ready();
         timedOut(new AtomicBoolean(false));
-        when(client.inspectExecCmd("exec").exec()).thenThrow(new IllegalStateException("inspect unavailable"));
+        when(client.inspectExecCmd("exec-" + helper(0)).exec()).thenThrow(new IllegalStateException("inspect unavailable"));
         assertThrows(IllegalStateException.class, manager::reconcileAll);
         assertTrue(stoppedHelpers.contains(helper(0)));
         assertEquals(1, installs.size());
@@ -101,7 +101,7 @@ class SecurityGroupFirewallRemoteWriterTest extends SecurityGroupFirewallPeerFix
     void alreadyStoppedExactHelperDoesNotNeedAnotherStop() throws Exception {
         SecurityGroupFirewallManager manager = ready();
         timedOut(new AtomicBoolean(true));
-        InspectExecResponse result = client.inspectExecCmd("exec").exec();
+        InspectExecResponse result = client.inspectExecCmd("exec-" + helper(0)).exec();
         when(result.isRunning()).thenAnswer(invocation -> {
             stoppedHelpers.add(helper(0));
             return true;
@@ -176,11 +176,13 @@ class SecurityGroupFirewallRemoteWriterTest extends SecurityGroupFirewallPeerFix
             callback.set(invocation.getArgument(0));
             return awaiter;
         });
-        when(client.execStartCmd("exec")).thenReturn(start);
+        when(client.execStartCmd("exec-" + helper(0))).thenReturn(start);
         InspectExecResponse result = mock(InspectExecResponse.class);
+        when(result.getId()).thenReturn("exec-" + helper(0));
+        when(result.getContainerID()).thenReturn(helper(0));
         when(result.isRunning()).thenAnswer(invocation -> running.get());
         when(result.getExitCodeLong()).thenReturn(0L);
-        when(client.inspectExecCmd("exec").exec()).thenReturn(result);
+        when(client.inspectExecCmd("exec-" + helper(0)).exec()).thenReturn(result);
         return callback;
     }
 }

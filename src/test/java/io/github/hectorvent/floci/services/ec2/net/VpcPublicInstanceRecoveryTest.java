@@ -136,6 +136,31 @@ class VpcPublicInstanceRecoveryTest {
     }
 
     @Test
+    void registeringTheRetainedNamespacePreservesItsPublishedIdentity() {
+        manager.attachPublicInstance(identity, "helper", PUBLIC_IP);
+        assertEquals(Set.of(PUBLIC_IP), manager.publicInstanceAddresses());
+        manager.register(identity, "helper", List.of("172.18.0.1"));
+        assertEquals(Set.of(PUBLIC_IP), manager.publicInstanceAddresses());
+        manager.attachPublicInstance(identity, "helper", PUBLIC_IP);
+        verify(connect, times(1)).exec();
+    }
+
+    @Test
+    void changedSubnetCannotInheritTheRetainedPublicAttachment() {
+        manager.attachPublicInstance(identity, "helper", PUBLIC_IP);
+        NetworkInterface changed = new NetworkInterface();
+        changed.setVpcId("vpc");
+        changed.setSubnetId("different-subnet");
+        changed.setPrivateIpAddress("10.0.1.10");
+        when(ec2.describeNetworkInterfaces(ACCOUNT, REGION, List.of("eni"), Map.of()))
+                .thenReturn(new NetworkInterfaceListResult(List.of(changed), null));
+
+        assertThrows(IllegalStateException.class, () -> manager.register(identity, "helper", List.of()));
+        assertEquals(Set.of(PUBLIC_IP), manager.publicInstanceAddresses());
+        verify(connect, times(1)).exec();
+    }
+
+    @Test
     void forbiddenFreshConnectionStillFails() {
         DockerException denied = new DockerException("permission denied", 403);
         doThrow(denied).when(connect).exec();

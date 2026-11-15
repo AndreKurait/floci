@@ -23,14 +23,30 @@ public final class SecurityGroupNftCompiler {
                            String logicalAddress, String transportAddress, Set<String> groupIds,
                            List<SecurityGroup> groups, List<ControlConnection> controlConnections,
                            boolean instanceMetadataAllowed, Set<String> additionalTransportAddresses,
-                           List<ControlListener> controlListeners) {
+                            List<ControlListener> controlListeners,
+                            Map<String, ControlConnection> nativePeerDependencies) {
         public Endpoint {
             controlConnections = List.copyOf(controlConnections);
             additionalTransportAddresses = Set.copyOf(additionalTransportAddresses);
             controlListeners = List.copyOf(controlListeners);
+            nativePeerDependencies = Map.copyOf(nativePeerDependencies);
+            nativePeerDependencies.keySet().forEach(Ec2NativePeerDependencies::requireHostname);
+            if ((!instanceMetadataAllowed && !nativePeerDependencies.isEmpty())
+                    || !controlConnections.containsAll(nativePeerDependencies.values())) {
+                throw new IllegalArgumentException("Native peer DNS requires its EC2 endpoint's exact control admission");
+            }
             if (additionalTransportAddresses.stream().anyMatch(address -> !literal(address))) {
                 throw new IllegalArgumentException("Transport addresses must be literal IP addresses");
             }
+        }
+
+        public Endpoint(String accountId, String region, String vpcId, String eniId,
+                        String logicalAddress, String transportAddress, Set<String> groupIds,
+                        List<SecurityGroup> groups, List<ControlConnection> controlConnections,
+                        boolean instanceMetadataAllowed, Set<String> additionalTransportAddresses,
+                        List<ControlListener> controlListeners) {
+            this(accountId, region, vpcId, eniId, logicalAddress, transportAddress, groupIds, groups,
+                    controlConnections, instanceMetadataAllowed, additionalTransportAddresses, controlListeners, Map.of());
         }
 
         public Endpoint(String accountId, String region, String vpcId, String eniId,

@@ -27,4 +27,12 @@ public interface DnsClientVpcSource {
      * no rules apply to it.
      */
     Optional<ClientVpc> vpcForClient(String clientAddress);
+
+    /**
+     * A deployment-owned control dependency explicitly admitted for this exact live namespace.
+     * Empty preserves normal DNS for unrelated callers and names; it never trusts request headers.
+     */
+    default Optional<DnsAnswer> controlDependency(String name, int type, String clientAddress) {
+        return Optional.empty();
+    }
 }
