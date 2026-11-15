@@ -45,6 +45,9 @@ public class CloudWatchMetricsJsonHandler {
 
     private static final Logger LOG = Logger.getLogger(CloudWatchMetricsJsonHandler.class);
 
+    private static final Set<String> CONSOLE_METRIC_DATUM_MEMBERS = Set.of(
+            "MetricName", "Dimensions", "Timestamp", "Unit", "Value", "StatisticValues");
+
     private final CloudWatchMetricsService metricsService;
     private final CloudWatchDashboardsService dashboardsService;
     private final CloudWatchMetricStreamsService metricStreamsService;
@@ -116,8 +119,10 @@ public class CloudWatchMetricsJsonHandler {
      * {@code Alias} and {@code MetricName}. So only the operations and top-level members in
      * {@code CloudWatchLegacyProtocol} are served: any other operation, and any other member set
      * to a value other than {@code null} or {@code false}, is refused rather than answered as if it
-     * were unset, and a top-level {@code null} member is dropped. Members nested inside the served
-     * ones are passed on unchecked, nulls included. A {@code DescribeAlarms} answer that would list
+     * were unset, and a top-level {@code null} member is dropped. {@code PutMetricData} also checks
+     * each datum against {@code CONSOLE_METRIC_DATUM_MEMBERS} before storing any metrics;
+     * {@code Values} and {@code Counts} are refused because this handler does not parse them. Other
+     * nested members are passed on unchecked, nulls included. A {@code DescribeAlarms} answer that would list
      * an alarm defined with {@code Metrics} is refused too, since the console's API gives those
      * items its own shape, with {@code Alias} instead of {@code Id} and {@code MetricStat}. The
      * name matches {@code DynamoDbJsonHandler.handleLegacy}, the entry point of the other JSON-only
@@ -138,6 +143,18 @@ public class CloudWatchMetricsJsonHandler {
                 served.set(member.getKey(), value);
             } else if (!value.isBoolean() || value.booleanValue()) {
                 return unsupportedWithConsoleTarget("Parameter " + member.getKey() + " of " + action);
+            }
+        }
+        if ("PutMetricData".equals(action)) {
+            for (JsonNode datum : served.path("MetricData")) {
+                for (Map.Entry<String, JsonNode> member : datum.properties()) {
+                    JsonNode value = member.getValue();
+                    if (!CONSOLE_METRIC_DATUM_MEMBERS.contains(member.getKey())
+                            && !value.isNull() && (!value.isBoolean() || value.booleanValue())) {
+                        return unsupportedWithConsoleTarget("MetricData parameter " + member.getKey()
+                                + " of " + action);
+                    }
+                }
             }
         }
         Response response = handle(action, served, region);
