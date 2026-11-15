@@ -15,6 +15,7 @@ import software.amazon.awssdk.services.applicationautoscaling.ApplicationAutoSca
 import software.amazon.awssdk.services.applicationautoscaling.model.DescribeScheduledActionsResponse;
 import software.amazon.awssdk.services.applicationautoscaling.model.InvalidNextTokenException;
 import software.amazon.awssdk.services.applicationautoscaling.model.ObjectNotFoundException;
+import software.amazon.awssdk.services.applicationautoscaling.model.ScalableTarget;
 import software.amazon.awssdk.services.applicationautoscaling.model.ScheduledAction;
 import software.amazon.awssdk.services.applicationautoscaling.model.ValidationException;
 
@@ -777,6 +778,81 @@ class ApplicationAutoScalingIntegrationTest {
                 "{\"MaxCapacity\":2147483648}", "{\"MinCapacity\":null}")) {
             call("PutScheduledAction").body("{" + base + bounds + "}").post("/").then()
                     .statusCode(400).body("__type", equalTo("ValidationException"));
+        }
+    }
+
+    @Test
+    void putScheduledActionNameRejectsPublishedForbiddenValuesWithoutMutation() {
+        String resource = "service/scheduled-name-validation/service";
+        try (ApplicationAutoScalingClient client = AwsTestClients.create(ApplicationAutoScalingClient.builder(),
+                "000000000000", Region.US_EAST_1)) {
+            ScheduledActionFixtures.register(client, resource, 0, 10);
+            try {
+                client.putScheduledAction(ScheduledActionFixtures.put(resource, "kept")
+                        .schedule("at(2099-01-01T00:00:00)")
+                        .scalableTargetAction(ScheduledActionFixtures.bounds(2, 5)).build());
+                List<ScheduledAction> actions = ScheduledActionFixtures.describe(client, resource).scheduledActions();
+                List<ScalableTarget> targets = client.describeScalableTargets(b -> b.serviceNamespace("ecs")
+                        .resourceIds(resource).scalableDimension(DIMENSION)).scalableTargets();
+                for (String name : List.of("", " kept", "kept ", " kept ", " ", "bad:name", "bad/name", "bad|name",
+                        "bad\u0001name", "bad\tname", "bad\nname", "bad\rname", "bad\u001fname",
+                        "bad\u007fname", "bad\u0085name", "bad\u009fname", "a".repeat(257), "\ud83d\ude00".repeat(257))) {
+                    ValidationException failure = assertThrows(ValidationException.class,
+                            () -> client.putScheduledAction(ScheduledActionFixtures.put(resource, name)
+                                    .schedule("at(2099-02-01T00:00:00)")
+                                    .scalableTargetAction(ScheduledActionFixtures.bounds(0, 0)).build()));
+                    assertEquals(400, failure.statusCode());
+                    assertEquals(actions, ScheduledActionFixtures.describe(client, resource).scheduledActions());
+                    assertEquals(targets, client.describeScalableTargets(b -> b.serviceNamespace("ecs")
+                            .resourceIds(resource).scalableDimension(DIMENSION)).scalableTargets());
+                    assertTrue(client.describeScalingActivities(b -> b.serviceNamespace("ecs")
+                            .resourceId(resource).scalableDimension(DIMENSION)).scalingActivities().isEmpty());
+                }
+            } finally {
+                ScheduledActionFixtures.deregister(client, resource);
+            }
+        }
+    }
+
+    @Test
+    void scheduledActionNamesPreservePermittedWhitespaceAndDeleteUsesItsOwnContract() {
+        String resource = "service/scheduled-name-round-trip/service";
+        try (ApplicationAutoScalingClient client = AwsTestClients.create(ApplicationAutoScalingClient.builder(),
+                "000000000000", Region.US_EAST_1)) {
+            ScheduledActionFixtures.register(client, resource, 0, 10);
+            try {
+                for (String name : List.of("name with spaces", "\u2003", "\u2003name\u2003", "\u00a0",
+                        "a".repeat(256), "\ud83d\ude00".repeat(256))) {
+                    client.putScheduledAction(ScheduledActionFixtures.put(resource, name)
+                            .schedule("at(2099-01-01T00:00:00)")
+                            .scalableTargetAction(ScheduledActionFixtures.bounds(1, 5)).build());
+                    List<ScheduledAction> actions = ScheduledActionFixtures.describe(client, resource).scheduledActions();
+                    assertEquals(1, actions.size());
+                    assertEquals(name, actions.getFirst().scheduledActionName());
+                    assertEquals(actions, client.describeScheduledActions(b -> b.serviceNamespace("ecs")
+                            .resourceId(resource).scheduledActionNames(name)).scheduledActions());
+                    for (String missing : List.of(" missing", "missing ", "missing:name", "missing/name",
+                            "missing|name", "missing\tname", "missing\nname", "missing\rname", "b".repeat(1600),
+                            "\ud83d\ude00".repeat(1600))) {
+                        assertThrows(ObjectNotFoundException.class, () -> client.deleteScheduledAction(b ->
+                                b.serviceNamespace("ecs").resourceId(resource).scalableDimension(DIMENSION)
+                                        .scheduledActionName(missing)));
+                        assertEquals(actions, ScheduledActionFixtures.describe(client, resource).scheduledActions());
+                    }
+                    for (String invalid : List.of("", "bad\u0001name", "bad\u001fname", "bad\uffffname",
+                            "b".repeat(1601), "\ud83d\ude00".repeat(1601))) {
+                        assertThrows(ValidationException.class, () -> client.deleteScheduledAction(b ->
+                                b.serviceNamespace("ecs").resourceId(resource).scalableDimension(DIMENSION)
+                                        .scheduledActionName(invalid)));
+                        assertEquals(actions, ScheduledActionFixtures.describe(client, resource).scheduledActions());
+                    }
+                    client.deleteScheduledAction(b -> b.serviceNamespace("ecs").resourceId(resource)
+                            .scalableDimension(DIMENSION).scheduledActionName(name));
+                    assertTrue(ScheduledActionFixtures.describe(client, resource).scheduledActions().isEmpty());
+                }
+            } finally {
+                ScheduledActionFixtures.deregister(client, resource);
+            }
         }
     }
 
