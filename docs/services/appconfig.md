@@ -254,6 +254,9 @@ For the first four types, `Ref` returns the AppConfig ID, which `Fn::GetAtt` als
 `ConfigurationProfileId` and `Id`. A configuration profile's `KmsKeyArn` is not set.
 
 For a hosted version, `Ref` and `Fn::GetAtt VersionNumber` return the version number as a string.
+CFN resource descriptions, resource lists, events and change-set previews expose the version number as
+the public physical ID. Different profiles can both report `1` while their stored ownership remains distinct.
+Use `StackName` for resource reads; numeric hosted IDs are not resolved by `PhysicalResourceId`-only stack lookup.
 Its physical identity also includes its application and profile, so versions with the same
 number in different profiles remain separate resources. Hosted version numbers increase
 across concurrent creates, deletions and restarts. Older persisted data without a counter
