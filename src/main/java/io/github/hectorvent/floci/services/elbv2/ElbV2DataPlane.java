@@ -174,7 +174,7 @@ public class ElbV2DataPlane {
         private long bindRetryTimer = -1;
         private long bindRetryDelay = INITIAL_BIND_RETRY_MILLIS;
         private ReloadingKeyManager tlsKeyManager;
-        private volatile RoutingView routing = new RoutingView(Map.of(), Map.of());
+        private volatile RoutingView routing = new RoutingView(Map.of(), Map.of(), null);
     }
 
     private <T> T onPort(int port, Function<PortState, T> operation) {
@@ -448,7 +448,7 @@ public class ElbV2DataPlane {
         }
         if (conflictsWithServedListener(prepared.port(), prepared.tcp(), arn)) {
             LOG.warnv("ELBv2 listener {0} on port {1} is registered but serves no traffic: a TCP listener "
-                    + "needs a dedicated local port and another listener already serves it. It takes over "
+                    + "needs a dedicated local port and another TCP listener already serves it. It takes over "
                     + "the port once the serving listener is deleted or moved.", arn, String.valueOf(prepared.port()));
             return true;
         }
@@ -465,6 +465,10 @@ public class ElbV2DataPlane {
             HttpServer server = servers.get(prepared.port());
             if (server == null) {
                 ensurePortServer(prepared.port());
+            } else if (prepared.tcp() && !isReservedByFloci(prepared.port())) {
+                // Raw TCP can only be reached on the local port; the port's host-routed listeners stay served
+                // by name through the shared endpoint.
+                restartPortServer(prepared.port());
             } else if (prepared.secure()) {
                 refreshTlsOptions(prepared.port(), server);
             }
@@ -481,12 +485,24 @@ public class ElbV2DataPlane {
     }
 
     private void removePortBinding(String listenerArn, ListenerBinding binding) {
+        Map<String, String> before = listenersByHostAndPort.get(binding.port());
+        boolean served = before != null && listenerArn.equals(before.get(binding.host()));
         removeHostBindings(listenerArn, binding);
         Map<String, String> listenersByHost = listenersByHostAndPort.get(binding.port());
         if ((listenersByHost == null || listenersByHost.isEmpty()) && promoteParkedListeners(binding.port())) {
             restartPortServer(binding.port());
         } else if (listenersByHost == null || listenersByHost.isEmpty()) {
             closePortServerIfUnused(binding.port(), listenersByHost);
+        } else if (binding.tcp()) {
+            // A serving TCP listener owned the local port: a parked TCP listener takes it over, else the
+            // port's host-routed listeners do. A parked one owned nothing, and Floci's own reserved port
+            // never had a TCP server to give back.
+            if (served) {
+                promoteParkedListeners(binding.port());
+                if (!isReservedByFloci(binding.port())) {
+                    restartPortServer(binding.port());
+                }
+            }
         } else if (binding.secure()) {
             HttpServer server = servers.get(binding.port());
             if (server != null) {
@@ -548,14 +564,17 @@ public class ElbV2DataPlane {
     }
 
     /**
-     * A TCP listener owns its local port outright, so it cannot share it with any other listener.
+     * Only two TCP listeners conflict on a port. Every load balancer answers on Floci's one address, and raw
+     * TCP carries no name to tell two of them apart, so one owns the local port. A listener selected by its
+     * load balancer's name (Host or SNI) never conflicts with another load balancer's listener: as on AWS,
+     * where each load balancer has its own addresses, one load balancer must not take another's port away.
      * Only listeners that serve the port count: a parked one must not keep a newcomer off it.
      */
     private boolean conflictsWithServedListener(int port, boolean tcp, String listenerArn) {
         Map<String, String> served = listenersByHostAndPort.getOrDefault(port, Map.of());
         for (String otherArn : served.values()) {
             ListenerBinding other = listenerBindings.get(otherArn);
-            if (!otherArn.equals(listenerArn) && other != null && other.port() == port && (other.tcp() || tcp)) {
+            if (!otherArn.equals(listenerArn) && other != null && other.port() == port && other.tcp() && tcp) {
                 return true;
             }
         }
@@ -635,8 +654,10 @@ public class ElbV2DataPlane {
 
     private void startPortServer(int port, PortState state) {
         boolean reserved = isReservedByFloci(port);
-        boolean sharedTls = reserved && port != config.port() && portIsSecure(port)
-                && servedBindings(port).noneMatch(ListenerBinding::tcp);
+        boolean tcp = servedBindings(port).anyMatch(ListenerBinding::tcp);
+        // A TCP listener cannot take Floci's own socket, but it must not keep another load balancer's HTTPS
+        // listener from sharing it by SNI either.
+        boolean sharedTls = reserved && port != config.port() && portIsSecure(port);
         if (reserved && !sharedTls) {
             // Returning null leaves `servers` untouched: computeIfAbsent skips a null mapping.
             // The emulator's own port cannot be handed over, so the two cases need different
@@ -648,7 +669,12 @@ public class ElbV2DataPlane {
                     + "registered but serves no traffic. {1}", String.valueOf(port), remedy);
             return;
         }
-        if (servedBindings(port).anyMatch(ListenerBinding::tcp)) {
+        if (reserved && tcp) {
+            LOG.warnv("ELBv2 TCP listener port {0} is reserved by Floci itself; the TCP listener is registered "
+                    + "but serves no traffic. The listeners of other load balancers on the port are still served "
+                    + "by name.", String.valueOf(port));
+        }
+        if (tcp && !reserved) {
             startTcpServer(port, state);
             return;
         }
@@ -919,12 +945,11 @@ public class ElbV2DataPlane {
     private void handleTcpConnection(NetSocket socket, PortState state) {
         socket.pause();
         socket.exceptionHandler(err -> socket.close());
-        RoutingView routing = state.routing;
-        if (routing.listeners().size() != 1) {
+        RoutedListener listener = state.routing.tcp();
+        if (listener == null) {
             socket.close();
             return;
         }
-        RoutedListener listener = routing.listeners().values().iterator().next();
         RequestScopes.runAs(AwsArnUtils.parse(listener.arn()).accountId(), listener.region(),
                 () -> dispatchTcpConnection(socket, listener));
     }
@@ -1008,6 +1033,16 @@ public class ElbV2DataPlane {
             ListenerBinding other = listenerBindings.get(otherArn);
             if (other == null || other.loadBalancerArn().equals(binding.loadBalancerArn())) {
                 continue;
+            }
+            if (other.tcp() != binding.tcp()) {
+                ListenerBinding tcp = other.tcp() ? other : binding;
+                ListenerBinding named = other.tcp() ? binding : other;
+                // No apostrophes: the message is a MessageFormat pattern, where one starts a quoted literal.
+                LOG.infov("ELBv2 port {0} serves two load balancers: the TCP listener of {1} on the local port, "
+                                + "and the listener of {2} by name ({3}) through the shared endpoint and, on the "
+                                + "TLS proxy port, by SNI.", String.valueOf(binding.port()), tcp.loadBalancerArn(),
+                        named.loadBalancerArn(), named.host());
+                return;
             }
             LOG.warnv("ELBv2 port {0} now serves two load balancers, {1} and {2}. Floci runs them "
                             + "on one socket and dispatches by Host header, so a request must send {3} "
@@ -1208,7 +1243,9 @@ public class ElbV2DataPlane {
     }
 
     private boolean portIsSecure(int port) {
+        // The port's host-routed listeners share one protocol (requireCompatiblePort); a TCP listener has none.
         return servedBindings(port)
+                .filter(binding -> !binding.tcp())
                 .findFirst()
                 .map(ListenerBinding::secure)
                 .orElse(false);
@@ -1259,22 +1296,38 @@ public class ElbV2DataPlane {
     private record RoutedListener(String arn, String region, String canonicalHostedZoneId,
                                   List<CompiledRule> chain, Set<String> certificateHosts, boolean http) {}
 
-    private record RoutingView(Map<String, String> hosts, Map<String, RoutedListener> listeners) {}
+    /**
+     * A port's listeners: every served load balancer's host, the listeners selected by their load balancer's name
+     * (Host or SNI), and the TCP listener that owns the local port, if any. A TCP listener's host maps to no
+     * host-routed listener, so it is never selected by name and never answers a request meant for another load
+     * balancer's listener on the same port.
+     */
+    private record RoutingView(Map<String, String> hosts, Map<String, RoutedListener> listeners, RoutedListener tcp) {}
 
     /** Publishes membership, region and compiled chain together after a coordinated write. */
     private void refreshRouting(int port, PortState state) {
-        Map<String, String> hosts = listenersByHostAndPort.getOrDefault(port, Map.of());
+        Map<String, String> served = listenersByHostAndPort.getOrDefault(port, Map.of());
+        Map<String, String> hosts = new HashMap<>();
         Map<String, RoutedListener> routes = new HashMap<>();
-        for (String arn : hosts.values()) {
+        RoutedListener tcp = null;
+        for (Map.Entry<String, String> entry : served.entrySet()) {
+            String arn = entry.getValue();
             ListenerBinding binding = listenerBindings.get(arn);
             AtomicReference<List<CompiledRule>> chain = ruleChains.get(arn);
             String region = listenerRegions.get(arn);
-            if (binding != null && binding.port() == port && chain != null && region != null) {
-                routes.put(arn, new RoutedListener(arn, region, binding.canonicalHostedZoneId(),
-                        chain.get(), binding.certificateHosts(), !binding.secure() && !binding.tcp()));
+            boolean complete = binding != null && binding.port() == port && chain != null && region != null;
+            RoutedListener route = complete ? new RoutedListener(arn, region, binding.canonicalHostedZoneId(),
+                    chain.get(), binding.certificateHosts(), !binding.secure() && !binding.tcp()) : null;
+            // A TCP listener keeps its host entry, so a request naming its load balancer is known and passed on
+            // unanswered, but it is never a host-routed listener.
+            hosts.put(entry.getKey(), arn);
+            if (binding != null && binding.tcp()) {
+                tcp = route == null ? tcp : route;
+            } else if (route != null) {
+                routes.put(arn, route);
             }
         }
-        state.routing = new RoutingView(Map.copyOf(hosts), Map.copyOf(routes));
+        state.routing = new RoutingView(Map.copyOf(hosts), Map.copyOf(routes), tcp);
     }
 
     private void handleRequest(HttpServerRequest req, int port) {
