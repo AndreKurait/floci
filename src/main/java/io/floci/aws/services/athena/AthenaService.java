@@ -59,6 +59,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.function.Predicate;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -113,8 +114,7 @@ public class AthenaService {
     private final StorageBackend<String, DataCatalog> dataCatalogStore;
     private final StorageBackend<String, List<String>> resultColumnTypeStore;
     // The Region each query execution was started in, by its id: the execution's own record is the API's shape, which
-    // carries none. Athena answers the execution in that Region alone, and IAM checks a request naming it on its
-    // workgroup there.
+    // carries none, and IAM checks a request naming the execution on its workgroup in that Region alone.
     private final StorageBackend<String, String> queryRegionStore;
     private final FlociDuckClient duckClient;
     private final GlueService glueService;
@@ -224,6 +224,7 @@ public class AthenaService {
                 : null;
 
         QueryExecution execution = new QueryExecution(id, query, workGroup, resolvedResult, resolvedContext);
+        execution.storeRegion(regionResolver.getRegion());
         if (createDatabaseStatement || hiveDdlStatement) {
             execution.setStatementType("DDL");
         }
@@ -374,33 +375,138 @@ public class AthenaService {
 
     /** The stored query execution of the id; empty for one Athena holds none of. */
     public Optional<QueryExecution> findQueryExecution(String id) {
-        return id == null ? Optional.empty() : queryStore.get(id);
+        return id == null ? Optional.empty() : batchScopedRead(queryStore, id, value -> true, false);
     }
 
-    /** The Region the query execution of the id was started in; empty for one whose Region Athena did not record. */
+    /** The recorded execution Region, or the admission Region retained when an unscoped legacy row was adopted. */
     public Optional<String> findQueryExecutionRegion(String id) {
-        return id == null ? Optional.empty() : queryRegionStore.get(id);
+        return id == null ? Optional.empty() : batchScopedRead(queryRegionStore, id, value -> true, false)
+                .or(() -> findQueryExecution(id).map(QueryExecution::storedRegion));
     }
 
-    /**
-     * The query execution of the id, as Athena answers a request sent to the Region: one started there, or one stored
-     * before Athena recorded each execution's Region, which it answers in every Region as it did then. AWS keeps query
-     * executions per account and Region, so one started in another Region is not found.
-     */
+    /** Only an unscoped legacy row may infer its original Region from the configured legacy default. */
+    Optional<String> findLegacyQueryExecutionRegion(String id) {
+        String account = regionResolver.getAccountId();
+        if (id == null || !Objects.equals(account, regionResolver.getDefaultAccountId())
+                || !(queryStore instanceof AccountAwareStorageBackend<QueryExecution> accounts)) {
+            return Optional.empty();
+        }
+        return accounts.getLegacyForAccount(account, id)
+                .map(execution -> Objects.requireNonNullElse(execution.storedRegion(),
+                        regionResolver.getDefaultRegion()));
+    }
+
+    public QueryExecution getQueryExecution(String id) {
+        return getQueryExecution(regionResolver.getRegion(), id);
+    }
+
     public QueryExecution getQueryExecution(String region, String id) {
-        return queryStore.get(id)
-                .filter(execution -> answeredIn(id, region))
-                .orElseThrow(() -> new AwsException("InvalidRequestException",
-                        "QueryExecution " + id + " was not found", 400));
+        QueryExecution execution = readScopedQuery(region, id, true)
+                .filter(found -> queryInRegion(found, region, false)).orElse(null);
+        if (execution == null) {
+            throw new AwsException("InvalidRequestException", "QueryExecution " + id + " was not found", 400);
+        }
+        return execution;
     }
 
-    /** Whether Athena answers the query execution of the id in the Region: started there, or in one it did not record. */
-    private boolean answeredIn(String id, String region) {
-        return queryRegionStore.get(id).map(startedIn -> startedIn.equals(region)).orElse(true);
+    /** Unscoped legacy rows belong to the default account; their missing region means the configured default. */
+    QueryExecution findBatchQueryExecution(String region, String id) {
+        return findBatchQueryExecution(region, id, true);
+    }
+
+    /** IAM target discovery cannot write or migrate rows before the permission decision. */
+    QueryExecution findBatchQueryExecutionForAuthorization(String region, String id) {
+        return findBatchQueryExecution(region, id, false);
+    }
+
+    private QueryExecution findBatchQueryExecution(String region, String id, boolean migrateLegacy) {
+        Optional<QueryExecution> execution = readScopedQuery(region, id, migrateLegacy);
+        return execution.filter(found -> queryInRegion(found, region, true)).orElse(null);
+    }
+
+    /** Preserve the established import scope when an authorized request adopts an unscoped legacy execution. */
+    private Optional<QueryExecution> readScopedQuery(String region, String id, boolean migrateLegacy) {
+        Predicate<QueryExecution> legacyInRegion = execution -> queryInRegion(execution, region, true);
+        if (migrateLegacy && queryStore instanceof AccountAwareStorageBackend<QueryExecution> accounts
+                && Objects.equals(regionResolver.getAccountId(), regionResolver.getDefaultAccountId())
+                && !AccountAwareStorageBackend.hasAccountPrefix(id)) {
+            synchronized (accounts) {
+                String account = regionResolver.getAccountId();
+                Optional<QueryExecution> scoped = accounts.getForAccount(account, id);
+                if (scoped.isPresent()) {
+                    return scoped;
+                }
+                Optional<QueryExecution> legacy = accounts.getLegacyForAccount(account, id).filter(legacyInRegion);
+                if (legacy.isEmpty()) {
+                    return Optional.empty();
+                }
+                if (findQueryExecutionRegion(id).isEmpty()) {
+                    // This is the legacy row's established admission scope, not a recovered execution start region.
+                    // Persist it before migration: a failed provenance write must leave the raw legacy row in place.
+                    queryRegionStore.put(id, regionResolver.getDefaultRegion());
+                }
+                return accounts.getForAccountMigratingLegacy(account, id, legacyInRegion);
+            }
+        }
+        return batchScopedRead(queryStore, id, legacyInRegion, migrateLegacy);
+    }
+
+    synchronized List<WorkGroupTag> batchWorkGroupTags(String region, String name) {
+        return batchScopedRead(workGroupStore, workGroupKey(region, name), group -> true, false)
+                .map(group -> group.getTags() == null ? List.<WorkGroupTag>of() : List.copyOf(group.getTags()))
+                .orElse(List.of());
+    }
+
+    private <T> Optional<T> batchScopedRead(StorageBackend<String, T> backend, String key,
+                                             Predicate<T> legacyScope, boolean migrateLegacy) {
+        if (backend instanceof AccountAwareStorageBackend<T> accounts) {
+            String account = regionResolver.getAccountId();
+            if (!account.equals(regionResolver.getDefaultAccountId()) || AccountAwareStorageBackend.hasAccountPrefix(key)) {
+                return accounts.getForAccount(account, key);
+            }
+            if (migrateLegacy) {
+                return accounts.getForAccountMigratingLegacy(account, key, legacyScope);
+            }
+            return accounts.getForAccount(account, key)
+                    .or(() -> accounts.getLegacyForAccount(account, key).filter(legacyScope));
+        }
+        return backend.get(key);
     }
 
     public List<QueryExecution> listQueryExecutions() {
         return queryStore.scan(k -> true);
+    }
+
+    private boolean queryInRegion(QueryExecution execution, String region, boolean unscopedLegacy) {
+        String startedIn = findQueryExecutionRegion(execution.getQueryExecutionId()).orElse(execution.storedRegion());
+        if (startedIn != null) {
+            return startedIn.equals(region);
+        }
+        return !unscopedLegacy || Objects.equals(region, regionResolver.getDefaultRegion());
+    }
+
+    /** Listing reads eligible legacy rows in place, with explicitly scoped records taking precedence. */
+    private List<QueryExecution> queryHistory(String region) {
+        if (queryStore instanceof AccountAwareStorageBackend<QueryExecution> accounts) {
+            String account = regionResolver.getAccountId();
+            Map<String, QueryExecution> records = new LinkedHashMap<>();
+            for (QueryExecution execution : accounts.scanForAccount(account, key -> true)) {
+                records.put(execution.getQueryExecutionId(), execution);
+            }
+            Set<String> scopedIds = Set.copyOf(records.keySet());
+            if (account.equals(regionResolver.getDefaultAccountId())) {
+                for (QueryExecution execution : accounts.scanUnscopedLegacy(value -> true)) {
+                    if (queryInRegion(execution, region, true)) {
+                        records.putIfAbsent(execution.getQueryExecutionId(), execution);
+                    }
+                }
+            }
+            return records.values().stream()
+                    .filter(execution -> queryInRegion(execution, region,
+                            !scopedIds.contains(execution.getQueryExecutionId())))
+                    .toList();
+        }
+        return listQueryExecutions().stream().filter(execution -> queryInRegion(execution, region, false)).toList();
     }
 
     public PaginatedResult<QueryExecution> listQueryExecutionsPage(String region, String workGroup,
@@ -413,15 +519,21 @@ public class AthenaService {
         }
         String group = workGroup == null ? DEFAULT_WORKGROUP : workGroup;
         validateWorkGroupName(group);
-        getWorkGroup(group, region);
-        List<QueryExecution> executions = listQueryExecutions().stream()
+        if (!DEFAULT_WORKGROUP.equals(group)
+                && batchScopedRead(workGroupStore, workGroupKey(region, group), value -> true, false).isEmpty()) {
+            throw new AwsException("InvalidRequestException", "WorkGroup " + group + " is not found.", 400);
+        }
+        List<QueryExecution> executions = queryHistory(region).stream()
                 .filter(execution -> group.equals(Objects.requireNonNullElse(execution.getWorkGroup(), DEFAULT_WORKGROUP)))
-                .filter(execution -> answeredIn(execution.getQueryExecutionId(), region))
                 .toList();
         int limit = maxResults == null || maxResults == 0 ? 50 : maxResults;
         return Pagination.paginate(executions, QueryExecution::getQueryExecutionId, limit, nextToken,
                 "ListQueryExecutions:" + regionResolver.getAccountId() + ":" + region + ":" + group,
                 token -> new AwsException("InvalidRequestException", "Invalid NextToken.", 400));
+    }
+
+    public void stopQueryExecution(String id) {
+        stopQueryExecution(regionResolver.getRegion(), id);
     }
 
     public void stopQueryExecution(String region, String id) {
@@ -745,6 +857,10 @@ public class AthenaService {
         return tableMetadata(catalog, database, glueService.getTable(database, tableName));
     }
 
+    public ResultSet getQueryResults(String id) {
+        return getQueryResults(regionResolver.getRegion(), id);
+    }
+
     public ResultSet getQueryResults(String region, String id) {
         QueryExecution execution = getQueryExecution(region, id);
 
@@ -759,7 +875,7 @@ public class AthenaService {
             return new ResultSet(List.of(), new ResultSet.ResultSetMetadata(List.of()));
         }
 
-        List<String> columnTypes = resultColumnTypeStore.get(id).orElse(List.of());
+        List<String> columnTypes = batchScopedRead(resultColumnTypeStore, id, value -> true, true).orElse(List.of());
         return readResultsFromS3(execution.getResultConfiguration().getOutputLocation(), id, columnTypes);
     }
 
@@ -1329,7 +1445,7 @@ public class AthenaService {
         return region + ":" + name;
     }
 
-    private void validateWorkGroupName(String name) {
+    static void validateWorkGroupName(String name) {
         if (name == null || name.isBlank()) {
             throw new AwsException("InvalidRequestException", "WorkGroup name is required", 400);
         }
