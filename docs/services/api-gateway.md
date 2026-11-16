@@ -1379,6 +1379,10 @@ When IAM enforcement is enabled, REST methods using `NONE` require an explicit a
 
 REST `CUSTOM` authorizers combine their validated policy with the API resource policy when IAM enforcement is enabled. An explicit resource-policy deny stops the request before the authorizer is called. After authorizer evaluation, either policy can grant access, while an explicit deny from either policy wins. The API policy is evaluated for every request, including authorizer cache hits; flushing the authorizer cache still invalidates its cached policy. Custom `principalId` strings do not establish a verified IAM identity. The current transport source-IP and secure-transport conditions are supported; complete inbound condition context and deployment-snapshot policy activation remain separate limitations.
 
+REST resource-policy checks preserve the request's trailing slash in the method ARN.
+Policies can distinguish `/items` from `/items/`, including public and Cognito methods,
+the check before a custom authorizer runs, and authorizer cache hits.
+
 REST `AWS_IAM` route policy evaluation supplies `aws:SourceIp` from the connection and
 `aws:SecureTransport` from the request URI scheme to the shared identity, resource, session,
 boundary and SCP evaluators. Forwarded IP/protocol headers do not supply these values under

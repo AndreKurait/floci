@@ -622,7 +622,8 @@ public class ApiGatewayExecuteController {
 
         if ("CUSTOM".equals(method.getAuthorizationType())
                 && callerCallAuthorizer.evaluateAnonymousResourcePolicy("execute-api:Invoke",
-                        buildMethodArn(region, apiId, stageName, httpMethod, path), routeContext.sourceIp(),
+                        buildMethodArn(region, apiId, stageName, httpMethod,
+                                preserveTrailingSlash(path, uriInfo.getRequestUri().getRawPath())), routeContext.sourceIp(),
                         isSecureTransport(uriInfo)) == ResourcePolicyDecision.EXPLICIT_DENY) {
             return gatewayResponse(scope, GatewayResponseType.ACCESS_DENIED, 403,
                     "User is not authorized to access this resource");
@@ -639,7 +640,8 @@ public class ApiGatewayExecuteController {
         String authorizationType = method.getAuthorizationType();
         if (authorizationType == null || "NONE".equalsIgnoreCase(authorizationType)
                 || "COGNITO_USER_POOLS".equalsIgnoreCase(authorizationType)) {
-            String invokeArn = buildMethodArn(region, apiId, stageName, httpMethod, path);
+            String invokeArn = buildMethodArn(region, apiId, stageName, httpMethod,
+                    preserveTrailingSlash(path, uriInfo.getRequestUri().getRawPath()));
             if (callerCallAuthorizer.authorizeAnonymousResource("execute-api:Invoke", invokeArn,
                     routeContext.sourceIp(), isSecureTransport(uriInfo)) != Decision.ALLOW) {
                 return gatewayResponse(scope, GatewayResponseType.ACCESS_DENIED, 403,
@@ -1449,12 +1451,14 @@ public class ApiGatewayExecuteController {
                     pending.cache(verified);
                 }
             }
-            String methodArn = buildMethodArn(region, apiId, stageName, httpMethod, requestPath);
+            String methodArn = buildMethodArn(region, apiId, stageName, httpMethod,
+                    preserveTrailingSlash(requestPath, uriInfo.getRequestUri().getRawPath()));
             Map<String, List<String>> conditions = AuthorizerPolicyEvaluator.requestConditions(
                     routeContext.sourceIp(), isSecureTransport(uriInfo));
             ResourcePolicyDecision resourceDecision = callerCallAuthorizer.evaluateAnonymousResourcePolicy(
                     "execute-api:Invoke", methodArn, routeContext.sourceIp(), isSecureTransport(uriInfo));
-            if (!restLambdaAuthorizer.permits(verified, methodArn, conditions, resourceDecision)) {
+            String authorizerMethodArn = buildMethodArn(region, apiId, stageName, httpMethod, requestPath);
+            if (!restLambdaAuthorizer.permits(verified, authorizerMethodArn, conditions, resourceDecision)) {
                 return authorizerError(scope, GatewayResponseType.ACCESS_DENIED, 403);
             }
             return new AuthorizerResult(null, verified.principalId(), verified.context(),
