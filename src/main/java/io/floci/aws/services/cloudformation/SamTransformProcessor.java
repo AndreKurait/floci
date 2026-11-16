@@ -2094,7 +2094,9 @@ class SamTransformProcessor {
         // no Body and no BodyS3Location for that case. The paths are empty either way, so the
         // runtime outcome (no method reachable) is the same, even though the stored Body differs.
         applyDefinitionSource(logicalId, properties, apiProps);
-        new SamRestApiAuth(objectMapper).apply(properties.path("Auth"), apiProps.path("Body"));
+        JsonNode stageName = properties.path("StageName");
+        new SamRestApiAuth(objectMapper).apply(properties.path("Auth"), apiProps.path("Body"),
+                stageName.isMissingNode() ? objectMapper.getNodeFactory().textNode("Prod") : stageName);
 
         apiDef.set("Properties", apiProps);
         resources.set(logicalId, apiDef);
@@ -2121,7 +2123,6 @@ class SamTransformProcessor {
         deployRef.put("Ref", deploymentLogicalId);
         stageProps.set("DeploymentId", deployRef);
 
-        JsonNode stageName = properties.path("StageName");
         if (!stageName.isMissingNode()) {
             stageProps.set("StageName", stageName.deepCopy());
         } else {
