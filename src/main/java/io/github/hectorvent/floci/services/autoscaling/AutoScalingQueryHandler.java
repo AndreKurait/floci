@@ -739,12 +739,13 @@ public class AutoScalingQueryHandler {
         xml.end("CapacityReservationSpecification");
     }
 
+    /**
+     * AWS returns EnabledMetrics on every group, as an empty list when no metrics are enabled, and clients that
+     * read the member directly (botocore leaves an absent list out of the parsed group) depend on it.
+     */
     private static void appendEnabledMetricsXml(XmlBuilder xml, List<String> enabledMetrics) {
-        if (enabledMetrics == null || enabledMetrics.isEmpty()) {
-            return;
-        }
         xml.start("EnabledMetrics");
-        for (String metric : enabledMetrics) {
+        for (String metric : enabledMetrics == null ? List.<String>of() : enabledMetrics) {
             xml.start("member")
                .elem("Metric", metric)
                .elem("Granularity", AutoScalingService.METRICS_GRANULARITY)

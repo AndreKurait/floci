@@ -34,7 +34,7 @@ Floci implements the EC2 Auto Scaling API — stored-state management for launch
 | `CreateOrUpdateTags` | Creates or updates group tags and their propagate-at-launch setting |
 | `DeleteTags` | Removes named group tags |
 | `EnableMetricsCollection` | Records the named group metrics, or all 20 when none are named, as `EnabledMetrics` on `DescribeAutoScalingGroups`. `Granularity` is required and must be `1Minute`; an unknown metric name raises `ValidationError`. No metrics are published to CloudWatch |
-| `DisableMetricsCollection` | Removes the named metrics from `EnabledMetrics`, or all of them when none are named |
+| `DisableMetricsCollection` | Removes the named metrics from `EnabledMetrics`, or all of them when none are named. A group with no metrics enabled describes an empty `EnabledMetrics`, as on AWS |
 
 `CreateAutoScalingGroup` accepts both `subnet-a,subnet-b` and
 `subnet-a, subnet-b` in `VPCZoneIdentifier`. `DescribeAutoScalingGroups` returns the
