@@ -230,6 +230,10 @@ port 53 only to the endpoint's declared resolvers, with connection-tracked repli
 The guard and its resolver permits are installed in one nftables transaction.
 Peer traffic remains withdrawn until the new routes and policy are installed;
 initial admission and failure quarantine still deny all traffic.
+Routing reconciliation plans changes under its topology lock and applies changed
+helpers with at most four concurrent workers. Each helper's guard and route writes
+remain ordered, unchanged policies are skipped, and all writers finish before
+successful state is published or failure quarantine begins.
 While that guard is active, endpoint route installation refreshes dynamic
 neighbors for only the distinct managed next-hop IPv4 addresses and interfaces.
 Each selector is an exact `/32`. This lets a retained guest learn a recreated

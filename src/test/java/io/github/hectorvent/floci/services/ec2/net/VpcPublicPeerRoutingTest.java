@@ -43,7 +43,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
@@ -383,6 +386,120 @@ class VpcPublicPeerRoutingTest {
         assertTrue(latest("first").contains("policy drop;"));
         assertFalse(latest("first").contains("accept"),
                 "Failure quarantine must not reuse the temporary update guard");
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {2, 6})
+    void changedHelpersApplyConcurrentlyWithinABoundedBatch(int count) throws Exception {
+        for (int index = 0; index < count; index++) {
+            admit("helper-" + index, index + 2, true);
+        }
+        gateway.setAttachments(List.of());
+        CountDownLatch writing = new CountDownLatch(Math.min(4, count));
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicInteger active = new AtomicInteger();
+        AtomicInteger maximum = new AtomicInteger();
+        for (int index = 0; index < count; index++) {
+            String helper = "helper-" + index;
+            scripts.get(helper).clear();
+            ExecCreateCmd ordinary = docker.execCreateCmd(helper);
+            AtomicBoolean first = new AtomicBoolean(true);
+            when(docker.execCreateCmd(helper)).thenAnswer(invocation -> {
+                if (first.compareAndSet(true, false)) {
+                    maximum.accumulateAndGet(active.incrementAndGet(), Math::max);
+                    writing.countDown();
+                    try {
+                        assertTrue(release.await(10, TimeUnit.SECONDS));
+                    } finally {
+                        active.decrementAndGet();
+                    }
+                }
+                return ordinary;
+            });
+        }
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread caller = reconcileInBackground(failure);
+        try {
+            assertTrue(writing.await(5, TimeUnit.SECONDS),
+                    "Independent helper writes must overlap instead of serializing the whole fleet");
+            assertEquals(Math.min(4, count), active.get());
+        } finally {
+            release.countDown();
+            caller.join(10000);
+        }
+        assertFalse(caller.isAlive());
+        assertNull(failure.get());
+        assertEquals(Math.min(4, count), maximum.get());
+        for (List<String> updates : scripts.values()) {
+            assertEquals(2, updates.size());
+            assertTrue(updates.getFirst().contains("policy drop;"));
+            assertFalse(updates.getFirst().contains("ip -4 route"));
+            assertTrue(updates.getLast().contains("ip -4 route"));
+        }
+        manager.reconcile();
+        for (List<String> updates : scripts.values()) {
+            assertEquals(2, updates.size(), "Unchanged policies must not be installed again");
+        }
+    }
+
+    @Test
+    void failedBatchDrainsOtherWritersBeforeQuarantiningHelpers() throws Exception {
+        admit("first", 2, true);
+        admit("second", 3, true);
+        gateway.setAttachments(List.of());
+        scripts.values().forEach(List::clear);
+        CountDownLatch writing = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        CountDownLatch failed = new CountDownLatch(1);
+        ExecCreateCmd firstCommand = docker.execCreateCmd("first");
+        AtomicBoolean firstWrite = new AtomicBoolean(true);
+        when(docker.execCreateCmd("first")).thenAnswer(invocation -> {
+            if (firstWrite.compareAndSet(true, false)) {
+                writing.countDown();
+                assertTrue(release.await(10, TimeUnit.SECONDS));
+            }
+            return firstCommand;
+        });
+        ExecCreateCmd secondCommand = docker.execCreateCmd("second");
+        AtomicBoolean secondWrite = new AtomicBoolean(true);
+        IllegalStateException expected = new IllegalStateException("route installation failed");
+        when(docker.execCreateCmd("second")).thenAnswer(invocation -> {
+            if (secondWrite.compareAndSet(true, false)) {
+                assertTrue(writing.await(5, TimeUnit.SECONDS));
+                failed.countDown();
+                throw expected;
+            }
+            return secondCommand;
+        });
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread caller = reconcileInBackground(failure);
+        try {
+            assertTrue(failed.await(5, TimeUnit.SECONDS));
+            assertTrue(caller.isAlive(), "A failed batch must wait for its outstanding writer");
+            assertTrue(scripts.values().stream().allMatch(List::isEmpty),
+                    "Quarantine must not race an outstanding policy write");
+        } finally {
+            release.countDown();
+            caller.join(10000);
+        }
+        assertFalse(caller.isAlive());
+        assertSame(expected, failure.get());
+        assertEquals(3, scripts.get("first").size(), "Guard, route update, then failure quarantine");
+        assertEquals(1, scripts.get("second").size());
+        for (String helper : List.of("first", "second")) {
+            assertFalse(latest(helper).contains("accept"),
+                    "No writer may replace the final failure quarantine");
+        }
+    }
+
+    private Thread reconcileInBackground(AtomicReference<Throwable> failure) {
+        return Thread.ofPlatform().start(() -> {
+            try {
+                manager.reconcile();
+            } catch (Throwable error) {
+                failure.set(error);
+            }
+        });
     }
 
     @Test
