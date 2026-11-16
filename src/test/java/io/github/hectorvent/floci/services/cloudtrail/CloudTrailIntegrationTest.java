@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.path.xml.XmlPath;
 import io.restassured.response.Response;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeAll;
@@ -192,6 +193,103 @@ class CloudTrailIntegrationTest {
         assertTrue(sawRangedGet, "Expected a GetObject record of the 5 bytes of a ranged read");
         assertTrue(sawGetInvalidRange, "Expected a GetObject InvalidRange record");
         assertTrue(sawHeadInvalidRange, "Expected a HeadObject InvalidRange record");
+    }
+
+    @Test
+    void aRoleSessionsS3ReadIsRecordedAsTheAssumedRoleThatMadeIt() throws Exception {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String sourceBucket = "audit-role-source-" + suffix;
+        String destBucket = "audit-role-logs-" + suffix;
+        String trailName = "audit-role-trail-" + suffix;
+        String roleName = "audit-reader-" + suffix;
+        createBucket(sourceBucket);
+        createBucket(destBucket);
+        putObject(sourceBucket, "blocks/0", "hello-world");
+
+        String roleArn = given()
+                .formParam("Action", "CreateRole")
+                .formParam("RoleName", roleName)
+                .formParam("Path", "/service/")
+                .formParam("AssumeRolePolicyDocument", """
+                        {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+                          "Principal":{"AWS":"*"},"Action":"sts:AssumeRole"}]}""")
+                .header("Authorization", rootAuthorization("iam"))
+            .when().post("/")
+            .then().statusCode(200)
+                .extract().xmlPath().getString("CreateRoleResponse.CreateRoleResult.Role.Arn");
+        try {
+            XmlPath session = given()
+                    .formParam("Action", "AssumeRole")
+                    .formParam("RoleArn", roleArn)
+                    .formParam("RoleSessionName", "audit-reader")
+                    .header("Authorization", rootAuthorization("sts"))
+                .when().post("/")
+                .then().statusCode(200)
+                    .extract().xmlPath();
+            String result = "AssumeRoleResponse.AssumeRoleResult.";
+            String sessionKey = session.getString(result + "Credentials.AccessKeyId");
+
+            invokeCloudTrail("CreateTrail", String.format(
+                    "{\"Name\":\"%s\",\"S3BucketName\":\"%s\"}", trailName, destBucket))
+                .then().statusCode(200);
+            invokeCloudTrail("PutEventSelectors", String.format("""
+                    {"TrailName":"%s","EventSelectors":[{"ReadWriteType":"All","IncludeManagementEvents":false,
+                      "DataResources":[{"Type":"AWS::S3::Object","Values":["arn:aws:s3:::%s/"]}]}]}""",
+                    trailName, sourceBucket))
+                .then().statusCode(200);
+            invokeCloudTrail("StartLogging", String.format("{\"Name\":\"%s\"}", trailName))
+                .then().statusCode(200);
+
+            given()
+                    .header("Authorization", "AWS4-HMAC-SHA256 Credential=" + sessionKey
+                            + "/20260629/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=abc")
+                    .header("X-Amz-Security-Token", session.getString(result + "Credentials.SessionToken"))
+                .when().get("/" + sourceBucket + "/blocks/0")
+                .then().statusCode(200);
+            writer.flushNow();
+
+            String listingXml = given()
+                .when().get("/" + destBucket + "?list-type=2")
+                .then().statusCode(200)
+                .extract().asString();
+            String logKey = extractFirstKey(listingXml);
+            assertNotNull(logKey, "No CloudTrail log file in the destination bucket:\n" + listingXml);
+            byte[] gz = given()
+                .when().get("/" + destBucket + "/" + logKey)
+                .then().statusCode(200)
+                .extract().asByteArray();
+            JsonNode records;
+            try (GZIPInputStream gzin = new GZIPInputStream(new ByteArrayInputStream(gz))) {
+                records = new ObjectMapper().readTree(gzin.readAllBytes()).get("Records");
+            }
+            JsonNode read = null;
+            for (JsonNode rec : records) {
+                if ("GetObject".equals(rec.path("eventName").asText())) {
+                    read = rec;
+                }
+            }
+            assertNotNull(read, "Expected a GetObject record among " + records.size() + " records");
+            JsonNode identity = read.path("userIdentity");
+            // Failure messages name no access key: they would carry the session's key id into the reports.
+            assertEquals("AssumedRole", identity.path("type").asText(), "userIdentity.type");
+            assertEquals(session.getString(result + "AssumedRoleUser.Arn"), identity.path("arn").asText());
+            assertEquals(session.getString(result + "AssumedRoleUser.AssumedRoleId"),
+                    identity.path("principalId").asText());
+            assertTrue(sessionKey.equals(identity.path("accessKeyId").asText()), "the session's own key is recorded");
+            JsonNode issuer = identity.path("sessionContext").path("sessionIssuer");
+            assertEquals("Role", issuer.path("type").asText());
+            assertEquals(roleArn, issuer.path("arn").asText());
+            assertEquals(roleName, issuer.path("userName").asText());
+            assertTrue(identity.path("principalId").asText().startsWith(issuer.path("principalId").asText() + ":"),
+                    "the session principal is RoleId:SessionName");
+        } finally {
+            invokeCloudTrail("DeleteTrail", String.format("{\"Name\":\"%s\"}", trailName));
+            given()
+                    .formParam("Action", "DeleteRole")
+                    .formParam("RoleName", roleName)
+                    .header("Authorization", rootAuthorization("iam"))
+                .when().post("/");
+        }
     }
 
     @Test
@@ -571,6 +669,12 @@ class CloudTrailIntegrationTest {
             .contentType(JSON11)
             .body(body)
         .when().post("/");
+    }
+
+    /** A placeholder SigV4 header for the account's root stand-in, scoped to {@code service}. */
+    private static String rootAuthorization(String service) {
+        return "AWS4-HMAC-SHA256 Credential=test/20260629/us-east-1/" + service
+                + "/aws4_request, SignedHeaders=host, Signature=abc";
     }
 
     private static void createBucket(String name) {
