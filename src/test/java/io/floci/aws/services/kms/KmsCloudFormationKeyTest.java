@@ -114,6 +114,49 @@ class KmsCloudFormationKeyTest {
     }
 
     @Test
+    void retainedOverrideReconcilesMutableTagsWithoutChangingIdentity() throws Exception {
+        JsonNode prior = mapper.readTree("""
+                {"Description":"before","Tags":[{"Key":"floci:override-id","Value":"fixed-key"},
+                {"Key":"old","Value":"v"}]}
+                """);
+        StackResource resource = create(prior.toString());
+        JsonNode next = mapper.readTree("""
+                {"Description":"after","Tags":[{"Key":"floci:override-id","Value":" fixed-key "},
+                {"Key":"new","Value":"v2"}]}
+                """);
+        provisioner.provision(resource, next, context(resource.getPhysicalId(), prior));
+        assertEquals("fixed-key", resource.getPhysicalId());
+        assertEquals("after", kms.describeKey("fixed-key", REGION).getDescription());
+        assertEquals(Map.of("new", "v2"), kms.describeKey("fixed-key", REGION).getTags());
+        provisioner.provision(resource, mapper.readTree("{}"), context(resource.getPhysicalId(), next));
+        assertTrue(kms.describeKey("fixed-key", REGION).getTags().isEmpty());
+    }
+
+    @Test
+    void changedOverrideFailsBeforeAnyMutableUpdate() throws Exception {
+        JsonNode prior = mapper.readTree("""
+                {"Description":"before","Tags":[{"Key":"floci:override-id","Value":"fixed-key"},
+                {"Key":"old","Value":"v"}]}
+                """);
+        StackResource resource = create(prior.toString());
+        JsonNode next = mapper.readTree("""
+                {"Description":"after","Enabled":false,"KeyPolicy":{"Statement":[]},
+                "Tags":[{"Key":"floci:override-id","Value":"different-key"}]}
+                """);
+        String policy = kms.describeKey("fixed-key", REGION).getPolicy();
+        int keyCount = kms.listKeys(REGION).size();
+        assertThrows(AwsException.class, () -> provisioner.provision(resource, next,
+                context(resource.getPhysicalId(), prior)));
+        KmsKey key = kms.describeKey("fixed-key", REGION);
+        assertEquals("before", key.getDescription());
+        assertEquals(policy, key.getPolicy());
+        assertTrue(key.isEnabled());
+        assertEquals(Map.of("old", "v"), key.getTags());
+        assertEquals("fixed-key", resource.getPhysicalId());
+        assertEquals(keyCount, kms.listKeys(REGION).size());
+    }
+
+    @Test
     void mutableUpdatePreservesIdentityAndReconcilesDescriptionPolicyTagsAndEnabled() throws Exception {
         JsonNode prior = mapper.readTree("""
                 {"Description":"before","Tags":[{"Key":"old","Value":"v"}]}

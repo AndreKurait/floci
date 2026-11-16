@@ -2,6 +2,7 @@ package io.floci.aws.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.ReservedTags;
 import io.floci.aws.services.cloudformation.model.StackResource;
 import io.floci.aws.services.kms.KmsService;
 import io.floci.aws.services.kms.model.KmsKey;
@@ -61,6 +62,12 @@ public class KmsCfnProvisioner implements CfnResourceProvisioner {
                     || key.isMultiRegion() != multiRegion) {
                 throw new AwsException("InvalidRequest", "KeySpec, KeyUsage and MultiRegion cannot be changed.", 400);
             }
+            String overrideId = ReservedTags.extractOverrideKeyId(tags);
+            if (overrideId != null && !overrideId.equals(key.getKeyId())) {
+                throw new AwsException("InvalidRequest", "The key ID override cannot be changed.", 400);
+            }
+            tags.remove(ReservedTags.OVERRIDE_ID_KEY);
+            ReservedTags.rejectReservedTagsOnUpdate(tags);
             if (description != null || ctx.previouslyDeclared("Description")) {
                 kmsService.updateKeyDescription(key.getKeyId(), description == null ? "" : description, ctx.region());
             }
