@@ -91,6 +91,29 @@ class AthenaPreparedStatementIntegrationTest {
     }
 
     @Test
+    void sdkMissingWorkGroupAndMissingStatementHaveDistinctErrors() {
+        assertThrows(InvalidRequestException.class, () -> get(client, "absent-group", "absent_statement"));
+        assertThrows(InvalidRequestException.class, () -> client.updatePreparedStatement(r ->
+                r.workGroup("absent-group").statementName("absent_statement").queryStatement("SELECT 1")));
+        assertThrows(InvalidRequestException.class, () -> client.deletePreparedStatement(r ->
+                r.workGroup("absent-group").statementName("absent_statement")));
+
+        client.createWorkGroup(r -> r.name("existing-group"));
+        try {
+            create(client, "existing-group", "retained_statement", "SELECT 1");
+            PreparedStatement retained = get(client, "existing-group", "retained_statement");
+            assertThrows(ResourceNotFoundException.class, () -> get(client, "existing-group", "absent_statement"));
+            assertThrows(ResourceNotFoundException.class, () -> client.updatePreparedStatement(r ->
+                    r.workGroup("existing-group").statementName("absent_statement").queryStatement("SELECT 1")));
+            assertThrows(ResourceNotFoundException.class, () -> client.deletePreparedStatement(r ->
+                    r.workGroup("existing-group").statementName("absent_statement")));
+            assertEquals(retained, get(client, "existing-group", "retained_statement"));
+        } finally {
+            client.deleteWorkGroup(r -> r.workGroup("existing-group").recursiveDeleteOption(true));
+        }
+    }
+
+    @Test
     void sdkUpdatePreservesOmittedDescriptionAndReplacesExplicitDescription() {
         client.createWorkGroup(r -> r.name("description-scope"));
         client.createPreparedStatement(r -> r.workGroup("description-scope").statementName("saved")
