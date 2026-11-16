@@ -890,7 +890,7 @@
     "cloudformation:GetResource": {"action": "cloudformation:GetResource", "types": [], "resources": []},
     "cloudformation:GetResourceRequestStatus": {"action": "cloudformation:GetResourceRequestStatus", "types": [], "resources": []},
     "cloudformation:GetStackPolicy": {"action": "cloudformation:GetStackPolicy", "types": ["stack"], "resources": [{"type": "stack", "fill": {"StackName": "StackName"}}]},
-    "cloudformation:GetTemplate": {"action": "cloudformation:GetTemplate", "types": ["stack"], "resources": [{"type": "stack", "fill": {"StackName": "StackName"}}]},
+    "cloudformation:GetTemplate": {"action": "cloudformation:GetTemplate", "types": ["stack"], "resources": [{"type": "stack", "fill": {"StackName": "StackName"}}, {"types": ["stack"], "through": "ChangeSetName"}]},
     "cloudformation:GetTemplateSummary": {"action": "cloudformation:GetTemplateSummary", "types": ["stack", "stackset"], "resources": [{"type": "stack", "fill": {"StackName": "StackName"}}, {"type": "stackset", "fill": {"StackSetName": "StackSetName"}}]},
     "cloudformation:ImportStacksToStackSet": {"action": "cloudformation:ImportStacksToStackSet", "types": ["stackset"], "resources": [{"type": "stackset", "fill": {"StackSetName": "StackSetName"}}]},
     "cloudformation:ListChangeSets": {"action": "cloudformation:ListChangeSets", "types": ["stack"], "resources": [{"type": "stack", "fill": {"StackName": "StackName"}}]},

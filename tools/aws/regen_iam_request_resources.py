@@ -3844,6 +3844,7 @@ def read_resources(operation: str, types: list[str], formats: dict[str, str], mo
     resources = with_default_pairs(resources, formats, optional)
     resources = with_enum_named(operation, resources, formats, models)
     resources = with_subject_through(operation, resources, members, map_fields(models, name), optional, models)
+    resources = with_named_arn_parent(resources, models, name)
     resources = with_documented_defaults(resources, formats, defaulted_members(models, name))
     resources = with_optional_qualifier(resources, optional)
     resources = with_qualifier(resources, types, formats, members, models, name)
@@ -3966,6 +3967,37 @@ def with_enum_named(operation: str, resources: list[dict], formats: dict[str, st
             if len(given) == 1:
                 fixed[variable] = given[0]
         found.append(dict(resource, fixed=fixed) if fixed else resource)
+    return found
+
+
+def with_named_arn_parent(resources: list[dict], models: dict[str, dict], operation: str) -> list[dict]:
+    """A resource named by an optional parent member, also reached through a member documented as accepting a name or
+    ARN and requiring that parent only for a name. GetTemplate's ChangeSetName requires StackName for a short name;
+    its ARN reaches the stack that owns the change set. The service resolves only complete ARNs through this member."""
+    found = list(resources)
+    for model in models.values():
+        spec = model["operations"].get(operation)
+        if spec is None or "input" not in spec:
+            continue
+        request = model["shapes"][spec["input"]["shape"]]
+        members = request_members({"model": model}, operation)
+        for name, member in request.get("members", {}).items():
+            if members.get(name) != name or model["shapes"][member["shape"]]["type"] != "string":
+                continue
+            documentation = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", member.get("documentation", ""))).strip()
+            if not re.match(r"(?:the )?name or (?:amazon resource name \(arn\)|arn) of ", documentation, re.IGNORECASE):
+                continue
+            parent = re.search(r"\bif you specify a name, you must also specify the (?P<member>\w+)\b",
+                               documentation, re.IGNORECASE)
+            if parent is None or parent.group("member") in request.get("required", []):
+                continue
+            for resource in resources:
+                if set(resource) - {"type", "fill", "arnOf"} or "type" not in resource \
+                        or set(resource.get("fill", {}).values()) != {parent.group("member")}:
+                    continue
+                reached = {"types": [resource["type"]], "through": name}
+                if reached not in found:
+                    found.append(reached)
     return found
 
 
