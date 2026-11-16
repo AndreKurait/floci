@@ -11,6 +11,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.time.Duration;
+import java.time.ZoneOffset;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -78,6 +79,30 @@ class DynamoDbTtlTimingTest {
     }
 
     @Test
+    void anItemWhoseTtlIsZeroIsNeverExpired() {
+        putWithTtl("unset", 0L);
+
+        time.advance(Duration.ofDays(1));
+        service.deleteExpiredItems();
+
+        assertNotNull(stored("unset"), "a TTL of 0 is more than five years in the past, which TTL ignores");
+    }
+
+    @Test
+    void anItemWhoseTtlIsMoreThanFiveYearsInThePastIsNotExpired() {
+        long fiveYearsAgo = time.now().atOffset(ZoneOffset.UTC).minusYears(5).toEpochSecond();
+        putWithTtl("ancient", fiveYearsAgo - 1);
+        putWithTtl("fiveYears", fiveYearsAgo);
+        putWithTtl("recent", time.now().minus(Duration.ofDays(1)).getEpochSecond());
+
+        service.deleteExpiredItems();
+
+        assertNotNull(stored("ancient"), "more than five years in the past: not considered for expiry");
+        assertNull(stored("fiveYears"), "exactly five years in the past is still considered");
+        assertNull(stored("recent"));
+    }
+
+    @Test
     void theSweeperFirstRunsSixtySecondsAfterStartup() {
         DynamoDbTtlService sweeper = new DynamoDbTtlService(service, time.newScheduler());
         putExpiringIn("s1", Duration.ofSeconds(10));
@@ -137,9 +162,12 @@ class DynamoDbTtlTimingTest {
     }
 
     private void putExpiringIn(String id, Duration ttl) {
+        putWithTtl(id, time.now().plus(ttl).getEpochSecond());
+    }
+
+    private void putWithTtl(String id, long epochSecond) {
         ObjectNode item = key(id);
-        item.set("expiresAt", mapper.createObjectNode()
-                .put("N", String.valueOf(time.now().plus(ttl).getEpochSecond())));
+        item.set("expiresAt", mapper.createObjectNode().put("N", String.valueOf(epochSecond)));
         service.putItem("Sessions", item, null, null, null, REGION, null);
     }
 
