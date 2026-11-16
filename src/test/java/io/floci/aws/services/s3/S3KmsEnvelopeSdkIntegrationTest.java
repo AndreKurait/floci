@@ -383,12 +383,12 @@ class S3KmsEnvelopeSdkIntegrationTest {
     }
 
     @Test
-    void nativeGrantContextEqualsKeysAreCaseSensitive() {
+    void nativeGrantContextEqualsKeysIgnoreCaseAndValuesRemainCaseSensitive() {
         verifyGrantContextKeyCase(true);
     }
 
     @Test
-    void nativeGrantContextSubsetKeysAreCaseSensitive() {
+    void nativeGrantContextSubsetKeysIgnoreCaseAndValuesRemainCaseSensitive() {
         verifyGrantContextKeyCase(false);
     }
 
@@ -404,11 +404,16 @@ class S3KmsEnvelopeSdkIntegrationTest {
                 .operationsWithStrings("GenerateDataKey").constraints(constraints));
         try (KmsClient direct = AwsTestClients.create(KmsClient.builder(), access.getAccessKeyId(),
                 access.getSecretAccessKey(), Region.US_EAST_1, endpoint)) {
+            assertEquals(32, direct.generateDataKey(request -> request.keyId(keyArn)
+                    .keySpec("AES_256").encryptionContext(Map.of("tenant", "allowed")))
+                    .plaintext().asByteArray().length);
             assertThrows(KmsException.class, () -> direct.generateDataKey(request -> request.keyId(keyArn)
-                    .keySpec("AES_256").encryptionContext(Map.of("tenant", "allowed"))));
+                    .keySpec("AES_256").encryptionContext(Map.of("tenant", "Allowed"))));
+            assertThrows(KmsException.class, () -> direct.generateDataKey(request -> request.keyId(keyArn)
+                    .keySpec("AES_256").encryptionContext(Map.of("other", "allowed"))));
             assertEquals(32, direct.generateDataKey(request -> request.keyId(keyArn).keySpec("AES_256")
                     .encryptionContext(Map.of("Tenant", "allowed"))).plaintext().asByteArray().length);
-            Map<String, String> distinctKeys = Map.of("Tenant", "allowed", "tenant", "different");
+            Map<String, String> distinctKeys = Map.of("tenant", "allowed", "purpose", "different");
             if (equals) {
                 assertThrows(KmsException.class, () -> direct.generateDataKey(request -> request.keyId(keyArn)
                         .keySpec("AES_256").encryptionContext(distinctKeys)));

@@ -103,7 +103,7 @@ public class KmsResourcePolicyProvider implements ResourcePolicyProvider {
                         if (context.isEmpty()) {
                             conditions.put("Null", Map.of("kms:EncryptionContextKeys", "true"));
                         } else {
-                            conditions.put("ForAllValues:StringEquals", Map.of("kms:EncryptionContextKeys",
+                            conditions.put("ForAllValues:StringEqualsIgnoreCase", Map.of("kms:EncryptionContextKeys",
                                     context.keySet().stream().map(Object::toString).toList()));
                         }
                     }
