@@ -246,7 +246,7 @@ there.
 
 ## Grant Support Scope
 
-Grant lifecycle operations (`CreateGrant`, `ListGrants`, `ListRetirableGrants`, `RevokeGrant`, `RetireGrant`) are supported. However, grant lifecycle support **does not** imply grant-based authorization enforcement on cryptographic operations (`Encrypt`, `Decrypt`, `Sign`, `Verify`, `GenerateDataKey`, etc.). Grants are stored and queryable but are not evaluated during crypto operations.
+Grant lifecycle operations (`CreateGrant`, `ListGrants`, `ListRetirableGrants`, `RevokeGrant`, `RetireGrant`) are supported. With IAM enforcement enabled, native KMS and delegated S3 authorization evaluate grants alongside key policies. A caller using grant-derived `CreateGrant` permission can create only a subset of one parent grant's operations, with equally strict or stricter constraints. Independent policy permission is not restricted by a parent grant. Encryption-context constraint keys and values remain case-sensitive and literal.
 
 ## IAM Enforcement
 

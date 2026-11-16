@@ -20,6 +20,7 @@ import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.iam.ResourceArnBuilder;
 import io.floci.aws.services.iam.model.IamRole;
 import io.floci.aws.services.iam.model.IamUser;
+import io.floci.aws.services.kms.KmsGrantConditions;
 import io.floci.aws.services.lambdaweb.LambdaWebService;
 import io.floci.aws.services.lambdaweb.model.WebFunctionEndpoint;
 import io.floci.aws.services.s3.S3ConditionKeys;
@@ -264,6 +265,10 @@ public class IamConditionContextResolver {
             conditions.put("kms:CallerAccount", List.of(account));
         }
         JsonNode body = bufferedJsonBody(ctx);
+        if ("kms:CreateGrant".equals(action)) {
+            conditions.putAll(KmsGrantConditions.requestContext(body));
+            return conditions;
+        }
         String member = switch (action) {
             case "kms:ReEncryptFrom" -> "SourceEncryptionContext";
             case "kms:ReEncryptTo" -> "DestinationEncryptionContext";

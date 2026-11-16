@@ -392,6 +392,62 @@ class S3KmsEnvelopeSdkIntegrationTest {
     }
 
     @Test
+    void childGrantCannotEscalateOperationsOrCombineParents() {
+        String principal = iam.getUser(user).getArn();
+        kms.createGrant(request -> request.keyId(keyArn).granteePrincipal(principal)
+                .operationsWithStrings("CreateGrant", "Encrypt"));
+        kms.createGrant(request -> request.keyId(keyArn).granteePrincipal(principal)
+                .operationsWithStrings("Decrypt"));
+        try (KmsClient direct = AwsTestClients.create(KmsClient.builder(), access.getAccessKeyId(),
+                access.getSecretAccessKey(), Region.US_EAST_1, endpoint)) {
+            int before = kms.listGrants(request -> request.keyId(keyArn)).grants().size();
+            assertEquals(400, assertThrows(KmsException.class, () -> direct.createGrant(request ->
+                    request.keyId(keyArn).granteePrincipal(principal).operationsWithStrings("Decrypt"))).statusCode());
+            assertEquals(before, kms.listGrants(request -> request.keyId(keyArn)).grants().size());
+            direct.createGrant(request -> request.keyId(keyArn).granteePrincipal(principal)
+                    .operationsWithStrings("Encrypt"));
+        }
+    }
+
+    @Test
+    void childGrantMustRetainOrStrengthenParentConstraints() {
+        String principal = iam.getUser(user).getArn();
+        kms.createGrant(request -> request.keyId(keyArn).granteePrincipal(principal)
+                .operationsWithStrings("CreateGrant", "Decrypt")
+                .constraints(GrantConstraints.builder().encryptionContextSubset(Map.of("Department", "IT")).build()));
+        try (KmsClient direct = AwsTestClients.create(KmsClient.builder(), access.getAccessKeyId(),
+                access.getSecretAccessKey(), Region.US_EAST_1, endpoint)) {
+            int before = kms.listGrants(request -> request.keyId(keyArn)).grants().size();
+            for (Map<String, String> pairs : List.of(Map.<String, String>of(), Map.of("Department", "HR"),
+                    Map.of("department", "IT"))) {
+                assertThrows(KmsException.class, () -> direct.createGrant(request -> request.keyId(keyArn)
+                        .granteePrincipal(principal).operationsWithStrings("Decrypt")
+                        .constraints(GrantConstraints.builder().encryptionContextSubset(pairs).build())));
+            }
+            assertEquals(before, kms.listGrants(request -> request.keyId(keyArn)).grants().size());
+            direct.createGrant(request -> request.keyId(keyArn).granteePrincipal(principal)
+                    .operationsWithStrings("Decrypt").constraints(GrantConstraints.builder()
+                            .encryptionContextEquals(Map.of("Department", "IT", "Purpose", "Test")).build()));
+        }
+    }
+
+    @Test
+    void independentPolicyCreateGrantIsNotLimitedByParentGrant() {
+        String principal = iam.getUser(user).getArn();
+        kms.createGrant(request -> request.keyId(keyArn).granteePrincipal(principal)
+                .operationsWithStrings("CreateGrant"));
+        iam.putUserPolicy(user, "Objects", """
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Action":"kms:CreateGrant","Resource":"*"}]}
+                """);
+        try (KmsClient direct = AwsTestClients.create(KmsClient.builder(), access.getAccessKeyId(),
+                access.getSecretAccessKey(), Region.US_EAST_1, endpoint)) {
+            direct.createGrant(request -> request.keyId(keyArn).granteePrincipal(principal)
+                    .operationsWithStrings("Decrypt"));
+        }
+    }
+
+    @Test
     void nativeReEncryptUsesDirectionalGrantsAndContexts() {
         String destination = kms.createKey().keyMetadata().arn();
         try {

@@ -87,6 +87,10 @@ public class KmsResourcePolicyProvider implements ResourcePolicyProvider {
         statement.put("Principal", Map.of("AWS", grant.get("GranteePrincipal")));
         statement.put("Action", "kms:" + operation);
         statement.put("Resource", resource);
+        if ("CreateGrant".equals(operation)) {
+            statement.put("Condition", KmsGrantConditions.parentConditions(grant));
+            return statement;
+        }
         Map<String, Object> conditions = new LinkedHashMap<>();
         Map<String, Object> equalities = new LinkedHashMap<>();
         if (grant.get("Constraints") instanceof Map<?, ?> constraints) {
