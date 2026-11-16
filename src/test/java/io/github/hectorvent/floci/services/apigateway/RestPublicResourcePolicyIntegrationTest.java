@@ -55,6 +55,20 @@ class RestPublicResourcePolicyIntegrationTest {
     final PartitionCleanup cleanup = new PartitionCleanup();
 
     @Test
+    void trailingSlashDenyUsesTheActualPublicRequestPath() throws Exception {
+        Fixture fixture = fixture("GET");
+        policy(fixture, """
+                {"Statement":[
+                  {"Effect":"Allow","Principal":"*","Action":"execute-api:Invoke","Resource":"%s*"},
+                  {"Effect":"Deny","Principal":"*","Action":"execute-api:Invoke","Resource":"%s/"}
+                ]}
+                """.formatted(fixture.arn(), fixture.arn()));
+        invoke(fixture, Map.of(), 200);
+        given().get("/execute-api/" + fixture.apiId() + "/prod/items/").then().statusCode(403);
+        assertEquals(1, fixture.hits().get());
+    }
+
+    @Test
     void unsignedPrincipalFlagIsAbsentAndPolicyRevocationStopsBackend() throws Exception {
         Fixture fixture = fixture("GET");
         policy(fixture, resourcePolicy("Allow", fixture.arn(),

@@ -55,6 +55,30 @@ class RestCustomResourcePolicyIntegrationTest {
     final PartitionCleanup cleanup = new PartitionCleanup();
 
     @Test
+    void trailingSlashResourceDenyPrecedesTheAuthorizer() throws Exception {
+        Fixture fixture = fixture("GET");
+        policy(fixture, resourcePolicy("Deny", fixture.arn() + "/", ""));
+        given().get("/execute-api/" + fixture.apiId() + "/prod/items/").then().statusCode(403);
+        verifyNoInteractions(lambda);
+        assertEquals(0, fixture.hits().get());
+    }
+
+    @Test
+    void trailingSlashResourceGrantIsRecheckedWithCachedAuthorizer() throws Exception {
+        Fixture fixture = fixture("GET");
+        authorizer("Allow", fixture.arn() + "other");
+        policy(fixture, resourcePolicy("Allow", fixture.arn() + "/", ""));
+        invoke(fixture, Map.of("Authorization", "token"), 403);
+        given().header("Authorization", "token").get("/execute-api/" + fixture.apiId() + "/prod/items/")
+                .then().statusCode(200);
+        policy(fixture, resourcePolicy("Deny", fixture.arn() + "/", ""));
+        given().header("Authorization", "token").get("/execute-api/" + fixture.apiId() + "/prod/items/")
+                .then().statusCode(403);
+        verify(lambda, times(1)).invokeTarget(anyString(), anyString(), any(byte[].class), any());
+        assertEquals(1, fixture.hits().get());
+    }
+
+    @Test
     void absentPrincipalFlagDenyPrecedesAuthorizerAndIsRecheckedOnCacheHit() throws Exception {
         Fixture f = fixture("GET");
         authorizer("Allow", f.arn() + "other");
