@@ -576,7 +576,11 @@ public class KmsService implements ResourceProvider {
         String prefix = region + "::";
         return grantStore.scan(storageKey -> storageKey.startsWith(prefix)).stream()
                 .filter(grant -> key.getKeyId().equals(grant.getKeyId()))
-                .map(this::grantToMap)
+                .map(grant -> {
+                    Map<String, Object> entry = grantToMap(grant);
+                    entry.put("GrantToken", grant.getGrantToken());
+                    return entry;
+                })
                 .toList();
     }
 

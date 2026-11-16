@@ -68,6 +68,11 @@ public class KmsResourcePolicyProvider implements ResourcePolicyProvider {
                 statements.add(grantStatement(grant, resource, symmetric, operation.toString()));
             }
         }
+        if (grant.get("RetiringPrincipal") instanceof String principal && !principal.isBlank()) {
+            Map<String, Object> retirement = grantStatement(grant, resource, symmetric, "RetireGrant");
+            retirement.put("Principal", Map.of("AWS", principal));
+            statements.add(retirement);
+        }
         // Grant constraints are literal values, not IAM policy-variable expressions.
         Map<String, Object> policy = Map.of("Version", "2008-10-17", "Statement", statements);
         return mapper.valueToTree(policy).toString();
@@ -79,6 +84,10 @@ public class KmsResourcePolicyProvider implements ResourcePolicyProvider {
         statement.put("Principal", Map.of("AWS", grant.get("GranteePrincipal")));
         statement.put("Action", "kms:" + operation);
         statement.put("Resource", resource);
+        if ("RetireGrant".equals(operation)) {
+            statement.put("Condition", KmsGrantConditions.retirementConditions(grant));
+            return statement;
+        }
         if ("CreateGrant".equals(operation)) {
             statement.put("Condition", KmsGrantConditions.parentConditions(grant));
             return statement;

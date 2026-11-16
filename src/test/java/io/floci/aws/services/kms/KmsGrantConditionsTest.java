@@ -84,6 +84,33 @@ class KmsGrantConditionsTest {
         assertEquals(Decision.DENY, evaluate(parent, context));
     }
 
+    @Test
+    void retirementTargetsMatchOnlyTheirOwnIdOrToken() {
+        Map<String, Object> grant = Map.of("GrantId", "grant-one", "GrantToken", "token-one");
+        assertEquals(Decision.ALLOW, retirementDecision(grant, Map.of("GrantId", "grant-one")));
+        assertEquals(Decision.ALLOW, retirementDecision(grant, Map.of("GrantToken", "token-one")));
+        assertEquals(Decision.DENY, retirementDecision(grant, Map.of("GrantId", "grant-two")));
+        assertEquals(Decision.DENY, retirementDecision(grant, Map.of("GrantToken", "token-two")));
+        assertEquals(Decision.DENY, retirementDecision(grant, Map.of()));
+    }
+
+    @Test
+    void retirementTokenTakesPrecedenceOverAnOtherwisePermittedId() {
+        Map<String, Object> grant = Map.of("GrantId", "grant-one", "GrantToken", "token-one");
+        assertEquals(Decision.DENY, retirementDecision(grant,
+                Map.of("GrantId", "grant-one", "GrantToken", "token-two")));
+        assertEquals(Decision.ALLOW, retirementDecision(grant,
+                Map.of("GrantId", "grant-one", "GrantToken", " ")));
+    }
+
+    private Decision retirementDecision(Map<String, Object> grant, Map<String, Object> request) {
+        String policy = mapper.valueToTree(Map.of("Version", "2008-10-17", "Statement", List.of(Map.of(
+                "Effect", "Allow", "Action", "kms:RetireGrant", "Resource", "*",
+                "Condition", KmsGrantConditions.retirementConditions(grant))))).toString();
+        return evaluator.evaluate(CallerContext.of(List.of(policy)), null, "kms:RetireGrant", "*",
+                KmsGrantConditions.retirementContext(mapper.valueToTree(request)));
+    }
+
     private Decision decision(Map<String, Object> parent, Map<String, Object> child, List<String> operations) {
         return evaluate(parent, KmsGrantConditions.requestContext(mapper.valueToTree(Map.of("Operations", operations,
                 "Constraints", child))));

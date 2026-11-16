@@ -265,6 +265,10 @@ public class IamConditionContextResolver {
             conditions.put("kms:CallerAccount", List.of(account));
         }
         JsonNode body = bufferedJsonBody(ctx);
+        if ("kms:RetireGrant".equals(action)) {
+            conditions.putAll(KmsGrantConditions.retirementContext(body));
+            return conditions;
+        }
         if ("kms:CreateGrant".equals(action)) {
             conditions.putAll(KmsGrantConditions.requestContext(body));
             return conditions;

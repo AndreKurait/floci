@@ -11,12 +11,36 @@ import java.util.Map;
 
 /** Internal condition context for the limits inherited from a parent KMS grant. */
 public final class KmsGrantConditions {
+    private static final String RETIREMENT_TARGET = "floci:kms:RetirementTarget";
     private static final String TYPE = "floci:kms:ChildConstraintType";
     private static final String KEYS = "floci:kms:ChildConstraintKeys";
     private static final String PAIR = "floci:kms:ChildConstraint:";
     private static final String SOURCE = "floci:kms:ChildSourceArn";
 
     private KmsGrantConditions() {
+    }
+
+    public static Map<String, List<String>> retirementContext(JsonNode body) {
+        if (body == null) {
+            return Map.of();
+        }
+        String token = body.path("GrantToken").asText("");
+        if (!token.isBlank()) {
+            return Map.of(RETIREMENT_TARGET, List.of("token:" + token));
+        }
+        String id = body.path("GrantId").asText("");
+        return id.isBlank() ? Map.of() : Map.of(RETIREMENT_TARGET, List.of("id:" + id));
+    }
+
+    public static Map<String, Object> retirementConditions(Map<?, ?> grant) {
+        List<String> targets = new ArrayList<>();
+        if (grant.get("GrantId") instanceof String id && !id.isBlank()) {
+            targets.add("id:" + id);
+        }
+        if (grant.get("GrantToken") instanceof String token && !token.isBlank()) {
+            targets.add("token:" + token);
+        }
+        return Map.of("StringEquals", Map.of(RETIREMENT_TARGET, targets));
     }
 
     public static Map<String, List<String>> requestContext(JsonNode body) {
