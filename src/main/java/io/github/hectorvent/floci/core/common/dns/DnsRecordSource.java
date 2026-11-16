@@ -38,11 +38,12 @@ public interface DnsRecordSource {
     }
 
     /**
-     * Validates an owned alias when its public name has an explicitly declared transport.
-     * Resource ownership, canonical-zone and query-type checks still apply.
+     * Resolves a resource behind an explicitly declared public peer. An owner may retain
+     * its shared transport after validating the resource's canonical zone and ready
+     * native frontend. Ordinary aliases keep their caller-scoped resolution.
      */
-    default Optional<DnsAnswer> resolveAliasTargetForDeclaredRoute(String name, String hostedZoneId, int type,
-                                                                   DnsClientVpcSource.ClientVpc origin) {
+    default Optional<DnsAnswer> resolveDeclaredPublicAliasTarget(String name, String hostedZoneId, int type,
+                                                                 DnsClientVpcSource.ClientVpc origin) {
         return resolveAliasTarget(name, hostedZoneId, type, origin);
     }
 

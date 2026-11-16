@@ -440,13 +440,13 @@ public class EmbeddedDnsServer {
     }
 
     private Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type,
-                                                   DnsClientVpcSource.ClientVpc origin, boolean declaredRoute) {
+                                                   DnsClientVpcSource.ClientVpc origin, boolean declaredPublicPeer) {
         DnsAnswer resolved = null;
         if (recordSources != null) {
             for (DnsRecordSource source : recordSources) {
                 try {
-                    Optional<DnsAnswer> candidate = declaredRoute
-                            ? source.resolveAliasTargetForDeclaredRoute(name, hostedZoneId, type, origin)
+                    Optional<DnsAnswer> candidate = declaredPublicPeer
+                            ? source.resolveDeclaredPublicAliasTarget(name, hostedZoneId, type, origin)
                             : source.resolveAliasTarget(name, hostedZoneId, type, origin);
                     if (candidate.isPresent()) {
                         if (resolved != null) {
@@ -471,12 +471,11 @@ public class EmbeddedDnsServer {
         if (normalized.endsWith(".")) {
             normalized = normalized.substring(0, normalized.length() - 1);
         }
-        boolean declaredRoute = publicAwsApi && (origin == null || isUsableOrigin(origin)) && type == 1
-                && publicApiHosts.contains(normalized);
-        Optional<DnsAnswer> resolved = resolveAliasTarget(target, hostedZoneId, type, origin, declaredRoute);
-        if (!declaredRoute) {
-            return resolved;
+        if (!publicAwsApi || origin != null && !isUsableOrigin(origin) || type != 1
+                || !publicApiHosts.contains(normalized)) {
+            return resolveAliasTarget(target, hostedZoneId, type, origin);
         }
+        Optional<DnsAnswer> resolved = resolveAliasTarget(target, hostedZoneId, type, origin, true);
         return resolved.map(answer -> {
             boolean localListener = getServerIp().map(address ->
                     answer.records().equals(List.of(new DnsRecord.Address(1, address)))).orElse(false);

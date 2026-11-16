@@ -36,12 +36,14 @@ class DeclaredNativeAlbAliasRoutingTest {
     private static final String ZONE = "ZOWNED";
     private static final String CONTROL = "172.18.0.2";
     private static final ClientVpc ORIGIN = new ClientVpc("111111111111", "us-east-1", "vpc-caller");
+    private static final ClientVpc OWNER = new ClientVpc("111111111111", "us-east-1", "vpc-load-balancer");
     private final List<DnsRecordSource> records = new ArrayList<>();
     private final ElbV2Service service = mock(ElbV2Service.class);
     private final ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
     private final LoadBalancer target = new LoadBalancer();
     private EmbeddedDnsServer dns;
     private ElbV2DnsRecordSource source;
+    private ElbV2FrontendManager frontends;
 
     @BeforeEach
     void prepareNativeAlias() {
@@ -60,8 +62,8 @@ class DeclaredNativeAlbAliasRoutingTest {
         when(networks.enabled()).thenReturn(true);
         VpcRoutingManager routing = mock(VpcRoutingManager.class);
         when(routing.enabled()).thenReturn(true);
-        ElbV2FrontendManager frontends = new ElbV2FrontendManager(
-                config, lifecycle, routing, mock(LoadBalancerProxySources.class));
+        frontends = spy(new ElbV2FrontendManager(
+                config, lifecycle, routing, mock(LoadBalancerProxySources.class)));
         ElbV2VpcNetworkManager nativeNetworks = new ElbV2VpcNetworkManager(
                 config, mock(Ec2Service.class), firewall, lifecycle, networks, frontends);
         source = new ElbV2DnsRecordSource(service, dns, config, nativeNetworks);
@@ -73,6 +75,7 @@ class DeclaredNativeAlbAliasRoutingTest {
         target.setScheme("internal");
         target.setCanonicalHostedZoneId(ZONE);
         ElbV2DnsOwnerFixture.targets(service, TARGET, target);
+        ElbV2DnsOwnerFixture.frontendAddresses(frontends, target, OWNER, List.of("10.174.1.8", "10.174.2.8"));
     }
 
     @Test
@@ -133,6 +136,14 @@ class DeclaredNativeAlbAliasRoutingTest {
     void unavailableRuntimeListenerDoesNotInventADeclaredRoute() {
         doReturn(Optional.empty()).when(dns).getServerIp();
         assertEquals(DnsAnswer.noData(), dns.resolvePublicAliasTarget(HOST, TARGET, ZONE, 1, ORIGIN).orElseThrow());
+    }
+
+    @Test
+    void unavailableNativeFrontendDoesNotInventADeclaredRoute() {
+        ElbV2DnsOwnerFixture.frontendAddresses(frontends, target, OWNER, List.of());
+        assertEquals(DnsAnswer.noData(), dns.resolvePublicAliasTarget(HOST, TARGET, ZONE, 1, ORIGIN).orElseThrow());
+        assertEquals(DnsAnswer.noData(), dns.resolvePublicAliasTarget(HOST, TARGET, ZONE, 1, null).orElseThrow());
+        verifyNoInteractions(lifecycle);
     }
 
     @Test

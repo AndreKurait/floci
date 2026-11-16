@@ -166,9 +166,7 @@ destination, not an implementation of any peer protocol or authorization.
 For an explicitly declared public hostname, a public Route 53 alias to an owned
 listener also uses the configured public transport for known VPC clients. The
 alias target and canonical zone must validate before its emulator listener
-address is translated. A declared front door selects its transport independently
-of native ALB frontend readiness and VPC scope; ordinary ALB DNS retains those
-checks. The declared route preserves the caller's NAT and security-group
+address is translated. This preserves the caller's NAT and security-group
 checks. Undeclared aliases, literal address records, private-zone answers and
 failed alias lookups retain their existing behavior. This configured front-door
 handoff does not implement general native Application Load Balancer frontends.
