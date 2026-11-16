@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.iam;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator;
+import io.github.hectorvent.floci.core.common.auth.SigV4aSignature;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.iam.model.SessionCredential;
 import io.quarkus.runtime.annotations.RegisterForReflection;
@@ -74,15 +75,38 @@ public class IssuedSessionVerifier {
         List<Snapshot> initial = snapshots("accessKeyId", request.get("accessKeyId"));
         require(initial.size() == 1);
         Snapshot session = initial.getFirst();
-        verifyProof(session, request, clock, 900, 300);
+        verifyProof(session, request, clock, 900, 300, true);
         require(initial.equals(snapshots("accessKeyId", request.get("accessKeyId"))));
         return session.identity(request.get("correlationId"), "Verify", session.expiry(), false);
     }
 
     static Instant verifyProof(Snapshot session, Map<String, String> request, Clock clock,
                                long maxAgeSeconds, long futureSkewSeconds) {
-        String[] scope = validateStringToSign(request.get("stringToSign"), clock, maxAgeSeconds, futureSkewSeconds);
+        return verifyProof(session, request, clock, maxAgeSeconds, futureSkewSeconds, false);
+    }
+
+    /**
+     * Verifies the caller's original proof. With {@code allowSigV4a}, a SigV4A
+     * ({@code AWS4-ECDSA-P256-SHA256}) string to sign is verified with the ECDSA key pair derived from the
+     * session's secret and access key, as AWS verifies a SigV4A request; its scope carries no region.
+     */
+    static Instant verifyProof(Snapshot session, Map<String, String> request, Clock clock,
+                               long maxAgeSeconds, long futureSkewSeconds, boolean allowSigV4a) {
+        String text = request.get("stringToSign");
+        boolean sigV4a = allowSigV4a && text != null && text.startsWith(SigV4aSignature.ALGORITHM + "\n");
+        String[] scope = sigV4a ? validateSigV4aStringToSign(text, clock, maxAgeSeconds, futureSkewSeconds)
+                : validateStringToSign(text, clock, maxAgeSeconds, futureSkewSeconds);
         require(constantEquals(session.token(), request.get("sessionToken")));
+        if (sigV4a) {
+            boolean valid;
+            try {
+                valid = SigV4aSignature.verify(session.secret(), session.accessKey(), text, request.get("signature"));
+            } catch (RuntimeException error) {
+                throw refused();
+            }
+            require(valid);
+            return LocalDateTime.parse(text.split("\n", -1)[1], SIGNED_TIME).toInstant(ZoneOffset.UTC);
+        }
         try {
             byte[] signingKey = SigV4RequestValidator.deriveSigningKey(session.secret(), scope[0], scope[1], scope[2]);
             byte[] expected;
@@ -237,6 +261,25 @@ public class IssuedSessionVerifier {
             require(scope.length == 4 && scope[0].equals(lines[1].substring(0, 8))
                     && scope[1].matches("[a-z][a-z0-9-]{0,62}")
                     && scope[2].matches("[A-Za-z][A-Za-z0-9_-]{0,63}") && scope[3].equals("aws4_request"));
+            return scope;
+        } catch (RuntimeException error) {
+            throw refused();
+        }
+    }
+
+    /** A SigV4A string to sign: algorithm, signed time, {@code date/service/aws4_request}, request hash. */
+    private static String[] validateSigV4aStringToSign(String value, Clock clock, long maxAgeSeconds,
+                                                       long futureSkewSeconds) {
+        try {
+            String[] lines = value.split("\n", -1);
+            require(lines.length == 4 && lines[0].equals(SigV4aSignature.ALGORITHM)
+                    && lines[3].matches("[a-fA-F0-9]{64}"));
+            Instant signed = LocalDateTime.parse(lines[1], SIGNED_TIME).toInstant(ZoneOffset.UTC);
+            Instant now = clock.instant();
+            require(!signed.isBefore(now.minusSeconds(maxAgeSeconds)) && !signed.isAfter(now.plusSeconds(futureSkewSeconds)));
+            String[] scope = lines[2].split("/", -1);
+            require(scope.length == 3 && scope[0].equals(lines[1].substring(0, 8))
+                    && scope[1].matches("[A-Za-z][A-Za-z0-9_-]{0,63}") && scope[2].equals("aws4_request"));
             return scope;
         } catch (RuntimeException error) {
             throw refused();

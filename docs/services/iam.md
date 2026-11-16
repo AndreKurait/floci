@@ -3176,7 +3176,11 @@ Both accept JSON over POST, reject unknown/duplicate fields, and return
 * `/_floci/iam/issued-sessions/verify` requires `correlationId`, `accessKeyId`,
   `sessionToken`, `stringToSign` and `signature`. It checks the original four-line
   `AWS4-HMAC-SHA256` string to sign, token, HMAC, current issuer role and finite
-  expiry. Timestamps may be at most 900 seconds old or 300 seconds ahead.
+  expiry. Timestamps may be at most 900 seconds old or 300 seconds ahead. A SigV4A
+  string to sign (`AWS4-ECDSA-P256-SHA256`, scope `date/service/aws4_request`) is
+  checked the same way, with the DER ECDSA P-256 signature verified against the key
+  pair derived from the session's secret and access key, as AWS verifies SigV4A.
+  The Lambda issued-identity endpoint stays SigV4 only.
 * `/_floci/iam/issued-sessions/lookup` requires `correlationId` and exactly one of
   `accessKeyId`, `principalArn` or `principalId`. There is no listing, account-only
   selector or wildcard. Matching issuances must agree on identity, origin account

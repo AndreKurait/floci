@@ -8,6 +8,7 @@ import io.github.hectorvent.floci.core.storage.InMemoryStorage;
 import io.github.hectorvent.floci.services.iam.IssuedSessionVerifier.Identity;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.iam.model.SessionCredential;
+import io.github.hectorvent.floci.testutil.SigV4aSigning;
 import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -327,6 +328,48 @@ class IssuedSessionVerifierTest {
         Response response = new IssuedSessionController(verifier, true).verify(stream(json.writeValueAsString(request)));
         assertEquals(403, response.getStatus());
         assertEquals(Map.of("code", "IssuedSessionVerificationFailed"), response.getEntity());
+    }
+
+    private Map<String, String> sigV4aProof(String scope, String signer) {
+        String text = "AWS4-ECDSA-P256-SHA256\n20261008T120000Z\n" + scope + "\n" + "b".repeat(64);
+        return new HashMap<>(Map.of("correlationId", "test-4a", "accessKeyId", KEY,
+                "sessionToken", "dummy-token", "stringToSign", text,
+                "signature", SigV4aSigning.sign(KEY, signer, text)));
+    }
+
+    @Test
+    void verifiesSigV4aProofWithTheSessionsDerivedKeyPair() {
+        Identity identity = verifier.verify(sigV4aProof("20261008/es/aws4_request", "dummy-secret"));
+        assertEquals("Verify", identity.operation());
+        assertEquals("ASSUMED_ROLE", identity.kind());
+        assertEquals(role.getArn(), identity.roleArn());
+        assertNull(identity.accessKeyId());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"other-secret", "token", "region-scope", "date-scope", "hmac-signature", "hash",
+            "not-der"})
+    void refusesSigV4aProofsTheSessionDidNotSign(String mutation) throws Exception {
+        Map<String, String> request = sigV4aProof("20261008/es/aws4_request", "dummy-secret");
+        switch (mutation) {
+            case "other-secret" -> request = sigV4aProof("20261008/es/aws4_request", "other-secret");
+            case "token" -> request.put("sessionToken", "other-token");
+            case "region-scope" -> request = sigV4aProof("20261008/us-gov-west-1/es/aws4_request", "dummy-secret");
+            case "date-scope" -> request = sigV4aProof("20261007/es/aws4_request", "dummy-secret");
+            case "hmac-signature" -> request.put("signature", proof().get("signature"));
+            case "hash" -> request.put("stringToSign", request.get("stringToSign").replace("b".repeat(64), "c".repeat(64)));
+            default -> request.put("signature", "zz");
+        }
+        Map<String, String> refused = request;
+        assertThrows(IllegalArgumentException.class, () -> verifier.verify(refused));
+    }
+
+    @Test
+    void theLambdaIdentityProofStaysSigV4Only() {
+        Map<String, String> request = sigV4aProof("20261008/es/aws4_request", "dummy-secret");
+        IssuedSessionVerifier.Snapshot session = verifier.eligible(KEY).getFirst();
+        assertThrows(IllegalArgumentException.class, () -> IssuedSessionVerifier.verifyProof(
+                session, request, Clock.fixed(NOW, ZoneOffset.UTC), 900, 300));
     }
 
     private static ByteArrayInputStream stream(String value) {
