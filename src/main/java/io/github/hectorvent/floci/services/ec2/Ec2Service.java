@@ -4714,6 +4714,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
                             Instance inst = new Instance();
                             inst.setInstanceId(instanceId);
+                            inst.setRegion(region);
                             inst.setOwnerId(callerAccountId());
                             inst.setImageId(imageId);
                             inst.setLaunchableImageId(launchableImageId);
@@ -4751,7 +4752,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             inst.setAmiLaunchIndex(i);
                             inst.setClientToken(clientToken);
                             inst.setReplayProtected(attempt != null);
-                            inst.setRegion(region);
                             inst.setUserData(userData);
                             inst.setEncodedUserData(encodedUserData);
                             inst.setIamInstanceProfileArn(iamInstanceProfileArn);
@@ -5819,7 +5819,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     private static void setPublicAddress(Instance instance, String publicIp) {
         instance.setPublicIpAddress(publicIp);
-        instance.setPublicDnsName("127.0.0.1".equals(publicIp) ? "localhost" : publicIp);
+        instance.setPublicDnsName(Ec2ContainerManager.publicDnsName(publicIp, instance.getRegion()));
     }
 
     private static void clearPublicAddress(Instance instance) {
@@ -16078,7 +16078,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             addr.setPublicIp(reachable);
             // An EIP association gives the instance a public address even in a subnet that does
             // not map one on launch, exactly as on AWS. An unchanged address is not written again.
-            String dnsName = "127.0.0.1".equals(reachable) ? "localhost" : reachable;
+            String dnsName = Ec2ContainerManager.publicDnsName(reachable, region);
             String state = inst.getState() == null ? null : inst.getState().getName();
             boolean ended = "terminated".equals(state) || "shutting-down".equals(state);
             if (secondary == null && !ended && (!reachable.equals(inst.getPublicIpAddress())

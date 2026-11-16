@@ -2745,7 +2745,8 @@ class Ec2ServiceTest {
         Set<String> addresses = new HashSet<>();
         for (Instance instance : launched) {
             assertTrue(instance.getPublicIpAddress().matches("203\\.0\\.113\\.[0-9]+"), instance.getPublicIpAddress());
-            assertEquals(instance.getPublicIpAddress(), instance.getPublicDnsName());
+            assertEquals("ec2-" + instance.getPublicIpAddress().replace('.', '-') + ".compute-1.amazonaws.com",
+                    instance.getPublicDnsName());
             addresses.add(instance.getPublicIpAddress());
         }
         assertEquals(3, addresses.size());
@@ -2760,7 +2761,8 @@ class Ec2ServiceTest {
     }
 
     @ParameterizedTest
-    @CsvSource(value = {"192.168.65.2,192.168.65.2,192.168.65.2", "' 192.168.65.3 ',192.168.65.3,192.168.65.3",
+    @CsvSource(value = {"192.168.65.2,192.168.65.2,ec2-192-168-65-2.compute-1.amazonaws.com",
+            "' 192.168.65.3 ',192.168.65.3,ec2-192-168-65-3.compute-1.amazonaws.com",
             "'  ',127.0.0.1,localhost", "NULL,127.0.0.1,localhost"}, nullValues = "NULL")
     void fixedMockAddressesUseTheConfiguredAddress(String configured, String expected, String dnsName) {
         EmulatorConfig config = mockConfig(true);

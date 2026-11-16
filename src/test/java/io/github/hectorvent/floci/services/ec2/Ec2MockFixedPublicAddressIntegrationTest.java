@@ -31,7 +31,8 @@ class Ec2MockFixedPublicAddressIntegrationTest {
         String second = launchInPublicSubnet(owner, "10.96");
         ValidatableResponse described = describe(owner, first);
         assertEquals(CONFIGURED, described.extract().xmlPath().getString(INSTANCE + "ipAddress"));
-        assertEquals(CONFIGURED, described.extract().xmlPath().getString(INSTANCE + "dnsName"));
+        assertEquals("ec2-192-168-65-2.compute-1.amazonaws.com",
+                described.extract().xmlPath().getString(INSTANCE + "dnsName"));
         assertEquals(CONFIGURED, publicIp(owner, second));
 
         // The rule still decides when the address applies: none while stopped, an Elastic IP first.

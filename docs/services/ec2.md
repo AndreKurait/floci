@@ -484,8 +484,8 @@ selected launch-template version's primary-interface setting.
 Repeated reads retain the address; stopping releases an automatic address and
 starting assigns a new one without changing the private address. These are API
 identities, not host routes or published ports. An external executor must supply
-networking. Public DNS is represented by the address itself; AWS public-hostname
-synthesis and Elastic IP lifecycle parity are not qualified by these checks.
+networking. The public DNS name has AWS's form (see [Public IPv4 addresses](#public-ipv4-addresses));
+Elastic IP lifecycle parity is not qualified by these checks.
 
 ### EBS launch mappings
 
@@ -2574,7 +2574,18 @@ Whether an instance has an automatic public IPv4 address is decided by the same 
 without containers. Only the address itself depends on the mode. With a container, it is the
 container's reachable address: its own IP when Floci's clients can route to it, otherwise
 `127.0.0.1` with the DNS name `localhost`. In mock mode there is no container to reach, so
-`FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESSES` chooses:
+`FLOCI_SERVICES_EC2_MOCK_PUBLIC_ADDRESSES` chooses the address (see below).
+
+An address other than `127.0.0.1` gets the DNS name AWS gives it, in `PublicDnsName`, the
+interface association and the instance metadata's `public-hostname`:
+`ec2-a-b-c-d.compute-1.amazonaws.com` in `us-east-1` and `ec2-a-b-c-d.<region>.compute.<DNS suffix>`
+elsewhere, with the DNS suffix of the region's partition. Floci's embedded DNS answers such a name
+with the address it carries, ahead of `FLOCI_DNS_SPOOF_AWS_ENDPOINTS`, also as a Route 53 CNAME
+target. Unlike AWS, a query from inside the instance's VPC gets the public address too, not the
+private one. Clients that resolve names elsewhere must forward `compute-1.amazonaws.com` and
+`compute.<DNS suffix>` to Floci's DNS.
+
+The mock addresses:
 
 - `none` (the default): no automatic address. DescribeInstances shows no `ipAddress` or `dnsName`
   unless an Elastic IP is associated. The launch still records whether it asked for one, so
