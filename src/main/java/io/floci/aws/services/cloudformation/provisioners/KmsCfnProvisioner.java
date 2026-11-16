@@ -54,7 +54,7 @@ public class KmsCfnProvisioner implements CfnResourceProvisioner {
                 : resolvedPolicy.isTextual() ? resolvedPolicy.textValue() : resolvedPolicy.toString();
         Map<String, String> tags = parseCfnTags(props != null ? props.get("Tags") : null, ctx);
         KmsKey key;
-        if (ctx.isUpdate()) {
+        if (ctx.isUpdate() && !CfnResourceDispatcher.isStub(ctx.priorPhysicalId(), r.getAttributes())) {
             key = kmsService.describeKey(ctx.priorPhysicalId(), ctx.region());
             // KMS rejects immutable property changes, even with UpdateReplacePolicy: Retain.
             // Validate before any mutable property is applied or key material is created.
