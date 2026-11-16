@@ -1209,7 +1209,8 @@ public class ApiGatewayExecuteController {
                     routeContext.sourceIp(), isSecureTransport(uriInfo));
             ResourcePolicyDecision resourceDecision = callerCallAuthorizer.evaluateAnonymousResourcePolicy(
                     "execute-api:Invoke", methodArn, routeContext.sourceIp(), isSecureTransport(uriInfo));
-            if (!restLambdaAuthorizer.permits(verified, methodArn, conditions, resourceDecision)) {
+            String authorizerMethodArn = buildMethodArn(region, apiId, stageName, httpMethod, requestPath);
+            if (!restLambdaAuthorizer.permits(verified, authorizerMethodArn, conditions, resourceDecision)) {
                 return authorizerError(scope, GatewayResponseType.ACCESS_DENIED, 403);
             }
             return new AuthorizerResult(null, verified.principalId(), verified.context(),
