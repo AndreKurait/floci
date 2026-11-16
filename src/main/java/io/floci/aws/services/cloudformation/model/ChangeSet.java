@@ -19,6 +19,8 @@ public class ChangeSet {
     private String executionStatus = "AVAILABLE";
     private String statusReason;
     private String templateBody;
+    /** The transform result captured when this change set was created; absent for older stored change sets. */
+    private String processedTemplateBody;
     private Map<String, String> parameters;
     private List<String> capabilities;
     private Map<String, String> tags;
@@ -44,6 +46,8 @@ public class ChangeSet {
     public void setStatusReason(String statusReason) { this.statusReason = statusReason; }
     public String getTemplateBody() { return templateBody; }
     public void setTemplateBody(String templateBody) { this.templateBody = templateBody; }
+    public String getProcessedTemplateBody() { return processedTemplateBody; }
+    public void setProcessedTemplateBody(String processedTemplateBody) { this.processedTemplateBody = processedTemplateBody; }
     public Map<String, String> getParameters() { return parameters; }
     public void setParameters(Map<String, String> parameters) { this.parameters = parameters; }
     public List<String> getCapabilities() { return capabilities; }
