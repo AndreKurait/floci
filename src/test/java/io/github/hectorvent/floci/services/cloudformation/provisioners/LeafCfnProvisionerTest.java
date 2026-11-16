@@ -31,6 +31,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -90,7 +91,8 @@ class LeafCfnProvisionerTest {
             KmsKey key = new KmsKey();
             key.setKeyId("k-123");
             key.setArn("arn:aws:kms:us-east-1:000000000000:key/k-123");
-            when(kms.createKey(eq("a key"), eq(null), any(), eq(REGION))).thenReturn(key);
+            when(kms.createKey(eq("a key"), eq("ENCRYPT_DECRYPT"), eq("SYMMETRIC_DEFAULT"),
+                    isNull(), eq(Map.of("env", "dev")), isNull(), eq(false), eq(REGION))).thenReturn(key);
 
             StackResource r = resource("Key", "AWS::KMS::Key");
             provisioner.provision(r, props("""
@@ -108,7 +110,8 @@ class LeafCfnProvisionerTest {
             KmsKey key = new KmsKey();
             key.setKeyId("k-1");
             ArgumentCaptor<Map<String, String>> tags = ArgumentCaptor.forClass(Map.class);
-            when(kms.createKey(any(), any(), tags.capture(), anyString())).thenReturn(key);
+            when(kms.createKey(isNull(), eq("ENCRYPT_DECRYPT"), eq("SYMMETRIC_DEFAULT"),
+                    isNull(), tags.capture(), isNull(), eq(false), eq(REGION))).thenReturn(key);
 
             provisioner.provision(resource("Key", "AWS::KMS::Key"), props("""
                     {"Tags": [{"Key": "team", "Value": "core"}]}
