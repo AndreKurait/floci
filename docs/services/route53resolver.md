@@ -104,8 +104,14 @@ labels in its domain name wins.
 
 **Association, account and region** all have to line up. A rule does nothing in AWS until it is
 associated with a VPC, and Route 53 Resolver is regional, so a rule created in one region governs
-nothing in another. Floci reads all three from the query's source address: a cluster container's
-address maps to the account that owns the cluster, the cluster's region, and its
+nothing in another. Floci reads all three from the query's source address. A registered protected
+ENI's Docker transport address identifies its account, region and VPC; its logical private address
+does not, because different VPCs can reuse it. Removing the namespace's registration also removes
+its DNS identity, before Docker cleanup finishes. DNS reads an address index without waiting for
+firewall updates or inspecting Docker. A background worker checks registered helpers once per
+second and retires an identity when its helper stops, disappears, or loses that transport address.
+External Docker changes are therefore observed asynchronously; an unrelated container reusing the
+address does not acquire the retired identity. EKS cluster container addresses identify the cluster's account, region and
 `resourcesVpcConfig.vpcId`. Only that account's associations are consulted, and only rules from the
 querying region among them. `AssociateResolverRule` stores whatever `VPCId` the caller names without
 proving ownership of it, so scoping the lookup to the querying account's own partition is what stops
