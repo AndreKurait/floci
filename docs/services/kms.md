@@ -255,7 +255,9 @@ there.
 
 ## Grant Support Scope
 
-Grant lifecycle operations (`CreateGrant`, `ListGrants`, `ListRetirableGrants`, `RevokeGrant`, `RetireGrant`) are supported. However, grant lifecycle support **does not** imply grant-based authorization enforcement on cryptographic operations (`Encrypt`, `Decrypt`, `Sign`, `Verify`, `GenerateDataKey`, etc.). Grants are stored and queryable but are not evaluated during crypto operations.
+Cryptographic grant constraints match encryption-context keys without regard to case; values remain case-sensitive and literal. Ciphertext encryption-context authentication remains case-sensitive for both keys and values.
+
+Grant lifecycle operations (`CreateGrant`, `ListGrants`, `ListRetirableGrants`, `RevokeGrant`, `RetireGrant`) are supported. With IAM enforcement enabled, native KMS and delegated S3 authorization evaluate grants alongside key policies.
 
 ## IAM Enforcement
 

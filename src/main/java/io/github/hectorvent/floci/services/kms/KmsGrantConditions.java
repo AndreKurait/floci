@@ -2,14 +2,15 @@ package io.github.hectorvent.floci.services.kms;
 
 import java.nio.charset.StandardCharsets;
 import java.util.HexFormat;
+import java.util.Locale;
 
-/** Case-preserving internal condition names for KMS grant constraints. */
+/** Internal condition names for cryptographic KMS grant constraints. */
 public final class KmsGrantConditions {
     private KmsGrantConditions() {
     }
 
     public static String encryptionContextKey(String key) {
-        // IAM condition names ignore case; encoding preserves case-sensitive grant keys.
-        return "floci:kms:EncryptionContext:" + HexFormat.of().formatHex(key.getBytes(StandardCharsets.UTF_8));
+        // Cryptographic grant constraint keys ignore case; values remain literal.
+        return "floci:kms:EncryptionContext:" + HexFormat.of().formatHex(key.toLowerCase(Locale.ROOT).getBytes(StandardCharsets.UTF_8));
     }
 }
