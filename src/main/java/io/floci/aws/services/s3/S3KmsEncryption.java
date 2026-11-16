@@ -6,6 +6,7 @@ import io.floci.aws.core.common.AwsRegions;
 import io.floci.aws.core.common.IamEnforcementFilter;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestContext;
+import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.kms.KmsService;
 import io.floci.aws.services.s3.model.S3KmsEnvelope;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -23,14 +24,16 @@ import java.util.function.Supplier;
 public class S3KmsEncryption {
 
     private final KmsService kms;
+    private final IamService iam;
     private final IamEnforcementFilter authorization;
     private final RequestContext request;
     private final RegionResolver regions;
     private final SecureRandom random = new SecureRandom();
 
     public S3KmsEncryption(KmsService kms, IamEnforcementFilter authorization,
-                           RequestContext request, RegionResolver regions) {
+                           RequestContext request, RegionResolver regions, IamService iam) {
         this.kms = kms;
+        this.iam = iam;
         this.authorization = authorization;
         this.request = request;
         this.regions = regions;
@@ -124,7 +127,9 @@ public class S3KmsEncryption {
     }
 
     private void authorize(String keyArn, String action, Map<String, String> encryptionContext, String region) {
-        String account = regions.getAccountId();
+        String accessKey = request.getAccessKeyId();
+        String account = accessKey == null ? regions.getAccountId()
+            : iam.resolveAccountId(accessKey).orElse(regions.getAccountId());
         Map<String, List<String>> context = new HashMap<>();
         context.put("kms:ViaService", List.of("s3." + region + "." + AwsRegions.dnsSuffixFor(region)));
         context.put("kms:CallerAccount", List.of(account));
@@ -133,6 +138,12 @@ public class S3KmsEncryption {
         for (Map.Entry<String, String> entry : encryptionContext.entrySet()) {
             context.put("kms:EncryptionContext:" + entry.getKey(), List.of(entry.getValue()));
         }
-        authorization.authorizeDelegatedResource(action, keyArn, context);
+        String previousAccount = request.getAccountId();
+        request.setAccountId(account);
+        try {
+            authorization.authorizeDelegatedResource(action, keyArn, context);
+        } finally {
+            request.setAccountId(previousAccount);
+        }
     }
 }

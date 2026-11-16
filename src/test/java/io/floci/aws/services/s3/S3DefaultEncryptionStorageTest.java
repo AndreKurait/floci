@@ -7,6 +7,7 @@ import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestContext;
 import io.floci.aws.core.common.ServiceConfigAccess;
 import io.floci.aws.core.storage.StorageFactory;
+import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.kms.KmsService;
 import io.floci.aws.services.s3.model.CopyObjectOptions;
 import io.floci.aws.services.s3.model.MultipartUpload;
@@ -226,7 +227,7 @@ class S3DefaultEncryptionStorageTest {
     private static S3Service service(StorageFactory factory, EmulatorConfig config) {
         RegionResolver regions = new RegionResolver("us-east-1", "000000000000");
         S3KmsEncryption encryption = new S3KmsEncryption(new KmsService(factory, regions),
-                mock(IamEnforcementFilter.class), new RequestContext(), regions);
+                mock(IamEnforcementFilter.class), new RequestContext(), regions, mock(IamService.class));
         return new S3Service(factory, config, null, null, null, null, null,
                 regions, new ObjectMapper(), null, Clock.systemUTC(), encryption);
     }
