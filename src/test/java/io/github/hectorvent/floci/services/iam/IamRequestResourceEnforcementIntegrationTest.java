@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.iam;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.cbor.CBORFactory;
+import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.redshift.model.Endpoint;
 import io.github.hectorvent.floci.services.redshiftserverless.RedshiftServerlessRuntime;
 import io.github.hectorvent.floci.testing.AwsTestClients;
@@ -20,11 +21,15 @@ import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
+import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
+import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.applicationautoscaling.ApplicationAutoScalingClient;
 import software.amazon.awssdk.services.applicationautoscaling.model.ApplicationAutoScalingException;
 import software.amazon.awssdk.services.applicationautoscaling.model.PutScheduledActionRequest;
 import software.amazon.awssdk.services.applicationautoscaling.model.ScalableTargetAction;
+import software.amazon.awssdk.services.ecr.EcrClient;
+import software.amazon.awssdk.services.ecr.model.RepositoryNotFoundException;
 
 import java.io.IOException;
 import java.io.UncheckedIOException;
@@ -93,6 +98,10 @@ class IamRequestResourceEnforcementIntegrationTest {
     /** A serverless workgroup's PostgreSQL container is not needed to check a request on it, so none starts. */
     @InjectMock
     RedshiftServerlessRuntime runtime;
+
+    /** Repository metadata and policy checks do not need a container image registry. */
+    @InjectMock
+    EcrRegistryManager ecrRegistry;
 
     @BeforeAll
     static void configureRestAssured() {
@@ -594,15 +603,48 @@ class IamRequestResourceEnforcementIntegrationTest {
     void aRepositoryIsCheckedInTheRegistryItsRequestNames() {
         String name = "res-repo-" + suffix();
         String other = "111122223333";
+        String arn = "arn:aws:ecr:" + REGION + ":" + other + ":repository/" + name;
+        String request = "{\"registryId\":\"" + other + "\",\"repositoryNames\":[\"" + name + "\"]}";
         User user = user("res-repo-registry");
-        user.policy(allowOn("ecr:DescribeRepositories", "arn:aws:ecr:" + REGION + ":" + other + ":repository/" + name));
-        describeRepositoriesWith(user, "{\"registryId\":\"" + other + "\",\"repositoryNames\":[\"" + name + "\"]}")
-                .statusCode(400).body(containsString("RepositoryNotFoundException"));
-        refusedJson(describeRepositories(user, name), "ecr:DescribeRepositories");
+        user.policy(allowOn("ecr:DescribeRepositories", arn));
+        refusedJson(describeRepositoriesWith(user, request), "ecr:DescribeRepositories");
+        when(ecrRegistry.internalRepoName(other, REGION, name)).thenReturn(other + "/" + REGION + "/" + name);
+        when(ecrRegistry.getRepositoryUri(other, REGION, name)).thenReturn("registry.example.test/" + name);
 
-        user.policy(allowOn("ecr:DescribeRepositories", "arn:aws:ecr:" + REGION + ":" + ACCOUNT + ":repository/" + name));
-        refusedJson(describeRepositoriesWith(user, "{\"registryId\":\"" + other + "\",\"repositoryNames\":[\"" + name
-                + "\"]}"), "ecr:DescribeRepositories");
+        try (EcrClient owner = ecrAccount(other)) {
+            String createdArn = owner.createRepository(r -> r.repositoryName(name)).repository().repositoryArn();
+            try {
+                assertEquals(arn, createdArn);
+                refusedJson(describeRepositoriesWith(user, request), "ecr:DescribeRepositories");
+                String policy = """
+                        {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+                          "Principal":{"AWS":"arn:aws:iam::%s:user/%s"},
+                          "Action":"ecr:DescribeRepositories","Resource":"%s"}]}
+                        """.formatted(ACCOUNT, user.name(), arn);
+                owner.setRepositoryPolicy(r -> r.repositoryName(name).policyText(policy));
+                describeRepositoriesWith(user, request).statusCode(200)
+                        .body("repositories[0].registryId", equalTo(other))
+                        .body("repositories[0].repositoryArn", equalTo(arn));
+                refusedJson(describeRepositories(user, name), "ecr:DescribeRepositories");
+
+                user.policy(allowOn("ecr:DescribeRepositories",
+                        "arn:aws:ecr:" + REGION + ":" + ACCOUNT + ":repository/" + name));
+                refusedJson(describeRepositoriesWith(user, request), "ecr:DescribeRepositories");
+                user.policy(allowOn("ecr:DescribeRepositories", arn));
+                owner.deleteRepositoryPolicy(r -> r.repositoryName(name));
+                refusedJson(describeRepositoriesWith(user, request), "ecr:DescribeRepositories");
+            } finally {
+                owner.deleteRepository(r -> r.repositoryName(name).force(true));
+            }
+            assertThrows(RepositoryNotFoundException.class,
+                    () -> owner.describeRepositories(r -> r.repositoryNames(name)));
+        }
+    }
+
+    private static EcrClient ecrAccount(String account) {
+        return EcrClient.builder().endpointOverride(baseUri).region(Region.of(REGION))
+                .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(account, "test")))
+                .build();
     }
 
     /** A {@code registryId} of JSON null is no registry, as ECR reads it, so a deny on the caller's repository holds. */
