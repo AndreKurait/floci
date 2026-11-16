@@ -16,6 +16,7 @@ import java.net.URI;
 import java.util.List;
 import java.util.Locale;
 
+import static io.floci.aws.services.apigateway.RestResourcePolicyTestSupport.disabledCaller;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.mockito.Mockito.mock;
@@ -55,7 +56,8 @@ class BuildV2ProxyEventMultiValueTest {
         controller = new ApiGatewayExecuteController(
                 null, null, null, null,
                 regionResolver, new ObjectMapper(), null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, null, new HttpProxyInvoker());
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, null, new HttpProxyInvoker(),
+                disabledCaller());
     }
 
     enum Builder { INTEGRATION, AUTHORIZER }

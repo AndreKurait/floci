@@ -17,6 +17,7 @@ import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.stream.Stream;
 
+import static io.floci.aws.services.apigateway.RestResourcePolicyTestSupport.disabledCaller;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.params.provider.Arguments.arguments;
@@ -52,7 +53,8 @@ class BuildV2ProxyEventBodyEncodingTest {
                 null, null, null, null,
                 regionResolver, objectMapper, null,
                 null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null
-        , null, null, null, new HttpProxyInvoker());
+        , null, null, null, new HttpProxyInvoker(),
+                disabledCaller());
     }
 
     @ParameterizedTest(name = "{0}")
