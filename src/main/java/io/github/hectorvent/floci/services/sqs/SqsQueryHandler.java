@@ -190,7 +190,7 @@ public class SqsQueryHandler {
 
     private Response handleGetQueueUrl(MultivaluedMap<String, String> params, String region) {
         String queueName = getParam(params, "QueueName");
-        String queueUrl = sqsService.getQueueUrl(queueName, region);
+        String queueUrl = sqsService.getQueueUrl(queueName, region, getParam(params, "QueueOwnerAWSAccountId"));
 
         String result = new XmlBuilder().elem("QueueUrl", queueUrl).build();
         return Response.ok(AwsQueryResponse.envelope("GetQueueUrl", null, result)).build();

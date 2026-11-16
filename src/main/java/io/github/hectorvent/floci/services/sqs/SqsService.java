@@ -997,10 +997,25 @@ public class SqsService implements Resettable, ResourceProvider {
     }
 
     public String getQueueUrl(String queueName, String region) {
-        String accountId = regionResolver.getAccountId();
+        return getQueueUrl(queueName, region, null);
+    }
+
+    /**
+     * The URL of the named queue in the caller's account, or in {@code ownerAccountId}'s when GetQueueUrl names one
+     * (QueueOwnerAWSAccountId). Whether the caller may see another account's queue is authorized before this, against
+     * that queue's ARN; an owner that is not an account id has no such queue.
+     */
+    public String getQueueUrl(String queueName, String region, String ownerAccountId) {
+        boolean named = ownerAccountId != null && !ownerAccountId.isEmpty();
+        if (named && !ownerAccountId.matches("\\d{12}")) {
+            throw new AwsException("AWS.SimpleQueueService.NonExistentQueue",
+                    "The specified queue does not exist for this wsdl version.", 400);
+        }
+        String accountId = named ? ownerAccountId : regionResolver.getAccountId();
         String queueUrl = buildQueueUrl(region, accountId, queueName);
         String storageKey = regionKey(region, queueUrl);
-        if (queueStore.get(storageKey).isEmpty()) {
+        // Look the queue up in the account its URL names, as a by-URL operation does, not in the caller's.
+        if (getQueueByUrl(storageKey, queueUrl).isEmpty()) {
             throw new AwsException("AWS.SimpleQueueService.NonExistentQueue",
                     "The specified queue does not exist for this wsdl version.", 400);
         }
