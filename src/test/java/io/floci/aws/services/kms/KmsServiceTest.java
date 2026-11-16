@@ -470,6 +470,17 @@ class KmsServiceTest {
     }
 
     @Test
+    void authorizationRetirementTokensAreNotExposedByPublicGrantListing() {
+        KmsKey key = kmsService.createKey("retirement grant", REGION);
+        KmsGrant grant = kmsService.createGrant(key.getKeyId(),
+                "arn:aws:iam::000000000000:user/grantee", List.of("RetireGrant"), REGION);
+        assertEquals(grant.getGrantToken(),
+                kmsService.grantsForAuthorization(key.getKeyId(), REGION).getFirst().get("GrantToken"));
+        Map<String, Object> listed = kmsService.listGrants(key.getKeyId(), REGION, null, null, null, null);
+        assertFalse(new ObjectMapper().valueToTree(listed).path("Grants").get(0).has("GrantToken"));
+    }
+
+    @Test
     void listGrantsReturnsEmptyListForExistingKey() {
         KmsKey key = kmsService.createKey("grant key", REGION);
 
