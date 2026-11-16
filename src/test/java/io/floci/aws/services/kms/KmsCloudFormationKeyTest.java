@@ -157,6 +157,30 @@ class KmsCloudFormationKeyTest {
     }
 
     @Test
+    void removingDisabledPropertyRestoresEnabledWithoutReplacingKey() throws Exception {
+        JsonNode prior = mapper.readTree("{\"Enabled\":false}");
+        StackResource resource = create(prior.toString());
+        String id = resource.getPhysicalId();
+        assertFalse(kms.describeKey(id, REGION).isEnabled());
+        provisioner.provision(resource, mapper.readTree("{}"), context(id, prior));
+        assertTrue(kms.describeKey(id, REGION).isEnabled());
+        assertEquals(id, resource.getPhysicalId());
+        byte[] message = "restored".getBytes(StandardCharsets.UTF_8);
+        assertArrayEquals(message, kms.decrypt(kms.encrypt(id, message, REGION), REGION));
+    }
+
+    @Test
+    void omittedEnabledDoesNotResetUndeclaredOutOfBandState() throws Exception {
+        StackResource resource = create("{}");
+        String id = resource.getPhysicalId();
+        kms.disableKey(id, REGION);
+        provisioner.provision(resource, mapper.readTree("{\"Description\":\"updated\"}"),
+                context(id, mapper.readTree("{}")));
+        assertFalse(kms.describeKey(id, REGION).isEnabled());
+        assertEquals("updated", kms.describeKey(id, REGION).getDescription());
+    }
+
+    @Test
     void mutableUpdatePreservesIdentityAndReconcilesDescriptionPolicyTagsAndEnabled() throws Exception {
         JsonNode prior = mapper.readTree("""
                 {"Description":"before","Tags":[{"Key":"old","Value":"v"}]}

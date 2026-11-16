@@ -82,8 +82,10 @@ public class KmsCfnProvisioner implements CfnResourceProvisioner {
             key = kmsService.createKey(description, usage, spec, policy, tags, null, multiRegion, ctx.region());
         }
         String enabled = ctx.resolveOptional(props, "Enabled");
-        if (enabled != null && Boolean.parseBoolean(enabled) != key.isEnabled()) {
-            if (Boolean.parseBoolean(enabled)) {
+        boolean desiredEnabled = enabled == null || Boolean.parseBoolean(enabled);
+        boolean reconcileEnabled = enabled != null || ctx.previouslyDeclared("Enabled");
+        if (reconcileEnabled && desiredEnabled != key.isEnabled()) {
+            if (desiredEnabled) {
                 kmsService.enableKey(key.getKeyId(), ctx.region());
             } else {
                 kmsService.disableKey(key.getKeyId(), ctx.region());
