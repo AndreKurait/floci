@@ -11,6 +11,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.kms.KmsClient;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.BucketVersioningStatus;
 import software.amazon.awssdk.services.s3.model.ChecksumAlgorithm;
@@ -34,8 +35,8 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 @QuarkusTest
 class S3DefaultEncryptionSdkIntegrationTest {
 
-    private static final String FIRST_KEY = "arn:aws:kms:us-east-1:000000000000:key/first";
-    private static final String SECOND_KEY = "arn:aws:kms:us-east-1:000000000000:key/second";
+    private String firstKey;
+    private String secondKey;
 
     @TestHTTPResource("/")
     URI endpoint;
@@ -50,6 +51,14 @@ class S3DefaultEncryptionSdkIntegrationTest {
     void createOwnedBucket() {
         s3 = AwsTestClients.create(S3Client.builder().forcePathStyle(true), "test", Region.US_EAST_1, endpoint);
         cleanup.register(s3::close);
+        KmsClient kms = AwsTestClients.create(KmsClient.builder(), "test", Region.US_EAST_1, endpoint);
+        cleanup.register(kms::close);
+        firstKey = kms.createKey().keyMetadata().arn();
+        secondKey = kms.createKey().keyMetadata().arn();
+        cleanup.register(() -> {
+            kms.scheduleKeyDeletion(request -> request.keyId(firstKey).pendingWindowInDays(7));
+            kms.scheduleKeyDeletion(request -> request.keyId(secondKey).pendingWindowInDays(7));
+        });
         bucket = "default-encryption-" + UUID.randomUUID();
         s3.createBucket(request -> request.bucket(bucket));
         cleanup.register(() -> {
@@ -88,39 +97,39 @@ class S3DefaultEncryptionSdkIntegrationTest {
 
     @Test
     void configuredKmsKeyIsCapturedInObjectMetadata() {
-        defaults(ServerSideEncryption.AWS_KMS, FIRST_KEY);
-        assertEquals(FIRST_KEY, s3.putObject(request -> request.bucket(bucket).key("report"),
+        defaults(ServerSideEncryption.AWS_KMS, firstKey);
+        assertEquals(firstKey, s3.putObject(request -> request.bucket(bucket).key("report"),
                 RequestBody.fromString("inventory data")).ssekmsKeyId());
         HeadObjectResponse object = head("report");
         assertEquals(ServerSideEncryption.AWS_KMS, object.serverSideEncryption());
-        assertEquals(FIRST_KEY, object.ssekmsKeyId());
-        assertEquals(FIRST_KEY, s3.getObjectAsBytes(
+        assertEquals(firstKey, object.ssekmsKeyId());
+        assertEquals(firstKey, s3.getObjectAsBytes(
                 request -> request.bucket(bucket).key("report")).response().ssekmsKeyId());
     }
 
     @Test
     void explicitObjectEncryptionOverridesTheBucketDefault() {
-        defaults(ServerSideEncryption.AWS_KMS, FIRST_KEY);
+        defaults(ServerSideEncryption.AWS_KMS, firstKey);
         s3.putObject(request -> request.bucket(bucket).key("s3").serverSideEncryption(ServerSideEncryption.AES256),
                 RequestBody.fromString("S3 encryption"));
         assertEquals(ServerSideEncryption.AES256, head("s3").serverSideEncryption());
         assertNull(head("s3").ssekmsKeyId());
         s3.putObject(request -> request.bucket(bucket).key("kms").serverSideEncryption(ServerSideEncryption.AWS_KMS)
-                .ssekmsKeyId(SECOND_KEY), RequestBody.fromString("explicit key"));
-        assertEquals(SECOND_KEY, head("kms").ssekmsKeyId());
+                .ssekmsKeyId(secondKey), RequestBody.fromString("explicit key"));
+        assertEquals(secondKey, head("kms").ssekmsKeyId());
     }
 
     @Test
     void copiesUseTheDestinationDefaultInsteadOfTheSourceEncryption() {
         s3.putObject(request -> request.bucket(bucket).key("source").serverSideEncryption(ServerSideEncryption.AWS_KMS)
-                .ssekmsKeyId(FIRST_KEY), RequestBody.fromString("source data"));
+                .ssekmsKeyId(firstKey), RequestBody.fromString("source data"));
         s3.copyObject(request -> request.bucket(bucket).key("s3-copy").copySource(bucket + "/source"));
         assertEquals(ServerSideEncryption.AES256, head("s3-copy").serverSideEncryption());
         assertNull(head("s3-copy").ssekmsKeyId());
-        defaults(ServerSideEncryption.AWS_KMS, SECOND_KEY);
+        defaults(ServerSideEncryption.AWS_KMS, secondKey);
         s3.copyObject(request -> request.bucket(bucket).key("kms-copy").copySource(bucket + "/source"));
-        assertEquals(SECOND_KEY, head("kms-copy").ssekmsKeyId());
-        assertEquals(FIRST_KEY, head("source").ssekmsKeyId());
+        assertEquals(secondKey, head("kms-copy").ssekmsKeyId());
+        assertEquals(firstKey, head("source").ssekmsKeyId());
         s3.copyObject(request -> request.bucket(bucket).key("explicit-copy").copySource(bucket + "/source")
                 .serverSideEncryption(ServerSideEncryption.AES256));
         assertEquals(ServerSideEncryption.AES256, head("explicit-copy").serverSideEncryption());
@@ -129,7 +138,7 @@ class S3DefaultEncryptionSdkIntegrationTest {
 
     @Test
     void multipartCompletionKeepsTheDefaultSelectedAtInitiation() {
-        defaults(ServerSideEncryption.AWS_KMS, FIRST_KEY);
+        defaults(ServerSideEncryption.AWS_KMS, firstKey);
         String upload = s3.createMultipartUpload(request -> request.bucket(bucket).key("multipart")
                 .checksumAlgorithm(ChecksumAlgorithm.SHA256)).uploadId();
         defaults(ServerSideEncryption.AES256, null);
@@ -139,7 +148,7 @@ class S3DefaultEncryptionSdkIntegrationTest {
                 .multipartUpload(parts -> parts.parts(completed -> completed.partNumber(1)
                         .eTag(part.eTag()).checksumSHA256(part.checksumSHA256()))));
         assertEquals(ServerSideEncryption.AWS_KMS, head("multipart").serverSideEncryption());
-        assertEquals(FIRST_KEY, head("multipart").ssekmsKeyId());
+        assertEquals(firstKey, head("multipart").ssekmsKeyId());
         assertEquals("multipart data", s3.getObjectAsBytes(
                 request -> request.bucket(bucket).key("multipart")).asUtf8String());
     }
@@ -150,22 +159,22 @@ class S3DefaultEncryptionSdkIntegrationTest {
                 .versioningConfiguration(versioning -> versioning.status(BucketVersioningStatus.ENABLED)));
         String first = s3.putObject(request -> request.bucket(bucket).key("versioned"),
                 RequestBody.fromString("first version")).versionId();
-        defaults(ServerSideEncryption.AWS_KMS, FIRST_KEY);
+        defaults(ServerSideEncryption.AWS_KMS, firstKey);
         String second = s3.putObject(request -> request.bucket(bucket).key("versioned"),
                 RequestBody.fromString("second version")).versionId();
         s3.deleteBucketEncryption(request -> request.bucket(bucket));
         assertEquals(ServerSideEncryption.AES256, s3.headObject(
                 request -> request.bucket(bucket).key("versioned").versionId(first)).serverSideEncryption());
-        assertEquals(FIRST_KEY, head("versioned").ssekmsKeyId());
+        assertEquals(firstKey, head("versioned").ssekmsKeyId());
         s3.putObject(request -> request.bucket(bucket).key("versioned"), RequestBody.fromString("third version"));
         assertEquals(ServerSideEncryption.AES256, head("versioned").serverSideEncryption());
-        assertEquals(FIRST_KEY, s3.headObject(
+        assertEquals(firstKey, s3.headObject(
                 request -> request.bucket(bucket).key("versioned").versionId(second)).ssekmsKeyId());
     }
 
     @Test
     void customerProvidedKeysDoNotInheritTheBucketEncryption() throws Exception {
-        defaults(ServerSideEncryption.AWS_KMS, FIRST_KEY);
+        defaults(ServerSideEncryption.AWS_KMS, firstKey);
         byte[] bytes = new byte[32];
         String key = Base64.getEncoder().encodeToString(bytes);
         String md5 = Base64.getEncoder().encodeToString(MessageDigest.getInstance("MD5").digest(bytes));
@@ -181,7 +190,7 @@ class S3DefaultEncryptionSdkIntegrationTest {
 
     @Test
     void malformedConfigurationDoesNotReplaceTheStoredDefault() {
-        defaults(ServerSideEncryption.AWS_KMS, FIRST_KEY);
+        defaults(ServerSideEncryption.AWS_KMS, firstKey);
         given().body("""
                 <ServerSideEncryptionConfiguration>
                     <Rule><ApplyServerSideEncryptionByDefault/></Rule>
@@ -189,12 +198,12 @@ class S3DefaultEncryptionSdkIntegrationTest {
                 """)
                 .put("/" + bucket + "?encryption").then().statusCode(400);
         s3.putObject(request -> request.bucket(bucket).key("after-rejection"), RequestBody.fromString("unchanged"));
-        assertEquals(FIRST_KEY, head("after-rejection").ssekmsKeyId());
+        assertEquals(firstKey, head("after-rejection").ssekmsKeyId());
     }
 
     @Test
     void unsupportedEncryptionBlockingDoesNotPretendToBeEnforced() {
-        defaults(ServerSideEncryption.AWS_KMS, FIRST_KEY);
+        defaults(ServerSideEncryption.AWS_KMS, firstKey);
         given().body("""
                 <ServerSideEncryptionConfiguration>
                     <Rule><BlockedEncryptionTypes><EncryptionType>SSE-C</EncryptionType></BlockedEncryptionTypes></Rule>
@@ -202,7 +211,7 @@ class S3DefaultEncryptionSdkIntegrationTest {
                 """)
                 .put("/" + bucket + "?encryption").then().statusCode(501);
         s3.putObject(request -> request.bucket(bucket).key("after-unsupported"), RequestBody.fromString("unchanged"));
-        assertEquals(FIRST_KEY, head("after-unsupported").ssekmsKeyId());
+        assertEquals(firstKey, head("after-unsupported").ssekmsKeyId());
     }
 
     private void defaults(ServerSideEncryption algorithm, String kmsKeyId) {

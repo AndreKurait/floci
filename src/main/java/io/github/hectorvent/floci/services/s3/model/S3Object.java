@@ -17,6 +17,8 @@ import java.util.Map;
 @JsonIgnoreProperties(ignoreUnknown = true)
 public class S3Object {
 
+    private S3KmsEnvelope kmsEnvelope;
+
     private String bucketName;
     private String key;
     @JsonIgnore
@@ -104,6 +106,7 @@ public class S3Object {
         this.cacheControl = source.cacheControl;
         this.serverSideEncryption = source.serverSideEncryption;
         this.sseKmsKeyId = source.sseKmsKeyId;
+        this.kmsEnvelope = source.kmsEnvelope;
         this.sseCustomerAlgorithm = source.sseCustomerAlgorithm;
         this.sseCustomerKeyMd5 = source.sseCustomerKeyMd5;
         this.size = source.size;
@@ -215,4 +218,7 @@ public class S3Object {
     public static String computeETag(byte[] data) {
         return "\"" + Digests.md5Hex(data) + "\"";
     }
+    public S3KmsEnvelope getKmsEnvelope() { return kmsEnvelope; }
+    public void setKmsEnvelope(S3KmsEnvelope envelope) { this.kmsEnvelope = envelope; }
+
 }

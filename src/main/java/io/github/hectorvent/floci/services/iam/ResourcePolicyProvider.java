@@ -11,7 +11,11 @@ import java.util.List;
  */
 public interface ResourcePolicyProvider {
 
-    record ResourcePolicy(String policyDocument, String ownerAccountId) {}
+    record ResourcePolicy(String policyDocument, String ownerAccountId, boolean grantRequired) {
+        public ResourcePolicy(String policyDocument, String ownerAccountId) {
+            this(policyDocument, ownerAccountId, false);
+        }
+    }
 
     /**
      * Returns the resource-based policies that apply to the specified resource,

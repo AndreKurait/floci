@@ -30,6 +30,7 @@ import org.jboss.logging.Logger;
 import javax.crypto.Cipher;
 import javax.crypto.spec.GCMParameterSpec;
 import javax.crypto.spec.SecretKeySpec;
+
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.security.*;
@@ -126,6 +127,17 @@ public class KmsService implements ResourceProvider {
         return "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"Enable IAM User Permissions\"," +
                "\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"" + regionResolver.buildGlobalArn("iam", account, "root") + "\"}," +
                "\"Action\":\"kms:*\",\"Resource\":\"*\"}]}";
+    }
+
+    private String buildS3ManagedKeyPolicy(String region) {
+        String root = buildDefaultKeyPolicy().replace("\"kms:*\"",
+                "[\"kms:DescribeKey\",\"kms:Get*\",\"kms:List*\",\"kms:RevokeGrant\"]");
+        String delegated = "{\"Effect\":\"Allow\",\"Principal\":{\"AWS\":\"*\"},"
+                + "\"Action\":[\"kms:Encrypt\",\"kms:Decrypt\",\"kms:ReEncrypt*\",\"kms:GenerateDataKey*\",\"kms:DescribeKey\"],"
+                + "\"Resource\":\"*\",\"Condition\":{\"StringEquals\":{"
+                + "\"kms:CallerAccount\":\"" + regionResolver.getAccountId() + "\","
+                + "\"kms:ViaService\":\"s3." + region + "." + AwsRegions.dnsSuffixFor(region) + "\"}}}";
+        return root.substring(0, root.length() - 2) + "," + delegated + "]}";
     }
 
     public KmsKey createKey(String description, String region) {
@@ -795,7 +807,10 @@ public class KmsService implements ResourceProvider {
     public Map<String, Object> getKeyPolicy(String keyId, String region) {
         KmsKey key = resolveKey(keyId, region);
         Map<String, Object> result = new HashMap<>();
-        result.put("Policy", key.getPolicy());
+        boolean managedS3 = AWS_KEY_MANAGER.equals(key.getKeyManager())
+                && aliasStore.get(region + "::alias/aws/s3")
+                        .map(alias -> key.getKeyId().equals(alias.getTargetKeyId())).orElse(false);
+        result.put("Policy", managedS3 ? buildS3ManagedKeyPolicy(region) : key.getPolicy());
         result.put("PolicyName", "default");
         return result;
     }
@@ -1393,7 +1408,8 @@ public class KmsService implements ResourceProvider {
                 key.setArn(regionResolver.buildArn("kms", region, "key/" + keyId));
                 key.setDescription(def.description());
                 key.setKeyManager(AWS_KEY_MANAGER);
-                key.setPolicy(buildDefaultKeyPolicy());
+                key.setPolicy("alias/aws/s3".equals(def.aliasName())
+                        ? buildS3ManagedKeyPolicy(region) : buildDefaultKeyPolicy());
                 // AWS rotates its own keys yearly and the customer cannot turn that off, so
                 // GetKeyRotationStatus reports true for every AWS managed key.
                 key.setKeyRotationEnabled(true);

@@ -375,6 +375,7 @@ public class IamConditionContextResolver {
             case "batch" -> batchSchedulingPolicyConditions(action, ctx);
             case "account" -> accountRegionConditionContext(action, ctx);
             case "s3" -> s3ConditionContext(action, ctx);
+            case "kms" -> kmsConditionContext(ctx);
             case "cloudfront" -> cloudFrontTestConditionContext(action, ctx);
             case "ec2" -> ec2ConditionContext(action, ctx);
             case "ecr" -> ecrPreviewConditionContext(action, ctx);
@@ -395,6 +396,25 @@ public class IamConditionContextResolver {
             case "states" -> stepFunctionsConditionContext(action, ctx);
             default -> null;
         };
+    }
+
+    private Map<String, List<String>> kmsConditionContext(ContainerRequestContext ctx) {
+        JsonNode body = bufferedJsonBody(ctx);
+        if (body == null || !body.path("EncryptionContext").isObject()) {
+            return null;
+        }
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        List<String> keys = new ArrayList<>();
+        body.path("EncryptionContext").properties().forEach(entry -> {
+            if (entry.getValue().isTextual()) {
+                keys.add(entry.getKey());
+                conditions.put("kms:EncryptionContext:" + entry.getKey(), List.of(entry.getValue().textValue()));
+            }
+        });
+        if (!keys.isEmpty()) {
+            conditions.put("kms:EncryptionContextKeys", keys);
+        }
+        return conditions;
     }
 
     private Map<String, List<String>> memoryDbParameterGroupConditions(String action, ContainerRequestContext ctx) {

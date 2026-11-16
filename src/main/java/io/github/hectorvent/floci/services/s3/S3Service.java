@@ -284,6 +284,7 @@ public class S3Service implements Resettable, ResourceProvider {
     private final boolean enforceAuth;
     private final boolean enforceIam;
     private final IamService iamService;
+    private final S3KmsEncryption kmsEncryption;
     private final boolean globalBucketNamespace;
     private final IamPolicyEvaluator policyEvaluator;
 
@@ -295,7 +296,7 @@ public class S3Service implements Resettable, ResourceProvider {
                      Event<S3ObjectUpdatedEvent> s3UpdatedEvent,
                      RegionResolver regionResolver,
                      ObjectMapper objectMapper,
-                     IamService iamService) {
+                     IamService iamService, S3KmsEncryption kmsEncryption) {
         this(
                 storageFactory.create("s3", "s3-buckets.json",
                         new TypeReference<Map<String, Bucket>>() {
@@ -316,8 +317,17 @@ public class S3Service implements Resettable, ResourceProvider {
                 regionResolver,
                 config.effectiveBaseUrl(), objectMapper,
                 config.services().s3().enforceAuth(), config.services().iam().enforcementEnabled(), iamService,
-                config.services().s3().globalBucketNamespace()
+                config.services().s3().globalBucketNamespace(), kmsEncryption
         );
+    }
+
+    public S3Service(StorageFactory storageFactory, EmulatorConfig config,
+                     SqsService sqsService, SnsService snsService,
+                     Instance<LambdaService> lambdaServiceProvider, EventBridgeService eventBridgeService,
+                     Event<S3ObjectUpdatedEvent> s3UpdatedEvent, RegionResolver regionResolver,
+                     ObjectMapper objectMapper, IamService iamService) {
+        this(storageFactory, config, sqsService, snsService, lambdaServiceProvider, eventBridgeService,
+                s3UpdatedEvent, regionResolver, objectMapper, iamService, null);
     }
 
     /**
@@ -328,7 +338,7 @@ public class S3Service implements Resettable, ResourceProvider {
               Path dataRoot, boolean inMemory) {
         this(bucketStore, objectStore, defaultAnnotationStore(), defaultAccountPublicAccessBlockStore(),
                 dataRoot, inMemory, null, null, null, null, null, null, null,
-                null, "http://localhost:4566", new ObjectMapper(), false, false, null, false);
+                null, "http://localhost:4566", new ObjectMapper(), false, false, null, false, null);
     }
 
     S3Service(StorageBackend<String, Bucket> bucketStore,
@@ -337,7 +347,7 @@ public class S3Service implements Resettable, ResourceProvider {
               boolean enforceAuth, IamService iamService) {
         this(bucketStore, objectStore, defaultAnnotationStore(), defaultAccountPublicAccessBlockStore(),
                 dataRoot, inMemory, null, null, null, null, null, null, null,
-                null, "http://localhost:4566", new ObjectMapper(), enforceAuth, false, iamService, false);
+                null, "http://localhost:4566", new ObjectMapper(), enforceAuth, false, iamService, false, null);
     }
 
     /** Package-private constructor for testing account-level Block Public Access persistence. */
@@ -347,7 +357,7 @@ public class S3Service implements Resettable, ResourceProvider {
               Path dataRoot, boolean inMemory) {
         this(bucketStore, objectStore, defaultAnnotationStore(), accountPublicAccessBlockStore,
                 dataRoot, inMemory, null, null, null, null, null, null, null,
-                null, "http://localhost:4566", new ObjectMapper(), false, false, null, false);
+                null, "http://localhost:4566", new ObjectMapper(), false, false, null, false, null);
     }
 
     /** Package-private constructor for testing the global-bucket-namespace resolution flag. */
@@ -356,7 +366,7 @@ public class S3Service implements Resettable, ResourceProvider {
               Path dataRoot, boolean inMemory, boolean globalBucketNamespace) {
         this(bucketStore, objectStore, defaultAnnotationStore(), defaultAccountPublicAccessBlockStore(),
                 dataRoot, inMemory, null, null, null, null, null, null, null,
-                null, "http://localhost:4566", new ObjectMapper(), false, false, null, globalBucketNamespace);
+                null, "http://localhost:4566", new ObjectMapper(), false, false, null, globalBucketNamespace, null);
     }
 
     S3Service(StorageBackend<String, Bucket> bucketStore,
@@ -366,7 +376,7 @@ public class S3Service implements Resettable, ResourceProvider {
               RegionResolver regionResolver) {
         this(bucketStore, objectStore, defaultAnnotationStore(), defaultAccountPublicAccessBlockStore(),
                 dataRoot, inMemory, null, null, lambdaService, null, null, null, null,
-                regionResolver, "http://localhost:4566", new ObjectMapper(), false, false, null, false);
+                regionResolver, "http://localhost:4566", new ObjectMapper(), false, false, null, false, null);
     }
 
     S3Service(StorageBackend<String, Bucket> bucketStore,
@@ -376,7 +386,7 @@ public class S3Service implements Resettable, ResourceProvider {
               RegionResolver regionResolver) {
         this(bucketStore, objectStore, defaultAnnotationStore(), defaultAccountPublicAccessBlockStore(),
                 dataRoot, inMemory, null, null, null, null, lambdaInvoker, null, null,
-                regionResolver, "http://localhost:4566", new ObjectMapper(), false, false, null, false);
+                regionResolver, "http://localhost:4566", new ObjectMapper(), false, false, null, false, null);
     }
 
     /** In-memory account-level Block Public Access store for the package-private test constructors. */
@@ -401,7 +411,7 @@ public class S3Service implements Resettable, ResourceProvider {
                       Event<S3ObjectUpdatedEvent> s3UpdatedEvent,
                       RegionResolver regionResolver, String baseUrl, ObjectMapper objectMapper,
                       boolean enforceAuth, boolean enforceIam, IamService iamService,
-                      boolean globalBucketNamespace) {
+                      boolean globalBucketNamespace, S3KmsEncryption kmsEncryption) {
         this.bucketStore = bucketStore;
         this.objectStore = objectStore;
         this.annotationStore = annotationStore;
@@ -421,6 +431,7 @@ public class S3Service implements Resettable, ResourceProvider {
         this.enforceAuth = enforceAuth;
         this.enforceIam = enforceIam;
         this.iamService = iamService;
+        this.kmsEncryption = kmsEncryption;
         this.globalBucketNamespace = globalBucketNamespace;
         this.policyEvaluator = new IamPolicyEvaluator(objectMapper);
         if (!inMemory) {
@@ -1029,11 +1040,12 @@ public class S3Service implements Resettable, ResourceProvider {
 
         DigestingInputStream digests = new DigestingInputStream(body,
                 digestAlgorithms(checksums, computed), MAX_PUT_OBJECT_SIZE);
-        Path staged = stageBody(digests);
+        AssembledBody stagedBody = stageEncryptedObject(digests, checkedBucket.value(), bucketName, key, effectiveOptions);
+        Path staged = stagedBody.file();
         try {
             checksums.verify(digests.md5(), digests::checksum);
             verifyChunkedTrailers(body, digests, checksums);
-            S3Object object = storeObject(checkedBucket, bucketName, key, new AssembledBody(staged, digests.size()),
+            S3Object object = storeObject(checkedBucket, bucketName, key, stagedBody,
                     contentType, metadata, computedChecksum(digests, computed), null, effectiveOptions,
                     digests.eTag());
             fireNotifications(bucketName, key, "ObjectCreated:Put", object);
@@ -1150,9 +1162,11 @@ public class S3Service implements Resettable, ResourceProvider {
      */
     private sealed interface ObjectBody permits BytesBody, AssembledBody {
         long size();
+        default S3KmsEnvelope envelope() { return null; }
     }
 
-    private record BytesBody(byte[] data) implements ObjectBody {
+    private record BytesBody(byte[] data, S3KmsEnvelope reuseKey) implements ObjectBody {
+        private BytesBody(byte[] data) { this(data, null); }
         @Override
         public long size() {
             return data.length;
@@ -1165,7 +1179,9 @@ public class S3Service implements Resettable, ResourceProvider {
      * out beforehand, since computing either here would mean reading the whole file under the bucket
      * lock.
      */
-    private record AssembledBody(Path file, long size) implements ObjectBody { }
+    private record AssembledBody(Path file, long size, S3KmsEnvelope envelope) implements ObjectBody {
+        private AssembledBody(Path file, long size) { this(file, size, null); }
+    }
 
     private S3Object storeObjectInternal(String bucketOwnerAccount, Bucket bucket,
                                          String bucketName, String key, ObjectBody body,
@@ -1228,6 +1244,29 @@ public class S3Service implements Resettable, ResourceProvider {
         // write order used by in-memory promotion. A failed body write may consume a value, which
         // is harmless because sequencers only need to be monotonic for writes that become visible.
         object.setEventSequencer(nextEventSequencer());
+        if ("aws:kms".equals(encryption.algorithm())) {
+            S3KmsEnvelope envelope = body.envelope();
+            if (envelope == null) {
+                try (S3KmsEncryption.Material material = body instanceof BytesBody bytes && bytes.reuseKey() != null
+                        ? kms().nextBody(bytes.reuseKey())
+                        : kms().generate(bucketName, key, encryption.kmsKeyId(), bucket.getRegion())) {
+                    envelope = material.envelope();
+                    if (body instanceof AssembledBody assembled) {
+                        encryptFile(assembled.file(), material);
+                        body = new AssembledBody(assembled.file(), assembled.size(), envelope);
+                    } else {
+                        try (InputStream encrypted = kms().encrypt(new ByteArrayInputStream(data), material)) {
+                            data = encrypted.readAllBytes();
+                        } catch (IOException error) {
+                            throw new UncheckedIOException("Failed to encrypt the S3 object", error);
+                        }
+                    }
+                }
+            }
+            object.setKmsEnvelope(envelope);
+            object.setSseKmsKeyId(envelope.keyArn());
+        }
+
 
         if (bucket.isVersioningEnabled()) {
             String versionId = UUID.randomUUID().toString();
@@ -1360,6 +1399,61 @@ public class S3Service implements Resettable, ResourceProvider {
             LOG.debugv("Put object: {0}/{1} ({2} bytes)", bucketName, key, body.size());
         }
         return object;
+    }
+
+    private S3KmsEncryption kms() {
+        if (kmsEncryption == null) {
+            throw new IllegalStateException("SSE-KMS requires the native KMS integration");
+        }
+        return kmsEncryption;
+    }
+
+    private AssembledBody stageEncryptedObject(DigestingInputStream plaintext, Bucket bucket,
+                                                String bucketName, String key, PutObjectOptions options) {
+        S3ObjectEncryption encryption = S3ObjectEncryption.resolve(bucket.getEncryptionConfiguration(),
+                normalizeServerSideEncryption(options.getServerSideEncryption()), options.getSseKmsKeyId(),
+                options.getSseCustomerKey() != null);
+        options.withServerSideEncryption(encryption.algorithm()).withSseKmsKeyId(encryption.kmsKeyId());
+        if (!"aws:kms".equals(encryption.algorithm())) {
+            Path file = stageBody(plaintext);
+            return new AssembledBody(file, plaintext.size());
+        }
+        try (S3KmsEncryption.Material material = kms().generate(bucketName, key, encryption.kmsKeyId(), bucket.getRegion());
+                InputStream encrypted = kms().encrypt(plaintext, material)) {
+            Path file = stageBody(encrypted);
+            options.withSseKmsKeyId(material.envelope().keyArn());
+            return new AssembledBody(file, plaintext.size(), material.envelope());
+        } catch (IOException error) {
+            throw new UncheckedIOException("Failed to stage encrypted object", error);
+        }
+    }
+
+    private AssembledBody stageEncryptedPart(DigestingInputStream plaintext, MultipartUpload upload) {
+        if (!"aws:kms".equals(upload.getServerSideEncryption())) {
+            Path file = stageBody(plaintext);
+            return new AssembledBody(file, plaintext.size());
+        }
+        try (S3KmsEncryption.Material material = kms().nextBody(upload.getKmsEnvelope());
+                InputStream encrypted = kms().encrypt(plaintext, material)) {
+            Path file = stageBody(encrypted);
+            return new AssembledBody(file, plaintext.size(), material.envelope());
+        } catch (IOException error) {
+            throw new UncheckedIOException("Failed to stage encrypted multipart part", error);
+        }
+    }
+
+    private void encryptFile(Path file, S3KmsEncryption.Material material) {
+        Path encrypted = null;
+        try (InputStream raw = Files.newInputStream(file); InputStream body = kms().encrypt(raw, material)) {
+            encrypted = stageBody(body);
+            moveIntoPlace(encrypted, file);
+        } catch (IOException error) {
+            throw new UncheckedIOException("Failed to encrypt staged S3 body", error);
+        } finally {
+            if (encrypted != null) {
+                deleteQuietly(encrypted, "encrypted body that was not stored");
+            }
+        }
     }
 
     private void checkWritePreconditions(String bucketName, String key, String ifMatch, String ifNoneMatch) {
@@ -2103,6 +2197,20 @@ public class S3Service implements Resettable, ResourceProvider {
     }
 
     public S3Object getObject(String bucketName, String key, String versionId) {
+        S3Object object = readStoredBody(bucketName, key, versionId);
+        if ("aws:kms".equals(object.getServerSideEncryption())) {
+            S3KmsEncryption.requireEnvelope(object.getKmsEnvelope());
+            try (InputStream plaintext = kms().decrypt(new ByteArrayInputStream(object.getData()),
+                    object.getKmsEnvelope(), object.getSize())) {
+                object.setData(plaintext.readAllBytes());
+            } catch (IOException error) {
+                throw new UncheckedIOException("Failed to decrypt the S3 object", error);
+            }
+        }
+        return object;
+    }
+
+    private S3Object readStoredBody(String bucketName, String key, String versionId) {
         if ("null".equals(versionId)) {
             Snapshot<byte[]> snapshot = readNullVersionSnapshot(bucketName, key,
                     location -> location.archived()
@@ -2331,10 +2439,10 @@ public class S3Service implements Resettable, ResourceProvider {
                 resolveVersionedPathForRead(bucketOwnerAccount, bucketName, key, versionId)));
     }
 
-    private static ObjectRead objectRead(S3Object obj, FileChannel channel) {
+    private ObjectRead objectRead(S3Object obj, FileChannel channel) {
         try {
             long fileSize = channel.size();
-            if (fileSize != obj.getSize()) {
+            if (fileSize != S3KmsEncryption.storedSize(obj.getSize(), obj.getKmsEnvelope())) {
                 throw new IllegalStateException("S3 object file for " + obj.getBucketName() + "/"
                         + obj.getKey() + " has " + fileSize + " bytes but metadata declares "
                         + obj.getSize() + "; serving it would corrupt the response framing");
@@ -2346,7 +2454,17 @@ public class S3Service implements Resettable, ResourceProvider {
             closeQuietly(channel);
             throw e;
         }
-        return new ObjectRead(obj, Channels.newInputStream(channel));
+        InputStream raw = Channels.newInputStream(channel);
+        try {
+            if ("aws:kms".equals(obj.getServerSideEncryption())) {
+                S3KmsEncryption.requireEnvelope(obj.getKmsEnvelope());
+            }
+            return new ObjectRead(obj, "aws:kms".equals(obj.getServerSideEncryption())
+                    ? kms().decrypt(raw, obj.getKmsEnvelope(), obj.getSize()) : raw);
+        } catch (RuntimeException error) {
+            closeQuietly(channel);
+            throw error;
+        }
     }
 
     private static FileChannel openForRead(Path path) {
@@ -3169,7 +3287,15 @@ public class S3Service implements Resettable, ResourceProvider {
             deleteQuietly(pinned, "pinned copy source whose size could not be read");
             throw new UncheckedIOException("Failed to read the copy source", e);
         }
-        if (fileSize != obj.getSize()) {
+        if ("aws:kms".equals(obj.getServerSideEncryption())) {
+            try {
+                S3KmsEncryption.requireEnvelope(obj.getKmsEnvelope());
+            } catch (RuntimeException error) {
+                deleteQuietly(pinned, "pinned legacy plaintext SSE-KMS source");
+                throw error;
+            }
+        }
+        if (fileSize != S3KmsEncryption.storedSize(obj.getSize(), obj.getKmsEnvelope())) {
             deleteQuietly(pinned, "pinned copy source whose size does not match its metadata");
             throw new IllegalStateException("S3 object file for " + obj.getBucketName() + "/"
                     + obj.getKey() + " has " + fileSize + " bytes but metadata declares " + obj.getSize());
@@ -3203,10 +3329,36 @@ public class S3Service implements Resettable, ResourceProvider {
      * of its bytes and stays, while a multipart one's has to be computed; the source's checksum
      * stays unless a new or composite one has to become a full-object checksum.
      */
-    private CopyBody copyBody(CopySource source, S3Checksum effectiveChecksum, ChecksumAlgorithm copyChecksumAlgorithm) {
+    private CopyBody copyBody(CopySource source, S3Checksum effectiveChecksum, ChecksumAlgorithm copyChecksumAlgorithm,
+                              String destinationBucket, String destinationKey, CopyObjectOptions options) {
         S3Object object = source.object();
         if (source.pinnedFile() == null) {
             return new CopyBody(new BytesBody(object.getData()), null, effectiveChecksum);
+        }
+        Bucket bucket = requireBucket(destinationBucket);
+        S3ObjectEncryption encryption = S3ObjectEncryption.resolve(bucket.getEncryptionConfiguration(),
+                options.getServerSideEncryption(), options.getSseKmsKeyId(), options.getSseCustomerKey() != null);
+        if ("aws:kms".equals(object.getServerSideEncryption()) || "aws:kms".equals(encryption.algorithm())) {
+            Path staged = null;
+            try (InputStream stored = Files.newInputStream(source.pinnedFile());
+                    InputStream plaintext = "aws:kms".equals(object.getServerSideEncryption())
+                            ? kms().decrypt(stored, object.getKmsEnvelope(), object.getSize()) : stored) {
+                DigestingInputStream digests = new DigestingInputStream(plaintext,
+                        copyChecksumAlgorithm == null ? List.of() : List.of(copyChecksumAlgorithm), MAX_COPY_OBJECT_SOURCE_SIZE);
+                PutObjectOptions destination = new PutObjectOptions()
+                        .withServerSideEncryption(encryption.algorithm()).withSseKmsKeyId(encryption.kmsKeyId());
+                AssembledBody body = stageEncryptedObject(digests, bucket, destinationBucket, destinationKey, destination);
+                staged = body.file();
+                moveIntoPlace(staged, source.pinnedFile());
+                return new CopyBody(new AssembledBody(source.pinnedFile(), body.size(), body.envelope()), digests.eTag(),
+                        copyChecksumAlgorithm == null ? effectiveChecksum : computedChecksum(digests, copyChecksumAlgorithm));
+            } catch (IOException error) {
+                throw new UncheckedIOException("Failed to prepare encrypted copy", error);
+            } finally {
+                if (staged != null) {
+                    deleteQuietly(staged, "encrypted copy staging file");
+                }
+            }
         }
         boolean needsETag = !SINGLE_PART_ETAG.matcher(stripSurroundingQuotes(object.getETag())).matches();
         S3Checksum.Calculator calculator = effectiveChecksum == null ? S3Checksum.calculator(copyChecksumAlgorithm) : null;
@@ -4962,6 +5114,12 @@ public class S3Service implements Resettable, ResourceProvider {
             upload.setCacheControl(objectOptions.getCacheControl());
             upload.setServerSideEncryption(encryption.algorithm());
             upload.setSseKmsKeyId(encryption.kmsKeyId());
+            if ("aws:kms".equals(encryption.algorithm())) {
+                try (S3KmsEncryption.Material material = kms().generate(bucket, key, encryption.kmsKeyId(), destination.getRegion())) {
+                    upload.setKmsEnvelope(material.envelope());
+                    upload.setSseKmsKeyId(material.envelope().keyArn());
+                }
+            }
             if (customerKey != null) {
                 upload.setSseCustomerAlgorithm(customerKey.algorithm());
                 upload.setSseCustomerKeyMd5(customerKey.keyMd5());
@@ -5025,6 +5183,17 @@ public class S3Service implements Resettable, ResourceProvider {
 
             // Each upload of a part gets its own storage, so a record and the bytes it describes are
             // published together and never change: a re-upload adds new bytes and drops the old ones.
+            byte[] stored = data;
+            S3KmsEnvelope envelope = null;
+            if ("aws:kms".equals(upload.getServerSideEncryption())) {
+                try (S3KmsEncryption.Material material = kms().nextBody(upload.getKmsEnvelope());
+                        InputStream encrypted = kms().encrypt(new ByteArrayInputStream(data), material)) {
+                    stored = encrypted.readAllBytes();
+                    envelope = material.envelope();
+                } catch (IOException error) {
+                    throw new UncheckedIOException("Failed to encrypt multipart part", error);
+                }
+            }
             String storageId = partNumber + "-" + UUID.randomUUID();
             if (inMemory) {
                 // A re-uploaded part number replaces its earlier part, so that part does not count.
@@ -5033,11 +5202,11 @@ public class S3Service implements Resettable, ResourceProvider {
                         .mapToLong(Part::getSize)
                         .sum();
                 requireFitsInMemory("Multipart upload " + uploadId, otherParts + data.length);
-                memoryMultipartStore.get(uploadId).put(storageId, data);
+                memoryMultipartStore.get(uploadId).put(storageId, stored);
             } else {
                 Path partPath = dataRoot.resolve(".multipart").resolve(uploadId).resolve(storageId);
                 try {
-                    Files.write(partPath, data, StandardOpenOption.CREATE_NEW);
+                    Files.write(partPath, stored, StandardOpenOption.CREATE_NEW);
                 } catch (IOException e) {
                     throw new UncheckedIOException("Failed to write multipart part", e);
                 }
@@ -5047,6 +5216,7 @@ public class S3Service implements Resettable, ResourceProvider {
             Part part = new Part(partNumber, eTag, data.length);
             part.setChecksum(S3Checksum.of(upload.getChecksumAlgorithm(), data));
             part.setStorageId(storageId);
+            part.setKmsEnvelope(envelope);
             Part replaced = upload.getParts().put(partNumber, part);
             if (replaced != null) {
                 discardPartBytes(uploadId, replaced);
@@ -5070,23 +5240,25 @@ public class S3Service implements Resettable, ResourceProvider {
                    UploadChecksums checksums,
                    String sseCustomerAlgorithm, String sseCustomerKey, String sseCustomerKeyMd5) {
         checksums.requireWellFormedContentMd5();
-        ChecksumAlgorithm declared = withMultipartOperationLock(bucket, uploadId, () -> {
+        MultipartUpload selectedUpload = withMultipartOperationLock(bucket, uploadId, () -> {
             MultipartUpload upload = getMultipartUpload(bucket, key, uploadId);
             if (partNumber < 1 || partNumber > 10000) {
                 throw PartRange.invalidPartNumber(Integer.toString(partNumber));
             }
             validateSseCustomerAccess(upload, sseCustomerAlgorithm, sseCustomerKey, sseCustomerKeyMd5);
-            return upload.getChecksumAlgorithm();
+            return upload;
         });
         if (inMemory) {
             byte[] data = readVerified(body, checksums, "Multipart upload " + uploadId, -1, null).data();
             return storePart(bucket, key, uploadId, partNumber, data,
                     sseCustomerAlgorithm, sseCustomerKey, sseCustomerKeyMd5);
         }
+        ChecksumAlgorithm declared = selectedUpload.getChecksumAlgorithm();
         ChecksumAlgorithm algorithm = declared != null ? declared : ChecksumAlgorithm.CRC64NVME;
         DigestingInputStream digests = new DigestingInputStream(body,
                 digestAlgorithms(checksums, algorithm), MAX_PART_SIZE);
-        Path staged = stageBody(digests);
+        AssembledBody stagedBody = stageEncryptedPart(digests, selectedUpload);
+        Path staged = stagedBody.file();
         try {
             checksums.verify(digests.md5(), digests::checksum);
             verifyChunkedTrailers(body, digests, checksums);
@@ -5104,6 +5276,7 @@ public class S3Service implements Resettable, ResourceProvider {
                 Part part = new Part(partNumber, digests.eTag(), digests.size());
                 part.setChecksum(partChecksum);
                 part.setStorageId(storageId);
+                part.setKmsEnvelope(stagedBody.envelope());
                 Part replaced = upload.getParts().put(partNumber, part);
                 if (replaced != null) {
                     discardPartBytes(uploadId, replaced);
@@ -5477,7 +5650,7 @@ public class S3Service implements Resettable, ResourceProvider {
                 }
 
                 ObjectBody body = inMemory
-                        ? new BytesBody(concatenateParts(uploadId, parts))
+                        ? new BytesBody(concatenateParts(uploadId, parts), upload.getKmsEnvelope())
                         : assembleParts(uploadId, parts);
                 S3Object object;
                 try {
@@ -5556,7 +5729,7 @@ public class S3Service implements Resettable, ResourceProvider {
      * Copies the in-memory bytes of {@code parts}, in order, into one array sized to the total
      * upload. The total is measured on the arrays being copied, so it holds whatever the records say.
      */
-    private byte[] concatenateParts(String uploadId, List<Part> parts) {
+    private byte[] concatenateUnencryptedParts(String uploadId, List<Part> parts) {
         Map<String, byte[]> memoryParts = memoryMultipartStore.getOrDefault(uploadId, Map.of());
         byte[][] partData = new byte[parts.size()][];
         long totalSize = 0;
@@ -5583,7 +5756,7 @@ public class S3Service implements Resettable, ResourceProvider {
      * whatever its size, and it happens before the bucket lock is taken. The file name is unique
      * per call, so two Completes racing on one upload never write the same file.
      */
-    private AssembledBody assembleParts(String uploadId, List<Part> parts) throws IOException {
+    private AssembledBody assembleUnencryptedParts(String uploadId, List<Part> parts) throws IOException {
         Path partsDir = dataRoot.resolve(".multipart").resolve(uploadId);
         Path assembled = partsDir.resolve("assembled-" + UUID.randomUUID());
         long totalSize = 0;
@@ -5601,6 +5774,108 @@ public class S3Service implements Resettable, ResourceProvider {
             throw e;
         }
         return new AssembledBody(assembled, totalSize);
+    }
+
+    private byte[] concatenateParts(String uploadId, List<Part> parts) {
+        if (!"aws:kms".equals(multipartUploads.get(uploadId).getServerSideEncryption())) {
+            return concatenateUnencryptedParts(uploadId, parts);
+        }
+        try (InputStream body = multipartBody(uploadId, parts)) {
+            return body.readAllBytes();
+        } catch (IOException error) {
+            throw new UncheckedIOException("Failed to read encrypted multipart parts", error);
+        }
+    }
+
+    /**
+     * Copies the part files, in order, into one file in the upload's directory for storeObject to
+     * move into place. The copy runs file to file, so the object never passes through the heap
+     * whatever its size, and it happens before the bucket lock is taken. The file name is unique
+     * per call, so two Completes racing on one upload never write the same file.
+     */
+    private AssembledBody assembleParts(String uploadId, List<Part> parts) throws IOException {
+        if (!"aws:kms".equals(multipartUploads.get(uploadId).getServerSideEncryption())) {
+            return assembleUnencryptedParts(uploadId, parts);
+        }
+        MultipartUpload upload = multipartUploads.get(uploadId);
+        if (upload == null) {
+            throw new AwsException("NoSuchUpload", "The specified multipart upload does not exist.", 404);
+        }
+        long size = parts.stream().mapToLong(Part::getSize).sum();
+        try (InputStream plaintext = multipartBody(uploadId, parts)) {
+            if ("aws:kms".equals(upload.getServerSideEncryption())) {
+                try (S3KmsEncryption.Material material = kms().nextBody(upload.getKmsEnvelope());
+                        InputStream encrypted = kms().encrypt(plaintext, material)) {
+                    return new AssembledBody(stageBody(encrypted), size, material.envelope());
+                }
+            }
+            return new AssembledBody(stageBody(plaintext), size);
+        }
+    }
+
+    private InputStream multipartBody(String uploadId, List<Part> parts) {
+        return new InputStream() {
+            private int index;
+            private InputStream current = InputStream.nullInputStream();
+            private boolean closed;
+
+            @Override
+            public int read() throws IOException {
+                byte[] one = new byte[1];
+                return read(one, 0, 1) < 0 ? -1 : Byte.toUnsignedInt(one[0]);
+            }
+
+            @Override
+            public int read(byte[] bytes, int offset, int length) throws IOException {
+                if (closed) {
+                    throw new IOException("Multipart body is closed");
+                }
+                if (length == 0) {
+                    return 0;
+                }
+                while (true) {
+                    int count = current.read(bytes, offset, length);
+                    if (count >= 0) {
+                        return count;
+                    }
+                    current.close();
+                    if (index == parts.size()) {
+                        return -1;
+                    }
+                    current = openStoredPart(uploadId, parts.get(index++));
+                }
+            }
+
+            @Override
+            public void close() throws IOException {
+                closed = true;
+                current.close();
+            }
+        };
+    }
+
+    private InputStream openStoredPart(String uploadId, Part part) throws IOException {
+        InputStream raw;
+        long expected = S3KmsEncryption.storedSize(part.getSize(), part.getKmsEnvelope());
+        if (inMemory) {
+            byte[] bytes = memoryMultipartStore.getOrDefault(uploadId, Map.of()).get(part.getStorageId());
+            if (bytes == null || bytes.length != expected) {
+                throw missingPartData(part);
+            }
+            raw = new ByteArrayInputStream(bytes);
+        } else {
+            Path file = dataRoot.resolve(".multipart").resolve(uploadId).resolve(part.getStorageId());
+            if (Files.size(file) != expected) {
+                throw missingPartData(part);
+            }
+            raw = Files.newInputStream(file);
+        }
+        try {
+            return part.getKmsEnvelope() == null ? raw : kms().decrypt(raw, part.getKmsEnvelope(), part.getSize());
+        } catch (RuntimeException error) {
+            raw.close();
+            throw error;
+        }
     }
 
     /**
@@ -8571,7 +8846,8 @@ public class S3Service implements Resettable, ResourceProvider {
         }
         // Prepared before any bucket monitor is taken, so reading a large source to hash it never
         // holds up other writes to either bucket.
-        CopyBody body = copyBody(copySource, effectiveChecksum, copyChecksumAlgorithm);
+        CopyBody body = copyBody(copySource, effectiveChecksum, copyChecksumAlgorithm,
+                destBucket, destKey, effectiveOptions);
 
         // Annotations travel with the copy by default (x-amz-annotation-directive COPY). They are
         // snapshotted before storeObject: a self-copy (same bucket and key) or a pre-versioning
