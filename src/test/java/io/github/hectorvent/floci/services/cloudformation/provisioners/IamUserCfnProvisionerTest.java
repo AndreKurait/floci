@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplate
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.model.AccessKey;
+import io.github.hectorvent.floci.services.iam.model.IamPolicy;
 import io.github.hectorvent.floci.services.iam.model.IamUser;
 import io.github.hectorvent.floci.testutil.IamInlinePolicyMock;
 import io.github.hectorvent.floci.testutil.IamServiceTestHelper;
@@ -24,6 +25,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.doThrow;
@@ -44,6 +46,11 @@ class IamUserCfnProvisionerTest {
     @BeforeEach
     void configureInlinePolicyChanges() {
         IamInlinePolicyMock.configure(iam);
+        when(iam.getPolicy(anyString())).thenAnswer(call -> {
+            IamPolicy policy = new IamPolicy();
+            policy.setArn(call.getArgument(0));
+            return policy;
+        });
     }
 
     private ProvisionContext ctx() {

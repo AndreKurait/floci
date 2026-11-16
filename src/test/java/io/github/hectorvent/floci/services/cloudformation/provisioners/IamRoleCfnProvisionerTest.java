@@ -6,8 +6,10 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.CloudFormationTemplateEngine;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.iam.model.IamPolicy;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.testutil.IamServiceTestHelper;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -50,6 +52,15 @@ class IamRoleCfnProvisionerTest {
     private final IamService iam = mock(IamService.class);
     private final IamRoleCfnProvisioner provisioner = new IamRoleCfnProvisioner(iam);
     private final ObjectMapper mapper = new ObjectMapper();
+
+    @BeforeEach
+    void configureManagedPolicyLookup() {
+        when(iam.getPolicy(anyString())).thenAnswer(call -> {
+            IamPolicy policy = new IamPolicy();
+            policy.setArn(call.getArgument(0));
+            return policy;
+        });
+    }
 
     private ProvisionContext ctx() {
         CloudFormationTemplateEngine engine = mock(CloudFormationTemplateEngine.class);
@@ -148,11 +159,12 @@ class IamRoleCfnProvisionerTest {
         StackResource r = resource();
         realProvisioner.provision(r, props("{\"RoleName\":\"app-role\",\"MaxSessionDuration\":7200}"), ctx());
         String originalId = realIam.getRole("app-role").getRoleId();
-        String policyArn = "arn:aws:iam::" + ACCOUNT_ID + ":policy/missing";
+        String policyArn = realIam.createPolicy("disappearing", "/", null, EMPTY_TRUST, Map.of()).getArn();
         doAnswer(invocation -> {
+            realIam.deletePolicy(policyArn);
             realIam.deleteRole("app-role");
             realIam.createRole("app-role", "/", EMPTY_TRUST, "new owner", 21600, Map.of());
-            throw new AwsException("NoSuchEntity", "policy missing", 404);
+            return invocation.callRealMethod();
         }).when(realIam).attachRolePolicy("app-role", policyArn);
 
         AwsException failure = assertThrows(AwsException.class, () -> realProvisioner.provision(r,

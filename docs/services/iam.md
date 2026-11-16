@@ -24,6 +24,13 @@ establish complete authentication for those alternative transports. Contested pa
 the existing signed-service routing rules; an unsigned path can deliberately resolve to S3.
 Disabling IAM enforcement preserves local unsigned management access.
 
+## AWS managed policy identifiers
+
+AWS managed policy resource paths and names resolve without regard to letter case.
+Responses retain the catalog's canonical ARN and policy name. Attachments and
+permissions boundaries use that same identity, so alternate spellings do not create
+duplicate attachments or prevent removal. Unknown policies still return `NoSuchEntity`.
+
 ## AWS Sign-In login credentials
 
 Floci also implements the AWS Sign-In data-plane flow used by the AWS CLI login credentials
