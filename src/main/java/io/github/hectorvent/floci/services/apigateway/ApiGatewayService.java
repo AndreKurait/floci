@@ -25,6 +25,7 @@ import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.acm.AcmCertificateReferenceProvider.CertificateReference;
 import io.github.hectorvent.floci.services.apigateway.model.Account;
 import io.github.hectorvent.floci.services.apigateway.model.ApiGatewayResource;
 import io.github.hectorvent.floci.services.apigateway.model.ApiKey;
@@ -2718,6 +2719,34 @@ public class ApiGatewayService implements ResourceProvider, PassedRoleLookup {
      */
     public static String domainNameArn(String region, String domainName) {
         return AwsArnUtils.Arn.of("apigateway", region, "", "/domainnames/" + domainName).toString();
+    }
+
+    /**
+     * The certificates the caller's custom domains (REST and HTTP APIs, edge-optimized and regional) use,
+     * each with the domain's ARN, for ACM's {@code InUseBy}.
+     */
+    public List<CertificateReference> acmCertificateReferences() {
+        List<CertificateReference> references = new ArrayList<>();
+        for (String key : domainStore.keys()) {
+            int separator = key.indexOf("::");
+            if (separator <= 0) {
+                continue;
+            }
+            String region = key.substring(0, separator);
+            domainStore.get(key).ifPresent(domain -> {
+                String domainArn = domainNameArn(region, domain.getDomainName());
+                addCertificateReference(references, domain.getCertificateArn(), domainArn);
+                addCertificateReference(references, domain.getRegionalCertificateArn(), domainArn);
+            });
+        }
+        return references;
+    }
+
+    private static void addCertificateReference(List<CertificateReference> references, String certificateArn,
+                                                String resourceArn) {
+        if (certificateArn != null && !certificateArn.isBlank()) {
+            references.add(new CertificateReference(certificateArn, resourceArn));
+        }
     }
 
     public CustomDomain createDomainName(String region, Map<String, Object> request) {

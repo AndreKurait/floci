@@ -12,6 +12,7 @@ import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.acm.AcmCertificateReferenceProvider.CertificateReference;
 import io.github.hectorvent.floci.services.opensearch.model.AdvancedSecurityOptions;
 import io.github.hectorvent.floci.services.opensearch.model.ClusterConfig;
 import io.github.hectorvent.floci.services.opensearch.model.Domain;
@@ -351,6 +352,23 @@ public class OpenSearchService implements ResourceProvider {
         domainStore.deleteForAccount(regionResolver.getAccountId(), storageKey(region, domainName));
         LOG.infov("Deleted OpenSearch domain: {0}", domainName);
         return domain;
+    }
+
+    /** The certificates the caller's domains serve their custom endpoints with, for ACM's {@code InUseBy}. */
+    public List<CertificateReference> acmCertificateReferences() {
+        List<CertificateReference> references = new ArrayList<>();
+        for (Domain domain : domainStore.scan(k -> true)) {
+            DomainEndpointOptions endpoint = domain.getDomainEndpointOptions();
+            if (domain.isDeleted() || domain.getArn() == null || endpoint == null
+                    || !endpoint.isCustomEndpointEnabled()) {
+                continue;
+            }
+            String certificateArn = endpoint.getCustomEndpointCertificateArn();
+            if (certificateArn != null && !certificateArn.isBlank()) {
+                references.add(new CertificateReference(certificateArn, domain.getArn()));
+            }
+        }
+        return references;
     }
 
     public void addTags(String arn, Map<String, String> tags) {

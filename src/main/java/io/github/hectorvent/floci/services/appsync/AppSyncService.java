@@ -12,6 +12,7 @@ import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.acm.AcmCertificateReferenceProvider.CertificateReference;
 import io.github.hectorvent.floci.services.appsync.graphql.SchemaCreationWorker;
 import io.github.hectorvent.floci.services.appsync.graphql.SchemaRegistry;
 import io.github.hectorvent.floci.services.appsync.graphql.auth.LambdaAuthorizerCache;
@@ -803,6 +804,21 @@ public class AppSyncService {
         associationStore.get(domainName).ifPresent(apiId -> assertSchemaNotBusy(apiId));
         associationStore.delete(domainName);
         domainStore.delete(domainName);
+    }
+
+    /**
+     * The certificates the custom domains use, each with the domain's ARN, for ACM's {@code InUseBy}. It reads
+     * the store without this service's lock, as ACM calls it while holding its own.
+     */
+    public List<CertificateReference> acmCertificateReferences() {
+        List<CertificateReference> references = new ArrayList<>();
+        for (DomainName domain : domainStore.scan(k -> true)) {
+            String certificateArn = domain.getCertificateArn();
+            if (certificateArn != null && !certificateArn.isBlank() && domain.getDomainNameArn() != null) {
+                references.add(new CertificateReference(certificateArn, domain.getDomainNameArn()));
+            }
+        }
+        return references;
     }
 
     public synchronized ApiAssociation associateApi(String domainName, String apiId) {

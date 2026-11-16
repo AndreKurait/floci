@@ -67,8 +67,11 @@ public class AcmEventPublisher {
         }
     }
 
-    /** {@code cert} has become available for use through {@code action}, as of {@code now}. */
-    void available(Certificate cert, Action action, Instant now) {
+    /**
+     * {@code cert} has become available for use through {@code action}, as of {@code now}; {@code inUse} is
+     * whether a resource uses it (its {@code InUseBy} is not empty).
+     */
+    void available(Certificate cert, Action action, Instant now, boolean inUse) {
         ObjectNode detail = objectMapper.createObjectNode().put("Action", action.name())
                 .put("CertificateType", cert.getType().name());
         identity(detail, cert);
@@ -83,7 +86,7 @@ public class AcmEventPublisher {
             detail.put("CertificateExpirationDate", TIME.format(cert.getNotAfter()))
                     .put("DaysToExpiry", daysToExpiry(cert, now));
         }
-        detail.put("InUse", !cert.getInUseBy().isEmpty()).put("Exported", cert.isExported());
+        detail.put("InUse", inUse).put("Exported", cert.isExported());
         publish(AVAILABLE, detail, cert.getArn());
     }
 
@@ -94,8 +97,8 @@ public class AcmEventPublisher {
         publish(APPROACHING_EXPIRATION, detail, cert.getArn());
     }
 
-    /** {@code cert}, issued by ACM, has expired. */
-    void expired(Certificate cert) {
+    /** {@code cert}, issued by ACM, has expired; {@code inUse} is whether a resource still uses it. */
+    void expired(Certificate cert, boolean inUse) {
         ObjectNode detail = objectMapper.createObjectNode().put("CertificateType", cert.getType().name());
         identity(detail, cert);
         if (cert.getType() == CertificateType.AMAZON_ISSUED && cert.getValidationMethod() != null) {
@@ -107,7 +110,7 @@ public class AcmEventPublisher {
         if (cert.getNotAfter() != null) {
             detail.put("CertificateExpirationDate", TIME.format(cert.getNotAfter()));
         }
-        detail.put("InUse", !cert.getInUseBy().isEmpty()).put("Exported", cert.isExported());
+        detail.put("InUse", inUse).put("Exported", cert.isExported());
         publish(EXPIRED, detail, cert.getArn());
     }
 

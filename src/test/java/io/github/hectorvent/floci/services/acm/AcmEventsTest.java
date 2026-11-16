@@ -146,6 +146,24 @@ class AcmEventsTest {
     }
 
     @Test
+    @SuppressWarnings("unchecked")
+    void anAvailableEventReportsWhetherAResourceUsesTheCertificate() throws Exception {
+        Certificate cert = privateCertificate();
+        AcmCertificateReferenceProvider consumer = mock(AcmCertificateReferenceProvider.class);
+        when(consumer.acmCertificateReferences()).thenReturn(List.of(new AcmCertificateReferenceProvider
+                .CertificateReference(cert.getArn(), "arn:aws:es:us-east-1:123456789012:domain/search")));
+        Instance<AcmCertificateReferenceProvider> consumers = mock(Instance.class);
+        when(consumers.iterator()).thenAnswer(call -> List.of(consumer).iterator());
+        acm.referenceProviders = consumers;
+
+        acm.renewCertificate(cert.getArn(), REGION);
+
+        List<JsonNode> available = events(AcmEventPublisher.AVAILABLE, cert.getArn());
+        assertFalse(available.get(0).path("InUse").asBoolean(true), "nothing used it when it was issued");
+        assertTrue(available.get(1).path("InUse").asBoolean(), "a resource uses it when it is renewed");
+    }
+
+    @Test
     void anImportAndAReimportAreAnnouncedAsAvailable() throws Exception {
         CertificateGenerator.GeneratedCertificate first =
                 localCa.issueServerCertificate("imported.example.com", List.of(), KeyAlgorithm.RSA_2048, null);

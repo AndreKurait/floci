@@ -124,7 +124,8 @@ public class AcmExpiryScheduler {
             String identity = cert.getArn() + "@" + cert.getNotAfter();
             if (!now.isBefore(cert.getNotAfter())) {
                 if (cert.getType() != CertificateType.IMPORTED && issued(cert) && expired.add(identity)) {
-                    events.expired(cert);
+                    events.expired(cert, RequestScopes.callAs(entry.accountId(), entry.region(),
+                            () -> !service.certificateInUseBy(cert).isEmpty()));
                 }
                 continue;
             }
