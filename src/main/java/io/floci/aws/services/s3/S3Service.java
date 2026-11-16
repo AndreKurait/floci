@@ -3186,7 +3186,8 @@ public class S3Service implements Resettable, ResourceProvider {
         if (source.pinnedFile() == null) {
             return new CopyBody(new BytesBody(object.getData()), null, effectiveChecksum);
         }
-        Bucket bucket = requireBucket(destinationBucket);
+        Bucket bucket = resolveBucket(destinationBucket)
+                .orElseThrow(() -> new AwsException("NoSuchBucket", "The specified bucket does not exist.", 404));
         S3ObjectEncryption encryption = S3ObjectEncryption.resolve(bucket.getEncryptionConfiguration(),
                 options.getServerSideEncryption(), options.getSseKmsKeyId(), options.getSseCustomerKey() != null);
         if ("aws:kms".equals(object.getServerSideEncryption()) || "aws:kms".equals(encryption.algorithm())) {
@@ -8847,7 +8848,9 @@ public class S3Service implements Resettable, ResourceProvider {
                 ? effectiveOptions.getCacheControl()
                 : source.getCacheControl();
         S3ObjectEncryption destinationEncryption = S3ObjectEncryption.resolve(
-                requireBucket(destBucket).getEncryptionConfiguration(), normalizedServerSideEncryption,
+                resolveBucket(destBucket)
+                        .orElseThrow(() -> new AwsException("NoSuchBucket", "The specified bucket does not exist.", 404))
+                        .getEncryptionConfiguration(), normalizedServerSideEncryption,
                 effectiveOptions.getSseKmsKeyId(), destinationCustomerKey != null);
         String effectiveServerSideEncryption = destinationEncryption.algorithm();
         String effectiveSseKmsKeyId = destinationEncryption.kmsKeyId();

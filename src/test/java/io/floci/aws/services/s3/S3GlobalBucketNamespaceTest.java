@@ -14,6 +14,9 @@ import io.floci.aws.services.s3.model.PutObjectOptions;
 import io.floci.aws.services.s3.model.S3Object;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Path;
 import java.time.Instant;
@@ -48,6 +51,33 @@ class S3GlobalBucketNamespaceTest {
     private static final String ACCOUNT_B = "000000000002";
 
     private final AtomicReference<String> caller = new AtomicReference<>(DEFAULT_ACCT);
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void copyToAnotherAccountsBucketPreservesDestinationOwnership(boolean memory, @TempDir Path directory) {
+        Instance<RequestContext> context = mutableContext();
+        AccountAwareStorageBackend<Bucket> buckets =
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), context, DEFAULT_ACCT);
+        AccountAwareStorageBackend<S3Object> objects =
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), context, DEFAULT_ACCT);
+        S3Service service = new S3Service(buckets, objects, directory, memory, true);
+        caller.set(ACCOUNT_A);
+        service.createBucket("copy-source", "us-east-1");
+        service.putObject("copy-source", "source", "cross-account copy".getBytes(UTF_8), "text/plain", Map.of());
+        caller.set(ACCOUNT_B);
+        service.createBucket("copy-destination", "us-east-1");
+        caller.set(ACCOUNT_A);
+        service.copyObject("copy-source", "source", "copy-destination", "copied");
+        assertArrayEquals("cross-account copy".getBytes(UTF_8),
+                service.getObject("copy-destination", "copied").getData());
+        assertArrayEquals("cross-account copy".getBytes(UTF_8),
+                service.getObject("copy-source", "source").getData());
+        assertEquals(1, objects.scanForAccount(ACCOUNT_B, key -> true).size());
+        assertEquals(1, objects.scanForAccount(ACCOUNT_A, key -> true).size());
+        caller.set(ACCOUNT_B);
+        assertEquals(List.of("copied"), service.listObjects("copy-destination", null, null, 100).stream()
+                .map(S3Object::getKey).toList());
+    }
 
     @Test
     void redshiftS3IntegrationSourceMustBelongToTheCallerEvenWithGlobalNamespace() {
