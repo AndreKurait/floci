@@ -66,7 +66,7 @@ class AthenaServiceTest {
         when(athena.mock()).thenReturn(false);
 
         service = new AthenaService(storageFactory, duckClient, glueService, s3Service,
-                config, vertx, ddlBuilder, mock(RegionResolver.class), mock(AthenaIcebergStatements.class));
+                config, vertx, ddlBuilder, new RegionResolver("us-east-1", "000000000000"), mock(AthenaIcebergStatements.class));
     }
 
     @AfterEach

@@ -28,13 +28,20 @@ public class AthenaJsonHandler {
     private final AthenaService athenaService;
     private final AthenaNamedQueryService namedQueryService;
     private final ObjectMapper mapper;
+    private final AthenaBatchQueryService batchQueryService;
 
     @Inject
     public AthenaJsonHandler(AthenaService athenaService, AthenaNamedQueryService namedQueryService,
-                              ObjectMapper mapper) {
+                              ObjectMapper mapper, AthenaBatchQueryService batchQueryService) {
         this.athenaService = athenaService;
         this.namedQueryService = namedQueryService;
         this.mapper = mapper;
+        this.batchQueryService = batchQueryService;
+    }
+
+    public AthenaJsonHandler(AthenaService athenaService, AthenaNamedQueryService namedQueryService,
+                              ObjectMapper mapper) {
+        this(athenaService, namedQueryService, mapper, new AthenaBatchQueryService(athenaService, null, mapper));
     }
 
     public Response handle(String action, JsonNode request, String region) throws Exception {
@@ -98,13 +105,14 @@ public class AthenaJsonHandler {
                 yield Response.ok(Map.of("QueryExecutionId", id)).build();
             }
             case "GetQueryExecution" -> {
-                String id = request.get("QueryExecutionId").asText();
-                QueryExecution execution = athenaService.getQueryExecution(id);
-                yield Response.ok(Map.of("QueryExecution", execution)).build();
+                String id = AthenaBatchQueryService.directIdentifier(request);
+                QueryExecution execution = athenaService.getQueryExecution(region, id);
+                yield Response.ok(Map.of("QueryExecution", batchQueryService.wireExecution(execution))).build();
             }
+            case "BatchGetQueryExecution" -> Response.ok(batchQueryService.batchGet(region, request)).build();
             case "GetQueryResults" -> {
-                String id = request.get("QueryExecutionId").asText();
-                ResultSet results = athenaService.getQueryResults(id);
+                String id = AthenaBatchQueryService.directIdentifier(request);
+                ResultSet results = athenaService.getQueryResults(region, id);
                 yield Response.ok(Map.of("ResultSet", results)).build();
             }
             case "ListQueryExecutions" -> {
@@ -124,7 +132,7 @@ public class AthenaJsonHandler {
                 yield Response.ok(response).build();
             }
             case "StopQueryExecution" -> {
-                athenaService.stopQueryExecution(request.get("QueryExecutionId").asText());
+                athenaService.stopQueryExecution(region, AthenaBatchQueryService.directIdentifier(request));
                 yield Response.ok(Map.of()).build();
             }
             case "GetWorkGroup" -> {
