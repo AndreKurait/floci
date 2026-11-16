@@ -295,51 +295,53 @@ public class EcrService implements ResourceProvider {
             return;
         }
         int recreated = 0;
-        for (String registryRepositoryName : catalog) {
+        for (String physical : catalog) {
             String defaultAccount = regionResolver.getAccountId();
             String defaultRegion = regionResolver.getDefaultRegion();
-            String legacyKey = key(defaultRegion, defaultAccount, registryRepositoryName);
-            Optional<Repository> legacyRepository = repoStore.get(legacyKey);
-            if (legacyRepository.isPresent()) {
-                Repository repo = legacyRepository.get();
-                repo.setRepositoryUri(registryManager.getRepositoryUri(
-                        defaultAccount, defaultRegion, repo.getRepositoryName()));
-                repo.setRegistryRepositoryName(registryRepositoryName);
-                repoStore.put(legacyKey, repo);
-                continue;
-            }
-            String[] parts = registryRepositoryName.split("/", 3);
-            boolean namespaced = parts.length == 3 && parts[0].matches("[0-9]{12}")
+            boolean legacy = catalogRepository(physical, defaultAccount, defaultRegion).isPresent();
+            String[] parts = physical.split("/", 3);
+            boolean namespaced = !legacy && parts.length == 3 && parts[0].matches("[0-9]{12}")
                     && parts[1].matches("[a-z0-9-]+");
             String account = namespaced ? parts[0] : defaultAccount;
             String region = namespaced ? parts[1] : defaultRegion;
-            String repoName = namespaced ? parts[2] : registryRepositoryName;
-            String key = key(region, account, repoName);
-            Optional<Repository> existing = repoStore.get(key);
-            if (existing.isPresent()) {
-                Repository repo = existing.get();
-                repo.setRepositoryUri(registryManager.getRepositoryUri(account, region, repoName));
-                if (!namespaced) {
-                    repo.setRegistryRepositoryName(registryRepositoryName);
+            String name = namespaced ? parts[2] : physical;
+            String logical = key(region, account, name);
+            synchronized (registryLocks.computeIfAbsent(region + "::" + account, ignored -> new Object())) {
+                Optional<Repository> existing = catalogRepository(name, account, region);
+                Repository repository = existing.orElseGet(Repository::new);
+                if (existing.isEmpty()) {
+                    repository.setRepositoryName(name);
+                    repository.setRegistryId(account);
+                    repository.setRepositoryArn(AwsArnUtils.Arn.of("ecr", region, account,
+                            "repository/" + name).toString());
+                    repository.setCreatedAt(Instant.now());
+                    recreated++;
                 }
-                repoStore.put(key, repo);
-                continue;
+                repository.setRepositoryUri(registryManager.getRepositoryUri(account, region, name));
+                if (!namespaced) {
+                    repository.setRegistryRepositoryName(physical);
+                }
+                if (repoStore instanceof AccountAwareStorageBackend<Repository> aware) {
+                    aware.putAllAtomicallyForAccount(account, Map.of(logical, repository));
+                } else {
+                    repoStore.put(logical, repository);
+                }
             }
-            Repository repo = new Repository();
-            repo.setRepositoryName(repoName);
-            repo.setRegistryId(account);
-            repo.setRepositoryArn(AwsArnUtils.Arn.of("ecr", region, account, "repository/" + repoName).toString());
-            repo.setRepositoryUri(registryManager.getRepositoryUri(account, region, repoName));
-            if (!namespaced) {
-                repo.setRegistryRepositoryName(registryRepositoryName);
-            }
-            repo.setCreatedAt(Instant.now());
-            repoStore.put(key, repo);
-            recreated++;
         }
         if (recreated > 0) {
             LOG.infov("Reconciled {0} ECR repository metadata entries from registry catalog", recreated);
         }
+    }
+
+    private Optional<Repository> catalogRepository(String name, String account, String region) {
+        String logical = key(region, account, name);
+        Optional<Repository> selected = registryRepository(name, account, region);
+        if (selected.isEmpty() && repoStore instanceof AccountAwareStorageBackend<Repository> aware) {
+            selected = aware.getLegacyForAccount(account, logical);
+        }
+        String expectedArn = AwsArnUtils.Arn.of("ecr", region, account, "repository/" + name).toString();
+        return selected.filter(repository -> account.equals(repository.getRegistryId())
+                && name.equals(repository.getRepositoryName()) && expectedArn.equals(repository.getRepositoryArn()));
     }
 
     // ============================================================
