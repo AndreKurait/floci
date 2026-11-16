@@ -39,6 +39,7 @@ import io.github.hectorvent.floci.services.iam.model.IamUser;
 import io.github.hectorvent.floci.services.kinesis.KinesisService;
 import io.github.hectorvent.floci.services.lambda.LambdaRuntimeManagementService;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
+import io.github.hectorvent.floci.services.kms.KmsGrantConditions;
 import io.github.hectorvent.floci.services.lambdaweb.LambdaWebService;
 import io.github.hectorvent.floci.services.memorydb.MemoryDbParameterGroupService;
 import io.github.hectorvent.floci.services.memorydb.MemoryDbParameterGroupTarget;
@@ -409,6 +410,8 @@ public class IamConditionContextResolver {
             if (entry.getValue().isTextual()) {
                 keys.add(entry.getKey());
                 conditions.put("kms:EncryptionContext:" + entry.getKey(), List.of(entry.getValue().textValue()));
+                conditions.put(KmsGrantConditions.encryptionContextKey(entry.getKey()),
+                        List.of(entry.getValue().textValue()));
             }
         });
         if (!keys.isEmpty()) {

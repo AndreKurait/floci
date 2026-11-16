@@ -16,6 +16,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.kms.KmsClient;
+import software.amazon.awssdk.services.kms.model.GrantConstraints;
 import software.amazon.awssdk.services.kms.model.KmsException;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.ChecksumAlgorithm;
@@ -257,6 +258,43 @@ class S3KmsEnvelopeSdkIntegrationTest {
                         .serverSideEncryption(ServerSideEncryption.AWS_KMS), RequestBody.fromString("managed body"));
         assertEquals("managed body", caller.getObjectAsBytes(request -> request.bucket(bucket).key("managed"))
                 .asUtf8String());
+    }
+
+    @Test
+    void nativeGrantContextEqualsKeysAreCaseSensitive() {
+        verifyGrantContextKeyCase(true);
+    }
+
+    @Test
+    void nativeGrantContextSubsetKeysAreCaseSensitive() {
+        verifyGrantContextKeyCase(false);
+    }
+
+    private void verifyGrantContextKeyCase(boolean equals) {
+        String principal = iam.getUser(user).getArn();
+        kms.putKeyPolicy(request -> request.keyId(keyArn).policyName("default").policy("""
+                {"Version":"2012-10-17","Statement":[]}
+                """).bypassPolicyLockoutSafetyCheck(true));
+        GrantConstraints constraints = equals
+                ? GrantConstraints.builder().encryptionContextEquals(Map.of("Tenant", "allowed")).build()
+                : GrantConstraints.builder().encryptionContextSubset(Map.of("Tenant", "allowed")).build();
+        kms.createGrant(request -> request.keyId(keyArn).granteePrincipal(principal)
+                .operationsWithStrings("GenerateDataKey").constraints(constraints));
+        try (KmsClient direct = AwsTestClients.create(KmsClient.builder(), access.getAccessKeyId(),
+                access.getSecretAccessKey(), Region.US_EAST_1, endpoint)) {
+            assertThrows(KmsException.class, () -> direct.generateDataKey(request -> request.keyId(keyArn)
+                    .keySpec("AES_256").encryptionContext(Map.of("tenant", "allowed"))));
+            assertEquals(32, direct.generateDataKey(request -> request.keyId(keyArn).keySpec("AES_256")
+                    .encryptionContext(Map.of("Tenant", "allowed"))).plaintext().asByteArray().length);
+            Map<String, String> distinctKeys = Map.of("Tenant", "allowed", "tenant", "different");
+            if (equals) {
+                assertThrows(KmsException.class, () -> direct.generateDataKey(request -> request.keyId(keyArn)
+                        .keySpec("AES_256").encryptionContext(distinctKeys)));
+            } else {
+                assertEquals(32, direct.generateDataKey(request -> request.keyId(keyArn).keySpec("AES_256")
+                        .encryptionContext(distinctKeys)).plaintext().asByteArray().length);
+            }
+        }
     }
 
     @Test

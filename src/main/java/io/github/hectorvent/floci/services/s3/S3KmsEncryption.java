@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.IamEnforcementFilter;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestContext;
+import io.github.hectorvent.floci.services.kms.KmsGrantConditions;
 import io.github.hectorvent.floci.services.kms.KmsService;
 import io.github.hectorvent.floci.services.s3.model.S3KmsEnvelope;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -132,6 +133,7 @@ public class S3KmsEncryption {
         context.put("kms:EncryptionContextKeys", List.copyOf(encryptionContext.keySet()));
         for (Map.Entry<String, String> entry : encryptionContext.entrySet()) {
             context.put("kms:EncryptionContext:" + entry.getKey(), List.of(entry.getValue()));
+            context.put(KmsGrantConditions.encryptionContextKey(entry.getKey()), List.of(entry.getValue()));
         }
         authorization.authorizeDelegatedResource(action, keyArn, context);
     }
