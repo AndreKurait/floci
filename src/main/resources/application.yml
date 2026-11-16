@@ -305,6 +305,8 @@ floci:
         flush-interval-ms: 5000
       emrserverless:
         flush-interval-ms: 5000
+      emrcontainers:
+        flush-interval-ms: 5000
       lakeformation:
         flush-interval-ms: 5000
 
@@ -927,6 +929,12 @@ floci:
       mock: false
       backend-keep-alive: true
       backend-keep-alive-timeout-seconds: 60
+
+      alb-zone-rule: ${FLOCI_SERVICES_ELBV2_ALB_ZONE_RULE:aws}
+      # Per-region entries override this global setting, including an explicit aws reset.
+      # alb-zone-rule-by-region:
+      #   ap-northeast-3: allow-single-zone
+      #   us-east-1: allow-single-zone
     codebuild:
       enabled: true
       # docker-network: floci-network
@@ -1078,6 +1086,9 @@ floci:
       # Remove the drivers and executors a previous run of this deployment left on the daemon before
       # the first job run starts. Scoped to this deployment's own containers.
       reconcile-containers-on-startup: true
+    emrcontainers:
+      enabled: true
+      job-run-duration-seconds: 0   # 0 = a job run completes as soon as it is submitted
     ssoadmin:
       enabled: true
     ssooidc:
