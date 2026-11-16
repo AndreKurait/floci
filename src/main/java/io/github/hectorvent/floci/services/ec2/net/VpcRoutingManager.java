@@ -237,7 +237,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         // Internal bridges cannot carry the routed API destination, so retain their managed transport.
         String apiNetwork = internal ? transportNetwork : nativeNetwork;
         endpoint.publicAddress = new NativePublicAddress(VpcRouteSelection.ipv4(publicIp),
-                transportNetwork, null, null, true, apiNetwork, null);
+                transportNetwork, null, null, true, apiNetwork, null, null);
         try {
             if (docker.inspectContainerCmd(helper).exec().getNetworkSettings().getNetworks().values().stream()
                     .noneMatch(value -> transportNetwork.equals(value.getNetworkID()))) {
@@ -245,8 +245,9 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
             }
             String transport = networkAddress(helper, transportNetwork);
             String publicDevice = deviceFor(helper, transport);
+            String nativeDevice = deviceFor(helper, publicIp);
             endpoint.publicAddress = new NativePublicAddress(publicIp, transportNetwork, publicDevice,
-                    transport, true, apiNetwork, internal ? publicDevice : deviceFor(helper, publicIp));
+                    transport, true, apiNetwork, internal ? publicDevice : nativeDevice, nativeDevice);
             reconcile();
         } catch (RuntimeException failure) {
             try {
@@ -678,10 +679,13 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
                 frontends.add(new VpcFrontendIngress(own.externalTransport, own.externalDevice, own.listeners, decisions));
             }
         }
+        VpcPublicInstanceIngress instanceIngress = nativeAddress == null ? null : new VpcPublicInstanceIngress(
+                nativeAddress.address(), identity.logicalAddress(), nativeAddress.nativeDevice(),
+                VpcFrontendIngress.decisions(vpc, routes, topology.gateways));
         String script = VpcRoutingCommands.endpointWithFrontends(identity.logicalAddress(), endpoint.privateDevice,
                 local, hops, denied, endpoint.resolvers, identity.controlConnections(),
                 identity.instanceMetadataAllowed(), own == null ? null : own.device, inbound,
-                identity.controlListeners(), directApi, frontends);
+                identity.controlListeners(), directApi, frontends, instanceIngress);
         if (endpoint.publicAddress != null && endpoint.publicAddress.separateTransport()) {
             NativePublicAddress address = endpoint.publicAddress;
             script += VpcRoutingCommands.publicInstanceSources(identity.logicalAddress(), address.address(),
@@ -1044,7 +1048,8 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
     private record EndpointPolicy(Endpoint endpoint, String script) {}
 
     private record NativePublicAddress(String address, String network, String device, String transport,
-                                       boolean separateTransport, String apiNetwork, String apiDevice) {}
+                                       boolean separateTransport, String apiNetwork, String apiDevice,
+                                       String nativeDevice) {}
 
     private static final class Endpoint {
         final SecurityGroupNftCompiler.Endpoint identity;
