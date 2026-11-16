@@ -1,5 +1,6 @@
 package io.floci.aws.services.s3;
 
+import io.floci.aws.core.common.AccountResolver;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.AwsRegions;
@@ -128,8 +129,13 @@ public class S3KmsEncryption {
 
     private void authorize(String keyArn, String action, Map<String, String> encryptionContext, String region) {
         String accessKey = request.getAccessKeyId();
-        String account = accessKey == null ? regions.getAccountId()
-            : iam.resolveAccountId(accessKey).orElse(regions.getAccountId());
+        String account;
+        if (AccountResolver.isAccountId(accessKey)) {
+            account = accessKey;
+        } else {
+            account = accessKey == null ? regions.getAccountId()
+                    : iam.resolveAccountId(accessKey).orElse(regions.getAccountId());
+        }
         Map<String, List<String>> context = new HashMap<>();
         context.put("kms:ViaService", List.of("s3." + region + "." + AwsRegions.dnsSuffixFor(region)));
         context.put("kms:CallerAccount", List.of(account));

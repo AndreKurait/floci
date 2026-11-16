@@ -8,7 +8,7 @@ import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.kms.KmsService;
 import io.floci.aws.services.s3.model.S3KmsEnvelope;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.util.List;
 import java.util.Map;
@@ -25,11 +25,11 @@ import static org.mockito.Mockito.when;
 class S3KmsEncryptionCallerTest {
 
     @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void delegatedCheckUsesFormCallerAndRestoresBucketAccount(boolean denied) {
+    @CsvSource({"form-key, false", "form-key, true", "222222222222, false", "222222222222, true"})
+    void delegatedCheckUsesCallerAndRestoresBucketAccount(String accessKey, boolean denied) {
         RequestContext request = new RequestContext();
         request.setAccountId("111111111111");
-        request.setAccessKeyId("form-key");
+        request.setAccessKeyId(accessKey);
         request.setSessionToken("form-token");
         IamService iam = mock(IamService.class);
         when(iam.resolveAccountId("form-key")).thenReturn(Optional.of("222222222222"));
@@ -39,7 +39,7 @@ class S3KmsEncryptionCallerTest {
         S3KmsEnvelope envelope = new S3KmsEnvelope(1, arn, new byte[] {1}, Map.of(), new byte[8]);
         doAnswer(call -> {
             assertEquals("222222222222", request.getAccountId());
-            assertEquals("form-key", request.getAccessKeyId());
+            assertEquals(accessKey, request.getAccessKeyId());
             assertEquals("form-token", request.getSessionToken());
             Map<String, List<String>> context = call.getArgument(2);
             assertEquals(List.of("222222222222"), context.get("kms:CallerAccount"));
@@ -63,7 +63,7 @@ class S3KmsEncryptionCallerTest {
             }
         }
         assertEquals("111111111111", request.getAccountId());
-        assertEquals("form-key", request.getAccessKeyId());
+        assertEquals(accessKey, request.getAccessKeyId());
         assertEquals("form-token", request.getSessionToken());
     }
 }

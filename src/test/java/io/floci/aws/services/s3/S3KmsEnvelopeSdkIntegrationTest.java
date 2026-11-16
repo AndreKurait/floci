@@ -23,6 +23,9 @@ import software.amazon.awssdk.services.s3.model.ServerSideEncryption;
 
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
+import java.time.LocalDate;
+import java.time.ZoneOffset;
+import java.time.format.DateTimeFormatter;
 import java.util.Arrays;
 import java.util.Base64;
 import java.util.List;
@@ -30,6 +33,7 @@ import java.util.Map;
 import java.util.Random;
 import java.util.UUID;
 
+import static io.restassured.RestAssured.given;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -88,6 +92,45 @@ class S3KmsEnvelopeSdkIntegrationTest {
             s3.close();
             kms.close();
         }
+    }
+
+    @Test
+    void numericForeignCallerRetainsItsAccountForDelegatedKms() {
+        String foreignAccount = "222222222222";
+        String ownerAccount = keyArn.split(":")[4];
+        String credential = foreignAccount + "/" + LocalDate.now(ZoneOffset.UTC)
+                .format(DateTimeFormatter.BASIC_ISO_DATE) + "/us-east-1/s3/aws4_request";
+        s3.putBucketPolicy(request -> request.bucket(bucket).policy("""
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::%s:root"},
+                   "Action":["s3:PutObject","s3:GetObject"],"Resource":"arn:aws:s3:::%s/*"}]}
+                """.formatted(foreignAccount, bucket)));
+        String policy = """
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::%s:root"},
+                   "Action":"kms:*","Resource":"*"},
+                  {"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::%s:root"},
+                   "Action":["kms:GenerateDataKey","kms:Decrypt"],"Resource":"*",
+                   "Condition":{"StringEquals":{"kms:CallerAccount":"%s"}}}]}
+                """;
+        kms.putKeyPolicy(request -> request.keyId(keyArn).policyName("default")
+                .policy(policy.formatted(ownerAccount, foreignAccount, foreignAccount)));
+        s3.putBucketEncryption(request -> request.bucket(bucket).serverSideEncryptionConfiguration(configuration ->
+                configuration.rules(rule -> rule.applyServerSideEncryptionByDefault(defaults ->
+                        defaults.sseAlgorithm(ServerSideEncryption.AWS_KMS).kmsMasterKeyID(keyArn)))));
+        given().multiPart("key", "numeric")
+                .multiPart("x-amz-credential", credential)
+                .multiPart("file", "upload.txt", "numeric caller".getBytes(StandardCharsets.UTF_8), "text/plain")
+                .when().post(endpoint.resolve(bucket)).then().statusCode(204);
+        assertEquals("numeric caller", s3.getObjectAsBytes(request -> request.bucket(bucket)
+                .key("numeric")).asUtf8String());
+        kms.putKeyPolicy(request -> request.keyId(keyArn).policyName("default")
+                .policy(policy.formatted(ownerAccount, foreignAccount, "333333333333")));
+        given().multiPart("key", "denied-numeric")
+                .multiPart("x-amz-credential", credential)
+                .multiPart("file", "upload.txt", "denied".getBytes(StandardCharsets.UTF_8), "text/plain")
+                .when().post(endpoint.resolve(bucket)).then().statusCode(403);
+        assertEquals(1, s3.listObjectsV2(request -> request.bucket(bucket)).keyCount());
     }
 
     @Test
