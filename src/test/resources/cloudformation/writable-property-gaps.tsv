@@ -236,6 +236,9 @@ AWS::EC2::VPCEndpoint	ResourceConfigurationArn	accepted and ignored
 AWS::EC2::VPCEndpoint	ServiceNetworkArn	accepted and ignored
 AWS::EC2::VPCEndpoint	ServiceRegion	accepted and ignored
 AWS::EC2::VPCEndpoint	Tags	accepted and ignored
+AWS::EC2::VPCEndpointService	ContributorInsightsEnabled	accepted and ignored: Floci keeps no Contributor Insights rules
+AWS::EC2::VPCEndpointService	PayerResponsibility	accepted and ignored: Floci does not bill endpoints
+AWS::EC2::VPCEndpointService	PrivateDnsNameConfiguration	read-only members only; Floci generates them from PrivateDnsName
 AWS::ECR::Repository	EmptyOnDelete	accepted and ignored
 AWS::ECR::Repository	EncryptionConfiguration	accepted and ignored
 AWS::ECR::Repository	ImageScanningConfiguration	accepted and ignored
