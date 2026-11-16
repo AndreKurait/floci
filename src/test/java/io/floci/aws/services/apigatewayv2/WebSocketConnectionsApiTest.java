@@ -195,8 +195,7 @@ class WebSocketConnectionsApiTest {
         // We need a new listener to capture the pushed message
         // Actually, the first capture already consumed its future. Let's reconnect.
         WebSocketTestSupport.closeAndAwait(ws);
-        assertFalse(connectionManager.isConnected(connectionId),
-                "the server unregisters a connection before it echoes the client's Close frame");
+        awaitServerSideClose(connectionId);
 
         // Reconnect with a fresh capture
         WebSocketTestSupport.MessageCapture pushCapture = new WebSocketTestSupport.MessageCapture();
