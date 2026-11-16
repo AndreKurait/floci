@@ -256,6 +256,8 @@ class Ec2ContainerManagerTest {
                 time.advance(Duration.ofMillis(999));
                 assertEquals(1, removals.get(), "The first retry waits a full second");
                 assertEquals(1, completed.getCount());
+                // A failed peer refresh is retried; the instance it no longer holds is terminated meanwhile.
+                assertEquals(peerRefreshFailure ? "terminated" : "shutting-down", instance.getState().getName());
                 time.advance(Duration.ofMillis(1));
             }
             assertTrue(completed.await(5, TimeUnit.SECONDS), "Container teardown must finish");
@@ -266,8 +268,86 @@ class Ec2ContainerManagerTest {
             assertEquals(transientFailure ? 2 : 1, removals.get());
             // A retry retains successful workload removal and its completed half-second teardown pause.
             assertEquals(TestTime.DEFAULT_START.plusMillis(retried ? 1_500 : 500), time.now());
-            assertEquals(time.clock().millis(), instance.getTerminatedAt());
+            // Terminated once its container was established gone, not when the peer refresh finished.
+            assertEquals(TestTime.DEFAULT_START.plusMillis(transientFailure ? 1_500 : 500).toEpochMilli(),
+                    instance.getTerminatedAt());
         } finally {
+            manager.stop();
+        }
+    }
+
+    @Test
+    void aSlowPeerRefreshNoLongerHoldsTheInstanceInShuttingDownButStillHoldsItsAddress() throws Exception {
+        DockerClient docker = mock(DockerClient.class);
+        SecurityGroupFirewallManager firewall = mock(SecurityGroupFirewallManager.class);
+        when(firewall.enabled()).thenReturn(true);
+        ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.port()).thenReturn(4566);
+        when(config.docker().resourceNamespace()).thenReturn(Optional.empty());
+        VpcNetworkManager vpc = mock(VpcNetworkManager.class);
+        TestTime time = TestTime.create();
+        Ec2ContainerManager manager = new Ec2ContainerManager(
+                mock(ContainerBuilder.class), lifecycle,
+                mock(ContainerLogStreamer.class), mock(ContainerDetector.class),
+                mock(DockerHostResolver.class), docker, mock(PortAllocator.class), config,
+                mock(Ec2MetadataServer.class), mock(Ec2PortForwardManager.class), mock(RegionResolver.class),
+                mock(ContainerNetworkReachability.class), vpc,
+                mock(ContainerReachableEndpoint.class), firewall, new Ec2InstanceTypeCatalog(),
+                timelinePause(time), time.newScheduler(), time::nanoTime, time.clock());
+        Instance instance = leasedInstance("i-slow-peer-refresh");
+        instance.setDockerContainerId(TEST_CONTAINER_ID);
+        InstanceNetworkInterface eni = new InstanceNetworkInterface();
+        eni.setNetworkInterfaceId("eni-slow-peer-refresh");
+        instance.setNetworkInterfaces(new ArrayList<>(List.of(eni)));
+        RemoveContainerCmd remove = mock(RemoveContainerCmd.class, RETURNS_SELF);
+        when(docker.removeContainerCmd(TEST_CONTAINER_ID)).thenReturn(remove);
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        InspectContainerResponse inspected = inspectResponse("172.18.0.12");
+        when(inspected.getHostConfig()).thenReturn(
+                HostConfig.newHostConfig().withNetworkMode("container:" + TEST_HELPER_ID));
+        when(inspect.exec()).thenReturn(inspected);
+        when(docker.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        InspectContainerCmd inspectHelper = mock(InspectContainerCmd.class);
+        InspectContainerResponse helper = inspectResponse("172.18.0.12");
+        when(helper.getConfig()).thenReturn(new ContainerConfig().withLabels(Map.of(
+                "io.floci.security-group.helper", "true",
+                "io.floci.service", "ec2",
+                "io.floci.resource-id", instance.getInstanceId(),
+                "io.floci.owner", "4566")));
+        when(inspectHelper.exec()).thenReturn(helper);
+        when(docker.inspectContainerCmd(TEST_HELPER_ID)).thenReturn(inspectHelper);
+        CountDownLatch refreshing = new CountDownLatch(1);
+        CountDownLatch finishRefresh = new CountDownLatch(1);
+        when(firewall.captureUnregister("eni-slow-peer-refresh")).thenReturn(() -> {
+            refreshing.countDown();
+            try {
+                assertTrue(finishRefresh.await(10, TimeUnit.SECONDS));
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(interrupted);
+            }
+        });
+        CountDownLatch completed = new CountDownLatch(1);
+        try {
+            manager.terminate(instance, completed::countDown);
+            assertTrue(refreshing.await(5, TimeUnit.SECONDS), "The peer refresh must start");
+
+            // The container is gone, so the instance is terminated while its peers are still refreshed.
+            assertEquals("terminated", instance.getState().getName());
+            assertEquals(TestTime.DEFAULT_START.plusMillis(500).toEpochMilli(), instance.getTerminatedAt());
+            // Fail-closed: no peer may still admit its address once it is reused, so the address, the
+            // helper and the post-teardown hook that releases its interfaces wait for the refresh.
+            verify(vpc, never()).releasePrivateIp(any(), any(), any());
+            verify(lifecycle, never()).removeIfExistsStrict(TEST_HELPER_ID);
+            assertEquals(1, completed.getCount());
+
+            finishRefresh.countDown();
+            assertTrue(completed.await(5, TimeUnit.SECONDS), "Container teardown must finish");
+            verify(lifecycle).removeIfExistsStrict(TEST_HELPER_ID);
+            verify(vpc).releasePrivateIp("us-west-2", "subnet-lease", "10.0.1.10");
+        } finally {
+            finishRefresh.countDown();
             manager.stop();
         }
     }
@@ -2645,14 +2725,15 @@ class Ec2ContainerManagerTest {
             harness.manager.terminate(instance, completed::incrementAndGet);
             executor.submit(() -> { }).get(2, TimeUnit.SECONDS);
 
-            assertEquals("shutting-down", instance.getState().getName());
+            // The workload container is gone, so the instance is terminated; the helper removal that
+            // follows is retried, and the port and the callback still wait for it.
+            assertEquals("terminated", instance.getState().getName());
             assertEquals(0, completed.get());
             verify(harness.portAllocator, never()).release(2201);
 
             harness.time().advance(Duration.ofMillis(999));
             executor.submit(() -> { }).get(2, TimeUnit.SECONDS);
-            assertEquals("shutting-down", instance.getState().getName(), "The retry waits a full second");
-            assertEquals(0, completed.get());
+            assertEquals(0, completed.get(), "The retry waits a full second");
             verify(harness.lifecycleManager).removeIfExistsStrict(TEST_HELPER_ID);
 
             harness.time().advance(Duration.ofMillis(1));
