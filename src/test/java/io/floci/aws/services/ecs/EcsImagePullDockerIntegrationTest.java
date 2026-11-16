@@ -12,6 +12,7 @@ import com.github.dockerjava.api.model.Ports;
 import com.github.dockerjava.api.model.PushResponseItem;
 import io.floci.aws.services.ecs.model.ContainerDefinition;
 import io.floci.aws.services.ecs.model.EcsTask;
+import io.floci.aws.services.ecs.model.LaunchType;
 import io.floci.aws.services.ecs.model.NetworkMode;
 import io.floci.aws.services.ecs.model.TaskDefinition;
 import io.floci.aws.testing.TestImages;
@@ -145,7 +146,7 @@ class EcsImagePullDockerIntegrationTest {
 
     private EcsTask runTask(TaskDefinition taskDef) {
         EcsTask task = ecsService.runTask(clusterName, taskDef.getTaskDefinitionArn(), 1,
-                null, null, null, null, null, REGION).getFirst();
+                LaunchType.FARGATE, null, null, null, null, REGION).getFirst();
         taskArns.add(task.getTaskArn());
         // RunTask answers before the launch; wait for it to land the task RUNNING or STOPPED.
         EcsTask described = awaitLastStatus(

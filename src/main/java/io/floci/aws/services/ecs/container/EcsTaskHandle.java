@@ -17,12 +17,12 @@ public class EcsTaskHandle {
     /**
      * The grace period a container gets when its definition does not ask for one.
      *
-     * <p>ECS defaults to 30 seconds. Floci answers StopTask synchronously, and a container that
-     * ignores SIGTERM (anything running as PID 1 without a signal handler, which is most of them)
-     * would hold the caller for the whole period, so the implicit default stays short. A
-     * {@code stopTimeout} the task definition asks for is honoured as given.
+     * <p>30 seconds, as on ECS (the agent's {@code ECS_CONTAINER_STOP_TIMEOUT} default, and
+     * Fargate's). StopTask answers {@code STOPPING} at once and tears the task down afterwards, so
+     * the grace no longer holds the caller. A {@code stopTimeout} the task definition asks for is
+     * honoured as given.
      */
-    public static final int DEFAULT_STOP_TIMEOUT_SECONDS = 5;
+    public static final int DEFAULT_STOP_TIMEOUT_SECONDS = 30;
 
     private final String taskArn;
     private final Map<String, String> containerIds;   // containerName → dockerId
