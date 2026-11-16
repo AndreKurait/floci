@@ -129,15 +129,36 @@ public class CodeArtifactNpmDataPlane {
             return;
         }
 
-        String npmRepositoryId;
-        try {
-            npmRepositoryId = service.resolveContainerIdAndBeginUse("npm", scope.get().region(),
-                    npmRequest.domain(), scope.get().owner(), npmRequest.repository(), verdaccioClient);
-        } catch (AwsException | IllegalStateException e) {
-            context.response().setStatusCode(404).end();
-            return;
-        }
-        NpmUse use = new NpmUse(npmRepositoryId);
+        context.request().pause();
+        AtomicBoolean responseClosed = new AtomicBoolean();
+        context.response().closeHandler(ignored -> responseClosed.set(true));
+        AuthorizationTokenScope tokenScope = scope.get();
+        vertx.<String>executeBlocking(promise -> promise.complete(service.resolveContainerIdAndBeginUse(
+                "npm", tokenScope.region(), npmRequest.domain(), tokenScope.owner(), npmRequest.repository(),
+                verdaccioClient)), false).onComplete(admission -> {
+                    if (admission.failed()) {
+                        if (!responseClosed.get()) {
+                            context.request().resume();
+                            if (admission.cause() instanceof AwsException
+                                    || admission.cause() instanceof IllegalStateException) {
+                                context.response().setStatusCode(404).end();
+                            } else {
+                                context.fail(admission.cause());
+                            }
+                        }
+                        return;
+                    }
+                    NpmUse use = new NpmUse(admission.result());
+                    if (responseClosed.get() || context.response().closed()) {
+                        use.responseDone();
+                        return;
+                    }
+                    handleAdmitted(context, npmRequest, tokenScope, admission.result(), use);
+                });
+    }
+
+    private void handleAdmitted(RoutingContext context, NpmRequest npmRequest, AuthorizationTokenScope tokenScope,
+            String npmRepositoryId, NpmUse use) {
         AtomicReference<Runnable> cleanupOnClose = new AtomicReference<>(() -> { });
         context.response().endHandler(ignored -> use.responseDone());
         context.response().closeHandler(ignored -> {
@@ -156,7 +177,7 @@ public class CodeArtifactNpmDataPlane {
                 }
             });
             PreflightGate.Waiter waiter = preflights.acquire(() -> eventLoop.runOnContext(ignored ->
-                    handlePublish(context, npmRequest, npmRepositoryId, scope.get(), use, cleanupOnClose)));
+                    handlePublish(context, npmRequest, npmRepositoryId, tokenScope, use, cleanupOnClose)));
             if (waiter == null) {
                 context.request().resume();
                 context.response().putHeader("Retry-After", "1").setStatusCode(429).end();
@@ -169,8 +190,6 @@ public class CodeArtifactNpmDataPlane {
 
         context.request().pause();
         String repoId = npmRepositoryId;
-        AuthorizationTokenScope tokenScope = scope.get();
-
         Optional<PackageIdentity> packumentTarget = nativePackumentRequestTarget(context.request().method(),
                 npmRequest.rest());
         if (packumentTarget.isPresent()) {

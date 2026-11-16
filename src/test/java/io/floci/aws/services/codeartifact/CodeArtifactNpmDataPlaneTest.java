@@ -8,6 +8,7 @@ import io.floci.aws.core.common.ServiceConfigAccess;
 import io.floci.aws.core.common.docker.ContainerBuilder;
 import io.floci.aws.core.common.docker.ContainerLifecycleManager;
 import io.floci.aws.services.codeartifact.CodeArtifactService.AuthorizationTokenScope;
+import io.vertx.core.Context;
 import io.vertx.core.Future;
 import io.vertx.core.Vertx;
 import io.vertx.core.http.HttpClient;
@@ -153,6 +154,78 @@ class CodeArtifactNpmDataPlaneTest {
         HttpResponse response = get("/codeartifact/npm/" + DOMAIN + "/" + REPOSITORY + "/lodash", "not-a-real-token");
 
         assertEquals(401, response.statusCode());
+    }
+
+    @Test
+    void admissionDoesNotRunOnTheEventLoop() throws Exception {
+        CodeArtifactService service = mock(CodeArtifactService.class);
+        when(service.resolveAuthorizationToken("good-token", DOMAIN))
+                .thenReturn(Optional.of(new AuthorizationTokenScope("000000000000", "us-east-1")));
+        VerdaccioSidecarClient verdaccioClient = mock(VerdaccioSidecarClient.class);
+        startDataPlane(service, verdaccioClient);
+        AtomicReference<Boolean> eventLoop = new AtomicReference<>();
+        doAnswer(call -> {
+            eventLoop.set(Context.isOnEventLoopThread());
+            throw new AwsException("ResourceNotFoundException", "no such repository", 404);
+        }).when(service).resolveContainerIdAndBeginUse(eq("npm"), anyString(), anyString(), anyString(),
+                anyString(), eq(verdaccioClient));
+
+        assertEquals(404, get("/codeartifact/npm/" + DOMAIN + "/" + REPOSITORY + "/lodash",
+                "good-token").statusCode());
+        assertEquals(Boolean.FALSE, eventLoop.get());
+        verify(verdaccioClient, never()).endUse(anyString());
+    }
+
+    @Test
+    void disconnectDuringAdmissionReleasesTheAdmittedLease() throws Exception {
+        CodeArtifactService service = mock(CodeArtifactService.class);
+        when(service.resolveAuthorizationToken("good-token", DOMAIN))
+                .thenReturn(Optional.of(new AuthorizationTokenScope("000000000000", "us-east-1")));
+        VerdaccioSidecarClient verdaccioClient = mock(VerdaccioSidecarClient.class);
+        startDataPlane(service, verdaccioClient);
+        CountDownLatch admitted = new CountDownLatch(1);
+        CountDownLatch finishAdmission = new CountDownLatch(1);
+        CompletableFuture<Void> eventLoopProgress = new CompletableFuture<>();
+        doAnswer(call -> {
+            Vertx.currentContext().runOnContext(ignored -> eventLoopProgress.complete(null));
+            admitted.countDown();
+            assertTrue(finishAdmission.await(5, TimeUnit.SECONDS));
+            return NPM_REPOSITORY_ID;
+        }).when(service).resolveContainerIdAndBeginUse(eq("npm"), anyString(), anyString(), anyString(),
+                anyString(), eq(verdaccioClient));
+        try {
+            HttpClientRequest request = client.request(new RequestOptions().setHost("127.0.0.1")
+                    .setPort(dataPlane.actualPort()).setMethod(HttpMethod.GET)
+                    .setURI("/codeartifact/npm/" + DOMAIN + "/" + REPOSITORY + "/lodash"))
+                    .toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            request.putHeader("Authorization", "Bearer good-token");
+            request.send();
+            assertTrue(admitted.await(2, TimeUnit.SECONDS));
+            eventLoopProgress.get(2, TimeUnit.SECONDS);
+            client.close().toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            // Closing the server confirms the server-side close event before admission resumes.
+            dataPlane.close().toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+            dataPlane = null;
+        } finally {
+            finishAdmission.countDown();
+        }
+        verify(verdaccioClient, timeout(2_000).times(1)).endUse(NPM_REPOSITORY_ID);
+        verify(verdaccioClient, never()).ensureReady(anyString(), anyString());
+    }
+
+    @Test
+    void unexpectedAdmissionFailureUsesTheRoutingFailureHandler() throws Exception {
+        CodeArtifactService service = mock(CodeArtifactService.class);
+        when(service.resolveAuthorizationToken("good-token", DOMAIN))
+                .thenReturn(Optional.of(new AuthorizationTokenScope("000000000000", "us-east-1")));
+        when(service.ensureFormatContainerId("npm", "us-east-1", DOMAIN, "000000000000", REPOSITORY))
+                .thenThrow(new UnsupportedOperationException("admission failed"));
+        VerdaccioSidecarClient verdaccioClient = mock(VerdaccioSidecarClient.class);
+        startDataPlane(service, verdaccioClient);
+
+        assertEquals(500, get("/codeartifact/npm/" + DOMAIN + "/" + REPOSITORY + "/lodash",
+                "good-token").statusCode());
+        verify(verdaccioClient, never()).endUse(anyString());
     }
 
     @Test
