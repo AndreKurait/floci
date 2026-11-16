@@ -7,7 +7,7 @@ import io.floci.aws.core.common.XmlParser;
 record S3ObjectEncryption(String algorithm, String kmsKeyId) {
 
     S3ObjectEncryption {
-        kmsKeyId = "aws:kms".equals(algorithm) ? kmsKeyId : null;
+        kmsKeyId = "aws:kms".equals(algorithm) || "aws:kms:dsse".equals(algorithm) ? kmsKeyId : null;
     }
 
     static S3ObjectEncryption resolve(String configuration, String requestedAlgorithm,
