@@ -18,6 +18,7 @@ import org.junit.jupiter.api.TestMethodOrder;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashSet;
 import java.util.List;
@@ -26,6 +27,7 @@ import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.zip.GZIPOutputStream;
@@ -34,6 +36,7 @@ import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.startsWith;
+import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -262,27 +265,32 @@ class CodeArtifactPypiDockerIntegrationTest {
         CountDownLatch ready = new CountDownLatch(attempts);
         CountDownLatch go = new CountDownLatch(1);
         AtomicInteger notFoundResponses = new AtomicInteger();
+        List<Future<Void>> requests = new ArrayList<>();
         try {
             for (int i = 0; i < attempts; i++) {
-                pool.submit(() -> {
+                requests.add(pool.submit(() -> {
                     ready.countDown();
-                    try {
-                        go.await();
-                        given().header("Authorization", "Bearer " + bearerToken)
-                                .get("/codeartifact/pypi/" + DOMAIN + "/concurrent-repo/simple/does-not-exist/")
-                                .then().statusCode(404);
-                        notFoundResponses.incrementAndGet();
-                    } catch (InterruptedException ignored) {
-                        Thread.currentThread().interrupt();
-                    }
-                });
+                    go.await();
+                    given().header("Authorization", "Bearer " + bearerToken)
+                            .get("/codeartifact/pypi/" + DOMAIN + "/concurrent-repo/simple/does-not-exist/")
+                            .then().statusCode(404);
+                    notFoundResponses.incrementAndGet();
+                    return null;
+                }));
             }
-            ready.await(5, TimeUnit.SECONDS);
+            assertTrue(ready.await(5, TimeUnit.SECONDS), "Concurrent requests did not become ready");
             go.countDown();
         } finally {
+            go.countDown();
             pool.shutdown();
-            assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS));
+            try {
+                assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS), "Concurrent requests did not finish");
+            } finally {
+                pool.shutdownNow();
+            }
         }
+        assertAll("Concurrent first-use request outcomes",
+                requests.stream().map(request -> () -> request.get()));
         assertEquals(attempts, notFoundResponses.get());
     }
 
