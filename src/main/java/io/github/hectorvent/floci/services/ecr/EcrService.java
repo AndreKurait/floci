@@ -579,15 +579,17 @@ public class EcrService implements ResourceProvider {
         String prefix = region + "::" + account + "::";
 
         if (repositoryNames == null || repositoryNames.isEmpty()) {
-            return repoStore.scan(k -> k.startsWith(prefix)).stream()
+            List<Repository> repositories = repoStore instanceof AccountAwareStorageBackend<Repository> aware
+                    ? aware.scanForAccount(account, k -> k.startsWith(prefix))
+                    : repoStore.scan(k -> k.startsWith(prefix));
+            return repositories.stream()
                     .map(repo -> refreshRepositoryUri(repo, region))
                     .toList();
         }
 
         List<Repository> out = new ArrayList<>();
         for (String name : repositoryNames) {
-            String key = key(region, account, name);
-            Repository repo = repoStore.get(key).orElseThrow(() -> notFound(name, account));
+            Repository repo = registryRepository(name, account, region).orElseThrow(() -> notFound(name, account));
             out.add(refreshRepositoryUri(repo, region));
         }
         return out;
@@ -1877,7 +1879,7 @@ public class EcrService implements ResourceProvider {
     }
 
     private Object repositoryMonitor(Repository repo, String region) {
-        return repositoryMonitor(callerAccount(), key(region, repo.getRegistryId(), repo.getRepositoryName()));
+        return repositoryMonitor(repo.getRegistryId(), key(region, repo.getRegistryId(), repo.getRepositoryName()));
     }
 
     private static boolean sameLifetime(Repository expected, Repository current) {
@@ -2027,7 +2029,7 @@ public class EcrService implements ResourceProvider {
     }
 
     private Repository currentRepository(Repository captured, String region, boolean physical) {
-        Repository current = repoStore.get(key(region, captured.getRegistryId(), captured.getRepositoryName()))
+        Repository current = registryRepository(captured.getRepositoryName(), captured.getRegistryId(), region)
                 .orElseThrow(() -> notFound(captured.getRepositoryName(), captured.getRegistryId()));
         if (physical) {
             requireSamePhysical(captured, current);
@@ -2047,7 +2049,12 @@ public class EcrService implements ResourceProvider {
     }
 
     private void saveRepository(Repository repo, String region) {
-        repoStore.putAllAtomically(Map.of(key(region, repo.getRegistryId(), repo.getRepositoryName()), repo));
+        Map<String, Repository> values = Map.of(key(region, repo.getRegistryId(), repo.getRepositoryName()), repo);
+        if (repoStore instanceof AccountAwareStorageBackend<Repository> aware) {
+            aware.putAllAtomicallyForAccount(repo.getRegistryId(), values);
+        } else {
+            repoStore.putAllAtomically(values);
+        }
     }
 
     private Repository nativeRepository(Repository captured, String region) {
@@ -2096,7 +2103,7 @@ public class EcrService implements ResourceProvider {
 
     private Repository requireRepo(String name, String registryId, String region) {
         String account = effectiveAccount(registryId);
-        Repository repo = repoStore.get(key(region, account, name)).orElseThrow(() -> notFound(name, account));
+        Repository repo = registryRepository(name, account, region).orElseThrow(() -> notFound(name, account));
         return refreshRepositoryUri(repo, region);
     }
 
@@ -2126,7 +2133,7 @@ public class EcrService implements ResourceProvider {
     private Repository refreshRepositoryUri(Repository repo, String region) {
         String uri = registryManager.getRepositoryUri(repo.getRegistryId(), region, repo.getRepositoryName());
         synchronized (repositoryMonitor(repo, region)) {
-            Repository stored = repoStore.get(key(region, repo.getRegistryId(), repo.getRepositoryName())).orElse(null);
+            Repository stored = registryRepository(repo.getRepositoryName(), repo.getRegistryId(), region).orElse(null);
             // A describe can finish with its captured row after deletion, without restoring it
             // or refreshing a replacement repository's URI from the old lifetime.
             if (stored == null || !sameLifetime(repo, stored)) {

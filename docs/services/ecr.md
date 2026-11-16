@@ -406,3 +406,7 @@ With IAM enforcement enabled, every Distribution request requires a native ECR p
 Explicitly disabling IAM enforcement retains the existing unauthenticated emulator mode. Tokens issued in that mode are not accepted after enforcement is enabled. Internal image consumers in enforced mode must supply native issued credentials too; loopback addressing is not an authentication exemption.
 
 Upload-status queries and cancellation (`GET`, `HEAD`, or `DELETE` on `/blobs/uploads/`) are explicitly unsupported in enforced mode; ordinary layer upload `POST`, `PATCH`, and `PUT` are supported.
+
+## Cross-account repository reads
+
+With IAM enforcement enabled, repository API requests use the account selected by `registryId`. Cross-account image pulls require both the caller identity permission and a repository policy granting that caller access to the target repository. An explicit deny in either policy takes precedence. Repository URI refreshes retain the owning account namespace. `GetAuthorizationToken` still requires its separate identity permission.
