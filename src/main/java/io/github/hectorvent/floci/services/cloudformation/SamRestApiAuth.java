@@ -9,6 +9,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.regex.Pattern;
@@ -19,8 +20,11 @@ final class SamRestApiAuth {
     private static final Set<String> METHODS = Set.of(
             "get", "put", "post", "delete", "options", "head", "patch", "trace",
             "x-amazon-apigateway-any-method");
-    private static final Set<String> SUPPORTED = Set.of("DefaultAuthorizer", "ApiKeyRequired");
+    private static final Set<String> SUPPORTED = Set.of("DefaultAuthorizer", "ApiKeyRequired", "ResourcePolicy");
+    private static final Set<String> RESOURCE_POLICY_PROPERTIES = Set.of(
+            "AwsAccountWhitelist", "AwsAccountBlacklist", "CustomStatements");
     private static final Pattern OPENAPI_3 = Pattern.compile("3(\\.\\d)(\\.\\d)?");
+    private static final Pattern PATH_PARAMETER = Pattern.compile("\\{[a-zA-Z0-9._-]+\\+?}");
 
     private final ObjectMapper mapper;
 
@@ -28,9 +32,109 @@ final class SamRestApiAuth {
         this.mapper = mapper;
     }
 
-    void apply(JsonNode auth, JsonNode body) {
+    void apply(JsonNode auth, JsonNode body, JsonNode stage) {
         applyDefaults(auth, body);
+        if (SamTransformProcessor.isTruthy(auth.path("ResourcePolicy"))) {
+            applyResourcePolicy(auth.path("ResourcePolicy"), (ObjectNode) body, stage);
+        }
         relocateOpenApiSchemes(body);
+    }
+
+    private void applyResourcePolicy(JsonNode settings, ObjectNode document, JsonNode stage) {
+        if (!settings.isObject()) {
+            throw invalid("ResourcePolicy must be an object.");
+        }
+        settings.fieldNames().forEachRemaining(name -> {
+            if (!RESOURCE_POLICY_PROPERTIES.contains(name)) {
+                throw invalid("Unsupported ResourcePolicy property: " + name + ".");
+            }
+        });
+        JsonNode existing = document.path("x-amazon-apigateway-policy");
+        if (CloudFormationTemplateEngine.callsIntrinsic(document)
+                || CloudFormationTemplateEngine.callsIntrinsic(existing)) {
+            throw invalid("ResourcePolicy requires an inline DefinitionBody and inline policy object.");
+        }
+        ObjectNode policy = mapper.createObjectNode();
+        if (SamTransformProcessor.isTruthy(existing)) {
+            if (!(existing instanceof ObjectNode object)) {
+                throw invalid("x-amazon-apigateway-policy must be an object.");
+            }
+            policy = object.deepCopy();
+        }
+        Iterator<Map.Entry<String, JsonNode>> paths = document.path("paths").fields();
+        while (paths.hasNext()) {
+            Map.Entry<String, JsonNode> path = paths.next();
+            ArrayNode resources = policyResources(path.getKey(), path.getValue(), stage);
+            addAccountPolicy(policy, settings.path("AwsAccountWhitelist"), "Allow", resources);
+            addAccountPolicy(policy, settings.path("AwsAccountBlacklist"), "Deny", resources);
+            document.set("x-amazon-apigateway-policy", policy);
+        }
+        JsonNode custom = settings.path("CustomStatements");
+        if (SamTransformProcessor.isTruthy(custom)) {
+            if (!custom.isObject() && !custom.isArray()) {
+                throw invalid("ResourcePolicy CustomStatements must be an object or array.");
+            }
+            appendPolicyStatements(policy, custom, true);
+            document.set("x-amazon-apigateway-policy", policy);
+        }
+    }
+
+    private ArrayNode policyResources(String path, JsonNode pathItem, JsonNode stage) {
+        ArrayNode resources = mapper.createArrayNode();
+        String resourcePath = PATH_PARAMETER.matcher(path).replaceAll("*");
+        for (JsonNode branch : conditionalContents(pathItem)) {
+            Iterator<String> methods = branch.fieldNames();
+            while (methods.hasNext()) {
+                String method = methods.next();
+                method = "any".equalsIgnoreCase(method) || "x-amazon-apigateway-any-method".equalsIgnoreCase(method)
+                        ? "*" : method.toUpperCase(Locale.ROOT);
+                ObjectNode resource = mapper.createObjectNode();
+                resource.putArray("Fn::Sub").add("execute-api:/${__Stage__}/" + method + resourcePath)
+                        .add(mapper.createObjectNode().set("__Stage__", stage.deepCopy()));
+                resources.add(resource);
+            }
+        }
+        return resources;
+    }
+
+    private void addAccountPolicy(ObjectNode policy, JsonNode accounts, String effect, ArrayNode resources) {
+        if (!SamTransformProcessor.isTruthy(accounts)) {
+            return;
+        }
+        if (!accounts.isArray() && !accounts.isObject()) {
+            throw invalid("ResourcePolicy account lists must be arrays or intrinsic objects.");
+        }
+        JsonNode principals = accounts.isArray() ? accounts.deepCopy() : mapper.createArrayNode().add(accounts.deepCopy());
+        ObjectNode statement = mapper.createObjectNode().put("Effect", effect).put("Action", "execute-api:Invoke");
+        statement.set("Resource", resources.deepCopy());
+        statement.set("Principal", mapper.createObjectNode().set("AWS", principals));
+        appendPolicyStatements(policy, statement, false);
+    }
+
+    private void appendPolicyStatements(ObjectNode policy, JsonNode additions, boolean unique) {
+        policy.put("Version", "2012-10-17");
+        JsonNode previous = policy.path("Statement");
+        if (previous.isMissingNode() || previous.isNull()) {
+            policy.set("Statement", additions.deepCopy());
+            return;
+        }
+        ArrayNode statements = previous.isArray() ? previous.deepCopy() : mapper.createArrayNode().add(previous);
+        Iterable<JsonNode> incoming = additions.isArray() ? additions : List.of(additions);
+        for (JsonNode statement : incoming) {
+            if (!unique || !hasStatement(statements, statement)) {
+                statements.add(statement.deepCopy());
+            }
+        }
+        policy.set("Statement", statements);
+    }
+
+    private boolean hasStatement(ArrayNode statements, JsonNode candidate) {
+        for (JsonNode statement : statements) {
+            if (statement.equals(candidate)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private void relocateOpenApiSchemes(JsonNode body) {

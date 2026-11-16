@@ -1178,8 +1178,21 @@ operation that has none of its own, which API Gateway does not. As in SAM, any n
 whose `paths` entries, and the branches of an `Fn::If` around one, are objects, so a body or
 a `paths` map written as an `Fn::If` is rejected.
 
-Other `Auth` properties, custom default authorizers and external definitions are rejected.
-When a default applies, so are unresolved or malformed security requirements, method
+`Auth.ResourcePolicy` supports `AwsAccountWhitelist`, `AwsAccountBlacklist`, and
+`CustomStatements`. Account lists become `Allow` or `Deny` statements in
+`x-amazon-apigateway-policy`, scoped to the declared stage, paths, and methods.
+Account and stage references remain intrinsic values until CloudFormation resolves them.
+`ANY` methods and path parameters become policy wildcards. Existing inline policy
+statements are preserved, including explicit denials; custom statements are appended
+without duplicates. The existing API Gateway resource-policy evaluator enforces the
+result, alongside any selected IAM or API-key requirements.
+
+Other resource-policy selectors, including IP and VPC lists, other `Auth` properties,
+custom default authorizers, and external definitions are rejected. A resource-policy
+merge also rejects a whole `DefinitionBody` or inline policy supplied as an intrinsic
+function, because generated sibling statements would otherwise be discarded during
+CloudFormation resolution. Intrinsics inside account lists and statements are preserved.
+When a default applies, the transform also rejects unresolved or malformed security requirements, method
 override markers, a nested `Fn::If` around a path item, a body or security
 scheme map written as an intrinsic function, an `AWS_IAM` or `api_key` scheme that contains
 one, and a body that declares both `swagger` and `openapi`. Existing
