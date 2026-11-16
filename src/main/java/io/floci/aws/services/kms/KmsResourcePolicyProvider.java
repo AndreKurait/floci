@@ -98,12 +98,12 @@ public class KmsResourcePolicyProvider implements ResourcePolicyProvider {
             for (String member : List.of("EncryptionContextSubset", "EncryptionContextEquals")) {
                 if (symmetric && !"DescribeKey".equals(operation) && !"RetireGrant".equals(operation)
                         && constraints.get(member) instanceof Map<?, ?> context) {
-                    context.forEach((key, value) -> equalities.put("kms:EncryptionContext:" + key, value));
+                    context.forEach((key, value) -> equalities.put(KmsGrantConditions.encryptionContextKey(key.toString()), value));
                     if ("EncryptionContextEquals".equals(member)) {
                         if (context.isEmpty()) {
                             conditions.put("Null", Map.of("kms:EncryptionContextKeys", "true"));
                         } else {
-                            conditions.put("ForAllValues:StringEqualsIgnoreCase", Map.of("kms:EncryptionContextKeys",
+                            conditions.put("ForAllValues:StringEquals", Map.of("kms:EncryptionContextKeys",
                                     context.keySet().stream().map(Object::toString).toList()));
                         }
                     }

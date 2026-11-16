@@ -286,6 +286,8 @@ public class IamConditionContextResolver {
             if (entry.getValue().isTextual()) {
                 keys.add(entry.getKey());
                 conditions.put("kms:EncryptionContext:" + entry.getKey(), List.of(entry.getValue().textValue()));
+                conditions.put(KmsGrantConditions.encryptionContextKey(entry.getKey()),
+                        List.of(entry.getValue().textValue()));
             }
         });
         if (!keys.isEmpty()) {

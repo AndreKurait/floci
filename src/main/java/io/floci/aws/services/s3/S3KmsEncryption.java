@@ -8,6 +8,7 @@ import io.floci.aws.core.common.IamEnforcementFilter;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestContext;
 import io.floci.aws.services.iam.IamService;
+import io.floci.aws.services.kms.KmsGrantConditions;
 import io.floci.aws.services.kms.KmsService;
 import io.floci.aws.services.s3.model.S3KmsEnvelope;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -143,6 +144,7 @@ public class S3KmsEncryption {
         context.put("kms:EncryptionContextKeys", List.copyOf(encryptionContext.keySet()));
         for (Map.Entry<String, String> entry : encryptionContext.entrySet()) {
             context.put("kms:EncryptionContext:" + entry.getKey(), List.of(entry.getValue()));
+            context.put(KmsGrantConditions.encryptionContextKey(entry.getKey()), List.of(entry.getValue()));
         }
         String previousAccount = request.getAccountId();
         request.setAccountId(account);

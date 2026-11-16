@@ -117,6 +117,10 @@ public final class KmsGrantConditions {
         return conditions;
     }
 
+    public static String encryptionContextKey(String key) {
+        return "floci:kms:EncryptionContext:" + encodedKey(key);
+    }
+
     private static String encodedKey(String key) {
         // IAM condition names ignore case; encoding preserves case-sensitive grant keys.
         return HexFormat.of().formatHex(key.getBytes(StandardCharsets.UTF_8));
