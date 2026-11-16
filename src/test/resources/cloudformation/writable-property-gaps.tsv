@@ -19,7 +19,6 @@ AWS::ApiGateway::RestApi	FailOnWarnings	accepted and ignored
 AWS::ApiGateway::RestApi	MinimumCompressionSize	accepted and ignored
 AWS::ApiGateway::RestApi	Mode	accepted and ignored
 AWS::ApiGateway::RestApi	Parameters	accepted and ignored
-AWS::ApiGateway::RestApi	Policy	accepted and ignored
 AWS::ApiGateway::RestApi	SecurityPolicy	accepted and ignored
 AWS::ApiGateway::RestApi	Tags	accepted and ignored
 AWS::ApiGateway::RestApi	Version	accepted and ignored

@@ -301,6 +301,10 @@ public class ApiGatewayRestApiCfnProvisioner implements CfnResourceProvisioner {
         // applyOpenApiSpec is the only place that turns it into resources and methods. Resolved
         // before anything changes, so a document that cannot be read leaves the API as it was.
         JsonNode openApiDocument = OpenApiDocuments.resolve(props, engine, s3Service, objectMapper);
+        // The declared resource policy, a JSON object or its string form. CloudFormation makes it the
+        // API's policy whatever the document carries, and API Gateway enforces it on execute-api:Invoke:
+        // without it every caller from another account is refused.
+        String policy = props == null ? null : engine.resolveJsonAttribute(props.path("Policy"));
         // The declared Name and Description; null clears an undeclared Description.
         List<Map<String, String>> nameAndDescription = List.of(
                 replacePatchOp("/name", name), replacePatchOp("/description", description));
@@ -357,6 +361,10 @@ public class ApiGatewayRestApiCfnProvisioner implements CfnResourceProvisioner {
                         // declared ones are applied again.
                         apiGatewayService.updateRestApi(region, api.getId(), nameAndDescription);
                     }
+                    if (policy != null) {
+                        apiGatewayService.updateRestApi(region, api.getId(), List.of(replacePatchOp("/policy", policy)));
+                        markPolicyApplied(r);
+                    }
                 });
         // An API created in place of one removed out of band is a replacement: a rollback deletes it.
         ReplacementCleanup.record(r, ctx, attributesBefore);
@@ -397,10 +405,11 @@ public class ApiGatewayRestApiCfnProvisioner implements CfnResourceProvisioner {
     }
 
     /**
-     * Keeps what an in-place update is about to patch, the name, description and endpoint
-     * configuration the API has now, so {@link #rollbackUpdate} can put them back. Its {@code body}
-     * flag starts false and is set by {@link #markDocumentApplied} once the update's OpenAPI
-     * document has replaced the API's definition.
+     * Keeps what an in-place update is about to patch, the name, description, endpoint
+     * configuration and resource policy the API has now, so {@link #rollbackUpdate} can put them
+     * back. Its {@code body} flag starts false and is set by {@link #markDocumentApplied} once the
+     * update's OpenAPI document has replaced the API's definition; its {@code policyApplied} flag is
+     * set by {@link #markPolicyApplied} once the update has written its declared policy.
      */
     private void snapshotBeforeUpdate(StackResource r, RestApi existing, String region) {
         ObjectNode snapshot = objectMapper.createObjectNode();
@@ -412,7 +421,19 @@ public class ApiGatewayRestApiCfnProvisioner implements CfnResourceProvisioner {
         if (existing.getEndpointConfiguration() != null) {
             existing.getEndpointConfiguration().getVpcEndpointIds().forEach(vpcEndpointIds::add);
         }
+        snapshot.put("policy", existing.getPolicy());
+        snapshot.put("policyApplied", false);
         snapshot.put("body", false);
+        r.getAttributes().put(CfnRollback.REST_API_UPDATE_SNAPSHOT_ATTR, snapshot.toString());
+    }
+
+    /** Records on an in-place update's snapshot that the update wrote its declared resource policy. */
+    private void markPolicyApplied(StackResource r) {
+        if (!r.getAttributes().containsKey(CfnRollback.REST_API_UPDATE_SNAPSHOT_ATTR)) {
+            return;
+        }
+        ObjectNode snapshot = (ObjectNode) readSnapshot(r);
+        snapshot.put("policyApplied", true);
         r.getAttributes().put(CfnRollback.REST_API_UPDATE_SNAPSHOT_ATTR, snapshot.toString());
     }
 
@@ -439,7 +460,10 @@ public class ApiGatewayRestApiCfnProvisioner implements CfnResourceProvisioner {
         }
     }
 
-    /** Patches the API back to the name, description and endpoint configuration {@code snapshot} holds. */
+    /**
+     * Patches the API back to the name, description and endpoint configuration {@code snapshot}
+     * holds, and to its resource policy when the update wrote one (an empty value clears it).
+     */
     private void restore(String apiId, JsonNode snapshot) {
         String region = snapshot.path("region").asText();
         List<String> vpcEndpointIds = new ArrayList<>();
@@ -449,6 +473,10 @@ public class ApiGatewayRestApiCfnProvisioner implements CfnResourceProvisioner {
                 replacePatchOp("/description", snapshot.path("description").asText(null))));
         operations.addAll(endpointPatchOps(apiGatewayService.getRestApi(region, apiId).getEndpointConfiguration(),
                 snapshot.path("endpointType").asText(), vpcEndpointIds));
+        if (snapshot.path("policyApplied").asBoolean(false)) {
+            JsonNode before = snapshot.path("policy");
+            operations.add(replacePatchOp("/policy", before.isTextual() ? before.asText() : ""));
+        }
         apiGatewayService.updateRestApi(region, apiId, operations);
     }
 
