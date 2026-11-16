@@ -2,6 +2,7 @@ package io.floci.aws.services.eks;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
+import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.model.Frame;
 import io.floci.aws.core.common.Digests;
 import io.floci.aws.core.common.docker.ContainerExec;
@@ -58,7 +59,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 @QuarkusTest
 @TestProfile(RealEksProfile.class)
-// Bounded cluster/workload waits total 285 s; allow Docker setup and cleanup as well.
+// Bounded cluster/workload waits total 315 s; allow Docker setup and cleanup as well.
 @Timeout(value = 6, unit = TimeUnit.MINUTES)
 class EksRegistryHostsDockerIntegrationTest {
 
@@ -86,6 +87,8 @@ class EksRegistryHostsDockerIntegrationTest {
     @Inject
     DockerHostResolver dockerHostResolver;
 
+    String diagnosticClusterName;
+
     @BeforeEach
     void requireDocker() {
         boolean dockerAvailable = isDockerAvailable();
@@ -97,8 +100,28 @@ class EksRegistryHostsDockerIntegrationTest {
 
     @Test
     void podPullsThroughRegistryHostConfiguredViaLaunchTemplateUserData() throws Exception {
+        try {
+            verifyRegistryHosts();
+        } catch (Exception | AssertionError failure) {
+            try {
+                if (diagnosticClusterName != null) {
+                    Cluster current = eksService.describeCluster(diagnosticClusterName);
+                    if (current.getContainerId() != null) {
+                        logPodDiagnostics(current.getContainerId());
+                    }
+                }
+            } catch (RuntimeException diagnosticFailure) {
+                failure.addSuppressed(diagnosticFailure);
+                LOG.warnv(diagnosticFailure, "Could not capture cluster {0} before cleanup", diagnosticClusterName);
+            }
+            throw failure;
+        }
+    }
+
+    void verifyRegistryHosts() throws Exception {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
         String clusterName = "reg-hosts-dock-" + suffix;
+        diagnosticClusterName = clusterName;
         String nodegroupName = "ng-" + suffix;
         String repo = "reg-hosts-it-" + suffix;
         // Not "000000000000": the generated ECR mirror only covers the default account, so this
@@ -188,6 +211,11 @@ class EksRegistryHostsDockerIntegrationTest {
         dockerClient.restartContainerCmd(containerId).exec();
         Instant restartCompletedAt = Instant.now();
         waitUntilReady(cluster);
+        long apiDeadline = System.currentTimeMillis() + 30000;
+        while (!eksClusterManager.isReady(cluster) && System.currentTimeMillis() < apiDeadline) {
+            Thread.sleep(1000);
+        }
+        assertTrue(eksClusterManager.isReady(cluster), "the restarted API server must respond before guest execs");
         String hostsTomlAfterRestart = null;
         long restartDeadline = System.currentTimeMillis() + 30000;
         while (System.currentTimeMillis() < restartDeadline) {
@@ -251,49 +279,69 @@ class EksRegistryHostsDockerIntegrationTest {
             }
             Thread.sleep(2000);
         }
-        if (!running) {
-            logPodDiagnostics(containerId);
-        }
         assertTrue(running, "registry-hosts-pod must reach Running, pulling its image through the configured host");
         execInContainerWithExitCode(containerId, new String[]{"kubectl", "delete", "pod", "registry-hosts-pod", "--now"});
     }
 
     /** Cleanup removes the k3s container, and kubelet's output reaches nothing else. */
-    private void logPodDiagnostics(String containerId) {
+    void logPodDiagnostics(String containerId) {
+        boolean running = false;
+        try {
+            InspectContainerResponse.ContainerState state = dockerClient.inspectContainerCmd(containerId).exec().getState();
+            LOG.warnv("Container {0}: status={1}, running={2}, exitCode={3}, oomKilled={4}, error={5}, "
+                            + "startedAt={6}, finishedAt={7}", containerId, state.getStatus(), state.getRunning(),
+                    state.getExitCodeLong(), state.getOOMKilled(), state.getError(), state.getStartedAt(), state.getFinishedAt());
+            running = Boolean.TRUE.equals(state.getRunning());
+        } catch (RuntimeException e) {
+            LOG.warnv(e, "Could not inspect container {0} before cleanup", containerId);
+        }
+        LOG.warnv("k3s log tail\n{0}", k3sLogTail(containerId));
+        if (!running) {
+            return;
+        }
         String[][] commands = {
+                {"tail", "-100", "/var/lib/rancher/k3s/agent/containerd/containerd.log"},
                 {"kubectl", "describe", "pod", "registry-hosts-pod"},
                 {"kubectl", "describe", "nodes"},
                 {"kubectl", "get", "pods", "-A", "-o", "wide"},
                 {"crictl", "images"},
                 {"cat", "/run/flannel/subnet.env"},
-                // An unassigned pod on a Ready node points at the cloud controller, whose role k3s installs as an addon.
-                {"kubectl", "get", "crd", "addons.k3s.cattle.io", "-o", "json"},
+                // Capture the addon and RBAC prerequisites when a Ready node cannot schedule a pod.
+                {"kubectl", "get", "crd", "addons.k3s.cattle.io", "helmcharts.helm.cattle.io",
+                        "helmchartconfigs.helm.cattle.io", "-o", "json"},
+                {"kubectl", "get", "addons.k3s.cattle.io", "-n", "kube-system", "-o", "json"},
+                {"kubectl", "get", "events", "-n", "kube-system", "--sort-by=.metadata.creationTimestamp"},
+                {"sh", "-c", "ls -l /var/lib/rancher/k3s/server/manifests/ccm.yaml; "
+                        + "sha256sum /var/lib/rancher/k3s/server/manifests/ccm.yaml; "
+                        + "cat /var/lib/rancher/k3s/server/manifests/ccm.yaml"},
                 {"kubectl", "get", "clusterrole/k3s-cloud-controller-manager",
                         "clusterrolebinding/k3s-cloud-controller-manager", "-o", "json"}
         };
         for (String[] command : commands) {
             try {
-                ContainerExec.Result result = ContainerExec.run(dockerClient, containerId, command, 10);
+                ContainerExec.Result result = ContainerExec.run(dockerClient, containerId, command, 2);
                 LOG.warnv("{0}\n{1}", String.join(" ", command), result.summary());
             } catch (RuntimeException e) {
                 LOG.warnv(e, "Could not run {0}", String.join(" ", command));
             }
         }
-        LOG.warnv("k3s log tail\n{0}", k3sLogTail(containerId));
     }
 
     private String k3sLogTail(String containerId) {
         ByteArrayOutputStream out = new ByteArrayOutputStream();
         String problem = "";
-        try {
+        try (ResultCallback.Adapter<Frame> callback = new ResultCallback.Adapter<>() {
+            @Override
+            public void onNext(Frame frame) {
+                synchronized (out) {
+                    int remaining = 256 * 1024 - out.size();
+                    byte[] payload = frame.getPayload();
+                    out.write(payload, 0, Math.min(remaining, payload.length));
+                }
+            }
+        }) {
             boolean completed = dockerClient.logContainerCmd(containerId).withStdOut(true).withStdErr(true)
-                    .withTail(2000)
-                    .exec(new ResultCallback.Adapter<Frame>() {
-                        @Override
-                        public void onNext(Frame frame) {
-                            out.writeBytes(frame.getPayload());
-                        }
-                    }).awaitCompletion(10, TimeUnit.SECONDS);
+                    .withTail(2000).exec(callback).awaitCompletion(10, TimeUnit.SECONDS);
             if (!completed) {
                 problem = "(timed out reading logs)";
             }
