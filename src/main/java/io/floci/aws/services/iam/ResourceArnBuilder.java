@@ -1446,13 +1446,9 @@ public class ResourceArnBuilder {
      * the alias and the key, {@code UpdateAlias} the alias, the key it points at and the key it
      * will point at, and {@code DeleteAlias} the alias and the key it points at.
      *
-     * <p>{@code ReEncrypt} is a stopgap here: AWS authorizes it as {@code kms:ReEncryptFrom} on
-     * the source key and {@code kms:ReEncryptTo} on the destination, while this evaluates the
-     * single {@code kms:ReEncrypt} action against both keys, so a policy naming either action
-     * AWS publishes still binds to nothing. The source is the key its optional
-     * {@code SourceKeyId} names and otherwise the key that encrypted the
-     * {@code CiphertextBlob}, never a {@code KeyId} member, which the handler does not read on
-     * {@code ReEncrypt}.
+     * <p>{@code ReEncrypt} authorizes the source as {@code kms:ReEncryptFrom} and the
+     * destination as {@code kms:ReEncryptTo}. Each directional lookup is independent, even
+     * when both identifiers resolve to the same key.
      *
      * <p>The grant operations name the key the grant they act on belongs to, the way the handler
      * resolves it: a {@code RetireGrant} carrying a {@code GrantToken} the key the grant it
@@ -1479,6 +1475,8 @@ public class ResourceArnBuilder {
             case "kms:DeleteAlias" -> deleteAliasTargets(body, region, accountId, partition);
             case "kms:Decrypt" -> List.of(decryptTarget(body, region, accountId, partition));
             case "kms:ReEncrypt" -> reEncryptTargets(body, region, accountId, partition);
+            case "kms:ReEncryptFrom" -> List.of(reEncryptSource(body, region, accountId, partition));
+            case "kms:ReEncryptTo" -> List.of(keyTarget(body, "DestinationKeyId", region, accountId, partition));
             case "kms:RetireGrant" -> retireGrantTargets(body, region, accountId, partition);
             case "kms:RevokeGrant" -> revokeGrantTargets(body, region, accountId, partition);
             default -> List.of(keyTarget(body, "KeyId", region, accountId, partition));
@@ -1567,12 +1565,16 @@ public class ResourceArnBuilder {
     private List<String> reEncryptTargets(JsonNode body, String region, String accountId,
                                           String partition) {
         Set<String> keys = new LinkedHashSet<>();
-        String sourceKeyId = body.path("SourceKeyId").asText(null);
-        keys.add(sourceKeyId == null || sourceKeyId.isBlank()
-                ? ciphertextKeyTarget(body, region, accountId, partition)
-                : keyArn(sourceKeyId, region, accountId, partition));
+        keys.add(reEncryptSource(body, region, accountId, partition));
         keys.add(keyTarget(body, "DestinationKeyId", region, accountId, partition));
         return new ArrayList<>(keys);
+    }
+
+    private String reEncryptSource(JsonNode body, String region, String accountId, String partition) {
+        String sourceKeyId = body.path("SourceKeyId").asText(null);
+        return sourceKeyId == null || sourceKeyId.isBlank()
+                ? ciphertextKeyTarget(body, region, accountId, partition)
+                : keyArn(sourceKeyId, region, accountId, partition);
     }
 
     /**

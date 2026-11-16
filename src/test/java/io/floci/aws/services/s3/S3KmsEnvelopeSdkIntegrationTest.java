@@ -11,9 +11,11 @@ import jakarta.inject.Inject;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import software.amazon.awssdk.core.SdkBytes;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.kms.KmsClient;
+import software.amazon.awssdk.services.kms.model.GrantConstraints;
 import software.amazon.awssdk.services.kms.model.KmsException;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.S3Exception;
@@ -21,6 +23,7 @@ import software.amazon.awssdk.services.s3.model.ServerSideEncryption;
 
 import java.net.URI;
 import java.util.Arrays;
+import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.UUID;
@@ -357,6 +360,77 @@ class S3KmsEnvelopeSdkIntegrationTest {
                               "Effect":"Allow","Principal":"*","Action":"kms:*","Resource":"*"
                             }]}
                             """).bypassPolicyLockoutSafetyCheck(true)));
+        }
+    }
+
+    @Test
+    void nativeReEncryptUsesDirectionalGrantsAndContexts() {
+        String destination = kms.createKey().keyMetadata().arn();
+        try {
+            verifyReEncryptGrants(destination, Map.of(), Map.of());
+        } finally {
+            kms.scheduleKeyDeletion(request -> request.keyId(destination).pendingWindowInDays(7));
+        }
+    }
+
+    @Test
+    void nativeReEncryptUsesSeparateContextsOnTheSameKey() {
+        verifyReEncryptGrants(keyArn, Map.of("purpose", "source"), Map.of("purpose", "destination"));
+    }
+
+    private void verifyReEncryptGrants(String destination, Map<String, String> sourceContext,
+                                       Map<String, String> destinationContext) {
+        String principal = iam.getUser(user).getArn();
+        iam.putUserPolicy(user, "Objects", """
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Action":"kms:*","Resource":"*"}]}
+                """);
+        SdkBytes ciphertext = kms.encrypt(request -> request.keyId(keyArn)
+                .plaintext(SdkBytes.fromUtf8String("directional grant body"))
+                .encryptionContext(sourceContext)).ciphertextBlob();
+        for (String key : keyArn.equals(destination)
+                ? List.of(keyArn) : List.of(keyArn, destination)) {
+            kms.putKeyPolicy(request -> request.keyId(key).policyName("default")
+                    .policy("{\"Version\":\"2012-10-17\",\"Statement\":[]}")
+                    .bypassPolicyLockoutSafetyCheck(true));
+        }
+        String sourceGrant = kms.createGrant(request -> request.keyId(keyArn).granteePrincipal(principal)
+                .operationsWithStrings("ReEncryptFrom")
+                .constraints(sourceContext.isEmpty() ? null :
+                        GrantConstraints.builder()
+                                .encryptionContextEquals(sourceContext).build())).grantId();
+        try (KmsClient direct = AwsTestClients.create(KmsClient.builder(), access.getAccessKeyId(),
+                access.getSecretAccessKey(), Region.US_EAST_1, endpoint)) {
+            assertThrows(KmsException.class, () -> direct.reEncrypt(request -> request.ciphertextBlob(ciphertext)
+                    .destinationKeyId(destination).sourceEncryptionContext(sourceContext)
+                    .destinationEncryptionContext(destinationContext)));
+            String destinationGrant = kms.createGrant(request -> request.keyId(destination).granteePrincipal(principal)
+                    .operationsWithStrings("ReEncryptTo")
+                    .constraints(destinationContext.isEmpty() ? null :
+                            GrantConstraints.builder()
+                                    .encryptionContextEquals(destinationContext).build())).grantId();
+            SdkBytes result = direct.reEncrypt(request -> request.ciphertextBlob(ciphertext)
+                    .destinationKeyId(destination).sourceEncryptionContext(sourceContext)
+                    .destinationEncryptionContext(destinationContext)).ciphertextBlob();
+            assertEquals("directional grant body", kms.decrypt(request -> request.ciphertextBlob(result)
+                    .encryptionContext(destinationContext)).plaintext().asUtf8String());
+            iam.putUserPolicy(user, "Objects", """
+                    {"Version":"2012-10-17","Statement":[
+                      {"Effect":"Allow","Action":"kms:*","Resource":"*"},
+                      {"Effect":"Deny","Action":"kms:ReEncryptTo","Resource":"%s"}]}
+                    """.formatted(destination));
+            assertThrows(KmsException.class, () -> direct.reEncrypt(request -> request.ciphertextBlob(ciphertext)
+                    .destinationKeyId(destination).sourceEncryptionContext(sourceContext)
+                    .destinationEncryptionContext(destinationContext)));
+            iam.putUserPolicy(user, "Objects", """
+                    {"Version":"2012-10-17","Statement":[
+                      {"Effect":"Allow","Action":"kms:*","Resource":"*"}]}
+                    """);
+            kms.revokeGrant(request -> request.keyId(keyArn).grantId(sourceGrant));
+            assertThrows(KmsException.class, () -> direct.reEncrypt(request -> request.sourceKeyId(keyArn)
+                    .ciphertextBlob(ciphertext).destinationKeyId(destination).sourceEncryptionContext(sourceContext)
+                    .destinationEncryptionContext(destinationContext)));
+            kms.revokeGrant(request -> request.keyId(destination).grantId(destinationGrant));
         }
     }
 

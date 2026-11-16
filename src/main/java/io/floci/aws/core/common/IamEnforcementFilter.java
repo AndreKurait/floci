@@ -608,6 +608,20 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             }
             return;
         }
+        if ("kms".equals(credentialScope) && "kms:ReEncrypt".equals(action)) {
+            for (String keyAction : List.of("kms:ReEncryptFrom", "kms:ReEncryptTo")) {
+                Map<String, List<String>> keyContext = new HashMap<>(
+                        conditionContextResolver.resolve(credentialScope, keyAction, ctx));
+                callerArns.ifPresent(arns -> arns.putPrincipalKeys(keyContext));
+                List<String> keyResources = arnBuilder.buildKmsResources(
+                        keyAction, ctx, region, accountId, requestPartition());
+                if (abortIfDenied(ctx, caller, principal, keyAction, credentialScope,
+                        keyResources, List.of(keyContext), region, accountId, akid)) {
+                    return;
+                }
+            }
+            return;
+        }
         if (abortIfDenied(ctx, caller, principal, action, credentialScope, resources, targetContexts,
                 region, accountId, akid)) {
             return;
