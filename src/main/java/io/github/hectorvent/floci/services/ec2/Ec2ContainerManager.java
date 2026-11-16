@@ -2886,9 +2886,19 @@ public class Ec2ContainerManager {
                 "done",
                 "ip -6 addr replace \"$2/64\" dev \"$vpc\" nodad",
                 "ip -6 route replace \"$3\" dev \"$vpc\"",
-                "ip -6 route replace default via fe80:ec2::1 dev \"$vpc\"");
+                "ip -6 route replace default via fe80:ec2::1 dev \"$vpc\"",
+                // Docker's hosts file also names ::1 localhost; getaddrinfo returns ::1 first once the namespace has
+                // IPv6, so a client of an IPv4-only loopback listener fails. EC2 Linux AMIs keep localhost on
+                // 127.0.0.1 (::1 is localhost6), so the guest does too. The guest shares this namespace's hosts file.
+                "hosts=$(awk '" + LOCALHOST_IPV4_ONLY + "' /etc/hosts) && printf '%s\\n' \"$hosts\" > /etc/hosts"
+                        + " || echo 'cannot keep localhost on 127.0.0.1 in /etc/hosts' >&2");
         return new String[] {"sh", "-c", script, "guest-ipv6", vpcAddress, ipv6Address, vpcIpv6Block};
     }
+
+    /** An awk program that drops the name localhost from ::1 lines of a hosts file, and a ::1 line left nameless. */
+    private static final String LOCALHOST_IPV4_ONLY = "$1 == \"::1\" { out = $1;"
+            + " for (i = 2; i <= NF; i++) if ($i != \"localhost\") out = out \"\\t\" $i;"
+            + " if (out != $1) print out; next } { print }";
 
     private void configureLinkLocalMetadataEndpoint(String containerId, Instance instance, String flociHost, int imdsPort) {
         configureLinkLocalMetadataEndpoint(containerId, instance, flociHost, imdsPort, () -> true);
