@@ -541,6 +541,7 @@ floci:
         # allowed-services: example-svc   # never a signing name Floci serves
         # allowed-levels: signing          # signing and/or service
       seed-deployer-principal: false
+      # bootstrap-principals-file: /run/secrets/floci-bootstrap.json  # explicit owner-only local IAM administrators
       # service-principal-memberships-path: /config/service-principals.json
       # FLOCI_SERVICES_IAM_SERVICE_PRINCIPAL_MEMBERSHIPS_PATH; optional local fixture, read at startup.
       # account-alias: ""  # When set, seeds the account alias at startup so callers can read one

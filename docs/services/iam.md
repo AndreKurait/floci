@@ -3323,3 +3323,53 @@ second-hop sessions, Kubernetes executions, hot reload, external AWS credential
 mounts, and executions without a complete native start/code seal are not
 supported by this identity facility. Generic STS issuance retains its normal
 behavior even when no Lambda lineage can be established.
+
+
+## Explicit local account bootstrap
+
+For an emulator that must preserve existing account IDs while authenticating real SDK calls,
+set `FLOCI_SERVICES_IAM_BOOTSTRAP_PRINCIPALS_FILE` to a private local JSON file. This is startup
+configuration, not an AWS endpoint. Organizations `CreateAccount` remains the native way to
+create generated account IDs and its management-account access role.
+
+This option requires `FLOCI_AUTH_VALIDATE_SIGNATURES=true`,
+`FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED=true`, IAM enabled, and
+`FLOCI_SERVICES_IAM_SEED_DEPLOYER_PRINCIPAL=false`. No numeric-key, unknown-key, or public
+credential authentication exception is added. Each declared identity receives the explicit
+`AdministratorAccess` managed-policy grant in its declared partition. Use these administrators
+to provision normal scoped IAM users or roles through the AWS SDK, including CloudFormation.
+
+The file contains an array of objects with exactly these string fields:
+
+| Field | Meaning |
+| --- | --- |
+| `accountId` | Exact 12-digit local account ID |
+| `partition` | Published AWS partition, such as `aws` or `aws-us-gov` |
+| `userName` | IAM user name, 1 to 64 supported characters |
+| `accessKeyId` | Unique local long-term key ID: `AKIA` followed by 16 uppercase letters/digits |
+| `secretAccessKey` | Locally generated secret: 40 to 128 printable non-space ASCII characters, at least 16 distinct |
+| `grant` | Must explicitly equal `AdministratorAccess` |
+
+Supply locally generated credentials through a secret file; do not place secret values in an
+application YAML, environment-variable value, source repository, or command line. The local key
+is an emulator credential, not a real AWS access key. Give the SDK caller the same key and secret
+using its normal credentials-provider mechanism. Mount the file read-only, owned by the Floci
+runtime user, with mode `0600` or `0400`. Symlinks, group/other permissions, non-regular files,
+unknown fields, duplicate identities, invalid partitions, and malformed input refuse startup.
+The file is bounded to 64 KiB and 32 principals. JSON parsing errors do not echo its contents.
+
+The whole configuration and all existing identity conflicts are validated before seeding.
+Users, keys, and bootstrap identity markers use the ordinary account-aware IAM stores and their
+configured persistence mode. Repeating identical configuration preserves IDs, secrets, dates,
+and grants. An existing unrelated user/key is never adopted or overwritten. A bootstrap user
+or key deleted through IAM, an inactive key, a removed administrator grant, or a changed secret
+causes startup to fail rather than silently recreate, reactivate, regrant, or rotate it. Remove
+the declaration before retiring an identity. Durable markers remain to prevent accidental
+recreation. An interrupted initial write can leave partial records; startup fails closed on
+that conflict rather than guessing how to repair operator-owned state. This option is not a
+credential rotation or account reconciliation API.
+
+Account IDs still identify local emulator storage namespaces. The option does not create an
+Organizations membership, grant another account access, or alter AWS API wire behavior. Keep the
+emulator listener private. A bootstrap administrator is powerful within its account; native IAM
+explicit-deny policies and SigV4 signature validation still apply.

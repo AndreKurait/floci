@@ -296,6 +296,7 @@ See [Initialization Hooks](./initialization-hooks.md) for lifecycle phases and s
 | `FLOCI_SERVICES_IAM_LAMBDA_IDENTITY_VERIFICATION_ENABLED` | `false` | Enable local observation and proof verification of current Lambda execution-role identities; does not grant permissions |
 | `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED` | `false` | When `true`, enforce IAM policies on API calls. Leave `false` for most local development scenarios |
 | `FLOCI_SERVICES_IAM_SEED_DEPLOYER_PRINCIPAL` | `false` | Create a local `floci-deployer` IAM user with `AdministratorAccess` and static `floci`/`floci` credentials |
+| `FLOCI_SERVICES_IAM_BOOTSTRAP_PRINCIPALS_FILE` | unset | Owner-only local JSON file declaring explicit per-account IAM bootstrap administrators; requires SigV4 and IAM enforcement, with the public deployer seed disabled. See [IAM bootstrap](../services/iam.md#explicit-local-account-bootstrap). |
 
 ### KMS
 

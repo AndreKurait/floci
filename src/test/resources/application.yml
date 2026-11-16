@@ -205,6 +205,7 @@ floci:
       issued-session-verification-enabled: false
       lambda-identity-verification-enabled: false
       seed-deployer-principal: false
+      # bootstrap-principals-file: /run/secrets/floci-bootstrap.json  # explicit owner-only local IAM administrators
       # service-principal-memberships-path: unset; tests explicitly select their local fixture.
     msk:
       enabled: true

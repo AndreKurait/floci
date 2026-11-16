@@ -426,6 +426,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     private final RegionResolver regionResolver;
     private final Clock clock;
     private final boolean seedDeployerPrincipal;
+    private IamBootstrapPrincipals bootstrapPrincipals;
     private final String seededAccountAlias;
     /** Guards case-insensitive IAM name uniqueness checks and their corresponding writes. */
     private final Object resourceNameLock = new Object();
@@ -498,6 +499,16 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             config.services().iam().accountAlias().orElse(null),
             clock
         );
+        config.services().iam().bootstrapPrincipalsFile().ifPresent(file -> {
+            if (!config.services().iam().enabled() || !config.services().iam().enforcementEnabled()
+                    || !config.auth().validateSignatures() || config.services().iam().seedDeployerPrincipal()) {
+                throw new IllegalStateException("IAM bootstrap requires IAM and SigV4 enforcement enabled and the public deployer seed disabled");
+            }
+            bootstrapPrincipals = new IamBootstrapPrincipals(file,
+                    (AccountAwareStorageBackend<IamUser>) users,
+                    (AccountAwareStorageBackend<AccessKey>) accessKeys,
+                    storageFactory.create("iam", "iam-bootstrap-identities.json", new TypeReference<>() {}));
+        });
     }
 
     IamService(StorageBackend<String, IamUser> users,
@@ -683,11 +694,17 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
 
     @PostConstruct
     void seedDefaults() {
+        if (bootstrapPrincipals != null) {
+            bootstrapPrincipals.validateStoredIdentities();
+        }
         seedAwsManagedPolicies();
         if (seedDeployerPrincipal) {
             seedDefaultDeployerPrincipal();
         }
         seedConfiguredAccountAlias();
+        if (bootstrapPrincipals != null) {
+            bootstrapPrincipals.seed();
+        }
     }
 
     private Map<String, IamPolicy> awsManagedPolicies(String partition) {
