@@ -1015,8 +1015,10 @@ public class S3Service implements Resettable, ResourceProvider {
      * out beforehand, since computing either here would mean reading the whole file under the bucket
      * lock.
      */
-    private record AssembledBody(Path file, long size, S3KmsEnvelope envelope) implements ObjectBody {
-        private AssembledBody(Path file, long size) { this(file, size, null); }
+    private record AssembledBody(Path file, long size, S3KmsEnvelope envelope,
+                                 S3ObjectEncryption encryption) implements ObjectBody {
+        private AssembledBody(Path file, long size) { this(file, size, null, null); }
+        private AssembledBody(Path file, long size, S3KmsEnvelope envelope) { this(file, size, envelope, null); }
     }
 
     private S3Object storeObjectInternal(String bucketOwnerAccount, Bucket bucket,
@@ -1030,8 +1032,10 @@ public class S3Service implements Resettable, ResourceProvider {
                 : validateSseCustomerKey(effectiveOptions.getSseCustomerAlgorithm(),
                         effectiveOptions.getSseCustomerKey(), effectiveOptions.getSseCustomerKeyMd5());
         rejectConflictingServerSideEncryption(normalizedServerSideEncryption, sseCustomerKey);
-        S3ObjectEncryption encryption = S3ObjectEncryption.resolve(bucket.getEncryptionConfiguration(),
-                normalizedServerSideEncryption, effectiveOptions.getSseKmsKeyId(), sseCustomerKey != null);
+        S3ObjectEncryption encryption = body instanceof AssembledBody assembled && assembled.encryption() != null
+                ? assembled.encryption()
+                : S3ObjectEncryption.resolve(bucket.getEncryptionConfiguration(),
+                        normalizedServerSideEncryption, effectiveOptions.getSseKmsKeyId(), sseCustomerKey != null);
         checkWritePreconditions(bucketName, key, effectiveOptions.getIfMatch(), effectiveOptions.getIfNoneMatch());
 
         byte[] data = body instanceof BytesBody bytes ? bytes.data() : null;
@@ -1251,22 +1255,19 @@ public class S3Service implements Resettable, ResourceProvider {
         S3ObjectEncryption encryption = S3ObjectEncryption.resolve(bucket.getEncryptionConfiguration(),
                 normalizeServerSideEncryption(options.getServerSideEncryption()), options.getSseKmsKeyId(),
                 options.getSseCustomerKey() != null);
-        return stageEncryptedObject(plaintext, bucket, bucketName, key, options, encryption);
+        return stageEncryptedObject(plaintext, bucket, bucketName, key, encryption);
     }
 
     private AssembledBody stageEncryptedObject(DigestingInputStream plaintext, Bucket bucket,
-                                                String bucketName, String key, PutObjectOptions options,
-                                                S3ObjectEncryption encryption) {
-        options.withServerSideEncryption(encryption.algorithm()).withSseKmsKeyId(encryption.kmsKeyId());
+                                                String bucketName, String key, S3ObjectEncryption encryption) {
         if (!"aws:kms".equals(encryption.algorithm())) {
             Path file = stageBody(plaintext);
-            return new AssembledBody(file, plaintext.size());
+            return new AssembledBody(file, plaintext.size(), null, encryption);
         }
         try (S3KmsEncryption.Material material = kms().generate(bucketName, key, encryption.kmsKeyId(), bucket.getRegion());
                 InputStream encrypted = kms().encrypt(plaintext, material)) {
             Path file = stageBody(encrypted);
-            options.withSseKmsKeyId(material.envelope().keyArn());
-            return new AssembledBody(file, plaintext.size(), material.envelope());
+            return new AssembledBody(file, plaintext.size(), material.envelope(), encryption);
         } catch (IOException error) {
             throw new UncheckedIOException("Failed to stage encrypted object", error);
         }
@@ -3212,9 +3213,7 @@ public class S3Service implements Resettable, ResourceProvider {
                             ? kms().decrypt(stored, object.getKmsEnvelope(), object.getSize()) : stored) {
                 DigestingInputStream digests = new DigestingInputStream(plaintext,
                         copyChecksumAlgorithm == null ? List.of() : List.of(copyChecksumAlgorithm), MAX_COPY_OBJECT_SOURCE_SIZE);
-                PutObjectOptions destination = new PutObjectOptions()
-                        .withServerSideEncryption(encryption.algorithm()).withSseKmsKeyId(encryption.kmsKeyId());
-                AssembledBody body = stageEncryptedObject(digests, bucket, destinationBucket, destinationKey, destination, encryption);
+                AssembledBody body = stageEncryptedObject(digests, bucket, destinationBucket, destinationKey, encryption);
                 staged = body.file();
                 moveIntoPlace(staged, source.pinnedFile());
                 return new CopyBody(new AssembledBody(source.pinnedFile(), body.size(), body.envelope()), digests.eTag(),
