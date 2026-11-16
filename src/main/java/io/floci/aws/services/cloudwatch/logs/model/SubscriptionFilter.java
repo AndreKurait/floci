@@ -12,6 +12,7 @@ public class SubscriptionFilter {
     private String filterPattern;
     private String destinationArn;
     private String distribution;
+    private Boolean applyOnTransformedLogs;
     private long creationTime;
 
     public SubscriptionFilter() {}
@@ -30,6 +31,11 @@ public class SubscriptionFilter {
 
     public String getDistribution() { return distribution; }
     public void setDistribution(String distribution) { this.distribution = distribution; }
+
+    public Boolean getApplyOnTransformedLogs() { return applyOnTransformedLogs; }
+    public void setApplyOnTransformedLogs(Boolean applyOnTransformedLogs) {
+        this.applyOnTransformedLogs = applyOnTransformedLogs;
+    }
 
     public long getCreationTime() { return creationTime; }
     public void setCreationTime(long creationTime) { this.creationTime = creationTime; }
