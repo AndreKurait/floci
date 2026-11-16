@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
 import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.services.acm.AcmService;
+import io.github.hectorvent.floci.services.acmpca.AcmPcaService;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayService;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
 import io.github.hectorvent.floci.services.appconfig.AppConfigService;
@@ -17,6 +18,7 @@ import io.github.hectorvent.floci.services.batch.BatchService;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.BedrockAgentCoreControlService;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.BedrockAgentCoreMemoryService;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.AcmCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.AcmPcaCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ApiGatewayAccountCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ApiGatewayApiKeyCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ApiGatewayDomainCfnProvisioner;
@@ -281,6 +283,7 @@ final class CfnProvisionerFixture {
         private CloudWatchMetricsService cloudWatchMetricsService;
         private AutoScalingService autoScalingService;
         private AcmService acmService;
+        private AcmPcaService acmPcaService;
         private FirehoseService firehoseService;
         private DocDbService docDbService;
         private CloudFrontService cloudFrontService;
@@ -510,6 +513,9 @@ final class CfnProvisionerFixture {
             }
             if (acmService != null) {
                 discovered.add(new AcmCfnProvisioner(acmService));
+            }
+            if (acmPcaService != null) {
+                discovered.add(new AcmPcaCfnProvisioner(acmPcaService));
             }
             if (appSyncService != null) {
                 discovered.add(new AppSyncCfnProvisioner(appSyncService));
@@ -865,6 +871,11 @@ final class CfnProvisionerFixture {
 
         public Builder acm(AcmService v) {
             this.acmService = v;
+            return this;
+        }
+
+        public Builder acmPca(AcmPcaService v) {
+            this.acmPcaService = v;
             return this;
         }
 

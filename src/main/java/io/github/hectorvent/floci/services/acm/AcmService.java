@@ -34,6 +34,7 @@ import java.nio.charset.StandardCharsets;
 import java.security.cert.X509Certificate;
 import java.time.Clock;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Base64;
@@ -76,8 +77,14 @@ public class AcmService implements ResourceProvider {
     /** Key algorithms real ACM accepts for RequestCertificate; the wider enum stays valid for ImportCertificate. */
     private static final Set<KeyAlgorithm> REQUESTABLE_KEY_ALGORITHMS =
         EnumSet.of(KeyAlgorithm.RSA_2048, KeyAlgorithm.EC_prime256v1, KeyAlgorithm.EC_secp384r1);
+    /** Validity of a PRIVATE certificate ACM issues from a private CA: 13 months, as ACM issues them. */
+    static final long PRIVATE_CERTIFICATE_VALIDITY_DAYS = 395;
+    /** {@code FailureReason} of a PRIVATE certificate whose CA is not ACTIVE. */
+    static final String PCA_INVALID_STATE = "PCA_INVALID_STATE";
     @Inject
     Instance<AcmCertificateReferenceProvider> referenceProviders;
+    @Inject
+    Instance<AcmPrivateCertificateAuthorities> privateAuthorities;
 
     private final StorageBackend<String, Certificate> store;
     private final CertificateGenerator certificateGenerator;
@@ -187,9 +194,13 @@ public class AcmService implements ResourceProvider {
         // Determine certificate type and initial status
         CertificateType type;
         CertificateStatus status;
+        Optional<AcmPrivateCertificateAuthorities.PrivateCertificateAuthority> authority = Optional.empty();
         if (certAuthorityArn != null && !certAuthorityArn.isEmpty()) {
             type = CertificateType.PRIVATE;
-            status = CertificateStatus.ISSUED;
+            authority = privateAuthority(certAuthorityArn, region);
+            // A private CA that exists but is not ACTIVE cannot sign: ACM fails the certificate.
+            status = authority.isPresent() && !authority.get().active()
+                ? CertificateStatus.FAILED : CertificateStatus.ISSUED;
         } else {
             type = CertificateType.AMAZON_ISSUED;
             status = validationWaitSeconds > 0 ? CertificateStatus.PENDING_VALIDATION : CertificateStatus.ISSUED;
@@ -197,10 +208,18 @@ public class AcmService implements ResourceProvider {
 
         ValidationMethod method = validationMethod != null ? validationMethod : ValidationMethod.DNS;
 
-        // A server leaf signed by the local CA, so Certificate plus CertificateChain from
-        // GetCertificate validate the way an ACM certificate and its chain do on AWS.
-        CertificateGenerator.GeneratedCertificate generated = certificateAuthority.issueServerCertificate(
-            domainName, sans, alg, null);
+        // A server leaf signed by the private CA the request names when AWS Private CA holds it, else by
+        // the local CA, so Certificate plus CertificateChain from GetCertificate validate the way an ACM
+        // certificate and its chain do on AWS. A FAILED certificate has no material.
+        CertificateGenerator.GeneratedCertificate generated = null;
+        String chainPem = certificateAuthority.caPem();
+        if (authority.isPresent() && authority.get().active()) {
+            generated = certificateGenerator.generateIssuedCertificate(domainName, sans, alg, null,
+                authority.get().issuer(), CertificateGenerator.LeafUsage.SERVER, privateNotAfter(authority.get()));
+            chainPem = authority.get().chainPem();
+        } else if (status != CertificateStatus.FAILED) {
+            generated = certificateAuthority.issueServerCertificate(domainName, sans, alg, null);
+        }
 
         Instant now = clock.instant();
 
@@ -221,7 +240,12 @@ public class AcmService implements ResourceProvider {
         cert.setValidationMethod(method);
         cert.setCreatedAt(now);
         cert.setIssuedAt(status == CertificateStatus.ISSUED ? now : null);
-        applyIssuedMaterial(cert, alg, generated);
+        if (generated != null) {
+            applyIssuedMaterial(cert, alg, generated, chainPem);
+        } else {
+            cert.setKeyAlgorithm(alg);
+            cert.setFailureReason(PCA_INVALID_STATE);
+        }
         cert.setCertOptions(options != null ? options : CertificateOptions.defaultOptions());
         cert.setCertAuthorityArn(certAuthorityArn);
         cert.setIdempotencyToken(idempotencyToken);
@@ -517,6 +541,9 @@ public class AcmService implements ResourceProvider {
             throw new AwsException("ValidationException",
                 "Certificate is not PRIVATE type and Export is not ENABLED", 400);
         }
+        if (cert.getCertificateBody() == null) {
+            throw notIssued(cert);
+        }
 
         String passphrase;
         try {
@@ -661,8 +688,18 @@ public class AcmService implements ResourceProvider {
                     }
                 }
             }
-            CertificateGenerator.GeneratedCertificate generated = certificateAuthority.issueServerCertificate(
-                cert.getDomainName(), sans, alg, null);
+            Optional<AcmPrivateCertificateAuthorities.PrivateCertificateAuthority> authority =
+                privateAuthority(cert.getCertAuthorityArn(), region);
+            if (authority.isPresent() && !authority.get().active()) {
+                // The CA that issued it can no longer sign: the certificate stays as it is, and no error is returned.
+                LOG.infov("Certificate {0} not renewed: its private CA is not ACTIVE", certificateArn);
+                return cert;
+            }
+            CertificateGenerator.GeneratedCertificate generated = authority.isPresent()
+                ? certificateGenerator.generateIssuedCertificate(cert.getDomainName(), sans, alg, null,
+                    authority.get().issuer(), CertificateGenerator.LeafUsage.SERVER, privateNotAfter(authority.get()))
+                : certificateAuthority.issueServerCertificate(cert.getDomainName(), sans, alg, null);
+            String chainPem = authority.isPresent() ? authority.get().chainPem() : certificateAuthority.caPem();
 
             renewed = new Certificate();
             renewed.setArn(cert.getArn());
@@ -674,7 +711,7 @@ public class AcmService implements ResourceProvider {
             renewed.setCreatedAt(cert.getCreatedAt());
             renewed.setImportedAt(cert.getImportedAt());
             renewed.setIssuedAt(clock.instant());
-            applyIssuedMaterial(renewed, alg, generated);
+            applyIssuedMaterial(renewed, alg, generated, chainPem);
             renewed.setCertOptions(cert.getCertOptions());
             renewed.setCertAuthorityArn(cert.getCertAuthorityArn());
             renewed.setIdempotencyToken(cert.getIdempotencyToken());
@@ -689,9 +726,9 @@ public class AcmService implements ResourceProvider {
         return renewed;
     }
 
-    /** The validity, identity and key material of a leaf issued by the local CA. */
+    /** The validity, identity and key material of an issued leaf, and the chain of the CA that signed it. */
     private void applyIssuedMaterial(Certificate cert, KeyAlgorithm alg,
-                                     CertificateGenerator.GeneratedCertificate generated) {
+                                     CertificateGenerator.GeneratedCertificate generated, String chainPem) {
         cert.setNotBefore(generated.notBefore());
         cert.setNotAfter(generated.notAfter());
         cert.setSerial(generated.serial());
@@ -701,7 +738,37 @@ public class AcmService implements ResourceProvider {
         cert.setSignatureAlgorithm(generated.signatureAlgorithm());
         cert.setCertificateBody(generated.certificatePem());
         cert.setPrivateKey(generated.privateKeyPem());
-        cert.setCertificateChain(certificateAuthority.caPem());
+        cert.setCertificateChain(chainPem);
+    }
+
+    /**
+     * A certificate with no body to return: one that ACM failed to issue. Floci answers
+     * {@code RequestInProgressException}, the modeled error {@code GetCertificate} and {@code ExportCertificate}
+     * document for a certificate that has no body yet; the public docs do not name the error for a failed one.
+     */
+    static AwsException notIssued(Certificate cert) {
+        return new AwsException("RequestInProgressException",
+            "Certificate " + cert.getArn() + " is " + cert.getStatus().name() + " and has no certificate body.", 400);
+    }
+
+    /** 395 days from now, as ACM issues private certificates, but never past the signing CA's own certificate. */
+    private static Instant privateNotAfter(AcmPrivateCertificateAuthorities.PrivateCertificateAuthority authority) {
+        Instant end = Instant.now().plus(PRIVATE_CERTIFICATE_VALIDITY_DAYS, ChronoUnit.DAYS);
+        Instant caEnd = authority.issuer().certificate().getNotAfter().toInstant();
+        return end.isAfter(caEnd) ? caEnd : end;
+    }
+
+    /**
+     * The private CA {@code certificateAuthorityArn} names, when AWS Private CA holds one of that ARN in the
+     * caller's account and the Region. Empty otherwise, which keeps the local CA as the signer.
+     */
+    private Optional<AcmPrivateCertificateAuthorities.PrivateCertificateAuthority> privateAuthority(
+            String certificateAuthorityArn, String region) {
+        if (certificateAuthorityArn == null || certificateAuthorityArn.isEmpty()
+                || privateAuthorities == null || !privateAuthorities.isResolvable()) {
+            return Optional.empty();
+        }
+        return privateAuthorities.get().find(certificateAuthorityArn, region);
     }
 
     /** A consumer may acquire IAM before ACM; never invoke it while holding this guard. */
@@ -940,7 +1007,11 @@ public class AcmService implements ResourceProvider {
      */
     private DomainValidation generateDomainValidation(String domain, String requestedValidationDomain,
                                                       ValidationMethod method, CertificateStatus status) {
-        String validationStatus = status == CertificateStatus.ISSUED ? "SUCCESS" : "PENDING_VALIDATION";
+        String validationStatus = switch (status) {
+            case ISSUED -> "SUCCESS";
+            case FAILED -> "FAILED";
+            default -> "PENDING_VALIDATION";
+        };
 
         if (method == ValidationMethod.EMAIL) {
             String validationDomain = requestedValidationDomain != null ? requestedValidationDomain : baseDomain(domain);

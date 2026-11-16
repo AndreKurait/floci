@@ -7,10 +7,14 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.Pem;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.ReservedTags;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.acm.AcmPrivateCertificateAuthorities;
+import io.github.hectorvent.floci.services.acm.CertificateGenerator;
 import io.github.hectorvent.floci.services.acmpca.model.CertificateAuthority;
 import io.github.hectorvent.floci.services.acmpca.model.CertificateAuthority.IssueToken;
 import io.github.hectorvent.floci.services.acmpca.model.CertificateAuthority.IssuedCertificate;
@@ -26,10 +30,13 @@ import java.time.Instant;
 import java.time.temporal.ChronoUnit;
 import java.util.Base64;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.UUID;
+import java.util.stream.Collectors;
 
 import static io.github.hectorvent.floci.services.acmpca.PrivateCaRequests.blob;
 import static io.github.hectorvent.floci.services.acmpca.PrivateCaRequests.fields;
@@ -38,7 +45,7 @@ import static io.github.hectorvent.floci.services.acmpca.PrivateCaRequests.optio
 import static io.github.hectorvent.floci.services.acmpca.PrivateCaRequests.text;
 
 @ApplicationScoped
-public class AcmPcaService implements Resettable {
+public class AcmPcaService implements Resettable, AcmPrivateCertificateAuthorities {
 
     private final StorageBackend<String, CertificateAuthority> store;
     private final RegionResolver regionResolver;
@@ -61,6 +68,9 @@ public class AcmPcaService implements Resettable {
 
     public synchronized ObjectNode create(JsonNode request, String region) {
         Map<String, String> subject = PrivateCaRequests.configuration(request);
+        Map<String, String> tags = request.hasNonNull("Tags")
+                ? tagMap(PrivateCaRequests.tags(request, true)) : new LinkedHashMap<>();
+        String id = overrideId(tags.remove(ReservedTags.OVERRIDE_ID_KEY));
         String token = PrivateCaRequests.token(request);
         Instant now = now();
         if (token != null) {
@@ -70,11 +80,16 @@ public class AcmPcaService implements Resettable {
                 }
             }
         }
+        String arn = regionResolver.buildArn("acm-pca", region, "certificate-authority/" + id);
+        if (authorities(region).stream().anyMatch(existing -> existing.arn().equals(arn))) {
+            throw invalid("A certificate authority with id " + id + " already exists");
+        }
         PrivateCaCertificates.KeyMaterial material = PrivateCaCertificates.create(subject);
-        String arn = regionResolver.buildArn("acm-pca", region, "certificate-authority/" + UUID.randomUUID());
+        String storage = optionalText(request, "KeyStorageSecurityStandard");
         CertificateAuthority authority = new CertificateAuthority(arn, regionResolver.getAccountId(), region,
                 subject, material.privateKeyPem(), material.csrPem(), null, "PENDING_CERTIFICATE",
-                now, now, null, token, Map.of(), Map.of());
+                now, now, null, token, Map.of(), Map.of(), text(request, "CertificateAuthorityType"), null,
+                storage == null ? "FIPS_140_2_LEVEL_3_OR_HIGHER" : storage, tags);
         save(authority);
         return mapper.createObjectNode().put("CertificateAuthorityArn", arn);
     }
@@ -105,8 +120,15 @@ public class AcmPcaService implements Resettable {
         String rootTemplate = templateArn(region, "RootCACertificate/V1");
         String leafTemplate = templateArn(region, "EndEntityCertificate/V1");
         boolean root = rootTemplate.equals(template);
-        if (template != null && !root && !leafTemplate.equals(template)) {
-            throw invalid("Only RootCACertificate/V1 and EndEntityCertificate/V1 templates are supported");
+        Integer pathLength = null;
+        for (int length = 0; length <= 3; length++) {
+            if (templateArn(region, "SubordinateCACertificate_PathLen" + length + "/V1").equals(template)) {
+                pathLength = length;
+            }
+        }
+        if (template != null && !root && pathLength == null && !leafTemplate.equals(template)) {
+            throw invalid("Only RootCACertificate/V1, SubordinateCACertificate_PathLen0/V1 to PathLen3/V1 "
+                    + "and EndEntityCertificate/V1 templates are supported");
         }
         String status = status(authority);
         if (root ? !"PENDING_CERTIFICATE".equals(status) : !"ACTIVE".equals(status)) {
@@ -118,6 +140,10 @@ public class AcmPcaService implements Resettable {
             PrivateCaCertificates.requireOwnCsr(csr, authority.csrPem());
         } else {
             parent = PrivateCaCertificates.certificate(authority.certificatePem());
+            // A CA certificate's path length must be below its issuer's; a root without one allows any.
+            if (pathLength != null && pathLength >= parent.getBasicConstraints()) {
+                throw invalid("The template path length must be less than the path length of the issuing CA");
+            }
         }
         Instant now = now();
         String token = PrivateCaRequests.token(request);
@@ -131,12 +157,12 @@ public class AcmPcaService implements Resettable {
             throw new AwsException("InvalidArgsException", "The requested validity exceeds the CA validity", 400);
         }
         X509Certificate certificate = PrivateCaCertificates.issue(
-                csr, authority.privateKeyPem(), parent, notBefore, notAfter);
+                csr, authority.privateKeyPem(), parent, pathLength, notBefore, notAfter);
         AwsArnUtils.Arn caArn = AwsArnUtils.parse(authority.arn());
         String arn = regionResolver.buildArn("acm-pca", region,
                 caArn.resource() + "/certificate/" + certificate.getSerialNumber().toString(16));
         IssuedCertificate issued = new IssuedCertificate(
-                PrivateCaCertificates.pem(certificate), root ? null : authority.certificatePem());
+                PrivateCaCertificates.pem(certificate), root ? null : chainOf(authority));
         save(authority.issued(arn, issued, token, now));
         return mapper.createObjectNode().put("CertificateArn", arn);
     }
@@ -157,14 +183,25 @@ public class AcmPcaService implements Resettable {
         fields(request, "request", Set.of("CertificateAuthorityArn", "Certificate", "CertificateChain"));
         CertificateAuthority authority = authority(request, region);
         if (!"PENDING_CERTIFICATE".equals(status(authority))) {
-            throw state("Only initial activation of a pending root certificate authority is supported");
+            throw state("Only initial activation of a pending certificate authority is supported");
         }
-        if (request.hasNonNull("CertificateChain")) {
-            throw invalid("A root certificate authority does not accept a certificate chain");
+        if ("ROOT".equals(authority.type())) {
+            if (request.hasNonNull("CertificateChain")) {
+                throw invalid("A root certificate authority does not accept a certificate chain");
+            }
+            X509Certificate certificate = PrivateCaCertificates.importedRoot(
+                    blob(request, "Certificate", 32_768), authority.csrPem(), now());
+            save(authority.transition("ACTIVE", PrivateCaCertificates.pem(certificate), now(), null));
+            return mapper.createObjectNode();
         }
-        X509Certificate certificate = PrivateCaCertificates.importedRoot(
-                blob(request, "Certificate", 32_768), authority.csrPem(), now());
-        save(authority.transition("ACTIVE", PrivateCaCertificates.pem(certificate), now(), null));
+        if (!request.hasNonNull("CertificateChain")) {
+            throw invalid("A subordinate certificate authority needs the CertificateChain of its issuer");
+        }
+        List<X509Certificate> chain = PrivateCaCertificates.certificates(blob(request, "CertificateChain", 2_097_152));
+        X509Certificate certificate = PrivateCaCertificates.importedSubordinate(
+                blob(request, "Certificate", 32_768), chain, authority.csrPem(), now());
+        save(authority.imported(PrivateCaCertificates.pem(certificate),
+                chain.stream().map(PrivateCaCertificates::pem).collect(Collectors.joining()), now()));
         return mapper.createObjectNode();
     }
 
@@ -174,7 +211,7 @@ public class AcmPcaService implements Resettable {
         if (authority.certificatePem() == null) {
             throw state("The certificate authority does not have an imported certificate");
         }
-        return certificateResponse(authority.certificatePem(), null);
+        return certificateResponse(authority.certificatePem(), authority.certificateChainPem());
     }
 
     public synchronized ObjectNode update(JsonNode request, String region) {
@@ -242,13 +279,134 @@ public class AcmPcaService implements Resettable {
         return result;
     }
 
+    public synchronized ObjectNode tag(JsonNode request, String region) {
+        fields(request, "request", Set.of("CertificateAuthorityArn", "Tags"));
+        Map<String, String> tags = tagMap(PrivateCaRequests.tags(request));
+        CertificateAuthority authority = authority(request, region);
+        requireUsable(authority);
+        Map<String, String> merged = new LinkedHashMap<>(authority.tags());
+        merged.putAll(tags);
+        if (merged.size() > PrivateCaRequests.MAX_TAGS) {
+            throw new AwsException("TooManyTagsException",
+                    "A certificate authority can have at most " + PrivateCaRequests.MAX_TAGS + " tags", 400);
+        }
+        save(authority.tagged(merged));
+        return mapper.createObjectNode();
+    }
+
+    /** Removes each named tag; a tag given with a value is removed only while it has that value. */
+    public synchronized ObjectNode untag(JsonNode request, String region) {
+        fields(request, "request", Set.of("CertificateAuthorityArn", "Tags"));
+        List<PrivateCaRequests.Tag> tags = PrivateCaRequests.tags(request);
+        CertificateAuthority authority = authority(request, region);
+        requireUsable(authority);
+        Map<String, String> remaining = new LinkedHashMap<>(authority.tags());
+        for (PrivateCaRequests.Tag tag : tags) {
+            if (tag.value() == null || tag.value().equals(remaining.get(tag.key()))) {
+                remaining.remove(tag.key());
+            }
+        }
+        save(authority.tagged(remaining));
+        return mapper.createObjectNode();
+    }
+
+    /** The authority's tags in key order, paged with a token scoped to the authority. */
+    public synchronized ObjectNode listTags(JsonNode request, String region) {
+        fields(request, "request", Set.of("CertificateAuthorityArn", "MaxResults", "NextToken"));
+        long limit = request.hasNonNull("MaxResults")
+                ? PrivateCaRequests.integer(request, "MaxResults", 1, 1000) : 1000;
+        CertificateAuthority authority = authority(request, region);
+        requireUsable(authority);
+        String token = optionalText(request, "NextToken");
+        String after = null;
+        if (token != null) {
+            try {
+                String[] parts = new String(Base64.getDecoder().decode(token), StandardCharsets.UTF_8).split("\n", -1);
+                if (parts.length != 2 || !parts[0].equals(authority.arn())) {
+                    throw new IllegalArgumentException("Token belongs to another authority");
+                }
+                after = parts[1];
+            } catch (IllegalArgumentException failure) {
+                throw new AwsException("InvalidNextTokenException", "The pagination token is invalid", 400);
+            }
+        }
+        String start = after;
+        List<String> keys = authority.tags().keySet().stream()
+                .filter(key -> start == null || key.compareTo(start) > 0).sorted().toList();
+        ObjectNode result = mapper.createObjectNode();
+        ArrayNode values = result.putArray("Tags");
+        int count = (int) Math.min(limit, keys.size());
+        for (String key : keys.subList(0, count)) {
+            values.addObject().put("Key", key).put("Value", authority.tags().get(key));
+        }
+        if (count < keys.size()) {
+            String cursor = authority.arn() + "\n" + keys.get(count - 1);
+            result.put("NextToken", Base64.getEncoder().encodeToString(cursor.getBytes(StandardCharsets.UTF_8)));
+        }
+        return result;
+    }
+
     @Override
     public synchronized void clear() {
         store.clear();
     }
 
+    /**
+     * The id of a new authority: a random UUID, or the value of Floci's reserved {@code floci:override-id}
+     * create tag, which must be a lowercase UUID like the ids AWS assigns.
+     */
+    private static String overrideId(String override) {
+        if (override == null) {
+            return UUID.randomUUID().toString();
+        }
+        if (!override.matches("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")) {
+            throw PrivateCaRequests.tagError(ReservedTags.OVERRIDE_ID_KEY + " must be a lowercase UUID");
+        }
+        return override;
+    }
+
+    /** The request's tags by key; a tag without a value has an empty one. */
+    private static Map<String, String> tagMap(List<PrivateCaRequests.Tag> tags) {
+        Map<String, String> map = new LinkedHashMap<>();
+        tags.forEach(tag -> map.put(tag.key(), tag.value() == null ? "" : tag.value()));
+        return map;
+    }
+
+    /** What a certificate the authority issues presents above itself: its certificate, then its own chain. */
+    private static String chainOf(CertificateAuthority authority) {
+        return authority.certificateChainPem() == null ? authority.certificatePem()
+                : authority.certificatePem() + authority.certificateChainPem();
+    }
+
+    /**
+     * ACM's view of the authority {@code certificateAuthorityArn} names in the caller's account and the
+     * Region: only an ACTIVE one signs, with its key, and presents its certificate and chain. Empty when
+     * Private CA holds no authority of that ARN there.
+     */
+    @Override
+    public synchronized Optional<PrivateCertificateAuthority> find(String certificateAuthorityArn, String region) {
+        CertificateAuthority authority;
+        try {
+            authority = authority(certificateAuthorityArn, region);
+        } catch (AwsException failure) {
+            if (Set.of("InvalidArnException", "ResourceNotFoundException").contains(failure.getErrorCode())) {
+                return Optional.empty();
+            }
+            throw failure;
+        }
+        if (!"ACTIVE".equals(status(authority))) {
+            return Optional.of(new PrivateCertificateAuthority(false, null, null));
+        }
+        CertificateGenerator.Issuer issuer = new CertificateGenerator.Issuer(
+                PrivateCaCertificates.certificate(authority.certificatePem()), Pem.parsePrivateKey(authority.privateKeyPem()));
+        return Optional.of(new PrivateCertificateAuthority(true, issuer, chainOf(authority)));
+    }
+
     private CertificateAuthority authority(JsonNode request, String region) {
-        String arn = text(request, "CertificateAuthorityArn");
+        return authority(text(request, "CertificateAuthorityArn"), region);
+    }
+
+    private CertificateAuthority authority(String arn, String region) {
         AwsArnUtils.Arn parsed = validateArn(arn, false);
         if (!region.equals(parsed.region()) || !regionResolver.getAccountId().equals(parsed.accountId())
                 || !regionResolver.partitionForRegion(region).equals(parsed.partition())) {
@@ -298,9 +456,12 @@ public class AcmPcaService implements Resettable {
 
     private ObjectNode description(CertificateAuthority authority) {
         ObjectNode result = mapper.createObjectNode().put("Arn", authority.arn()).put("OwnerAccount", authority.ownerAccount())
-                .put("Type", "ROOT").put("Status", status(authority)).put("UsageMode", "GENERAL_PURPOSE")
+                .put("Type", authority.type()).put("Status", status(authority)).put("UsageMode", "GENERAL_PURPOSE")
                 .put("CreatedAt", authority.createdAt().getEpochSecond())
                 .put("LastStateChangeAt", authority.lastStateChangeAt().getEpochSecond());
+        if (authority.keyStorageSecurityStandard() != null) {
+            result.put("KeyStorageSecurityStandard", authority.keyStorageSecurityStandard());
+        }
         ObjectNode config = result.putObject("CertificateAuthorityConfiguration")
                 .put("KeyAlgorithm", "RSA_2048").put("SigningAlgorithm", "SHA256WITHRSA");
         config.set("Subject", mapper.valueToTree(authority.subject()));
