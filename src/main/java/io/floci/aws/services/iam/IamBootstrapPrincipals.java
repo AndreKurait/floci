@@ -11,6 +11,7 @@ import io.floci.aws.services.iam.model.AccessKey;
 import io.floci.aws.services.iam.model.IamUser;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.file.Files;
 import java.nio.file.LinkOption;
 import java.nio.file.Path;
@@ -28,7 +29,7 @@ import java.util.UUID;
 final class IamBootstrapPrincipals {
     private static final Set<String> FIELDS = Set.of("accountId", "partition", "userName", "accessKeyId",
             "secretAccessKey", "grant");
-    private static final long MAX_FILE_BYTES = 65536;
+    private static final int MAX_FILE_BYTES = 65536;
     private final List<Principal> principals;
     private final AccountAwareStorageBackend<IamUser> users;
     private final AccountAwareStorageBackend<AccessKey> keys;
@@ -45,6 +46,10 @@ final class IamBootstrapPrincipals {
 
     /** Validate the entire file and every stored identity before startup writes anything. */
     void validateStoredIdentities() {
+        if (keys.scanAllAccountEntries("floci"::equals).stream()
+                .anyMatch(entry -> "Active".equals(entry.value().getStatus()))) {
+            throw invalid("conflicts with an active stored public deployer key; remove or deactivate it first");
+        }
         for (Principal principal : principals) {
             List<AccountAwareStorageBackend.AccountEntry<IamUser>> matchingUsers =
                     users.scanAllAccountEntries(principal.userName()::equalsIgnoreCase).stream()
@@ -121,7 +126,7 @@ final class IamBootstrapPrincipals {
             ObjectMapper mapper = new ObjectMapper();
             mapper.enable(JsonParser.Feature.STRICT_DUPLICATE_DETECTION);
             mapper.enable(DeserializationFeature.FAIL_ON_TRAILING_TOKENS);
-            root = mapper.readTree(Files.readAllBytes(path));
+            root = mapper.readTree(readBytes(path));
         } catch (IOException | IllegalArgumentException error) {
             // Jackson errors can contain the original JSON, so never retain or log the cause.
             throw invalid("must contain readable valid JSON");
@@ -152,9 +157,19 @@ final class IamBootstrapPrincipals {
             if (!ids.add(id) || !names.add(account + "/" + user.toLowerCase(Locale.ROOT))) {
                 throw invalid("contains duplicate keys or account/user identities");
             }
-            result.add(new Principal(account, partition, user, id, secret));
+            result.add(new Principal(account, AwsPartitions.byId(partition).id(), user, id, secret));
         }
         return List.copyOf(result);
+    }
+
+    static byte[] readBytes(Path path) throws IOException {
+        try (InputStream input = Files.newInputStream(path, LinkOption.NOFOLLOW_LINKS)) {
+            byte[] bytes = input.readNBytes(MAX_FILE_BYTES + 1);
+            if (bytes.length > MAX_FILE_BYTES) {
+                throw invalid("exceeds the size limit");
+            }
+            return bytes;
+        }
     }
 
     private static String text(JsonNode node, String field) {

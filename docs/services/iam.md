@@ -3555,9 +3555,14 @@ is an emulator credential, not a real AWS access key. Give the SDK caller the sa
 using its normal credentials-provider mechanism. Mount the file read-only, owned by the Floci
 runtime user, with mode `0600` or `0400`. Symlinks, group/other permissions, non-regular files,
 unknown fields, duplicate identities, invalid partitions, and malformed input refuse startup.
-The file is bounded to 64 KiB and 32 principals. JSON parsing errors do not echo its contents.
+The file is bounded to 64 KiB and 32 principals, including the bytes read after opening it without
+following a symbolic link. Accepted partition spellings are stored as canonical partition IDs.
+JSON parsing errors do not echo its contents.
 
 The whole configuration and all existing identity conflicts are validated before seeding.
+An active public `floci` deployer key in any stored account also refuses startup. Remove or
+deactivate that key before enabling private bootstrap; disabling its seed flag alone does not
+remove a key persisted by an earlier run.
 Users, keys, and bootstrap identity markers use the ordinary account-aware IAM stores and their
 configured persistence mode. Repeating identical configuration preserves IDs, secrets, dates,
 and grants. An existing unrelated user/key is never adopted or overwritten. A bootstrap user
