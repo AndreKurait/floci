@@ -2483,6 +2483,17 @@ public interface EmulatorConfig {
         /** Seconds to wait before transitioning from PENDING_VALIDATION to ISSUED (0 = immediate) */
         @WithDefault("0")
         int validationWaitSeconds();
+
+        /**
+         * Whether ACM's expiry sweep runs: managed renewal of private certificates 60 days before they
+         * expire, and the daily "Approaching Expiration" and the "Expired" EventBridge events.
+         */
+        @WithDefault("true")
+        boolean expirySweepEnabled();
+
+        /** Seconds between expiry sweeps; a notice is still sent at most once a day per certificate. */
+        @WithDefault("3600")
+        long expirySweepSeconds();
     }
 
     interface CloudHsmV2ServiceConfig {
