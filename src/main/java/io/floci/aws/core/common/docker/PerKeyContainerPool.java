@@ -6,6 +6,8 @@ import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.function.BiConsumer;
+import java.util.function.BiPredicate;
 
 /**
  * Lazily starts, health-checks, and reuses one container per arbitrary key. Pulled out of
@@ -35,6 +37,8 @@ public class PerKeyContainerPool {
 
     private final ContainerLifecycleManager lifecycleManager;
     private final String healthPath;
+    private final BiPredicate<String, String> healthProbe;
+    private final BiConsumer<String, String> healthWait;
     private final ConcurrentHashMap<String, StartedContainer> containers = new ConcurrentHashMap<>();
     private final ConcurrentHashMap<String, Object> startLocks = new ConcurrentHashMap<>();
     /**
@@ -52,8 +56,15 @@ public class PerKeyContainerPool {
      *                   readiness; expected to return HTTP 200 once the container can serve
      */
     public PerKeyContainerPool(ContainerLifecycleManager lifecycleManager, String healthPath) {
+        this(lifecycleManager, healthPath, SidecarHealthHelper::probeHealth, SidecarHealthHelper::waitForHealth);
+    }
+
+    PerKeyContainerPool(ContainerLifecycleManager lifecycleManager, String healthPath,
+                        BiPredicate<String, String> healthProbe, BiConsumer<String, String> healthWait) {
         this.lifecycleManager = lifecycleManager;
         this.healthPath = healthPath;
+        this.healthProbe = healthProbe;
+        this.healthWait = healthWait;
     }
 
     /**
@@ -63,14 +74,19 @@ public class PerKeyContainerPool {
      * only one container is ever started for it.
      */
     public String ensureReady(String key, Starter starter) {
-        StartedContainer existing = containers.get(key);
-        if (existing != null && SidecarHealthHelper.probeHealth(existing.baseUrl(), healthPath)) {
-            return existing.baseUrl();
-        }
+        return ensureReady(key, starter, true);
+    }
+
+    /** A caller with other admitted uses must keep their container alive during a failed probe. */
+    public String ensureReady(String key, Starter starter, boolean mayRestart) {
         Object lock = startLocks.computeIfAbsent(key, k -> new Object());
         synchronized (lock) {
-            existing = containers.get(key);
-            if (existing != null && SidecarHealthHelper.probeHealth(existing.baseUrl(), healthPath)) {
+            StartedContainer existing = containers.get(key);
+            if (existing != null && healthProbe.test(existing.baseUrl(), healthPath)) {
+                return existing.baseUrl();
+            }
+            if (existing != null && !mayRestart) {
+                healthWait.accept(existing.baseUrl(), healthPath);
                 return existing.baseUrl();
             }
             if (existing != null) {
@@ -99,7 +115,11 @@ public class PerKeyContainerPool {
                 lifecycleManager.stopAndRemove(started.containerId(), null);
                 throw new IllegalStateException("Sidecar pool was reset while starting a container for key " + key);
             }
-            SidecarHealthHelper.waitForHealth(started.baseUrl(), healthPath);
+            healthWait.accept(started.baseUrl(), healthPath);
+            if (generation.get() != startedGeneration || containers.get(key) != started) {
+                throw new IllegalStateException("Sidecar pool was reset while waiting for container readiness for key "
+                        + key);
+            }
             return started.baseUrl();
         }
     }

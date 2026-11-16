@@ -18,16 +18,18 @@ import org.junit.jupiter.api.TestMethodOrder;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.zip.GZIPOutputStream;
 
 import static io.restassured.RestAssured.given;
@@ -252,7 +254,7 @@ class CodeArtifactPypiDockerIntegrationTest {
 
     @Test
     @Order(8)
-    void concurrentFirstUseOfANewRepositoryOnlyStartsOneContainer() throws InterruptedException {
+    void concurrentFirstUseOfANewRepositoryOnlyStartsOneContainer() throws InterruptedException, ExecutionException {
         given().contentType("application/json").header("Authorization", AUTH).body("{}")
                 .post("/v1/repository?domain=" + DOMAIN + "&repository=concurrent-repo")
                 .then().statusCode(200);
@@ -261,29 +263,32 @@ class CodeArtifactPypiDockerIntegrationTest {
         ExecutorService pool = Executors.newFixedThreadPool(attempts);
         CountDownLatch ready = new CountDownLatch(attempts);
         CountDownLatch go = new CountDownLatch(1);
-        AtomicInteger notFoundResponses = new AtomicInteger();
+        List<Future<?>> requests = new ArrayList<>();
         try {
             for (int i = 0; i < attempts; i++) {
-                pool.submit(() -> {
+                requests.add(pool.submit(() -> {
                     ready.countDown();
                     try {
                         go.await();
                         given().header("Authorization", "Bearer " + bearerToken)
                                 .get("/codeartifact/pypi/" + DOMAIN + "/concurrent-repo/simple/does-not-exist/")
                                 .then().statusCode(404);
-                        notFoundResponses.incrementAndGet();
-                    } catch (InterruptedException ignored) {
+                    } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
+                        throw new IllegalStateException("Concurrent request was interrupted", e);
                     }
-                });
+                }));
             }
-            ready.await(5, TimeUnit.SECONDS);
+            assertTrue(ready.await(5, TimeUnit.SECONDS));
             go.countDown();
         } finally {
+            go.countDown();
             pool.shutdown();
             assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS));
         }
-        assertEquals(attempts, notFoundResponses.get());
+        for (Future<?> request : requests) {
+            request.get();
+        }
     }
 
     @Test

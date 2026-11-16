@@ -67,7 +67,7 @@ public class BagetterSidecarManager implements ContainerTeardown {
      * internal, client-unreachable address to leak into.
      */
     public String ensureReady(String nugetRepositoryId, String publicUrl) {
-        return pool.ensureReady(nugetRepositoryId, () -> startContainer(nugetRepositoryId));
+        return lease.ensureReady(nugetRepositoryId, () -> startContainer(nugetRepositoryId));
     }
 
     /** Stops and removes the container for one nuget repository, if one was ever started. */

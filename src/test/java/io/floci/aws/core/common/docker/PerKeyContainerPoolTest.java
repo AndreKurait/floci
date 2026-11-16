@@ -2,6 +2,7 @@ package io.floci.aws.core.common.docker;
 
 import com.sun.net.httpserver.HttpServer;
 import io.floci.aws.core.common.docker.PerKeyContainerPool.StartedContainer;
+import io.floci.aws.testing.ThreadStates;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 
@@ -9,15 +10,20 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -41,6 +47,49 @@ class PerKeyContainerPoolTest {
     @AfterEach
     void stopFakeContainers() {
         fakeContainers.forEach(server -> server.stop(0));
+    }
+
+    @Test
+    void concurrentCallerCannotUseAContainerBeforeItsInitialHealthWaitCompletes() throws Exception {
+        String url = "http://127.0.0.1:12345";
+        CountDownLatch waitingForHealth = new CountDownLatch(1);
+        CountDownLatch finishHealth = new CountDownLatch(1);
+        CountDownLatch secondCallerStarted = new CountDownLatch(1);
+        AtomicReference<Thread> secondCaller = new AtomicReference<>();
+        PerKeyContainerPool controlled = new PerKeyContainerPool(lifecycleManager, "/ping",
+                (baseUrl, path) -> true, (baseUrl, path) -> {
+                    waitingForHealth.countDown();
+                    try {
+                        assertTrue(finishHealth.await(5, TimeUnit.SECONDS));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new IllegalStateException("Interrupted health wait", e);
+                    }
+                });
+        ExecutorService callers = Executors.newFixedThreadPool(2);
+        try {
+            Future<String> first = callers.submit(() -> controlled.ensureReady("repo",
+                    () -> new StartedContainer("starting-container", url)));
+            assertTrue(waitingForHealth.await(5, TimeUnit.SECONDS));
+            Future<String> second = callers.submit(() -> {
+                secondCaller.set(Thread.currentThread());
+                secondCallerStarted.countDown();
+                return controlled.ensureReady("repo", () -> {
+                    throw new AssertionError("Concurrent request must reuse the initial container");
+                });
+            });
+            assertTrue(secondCallerStarted.await(5, TimeUnit.SECONDS));
+            ThreadStates.awaitState(secondCaller.get(), Set.of(Thread.State.BLOCKED),
+                    Duration.ofSeconds(2), "second caller at the readiness lock");
+            assertThrows(TimeoutException.class, () -> second.get(100, TimeUnit.MILLISECONDS));
+            finishHealth.countDown();
+            assertEquals(url, first.get(5, TimeUnit.SECONDS));
+            assertEquals(url, second.get(5, TimeUnit.SECONDS));
+        } finally {
+            finishHealth.countDown();
+            callers.shutdown();
+            assertTrue(callers.awaitTermination(5, TimeUnit.SECONDS));
+        }
     }
 
     @Test
@@ -85,6 +134,38 @@ class PerKeyContainerPoolTest {
 
         assertEquals(freshUrl, result);
         verify(lifecycleManager).stopAndRemove("stale-container", null);
+    }
+
+    @Test
+    void failedProbeWithAnotherAdmittedUseWaitsWithoutDestroyingItsContainer() {
+        String url = "http://127.0.0.1:12345";
+        AtomicInteger waits = new AtomicInteger();
+        PerKeyContainerPool controlled = new PerKeyContainerPool(lifecycleManager, "/ping",
+                (baseUrl, path) -> false, (baseUrl, path) -> waits.incrementAndGet());
+        controlled.ensureReady("repo", () -> new StartedContainer("busy-container", url));
+        assertEquals(url, controlled.ensureReady("repo", () -> {
+            throw new AssertionError("Must not replace an in-use container");
+        }, false));
+        assertEquals(2, waits.get());
+        verifyNoInteractions(lifecycleManager);
+    }
+
+    @Test
+    void sustainedUnhealthyBusyContainerFailsReadinessWithoutStoppingOtherRequests() {
+        String url = "http://127.0.0.1:12345";
+        AtomicBoolean unhealthy = new AtomicBoolean();
+        PerKeyContainerPool controlled = new PerKeyContainerPool(lifecycleManager, "/ping",
+                (baseUrl, path) -> !unhealthy.get(), (baseUrl, path) -> {
+                    if (unhealthy.get()) {
+                        throw new IllegalStateException("Health wait timed out");
+                    }
+                });
+        controlled.ensureReady("repo", () -> new StartedContainer("busy-container", url));
+        unhealthy.set(true);
+        assertThrows(IllegalStateException.class, () -> controlled.ensureReady("repo", () -> {
+            throw new AssertionError("Must not replace an in-use container");
+        }, false));
+        verifyNoInteractions(lifecycleManager);
     }
 
     @Test

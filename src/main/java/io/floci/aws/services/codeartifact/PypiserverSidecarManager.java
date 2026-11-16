@@ -59,7 +59,7 @@ public class PypiserverSidecarManager implements ContainerTeardown {
      * address to leak into.
      */
     public String ensureReady(String pypiRepositoryId, String publicUrl) {
-        return pool.ensureReady(pypiRepositoryId, () -> startContainer(pypiRepositoryId));
+        return lease.ensureReady(pypiRepositoryId, () -> startContainer(pypiRepositoryId));
     }
 
     /** Stops and removes the container for one pypi repository, if one was ever started. */
