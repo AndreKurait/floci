@@ -23,6 +23,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.LocallyBuiltHelperImage;
 import io.github.hectorvent.floci.core.common.docker.NetworkNamespaceLease;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.PolicyApplyBatch;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler;
 import io.github.hectorvent.floci.services.ec2.model.InternetGateway;
 import io.github.hectorvent.floci.services.ec2.model.NatGateway;
@@ -483,9 +484,29 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         for (NatRuntime nat : activeNats()) {
             RequestScopes.runAs(nat.account, nat.region, () -> configureNat(nat, topology(nat.region)));
         }
+        List<EndpointPolicy> policies = new ArrayList<>();
+        Map<String, List<EndpointPolicy>> byHelper = new LinkedHashMap<>();
         for (Endpoint endpoint : activeEndpoints()) {
-            RequestScopes.runAs(endpoint.identity.accountId(), endpoint.identity.region(),
-                    () -> configureEndpoint(endpoint, topology(endpoint.identity.region())));
+            EndpointPolicy policy = RequestScopes.callAs(endpoint.identity.accountId(), endpoint.identity.region(),
+                    () -> planEndpoint(endpoint, topology(endpoint.identity.region())));
+            if (policy != null) {
+                policies.add(policy);
+                byHelper.computeIfAbsent(endpoint.helper, ignored -> new ArrayList<>()).add(policy);
+            }
+        }
+        for (EndpointPolicy policy : policies) {
+            policy.endpoint().applied = null;
+        }
+        // Keep topology and identities fixed while independent helpers perform Docker I/O.
+        PolicyApplyBatch.run(byHelper.values().stream().<Runnable>map(batch -> () -> {
+            for (EndpointPolicy policy : batch) {
+                Endpoint endpoint = policy.endpoint();
+                run(endpoint.helper, VpcRoutingCommands.endpointGuard(endpoint.resolvers));
+                run(endpoint.helper, policy.script());
+            }
+        }).toList());
+        for (EndpointPolicy policy : policies) {
+            policy.endpoint().applied = policy.script();
         }
     }
 
@@ -566,7 +587,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         }
     }
 
-    private void configureEndpoint(Endpoint endpoint, Topology topology) {
+    private EndpointPolicy planEndpoint(Endpoint endpoint, Topology topology) {
         SecurityGroupNftCompiler.Endpoint identity = endpoint.identity;
         String account = identity.accountId();
         String region = identity.region();
@@ -671,14 +692,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         if (nativeAddress != null) {
             script += VpcRoutingCommands.nativePublicApi(identity.logicalAddress(), nativeAddress.address(), directApi);
         }
-        if (!script.equals(endpoint.applied)) {
-            // Resolver access is independent of VPC routes. Keep it available while
-            // withdrawing peer traffic before changing kernel routes and source NAT.
-            run(endpoint.helper, VpcRoutingCommands.endpointGuard(endpoint.resolvers));
-            endpoint.applied = null;
-            run(endpoint.helper, script);
-            endpoint.applied = script;
-        }
+        return script.equals(endpoint.applied) ? null : new EndpointPolicy(endpoint, script);
     }
 
     private VpcRoutingCommands.NativeApi nativePublicApi(Endpoint endpoint) {
@@ -1026,6 +1040,8 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
     }
 
     private record Topology(List<RouteTable> tables, List<NatGateway> nats, List<InternetGateway> gateways) {}
+
+    private record EndpointPolicy(Endpoint endpoint, String script) {}
 
     private record NativePublicAddress(String address, String network, String device, String transport,
                                        boolean separateTransport, String apiNetwork, String apiDevice) {}

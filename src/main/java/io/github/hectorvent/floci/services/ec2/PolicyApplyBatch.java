@@ -6,12 +6,12 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 /** Bounded Docker operations that must all finish before failure handling can quarantine helpers. */
-final class PolicyApplyBatch {
+public final class PolicyApplyBatch {
     private static final int MAX_WORKERS = 4;
 
     private PolicyApplyBatch() {}
 
-    static void run(List<Runnable> operations) {
+    public static void run(List<Runnable> operations) {
         AtomicInteger next = new AtomicInteger();
         AtomicReference<Throwable> failure = new AtomicReference<>();
         List<Thread> workers = new ArrayList<>(MAX_WORKERS);
