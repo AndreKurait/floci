@@ -689,6 +689,8 @@ Configuration resource reads and `ListFunctionsByCodeSigningConfig` return
 | `FLOCI_SERVICES_LAMBDA_REACTIVE_S3_SYNC_ASYNC` | `false` | Run that re-deploy in the background so the upload does not wait for it |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_NETWORK` | *(unset)* | Docker network to attach Lambda containers to (overrides `FLOCI_SERVICES_DOCKER_NETWORK`) |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_FLAGS` | *(unset)* | Additional Docker flags applied to Lambda containers, including `--env`, `--volume`, `--publish`, `--add-host`, `--dns`, `--label`, `--network`, `--user`, `--privileged`, and `--platform`. Explicit `--dns` entries replace automatic embedded DNS and public fallback resolvers. Published ports support `host:container` and `127.0.0.1:host:container` forms |
+| `FLOCI_SERVICES_LAMBDA_CONTAINER_READINESS_COMMAND` | *(unset)* | Optional Docker exec command that must succeed before a new container enters either invocation pool; quoted arguments are supported, with no implicit shell |
+| `FLOCI_SERVICES_LAMBDA_CONTAINER_READINESS_TIMEOUT_SECONDS` | `60` | One readiness budget, from 1 to 900 seconds, including the final fractional second; nonzero results retry, while timeout, interruption or an unavailable executable fails launch and cleans up the container |
 | `FLOCI_SERVICES_LAMBDA_EXTRA_HOSTS` | *(unset)* | Comma-separated `hostname:ip` entries added to each Lambda container's `/etc/hosts`; `ip` may be `host-gateway`, mirroring `docker run --add-host` |
 | `FLOCI_SERVICES_LAMBDA_DOCKER_HOST_OVERRIDE` | *(unset)* | Explicit host/IP that spawned Lambda containers use to reach Floci's Runtime API, bypassing auto-detection |
 | `FLOCI_SERVICES_LAMBDA_CONTAINER_NAME_PREFIX` | `floci` | Base name prefix for spawned Lambda containers and code volumes (e.g. `acme` → `acme-<function>-<id>` containers, `acme-code-<function>-<hash>` volumes; with `FLOCI_DOCKER_RESOURCE_NAMESPACE` set, the namespace follows the prefix and a short hash of it ends the volume name, e.g. `acme-<namespace>-code-<function>-<hash>-<namespace hash>`). Must be a valid Docker name segment (`[A-Za-z0-9][A-Za-z0-9_.-]*`); invalid values are ignored with a warning |
@@ -1501,3 +1503,11 @@ remain in effect.
 
 Environment variables use the quoted map-key form, for example
 `FLOCI_SERVICES_LAMBDA_RUNTIME_IMAGES__JAVA17_LINUX_ARM64__`.
+
+The readiness command runs inside each new Lambda container, including provisioned concurrency.
+Use it when a local network controller must finish configuring that namespace before invocation.
+The executable must exist in the runtime image. It is disabled by default and does not modify
+function code or AWS API responses. `/_floci/health` advertises
+`features.lambda_container_readiness: 1` so controllers can reject images without this support.
+When Lambda identity verification is enabled, Floci binds the running identity before
+the probe so initialization retains authenticated access while invocation waits.
