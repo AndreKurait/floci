@@ -10,6 +10,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
@@ -54,6 +55,33 @@ class HybridStorageTest {
         store2.load();
         assertEquals("value1", store2.get("key1").orElseThrow());
         store2.shutdown();
+    }
+
+    @Test
+    void durableBatchFailureDoesNotPublishAndSuccessSurvivesRestart() throws Exception {
+        Path file = tempDir.resolve("hybrid-test.json");
+        storage.putAllDurably(Map.of("existing", "original"));
+        byte[] original = Files.readAllBytes(file);
+        Path temporary = file.resolveSibling(file.getFileName() + ".tmp");
+        Files.createDirectory(temporary);
+        try {
+            assertThrows(UncheckedIOException.class,
+                    () -> storage.putAllDurably(Map.of("existing", "changed", "new", "value")));
+            assertEquals("original", storage.get("existing").orElseThrow());
+            assertTrue(storage.get("new").isEmpty());
+            assertArrayEquals(original, Files.readAllBytes(file));
+        } finally {
+            Files.delete(temporary);
+        }
+        storage.putAllDurably(Map.of("new", "value"));
+        HybridStorage<String, String> restarted = new HybridStorage<>(file, new TypeReference<>() {}, 60000);
+        try {
+            restarted.load();
+            assertEquals("original", restarted.get("existing").orElseThrow());
+            assertEquals("value", restarted.get("new").orElseThrow());
+        } finally {
+            restarted.shutdown();
+        }
     }
 
     @Test
