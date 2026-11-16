@@ -134,3 +134,38 @@ jobs:
             echo "Tested immutable image: \`$IMAGE\`"
             echo "Source: \`$SOURCE_SHA\`"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  cache-evidence:
+    name: Deliver cache publication evidence
+    needs: [build, smoke, stock-agent, promote]
+    if: >-
+      github.repository == 'AndreKurait/floci' && github.ref == 'refs/heads/dev' &&
+      vars.FLOCI_CACHE_ROLE_ARN != '' && vars.FLOCI_CACHE_BUCKET != '' &&
+      vars.FLOCI_CACHE_REGION != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Validate cache delivery controls
+        run: python3 -m unittest discover -s .github/scripts -p test_deliver_floci_cache.py -v
+
+      - name: Configure ingress credentials
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ vars.FLOCI_CACHE_ROLE_ARN }}
+          aws-region: ${{ vars.FLOCI_CACHE_REGION }}
+
+      - name: Deliver the original provenance archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FLOCI_CACHE_BUCKET: ${{ vars.FLOCI_CACHE_BUCKET }}
+          FLOCI_CACHE_REGION: ${{ vars.FLOCI_CACHE_REGION }}
+        run: python3 .github/scripts/deliver-floci-cache.py

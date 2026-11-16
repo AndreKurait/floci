@@ -185,6 +185,21 @@ when applying registry retention rules. Runtime helper-image settings remain
 overridable. Standalone Java runs and Docker builds without
 `--build-arg NETWORK_HELPER_IMAGE=<image>` keep the local helper-build default.
 
+The fork can optionally deliver the original provenance archive to a private
+cache ingress after its build, smoke, stock-agent, and tag-promotion jobs succeed.
+Set all three repository variables, `FLOCI_CACHE_ROLE_ARN`, `FLOCI_CACHE_BUCKET`,
+and `FLOCI_CACHE_REGION`, to enable this job. The role must trust the fork's
+`refs/heads/dev` OIDC subject and permit object reads and writes only under
+`fleet-releases/floci-ingress/v1/` in the configured versioned bucket. Delivery
+uses conditional creation. No personal GitHub token is copied to AWS.
+
+Delivery preserves the GitHub artifact's original ZIP bytes and publishes a
+request referencing its exact S3 version. Repeated delivery can reuse identical
+objects; a conflicting object or unknown write outcome stops the job. The
+receiving backend must wait for the entire original workflow to succeed and
+validate its provenance before importing images. Delivery alone does not
+qualify a cache publication or a native test run.
+
 The fork's `dev` workflow tests EC2 first-boot metadata, stop/start, and
 termination with the published helper on native AMD64 and ARM64 runners before
 updating the moving `dev` tag. Each runner tests both guest architectures, using
