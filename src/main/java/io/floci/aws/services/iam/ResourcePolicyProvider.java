@@ -15,7 +15,11 @@ import java.util.Optional;
  */
 public interface ResourcePolicyProvider {
 
-    record ResourcePolicy(String policyDocument, String ownerAccountId) {}
+    record ResourcePolicy(String policyDocument, String ownerAccountId, boolean grantRequired) {
+        public ResourcePolicy(String policyDocument, String ownerAccountId) {
+            this(policyDocument, ownerAccountId, false);
+        }
+    }
 
     /**
      * Parses a regional, account-owned ARN for the service. Resource-name constraints remain

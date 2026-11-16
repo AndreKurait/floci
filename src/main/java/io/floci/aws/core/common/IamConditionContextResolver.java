@@ -257,10 +257,30 @@ public class IamConditionContextResolver {
         return null;
     }
 
+    private Map<String, List<String>> kmsConditionContext(ContainerRequestContext ctx) {
+        JsonNode body = bufferedJsonBody(ctx);
+        if (body == null || !body.path("EncryptionContext").isObject()) {
+            return null;
+        }
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        List<String> keys = new ArrayList<>();
+        body.path("EncryptionContext").properties().forEach(entry -> {
+            if (entry.getValue().isTextual()) {
+                keys.add(entry.getKey());
+                conditions.put("kms:EncryptionContext:" + entry.getKey(), List.of(entry.getValue().textValue()));
+            }
+        });
+        if (!keys.isEmpty()) {
+            conditions.put("kms:EncryptionContextKeys", keys);
+        }
+        return conditions;
+    }
+
     public Map<String, List<String>> resolve(String credentialScope, String action,
                                              ContainerRequestContext ctx) {
         return switch (credentialScope) {
             case "s3" -> s3ConditionContext(action, ctx);
+            case "kms" -> kmsConditionContext(ctx);
             case "ec2" -> ec2ConditionContext(action, ctx);
             case "dynamodb" -> dynamoDbConditionContext(action, ctx);
             case "iam" -> iamConditionContext(action, ctx);
