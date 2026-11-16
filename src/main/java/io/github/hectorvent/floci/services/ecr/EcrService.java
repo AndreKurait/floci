@@ -308,7 +308,7 @@ public class EcrService implements ResourceProvider {
             String defaultAccount = regionResolver.getAccountId();
             String defaultRegion = regionResolver.getDefaultRegion();
             String legacyKey = key(defaultRegion, defaultAccount, physical);
-            boolean legacy = repoStore.get(legacyKey).isPresent();
+            boolean legacy = readPreviewRepository(defaultAccount, legacyKey, defaultRegion, physical).isPresent();
             String[] parts = physical.split("/", 3);
             boolean namespaced = !legacy && parts.length == 3 && parts[0].matches("[0-9]{12}")
                     && parts[1].matches("[a-z0-9-]+");
@@ -317,8 +317,8 @@ public class EcrService implements ResourceProvider {
             String name = namespaced ? parts[2] : physical;
             String logical = key(region, account, name);
             String uri = registryManager.getRepositoryUri(account, region, name);
-            synchronized (repositoryMonitor(callerAccount(), logical)) {
-                Repository next = repoStore.get(logical).map(Repository::new).orElseGet(() -> {
+            synchronized (repositoryMonitor(account, logical)) {
+                Repository next = readPreviewRepository(account, logical, region, name).map(Repository::new).orElseGet(() -> {
                     Repository fresh = new Repository();
                     fresh.setRepositoryGeneration(UUID.randomUUID().toString());
                     fresh.setRepositoryName(name);

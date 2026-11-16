@@ -128,6 +128,30 @@ class EcrCrossAccountRepositoryIntegrationTest {
     }
 
     @Test
+    void staleForeignAliasCannotEraseOwnerPolicyDuringNativePull() throws Exception {
+        repositoryPolicy("Allow", principal);
+        AccountAwareStorageBackend<Repository> repositories = repositories();
+        String key = REGION + "::" + OWNER + "::" + name;
+        Repository before = new Repository(repositories.getForAccount(OWNER, key).orElseThrow());
+        Repository stale = new Repository(before);
+        stale.setRepositoryGeneration("stale-foreign-alias");
+        stale.setRepositoryPolicyText(null);
+        stale.setTags(Map.of());
+        repositories.putAllAtomicallyForAccount(CALLER, Map.of(key, stale));
+        try {
+            assertTrue(pull().failures().isEmpty());
+            Repository after = repositories.getForAccount(OWNER, key).orElseThrow();
+            assertEquals(before.getRepositoryPolicyText(), after.getRepositoryPolicyText());
+            assertEquals(before.getRepositoryGeneration(), after.getRepositoryGeneration());
+            repositoryPolicy("Deny", principal);
+            clearInvocations(registry);
+            denied();
+        } finally {
+            repositories.deleteForAccount(CALLER, key);
+        }
+    }
+
+    @Test
     void identityGrantWithoutRepositoryGrantIsDeniedBeforeRegistryAccess() {
         denied();
     }
