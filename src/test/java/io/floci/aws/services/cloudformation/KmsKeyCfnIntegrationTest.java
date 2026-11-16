@@ -1,5 +1,6 @@
 package io.floci.aws.services.cloudformation;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.aws.testing.CfnStackWaits;
@@ -143,6 +144,46 @@ class KmsKeyCfnIntegrationTest {
                 assertEquals(id, cfn.describeStackResource(request -> request.stackName(stack)
                         .logicalResourceId("Key")).stackResourceDetail().physicalResourceId());
                 assertTrue(kms.describeKey(request -> request.keyId(id)).keyMetadata().enabled());
+                SdkBytes message = SdkBytes.fromUtf8String("restored key");
+                SdkBytes encrypted = kms.encrypt(request -> request.keyId(id).plaintext(message)).ciphertextBlob();
+                assertEquals(message, kms.decrypt(request -> request.ciphertextBlob(encrypted)).plaintext());
+            } finally {
+                cfn.deleteStack(request -> request.stackName(stack));
+                CfnStackWaits.awaitStackDeleted(stack);
+            }
+        }
+    }
+
+    @Test
+    void sdkRemovingPolicyRestoresAccountDefaultWithoutReplacement() throws Exception {
+        String stack = "kms-policy-removal-" + Long.toString(System.nanoTime(), 36);
+        ObjectMapper mapper = new ObjectMapper();
+        ObjectNode template = mapper.createObjectNode();
+        ObjectNode key = template.putObject("Resources").putObject("Key");
+        key.put("Type", "AWS::KMS::Key");
+        ObjectNode properties = key.putObject("Properties");
+        properties.putObject("KeyPolicy").putArray("Statement");
+        StaticCredentialsProvider credentials = StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test"));
+        try (CloudFormationClient cfn = CloudFormationClient.builder().endpointOverride(endpoint)
+                .region(Region.US_EAST_1).credentialsProvider(credentials).build();
+                KmsClient kms = KmsClient.builder().endpointOverride(endpoint)
+                        .region(Region.US_EAST_1).credentialsProvider(credentials).build()) {
+            try {
+                cfn.createStack(request -> request.stackName(stack).templateBody(template.toString()));
+                assertEquals("CREATE_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+                String id = cfn.describeStackResource(request -> request.stackName(stack)
+                        .logicalResourceId("Key")).stackResourceDetail().physicalResourceId();
+                assertEquals("{\"Statement\":[]}", kms.getKeyPolicy(request -> request.keyId(id).policyName("default")).policy());
+                properties.remove("KeyPolicy");
+                cfn.updateStack(request -> request.stackName(stack).templateBody(template.toString()));
+                assertEquals("UPDATE_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+                assertEquals(id, cfn.describeStackResource(request -> request.stackName(stack)
+                        .logicalResourceId("Key")).stackResourceDetail().physicalResourceId());
+                JsonNode restored = mapper.readTree(kms.getKeyPolicy(request -> request.keyId(id).policyName("default")).policy());
+                assertEquals("2012-10-17", restored.path("Version").asText());
+                assertEquals("Allow", restored.path("Statement").get(0).path("Effect").asText());
+                assertEquals("kms:*", restored.path("Statement").get(0).path("Action").asText());
+                assertTrue(restored.path("Statement").get(0).path("Principal").path("AWS").asText().endsWith(":root"));
                 SdkBytes message = SdkBytes.fromUtf8String("restored key");
                 SdkBytes encrypted = kms.encrypt(request -> request.keyId(id).plaintext(message)).ciphertextBlob();
                 assertEquals(message, kms.decrypt(request -> request.ciphertextBlob(encrypted)).plaintext());

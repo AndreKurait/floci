@@ -71,8 +71,9 @@ public class KmsCfnProvisioner implements CfnResourceProvisioner {
             if (description != null || ctx.previouslyDeclared("Description")) {
                 kmsService.updateKeyDescription(key.getKeyId(), description == null ? "" : description, ctx.region());
             }
-            if (policy != null) {
-                kmsService.putKeyPolicy(key.getKeyId(), policy, ctx.region());
+            if (policy != null || ctx.previouslyDeclared("KeyPolicy")) {
+                kmsService.putKeyPolicy(key.getKeyId(),
+                        policy == null ? kmsService.buildDefaultKeyPolicy() : policy, ctx.region());
             }
             if (props != null && props.has("Tags") || ctx.previouslyDeclared("Tags")) {
                 kmsService.untagResource(key.getKeyId(), ProvisionContext.staleTagKeys(key.getTags(), tags), ctx.region());

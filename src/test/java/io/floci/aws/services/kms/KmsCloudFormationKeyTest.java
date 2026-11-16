@@ -114,6 +114,31 @@ class KmsCloudFormationKeyTest {
     }
 
     @Test
+    void removingDeclaredPolicyRestoresAccountDefaultWithoutReplacingKey() throws Exception {
+        JsonNode prior = mapper.readTree("{\"KeyPolicy\":{\"Statement\":[]}}");
+        StackResource resource = create(prior.toString());
+        String id = resource.getPhysicalId();
+        provisioner.provision(resource, mapper.createObjectNode(), context(id, prior));
+        JsonNode policy = mapper.readTree(kms.describeKey(id, REGION).getPolicy());
+        assertEquals("2012-10-17", policy.path("Version").asText());
+        JsonNode statement = policy.path("Statement").get(0);
+        assertEquals("Allow", statement.path("Effect").asText());
+        assertEquals("arn:aws:iam::111111111111:root", statement.path("Principal").path("AWS").asText());
+        assertEquals("kms:*", statement.path("Action").asText());
+        assertEquals("*", statement.path("Resource").asText());
+        assertEquals(id, resource.getPhysicalId());
+    }
+
+    @Test
+    void omittedPolicyDoesNotResetUndeclaredOutOfBandPolicy() throws Exception {
+        StackResource resource = create("{}");
+        String policy = "{\"Statement\":[],\"Id\":\"manual\"}";
+        kms.putKeyPolicy(resource.getPhysicalId(), policy, REGION);
+        provisioner.provision(resource, mapper.createObjectNode(), context(resource.getPhysicalId(), mapper.createObjectNode()));
+        assertEquals(policy, kms.describeKey(resource.getPhysicalId(), REGION).getPolicy());
+    }
+
+    @Test
     void retainedOverrideReconcilesMutableTagsWithoutChangingIdentity() throws Exception {
         JsonNode prior = mapper.readTree("""
                 {"Description":"before","Tags":[{"Key":"floci:override-id","Value":"fixed-key"},
