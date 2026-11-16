@@ -1125,16 +1125,27 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     }
 
     private void retireStoppedHelpers() {
-        List<String> helpers = new ArrayList<>();
-        for (Map.Entry<String, ProtectedEndpoint> entry : new ArrayList<>(endpoints.entrySet())) {
-            boolean running;
-            try {
-                running = Boolean.TRUE.equals(dockerClient.inspectContainerCmd(entry.getValue().helperId())
-                        .exec().getState().getRunning());
-            } catch (NotFoundException e) {
-                running = false;
+        List<Map.Entry<String, ProtectedEndpoint>> snapshot = new ArrayList<>(endpoints.entrySet());
+        Map<String, Boolean> running = new ConcurrentHashMap<>();
+        Set<String> inspected = new HashSet<>();
+        List<Runnable> inspections = new ArrayList<>();
+        for (Map.Entry<String, ProtectedEndpoint> entry : snapshot) {
+            String helper = entry.getValue().helperId();
+            if (inspected.add(helper)) {
+                inspections.add(() -> {
+                    try {
+                        running.put(helper, Boolean.TRUE.equals(dockerClient.inspectContainerCmd(helper)
+                                .exec().getState().getRunning()));
+                    } catch (NotFoundException e) {
+                        running.put(helper, false);
+                    }
+                });
             }
-            if (!running) {
+        }
+        PolicyApplyBatch.run(inspections);
+        List<String> helpers = new ArrayList<>();
+        for (Map.Entry<String, ProtectedEndpoint> entry : snapshot) {
+            if (!running.get(entry.getValue().helperId()) && endpoints.get(entry.getKey()) == entry.getValue()) {
                 removeDnsOrigin(entry.getValue());
                 endpoints.remove(entry.getKey());
                 pendingHelperCleanup.computeIfAbsent(entry.getKey(), ignored -> new HashSet<>())
