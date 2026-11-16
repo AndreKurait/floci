@@ -90,8 +90,8 @@ class LeafCfnProvisionerTest {
             KmsKey key = new KmsKey();
             key.setKeyId("k-123");
             key.setArn("arn:aws:kms:us-east-1:000000000000:key/k-123");
-            when(kms.createKey(eq("a key"), eq(null), eq(null),
-                    eq(null), any(), eq(REGION))).thenReturn(key);
+            when(kms.createKey(eq("a key"), eq("ENCRYPT_DECRYPT"), eq("SYMMETRIC_DEFAULT"),
+                    eq(null), any(), eq(null), eq(false), eq(REGION))).thenReturn(key);
 
             StackResource r = resource("Key", "AWS::KMS::Key");
             provisioner.provision(r, props("""
@@ -109,7 +109,8 @@ class LeafCfnProvisionerTest {
             KmsKey key = new KmsKey();
             key.setKeyId("k-1");
             ArgumentCaptor<Map<String, String>> tags = ArgumentCaptor.forClass(Map.class);
-            when(kms.createKey(any(), eq(null), eq(null), any(), tags.capture(), anyString())).thenReturn(key);
+            when(kms.createKey(any(), eq("ENCRYPT_DECRYPT"), eq("SYMMETRIC_DEFAULT"),
+                    any(), tags.capture(), eq(null), eq(false), anyString())).thenReturn(key);
 
             provisioner.provision(resource("Key", "AWS::KMS::Key"), props("""
                     {"Tags": [{"Key": "team", "Value": "core"}]}
@@ -124,7 +125,7 @@ class LeafCfnProvisionerTest {
             key.setKeyId("k-real");
             key.setArn("arn:aws:kms:us-east-1:000000000000:key/k-real");
             when(kms.createKey(eq(null), eq("SIGN_VERIFY"), eq("ECC_NIST_P256"),
-                    eq(null), any(), eq(REGION))).thenReturn(key);
+                    eq(null), any(), eq(null), eq(false), eq(REGION))).thenReturn(key);
 
             StackResource r = resource("Key", "AWS::KMS::Key");
             r.setPhysicalId("Key-1a2b3c4d");
@@ -145,26 +146,30 @@ class LeafCfnProvisionerTest {
         void explicitBlankKeySpecReachesTheService() {
             KmsKey key = new KmsKey();
             key.setKeyId("k-blank-spec");
-            when(kms.createKey(eq(null), eq(null), eq(""), eq(null), any(), eq(REGION)))
+            when(kms.createKey(eq(null), eq("ENCRYPT_DECRYPT"), eq(""),
+                    eq(null), any(), eq(null), eq(false), eq(REGION)))
                     .thenReturn(key);
 
             provisioner.provision(resource("Key", "AWS::KMS::Key"),
                     props("{\"KeySpec\":\"\"}"), ctx);
 
-            verify(kms).createKey(eq(null), eq(null), eq(""), eq(null), any(), eq(REGION));
+            verify(kms).createKey(eq(null), eq("ENCRYPT_DECRYPT"), eq(""),
+                    eq(null), any(), eq(null), eq(false), eq(REGION));
         }
 
         @Test
         void explicitBlankKeyUsageReachesTheService() {
             KmsKey key = new KmsKey();
             key.setKeyId("k-blank-usage");
-            when(kms.createKey(eq(null), eq(""), eq(null), eq(null), any(), eq(REGION)))
+            when(kms.createKey(eq(null), eq(""), eq("SYMMETRIC_DEFAULT"),
+                    eq(null), any(), eq(null), eq(false), eq(REGION)))
                     .thenReturn(key);
 
             provisioner.provision(resource("Key", "AWS::KMS::Key"),
                     props("{\"KeyUsage\":\"\"}"), ctx);
 
-            verify(kms).createKey(eq(null), eq(""), eq(null), eq(null), any(), eq(REGION));
+            verify(kms).createKey(eq(null), eq(""), eq("SYMMETRIC_DEFAULT"),
+                    eq(null), any(), eq(null), eq(false), eq(REGION));
         }
 
         @Test
