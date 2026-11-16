@@ -440,12 +440,14 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
                 try {
                     reconcilePresentNamespaces();
                     return;
-                } catch (NotFoundException | ConflictException unavailable) {
+                } catch (NotFoundException | ConflictException | InvalidPublicInterfaceException unavailable) {
                     boolean retired;
                     try {
                         retired = withdrawUnavailableNamespaces();
                     } catch (RuntimeException inspectionFailure) {
-                        unavailable.addSuppressed(inspectionFailure);
+                        if (inspectionFailure != unavailable) {
+                            unavailable.addSuppressed(inspectionFailure);
+                        }
                         throw unavailable;
                     }
                     if (!retired) {
@@ -710,7 +712,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
                 .getNetworkSettings().getNetworks().values().stream()
                 .filter(network -> publicAddress.equals(network.getIpAddress())).toList();
         if (attachments.size() != 1) {
-            throw new IllegalStateException("Native public API caller lost its unique public interface");
+            throw new InvalidPublicInterfaceException();
         }
         Network network = docker.inspectNetworkCmd().withNetworkId(networkName).exec();
         if (!"bridge".equals(network.getDriver()) || !network.getId().equals(attachments.getFirst().getNetworkID())) {
@@ -1037,6 +1039,12 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
 
     private String key(String account, String region, String id) {
         return account + "/" + region + "/" + id;
+    }
+
+    private static final class InvalidPublicInterfaceException extends IllegalStateException {
+        private InvalidPublicInterfaceException() {
+            super("Native public API caller lost its unique public interface");
+        }
     }
 
     private record Topology(List<RouteTable> tables, List<NatGateway> nats, List<InternetGateway> gateways) {}

@@ -227,6 +227,62 @@ class VpcPublicPeerRoutingTest {
         assertTrue(latest("first").contains("egress ip daddr 192.0.2.1 counter drop"));
     }
 
+    @Test
+    void stoppedPublicCallerWithDetachedInterfacesDoesNotQuarantineSurvivors() {
+        prepareSharedUpstream();
+        admit("first", 2, true);
+        admit("second", 3, true);
+        stopped("second");
+        when(docker.inspectContainerCmd("second").exec().getNetworkSettings().getNetworks()).thenReturn(Map.of());
+
+        assertDoesNotThrow(manager::reconcile);
+
+        assertEquals(Set.of("172.18.0.2"), manager.publicInstanceAddresses());
+        assertTrue(latest("first").contains("dnat to 172.18.0.20:8443"));
+        assertTrue(latest("first").contains("egress ip daddr 172.18.0.3 counter drop"));
+        assertFalse(latest("first").contains("via 240.0.0.3"));
+        assertThrows(ConflictException.class, () -> manager.unregister(ACCOUNT, REGION, "second"),
+                "A stopped caller still belongs to its owner until namespace users are retired");
+        verify(docker, never()).startContainerCmd("second");
+        verify(docker, never()).removeContainerCmd("second");
+        verify(docker, never()).stopContainerCmd("first");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void runningCallerWithoutItsPublicInterfaceStillFailsEvenWhenAnotherCallerRetires(boolean retiredPeer) {
+        prepareSharedUpstream();
+        admit("first", 2, true);
+        admit("second", 3, true);
+        if (retiredPeer) {
+            admit("third", 4, true);
+            stopped("third");
+        }
+        when(docker.inspectContainerCmd("second").exec().getNetworkSettings().getNetworks()).thenReturn(Map.of());
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class, manager::reconcile);
+
+        assertEquals("Native public API caller lost its unique public interface", failure.getMessage());
+        assertFalse(latest("first").contains("accept"));
+        assertFalse(latest("second").contains("accept"));
+        assertTrue(manager.publicInstanceAddresses().containsAll(Set.of("172.18.0.2", "172.18.0.3")));
+    }
+
+    @Test
+    void repeatedInspectionFailurePreservesTheOriginalErrorAndQuarantinesSurvivors() {
+        prepareSharedUpstream();
+        admit("first", 2, true);
+        admit("second", 3, true);
+        ConflictException failure = new ConflictException("Docker inspection unavailable");
+        when(docker.inspectContainerCmd("second").exec()).thenThrow(failure);
+
+        assertSame(failure, assertThrows(ConflictException.class, manager::reconcile));
+
+        assertFalse(latest("first").contains("accept"));
+        assertFalse(latest("second").contains("accept"));
+        assertEquals(Set.of("172.18.0.2", "172.18.0.3"), manager.publicInstanceAddresses());
+    }
+
     private void prepareSharedUpstream() {
         enablePublicApi();
         when(config.network().vpcRouting().publicAwsApiUpstreamHost()).thenReturn(Optional.of("172.18.0.20"));
