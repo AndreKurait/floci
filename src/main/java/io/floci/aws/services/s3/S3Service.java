@@ -1240,6 +1240,12 @@ public class S3Service implements Resettable, ResourceProvider {
         S3ObjectEncryption encryption = S3ObjectEncryption.resolve(bucket.getEncryptionConfiguration(),
                 normalizeServerSideEncryption(options.getServerSideEncryption()), options.getSseKmsKeyId(),
                 options.getSseCustomerKey() != null);
+        return stageEncryptedObject(plaintext, bucket, bucketName, key, options, encryption);
+    }
+
+    private AssembledBody stageEncryptedObject(DigestingInputStream plaintext, Bucket bucket,
+                                                String bucketName, String key, PutObjectOptions options,
+                                                S3ObjectEncryption encryption) {
         options.withServerSideEncryption(encryption.algorithm()).withSseKmsKeyId(encryption.kmsKeyId());
         if (!"aws:kms".equals(encryption.algorithm())) {
             Path file = stageBody(plaintext);
@@ -3181,15 +3187,13 @@ public class S3Service implements Resettable, ResourceProvider {
      * stays unless a new or composite one has to become a full-object checksum.
      */
     private CopyBody copyBody(CopySource source, S3Checksum effectiveChecksum, ChecksumAlgorithm copyChecksumAlgorithm,
-                              String destinationBucket, String destinationKey, CopyObjectOptions options) {
+                              String destinationBucket, String destinationKey, S3ObjectEncryption encryption) {
         S3Object object = source.object();
         if (source.pinnedFile() == null) {
             return new CopyBody(new BytesBody(object.getData()), null, effectiveChecksum);
         }
         Bucket bucket = resolveBucket(destinationBucket)
                 .orElseThrow(() -> new AwsException("NoSuchBucket", "The specified bucket does not exist.", 404));
-        S3ObjectEncryption encryption = S3ObjectEncryption.resolve(bucket.getEncryptionConfiguration(),
-                options.getServerSideEncryption(), options.getSseKmsKeyId(), options.getSseCustomerKey() != null);
         if ("aws:kms".equals(object.getServerSideEncryption()) || "aws:kms".equals(encryption.algorithm())) {
             Path staged = null;
             try (InputStream stored = Files.newInputStream(source.pinnedFile());
@@ -3199,7 +3203,7 @@ public class S3Service implements Resettable, ResourceProvider {
                         copyChecksumAlgorithm == null ? List.of() : List.of(copyChecksumAlgorithm), MAX_COPY_OBJECT_SOURCE_SIZE);
                 PutObjectOptions destination = new PutObjectOptions()
                         .withServerSideEncryption(encryption.algorithm()).withSseKmsKeyId(encryption.kmsKeyId());
-                AssembledBody body = stageEncryptedObject(digests, bucket, destinationBucket, destinationKey, destination);
+                AssembledBody body = stageEncryptedObject(digests, bucket, destinationBucket, destinationKey, destination, encryption);
                 staged = body.file();
                 moveIntoPlace(staged, source.pinnedFile());
                 return new CopyBody(new AssembledBody(source.pinnedFile(), body.size(), body.envelope()), digests.eTag(),
@@ -8873,7 +8877,7 @@ public class S3Service implements Resettable, ResourceProvider {
         // Prepared before any bucket monitor is taken, so reading a large source to hash it never
         // holds up other writes to either bucket.
         CopyBody body = copyBody(copySource, effectiveChecksum, copyChecksumAlgorithm,
-                destBucket, destKey, effectiveOptions);
+                destBucket, destKey, destinationEncryption);
 
         // Annotations travel with the copy by default (x-amz-annotation-directive COPY). They are
         // snapshotted before storeObject: a self-copy (same bucket and key) or a pre-versioning

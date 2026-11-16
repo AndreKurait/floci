@@ -8,6 +8,7 @@ import io.floci.aws.core.common.RequestContext;
 import io.floci.aws.core.common.ServiceConfigAccess;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.kms.KmsService;
+import io.floci.aws.services.s3.model.CopyObjectOptions;
 import io.floci.aws.services.s3.model.S3Object;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -18,6 +19,7 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
+import java.util.Base64;
 import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Stream;
@@ -26,10 +28,13 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.when;
 
 class S3DefaultEncryptionStorageTest {
@@ -104,6 +109,81 @@ class S3DefaultEncryptionStorageTest {
         } finally {
             second.shutdownAll();
         }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"memory", "persistent", "hybrid", "wal"})
+    void copyFromKmsToCustomerKeyIgnoresBucketKmsDefault(String mode) {
+        EmulatorConfig config = storageConfig(mode);
+        ServiceConfigAccess access = mock(ServiceConfigAccess.class);
+        when(access.storageMode(anyString())).thenReturn(mode);
+        when(access.storageFlushInterval(anyString())).thenReturn(3_600_000L);
+        StorageFactory factory = new StorageFactory(config, access);
+        try {
+            S3Service service = service(factory, config);
+            service.createBucket(BUCKET, "us-east-1");
+            service.putBucketEncryption(BUCKET, kmsDefault());
+            service.putObject(BUCKET, "source", DATA, "text/plain", Map.of());
+            CopyObjectOptions options = new CopyObjectOptions()
+                    .withSseCustomerAlgorithm("AES256")
+                    .withSseCustomerKey(Base64.getEncoder().encodeToString(new byte[32]))
+                    .withSseCustomerKeyMd5("cLyPS3KoaSFGi/joRB3OUQ==");
+            S3Object copied = service.copyObject(BUCKET, "source", BUCKET, "copy", options);
+            assertNull(copied.getServerSideEncryption());
+            assertNull(copied.getKmsEnvelope());
+            assertEquals("AES256", copied.getSseCustomerAlgorithm());
+            assertArrayEquals(DATA, service.getObject(BUCKET, "copy").getData());
+            assertArrayEquals(DATA, service.getObject(BUCKET, "source").getData());
+        } finally {
+            factory.shutdownAll();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"memory", "persistent", "hybrid", "wal"})
+    void copyKeepsEncryptionSelectedBeforeBucketDefaultChanges(String mode) {
+        EmulatorConfig config = storageConfig(mode);
+        ServiceConfigAccess access = mock(ServiceConfigAccess.class);
+        when(access.storageMode(anyString())).thenReturn(mode);
+        when(access.storageFlushInterval(anyString())).thenReturn(3_600_000L);
+        StorageFactory factory = new StorageFactory(config, access);
+        try {
+            S3Service service = service(factory, config);
+            service.createBucket(BUCKET, "us-east-1");
+            service.putObject(BUCKET, "source", DATA, "text/plain", Map.of());
+            CopyObjectOptions options = spy(new CopyObjectOptions());
+            doAnswer(invocation -> {
+                service.putBucketEncryption(BUCKET, kmsDefault());
+                return null;
+            }).when(options).getChecksumAlgorithm();
+            S3Object copied = service.copyObject(BUCKET, "source", BUCKET, "copy", options);
+            assertEquals("AES256", copied.getServerSideEncryption());
+            assertNull(copied.getKmsEnvelope());
+            assertArrayEquals(DATA, service.getObject(BUCKET, "copy").getData());
+            assertEquals("aws:kms", service.putObject(BUCKET, "after", DATA, "text/plain", Map.of())
+                    .getServerSideEncryption());
+        } finally {
+            factory.shutdownAll();
+        }
+    }
+
+    private EmulatorConfig storageConfig(String mode) {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.defaultAccountId()).thenReturn("000000000000");
+        when(config.storage().persistentPath()).thenReturn(directory.toString());
+        when(config.storage().mode()).thenReturn(mode);
+        when(config.storage().services().s3().mode()).thenReturn(Optional.of(mode));
+        when(config.storage().wal().compactionIntervalMs()).thenReturn(3_600_000L);
+        when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
+        return config;
+    }
+
+    private static String kmsDefault() {
+        return """
+                <ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault>
+                    <SSEAlgorithm>aws:kms</SSEAlgorithm>
+                </ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>
+                """;
     }
 
     private static S3Service service(StorageFactory factory, EmulatorConfig config) {
