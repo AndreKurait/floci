@@ -72,6 +72,7 @@ public final class CfnRollback {
      */
     public static final String LOAD_BALANCER_SUBNETS_UPDATE_SNAPSHOT_ATTR = "__FlociLoadBalancerSubnetsUpdateSnapshot";
     public static final String LOAD_BALANCER_ATTRIBUTES_UPDATE_SNAPSHOT_ATTR = "__FlociLoadBalancerAttributesUpdateSnapshot";
+    public static final String TARGET_GROUP_ATTRIBUTES_UPDATE_SNAPSHOT_ATTR = "__FlociTargetGroupAttributesUpdateSnapshot";
 
     /** Registrations affected by an in-place target-group update, retained until commit or successful undo. */
     public static final String TARGET_GROUP_TARGETS_UPDATE_SNAPSHOT_ATTR = "__FlociTargetGroupTargetsUpdateSnapshot";

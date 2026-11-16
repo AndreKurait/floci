@@ -88,6 +88,10 @@ creation and update. Attributes omitted by an update retain their current values
 A failed stack update restores only the attributes changed by that update,
 preserving changes to other attributes.
 
+`AWS::ElasticLoadBalancingV2::TargetGroup` applies `TargetGroupAttributes` the same
+way: on creation and update, attributes omitted by an update retain their current
+values, and a failed stack update restores only the attributes it changed.
+
 ## Native drift detection
 
 `DetectStackResourceDrift` and `DetectStackDrift` compare the committed template's
