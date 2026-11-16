@@ -92,7 +92,7 @@ PREFIX ?= $(HOME)/.local
 .PHONY: help dev build test native native-host run-native native-install native-image native-up native-down native-logs clean-sidecars clean-volumes compat docker-tests \
         docs-sync docs-check docs-test partition-check partition-baseline partition-audit partition-test rename-test \
         slr-check slr-table slr-audit slr-test snapshot-mine snapshot-mine-test \
-        aws-data-sync aws-data-sync-botocore aws-data-check aws-data-check-botocore aws-data-test botocore-bump eks-addons-sync \
+        aws-data-sync aws-data-sync-botocore aws-data-check aws-data-check-botocore aws-data-test botocore-bump eks-addons-sync eks-access-policies-sync \
         iam-namespaces-sync iam-namespaces-check iam-namespaces-verify iam-namespaces-test \
         iam-action-resources-sync iam-action-resources-check iam-action-resources-verify \
         iam-action-resources-test iam-authorized-actions-sync iam-authorized-actions-check \
@@ -322,6 +322,7 @@ aws-data-sync-botocore: ## Regenerate only the AWS data derived from botocore, s
 	$(PYTHON) tools/aws/regen_iam_paginators.py
 
 aws-data-check: aws-data-check-botocore ## CI gate: the vendored AWS data must match a fresh generation
+	@$(PYTHON) tools/aws/regen_eks_access_policies.py --check
 	@$(PYTHON) tools/aws/regen_partitions.py --check || { \
 		echo ""; \
 		echo "error: src/main/resources/aws/partitions.json is out of date."; \
@@ -523,6 +524,9 @@ aws-data-check-botocore: ## The AWS data derived from botocore must match a fres
 
 eks-addons-sync: ## Regenerate src/main/resources/eks/addon-versions.json from EKS (needs AWS credentials; commit the result)
 	$(PYTHON) tools/aws/regen_eks_addon_versions.py
+
+eks-access-policies-sync: ## Refresh the EKS access-policy catalog (needs AWS credentials; commit the result)
+	$(PYTHON) tools/aws/regen_eks_access_policies.py
 
 aws-data-test: ## Run the AWS data generators' unit tests
 	$(PYTHON) -m pytest tools/aws -q
