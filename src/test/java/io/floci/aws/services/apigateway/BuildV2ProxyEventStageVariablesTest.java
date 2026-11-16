@@ -14,6 +14,7 @@ import java.net.URI;
 import java.util.List;
 import java.util.Map;
 
+import static io.floci.aws.services.apigateway.RestResourcePolicyTestSupport.disabledCaller;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -43,7 +44,8 @@ class BuildV2ProxyEventStageVariablesTest {
         controller = new ApiGatewayExecuteController(
                 null, null, null, null,
                 regionResolver, MAPPER, null,
-                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, null, new HttpProxyInvoker());
+                null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null, null, null, null, new HttpProxyInvoker(),
+                disabledCaller());
     }
 
     @Test
