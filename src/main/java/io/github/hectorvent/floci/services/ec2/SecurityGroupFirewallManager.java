@@ -573,6 +573,15 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     public Namespace createNamespace(String service, String resourceId, String accountId, String region,
                                      Optional<String> dockerNetwork, Map<Integer, Integer> portBindings,
                                      Map<String, String> extraLabels, String hostIp, List<String> workloadHosts) {
+        return createNamespace(service, resourceId, accountId, region, dockerNetwork, portBindings, extraLabels,
+                hostIp, workloadHosts, false);
+    }
+
+    /** With {@code ipv6}, the namespace starts with IPv6 enabled, so interfaces connected later carry it too. */
+    public Namespace createNamespace(String service, String resourceId, String accountId, String region,
+                                     Optional<String> dockerNetwork, Map<Integer, Integer> portBindings,
+                                     Map<String, String> extraLabels, String hostIp, List<String> workloadHosts,
+                                     boolean ipv6) {
         if (!enabled()) {
             throw new IllegalStateException("Security-group enforcement is disabled");
         }
@@ -605,6 +614,10 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 int separator = entry.indexOf(':');
                 builder.withExtraHost(entry.substring(0, separator), entry.substring(separator + 1));
             }
+        }
+        if (ipv6) {
+            builder.withNetworkSysctl("net.ipv6.conf.all.disable_ipv6", "0")
+                    .withNetworkSysctl("net.ipv6.conf.default.disable_ipv6", "0");
         }
         if (portBindings != null) {
             portBindings.forEach((containerPort, hostPort) -> {

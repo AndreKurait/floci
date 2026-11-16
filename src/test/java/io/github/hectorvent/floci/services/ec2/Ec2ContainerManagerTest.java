@@ -114,6 +114,7 @@ import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anySet;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.atLeast;
 import static org.mockito.Mockito.atLeastOnce;
 import static org.mockito.Mockito.clearInvocations;
@@ -2617,7 +2618,8 @@ class Ec2ContainerManagerTest {
         InspectContainerCmd inspect = mock(InspectContainerCmd.class);
         when(inspect.exec()).thenReturn(helper);
         when(harness.dockerClient.inspectContainerCmd(TEST_HELPER_ID)).thenReturn(inspect);
-        when(harness.vpcNetworkManager.attach("us-west-2", "vpc-lease", "subnet-lease", TEST_HELPER_ID, "10.0.1.10"))
+        when(harness.vpcNetworkManager.attach("us-west-2", "vpc-lease", "subnet-lease", TEST_HELPER_ID, "10.0.1.10",
+                false))
                 .thenReturn(Optional.of("floci-vpc"));
         Instance guest = leasedInstance("i-public-routing-order");
         AtomicBoolean started = new AtomicBoolean();
@@ -4951,7 +4953,8 @@ class Ec2ContainerManagerTest {
         SecurityGroupFirewallManager firewall = mock(SecurityGroupFirewallManager.class);
         when(firewall.enabled()).thenReturn(protectedNamespace);
         when(firewall.createNamespace(eq("ec2"), eq("i-spec-limits"), eq("000000000000"),
-                eq("us-west-2"), eq(Optional.empty()), eq(Map.of(22, 2201)), eq(Map.of()), eq(sshHostAddress)))
+                eq("us-west-2"), eq(Optional.empty()), eq(Map.of(22, 2201)), eq(Map.of()), eq(sshHostAddress),
+                isNull(), eq(false)))
                 .thenReturn(new SecurityGroupFirewallManager.Namespace("firewall-helper", "172.18.0.12"));
 
         Ec2ContainerManager manager = new Ec2ContainerManager(
@@ -4997,14 +5000,14 @@ class Ec2ContainerManagerTest {
             if (refused) {
                 verify(portAllocator, never()).allocate(anyInt(), anyInt());
                 verify(firewall, never()).createNamespace(anyString(), anyString(), anyString(), anyString(),
-                        any(), any(), any(), any());
+                        any(), any(), any(), any(), any(), anyBoolean());
                 verify(lifecycleManager, never()).create(any());
                 verify(lifecycleManager, never()).create(any(), anyString());
                 return null;
             }
             if (protectedNamespace) {
                 verify(firewall).createNamespace("ec2", "i-spec-limits", "000000000000",
-                        "us-west-2", Optional.empty(), Map.of(22, 2201), Map.of(), sshHostAddress);
+                        "us-west-2", Optional.empty(), Map.of(22, 2201), Map.of(), sshHostAddress, null, false);
                 if (image.dockerPlatform() == null) {
                     verify(lifecycleManager, times(1)).create(any());
                 } else {

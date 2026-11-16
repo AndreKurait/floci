@@ -703,6 +703,44 @@ class SecurityGroupFirewallManagerTest {
     }
 
     @Test
+    void aHelperForADualStackGuestStartsItsNamespaceWithIpv6Enabled() {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.network().securityGroupEnforcement().enabled()).thenReturn(true);
+        when(config.network().securityGroupEnforcement().helperImage()).thenReturn("example/network-helper:test");
+        when(config.docker().resourceNamespace()).thenReturn(Optional.empty());
+        when(config.docker().imageRegistryBase()).thenReturn(Optional.empty());
+        DockerClient dockerClient = mock(DockerClient.class, RETURNS_DEEP_STUBS);
+        Info linux = mock(Info.class);
+        when(linux.getOsType()).thenReturn("linux");
+        when(linux.getArchitecture()).thenReturn("amd64");
+        when(dockerClient.infoCmd().exec()).thenReturn(linux);
+        InspectImageResponse image = mock(InspectImageResponse.class);
+        when(image.getOs()).thenReturn("linux");
+        when(image.getArch()).thenReturn("amd64");
+        when(dockerClient.inspectImageCmd(anyString()).exec()).thenReturn(image);
+        DockerHostResolver dockerHostResolver = mock(DockerHostResolver.class);
+        when(dockerHostResolver.isLinuxHost()).thenReturn(true);
+        EmbeddedDnsServer embeddedDnsServer = mock(EmbeddedDnsServer.class);
+        ContainerLifecycleManager lifecycleManager = mock(ContainerLifecycleManager.class);
+        when(lifecycleManager.createAndStart(any())).thenThrow(new IllegalStateException("stop after the spec"));
+        SecurityGroupFirewallManager manager = SecurityGroupDnsFixture.rawManager(dockerClient,
+                new ContainerBuilder(config, dockerHostResolver, embeddedDnsServer), lifecycleManager, config,
+                embeddedDnsServer);
+
+        assertThrows(IllegalStateException.class, () -> manager.createNamespace("ec2", "i-1", "000000000000",
+                "us-east-1", Optional.empty(), Map.of(22, 2201), Map.of(), "127.0.0.1", null, true));
+        assertThrows(IllegalStateException.class, () -> manager.createNamespace("ec2", "i-2", "000000000000",
+                "us-east-1", Optional.empty(), Map.of(22, 2202), Map.of(), "127.0.0.1", null));
+
+        ArgumentCaptor<ContainerSpec> helpers = ArgumentCaptor.forClass(ContainerSpec.class);
+        verify(lifecycleManager, times(2)).createAndStart(helpers.capture());
+        assertEquals(Map.of("net.ipv6.conf.all.disable_ipv6", "0", "net.ipv6.conf.default.disable_ipv6", "0"),
+                helpers.getAllValues().get(0).linuxOptions().networkSysctls());
+        assertEquals(Map.of(), helpers.getAllValues().get(1).linuxOptions().networkSysctls(),
+                "a helper for an IPv4-only workload keeps Docker's default");
+    }
+
+    @Test
     void helperCarriesExactlyTheHostsItsServiceChooses() {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.network().securityGroupEnforcement().enabled()).thenReturn(true);

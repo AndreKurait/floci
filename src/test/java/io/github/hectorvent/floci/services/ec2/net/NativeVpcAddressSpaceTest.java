@@ -12,6 +12,7 @@ import java.util.HashMap;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 class NativeVpcAddressSpaceTest {
@@ -119,6 +120,36 @@ class NativeVpcAddressSpaceTest {
                 [{"addr_info":[{"family":"inet","local":"10.0.1.10","prefixlen":24},
                                {"family":"inet","local":"172.28.0.2","prefixlen":16}]}]
                 """), "10.0.1.10", 24));
+    }
+
+    @Test
+    void aDualStackGuestsNativeInterfaceKeepsOnlyItsOwnIpv6Address() throws Exception {
+        String ipv4Only = NativeVpcAddressSpace.commands("eth1", "10.0.1.10", cidr("10.0.1.0/24"),
+                cidr("10.0.0.0/16"));
+        String dualStack = NativeVpcAddressSpace.commands("eth1", "10.0.1.10", cidr("10.0.1.0/24"),
+                cidr("10.0.0.0/16"), true);
+        assertEquals(ipv4Only, NativeVpcAddressSpace.commands("eth1", "10.0.1.10", cidr("10.0.1.0/24"),
+                cidr("10.0.0.0/16"), false));
+        assertEquals(4, ipv4Only.lines().filter(line -> line.endsWith("meta nfproto ipv6 drop")).count());
+        assertFalse(dualStack.contains("nfproto ipv6"), dualStack);
+        assertEquals(ipv4Only.lines().filter(line -> !line.endsWith("meta nfproto ipv6 drop")).toList(),
+                dualStack.lines().toList(), "only the IPv6 drop rules differ");
+
+        String own = """
+                [{"addr_info":[{"family":"inet","local":"10.0.1.10","prefixlen":24},
+                               {"family":"inet6","local":"2600:1f18:abcd:ef01::1234","prefixlen":64}]}]
+                """;
+        NativeVpcAddressSpace.verifyAddress(JSON.readTree(own), "10.0.1.10", 24,
+                "2600:1f18:abcd:ef01:0:0:0:1234");
+        assertThrows(IllegalStateException.class,
+                () -> NativeVpcAddressSpace.verifyAddress(JSON.readTree(own), "10.0.1.10", 24));
+        assertThrows(IllegalStateException.class, () -> NativeVpcAddressSpace.verifyAddress(JSON.readTree(own),
+                "10.0.1.10", 24, "2600:1f18:abcd:ef01::99"));
+        assertThrows(IllegalStateException.class, () -> NativeVpcAddressSpace.verifyAddress(JSON.readTree("""
+                [{"addr_info":[{"family":"inet","local":"10.0.1.10","prefixlen":24},
+                               {"family":"inet6","local":"2600:1f18:abcd:ef01::1234","prefixlen":64},
+                               {"family":"inet6","local":"fe80::1","prefixlen":64}]}]
+                """), "10.0.1.10", 24, "2600:1f18:abcd:ef01::1234"));
     }
 
     private static Cidr4 cidr(String text) {

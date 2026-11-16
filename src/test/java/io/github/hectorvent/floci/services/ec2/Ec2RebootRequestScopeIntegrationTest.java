@@ -84,7 +84,7 @@ class Ec2RebootRequestScopeIntegrationTest {
                 when(networks.isolatesAddressSpaces()).thenReturn(true);
                 CompletableFuture<Scope> lookedUp = new CompletableFuture<>();
                 when(networks.requireNativePrivateAddress(expected.region(), "vpc-protected", "subnet-protected",
-                        "helper", "10.0.0.7")).thenAnswer(invocation -> {
+                        "helper", "10.0.0.7", null)).thenAnswer(invocation -> {
                             lookedUp.complete(scope());
                             // Native address spaces are keyed by account: any other account has no such subnet.
                             if (!expected.account().equals(resolver.getAccountId())) {

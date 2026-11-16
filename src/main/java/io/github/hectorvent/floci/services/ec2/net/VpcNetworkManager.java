@@ -569,6 +569,15 @@ public class VpcNetworkManager {
      */
     public Optional<String> attach(String region, String vpcId, String subnetId,
                                    String containerId, String address) {
+        return attach(region, vpcId, subnetId, containerId, address, false);
+    }
+
+    /**
+     * As above. With {@code ipv6}, an isolated address space leaves the interface's IPv6 traffic unblocked, for a
+     * guest that puts its own IPv6 address on it (FLOCI_SERVICES_EC2_GUEST_IPV6).
+     */
+    public Optional<String> attach(String region, String vpcId, String subnetId,
+                                   String containerId, String address, boolean ipv6) {
         if (!enabled() || containerId == null || address == null) {
             return Optional.empty();
         }
@@ -592,7 +601,7 @@ public class VpcNetworkManager {
         try {
             if (isolatesAddressSpaces()) {
                 NativeVpcAddressSpace.attach(dockerClient, config, vpc.accountId, vpc.region,
-                        networkName, vpc.effective, subnet.effective, containerId, address);
+                        networkName, vpc.effective, subnet.effective, containerId, address, ipv6);
             } else {
                 dockerClient.connectToNetworkCmd()
                         .withContainerId(containerId)
@@ -630,6 +639,12 @@ public class VpcNetworkManager {
     /** Revalidates the account, VPC attachment and actual interface before routing or restoration. */
     public String requireNativePrivateAddress(String region, String vpcId, String subnetId,
                                                String helper, String address) {
+        return requireNativePrivateAddress(region, vpcId, subnetId, helper, address, null);
+    }
+
+    /** As above, and the interface may also hold {@code ipv6Address}, a dual-stack guest's own address. */
+    public String requireNativePrivateAddress(String region, String vpcId, String subnetId,
+                                               String helper, String address, String ipv6Address) {
         if (!enabled() || !isolatesAddressSpaces()) {
             throw new IllegalStateException("Native VPC address spaces are not enabled");
         }
@@ -643,7 +658,7 @@ public class VpcNetworkManager {
         }
         validateNativeNetwork(vpc, dockerClient.inspectNetworkCmd().withNetworkId(vpc.networkName).exec());
         NativeVpcAddressSpace.verify(dockerClient, config, vpc.accountId, region,
-                vpc.networkName, helper, address, subnet.effective.prefix());
+                vpc.networkName, helper, address, subnet.effective.prefix(), ipv6Address);
         return address;
     }
 
