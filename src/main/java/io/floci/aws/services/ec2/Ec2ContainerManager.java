@@ -444,23 +444,24 @@ public class Ec2ContainerManager {
      * @param region      AWS region (for CloudWatch log group naming)
      */
     public void launch(Instance instance, String dockerImage, String publicKey, String region) {
-        launch(instance, ResolvedAmiImage.minimal(dockerImage), publicKey, region, Set.of());
+        launch(instance, ResolvedAmiImage.minimal(dockerImage), publicKey, region);
     }
 
     public void launch(Instance instance, ResolvedAmiImage image, String publicKey, String region) {
-        launch(instance, image, publicKey, region, Set.of());
+        launch(instance, image, publicKey, region, Ec2PortForwardManager.DesiredPorts.NONE);
     }
 
     /**
      * @param appPorts TCP ports opened by the instance's security groups to publish on the host
-     *                 via socat sidecars once the container is running (empty for none)
+     *                 via socat sidecars once the container is running ({@code DesiredPorts.NONE} for none)
      */
-    public void launch(Instance instance, ResolvedAmiImage image, String publicKey, String region, Set<Integer> appPorts) {
+    public void launch(Instance instance, ResolvedAmiImage image, String publicKey, String region,
+                       Ec2PortForwardManager.DesiredPorts appPorts) {
         launch(instance, image, publicKey, region, appPorts, List.of(), Map.of());
     }
 
     public void launch(Instance instance, ResolvedAmiImage image, String publicKey, String region,
-                       Set<Integer> appPorts, List<SecurityGroup> groups,
+                       Ec2PortForwardManager.DesiredPorts appPorts, List<SecurityGroup> groups,
                        Map<String, List<String>> prefixLists) {
         instance.setState(InstanceState.pending());
 
@@ -502,7 +503,7 @@ public class Ec2ContainerManager {
                     // Nothing holds the address, and moments from now this instance will be
                     // reporting its bridge address instead, so the lease would no longer be
                     // findable from the instance at terminate time. Give it back here.
-                    vpcNetworkManager.releasePrivateIp(region, instance.getSubnetId(), leasedPrivateIp);
+                    vpcNetworkManager.releasePrivateIp(instance.getOwnerId(), region, instance.getSubnetId(), leasedPrivateIp);
                 }
 
                 if (isLaunchCancelled(instance)) {
@@ -594,7 +595,7 @@ public class Ec2ContainerManager {
                 installInstanceConnectTrustAnchor(containerId, instanceId);
 
                 // Publish security-group TCP ingress ports on the host via socat sidecars.
-                if (appPorts != null && !appPorts.isEmpty()) {
+                if (appPorts != null && !appPorts.ports().isEmpty()) {
                     portForwardManager.reconcile(instance, appPorts);
                 }
 
@@ -701,7 +702,7 @@ public class Ec2ContainerManager {
                 // default bridge attachment stays: it is what carries the published SSH host
                 // port, which a network mode set at creation time would suppress.
                 String vpcAddress = namespace == null
-                        ? vpcNetworkManager.attach(region, instance.getVpcId(), instance.getSubnetId(),
+                        ? vpcNetworkManager.attach(instance.getOwnerId(), region, instance.getVpcId(), instance.getSubnetId(),
                                 containerId, leasedPrivateIp).map(network -> leasedPrivateIp).orElse(null)
                         : null;
                 lifecycleManager.startCreated(containerId, spec);
@@ -858,8 +859,8 @@ public class Ec2ContainerManager {
             return;
         }
         try {
-            vpcNetworkManager.detach(instance.getRegion(), instance.getVpcId(), containerId);
-            vpcNetworkManager.releasePrivateIp(instance.getRegion(), instance.getSubnetId(), leasedPrivateIp);
+            vpcNetworkManager.detach(instance.getOwnerId(), instance.getRegion(), instance.getVpcId(), containerId);
+            vpcNetworkManager.releasePrivateIp(instance.getOwnerId(), instance.getRegion(), instance.getSubnetId(), leasedPrivateIp);
         } catch (Exception e) {
             LOG.warnv("Error releasing the VPC address of failed EC2 launch {0}: {1}",
                     instance.getInstanceId(), e.getMessage());
@@ -1674,7 +1675,7 @@ public class Ec2ContainerManager {
                 // Give the address back only now that the container is gone: releasing it while
                 // Docker still holds the endpoint would hand the same IP to the next launch and
                 // have Docker refuse it.
-                vpcNetworkManager.releasePrivateIp(instance.getRegion(), instance.getSubnetId(),
+                vpcNetworkManager.releasePrivateIp(instance.getOwnerId(), instance.getRegion(), instance.getSubnetId(),
                         instance.getPrivateIpAddress());
                 instance.setState(InstanceState.terminated());
                 instance.setTerminatedAt(System.currentTimeMillis());
