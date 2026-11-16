@@ -5838,10 +5838,10 @@ public class S3Service implements Resettable, ResourceProvider {
                     if (count >= 0) {
                         return count;
                     }
-                    current.close();
                     if (index == parts.size()) {
                         return -1;
                     }
+                    current.close();
                     current = openStoredPart(uploadId, parts.get(index++));
                 }
             }
