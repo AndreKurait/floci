@@ -19,6 +19,16 @@ public interface DnsRecordSource {
     }
 
     /**
+     * Resolves a resource behind an explicitly declared public peer. An owner may retain
+     * its shared transport after validating the resource's canonical zone and ready
+     * native frontend. Ordinary aliases keep their caller-scoped resolution.
+     */
+    default Optional<DnsAnswer> resolveDeclaredPublicAliasTarget(String name, String hostedZoneId, int type,
+                                                                 DnsClientVpcSource.ClientVpc origin) {
+        return resolveAliasTarget(name, hostedZoneId, type, origin);
+    }
+
+    /**
      * Resolves a query name to IPv4 addresses and their TTL. An empty optional means this
      * source does not own the name. The name arrives without a trailing dot and in the case the client sent.
      */
