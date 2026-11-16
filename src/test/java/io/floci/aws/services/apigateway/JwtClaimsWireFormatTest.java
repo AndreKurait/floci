@@ -8,6 +8,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.List;
 
+import static io.floci.aws.services.apigateway.RestResourcePolicyTestSupport.disabledCaller;
 import static org.junit.jupiter.api.Assertions.*;
 
 /**
@@ -30,7 +31,8 @@ class JwtClaimsWireFormatTest {
                 null, new ObjectMapper(), null,
                 null, null, null, null, new ApiGatewayExecuteRouteContext(), null,
                 null, null
-        , null, null, null, new HttpProxyInvoker());
+        , null, null, null, new HttpProxyInvoker(),
+                disabledCaller());
     }
 
     private static String unsignedToken(String claimsJson) {

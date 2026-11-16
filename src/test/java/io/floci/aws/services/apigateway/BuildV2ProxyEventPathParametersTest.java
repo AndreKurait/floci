@@ -12,6 +12,7 @@ import org.junit.jupiter.api.Test;
 
 import java.net.URI;
 
+import static io.floci.aws.services.apigateway.RestResourcePolicyTestSupport.disabledCaller;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -43,7 +44,8 @@ class BuildV2ProxyEventPathParametersTest {
                 null, null, null, null,
                 regionResolver, new ObjectMapper(), null,
                 null, null, null, null, new ApiGatewayExecuteRouteContext(), null, null, null
-        , null, null, null, new HttpProxyInvoker());
+        , null, null, null, new HttpProxyInvoker(),
+                disabledCaller());
     }
 
     @Test
