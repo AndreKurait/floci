@@ -105,7 +105,8 @@ public class KmsResourcePolicyProvider implements ResourcePolicyProvider {
         if (!conditions.isEmpty()) {
             statement.put("Condition", conditions);
         }
-        Map<String, Object> policy = Map.of("Version", "2012-10-17", "Statement", List.of(statement));
+        // Grant constraints are literal values, not IAM policy-variable expressions.
+        Map<String, Object> policy = Map.of("Version", "2008-10-17", "Statement", List.of(statement));
         return mapper.valueToTree(policy).toString();
     }
 

@@ -273,6 +273,28 @@ class S3KmsEnvelopeSdkIntegrationTest {
     }
 
     @Test
+    void nativeGrantConstraintValuesRemainLiteral() {
+        String principal = iam.getUser(user).getArn();
+        String account = principal.split(":")[4];
+        kms.putKeyPolicy(request -> request.keyId(keyArn).policyName("default").policy("""
+                {"Version":"2012-10-17","Statement":[]}
+                """).bypassPolicyLockoutSafetyCheck(true));
+        kms.createGrant(request -> request.keyId(keyArn).granteePrincipal(principal)
+                .operationsWithStrings("GenerateDataKey")
+                .constraints(constraints -> constraints.encryptionContextEquals(
+                        Map.of("purpose", "${aws:PrincipalAccount}"))));
+        try (KmsClient direct = AwsTestClients.create(KmsClient.builder(), access.getAccessKeyId(),
+                access.getSecretAccessKey(), Region.US_EAST_1, endpoint)) {
+            assertThrows(KmsException.class, () -> direct.generateDataKey(request -> request.keyId(keyArn)
+                    .keySpec("AES_256").encryptionContext(Map.of("purpose", account))));
+            assertEquals(32, direct.generateDataKey(request -> request.keyId(keyArn).keySpec("AES_256")
+                    .encryptionContext(Map.of("purpose", "${aws:PrincipalAccount}"))).plaintext().asByteArray().length);
+            assertThrows(KmsException.class, () -> direct.generateDataKey(request -> request.keyId(keyArn)
+                    .keySpec("AES_256").encryptionContext(Map.of("purpose", "${aws:principalaccount}"))));
+        }
+    }
+
+    @Test
     void identityPolicyCannotManufactureItsOwnKeyGrant() {
         iam.putUserPolicy(user, "Objects", """
                 {"Version":"2012-10-17","Statement":[
