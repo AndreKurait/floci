@@ -98,6 +98,22 @@ class KmsCloudFormationKeyTest {
     }
 
     @Test
+    void resolvedStringPolicyIsStoredAsADocumentOnCreateAndUpdate() throws Exception {
+        String policy = "{\"Version\":\"2012-10-17\",\"Statement\":[],\"Id\":\"${AWS::AccountId}\"}";
+        JsonNode properties = mapper.createObjectNode().set("KeyPolicy",
+                mapper.createObjectNode().put("Fn::Sub", policy));
+        StackResource resource = create(properties.toString());
+        String expected = policy.replace("${AWS::AccountId}", "111111111111");
+        assertEquals(expected, kms.describeKey(resource.getPhysicalId(), REGION).getPolicy());
+        assertTrue(mapper.readTree(kms.describeKey(resource.getPhysicalId(), REGION).getPolicy()).isObject());
+
+        String updated = "{\"Version\":\"2012-10-17\",\"Statement\":[],\"Id\":\"updated\"}";
+        JsonNode next = mapper.createObjectNode().put("KeyPolicy", updated);
+        provisioner.provision(resource, next, context(resource.getPhysicalId(), properties));
+        assertEquals(updated, kms.describeKey(resource.getPhysicalId(), REGION).getPolicy());
+    }
+
+    @Test
     void mutableUpdatePreservesIdentityAndReconcilesDescriptionPolicyTagsAndEnabled() throws Exception {
         JsonNode prior = mapper.readTree("""
                 {"Description":"before","Tags":[{"Key":"old","Value":"v"}]}

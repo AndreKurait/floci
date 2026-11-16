@@ -48,8 +48,9 @@ public class KmsCfnProvisioner implements CfnResourceProvisioner {
         usage = usage == null ? "ENCRYPT_DECRYPT" : usage;
         boolean multiRegion = Boolean.parseBoolean(ctx.resolveOptional(props, "MultiRegion"));
         JsonNode policyNode = props == null ? null : props.get("KeyPolicy");
-        String policy = policyNode == null || policyNode.isNull() ? null
-                : ctx.engine().resolveNode(policyNode).toString();
+        JsonNode resolvedPolicy = ctx.engine().resolveNode(policyNode);
+        String policy = resolvedPolicy == null || resolvedPolicy.isNull() ? null
+                : resolvedPolicy.isTextual() ? resolvedPolicy.textValue() : resolvedPolicy.toString();
         Map<String, String> tags = parseCfnTags(props != null ? props.get("Tags") : null, ctx);
         KmsKey key;
         if (ctx.isUpdate()) {

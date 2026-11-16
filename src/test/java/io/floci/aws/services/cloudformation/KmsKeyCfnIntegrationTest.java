@@ -1,5 +1,7 @@
 package io.floci.aws.services.cloudformation;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.aws.testing.CfnStackWaits;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
@@ -36,6 +38,42 @@ class KmsKeyCfnIntegrationTest {
                   }}
                 }}
                 """.formatted(description);
+    }
+
+    @Test
+    void sdkReadsResolvedStringPolicyAsJsonDocumentAfterCreateAndUpdate() throws Exception {
+        String stack = "kms-text-policy-" + Long.toString(System.nanoTime(), 36);
+        ObjectMapper mapper = new ObjectMapper();
+        String policy = "{\"Version\":\"2012-10-17\",\"Statement\":[],\"Id\":\"${AWS::StackName}\"}";
+        ObjectNode template = mapper.createObjectNode();
+        ObjectNode key = template.putObject("Resources").putObject("Key");
+        key.put("Type", "AWS::KMS::Key");
+        ObjectNode properties = key.putObject("Properties");
+        properties.putObject("KeyPolicy").put("Fn::Sub", policy);
+        StaticCredentialsProvider credentials = StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test"));
+        try (CloudFormationClient cfn = CloudFormationClient.builder().endpointOverride(endpoint)
+                .region(Region.US_EAST_1).credentialsProvider(credentials).build();
+                KmsClient kms = KmsClient.builder().endpointOverride(endpoint)
+                        .region(Region.US_EAST_1).credentialsProvider(credentials).build()) {
+            try {
+                cfn.createStack(request -> request.stackName(stack).templateBody(template.toString()));
+                assertEquals("CREATE_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+                String id = cfn.describeStackResource(request -> request.stackName(stack)
+                        .logicalResourceId("Key")).stackResourceDetail().physicalResourceId();
+                String expected = policy.replace("${AWS::StackName}", stack);
+                assertEquals(expected, kms.getKeyPolicy(request -> request.keyId(id).policyName("default")).policy());
+                String updated = "{\"Version\":\"2012-10-17\",\"Statement\":[],\"Id\":\"updated\"}";
+                properties.put("KeyPolicy", updated);
+                cfn.updateStack(request -> request.stackName(stack).templateBody(template.toString()));
+                assertEquals("UPDATE_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+                assertEquals(id, cfn.describeStackResource(request -> request.stackName(stack)
+                        .logicalResourceId("Key")).stackResourceDetail().physicalResourceId());
+                assertEquals(updated, kms.getKeyPolicy(request -> request.keyId(id).policyName("default")).policy());
+            } finally {
+                cfn.deleteStack(request -> request.stackName(stack));
+                CfnStackWaits.awaitStackDeleted(stack);
+            }
+        }
     }
 
     @Test
