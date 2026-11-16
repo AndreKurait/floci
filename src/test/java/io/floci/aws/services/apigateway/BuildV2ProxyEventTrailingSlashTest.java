@@ -15,6 +15,7 @@ import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.net.URI;
 
+import static io.floci.aws.services.apigateway.RestResourcePolicyTestSupport.disabledCaller;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -52,7 +53,8 @@ class BuildV2ProxyEventTrailingSlashTest {
                 regionResolver, new ObjectMapper(), null,
                 null, null, null, null, new ApiGatewayExecuteRouteContext(), null,
                 null, null
-        , null, null, null, new HttpProxyInvoker());
+        , null, null, null, new HttpProxyInvoker(),
+                null, disabledCaller());
     }
 
     private JsonNode buildEvent(String normalizedPath, String rawRequestUri, String routeKey) throws Exception {
