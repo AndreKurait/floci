@@ -102,6 +102,7 @@ class SecurityGroupFirewallPeerFixture {
     final List<String> violations = Collections.synchronizedList(new ArrayList<>());
     final ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
     BiConsumer<String, String> beforeInstall = (helper, script) -> {};
+    Consumer<String> beforeInspect = helper -> {};
     Consumer<String> beforeStop = helper -> {};
 
     void assertFinal(int count) {
@@ -210,6 +211,7 @@ class SecurityGroupFirewallPeerFixture {
                 when(response.getNetworkSettings().getNetworks()).thenReturn(networks);
             }
             when(inspect.exec()).thenAnswer(call -> {
+                beforeInspect.accept(helper);
                 if (missingHelpers.contains(helper)) {
                     throw new NotFoundException("No such container: " + helper);
                 }
