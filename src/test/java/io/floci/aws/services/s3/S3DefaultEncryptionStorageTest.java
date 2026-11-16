@@ -9,6 +9,8 @@ import io.floci.aws.core.common.ServiceConfigAccess;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.kms.KmsService;
 import io.floci.aws.services.s3.model.CopyObjectOptions;
+import io.floci.aws.services.s3.model.MultipartUpload;
+import io.floci.aws.services.s3.model.PutObjectOptions;
 import io.floci.aws.services.s3.model.S3Object;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -20,6 +22,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.util.Base64;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Stream;
@@ -162,6 +165,40 @@ class S3DefaultEncryptionStorageTest {
             assertArrayEquals(DATA, service.getObject(BUCKET, "copy").getData());
             assertEquals("aws:kms", service.putObject(BUCKET, "after", DATA, "text/plain", Map.of())
                     .getServerSideEncryption());
+        } finally {
+            factory.shutdownAll();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"memory", "persistent", "hybrid", "wal"})
+    void multipartCustomerKeyOverridesKmsDefaultAtCompletion(String mode) {
+        EmulatorConfig config = storageConfig(mode);
+        ServiceConfigAccess access = mock(ServiceConfigAccess.class);
+        when(access.storageMode(anyString())).thenReturn(mode);
+        when(access.storageFlushInterval(anyString())).thenReturn(3_600_000L);
+        StorageFactory factory = new StorageFactory(config, access);
+        try {
+            S3Service service = service(factory, config);
+            service.createBucket(BUCKET, "us-east-1");
+            service.putBucketEncryption(BUCKET, kmsDefault());
+            MultipartUpload upload = service.initiateMultipartUpload(BUCKET, "multipart", "text/plain",
+                    Map.of(), null, new PutObjectOptions()
+                            .withSseCustomerAlgorithm("AES256")
+                            .withSseCustomerKey(Base64.getEncoder().encodeToString(new byte[32]))
+                            .withSseCustomerKeyMd5("cLyPS3KoaSFGi/joRB3OUQ=="));
+            service.uploadPart(BUCKET, "multipart", upload.getUploadId(), 1, DATA,
+                    "AES256", Base64.getEncoder().encodeToString(new byte[32]), "cLyPS3KoaSFGi/joRB3OUQ==");
+            S3Object completed = service.completeMultipartUpload(BUCKET, "multipart", upload.getUploadId(),
+                    List.of(1), null, null);
+            assertNull(completed.getServerSideEncryption());
+            assertNull(completed.getSseKmsKeyId());
+            assertNull(completed.getKmsEnvelope());
+            assertEquals("AES256", completed.getSseCustomerAlgorithm());
+            assertEquals("cLyPS3KoaSFGi/joRB3OUQ==", completed.getSseCustomerKeyMd5());
+            S3Object stored = service.getObject(BUCKET, "multipart");
+            assertNull(stored.getKmsEnvelope());
+            assertArrayEquals(DATA, stored.getData());
         } finally {
             factory.shutdownAll();
         }

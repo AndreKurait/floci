@@ -22,7 +22,9 @@ import software.amazon.awssdk.services.s3.model.S3Exception;
 import software.amazon.awssdk.services.s3.model.ServerSideEncryption;
 
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.util.Arrays;
+import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.Random;
@@ -30,6 +32,7 @@ import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
 @QuarkusTest
@@ -145,6 +148,31 @@ class S3KmsEnvelopeSdkIntegrationTest {
         kms.disableKey(request -> request.keyId(keyArn));
         assertThrows(S3Exception.class, () ->
                 s3.getObjectAsBytes(request -> request.bucket(bucket).key("disabled")));
+    }
+
+    @Test
+    void multipartCustomerKeyDoesNotRequireBucketDefaultKmsPermission() {
+        s3.putBucketEncryption(request -> request.bucket(bucket).serverSideEncryptionConfiguration(configuration ->
+                configuration.rules(rule -> rule.applyServerSideEncryptionByDefault(defaults ->
+                        defaults.sseAlgorithm(ServerSideEncryption.AWS_KMS).kmsMasterKeyID(keyArn)))));
+        String customerKey = Base64.getEncoder().encodeToString(new byte[32]);
+        String customerMd5 = "cLyPS3KoaSFGi/joRB3OUQ==";
+        String upload = caller.createMultipartUpload(request -> request.bucket(bucket).key("customer-parts")
+                .sseCustomerAlgorithm("AES256").sseCustomerKey(customerKey).sseCustomerKeyMD5(customerMd5)).uploadId();
+        byte[] data = "customer multipart bytes".getBytes(StandardCharsets.UTF_8);
+        String tag = caller.uploadPart(request -> request.bucket(bucket).key("customer-parts").uploadId(upload)
+                .partNumber(1).sseCustomerAlgorithm("AES256").sseCustomerKey(customerKey)
+                .sseCustomerKeyMD5(customerMd5), RequestBody.fromBytes(data)).eTag();
+        caller.completeMultipartUpload(request -> request.bucket(bucket).key("customer-parts").uploadId(upload)
+                .sseCustomerAlgorithm("AES256").sseCustomerKey(customerKey).sseCustomerKeyMD5(customerMd5)
+                .multipartUpload(parts -> parts.parts(part -> part.partNumber(1).eTag(tag))));
+        assertArrayEquals(data, caller.getObjectAsBytes(request -> request.bucket(bucket).key("customer-parts")
+                .sseCustomerAlgorithm("AES256").sseCustomerKey(customerKey).sseCustomerKeyMD5(customerMd5)).asByteArray());
+        assertNull(caller.headObject(request -> request.bucket(bucket).key("customer-parts")
+                .sseCustomerAlgorithm("AES256").sseCustomerKey(customerKey).sseCustomerKeyMD5(customerMd5))
+                .ssekmsKeyId());
+        assertThrows(S3Exception.class, () -> caller.getObjectAsBytes(request ->
+                request.bucket(bucket).key("customer-parts")));
     }
 
     @Test

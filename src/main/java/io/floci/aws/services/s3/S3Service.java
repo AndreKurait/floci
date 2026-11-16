@@ -967,6 +967,15 @@ public class S3Service implements Resettable, ResourceProvider {
                                  String contentType, Map<String, String> metadata,
                                  S3Checksum checksum, List<Part> parts, PutObjectOptions options, String eTag,
                                  String aclRequestAccount) {
+        return storeObject(checkedBucket, bucketName, key, body, contentType, metadata, checksum,
+                parts, options, eTag, aclRequestAccount, null);
+    }
+
+    private S3Object storeObject(AccountAwareStorageBackend.OwnedEntry<Bucket> checkedBucket,
+                                 String bucketName, String key, ObjectBody body,
+                                 String contentType, Map<String, String> metadata,
+                                 S3Checksum checksum, List<Part> parts, PutObjectOptions options, String eTag,
+                                 String aclRequestAccount, SseCustomerKey multipartCustomerKey) {
         AccountAwareStorageBackend.OwnedEntry<Bucket> ownedBucket = resolveBucketEntry(bucketName)
                 .orElseThrow(() -> new AwsException("NoSuchBucket",
                         "The specified bucket does not exist.", 404));
@@ -979,7 +988,7 @@ public class S3Service implements Resettable, ResourceProvider {
                 throw new AwsException("NoSuchBucket", "The specified bucket does not exist.", 404);
             }
             return storeObjectInternal(ownedBucket.account(), bucket, bucketName, key, body,
-                    contentType, metadata, checksum, parts, options, eTag, aclRequestAccount);
+                    contentType, metadata, checksum, parts, options, eTag, aclRequestAccount, multipartCustomerKey);
         }
     }
 
@@ -1014,10 +1023,12 @@ public class S3Service implements Resettable, ResourceProvider {
                                          String bucketName, String key, ObjectBody body,
                                          String contentType, Map<String, String> metadata,
                                          S3Checksum checksum, List<Part> parts, PutObjectOptions options,
-                                         String eTag, String aclRequestAccount) {
+                                         String eTag, String aclRequestAccount, SseCustomerKey multipartCustomerKey) {
         PutObjectOptions effectiveOptions = options != null ? options : new PutObjectOptions();
         String normalizedServerSideEncryption = normalizeServerSideEncryption(effectiveOptions.getServerSideEncryption());
-        SseCustomerKey sseCustomerKey = validateSseCustomerKey(effectiveOptions.getSseCustomerAlgorithm(), effectiveOptions.getSseCustomerKey(), effectiveOptions.getSseCustomerKeyMd5());
+        SseCustomerKey sseCustomerKey = multipartCustomerKey != null ? multipartCustomerKey
+                : validateSseCustomerKey(effectiveOptions.getSseCustomerAlgorithm(),
+                        effectiveOptions.getSseCustomerKey(), effectiveOptions.getSseCustomerKeyMd5());
         rejectConflictingServerSideEncryption(normalizedServerSideEncryption, sseCustomerKey);
         S3ObjectEncryption encryption = S3ObjectEncryption.resolve(bucket.getEncryptionConfiguration(),
                 normalizedServerSideEncryption, effectiveOptions.getSseKmsKeyId(), sseCustomerKey != null);
@@ -5527,7 +5538,7 @@ public class S3Service implements Resettable, ResourceProvider {
                         : assembleParts(uploadId, parts);
                 S3Object object;
                 try {
-                    object = storeObject(bucket, key, body, upload.getContentType(), upload.getMetadata(),
+                    object = storeObject(null, bucket, key, body, upload.getContentType(), upload.getMetadata(),
                             checksum, completedParts,
                             new PutObjectOptions()
                                     .withStorageClass(upload.getStorageClass())
@@ -5549,17 +5560,15 @@ public class S3Service implements Resettable, ResourceProvider {
                                     .withIfMatch(ifMatch)
                                     .withIfNoneMatch(ifNoneMatch),
                             compositeETag,
-                            upload.getInitiatorAccountId() != null ? upload.getInitiatorAccountId() : ownerId());
+                            upload.getInitiatorAccountId() != null ? upload.getInitiatorAccountId() : ownerId(),
+                            upload.getSseCustomerAlgorithm() == null ? null
+                                    : new SseCustomerKey(upload.getSseCustomerAlgorithm(), upload.getSseCustomerKeyMd5()));
                 } finally {
                     // A stored body was moved away, so this only removes the file of a failed store and
                     // leaves the parts in place for a retry or an abort.
                     if (body instanceof AssembledBody assembled) {
                         deleteQuietly(assembled.file(), "assembled multipart object that was not stored");
                     }
-                }
-                if (upload.getSseCustomerAlgorithm() != null) {
-                    object.setSseCustomerAlgorithm(upload.getSseCustomerAlgorithm());
-                    object.setSseCustomerKeyMd5(upload.getSseCustomerKeyMd5());
                 }
                 String bucketOwnerAccount = resolveBucketEntry(bucket)
                         .map(AccountAwareStorageBackend.OwnedEntry::account)
