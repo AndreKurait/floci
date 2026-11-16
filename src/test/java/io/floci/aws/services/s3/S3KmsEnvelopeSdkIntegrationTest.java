@@ -85,6 +85,33 @@ class S3KmsEnvelopeSdkIntegrationTest {
     }
 
     @Test
+    void nativeDescribeKeyHonorsCallerAccountWithoutEncryptionContext() {
+        String principal = iam.getUser(user).getArn();
+        String account = principal.split(":")[4];
+        String policy = """
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Principal":{"AWS":"%s"},
+                   "Action":"kms:DescribeKey","Resource":"*",
+                   "Condition":{"StringEquals":{"kms:CallerAccount":"%s"}}},
+                  {"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::%s:root"},
+                   "Action":["kms:PutKeyPolicy","kms:ScheduleKeyDeletion"],"Resource":"*"}]}
+                """;
+        iam.putUserPolicy(user, "Objects", """
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Action":"kms:DescribeKey","Resource":"*"}]}
+                """);
+        try (KmsClient nativeCaller = AwsTestClients.create(KmsClient.builder(),
+                access.getAccessKeyId(), access.getSecretAccessKey(), Region.US_EAST_1, endpoint)) {
+            kms.putKeyPolicy(request -> request.keyId(keyArn).policyName("default")
+                    .policy(policy.formatted(principal, account, account)));
+            assertEquals(keyArn, nativeCaller.describeKey(request -> request.keyId(keyArn)).keyMetadata().arn());
+            kms.putKeyPolicy(request -> request.keyId(keyArn).policyName("default")
+                    .policy(policy.formatted(principal, "999999999999", account)));
+            assertThrows(KmsException.class, () -> nativeCaller.describeKey(request -> request.keyId(keyArn)));
+        }
+    }
+
+    @Test
     void putRequiresAnExistingKmsKey() {
         assertThrows(S3Exception.class, () -> s3.putObject(request -> request.bucket(bucket).key("missing")
                         .serverSideEncryption(ServerSideEncryption.AWS_KMS).ssekmsKeyId(UUID.randomUUID().toString()),

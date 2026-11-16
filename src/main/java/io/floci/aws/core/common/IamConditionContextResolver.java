@@ -258,11 +258,15 @@ public class IamConditionContextResolver {
     }
 
     private Map<String, List<String>> kmsConditionContext(ContainerRequestContext ctx) {
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        String account = requestContext.getAccountId();
+        if (account != null) {
+            conditions.put("kms:CallerAccount", List.of(account));
+        }
         JsonNode body = bufferedJsonBody(ctx);
         if (body == null || !body.path("EncryptionContext").isObject()) {
-            return null;
+            return conditions;
         }
-        Map<String, List<String>> conditions = new LinkedHashMap<>();
         List<String> keys = new ArrayList<>();
         body.path("EncryptionContext").properties().forEach(entry -> {
             if (entry.getValue().isTextual()) {
