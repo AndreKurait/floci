@@ -295,6 +295,48 @@ class S3KmsEnvelopeSdkIntegrationTest {
     }
 
     @Test
+    void nativeGrantManagementOperationsIgnoreEncryptionContextConstraints() {
+        String principal = iam.getUser(user).getArn();
+        kms.putKeyPolicy(request -> request.keyId(keyArn).policyName("default").policy("""
+                {"Version":"2012-10-17","Statement":[]}
+                """).bypassPolicyLockoutSafetyCheck(true));
+        String grant = kms.createGrant(request -> request.keyId(keyArn).granteePrincipal(principal)
+                .operationsWithStrings("DescribeKey", "RetireGrant", "GenerateDataKey")
+                .constraints(constraints -> constraints.encryptionContextEquals(Map.of("purpose", "allowed"))))
+                .grantId();
+        try (KmsClient direct = AwsTestClients.create(KmsClient.builder(), access.getAccessKeyId(),
+                access.getSecretAccessKey(), Region.US_EAST_1, endpoint)) {
+            assertEquals(keyArn, direct.describeKey(request -> request.keyId(keyArn)).keyMetadata().arn());
+            assertThrows(KmsException.class, () -> direct.generateDataKey(request -> request.keyId(keyArn)
+                    .keySpec("AES_256")));
+            assertThrows(KmsException.class, () -> direct.generateDataKey(request -> request.keyId(keyArn)
+                    .keySpec("AES_256").encryptionContext(Map.of("purpose", "denied"))));
+            assertEquals(32, direct.generateDataKey(request -> request.keyId(keyArn).keySpec("AES_256")
+                    .encryptionContext(Map.of("purpose", "allowed"))).plaintext().asByteArray().length);
+            direct.retireGrant(request -> request.keyId(keyArn).grantId(grant));
+            assertThrows(KmsException.class, () -> direct.describeKey(request -> request.keyId(keyArn)));
+        }
+    }
+
+    @Test
+    void nativeGrantRetirementIgnoresSourceArnButDescribeKeyDoesNot() {
+        String principal = iam.getUser(user).getArn();
+        kms.putKeyPolicy(request -> request.keyId(keyArn).policyName("default").policy("""
+                {"Version":"2012-10-17","Statement":[]}
+                """).bypassPolicyLockoutSafetyCheck(true));
+        String grant = kms.createGrant(request -> request.keyId(keyArn).granteePrincipal(principal)
+                .operationsWithStrings("DescribeKey", "RetireGrant")
+                .constraints(constraints -> constraints.sourceArn(
+                        "arn:aws:lambda:us-east-1:" + principal.split(":")[4] + ":function:grant-source"))).grantId();
+        try (KmsClient direct = AwsTestClients.create(KmsClient.builder(), access.getAccessKeyId(),
+                access.getSecretAccessKey(), Region.US_EAST_1, endpoint)) {
+            assertThrows(KmsException.class, () -> direct.describeKey(request -> request.keyId(keyArn)));
+            direct.retireGrant(request -> request.keyId(keyArn).grantId(grant));
+            assertEquals(0, kms.listGrants(request -> request.keyId(keyArn)).grants().size());
+        }
+    }
+
+    @Test
     void identityPolicyCannotManufactureItsOwnKeyGrant() {
         iam.putUserPolicy(user, "Objects", """
                 {"Version":"2012-10-17","Statement":[

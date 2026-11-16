@@ -70,20 +70,29 @@ public class KmsResourcePolicyProvider implements ResourcePolicyProvider {
     }
 
     private String grantPolicy(Map<?, ?> grant, String resource, boolean symmetric) {
+        List<Map<String, Object>> statements = new ArrayList<>();
+        if (grant.get("Operations") instanceof List<?> operations) {
+            for (Object operation : operations) {
+                statements.add(grantStatement(grant, resource, symmetric, operation.toString()));
+            }
+        }
+        // Grant constraints are literal values, not IAM policy-variable expressions.
+        Map<String, Object> policy = Map.of("Version", "2008-10-17", "Statement", statements);
+        return mapper.valueToTree(policy).toString();
+    }
+
+    private Map<String, Object> grantStatement(Map<?, ?> grant, String resource, boolean symmetric, String operation) {
         Map<String, Object> statement = new LinkedHashMap<>();
         statement.put("Effect", "Allow");
         statement.put("Principal", Map.of("AWS", grant.get("GranteePrincipal")));
-        List<String> actions = new ArrayList<>();
-        if (grant.get("Operations") instanceof List<?> operations) {
-            operations.forEach(operation -> actions.add("kms:" + operation));
-        }
-        statement.put("Action", actions);
+        statement.put("Action", "kms:" + operation);
         statement.put("Resource", resource);
         Map<String, Object> conditions = new LinkedHashMap<>();
         Map<String, Object> equalities = new LinkedHashMap<>();
         if (grant.get("Constraints") instanceof Map<?, ?> constraints) {
             for (String member : List.of("EncryptionContextSubset", "EncryptionContextEquals")) {
-                if (symmetric && constraints.get(member) instanceof Map<?, ?> context) {
+                if (symmetric && !"DescribeKey".equals(operation) && !"RetireGrant".equals(operation)
+                        && constraints.get(member) instanceof Map<?, ?> context) {
                     context.forEach((key, value) -> equalities.put("kms:EncryptionContext:" + key, value));
                     if ("EncryptionContextEquals".equals(member)) {
                         if (context.isEmpty()) {
@@ -95,7 +104,7 @@ public class KmsResourcePolicyProvider implements ResourcePolicyProvider {
                     }
                 }
             }
-            if (constraints.get("SourceArn") instanceof String sourceArn) {
+            if (!"RetireGrant".equals(operation) && constraints.get("SourceArn") instanceof String sourceArn) {
                 equalities.put("aws:SourceArn", sourceArn);
             }
         }
@@ -105,9 +114,7 @@ public class KmsResourcePolicyProvider implements ResourcePolicyProvider {
         if (!conditions.isEmpty()) {
             statement.put("Condition", conditions);
         }
-        // Grant constraints are literal values, not IAM policy-variable expressions.
-        Map<String, Object> policy = Map.of("Version", "2008-10-17", "Statement", List.of(statement));
-        return mapper.valueToTree(policy).toString();
+        return statement;
     }
 
 }
