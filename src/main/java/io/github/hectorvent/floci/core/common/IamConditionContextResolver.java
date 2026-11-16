@@ -38,6 +38,8 @@ import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.iam.model.IamUser;
 import io.github.hectorvent.floci.services.kinesis.KinesisService;
 import io.github.hectorvent.floci.services.kms.KmsGrantConditions;
+import io.github.hectorvent.floci.services.kms.KmsService;
+import io.github.hectorvent.floci.services.kms.model.KmsAlias;
 import io.github.hectorvent.floci.services.lambda.LambdaRuntimeManagementService;
 import io.github.hectorvent.floci.services.lambda.LambdaService;
 import io.github.hectorvent.floci.services.lambdaweb.LambdaWebService;
@@ -130,6 +132,10 @@ public class IamConditionContextResolver {
 
     @Inject
     Instance<CloudFormationDriftService> driftService;
+
+    /** Resolved lazily: KMS's own condition keys need the aliases of the key a request names. */
+    @Inject
+    Instance<KmsService> kmsService;
 
     private final Instance<DynamoDbFacade> dynamoDbFacade;
     private final Instance<Ec2Service> ec2Service;
@@ -376,7 +382,7 @@ public class IamConditionContextResolver {
             case "batch" -> batchSchedulingPolicyConditions(action, ctx);
             case "account" -> accountRegionConditionContext(action, ctx);
             case "s3" -> s3ConditionContext(action, ctx);
-            case "kms" -> kmsConditionContext(ctx);
+            case "kms" -> kmsConditionContext(action, ctx);
             case "cloudfront" -> cloudFrontTestConditionContext(action, ctx);
             case "ec2" -> ec2ConditionContext(action, ctx);
             case "ecr" -> ecrPreviewConditionContext(action, ctx);
@@ -399,12 +405,44 @@ public class IamConditionContextResolver {
         };
     }
 
-    private Map<String, List<String>> kmsConditionContext(ContainerRequestContext ctx) {
+    /**
+     * KMS's own condition keys: the request's encryption context; kms:ResourceAliases, every alias of
+     * the key its KeyId names (by id, ARN, alias name or alias ARN); kms:RequestAlias, the alias name
+     * when the KeyId is an alias name or alias ARN; and on CreateGrant kms:GrantOperations, the
+     * operations it grants. A KeyId naming no key the account holds adds no alias, so the handler
+     * still answers its own NotFoundException.
+     */
+    private Map<String, List<String>> kmsConditionContext(String action, ContainerRequestContext ctx) {
         JsonNode body = bufferedJsonBody(ctx);
-        if (body == null || !body.path("EncryptionContext").isObject()) {
+        if (body == null || !body.isObject()) {
             return null;
         }
         Map<String, List<String>> conditions = new LinkedHashMap<>();
+        String keyId = body.path("KeyId").isTextual() ? body.path("KeyId").textValue() : null;
+        if (keyId != null && !keyId.isBlank() && kmsService != null && kmsService.isResolvable()) {
+            String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+            try {
+                List<String> aliases = kmsService.get().listAliases(keyId, region).stream()
+                        .map(KmsAlias::getAliasName).filter(name -> name != null && !name.isBlank()).sorted().toList();
+                if (!aliases.isEmpty()) {
+                    conditions.put("kms:ResourceAliases", aliases);
+                }
+            } catch (AwsException expected) {
+                // No such key: the handler answers NotFoundException.
+            }
+        }
+        String requestAlias = kmsRequestAlias(keyId);
+        if (requestAlias != null) {
+            conditions.put("kms:RequestAlias", List.of(requestAlias));
+        }
+        if ("kms:CreateGrant".equals(action) && body.path("Operations").isArray()) {
+            List<String> operations = new ArrayList<>();
+            body.path("Operations").forEach(operation -> operations.add(operation.asText()));
+            conditions.put("kms:GrantOperations", operations);
+        }
+        if (!body.path("EncryptionContext").isObject()) {
+            return conditions.isEmpty() ? null : conditions;
+        }
         List<String> keys = new ArrayList<>();
         body.path("EncryptionContext").properties().forEach(entry -> {
             if (entry.getValue().isTextual()) {
@@ -418,6 +456,18 @@ public class IamConditionContextResolver {
             conditions.put("kms:EncryptionContextKeys", keys);
         }
         return conditions;
+    }
+
+    /** The alias name ({@code alias/...}) a KeyId names by alias name or alias ARN, or null for a key id or key ARN. */
+    static String kmsRequestAlias(String keyId) {
+        if (keyId == null) {
+            return null;
+        }
+        if (keyId.startsWith("alias/")) {
+            return keyId;
+        }
+        int alias = keyId.startsWith("arn:") ? keyId.indexOf(":alias/") : -1;
+        return alias < 0 ? null : keyId.substring(alias + 1);
     }
 
     private Map<String, List<String>> memoryDbParameterGroupConditions(String action, ContainerRequestContext ctx) {
