@@ -6097,23 +6097,29 @@ public class CloudFormationService implements ResourceProvider {
             }
         }
 
+        // A wait condition holds the stack's creation until it is signalled. AWS creates resources that
+        // do not depend on each other in parallel, so the signal can come from a resource created beside
+        // it, such as a custom resource whose handler signals the handle. A ready wait condition is
+        // therefore taken only when no other resource is ready: every resource that does not depend on
+        // it is created before it starts to wait.
         Deque<String> queue = new ArrayDeque<>();
+        Deque<String> waits = new ArrayDeque<>();
         for (String id : activeIds) {
             if (inDegree.get(id) == 0) {
-                queue.add(id);
+                (isWaitCondition(resources, id) ? waits : queue).add(id);
             }
         }
 
         List<String> sorted = new ArrayList<>();
-        while (!queue.isEmpty()) {
-            String current = queue.poll();
+        while (!queue.isEmpty() || !waits.isEmpty()) {
+            String current = queue.isEmpty() ? waits.poll() : queue.poll();
             sorted.add(current);
             for (var entry : dependencies.entrySet()) {
                 if (entry.getValue().contains(current)) {
                     int newDegree = inDegree.get(entry.getKey()) - 1;
                     inDegree.put(entry.getKey(), newDegree);
                     if (newDegree == 0) {
-                        queue.add(entry.getKey());
+                        (isWaitCondition(resources, entry.getKey()) ? waits : queue).add(entry.getKey());
                     }
                 }
             }
@@ -6134,6 +6140,10 @@ public class CloudFormationService implements ResourceProvider {
             }
         }
         return new CreationOrder(sorted, circular);
+    }
+
+    private static boolean isWaitCondition(JsonNode resources, String logicalId) {
+        return "AWS::CloudFormation::WaitCondition".equals(resources.path(logicalId).path("Type").asText());
     }
 
     /**
