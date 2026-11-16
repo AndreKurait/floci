@@ -568,16 +568,18 @@ public class CloudFormationQueryHandler {
 
     private Response getTemplate(MultivaluedMap<String, String> params, String region) {
         String stackName = params.getFirst("StackName");
+        String changeSetName = params.getFirst("ChangeSetName");
         String templateStage = params.getFirst("TemplateStage");
         try {
-            String template = cfnService.getTemplate(stackName, templateStage, region);
+            CloudFormationService.TemplateResponse template =
+                    cfnService.getTemplate(stackName, changeSetName, templateStage, region);
             XmlBuilder xml = new XmlBuilder()
                     .start("GetTemplateResponse", CF_NS)
                     .start("GetTemplateResult")
-                    .elem("TemplateBody", template);
+                    .elem("TemplateBody", template.body());
 
             xml.start("StagesAvailable");
-            for (String stage : cfnService.templateStagesAvailable()) {
+            for (String stage : template.stagesAvailable()) {
                 xml.elem("member", stage);
             }
             xml.end("StagesAvailable");

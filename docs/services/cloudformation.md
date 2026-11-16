@@ -38,7 +38,7 @@ changing credentials already issued.
 | `DescribeStackEvents` | Get stack creation/update event history |
 | `DescribeStackResources` | Get all resources in a stack |
 | `ListStackResources` | List resource summaries |
-| `GetTemplate` | Retrieve the template body |
+| `GetTemplate` | Retrieve a stack or change set's Original or Processed template body |
 | `GetTemplateSummary` | Summarize a template's Parameters, Resources and Transform sections, by StackName, TemplateBody or TemplateURL |
 | `ValidateTemplate` | Refuses a body that is no template (see [Template format](#template-format)) and a template holding a `null` value (see [Null values](#null-values)); otherwise returns success without validating further |
 | `ListStacks` | List stacks by status |
@@ -984,17 +984,29 @@ against that enum, rejecting anything else with a `ValidationError` naming the v
 `Original` returns the template exactly as submitted, `Fn::Transform` node and all. `Processed`
 returns the merged and SAM-expanded tree, the same one a `CreateChangeSet` preview diffs against.
 
+`ChangeSetName` selects the change set's submitted template, including before its first execution
+or while an update is waiting to execute. A full change-set ARN works without `StackName`; a short
+name requires its stack. The ARN's complete identity, account and Region must match.
+
+Change sets retain the processed template from creation. Preview, `GetTemplate` and execution use
+that snapshot, so changing an included S3 object does not change an already-created change set.
+Both a stack name and a change-set ARN authorize `cloudformation:GetTemplate` against the selected
+stack's complete ARN, so stack-scoped grants and explicit denies apply to either selector.
+`StagesAvailable` includes `Processed` only when processing produced a template. A failed transform
+still exposes `Original`. Older persisted change sets that have no processed snapshot expose only
+`Original`; a `Processed` request fails explicitly instead of rebuilding history from current S3 data.
+
 floci expands neither `AWS::LanguageExtensions`, nor a third-party macro, nor the top-level
 `Transform: {Name: AWS::Include, Parameters: {Location: ...}}` form. A template carrying only one of
 those three keeps `Processed` equal to `Original`, byte for byte.
 
-Two triggers break that equality, because `executeTemplate` re-serializes the persisted body when
-either one fires: an embedded `Fn::Transform` that merges, and a SAM transform. A SAM transform goes
+Two triggers break that equality, because processing re-serializes the retained body when either
+one fires: an embedded `Fn::Transform` that merges, and a SAM transform. A SAM transform goes
 further, because `SamTransformProcessor` removes the whole `Transform` section unconditionally, so a
 macro co-declared beside SAM is absent from `Processed` as well.
 
-Real AWS's answer for these shapes is unmeasured, co-declared with SAM or not. `StagesAvailable`
-always lists both stages, matching AWS.
+Real AWS's answer for these shapes is unmeasured, co-declared with SAM or not. For stacks,
+`StagesAvailable` lists both stages; change sets advertise only the stages they retained.
 
 ## Explicit SAM REST API authentication
 
@@ -1024,8 +1036,21 @@ operation that has none of its own, which API Gateway does not. As in SAM, any n
 whose `paths` entries, and the branches of an `Fn::If` around one, are objects, so a body or
 a `paths` map written as an `Fn::If` is rejected.
 
-Other `Auth` properties, custom default authorizers and external definitions are rejected.
-When a default applies, so are unresolved or malformed security requirements, method
+`Auth.ResourcePolicy` supports `AwsAccountWhitelist`, `AwsAccountBlacklist`, and
+`CustomStatements`. Account lists become `Allow` or `Deny` statements in
+`x-amazon-apigateway-policy`, scoped to the declared stage, paths, and methods.
+Account and stage references remain intrinsic values until CloudFormation resolves them.
+`ANY` methods and path parameters become policy wildcards. Existing inline policy
+statements are preserved, including explicit denials; custom statements are appended
+without duplicates. The existing API Gateway resource-policy evaluator enforces the
+result, alongside any selected IAM or API-key requirements.
+
+Other resource-policy selectors, including IP and VPC lists, other `Auth` properties,
+custom default authorizers, and external definitions are rejected. A resource-policy
+merge also rejects a whole `DefinitionBody` or inline policy supplied as an intrinsic
+function, because generated sibling statements would otherwise be discarded during
+CloudFormation resolution. Intrinsics inside account lists and statements are preserved.
+When a default applies, the transform also rejects unresolved or malformed security requirements, method
 override markers, a nested `Fn::If` around a path item, a body or security
 scheme map written as an intrinsic function, an `AWS_IAM` or `api_key` scheme that contains
 one, and a body that declares both `swagger` and `openapi`. Existing

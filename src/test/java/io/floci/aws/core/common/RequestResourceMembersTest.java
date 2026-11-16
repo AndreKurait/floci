@@ -161,7 +161,8 @@ class RequestResourceMembersTest {
     @Test
     void theTableReadsItsNamespacesAndGivesEachTypeItNamesAnArnFormat() {
         RequestResourceMembers.Table table = RequestResourceMembers.table();
-        assertTrue(table.namespaces().containsAll(List.of("cognito-idp", "ecr", "elasticloadbalancing", "states")));
+        assertTrue(table.namespaces().containsAll(List.of("cloudformation", "cognito-idp", "ecr",
+                "elasticloadbalancing", "states")));
         assertTrue(table.namespaces().contains("lambda"));
         assertFalse(table.handBuilt().contains("lambda"));
         assertEquals(Set.of("dynamodb", "logs"), table.namespaces().stream().filter(table.handBuilt()::contains)
@@ -180,6 +181,7 @@ class RequestResourceMembersTest {
                 .collect(Collectors.toSet()),
                 "only the operations listed to read override hand-built operations");
         assertTrue(table.namespaces().stream().noneMatch(table.notCovered()::contains));
+        assertTrue(table.operations().containsKey("cloudformation:GetTemplate"));
         assertTrue(table.operations().containsKey("rds:CreateDBParameterGroup"));
         assertTrue(table.operations().containsKey("rds:CreateDBProxy"));
         assertTrue(table.otherNamespaces().stream().noneMatch(table.notCovered()::contains));
