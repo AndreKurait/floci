@@ -19,6 +19,8 @@ public class ChangeSet {
     private String executionStatus = "AVAILABLE";
     private String statusReason;
     private String templateBody;
+    /** The transform result captured when this change set was created; absent for older stored change sets. */
+    private String processedTemplateBody;
     /** A requested execution-role change is applied only when this change set executes. */
     private String roleArn;
     private Map<String, String> parameters;
@@ -48,6 +50,8 @@ public class ChangeSet {
     public void setStatusReason(String statusReason) { this.statusReason = statusReason; }
     public String getTemplateBody() { return templateBody; }
     public void setTemplateBody(String templateBody) { this.templateBody = templateBody; }
+    public String getProcessedTemplateBody() { return processedTemplateBody; }
+    public void setProcessedTemplateBody(String processedTemplateBody) { this.processedTemplateBody = processedTemplateBody; }
     public String getRoleArn() { return roleArn; }
     public void setRoleArn(String roleArn) { this.roleArn = roleArn; }
     public Map<String, String> getParameters() { return parameters; }
