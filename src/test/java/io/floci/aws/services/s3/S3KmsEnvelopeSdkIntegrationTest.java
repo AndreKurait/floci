@@ -11,6 +11,8 @@ import jakarta.inject.Inject;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import software.amazon.awssdk.core.SdkBytes;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.regions.Region;
@@ -18,8 +20,12 @@ import software.amazon.awssdk.services.kms.KmsClient;
 import software.amazon.awssdk.services.kms.model.GrantConstraints;
 import software.amazon.awssdk.services.kms.model.KmsException;
 import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.ChecksumAlgorithm;
+import software.amazon.awssdk.services.s3.model.ChecksumType;
+import software.amazon.awssdk.services.s3.model.CompletedPart;
 import software.amazon.awssdk.services.s3.model.S3Exception;
 import software.amazon.awssdk.services.s3.model.ServerSideEncryption;
+import software.amazon.awssdk.services.s3.model.UploadPartResponse;
 
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
@@ -265,6 +271,36 @@ class S3KmsEnvelopeSdkIntegrationTest {
                 RequestBody.fromString("discarded"));
         s3.abortMultipartUpload(request -> request.bucket(bucket).key("abort").uploadId(abort));
         assertEquals(0, s3.listMultipartUploads(request -> request.bucket(bucket)).uploads().size());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {1, 65536, 65537})
+    void multipartCompositeChecksumRoundTripsAcrossFrameBoundaries(int tailSize) {
+        byte[] first = new byte[5 * 1024 * 1024];
+        byte[] last = new byte[tailSize];
+        new Random(37).nextBytes(first);
+        new Random(41).nextBytes(last);
+        String upload = s3.createMultipartUpload(request -> request.bucket(bucket).key("framed-parts")
+                .serverSideEncryption(ServerSideEncryption.AWS_KMS).ssekmsKeyId(keyArn)
+                .checksumAlgorithm(ChecksumAlgorithm.SHA256).checksumType(ChecksumType.COMPOSITE)).uploadId();
+        UploadPartResponse partOne = s3.uploadPart(request -> request.bucket(bucket).key("framed-parts")
+                .uploadId(upload).partNumber(1).checksumAlgorithm(ChecksumAlgorithm.SHA256),
+                RequestBody.fromBytes(first));
+        UploadPartResponse partTwo = s3.uploadPart(request -> request.bucket(bucket).key("framed-parts")
+                .uploadId(upload).partNumber(2).checksumAlgorithm(ChecksumAlgorithm.SHA256),
+                RequestBody.fromBytes(last));
+        s3.completeMultipartUpload(request -> request.bucket(bucket).key("framed-parts").uploadId(upload)
+                .checksumType(ChecksumType.COMPOSITE).multipartUpload(parts -> parts.parts(
+                        CompletedPart.builder().partNumber(1).eTag(partOne.eTag())
+                                .checksumSHA256(partOne.checksumSHA256()).build(),
+                        CompletedPart.builder().partNumber(2).eTag(partTwo.eTag())
+                                .checksumSHA256(partTwo.checksumSHA256()).build())));
+        byte[] expected = Arrays.copyOf(first, first.length + last.length);
+        System.arraycopy(last, 0, expected, first.length, last.length);
+        assertArrayEquals(expected, s3.getObjectAsBytes(request -> request.bucket(bucket)
+                .key("framed-parts")).asByteArray());
+        assertArrayEquals(last, s3.getObjectAsBytes(request -> request.bucket(bucket)
+                .key("framed-parts").range("bytes=" + first.length + "-")).asByteArray());
     }
 
     @Test
