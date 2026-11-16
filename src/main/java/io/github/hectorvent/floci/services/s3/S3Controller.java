@@ -4165,8 +4165,24 @@ public class S3Controller {
             }
         }
 
-        S3Object obj = s3Service.postObject(bucket, key, fileData, objectContentType,
+        String previousAccessKey = requestContext.getAccessKeyId();
+        String previousSessionToken = requestContext.getSessionToken();
+        S3Object obj;
+        try {
+            if (credential != null && !credential.isEmpty()) {
+                String accessKey = accountResolver.extractAccessKeyId(
+                    AccountResolver.SIGV4_SCHEME + " Credential=" + credential);
+                if (accessKey != null) {
+                    requestContext.setAccessKeyId(accessKey);
+                    requestContext.setSessionToken(lcFields.get("x-amz-security-token"));
+                }
+            }
+            obj = s3Service.postObject(bucket, key, fileData, objectContentType,
                 metadata.isEmpty() ? null : metadata);
+        } finally {
+            requestContext.setAccessKeyId(previousAccessKey);
+            requestContext.setSessionToken(previousSessionToken);
+        }
         LOG.infov("Presigned POST upload: {0}/{1} ({2} bytes)", bucket, key, fileData.length);
 
         String xml = new XmlBuilder()

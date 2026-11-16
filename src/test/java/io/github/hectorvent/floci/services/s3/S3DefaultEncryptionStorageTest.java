@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.kms.KmsService;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
 import org.junit.jupiter.api.io.TempDir;
@@ -108,7 +109,7 @@ class S3DefaultEncryptionStorageTest {
     private static S3Service service(StorageFactory factory, EmulatorConfig config) {
         RegionResolver regions = new RegionResolver("us-east-1", "000000000000");
         S3KmsEncryption encryption = new S3KmsEncryption(new KmsService(factory, regions),
-                mock(IamEnforcementFilter.class), new RequestContext(), regions);
+                mock(IamEnforcementFilter.class), new RequestContext(), regions, mock(IamService.class));
         return new S3Service(factory, config, null, null, null, null, null,
                 regions, new ObjectMapper(), null, encryption);
     }

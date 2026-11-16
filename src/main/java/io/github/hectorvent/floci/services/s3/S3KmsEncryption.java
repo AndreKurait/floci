@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.IamEnforcementFilter;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestContext;
+import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.kms.KmsGrantConditions;
 import io.github.hectorvent.floci.services.kms.KmsService;
 import io.github.hectorvent.floci.services.s3.model.S3KmsEnvelope;
@@ -24,14 +25,16 @@ import java.util.function.Supplier;
 public class S3KmsEncryption {
 
     private final KmsService kms;
+    private final IamService iam;
     private final IamEnforcementFilter authorization;
     private final RequestContext request;
     private final RegionResolver regions;
     private final SecureRandom random = new SecureRandom();
 
     public S3KmsEncryption(KmsService kms, IamEnforcementFilter authorization,
-                           RequestContext request, RegionResolver regions) {
+                           RequestContext request, RegionResolver regions, IamService iam) {
         this.kms = kms;
+        this.iam = iam;
         this.authorization = authorization;
         this.request = request;
         this.regions = regions;
@@ -109,7 +112,7 @@ public class S3KmsEncryption {
             }
             return arn.accountId();
         }
-        return regions.getAccountId();
+        return callerAccount();
     }
 
     private <T> T withOwner(String account, Supplier<T> operation) {
@@ -124,8 +127,17 @@ public class S3KmsEncryption {
         }
     }
 
+    private String callerAccount() {
+        String accessKey = request.getAccessKeyId();
+        if (accessKey != null && accessKey.matches("[0-9]{12}")) {
+            return accessKey;
+        }
+        return accessKey == null ? regions.getAccountId()
+                : iam.resolveAccountId(accessKey).orElse(regions.getAccountId());
+    }
+
     private void authorize(String keyArn, String action, Map<String, String> encryptionContext, String region) {
-        String account = regions.getAccountId();
+        String account = callerAccount();
         Map<String, List<String>> context = new HashMap<>();
         context.put("kms:ViaService", List.of("s3." + region + "." + AwsRegions.dnsSuffixFor(region)));
         context.put("kms:CallerAccount", List.of(account));
@@ -135,6 +147,12 @@ public class S3KmsEncryption {
             context.put("kms:EncryptionContext:" + entry.getKey(), List.of(entry.getValue()));
             context.put(KmsGrantConditions.encryptionContextKey(entry.getKey()), List.of(entry.getValue()));
         }
-        authorization.authorizeDelegatedResource(action, keyArn, context);
+        String previousAccount = request.getAccountId();
+        request.setAccountId(account);
+        try {
+            authorization.authorizeDelegatedResource(action, keyArn, context);
+        } finally {
+            request.setAccountId(previousAccount);
+        }
     }
 }
