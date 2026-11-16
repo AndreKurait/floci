@@ -9,6 +9,8 @@ import org.junit.jupiter.api.Test;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.Map;
@@ -19,6 +21,11 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 /**
  * The wire contract towards the real public npm registry, exercised against a local {@code
@@ -59,6 +66,72 @@ class NpmExternalConnectionClientTest {
 
         assertTrue(result.isPresent());
         assertArrayEquals(content, result.get().content());
+    }
+
+    @Test
+    void fetchPackumentRetriesAConnectionResetBeforeReceivingTheBody() throws Exception {
+        HttpClient transport = mock(HttpClient.class);
+        HttpResponse<byte[]> response = mock(HttpResponse.class);
+        byte[] content = "{\"name\":\"widget\"}".getBytes(StandardCharsets.UTF_8);
+        when(response.statusCode()).thenReturn(200);
+        when(response.body()).thenReturn(content);
+        when(transport.send(any(HttpRequest.class), any(HttpResponse.BodyHandler.class)))
+                .thenThrow(new IOException("Connection reset"))
+                .thenReturn(response);
+        NpmExternalConnectionClient retryClient =
+                new NpmExternalConnectionClient(transport, Map.of("fake", "http://127.0.0.1"));
+
+        Optional<NpmExternalConnectionClient.FetchedAsset> result =
+                retryClient.fetchPackument("fake", null, "widget");
+
+        assertTrue(result.isPresent());
+        assertArrayEquals(content, result.get().content());
+        verify(transport, times(2)).send(any(HttpRequest.class), any(HttpResponse.BodyHandler.class));
+    }
+
+    @Test
+    void fetchPackumentStopsAfterTwoFailedTransportAttempts() throws Exception {
+        HttpClient transport = mock(HttpClient.class);
+        when(transport.send(any(HttpRequest.class), any(HttpResponse.BodyHandler.class)))
+                .thenThrow(new IOException("Connection reset"));
+        NpmExternalConnectionClient retryClient =
+                new NpmExternalConnectionClient(transport, Map.of("fake", "http://127.0.0.1"));
+
+        assertTrue(retryClient.fetchPackument("fake", null, "widget").isEmpty());
+
+        verify(transport, times(2)).send(any(HttpRequest.class), any(HttpResponse.BodyHandler.class));
+    }
+
+    @Test
+    void fetchPackumentDoesNotRetryAnHttpNotFoundResponse() throws Exception {
+        HttpClient transport = mock(HttpClient.class);
+        HttpResponse<byte[]> response = mock(HttpResponse.class);
+        when(response.statusCode()).thenReturn(404);
+        when(response.body()).thenReturn(new byte[0]);
+        when(transport.send(any(HttpRequest.class), any(HttpResponse.BodyHandler.class))).thenReturn(response);
+        NpmExternalConnectionClient retryClient =
+                new NpmExternalConnectionClient(transport, Map.of("fake", "http://127.0.0.1"));
+
+        assertTrue(retryClient.fetchPackument("fake", null, "widget").isEmpty());
+
+        verify(transport).send(any(HttpRequest.class), any(HttpResponse.BodyHandler.class));
+    }
+
+    @Test
+    void fetchPackumentPreservesInterruptionWithoutRetrying() throws Exception {
+        HttpClient transport = mock(HttpClient.class);
+        when(transport.send(any(HttpRequest.class), any(HttpResponse.BodyHandler.class)))
+                .thenThrow(new InterruptedException("cancelled"));
+        NpmExternalConnectionClient retryClient =
+                new NpmExternalConnectionClient(transport, Map.of("fake", "http://127.0.0.1"));
+
+        try {
+            assertTrue(retryClient.fetchPackument("fake", null, "widget").isEmpty());
+            assertTrue(Thread.currentThread().isInterrupted());
+            verify(transport).send(any(HttpRequest.class), any(HttpResponse.BodyHandler.class));
+        } finally {
+            Thread.interrupted();
+        }
     }
 
     /**

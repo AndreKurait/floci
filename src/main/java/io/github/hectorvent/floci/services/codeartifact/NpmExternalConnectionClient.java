@@ -129,7 +129,7 @@ public class NpmExternalConnectionClient {
                     .header("Accept", accept)
                     .GET()
                     .build();
-            HttpResponse<byte[]> response = httpClient.send(request, BodyHandlers.ofByteArray());
+            HttpResponse<byte[]> response = sendWithTransportRetry(request);
             return response.statusCode() == 200 ? Optional.of(new FetchedAsset(response.body())) : Optional.empty();
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
@@ -138,6 +138,17 @@ public class NpmExternalConnectionClient {
             LOG.warnv("Could not fetch {0} {1} from the public npm registry: {2}", namespace, packageName,
                     e.getMessage());
             return Optional.empty();
+        }
+    }
+
+    private HttpResponse<byte[]> sendWithTransportRetry(HttpRequest request)
+            throws IOException, InterruptedException {
+        try {
+            return httpClient.send(request, BodyHandlers.ofByteArray());
+        } catch (IOException e) {
+            // The GET is idempotent and no response content has been returned to its caller.
+            LOG.debugv("Retrying public npm request after transport failure: {0}", e.getMessage());
+            return httpClient.send(request, BodyHandlers.ofByteArray());
         }
     }
 
