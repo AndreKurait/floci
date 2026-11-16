@@ -583,15 +583,17 @@ public class EcrService implements ResourceProvider, Resettable {
         String prefix = region + "::" + account + "::";
 
         if (repositoryNames == null || repositoryNames.isEmpty()) {
-            return repoStore.scan(k -> k.startsWith(prefix)).stream()
+            List<Repository> repositories = repoStore instanceof AccountAwareStorageBackend<Repository> aware
+                    ? aware.scanForAccount(account, k -> k.startsWith(prefix))
+                    : repoStore.scan(k -> k.startsWith(prefix));
+            return repositories.stream()
                     .map(repo -> refreshRepositoryUri(repo, region))
                     .toList();
         }
 
         List<Repository> out = new ArrayList<>();
         for (String name : repositoryNames) {
-            String key = key(region, account, name);
-            Repository repo = repoStore.get(key).orElseThrow(() -> notFound(name, account));
+            Repository repo = registryRepository(name, account, region).orElseThrow(() -> notFound(name, account));
             out.add(refreshRepositoryUri(repo, region));
         }
         return out;
@@ -1798,9 +1800,17 @@ public class EcrService implements ResourceProvider, Resettable {
     // Helpers
     // ============================================================
 
+    public Optional<Repository> registryRepository(String name, String account, String region) {
+        String repositoryKey = key(region, account, name);
+        if (repoStore instanceof AccountAwareStorageBackend<Repository> aware) {
+            return aware.getForAccount(account, repositoryKey);
+        }
+        return repoStore.get(repositoryKey);
+    }
+
     private Repository requireRepo(String name, String registryId, String region) {
         String account = effectiveAccount(registryId);
-        Repository repo = repoStore.get(key(region, account, name)).orElseThrow(() -> notFound(name, account));
+        Repository repo = registryRepository(name, account, region).orElseThrow(() -> notFound(name, account));
         return refreshRepositoryUri(repo, region);
     }
 
@@ -1882,7 +1892,11 @@ public class EcrService implements ResourceProvider, Resettable {
 
     private Repository refreshRepositoryUri(Repository repo, String region) {
         repo.setRepositoryUri(registryManager.getRepositoryUri(repo.getRegistryId(), region, repo.getRepositoryName()));
-        repoStore.put(key(region, repo.getRegistryId(), repo.getRepositoryName()), repo);
+        if (repoStore instanceof AccountAwareStorageBackend<Repository> aware) {
+            aware.putForAccount(repo.getRegistryId(), key(region, repo.getRegistryId(), repo.getRepositoryName()), repo);
+        } else {
+            repoStore.put(key(region, repo.getRegistryId(), repo.getRepositoryName()), repo);
+        }
         return repo;
     }
 
