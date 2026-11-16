@@ -63,7 +63,8 @@ public class ElbV2DnsRecordSource implements DnsRecordSource {
 
     @Override
     public Optional<DnsAnswer> resolveAuthoritative(String name, int type, ClientVpc origin) {
-        return resolve(name, type, origin);
+        Optional<DnsAnswer> frontend = resolve(name, type, origin);
+        return frontend.isPresent() ? frontend : awsFormAnswer(name, type);
     }
 
     private DnsAnswer frontendAnswer(LoadBalancer target, int type, ClientVpc origin) {
@@ -72,6 +73,33 @@ public class ElbV2DnsRecordSource implements DnsRecordSource {
         }
         List<String> addresses = type == 1 ? networks.frontendAddresses(target, origin) : List.of();
         return addresses.isEmpty() ? DnsAnswer.noData() : DnsAnswer.records(addresses, 60);
+    }
+
+    /**
+     * A load balancer's own AWS-form DNS name ({@code floci.services.elbv2.dns-name-strategy=aws}), or the
+     * name with {@code dualstack.} in front, answers with the address the {@code floci} form resolves to:
+     * Floci's own. It is answered ahead of AWS endpoint spoofing, which would otherwise send it to the
+     * public AWS API address, and ahead of upstream DNS, which does not know it. The {@code floci} form
+     * stays with the emulator suffix, so it is not answered here. A load balancer frontend's own addresses
+     * ({@link #resolve}) take precedence.
+     */
+    private Optional<DnsAnswer> awsFormAnswer(String name, int type) {
+        if (!service.awsDnsNames()) {
+            return Optional.empty();
+        }
+        List<LoadBalancer> matches = service.findByDnsName(name);
+        if (matches.isEmpty()) {
+            return Optional.empty();
+        }
+        if (matches.size() != 1) {
+            return Optional.of(DnsAnswer.refused());
+        }
+        if (type != 1) {
+            return Optional.of(DnsAnswer.noData());
+        }
+        return Optional.of(dns.getServerIp()
+                .map(address -> DnsAnswer.records(List.of(address), DnsAnswer.DEFAULT_TTL_SECONDS))
+                .orElseGet(DnsAnswer::noData));
     }
 
     @Override

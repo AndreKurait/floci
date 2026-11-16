@@ -1094,6 +1094,34 @@ class ElbV2ServiceTest {
     }
 
     @Test
+    void theAwsFormUsesTheRegionAndTheSuffixOfItsPartition() {
+        EmulatorConfig config = mock(EmulatorConfig.class);
+        EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.ElbV2ServiceConfig elbv2 = mock(EmulatorConfig.ElbV2ServiceConfig.class);
+        when(config.services()).thenReturn(services);
+        when(services.elbv2()).thenReturn(elbv2);
+        when(elbv2.dnsNameStrategy()).thenReturn(EmulatorConfig.ElbV2ServiceConfig.DnsNameStrategy.AWS);
+        service.config = config;
+        String china = "cn-north-1";
+        Subnet subnetA = subnet("subnet-a", china + "a");
+        Subnet subnetB = subnet("subnet-b", china + "b");
+        lenient().when(ec2Service.requireSubnet(china, "subnet-a")).thenReturn(subnetA);
+        lenient().when(ec2Service.requireSubnet(china, "subnet-b")).thenReturn(subnetB);
+        lenient().when(ec2Service.describeSubnets(eq(china), anyList(), eq(Map.of())))
+                .thenAnswer(invocation -> invocation.<List<String>>getArgument(1).size() == 2
+                        ? List.of(subnetA, subnetB) : List.of(subnetA));
+
+        String alb = service.createLoadBalancer(china, "web", "internal", "application", "ipv4",
+                ALB_SUBNETS, List.of("sg-a"), Map.of()).getDnsName();
+        LoadBalancer nlb = service.createLoadBalancer(china, "tcp", "internet-facing", "network", "ipv4",
+                List.of("subnet-a"), List.of(), Map.of());
+
+        assertTrue(alb.matches("internal-web-\\d{10}\\.cn-north-1\\.elb\\.amazonaws\\.com\\.cn"), alb);
+        String id = nlb.getLoadBalancerArn().substring(nlb.getLoadBalancerArn().lastIndexOf('/') + 1);
+        assertEquals("tcp-" + id + ".elb.cn-north-1.amazonaws.com.cn", nlb.getDnsName());
+    }
+
+    @Test
     void initializeStorageReloadsPersistedResourcesAndRebuildsIndexes() {
         SharedStorageFactory storageFactory = new SharedStorageFactory();
         ElbV2DataPlane firstDataPlane = mock(ElbV2DataPlane.class);

@@ -96,6 +96,12 @@ class ElbV2DnsRecordSourceTest {
     }
 
     @Test
+    void theDefaultFormIsLeftToTheEmulatorSuffix() {
+        assertTrue(source.resolveAuthoritative("owned.elb.example", 1, null).isEmpty());
+        verifyNoInteractions(dns);
+    }
+
+    @Test
     void nonAddressAliasQueriesAreRefused() {
         assertEquals(5, source.resolveAliasTarget("owned.elb.example", "OWNED", 16).orElseThrow().responseCode());
         verifyNoInteractions(dns);
