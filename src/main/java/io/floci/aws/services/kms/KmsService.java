@@ -571,6 +571,15 @@ public class KmsService implements ResourceProvider {
         return paginateGrants(sortedGrants, marker, limit);
     }
 
+    List<Map<String, Object>> grantsForAuthorization(String keyId, String region) {
+        KmsKey key = resolveKey(keyId, region);
+        String prefix = region + "::";
+        return grantStore.scan(storageKey -> storageKey.startsWith(prefix)).stream()
+                .filter(grant -> key.getKeyId().equals(grant.getKeyId()))
+                .map(this::grantToMap)
+                .toList();
+    }
+
     public Map<String, Object> listRetirableGrants(String retiringPrincipal, String region,
                                                     String marker, Integer limit) {
         if (retiringPrincipal == null || retiringPrincipal.isBlank()) {

@@ -51,18 +51,10 @@ public class KmsResourcePolicyProvider implements ResourcePolicyProvider {
             policy = (String) service.getKeyPolicy(resource, arn.region()).get("Policy");
             List<ResourcePolicy> policies = new ArrayList<>();
             policies.add(new ResourcePolicy(policy, arn.accountId(), true));
-            String marker = null;
-            do {
-                Map<String, Object> page = service.listGrants(resource, arn.region(), marker, 100, null, null);
-                if (page.get("Grants") instanceof List<?> grants) {
-                    for (Object entry : grants) {
-                        if (entry instanceof Map<?, ?> grant) {
-                            policies.add(new ResourcePolicy(grantPolicy(grant, resource, "SYMMETRIC_DEFAULT".equals(service.describeKey(resource, arn.region()).getKeySpec().name())), arn.accountId(), true));
-                        }
-                    }
-                }
-                marker = (String) page.get("NextMarker");
-            } while (marker != null);
+            boolean symmetric = "SYMMETRIC_DEFAULT".equals(service.describeKey(resource, arn.region()).getKeySpec().name());
+            for (Map<String, Object> grant : service.grantsForAuthorization(resource, arn.region())) {
+                policies.add(new ResourcePolicy(grantPolicy(grant, resource, symmetric), arn.accountId(), true));
+            }
             return policies;
         } finally {
             request.setAccountId(previous);

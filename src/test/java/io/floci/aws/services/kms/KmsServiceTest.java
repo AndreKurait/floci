@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.Digests;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.RequestContext;
 import io.floci.aws.core.common.ReservedTags;
 import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.services.kms.model.KmsAlias;
@@ -78,6 +79,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
 
 @Execution(ExecutionMode.CONCURRENT)
 class KmsServiceTest {
@@ -433,6 +435,38 @@ class KmsServiceTest {
         // count this test is about is the customer-managed one.
         assertEquals(2, customerKeys(REGION).size());
         assertEquals(1, customerKeys("eu-west-1").size());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {2, 101})
+    void authorizationEnumeratesGrantsWithoutADeletablePageCursor(int count) {
+        KmsKey key = kmsService.createKey("authorization grants", REGION);
+        KmsKey otherKey = kmsService.createKey("other grants", REGION);
+        List<KmsGrant> grants = new ArrayList<>();
+        for (int i = 0; i < count; i++) {
+            grants.add(kmsService.createGrant(key.getKeyId(),
+                    "arn:aws:iam::000000000000:user/grantee", List.of("Encrypt"), REGION));
+        }
+        kmsService.createGrant(otherKey.getKeyId(), "arn:aws:iam::000000000000:user/other",
+                List.of("Decrypt"), REGION);
+        KmsService observed = spy(kmsService);
+        doAnswer(invocation -> {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> page = (Map<String, Object>) invocation.callRealMethod();
+            if (page.get("NextMarker") instanceof String marker) {
+                String grantId = new String(Base64.getDecoder().decode(marker), StandardCharsets.UTF_8);
+                kmsService.revokeGrant(key.getKeyId(), grantId, REGION);
+            }
+            return page;
+        }).when(observed).listGrants(key.getArn(), REGION, null, 100, null, null);
+        RequestContext request = new RequestContext();
+        request.setAccountId("111111111111");
+        KmsResourcePolicyProvider provider = new KmsResourcePolicyProvider(observed, request, new ObjectMapper());
+        assertEquals(count + 1, provider.getResourcePolicies(REGION, key.getArn()).size());
+        assertEquals("111111111111", request.getAccountId());
+        kmsService.revokeGrant(key.getKeyId(), grants.getFirst().getGrantId(), REGION);
+        assertEquals(count, provider.getResourcePolicies(REGION, key.getArn()).size());
+        assertEquals("111111111111", request.getAccountId());
     }
 
     @Test
