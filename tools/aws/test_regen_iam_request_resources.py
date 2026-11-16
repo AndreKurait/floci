@@ -223,6 +223,45 @@ def corrections(monkeypatch):
     return monkeypatch
 
 
+@pytest.mark.parametrize("selector", ["RevisionName", "SnapshotName"])
+def test_a_documented_name_or_arn_selector_reaches_its_optional_parent(selector):
+    spec = model({"GetPayload": {"GroupName": "String", selector: "String"}}, "query")
+    spec["metadata"]["endpointPrefix"] = "svc"
+    spec["shapes"]["GetPayloadIn"]["members"][selector]["documentation"] = (
+        "<p>The name or Amazon Resource Name (ARN) of a revision. "
+        "If you specify a name, you must also specify the <code>GroupName</code>.</p>")
+    entry = r.entry_for("svc:GetPayload", {"action": "svc:GetPayload", "types": ["group"]},
+                        FORMATS, {"svc": spec})
+    assert entry["resources"] == [
+        {"type": "group", "fill": {"GroupName": "GroupName"}},
+        {"types": ["group"], "through": selector},
+    ]
+
+
+@pytest.mark.parametrize("change", ["name_only", "no_parent_contract", "wrong_parent", "required_parent", "list_selector"])
+def test_a_parent_relationship_is_not_inferred_without_the_documented_arn_alternative(change):
+    spec = model({"GetPayload": {"GroupName": "String", "RevisionName": "String"}}, "query")
+    spec["metadata"]["endpointPrefix"] = "svc"
+    request = spec["shapes"]["GetPayloadIn"]
+    child = request["members"]["RevisionName"]
+    child["documentation"] = (
+        "<p>The name or Amazon Resource Name (ARN) of a revision. "
+        "If you specify a name, you must also specify the <code>GroupName</code>.</p>")
+    if change == "name_only":
+        child["documentation"] = child["documentation"].replace(" or Amazon Resource Name (ARN)", "")
+    elif change == "no_parent_contract":
+        child["documentation"] = "<p>The name or Amazon Resource Name (ARN) of a revision.</p>"
+    elif change == "wrong_parent":
+        child["documentation"] = child["documentation"].replace("<code>GroupName</code>", "<code>OtherName</code>")
+    elif change == "required_parent":
+        request["required"] = ["GroupName"]
+    else:
+        child["shape"] = "Strings"
+    entry = r.entry_for("svc:GetPayload", {"action": "svc:GetPayload", "types": ["group"]},
+                        FORMATS, {"svc": spec})
+    assert entry["resources"] == [{"type": "group", "fill": {"GroupName": "GroupName"}}]
+
+
 def write_models(root, models: dict[str, dict]):
     for name, value in models.items():
         directory = root / name / "2020-01-01"

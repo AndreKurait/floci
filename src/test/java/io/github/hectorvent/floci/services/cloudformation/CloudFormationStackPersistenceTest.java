@@ -103,6 +103,16 @@ class CloudFormationStackPersistenceTest {
         changeSet.setChangeSetName("initial-create");
         changeSet.setStackName("my-stack");
         changeSet.setStatus("CREATE_COMPLETE");
+        String original = """
+                {"Resources":{"Resource":{"Fn::Transform":{"Name":"AWS::Include",
+                  "Parameters":{"Location":"s3://template-snippets/resource.json"}}}}}
+                """;
+        String processed = """
+                {"Resources":{"Resource":{"Type":"AWS::SSM::Parameter",
+                  "Properties":{"Type":"String","Value":"approved"}}}}
+                """;
+        changeSet.setTemplateBody(original);
+        changeSet.setProcessedTemplateBody(processed);
         changeSet.setRoleArn("arn:aws:iam::000000000000:role/deployment/proposed");
         changeSet.setStackPolicyBody(PENDING_POLICY);
         stack.getChangeSets().put("initial-create", changeSet);
@@ -147,6 +157,8 @@ class CloudFormationStackPersistenceTest {
         assertEquals("arn:aws:iam::000000000000:role/deployment/proposed",
                 loaded.getChangeSets().get("initial-create").getRoleArn());
         assertEquals(PENDING_POLICY, loaded.getChangeSets().get("initial-create").getStackPolicyBody());
+        assertEquals(original, loaded.getChangeSets().get("initial-create").getTemplateBody());
+        assertEquals(processed, loaded.getChangeSets().get("initial-create").getProcessedTemplateBody());
     }
 
     @Test
@@ -232,6 +244,12 @@ class CloudFormationStackPersistenceTest {
                     "stackName" : "legacy-stack",
                     "region" : "us-east-1",
                     "status" : "CREATE_COMPLETE",
+                    "changeSets" : {
+                      "preview" : {
+                        "changeSetName" : "preview",
+                        "templateBody" : "{\\\"Resources\\\":{}}"
+                      }
+                    },
                     "fieldFromFutureVersion" : "whatever"
                   }
                 }
@@ -248,5 +266,9 @@ class CloudFormationStackPersistenceTest {
         assertEquals("CREATE_COMPLETE", loaded.get().getStatus());
         assertFalse(loaded.get().isDisableRollback(), "Legacy records retain default creation rollback");
         assertNull(loaded.get().getRoleArn(), "Legacy stacks retain caller-based execution");
+        ChangeSet legacyChangeSet = loaded.get().getChangeSets().get("preview");
+        assertEquals("{\"Resources\":{}}", legacyChangeSet.getTemplateBody());
+        assertNull(legacyChangeSet.getProcessedTemplateBody(),
+                "An older change set must not invent a historical processed template");
     }
 }

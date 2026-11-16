@@ -196,8 +196,9 @@ READ_IN_HAND_BUILT: dict[str, str] = {
 
 # Bounded families of a namespace whose other operations remain explicitly not covered.
 READ_IN_NOT_COVERED = {
-    f"cloudfront:{operation}": "KVS control-plane IAM checks only; other CloudFront operations remain unchanged"
-    for operation in REST_ONLY_OPERATIONS["cloudfront"]
+    **{f"cloudfront:{operation}": "KVS control-plane IAM checks only; other CloudFront operations remain unchanged"
+       for operation in REST_ONLY_OPERATIONS["cloudfront"]},
+    "cloudformation:GetTemplate": "Template reads name their stack directly or through the owning change-set ARN",
 }
 
 
@@ -219,7 +220,8 @@ NOT_COVERED: dict[str, str] = {
     "backup": _REST,
     "batch": _REST,
     "bedrock-agentcore": _REST,
-    "cloudformation": _LATER,
+    "cloudformation": "Only GetTemplate is read; other CloudFormation operations await their own route and resource "
+                      "qualification",
     "cloudfront": "Only the five KeyValueStore control operations are read; other CloudFront management "
                   "operations still await their own route and resource qualification",
     "cloudhsm": "not read yet: its ARN formats end in ${CloudHsmClusterInstanceName} and "
@@ -1129,6 +1131,7 @@ def entry_for(operation: str, upstream: dict, formats: dict[str, str], models: d
                                  namespace_of(operation), types, members)
     resources = with_account(resources, formats, account_members(models, operation.split(":", 1)[1]))
     resources = with_arn_of(resources, formats, name_or_arn_members(models, operation.split(":", 1)[1]))
+    resources = with_named_arn_parent(resources, models, operation.split(":", 1)[1])
     resources = with_made(resources, operation, formats)
     entry = {"action": upstream["action"], "types": types, "resources": resources}
     creates = creates_for(operation, types, formats, members)
@@ -1160,6 +1163,37 @@ def with_found(resources: list[dict], namespace: str, types: list[str], members:
         by = FOUND_BY.get(f"{namespace}:{kind}", ([], ""))[0]
         if by and all(members.get(member) == member for member in by):
             found.append({"type": kind, "fill": {}, "find": list(by)})
+    return found
+
+
+def with_named_arn_parent(resources: list[dict], models: dict[str, dict], operation: str) -> list[dict]:
+    """A resource named by an optional parent member, also reached through a member documented as accepting a name or
+    ARN and requiring that parent only for a name. GetTemplate's ChangeSetName requires StackName for a short name;
+    its ARN reaches the stack that owns the change set. The service resolves only complete ARNs through this member."""
+    found = list(resources)
+    for model in models.values():
+        spec = model["operations"].get(operation)
+        if spec is None or "input" not in spec:
+            continue
+        request = model["shapes"][spec["input"]["shape"]]
+        members = request_members({"model": model}, operation)
+        for name, member in request.get("members", {}).items():
+            if members.get(name) != name or model["shapes"][member["shape"]]["type"] != "string":
+                continue
+            documentation = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", "", member.get("documentation", ""))).strip()
+            if not re.match(r"(?:the )?name or (?:amazon resource name \(arn\)|arn) of ", documentation, re.IGNORECASE):
+                continue
+            parent = re.search(r"\bif you specify a name, you must also specify the (?P<member>\w+)\b",
+                               documentation, re.IGNORECASE)
+            if parent is None or parent.group("member") in request.get("required", []):
+                continue
+            for resource in resources:
+                if set(resource) - {"type", "fill", "arnOf"} or "type" not in resource \
+                        or set(resource.get("fill", {}).values()) != {parent.group("member")}:
+                    continue
+                reached = {"types": [resource["type"]], "through": name}
+                if reached not in found:
+                    found.append(reached)
     return found
 
 
