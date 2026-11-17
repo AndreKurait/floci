@@ -2,9 +2,12 @@ package io.github.hectorvent.floci.core.common.docker;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.CreateContainerCmd;
+import com.github.dockerjava.api.command.InspectContainerCmd;
+import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.ListContainersCmd;
 import com.github.dockerjava.api.exception.ConflictException;
 import com.github.dockerjava.api.model.Container;
+import com.github.dockerjava.api.model.ContainerConfig;
 import com.github.dockerjava.core.command.WaitContainerResultCallback;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.services.lambda.launcher.ImageCacheService;
@@ -364,6 +367,46 @@ class ContainerLifecycleManagerCreateConflictRecoveryTest {
         verifyOnlyOriginalCreate(scenario);
     }
 
+    /**
+     * A daemon stalled for minutes (overlay unmounts that sync the whole filesystem) gives a named
+     * create no answer within the API timeout, the transport replays it, and the replay hits 409 on
+     * this call's own container. Listing every container fails in that same stall, but inspecting
+     * the one name still answers, and that is enough to adopt this call's container.
+     */
+    @Test
+    void createAdoptsOwnContainerByNameWhenListingContainersFailsDuringADaemonStall() {
+        ConflictScenario scenario = conflictScenario();
+        AtomicLong now = new AtomicLong();
+        IllegalStateException stalledList = new IllegalStateException("java.net.SocketTimeoutException: Read timed out");
+        when(scenario.listCmd().exec()).thenThrow(stalledList);
+        inspectReturnsOwnContainer(scenario);
+
+        assertEquals("original-container-id", manager(now, now::addAndGet).create(scenario.spec()));
+        assertEquals(0, now.get());
+        verify(dockerClient, never()).removeContainerCmd(anyString());
+    }
+
+    /** A name that cannot be inspected either gives no proof of ownership: the list failure stands. */
+    @Test
+    void createKeepsTheListFailureWhenTheConflictingNameCannotBeInspectedEither() {
+        ConflictScenario scenario = conflictScenario();
+        AtomicLong now = new AtomicLong();
+        IllegalStateException stalledList = new IllegalStateException("Docker inventory unavailable");
+        when(scenario.listCmd().exec()).thenThrow(stalledList);
+        InspectContainerCmd inspectCmd = mock(InspectContainerCmd.class);
+        lenient().when(dockerClient.inspectContainerCmd("emulator-fixed-name")).thenReturn(inspectCmd);
+        lenient().when(inspectCmd.exec()).thenThrow(new IllegalStateException("java.net.SocketTimeoutException: Read timed out"));
+
+        ConflictException failure = assertThrows(ConflictException.class,
+                () -> manager(now, now::addAndGet).create(scenario.spec()));
+
+        assertSame(scenario.conflict(), failure);
+        assertEquals(1, failure.getSuppressed().length);
+        assertSame(stalledList, failure.getSuppressed()[0]);
+        assertEquals(0, now.get());
+        verifyOnlyOriginalCreate(scenario);
+    }
+
     @Test
     void createPreservesInterruptedSleepAndOriginalConflict() {
         ConflictScenario scenario = conflictScenario();
@@ -448,6 +491,17 @@ class ContainerLifecycleManagerCreateConflictRecoveryTest {
                 List.of(), null, List.of(), List.of(), List.of(), Map.of("resource_owner", "caller-a"),
                 null, false, null, List.of(), null, null, List.of());
         return new ConflictScenario(createCmd, listCmd, owned, spec, conflict);
+    }
+
+    private void inspectReturnsOwnContainer(ConflictScenario scenario) {
+        InspectContainerCmd inspectCmd = mock(InspectContainerCmd.class);
+        InspectContainerResponse response = mock(InspectContainerResponse.class);
+        ContainerConfig containerConfig = mock(ContainerConfig.class);
+        when(dockerClient.inspectContainerCmd("emulator-fixed-name")).thenReturn(inspectCmd);
+        when(inspectCmd.exec()).thenReturn(response);
+        when(response.getId()).thenReturn("original-container-id");
+        when(response.getConfig()).thenReturn(containerConfig);
+        when(containerConfig.getLabels()).thenAnswer(inv -> scenario.owned().getLabels());
     }
 
     private void verifyOnlyOriginalCreate(ConflictScenario scenario) {
