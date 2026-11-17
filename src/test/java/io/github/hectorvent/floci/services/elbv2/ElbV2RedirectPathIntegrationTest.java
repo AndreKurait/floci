@@ -19,6 +19,7 @@ import software.amazon.awssdk.services.elasticloadbalancingv2.model.Action;
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.RedirectActionConfig;
 
 import java.io.IOException;
+import java.net.ConnectException;
 import java.net.Socket;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -109,6 +110,7 @@ class ElbV2RedirectPathIntegrationTest {
                 .listeners().getFirst().listenerArn();
         cleanup.add(() -> elb.deleteListener(r -> r.listenerArn(listener)));
         await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .ignoreException(ConnectException.class)
                 .untilAsserted(() -> {
                     try (Socket socket = new Socket("127.0.0.1", listenerPort)) {
                         assertTrue(socket.isConnected());
