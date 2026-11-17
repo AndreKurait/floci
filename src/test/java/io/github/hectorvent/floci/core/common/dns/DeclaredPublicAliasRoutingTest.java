@@ -32,6 +32,19 @@ class DeclaredPublicAliasRoutingTest {
     }
 
     @Test
+    void declaredNativeAlbAliasKeepsItsListenerAddressForVpcCallers() {
+        DnsAnswer original = DnsAnswer.records(
+                List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS), 45).withAuthority(
+                "peer.example", new DnsRecord.Soa("ns.peer.example hostmaster.peer.example 1 2 3 4 5"), 60);
+        EmbeddedDnsServer dns = server(true, original);
+        assertEquals(original, dns.resolvePublicAliasTarget(
+                "API.PEER.EXAMPLE.", "lb.example", "ZOWNED", 1, VPC).orElseThrow());
+        DnsAnswer external = dns.resolvePublicAliasTarget(HOST, "lb.example", "ZOWNED", 1, null).orElseThrow();
+        assertTrue(external.upstream());
+        assertEquals(original.records(), external.records());
+    }
+
+    @Test
     void declarationDoesNotInventOrRepairAnInvalidAliasTarget() {
         assertTrue(server(true, null)
                 .resolvePublicAliasTarget(HOST, "missing.example", "ZOWNED", 1, VPC).isEmpty());

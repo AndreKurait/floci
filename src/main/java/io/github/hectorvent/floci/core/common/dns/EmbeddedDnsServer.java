@@ -495,7 +495,12 @@ public class EmbeddedDnsServer {
             if (ownedListener && origin == null) {
                 return answer.viaUpstream();
             }
-            return ownedListener && !nativeAlb ? new DnsAnswer(
+            // The native ALB transport owns its certificate and listener admission. Routing
+            // that address through the API bridge would select the emulator API certificate.
+            if (nativeAlb) {
+                return answer;
+            }
+            return ownedListener ? new DnsAnswer(
                     List.of(new DnsRecord.Address(1, EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS)),
                     answer.ttlSeconds(), answer.nameExists(), answer.authority(), answer.responseCode()) : answer;
         });

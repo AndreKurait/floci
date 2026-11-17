@@ -91,6 +91,24 @@ class DeclaredNativeAlbAliasRoutingTest {
     }
 
     @Test
+    void declaredInternetFacingAliasKeepsItsNativeTransportForVpcCallers() {
+        target.setScheme("internet-facing");
+        when(config.network().vpcRouting().enabled()).thenReturn(true);
+        when(config.network().vpcRouting().publicAwsApi()).thenReturn(true);
+        when(config.network().vpcRouting().publicAwsApiUpstreamHost()).thenReturn(Optional.of("172.18.0.20"));
+        Listener listener = new Listener();
+        listener.setProtocol("HTTPS");
+        listener.setPort(443);
+        ElbV2DnsOwnerFixture.listeners(service, target, listener);
+        DnsAnswer answer = dns.resolvePublicAliasTarget(HOST, TARGET, ZONE, 1, ORIGIN).orElseThrow();
+        assertEquals(List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS), answer.addresses());
+        assertEquals(60, answer.ttlSeconds());
+        assertEquals(DnsAnswer.refused(),
+                dns.resolvePublicAliasTarget(HOST, TARGET, "OTHER", 1, ORIGIN).orElseThrow());
+        verifyNoInteractions(lifecycle);
+    }
+
+    @Test
     void declaredAliasOutsideAVpcKeepsItsExplicitUpstreamRoute() {
         assertEquals(DnsAnswer.noData(), source.resolveAliasTarget(TARGET, ZONE, 1, null).orElseThrow());
         DnsAnswer answer = dns.resolvePublicAliasTarget(HOST, TARGET, ZONE, 1, null).orElseThrow();
