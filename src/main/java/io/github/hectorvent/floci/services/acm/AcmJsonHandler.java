@@ -145,6 +145,9 @@ public class AcmJsonHandler {
                 "The certificate request is in progress. The certificate body is not yet available.",
                 400);
         }
+        if (cert.getCertificateBody() == null) {
+            throw AcmService.notIssued(cert);
+        }
 
         ObjectNode response = objectMapper.createObjectNode();
         response.put("Certificate", cert.getCertificateBody());
@@ -368,6 +371,12 @@ public class AcmJsonHandler {
 
         node.put("Status", cert.getStatus().name());
         node.put("Type", cert.getType().name());
+        if (cert.getFailureReason() != null) {
+            node.put("FailureReason", cert.getFailureReason());
+        }
+        if (cert.getCertAuthorityArn() != null && !cert.getCertAuthorityArn().isEmpty()) {
+            node.put("CertificateAuthorityArn", cert.getCertAuthorityArn());
+        }
 
         if (cert.getKeyAlgorithm() != null) {
             node.put("KeyAlgorithm", cert.getKeyAlgorithm().getAwsName());

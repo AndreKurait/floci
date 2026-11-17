@@ -13,17 +13,35 @@ public record CertificateAuthority(
         String privateKeyPem, String csrPem, String certificatePem, String status,
         Instant createdAt, Instant lastStateChangeAt, Instant restorableUntil,
         String creationToken, Map<String, IssuedCertificate> certificates,
-        Map<String, IssueToken> issueTokens) {
+        Map<String, IssueToken> issueTokens, String type, String certificateChainPem,
+        String keyStorageSecurityStandard, Map<String, String> tags) {
 
     public CertificateAuthority {
         subject = Map.copyOf(subject);
         certificates = Map.copyOf(certificates);
         issueTokens = Map.copyOf(issueTokens);
+        // Authorities stored before subordinate and tag support are untagged roots.
+        type = type == null ? "ROOT" : type;
+        tags = tags == null ? Map.of() : Map.copyOf(tags);
     }
 
     public CertificateAuthority transition(String nextStatus, String certificate, Instant now, Instant restoreUntil) {
         return new CertificateAuthority(arn, ownerAccount, region, subject, privateKeyPem, csrPem,
-                certificate, nextStatus, createdAt, now, restoreUntil, creationToken, certificates, issueTokens);
+                certificate, nextStatus, createdAt, now, restoreUntil, creationToken, certificates, issueTokens,
+                type, certificateChainPem, keyStorageSecurityStandard, tags);
+    }
+
+    /** Activates the authority with its imported certificate and, for a subordinate, the chain above it. */
+    public CertificateAuthority imported(String certificate, String chain, Instant now) {
+        return new CertificateAuthority(arn, ownerAccount, region, subject, privateKeyPem, csrPem,
+                certificate, "ACTIVE", createdAt, now, null, creationToken, certificates, issueTokens,
+                type, chain, keyStorageSecurityStandard, tags);
+    }
+
+    public CertificateAuthority tagged(Map<String, String> nextTags) {
+        return new CertificateAuthority(arn, ownerAccount, region, subject, privateKeyPem, csrPem,
+                certificatePem, status, createdAt, lastStateChangeAt, restorableUntil, creationToken,
+                certificates, issueTokens, type, certificateChainPem, keyStorageSecurityStandard, nextTags);
     }
 
     public CertificateAuthority issued(String certificateArn, IssuedCertificate certificate,
@@ -41,7 +59,7 @@ public record CertificateAuthority(
         }
         return new CertificateAuthority(arn, ownerAccount, region, subject, privateKeyPem, csrPem,
                 certificatePem, status, createdAt, lastStateChangeAt, restorableUntil,
-                creationToken, issued, tokens);
+                creationToken, issued, tokens, type, certificateChainPem, keyStorageSecurityStandard, tags);
     }
 
     @RegisterForReflection
