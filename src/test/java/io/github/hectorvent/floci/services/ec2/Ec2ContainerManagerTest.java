@@ -3544,6 +3544,76 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
+    void aRebootingInstanceCountsAsRunningWhileDockerRestartsIt() throws Exception {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
+        RestartContainerCmd restart = mock(RestartContainerCmd.class);
+        when(harness.dockerClient.restartContainerCmd(TEST_CONTAINER_ID)).thenReturn(restart);
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        when(restart.exec()).thenAnswer(call -> {
+            entered.countDown();
+            assertTrue(release.await(5, TimeUnit.SECONDS));
+            return null;
+        });
+        // Between Docker's stop and start the container is not running.
+        when(harness.lifecycleManager.isContainerRunning(TEST_CONTAINER_ID)).thenReturn(false);
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        InspectContainerResponse response = inspectResponse("172.18.0.99");
+        when(inspect.exec()).thenReturn(response);
+        Instance guest = instance("i-reboot-window");
+        guest.setState(InstanceState.running());
+        guest.setDockerContainerId(TEST_CONTAINER_ID);
+        try {
+            harness.manager.reboot(guest);
+            assertTrue(entered.await(5, TimeUnit.SECONDS));
+            assertTrue(harness.manager.isContainerRunning(guest),
+                    "Auto Scaling must not replace an instance while EC2 reboots it");
+            release.countDown();
+            executor.shutdown();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+            assertFalse(harness.manager.isContainerRunning(guest), "Once the reboot is over Docker answers again");
+            assertEquals("running", guest.getState().getName());
+        } finally {
+            release.countDown();
+            executor.shutdownNow();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+            harness.manager.stop();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void aRebootThatFailsAfterDockerStoppedTheGuestStartsItAgain(boolean stillRunning) throws Exception {
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
+        RestartContainerCmd restart = mock(RestartContainerCmd.class);
+        when(harness.dockerClient.restartContainerCmd(TEST_CONTAINER_ID)).thenReturn(restart);
+        when(restart.exec()).thenThrow(new IllegalStateException("start failed after stop"));
+        when(harness.lifecycleManager.isContainerRunning(TEST_CONTAINER_ID)).thenReturn(stillRunning);
+        StartContainerCmd start = mock(StartContainerCmd.class);
+        when(harness.dockerClient.startContainerCmd(TEST_CONTAINER_ID)).thenReturn(start);
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        InspectContainerResponse response = inspectResponse("172.18.0.99");
+        when(inspect.exec()).thenReturn(response);
+        Instance guest = instance("i-reboot-failed");
+        guest.setState(InstanceState.running());
+        guest.setDockerContainerId(TEST_CONTAINER_ID);
+        try {
+            harness.manager.reboot(guest);
+            executor.shutdown();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
+            verify(start, stillRunning ? never() : times(1)).exec();
+            assertEquals("running", guest.getState().getName());
+            assertEquals(TEST_CONTAINER_ID, guest.getDockerContainerId());
+        } finally {
+            harness.manager.stop();
+        }
+    }
+
+    @Test
     void rebootWithoutAContainerDoesNotPublishAddresses() {
         LaunchHarness harness = launchHarness();
         Instance guest = instance("i-no-reboot-container");

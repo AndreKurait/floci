@@ -197,6 +197,8 @@ public class Ec2ContainerManager {
     private final ExecutorService executor;
     private final Semaphore metadataSetupSlots = new Semaphore(METADATA_SETUP_CONCURRENCY);
     private final Map<String, CompletableFuture<Void>> lifecycleOperations = new ConcurrentHashMap<>();
+    /** RebootInstances calls queued or running per container: EC2 keeps a rebooting instance running. */
+    private final Map<String, Integer> apiReboots = new ConcurrentHashMap<>();
     private final Map<String, String> networkHelpers = new ConcurrentHashMap<>();
     private final Map<String, PendingTermination> pendingTerminations = new ConcurrentHashMap<>();
     private final Map<String, FailedLaunchCleanup> failedLaunchCleanups = new ConcurrentHashMap<>();
@@ -1716,7 +1718,8 @@ public class Ec2ContainerManager {
     boolean isContainerRunning(String containerId) {
         return containerId != null && !containerId.isBlank()
                 && !guestReboots.recoveryFailed(containerId)
-                && (lifecycleManager.isContainerRunning(containerId) || guestReboots.isRebooting(containerId));
+                && (apiReboots.containsKey(containerId) || lifecycleManager.isContainerRunning(containerId)
+                    || guestReboots.isRebooting(containerId));
     }
 
     /**
@@ -2463,6 +2466,10 @@ public class Ec2ContainerManager {
     /**
      * Reboots as {@link #reboot(Instance)} does, then re-reads the container's addresses and runs
      * {@code postReboot}, so the caller publishes them only after Docker restarted the container.
+     *
+     * <p>The instance stays running throughout, as on AWS: Auto Scaling must not replace it in the
+     * moment between Docker's stop and start, and a reboot that fails after Docker stopped the
+     * container starts it again.
      */
     public void reboot(Instance instance, Runnable postReboot) {
         String containerId = instance.getDockerContainerId();
@@ -2470,7 +2477,11 @@ public class Ec2ContainerManager {
             return;
         }
         InstanceState expected = instance.getState();
-        submitLifecycleOperation(containerId, () -> {
+        // As for start: the lifecycle worker has no request context, and native VPC address
+        // spaces are keyed by account, so the default account would find no subnet at all.
+        String accountId = instance.getOwnerId() != null ? instance.getOwnerId() : regionResolver.getAccountId();
+        apiReboots.merge(containerId, 1, Integer::sum);
+        submitLifecycleOperation(containerId, () -> RequestScopes.runAs(accountId, instance.getRegion(), () -> {
             if (instance.getState() != expected || expected == null || !"running".equals(expected.getName())
                     || !containerId.equals(instance.getDockerContainerId())) {
                 return;
@@ -2489,8 +2500,25 @@ public class Ec2ContainerManager {
                 LOG.debugv(e, "Interrupted address refresh after rebooting EC2 container {0}", containerId);
             } catch (Exception e) {
                 LOG.warnv("Error rebooting EC2 container {0}: {1}", containerId, e.getMessage());
+                startAfterFailedReboot(instance, containerId, expected);
             }
-        });
+        })).whenComplete((ignored, failure) ->
+                apiReboots.computeIfPresent(containerId, (id, count) -> count > 1 ? count - 1 : null));
+    }
+
+    /** A failed reboot must not leave the guest stopped, which Auto Scaling would take for a dead instance. */
+    private void startAfterFailedReboot(Instance instance, String containerId, InstanceState expected) {
+        if (instance.getState() != expected || lifecycleManager.isContainerRunning(containerId)) {
+            return;
+        }
+        try {
+            dockerClient.startContainerCmd(containerId).exec();
+            releaseNativeGuest(instance, containerId);
+            LOG.infov("Started EC2 container {0} again after its reboot failed", containerId);
+        } catch (RuntimeException failure) {
+            LOG.warnv("Could not start EC2 container {0} again after its reboot failed: {1}",
+                    containerId, failure.getMessage());
+        }
     }
 
     public boolean isContainerRunning(Instance instance) {
