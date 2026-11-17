@@ -177,9 +177,9 @@ class Ec2HotAttachInterfaceTest {
         Ec2ContainerManager manager = manager();
         InstanceNetworkInterface attached = customer();
         when(vpcNetworks.attachInterface(any(), any(), any(), any(), any(), any()))
-                .thenThrow(new IllegalStateException("endpoint MACs need Docker Engine 25 or later"));
+                .thenThrow(new IllegalStateException("the attached device did not take the interface's MAC"));
 
-        assertEquals(Optional.of("endpoint MACs need Docker Engine 25 or later"),
+        assertEquals(Optional.of("the attached device did not take the interface's MAC"),
                 manager.plugNetworkInterface(instanceWith(primary(), attached), attached));
         doReturn(Optional.empty()).when(vpcNetworks).attachInterface(any(), any(), any(), any(), any(), any());
         assertTrue(manager.plugNetworkInterface(instanceWith(primary(), attached), attached).orElseThrow()
