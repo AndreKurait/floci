@@ -416,7 +416,8 @@ class VpcPublicPeerRoutingTest {
         admit("second", 3, true);
 
         List<String> updates = scripts.get("first");
-        String guard = updates.get(updates.size() - 2);
+        assertEquals(1, updates.size(), "The guard and replacement policy must share one exec");
+        String guard = updateGuard(updates.getFirst());
         assertTrue(guard.contains("policy drop;"));
         assertEquals(1, guard.lines().filter(line -> line.startsWith("nft ")).count(),
                 "Replacing the guard must install resolver permits in the same nft transaction");
@@ -487,14 +488,15 @@ class VpcPublicPeerRoutingTest {
         assertNull(failure.get());
         assertEquals(Math.min(4, count), maximum.get());
         for (List<String> updates : scripts.values()) {
-            assertEquals(2, updates.size());
-            assertTrue(updates.getFirst().contains("policy drop;"));
-            assertFalse(updates.getFirst().contains("ip -4 route"));
-            assertTrue(updates.getLast().contains("ip -4 route"));
+            assertEquals(1, updates.size());
+            String guard = updateGuard(updates.getFirst());
+            assertTrue(guard.contains("policy drop;"));
+            assertFalse(guard.contains("ip -4 route"));
+            assertTrue(updates.getFirst().substring(guard.length()).contains("ip -4 route"));
         }
         manager.reconcile();
         for (List<String> updates : scripts.values()) {
-            assertEquals(2, updates.size(), "Unchanged policies must not be installed again");
+            assertEquals(1, updates.size(), "Unchanged policies must not be installed again");
         }
     }
 
@@ -540,12 +542,23 @@ class VpcPublicPeerRoutingTest {
         }
         assertFalse(caller.isAlive());
         assertSame(expected, failure.get());
-        assertEquals(3, scripts.get("first").size(), "Guard, route update, then failure quarantine");
+        assertEquals(2, scripts.get("first").size(), "Combined guard and route update, then failure quarantine");
+        String firstUpdate = scripts.get("first").getFirst();
+        String guard = updateGuard(firstUpdate);
+        assertTrue(guard.contains("policy drop;"));
+        assertTrue(firstUpdate.substring(guard.length()).contains("ip -4 route"));
         assertEquals(1, scripts.get("second").size());
         for (String helper : List.of("first", "second")) {
             assertFalse(latest(helper).contains("accept"),
                     "No writer may replace the final failure quarantine");
         }
+    }
+
+    private String updateGuard(String script) {
+        String delimiter = "\nFLOCI_RULES\n";
+        int guardEnd = script.indexOf(delimiter);
+        assertTrue(guardEnd >= 0, "The guard transaction must end before the replacement policy");
+        return script.substring(0, guardEnd + delimiter.length());
     }
 
     private Thread reconcileInBackground(AtomicReference<Throwable> failure) {
