@@ -43,6 +43,7 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -458,7 +459,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         String typePrefix = lbTypePrefix(lbType);
         String id = randomHex16();
         String arn = AwsArnUtils.Arn.of("elasticloadbalancing", region, regionResolver.getAccountId(), "loadbalancer/" + typePrefix + "/" + name + "/" + id).toString();
-        String dnsName = name + "-" + id + ".elb." + loadBalancerDnsSuffix();
+        String dnsName = loadBalancerDnsName(name, id, lbType, lbScheme, region);
         requireSubnets(region, lbType, subnets);
         String vpcId = resolveSubnetVpcId(region, lbType, subnets);
 
@@ -538,6 +539,33 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
             return EmbeddedDnsServer.DEFAULT_SUFFIX;
         }
         return config.hostname().orElse(EmbeddedDnsServer.DEFAULT_SUFFIX);
+    }
+
+    /**
+     * The DNS name a new load balancer gets, in the form {@code floci.services.elbv2.dns-name-strategy}
+     * selects. The AWS form is the documented one: an Application Load Balancer's name ends in a
+     * decimal number and the region comes before {@code elb}, with {@code internal-} in front for an
+     * internal scheme; a Network or Gateway Load Balancer's name ends in the id its ARN carries and
+     * {@code elb} comes before the region.
+     */
+    private String loadBalancerDnsName(String name, String id, String type, String scheme, String region) {
+        if (!awsDnsNames()) {
+            return name + "-" + id + ".elb." + loadBalancerDnsSuffix();
+        }
+        String suffix = AwsRegions.dnsSuffixFor(region);
+        if ("application".equals(type)) {
+            String prefix = "internal".equals(scheme) ? "internal-" : "";
+            long number = ThreadLocalRandom.current().nextLong(1_000_000_000L, 10_000_000_000L);
+            return prefix + name + "-" + number + "." + region + ".elb." + suffix;
+        }
+        return name + "-" + id + ".elb." + region + "." + suffix;
+    }
+
+    boolean awsDnsNames() {
+        if (config == null || config.services() == null || config.services().elbv2() == null) {
+            return false;
+        }
+        return config.services().elbv2().dnsNameStrategy() == EmulatorConfig.ElbV2ServiceConfig.DnsNameStrategy.AWS;
     }
 
     /** DNS selects the resource owner independently of a management request's account. */

@@ -623,6 +623,7 @@ See [Web Console](../ui/index.md) for running the console and swapping in a thir
 | `FLOCI_SERVICES_ELBV2_ENABLED` | `true` | Enable the ELBv2 (ALB/NLB) service |
 | `FLOCI_SERVICES_ELBV2_MOCK` | `false` | When `true`, load balancers are registered but no containers are spawned |
 | `FLOCI_SERVICES_ELBV2_MAX_HEALTH_CHECK_INTERVAL_MILLIS` | `0` | Optional local health probe interval ceiling in milliseconds. Zero preserves target group intervals; positive values accelerate probes without changing their timeouts or success thresholds |
+| `FLOCI_SERVICES_ELBV2_DNS_NAME_STRATEGY` | `floci` | Form of a new load balancer's `DNSName`. `floci` gives `<name>-<id>.elb.<FLOCI_HOSTNAME>`. `aws` gives the AWS form: `[internal-]<name>-<digits>.<region>.elb.<dns-suffix>` for an Application Load Balancer and `<name>-<id>.elb.<region>.<dns-suffix>` for a Network or Gateway Load Balancer. Floci's DNS answers an `aws`-form name, and its `dualstack.` form, with Floci's own address |
 | `FLOCI_SERVICES_AUTOSCALING_ENABLED` | `true` | Enable the Auto Scaling service |
 | `FLOCI_SERVICES_CODEBUILD_ENABLED` | `true` | Enable the CodeBuild service |
 | `FLOCI_SERVICES_CODEBUILD_DOCKER_NETWORK` | _(none)_ | Docker network for CodeBuild build containers |

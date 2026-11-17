@@ -4057,6 +4057,24 @@ public interface EmulatorConfig {
 
         /** A region entry takes precedence over the global rule, including an explicit AWS reset. */
         Map<String, AlbZoneRule> albZoneRuleByRegion();
+
+        /**
+         * The form of the DNS name a new load balancer gets:
+         * <ul>
+         *   <li>{@code floci}: {@code <name>-<id>.elb.<hostname>}, under the emulator's own DNS suffix.</li>
+         *   <li>{@code aws}: the AWS form, {@code [internal-]<name>-<digits>.<region>.elb.<dnsSuffix>} for an
+         *       Application Load Balancer and {@code <name>-<id>.elb.<region>.<dnsSuffix>} for a Network or
+         *       Gateway Load Balancer, with the DNS suffix of the region's partition. Floci's DNS answers
+         *       each such name with the address it answers the {@code floci} form with.</li>
+         * </ul>
+         */
+        @WithDefault("floci")
+        DnsNameStrategy dnsNameStrategy();
+
+        enum DnsNameStrategy {
+            FLOCI,
+            AWS
+        }
     }
 
     enum AlbZoneRule {
