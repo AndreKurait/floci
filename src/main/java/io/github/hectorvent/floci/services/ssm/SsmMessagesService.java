@@ -26,7 +26,7 @@ import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
 
-/** Ephemeral authenticated channels deliver the persisted Run Command invocations. */
+/** Ephemeral authenticated channels deliver the persisted Run Command invocations and Session Manager sessions. */
 @ApplicationScoped
 public class SsmMessagesService implements Resettable {
     private static final Logger LOG = Logger.getLogger(SsmMessagesService.class);
@@ -34,6 +34,7 @@ public class SsmMessagesService implements Resettable {
     private static final long REDELIVERY_MILLIS = 5000;
 
     private final SsmCommandService commands;
+    private final SsmSessionService sessions;
     private final SsmChannelAuthentication authentication;
     private final ObjectMapper mapper;
     private final Vertx vertx;
@@ -42,10 +43,16 @@ public class SsmMessagesService implements Resettable {
     private final Map<Owner, Channel> channels = new ConcurrentHashMap<>();
     private final Set<Channel> sockets = ConcurrentHashMap.newKeySet();
 
+    SsmMessagesService(SsmCommandService commands, SsmChannelAuthentication authentication,
+                       ObjectMapper mapper, Vertx vertx, Clock clock) {
+        this(commands, null, authentication, mapper, vertx, clock);
+    }
+
     @Inject
-    public SsmMessagesService(SsmCommandService commands, SsmChannelAuthentication authentication,
-                              ObjectMapper mapper, Vertx vertx, Clock clock) {
+    public SsmMessagesService(SsmCommandService commands, SsmSessionService sessions,
+                              SsmChannelAuthentication authentication, ObjectMapper mapper, Vertx vertx, Clock clock) {
         this.commands = commands;
+        this.sessions = sessions;
         this.authentication = authentication;
         this.mapper = mapper;
         this.vertx = vertx;
@@ -183,7 +190,11 @@ public class SsmMessagesService implements Resettable {
         }
 
         private void poll() {
-            if (!active() || polling) {
+            if (!active()) {
+                return;
+            }
+            deliverSessionMessages();
+            if (polling || !active()) {
                 return;
             }
             polling = true;
@@ -230,6 +241,31 @@ public class SsmMessagesService implements Resettable {
                     .onComplete(ignored -> polling = false);
         }
 
+        /** Session starts and termination notices for this node, in the agent's own message types. */
+        private void deliverSessionMessages() {
+            if (sessions == null) {
+                return;
+            }
+            List<SsmSessionService.ControlMessage> pending = sessions.pendingControlMessages(
+                    owner.account(), owner.region(), owner.instanceId(), id);
+            if (pending.isEmpty()) {
+                return;
+            }
+            try {
+                authentication.authorizeNode(caller, owner.instanceId());
+                RequestScopes.runAs(owner.account(), owner.region(),
+                        () -> authentication.authorize(caller, "OpenControlChannel"));
+            } catch (Exception rejected) {
+                LOG.debugv(rejected, "SSM session delivery rejected for node {0}", owner.instanceId());
+                close((short) 1008, "Session delivery was rejected.");
+                return;
+            }
+            for (SsmSessionService.ControlMessage message : pending) {
+                send(SsmAgentMessage.create(message.type, message.payload));
+                sessions.controlDelivered(message, id);
+            }
+        }
+
         private void receive(Buffer bytes) {
             if (!active()) {
                 close((short) 1008, "Authenticate the control channel first.");
@@ -237,6 +273,15 @@ public class SsmMessagesService implements Resettable {
             }
             try {
                 SsmAgentMessage message = SsmAgentMessage.decode(bytes.getBytes());
+                if ("agent_task_complete".equals(message.type()) && sessions != null) {
+                    JsonNode payload = mapper.readTree(message.payload());
+                    sessions.agentTaskComplete(owner.account(), owner.region(), owner.instanceId(), payload);
+                    send(message("agent_task_acknowledge", mapper.createObjectNode().put("SchemaVersion", 1)
+                            .put("MessageId", message.id().toString())
+                            .put("TaskId", payload.path("TaskId").asText())
+                            .put("Topic", payload.path("Topic").asText())));
+                    return;
+                }
                 if (!"agent_job_ack".equals(message.type()) && !"agent_job_reply".equals(message.type())) {
                     LOG.debugv("Ignoring unsupported SSM control-channel message type {0}", message.type());
                     return;

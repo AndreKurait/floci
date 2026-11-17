@@ -56,6 +56,17 @@ public class SsmJsonHandler {
     private final SsmAgentAssociationService agentAssociations;
     private final SsmManagedNodeDiscovery managedNodeDiscovery;
     private final SsmEc2RegistrationService ec2Registrations;
+    private final SsmSessionService sessions;
+
+    public SsmJsonHandler(SsmService ssmService, SsmCommandService commandService,
+                          SsmInventoryService inventoryService, ObjectMapper objectMapper,
+                          IamEnforcementFilter iamEnforcementFilter, SsmPatchBaselineService patchBaselines,
+                          SsmResourceDataSyncService resourceDataSyncs,
+                          SsmAgentAssociationService agentAssociations, SsmManagedNodeDiscovery managedNodeDiscovery,
+                          SsmEc2RegistrationService ec2Registrations) {
+        this(ssmService, commandService, inventoryService, objectMapper, iamEnforcementFilter, patchBaselines,
+                resourceDataSyncs, agentAssociations, managedNodeDiscovery, ec2Registrations, null);
+    }
 
     @Inject
     public SsmJsonHandler(SsmService ssmService, SsmCommandService commandService,
@@ -63,7 +74,7 @@ public class SsmJsonHandler {
                           IamEnforcementFilter iamEnforcementFilter, SsmPatchBaselineService patchBaselines,
                           SsmResourceDataSyncService resourceDataSyncs,
                           SsmAgentAssociationService agentAssociations, SsmManagedNodeDiscovery managedNodeDiscovery,
-                          SsmEc2RegistrationService ec2Registrations) {
+                          SsmEc2RegistrationService ec2Registrations, SsmSessionService sessions) {
         this.ssmService = ssmService;
         this.commandService = commandService;
         this.inventoryService = inventoryService;
@@ -74,6 +85,7 @@ public class SsmJsonHandler {
         this.agentAssociations = agentAssociations;
         this.managedNodeDiscovery = managedNodeDiscovery;
         this.ec2Registrations = ec2Registrations;
+        this.sessions = sessions;
     }
 
     public Response handle(String action, JsonNode request, String region, String authorization) {
@@ -103,6 +115,12 @@ public class SsmJsonHandler {
             case "ListCommandInvocations" -> handleListCommandInvocations(request, region);
             case "CancelCommand" -> handleCancelCommand(request, region);
             case "DescribeInstanceInformation" -> handleDescribeInstanceInformation(request, region);
+            // Session Manager
+            case "StartSession" -> Response.ok(sessions.start(request, region)).build();
+            case "ResumeSession" -> Response.ok(sessions.resume(request, region)).build();
+            case "TerminateSession" -> Response.ok(sessions.terminate(request, region)).build();
+            case "DescribeSessions" -> Response.ok(sessions.describe(request, region)).build();
+            case "GetConnectionStatus" -> Response.ok(sessions.connectionStatus(request, region)).build();
             case "PutInventory" -> {
                 inventoryService.putInventory(request, region);
                 yield Response.ok(objectMapper.createObjectNode()).build();

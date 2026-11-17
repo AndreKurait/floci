@@ -289,9 +289,9 @@ NOT_COVERED: dict[str, str] = {
                       "named in the path",
     "ses": _LATER,
     "signin": _REST,
-    "ssmmessages": "not read yet: the session resource applies to OpenDataChannel, which Floci does not serve; "
-                   "the served CreateControlChannel and OpenControlChannel operations are unscoped and "
-                   "authorized by SsmChannelAuthentication",
+    "ssmmessages": "not read yet: SsmChannelAuthentication authorizes the served operations itself, "
+                   "CreateControlChannel, OpenControlChannel and CreateDataChannel unscoped and "
+                   "OpenDataChannel on its session",
     "sso-oauth": _REST,
     "transcribe": _LATER,
     "transfer": _LATER,

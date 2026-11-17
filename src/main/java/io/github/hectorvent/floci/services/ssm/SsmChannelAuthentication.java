@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.ssm;
 
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsPartitions;
+import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.CallerCallAuthorizer;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestHost;
@@ -22,7 +23,7 @@ import java.net.URI;
 import java.time.Clock;
 import java.util.function.UnaryOperator;
 
-/** Authenticates both control-channel handshakes before they can receive a node's commands. */
+/** Authenticates the control- and data-channel handshakes before they can carry a node's commands or sessions. */
 @ApplicationScoped
 public class SsmChannelAuthentication {
     private static final Logger LOG = Logger.getLogger(SsmChannelAuthentication.class);
@@ -49,6 +50,14 @@ public class SsmChannelAuthentication {
     Caller authenticate(String method, URI uri, UnaryOperator<String> headers,
                         UnaryOperator<String> query, byte[] body, String action,
                         String sourceIp, boolean secureTransport) {
+        Caller caller = verify(method, uri, headers, query, body, sourceIp, secureTransport);
+        RequestScopes.runAs(caller.account(), caller.region(), () -> authorize(caller, action));
+        return caller;
+    }
+
+    /** Verifies the SigV4 signature and returns the signing identity, without authorizing an action. */
+    Caller verify(String method, URI uri, UnaryOperator<String> headers, UnaryOperator<String> query,
+                  byte[] body, String sourceIp, boolean secureTransport) {
         String authorization = headers.apply("Authorization");
         SigV4SignedRequest signed = authorization == null || authorization.isBlank()
                 ? SigV4SignedRequest.fromQuery(query)
@@ -93,9 +102,7 @@ public class SsmChannelAuthentication {
             String arn = localTest ? regions.buildGlobalArn("iam", account, "root")
                     : iam.resolveCallerArn(scope.accessKeyId())
                             .orElseThrow(() -> denied("Invalid signing identity."));
-            Caller caller = new Caller(account, scope.region(), scope.accessKeyId(), arn, sourceIp, secureTransport);
-            authorize(caller, action);
-            return caller;
+            return new Caller(account, scope.region(), scope.accessKeyId(), arn, sourceIp, secureTransport);
         });
     }
 
@@ -108,6 +115,21 @@ public class SsmChannelAuthentication {
                 caller.arn(), "ssmmessages:" + action, caller.region(), caller.sourceIp(), caller.secureTransport());
         if (decision != Decision.ALLOW) {
             throw denied("The caller cannot perform ssmmessages:" + action + ".");
+        }
+    }
+
+    /** Authorizes an action whose AWS authorization model names a resource, such as a session. */
+    void authorizeResource(Caller caller, String action, String resourceArn) {
+        if (!"test".equals(caller.accessKey())
+                && !iam.resolveAccountId(caller.accessKey()).filter(caller.account()::equals).isPresent()) {
+            throw denied("The channel credential is no longer valid.");
+        }
+        Decision decision = RequestScopes.callAs(caller.account(), caller.region(), () ->
+                authorizer.authorizeRequest(caller.accessKey(), caller.account(), caller.arn(),
+                        "ssmmessages:" + action, resourceArn, AwsRegions.partitionFor(caller.region()),
+                        caller.sourceIp(), caller.secureTransport()));
+        if (decision != Decision.ALLOW) {
+            throw denied("The caller cannot perform ssmmessages:" + action + " on " + resourceArn + ".");
         }
     }
 
