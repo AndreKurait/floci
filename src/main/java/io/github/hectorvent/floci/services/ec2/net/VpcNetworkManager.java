@@ -764,6 +764,64 @@ public class VpcNetworkManager {
         disconnect(vpc.networkName, containerId);
     }
 
+    /**
+     * With isolated address spaces, plugs a hot-attached interface of another VPC into a protected
+     * namespace as its own native device (see {@link NativeVpcAddressSpace#attachAdditional}).
+     *
+     * @return the device name; empty when the address is not on a network this manager planned
+     */
+    public Optional<String> attachInterfaceAcrossAddressSpaces(String region, String vpcId, String subnetId,
+                                                               String helper, String instanceAccount,
+                                                               String address, String macAddress) {
+        if (!enabled() || !isolatesAddressSpaces() || helper == null || address == null || macAddress == null) {
+            return Optional.empty();
+        }
+        VpcBinding vpc = plannedVpc(region, vpcId);
+        SubnetBinding subnet = subnetBinding(region, subnetId);
+        Optional<Cidr4> parsed = Cidr4.parse(address + "/32");
+        if (vpc == null || vpc.effective == null || subnet == null || subnet.effective == null
+                || parsed.isEmpty() || !subnet.effective.containsAddress(parsed.get().network())) {
+            return Optional.empty();
+        }
+        String networkName = materialise(vpc);
+        if (networkName == null) {
+            return Optional.empty();
+        }
+        String device = NativeVpcAddressSpace.attachAdditional(dockerClient, config, instanceAccount, region,
+                networkName, vpc.effective, subnet.effective, helper, address, macAddress);
+        LOG.infov("Plugged an attached interface into protected namespace {0}: native VPC {1}, {2}, {3} as {4}",
+                helper, networkName, address, macAddress, device);
+        return Optional.of(device);
+    }
+
+    /** Re-configures a device {@link #attachInterfaceAcrossAddressSpaces} left after a restart, if any. */
+    public Optional<String> restoreInterfaceAcrossAddressSpaces(String region, String vpcId, String subnetId,
+                                                                String helper, String address, String macAddress) {
+        if (!enabled() || !isolatesAddressSpaces() || helper == null || address == null || macAddress == null) {
+            return Optional.empty();
+        }
+        VpcBinding vpc = plannedVpc(region, vpcId);
+        SubnetBinding subnet = subnetBinding(region, subnetId);
+        if (vpc == null || vpc.effective == null || subnet == null || subnet.effective == null) {
+            return Optional.empty();
+        }
+        return NativeVpcAddressSpace.restoreAdditional(dockerClient, helper, vpc.networkName, vpc.effective,
+                subnet.effective, address, macAddress);
+    }
+
+    /** Unplugs what {@link #attachInterfaceAcrossAddressSpaces} added; nothing when it holds none. */
+    public void detachInterfaceAcrossAddressSpaces(String region, String vpcId, String helper, String address,
+                                                   String macAddress) {
+        if (!enabled() || !isolatesAddressSpaces() || helper == null || macAddress == null) {
+            return;
+        }
+        VpcBinding vpc = bindings.get(key(region, vpcId));
+        if (vpc == null || !vpc.created) {
+            return;
+        }
+        NativeVpcAddressSpace.detachAdditional(dockerClient, helper, vpc.networkName, macAddress, address);
+    }
+
     private Map<String, ContainerNetwork> endpoints(String containerId) {
         InspectContainerResponse inspection = dockerClient.inspectContainerCmd(containerId).exec();
         Map<String, ContainerNetwork> networks = inspection.getNetworkSettings() == null

@@ -15,19 +15,26 @@ import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.core.common.docker.PortAllocator;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.services.ec2.model.InstanceNetworkInterface;
+import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.net.VpcNetworkManager;
 import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -47,8 +54,11 @@ class Ec2HotAttachInterfaceTest {
     private final VpcNetworkManager vpcNetworks = mock(VpcNetworkManager.class);
     private final SecurityGroupFirewallManager firewall = mock(SecurityGroupFirewallManager.class);
 
+    private EmulatorConfig managerConfig;
+
     private Ec2ContainerManager manager() {
         EmulatorConfig config = mock(EmulatorConfig.class);
+        managerConfig = config;
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
         EmulatorConfig.Ec2ServiceConfig ec2 = mock(EmulatorConfig.Ec2ServiceConfig.class);
         when(config.services()).thenReturn(services);
@@ -140,6 +150,123 @@ class Ec2HotAttachInterfaceTest {
         assertTrue(reason.orElseThrow().contains("isolated VPC address spaces"), reason.toString());
         verify(vpcNetworks, never()).attachInterface(anyString(), anyString(), anyString(), anyString(),
                 anyString(), anyString());
+    }
+
+    /** Isolated address spaces together with security-group enforcement. */
+    private Ec2ContainerManager isolatedManager(boolean hotAttach) {
+        Ec2ContainerManager manager = manager();
+        EmulatorConfig.VpcNetworksConfig networks = mock(EmulatorConfig.VpcNetworksConfig.class);
+        when(networks.hotAttachAcrossAddressSpaces()).thenReturn(hotAttach);
+        when(managerConfig.services().ec2().vpcNetworks()).thenReturn(networks);
+        when(vpcNetworks.isolatesAddressSpaces()).thenReturn(true);
+        when(firewall.enabled()).thenReturn(true);
+        return manager;
+    }
+
+    private static SecurityGroup customerGroup() {
+        SecurityGroup group = new SecurityGroup();
+        group.setGroupId("sg-0customer");
+        group.setVpcId("vpc-customer");
+        return group;
+    }
+
+    private static Instance protectedInstance(InstanceNetworkInterface attached) {
+        InstanceNetworkInterface primary = primary();
+        primary.setOwnerId("111111111111");
+        attached.setOwnerId("222222222222");
+        return instanceWith(primary, attached);
+    }
+
+    @Test
+    void isolatedAddressSpacesWithTheSettingOffNameIt() {
+        Ec2ContainerManager manager = isolatedManager(false);
+        InstanceNetworkInterface attached = customer();
+
+        Optional<String> reason = manager.plugNetworkInterface(protectedInstance(attached), attached,
+                List.of(customerGroup()), Map.of());
+
+        assertTrue(reason.orElseThrow().contains("FLOCI_SERVICES_EC2_VPC_NETWORKS_HOT_ATTACH_ACROSS_ADDRESS_SPACES"),
+                reason.toString());
+        verify(vpcNetworks, never()).attachInterfaceAcrossAddressSpaces(any(), any(), any(), any(), any(), any(), any());
+        verify(firewall, never()).attachDevice(any(), any(), any(), any());
+    }
+
+    @Test
+    void isolatedAddressSpacesWithTheSettingOnGiveTheDeviceTheInterfacesOwnGroups() {
+        Ec2ContainerManager manager = isolatedManager(true);
+        InstanceNetworkInterface attached = customer();
+        Instance instance = protectedInstance(attached);
+        Map<String, List<String>> prefixLists = Map.of("pl-0customer", List.of("172.31.0.0/16"));
+        when(vpcNetworks.attachInterfaceAcrossAddressSpaces(REGION, "vpc-customer", "subnet-customer", "helper-1",
+                "111111111111", "172.31.5.9", MAC)).thenReturn(Optional.of("eth2"));
+
+        assertEquals(Optional.empty(), manager.plugNetworkInterface(instance, attached, List.of(customerGroup()),
+                prefixLists));
+
+        ArgumentCaptor<SecurityGroupNftCompiler.Endpoint> identity =
+                ArgumentCaptor.forClass(SecurityGroupNftCompiler.Endpoint.class);
+        verify(firewall).attachDevice(eq("eni-0primary"), identity.capture(), eq("eth2"), eq(prefixLists));
+        SecurityGroupNftCompiler.Endpoint endpoint = identity.getValue();
+        assertEquals("222222222222", endpoint.accountId());
+        assertEquals("vpc-customer", endpoint.vpcId());
+        assertEquals("eni-0customer", endpoint.eniId());
+        assertEquals("172.31.5.9", endpoint.logicalAddress());
+        assertEquals("172.31.5.9", endpoint.transportAddress());
+        assertEquals(Set.of("172.31.5.9"), endpoint.additionalTransportAddresses());
+        assertEquals(Set.of("sg-0customer"), endpoint.groupIds());
+        assertFalse(endpoint.instanceMetadataAllowed());
+        assertTrue(endpoint.controlConnections().isEmpty());
+        verify(vpcNetworks, never()).attachInterface(any(), any(), any(), any(), any(), any());
+
+        manager.unplugNetworkInterface(instance, attached);
+
+        verify(firewall).detachDevice("eni-0primary", "eni-0customer");
+        verify(vpcNetworks).detachInterfaceAcrossAddressSpaces(REGION, "vpc-customer", "helper-1", "172.31.5.9", MAC);
+    }
+
+    @Test
+    void isolatedAddressSpacesNeedTheInterfacesGroupsAndEnforcement() {
+        Ec2ContainerManager manager = isolatedManager(true);
+        InstanceNetworkInterface attached = customer();
+        assertTrue(manager.plugNetworkInterface(protectedInstance(attached), attached, List.of(), Map.of())
+                .orElseThrow().contains("security groups are unknown"));
+        when(firewall.enabled()).thenReturn(false);
+        assertTrue(manager.plugNetworkInterface(protectedInstance(attached), attached, List.of(customerGroup()),
+                Map.of()).orElseThrow().contains("need security-group enforcement"));
+        verify(vpcNetworks, never()).attachInterfaceAcrossAddressSpaces(any(), any(), any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void aPolicyThatCannotBeInstalledUnplugsTheDeviceAgain() {
+        Ec2ContainerManager manager = isolatedManager(true);
+        InstanceNetworkInterface attached = customer();
+        when(vpcNetworks.attachInterfaceAcrossAddressSpaces(any(), any(), any(), any(), any(), any(), any()))
+                .thenReturn(Optional.of("eth2"));
+        doThrow(new IllegalStateException("Security-group policies did not converge"))
+                .when(firewall).attachDevice(any(), any(), any(), any());
+
+        assertEquals(Optional.of("Security-group policies did not converge"), manager.plugNetworkInterface(
+                protectedInstance(attached), attached, List.of(customerGroup()), Map.of()));
+        verify(vpcNetworks).detachInterfaceAcrossAddressSpaces(REGION, "vpc-customer", "helper-1", "172.31.5.9", MAC);
+    }
+
+    @Test
+    void afterARestartTheDeviceGetsItsPolicyBackOrIsRemoved() {
+        Ec2ContainerManager manager = isolatedManager(true);
+        InstanceNetworkInterface attached = customer();
+        Instance instance = protectedInstance(attached);
+        when(vpcNetworks.restoreInterfaceAcrossAddressSpaces(REGION, "vpc-customer", "subnet-customer", "helper-1",
+                "172.31.5.9", MAC)).thenReturn(Optional.of("eth2"));
+
+        manager.restoreAttachedInterface(instance, attached, List.of(customerGroup()), Map.of());
+
+        verify(firewall).attachDevice(eq("eni-0primary"), any(), eq("eth2"), eq(Map.of()));
+        verify(vpcNetworks, never()).detachInterfaceAcrossAddressSpaces(any(), any(), any(), any(), any());
+
+        Ec2ContainerManager off = isolatedManager(false);
+        off.restoreAttachedInterface(instance, attached, List.of(customerGroup()), Map.of());
+        verify(vpcNetworks).detachInterfaceAcrossAddressSpaces(REGION, "vpc-customer", "helper-1", "172.31.5.9", MAC);
+        verify(firewall).attachDevice(any(), any(), any(), any());
     }
 
     @Test

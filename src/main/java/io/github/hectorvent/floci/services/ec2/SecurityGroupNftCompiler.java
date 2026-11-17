@@ -7,12 +7,14 @@ import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.util.Collection;
+import java.util.Comparator;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.function.Predicate;
+import java.util.regex.Pattern;
 
 /** Builds only rules for an endpoint's private nftables table. Docker's tables are untouched. */
 public final class SecurityGroupNftCompiler {
@@ -124,6 +126,32 @@ public final class SecurityGroupNftCompiler {
         }
     }
 
+    /**
+     * A hot-attached interface's device in a protected namespace. Its own security groups are enforced in
+     * a chain pair of its own, which the namespace's base chains enter for that device only.
+     */
+    public record AttachedDevice(String device, String eniId) {
+        private static final Pattern DEVICE = Pattern.compile("[A-Za-z0-9_.-]{1,15}");
+        private static final Pattern ENI = Pattern.compile("eni-[0-9a-z]{1,40}");
+
+        public AttachedDevice {
+            if (device == null || !DEVICE.matcher(device).matches() || "lo".equals(device)) {
+                throw new IllegalArgumentException("An attached device needs a plain interface name");
+            }
+            if (eniId == null || !ENI.matcher(eniId).matches()) {
+                throw new IllegalArgumentException("An attached device needs its network interface id");
+            }
+        }
+
+        String ingressChain() {
+            return "attached_" + eniId.replace('-', '_') + "_ingress";
+        }
+
+        String egressChain() {
+            return "attached_" + eniId.replace('-', '_') + "_egress";
+        }
+    }
+
     public static String initialRuleset() {
         return "add table inet floci_sg\n"
                 + "add chain inet floci_sg ingress { type filter hook input priority -10; policy drop; }\n"
@@ -176,11 +204,40 @@ public final class SecurityGroupNftCompiler {
                                   boolean isolatedAddressSpaces, Predicate<Endpoint> admitted,
                                   Collection<EmulatorOrigin> emulatorOrigins, List<String> emulatorAddresses,
                                   Set<String> routedPublicAddresses) {
+        return compile(target, peers, prefixLists, vpcResolvers, isolatedAddressSpaces, admitted, emulatorOrigins,
+                emulatorAddresses, routedPublicAddresses, List.of());
+    }
+
+    /**
+     * As above, for a namespace that also holds hot-attached devices. Each device's traffic enters only its
+     * own chain pair and is dropped if that chain returns, so the primary interface's rules never see it.
+     * With no attached device the ruleset is exactly the one above.
+     */
+    public static String compile(Endpoint target, Collection<Endpoint> peers,
+                                  Map<String, List<String>> prefixLists, List<String> vpcResolvers,
+                                  boolean isolatedAddressSpaces, Predicate<Endpoint> admitted,
+                                  Collection<EmulatorOrigin> emulatorOrigins, List<String> emulatorAddresses,
+                                  Set<String> routedPublicAddresses, List<AttachedDevice> attachedDevices) {
         if (target == null || target.groups() == null || target.groups().isEmpty()) {
             throw new IllegalArgumentException("Protected endpoint needs at least one security group");
         }
         StringBuilder rules = new StringBuilder("flush chain inet floci_sg ingress\n")
                 .append("flush chain inet floci_sg egress\n");
+        List<AttachedDevice> devices = attachedDevices.stream()
+                .sorted(Comparator.comparing(AttachedDevice::device)).toList();
+        if (devices.stream().map(AttachedDevice::device).distinct().count() != devices.size()) {
+            throw new IllegalArgumentException("Two attached interfaces cannot share one device");
+        }
+        for (AttachedDevice device : devices) {
+            rules.append("add chain inet floci_sg ").append(device.ingressChain()).append('\n')
+                    .append("add chain inet floci_sg ").append(device.egressChain()).append('\n')
+                    .append("add rule inet floci_sg ingress iifname \"").append(device.device())
+                    .append("\" jump ").append(device.ingressChain()).append('\n')
+                    .append("add rule inet floci_sg ingress iifname \"").append(device.device()).append("\" drop\n")
+                    .append("add rule inet floci_sg egress oifname \"").append(device.device())
+                    .append("\" jump ").append(device.egressChain()).append('\n')
+                    .append("add rule inet floci_sg egress oifname \"").append(device.device()).append("\" drop\n");
+        }
         if (!target.instanceMetadataAllowed()) {
             // Lambda has no EC2 instance metadata, even after DNAT or a control-endpoint override.
             rules.append("add rule inet floci_sg egress ip daddr 169.254.169.254 drop\n")
@@ -324,6 +381,41 @@ public final class SecurityGroupNftCompiler {
                             .append(target.transportAddress()).append('\n');
                 }
             }
+        }
+        return rules.toString();
+    }
+
+    /**
+     * The policy of a hot-attached interface, for its own chain pair: its own security groups toward the
+     * peers of its own VPC, exactly as {@link #compile} builds it for an interface that owns a namespace.
+     * It never carries the namespace's control, resolver or metadata admissions, which stay on the
+     * primary interface's device, and it is installed together with the primary policy that enters it.
+     */
+    public static String compileAttached(Endpoint attached, AttachedDevice device, Collection<Endpoint> peers,
+                                         Map<String, List<String>> prefixLists, Predicate<Endpoint> admitted) {
+        if (attached.instanceMetadataAllowed() || !attached.controlConnections().isEmpty()
+                || !attached.controlListeners().isEmpty() || !attached.eniId().equals(device.eniId())) {
+            throw new IllegalArgumentException("An attached interface's policy carries no namespace admissions");
+        }
+        String compiled = compile(attached, peers, prefixLists, List.of(), true, admitted, List.of(), List.of(),
+                Set.of());
+        StringBuilder rules = new StringBuilder()
+                .append("add chain inet floci_sg ").append(device.ingressChain()).append('\n')
+                .append("add chain inet floci_sg ").append(device.egressChain()).append('\n');
+        for (String line : compiled.split("\n")) {
+            if (line.startsWith("flush chain inet floci_sg ingress")
+                    || line.startsWith("add rule inet floci_sg ingress ")) {
+                rules.append(line.replaceFirst(" inet floci_sg ingress", " inet floci_sg " + device.ingressChain()));
+            } else if (line.startsWith("flush chain inet floci_sg egress")
+                    || line.startsWith("add rule inet floci_sg egress ")) {
+                rules.append(line.replaceFirst(" inet floci_sg egress", " inet floci_sg " + device.egressChain()));
+            } else if (line.matches("(add table|add chain|flush chain|add rule) ip floci_vpc_dns\\b.*")) {
+                // The namespace's resolver translation belongs to its primary interface.
+                continue;
+            } else {
+                throw new IllegalStateException("Unexpected rule for an attached interface: " + line);
+            }
+            rules.append('\n');
         }
         return rules.toString();
     }

@@ -1517,10 +1517,6 @@ public class Ec2ContainerManager {
     }
 
     /**
-     * Gracefully stops a running container (30 second timeout then SIGKILL).
-     * Updates instance state through stopping → stopped.
-     */
-    /**
      * Puts an interface AttachNetworkInterface attached into the instance's network namespace, as a
      * hot attach adds a device to a running instance: the interface's MAC and primary private
      * IPv4 on its own VPC's network (EC2 User Guide, "Attach a network interface to an instance").
@@ -1530,13 +1526,30 @@ public class Ec2ContainerManager {
      * @return empty once plugged, otherwise why the interface is record-only
      */
     public Optional<String> plugNetworkInterface(Instance instance, InstanceNetworkInterface eni) {
+        return plugNetworkInterface(instance, eni, List.of(), Map.of());
+    }
+
+    /**
+     * As above, with the interface's own security groups and their prefix lists, which a protected
+     * namespace enforces on the attached device (isolated address spaces with
+     * {@code hot-attach-across-address-spaces}).
+     */
+    public Optional<String> plugNetworkInterface(Instance instance, InstanceNetworkInterface eni,
+                                                 List<SecurityGroup> groups, Map<String, List<String>> prefixLists) {
         String reason = hotAttachBlocker(instance, eni);
+        if (reason == null && isolatedHotAttach() && (groups == null || groups.isEmpty() || groups.stream().anyMatch(Objects::isNull))) {
+            reason = "the interface's security groups are unknown";
+        }
         if (reason == null) {
             try {
-                String helper = networkContainerOf(instance);
-                if (vpcNetworkManager.attachInterface(instance.getRegion(), eni.getVpcId(), eni.getSubnetId(),
-                        helper, eni.getPrivateIpAddress(), eni.getMacAddress()).isEmpty()) {
-                    reason = "its address is not on a VPC network Floci created";
+                if (isolatedHotAttach()) {
+                    reason = plugProtected(instance, eni, groups, prefixLists);
+                } else {
+                    String helper = networkContainerOf(instance);
+                    if (vpcNetworkManager.attachInterface(instance.getRegion(), eni.getVpcId(), eni.getSubnetId(),
+                            helper, eni.getPrivateIpAddress(), eni.getMacAddress()).isEmpty()) {
+                        reason = "its address is not on a VPC network Floci created";
+                    }
                 }
             } catch (RuntimeException failure) {
                 reason = failure.getMessage();
@@ -1555,11 +1568,124 @@ public class Ec2ContainerManager {
             return;
         }
         try {
-            vpcNetworkManager.detachInterface(instance.getRegion(), eni.getVpcId(), networkContainerOf(instance));
+            if (isolatedHotAttach()) {
+                String helper = networkContainerOf(instance);
+                String primary = primaryInterfaceId(instance);
+                if (primary != null) {
+                    firewallManager.detachDevice(primary, eni.getNetworkInterfaceId());
+                }
+                vpcNetworkManager.detachInterfaceAcrossAddressSpaces(instance.getRegion(), eni.getVpcId(), helper,
+                        eni.getPrivateIpAddress(), eni.getMacAddress());
+            } else {
+                vpcNetworkManager.detachInterface(instance.getRegion(), eni.getVpcId(), networkContainerOf(instance));
+            }
         } catch (RuntimeException failure) {
             LOG.warnv("Could not unplug interface {0} from EC2 instance {1}: {2}",
                     eni.getNetworkInterfaceId(), instance.getInstanceId(), failure.getMessage());
         }
+    }
+
+    /**
+     * Isolated address spaces: the device joins the instance's protected helper on the attached interface's
+     * own native VPC network, and its own security groups are enforced on that device only.
+     */
+    private String plugProtected(Instance instance, InstanceNetworkInterface eni, List<SecurityGroup> groups,
+                                 Map<String, List<String>> prefixLists) {
+        String helper = networkContainerOf(instance);
+        String primary = primaryInterfaceId(instance);
+        if (helper == null || helper.equals(instance.getDockerContainerId()) || primary == null) {
+            return "the instance has no protected namespace";
+        }
+        Optional<String> device = vpcNetworkManager.attachInterfaceAcrossAddressSpaces(instance.getRegion(),
+                eni.getVpcId(), eni.getSubnetId(), helper, instanceAccount(instance), eni.getPrivateIpAddress(),
+                eni.getMacAddress());
+        if (device.isEmpty()) {
+            return "its address is not on a native VPC network Floci created";
+        }
+        try {
+            firewallManager.attachDevice(primary, attachedIdentity(instance, eni, groups), device.get(), prefixLists);
+        } catch (RuntimeException failure) {
+            try {
+                vpcNetworkManager.detachInterfaceAcrossAddressSpaces(instance.getRegion(), eni.getVpcId(), helper,
+                        eni.getPrivateIpAddress(), eni.getMacAddress());
+            } catch (RuntimeException cleanup) {
+                failure.addSuppressed(cleanup);
+            }
+            throw failure;
+        }
+        return null;
+    }
+
+    /**
+     * After an emulator restart, gives a hot-attached interface of a protected namespace its device and
+     * policy again. Where this backend no longer hot-attaches across address spaces (the setting was turned
+     * off), a device left from before is removed, so no traffic reaches the namespace outside a policy.
+     */
+    public void restoreAttachedInterface(Instance instance, InstanceNetworkInterface eni, List<SecurityGroup> groups,
+                                         Map<String, List<String>> prefixLists) {
+        if (vpcNetworkManager == null || !vpcNetworkManager.isolatesAddressSpaces() || eni.getDeviceIndex() < 1
+                || instance.getDockerContainerId() == null) {
+            return;
+        }
+        try {
+            String helper = networkContainerOf(instance);
+            String primary = primaryInterfaceId(instance);
+            boolean usable = isolatedHotAttach() && hotAttachBlocker(instance, eni) == null && primary != null
+                    && groups != null && !groups.isEmpty() && groups.stream().noneMatch(Objects::isNull);
+            if (!usable) {
+                vpcNetworkManager.detachInterfaceAcrossAddressSpaces(instance.getRegion(), eni.getVpcId(), helper,
+                        eni.getPrivateIpAddress(), eni.getMacAddress());
+                return;
+            }
+            Optional<String> device = vpcNetworkManager.restoreInterfaceAcrossAddressSpaces(instance.getRegion(),
+                    eni.getVpcId(), eni.getSubnetId(), helper, eni.getPrivateIpAddress(), eni.getMacAddress());
+            if (device.isEmpty()) {
+                plugNetworkInterface(instance, eni, groups, prefixLists);
+                return;
+            }
+            firewallManager.attachDevice(primary, attachedIdentity(instance, eni, groups), device.get(), prefixLists);
+        } catch (RuntimeException failure) {
+            LOG.warnv("Could not restore interface {0} attached to EC2 instance {1}: {2}",
+                    eni.getNetworkInterfaceId(), instance.getInstanceId(), failure.getMessage());
+            try {
+                vpcNetworkManager.detachInterfaceAcrossAddressSpaces(instance.getRegion(), eni.getVpcId(),
+                        networkContainerOf(instance), eni.getPrivateIpAddress(), eni.getMacAddress());
+            } catch (RuntimeException cleanup) {
+                LOG.warnv("Could not remove the device of interface {0}: {1}", eni.getNetworkInterfaceId(),
+                        cleanup.getMessage());
+            }
+        }
+    }
+
+    private String instanceAccount(Instance instance) {
+        return instance.getNetworkInterfaces().stream().filter(other -> other.getDeviceIndex() == 0)
+                .map(InstanceNetworkInterface::getOwnerId).filter(Objects::nonNull).findFirst()
+                .orElse(regionResolver.getAccountId());
+    }
+
+    /** The attached interface as its VPC's peers and its own policy see it: its own account, address and groups. */
+    private SecurityGroupNftCompiler.Endpoint attachedIdentity(Instance instance, InstanceNetworkInterface eni,
+                                                               List<SecurityGroup> groups) {
+        String account = eni.getOwnerId() != null ? eni.getOwnerId() : instanceAccount(instance);
+        return new SecurityGroupNftCompiler.Endpoint(account, instance.getRegion(), eni.getVpcId(),
+                eni.getNetworkInterfaceId(), eni.getPrivateIpAddress(), eni.getPrivateIpAddress(),
+                groups.stream().map(SecurityGroup::getGroupId).collect(Collectors.toSet()), List.copyOf(groups),
+                List.of(), false, Set.of(eni.getPrivateIpAddress()), List.of(), Map.of());
+    }
+
+    private static String primaryInterfaceId(Instance instance) {
+        return instance.getNetworkInterfaces().stream().filter(other -> other.getDeviceIndex() == 0)
+                .map(InstanceNetworkInterface::getNetworkInterfaceId).filter(Objects::nonNull).findFirst()
+                .orElse(null);
+    }
+
+    /** Isolated address spaces with hot attach across them turned on. */
+    private boolean isolatedHotAttach() {
+        if (vpcNetworkManager == null || !vpcNetworkManager.isolatesAddressSpaces() || config == null) {
+            return false;
+        }
+        EmulatorConfig.VpcNetworksConfig networks = config.services().ec2().vpcNetworks();
+        return networks != null && networks.hotAttachAcrossAddressSpaces();
     }
 
     /** Null when this backend can give the attached interface its own device; otherwise why not. */
@@ -1571,9 +1697,14 @@ public class Ec2ContainerManager {
             return "the instance has no container";
         }
         if (vpcNetworkManager.isolatesAddressSpaces()) {
-            return "isolated VPC address spaces keep one native address space per namespace";
-        }
-        if (firewallManager != null && firewallManager.enabled()) {
+            if (!isolatedHotAttach()) {
+                return "isolated VPC address spaces keep one native address space per namespace"
+                        + " (FLOCI_SERVICES_EC2_VPC_NETWORKS_HOT_ATTACH_ACROSS_ADDRESS_SPACES is off)";
+            }
+            if (firewallManager == null || !firewallManager.enabled()) {
+                return "isolated VPC address spaces need security-group enforcement";
+            }
+        } else if (firewallManager != null && firewallManager.enabled()) {
             return "security-group enforcement filters the namespace with the primary interface's groups only";
         }
         if (eni.getVpcId() == null || eni.getMacAddress() == null || eni.getPrivateIpAddress() == null) {
@@ -1605,6 +1736,10 @@ public class Ec2ContainerManager {
         }
     }
 
+    /**
+     * Gracefully stops a running container (30 second timeout then SIGKILL).
+     * Updates instance state through stopping → stopped.
+     */
     public void stop(Instance instance) {
         guestReboots.forget(instance);
         String containerId = instance.getDockerContainerId();

@@ -3905,6 +3905,16 @@ public interface EmulatorConfig {
         boolean isolateAddressSpaces();
 
         /**
+         * With {@link #isolateAddressSpaces}, lets {@code AttachNetworkInterface} plug an interface of another
+         * VPC into a running instance's protected namespace (hot attach). The device gets the interface's own
+         * native address, source-based return routing and the interface's own security groups, enforced on
+         * that device only. Off by default: the attachment is then record-only, as without this setting.
+         * Env: {@code FLOCI_SERVICES_EC2_VPC_NETWORKS_HOT_ATTACH_ACROSS_ADDRESS_SPACES}.
+         */
+        @WithDefault("false")
+        boolean hotAttachAcrossAddressSpaces();
+
+        /**
          * Private range that substituted CIDRs are allocated from, used when a declared VPC CIDR
          * is absent, malformed, outside RFC 1918, or already claimed on the Docker daemon. Must
          * itself be RFC 1918. The default sits high in 10/8, away from both Docker's default
