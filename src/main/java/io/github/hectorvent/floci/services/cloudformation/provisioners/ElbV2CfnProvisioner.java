@@ -42,17 +42,20 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
     private static final List<String> UPDATE_SNAPSHOTS = List.of(
             CfnRollback.LOAD_BALANCER_SUBNETS_UPDATE_SNAPSHOT_ATTR,
             CfnRollback.LOAD_BALANCER_ATTRIBUTES_UPDATE_SNAPSHOT_ATTR,
+            CfnRollback.TARGET_GROUP_ATTRIBUTES_UPDATE_SNAPSHOT_ATTR,
             CfnRollback.TARGET_GROUP_TARGETS_UPDATE_SNAPSHOT_ATTR);
 
     private final ElbV2Service elbV2Service;
     private final ElbV2CfnTargets targets;
     private final ElbV2CfnLoadBalancerAttributes loadBalancerAttributes;
+    private final ElbV2CfnTargetGroupAttributes targetGroupAttributes;
 
     @Inject
     public ElbV2CfnProvisioner(ElbV2Service elbV2Service) {
         this.elbV2Service = elbV2Service;
         this.targets = new ElbV2CfnTargets(elbV2Service);
         this.loadBalancerAttributes = new ElbV2CfnLoadBalancerAttributes(elbV2Service);
+        this.targetGroupAttributes = new ElbV2CfnTargetGroupAttributes(elbV2Service);
     }
 
     @Override
@@ -156,7 +159,11 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
             loadBalancerAttributes.restore(resource);
             return restorePriorSubnets(resource);
         }
-        return TARGET_GROUP.equals(resource.getResourceType()) && targets.restore(resource);
+        if (TARGET_GROUP.equals(resource.getResourceType())) {
+            targetGroupAttributes.restore(resource);
+            return targets.restore(resource);
+        }
+        return false;
     }
 
     /**
@@ -290,6 +297,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
 
     private void provisionTargetGroup(StackResource r, JsonNode props, ProvisionContext ctx) {
         List<TargetDescription> requestedTargets = ElbV2CfnTargets.declared(props, ctx);
+        Map<String, String> declaredAttributes = ElbV2CfnTargetGroupAttributes.declared(props, ctx);
         String name = nameOrPrior(ctx.resolveOptional(props, "Name"), r.getAttributes().get("TargetGroupName"),
                 ctx, r.getLogicalId());
         String protocol = ctx.resolveOptional(props, "Protocol");
@@ -331,6 +339,7 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
         // A list-valued attribute, joined the way Route53's NameServers is. Empty until a listener
         // forwards to the group, as on AWS.
         r.getAttributes().put("LoadBalancerArns", String.join(",", tg.getLoadBalancerArns()));
+        targetGroupAttributes.apply(r, declaredAttributes, ctx, created);
         targets.apply(r, tg, requestedTargets, ctx, created);
     }
 

@@ -1116,6 +1116,19 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         persistRegion(targetGroups, region);
     }
 
+    /** Puts back the values a rolled-back update replaced; a key that had no stored value is removed again. */
+    public void restoreTargetGroupAttributes(String region, String arn, Map<String, String> previous) {
+        TargetGroup tg = requireTargetGroup(region, arn);
+        previous.forEach((key, value) -> {
+            if (value == null) {
+                tg.getAttributes().remove(key);
+            } else {
+                tg.getAttributes().put(key, value);
+            }
+        });
+        persistRegion(targetGroups, region);
+    }
+
     // ── Listeners ─────────────────────────────────────────────────────────────
 
     public Listener createListener(String region, String lbArn, String protocol, Integer port,
