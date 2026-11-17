@@ -98,6 +98,36 @@ class AutoScalingEventPublisherTest {
         assertEquals(ACCOUNT, event.get("Account"));
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"launch", "terminate"})
+    void successEventsUseDocumentedWholeSecondTimestamps(String transition) throws Exception {
+        capture();
+        AutoScalingEventPublisher fractional = new AutoScalingEventPublisher(bus, mapper,
+                Clock.fixed(NOW.plusSeconds(1).plusNanos(987654321), ZoneOffset.UTC));
+        fractional.start();
+        try {
+            ScalingActivity activity = activity();
+            activity.setStartTime(NOW.plusNanos(123456789));
+            Instance instance = instance();
+            if ("launch".equals(transition)) {
+                fractional.launched(group(), instance, activity);
+            } else {
+                instance.setState(InstanceState.terminated());
+                AutoScalingEventPublisher.Termination termination = fractional.termination(group(), List.of("i-owned"));
+                termination.activity(List.of("i-owned"), activity);
+                termination.accept(instance);
+            }
+
+            Map<String, Object> event = take();
+            assertEquals(NOW.plusSeconds(1), event.get("Time"));
+            JsonNode detail = mapper.readTree((String) event.get("Detail"));
+            assertEquals(NOW.toString(), detail.path("StartTime").asText());
+            assertEquals(NOW.plusSeconds(1).toString(), detail.path("EndTime").asText());
+        } finally {
+            fractional.stop();
+        }
+    }
+
     @Test
     void pendingLaunchAndUnfinishedTerminationDoNotReachBus() throws Exception {
         capture();

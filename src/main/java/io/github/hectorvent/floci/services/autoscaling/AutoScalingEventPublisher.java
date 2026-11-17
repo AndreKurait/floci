@@ -17,6 +17,7 @@ import org.jboss.logging.Logger;
 
 import java.time.Clock;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -163,7 +164,7 @@ public class AutoScalingEventPublisher {
         }
         String instanceId = instance.getInstanceId();
         // A backward wall-clock adjustment cannot put completion before its recorded activity start.
-        Instant completed = ended.isBefore(started) ? started : ended;
+        Instant completed = (ended.isBefore(started) ? started : ended).truncatedTo(ChronoUnit.SECONDS);
         ObjectNode detail = mapper.createObjectNode();
         // AWS's successful scaling event examples retain InProgress in this member.
         detail.put("StatusCode", "InProgress");
@@ -182,7 +183,7 @@ public class AutoScalingEventPublisher {
         detail.put("StatusMessage", "");
         detail.put("EndTime", completed.toString());
         detail.put("EC2InstanceId", instanceId);
-        detail.put("StartTime", started.toString());
+        detail.put("StartTime", started.truncatedTo(ChronoUnit.SECONDS).toString());
         detail.put("Cause", cause == null ? "" : cause);
         detail.put("Origin", launch ? "EC2" : "AutoScalingGroup");
         detail.put("Destination", launch ? "AutoScalingGroup" : "EC2");
