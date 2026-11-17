@@ -153,11 +153,14 @@ helper="$(docker inspect --format '{{.HostConfig.NetworkMode}}' "$guest")"
 [[ "$(docker exec "$guest" uname -m)" == "$machine" ]]
 [[ "$(docker exec "$guest" sh -c \
     'curl --noproxy "*" -fsS --max-time 3 "$AWS_EC2_METADATA_SERVICE_ENDPOINT/latest/meta-data/instance-id"')" == "$instance" ]]
-parent_ip="$(docker inspect "$parent" | jq -r '.[0].NetworkSettings.Networks[].IPAddress')"
-if docker exec "$guest" curl --noproxy '*' -sS --max-time 2 "http://$parent_ip:4566/" >/dev/null 2>&1; then
-    echo "Metadata access also opened unrelated service traffic." >&2
-    exit 1
-fi
+parent_ips="$(docker inspect "$parent" | jq -r '.[0].NetworkSettings.Networks[].IPAddress | select(length > 0)')"
+[[ -n "$parent_ips" ]]
+while IFS= read -r parent_ip; do
+    if docker exec "$guest" curl --noproxy '*' -sS --max-time 2 "http://$parent_ip:4566/" >/dev/null 2>&1; then
+        echo "Metadata access also opened unrelated service traffic at $parent_ip." >&2
+        exit 1
+    fi
+done <<< "$parent_ips"
 
 aws ec2 stop-instances --instance-ids "$instance" >/dev/null
 aws ec2 wait instance-stopped --instance-ids "$instance"
