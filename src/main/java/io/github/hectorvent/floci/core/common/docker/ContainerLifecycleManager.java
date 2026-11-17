@@ -445,7 +445,7 @@ public class ContainerLifecycleManager implements ContainerTeardown {
                 }
                 if (existing.isPresent()) {
                     if (matchesSpec(existing.get(), spec, createAttemptId)) {
-                        LOG.infov("Create for {0} hit a name conflict; an earlier attempt's response "
+                        LOG.infov("Create for {0} hit a name conflict; an earlier attempt''s response "
                                 + "was lost but the container exists, adopting {1}",
                                 spec.name(), existing.get().getId());
                         return existing.get().getId();
