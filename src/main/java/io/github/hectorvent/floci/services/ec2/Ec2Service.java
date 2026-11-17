@@ -128,6 +128,7 @@ import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.security.SecureRandom;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
@@ -2633,6 +2634,137 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return resourceLocks.lockAt(Math.max(stripeOf(keyA), stripeOf(keyB)));
     }
 
+    /**
+     * A launch's implicit primary interface takes one IPv6 address when its subnet assigns IPv6 on creation and
+     * holds an associated IPv6 block, as EC2 does for AssignIpv6AddressOnCreation. The address is a random
+     * interface id inside the subnet's /64, never one of the four AWS reserves at the start of the block, and
+     * never one a live instance interface in the subnet holds. The subnet's and VPC's associated IPv6 blocks are
+     * recorded on the interface for the instance metadata service.
+     */
+    private void assignLaunchIpv6(String region, String subnetId, InstanceNetworkInterface eni) {
+        Subnet subnet = subnetId == null ? null : subnets.get(key(region, subnetId)).orElse(null);
+        if (subnet == null || !subnet.isAssignIpv6AddressOnCreation()) {
+            return;
+        }
+        List<String> subnetBlocks = subnet.getIpv6CidrBlockAssociationSet().stream()
+                .filter(assoc -> "associated".equalsIgnoreCase(assoc.getIpv6CidrBlockState()))
+                .map(VpcIpv6CidrBlockAssociation::getIpv6CidrBlock)
+                .toList();
+        if (subnetBlocks.isEmpty()) {
+            return;
+        }
+        Set<String> held = new HashSet<>();
+        for (Instance other : instances.scan(k -> true)) {
+            String state = other.getState() == null ? null : other.getState().getName();
+            // A terminated instance has released its interface; every other one still holds its addresses.
+            if (region.equals(other.getRegion()) && !"terminated".equals(state)) {
+                for (InstanceNetworkInterface otherEni : other.getNetworkInterfaces()) {
+                    if (subnet.getSubnetId().equals(otherEni.getSubnetId())) {
+                        held.addAll(otherEni.getIpv6Addresses());
+                    }
+                }
+            }
+        }
+        String address = randomIpv6InBlock(subnetBlocks.get(0), held);
+        eni.setIpv6Addresses(new ArrayList<>(List.of(address)));
+        eni.setSubnetIpv6CidrBlocks(new ArrayList<>(subnetBlocks));
+        Vpc vpc = vpcs.get(key(region, subnet.getVpcId())).orElse(null);
+        if (vpc != null) {
+            eni.setVpcIpv6CidrBlocks(new ArrayList<>(vpc.getIpv6CidrBlockAssociationSet().stream()
+                    .filter(assoc -> "associated".equalsIgnoreCase(assoc.getIpv6CidrBlockState()))
+                    .map(VpcIpv6CidrBlockAssociation::getIpv6CidrBlock)
+                    .toList()));
+        }
+    }
+
+    /** A random address in an IPv6 /64 (or larger) block, outside its first four addresses and {@code held}. */
+    static String randomIpv6InBlock(String block, Set<String> held) {
+        String[] parts = block.split("/", 2);
+        int prefix = Integer.parseInt(parts[1]);
+        if (prefix > 64) {
+            throw new AwsException("InvalidParameterValue", "IPv6 block " + block + " is smaller than a /64.", 400);
+        }
+        byte[] base;
+        try {
+            base = InetAddress.getByName(parts[0]).getAddress();
+        } catch (java.net.UnknownHostException e) {
+            throw new AwsException("InvalidParameterValue", "Invalid IPv6 block " + block, 400);
+        }
+        Set<String> canonicalHeld = new HashSet<>();
+        for (String address : held) {
+            canonicalHeld.add(canonicalIpv6(address));
+        }
+        SecureRandom random = new SecureRandom();
+        for (int attempt = 0; attempt < 64; attempt++) {
+            byte[] candidate = base.clone();
+            byte[] interfaceId = new byte[8];
+            random.nextBytes(interfaceId);
+            System.arraycopy(interfaceId, 0, candidate, 8, 8);
+            boolean reserved = true;
+            for (int i = 8; i < 15; i++) {
+                if (candidate[i] != 0) {
+                    reserved = false;
+                    break;
+                }
+            }
+            if (reserved && (candidate[15] & 0xff) < 4) {
+                continue;
+            }
+            String address = canonicalIpv6(candidate);
+            if (!canonicalHeld.contains(address)) {
+                return address;
+            }
+        }
+        throw new AwsException("InsufficientFreeAddressesInSubnet",
+                "No free IPv6 address in " + block + ".", 400);
+    }
+
+    private static String canonicalIpv6(String address) {
+        try {
+            return canonicalIpv6(InetAddress.getByName(address).getAddress());
+        } catch (java.net.UnknownHostException e) {
+            return address;
+        }
+    }
+
+    /** RFC 5952 text for a 16-byte address: lower case, no leading zeros, the longest zero run as "::". */
+    private static String canonicalIpv6(byte[] bytes) {
+        int[] groups = new int[8];
+        for (int i = 0; i < 8; i++) {
+            groups[i] = ((bytes[2 * i] & 0xff) << 8) | (bytes[2 * i + 1] & 0xff);
+        }
+        int bestStart = -1;
+        int bestLength = 0;
+        for (int i = 0; i < 8; ) {
+            if (groups[i] == 0) {
+                int j = i;
+                while (j < 8 && groups[j] == 0) {
+                    j++;
+                }
+                if (j - i > bestLength && j - i >= 2) {
+                    bestStart = i;
+                    bestLength = j - i;
+                }
+                i = j;
+            } else {
+                i++;
+            }
+        }
+        StringBuilder text = new StringBuilder();
+        for (int i = 0; i < 8; i++) {
+            if (i == bestStart) {
+                text.append("::");
+                i += bestLength - 1;
+                continue;
+            }
+            if (text.length() > 0 && text.charAt(text.length() - 1) != ':') {
+                text.append(':');
+            }
+            text.append(Integer.toHexString(groups[i]));
+        }
+        return text.toString();
+    }
+
     /** Synthesizes a locally-administered unicast MAC (AWS never discloses how it derives its own). */
     private String randomMac() {
         byte[] bytes = new byte[5];
@@ -4809,6 +4941,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                                     ? networkInterfaceDeleteOnTermination : suppliedEni == null);
                             if (inst.getLaunchTime() != null) {
                                 eni.setAttachTime(ISO_FMT.format(inst.getLaunchTime()));
+                            }
+                            if (suppliedEni == null) {
+                                assignLaunchIpv6(region, finalSubnetId, eni);
                             }
                             inst.getNetworkInterfaces().add(eni);
                             if (suppliedEni != null) {
@@ -18421,6 +18556,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             attached.setDeleteOnTermination(attachment.isDeleteOnTermination());
             inst.getNetworkInterfaces().add(attached);
             instances.put(key(region, instanceId), inst);
+            // IMDS lists the interface under network/interfaces/macs/ from now on, as EC2 does.
+            if (containerManager != null) {
+                containerManager.refreshInstanceMetadata(inst);
+            }
             return attachment;
         }
     }
@@ -18471,6 +18610,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 aware.putForAccount(safeAccount, key(region, instanceId), inst);
             } else {
                 instances.put(key(region, instanceId), inst);
+            }
+            if (containerManager != null) {
+                containerManager.refreshInstanceMetadata(inst);
             }
         }
     }
