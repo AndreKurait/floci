@@ -1,13 +1,19 @@
 package io.github.hectorvent.floci.services.cloudwatch.metrics;
 
+import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricAlarm;
+import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricDatum;
+import io.github.hectorvent.floci.testing.InMemoryStorageFactory;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 
+import java.time.Clock;
 import java.time.Instant;
+import java.time.ZoneOffset;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ScheduledExecutorService;
 
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -18,6 +24,7 @@ import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -64,6 +71,28 @@ class AlarmEvaluatorTest {
         when(metricsService.getMetricStatistics(
                 any(), any(), any(), any(), any(), anyInt(), any(), any(), anyString()))
                 .thenReturn(points);
+    }
+
+    @Test
+    void includesFinalSecondOfCompletedPeriodButExcludesCurrentPeriod() {
+        CloudWatchMetricsService realMetrics = spy(new CloudWatchMetricsService(
+                new InMemoryStorageFactory("000000000000"), new RegionResolver(REGION, "000000000000")));
+        MetricAlarm alarm = alarm();
+        alarm.setEvaluationPeriods(1);
+        realMetrics.putMetricAlarm(alarm, REGION);
+        Instant boundary = Instant.parse("2026-11-17T12:01:00Z");
+        realMetrics.putMetricData(alarm.getNamespace(), List.of(
+                MetricDatum.of(alarm.getMetricName(), "Percent", 90, List.of(), boundary.getEpochSecond() - 1),
+                MetricDatum.of(alarm.getMetricName(), "Percent", 0, List.of(), boundary.getEpochSecond())), REGION);
+        when(handlers.iterator()).thenAnswer(invocation -> List.<AlarmActionHandler>of().iterator());
+        AlarmEvaluator fixed = new AlarmEvaluator(realMetrics, handlers,
+                Clock.fixed(boundary.plusSeconds(10), ZoneOffset.UTC), mock(ScheduledExecutorService.class));
+
+        fixed.evaluate(alarm);
+
+        verify(realMetrics).getMetricStatistics(any(), any(), any(), any(), eq(boundary),
+                eq(60), any(), any(), eq(REGION));
+        verify(realMetrics).setAlarmState(eq(alarm.getAlarmName()), eq("ALARM"), anyString(), any(), eq(REGION));
     }
 
     @Test
