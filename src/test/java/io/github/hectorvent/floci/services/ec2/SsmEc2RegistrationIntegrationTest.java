@@ -244,7 +244,7 @@ class SsmEc2RegistrationIntegrationTest {
         SessionCredential restored = mapper.readValue(mapper.writeValueAsBytes(credential), SessionCredential.class);
         assertNull(restored.getEc2InstanceArn());
         iam.registerEc2InstanceSession(restored);
-        signed("RegisterManagedInstance", REGION, body, body, false).then().defaultParser(Parser.JSON).statusCode(400)
+        signed("RegisterManagedInstance", REGION, body, body, false).then().defaultParser(Parser.JSON).statusCode(403)
                 .body("__type", equalTo("AccessDeniedException"));
     }
 
