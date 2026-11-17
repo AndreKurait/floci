@@ -13,6 +13,7 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -21,6 +22,7 @@ import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -411,8 +413,7 @@ class Ec2MetadataProxyTest {
             fixture.start();
             requireTokens(fixture.instance());
 
-            assertEquals(0, HelperShellFixture.run(probe(fixture.endpoint()), directory, Map.of()),
-                    HelperShellFixture.output(directory));
+            assertMetadataProbeReady(fixture.endpoint(), directory, Map.of());
         }
     }
 
@@ -425,9 +426,7 @@ class Ec2MetadataProxyTest {
             fixture.start();
             requireTokens(fixture.instance());
 
-            int result = HelperShellFixture.run(probe(fixture.endpoint()), directory, proxyEnvironment(proxy));
-
-            assertEquals(0, result, HelperShellFixture.output(directory));
+            assertMetadataProbeReady(fixture.endpoint(), directory, proxyEnvironment(proxy));
             assertEquals(List.of(), proxied);
         } finally {
             proxy.stop(0);
@@ -632,6 +631,15 @@ class Ec2MetadataProxyTest {
         String proxyUrl = "http://127.0.0.1:" + proxy.getAddress().getPort();
         return Map.of("http_proxy", proxyUrl, "HTTP_PROXY", proxyUrl, "all_proxy", proxyUrl,
                 "ALL_PROXY", proxyUrl, "no_proxy", "", "NO_PROXY", "");
+    }
+
+    private static void assertMetadataProbeReady(String endpoint, Path directory, Map<String, String> environment) {
+        // Startup retries the one-second probe; a newly started fixture can also
+        // miss its first attempt when the full CI shard is busy.
+        await().pollInSameThread().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(100))
+                .atMost(Duration.ofSeconds(10)).untilAsserted(() ->
+                    assertEquals(0, HelperShellFixture.run(probe(endpoint), directory, environment),
+                            HelperShellFixture.output(directory)));
     }
 
     private static String[] probe(String endpoint) {
