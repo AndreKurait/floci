@@ -1,6 +1,8 @@
 package io.floci.aws.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.ReservedTags;
 import io.floci.aws.services.cloudformation.model.StackResource;
 import io.floci.aws.services.kms.KmsService;
 import io.floci.aws.services.kms.model.KmsKey;
@@ -41,10 +43,55 @@ public class KmsCfnProvisioner implements CfnResourceProvisioner {
 
     private void provisionKey(StackResource r, JsonNode props, ProvisionContext ctx) {
         String description = ctx.resolveOptional(props, "Description");
-        String requestedSpec = ctx.resolveOptional(props, "KeySpec");
-        String requestedUsage = ctx.resolveOptional(props, "KeyUsage");
+        String spec = ctx.resolveOptional(props, "KeySpec");
+        String usage = ctx.resolveOptional(props, "KeyUsage");
+        spec = spec == null ? "SYMMETRIC_DEFAULT" : spec;
+        usage = usage == null ? "ENCRYPT_DECRYPT" : usage;
+        boolean multiRegion = Boolean.parseBoolean(ctx.resolveOptional(props, "MultiRegion"));
+        JsonNode policyNode = props == null ? null : props.get("KeyPolicy");
+        JsonNode resolvedPolicy = ctx.engine().resolveNode(policyNode);
+        String policy = resolvedPolicy == null || resolvedPolicy.isNull() ? null
+                : resolvedPolicy.isTextual() ? resolvedPolicy.textValue() : resolvedPolicy.toString();
         Map<String, String> tags = parseCfnTags(props != null ? props.get("Tags") : null, ctx);
-        KmsKey key = kmsService.createKey(description, requestedUsage, requestedSpec, null, tags, ctx.region());
+        KmsKey key;
+        if (ctx.isUpdate() && !CfnResourceDispatcher.isStub(ctx.priorPhysicalId(), r.getAttributes())) {
+            key = kmsService.describeKey(ctx.priorPhysicalId(), ctx.region());
+            // KMS rejects immutable property changes, even with UpdateReplacePolicy: Retain.
+            // Validate before any mutable property is applied or key material is created.
+            if (!key.getKeySpec().name().equals(spec) || !key.getKeyUsage().name().equals(usage)
+                    || key.isMultiRegion() != multiRegion) {
+                throw new AwsException("InvalidRequest", "KeySpec, KeyUsage and MultiRegion cannot be changed.", 400);
+            }
+            String overrideId = ReservedTags.extractOverrideKeyId(tags);
+            if (overrideId != null && !overrideId.equals(key.getKeyId())) {
+                throw new AwsException("InvalidRequest", "The key ID override cannot be changed.", 400);
+            }
+            tags.remove(ReservedTags.OVERRIDE_ID_KEY);
+            ReservedTags.rejectReservedTagsOnUpdate(tags);
+            if (description != null || ctx.previouslyDeclared("Description")) {
+                kmsService.updateKeyDescription(key.getKeyId(), description == null ? "" : description, ctx.region());
+            }
+            if (policy != null || ctx.previouslyDeclared("KeyPolicy")) {
+                kmsService.putKeyPolicy(key.getKeyId(),
+                        policy == null ? kmsService.buildDefaultKeyPolicy() : policy, ctx.region());
+            }
+            if (props != null && props.has("Tags") || ctx.previouslyDeclared("Tags")) {
+                kmsService.untagResource(key.getKeyId(), ProvisionContext.staleTagKeys(key.getTags(), tags), ctx.region());
+                kmsService.tagResource(key.getKeyId(), tags, ctx.region());
+            }
+        } else {
+            key = kmsService.createKey(description, usage, spec, policy, tags, null, multiRegion, ctx.region());
+        }
+        String enabled = ctx.resolveOptional(props, "Enabled");
+        boolean desiredEnabled = enabled == null || Boolean.parseBoolean(enabled);
+        boolean reconcileEnabled = enabled != null || ctx.previouslyDeclared("Enabled");
+        if (reconcileEnabled && desiredEnabled != key.isEnabled()) {
+            if (desiredEnabled) {
+                kmsService.enableKey(key.getKeyId(), ctx.region());
+            } else {
+                kmsService.disableKey(key.getKeyId(), ctx.region());
+            }
+        }
         r.setPhysicalId(key.getKeyId());
         r.getAttributes().put("Arn", key.getArn());
         r.getAttributes().put("KeyId", key.getKeyId());
