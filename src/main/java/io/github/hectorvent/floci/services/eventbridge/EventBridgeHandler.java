@@ -7,6 +7,7 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.AwsJson11Controller;
+import io.github.hectorvent.floci.core.common.AwsJsonTimestamp;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.Pagination;
 import io.github.hectorvent.floci.services.eventbridge.model.ApiDestination;
@@ -439,6 +440,10 @@ public class EventBridgeHandler {
                 }
                 if (!entryNode.path("Resources").isMissingNode()) {
                     entry.put("Resources", entryNode.path("Resources"));
+                }
+                Instant time = AwsJsonTimestamp.epochSeconds(entryNode, "Time", "SerializationException");
+                if (time != null) {
+                    entry.put("Time", time);
                 }
                 entries.add(entry);
             }
