@@ -1649,7 +1649,7 @@ public class EcrService implements ResourceProvider, Resettable {
                                                     boolean scanOnPush, String region) {
         Repository repo = requireRepo(repositoryName, registryId, region);
         repo.setScanOnPush(scanOnPush);
-        repoStore.put(key(region, repo.getRegistryId(), repositoryName), repo);
+        persistRepository(repo, region);
         return repo;
     }
 
@@ -1662,7 +1662,7 @@ public class EcrService implements ResourceProvider, Resettable {
         }
         Repository repo = requireRepo(repositoryName, registryId, region);
         repo.setImageTagMutability(mutability);
-        repoStore.put(key(region, repo.getRegistryId(), repositoryName), repo);
+        persistRepository(repo, region);
         return repo;
     }
 
@@ -1692,7 +1692,7 @@ public class EcrService implements ResourceProvider, Resettable {
                 tags.forEach(updated::put);
                 repo.setTags(updated);
             }
-            repoStore.put(key(region, repo.getRegistryId(), repoName), repo);
+            persistRepository(repo, region);
         }
     }
 
@@ -1705,7 +1705,7 @@ public class EcrService implements ResourceProvider, Resettable {
                 tagKeys.forEach(updated::remove);
                 repo.setTags(updated);
             }
-            repoStore.put(key(region, repo.getRegistryId(), repoName), repo);
+            persistRepository(repo, region);
         }
     }
 
@@ -1738,7 +1738,7 @@ public class EcrService implements ResourceProvider, Resettable {
         validateLifecyclePolicyDocument(policyText);
         Repository repo = requireRepo(repoName, registryId, region);
         repo.setLifecyclePolicyText(policyText);
-        repoStore.put(key(region, repo.getRegistryId(), repoName), repo);
+        persistRepository(repo, region);
         return repo;
     }
 
@@ -1777,14 +1777,14 @@ public class EcrService implements ResourceProvider, Resettable {
     public Repository deleteLifecyclePolicy(String repoName, String registryId, String region) {
         Repository repo = getLifecyclePolicy(repoName, registryId, region);
         repo.setLifecyclePolicyText(null);
-        repoStore.put(key(region, repo.getRegistryId(), repoName), repo);
+        persistRepository(repo, region);
         return repo;
     }
 
     public Repository setRepositoryPolicy(String repoName, String registryId, String policyText, String region) {
         Repository repo = requireRepo(repoName, registryId, region);
         repo.setRepositoryPolicyText(policyText);
-        repoStore.put(key(region, repo.getRegistryId(), repoName), repo);
+        persistRepository(repo, region);
         return repo;
     }
 
@@ -1800,7 +1800,7 @@ public class EcrService implements ResourceProvider, Resettable {
     public Repository deleteRepositoryPolicy(String repoName, String registryId, String region) {
         Repository repo = getRepositoryPolicy(repoName, registryId, region);
         repo.setRepositoryPolicyText(null);
-        repoStore.put(key(region, repo.getRegistryId(), repoName), repo);
+        persistRepository(repo, region);
         return repo;
     }
 
@@ -1841,10 +1841,7 @@ public class EcrService implements ResourceProvider, Resettable {
 
     public Optional<Repository> registryRepository(String name, String account, String region) {
         String repositoryKey = key(region, account, name);
-        if (repoStore instanceof AccountAwareStorageBackend<Repository> aware) {
-            return aware.getForAccount(account, repositoryKey);
-        }
-        return repoStore.get(repositoryKey);
+        return AccountAwareStorageBackend.readInAccount(repoStore, account, repositoryKey);
     }
 
     private Repository requireRepo(String name, String registryId, String region) {
@@ -1931,12 +1928,13 @@ public class EcrService implements ResourceProvider, Resettable {
 
     private Repository refreshRepositoryUri(Repository repo, String region) {
         repo.setRepositoryUri(registryManager.getRepositoryUri(repo.getRegistryId(), region, repo.getRepositoryName()));
-        if (repoStore instanceof AccountAwareStorageBackend<Repository> aware) {
-            aware.putForAccount(repo.getRegistryId(), key(region, repo.getRegistryId(), repo.getRepositoryName()), repo);
-        } else {
-            repoStore.put(key(region, repo.getRegistryId(), repo.getRepositoryName()), repo);
-        }
+        persistRepository(repo, region);
         return repo;
+    }
+
+    private void persistRepository(Repository repo, String region) {
+        AccountAwareStorageBackend.putInAccount(repoStore, repo.getRegistryId(),
+                key(region, repo.getRegistryId(), repo.getRepositoryName()), repo);
     }
 
     private String registryRepositoryName(Repository repo, String region) {
