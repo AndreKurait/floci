@@ -1520,6 +1520,13 @@ public class Ec2ContainerManager {
      * Gracefully stops a running container (30 second timeout then SIGKILL).
      * Updates instance state through stopping → stopped.
      */
+    /** Serves the instance's current record from IMDS after its network interfaces change. */
+    public void refreshInstanceMetadata(Instance instance) {
+        if (metadataServer != null) {
+            metadataServer.refreshInstance(instance);
+        }
+    }
+
     public void stop(Instance instance) {
         guestReboots.forget(instance);
         String containerId = instance.getDockerContainerId();

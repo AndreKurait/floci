@@ -803,10 +803,21 @@ their metadata version or parsers.
 | `GET /latest/meta-data/mac` | MAC address of first ENI |
 | `GET /latest/meta-data/security-groups` | Security group names |
 | `GET /latest/meta-data/ipv6` | The primary interface's IPv6 address; 404 without one |
-| `GET /latest/meta-data/network/interfaces/macs/` | One `<mac>/` line per interface |
+| `GET /latest/meta-data/network/interfaces/macs/` | One `<mac>/` line per interface, including one `AttachNetworkInterface` added to the running instance and without one `DetachNetworkInterface` removed |
 | `GET /latest/meta-data/network/interfaces/macs/{mac}/ipv6s` | That interface's IPv6 addresses; 404 without one |
 | `GET /latest/meta-data/network/interfaces/macs/{mac}/subnet-ipv6-cidr-blocks` | Its subnet's associated IPv6 blocks |
 | `GET /latest/meta-data/network/interfaces/macs/{mac}/vpc-ipv6-cidr-blocks` | Its VPC's associated IPv6 blocks |
+| `GET /latest/meta-data/network/interfaces/macs/{mac}/` | The categories that interface answers, one per line; 404 for an unknown MAC |
+| `GET /latest/meta-data/network/interfaces/macs/{mac}/device-number` | The interface's device index on the instance (`0` for the primary interface) |
+| `GET /latest/meta-data/network/interfaces/macs/{mac}/interface-id` | The interface's ID |
+| `GET /latest/meta-data/network/interfaces/macs/{mac}/local-hostname` | The interface's private DNS name |
+| `GET /latest/meta-data/network/interfaces/macs/{mac}/local-ipv4s` | The interface's primary private IPv4 address |
+| `GET /latest/meta-data/network/interfaces/macs/{mac}/mac` | The interface's MAC address |
+| `GET /latest/meta-data/network/interfaces/macs/{mac}/owner-id` | The account that owns the interface; 404 when Floci did not record one |
+| `GET /latest/meta-data/network/interfaces/macs/{mac}/security-group-ids` | The IDs of the interface's security groups, one per line |
+| `GET /latest/meta-data/network/interfaces/macs/{mac}/security-groups` | The names of the interface's security groups, one per line |
+| `GET /latest/meta-data/network/interfaces/macs/{mac}/subnet-id` | The interface's subnet |
+| `GET /latest/meta-data/network/interfaces/macs/{mac}/vpc-id` | The interface's VPC |
 | `GET /latest/meta-data/placement/availability-zone` | AZ |
 | `GET /latest/meta-data/placement/region` | Region |
 | `GET /latest/meta-data/services/` | Service metadata keys (`domain` and `partition`); also accepts the path without a trailing slash |

@@ -18448,6 +18448,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             attached.setDeleteOnTermination(attachment.isDeleteOnTermination());
             inst.getNetworkInterfaces().add(attached);
             instances.put(key(region, instanceId), inst);
+            // IMDS lists the interface under network/interfaces/macs/ from now on, as EC2 does.
+            if (containerManager != null) {
+                containerManager.refreshInstanceMetadata(inst);
+            }
             return attachment;
         }
     }
@@ -18498,6 +18502,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 aware.putForAccount(safeAccount, key(region, instanceId), inst);
             } else {
                 instances.put(key(region, instanceId), inst);
+            }
+            if (containerManager != null) {
+                containerManager.refreshInstanceMetadata(inst);
             }
         }
     }
