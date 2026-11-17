@@ -3100,6 +3100,40 @@ class Ec2ServiceTest {
                 .noneMatch(eni -> extra.getNetworkInterfaceId().equals(eni.getNetworkInterfaceId())));
     }
 
+    @Test
+    void attachingPlugsTheInterfaceAsADeviceAndDetachingUnplugsIt() {
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service service = containerModeService(manager);
+        String region = "us-east-1";
+        String subnetId = publicSubnet(service, region, "10.246.0.0/24");
+        String otherSubnet = publicSubnet(service, region, "10.247.0.0/24");
+        Instance instance = runningContainerInstance(service, region, subnetId, null);
+        NetworkInterface extra = service.createNetworkInterface(region, otherSubnet, null, null, List.of(), List.of(),
+                List.of());
+
+        NetworkInterfaceAttachment attachment = service.attachNetworkInterface(
+                region, extra.getNetworkInterfaceId(), instance.getInstanceId(), 1);
+
+        ArgumentCaptor<Instance> holder = ArgumentCaptor.forClass(Instance.class);
+        ArgumentCaptor<InstanceNetworkInterface> device = ArgumentCaptor.forClass(InstanceNetworkInterface.class);
+        verify(manager).plugNetworkInterface(holder.capture(), device.capture());
+        assertEquals(instance.getInstanceId(), holder.getValue().getInstanceId());
+        assertEquals(extra.getNetworkInterfaceId(), device.getValue().getNetworkInterfaceId());
+        assertEquals(1, device.getValue().getDeviceIndex());
+        assertEquals(extra.getVpcId(), device.getValue().getVpcId());
+        assertEquals(extra.getSubnetId(), device.getValue().getSubnetId());
+        assertEquals(extra.getPrivateIpAddress(), device.getValue().getPrivateIpAddress());
+        assertEquals(extra.getMacAddress(), device.getValue().getMacAddress());
+        verify(manager, never()).unplugNetworkInterface(any(), any());
+
+        service.detachNetworkInterface(region, attachment.getAttachmentId(), false);
+
+        verify(manager).unplugNetworkInterface(holder.capture(), device.capture());
+        assertEquals(instance.getInstanceId(), holder.getValue().getInstanceId());
+        assertEquals(extra.getNetworkInterfaceId(), device.getValue().getNetworkInterfaceId());
+        assertEquals(extra.getMacAddress(), device.getValue().getMacAddress());
+    }
+
     private static Ec2Service containerModeService() {
         return containerModeService(mock(Ec2ContainerManager.class));
     }

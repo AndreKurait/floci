@@ -1520,6 +1520,84 @@ public class Ec2ContainerManager {
      * Gracefully stops a running container (30 second timeout then SIGKILL).
      * Updates instance state through stopping → stopped.
      */
+    /**
+     * Puts an interface AttachNetworkInterface attached into the instance's network namespace, as a
+     * hot attach adds a device to a running instance: the interface's MAC and primary private
+     * IPv4 on its own VPC's network (EC2 User Guide, "Attach a network interface to an instance").
+     * The interface stays record-only, as before, wherever this backend cannot give it its own
+     * device with its own security groups; the reason is returned and logged.
+     *
+     * @return empty once plugged, otherwise why the interface is record-only
+     */
+    public Optional<String> plugNetworkInterface(Instance instance, InstanceNetworkInterface eni) {
+        String reason = hotAttachBlocker(instance, eni);
+        if (reason == null) {
+            try {
+                String helper = networkContainerOf(instance);
+                if (vpcNetworkManager.attachInterface(instance.getRegion(), eni.getVpcId(), eni.getSubnetId(),
+                        helper, eni.getPrivateIpAddress(), eni.getMacAddress()).isEmpty()) {
+                    reason = "its address is not on a VPC network Floci created";
+                }
+            } catch (RuntimeException failure) {
+                reason = failure.getMessage();
+            }
+        }
+        if (reason != null) {
+            LOG.infov("Interface {0} attached to EC2 instance {1} is record-only: {2}",
+                    eni.getNetworkInterfaceId(), instance.getInstanceId(), reason);
+        }
+        return Optional.ofNullable(reason);
+    }
+
+    /** Removes the device {@link #plugNetworkInterface} added, when there is one. */
+    public void unplugNetworkInterface(Instance instance, InstanceNetworkInterface eni) {
+        if (hotAttachBlocker(instance, eni) != null) {
+            return;
+        }
+        try {
+            vpcNetworkManager.detachInterface(instance.getRegion(), eni.getVpcId(), networkContainerOf(instance));
+        } catch (RuntimeException failure) {
+            LOG.warnv("Could not unplug interface {0} from EC2 instance {1}: {2}",
+                    eni.getNetworkInterfaceId(), instance.getInstanceId(), failure.getMessage());
+        }
+    }
+
+    /** Null when this backend can give the attached interface its own device; otherwise why not. */
+    String hotAttachBlocker(Instance instance, InstanceNetworkInterface eni) {
+        if (vpcNetworkManager == null || !vpcNetworkManager.enabled()) {
+            return "VPC networks are disabled";
+        }
+        if (instance.getDockerContainerId() == null) {
+            return "the instance has no container";
+        }
+        if (vpcNetworkManager.isolatesAddressSpaces()) {
+            return "isolated VPC address spaces keep one native address space per namespace";
+        }
+        if (firewallManager != null && firewallManager.enabled()) {
+            return "security-group enforcement filters the namespace with the primary interface's groups only";
+        }
+        if (eni.getVpcId() == null || eni.getMacAddress() == null || eni.getPrivateIpAddress() == null) {
+            return "the interface has no VPC, MAC or private address";
+        }
+        if (eni.getVpcId().equals(instance.getVpcId()) || instance.getNetworkInterfaces().stream().anyMatch(other ->
+                other != eni && !Objects.equals(other.getNetworkInterfaceId(), eni.getNetworkInterfaceId())
+                        && eni.getVpcId().equals(other.getVpcId()))) {
+            return "the instance already holds an interface in VPC " + eni.getVpcId()
+                    + ", and Docker gives a namespace one endpoint per network";
+        }
+        return null;
+    }
+
+    /** The container that owns the instance's network namespace: its helper, or the guest itself. */
+    private String networkContainerOf(Instance instance) {
+        String helper = networkHelpers.get(instance.getInstanceId());
+        if (helper != null) {
+            return helper;
+        }
+        String owner = namespaceOwnerId(dockerClient.inspectContainerCmd(instance.getDockerContainerId()).exec());
+        return owner != null ? owner : instance.getDockerContainerId();
+    }
+
     /** Serves the instance's current record from IMDS after its network interfaces change. */
     public void refreshInstanceMetadata(Instance instance) {
         if (metadataServer != null) {

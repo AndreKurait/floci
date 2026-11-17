@@ -1970,8 +1970,8 @@ The `client-token` instance filter selects only matching launches.
 |--------|-------------|
 | CreateNetworkInterface | Creates a standalone elastic network interface (ENI) in a subnet, unattached. |
 | DescribeNetworkInterfaces | Lists network interfaces known to the local EC2 service, both an instance's implicit primary interface and standalone ENIs created via `CreateNetworkInterface`. |
-| AttachNetworkInterface | Attaches an available standalone ENI to a running or stopped instance at a device index. |
-| DetachNetworkInterface | Detaches a standalone ENI by attachment ID, returning it to `available`. |
+| AttachNetworkInterface | Attaches an available standalone ENI to a running or stopped instance at a device index. With VPC networks on, an ENI in a VPC the instance holds no other interface in also becomes a device of the instance's container (hot attach): an endpoint on that VPC's network with the ENI's MAC address and primary private IPv4, which needs Docker Engine 25 or later. The ENI stays record-only, and Floci logs why, when security-group enforcement or isolated VPC address spaces are on, when the instance already holds an interface in that VPC (Docker gives a container one endpoint per network), or in mock mode. |
+| DetachNetworkInterface | Detaches a standalone ENI by attachment ID, returning it to `available`, and removes the device a hot attach added. |
 | DeleteNetworkInterface | Deletes a standalone ENI. Fails while the ENI is still attached, matching AWS. |
 
 A standalone ENI created via `CreateNetworkInterface` can also be handed to `RunInstances` as an instance's primary interface (`NetworkInterface.1.NetworkInterfaceId` / `NetworkInterface.1.DeviceIndex`) instead of letting the instance create its own implicit one, the pattern Terraform's `aws_instance` resource uses for `network_interface { network_interface_id = ... }`. AWS only allows this for a single instance per launch call; `RunInstances` rejects it otherwise with `InvalidParameterCombination`.

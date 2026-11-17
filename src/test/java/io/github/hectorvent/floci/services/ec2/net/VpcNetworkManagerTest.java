@@ -866,6 +866,109 @@ class VpcNetworkManagerTest {
         assertSame(inspectFailure, failure.getCause().getSuppressed()[0]);
     }
 
+    private static final String INTERFACE_MAC = "02:11:22:33:44:55";
+
+    /** The guest namespace's endpoints, before and after the connect, as Docker reports them. */
+    private void endpointsAcrossConnect(Map<String, ContainerNetwork> before, Map<String, ContainerNetwork> after) {
+        InspectContainerResponse first = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
+        when(first.getNetworkSettings().getNetworks()).thenReturn(before);
+        InspectContainerResponse second = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
+        when(second.getNetworkSettings().getNetworks()).thenReturn(after);
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(docker.inspectContainerCmd("helper-1")).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(first, second);
+    }
+
+    private ContainerNetwork endpointWith(String address, String mac) {
+        ContainerNetwork endpoint = observedEndpoint(address);
+        when(endpoint.getMacAddress()).thenReturn(mac);
+        return endpoint;
+    }
+
+    @Test
+    void anAttachedInterfaceIsPluggedWithItsOwnAddressAndMac() {
+        manager.declareVpc(REGION, "vpc-2", "172.31.0.0/16");
+        manager.declareSubnet(REGION, "vpc-2", "subnet-c", "172.31.5.0/24");
+        String address = manager.allocatePrivateIp(REGION, "subnet-c").orElseThrow();
+        String networkName = manager.networkName(REGION, "vpc-2");
+        endpointsAcrossConnect(Map.of(), Map.of(networkName, endpointWith(address, "02:11:22:33:44:55")));
+
+        assertEquals(Optional.of(networkName),
+                manager.attachInterface(REGION, "vpc-2", "subnet-c", "helper-1", address, INTERFACE_MAC));
+
+        ConnectToNetworkCmd connect = docker.connectToNetworkCmd();
+        verify(connect).withContainerId("helper-1");
+        verify(connect).withNetworkId(networkName);
+        ArgumentCaptor<ContainerNetwork> endpoint = ArgumentCaptor.forClass(ContainerNetwork.class);
+        verify(connect).withContainerNetwork(endpoint.capture());
+        JsonNode sent = new ObjectMapper().valueToTree(endpoint.getValue());
+        assertEquals(address, sent.path("IPAMConfig").path("IPv4Address").asText());
+        assertEquals(INTERFACE_MAC, sent.path("MacAddress").asText());
+        assertFalse(sent.has("GwPriority"), "the attached device leaves the namespace's default route alone");
+        verify(docker, never()).disconnectFromNetworkCmd();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"02:42:ac:11:00:09", ""})
+    void anEndpointWithoutTheInterfacesMacIsUnpluggedAndRefused(String observedMac) {
+        manager.declareVpc(REGION, "vpc-2", "172.31.0.0/16");
+        manager.declareSubnet(REGION, "vpc-2", "subnet-c", "172.31.5.0/24");
+        String address = manager.allocatePrivateIp(REGION, "subnet-c").orElseThrow();
+        String networkName = manager.networkName(REGION, "vpc-2");
+        endpointsAcrossConnect(Map.of(), Map.of(networkName,
+                endpointWith(address, observedMac.isEmpty() ? null : observedMac)));
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> manager.attachInterface(REGION, "vpc-2", "subnet-c", "helper-1", address, INTERFACE_MAC));
+
+        assertTrue(failure.getMessage().contains("Docker Engine 25"), failure.getMessage());
+        verify(docker.disconnectFromNetworkCmd()).withContainerId("helper-1");
+        verify(docker.disconnectFromNetworkCmd()).withNetworkId(networkName);
+    }
+
+    @Test
+    void aNamespaceAlreadyOnTheInterfacesVpcNetworkIsNotGivenASecondEndpoint() {
+        manager.declareVpc(REGION, "vpc-2", "172.31.0.0/16");
+        manager.declareSubnet(REGION, "vpc-2", "subnet-c", "172.31.5.0/24");
+        String address = manager.allocatePrivateIp(REGION, "subnet-c").orElseThrow();
+        String networkName = manager.networkName(REGION, "vpc-2");
+        endpointsAcrossConnect(Map.of(networkName, endpointWith("172.31.5.20", "02:aa:aa:aa:aa:aa")), Map.of());
+
+        assertThrows(IllegalStateException.class,
+                () -> manager.attachInterface(REGION, "vpc-2", "subnet-c", "helper-1", address, INTERFACE_MAC));
+        verify(docker.connectToNetworkCmd(), never()).exec();
+    }
+
+    @Test
+    void anInterfaceOffEveryPlannedNetworkOrWithoutAMacIsNotPlugged() {
+        manager.declareVpc(REGION, "vpc-2", "172.31.0.0/16");
+        manager.declareSubnet(REGION, "vpc-2", "subnet-c", "172.31.5.0/24");
+        String address = manager.allocatePrivateIp(REGION, "subnet-c").orElseThrow();
+
+        assertTrue(manager.attachInterface(REGION, "vpc-2", "subnet-c", "helper-1", "192.168.9.9", INTERFACE_MAC)
+                .isEmpty());
+        assertTrue(manager.attachInterface(REGION, "vpc-9", "subnet-9", "helper-1", address, INTERFACE_MAC)
+                .isEmpty());
+        assertTrue(manager.attachInterface(REGION, "vpc-2", "subnet-c", "helper-1", address, null).isEmpty());
+        verify(docker.connectToNetworkCmd(), never()).exec();
+    }
+
+    @Test
+    void unpluggingRemovesOnlyTheInterfacesVpcEndpoint() {
+        manager.declareVpc(REGION, "vpc-2", "172.31.0.0/16");
+        manager.declareSubnet(REGION, "vpc-2", "subnet-c", "172.31.5.0/24");
+        String address = manager.allocatePrivateIp(REGION, "subnet-c").orElseThrow();
+        String networkName = manager.networkName(REGION, "vpc-2");
+        endpointsAcrossConnect(Map.of(), Map.of(networkName, endpointWith(address, INTERFACE_MAC)));
+        manager.attachInterface(REGION, "vpc-2", "subnet-c", "helper-1", address, INTERFACE_MAC);
+
+        manager.detachInterface(REGION, "vpc-2", "helper-1");
+        manager.detachInterface(REGION, "vpc-never-created", "helper-1");
+
+        verify(docker.disconnectFromNetworkCmd(), times(1)).withNetworkId(networkName);
+        verify(docker.disconnectFromNetworkCmd(), times(1)).exec();
+    }
+
     private String prepareUncertainAttach() {
         manager.declareVpc(REGION, "vpc-1", "10.0.0.0/16");
         manager.declareSubnet(REGION, "vpc-1", "subnet-a", "10.0.1.0/24");

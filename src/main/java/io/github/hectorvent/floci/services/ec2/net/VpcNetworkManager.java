@@ -627,6 +627,82 @@ public class VpcNetworkManager {
         }
     }
 
+    /**
+     * Plugs an additional network interface into a running container's namespace, as attaching an
+     * interface to a running instance (hot attach) adds a device to it: an endpoint on the
+     * interface's VPC network at its primary private address, carrying the interface's MAC
+     * address. Docker applies an endpoint MAC from API 1.44 (Engine 25) on; an endpoint that comes
+     * up with any other MAC or address is disconnected again, so the guest never holds a device
+     * its instance metadata does not describe.
+     *
+     * <p>Only the non-isolated backend: a protected namespace holds one native address space.
+     * Docker gives a container one endpoint per network, so the container must not be on this
+     * VPC's network already (an interface in the VPC of an interface it already holds).
+     *
+     * @return the network name once plugged; empty when the address is not on a network this
+     *         manager planned, or the backend cannot plug it
+     */
+    public Optional<String> attachInterface(String region, String vpcId, String subnetId, String containerId,
+                                            String address, String macAddress) {
+        if (!enabled() || isolatesAddressSpaces() || containerId == null || address == null
+                || macAddress == null) {
+            return Optional.empty();
+        }
+        VpcBinding vpc = plannedVpc(region, vpcId);
+        SubnetBinding subnet = subnetBinding(region, subnetId);
+        Optional<Cidr4> parsed = Cidr4.parse(address + "/32");
+        if (vpc == null || vpc.effective == null || subnet == null || subnet.effective == null
+                || parsed.isEmpty() || !subnet.effective.containsAddress(parsed.get().network())) {
+            return Optional.empty();
+        }
+        String networkName = materialise(vpc);
+        if (networkName == null) {
+            return Optional.empty();
+        }
+        Map<String, ContainerNetwork> before = endpoints(containerId);
+        if (before.containsKey(networkName)) {
+            throw new IllegalStateException("Container " + containerId + " already holds an endpoint on VPC network "
+                    + networkName + "; Docker gives a container one endpoint per network");
+        }
+        dockerClient.connectToNetworkCmd()
+                .withContainerId(containerId)
+                .withNetworkId(networkName)
+                .withContainerNetwork(new ContainerNetwork()
+                        .withIpamConfig(new ContainerNetwork.Ipam().withIpv4Address(address))
+                        .withMacAddress(macAddress))
+                .exec();
+        ContainerNetwork endpoint = endpoints(containerId).get(networkName);
+        if (endpoint == null || !address.equals(endpoint.getIpAddress())
+                || !macAddress.equalsIgnoreCase(String.valueOf(endpoint.getMacAddress()))) {
+            disconnect(networkName, containerId);
+            throw new IllegalStateException("Docker did not give container " + containerId + " the interface's "
+                    + "address " + address + " and MAC " + macAddress + " on " + networkName
+                    + " (endpoint MACs need Docker Engine 25 or later)");
+        }
+        LOG.infov("Plugged an attached interface into container {0}: VPC network {1}, {2}, {3}",
+                containerId, networkName, address, macAddress);
+        return Optional.of(networkName);
+    }
+
+    /** Unplugs the endpoint {@link #attachInterface} added; nothing when the container holds none. */
+    public void detachInterface(String region, String vpcId, String containerId) {
+        if (!enabled() || isolatesAddressSpaces() || containerId == null) {
+            return;
+        }
+        VpcBinding vpc = bindings.get(key(region, vpcId));
+        if (vpc == null || !vpc.created) {
+            return;
+        }
+        disconnect(vpc.networkName, containerId);
+    }
+
+    private Map<String, ContainerNetwork> endpoints(String containerId) {
+        InspectContainerResponse inspection = dockerClient.inspectContainerCmd(containerId).exec();
+        Map<String, ContainerNetwork> networks = inspection.getNetworkSettings() == null
+                ? null : inspection.getNetworkSettings().getNetworks();
+        return networks == null ? Map.of() : networks;
+    }
+
     /** Revalidates the account, VPC attachment and actual interface before routing or restoration. */
     public String requireNativePrivateAddress(String region, String vpcId, String subnetId,
                                                String helper, String address) {
