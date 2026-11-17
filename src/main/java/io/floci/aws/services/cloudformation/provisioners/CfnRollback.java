@@ -23,6 +23,9 @@ import java.util.function.BiConsumer;
  */
 public final class CfnRollback {
 
+    /** Mutable key settings retained until the stack update commits or rollback succeeds. */
+    public static final String KMS_KEY_UPDATE_SNAPSHOT_ATTR = "__FlociKmsKeyUpdateSnapshot";
+
     private static final Logger LOG = Logger.getLogger(CfnRollback.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
 

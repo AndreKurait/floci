@@ -45,6 +45,95 @@ class KmsKeyCfnIntegrationTest {
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
+    void sdkFailedLaterResourceRestoresKeySettings(boolean initiallyEnabled) throws Exception {
+        String stack = "kms-update-rollback-" + Long.toString(System.nanoTime(), 36);
+        ObjectMapper mapper = new ObjectMapper();
+        ObjectNode template = mapper.createObjectNode();
+        ObjectNode resources = template.putObject("Resources");
+        ObjectNode key = resources.putObject("Key");
+        key.put("Type", "AWS::KMS::Key");
+        ObjectNode properties = key.putObject("Properties");
+        properties.put("Enabled", initiallyEnabled);
+        properties.put("Description", "before");
+        properties.putObject("KeyPolicy").putArray("Statement");
+        properties.putArray("Tags").addObject().put("Key", "original").put("Value", "before");
+        StaticCredentialsProvider credentials = StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test"));
+        try (CloudFormationClient cfn = CloudFormationClient.builder().endpointOverride(endpoint)
+                .region(Region.US_EAST_1).credentialsProvider(credentials).build();
+                KmsClient kms = KmsClient.builder().endpointOverride(endpoint)
+                        .region(Region.US_EAST_1).credentialsProvider(credentials).build()) {
+            try {
+                cfn.createStack(request -> request.stackName(stack).templateBody(template.toString()));
+                assertEquals("CREATE_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+                String id = cfn.describeStackResource(request -> request.stackName(stack)
+                        .logicalResourceId("Key")).stackResourceDetail().physicalResourceId();
+                String policy = kms.getKeyPolicy(request -> request.keyId(id).policyName("default")).policy();
+                properties.put("Enabled", !initiallyEnabled);
+                properties.put("Description", "after");
+                properties.putObject("KeyPolicy").put("Id", "changed").putArray("Statement");
+                properties.putArray("Tags").addObject().put("Key", "added").put("Value", "after");
+                if (!initiallyEnabled) {
+                    properties.put("EnableKeyRotation", true);
+                }
+                ObjectNode failure = resources.putObject("Failure");
+                failure.put("Type", "AWS::KMS::Alias");
+                failure.put("DependsOn", "Key");
+                failure.putObject("Properties").put("AliasName", "alias/" + stack)
+                        .put("TargetKeyId", "missing-" + stack);
+                cfn.updateStack(request -> request.stackName(stack).templateBody(template.toString()));
+                assertEquals("UPDATE_ROLLBACK_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+                assertEquals(id, cfn.describeStackResource(request -> request.stackName(stack)
+                        .logicalResourceId("Key")).stackResourceDetail().physicalResourceId());
+                assertEquals(initiallyEnabled, kms.describeKey(request -> request.keyId(id)).keyMetadata().enabled());
+                assertEquals("before", kms.describeKey(request -> request.keyId(id)).keyMetadata().description());
+                assertEquals(policy, kms.getKeyPolicy(request -> request.keyId(id).policyName("default")).policy());
+                assertFalse(kms.getKeyRotationStatus(request -> request.keyId(id)).keyRotationEnabled());
+                assertEquals(1, kms.listResourceTags(request -> request.keyId(id)).tags().size());
+                assertEquals("original", kms.listResourceTags(request -> request.keyId(id)).tags().getFirst().tagKey());
+                assertEquals("before", kms.listResourceTags(request -> request.keyId(id)).tags().getFirst().tagValue());
+            } finally {
+                cfn.deleteStack(request -> request.stackName(stack));
+                CfnStackWaits.awaitStackDeleted(stack);
+            }
+        }
+    }
+
+    @Test
+    void sdkFailedRotationRestoresEarlierKeyMutations() {
+        String stack = "kms-partial-rollback-" + Long.toString(System.nanoTime(), 36);
+        ObjectMapper mapper = new ObjectMapper();
+        ObjectNode template = mapper.createObjectNode();
+        ObjectNode key = template.putObject("Resources").putObject("Key");
+        key.put("Type", "AWS::KMS::Key");
+        ObjectNode properties = key.putObject("Properties");
+        properties.put("Description", "before");
+        properties.put("KeySpec", "HMAC_256");
+        properties.put("KeyUsage", "GENERATE_VERIFY_MAC");
+        StaticCredentialsProvider credentials = StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test"));
+        try (CloudFormationClient cfn = CloudFormationClient.builder().endpointOverride(endpoint)
+                .region(Region.US_EAST_1).credentialsProvider(credentials).build();
+                KmsClient kms = KmsClient.builder().endpointOverride(endpoint)
+                        .region(Region.US_EAST_1).credentialsProvider(credentials).build()) {
+            try {
+                cfn.createStack(request -> request.stackName(stack).templateBody(template.toString()));
+                assertEquals("CREATE_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+                String id = cfn.describeStackResource(request -> request.stackName(stack)
+                        .logicalResourceId("Key")).stackResourceDetail().physicalResourceId();
+                properties.put("Description", "after");
+                properties.put("EnableKeyRotation", true);
+                cfn.updateStack(request -> request.stackName(stack).templateBody(template.toString()));
+                assertEquals("UPDATE_ROLLBACK_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+                assertEquals("before", kms.describeKey(request -> request.keyId(id)).keyMetadata().description());
+                assertTrue(kms.describeKey(request -> request.keyId(id)).keyMetadata().enabled());
+            } finally {
+                cfn.deleteStack(request -> request.stackName(stack));
+                CfnStackWaits.awaitStackDeleted(stack);
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
     void sdkPendingDeletionUpdatePreservesPolicyAndTags(boolean includeTags) {
         String stack = "kms-pending-update-" + Long.toString(System.nanoTime(), 36);
         ObjectMapper mapper = new ObjectMapper();
