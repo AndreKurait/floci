@@ -31,20 +31,23 @@ class SidecarStartupCleanupTest {
     void failedStartupRemovalRemainsOwnedForRetry(String kind, boolean release) {
         Fixture fixture = new Fixture(kind);
         RuntimeException removalFailure = new IllegalStateException("daemon refused removal");
-        doThrow(removalFailure).doNothing().when(fixture.remove).exec();
+        // Startup can retry cleanup; keep removal unavailable until the explicit retry below.
+        doThrow(removalFailure).when(fixture.remove).exec();
 
         RuntimeException startup = assertThrows(RuntimeException.class,
                 fixture.start::run);
         assertFalse(fixture.running.getAsBoolean());
-        verify(fixture.remove).exec();
+        verify(fixture.remove, atLeastOnce()).exec();
+        doNothing().when(fixture.remove).exec();
+        clearInvocations(fixture.remove);
         if (release) {
             fixture.release.run();
         } else {
             fixture.stopAll.run();
         }
-        verify(fixture.remove, times(2)).exec();
+        verify(fixture.remove).exec();
         fixture.stopAll.run();
-        verify(fixture.remove, times(2)).exec();
+        verify(fixture.remove).exec();
         assertEquals(1, startup.getSuppressed().length);
         assertSame(removalFailure, startup.getSuppressed()[0].getCause());
         if (!kind.equals("npm-upload")) {
