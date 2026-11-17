@@ -1853,6 +1853,11 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         }
     }
 
+    /** Resolves known policy identity without attachment counts, retaining an unresolved ARN as given. */
+    public String canonicalPolicyArn(String policyArn) {
+        return resolvePolicy(policyArn).map(IamPolicy::getArn).orElse(policyArn);
+    }
+
     public IamPolicy getPolicy(String policyArn) {
         IamPolicy policy = requirePolicy(policyArn);
         if (AwsManagedPolicies.isManagedPolicyArn(policyArn)) {
@@ -2256,7 +2261,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
 
     public void detachUserPolicy(String userName, String policyArn) {
         IamUser user = getUser(userName);
-        String canonicalArn = resolvePolicy(policyArn).map(IamPolicy::getArn).orElse(policyArn);
+        String canonicalArn = canonicalPolicyArn(policyArn);
         if (!user.getAttachedPolicyArns().remove(canonicalArn)) {
             throw new AwsException("NoSuchEntity",
                     "Policy " + policyArn + " is not attached to user " + userName + ".", 404);
@@ -2288,7 +2293,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
 
     public void detachGroupPolicy(String groupName, String policyArn) {
         IamGroup group = getGroup(groupName);
-        String canonicalArn = resolvePolicy(policyArn).map(IamPolicy::getArn).orElse(policyArn);
+        String canonicalArn = canonicalPolicyArn(policyArn);
         if (!group.getAttachedPolicyArns().remove(canonicalArn)) {
             throw new AwsException("NoSuchEntity",
                     "Policy " + policyArn + " is not attached to group " + groupName + ".", 404);
@@ -2324,7 +2329,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         validateRoleName(roleName);
         IamRole role = getRole(roleName);
         requireNotServiceLinked(role, roleName);
-        String canonicalArn = resolvePolicy(policyArn).map(IamPolicy::getArn).orElse(policyArn);
+        String canonicalArn = canonicalPolicyArn(policyArn);
         if (!role.getAttachedPolicyArns().remove(canonicalArn)) {
             throw new AwsException("NoSuchEntity",
                     "Policy " + policyArn + " is not attached to role " + roleName + ".", 404);
