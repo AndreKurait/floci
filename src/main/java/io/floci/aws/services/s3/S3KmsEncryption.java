@@ -113,7 +113,7 @@ public class S3KmsEncryption {
             }
             return arn.accountId();
         }
-        return regions.getAccountId();
+        return callerAccount();
     }
 
     private <T> T withOwner(String account, Supplier<T> operation) {
@@ -128,15 +128,17 @@ public class S3KmsEncryption {
         }
     }
 
-    private void authorize(String keyArn, String action, Map<String, String> encryptionContext, String region) {
+    private String callerAccount() {
         String accessKey = request.getAccessKeyId();
-        String account;
         if (AccountResolver.isAccountId(accessKey)) {
-            account = accessKey;
-        } else {
-            account = accessKey == null ? regions.getAccountId()
-                    : iam.resolveAccountId(accessKey).orElse(regions.getAccountId());
+            return accessKey;
         }
+        return accessKey == null ? regions.getAccountId()
+                : iam.resolveAccountId(accessKey).orElse(regions.getAccountId());
+    }
+
+    private void authorize(String keyArn, String action, Map<String, String> encryptionContext, String region) {
+        String account = callerAccount();
         Map<String, List<String>> context = new HashMap<>();
         context.put("kms:ViaService", List.of("s3." + region + "." + AwsRegions.dnsSuffixFor(region)));
         context.put("kms:CallerAccount", List.of(account));
