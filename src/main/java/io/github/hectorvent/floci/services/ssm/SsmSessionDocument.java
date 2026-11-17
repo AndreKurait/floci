@@ -71,9 +71,34 @@ record SsmSessionDocument(String name, JsonNode content) {
               }
             }
             """;
+    /**
+     * A non-interactive command can ask the agent to deliver stderr and the exit code apart from stdout
+     * (amazon-ssm-agent 3.1.1511.0, "Support separate output stream for non-interactive session"; the
+     * shell properties' {@code separateOutputStream}). The separator prefixes the agent also reads are not
+     * declared: AWS publishes no document that declares them.
+     */
+    private static final String NON_INTERACTIVE_COMMAND = """
+            {
+              "schemaVersion": "1.0",
+              "description": "Run one non-interactive command on a managed node",
+              "sessionType": "NonInteractiveCommands",
+              "parameters": {
+                "command": {"type": "String", "description": "The command to run."},
+                "separateOutputStream": {"type": "String", "default": "false", "allowedValues": ["true", "false"],
+                  "description": "Deliver stderr and the exit code separately from stdout."}
+              },
+              "properties": {
+                "windows": {"commands": "{{ command }}", "runAsElevated": false,
+                  "separateOutputStream": "{{ separateOutputStream }}"},
+                "linux": {"commands": "{{ command }}", "runAsElevated": false,
+                  "separateOutputStream": "{{ separateOutputStream }}"},
+                "macos": {"commands": "{{ command }}", "runAsElevated": false,
+                  "separateOutputStream": "{{ separateOutputStream }}"}
+              }
+            }
+            """;
     private static final Map<String, String> AWS_DOCUMENTS = Map.of(
-            "AWS-StartNonInteractiveCommand", COMMAND.formatted(
-                    "Run one non-interactive command on a managed node", "NonInteractiveCommands"),
+            "AWS-StartNonInteractiveCommand", NON_INTERACTIVE_COMMAND,
             "AWS-StartInteractiveCommand", COMMAND.formatted(
                     "Run one interactive command on a managed node", "InteractiveCommands"),
             "AWS-StartPortForwardingSession", PORT.formatted("", ""),

@@ -244,8 +244,9 @@ documented `prefix-random-suffix` form, where the prefix is the caller's user na
 role session name, federated user name or `root`.
 
 Session documents: a stored `DocumentType` `Session` document of the caller's account,
-or one of the built-in definitions of `AWS-StartNonInteractiveCommand` and
-`AWS-StartInteractiveCommand` (one `String` parameter, `command`),
+or one of the built-in definitions of `AWS-StartNonInteractiveCommand` (`command`, and
+`separateOutputStream`, `true` or `false`, default `false`, passed to the agent's shell properties so it
+delivers stderr and the exit code apart from stdout) and `AWS-StartInteractiveCommand` (`command`),
 `AWS-StartPortForwardingSession` (`portNumber`, default `80`, and `localPortNumber`) and
 `AWS-StartPortForwardingSessionToRemoteHost` (adds `host`). An omitted `DocumentName`
 uses the account's stored `SSM-SessionManagerRunShell`, or the documented defaults

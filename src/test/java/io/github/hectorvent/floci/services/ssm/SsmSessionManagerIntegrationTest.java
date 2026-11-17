@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.testutil.AwsRequestSigner;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
+import io.restassured.path.json.JsonPath;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -27,6 +28,8 @@ import software.amazon.awssdk.services.ssm.model.SessionState;
 import software.amazon.awssdk.services.ssm.model.SsmException;
 import software.amazon.awssdk.services.ssm.model.StartSessionResponse;
 import software.amazon.awssdk.services.ssm.model.TargetNotConnectedException;
+import software.amazon.awssdk.services.sts.StsClient;
+import software.amazon.awssdk.services.sts.model.Credentials;
 
 import java.io.ByteArrayOutputStream;
 import java.net.URI;
@@ -299,6 +302,84 @@ class SsmSessionManagerIntegrationTest {
             ssm.terminateSession(request -> request.sessionId(sessionId));
             assertEquals("Terminated", only(SessionState.HISTORY, sessionId).statusAsString());
         }
+    }
+
+    @Test
+    void aNonInteractiveSessionCanAskTheAgentToSeparateItsOutputStreams() throws Exception {
+        Receiver control = new Receiver();
+        handshake(openControl(control), controlToken());
+        StartSessionResponse started = ssm.startSession(request -> request.target(instance)
+                .documentName("AWS-StartNonInteractiveCommand")
+                .parameters(Map.of("command", List.of("true"), "separateOutputStream", List.of("true"))));
+        JsonNode task = mapper.readTree(mapper.readTree(control.next("interactive_shell").payload())
+                .path("Content").asText());
+        assertEquals(started.sessionId(), task.path("SessionId").asText());
+        assertEquals("true", task.at("/Parameters/separateOutputStream").asText());
+        for (String os : List.of("linux", "windows", "macos")) {
+            assertEquals("{{ separateOutputStream }}",
+                    task.at("/DocumentContent/properties/" + os + "/separateOutputStream").asText(), os);
+        }
+        assertEquals("false", task.at("/DocumentContent/parameters/separateOutputStream/default").asText());
+        SsmException invalid = assertThrows(SsmException.class, () -> ssm.startSession(request -> request
+                .target(instance).documentName("AWS-StartNonInteractiveCommand")
+                .parameters(Map.of("command", List.of("true"), "separateOutputStream", List.of("yes")))));
+        assertEquals("ValidationException", invalid.awsErrorDetails().errorCode());
+    }
+
+    @Test
+    void aPresignedClientStreamAndStderrAndExitCodeFramesRelayUnchanged() throws Exception {
+        Receiver control = new Receiver();
+        handshake(openControl(control), controlToken());
+        StartSessionResponse started = ssm.startSession(request -> request.target(instance)
+                .documentName("AWS-StartNonInteractiveCommand").parameters(Map.of("command", List.of("false"))));
+        control.next("interactive_shell");
+        Receiver agent = new Receiver();
+        attachAgent(started.sessionId(), agent);
+        agent.next("pause_publication");
+        URI base = URI.create(started.streamUrl().substring(0, started.streamUrl().indexOf('?')));
+        try (SignedIamUsers.User user = SignedIamUsers.createUser(endpoint, "ssm-presign-", "open", """
+                {"Statement":{"Effect":"Allow","Action":"ssmmessages:OpenDataChannel","Resource":"*"}}
+                """); StsClient sts = StsClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
+                .credentialsProvider(StaticCredentialsProvider.create(
+                        AwsBasicCredentials.create(user.accessKeyId(), user.secretAccessKey()))).build()) {
+            Credentials session = sts.getSessionToken().credentials();
+            URI presigned = AwsRequestSigner.signedAs(session.accessKeyId(), session.secretAccessKey(), "ssmmessages")
+                    .presignedUri("GET", base, Map.of("role", "publish_subscribe",
+                            "X-Amz-Security-Token", session.sessionToken()), new byte[0]);
+            for (String name : List.of("X-Amz-Algorithm", "X-Amz-Credential", "X-Amz-Date", "X-Amz-Expires",
+                    "X-Amz-SignedHeaders", "X-Amz-Signature", "X-Amz-Security-Token", "role=publish_subscribe")) {
+                assertTrue(presigned.getRawQuery().contains(name), name);
+            }
+            Receiver client = new Receiver();
+            attachClient(presigned.toString(), started.tokenValue(), client);
+            agent.next("start_publication");
+            for (int payloadType : List.of(1, 11, 12)) {
+                byte[] output = withPayloadType(frame("output_stream_data", "payload " + payloadType), payloadType);
+                agent.socket.sendBinary(ByteBuffer.wrap(output), true).get(5, TimeUnit.SECONDS);
+                assertArrayEquals(output, client.nextRaw(), "payload type " + payloadType);
+            }
+        }
+    }
+
+    @Test
+    void theStreamUrlNamesTheRegionalMessagingHostWhenTheRegionalHostWasAddressed() throws Exception {
+        Receiver control = new Receiver();
+        handshake(openControl(control), controlToken());
+        byte[] body = mapper.writeValueAsBytes(Map.of("Target", instance));
+        AwsRequestSigner signer = AwsRequestSigner.signedAs("test", "test", "ssm");
+        Map<String, String> headers = signer.headersFor("POST", URI.create("https://ssm.us-east-1.amazonaws.com/"),
+                Map.of("x-amz-target", "AmazonSSM.StartSession"), body);
+        JsonPath started = given().header("Host", "ssm.us-east-1.amazonaws.com")
+                .headers(headers).header("X-Amz-Target", "AmazonSSM.StartSession")
+                .contentType("application/x-amz-json-1.1").body(body).post(endpoint)
+                .then().statusCode(200).extract().jsonPath();
+        assertEquals("wss://ssmmessages.us-east-1.amazonaws.com/v1/data-channel/" + started.getString("SessionId")
+                + "?role=publish_subscribe", started.getString("StreamUrl"));
+    }
+
+    private static byte[] withPayloadType(byte[] frame, int payloadType) {
+        ByteBuffer.wrap(frame).putInt(SsmAgentMessage.HEADER_LENGTH - 4, payloadType);
+        return frame;
     }
 
     private Session only(SessionState state, String sessionId) {
