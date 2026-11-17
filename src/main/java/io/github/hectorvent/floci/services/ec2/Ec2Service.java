@@ -368,7 +368,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     // a concurrent allocation, which reads persisted resources to see what is taken, cannot pick
     // the same address in between. Taken after imageRegistryLock where a caller holds both.
     private final Object privateIpAllocationLock = new Object();
-    private final Object[] natGatewayLifecycleLocks = newLockStripes();
+    private final StripedLocks natGatewayLifecycleLocks = new StripedLocks(LOCK_STRIPES);
     private final Object amazonProvidedIpv6AllocationLock = new Object();
     /** Host part (1-254) of the last 203.0.113.0/24 address handed out; guarded by the allocation lock. */
     private int documentationHost;
@@ -15063,8 +15063,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
 
     private Object natGatewayLifecycleLock(String region, String natGatewayId) {
-        return natGatewayLifecycleLocks[Math.floorMod(
-                (callerAccountId() + "/" + key(region, natGatewayId)).hashCode(), natGatewayLifecycleLocks.length)];
+        return natGatewayLifecycleLocks.lockFor(callerAccountId() + "/" + key(region, natGatewayId));
     }
 
     private NatGateway completeTokenNatGatewayCreation(String region, NatGateway created, VpcRoutingManager routing) {
