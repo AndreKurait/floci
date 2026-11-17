@@ -11,6 +11,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.ContainerExecStubs;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
+import io.github.hectorvent.floci.core.common.docker.ContainerLiveness;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
@@ -73,6 +74,8 @@ class Ec2LifecycleBackpressureTest {
         when(docker.inspectContainerCmd(container).exec()).thenReturn(guest);
         ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
         when(lifecycle.isContainerRunning(container)).thenAnswer(ignored -> running.get());
+        when(lifecycle.probeContainer(container)).thenAnswer(ignored ->
+                running.get() ? ContainerLiveness.RUNNING : ContainerLiveness.NOT_RUNNING);
         ContainerExecStubs.completeEveryExec(docker, container, 0, "", "");
         CountDownLatch recovered = new CountDownLatch(1);
         StartContainerCmd start = docker.startContainerCmd(container);
