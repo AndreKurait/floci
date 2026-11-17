@@ -50,6 +50,29 @@ class KmsGrantConditionsTest {
     }
 
     @Test
+    void combinedParentConstraintsRetainEquality() {
+        Map<String, Object> parent = Map.of("EncryptionContextEquals", Map.of("Tenant", "A"),
+                "EncryptionContextSubset", Map.of("Tenant", "A"));
+        assertEquals(Decision.DENY, decision(parent, Map.of("EncryptionContextSubset",
+                Map.of("Tenant", "A")), List.of("Decrypt")));
+        assertEquals(Decision.DENY, decision(parent, Map.of("EncryptionContextEquals",
+                Map.of("Tenant", "A", "Purpose", "B")), List.of("Decrypt")));
+        assertEquals(Decision.ALLOW, decision(parent, parent, List.of("Decrypt")));
+        assertEquals(Decision.ALLOW, decision(parent, Map.of("EncryptionContextEquals",
+                Map.of("Tenant", "A")), List.of("Decrypt")));
+    }
+
+    @Test
+    void combinedChildConstraintsUseEqualityKeys() {
+        Map<String, Object> parent = Map.of("EncryptionContextEquals", Map.of("Tenant", "A"));
+        assertEquals(Decision.ALLOW, decision(parent, Map.of("EncryptionContextEquals", Map.of("Tenant", "A"),
+                "EncryptionContextSubset", Map.of("Tenant", "A")), List.of("Decrypt")));
+        assertEquals(Decision.DENY, decision(parent, Map.of("EncryptionContextEquals",
+                Map.of("Tenant", "A", "Purpose", "B"), "EncryptionContextSubset", Map.of("Tenant", "A")),
+                List.of("Decrypt")));
+    }
+
+    @Test
     void emptyEqualityStillRequiresEmptyEquality() {
         Map<String, Object> parent = Map.of("EncryptionContextEquals", Map.of());
         assertEquals(Decision.ALLOW, decision(parent, parent, List.of("Decrypt")));

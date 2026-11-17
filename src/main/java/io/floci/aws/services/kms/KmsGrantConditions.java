@@ -61,7 +61,8 @@ public final class KmsGrantConditions {
             }
         }
         JsonNode constraints = body.path("Constraints");
-        for (String type : List.of("EncryptionContextEquals", "EncryptionContextSubset")) {
+        // Match grant-policy evaluation: equality retains the key limit when both maps exist.
+        for (String type : List.of("EncryptionContextSubset", "EncryptionContextEquals")) {
             JsonNode pairs = constraints.path(type);
             if (pairs.isObject()) {
                 result.put(TYPE, List.of(type));
@@ -90,7 +91,8 @@ public final class KmsGrantConditions {
         conditions.put("Null", Map.of("kms:GrantOperations", "false"));
         Map<String, Object> equalities = new LinkedHashMap<>();
         if (grant.get("Constraints") instanceof Map<?, ?> constraints) {
-            for (String type : List.of("EncryptionContextEquals", "EncryptionContextSubset")) {
+            // Equality must win over subset, as it does for the parent's cryptographic permissions.
+            for (String type : List.of("EncryptionContextSubset", "EncryptionContextEquals")) {
                 if (constraints.get(type) instanceof Map<?, ?> pairs) {
                     equalities.put(TYPE, "EncryptionContextEquals".equals(type) ? List.of(type)
                             : List.of("EncryptionContextEquals", "EncryptionContextSubset"));
