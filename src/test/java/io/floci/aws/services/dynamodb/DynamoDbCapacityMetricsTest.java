@@ -19,6 +19,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -291,7 +292,7 @@ class DynamoDbCapacityMetricsTest {
     }
 
     @Test
-    void aSustainedStorageOutageRetainsOnlyTheDocumentedBoundedRetryQueue() {
+    void aSustainedStorageOutageCoalescesRepeatedSamplesWithoutLosingConsumption() {
         store.failEveryWrite = true;
         for (int i = 0; i < 4097; i++) {
             publisher.record(usage(0, 1, Map.of(), Map.of(), clock.instant()));
@@ -299,7 +300,43 @@ class DynamoDbCapacityMetricsTest {
         assertTrue(store.keys().isEmpty());
         store.failEveryWrite = false;
         publisher.tick();
-        assertPoint(WRITE, null, 120, 4096, 4096);
+        assertPoint(WRITE, null, 120, 4097, 4097);
+        assertEquals(1, store.keys().size());
+    }
+
+    @Test
+    void repeatedConsumptionRetainsTheExactWeightedDistribution() {
+        for (int i = 0; i < 10_000; i++) {
+            publisher.record(usage(0, i % 2 == 0 ? 1 : 3, Map.of(), Map.of(), clock.instant()));
+        }
+        assertPoint(WRITE, null, 120, 20_000, 10_000);
+        assertEquals(2, store.keys().size(), "one stored record per distinct value, not per request");
+        Map<Double, List<Double>> distribution = new HashMap<>();
+        for (String key : store.keys()) {
+            MetricDatum sample = store.get(key).orElseThrow();
+            assertEquals(sample.getValue(), sample.getMinimum());
+            assertEquals(sample.getValue(), sample.getMaximum());
+            distribution.put(sample.getValue(), List.of(sample.getSampleCount(), sample.getSum()));
+        }
+        assertEquals(Map.of(1.0, List.of(5000.0, 5000.0), 3.0, List.of(5000.0, 15000.0)), distribution);
+        clock.advance(Duration.ofSeconds(60));
+        publisher.record(usage(0, 1, Map.of(), Map.of(), clock.instant()));
+        assertPoint(WRITE, null, 180, 1, 1);
+        assertEquals(3, store.keys().size());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void ambiguousFailedSnapshotCannotOverwriteNewerCumulativeCount(boolean after) {
+        publisher.record(usage(0, 7, Map.of(), Map.of(), clock.instant()));
+        store.after = after;
+        store.failValue = 7;
+        store.armed.set(true);
+        publisher.record(usage(0, 7, Map.of(), Map.of(), clock.instant()));
+        publisher.record(usage(0, 7, Map.of(), Map.of(), clock.instant()));
+        publisher.tick();
+        assertPoint(WRITE, null, 120, 21, 3);
+        assertEquals(1, store.keys().size());
     }
 
     private static List<DynamoDbService.CapacitySnapshot> snapshots(boolean provisioned, String id, long reads) {
