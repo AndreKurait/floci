@@ -2,7 +2,9 @@ package io.github.hectorvent.floci.services.codedeploy;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.exception.NotFoundException;
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.docker.ContainerExec;
+import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.services.ec2.AmiImageResolver;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.ResolvedAmiImage;
@@ -106,6 +108,7 @@ abstract class CodeDeployAgentDockerFixture {
     }
 
     @Inject DockerClient docker;
+    @Inject EmulatorConfig config;
     @Inject Ec2Service instances;
     @InjectMock AmiImageResolver images;
     @TestHTTPResource URI endpoint;
@@ -246,7 +249,13 @@ abstract class CodeDeployAgentDockerFixture {
         assertTrue(guestRole.contains(":role/"));
 
         String vpc = ec2.createVpc(request -> request.cidrBlock("10.94.0.0/16")).vpc().vpcId();
-        cleanup.addFirst(() -> ec2.deleteVpc(request -> request.vpcId(vpc)));
+        cleanup.addFirst(() -> {
+            ec2.deleteVpc(request -> request.vpcId(vpc));
+            await("CodeDeploy VPC network removal").atMost(Duration.ofSeconds(30)).until(() ->
+                    docker.listNetworksCmd().withFilter("label", List.of(
+                            ContainerStorageHelper.OWNER_LABEL + "=" + ContainerStorageHelper.ownerIdentity(config),
+                            ContainerStorageHelper.RESOURCE_ID_LABEL + "=" + vpc)).exec().isEmpty());
+        });
         String subnet = ec2.createSubnet(request -> request.vpcId(vpc).cidrBlock("10.94.1.0/24")
                 .availabilityZone("us-east-1a")).subnet().subnetId();
         cleanup.addFirst(() -> ec2.deleteSubnet(request -> request.subnetId(subnet)));
