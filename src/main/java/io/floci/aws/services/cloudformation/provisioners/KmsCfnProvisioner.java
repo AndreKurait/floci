@@ -56,6 +56,9 @@ public class KmsCfnProvisioner implements CfnResourceProvisioner {
         KmsKey key;
         if (ctx.isUpdate() && !CfnResourceDispatcher.isStub(ctx.priorPhysicalId(), r.getAttributes())) {
             key = kmsService.describeKey(ctx.priorPhysicalId(), ctx.region());
+            if ("PendingDeletion".equals(key.getKeyState())) {
+                throw new AwsException("KMSInvalidStateException", key.getArn() + " is pending deletion.", 400);
+            }
             // KMS rejects immutable property changes, even with UpdateReplacePolicy: Retain.
             // Validate before any mutable property is applied or key material is created.
             if (!key.getKeySpec().name().equals(spec) || !key.getKeyUsage().name().equals(usage)

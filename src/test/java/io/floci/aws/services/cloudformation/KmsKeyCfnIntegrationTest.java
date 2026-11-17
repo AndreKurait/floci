@@ -7,6 +7,8 @@ import io.floci.aws.testing.CfnStackWaits;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.core.SdkBytes;
@@ -39,6 +41,55 @@ class KmsKeyCfnIntegrationTest {
                   }}
                 }}
                 """.formatted(description);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void sdkPendingDeletionUpdatePreservesPolicyAndTags(boolean includeTags) {
+        String stack = "kms-pending-update-" + Long.toString(System.nanoTime(), 36);
+        ObjectMapper mapper = new ObjectMapper();
+        ObjectNode template = mapper.createObjectNode();
+        ObjectNode key = template.putObject("Resources").putObject("Key");
+        key.put("Type", "AWS::KMS::Key");
+        ObjectNode properties = key.putObject("Properties");
+        String originalPolicy = "{\"Version\":\"2012-10-17\",\"Statement\":[],\"Id\":\"original\"}";
+        properties.put("KeyPolicy", originalPolicy);
+        if (includeTags) {
+            properties.putArray("Tags").addObject().put("Key", "state").put("Value", "original");
+        }
+        StaticCredentialsProvider credentials = StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test"));
+        try (CloudFormationClient cfn = CloudFormationClient.builder().endpointOverride(endpoint)
+                .region(Region.US_EAST_1).credentialsProvider(credentials).build();
+                KmsClient kms = KmsClient.builder().endpointOverride(endpoint)
+                        .region(Region.US_EAST_1).credentialsProvider(credentials).build()) {
+            try {
+                cfn.createStack(request -> request.stackName(stack).templateBody(template.toString()));
+                assertEquals("CREATE_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+                String id = cfn.describeStackResource(request -> request.stackName(stack)
+                        .logicalResourceId("Key")).stackResourceDetail().physicalResourceId();
+                kms.scheduleKeyDeletion(request -> request.keyId(id).pendingWindowInDays(7));
+                properties.put("KeyPolicy", originalPolicy.replace("original", "updated"));
+                if (includeTags) {
+                    properties.putArray("Tags").addObject().put("Key", "state").put("Value", "updated");
+                }
+                cfn.updateStack(request -> request.stackName(stack).templateBody(template.toString()));
+                assertEquals("UPDATE_ROLLBACK_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+                assertEquals(originalPolicy, kms.getKeyPolicy(request -> request.keyId(id).policyName("default")).policy());
+                assertEquals("PendingDeletion", kms.describeKey(request -> request.keyId(id))
+                        .keyMetadata().keyStateAsString());
+                assertEquals(id, cfn.describeStackResource(request -> request.stackName(stack)
+                        .logicalResourceId("Key")).stackResourceDetail().physicalResourceId());
+                if (includeTags) {
+                    assertEquals("original", kms.listResourceTags(request -> request.keyId(id))
+                            .tags().getFirst().tagValue());
+                } else {
+                    assertTrue(kms.listResourceTags(request -> request.keyId(id)).tags().isEmpty());
+                }
+            } finally {
+                cfn.deleteStack(request -> request.stackName(stack));
+                CfnStackWaits.awaitStackDeleted(stack);
+            }
+        }
     }
 
     @Test
