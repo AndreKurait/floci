@@ -3,6 +3,8 @@ package io.github.hectorvent.floci.core.common.dns;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.LocalStackParity;
 import io.github.hectorvent.floci.config.TlsConfigSource;
+import io.github.hectorvent.floci.core.common.AwsEndpoints;
+import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.DomainNames;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
@@ -100,6 +102,9 @@ public class EmbeddedDnsServer {
     private static final int FORWARD_POOL_SIZE = 8;
     public static final String DEFAULT_SUFFIX = "localhost.floci.io";
     public static final String LOCALSTACK_SUFFIX = "localhost.localstack.cloud";
+    private static final Pattern EC2_PUBLIC_DNS_NAME =
+            Pattern.compile("^ec2-(\\d{1,3})-(\\d{1,3})-(\\d{1,3})-(\\d{1,3})\\.(?:compute-1|((?:[a-z0-9]+-)+\\d+)\\.compute)\\.[a-z0-9.-]+$",
+                    Pattern.CASE_INSENSITIVE);
     private static final Pattern EC2_PRIVATE_DNS_NAME =
             Pattern.compile("^ip-(\\d{1,3})-(\\d{1,3})-(\\d{1,3})-(\\d{1,3})\\.(?:ec2|((?:[a-z0-9]+-)+\\d+)\\.compute)\\.internal$",
                     Pattern.CASE_INSENSITIVE);
@@ -389,9 +394,14 @@ public class EmbeddedDnsServer {
     /**
      * The address this server answers for a name it spoofs, as a client in {@code origin} receives it
      * (the routed public AWS API address for a VPC client when that routing is on), or empty when the
-     * server does not own the name or does not know its own address.
+     * server does not own the name or does not know its own address. An EC2 public DNS name answers
+     * with the address it carries.
      */
     public Optional<String> emulatorAddress(String name, DnsClientVpcSource.ClientVpc origin) {
+        Optional<String> publicInstance = resolveEc2PublicDnsName(name);
+        if (publicInstance.isPresent()) {
+            return publicInstance;
+        }
         if (!matchesSuffix(name)) {
             return Optional.empty();
         }
@@ -648,6 +658,12 @@ public class EmbeddedDnsServer {
     }
 
     private Optional<DnsAnswer> resolveEmulatorName(String name, String myIp, int type) {
+        // An instance's public DNS name answers with its own address, ahead of any spoofed AWS suffix.
+        Optional<String> publicInstance = resolveEc2PublicDnsName(name);
+        if (publicInstance.isPresent()) {
+            return Optional.of(type == 1 ? DnsAnswer.records(List.of(publicInstance.orElseThrow()),
+                    DnsAnswer.DEFAULT_TTL_SECONDS) : DnsAnswer.noData());
+        }
         if (matchesSuffix(name)) {
             return Optional.of(type == 1 ? DnsAnswer.records(List.of(myIp), DnsAnswer.DEFAULT_TTL_SECONDS)
                     : DnsAnswer.noData());
@@ -795,11 +811,33 @@ public class EmbeddedDnsServer {
         return response.array();
     }
 
+    /**
+     * The address in an EC2 public DNS name exactly as {@link AwsEndpoints#ec2PublicDns} forms it
+     * ({@code ec2-a-b-c-d.compute-1.amazonaws.com} in us-east-1), as {@code a.b.c.d}.
+     */
+    Optional<String> resolveEc2PublicDnsName(String name) {
+        Matcher matcher = name == null ? null : EC2_PUBLIC_DNS_NAME.matcher(name);
+        if (matcher == null || !matcher.matches()) {
+            return Optional.empty();
+        }
+        String region = matcher.group(5) == null ? "us-east-1" : matcher.group(5); // partition-literal: compute-1 is us-east-1's zone
+        // Only the vendored region catalog owns these names; new regions require a catalog update.
+        if (!AwsRegions.isRegionId(region)) {
+            return Optional.empty();
+        }
+        return addressOf(EC2_PUBLIC_DNS_NAME, name)
+                .filter(address -> AwsEndpoints.ec2PublicDns(address, region).equalsIgnoreCase(name));
+    }
+
     Optional<String> resolveEc2PrivateDnsName(String name) {
+        return addressOf(EC2_PRIVATE_DNS_NAME, name);
+    }
+
+    private static Optional<String> addressOf(Pattern pattern, String name) {
         if (name == null || name.isEmpty()) {
             return Optional.empty();
         }
-        Matcher matcher = EC2_PRIVATE_DNS_NAME.matcher(name);
+        Matcher matcher = pattern.matcher(name);
         if (!matcher.matches()) {
             return Optional.empty();
         }

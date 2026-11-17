@@ -1936,15 +1936,40 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         ingressSelf.getUserIdGroupPairs().add(self);
         defaultSg.getIpPermissions().add(ingressSelf);
 
-        // Default egress: all traffic
-        IpPermission egressAll = new IpPermission();
-        egressAll.setIpProtocol("-1");
-        egressAll.getIpRanges().add(new IpRange("0.0.0.0/0"));
+        IpPermission egressAll = defaultEgress(vpcs.get(key(region, vpcId)).orElse(null));
         defaultSg.getIpPermissionsEgress().add(egressAll);
         securityGroups.put(key(region, securityGroupId), defaultSg);
         // DescribeSecurityGroupRules must expose the same default permissions.
         createRules(region, securityGroupId, ingressSelf, false);
         createRules(region, securityGroupId, egressAll, true);
+    }
+
+    /**
+     * A new group's outbound rule: all IPv4 traffic and, when its VPC has an IPv6 block, all IPv6 traffic. AWS adds the
+     * IPv6 half "only if your VPC has an associated IPv6 CIDR block" (VPC User Guide, default security groups).
+     */
+    private static IpPermission defaultEgress(Vpc vpc) {
+        IpPermission egressAll = new IpPermission();
+        egressAll.setIpProtocol("-1");
+        egressAll.getIpRanges().add(new IpRange("0.0.0.0/0"));
+        if (vpc != null && vpc.getIpv6CidrBlockAssociationSet() != null && !vpc.getIpv6CidrBlockAssociationSet().isEmpty()) {
+            egressAll.getIpv6Ranges().add(new Ipv6Range("::/0"));
+        }
+        return egressAll;
+    }
+
+    /** Only the IPv4 half of the original outbound rule: a group whose outbound rules were never changed. */
+    private static boolean hasOnlyOriginalIpv4Egress(SecurityGroup group) {
+        List<IpPermission> egress = group.getIpPermissionsEgress();
+        if (egress == null || egress.size() != 1) {
+            return false;
+        }
+        IpPermission only = egress.get(0);
+        return "-1".equals(only.getIpProtocol()) && only.getIpRanges().size() == 1
+                && "0.0.0.0/0".equals(only.getIpRanges().get(0).getCidrIp())
+                && (only.getIpv6Ranges() == null || only.getIpv6Ranges().isEmpty())
+                && (only.getUserIdGroupPairs() == null || only.getUserIdGroupPairs().isEmpty())
+                && (only.getPrefixListIds() == null || only.getPrefixListIds().isEmpty());
     }
 
     private String createMainRouteTable(String region, Vpc vpc, String routeTableId, String associationId) {
@@ -4707,6 +4732,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
                             Instance inst = new Instance();
                             inst.setInstanceId(instanceId);
+                            inst.setRegion(region);
                             inst.setOwnerId(callerAccountId());
                             inst.setImageId(imageId);
                             inst.setLaunchableImageId(launchableImageId);
@@ -4744,7 +4770,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             inst.setAmiLaunchIndex(i);
                             inst.setClientToken(clientToken);
                             inst.setReplayProtected(attempt != null);
-                            inst.setRegion(region);
                             inst.setUserData(userData);
                             inst.setEncodedUserData(encodedUserData);
                             inst.setIamInstanceProfileArn(iamInstanceProfileArn);
@@ -5812,7 +5837,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     private static void setPublicAddress(Instance instance, String publicIp) {
         instance.setPublicIpAddress(publicIp);
-        instance.setPublicDnsName("127.0.0.1".equals(publicIp) ? "localhost" : publicIp);
+        instance.setPublicDnsName(Ec2ContainerManager.publicDnsName(publicIp, instance.getRegion()));
     }
 
     private static void clearPublicAddress(Instance instance) {
@@ -7826,17 +7851,33 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      */
     public VpcIpv6CidrBlockAssociation associateAmazonProvidedIpv6CidrBlock(String region, String vpcId) {
         ensureDefaultResources(region);
+        VpcIpv6CidrBlockAssociation assoc;
+        boolean first;
         synchronized (attachmentTopologyLock(region)) {
             synchronized (lockFor(key(region, vpcId))) {
                 Vpc vpc = getRequiredVpc(region, vpcId);
                 synchronized (amazonProvidedIpv6AllocationLock) {
-                    VpcIpv6CidrBlockAssociation assoc = amazonProvidedIpv6Association(region);
+                    first = vpc.getIpv6CidrBlockAssociationSet().isEmpty();
+                    assoc = amazonProvidedIpv6Association(region);
                     vpc.getIpv6CidrBlockAssociationSet().add(assoc);
                     vpcs.put(key(region, vpcId), vpc);
-                    return assoc;
                 }
             }
         }
+        if (first) {
+            // "When you associate an IPv6 CIDR block with your VPC, we automatically add an outbound rule to the
+            // security groups for the VPC that allows all IPv6 traffic. However, if you modified the original outbound
+            // rules for your security group, this rule is not automatically added." (VPC User Guide)
+            for (SecurityGroup group : securityGroups.scan(k -> true)) {
+                if (region.equals(group.getRegion()) && vpcId.equals(group.getVpcId()) && hasOnlyOriginalIpv4Egress(group)) {
+                    IpPermission ipv6All = new IpPermission();
+                    ipv6All.setIpProtocol("-1");
+                    ipv6All.getIpv6Ranges().add(new Ipv6Range("::/0"));
+                    authorizeSecurityGroupEgress(region, group.getGroupId(), List.of(ipv6All));
+                }
+            }
+        }
+        return assoc;
     }
 
     /**
@@ -8934,7 +8975,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     public SecurityGroup createSecurityGroup(String region, String groupName, String description, String vpcId) {
-        vpcId = requireSecurityGroupVpc(region, vpcId).getVpcId();
+        Vpc groupVpc = requireSecurityGroupVpc(region, vpcId);
+        vpcId = groupVpc.getVpcId();
         String sgId = "sg-" + randomHex(17);
         SecurityGroup sg = new SecurityGroup();
         sg.setGroupId(sgId);
@@ -8943,10 +8985,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         sg.setVpcId(vpcId);
         sg.setOwnerId(callerAccountId());
         sg.setRegion(region);
-        // Default egress all
-        IpPermission egressAll = new IpPermission();
-        egressAll.setIpProtocol("-1");
-        egressAll.getIpRanges().add(new IpRange("0.0.0.0/0"));
+        IpPermission egressAll = defaultEgress(groupVpc);
         sg.getIpPermissionsEgress().add(egressAll);
         synchronized (attachmentTopologyLock(region)) {
             getRequiredVpc(region, sg.getVpcId());
@@ -16070,7 +16109,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             addr.setPublicIp(reachable);
             // An EIP association gives the instance a public address even in a subnet that does
             // not map one on launch, exactly as on AWS. An unchanged address is not written again.
-            String dnsName = "127.0.0.1".equals(reachable) ? "localhost" : reachable;
+            String dnsName = Ec2ContainerManager.publicDnsName(reachable, region);
             String state = inst.getState() == null ? null : inst.getState().getName();
             boolean ended = "terminated".equals(state) || "shutting-down".equals(state);
             if (secondary == null && !ended && (!reachable.equals(inst.getPublicIpAddress())

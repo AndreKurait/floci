@@ -11,6 +11,7 @@ import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.Mount;
 import com.github.dockerjava.api.model.MountType;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.AwsEndpoints;
 import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestScopes;
@@ -860,7 +861,11 @@ public class Ec2ContainerManager {
         }
         boolean customResolver = options.mounts().stream().anyMatch(mount ->
                 "/etc".equals(mount.getTarget()) || "/etc/resolv.conf".equals(mount.getTarget()));
-        String serviceEndpoint = customResolver ? reachableEndpoint.baseUrl(false) : reachableEndpoint.baseUrl();
+        // With guest-tls-endpoint the guest reaches Floci over https, so its requests carry aws:SecureTransport
+        // true, as an instance's requests to AWS do; baseUrlWithTls stays http while Floci's TLS is off.
+        String serviceEndpoint = config.services().ec2().guestTlsEndpoint()
+                ? reachableEndpoint.baseUrlWithTls(!customResolver)
+                : (customResolver ? reachableEndpoint.baseUrl(false) : reachableEndpoint.baseUrl());
 
         return portAllocator.allocateAndStart(
                 config.services().ec2().sshPortRangeStart(),
@@ -2097,10 +2102,8 @@ public class Ec2ContainerManager {
     }
 
     /**
-     * Publishes {@link #reachablePublicAddress} as the instance's public IP and DNS name.
-     * The DNS name is set to the same literal rather than an AWS-shaped
-     * {@code ec2-…​.compute-1.amazonaws.com} hostname, because that hostname resolves nowhere
-     * and callers that prefer PublicDnsName over PublicIpAddress would be handed a dead name.
+     * Publishes {@link #reachablePublicAddress} as the instance's public IP and DNS name. The DNS name has AWS's
+     * form ({@link #publicDnsName}); Floci's DNS answers it with the same address.
      *
      * @return the published address, or null when none is reachable
      */
@@ -2110,9 +2113,20 @@ public class Ec2ContainerManager {
             return null;
         }
         instance.setPublicIpAddress(publicAddress);
-        instance.setPublicDnsName("127.0.0.1".equals(publicAddress) ? "localhost" : publicAddress);
+        instance.setPublicDnsName(publicDnsName(publicAddress, instance.getRegion()));
         refreshPublicRouting(instance, publicAddress);
         return publicAddress;
+    }
+
+    /**
+     * The public DNS name for {@code publicIp}: AWS's {@code ec2-a-b-c-d...} name, which Floci's DNS resolves back to
+     * the address, or {@code localhost} for the loopback address a host-local Floci publishes; null without an address.
+     */
+    static String publicDnsName(String publicIp, String region) {
+        if (publicIp == null) {
+            return null;
+        }
+        return "127.0.0.1".equals(publicIp) ? "localhost" : AwsEndpoints.ec2PublicDns(publicIp, region);
     }
 
     void refreshPublicRouting(Instance instance) {

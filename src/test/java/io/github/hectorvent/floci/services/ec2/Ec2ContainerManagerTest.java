@@ -1387,12 +1387,13 @@ class Ec2ContainerManagerTest {
         Ec2ContainerManager manager = managerWithReachability(reachability);
 
         Instance instance = new Instance();
+        instance.setRegion("us-east-1");
         instance.setContainerBridgeIp("192.168.215.2");
 
         assertEquals("192.168.215.2", manager.reachablePublicAddress(instance));
         manager.exposeReachablePublicAddress(instance);
         assertEquals("192.168.215.2", instance.getPublicIpAddress());
-        assertEquals("192.168.215.2", instance.getPublicDnsName());
+        assertEquals("ec2-192-168-215-2.compute-1.amazonaws.com", instance.getPublicDnsName());
     }
 
     @Test
@@ -1402,6 +1403,7 @@ class Ec2ContainerManagerTest {
         when(reachability.isContainerIpRoutable("172.17.0.4")).thenReturn(true);
         Ec2ContainerManager manager = managerWithReachability(reachability);
         Instance instance = new Instance();
+        instance.setRegion("eu-west-1");
         instance.setPrivateIpAddress("10.0.1.10");
         instance.setContainerBridgeIp("10.0.1.10");
         instance.setImdsSourceIp("172.17.0.4");
@@ -1410,7 +1412,7 @@ class Ec2ContainerManagerTest {
         manager.exposeReachablePublicAddress(instance);
 
         assertEquals("172.17.0.4", instance.getPublicIpAddress());
-        assertEquals("172.17.0.4", instance.getPublicDnsName());
+        assertEquals("ec2-172-17-0-4.eu-west-1.compute.amazonaws.com", instance.getPublicDnsName());
         assertEquals("10.0.1.10", instance.getPrivateIpAddress());
     }
 
@@ -4419,6 +4421,24 @@ class Ec2ContainerManagerTest {
         assertNull(spec.cmd());
     }
 
+    @ParameterizedTest
+    @CsvSource({
+            "/etc/resolv.conf,https://172.30.0.2:4680",
+            "/etc/guest-ca.pem,https://localhost.floci.io:4680"
+    })
+    void guestTlsEndpointGivesGuestsFlociHttpsEndpoint(String target, String endpoint) throws Exception {
+        ContainerSpec spec = launchConfiguredGuest(new ResolvedAmiImage(
+                "example/guest:1", ResolvedAmiImage.IMAGE_RUNTIME, false, "linux/arm64"), Map.of(
+                "FLOCI_SERVICES_EC2_GUEST_TLS_ENDPOINT", "true",
+                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__SOURCE", "/host/input",
+                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__TARGET", target), false, true, false);
+
+        // The guest's requests then carry aws:SecureTransport true, so a bucket policy that denies insecure
+        // transport (aws:SecureTransport false) admits a guest's reads.
+        assertTrue(spec.env().contains("AWS_ENDPOINT_URL=" + endpoint));
+        assertEquals(1, spec.env().stream().filter(value -> value.startsWith("AWS_ENDPOINT_URL=")).count());
+    }
+
     @Test
     void configuredGuestOptionsPreserveInstanceProfileAndProtectedNamespace() throws Exception {
         ContainerSpec spec = launchConfiguredGuest(ResolvedAmiImage.minimal("ubuntu:24.04"), Map.of(
@@ -4688,6 +4708,8 @@ class Ec2ContainerManagerTest {
         ContainerReachableEndpoint reachableEndpoint = mock(ContainerReachableEndpoint.class);
         when(reachableEndpoint.baseUrl()).thenReturn("http://localhost.floci.io:4680");
         when(reachableEndpoint.baseUrl(false)).thenReturn("http://172.30.0.2:4680");
+        lenient().when(reachableEndpoint.baseUrlWithTls(true)).thenReturn("https://localhost.floci.io:4680");
+        lenient().when(reachableEndpoint.baseUrlWithTls(false)).thenReturn("https://172.30.0.2:4680");
         PortAllocator portAllocator = mock(PortAllocator.class);
         when(portAllocator.allocate(anyInt(), anyInt())).thenReturn(2201);
         when(portAllocator.allocateAndStart(anyInt(), anyInt(), any())).thenCallRealMethod();
