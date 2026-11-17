@@ -1319,11 +1319,12 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     void populateCodeVolume(String volName, LambdaFunction fn, String image) {
         lifecycleManager.ensureVolume(volName);
         String shortId = UUID.randomUUID().toString().replace("-", "").substring(0, 8);
+        String helperName = ContainerStorageHelper.prefixedDockerName(config, resolveContainerNamePrefix(config),
+                "codevol-" + fn.getFunctionName() + "-" + shortId);
         // A minimal helper container (sleep) with the volume mounted read-write at /var/task; we
         // tar-copy the code into it, then discard it — the data persists in the volume.
         ContainerBuilder.Builder helperBuilder = containerBuilder.newContainer(image)
-                .withName(ContainerStorageHelper.prefixedDockerName(config, resolveContainerNamePrefix(config),
-                        "codevol-" + fn.getFunctionName() + "-" + shortId))
+                .withName(helperName)
                 .withEnv(List.of())
                 .withEntrypoint(List.of("sleep"))
                 .withCmd(List.of("3600"))
@@ -1345,6 +1346,16 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                     lifecycleManager.stopAndRemove(helperId, null, 0);
                 } catch (Exception e) {
                     LOG.warnv("Could not remove code-volume helper {0}: {1}", helperId, e.getMessage());
+                }
+            } else {
+                // A create that threw may still have made the helper: the daemon can accept it while
+                // its response is lost. Left behind, it outlives this run and makes every later
+                // shutdown keep the Floci parent for cleanup. The name is unique to this call.
+                try {
+                    lifecycleManager.removeIfExistsStrict(helperName);
+                } catch (Exception e) {
+                    LOG.warnv("Could not remove code-volume helper {0} after its create failed: {1}",
+                            helperName, e.getMessage());
                 }
             }
             populateSemaphore.release();

@@ -2332,6 +2332,36 @@ class ContainerLauncherTest {
                 .resolve(ContainerLauncher.codeVolumeName(fn))));
     }
 
+    /**
+     * Under a daemon stall the helper's create can be accepted while its response is lost, so
+     * create() throws while the helper exists. populateCodeVolume removed a helper only
+     * when create() returned an id, so the helper stayed in Created state, and every later shutdown
+     * then kept the Floci parent for cleanup. The helper's name is unique to this populate, so a
+     * create that throws must still remove that name.
+     */
+    @Test
+    void launchFunction_helperCreateThatThrowsStillRemovesTheHelperByName() throws Exception {
+        Path codePath = Files.createDirectory(tempDir.resolve("helper-create-failure"));
+        Files.write(codePath.resolve("bundle.bin"), new byte[8 * 1024]);
+        LambdaFunction fn = new LambdaFunction();
+        fn.setFunctionName("helper-create-failure");
+        fn.setRuntime("nodejs20.x");
+        fn.setHandler("index.handler");
+        fn.setCodeLocalPath(codePath.toString());
+        fn.setCodeSha256("helper-create-failure-sha");
+        when(lifecycleManager.create(any())).thenThrow(new ConflictException(
+                "The container name is already in use by its own lost-response create"));
+
+        withLoweredCodeVolumeThreshold(() -> assertThrows(RuntimeException.class, () -> launcher.launch(fn)));
+
+        ArgumentCaptor<ContainerSpec> helper = ArgumentCaptor.forClass(ContainerSpec.class);
+        verify(lifecycleManager).create(helper.capture());
+        assertTrue(helper.getValue().name().contains("codevol-helper-create-failure-"), helper.getValue().name());
+        verify(lifecycleManager).removeIfExistsStrict(helper.getValue().name());
+        verify(lifecycleManager, never()).startCreated(any(), any());
+        verify(runtimeApiServerFactory).release(runtimeApiServer);
+    }
+
     @Test
     void launchFunction_releasesRuntimeApiServer_whenCodeVolumePopulateFails() throws Exception {
         // Regression for the runtime-api port leak: the volume path allocates a runtime-api server
