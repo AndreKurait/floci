@@ -129,6 +129,8 @@ class EmbeddedDnsServerTest {
                 "ec2-172-16-5-5.eu-west-1.compute.amazonaws.com").orElseThrow());
         assertEquals("54.222.0.9", dns.resolveEc2PublicDnsName(
                 "ec2-54-222-0-9.cn-north-1.compute.amazonaws.com.cn").orElseThrow());
+        assertEquals("54.222.0.9", dns.resolveEc2PublicDnsName(
+                "EC2-54-222-0-9.CN-NORTH-1.COMPUTE.AMAZONAWS.COM.CN").orElseThrow());
         assertEquals("10.42.32.17", dns.resolveEc2PublicDnsName(
                 "EC2-10-42-32-17.COMPUTE-1.AMAZONAWS.COM").orElseThrow());
     }
@@ -139,6 +141,8 @@ class EmbeddedDnsServerTest {
         assertTrue(dns.resolveEc2PublicDnsName("ec2-172-16-5-5.eu-west-1.compute.amazonaws.com.cn").isEmpty());
         assertTrue(dns.resolveEc2PublicDnsName("ec2-172-16-5-5.cn-north-1.compute.amazonaws.com").isEmpty());
         assertTrue(dns.resolveEc2PublicDnsName("ec2-172-16-5-5.invalid.compute.amazonaws.com").isEmpty());
+        assertTrue(dns.resolveEc2PublicDnsName("ec2-172-16-5-5.my-cd-1.compute.amazonaws.com").isEmpty());
+        assertTrue(dns.resolveEc2PublicDnsName("ec2-172-16-5-5.eu-team-2.compute.amazonaws.com").isEmpty());
         assertTrue(dns.resolveEc2PublicDnsName("ec2-172-16-5-5.compute-1.example.com").isEmpty());
         assertTrue(dns.resolveEc2PublicDnsName("ec2-172-16-5-5.compute-1.amazonaws.com.evil.example").isEmpty());
         assertTrue(dns.resolveEc2PublicDnsName(null).isEmpty());

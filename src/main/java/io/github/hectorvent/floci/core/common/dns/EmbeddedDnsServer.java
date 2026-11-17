@@ -4,6 +4,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.LocalStackParity;
 import io.github.hectorvent.floci.config.TlsConfigSource;
 import io.github.hectorvent.floci.core.common.AwsEndpoints;
+import io.github.hectorvent.floci.core.common.AwsRegions;
 import io.github.hectorvent.floci.core.common.DomainNames;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
@@ -820,6 +821,10 @@ public class EmbeddedDnsServer {
             return Optional.empty();
         }
         String region = matcher.group(5) == null ? "us-east-1" : matcher.group(5); // partition-literal: compute-1 is us-east-1's zone
+        // Only the vendored region catalog owns these names; new regions require a catalog update.
+        if (!AwsRegions.isRegionId(region)) {
+            return Optional.empty();
+        }
         return addressOf(EC2_PUBLIC_DNS_NAME, name)
                 .filter(address -> AwsEndpoints.ec2PublicDns(address, region).equalsIgnoreCase(name));
     }
