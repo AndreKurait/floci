@@ -1,3 +1,4 @@
+AWS::ACMPCA::CertificateAuthority	Arn,CertificateSigningRequest	CsrExtensions,KeyAlgorithm,KeyStorageSecurityStandard,RevocationConfiguration,SigningAlgorithm,Subject,Tags,Type,UsageMode
 AWS::ApiGateway::Account	Id	CloudWatchRoleArn
 AWS::ApiGateway::ApiKey	APIKeyId	CustomerId,Description,Enabled,GenerateDistinctId,Name,StageKeys,Tags,Value
 AWS::ApiGateway::Authorizer	AuthorizerId	AuthType,AuthorizerCredentials,AuthorizerResultTtlInSeconds,AuthorizerUri,IdentitySource,IdentityValidationExpression,Name,ProviderARNs,RestApiId,Type
@@ -103,6 +104,8 @@ AWS::EC2::SubnetRouteTableAssociation	Id	RouteTableId,SubnetId
 AWS::EC2::VPC	CidrBlockAssociations,DefaultNetworkAcl,DefaultSecurityGroup,Ipv6CidrBlocks,VpcId	CidrBlock,EnableDnsHostnames,EnableDnsSupport,InstanceTenancy,Ipv4IpamPoolId,Ipv4NetmaskLength,Tags,VpcEncryptionControl
 AWS::EC2::VPCDHCPOptionsAssociation		DhcpOptionsId,VpcId
 AWS::EC2::VPCEndpoint	CreationTimestamp,DnsEntries,Id,NetworkInterfaceIds	DnsOptions,IpAddressType,PolicyDocument,PrivateDnsEnabled,ResourceConfigurationArn,RouteTableIds,SecurityGroupIds,ServiceName,ServiceNetworkArn,ServiceRegion,SubnetIds,Tags,VpcEndpointType,VpcId
+AWS::EC2::VPCEndpointService	ServiceId	AcceptanceRequired,ContributorInsightsEnabled,GatewayLoadBalancerArns,NetworkLoadBalancerArns,PayerResponsibility,PrivateDnsName,PrivateDnsNameConfiguration,SupportedIpAddressTypes,SupportedRegions,Tags
+AWS::EC2::VPCEndpointServicePermissions		AllowedPrincipals,ServiceId
 AWS::EC2::VPCGatewayAttachment	AttachmentType	InternetGatewayId,VpcId,VpnGatewayId
 AWS::ECR::Repository	Arn,RepositoryUri	EmptyOnDelete,EncryptionConfiguration,ImageScanningConfiguration,ImageTagMutability,ImageTagMutabilityExclusionFilters,LifecyclePolicy,RepositoryName,RepositoryPolicyText,Tags
 AWS::ECS::CapacityProvider		AutoScalingGroupProvider,ClusterName,ManagedInstancesProvider,Name,Tags

@@ -38,16 +38,25 @@ import java.security.KeyPairGenerator;
 import java.security.PrivateKey;
 import java.security.PublicKey;
 import java.security.SecureRandom;
+import java.security.cert.CertPathValidator;
+import java.security.cert.CertificateFactory;
+import java.security.cert.PKIXParameters;
+import java.security.cert.TrustAnchor;
 import java.security.cert.X509Certificate;
 import java.security.interfaces.RSAPublicKey;
 import java.time.Instant;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-/** RootCACertificate/V1 and EndEntityCertificate/V1, with actual CSR proof of possession. */
+/**
+ * RootCACertificate/V1, SubordinateCACertificate_PathLen0/V1 to PathLen3/V1 and EndEntityCertificate/V1,
+ * with actual CSR proof of possession.
+ */
 final class PrivateCaCertificates {
 
     private static final Map<String, ASN1ObjectIdentifier> SUBJECT_FIELDS = subjectFields();
@@ -112,10 +121,15 @@ final class PrivateCaCertificates {
         }
     }
 
+    /**
+     * Signs {@code csr}: a self-signed root when {@code parent} is null, a subordinate CA certificate with
+     * that path length when {@code pathLength} is set, and an end-entity certificate otherwise.
+     */
     static X509Certificate issue(PKCS10CertificationRequest csr, String privateKeyPem,
-                                 X509Certificate parent, Instant notBefore, Instant notAfter) {
+                                 X509Certificate parent, Integer pathLength, Instant notBefore, Instant notAfter) {
         try {
             boolean root = parent == null;
+            boolean ca = root || pathLength != null;
             PrivateKey key = Pem.parsePrivateKey(privateKeyPem);
             X500Name issuer = root ? csr.getSubject()
                     : X500Name.getInstance(parent.getSubjectX500Principal().getEncoded());
@@ -124,15 +138,18 @@ final class PrivateCaCertificates {
                     issuer, serial, Date.from(notBefore), Date.from(notAfter),
                     csr.getSubject(), csr.getSubjectPublicKeyInfo());
             JcaX509ExtensionUtils extensions = new JcaX509ExtensionUtils();
-            builder.addExtension(Extension.basicConstraints, root, new BasicConstraints(root));
+            builder.addExtension(Extension.basicConstraints, ca, root || pathLength == null
+                    ? new BasicConstraints(root) : new BasicConstraints(pathLength));
             builder.addExtension(Extension.subjectKeyIdentifier, false,
                     extensions.createSubjectKeyIdentifier(csr.getSubjectPublicKeyInfo()));
-            builder.addExtension(Extension.keyUsage, true, new KeyUsage(root
+            builder.addExtension(Extension.keyUsage, true, new KeyUsage(ca
                     ? KeyUsage.digitalSignature | KeyUsage.keyCertSign | KeyUsage.cRLSign
                     : KeyUsage.digitalSignature | KeyUsage.keyEncipherment));
             if (!root) {
                 builder.addExtension(Extension.authorityKeyIdentifier, false,
                         extensions.createAuthorityKeyIdentifier(parent));
+            }
+            if (!ca) {
                 builder.addExtension(Extension.extendedKeyUsage, false, new ExtendedKeyUsage(
                         new KeyPurposeId[]{KeyPurposeId.id_kp_serverAuth, KeyPurposeId.id_kp_clientAuth}));
             }
@@ -161,7 +178,57 @@ final class PrivateCaCertificates {
         }
     }
 
+    /** One or more PEM certificates, in order, as a certificate chain holds them. */
+    static List<X509Certificate> certificates(String text) {
+        List<X509Certificate> certificates = new ArrayList<>();
+        try (PEMParser parser = new PEMParser(new StringReader(text))) {
+            for (Object object = parser.readObject(); object != null; object = parser.readObject()) {
+                if (!(object instanceof X509CertificateHolder holder)) {
+                    throw new IllegalArgumentException("Expected only X.509 certificates");
+                }
+                certificates.add(new JcaX509CertificateConverter().getCertificate(holder));
+            }
+        } catch (Exception failure) {
+            throw new AwsException("MalformedCertificateException", "The certificate chain is malformed", 400);
+        }
+        if (certificates.isEmpty()) {
+            throw new AwsException("MalformedCertificateException", "The certificate chain is malformed", 400);
+        }
+        return certificates;
+    }
+
     static X509Certificate importedRoot(String text, String ownCsr, Instant now) {
+        return imported(text, ownCsr, now, true);
+    }
+
+    /**
+     * A subordinate authority's certificate: the CA profile a root import checks, issued by the first
+     * certificate of {@code chain}, which must validate it up to the self-signed root that ends the chain.
+     */
+    static X509Certificate importedSubordinate(String text, List<X509Certificate> chain, String ownCsr, Instant now) {
+        X509Certificate certificate = imported(text, ownCsr, now, false);
+        X509Certificate root = chain.get(chain.size() - 1);
+        try {
+            if (!root.getIssuerX500Principal().equals(root.getSubjectX500Principal())) {
+                throw new IllegalArgumentException("The chain must end in a self-signed root");
+            }
+            root.verify(root.getPublicKey());
+            List<X509Certificate> path = new ArrayList<>();
+            path.add(certificate);
+            path.addAll(chain.subList(0, chain.size() - 1));
+            PKIXParameters validation = new PKIXParameters(Set.of(new TrustAnchor(root, null)));
+            validation.setRevocationEnabled(false);
+            validation.setDate(Date.from(now));
+            CertPathValidator.getInstance("PKIX").validate(
+                    CertificateFactory.getInstance("X.509").generateCertPath(path), validation);
+            return certificate;
+        } catch (Exception failure) {
+            throw new AwsException("InvalidRequestException",
+                    "The certificate chain must validate the certificate up to a self-signed root", 400);
+        }
+    }
+
+    private static X509Certificate imported(String text, String ownCsr, Instant now, boolean root) {
         X509Certificate certificate = certificate(text);
         try {
             PKCS10CertificationRequest request = csr(ownCsr);
@@ -170,10 +237,12 @@ final class PrivateCaCertificates {
                     .equals(request.getSubject())) {
                 throw new AwsException("CertificateMismatchException", "The certificate does not match this CA's CSR", 400);
             }
-            if (!certificate.getIssuerX500Principal().equals(certificate.getSubjectX500Principal())) {
-                throw new IllegalArgumentException("A root certificate must be self-signed");
+            if (root) {
+                if (!certificate.getIssuerX500Principal().equals(certificate.getSubjectX500Principal())) {
+                    throw new IllegalArgumentException("A root certificate must be self-signed");
+                }
+                certificate.verify(certificate.getPublicKey());
             }
-            certificate.verify(certificate.getPublicKey());
             certificate.checkValidity(Date.from(now));
             Set<String> critical = certificate.getCriticalExtensionOIDs();
             boolean[] usage = certificate.getKeyUsage();
@@ -190,15 +259,16 @@ final class PrivateCaCertificates {
                     || certificate.getExtensionValue(Extension.policyMappings.getId()) != null
                     || certificate.getExtensionValue(Extension.inhibitAnyPolicy.getId()) != null
                     || certificate.getExtendedKeyUsage() != null) {
-                throw new AwsException("InvalidRequestException",
-                        "Imported certificate constraints outside the root CA profile are not supported", 400);
+                throw new AwsException("InvalidRequestException", "Imported certificate constraints outside the "
+                        + (root ? "root" : "subordinate") + " CA profile are not supported", 400);
             }
             return certificate;
         } catch (AwsException failure) {
             throw failure;
         } catch (Exception failure) {
-            throw new AwsException("MalformedCertificateException",
-                    "A currently valid self-signed CA certificate with keyCertSign is required", 400);
+            throw new AwsException("MalformedCertificateException", root
+                    ? "A currently valid self-signed CA certificate with keyCertSign is required"
+                    : "A currently valid CA certificate with keyCertSign is required", 400);
         }
     }
 

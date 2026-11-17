@@ -42,6 +42,7 @@ public class Certificate {
     private String certificateChain;
     private CertificateOptions certOptions;
     private String certAuthorityArn;
+    private String failureReason;
     private List<DomainValidation> domainValidationOptions;
     private String idempotencyToken;
 
@@ -235,6 +236,15 @@ public class Certificate {
 
     public void setCertAuthorityArn(String certAuthorityArn) {
         this.certAuthorityArn = certAuthorityArn;
+    }
+
+    /** Why a FAILED certificate was not issued, as {@code DescribeCertificate}'s {@code FailureReason} names it. */
+    public String getFailureReason() {
+        return failureReason;
+    }
+
+    public void setFailureReason(String failureReason) {
+        this.failureReason = failureReason;
     }
 
     public List<DomainValidation> getDomainValidationOptions() {

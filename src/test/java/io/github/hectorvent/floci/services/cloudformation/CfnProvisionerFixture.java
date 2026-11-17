@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
 import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.services.acm.AcmService;
+import io.github.hectorvent.floci.services.acmpca.AcmPcaService;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayService;
 import io.github.hectorvent.floci.services.apigatewayv2.ApiGatewayV2Service;
 import io.github.hectorvent.floci.services.appconfig.AppConfigService;
@@ -17,6 +18,7 @@ import io.github.hectorvent.floci.services.batch.BatchService;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.BedrockAgentCoreControlService;
 import io.github.hectorvent.floci.services.bedrockagentcorecontrol.BedrockAgentCoreMemoryService;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.AcmCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.AcmPcaCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ApiGatewayAccountCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ApiGatewayApiKeyCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.ApiGatewayDomainCfnProvisioner;
@@ -70,6 +72,7 @@ import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2Securi
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2SecurityGroupRuleCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2VpcCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2VpcEndpointCfnProvisioner;
+import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2VpcEndpointServiceCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.Ec2VpcGatewayAttachmentCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EcrCfnProvisioner;
 import io.github.hectorvent.floci.services.cloudformation.provisioners.EcsCapacityCfnProvisioner;
@@ -156,6 +159,7 @@ import io.github.hectorvent.floci.services.dynamodb.DynamoDbFacade;
 import io.github.hectorvent.floci.services.dynamodb.DynamoDbService;
 import io.github.hectorvent.floci.services.dynamodb.backend.DynamoDbOperations.Reply;
 import io.github.hectorvent.floci.services.dynamodb.backend.NativeDynamoDbBackend;
+import io.github.hectorvent.floci.services.ec2.Ec2PrivateLinkService;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.FlowLogService;
 import io.github.hectorvent.floci.services.ecr.EcrService;
@@ -281,6 +285,7 @@ final class CfnProvisionerFixture {
         private CloudWatchMetricsService cloudWatchMetricsService;
         private AutoScalingService autoScalingService;
         private AcmService acmService;
+        private AcmPcaService acmPcaService;
         private FirehoseService firehoseService;
         private DocDbService docDbService;
         private CloudFrontService cloudFrontService;
@@ -291,6 +296,7 @@ final class CfnProvisionerFixture {
         // Services that back a provisioner without being a constructor argument of the
         // dispatcher. They exist only so inferredProvisioners() can wire their provisioner.
         private FlowLogService flowLogService;
+        private Ec2PrivateLinkService privateLinkService;
         private CloudWatchDashboardsService cloudWatchDashboardsService;
         private CloudWatchInsightRulesService cloudWatchInsightRulesService;
         private CloudWatchLogsMetricFilterService logsMetricFilterService;
@@ -511,6 +517,9 @@ final class CfnProvisionerFixture {
             if (acmService != null) {
                 discovered.add(new AcmCfnProvisioner(acmService));
             }
+            if (acmPcaService != null) {
+                discovered.add(new AcmPcaCfnProvisioner(acmPcaService));
+            }
             if (appSyncService != null) {
                 discovered.add(new AppSyncCfnProvisioner(appSyncService));
             }
@@ -527,6 +536,9 @@ final class CfnProvisionerFixture {
             }
             if (flowLogService != null) {
                 discovered.add(new Ec2FlowLogCfnProvisioner(flowLogService, ec2Service));
+            }
+            if (privateLinkService != null) {
+                discovered.add(new Ec2VpcEndpointServiceCfnProvisioner(privateLinkService, ec2Service));
             }
             if (iotAuthorizerService != null) {
                 discovered.add(new IotAuthorizerCfnProvisioner(iotAuthorizerService));
@@ -868,6 +880,11 @@ final class CfnProvisionerFixture {
             return this;
         }
 
+        public Builder acmPca(AcmPcaService v) {
+            this.acmPcaService = v;
+            return this;
+        }
+
         public Builder firehose(FirehoseService v) {
             this.firehoseService = v;
             return this;
@@ -885,6 +902,11 @@ final class CfnProvisionerFixture {
 
         public Builder flowLog(FlowLogService v) {
             this.flowLogService = v;
+            return this;
+        }
+
+        public Builder privateLink(Ec2PrivateLinkService v) {
+            this.privateLinkService = v;
             return this;
         }
 

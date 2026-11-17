@@ -103,6 +103,12 @@ runner mode a Spark run executes; see [Running Spark job runs](#running-spark-jo
   No source says whether a run's timeout spans its attempts; Floci applies it to each.
 * `createdBy` is the caller's ARN, as `GetCallerIdentity` reports it. `releaseLabel` and
   `networkConfiguration` come from the application.
+* **Resource utilization**: a finished run reports `billedResourceUtilization` and
+  `totalResourceUtilization` with a `vCPUHour`, `memoryGBHour` and `storageGBHour` of 0, in every runner
+  mode. AWS aggregates what a run's workers use "from the time the job starts executing until the job is
+  terminated", and bills its workers; Floci readies no worker, so a run that never started, such as a
+  refused one, has used and been billed nothing, and Floci meters none of the containers of the `docker`
+  mode. A run that has not finished reports neither.
 
 ### Refusing job runs
 
@@ -117,6 +123,26 @@ every other operation behave as in the default mode.
 
 A state machine drives applications and job runs through the `emr-serverless:` integrations, `.sync`
 included; see [Step Functions: Amazon EMR Serverless tasks](step-functions.md#amazon-emr-serverless-tasks).
+
+## EventBridge events
+
+Every state a job run enters is sent to the default EventBridge bus of the run's account and Region, as
+AWS sends it: source `aws.emr-serverless`, detail type `EMR Serverless Job Run State Change`, an empty
+`resources`, and the detail of the EMR Serverless User Guide's example, `jobRunId`, `applicationId`, `arn`,
+`releaseLabel`, `state`, `previousState`, `createdBy`, `updatedAt` and `createdAt`, with times to the
+microsecond (`2026-10-24T09:41:07.123000Z`). A run is `SUBMITTED` first, in an event without
+`previousState`, and each later event's `previousState` is the state the run left. The events go out in
+order, just after the call, or the change of a run's driver, that made them.
+
+| Runner mode | States, in order |
+|---|---|
+| `immediate` | `SUBMITTED`, `RUNNING`, then `SUCCESS`, or `CANCELLED` when the run is cancelled or reaches its timeout |
+| `docker` | `SUBMITTED`, `SCHEDULED`, `RUNNING` once its driver runs, then `SUCCESS` or `FAILED`; `CANCELLING` then `CANCELLED` for a run cancelled or past its timeout; `SCHEDULED` again for a run tried again after its driver failed |
+| `refuse` | `SUBMITTED`, then `FAILED` |
+
+An `immediate` run with a positive `job-run-duration-seconds` settles when it is read, so its end is sent
+when a call first reads the run ended, with the `updatedAt` of that end. Floci's runs take no `PENDING` or
+`QUEUED` state, so no event reports one.
 
 ## Running Spark job runs
 
@@ -253,6 +279,7 @@ application's `imageConfiguration`; a `TezTask` image is not used, as Tez's task
   whatever the execution role may read, though Spark's own read of it uses the role's credentials.
 * **Custom images**: Floci does not check an `imageUri` against the model's pattern, which would refuse the repository URIs Floci's own ECR hands out, nor that the image was built from its release's base image (AWS refuses one that was not from `emr-7.14.0` and `emr-spark-8.1.0` on), nor the image's size. An image that cannot be pulled fails the run, not the request that names it. Every run resolves its image again, as releases from 7.14 do and earlier ones with `applicationLevelDigestResolution` false: Floci keeps no digest from the application's start, and reports no `resolvedImageDigest`, on the application or on a job run.
 * **StopApplication with running jobs**: AWS requires running jobs to finish or be cancelled before an application stops. Floci does not enforce it; with the default duration of `0` no `BATCH` run is ever running.
-* **Not emulated**: the "EMR Serverless Job Run Retry" event, as Floci sends no EMR Serverless events, queuing (`QUEUED`), `totalResourceUtilization` and `billedResourceUtilization`, and `shutdownGracePeriodInSeconds` (accepted and ignored: a cancelled run's driver is stopped at once).
+* **Resource utilization**: AWS bills each worker of a run that ran for at least one minute; Floci reports 0 `billedResourceUtilization` and `totalResourceUtilization` for every finished run, as it readies no worker and meters no container.
+* **Not emulated**: the "EMR Serverless Application State Change", "EMR Serverless Job Run Retry" and "EMR Serverless Job Resource Utilization Update" events, queuing (`QUEUED`), and `shutdownGracePeriodInSeconds` (accepted and ignored: a cancelled run's driver is stopped at once).
 * **Instant Start/Stop**: Floci marks the application `STARTED` or `STOPPED` immediately without provisioning actual compute capacity in the background.
 * **Data Plane**: Floci does not implement the data-plane API, such as interactive sessions.

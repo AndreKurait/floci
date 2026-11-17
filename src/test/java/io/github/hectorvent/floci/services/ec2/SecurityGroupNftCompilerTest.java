@@ -127,9 +127,9 @@ class SecurityGroupNftCompilerTest {
         permission.setIpProtocol("tcp");
         permission.setFromPort(443);
         permission.setToPort(443);
-        IpRange cidr = new IpRange();
-        cidr.setCidrIp("0.0.0.0/0");
-        permission.getIpRanges().add(cidr);
+        UserIdGroupPair member = new UserIdGroupPair();
+        member.setGroupId("sg-1");
+        permission.getUserIdGroupPairs().add(member);
         group.getIpPermissions().add(permission);
         group.getIpPermissionsEgress().add(permission);
         SecurityGroupNftCompiler.Endpoint target = endpoint("eni-a", "10.0.0.2", "172.17.0.2", group);
@@ -147,10 +147,8 @@ class SecurityGroupNftCompilerTest {
                 assertTrue(nft.contains(direction + address + " tcp dport 443 accept"));
             }
             for (String address : List.of("172.17.0.4", "10.1.0.3")) {
-                String drop = direction + address + " drop";
                 assertFalse(nft.contains(direction + address + " tcp dport 443 accept"));
-                assertTrue(nft.contains(drop));
-                assertTrue(nft.indexOf(drop) < nft.indexOf(direction + "0.0.0.0/0 tcp dport 443 accept"));
+                assertTrue(nft.contains(direction + address + " drop"));
             }
         }
     }
@@ -366,6 +364,90 @@ class SecurityGroupNftCompilerTest {
         permission.getUserIdGroupPairs().add(source);
         group.getIpPermissions().add(permission);
         return group;
+    }
+
+    @Test
+    void crossVpcPeersAreAdmittedByAddressRulesOnTheirLogicalAddress() {
+        SecurityGroup group = new SecurityGroup();
+        group.setVpcId("vpc-1");
+        group.setOwnerId("000000000000");
+        IpPermission fromList = permission(80);
+        PrefixListId reference = new PrefixListId();
+        reference.setPrefixListId("pl-1");
+        fromList.getPrefixListIds().add(reference);
+        group.getIpPermissions().add(fromList);
+        IpPermission anywhere = permission(80);
+        IpRange all = new IpRange();
+        all.setCidrIp("0.0.0.0/0");
+        anywhere.getIpRanges().add(all);
+        group.getIpPermissionsEgress().add(anywhere);
+        SecurityGroupNftCompiler.Endpoint target = endpoint("eni-a", "10.0.0.2", "172.17.0.2", group);
+        SecurityGroupNftCompiler.Endpoint other = new SecurityGroupNftCompiler.Endpoint(
+                "222222222222", "us-east-1", "vpc-2", "eni-b", "10.9.128.34", "172.17.0.9",
+                Set.of("sg-2"), List.of(group));
+
+        String nft = SecurityGroupNftCompiler.compile(target, List.of(other),
+                Map.of("pl-1", List.of("10.9.128.0/19")), List.of("172.17.0.1"), true);
+
+        // Ingress from the prefix list's entry, egress from the 0.0.0.0/0 rule, both ahead of the peer's drop.
+        assertTrue(nft.indexOf("ingress ip saddr 172.17.0.9 tcp dport 80 accept")
+                < nft.indexOf("ingress ip saddr 172.17.0.9 drop"));
+        assertTrue(nft.indexOf("egress ip daddr 172.17.0.9 tcp dport 80 accept")
+                < nft.indexOf("egress ip daddr 172.17.0.9 drop"));
+        assertTrue(nft.indexOf("egress ip daddr 172.17.0.9 tcp dport 80 accept") >= 0);
+        assertFalse(nft.contains(" 10.9.128.34 "), "the other VPC's logical address is matched, never installed");
+    }
+
+    @Test
+    void crossVpcSecurityGroupReferencesAreStillRefused() {
+        SecurityGroup group = new SecurityGroup();
+        group.setVpcId("vpc-1");
+        group.setOwnerId("000000000000");
+        IpPermission byGroup = permission(80);
+        UserIdGroupPair member = new UserIdGroupPair();
+        member.setGroupId("sg-2");
+        member.setUserId("222222222222");
+        byGroup.getUserIdGroupPairs().add(member);
+        group.getIpPermissions().add(byGroup);
+        SecurityGroupNftCompiler.Endpoint target = endpoint("eni-a", "10.0.0.2", "172.17.0.2", group);
+        SecurityGroupNftCompiler.Endpoint other = new SecurityGroupNftCompiler.Endpoint(
+                "222222222222", "us-east-1", "vpc-2", "eni-b", "10.9.128.34", "172.17.0.9",
+                Set.of("sg-2"), List.of(group));
+
+        String nft = SecurityGroupNftCompiler.compile(target, List.of(other), Map.of(), List.of("172.17.0.1"), true);
+
+        assertFalse(nft.contains("ingress ip saddr 172.17.0.9 tcp dport 80 accept"));
+        assertTrue(nft.contains("ingress ip saddr 172.17.0.9 drop"));
+    }
+
+    @Test
+    void crossVpcPeersMatchingNoRuleAreStillDropped() {
+        SecurityGroup group = new SecurityGroup();
+        group.setVpcId("vpc-1");
+        group.setOwnerId("000000000000");
+        IpPermission documentation = permission(80);
+        IpRange range = new IpRange();
+        range.setCidrIp("192.0.2.0/24");
+        documentation.getIpRanges().add(range);
+        group.getIpPermissions().add(documentation);
+        SecurityGroupNftCompiler.Endpoint target = endpoint("eni-a", "10.0.0.2", "172.17.0.2", group);
+        SecurityGroupNftCompiler.Endpoint other = new SecurityGroupNftCompiler.Endpoint(
+                "222222222222", "us-east-1", "vpc-2", "eni-b", "10.9.128.34", "172.17.0.9",
+                Set.of("sg-2"), List.of(group));
+
+        String nft = SecurityGroupNftCompiler.compile(target, List.of(other), Map.of(), List.of("172.17.0.1"), true);
+
+        assertFalse(nft.contains("ingress ip saddr 172.17.0.9 tcp dport 80 accept"));
+        assertTrue(nft.indexOf("ingress ip saddr 172.17.0.9 drop")
+                < nft.indexOf("ingress ip saddr 192.0.2.0/24 tcp dport 80 accept"));
+    }
+
+    private static IpPermission permission(int port) {
+        IpPermission permission = new IpPermission();
+        permission.setIpProtocol("tcp");
+        permission.setFromPort(port);
+        permission.setToPort(port);
+        return permission;
     }
 
     private static SecurityGroupNftCompiler.Endpoint endpoint(String eni, String logical,

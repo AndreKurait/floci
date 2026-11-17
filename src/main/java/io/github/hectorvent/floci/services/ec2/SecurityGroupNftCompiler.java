@@ -249,9 +249,19 @@ public final class SecurityGroupNftCompiler {
                         continue;
                     }
                     for (Endpoint peer : managed) {
-                        if (admitted.test(peer) && target.sameVpc(peer)
-                                && SecurityGroupPolicy.matchesPeer(group, permission, peer.peer(), prefixLists)) {
-                            for (String address : peer.transportAddresses()) {
+                        if (!admitted.test(peer)) {
+                            continue;
+                        }
+                        // Within a VPC any rule may admit a managed peer. Across VPCs only an address
+                        // rule (CIDR or prefix list) may, matched against the peer's logical address:
+                        // Floci models no NAT or public addresses, so this stands in for the translated
+                        // path. Security-group references never cross a VPC boundary.
+                        boolean sameVpc = target.sameVpc(peer);
+                        if (sameVpc ? SecurityGroupPolicy.matchesPeer(group, permission, peer.peer(), prefixLists)
+                                : SecurityGroupPolicy.matchesPeerAddress(permission, peer.peer(), prefixLists)) {
+                            List<String> visible = isolatedAddressSpaces && !sameVpc
+                                    ? List.of(peer.transportAddress()) : peer.transportAddresses();
+                            for (String address : visible) {
                                 appendRule(rules, chain, addressField, address, protocol);
                             }
                         }

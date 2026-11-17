@@ -2,20 +2,33 @@ package io.github.hectorvent.floci.services.acmpca;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.core.common.AwsException;
+import io.github.hectorvent.floci.core.common.ReservedTags;
 
 import java.nio.charset.StandardCharsets;
 import java.time.DateTimeException;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
+import java.util.ArrayList;
 import java.util.Base64;
 import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.regex.Pattern;
 
 final class PrivateCaRequests {
 
+    static final Set<String> KEY_STORAGE_STANDARDS =
+            Set.of("FIPS_140_2_LEVEL_2_OR_HIGHER", "FIPS_140_2_LEVEL_3_OR_HIGHER", "CCPC_LEVEL_1_OR_HIGHER");
+    static final int MAX_TAGS = 50;
+    private static final Pattern TAG_TEXT = Pattern.compile("[\\p{L}\\p{Z}\\p{N}_.:/=+\\-@]*");
+
     private PrivateCaRequests() {}
+
+    /** One {@code Tag} of a request: {@code Value} is optional, and null when absent. */
+    record Tag(String key, String value) {}
 
     static AwsException invalid(String message) {
         return new AwsException("InvalidArgsException", message, 400);
@@ -54,9 +67,14 @@ final class PrivateCaRequests {
 
     static Map<String, String> configuration(JsonNode request) {
         fields(request, "request", Set.of("CertificateAuthorityType", "CertificateAuthorityConfiguration",
-                "IdempotencyToken", "RevocationConfiguration", "UsageMode"));
-        if (!"ROOT".equals(text(request, "CertificateAuthorityType"))) {
-            throw invalid("Only ROOT certificate authorities are supported");
+                "IdempotencyToken", "RevocationConfiguration", "UsageMode", "KeyStorageSecurityStandard", "Tags"));
+        if (!Set.of("ROOT", "SUBORDINATE").contains(text(request, "CertificateAuthorityType"))) {
+            throw invalid("CertificateAuthorityType must be ROOT or SUBORDINATE");
+        }
+        String storage = optionalText(request, "KeyStorageSecurityStandard");
+        if (storage != null && !KEY_STORAGE_STANDARDS.contains(storage)) {
+            throw invalid("KeyStorageSecurityStandard must be FIPS_140_2_LEVEL_2_OR_HIGHER, "
+                    + "FIPS_140_2_LEVEL_3_OR_HIGHER or CCPC_LEVEL_1_OR_HIGHER");
         }
         String usage = optionalText(request, "UsageMode");
         if (usage != null && !"GENERAL_PURPOSE".equals(usage)) {
@@ -114,6 +132,44 @@ final class PrivateCaRequests {
                 throw invalid(name + " must contain only Enabled=false; revocation delivery is not supported");
             }
         }
+    }
+
+    /**
+     * The request's {@code Tags}: 1 to 50 entries, each a {@code Key} of 1 to 128 and an optional
+     * {@code Value} of up to 256 letters, spaces, digits or {@code _.:/=+-@}. Keys starting {@code aws:}
+     * are reserved by AWS and keys starting {@code floci:} by the emulator.
+     */
+    static List<Tag> tags(JsonNode request) {
+        return tags(request, false);
+    }
+
+    /** As {@link #tags(JsonNode)}; on {@code create}, the reserved {@code floci:override-id} is admitted too. */
+    static List<Tag> tags(JsonNode request, boolean create) {
+        JsonNode tags = request.path("Tags");
+        if (!tags.isArray() || tags.isEmpty() || tags.size() > MAX_TAGS) {
+            throw tagError("Tags must contain 1 to " + MAX_TAGS + " tags");
+        }
+        List<Tag> result = new ArrayList<>();
+        for (JsonNode tag : tags) {
+            fields(tag, "Tag", Set.of("Key", "Value"));
+            String key = tag.path("Key").isTextual() ? tag.path("Key").textValue() : null;
+            String value = tag.hasNonNull("Value") && tag.path("Value").isTextual() ? tag.path("Value").textValue() : null;
+            if (key == null || key.isEmpty() || key.length() > 128 || !TAG_TEXT.matcher(key).matches()
+                    || tag.hasNonNull("Value") && (value == null || value.length() > 256
+                    || !TAG_TEXT.matcher(value).matches())) {
+                throw tagError("Each tag needs a Key of 1 to 128 and a Value of at most 256 supported characters");
+            }
+            if (key.toLowerCase(Locale.ROOT).startsWith("aws:") || key.startsWith(ReservedTags.RESERVED_PREFIX)
+                    && !(create && ReservedTags.OVERRIDE_ID_KEY.equals(key))) {
+                throw tagError("Tag keys starting with aws: or " + ReservedTags.RESERVED_PREFIX + " are reserved");
+            }
+            result.add(new Tag(key, value));
+        }
+        return result;
+    }
+
+    static AwsException tagError(String message) {
+        return new AwsException("InvalidTagException", message, 400);
     }
 
     static String blob(JsonNode request, String field, int maximum) {
