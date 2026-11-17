@@ -643,12 +643,17 @@ decompress their body.
 JSON 1.0 requests name their operation in `X-Amz-Target` with the `GraniteServiceVersion20100801.`
 prefix the AWS SDKs send, or with `CloudWatchVersion20130116.`, the prefix of the CloudWatch
 console's API. Both get the same signature validation and IAM checks. The console prefix serves
-four operations on the same metrics and alarms, with these request members: `ListMetrics`
+five operations on the same metrics and alarms, with these request members: `PutMetricData`
+(`Namespace`, `MetricData`), `ListMetrics`
 (`Namespace`, `MetricName`, `Dimensions`, `NextToken`), `DescribeAlarms` (`AlarmNames`,
 `AlarmNamePrefix`, `MaxRecords`, `NextToken`), `GetMetricStatistics` (`Namespace`, `MetricName`,
 `Dimensions`, `StartTime`, `EndTime`, `Period`, `Statistics`, `Unit`) and `DeleteAlarms`
 (`AlarmNames`). `ListMetrics` supports `NextToken`; `DescribeAlarms` returns every result
 at once, so its `MaxRecords` and `NextToken` change nothing.
+The console target accepts scalar values, statistic sets, and `Values` with optional `Counts`
+for `PutMetricData`. Weighted samples use the same validation and storage as the standard
+protocol; an invalid datum rejects the entire request. Unsupported datum fields, including
+nonempty `Timestamps` and `OffsetTimestamps`, remain rejected.
 Unknown legacy operation names return HTTP 404 `UnknownOperationException` before
 body parsing. Recognized operations outside the supported set return HTTP 400
 `UnsupportedOperation`, including the console's `GetMetricData` with `Defaults` and
