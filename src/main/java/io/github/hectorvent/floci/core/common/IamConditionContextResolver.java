@@ -466,8 +466,11 @@ public class IamConditionContextResolver {
         if (keyId.startsWith("alias/")) {
             return keyId;
         }
-        int alias = keyId.startsWith("arn:") ? keyId.indexOf(":alias/") : -1;
-        return alias < 0 ? null : keyId.substring(alias + 1);
+        if (!AwsArnUtils.isArn(keyId)) {
+            return null;
+        }
+        String resource = AwsArnUtils.parse(keyId).resource();
+        return resource.startsWith("alias/") ? resource : null;
     }
 
     private Map<String, List<String>> memoryDbParameterGroupConditions(String action, ContainerRequestContext ctx) {
