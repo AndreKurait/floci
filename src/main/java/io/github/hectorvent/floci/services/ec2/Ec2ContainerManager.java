@@ -20,6 +20,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.ContainerExec;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
+import io.github.hectorvent.floci.core.common.docker.ContainerLiveness;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
@@ -1716,10 +1717,20 @@ public class Ec2ContainerManager {
     }
 
     boolean isContainerRunning(String containerId) {
-        return containerId != null && !containerId.isBlank()
-                && !guestReboots.recoveryFailed(containerId)
-                && (apiReboots.containsKey(containerId) || lifecycleManager.isContainerRunning(containerId)
-                    || guestReboots.isRebooting(containerId));
+        if (containerId == null || containerId.isBlank() || guestReboots.recoveryFailed(containerId)) {
+            return false;
+        }
+        if (apiReboots.containsKey(containerId)) {
+            return true;
+        }
+        ContainerLiveness liveness = lifecycleManager.probeContainer(containerId);
+        if (liveness == ContainerLiveness.RUNNING || guestReboots.isRebooting(containerId)) {
+            return true;
+        }
+        if (liveness == ContainerLiveness.UNKNOWN) {
+            throw new IllegalStateException("Cannot determine EC2 container liveness: " + containerId);
+        }
+        return false;
     }
 
     /**

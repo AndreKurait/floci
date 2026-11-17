@@ -1053,6 +1053,35 @@ class AutoScalingReconcilerTest {
     }
 
     @Test
+    void unknownEc2ContainerHealthPreservesMembershipAndTargetsUntilRetry() {
+        AutoScalingService asgService = scalingService();
+        Ec2Service ec2Service = mock(Ec2Service.class);
+        ElbV2Service elbV2Service = mock(ElbV2Service.class);
+        AutoScalingReconciler reconciler = new AutoScalingReconciler(asgService, ec2Service, elbV2Service);
+        AutoScalingGroup asg = new AutoScalingGroup();
+        asg.setRegion("us-east-1");
+        asg.setAutoScalingGroupName("app-asg");
+        asg.setDesiredCapacity(1);
+        asg.setTargetGroupARNs(List.of("owned-target-group"));
+        asg.getInstances().add(instance("i-probe", "InService"));
+        when(ec2Service.describeInstances("us-east-1", List.of("i-probe"), null))
+                .thenReturn(List.of(reservation(runningEc2Instance("i-probe"))));
+        when(ec2Service.isInstanceContainerRunning("i-probe"))
+                .thenThrow(new IllegalStateException("Docker probe unavailable")).thenReturn(true);
+
+        assertThrows(IllegalStateException.class, () -> reconciler.reconcile(asg));
+        assertEquals(List.of("i-probe"), asg.getInstances().stream().map(AsgInstance::getInstanceId).toList());
+        assertEquals(1, asg.getDesiredCapacity());
+        verify(ec2Service, never()).terminateInstances(anyString(), anyList());
+        verify(elbV2Service, never()).deregisterTargets(anyString(), anyString(), anyList());
+
+        reconciler.reconcile(asg);
+        assertEquals(List.of("i-probe"), asg.getInstances().stream().map(AsgInstance::getInstanceId).toList());
+        verify(ec2Service, never()).terminateInstances(anyString(), anyList());
+        verify(elbV2Service, never()).deregisterTargets(anyString(), anyString(), anyList());
+    }
+
+    @Test
     void reconcileDeregistersStaleInstanceFromClassicLoadBalancerBeforePruning() {
         AutoScalingService asgService = scalingService();
         Ec2Service ec2Service = mock(Ec2Service.class);
