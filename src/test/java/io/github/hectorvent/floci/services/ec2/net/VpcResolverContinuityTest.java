@@ -103,8 +103,13 @@ class VpcResolverContinuityTest {
 
         manager.reconcile();
 
-        assertEquals(2, scripts.size(), "The existing endpoint must receive a guard and a replacement policy");
-        String guard = scripts.getFirst();
+        assertEquals(1, scripts.size(), "The guard and replacement policy must share one exec");
+        String script = scripts.getFirst();
+        String delimiter = "\nFLOCI_RULES\n";
+        int guardEnd = script.indexOf(delimiter);
+        assertTrue(guardEnd >= 0, "The guard transaction must end before the replacement policy");
+        String guard = script.substring(0, guardEnd + delimiter.length());
+        String replacement = script.substring(guardEnd + delimiter.length());
         assertTrue(guard.contains("policy drop;"));
         assertEquals(1, guard.lines().filter(line -> line.startsWith("nft ")).count(),
                 "The guard and resolver permits must be installed in one transaction");
@@ -115,7 +120,7 @@ class VpcResolverContinuityTest {
         }
         assertEquals(4, guard.lines().filter(line -> line.endsWith("counter accept")).count(),
                 "Peer and unsolicited inbound traffic must remain denied during replacement");
-        assertTrue(scripts.getLast().contains("10.0.2.0/24"));
+        assertTrue(replacement.contains("10.0.2.0/24"));
     }
 
     @Test
