@@ -128,11 +128,12 @@ public class CloudWatchLogsSubscriptionDeliveryService {
         FilterPattern pattern = FilterPattern.parse(filter.getFilterPattern());
         List<SubscriptionLogEvent> matching = new ArrayList<>();
         for (LogEvent logEvent : event.events()) {
-            if (pattern.match(logEvent.getMessage()).matched()) {
+            String message = logEvent.messageForFilter(Boolean.TRUE.equals(filter.getApplyOnTransformedLogs()));
+            if (message != null && pattern.match(message).matched()) {
                 matching.add(new SubscriptionLogEvent(
                         logEvent.getEventId(),
                         logEvent.getTimestamp(),
-                        logEvent.getMessage()));
+                        message));
             }
         }
         if (matching.isEmpty()) {

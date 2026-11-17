@@ -43,6 +43,7 @@ public class CloudWatchLogsHandler {
     private final CloudWatchLogsDeliveryHandler deliveryHandler;
     private final CloudWatchLogsQueryDefinitionHandler queryDefinitionHandler;
     private final ObjectMapper objectMapper;
+    private final CloudWatchLogsTransformerHandler transformerHandler;
 
     @Inject
     public CloudWatchLogsHandler(CloudWatchLogsService logsService,
@@ -58,6 +59,7 @@ public class CloudWatchLogsHandler {
         this.deliveryHandler = new CloudWatchLogsDeliveryHandler(deliveryService, objectMapper);
         this.queryDefinitionHandler = new CloudWatchLogsQueryDefinitionHandler(queryDefinitionService, objectMapper);
         this.objectMapper = objectMapper;
+        this.transformerHandler = new CloudWatchLogsTransformerHandler(logsService, objectMapper);
     }
 
     CloudWatchLogsHandler(CloudWatchLogsService logsService, CloudWatchLogsCrossAccountService crossAccountService,
@@ -89,6 +91,8 @@ public class CloudWatchLogsHandler {
             case "PutLogEvents" -> handlePutLogEvents(request, region);
             case "GetLogEvents" -> handleGetLogEvents(request, region);
             case "FilterLogEvents" -> handleFilterLogEvents(request, region);
+            case "PutTransformer", "GetTransformer", "DeleteTransformer", "TestTransformer" ->
+                    transformerHandler.handle(action, request, region);
             case "PutRetentionPolicy" -> handlePutRetentionPolicy(request, region);
             case "DeleteRetentionPolicy" -> handleDeleteRetentionPolicy(request, region);
             case "PutLogGroupDeletionProtection" -> handlePutLogGroupDeletionProtection(request, region);
@@ -706,7 +710,12 @@ public class CloudWatchLogsHandler {
                     "distribution must be Random or ByLogStream.", 400);
         }
 
-        logsService.putSubscriptionFilter(logGroupName, filterName, filterPattern, destinationArn, distribution, region);
+        JsonNode transformed = request.get("applyOnTransformedLogs");
+        if (transformed != null && !transformed.isBoolean()) {
+            throw new AwsException("InvalidParameterException", "applyOnTransformedLogs must be a boolean.", 400);
+        }
+        logsService.putSubscriptionFilter(logGroupName, filterName, filterPattern, destinationArn, distribution,
+                transformed == null ? null : transformed.booleanValue(), region);
         return Response.ok(objectMapper.createObjectNode()).build();
     }
 
@@ -727,6 +736,9 @@ public class CloudWatchLogsHandler {
             node.put("logGroupName", f.getLogGroupName());
             node.put("filterPattern", f.getFilterPattern());
             node.put("destinationArn", f.getDestinationArn());
+            if (f.getApplyOnTransformedLogs() != null) {
+                node.put("applyOnTransformedLogs", f.getApplyOnTransformedLogs());
+            }
             if (f.getDistribution() != null) {
                 node.put("distribution", f.getDistribution());
             }
