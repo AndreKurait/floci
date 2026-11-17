@@ -125,6 +125,17 @@ final class VpcRoutingCommands {
                                         String publicDevice, List<String> inboundPublicSources,
                                         List<ControlListener> listeners, NativeApi nativeApi,
                                         List<VpcFrontendIngress> frontends) {
+        return endpointWithFrontends(privateAddress, privateDevice, localRoutes, hops, deniedDestinations, resolvers,
+                controls, instanceMetadataAllowed, publicDevice, inboundPublicSources, listeners, nativeApi,
+                frontends, null);
+    }
+
+    static String endpointWithFrontends(String privateAddress, String privateDevice, List<LocalRoute> localRoutes,
+                                        List<Hop> hops, List<String> deniedDestinations, List<String> resolvers,
+                                        List<ControlConnection> controls, boolean instanceMetadataAllowed,
+                                        String publicDevice, List<String> inboundPublicSources,
+                                        List<ControlListener> listeners, NativeApi nativeApi,
+                                        List<VpcFrontendIngress> frontends, VpcPublicInstanceIngress instanceIngress) {
         String source = VpcRouteSelection.ipv4(privateAddress);
         StringBuilder script = new StringBuilder("set -eu\nip -4 route flush proto 186\n");
         // A retained namespace can cache the retired MAC of a recreated next hop.
@@ -153,6 +164,9 @@ final class VpcRoutingCommands {
         for (VpcFrontendIngress frontend : frontends) {
             frontend.appendIngress(rules);
             frontend.appendReply(rules);
+        }
+        if (instanceIngress != null) {
+            instanceIngress.append(rules);
         }
         if (publicDevice != null) {
             String device = device(publicDevice);
