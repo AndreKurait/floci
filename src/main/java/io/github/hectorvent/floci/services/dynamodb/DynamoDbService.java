@@ -3676,12 +3676,21 @@ public class DynamoDbService {
                 .orElseThrow(() -> new AwsException("TableNotFoundException", "Table not found: " + tableName, 400));
     }
 
+    /**
+     * An item expires once the epoch second its TTL attribute names has passed, unless that second is
+     * more than five years in the past: "To be considered for expiry and deletion, the TTL can't be
+     * more than five years in the past" (DynamoDB Developer Guide, Computing time to live). So an
+     * item whose TTL is 0, as an unset numeric field is often written, is never deleted.
+     */
     boolean isExpired(JsonNode item, TableDefinition table) {
         if (!table.isTtlEnabled() || table.getTtlAttributeName() == null) return false;
         JsonNode attr = item.get(table.getTtlAttributeName());
         if (attr == null || !attr.has("N")) return false;
         try {
-            return Long.parseLong(attr.get("N").asText()) < clock.instant().getEpochSecond();
+            long ttl = Long.parseLong(attr.get("N").asText());
+            Instant now = clock.instant();
+            long oldestConsidered = now.atOffset(ZoneOffset.UTC).minusYears(5).toEpochSecond();
+            return ttl >= oldestConsidered && ttl < now.getEpochSecond();
         } catch (NumberFormatException e) {
             return false;
         }
