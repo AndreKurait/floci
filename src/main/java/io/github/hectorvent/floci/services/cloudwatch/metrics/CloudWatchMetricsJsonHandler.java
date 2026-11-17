@@ -46,7 +46,7 @@ public class CloudWatchMetricsJsonHandler {
     private static final Logger LOG = Logger.getLogger(CloudWatchMetricsJsonHandler.class);
 
     private static final Set<String> CONSOLE_METRIC_DATUM_MEMBERS = Set.of(
-            "MetricName", "Dimensions", "Timestamp", "Unit", "Value", "StatisticValues");
+            "MetricName", "Dimensions", "Timestamp", "Unit", "Value", "StatisticValues", "Values", "Counts");
 
     private final CloudWatchMetricsService metricsService;
     private final CloudWatchDashboardsService dashboardsService;
@@ -121,7 +121,7 @@ public class CloudWatchMetricsJsonHandler {
      * to a value other than {@code null} or {@code false}, is refused rather than answered as if it
      * were unset, and a top-level {@code null} member is dropped. {@code PutMetricData} also checks
      * each datum against {@code CONSOLE_METRIC_DATUM_MEMBERS} before storing any metrics;
-     * {@code Values} and {@code Counts} are refused because this handler does not parse them. Other
+     * {@code Values} and {@code Counts} use the shared weighted-sample parser and validation. Other
      * nested members are passed on unchecked, nulls included. A {@code DescribeAlarms} answer that would list
      * an alarm defined with {@code Metrics} is refused too, since the console's API gives those
      * items its own shape, with {@code Alias} instead of {@code Id} and {@code MetricStat}. The
