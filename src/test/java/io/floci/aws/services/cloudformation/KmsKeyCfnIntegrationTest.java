@@ -92,6 +92,46 @@ class KmsKeyCfnIntegrationTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void sdkReconcilesRotationOnCreateUpdateAndRemoval(boolean initiallyEnabled) {
+        String stack = "kms-rotation-" + Long.toString(System.nanoTime(), 36);
+        ObjectNode template = new ObjectMapper().createObjectNode();
+        ObjectNode key = template.putObject("Resources").putObject("Key");
+        key.put("Type", "AWS::KMS::Key");
+        ObjectNode properties = key.putObject("Properties");
+        properties.put("EnableKeyRotation", initiallyEnabled);
+        StaticCredentialsProvider credentials = StaticCredentialsProvider.create(AwsBasicCredentials.create("test", "test"));
+        try (CloudFormationClient cfn = CloudFormationClient.builder().endpointOverride(endpoint)
+                .region(Region.US_EAST_1).credentialsProvider(credentials).build();
+                KmsClient kms = KmsClient.builder().endpointOverride(endpoint)
+                        .region(Region.US_EAST_1).credentialsProvider(credentials).build()) {
+            try {
+                cfn.createStack(request -> request.stackName(stack).templateBody(template.toString()));
+                assertEquals("CREATE_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+                String id = cfn.describeStackResource(request -> request.stackName(stack)
+                        .logicalResourceId("Key")).stackResourceDetail().physicalResourceId();
+                assertEquals(initiallyEnabled, kms.getKeyRotationStatus(request -> request.keyId(id)).keyRotationEnabled());
+                for (boolean enabled : new boolean[]{!initiallyEnabled, initiallyEnabled, true}) {
+                    properties.put("EnableKeyRotation", enabled);
+                    properties.put("Description", "rotation-" + System.nanoTime());
+                    cfn.updateStack(request -> request.stackName(stack).templateBody(template.toString()));
+                    assertEquals("UPDATE_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+                    assertEquals(enabled, kms.getKeyRotationStatus(request -> request.keyId(id)).keyRotationEnabled());
+                    assertEquals(id, cfn.describeStackResource(request -> request.stackName(stack)
+                            .logicalResourceId("Key")).stackResourceDetail().physicalResourceId());
+                }
+                properties.remove("EnableKeyRotation");
+                cfn.updateStack(request -> request.stackName(stack).templateBody(template.toString()));
+                assertEquals("UPDATE_COMPLETE", CfnStackWaits.awaitTerminal(stack).status());
+                assertFalse(kms.getKeyRotationStatus(request -> request.keyId(id)).keyRotationEnabled());
+            } finally {
+                cfn.deleteStack(request -> request.stackName(stack));
+                CfnStackWaits.awaitStackDeleted(stack);
+            }
+        }
+    }
+
     @Test
     void sdkReadsResolvedStringPolicyAsJsonDocumentAfterCreateAndUpdate() throws Exception {
         String stack = "kms-text-policy-" + Long.toString(System.nanoTime(), 36);

@@ -95,6 +95,17 @@ public class KmsCfnProvisioner implements CfnResourceProvisioner {
                 kmsService.disableKey(key.getKeyId(), ctx.region());
             }
         }
+        String rotation = ctx.resolveOptional(props, "EnableKeyRotation");
+        if (rotation != null || ctx.previouslyDeclared("EnableKeyRotation")) {
+            boolean desiredRotation = Boolean.parseBoolean(rotation);
+            if (desiredRotation != kmsService.getKeyRotationStatus(key.getKeyId(), ctx.region())) {
+                if (desiredRotation) {
+                    kmsService.enableKeyRotation(key.getKeyId(), ctx.region());
+                } else {
+                    kmsService.disableKeyRotation(key.getKeyId(), ctx.region());
+                }
+            }
+        }
         r.setPhysicalId(key.getKeyId());
         r.getAttributes().put("Arn", key.getArn());
         r.getAttributes().put("KeyId", key.getKeyId());
