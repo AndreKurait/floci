@@ -105,6 +105,45 @@ class KmsCrossAccountGrantIamEnforcementIntegrationTest {
     }
 
     @Test
+    void aDecryptNamingNoKeyIsAuthorizedAgainstTheKeyThatEncryptedTheCiphertextInItsOwnersAccount() {
+        // Decrypt's KeyId is optional: "AWS KMS gets the KMS key that was used to encrypt the data from
+        // metadata in the ciphertext blob" (Decrypt API reference), and kms:Decrypt is authorized on that
+        // key. A caller whose policy names only the other account's key must therefore be allowed, not
+        // refused as if it had asked for a key of its own account.
+        String userName = "decrypter-" + UUID.randomUUID().toString().substring(0, 8);
+        String keyArn = customerKey();
+        EnforcementFixtures.UserCredentials user = EnforcementFixtures.createUser(
+                cleanup, RestAssured.port, auth(GRANTEE, "iam"), userName);
+        EnforcementFixtures.putUserPolicy(RestAssured.port, auth(GRANTEE, "iam"), userName, "that-key", """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+                  "Action":["kms:Encrypt","kms:Decrypt"],"Resource":"%s"}]}""".formatted(keyArn));
+        grant(keyArn, "arn:aws:iam::" + GRANTEE + ":user/" + userName, "[\"Encrypt\",\"Decrypt\"]");
+        String ciphertext = kms(user.accessKeyId(), "Encrypt", "{\"KeyId\":\"" + keyArn + "\",\"Plaintext\":\""
+                + plaintext() + "\"}").then().statusCode(200).extract().path("CiphertextBlob");
+
+        kms(user.accessKeyId(), "Decrypt", "{\"CiphertextBlob\":\"" + ciphertext + "\"}")
+                .then().statusCode(200).body("KeyId", equalTo(keyArn)).body("Plaintext", equalTo(plaintext()));
+    }
+
+    @Test
+    void aDecryptNamingNoKeyStaysRefusedWhenThePolicyDoesNotNameTheCiphertextsKey() {
+        String userName = "other-key-" + UUID.randomUUID().toString().substring(0, 8);
+        String keyArn = customerKey();
+        String otherKey = customerKey();
+        EnforcementFixtures.UserCredentials user = EnforcementFixtures.createUser(
+                cleanup, RestAssured.port, auth(GRANTEE, "iam"), userName);
+        EnforcementFixtures.putUserPolicy(RestAssured.port, auth(GRANTEE, "iam"), userName, "other-key", """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"kms:Encrypt","Resource":"%s"},
+                  {"Effect":"Allow","Action":"kms:Decrypt","Resource":"%s"}]}""".formatted(keyArn, otherKey));
+        grant(keyArn, "arn:aws:iam::" + GRANTEE + ":user/" + userName, "[\"Encrypt\"]");
+        String ciphertext = kms(user.accessKeyId(), "Encrypt", "{\"KeyId\":\"" + keyArn + "\",\"Plaintext\":\""
+                + plaintext() + "\"}").then().statusCode(200).extract().path("CiphertextBlob");
+
+        kms(user.accessKeyId(), "Decrypt", "{\"CiphertextBlob\":\"" + ciphertext + "\"}")
+                .then().statusCode(400).body("__type", equalTo("AccessDeniedException"));
+    }
+
+    @Test
     void anExplicitDenyOverridesAGrantOnAnotherAccountsKey() {
         String userName = "denied-" + UUID.randomUUID().toString().substring(0, 8);
         EnforcementFixtures.UserCredentials user = granteeUser(userName,

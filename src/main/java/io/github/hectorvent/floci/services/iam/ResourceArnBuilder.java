@@ -2314,8 +2314,9 @@ public class ResourceArnBuilder {
 
     /**
      * The key that encrypted the request's {@code CiphertextBlob}, read out of the blob the
-     * same way the handler reads it, or every key the account holds when the blob names none
-     * the account holds.
+     * same way the handler reads it: the caller's own key, or another account's key by its ARN in
+     * the account that owns it (the handler then decrypts there under a grant), or every key the
+     * account holds when the blob names no key any account holds.
      */
     private String ciphertextKeyTarget(JsonNode body, String region, String accountId, String partition) {
         JsonNode ciphertext = body.path("CiphertextBlob");
@@ -2332,6 +2333,15 @@ public class ResourceArnBuilder {
             String keyArn = blob == null ? null : kmsService.get().decryptToKeyArn(blob, region);
             if (keyArn != null) {
                 return keyArn;
+            }
+            // Decrypt is authorized on the key that encrypted the ciphertext, also when another
+            // account owns it; the caller's own key/* would make a policy naming that key miss.
+            if (blob != null) {
+                Optional<String> owner = kmsService.get().foreignCiphertextOwner(blob, region, accountId);
+                Optional<String> keyId = kmsService.get().ciphertextKeyId(blob);
+                if (owner.isPresent() && keyId.isPresent()) {
+                    return new AwsArnUtils.Arn(partition, "kms", region, owner.get(), "key/" + keyId.get()).toString();
+                }
             }
         }
         return keyWildcard(region, accountId, partition);
