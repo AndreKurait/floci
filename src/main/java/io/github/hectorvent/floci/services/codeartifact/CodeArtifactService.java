@@ -693,18 +693,17 @@ public class CodeArtifactService implements Resettable {
     }
 
     /**
-     * {@link #ensureFormatContainerId} plus {@link RepositorySidecarManager#beginUse}, both under
-     * this same {@code synchronized} monitor {@link #deleteRepository} also holds for its own
-     * sidecar cleanup, so a delete can never run its cleanup in the gap between resolving
-     * {@code repoId} and registering use of it. Used by every caller of {@link
-     * #ensureFormatContainerId} whose sidecar call is bracketed by {@code beginUse}/{@code
-     * endUse}. Exposed so the npm data plane can register use under this service's lock
-     * before its asynchronous fetch starts.
+     * Resolves and registers the lease under the repository deletion lock. Admission may wait
+     * for that repository's readiness, so it runs without holding the service-wide monitor.
+     * If deletion releases the registered lease first, beginUse rejects the stale admission.
      */
-    public synchronized String resolveContainerIdAndBeginUse(String format, String region, String domain,
+    public String resolveContainerIdAndBeginUse(String format, String region, String domain,
             String domainOwner, String repository, RepositorySidecarManager manager) {
-        String id = ensureFormatContainerId(format, region, domain, domainOwner, repository);
-        manager.registerRepository(id);
+        String id;
+        synchronized (this) {
+            id = ensureFormatContainerId(format, region, domain, domainOwner, repository);
+            manager.registerRepository(id);
+        }
         manager.beginUse(id);
         return id;
     }

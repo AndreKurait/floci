@@ -21,6 +21,7 @@ final class SidecarRepositoryLease {
         private boolean stopping;
         private boolean stopped;
         private boolean repairPending;
+        private boolean checking;
     }
 
     SidecarRepositoryLease(String sidecarName, PerKeyContainerPool pool) {
@@ -37,40 +38,69 @@ final class SidecarRepositoryLease {
         if (use == null) {
             throw new IllegalStateException("No " + sidecarName + " repository lease for " + repositoryId);
         }
-        synchronized (use) {
-            if (use.releasing) {
-                throw new IllegalStateException(sidecarName + " sidecar is being released for repository "
-                        + repositoryId);
+        while (true) {
+            synchronized (use) {
+                awaitReadiness(use);
+                if (use.releasing) {
+                    throw new IllegalStateException(sidecarName + " sidecar is being released for repository "
+                            + repositoryId);
+                }
+                if (!use.repairPending || use.active != 0) {
+                    use.active++;
+                    return;
+                }
             }
-            repairIfUnused(repositoryId, use);
-            use.active++;
+            stopIfUnused(repositoryId, use);
         }
     }
 
     String ensureReady(String repositoryId, PerKeyContainerPool.Starter starter) {
         UseState use = uses.computeIfAbsent(repositoryId, key -> new UseState());
-        synchronized (use) {
-            if (use.releasing && use.active == 0) {
-                throw new IllegalStateException(sidecarName + " sidecar is being released for repository "
-                        + repositoryId);
+        boolean allowReplacement;
+        while (true) {
+            synchronized (use) {
+                awaitReadiness(use);
+                if (use.releasing && use.active == 0) {
+                    throw new IllegalStateException(sidecarName + " sidecar is being released for repository "
+                            + repositoryId);
+                }
+                if (!use.repairPending || use.active != 0) {
+                    use.checking = true;
+                    allowReplacement = use.active == 0;
+                    break;
+                }
             }
-            repairIfUnused(repositoryId, use);
+            stopIfUnused(repositoryId, use);
+        }
+        boolean healthy = false;
+        try {
+            String ready = pool.ensureReady(repositoryId, starter, allowReplacement);
+            healthy = true;
+            return ready;
+        } finally {
+            synchronized (use) {
+                use.repairPending = !healthy;
+                use.checking = false;
+                use.notifyAll();
+            }
             try {
-                String ready = pool.ensureReady(repositoryId, starter, use.active == 0);
-                use.repairPending = false;
-                return ready;
+                stopIfUnused(repositoryId, use);
             } catch (RuntimeException e) {
-                use.repairPending = true;
-                throw e;
+                LOG.warnv(e, "Could not retire {0} sidecar for repository {1} after readiness; "
+                        + "teardown or the next admission can retry cleanup.", sidecarName, repositoryId);
             }
         }
     }
 
-    /** Called with the use lock held so a new admission cannot race retirement. */
-    private void repairIfUnused(String repositoryId, UseState use) {
-        if (use.repairPending && use.active == 0 && !use.releasing) {
-            pool.stopContainerStrict(repositoryId);
-            use.repairPending = false;
+    /** Waiters release the repository monitor; readiness and cleanup I/O never hold it. */
+    private void awaitReadiness(UseState use) {
+        while (use.checking || use.stopping) {
+            try {
+                use.wait();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while waiting for " + sidecarName + " readiness", e);
+            }
         }
     }
 
@@ -85,12 +115,6 @@ final class SidecarRepositoryLease {
                         + repositoryId);
             }
             use.active--;
-            try {
-                repairIfUnused(repositoryId, use);
-            } catch (RuntimeException e) {
-                LOG.warnv(e, "Could not retire unhealthy {0} sidecar for repository {1}; "
-                        + "the next admission will retry cleanup.", sidecarName, repositoryId);
-            }
         }
         try {
             stopIfUnused(repositoryId, use);
@@ -110,7 +134,8 @@ final class SidecarRepositoryLease {
 
     private void stopIfUnused(String repositoryId, UseState use) {
         synchronized (use) {
-            if (!use.releasing || use.active != 0 || use.stopping || use.stopped) {
+            if ((!use.releasing && !use.repairPending) || use.active != 0 || use.checking
+                    || use.stopping || use.stopped) {
                 return;
             }
             use.stopping = true;
@@ -121,11 +146,15 @@ final class SidecarRepositoryLease {
             stopped = true;
         } finally {
             synchronized (use) {
-                use.stopped = stopped;
+                use.stopped = stopped && use.releasing;
                 use.stopping = false;
                 if (stopped) {
-                    uses.remove(repositoryId, use);
+                    use.repairPending = false;
+                    if (use.releasing) {
+                        uses.remove(repositoryId, use);
+                    }
                 }
+                use.notifyAll();
             }
         }
     }

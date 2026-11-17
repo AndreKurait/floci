@@ -262,9 +262,10 @@ public interface RepositorySidecarManager {
     }
 
     /**
-     * Marks that a resolved sidecar id is about to be used before a concurrent repository delete
-     * can release it. Paired with {@link #endUse} around the whole sidecar call. The default is a
-     * no-op for formats whose containers need no per-request lease.
+     * Admits use of a registered sidecar id, rejecting a lease already released by deletion.
+     * May wait for repository readiness without holding CodeArtifactService's deletion lock.
+     * Paired with {@link #endUse} around the whole sidecar call. The default is a no-op for
+     * formats whose containers need no per-request lease.
      */
     default void beginUse(String repositoryContainerId) {
     }

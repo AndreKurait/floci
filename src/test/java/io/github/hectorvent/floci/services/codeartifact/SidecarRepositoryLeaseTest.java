@@ -3,7 +3,16 @@ package io.github.hectorvent.floci.services.codeartifact;
 import io.github.hectorvent.floci.core.common.docker.PerKeyContainerPool;
 import org.junit.jupiter.api.Test;
 
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
@@ -74,4 +83,55 @@ class SidecarRepositoryLeaseTest {
         lease.endUse("repo");
         verify(pool, never()).stopContainerStrict("repo");
     }
+    @Test
+    void releaseDuringReadinessReturnsWithoutWaitingAndRetiresAfterTheProbe() throws Exception {
+        CountDownLatch checking = new CountDownLatch(1);
+        CountDownLatch ready = new CountDownLatch(1);
+        when(pool.ensureReady("repo", starter, true)).thenAnswer(call -> {
+            checking.countDown();
+            assertTrue(ready.await(5, TimeUnit.SECONDS));
+            return "ready";
+        });
+        try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
+            Future<String> probe = executor.submit(() -> lease.ensureReady("repo", starter));
+            try {
+                assertTrue(checking.await(5, TimeUnit.SECONDS));
+                executor.submit(() -> lease.release("repo")).get(2, TimeUnit.SECONDS);
+                verify(pool, never()).stopContainerStrict("repo");
+            } finally {
+                ready.countDown();
+            }
+            assertEquals("ready", probe.get(5, TimeUnit.SECONDS));
+            verify(pool).stopContainerStrict("repo");
+            assertThrows(IllegalStateException.class, () -> lease.beginUse("repo"));
+        }
+    }
+
+    @Test
+    void finalUseCanFinishDuringReadinessAndFailedProbeRetiresAfterward() throws Exception {
+        lease.registerRepository("repo");
+        lease.beginUse("repo");
+        CountDownLatch checking = new CountDownLatch(1);
+        CountDownLatch ready = new CountDownLatch(1);
+        when(pool.ensureReady("repo", starter, false)).thenAnswer(call -> {
+            checking.countDown();
+            assertTrue(ready.await(5, TimeUnit.SECONDS));
+            throw new IllegalStateException("health timeout");
+        });
+        try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
+            Future<String> probe = executor.submit(() -> lease.ensureReady("repo", starter));
+            try {
+                assertTrue(checking.await(5, TimeUnit.SECONDS));
+                executor.submit(() -> lease.endUse("repo")).get(2, TimeUnit.SECONDS);
+                verify(pool, never()).stopContainerStrict("repo");
+            } finally {
+                ready.countDown();
+            }
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> probe.get(5, TimeUnit.SECONDS));
+            assertEquals("health timeout", failure.getCause().getMessage());
+            verify(pool).stopContainerStrict("repo");
+        }
+    }
+
 }

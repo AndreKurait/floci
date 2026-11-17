@@ -10,6 +10,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.net.http.HttpResponse.BodyHandlers;
+import java.net.http.HttpTimeoutException;
 import java.time.Duration;
 import java.util.Map;
 import java.util.Optional;
@@ -145,6 +146,8 @@ public class NpmExternalConnectionClient {
             throws IOException, InterruptedException {
         try {
             return httpClient.send(request, BodyHandlers.ofByteArray());
+        } catch (HttpTimeoutException e) {
+            throw e;
         } catch (IOException e) {
             // The GET is idempotent and no response content has been returned to its caller.
             LOG.debugv("Retrying public npm request after transport failure: {0}", e.getMessage());

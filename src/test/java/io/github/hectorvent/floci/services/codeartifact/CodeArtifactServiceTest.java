@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.docker.PerKeyContainerPool;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.services.codeartifact.CodeArtifactService.AuthorizationToken;
 import io.github.hectorvent.floci.services.codeartifact.CodeArtifactService.AuthorizationTokenScope;
@@ -38,8 +39,10 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -59,6 +62,7 @@ import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
@@ -4848,68 +4852,87 @@ class CodeArtifactServiceTest {
         verify(pypiserverClient).endUse(repoId);
     }
 
-    /**
-     * {@code listPackageVersions} and {@code deleteRepository} can never interleave: resolving
-     * {@code repoId} and calling {@code beginUse} happen under the same lock {@code
-     * deleteRepository} holds for its own sidecar cleanup. Parks {@code beginUse} while it still
-     * holds that lock, confirms a concurrently-started delete cannot even begin until it is
-     * released, then confirms the delete's {@code release} call never runs until {@code beginUse}
-     * has returned.
-     */
     @Test
-    void listPackageVersionsNeverRegistersUseWhileADeleteIsStillCleaningUpTheSameRepository()
-            throws InterruptedException {
+    void deletionRejectsAnAdmissionWaitingOutsideTheServiceMonitor() throws Exception {
         service.createDomain(REGION, "dom", null, Map.of());
         service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
-
-        List<String> events = new CopyOnWriteArrayList<>();
-        CountDownLatch beginUseStarted = new CountDownLatch(1);
-        CountDownLatch beginUseMayFinish = new CountDownLatch(1);
-        doAnswer(invocation -> {
-            events.add("beginUse-start");
-            beginUseStarted.countDown();
-            beginUseMayFinish.await(5, TimeUnit.SECONDS);
-            events.add("beginUse-end");
+        SidecarRepositoryLease lease = new SidecarRepositoryLease("test", mock(PerKeyContainerPool.class));
+        CountDownLatch admissionStarted = new CountDownLatch(1);
+        CountDownLatch admit = new CountDownLatch(1);
+        doAnswer(call -> {
+            lease.registerRepository(call.getArgument(0));
+            return null;
+        }).when(pypiserverClient).registerRepository(anyString());
+        doAnswer(call -> {
+            admissionStarted.countDown();
+            assertTrue(admit.await(5, TimeUnit.SECONDS));
+            lease.beginUse(call.getArgument(0));
             return null;
         }).when(pypiserverClient).beginUse(anyString());
-        doAnswer(invocation -> {
-            events.add("release");
+        doAnswer(call -> {
+            lease.release(call.getArgument(0));
             return null;
         }).when(pypiserverClient).release(anyString());
-
-        AtomicReference<Throwable> listingFailure = new AtomicReference<>();
-        Thread lister = new Thread(() -> {
+        try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
+            Future<String> admission = executor.submit(() -> service.resolveContainerIdAndBeginUse(
+                    "pypi", REGION, "dom", null, "repo", pypiserverClient));
             try {
-                service.listPackageVersions(REGION, "dom", null, "repo", "pypi", null, "my-pkg", null, null, null,
-                        null, null);
-            } catch (Throwable t) {
-                listingFailure.set(t);
+                assertTrue(admissionStarted.await(5, TimeUnit.SECONDS));
+                executor.submit(() -> service.deleteRepository(REGION, "dom", null, "repo"))
+                        .get(2, TimeUnit.SECONDS);
+            } finally {
+                admit.countDown();
             }
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> admission.get(5, TimeUnit.SECONDS));
+            assertTrue(failure.getCause() instanceof IllegalStateException);
+        }
+    }
+
+    @Test
+    void repositoryReadinessDoesNotBlockUnrelatedServiceOperations() throws Exception {
+        service.createDomain(REGION, "dom", null, Map.of());
+        service.createRepository(REGION, "dom", null, "repo", null, null, Map.of());
+        PerKeyContainerPool pool = mock(PerKeyContainerPool.class);
+        PerKeyContainerPool.Starter starter = mock(PerKeyContainerPool.Starter.class);
+        SidecarRepositoryLease lease = new SidecarRepositoryLease("test", pool);
+        CountDownLatch checking = new CountDownLatch(1);
+        CountDownLatch ready = new CountDownLatch(1);
+        CountDownLatch admitting = new CountDownLatch(1);
+        doAnswer(call -> {
+            lease.registerRepository(call.getArgument(0));
+            return null;
+        }).when(pypiserverClient).registerRepository(anyString());
+        doAnswer(call -> {
+            admitting.countDown();
+            lease.beginUse(call.getArgument(0));
+            return null;
+        }).when(pypiserverClient).beginUse(anyString());
+        String id = service.ensureFormatContainerId("pypi", REGION, "dom", null, "repo");
+        lease.registerRepository(id);
+        when(pool.ensureReady(eq(id), eq(starter), anyBoolean())).thenAnswer(call -> {
+            checking.countDown();
+            assertTrue(ready.await(5, TimeUnit.SECONDS));
+            return "ready";
         });
-        lister.start();
-        assertTrue(beginUseStarted.await(5, TimeUnit.SECONDS), "expected listPackageVersions to reach beginUse "
-                + "while still holding the service's lock");
-
-        Thread deleter = new Thread(() -> service.deleteRepository(REGION, "dom", null, "repo"));
-        deleter.start();
-        deleter.join(200);
-        assertTrue(deleter.isAlive(), "expected deleteRepository to block trying to acquire the service's lock "
-                + "while listPackageVersions still holds it inside beginUse");
-        assertFalse(events.contains("release"), "expected deleteRepository to not have reached its sidecar "
-                + "release call while listPackageVersions still holds the lock");
-
-        beginUseMayFinish.countDown();
-        lister.join(5_000);
-        deleter.join(5_000);
-
-        assertTrue(listingFailure.get() == null || listingFailure.get() instanceof AwsException,
-                "expected listPackageVersions to either succeed or fail with a real error, got "
-                        + listingFailure.get());
-        int beginUseEndIndex = events.indexOf("beginUse-end");
-        int releaseIndex = events.indexOf("release");
-        assertTrue(beginUseEndIndex != -1 && releaseIndex != -1 && releaseIndex > beginUseEndIndex,
-                "expected the delete's release call to only ever run after beginUse had fully finished; recorded "
-                        + "order was " + events);
+        try (ExecutorService executor = Executors.newFixedThreadPool(3)) {
+            Future<String> readiness = executor.submit(() -> lease.ensureReady(id, starter));
+            try {
+                assertTrue(checking.await(5, TimeUnit.SECONDS));
+                Future<String> admission = executor.submit(() -> service.resolveContainerIdAndBeginUse(
+                        "pypi", REGION, "dom", null, "repo", pypiserverClient));
+                assertTrue(admitting.await(5, TimeUnit.SECONDS));
+                executor.submit(() -> service.createDomain(REGION, "unrelated", null, Map.of()))
+                        .get(2, TimeUnit.SECONDS);
+                assertFalse(admission.isDone());
+                ready.countDown();
+                assertEquals(id, admission.get(5, TimeUnit.SECONDS));
+                lease.endUse(id);
+            } finally {
+                ready.countDown();
+            }
+            assertEquals("ready", readiness.get(5, TimeUnit.SECONDS));
+        }
     }
 
     @Test
