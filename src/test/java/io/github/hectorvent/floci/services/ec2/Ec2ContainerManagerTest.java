@@ -1387,12 +1387,13 @@ class Ec2ContainerManagerTest {
         Ec2ContainerManager manager = managerWithReachability(reachability);
 
         Instance instance = new Instance();
+        instance.setRegion("us-east-1");
         instance.setContainerBridgeIp("192.168.215.2");
 
         assertEquals("192.168.215.2", manager.reachablePublicAddress(instance));
         manager.exposeReachablePublicAddress(instance);
         assertEquals("192.168.215.2", instance.getPublicIpAddress());
-        assertEquals("192.168.215.2", instance.getPublicDnsName());
+        assertEquals("ec2-192-168-215-2.compute-1.amazonaws.com", instance.getPublicDnsName());
     }
 
     @Test
@@ -1402,6 +1403,7 @@ class Ec2ContainerManagerTest {
         when(reachability.isContainerIpRoutable("172.17.0.4")).thenReturn(true);
         Ec2ContainerManager manager = managerWithReachability(reachability);
         Instance instance = new Instance();
+        instance.setRegion("eu-west-1");
         instance.setPrivateIpAddress("10.0.1.10");
         instance.setContainerBridgeIp("10.0.1.10");
         instance.setImdsSourceIp("172.17.0.4");
@@ -1410,7 +1412,7 @@ class Ec2ContainerManagerTest {
         manager.exposeReachablePublicAddress(instance);
 
         assertEquals("172.17.0.4", instance.getPublicIpAddress());
-        assertEquals("172.17.0.4", instance.getPublicDnsName());
+        assertEquals("ec2-172-17-0-4.eu-west-1.compute.amazonaws.com", instance.getPublicDnsName());
         assertEquals("10.0.1.10", instance.getPrivateIpAddress());
     }
 
