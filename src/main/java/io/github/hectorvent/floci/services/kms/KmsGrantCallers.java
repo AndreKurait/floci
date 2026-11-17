@@ -1,5 +1,6 @@
 package io.github.hectorvent.floci.services.kms;
 
+import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.IamService.CallerArns;
@@ -37,7 +38,7 @@ public class KmsGrantCallers {
         RequestContext context = requestContext.get();
         String account = context.getAccountId();
         String partition = context.getPartition() == null ? "aws" : context.getPartition();
-        String root = "arn:" + partition + ":iam::" + account + ":root";
+        String root = AwsArnUtils.Arn.global(partition, "iam", account, "root").toString();
         Set<String> principals = new LinkedHashSet<>();
         Optional<CallerArns> arns = iamService.isResolvable()
                 ? iamService.get().resolveCallerArns(context.getAccessKeyId()) : Optional.empty();
