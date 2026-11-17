@@ -9159,12 +9159,28 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return selectedId;
     }
 
+    /**
+     * Whether an interface is deleted with the terminated instance it is attached to. Its record outlives
+     * the instance's terminated state until teardown has retired its peers and released its address, but
+     * like on AWS it no longer keeps its groups in use. An interface kept on termination still does.
+     */
+    private boolean goesWithTerminatedInstance(String region, NetworkInterface eni) {
+        NetworkInterfaceAttachment attachment = eni.getAttachment();
+        if (attachment == null || !attachment.isDeleteOnTermination() || attachment.getInstanceId() == null) {
+            return false;
+        }
+        return instances.get(key(region, attachment.getInstanceId()))
+                .map(instance -> instance.getState() != null && "terminated".equals(instance.getState().getName()))
+                .orElse(false);
+    }
+
     private boolean hasSecurityGroupDependencies(String region, SecurityGroup selected) {
         String groupId = selected.getGroupId();
         if (pendingSecurityGroupAssignments.containsKey(callerAccountId() + "::" + key(region, groupId))) {
             return true;
         }
         if (networkInterfaces.scan(k -> k.startsWith(region + "::")).stream()
+                .filter(eni -> !goesWithTerminatedInstance(region, eni))
                 .anyMatch(eni -> eni.getGroups().stream().anyMatch(group -> groupId.equals(group.getGroupId())))) {
             return true;
         }

@@ -3063,6 +3063,63 @@ class Ec2ServiceTest {
         assertNull(instance.getPublicIpAddress());
     }
 
+    @Test
+    void aTerminatedInstanceWhosePeerRefreshIsStillRunningNoLongerKeepsItsGroupInUse() {
+        Ec2ContainerManager containerManager = mock(Ec2ContainerManager.class);
+        Ec2Service service = containerModeService(containerManager);
+        String region = "us-east-1";
+        String subnetId = publicSubnet(service, region, "10.252.0.0/24");
+        String vpcId = service.describeSubnets(region, List.of(subnetId), Map.of()).getFirst().getVpcId();
+        SecurityGroup group = service.createSecurityGroup(region, "teardown", "teardown", vpcId);
+        Instance instance = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(group.getGroupId()), subnetId, null, List.of(), null, null,
+                null, null, 0).getInstances().getFirst();
+        instance.setDockerContainerId("container-" + instance.getInstanceId());
+        instance.setState(InstanceState.running());
+        service.terminateInstances(region, List.of(instance.getInstanceId()));
+        // Still shutting down: the instance and its interface hold the group.
+        assertEquals("DependencyViolation", assertThrows(AwsException.class,
+                () -> service.deleteSecurityGroup(region, group.getGroupId())).getErrorCode());
+
+        // The container is gone, so the manager reports the instance terminated, while the peer refresh
+        // that must finish before the post-teardown hook deletes the interface is still running.
+        instance.setState(InstanceState.terminated());
+        verify(containerManager).terminate(eq(instance), any(Runnable.class));
+        assertEquals(1, instance.getNetworkInterfaces().size());
+
+        service.deleteSecurityGroup(region, group.getGroupId());
+        assertTrue(service.describeSecurityGroups(region, List.of(), List.of(), Map.of()).stream()
+                .noneMatch(candidate -> group.getGroupId().equals(candidate.getGroupId())));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void anInterfaceDeletedWithItsTerminatedInstanceNoLongerKeepsItsGroupInUse(boolean deleteOnTermination) {
+        Ec2Service service = containerModeService();
+        String region = "us-east-1";
+        String subnetId = publicSubnet(service, region, "10.253.0.0/24");
+        String vpcId = service.describeSubnets(region, List.of(subnetId), Map.of()).getFirst().getVpcId();
+        SecurityGroup group = service.createSecurityGroup(region, "attached", "attached", vpcId);
+        Instance instance = runningContainerInstance(service, region, subnetId, null);
+        NetworkInterface eni = service.createNetworkInterface(region, subnetId, null, null, List.of(),
+                List.of(group.getGroupId()), List.of());
+        // As ModifyNetworkInterfaceAttribute would set it on the attachment.
+        service.attachNetworkInterface(region, eni.getNetworkInterfaceId(), instance.getInstanceId(), 1)
+                .setDeleteOnTermination(deleteOnTermination);
+        service.terminateInstances(region, List.of(instance.getInstanceId()));
+        // Terminated once its container is gone; the post-teardown hook that deletes or releases the
+        // interface waits for the peer refresh, which is still running.
+        instance.setState(InstanceState.terminated());
+
+        if (deleteOnTermination) {
+            service.deleteSecurityGroup(region, group.getGroupId());
+        } else {
+            // A retained interface outlives the instance with its groups, as on AWS.
+            assertEquals("DependencyViolation", assertThrows(AwsException.class,
+                    () -> service.deleteSecurityGroup(region, group.getGroupId())).getErrorCode());
+        }
+    }
+
     private static void completeContainerTermination(Ec2ContainerManager containerManager, Instance instance,
                                                       NetworkInterface retained) {
         assertEquals("in-use", retained.getStatus());

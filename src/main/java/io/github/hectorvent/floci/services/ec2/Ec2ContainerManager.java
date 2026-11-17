@@ -2234,7 +2234,8 @@ public class Ec2ContainerManager {
             if (instance.getState() != null && "terminated".equals(instance.getState().getName())) {
                 return null;
             }
-            return new PendingTermination(instance, terminationOperation(instance, afterTeardown));
+            AtomicBoolean complete = new AtomicBoolean();
+            return new PendingTermination(instance, terminationOperation(instance, afterTeardown, complete), complete);
         });
     }
 
@@ -2288,7 +2289,7 @@ public class Ec2ContainerManager {
                     LOG.warnv(failure, "EC2 instance {0} teardown failed; retaining it for retry", instanceId);
                 } finally {
                     try {
-                        if ("terminated".equals(pending.instance.getState().getName())) {
+                        if (pending.complete.get()) {
                             pendingTerminations.remove(instanceId, pending);
                         } else {
                             pending.retryAtNanos = nanoTime.getAsLong()
@@ -2312,15 +2313,18 @@ public class Ec2ContainerManager {
     private static final class PendingTermination {
         private final Instance instance;
         private final Runnable operation;
+        /** Set once teardown finished, peer refresh and address release included; the state turns terminated earlier. */
+        private final AtomicBoolean complete;
         private final AtomicBoolean executing = new AtomicBoolean();
         /** Whether an attempt has failed, so that {@link #retryAtNanos} holds a deadline. */
         private volatile boolean retryArmed;
         private volatile long retryAtNanos;
         private int retryDelaySeconds = 1;
 
-        private PendingTermination(Instance instance, Runnable operation) {
+        private PendingTermination(Instance instance, Runnable operation, AtomicBoolean complete) {
             this.instance = instance;
             this.operation = operation;
+            this.complete = complete;
         }
     }
 
@@ -2337,13 +2341,13 @@ public class Ec2ContainerManager {
             return;
         }
         pending.operation.run();
-        if (instance.getState() == null || !"terminated".equals(instance.getState().getName())) {
+        if (!pending.complete.get()) {
             throw new IllegalStateException("EC2 instance teardown did not complete: " + instance.getInstanceId());
         }
         pendingTerminations.remove(instance.getInstanceId(), pending);
     }
 
-    private Runnable terminationOperation(Instance instance, Runnable afterTeardown) {
+    private Runnable terminationOperation(Instance instance, Runnable afterTeardown, AtomicBoolean complete) {
         String containerId;
         String containerIp;
         String imdsSourceIp;
@@ -2382,12 +2386,7 @@ public class Ec2ContainerManager {
                 () -> metadataServer.unregisterInstance(instance),
                 // Give the address back only after its original workload and helper are gone.
                 () -> vpcNetworkManager.releasePrivateIp(instance.getRegion(), instance.getSubnetId(),
-                        instance.getPrivateIpAddress()),
-                () -> {
-                    long terminatedAt = clock.millis();
-                    instance.setState(InstanceState.terminated());
-                    instance.setTerminatedAt(terminatedAt);
-                });
+                        instance.getPrivateIpAddress()));
         return new Runnable() {
             private boolean unpublished;
             private boolean workloadGone;
@@ -2454,6 +2453,15 @@ public class Ec2ContainerManager {
                             Thread.currentThread().interrupt();
                         }
                     }
+                    // The workload is gone, so the instance is terminated now, as on AWS, instead of after
+                    // the peer refresh below, which can take minutes with many helpers. Its address and its
+                    // interfaces are released only once that refresh and the helper removal are done.
+                    synchronized (instance) {
+                        if (instance.getState() == null || !"terminated".equals(instance.getState().getName())) {
+                            instance.setState(InstanceState.terminated());
+                            instance.setTerminatedAt(clock.millis());
+                        }
+                    }
                 }
                 while (nextTeardown < teardownSteps.size()) {
                     teardownSteps.get(nextTeardown).run();
@@ -2463,6 +2471,7 @@ public class Ec2ContainerManager {
                     ownerCleanupSteps.get(nextOwnerCleanup).run();
                     nextOwnerCleanup++;
                 }
+                complete.set(true);
             }
         };
     }
