@@ -69,6 +69,7 @@ import java.util.stream.Collectors;
 public class SecurityGroupFirewallManager implements DnsClientVpcSource {
 
     private static final Logger LOG = Logger.getLogger(SecurityGroupFirewallManager.class);
+    private static final int MIN_NAMESPACE_SETUP_TIMEOUT_SECONDS = 10;
     private final DockerClient dockerClient;
     private final PolicyWriterJournal policyWriters;
     /** Never reuse a namespace whose remote policy writer has no proven terminal result. */
@@ -626,12 +627,13 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 // this file, so finish configuring the VPC resolver before admitting any workload.
                 ContainerExec.Result result = ContainerExec.run(dockerClient, helperId, new String[]{
                         "sh", "-c", "printf 'nameserver %s\\noptions ndots:0\\n' \"$1\" > /etc/resolv.conf",
-                        "floci-vpc-dns", resolver}, 10).throwIfTimedOut(helperId);
+                        "floci-vpc-dns", resolver}, namespaceSetupTimeoutSeconds()).throwIfTimedOut(helperId);
                 if (result.exitCode() != 0) {
                     throw new IllegalStateException("Cannot configure namespace DNS: " + result.summary());
                 }
                 ContainerExec.Result routing = ContainerExec.run(dockerClient, helperId,
-                        new String[]{"sh", "-c", VpcResolverRouting.commands(resolver)}, 10).throwIfTimedOut(helperId);
+                        new String[]{"sh", "-c", VpcResolverRouting.commands(resolver)},
+                        namespaceSetupTimeoutSeconds()).throwIfTimedOut(helperId);
                 if (routing.exitCode() != 0) {
                     throw new IllegalStateException("Cannot route the VPC link-local resolver: " + routing.summary());
                 }
@@ -648,6 +650,16 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             }
             throw new IllegalStateException("Cannot prepare protected network namespace for " + resourceId, e);
         }
+    }
+
+    /**
+     * How long a namespace setup command may take. The commands themselves finish in milliseconds,
+     * so only a stalled daemon slows them, and it gets the API timeout every other Docker call gets.
+     * A shorter budget fails the namespace while the command still runs, and these commands are not
+     * safe to run again (the resolver route and its DNAT rules are added, not replaced).
+     */
+    private int namespaceSetupTimeoutSeconds() {
+        return Math.max(MIN_NAMESPACE_SETUP_TIMEOUT_SECONDS, config.docker().apiTimeoutSeconds());
     }
 
     private void ensureHelperImage() {
