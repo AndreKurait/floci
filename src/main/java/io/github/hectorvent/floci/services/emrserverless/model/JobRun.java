@@ -30,6 +30,8 @@ public class JobRun {
     private Map<String, String> tags;
     private NetworkConfiguration networkConfiguration;
     private Integer totalExecutionDurationSeconds;
+    private ResourceUtilization billedResourceUtilization;
+    private ResourceUtilization totalResourceUtilization;
     private Long executionTimeoutMinutes;
     private String mode;
     private Map<String, Object> retryPolicy;
@@ -77,6 +79,10 @@ public class JobRun {
     public void setNetworkConfiguration(NetworkConfiguration networkConfiguration) { this.networkConfiguration = networkConfiguration; }
     public Integer getTotalExecutionDurationSeconds() { return totalExecutionDurationSeconds; }
     public void setTotalExecutionDurationSeconds(Integer totalExecutionDurationSeconds) { this.totalExecutionDurationSeconds = totalExecutionDurationSeconds; }
+    public ResourceUtilization getBilledResourceUtilization() { return billedResourceUtilization; }
+    public void setBilledResourceUtilization(ResourceUtilization billedResourceUtilization) { this.billedResourceUtilization = billedResourceUtilization; }
+    public ResourceUtilization getTotalResourceUtilization() { return totalResourceUtilization; }
+    public void setTotalResourceUtilization(ResourceUtilization totalResourceUtilization) { this.totalResourceUtilization = totalResourceUtilization; }
     public Long getExecutionTimeoutMinutes() { return executionTimeoutMinutes; }
     public void setExecutionTimeoutMinutes(Long executionTimeoutMinutes) { this.executionTimeoutMinutes = executionTimeoutMinutes; }
     public String getMode() { return mode; }
