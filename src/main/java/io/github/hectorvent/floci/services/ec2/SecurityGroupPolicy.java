@@ -78,6 +78,21 @@ public final class SecurityGroupPolicy {
 
     static boolean matchesPeer(SecurityGroup group, IpPermission permission, Peer peer,
                                Map<String, List<String>> prefixLists) {
+        if (matchesPeerAddress(permission, peer, prefixLists)) {
+            return true;
+        }
+        if (permission.getUserIdGroupPairs() != null && peer.groupIds() != null
+                && Objects.equals(group.getVpcId(), peer.vpcId())) {
+            return permission.getUserIdGroupPairs().stream().anyMatch(reference ->
+                    peer.groupIds().contains(reference.getGroupId())
+                            && Objects.equals(reference.getUserId() == null
+                                    ? group.getOwnerId() : reference.getUserId(), peer.accountId()));
+        }
+        return false;
+    }
+
+    /** Whether an address rule of {@code permission} (CIDR or prefix list) covers the peer's logical address. */
+    static boolean matchesPeerAddress(IpPermission permission, Peer peer, Map<String, List<String>> prefixLists) {
         if (permission.getIpRanges() != null && permission.getIpRanges().stream()
                 .anyMatch(range -> inCidr(peer.logicalAddress(), range.getCidrIp()))) {
             return true;
@@ -93,13 +108,6 @@ public final class SecurityGroupPolicy {
                     return true;
                 }
             }
-        }
-        if (permission.getUserIdGroupPairs() != null && peer.groupIds() != null
-                && Objects.equals(group.getVpcId(), peer.vpcId())) {
-            return permission.getUserIdGroupPairs().stream().anyMatch(reference ->
-                    peer.groupIds().contains(reference.getGroupId())
-                            && Objects.equals(reference.getUserId() == null
-                                    ? group.getOwnerId() : reference.getUserId(), peer.accountId()));
         }
         return false;
     }
