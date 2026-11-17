@@ -35,6 +35,11 @@ public interface StorageBackend<K, V> {
         throw new UnsupportedOperationException("Atomic batches are not supported by this backend");
     }
 
+    /** Persist a batch before publishing it; unsupported backends fail without changing entries. */
+    default void putAllDurably(Map<K, V> entries) {
+        throw new UnsupportedOperationException("Durable atomic batches are not supported by this backend");
+    }
+
     Optional<V> get(K key);
 
     void delete(K key);

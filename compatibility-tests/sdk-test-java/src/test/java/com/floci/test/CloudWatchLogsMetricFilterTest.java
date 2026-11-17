@@ -24,10 +24,12 @@ import software.amazon.awssdk.services.cloudwatchlogs.model.ResourceNotFoundExce
 import software.amazon.awssdk.services.cloudwatchlogs.model.StandardUnit;
 import software.amazon.awssdk.services.sts.StsClient;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -359,7 +361,7 @@ class CloudWatchLogsMetricFilterTest {
     }
 
     /**
-     * A present series is awaited: the publisher writes it shortly after PutLogEvents returns, as
+     * All expected samples of a present series are awaited: the publisher writes batches after PutLogEvents returns, as
      * AWS does. An absent series is asserted once; callers await a later positive control first.
      * The window ends at second 59 so a sample stamped on the next minute is never in scope.
      */
@@ -367,12 +369,10 @@ class CloudWatchLogsMetricFilterTest {
             throws Exception {
         boolean present = expected != null && expected.has("Sum");
         List<Statistic> statistics = MetricFilterQueryAssertions.STATISTICS.stream().map(Statistic::fromValue).toList();
-        List<Datapoint> points = statistics(metric, minute, dimensions, statistics);
-        long deadline = System.nanoTime() + 10_000_000_000L;
-        while (present && points.isEmpty() && System.nanoTime() < deadline) {
-            Thread.sleep(50);
-            points = statistics(metric, minute, dimensions, statistics);
-        }
+        List<Datapoint> points = present
+                ? awaitPublishedSamples(() -> statistics(metric, minute, dimensions, statistics),
+                        expected.get("SampleCount").asDouble(), Duration.ofSeconds(10))
+                : statistics(metric, minute, dimensions, statistics);
         assertThat(points).as(metric + " at " + minute + " " + dimensions).hasSize(present ? 1 : 0);
         List<String> recorded = present ? MetricFilterQueryAssertions.recorded(expected) : List.of();
         if (present) {
@@ -404,6 +404,18 @@ class CloudWatchLogsMetricFilterTest {
             }
         }
         MetricFilterQueryAssertions.assertSeries(namespace, metric, minute, dimensions, expected);
+    }
+
+    static List<Datapoint> awaitPublishedSamples(Supplier<List<Datapoint>> read, double expectedCount,
+                                                Duration timeout) throws InterruptedException {
+        long deadline = System.nanoTime() + timeout.toNanos();
+        List<Datapoint> points = read.get();
+        while ((points.isEmpty() || (points.size() == 1 && points.get(0).sampleCount() < expectedCount))
+                && System.nanoTime() < deadline) {
+            Thread.sleep(50);
+            points = read.get();
+        }
+        return points;
     }
 
     private static List<Datapoint> statistics(String metric, Instant minute, List<Dimension> dimensions,

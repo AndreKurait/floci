@@ -1720,6 +1720,9 @@ public interface EmulatorConfig {
         @WithDefault("false")
         boolean seedDeployerPrincipal();
 
+        /** Owner-only local JSON file declaring explicit per-account bootstrap administrators. */
+        Optional<String> bootstrapPrincipalsFile();
+
         /**
          * Alias to seed for the default account at startup, so callers that read the account
          * alias find one without creating it first. Unset means the account has no alias, which

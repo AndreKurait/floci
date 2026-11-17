@@ -207,6 +207,7 @@ floci:
       enabled: true
       enforcement-enabled: false        # Set to true to enforce IAM policies on all requests
       seed-deployer-principal: false    # Set to true to create a local floci-deployer admin principal
+      # bootstrap-principals-file: /run/secrets/floci-bootstrap.json  # explicit owner-only account administrators
 
     networkfirewall:
       enabled: true
