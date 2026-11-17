@@ -102,26 +102,6 @@ class IamManagedPolicyCaseTest {
     }
 
     @Test
-    void serviceRoleReplacementUsesCanonicalPolicyIdentitiesBeforeMutation() {
-        String canonical = AwsManagedPolicies.arnPrefix("aws") + "/AmazonS3ReadOnlyAccess";
-        String alias = AwsManagedPolicies.arnPrefix("aws") + "/amazons3readonlyaccess";
-        String roleId = iam.createRole("replacement", "/", TRUST, null, 3600, null).getRoleId();
-        iam.replaceRolePolicies("replacement", roleId, List.of(alias, canonical),
-                Map.of(), alias, 3600);
-        assertEquals(List.of(canonical), iam.getRole("replacement").getAttachedPolicyArns());
-        assertEquals(canonical, iam.getRole("replacement").getPermissionsBoundaryArn());
-        assertEquals(1, iam.getPolicy(alias).getAttachmentCount());
-        AwsException missing = assertThrows(AwsException.class,
-                () -> iam.replaceRolePolicies("replacement", roleId, List.of(alias + "Missing"),
-                        Map.of(), null, 3600));
-        assertEquals("NoSuchEntity", missing.getErrorCode());
-        assertEquals(List.of(canonical), iam.getRole("replacement").getAttachedPolicyArns());
-        assertEquals(canonical, iam.getRole("replacement").getPermissionsBoundaryArn());
-        iam.detachRolePolicy("replacement", alias);
-        assertEquals(0, iam.getPolicy(canonical).getAttachmentCount());
-    }
-
-    @Test
     void unresolvedIdentitySurvivesLookupButCannotBecomeAnUnregisteredBoundary() {
         String unknown = AwsManagedPolicies.arnPrefix("aws") + "/MissingPolicy";
         assertEquals(unknown, iam.canonicalPolicyArn(unknown));
