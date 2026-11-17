@@ -1191,11 +1191,17 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         for (int round = 0; round < 3; round++) {
             List<SecurityGroupNftCompiler.Endpoint> peers = peerEndpoints();
             List<ProtectedEndpoint> order = new ArrayList<>(endpoints.values());
-            order.sort(Comparator.comparing((ProtectedEndpoint target) -> knownByAllPeers(target))
-                    .thenComparing(target -> target.endpoint().eniId()));
+            order.sort(Comparator.comparing(target -> target.endpoint().eniId()));
             // Freeze the partition before any install can teach a peer another identity.
-            List<ProtectedEndpoint> unknown = order.stream().filter(target -> !knownByAllPeers(target)).toList();
-            List<ProtectedEndpoint> stable = order.stream().filter(this::knownByAllPeers).toList();
+            List<ProtectedEndpoint> unknown = new ArrayList<>();
+            List<ProtectedEndpoint> stable = new ArrayList<>();
+            for (ProtectedEndpoint target : order) {
+                if (knownByAllPeers(target)) {
+                    stable.add(target);
+                } else {
+                    unknown.add(target);
+                }
+            }
             boolean changed = false;
             for (ProtectedEndpoint target : unknown) {
                 // Withdraw old accepts before any peer learns a changed identity.
