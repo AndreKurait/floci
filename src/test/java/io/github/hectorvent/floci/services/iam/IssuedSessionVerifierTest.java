@@ -365,6 +365,47 @@ class IssuedSessionVerifierTest {
     }
 
     @Test
+    void controllerAdmitsASigV4aProofWithItsDerEcdsaSignature() throws Exception {
+        // A SigV4A signature is a DER-encoded ECDSA P-256 signature (about 140 hex digits), not SigV4's 64.
+        Map<String, String> request = sigV4aProof("20261008/es/aws4_request", "dummy-secret");
+        assertNotEquals(64, request.get("signature").length());
+        Response response = new IssuedSessionController(verifier, true).verify(stream(json.writeValueAsString(request)));
+        assertEquals(200, response.getStatus());
+        assertEquals("Verify", ((Identity) response.getEntity()).operation());
+    }
+
+    @Test
+    void controllerRefusesASigV4aProofTheSessionDidNotSignAsAVerificationFailure() throws Exception {
+        Map<String, String> request = sigV4aProof("20261008/es/aws4_request", "other-secret");
+        Response response = new IssuedSessionController(verifier, true).verify(stream(json.writeValueAsString(request)));
+        assertEquals(403, response.getStatus());
+        assertEquals(Map.of("code", "IssuedSessionVerificationFailed"), response.getEntity());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"sigv4-long", "sigv4a-odd", "sigv4a-short", "sigv4a-long", "sigv4a-non-hex"})
+    void controllerKeepsEachAlgorithmsSignatureShape(String mutation) throws Exception {
+        Map<String, String> request = switch (mutation) {
+            case "sigv4-long" -> {
+                Map<String, String> sigV4 = proof();
+                sigV4.put("signature", sigV4aProof("20261008/es/aws4_request", "dummy-secret").get("signature"));
+                yield sigV4;
+            }
+            default -> sigV4aProof("20261008/es/aws4_request", "dummy-secret");
+        };
+        switch (mutation) {
+            case "sigv4a-odd" -> request.put("signature", request.get("signature") + "0");
+            case "sigv4a-short" -> request.put("signature", "30060201010201");
+            case "sigv4a-long" -> request.put("signature", "a".repeat(146));
+            case "sigv4a-non-hex" -> request.put("signature", "z".repeat(140));
+            default -> { }
+        }
+        Response response = new IssuedSessionController(verifier, true).verify(stream(json.writeValueAsString(request)));
+        assertEquals(400, response.getStatus());
+        assertEquals(Map.of("code", "InvalidIssuedSessionRequest"), response.getEntity());
+    }
+
+    @Test
     void theLambdaIdentityProofStaysSigV4Only() {
         Map<String, String> request = sigV4aProof("20261008/es/aws4_request", "dummy-secret");
         IssuedSessionVerifier.Snapshot session = verifier.eligible(KEY).getFirst();

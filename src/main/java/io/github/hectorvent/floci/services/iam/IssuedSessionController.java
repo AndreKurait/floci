@@ -6,6 +6,7 @@ import com.fasterxml.jackson.core.StreamReadFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.auth.SigV4aSignature;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
 import jakarta.ws.rs.POST;
@@ -31,6 +32,10 @@ public class IssuedSessionController {
     private static final Set<String> VERIFY_FIELDS = Set.of(
             "correlationId", "accessKeyId", "sessionToken", "stringToSign", "signature");
     private static final Set<String> SELECTORS = Set.of("accessKeyId", "principalId", "principalArn");
+    /** SigV4's HMAC-SHA256 signature: 32 bytes, hex. */
+    private static final String SIGV4_SIGNATURE = "[a-fA-F0-9]{64}";
+    /** SigV4A's DER-encoded ECDSA P-256 signature: a SEQUENCE of r and s, at most 72 bytes, hex (even length). */
+    private static final String SIGV4A_SIGNATURE = "(?:[a-fA-F0-9]{2}){8,72}";
     private final IssuedSessionVerifier verifier;
     private final boolean enabled;
 
@@ -106,7 +111,7 @@ public class IssuedSessionController {
                     || !IssuedSessionVerifier.validSelector("accessKeyId", result.get("accessKeyId"))
                     || result.get("sessionToken").isEmpty() || result.get("sessionToken").length() > 4096
                     || result.get("stringToSign").isEmpty() || result.get("stringToSign").length() > 2048
-                    || !result.get("signature").matches("[a-fA-F0-9]{64}")) {
+                    || !result.get("signature").matches(signatureShape(result.get("stringToSign")))) {
                 throw new IllegalArgumentException();
             }
         } else {
@@ -120,6 +125,14 @@ public class IssuedSessionController {
             }
         }
         return Map.copyOf(result);
+    }
+
+    /**
+     * The signature shape a verify request must carry: a SigV4A string to sign ({@code AWS4-ECDSA-P256-SHA256}) is
+     * signed with ECDSA P-256 and carries a DER signature; every other string to sign carries SigV4's HMAC signature.
+     */
+    static String signatureShape(String stringToSign) {
+        return stringToSign.startsWith(SigV4aSignature.ALGORITHM + "\n") ? SIGV4A_SIGNATURE : SIGV4_SIGNATURE;
     }
 
     private static Response error(int status, String code) {

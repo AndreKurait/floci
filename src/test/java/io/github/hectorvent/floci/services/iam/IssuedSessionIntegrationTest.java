@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.iam;
 
 import io.github.hectorvent.floci.core.common.auth.SigV4RequestValidator;
+import io.github.hectorvent.floci.testutil.SigV4aSigning;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.QuarkusTestProfile;
 import io.quarkus.test.junit.TestProfile;
@@ -94,6 +95,27 @@ class IssuedSessionIntegrationTest {
                 .header("X-Amz-Security-Token", token).post("/").then().statusCode(200)
                 .body("GetCallerIdentityResponse.GetCallerIdentityResult.Arn", equalTo(arn));
         request.put("signature", "0".repeat(64));
+        given().contentType("application/json").body(request).post(BASE + "verify")
+                .then().statusCode(403).body("code", equalTo("IssuedSessionVerificationFailed"));
+    }
+
+    @Test
+    void publicAssumeRoleSigV4aProofIsVerifiedThroughTheEndpoint() {
+        // A SigV4A caller (for example a service signing AWS4-ECDSA-P256-SHA256 with an assumed role) sends a
+        // DER ECDSA signature, not SigV4's 64-digit HMAC; the endpoint must hand it to the verifier.
+        ValidatableResponse assumed = assume(null, false);
+        String key = field(assumed, "Credentials.AccessKeyId");
+        String token = field(assumed, "Credentials.SessionToken");
+        String secret = field(assumed, "Credentials.SecretAccessKey");
+        String timestamp = DateTimeFormatter.ofPattern("uuuuMMdd'T'HHmmss'Z'").withZone(ZoneOffset.UTC).format(Instant.now());
+        String text = "AWS4-ECDSA-P256-SHA256\n" + timestamp + "\n" + timestamp.substring(0, 8) + "/es/aws4_request\n"
+                + "a".repeat(64);
+        Map<String, String> request = new HashMap<>(Map.of("correlationId", "integration-4a", "accessKeyId", key,
+                "sessionToken", token, "stringToSign", text, "signature", SigV4aSigning.sign(key, secret, text)));
+        given().contentType("application/json").body(request).post(BASE + "verify")
+                .then().statusCode(200).body("operation", equalTo("Verify"))
+                .body("principalArn", equalTo(field(assumed, "AssumedRoleUser.Arn")));
+        request.put("signature", SigV4aSigning.sign(key, "not-" + secret, text));
         given().contentType("application/json").body(request).post(BASE + "verify")
                 .then().statusCode(403).body("code", equalTo("IssuedSessionVerificationFailed"));
     }
