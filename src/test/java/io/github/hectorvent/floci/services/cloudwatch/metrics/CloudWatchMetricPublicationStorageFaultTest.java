@@ -64,6 +64,37 @@ class CloudWatchMetricPublicationStorageFaultTest {
         }
     }
 
+    @ParameterizedTest
+    @CsvSource({"persistent", "hybrid", "wal"})
+    void repeatedSamplesSurviveReloadWithoutChangingTheSnapshotFormat(String mode) {
+        StorageBackend<String, MetricDatum> actual = backend(mode);
+        List<CloudWatchMetricsService.Datapoint> expected;
+        try {
+            actual.load();
+            CloudWatchMetricsService service = metrics(new AccountAwareStorageBackend<>(actual, null, ACCOUNT));
+            MetricDatum datum = MetricDatum.of("Value", "Count", 7, List.of(), 120);
+            service.publishRepeatedMetricForAccount(ACCOUNT, "App", datum, REGION, "repeated", 100);
+            service.publishRepeatedMetricForAccount(ACCOUNT, "App", datum, REGION, "repeated", 101);
+            expected = repeatedStatistics(service);
+            assertEquals(707, expected.getFirst().sum());
+            assertEquals(101, expected.getFirst().sampleCount());
+            assertEquals(Map.of("p0", 7.0, "p100", 7.0), expected.getFirst().extendedStatistics());
+            assertEquals(1, actual.keys().size());
+            actual.flush();
+        } finally { close(actual); }
+        StorageBackend<String, MetricDatum> reloaded = backend(mode);
+        try {
+            reloaded.load();
+            assertEquals(expected, repeatedStatistics(metrics(new AccountAwareStorageBackend<>(reloaded, null, ACCOUNT))));
+            assertEquals(1, reloaded.keys().size());
+        } finally { close(reloaded); }
+    }
+
+    private static List<CloudWatchMetricsService.Datapoint> repeatedStatistics(CloudWatchMetricsService service) {
+        return service.getMetricStatistics("App", "Value", List.of(), Instant.ofEpochSecond(120),
+                Instant.ofEpochSecond(179), 60, List.of("Sum", "SampleCount", "p0", "p100"), "Count", REGION);
+    }
+
     private StorageBackend<String, MetricDatum> backend(String mode) {
         return switch (mode) {
             case "memory" -> new InMemoryStorage<>();

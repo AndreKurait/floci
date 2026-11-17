@@ -38,6 +38,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.ContainerExecStubs;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
+import io.github.hectorvent.floci.core.common.docker.ContainerLiveness;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
@@ -2274,6 +2275,25 @@ class Ec2ContainerManagerTest {
         }
     }
 
+    @Test
+    void unknownContainerProbeDoesNotReportAnExitedEc2Guest() {
+        LaunchHarness harness = launchHarness();
+        Instance guest = instance("i-health-probe");
+        guest.setDockerContainerId(TEST_CONTAINER_ID);
+        guest.setState(InstanceState.running());
+        when(harness.lifecycleManager.isContainerRunning(TEST_CONTAINER_ID)).thenReturn(false);
+        doReturn(ContainerLiveness.UNKNOWN, ContainerLiveness.RUNNING, ContainerLiveness.NOT_RUNNING)
+                .when(harness.lifecycleManager).probeContainer(TEST_CONTAINER_ID);
+        try {
+            assertThrows(IllegalStateException.class, () -> harness.manager.isContainerRunning(guest));
+            assertTrue(harness.manager.isContainerRunning(guest));
+            assertFalse(harness.manager.isContainerRunning(guest));
+            assertEquals("running", guest.getState().getName());
+        } finally {
+            harness.manager.stop();
+        }
+    }
+
     private static final String TEST_INIT_HELPER_ID = "native-init-helper";
 
     @Test
@@ -3641,6 +3661,9 @@ class Ec2ContainerManagerTest {
         ContainerLifecycleManager lifecycleManager = mock(ContainerLifecycleManager.class);
         when(lifecycleManager.create(any(ContainerSpec.class))).thenReturn(TEST_CONTAINER_ID);
         when(lifecycleManager.isContainerRunning(TEST_CONTAINER_ID)).thenReturn(true);
+        lenient().when(lifecycleManager.probeContainer(TEST_CONTAINER_ID)).thenAnswer(ignored ->
+                lifecycleManager.isContainerRunning(TEST_CONTAINER_ID)
+                        ? ContainerLiveness.RUNNING : ContainerLiveness.NOT_RUNNING);
 
         DockerHostResolver dockerHostResolver = mock(DockerHostResolver.class);
         when(dockerHostResolver.resolve()).thenReturn("floci");

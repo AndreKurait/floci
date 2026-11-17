@@ -148,10 +148,10 @@ class ElbV2AliasDnsIntegrationTest {
                 assertEquals(0, rcode(response));
                 assertEquals(1, ByteBuffer.wrap(response).getShort(6));
                 String expectedAddress = "127.0.0.1";
-                if (declaredPublicRoute) {
-                    expectedAddress = EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS;
-                } else if (externalApi && knownVpc && "internet-facing".equals(scheme)) {
+                if (externalApi && !nativeHttps && knownVpc && "internet-facing".equals(scheme)) {
                     expectedAddress = EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS;
+                } else if (declaredPublicRoute) {
+                    expectedAddress = EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS;
                 } else if (nativeHttps && knownVpc && "internet-facing".equals(scheme)) {
                     expectedAddress = EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS;
                 }

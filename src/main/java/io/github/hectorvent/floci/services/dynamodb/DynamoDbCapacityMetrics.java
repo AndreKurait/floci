@@ -45,6 +45,7 @@ public class DynamoDbCapacityMetrics implements Resettable {
     private final String producerId = UUID.randomUUID().toString();
     private final Map<Resource, Observed> resources = new LinkedHashMap<>();
     private final Map<Minute, Boolean> minutes = new LinkedHashMap<>();
+    private final Map<Sample, RepeatedSample> samples = new LinkedHashMap<>();
     private final Map<String, Publication> pending = new LinkedHashMap<>();
     private long generation;
     private long suppressIdleThrough = Long.MIN_VALUE;
@@ -135,7 +136,18 @@ public class DynamoDbCapacityMetrics implements Resettable {
             id = !Boolean.TRUE.equals(prior) ? key.id()
                     : resource.id() + ":" + metric + ":" + usage.publicationId();
         }
-        publish(new Publication(resource, metric, minute, units, id, clock.instant()));
+        Sample sample = new Sample(key, units);
+        RepeatedSample priorSample = samples.get(sample);
+        long count = 1;
+        if (priorSample != null) {
+            id = priorSample.id();
+            count = priorSample.count() + 1;
+            samples.put(sample, new RepeatedSample(id, count));
+        } else if (samples.size() < MAX_MINUTES) {
+            samples.put(sample, new RepeatedSample(id, count));
+        }
+        // Saturated tracking falls back to independent publications, never discarding consumption.
+        publish(new Publication(resource, metric, minute, units, id, clock.instant(), count));
     }
 
     void tick() {
@@ -160,6 +172,7 @@ public class DynamoDbCapacityMetrics implements Resettable {
             Instant now = clock.instant();
             long currentMinute = minute(now);
             minutes.keySet().removeIf(key -> key.minute() < currentMinute - RETRY_SECONDS);
+            samples.keySet().removeIf(key -> key.minute().minute() < currentMinute - RETRY_SECONDS);
             Set<Resource> current = new HashSet<>();
             for (DynamoDbService.CapacitySnapshot snapshot : snapshots) {
                 Resource resource = new Resource(snapshot.accountId(), snapshot.region(), snapshot.tableName(),
@@ -251,8 +264,8 @@ public class DynamoDbCapacityMetrics implements Resettable {
             }
             MetricDatum datum = MetricDatum.of(publication.metric(), "Count", publication.units(), dimensions,
                     publication.timestamp());
-            metrics.publishMetricForAccount(publication.resource().accountId(), NAMESPACE, datum,
-                    publication.resource().region(), producerId + ":" + publication.id());
+            metrics.publishRepeatedMetricForAccount(publication.resource().accountId(), NAMESPACE, datum,
+                    publication.resource().region(), producerId + ":" + publication.id(), publication.sampleCount());
             return true;
         } catch (RuntimeException failure) {
             warn(failure);
@@ -276,6 +289,7 @@ public class DynamoDbCapacityMetrics implements Resettable {
     public synchronized void clear() {
         resources.clear();
         minutes.clear();
+        samples.clear();
         pending.clear();
         suppressIdleThrough = Long.MIN_VALUE;
         lastRetentionHour = Long.MIN_VALUE;
@@ -321,8 +335,16 @@ public class DynamoDbCapacityMetrics implements Resettable {
         }
     }
 
+    private record Sample(Minute minute, double units) {}
+
+    private record RepeatedSample(String id, long count) {}
+
     private record Publication(Resource resource, String metric, long timestamp, double units, String id,
-                               Instant enqueuedAt) {}
+                               Instant enqueuedAt, double sampleCount) {
+        Publication(Resource resource, String metric, long timestamp, double units, String id, Instant enqueuedAt) {
+            this(resource, metric, timestamp, units, id, enqueuedAt, 1);
+        }
+    }
 
     private static final class Observed {
         private long nextIdleMinute;

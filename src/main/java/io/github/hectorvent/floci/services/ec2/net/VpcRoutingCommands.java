@@ -41,6 +41,11 @@ final class VpcRoutingCommands {
         }
     }
 
+    /** Keep deny-first ordering in one exec; set -e prevents applying routes if the guard fails. */
+    static String guardedEndpoint(List<String> resolvers, String policy) {
+        return endpointGuard(resolvers) + "\n" + policy;
+    }
+
     static String endpointGuard() {
         return endpointGuard(List.of());
     }
