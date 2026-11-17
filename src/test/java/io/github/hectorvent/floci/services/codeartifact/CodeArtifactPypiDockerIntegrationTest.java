@@ -5,6 +5,7 @@ import io.github.hectorvent.floci.core.common.Digests;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.github.hectorvent.floci.testing.SidecarContainersProfile;
+import io.github.hectorvent.floci.testing.StartGate;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.path.json.JsonPath;
@@ -17,23 +18,20 @@ import org.junit.jupiter.api.TestMethodOrder;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.startsWith;
+import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -252,41 +250,30 @@ class CodeArtifactPypiDockerIntegrationTest {
 
     @Test
     @Order(8)
-    void concurrentFirstUseOfANewRepositoryOnlyStartsOneContainer() throws InterruptedException, ExecutionException {
+    void concurrentFirstUseOfANewRepositoryOnlyStartsOneContainer() throws InterruptedException {
         given().contentType("application/json").header("Authorization", AUTH).body("{}")
                 .post("/v1/repository?domain=" + DOMAIN + "&repository=concurrent-repo")
                 .then().statusCode(200);
 
         int attempts = 8;
-        ExecutorService pool = Executors.newFixedThreadPool(attempts);
         CountDownLatch ready = new CountDownLatch(attempts);
-        CountDownLatch go = new CountDownLatch(1);
-        List<Future<?>> requests = new ArrayList<>();
-        try {
-            for (int i = 0; i < attempts; i++) {
-                requests.add(pool.submit(() -> {
-                    ready.countDown();
-                    try {
-                        go.await();
-                        given().header("Authorization", "Bearer " + bearerToken)
-                                .get("/codeartifact/pypi/" + DOMAIN + "/concurrent-repo/simple/does-not-exist/")
-                                .then().statusCode(404);
-                    } catch (InterruptedException e) {
-                        Thread.currentThread().interrupt();
-                        throw new IllegalStateException("Concurrent request was interrupted", e);
-                    }
-                }));
+        StartGate.Results<Integer> results = StartGate.runConcurrently(attempts, index -> {
+            ready.countDown();
+            try {
+                assertTrue(ready.await(5, TimeUnit.SECONDS), "all request workers must be ready");
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("request worker interrupted before admission", e);
             }
-            assertTrue(ready.await(5, TimeUnit.SECONDS));
-            go.countDown();
-        } finally {
-            go.countDown();
-            pool.shutdown();
-            assertTrue(pool.awaitTermination(30, TimeUnit.SECONDS));
-        }
-        for (Future<?> request : requests) {
-            request.get();
-        }
+            given().header("Authorization", "Bearer " + bearerToken)
+                    .get("/codeartifact/pypi/" + DOMAIN + "/concurrent-repo/simple/does-not-exist/")
+                    .then().statusCode(404);
+            return 404;
+        });
+        assertAll("concurrent PyPI requests", results.errors().stream().map(error -> () -> {
+            throw error;
+        }));
+        assertEquals(Collections.nCopies(attempts, 404), results.values());
     }
 
     @Test
