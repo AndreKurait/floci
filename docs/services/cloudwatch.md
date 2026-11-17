@@ -477,7 +477,10 @@ through 2^360. They reject incomplete `StatisticValues` sets and datums combinin
 `StatisticValues` before storing any part of the batch. Missing statistics return `MissingParameter`;
 invalid values and non-object statistics return `InvalidParameterValue`; combining scalar and
 statistics returns `InvalidParameterCombination`. JSON bodies use the corresponding SDK exception
-shape names. The console's supported numeric values use the same bounds.
+shape names. `Values` accepts 1 to 150 numeric samples with optional matching, nonnegative
+`Counts`; omitted counts default to one. JSON and Query normalize these weighted samples without
+expanding their counts, and reject combinations with `Value` or `StatisticValues`. The console's
+supported numeric values use the same bounds.
 
 **Endpoint:** `http://localhost:4566/`. Query: GET or POST; JSON: POST.
 
@@ -491,11 +494,11 @@ five operations on the same metrics and alarms, with these request members: `Put
 `Dimensions`, `StartTime`, `EndTime`, `Period`, `Statistics`, `Unit`) and `DeleteAlarms`
 (`AlarmNames`). Every result comes back at once, so `MaxRecords` and `NextToken` change nothing.
 Console metric publication accepts a nonempty array of metric objects with either a finite
-numeric `Value` or a complete numeric `StatisticValues` object (`SampleCount`, `Sum`, `Minimum`,
+numeric `Value`, weighted `Values` with optional `Counts`, or a complete numeric `StatisticValues` object (`SampleCount`, `Sum`, `Minimum`,
 `Maximum`, with positive sample count), with string dimension names and values. Timestamps may
 be finite numeric epochs or valid ISO-8601/epoch strings. It rejects malformed batches, conflicting
-scalar/statistic-set readings, and unsupported datum fields such as `Values`, `Counts` and
-`StorageResolution` before storing any metrics. This supported subset is not complete console
+scalar/statistic-set readings, invalid weighted samples, and unsupported datum fields such as
+`StorageResolution`, `Timestamps` and `OffsetTimestamps` before storing any metrics. This supported subset is not complete console
 API parity.
 It returns HTTP 400 `UnsupportedOperation` for every other operation, such as the console's
 `GetMetricData` with `Defaults` and `Metrics`; for a request that sets any other member, such as
