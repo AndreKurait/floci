@@ -1846,14 +1846,19 @@ public class ResourceArnBuilder {
     // ── SQS ─────────────────────────────────────────────────────────────────────
     private String buildSqsArn(String operation, ContainerRequestContext ctx, String region, String accountId) {
         if ("sqs:GetQueueUrl".equals(operation) || "sqs:CreateQueue".equals(operation)) {
-            // These handlers select by name, even if an unrelated QueueUrl was sent.
-            // QueueOwnerAWSAccountId is not consumed by either handler.
+            // These handlers select by name, even if an unrelated QueueUrl was sent. GetQueueUrl selects in the
+            // QueueOwnerAWSAccountId account when it names one, so the owner's queue (and its policy) is authorized;
+            // CreateQueue has no such parameter.
             String queueName = firstFormParam(ctx, "QueueName");
+            String owner = firstFormParam(ctx, "QueueOwnerAWSAccountId");
             JsonNode json = readJsonBody(ctx);
             if (json != null && json.isObject()) {
                 queueName = json.path("QueueName").asText(null);
+                owner = json.path("QueueOwnerAWSAccountId").asText(null);
             }
-            return AwsArnUtils.Arn.of("sqs", region, accountId,
+            String queueAccount = "sqs:GetQueueUrl".equals(operation) && owner != null && owner.matches("\\d{12}")
+                    ? owner : accountId;
+            return AwsArnUtils.Arn.of("sqs", region, queueAccount,
                     queueName == null || queueName.isEmpty() ? "*" : queueName).toString();
         }
         String queueUrl = firstFormParam(ctx, "QueueUrl");

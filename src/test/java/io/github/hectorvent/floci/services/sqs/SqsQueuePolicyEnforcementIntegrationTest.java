@@ -29,6 +29,7 @@ import java.util.UUID;
 
 import static io.github.hectorvent.floci.testing.EnforcementFixtures.auth;
 import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.containsString;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 
@@ -69,6 +70,33 @@ class SqsQueuePolicyEnforcementIntegrationTest {
         queue.addPermission("from-other", OTHER, "SendMessage");
         send(accessKey, queue).statusCode(200);
         assertEquals("hello", queue.receive().getFirst().getBody());
+    }
+
+    @Test
+    void anotherAccountGetsTheQueueUrlByOwnerOnlyWhenTheQueueGrantsIt() {
+        // A producer in another account finds a queue it may send to by name and owner (QueueOwnerAWSAccountId),
+        // as an SDK client resolving a cross-account queue does.
+        SqsTestQueue queue = queue();
+        String name = "sqs-owner-" + UUID.randomUUID();
+        String authorization = auth(OTHER, REGION, "iam");
+        UserCredentials credentials = EnforcementFixtures.createUser(cleanup, baseUri.getPort(), authorization, name);
+        EnforcementFixtures.putUserPolicy(baseUri.getPort(), authorization, name, "p", READ_ONLY);
+
+        ownerRequest(credentials.accessKeyId(), queue).statusCode(403);
+
+        queue.addPermission("url-from-other", OTHER, "GetQueueUrl");
+        ownerRequest(credentials.accessKeyId(), queue).statusCode(200).body(containsString(queue.url()));
+        try (SqsClient client = SqsClient.builder().endpointOverride(baseUri).region(Region.of(REGION))
+                .credentialsProvider(StaticCredentialsProvider.create(
+                        AwsBasicCredentials.create(credentials.accessKeyId(), credentials.secretAccessKey())))
+                .httpClientBuilder(UrlConnectionHttpClient.builder())
+                .overrideConfiguration(config -> config.apiCallTimeout(Duration.ofSeconds(10)))
+                .build()) {
+            assertEquals(queue.url(), client.getQueueUrl(request -> request.queueName(queueName(queue))
+                    .queueOwnerAWSAccountId(OWNER)).queueUrl());
+        }
+        // The grant names GetQueueUrl only.
+        send(credentials.accessKeyId(), queue).statusCode(403);
     }
 
     @Test
@@ -203,6 +231,14 @@ class SqsQueuePolicyEnforcementIntegrationTest {
                 .queryParam("QueueName", "url-query-decoy")
                 .formParam("Action", operation).formParam("Version", "2012-11-05")
                 .formParam("QueueName", queueName(queue)).formParam("QueueUrl", decoyUrl)
+                .post("/").then();
+    }
+
+    private ValidatableResponse ownerRequest(String accessKey, SqsTestQueue queue) {
+        return given().port(baseUri.getPort()).header("Authorization", auth(accessKey, "sqs"))
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "GetQueueUrl").formParam("Version", "2012-11-05")
+                .formParam("QueueName", queueName(queue)).formParam("QueueOwnerAWSAccountId", OWNER)
                 .post("/").then();
     }
 
