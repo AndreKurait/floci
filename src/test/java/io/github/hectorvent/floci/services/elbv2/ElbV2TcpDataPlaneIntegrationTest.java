@@ -441,6 +441,72 @@ class ElbV2TcpDataPlaneIntegrationTest {
         }
     }
 
+    /**
+     * On AWS every load balancer has its own addresses, so an NLB's TCP listener and another load balancer's
+     * HTTP listener on the same port both serve. Here the TCP listener keeps the local port, and the other load
+     * balancer's listener is selected by its name and the port through the emulator's endpoint, the way a
+     * front door that terminates TLS forwards to it. Before, the TCP listener parked it, and the request fell
+     * through to the emulator's own API.
+     */
+    @Test
+    void anotherLoadBalancersHttpListenerOnTheTcpPortIsServedByNameThroughTheEmulatorEndpoint() throws Exception {
+        LoadBalancer other = client.createLoadBalancer(
+                request -> request.name("tcp-regression-named")
+                        .type(LoadBalancerTypeEnum.APPLICATION)
+                        .subnets(Ec2Service.defaultSubnetId("us-east-1", "a"),
+                                Ec2Service.defaultSubnetId("us-east-1", "b")))
+                .loadBalancers().getFirst();
+        try {
+            client.createListener(request -> request.loadBalancerArn(other.loadBalancerArn())
+                    .protocol(ProtocolEnum.HTTP).port(listenerPort)
+                    .defaultActions(Action.builder().type(ActionTypeEnum.FIXED_RESPONSE).fixedResponseConfig(
+                            FixedResponseActionConfig.builder().statusCode("200").contentType("text/plain")
+                                    .messageBody("named").build()).build()));
+            try (Socket socket = connect(listenerPort)) {
+                assertEcho(socket, new byte[]{0, 7, 13, 10});
+            }
+            await().atMost(Duration.ofSeconds(5)).ignoreExceptions()
+                    .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                    .untilAsserted(() -> {
+                        try (Socket socket = connect(endpoint.getPort())) {
+                            socket.getOutputStream().write(("GET / HTTP/1.1\r\nHost: " + other.dnsName() + ":"
+                                    + listenerPort + "\r\nConnection: close\r\n\r\n")
+                                    .getBytes(StandardCharsets.US_ASCII));
+                            String response = new String(socket.getInputStream().readAllBytes(),
+                                    StandardCharsets.US_ASCII);
+                            assertTrue(response.startsWith("HTTP/1.1 200"), response);
+                            assertTrue(response.endsWith("named"), response);
+                        }
+                    });
+            try (Socket socket = connect(listenerPort)) {
+                assertEcho(socket, new byte[]{0, 7, 13, 11});
+            }
+        } finally {
+            client.deleteLoadBalancer(request -> request.loadBalancerArn(other.loadBalancerArn()));
+        }
+    }
+
+    /** A parked TCP listener owns nothing, so deleting it must not restart the port its peer serves. */
+    @Test
+    void deletingAParkedTcpListenerKeepsTheServingListenersConnections() throws Exception {
+        String otherLbArn = client.createLoadBalancer(request -> request.name("tcp-regression-parked-tcp")
+                .type(LoadBalancerTypeEnum.NETWORK)
+                .subnets(Ec2Service.defaultSubnetId("us-east-1", "a")))
+                .loadBalancers().getFirst().loadBalancerArn();
+        try (Socket socket = connect(listenerPort)) {
+            assertEcho(socket, new byte[]{0, 5, 13, 10});
+            String parked = client.createListener(request -> request.loadBalancerArn(otherLbArn)
+                    .protocol(ProtocolEnum.TCP).port(listenerPort)
+                    .defaultActions(Action.builder().type(ActionTypeEnum.FORWARD)
+                            .targetGroupArn(targetGroupArn).build()))
+                    .listeners().getFirst().listenerArn();
+            client.deleteListener(request -> request.listenerArn(parked));
+            assertEcho(socket, new byte[]{0, 5, 13, 11});
+        } finally {
+            client.deleteLoadBalancer(request -> request.loadBalancerArn(otherLbArn));
+        }
+    }
+
     @ParameterizedTest
     @EnumSource(value = ProtocolEnum.class, names = {"TCP", "HTTP"})
     void listenerStartsAfterExternalPortOwnerReleasesIt(ProtocolEnum protocol) throws Exception {
