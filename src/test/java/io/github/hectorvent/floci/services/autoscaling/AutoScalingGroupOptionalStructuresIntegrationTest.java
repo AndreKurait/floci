@@ -10,7 +10,9 @@ import org.junit.jupiter.api.TestMethodOrder;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.not;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /**
  * Wire-level coverage for the AutoScalingGroup members that DescribeAutoScalingGroups used to drop:
@@ -29,8 +31,9 @@ class AutoScalingGroupOptionalStructuresIntegrationTest {
 
     private static final String GROUP = "opt-structures-asg";
     private static final String BARE_GROUP = "opt-structures-bare-asg";
-    private static final String MEMBER =
-            "DescribeAutoScalingGroupsResponse.DescribeAutoScalingGroupsResult.AutoScalingGroups.member.";
+    private static final String GROUPS =
+            "DescribeAutoScalingGroupsResponse.DescribeAutoScalingGroupsResult.AutoScalingGroups.";
+    private static final String MEMBER = GROUPS + "member.";
     private static final String ROLE_ARN =
             "arn:aws:iam::000000000000:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling_opt";
 
@@ -180,7 +183,10 @@ class AutoScalingGroupOptionalStructuresIntegrationTest {
             .then()
                 .statusCode(200);
 
-        describe(GROUP).body(not(containsString("<EnabledMetrics>")));
+        // AWS still returns the member, as an empty list, once every metric is disabled.
+        describe(GROUP)
+                .body(containsString("<EnabledMetrics>"))
+                .body(MEMBER + "EnabledMetrics.member.size()", equalTo(0));
     }
 
     @Test
@@ -239,7 +245,9 @@ class AutoScalingGroupOptionalStructuresIntegrationTest {
                 .body(not(containsString("<InstanceMaintenancePolicy>")))
                 .body(not(containsString("<AvailabilityZoneDistribution>")))
                 .body(not(containsString("<CapacityReservationSpecification>")))
-                .body(not(containsString("<EnabledMetrics>")));
+                // EnabledMetrics is a list, which AWS always returns: empty for a group with no metrics enabled.
+                .body(containsString("<EnabledMetrics>"))
+                .body(MEMBER + "EnabledMetrics.member.size()", equalTo(0));
     }
 
     @Test
@@ -354,6 +362,41 @@ class AutoScalingGroupOptionalStructuresIntegrationTest {
 
     @Test
     @Order(17)
+    void aBatchDescribeCarriesEnabledMetricsOnEveryGroupWithOrWithoutMetrics() {
+        // Clients that index the member directly (botocore leaves an absent list out of the parsed group) must
+        // find it on every group of a batch, including one that never enabled metrics collection.
+        given()
+                .formParam("Action", "EnableMetricsCollection")
+                .formParam("AutoScalingGroupName", GROUP)
+                .formParam("Metrics.member.1", "GroupMinSize")
+                .formParam("Granularity", "1Minute")
+                .header("Authorization", AUTH)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200);
+
+        String body = given()
+                .formParam("Action", "DescribeAutoScalingGroups")
+                .formParam("AutoScalingGroupNames.member.1", GROUP)
+                .formParam("AutoScalingGroupNames.member.2", BARE_GROUP)
+                .header("Authorization", AUTH)
+            .when()
+                .post("/")
+            .then()
+                .statusCode(200)
+                .body(GROUPS + "member.size()", equalTo(2))
+                .body(GROUPS + "member.find { it.AutoScalingGroupName == '" + GROUP + "' }"
+                        + ".EnabledMetrics.member.Metric", hasItem("GroupMinSize"))
+                .body(GROUPS + "member.find { it.AutoScalingGroupName == '" + BARE_GROUP + "' }"
+                        + ".EnabledMetrics.member.size()", equalTo(0))
+                .extract().asString();
+
+        assertEquals(2, body.split("<EnabledMetrics>", -1).length - 1, body);
+    }
+
+    @Test
+    @Order(18)
     void cleanUp() {
         for (String name : new String[] {GROUP, BARE_GROUP}) {
             given()
