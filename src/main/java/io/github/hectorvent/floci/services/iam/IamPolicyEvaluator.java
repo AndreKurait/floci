@@ -224,6 +224,27 @@ public class IamPolicyEvaluator {
     }
 
     /**
+     * True when a service control policy withholds {@code action} from the caller, or any of the
+     * caller's identity, session or boundary policies explicitly denies it. A grant authorizes on
+     * its own, but never past an explicit deny.
+     */
+    public boolean deniesExplicitly(CallerContext caller, String action, String resource,
+                                    Map<String, List<String>> conditionCtx) {
+        Map<String, List<String>> ctx = normalizeConditionContext(conditionCtx);
+        String loweredAction = lowercase(action);
+        if (!scpAllows(caller.scpLevels(), loweredAction, resource, ctx)) {
+            return true;
+        }
+        List<PolicyStatement> sessionStmts = caller.sessionPolicyDocuments().isEmpty()
+                ? null : parseAll(caller.sessionPolicyDocuments());
+        List<PolicyStatement> boundaryStmts = caller.boundaryPolicyDocument() == null
+                ? null : parseAll(List.of(caller.boundaryPolicyDocument()));
+        return anyExplicitDeny(parseAll(caller.identityPolicies()), loweredAction, resource, ctx)
+                || (sessionStmts != null && anyExplicitDeny(sessionStmts, loweredAction, resource, ctx))
+                || (boundaryStmts != null && anyExplicitDeny(boundaryStmts, loweredAction, resource, ctx));
+    }
+
+    /**
      * Evaluates a resource-based policy standalone for an IAM caller identified by its ARN. With no
      * ARN, the request's {@code aws:PrincipalArn} stands in for it, which is IAM-only too: the key
      * names IAM users, roles, federated users and the account root, never a service.
