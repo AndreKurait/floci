@@ -29,6 +29,7 @@ import org.jboss.logging.Logger;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.List;
@@ -1052,12 +1053,48 @@ public class CloudTrailService {
             }
         }
 
+        Optional<IamService.CallerArns> roleSession = iamService.resolveCallerArns(accessKeyId)
+                .filter(arns -> IamService.CallerArns.TYPE_ASSUMED_ROLE.equals(arns.principalType()));
+        if (roleSession.isPresent()) {
+            return assumedRoleIdentity(roleSession.get(), accessKeyId);
+        }
+
         identity.put("type", "IAMUser");
         identity.put("principalId", "AIDA" + repeat('A', 17));
         identity.put("arn", regionResolver.buildGlobalArn("iam", accountId, "user/anonymous"));
         identity.put("accountId", accountId);
         identity.put("accessKeyId", accessKeyId);
         identity.put("userName", "anonymous");
+        return identity;
+    }
+
+    /**
+     * The identity AWS records for a role session's request: the session's assumed-role ARN and
+     * {@code RoleId:SessionName} principal, with the role that issued it as the session issuer.
+     */
+    private ObjectNode assumedRoleIdentity(IamService.CallerArns session, String accessKeyId) {
+        String roleArn = session.principalArn();
+        String accountId = AwsArnUtils.accountOrDefault(session.callerArn(), regionResolver.getAccountId());
+        String principalId = session.userId() == null ? "" : session.userId();
+        int separator = principalId.indexOf(':');
+        ObjectNode identity = mapper.createObjectNode();
+        identity.put("type", "AssumedRole");
+        identity.put("principalId", principalId);
+        identity.put("arn", session.callerArn());
+        identity.put("accountId", accountId);
+        identity.put("accessKeyId", accessKeyId);
+        ObjectNode context = identity.putObject("sessionContext");
+        ObjectNode issuer = context.putObject("sessionIssuer");
+        issuer.put("type", "Role");
+        issuer.put("principalId", separator < 0 ? principalId : principalId.substring(0, separator));
+        issuer.put("arn", roleArn);
+        issuer.put("accountId", AwsArnUtils.accountOrDefault(roleArn, accountId));
+        issuer.put("userName", roleArn.substring(roleArn.lastIndexOf('/') + 1));
+        ObjectNode attributes = context.putObject("attributes");
+        if (session.tokenIssueTime() != null) {
+            attributes.put("creationDate", session.tokenIssueTime().truncatedTo(ChronoUnit.SECONDS).toString());
+        }
+        attributes.put("mfaAuthenticated", String.valueOf(Boolean.TRUE.equals(session.multiFactorAuthPresent())));
         return identity;
     }
 
