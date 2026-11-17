@@ -394,6 +394,11 @@
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>kinesis</artifactId>
         </dependency>
+        <!-- Sync HTTP client: explicit local RDS response deadline -->
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>apache-client</artifactId>
+        </dependency>
         <!-- Netty async HTTP client — required for KinesisAsyncClient (SubscribeToShard) -->
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
