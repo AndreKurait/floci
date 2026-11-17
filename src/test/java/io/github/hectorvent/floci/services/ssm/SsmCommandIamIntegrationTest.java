@@ -234,7 +234,7 @@ class SsmCommandIamIntegrationTest {
 
     private static void denied(Executable operation) {
         SsmException failure = assertThrows(SsmException.class, operation);
-        assertEquals(400, failure.statusCode());
+        assertEquals(403, failure.statusCode());
         assertEquals("AccessDeniedException", failure.awsErrorDetails().errorCode());
     }
 

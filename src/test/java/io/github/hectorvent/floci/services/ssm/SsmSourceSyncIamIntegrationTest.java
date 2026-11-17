@@ -260,7 +260,7 @@ class SsmSourceSyncIamIntegrationTest {
 
     static void assertDenied(Runnable operation) {
         SsmException failure = assertThrows(SsmException.class, operation::run);
-        assertEquals(400, failure.statusCode());
+        assertEquals(403, failure.statusCode());
         assertEquals("AccessDeniedException", failure.awsErrorDetails().errorCode());
     }
 

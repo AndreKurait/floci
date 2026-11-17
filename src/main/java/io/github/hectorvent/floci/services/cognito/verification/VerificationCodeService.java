@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.cognito.verification;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import io.github.hectorvent.floci.core.common.Digests;
+import io.github.hectorvent.floci.core.common.StripedLocks;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 
@@ -50,7 +51,7 @@ public final class VerificationCodeService {
      * one, never a Lambda trigger or a Cognito lock, so no lock a caller holds around these methods can form
      * a cycle with it.
      */
-    private final Object[] codeLocks = newCodeLocks();
+    private final StripedLocks codeLocks = new StripedLocks(CODE_LOCK_STRIPES);
 
     public VerificationCodeService(StorageFactory storageFactory, Clock clock) {
         this.store = storageFactory.create(
@@ -237,15 +238,7 @@ public final class VerificationCodeService {
     }
 
     private Object lockFor(String key) {
-        return codeLocks[Math.floorMod(key.hashCode(), CODE_LOCK_STRIPES)];
-    }
-
-    private static Object[] newCodeLocks() {
-        Object[] locks = new Object[CODE_LOCK_STRIPES];
-        for (int i = 0; i < locks.length; i++) {
-            locks[i] = new Object();
-        }
-        return locks;
+        return codeLocks.lockFor(key);
     }
 
     private byte[] randomBytes(int n) {
