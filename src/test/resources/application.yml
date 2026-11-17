@@ -450,6 +450,7 @@ floci:
       enabled: true
       mock: true
       max-health-check-interval-millis: 0
+      dns-name-strategy: floci
       alb-zone-rule: aws
     codebuild:
       enabled: true
