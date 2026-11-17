@@ -1,19 +1,28 @@
 package io.floci.aws.services.cloudformation.provisioners;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.ReservedTags;
 import io.floci.aws.services.cloudformation.model.StackResource;
 import io.floci.aws.services.kms.KmsService;
 import io.floci.aws.services.kms.model.KmsKey;
 import jakarta.enterprise.context.ApplicationScoped;
 
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.UUID;
 
 /** Provisions {@code AWS::KMS::Key} and {@code AWS::KMS::Alias}. */
 @ApplicationScoped
 public class KmsCfnProvisioner implements CfnResourceProvisioner {
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private static final String KEY = "AWS::KMS::Key";
     private static final String ALIAS = "AWS::KMS::Alias";
@@ -40,14 +49,158 @@ public class KmsCfnProvisioner implements CfnResourceProvisioner {
     }
 
     private void provisionKey(StackResource r, JsonNode props, ProvisionContext ctx) {
+        clearUpdate(r);
         String description = ctx.resolveOptional(props, "Description");
-        String requestedSpec = ctx.resolveOptional(props, "KeySpec");
-        String requestedUsage = ctx.resolveOptional(props, "KeyUsage");
+        String spec = ctx.resolveOptional(props, "KeySpec");
+        String usage = ctx.resolveOptional(props, "KeyUsage");
+        spec = spec == null ? "SYMMETRIC_DEFAULT" : spec;
+        usage = usage == null ? "ENCRYPT_DECRYPT" : usage;
+        boolean multiRegion = Boolean.parseBoolean(ctx.resolveOptional(props, "MultiRegion"));
+        JsonNode policyNode = props == null ? null : props.get("KeyPolicy");
+        JsonNode resolvedPolicy = ctx.engine().resolveNode(policyNode);
+        String policy = resolvedPolicy == null || resolvedPolicy.isNull() ? null
+                : resolvedPolicy.isTextual() ? resolvedPolicy.textValue() : resolvedPolicy.toString();
         Map<String, String> tags = parseCfnTags(props != null ? props.get("Tags") : null, ctx);
-        KmsKey key = kmsService.createKey(description, requestedUsage, requestedSpec, null, tags, ctx.region());
+        KmsKey key;
+        if (ctx.isUpdate() && !CfnResourceDispatcher.isStub(ctx.priorPhysicalId(), r.getAttributes())) {
+            key = kmsService.describeKey(ctx.priorPhysicalId(), ctx.region());
+            if ("PendingDeletion".equals(key.getKeyState())) {
+                throw new AwsException("KMSInvalidStateException", key.getArn() + " is pending deletion.", 400);
+            }
+            // KMS rejects immutable property changes, even with UpdateReplacePolicy: Retain.
+            // Validate before any mutable property is applied or key material is created.
+            if (!key.getKeySpec().name().equals(spec) || !key.getKeyUsage().name().equals(usage)
+                    || key.isMultiRegion() != multiRegion) {
+                throw new AwsException("InvalidRequest", "KeySpec, KeyUsage and MultiRegion cannot be changed.", 400);
+            }
+            String overrideId = ReservedTags.extractOverrideKeyId(tags);
+            if (overrideId != null && !overrideId.equals(key.getKeyId())) {
+                throw new AwsException("InvalidRequest", "The key ID override cannot be changed.", 400);
+            }
+            tags.remove(ReservedTags.OVERRIDE_ID_KEY);
+            ReservedTags.rejectReservedTagsOnUpdate(tags);
+            snapshotKey(r, key, tags, ctx.region());
+            if (description != null || ctx.previouslyDeclared("Description")) {
+                kmsService.updateKeyDescription(key.getKeyId(), description == null ? "" : description, ctx.region());
+            }
+            if (policy != null || ctx.previouslyDeclared("KeyPolicy")) {
+                kmsService.putKeyPolicy(key.getKeyId(),
+                        policy == null ? kmsService.buildDefaultKeyPolicy() : policy, ctx.region());
+            }
+            if (props != null && props.has("Tags") || ctx.previouslyDeclared("Tags")) {
+                kmsService.untagResource(key.getKeyId(), ProvisionContext.staleTagKeys(key.getTags(), tags), ctx.region());
+                kmsService.tagResource(key.getKeyId(), tags, ctx.region());
+            }
+        } else {
+            key = kmsService.createKey(description, usage, spec, policy, tags, null, multiRegion, ctx.region());
+        }
+        String enabled = ctx.resolveOptional(props, "Enabled");
+        boolean desiredEnabled = enabled == null || Boolean.parseBoolean(enabled);
+        boolean reconcileEnabled = enabled != null || ctx.previouslyDeclared("Enabled");
+        if (reconcileEnabled && desiredEnabled != key.isEnabled()) {
+            if (desiredEnabled) {
+                kmsService.enableKey(key.getKeyId(), ctx.region());
+            } else {
+                kmsService.disableKey(key.getKeyId(), ctx.region());
+            }
+        }
+        String rotation = ctx.resolveOptional(props, "EnableKeyRotation");
+        if (rotation != null || ctx.previouslyDeclared("EnableKeyRotation")) {
+            boolean desiredRotation = Boolean.parseBoolean(rotation);
+            if (desiredRotation != kmsService.getKeyRotationStatus(key.getKeyId(), ctx.region())) {
+                if (desiredRotation) {
+                    kmsService.enableKeyRotation(key.getKeyId(), ctx.region());
+                } else {
+                    kmsService.disableKeyRotation(key.getKeyId(), ctx.region());
+                }
+            }
+        }
         r.setPhysicalId(key.getKeyId());
         r.getAttributes().put("Arn", key.getArn());
         r.getAttributes().put("KeyId", key.getKeyId());
+    }
+
+    private void snapshotKey(StackResource resource, KmsKey key, Map<String, String> desiredTags, String region) {
+        ObjectNode snapshot = MAPPER.createObjectNode();
+        snapshot.put("region", region);
+        snapshot.put("keyId", key.getKeyId());
+        snapshot.put("description", key.getDescription());
+        snapshot.put("policy", key.getPolicy());
+        snapshot.put("enabled", key.isEnabled());
+        snapshot.put("rotation", key.isKeyRotationEnabled());
+        Set<String> tagKeys = new HashSet<>(key.getTags().keySet());
+        tagKeys.addAll(desiredTags.keySet());
+        CfnRollback.putTagSnapshot(snapshot, tagKeys, key.getTags());
+        resource.getAttributes().put(CfnRollback.KMS_KEY_UPDATE_SNAPSHOT_ATTR, snapshot.toString());
+    }
+
+    @Override
+    public boolean retainsFailedUpdateState(StackResource resource) {
+        return resource.getAttributes().containsKey(CfnRollback.KMS_KEY_UPDATE_SNAPSHOT_ATTR);
+    }
+
+    @Override
+    public UpdateCleanupResult completeUpdate(StackResource resource) {
+        clearUpdate(resource);
+        return UpdateCleanupResult.notApplicable();
+    }
+
+    @Override
+    public void clearUpdate(StackResource resource) {
+        resource.getAttributes().remove(CfnRollback.KMS_KEY_UPDATE_SNAPSHOT_ATTR);
+    }
+
+    @Override
+    public boolean rollbackUpdate(StackResource resource) {
+        String raw = resource.getAttributes().get(CfnRollback.KMS_KEY_UPDATE_SNAPSHOT_ATTR);
+        if (raw == null) {
+            return false;
+        }
+        JsonNode snapshot;
+        try {
+            snapshot = MAPPER.readTree(raw);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("Could not read the KMS key update snapshot for "
+                    + resource.getLogicalId(), e);
+        }
+        String id = snapshot.path("keyId").asText();
+        String region = snapshot.path("region").asText();
+        KmsKey current = kmsService.describeKey(id, region);
+        String description = snapshot.path("description").textValue();
+        String policy = snapshot.path("policy").textValue();
+        if (!Objects.equals(description, current.getDescription())) {
+            kmsService.updateKeyDescription(id, description, region);
+        }
+        if (!Objects.equals(policy, current.getPolicy())) {
+            kmsService.putKeyPolicy(id, policy, region);
+        }
+        Map<String, String> tags = CfnRollback.snapshotTags(snapshot);
+        kmsService.untagResource(id, CfnRollback.snapshotTagKeys(snapshot).stream()
+                .filter(key -> !tags.containsKey(key)).toList(), region);
+        kmsService.tagResource(id, tags, region);
+        boolean rotation = snapshot.path("rotation").asBoolean();
+        boolean enabled = current.isEnabled();
+        if (rotation != kmsService.getKeyRotationStatus(id, region)) {
+            // Rotation operations require an enabled key, even when restoring a disabled key.
+            if (!enabled) {
+                kmsService.enableKey(id, region);
+                enabled = true;
+            }
+            if (rotation) {
+                kmsService.enableKeyRotation(id, region);
+            } else {
+                kmsService.disableKeyRotation(id, region);
+            }
+        }
+        if (snapshot.path("enabled").asBoolean() != enabled) {
+            if (snapshot.path("enabled").asBoolean()) {
+                kmsService.enableKey(id, region);
+            } else {
+                kmsService.disableKey(id, region);
+            }
+        }
+        clearUpdate(resource);
+        return true;
     }
 
     private void provisionAlias(StackResource r, JsonNode props, ProvisionContext ctx) {
