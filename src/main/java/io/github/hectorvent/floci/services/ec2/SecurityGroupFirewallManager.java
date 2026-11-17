@@ -4,6 +4,7 @@ import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.InspectExecResponse;
+import com.github.dockerjava.api.exception.ConflictException;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.Container;
 import com.github.dockerjava.api.model.ContainerNetwork;
@@ -1170,7 +1171,10 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 return;
             } catch (RuntimeException failure) {
                 quarantineAll(endpoints.values().stream().map(ProtectedEndpoint::helperId).toList());
-                if (!(failure.getCause() instanceof NotFoundException)) {
+                // Docker answers 404 for a removed helper and 409 for a stopped one that still exists;
+                // either way retiring the helpers that no longer run may let the pass complete.
+                if (!(failure.getCause() instanceof NotFoundException)
+                        && !(failure.getCause() instanceof ConflictException)) {
                     throw failure;
                 }
                 int previousCount = endpoints.size();
