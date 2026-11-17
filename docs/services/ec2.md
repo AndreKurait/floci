@@ -938,8 +938,8 @@ address behavior.
 | DescribeDhcpOptions | Lists DHCP options sets by ID or filters, with paginated results. |
 | AssociateDhcpOptions | Associates an options set with a VPC; `default` leaves the VPC with no DHCP options. |
 | DeleteDhcpOptions | Deletes an unassociated DHCP options set. |
-| DescribeVpcEndpointServices | Lists common AWS interface endpoint services and S3 (gateway and interface) in every availability zone, named per partition (see [Partitions](../configuration/partitions.md)). A `ServiceName` filter is echoed back as asked. |
-| CreateVpcEndpoint | Creates a VPC endpoint record, including its `PolicyDocument` and the per-subnet IPv4 and IPv6 addresses named by `SubnetConfiguration.N`. `IpAddressType` defaults to `ipv4`. Interface and gateway address types are stored as metadata. Synthesized endpoint interfaces still carry IPv4 only; IPv6 networking is not emulated. An `Ipv4` value outside the named subnet's CIDR, or among the first four or the last address AWS reserves in it, is rejected with `InvalidParameterValue`. |
+| DescribeVpcEndpointServices | Lists common AWS interface endpoint services and S3 (gateway and interface) in every availability zone, named per partition (see [Partitions](../configuration/partitions.md)), followed by the [VPC endpoint services](#vpc-endpoint-services) the caller owns or is allowed to connect to. A `ServiceName` filter is echoed back as asked, except that the name of an endpoint service the caller may not see is refused with `InvalidServiceName`. |
+| CreateVpcEndpoint | Creates a VPC endpoint record, including its `PolicyDocument` and the per-subnet IPv4 and IPv6 addresses named by `SubnetConfiguration.N`. An endpoint to a [VPC endpoint service](#vpc-endpoint-services) must be of the service's type, and starts `pendingAcceptance` or `available` as the service decides. `IpAddressType` defaults to `ipv4`. Interface and gateway address types are stored as metadata. Synthesized endpoint interfaces still carry IPv4 only; IPv6 networking is not emulated. An `Ipv4` value outside the named subnet's CIDR, or among the first four or the last address AWS reserves in it, is rejected with `InvalidParameterValue`. |
 | DescribeVpcEndpoints | Lists or returns stored VPC endpoints, including their IP address type. |
 | ModifyVpcEndpoint | Associates or disassociates route tables, subnets and security groups, sets or resets the endpoint policy, and updates stored `IpAddressType` metadata. Omitting the type preserves its current value; malformed types are rejected before changes are applied. `SubnetConfiguration.N` replaces the addresses pinned for a subnet, under the same address validation as CreateVpcEndpoint. `DnsOptions` is accepted and ignored. |
 | DeleteVpcEndpoints | Deletes VPC endpoint records. |
@@ -1182,6 +1182,45 @@ A connection's storage entry lives under whichever account's request created it,
 RAM-shared IPAM resources. `AcceptVpcPeeringConnection` additionally enforces that the caller is the
 connection's accepter — reporting a connection it cannot see as absent, not as a permission error,
 matching how AWS itself responds.
+
+### VPC Endpoint Services
+
+| Action | Description |
+|--------|-------------|
+| CreateVpcEndpointServiceConfiguration | Creates an endpoint service, `Available` at once, for one or more Network Load Balancers (an `Interface` service) or Gateway Load Balancers (a `GatewayLoadBalancer` service), never both. Its name is `com.amazonaws.vpce.<region>.vpce-svc-<id>` (the partition's own prefix outside `aws`), its zones are those of its load balancers, and `SupportedIpAddressType` defaults to `ipv4`. A malformed or unknown Network Load Balancer is `InvalidNetworkLoadBalancerArn.Malformed` or `.NotFound`; neither or both load balancer kinds is `InvalidParameterCombination`. `ClientToken` returns the service an earlier request with the same token created. |
+| DescribeVpcEndpointServiceConfigurations | Lists the caller's services in the Region, by `ServiceId.N` or the filters `service-name`, `service-id`, `service-state`, `supported-ip-address-types`, `tag:<key>` and `tag-key`. Results are not paged. |
+| ModifyVpcEndpointServiceConfiguration | Changes `AcceptanceRequired`, the private DNS name, the supported IP address types and Regions, and the load balancers. The load balancers cannot change while an endpoint is `available` or `pendingAcceptance` (`ExistingVpcEndpointConnections`), and the hosting Region cannot be removed. |
+| DeleteVpcEndpointServiceConfigurations | Deletes services. A service with an `available` or `pendingAcceptance` endpoint is reported in `unsuccessful` with `ExistingVpcEndpointConnections`, an unknown one with `InvalidVpcEndpointServiceId.NotFound`. |
+| DescribeVpcEndpointServicePermissions | Lists a service's allowed principals, filtered by `principal` or `principal-type`. |
+| ModifyVpcEndpointServicePermissions | Adds and removes allowed principals: `*` (`All`), an account's `root` ARN (`Account`), and IAM role (`Role`) and user (`User`) ARNs without a path. A path is `InvalidParameterValue`; any other principal is `UnknownPrincipalType.Unsupported`. |
+| DescribeVpcEndpointConnections | Lists the endpoints, in any account, connected to the caller's services, filtered by `service-id`, `vpc-endpoint-id`, `vpc-endpoint-owner`, `vpc-endpoint-state`, `vpc-endpoint-region` and `ip-address-type`. |
+| AcceptVpcEndpointConnections | Makes `pendingAcceptance` endpoints `available`. An endpoint not connected to the service is reported in `unsuccessful` with `InvalidVpcEndpoint.NotFound`, a `rejected` one with `InvalidState`. |
+| RejectVpcEndpointConnections | Makes `pendingAcceptance` and `available` endpoints `rejected`. |
+
+A connection is the consumer's own endpoint: its state, as the consumer's `DescribeVpcEndpoints`
+reports it, is what the provider sees, accepts and rejects. A consumer can discover and connect to a
+service when it is in the service's account, or when an allowed principal names its account, its IAM
+user or role, or `*`; otherwise the service's name is refused with `InvalidServiceName`. Endpoints
+from the service's own account are `available` at once; others start `pendingAcceptance` while
+`AcceptanceRequired` is set. Removing a permission leaves existing connections as they are.
+
+A `CreateVpcEndpoint` to a service name Floci holds no endpoint service for is accepted as before,
+so endpoints to AWS services and to services outside the emulator keep working.
+
+Not emulated:
+
+- Traffic. An endpoint's interfaces are synthesized, so nothing sent to them reaches the service's
+  load balancer; this is the control plane only.
+- Private DNS verification. A private DNS name stays `pendingVerification`, with a generated TXT
+  record name and value, and consumers' endpoints get no private DNS name for it.
+  `StartVpcEndpointServicePrivateDnsVerification` is not implemented.
+- Organization and service principals, cross-Region access (`SupportedRegions` is stored only),
+  payer responsibility, connection notifications and consumers' zone checks.
+
+CloudFormation provisions `AWS::EC2::VPCEndpointService` (`Ref` and `ServiceId` are the service id;
+`PrivateDnsNameConfiguration.*` is set when `PrivateDnsName` is) and
+`AWS::EC2::VPCEndpointServicePermissions`, whose `AllowedPrincipals` becomes the whole set. Both
+update in place.
 
 ### Network ACLs
 
