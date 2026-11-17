@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_call:
   push:
     branches:
       - main
@@ -54,7 +55,7 @@ jobs:
     # shard's Run tests step was canceled at the 25-minute job limit; leave room for normal variance.
     timeout-minutes: 35
     # Drafts skip the suite to spare runners; it runs once the PR is ready for review.
-    # Written on the job rather than as a gate job so it costs no runner. Pushes to main
+    # Written on the job rather than as a gate job so it costs no runner. Pushes
     # always run; `closed` and `edited` are excluded so widening the trigger types cannot
     # let those events through.
     if: >-

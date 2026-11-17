@@ -12,6 +12,12 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  test:
+    if: github.repository == 'AndreKurait/floci' && github.ref == 'refs/heads/dev'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
   build:
     if: github.repository == 'AndreKurait/floci' && github.ref == 'refs/heads/dev'
     permissions:
@@ -101,7 +107,7 @@ jobs:
 
   promote:
     name: Update dev tag
-    needs: [build, smoke, stock-agent]
+    needs: [test, build, smoke, stock-agent]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
