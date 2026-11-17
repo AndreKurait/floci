@@ -19,7 +19,7 @@ import java.util.regex.Pattern;
  * account." Which accounts belong to which service is deployment data, so
  * {@code floci.services.kms.listed-grantee-service-principals} names it as
  * {@code <account-id>=<service principal>} entries. Empty by default, which lists every principal as
- * stored. The grant keeps the principal it was created with, and the list filters use that.
+ * stored. The grant keeps the principal it was created with; filters and authorization use that.
  */
 @ApplicationScoped
 public class KmsListedGranteeServicePrincipals {
