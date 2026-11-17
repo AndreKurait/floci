@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.eventbridge;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
+import io.github.hectorvent.floci.core.common.AwsErrorResponse;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RegionResolver;
@@ -22,6 +23,7 @@ import io.github.hectorvent.floci.services.eventbridge.model.Target;
 import io.github.hectorvent.floci.services.resourcegroupstagging.ResourceGroupsTaggingService;
 import io.github.hectorvent.floci.testing.ManualClock;
 import io.github.hectorvent.floci.testing.PartitionMatrix;
+import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -33,6 +35,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 
+import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -49,6 +52,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 class EventBridgeServiceTest {
@@ -1341,6 +1345,71 @@ class EventBridgeServiceTest {
     }
 
     // ─────────────── Envelope region/account propagation ───────────────
+
+    @ParameterizedTest
+    @MethodSource("eventTimestampCases")
+    void eventEnvelopeUsesWholeSecondsForGeneratedTimeAndPreservesExplicitTime(
+            String now, Object supplied, boolean request, String expected) throws Exception {
+        service = new EventBridgeService(new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new RegionResolver(REGION, "000000000000"),
+                new ObjectMapper(), null, dispatcherMock, replayDispatcherMock,
+                new ResourceGroupsTaggingService(null), mock(AppSyncTargetValidator.class),
+                new ManualClock(Instant.parse(now)));
+        service.putRule("timestamp-rule", null, "{\"source\":[\"example.app\"]}", null, RuleState.ENABLED,
+                null, null, null, REGION);
+        Target target = new Target();
+        target.setId("queue");
+        target.setArn("arn:aws:sqs:us-east-1:000000000000:events");
+        service.putTargets("timestamp-rule", null, List.of(target), REGION);
+        Map<String, Object> entry = new HashMap<>(Map.of(
+                "Source", "example.app", "DetailType", "Example", "Detail", "{}"));
+        if (supplied != null) {
+            entry.put("Time", supplied);
+        }
+
+        if (request) {
+            EventBridgeHandler handler = new EventBridgeHandler(service, OBJECT_MAPPER);
+            try (Response response = handler.handle("PutEvents",
+                    OBJECT_MAPPER.valueToTree(Map.of("Entries", List.of(entry))), REGION)) {
+                assertEquals(200, response.getStatus());
+                assertEquals(0, ((JsonNode) response.getEntity()).path("FailedEntryCount").asInt());
+            }
+        } else {
+            assertEquals(0, service.putEvents(List.of(entry), REGION).failedCount());
+        }
+
+        ArgumentCaptor<String> json = ArgumentCaptor.forClass(String.class);
+        verify(dispatcherMock).dispatch(anyString(), eq(target), json.capture(), eq(REGION), any());
+        assertEquals(expected, OBJECT_MAPPER.readTree(json.getValue()).path("time").asText());
+    }
+
+    static Stream<Arguments> eventTimestampCases() {
+        String now = "2030-04-05T06:07:08.123456789Z";
+        return Stream.of(
+                Arguments.of(now, null, false, "2030-04-05T06:07:08Z"),
+                Arguments.of("2030-04-05T06:07:59.999999999Z", null, true, "2030-04-05T06:07:59Z"),
+                Arguments.of("2030-04-05T06:07:08Z", null, true, "2030-04-05T06:07:08Z"),
+                Arguments.of(now, Instant.parse("2026-01-02T03:04:05.123456789Z"), false,
+                        "2026-01-02T03:04:05.123456789Z"),
+                Arguments.of(now, new BigDecimal("1700000000.125"), true, "2023-11-14T22:13:20.125Z"),
+                Arguments.of(now, BigDecimal.ZERO, true, "1970-01-01T00:00:00Z"),
+                Arguments.of(now, new BigDecimal("-0.125"), true, "1969-12-31T23:59:59.875Z")
+        );
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"\"not-a-timestamp\"", "\"2026-01-02T03:04:05Z\"", "{}", "true", "1e100"})
+    void putEventsRejectsInvalidExplicitTimeInsteadOfReplacingItWithNow(String supplied) throws Exception {
+        EventBridgeHandler handler = new EventBridgeHandler(service, OBJECT_MAPPER);
+        JsonNode request = OBJECT_MAPPER.readTree("{\"Entries\":[{\"Source\":\"example.app\","
+                + "\"DetailType\":\"Example\",\"Detail\":\"{}\",\"Time\":" + supplied + "}]}");
+        try (Response response = handler.handle("PutEvents", request, REGION)) {
+            assertEquals(400, response.getStatus());
+            assertEquals("SerializationException", ((AwsErrorResponse) response.getEntity()).type());
+        }
+        verifyNoInteractions(dispatcherMock);
+    }
 
     @Test
     void putEvents_envelopeRegionMatchesPutEventsCallRegion() throws Exception {
