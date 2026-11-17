@@ -3013,17 +3013,28 @@ class Ec2ContainerManagerTest {
 
     @Test
     void launchTerminatesBeforeCleanupFailure() throws Exception {
-        LaunchHarness harness = launchHarness();
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
         when(harness.lifecycleManager.startCreated(eq(TEST_CONTAINER_ID), any(ContainerSpec.class)))
                 .thenThrow(new RuntimeException("Docker daemon unavailable"));
-        doThrow(new RuntimeException("port-forward cleanup failed"))
-                .when(harness.portForwardManager).unpublishAll(any(Instance.class));
-
         Instance instance = instance("i-cleanup-failure");
-        harness.manager.launch(instance, "ubuntu:24.04", null, "us-west-2");
-
-        awaitUntil(() -> "terminated".equals(instance.getState().getName()), Duration.ofSeconds(2));
-        verify(harness.portForwardManager).unpublishAll(instance);
+        AtomicReference<String> stateAtCleanup = new AtomicReference<>();
+        doAnswer(invocation -> {
+            stateAtCleanup.compareAndSet(null, instance.getState().getName());
+            throw new RuntimeException("port-forward cleanup failed");
+        }).when(harness.portForwardManager).unpublishAll(instance);
+        try {
+            harness.manager.launch(instance, "ubuntu:24.04", null, "us-west-2");
+            executor.shutdown();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS), "launch worker should finish");
+            verify(harness.portForwardManager).unpublishAll(instance);
+            assertEquals("terminated", stateAtCleanup.get(),
+                    "the instance must become terminated before cleanup can fail");
+            assertEquals("terminated", instance.getState().getName());
+        } finally {
+            executor.shutdownNow();
+            harness.manager.stop();
+        }
     }
 
     @Test
@@ -3644,8 +3655,9 @@ class Ec2ContainerManagerTest {
         }
     }
 
-    @Test
-    void aRebootingInstanceCountsAsRunningWhileDockerRestartsIt() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void aRebootingInstanceCountsAsRunningWhileDockerRestartsIt(boolean indeterminate) throws Exception {
         ExecutorService executor = Executors.newSingleThreadExecutor();
         LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
         RestartContainerCmd restart = mock(RestartContainerCmd.class);
@@ -3659,6 +3671,8 @@ class Ec2ContainerManagerTest {
         });
         // Between Docker's stop and start the container is not running.
         when(harness.lifecycleManager.isContainerRunning(TEST_CONTAINER_ID)).thenReturn(false);
+        doReturn(indeterminate ? ContainerLiveness.UNKNOWN : ContainerLiveness.NOT_RUNNING)
+                .when(harness.lifecycleManager).probeContainer(TEST_CONTAINER_ID);
         InspectContainerCmd inspect = mock(InspectContainerCmd.class);
         when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
         InspectContainerResponse response = inspectResponse("172.18.0.99");
@@ -3671,10 +3685,16 @@ class Ec2ContainerManagerTest {
             assertTrue(entered.await(5, TimeUnit.SECONDS));
             assertTrue(harness.manager.isContainerRunning(guest),
                     "Auto Scaling must not replace an instance while EC2 reboots it");
+            verify(harness.lifecycleManager, never()).probeContainer(TEST_CONTAINER_ID);
             release.countDown();
             executor.shutdown();
             assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
-            assertFalse(harness.manager.isContainerRunning(guest), "Once the reboot is over Docker answers again");
+            if (indeterminate) {
+                assertThrows(IllegalStateException.class, () -> harness.manager.isContainerRunning(guest),
+                        "an unknown probe must remain indeterminate after the reboot");
+            } else {
+                assertFalse(harness.manager.isContainerRunning(guest), "Once the reboot is over Docker answers again");
+            }
             assertEquals("running", guest.getState().getName());
         } finally {
             release.countDown();
