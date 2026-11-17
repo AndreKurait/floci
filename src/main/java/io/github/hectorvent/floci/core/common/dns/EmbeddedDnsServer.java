@@ -495,7 +495,7 @@ public class EmbeddedDnsServer {
             if (ownedListener && origin == null) {
                 return answer.viaUpstream();
             }
-            return ownedListener ? new DnsAnswer(
+            return ownedListener && !nativeAlb ? new DnsAnswer(
                     List.of(new DnsRecord.Address(1, EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS)),
                     answer.ttlSeconds(), answer.nameExists(), answer.authority(), answer.responseCode()) : answer;
         });
