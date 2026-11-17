@@ -44,7 +44,8 @@ import static org.mockito.Mockito.spy;
 /**
  * With {@code floci.services.elbv2.dns-name-strategy=aws} a load balancer is named the way AWS documents, which
  * clients that check the ELB DNS form accept. Floci's DNS answers the name with the address the {@code floci}
- * form resolved to, also where AWS endpoint names are spoofed to the public API address, and a load balancer is
+ * form resolved to, also where AWS endpoint names are spoofed to the public API address, answers NXDOMAIN for a name
+ * in those zones that no load balancer has, and a load balancer is
  * still selected by that name and through a Route 53 alias to it. Before, the name was
  * {@code <name>-<hex id>.elb.<emulator host>} whatever the setting.
  */
@@ -110,8 +111,16 @@ class ElbV2AwsDnsNameIntegrationTest {
         DnsAnswer ipv6 = spoofing.planQuery(publicAlb.dnsName(), CLIENT, FLOCI, 28).answer().orElseThrow();
         assertThat(ipv6.isEmpty()).isTrue();
         assertThat(ipv6.nameExists()).isTrue();
-        assertThat(addresses(spoofing.planQuery("awsdns-none-1234567890" + ALB_SUFFIX, CLIENT, FLOCI, 1)))
-                .as("a name no load balancer has is spoofed as before")
+        for (String unknown : List.of("awsdns-none-1234567890" + ALB_SUFFIX, "dualstack.awsdns-none-1234567890" + ALB_SUFFIX,
+                "awsdns-none-0123456789abcdef.elb.us-east-1.amazonaws.com")) {
+            for (EmbeddedDnsServer dns : List.of(spoofing, server(false))) {
+                DnsAnswer answer = dns.planQuery(unknown, CLIENT, FLOCI, 1).answer().orElseThrow();
+                assertThat(answer.isEmpty()).as(unknown).isTrue();
+                assertThat(answer.nameExists()).as(unknown + " is NXDOMAIN, as on AWS, not forwarded").isFalse();
+            }
+        }
+        assertThat(addresses(spoofing.planQuery("sqs.us-east-1.amazonaws.com", CLIENT, FLOCI, 1)))
+                .as("a name outside the load balancer zones is spoofed as before")
                 .containsExactly(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS);
         assertThat(addresses(server(false).planQuery(publicAlb.dnsName(), CLIENT, FLOCI, 1)))
                 .as("answered by Floci rather than left to upstream DNS").containsExactly(FLOCI);

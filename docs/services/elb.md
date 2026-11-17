@@ -26,8 +26,10 @@ balancer gets the form AWS documents instead, for clients that check it:
 `<dns-suffix>` is the region's partition suffix, for example `amazonaws.com` or `amazonaws.com.cn`.
 Floci's DNS answers such a name, and the same name with `dualstack.` in front, with the address the
 default form resolves to. That answer comes ahead of `FLOCI_DNS_SPOOF_AWS_ENDPOINTS`, which would
-otherwise give it the AWS API address. A name that no load balancer has is resolved as before. A
-client that uses another resolver needs those names forwarded to Floci's DNS. Listener selection by DNS
+otherwise give it the AWS API address. A name in those zones (`<region>.elb.<dns-suffix>` and
+`elb.<region>.<dns-suffix>`) that no load balancer has gets NXDOMAIN, as on AWS, rather than being spoofed or
+forwarded upstream; names outside them resolve as before. A client that uses another resolver needs those zones
+forwarded to Floci's DNS. Listener selection by DNS
 name and Route 53 aliases work the same with either form. A load balancer keeps the name it was
 created with when the setting changes.
 
