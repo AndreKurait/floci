@@ -504,8 +504,8 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         PolicyApplyBatch.run(byHelper.values().stream().<Runnable>map(batch -> () -> {
             for (EndpointPolicy policy : batch) {
                 Endpoint endpoint = policy.endpoint();
-                run(endpoint.helper, VpcRoutingCommands.endpointGuard(endpoint.resolvers));
-                run(endpoint.helper, policy.script());
+                // Retain the combined budget of the two former 20-second exec calls.
+                run(endpoint.helper, VpcRoutingCommands.guardedEndpoint(endpoint.resolvers, policy.script()), 40);
             }
         }).toList());
         for (EndpointPolicy policy : policies) {
@@ -953,7 +953,11 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
     }
 
     private void run(String helper, String script) {
-        ContainerExec.Result result = ContainerExec.run(docker, helper, new String[]{"sh", "-c", script}, 20)
+        run(helper, script, 20);
+    }
+
+    private void run(String helper, String script, int timeoutSeconds) {
+        ContainerExec.Result result = ContainerExec.run(docker, helper, new String[]{"sh", "-c", script}, timeoutSeconds)
                 .throwIfTimedOut(helper);
         if (result.exitCode() != 0) {
             throw new IllegalStateException("Cannot reconcile native VPC routing: " + result.summary());
