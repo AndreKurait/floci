@@ -362,7 +362,8 @@ public class CloudWatchMetricsService {
             if (parts.length < 6) return false;
             try {
                 long ts = Long.parseLong(parts[parts.length - 2]);
-                return ts >= startEpoch && ts <= endEpoch;
+                return ts >= startEpoch && (endTime == null || ts < endEpoch
+                        || ts == endEpoch && endTime.getNano() > 0);
             } catch (NumberFormatException e) {
                 return false;
             }
@@ -462,7 +463,7 @@ public class CloudWatchMetricsService {
         return plan.evaluate(startTime, endTime, stat -> {
             Map<Instant, Double> values = new LinkedHashMap<>();
             for (Datapoint point : getMetricStatistics(stat.namespace(), stat.metricName(), stat.dimensions(),
-                    startTime, endTime.minusNanos(1), stat.period(), List.of(stat.stat()), stat.unit(), region)) {
+                    startTime, endTime, stat.period(), List.of(stat.stat()), stat.unit(), region)) {
                 values.put(point.timestamp(), resolveStatValue(point, stat.stat()));
             }
             return values;
