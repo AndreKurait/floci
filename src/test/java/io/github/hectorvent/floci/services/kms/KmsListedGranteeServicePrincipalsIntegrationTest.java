@@ -8,6 +8,8 @@ import io.restassured.response.Response;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
+import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.util.Map;
 
 import static io.restassured.RestAssured.given;
@@ -18,7 +20,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  * {@code floci.services.kms.listed-grantee-service-principals} changes only how ListGrants and
  * ListRetirableGrants list a grant's grantee and retiring principal ("if the grantee principal is an
  * AWS service, the GranteePrincipal field contains an AWS service principal", KMS GrantListEntry). The
- * grant keeps the principal it was created with, and the list filters use it.
+ * grant keeps the principal it was created with, and authorization uses it.
  */
 @QuarkusTest
 @TestProfile(KmsListedGranteeServicePrincipalsIntegrationTest.Profile.class)
@@ -70,12 +72,15 @@ class KmsListedGranteeServicePrincipalsIntegrationTest {
         assertEquals(LISTED_AS, listed.path("Grants.find { it.GrantId == '" + serviceGrant + "' }.GranteePrincipal"));
         assertEquals(LISTED_AS, listed.path("Grants.find { it.GrantId == '" + serviceGrant + "' }.RetiringPrincipal"));
         assertEquals(other, listed.path("Grants.find { it.GrantId == '" + otherGrant + "' }.GranteePrincipal"));
-        // The stored grantee still filters.
+        // The stored grantee still filters and still authorizes.
         kmsAs(OWNER, "ListGrants", "{\"KeyId\":\"" + keyArn + "\",\"GranteePrincipal\":\"" + service + "\"}")
                 .then().statusCode(200).body("Grants.size()", equalTo(1));
         kmsAs(OWNER, "ListRetirableGrants", "{\"RetiringPrincipal\":\"" + service + "\"}")
                 .then().statusCode(200).body("Grants.size()", equalTo(1))
                 .body("Grants[0].RetiringPrincipal", equalTo(LISTED_AS))
                 .body("Grants[0].GranteePrincipal", equalTo(LISTED_AS));
+        String plaintext = Base64.getEncoder().encodeToString("p".getBytes(StandardCharsets.UTF_8));
+        kmsAs(SERVICE, "Encrypt", "{\"KeyId\":\"" + keyArn + "\",\"Plaintext\":\"" + plaintext + "\"}")
+                .then().statusCode(200);
     }
 }
