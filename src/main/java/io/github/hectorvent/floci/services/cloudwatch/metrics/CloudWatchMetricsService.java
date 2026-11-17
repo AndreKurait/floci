@@ -374,6 +374,8 @@ public class CloudWatchMetricsService {
                     .collect(Collectors.toList());
         }
 
+        matching = matching.stream().flatMap(MetricValues::expand).toList();
+
         // Group by period bucket
         Map<Long, List<MetricDatum>> buckets = new LinkedHashMap<>();
         for (MetricDatum d : matching) {

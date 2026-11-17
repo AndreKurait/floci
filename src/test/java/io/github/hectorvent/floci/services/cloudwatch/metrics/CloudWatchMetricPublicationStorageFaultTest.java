@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.cloudwatch.metrics;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.HybridStorage;
@@ -62,6 +63,38 @@ class CloudWatchMetricPublicationStorageFaultTest {
                 assertEquals(3, reloaded.keys().size());
             } finally { close(reloaded); }
         }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"persistent", "hybrid", "wal"})
+    void packedValuesAndLegacyScalarRetainStatisticsAfterReload(String mode) throws Exception {
+        StorageBackend<String, MetricDatum> actual = backend(mode);
+        List<CloudWatchMetricsService.Datapoint> before;
+        try {
+            actual.load();
+            CloudWatchMetricsService service = metrics(new AccountAwareStorageBackend<>(actual, null, ACCOUNT));
+            MetricDatum template = MetricDatum.of("Value", "Count", 0, List.of(), 120);
+            service.putMetricData("App", MetricValues.fromJson(new ObjectMapper().readTree(
+                    "{\"Values\":[3,7],\"Counts\":[2,1]}"), template), REGION);
+            service.putMetricData("App", List.of(MetricDatum.of("Value", "Count", 11, List.of(), 120)), REGION);
+            before = packedStatistics(service);
+            assertEquals(2, actual.keys().size());
+            assertEquals(24, before.getFirst().sum());
+            assertEquals(4, before.getFirst().sampleCount());
+            assertEquals(Map.of("p0", 3.0, "p100", 11.0), before.getFirst().extendedStatistics());
+            actual.flush();
+        } finally { close(actual); }
+        StorageBackend<String, MetricDatum> reloaded = backend(mode);
+        try {
+            reloaded.load();
+            assertEquals(2, reloaded.keys().size());
+            assertEquals(before, packedStatistics(metrics(new AccountAwareStorageBackend<>(reloaded, null, ACCOUNT))));
+        } finally { close(reloaded); }
+    }
+
+    private static List<CloudWatchMetricsService.Datapoint> packedStatistics(CloudWatchMetricsService service) {
+        return service.getMetricStatistics("App", "Value", List.of(), Instant.ofEpochSecond(120),
+                Instant.ofEpochSecond(179), 60, List.of("Sum", "SampleCount", "p0", "p100"), "Count", REGION);
     }
 
     private StorageBackend<String, MetricDatum> backend(String mode) {

@@ -23,6 +23,8 @@ public class MetricDatum {
     private double minimum;
     private double maximum;
     private String unit;
+    private double[] sampleValues;
+    private double[] sampleWeights;
 
     public MetricDatum() {}
 
@@ -73,6 +75,12 @@ public class MetricDatum {
 
     public double getMaximum() { return maximum; }
     public void setMaximum(double maximum) { this.maximum = maximum; }
+
+    public double[] getSampleValues() { return sampleValues == null ? null : sampleValues.clone(); }
+    public void setSampleValues(double[] values) { sampleValues = values == null ? null : values.clone(); }
+
+    public double[] getSampleWeights() { return sampleWeights == null ? null : sampleWeights.clone(); }
+    public void setSampleWeights(double[] weights) { sampleWeights = weights == null ? null : weights.clone(); }
 
     public String getUnit() { return unit; }
     public void setUnit(String unit) { this.unit = unit; }
