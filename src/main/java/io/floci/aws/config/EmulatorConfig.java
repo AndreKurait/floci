@@ -420,6 +420,7 @@ public interface EmulatorConfig {
         RumStorageConfig rum();
         GuardDutyStorageConfig guardduty();
         EmrServerlessStorageConfig emrserverless();
+        EmrContainersStorageConfig emrcontainers();
 
         ControlTowerStorageConfig controltower();
 
@@ -734,6 +735,13 @@ public interface EmulatorConfig {
         long flushIntervalMs();
     }
 
+    interface EmrContainersStorageConfig {
+        Optional<String> mode();
+
+        @WithDefault("5000")
+        long flushIntervalMs();
+    }
+
     interface LakeFormationStorageConfig {
         Optional<String> mode();
 
@@ -882,6 +890,7 @@ public interface EmulatorConfig {
         RumServiceConfig rum();
         GuardDutyServiceConfig guardduty();
         EmrServerlessServiceConfig emrserverless();
+        EmrContainersServiceConfig emrcontainers();
         Route53ResolverServiceConfig route53resolver();
         NetworkFirewallServiceConfig networkfirewall();
         ServiceCatalogServiceConfig servicecatalog();
@@ -1173,6 +1182,20 @@ public interface EmulatorConfig {
     interface GuardDutyServiceConfig {
         @WithDefault("true")
         boolean enabled();
+    }
+
+    interface EmrContainersServiceConfig {
+        @WithDefault("true")
+        boolean enabled();
+
+        /**
+         * How long a job run stays RUNNING before it completes; 0, the default, completes a job run as
+         * soon as it is submitted. Floci follows the job run states without running Spark on Kubernetes.
+         *
+         * Env var: FLOCI_SERVICES_EMRCONTAINERS_JOB_RUN_DURATION_SECONDS
+         */
+        @WithDefault("0")
+        int jobRunDurationSeconds();
     }
 
     interface EmrServerlessServiceConfig {
@@ -1822,6 +1845,27 @@ public interface EmulatorConfig {
         @WithDefault("memcached:1.6")
         String defaultMemcachedImage();
 
+        /**
+         * Start and snapshot the backend of a Redis or Valkey replication group the way an image
+         * with no shell and no CLI needs: server flags go to the container as arguments instead of
+         * the {@code VALKEY_EXTRA_FLAGS} hook, a snapshot is taken with {@code SAVE} over the RESP
+         * connection and read out of the container through the Docker archive API, and a snapshot
+         * is restored by placing its file in the data directory before the server starts, so no
+         * {@code DEBUG} command is involved. Off by default and never inferred from the image name:
+         * the default image keeps the {@code VALKEY_EXTRA_FLAGS} and CLI path.
+         */
+        @WithDefault("false")
+        boolean shellLessBackend();
+
+        /**
+         * Name of the snapshot file the server loads from its data directory at startup. Only used
+         * with {@link #shellLessBackend()}: a restore places the snapshot under this name, and a
+         * snapshot export falls back to it when the server does not report {@code dbfilename}.
+         * Set it to the name the image's server uses ({@code dump.rdb} for Redis and Valkey).
+         */
+        @WithDefault("dump.rdb")
+        String shellLessBackendDbfilename();
+
         /** Docker network to attach ElastiCache containers to. Empty = default bridge. */
         Optional<String> dockerNetwork();
 
@@ -2230,6 +2274,9 @@ public interface EmulatorConfig {
         @WithDefault("4")
         int yarnMaxWorkerNodes();
 
+        /** Apache Pig for a {@code docker} cluster's Pig steps, which no AWS image carries; off unless enabled. */
+        EmrPigConfig pig();
+
         /**
          * When true, Floci removes, in the {@code docker} runner mode, every EMR step driver and bootstrap
          * container a previous run of <em>this same</em> Floci left on the daemon (matched by the
@@ -2241,6 +2288,37 @@ public interface EmulatorConfig {
          */
         @WithDefault("true")
         boolean reconcileContainersOnStartup();
+    }
+
+    interface EmrPigConfig {
+        /**
+         * When true, a {@code docker} cluster whose {@code Applications} name Pig has Apache Pig in the image its steps
+         * run in, downloaded from {@link #urls()} when Floci makes that image, and its Pig steps run it. Off by default,
+         * as the download is Apache's, not AWS's, and about 470 MB.
+         *
+         * Env var: FLOCI_SERVICES_EMR_PIG_ENABLED
+         */
+        @WithDefault("false")
+        boolean enabled();
+
+        /**
+         * Where Floci downloads Apache Pig's binary distribution from, the first that answers: Apache's download CDN,
+         * which serves current releases, then its archive, which keeps every release.
+         *
+         * Env var: FLOCI_SERVICES_EMR_PIG_URLS
+         */
+        @WithDefault("https://dlcdn.apache.org/pig/pig-0.18.0/pig-0.18.0.tar.gz,"
+                + "https://archive.apache.org/dist/pig/pig-0.18.0/pig-0.18.0.tar.gz")
+        List<String> urls();
+
+        /**
+         * The SHA-256 of the distribution {@link #urls()} name; one downloaded with another fails the step, and no
+         * image is made of it.
+         *
+         * Env var: FLOCI_SERVICES_EMR_PIG_SHA256
+         */
+        @WithDefault("6845adb936a3c3bcc71451765953cae4103e410ba2f6c5a47cc9becade0a434a")
+        String sha256();
     }
 
     interface WafV2ServiceConfig {
@@ -2629,6 +2707,15 @@ public interface EmulatorConfig {
         /** Host interface for published awsvpc task ports, including firewall namespaces. */
         @WithDefault("127.0.0.1")
         String hostPortBindAddress();
+
+        /**
+         * Opt-in: the containers of an {@code awsvpc} task share one network namespace, held by a helper
+         * container as the ECS agent's pause container holds it, so they reach each other on {@code localhost}
+         * as on Fargate. Applies while security-group enforcement is off, which already gives a task one
+         * namespace. Off by default: each container keeps a namespace and address of its own.
+         */
+        @WithDefault("false")
+        boolean sharedTaskNetwork();
 
         Optional<String> dockerNetwork();
 
@@ -3665,7 +3752,8 @@ public interface EmulatorConfig {
         /**
          * When true, TCP ports opened by an instance's security-group ingress rules are
          * published on the host via a socat sidecar container, both at launch and on later
-         * authorize-security-group-ingress. Set false to keep security groups as metadata only.
+         * authorize-security-group-ingress. With security-group enforcement on, only ports a rule
+         * opens to every address (0.0.0.0/0 or ::/0) are. Set false to publish none.
          */
         @WithDefault("true")
         boolean publishSecurityGroupPorts();
@@ -3870,6 +3958,18 @@ public interface EmulatorConfig {
         /** Default idle-pool timeout in seconds; zero disables expiry. Target Keep-Alive may override it. */
         @WithDefault("60")
         int backendKeepAliveTimeoutSeconds();
+
+        /** AWS defaults unless explicitly overridden for local deployments. */
+        @WithDefault("aws")
+        AlbZoneRule albZoneRule();
+
+        /** A region entry takes precedence over the global rule, including an explicit AWS reset. */
+        Map<String, AlbZoneRule> albZoneRuleByRegion();
+    }
+
+    enum AlbZoneRule {
+        AWS,
+        ALLOW_SINGLE_ZONE
     }
 
     interface EksServiceConfig {
