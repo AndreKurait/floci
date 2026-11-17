@@ -18411,6 +18411,20 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     /** Detaches a standalone ENI by attachment id, floci-kt9. */
+    /** The interface and the instance an attachment joins. */
+    public record AttachmentTarget(String networkInterfaceId, String instanceId) {}
+
+    /** For IAM authorization: what DetachNetworkInterface's {@code AttachmentId} names, if the caller can see it. */
+    public Optional<AttachmentTarget> attachmentForAuthorization(String region, String attachmentId) {
+        if (attachmentId == null || attachmentId.isBlank()) {
+            return Optional.empty();
+        }
+        return networkInterfaces.scan(k -> k.startsWith(region + "::")).stream()
+                .filter(n -> n.getAttachment() != null && attachmentId.equals(n.getAttachment().getAttachmentId()))
+                .findFirst()
+                .map(n -> new AttachmentTarget(n.getNetworkInterfaceId(), n.getAttachment().getInstanceId()));
+    }
+
     public NetworkInterfaceAttachment detachNetworkInterface(String region, String attachmentId, boolean force) {
         synchronized (privateIpAllocationLock) {
             if (attachmentId == null || attachmentId.isBlank()) {
