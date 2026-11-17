@@ -13,6 +13,7 @@ import java.net.InetSocketAddress;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.net.http.HttpTimeoutException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -91,6 +92,19 @@ class NpmExternalConnectionClientTest {
         assertTrue(result.isPresent());
         assertArrayEquals(content, result.get().content());
         verify(transport, times(2)).send(any(HttpRequest.class), any(HttpResponse.BodyHandler.class));
+    }
+
+    @Test
+    void fetchPackumentDoesNotRetryARequestTimeout() throws Exception {
+        HttpClient transport = mock(HttpClient.class);
+        when(transport.send(any(HttpRequest.class), any(HttpResponse.BodyHandler.class)))
+                .thenThrow(new HttpTimeoutException("request timed out"));
+        NpmExternalConnectionClient retryClient =
+                new NpmExternalConnectionClient(transport, Map.of("fake", "http://127.0.0.1"));
+
+        assertTrue(retryClient.fetchPackument("fake", null, "widget").isEmpty());
+
+        verify(transport).send(any(HttpRequest.class), any(HttpResponse.BodyHandler.class));
     }
 
     @Test
