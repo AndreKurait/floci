@@ -860,7 +860,11 @@ public class Ec2ContainerManager {
         }
         boolean customResolver = options.mounts().stream().anyMatch(mount ->
                 "/etc".equals(mount.getTarget()) || "/etc/resolv.conf".equals(mount.getTarget()));
-        String serviceEndpoint = customResolver ? reachableEndpoint.baseUrl(false) : reachableEndpoint.baseUrl();
+        // With guest-tls-endpoint the guest reaches Floci over https, so its requests carry aws:SecureTransport
+        // true, as an instance's requests to AWS do; baseUrlWithTls stays http while Floci's TLS is off.
+        String serviceEndpoint = config.services().ec2().guestTlsEndpoint()
+                ? reachableEndpoint.baseUrlWithTls(!customResolver)
+                : (customResolver ? reachableEndpoint.baseUrl(false) : reachableEndpoint.baseUrl());
 
         return portAllocator.allocateAndStart(
                 config.services().ec2().sshPortRangeStart(),
