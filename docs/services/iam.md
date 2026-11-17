@@ -1807,8 +1807,8 @@ Policy evaluation follows the standard AWS precedence:
 5. If a permission boundary is present, it must also explicitly allow the request
 6. No matching effective allow results in an implicit deny
 
-IAM authorization denials return HTTP 400 `AccessDeniedException` for AWS JSON 1.0/1.1
-requests. REST-JSON requests return HTTP 403 `AccessDeniedException`; AWS Query and S3
+IAM authorization denials return HTTP 403 `AccessDeniedException` for KMS, SSM, and
+REST-JSON requests. Other AWS JSON 1.0/1.1 requests return HTTP 400 `AccessDeniedException`; AWS Query and S3
 requests retain HTTP 403 XML `AccessDenied` responses, except SNS's, which return HTTP 403
 `AuthorizationError`, the error every SNS operation lists for a caller denied access, whichever
 action is denied. The routed protocol determines the status, not just the request's content type.

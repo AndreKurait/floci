@@ -16,6 +16,7 @@ import software.amazon.awssdk.services.sfn.model.Tag;
 import java.time.Duration;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Collectors;
 
 import static org.awaitility.Awaitility.await;
@@ -26,6 +27,25 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 @QuarkusTest
 class CloudFormationActivityIntegrationTest {
+    @ParameterizedTest
+    @ValueSource(strings = {"bad:name", "bad/name", "bad name", "bad?name"})
+    void activityNamesFollowTheSdkContract(String prefix) {
+        String name = prefix + "-" + UUID.randomUUID();
+        AtomicReference<String> created = new AtomicReference<>();
+        try (SfnClient sfn = AwsTestClients.create(
+                SfnClient.builder(), "867530900003", Region.US_WEST_2)) {
+            try {
+                SfnException invalid = assertThrows(SfnException.class, () ->
+                        created.set(sfn.createActivity(request -> request.name(name)).activityArn()));
+                assertEquals("InvalidName", invalid.awsErrorDetails().errorCode());
+            } finally {
+                if (created.get() != null) {
+                    sfn.deleteActivity(request -> request.activityArn(created.get()));
+                }
+            }
+        }
+    }
+
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void renameCleansUpTheDisplacedActivityUnlessRetained(boolean retain) {

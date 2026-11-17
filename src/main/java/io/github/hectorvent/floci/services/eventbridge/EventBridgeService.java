@@ -51,6 +51,7 @@ import java.net.URI;
 import java.net.URISyntaxException;
 import java.time.Clock;
 import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -1423,7 +1424,9 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
             node.put("source", source);
             node.put("detail-type", detailType);
             node.put("account", envelopeAccount);
-            node.put("time", clock.instant().toString());
+            Instant time = entry.get("Time") instanceof Instant supplied
+                    ? supplied : clock.instant().truncatedTo(ChronoUnit.SECONDS);
+            node.put("time", time.toString());
             node.put("region", envelopeRegion);
             node.putArray("resources").addAll(resources);
             node.set("detail", objectMapper.readTree(detail));

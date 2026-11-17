@@ -116,6 +116,26 @@ class CloudFormationWaitConditionIntegrationTest {
     }
 
     @Test
+    void aResourceBesideTheWaitIsCreatedBeforeItWaits() throws Exception {
+        // Beside depends on First, so it becomes ready after Wait; it does not depend on Wait, so AWS
+        // creates it while Wait waits, and it may be what signals the handle.
+        ObjectNode template = template(1);
+        template.withObject("/Resources").putObject("First").put("Type", "AWS::S3::Bucket");
+        template.withObject("/Resources").putObject("Beside").put("Type", "AWS::S3::Bucket").put("DependsOn", "First");
+        create(template);
+        URI handle = handle("Handle");
+        await().atMost(Duration.ofSeconds(5)).pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
+                .untilAsserted(() -> assertTrue(cfn.describeStackResources(request -> request.stackName(stack))
+                        .stackResources().stream().anyMatch(resource -> "Beside".equals(resource.logicalResourceId())
+                                && "CREATE_COMPLETE".equals(resource.resourceStatusAsString()))));
+        assertEquals("CREATE_IN_PROGRESS", status());
+        assertEquals(2, s3.listBuckets().buckets().size(), "Only First and Beside exist while Wait waits");
+        put(handle, signal("SUCCESS", "beside", "ready"));
+        awaitStatus("CREATE_COMPLETE");
+        assertEquals(3, s3.listBuckets().buckets().size());
+    }
+
+    @Test
     void failureSignalFailsTheResourceWithItsReason() throws Exception {
         create(template(2));
         URI handle = handle("Handle");

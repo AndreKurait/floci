@@ -85,6 +85,19 @@ class AwsQueryControllerIntegrationTest {
             .body("DescribeRegionsResponse.regionInfo.item.size()", greaterThan(0));
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"CreateSnapshot", "DeleteSnapshot"})
+    void unversionedSnapshotActionsReachEc2Validation(String action) {
+        given()
+            .contentType("application/x-www-form-urlencoded")
+            .formParam("Action", action)
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("Response.Errors.Error.Code", equalTo("MissingParameter"));
+    }
+
     @Test
     void sharedActionNameReachesTheServiceItsVersionDeclares() {
         // IAM and ElastiCache both define CreateUser and IAM takes it by name. The Version an

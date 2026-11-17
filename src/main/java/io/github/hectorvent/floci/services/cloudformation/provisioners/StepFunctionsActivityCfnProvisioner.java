@@ -35,8 +35,10 @@ public class StepFunctionsActivityCfnProvisioner implements CfnResourceProvision
     @Override
     public void provision(StackResource resource, JsonNode props, ProvisionContext ctx) {
         String name = ctx.resolveOptional(props, "Name");
-        if (name == null || name.isBlank() || name.length() > 80) {
-            throw new AwsException("ValidationError", TYPE + " requires Name with 1 to 80 characters", 400);
+        try {
+            StepFunctionsService.validateActivityName(name);
+        } catch (AwsException invalidName) {
+            throw new AwsException("ValidationError", TYPE + " requires a valid activity Name", 400);
         }
         if (props != null && props.hasNonNull("EncryptionConfiguration")) {
             throw new AwsException("ValidationError",

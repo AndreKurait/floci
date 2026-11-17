@@ -10,6 +10,7 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.List;
+import java.util.Map;
 import java.util.function.BiConsumer;
 import java.util.function.Supplier;
 
@@ -38,6 +39,7 @@ class IamManagedPolicyCaseTest {
         String prefix = AwsManagedPolicies.arnPrefix(partition) + "/";
         IamPolicy canonical = iam.getPolicy(prefix + name);
         IamPolicy observed = iam.getPolicy(prefix + alias);
+        assertEquals(canonical.getArn(), iam.canonicalPolicyArn(prefix + alias));
         assertEquals(canonical.getArn(), observed.getArn());
         assertEquals(canonical.getPolicyId(), observed.getPolicyId());
         assertEquals(canonical.getPolicyName(), observed.getPolicyName());
@@ -97,5 +99,38 @@ class IamManagedPolicyCaseTest {
         iam.putRolePermissionsBoundary("bounded", alias);
         assertEquals(canonical, iam.getUser("bounded").getPermissionsBoundaryArn());
         assertEquals(canonical, iam.getRole("bounded").getPermissionsBoundaryArn());
+    }
+
+    @Test
+    void unresolvedIdentitySurvivesLookupButCannotBecomeAnUnregisteredBoundary() {
+        String unknown = AwsManagedPolicies.arnPrefix("aws") + "/MissingPolicy";
+        assertEquals(unknown, iam.canonicalPolicyArn(unknown));
+        iam.createUser("missing", "/");
+        iam.createRole("missing", "/", TRUST, null, 3600, null);
+        assertEquals("NoSuchEntity", assertThrows(AwsException.class,
+                () -> iam.putUserPermissionsBoundary("missing", unknown)).getErrorCode());
+        assertEquals("NoSuchEntity", assertThrows(AwsException.class,
+                () -> iam.putRolePermissionsBoundary("missing", unknown)).getErrorCode());
+        assertEquals("NoSuchEntity", assertThrows(AwsException.class,
+                () -> iam.createRole("missing-cap", "/", TRUST, null, 3600, null, unknown)).getErrorCode());
+        assertEquals("NoSuchEntity", assertThrows(AwsException.class,
+                () -> iam.getRole("missing-cap")).getErrorCode());
+    }
+
+    @Test
+    void customerManagedPolicyLookupRetainsCaseSensitivity() {
+        String canonical = iam.createPolicy("CaseSensitive", "/", null,
+                "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"s3:GetObject\",\"Resource\":\"*\"}}",
+                Map.of()).getArn();
+        String alias = canonical.replace("CaseSensitive", "casesensitive");
+        assertEquals(canonical, iam.getPolicy(canonical).getArn());
+        AwsException missing = assertThrows(AwsException.class, () -> iam.getPolicy(alias));
+        assertEquals("NoSuchEntity", missing.getErrorCode());
+        iam.createUser("customer", "/");
+        assertThrows(AwsException.class, () -> iam.attachUserPolicy("customer", alias));
+        assertTrue(iam.listAttachedUserPolicies("customer", null).isEmpty());
+        iam.attachUserPolicy("customer", canonical);
+        assertEquals(List.of(canonical), iam.listAttachedUserPolicies("customer", null).stream()
+                .map(IamPolicy::getArn).toList());
     }
 }

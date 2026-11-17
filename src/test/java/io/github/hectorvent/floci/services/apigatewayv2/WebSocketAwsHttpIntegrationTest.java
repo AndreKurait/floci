@@ -13,6 +13,7 @@ import org.junit.jupiter.api.TestMethodOrder;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.WebSocket;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 
 import static io.restassured.RestAssured.given;
@@ -200,7 +201,7 @@ class WebSocketAwsHttpIntegrationTest {
         JsonNode responseNode = MAPPER.readTree(response);
         assertTrue(responseNode.has("result"), "Response should have 'result' field from response template");
 
-        WebSocketTestSupport.closeAndAwait(ws);
+        closeWebSocket(ws, capture);
     }
 
     @Test
@@ -214,7 +215,7 @@ class WebSocketAwsHttpIntegrationTest {
         String response = capture.getNextMessage(15, TimeUnit.SECONDS);
         assertNotNull(response, "Should receive response");
 
-        WebSocketTestSupport.closeAndAwait(ws);
+        closeWebSocket(ws, capture);
     }
 
     // ──────────────────────────── HTTP_PROXY Integration Type Tests ────────────────────────────
@@ -297,7 +298,7 @@ class WebSocketAwsHttpIntegrationTest {
         assertTrue(responseNode.has("transformed") || responseNode.has("input"),
                 "Response should contain Lambda output forwarded via HTTP_PROXY");
 
-        WebSocketTestSupport.closeAndAwait(ws);
+        closeWebSocket(ws, capture);
     }
 
     @Test
@@ -311,7 +312,7 @@ class WebSocketAwsHttpIntegrationTest {
         String response = capture.getNextMessage(15, TimeUnit.SECONDS);
         assertNotNull(response, "Should receive response without template transformation");
 
-        WebSocketTestSupport.closeAndAwait(ws);
+        closeWebSocket(ws, capture);
     }
 
     // ──────────────────────────── HTTP Integration Type Tests ────────────────────────────
@@ -394,7 +395,7 @@ class WebSocketAwsHttpIntegrationTest {
         assertTrue(responseNode.has("httpResult"),
                 "Response should have 'httpResult' field from response template");
 
-        WebSocketTestSupport.closeAndAwait(ws);
+        closeWebSocket(ws, capture);
     }
 
     @Test
@@ -408,7 +409,7 @@ class WebSocketAwsHttpIntegrationTest {
         String response = capture.getNextMessage(15, TimeUnit.SECONDS);
         assertNotNull(response, "Should receive response from HTTP endpoint");
 
-        WebSocketTestSupport.closeAndAwait(ws);
+        closeWebSocket(ws, capture);
     }
 
     // ──────────────────────────── Stage Variable Substitution in HTTP URI ────────────────────────────
@@ -491,7 +492,7 @@ class WebSocketAwsHttpIntegrationTest {
         assertTrue(responseNode.has("transformed") || responseNode.has("input"),
                 "Response should come from Lambda invoked via stage-variable-resolved HTTP URI");
 
-        WebSocketTestSupport.closeAndAwait(ws);
+        closeWebSocket(ws, capture);
     }
 
     // ──────────────────────────── Cleanup ────────────────────────────
@@ -517,6 +518,18 @@ class WebSocketAwsHttpIntegrationTest {
     }
 
     // ──────────────────────────── Helpers ────────────────────────────
+
+    private static void closeWebSocket(WebSocket socket,
+                                       WebSocketTestSupport.MultiMessageCapture capture) throws Exception {
+        CompletableFuture<Integer> closed = new CompletableFuture<>();
+        capture.setCloseFuture(closed);
+        try {
+            socket.sendClose(WebSocket.NORMAL_CLOSURE, "done").get(5, TimeUnit.SECONDS);
+            assertEquals(WebSocket.NORMAL_CLOSURE, closed.get(5, TimeUnit.SECONDS));
+        } finally {
+            socket.abort();
+        }
+    }
 
     private WebSocket connectWebSocket(String apiId, String stageName,
                                        WebSocketTestSupport.MultiMessageCapture capture) throws Exception {

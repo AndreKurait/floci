@@ -17,6 +17,7 @@ import io.github.hectorvent.floci.core.common.RequestContext;
 import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.Resettable;
 import io.github.hectorvent.floci.core.common.SmithyValidationErrors;
+import io.github.hectorvent.floci.core.common.StripedLocks;
 import io.github.hectorvent.floci.core.common.concurrent.DeadlineWaits;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
@@ -367,7 +368,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     // a concurrent allocation, which reads persisted resources to see what is taken, cannot pick
     // the same address in between. Taken after imageRegistryLock where a caller holds both.
     private final Object privateIpAllocationLock = new Object();
-    private final Object[] natGatewayLifecycleLocks = newLockStripes();
+    private final StripedLocks natGatewayLifecycleLocks = new StripedLocks(LOCK_STRIPES);
     private final Object amazonProvidedIpv6AllocationLock = new Object();
     /** Host part (1-254) of the last 203.0.113.0/24 address handed out; guarded by the allocation lock. */
     private int documentationHost;
@@ -2549,7 +2550,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     // bounded — a lock per storage key would never evict — at the cost of unrelated resources
     // sharing a monitor on hash collision.
     private static final int LOCK_STRIPES = 512;
-    private final Object[] resourceLocks = newLockStripes();
+    private final StripedLocks resourceLocks = new StripedLocks(LOCK_STRIPES);
 
     /** The AMI state a deregistered image is tombstoned with; one of EC2's documented ImageState values. */
     private static final String DEREGISTERED_STATE = "deregistered";
@@ -2584,31 +2585,23 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return imageRegistryLock;
     }
 
-    private static Object[] newLockStripes() {
-        Object[] stripes = new Object[LOCK_STRIPES];
-        for (int i = 0; i < stripes.length; i++) {
-            stripes[i] = new Object();
-        }
-        return stripes;
-    }
-
     private int stripeOf(String storeKey) {
-        return Math.floorMod(storeKey.hashCode(), LOCK_STRIPES);
+        return resourceLocks.stripeOf(storeKey);
     }
 
     private Object lockFor(String storeKey) {
-        return resourceLocks[stripeOf(storeKey)];
+        return resourceLocks.lockFor(storeKey);
     }
 
     // Stripe index, not key order, is the total order two-lock callers must agree on: distinct
     // keys can share a stripe, so ordering by key could have two callers take the same pair of
     // monitors in opposite orders.
     private Object lowerLockOf(String keyA, String keyB) {
-        return resourceLocks[Math.min(stripeOf(keyA), stripeOf(keyB))];
+        return resourceLocks.lockAt(Math.min(stripeOf(keyA), stripeOf(keyB)));
     }
 
     private Object higherLockOf(String keyA, String keyB) {
-        return resourceLocks[Math.max(stripeOf(keyA), stripeOf(keyB))];
+        return resourceLocks.lockAt(Math.max(stripeOf(keyA), stripeOf(keyB)));
     }
 
     /** Synthesizes a locally-administered unicast MAC (AWS never discloses how it derives its own). */
@@ -12296,7 +12289,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             change.run();
             return;
         }
-        synchronized (resourceLocks[stripes[next]]) {
+        synchronized (resourceLocks.lockAt(stripes[next])) {
             runHoldingStripes(stripes, next + 1, change);
         }
     }
@@ -15070,8 +15063,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
 
     private Object natGatewayLifecycleLock(String region, String natGatewayId) {
-        return natGatewayLifecycleLocks[Math.floorMod(
-                (callerAccountId() + "/" + key(region, natGatewayId)).hashCode(), natGatewayLifecycleLocks.length)];
+        return natGatewayLifecycleLocks.lockFor(callerAccountId() + "/" + key(region, natGatewayId));
     }
 
     private NatGateway completeTokenNatGatewayCreation(String region, NatGateway created, VpcRoutingManager routing) {

@@ -121,6 +121,59 @@ class LeafCfnProvisionerTest {
         }
 
         @Test
+        void stubbedKeyCanBecomeARealKeyOnUpdate() {
+            KmsKey key = new KmsKey();
+            key.setKeyId("k-real");
+            key.setArn("arn:aws:kms:us-east-1:000000000000:key/k-real");
+            when(kms.createKey(eq(null), eq("SIGN_VERIFY"), eq("ECC_NIST_P256"),
+                    eq(null), any(), eq(null), eq(false), eq(REGION))).thenReturn(key);
+
+            StackResource r = resource("Key", "AWS::KMS::Key");
+            r.setPhysicalId("Key-1a2b3c4d");
+            r.getAttributes().put("Arn", CfnResourceDispatcher.STUB_ARN_PREFIX + "Key");
+            ProvisionContext update = new ProvisionContext(engine, REGION, "000000000000",
+                    "my-stack", "Key-1a2b3c4d");
+
+            provisioner.provision(r, props("""
+                    {"KeySpec": "ECC_NIST_P256", "KeyUsage": "SIGN_VERIFY"}
+                    """), update);
+
+            verify(kms, never()).describeKey(anyString(), anyString());
+            assertEquals("k-real", r.getPhysicalId());
+            assertEquals(Map.of("Arn", key.getArn(), "KeyId", "k-real"), r.getAttributes());
+        }
+
+        @Test
+        void explicitBlankKeySpecReachesTheService() {
+            KmsKey key = new KmsKey();
+            key.setKeyId("k-blank-spec");
+            when(kms.createKey(eq(null), eq("ENCRYPT_DECRYPT"), eq(""),
+                    eq(null), any(), eq(null), eq(false), eq(REGION)))
+                    .thenReturn(key);
+
+            provisioner.provision(resource("Key", "AWS::KMS::Key"),
+                    props("{\"KeySpec\":\"\"}"), ctx);
+
+            verify(kms).createKey(eq(null), eq("ENCRYPT_DECRYPT"), eq(""),
+                    eq(null), any(), eq(null), eq(false), eq(REGION));
+        }
+
+        @Test
+        void explicitBlankKeyUsageReachesTheService() {
+            KmsKey key = new KmsKey();
+            key.setKeyId("k-blank-usage");
+            when(kms.createKey(eq(null), eq(""), eq("SYMMETRIC_DEFAULT"),
+                    eq(null), any(), eq(null), eq(false), eq(REGION)))
+                    .thenReturn(key);
+
+            provisioner.provision(resource("Key", "AWS::KMS::Key"),
+                    props("{\"KeyUsage\":\"\"}"), ctx);
+
+            verify(kms).createKey(eq(null), eq(""), eq("SYMMETRIC_DEFAULT"),
+                    eq(null), any(), eq(null), eq(false), eq(REGION));
+        }
+
+        @Test
         void aliasRefIsTheAliasName() {
             StackResource r = resource("Alias", "AWS::KMS::Alias");
             provisioner.provision(r, props("""

@@ -16,6 +16,8 @@ import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator.Decision;
 import io.github.hectorvent.floci.services.iam.IamService;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
 import io.github.hectorvent.floci.services.iam.model.IamUser;
+import io.github.hectorvent.floci.services.kms.KmsService;
+import io.github.hectorvent.floci.services.kms.model.KmsAlias;
 import io.github.hectorvent.floci.services.lambdaweb.LambdaWebService;
 import io.github.hectorvent.floci.services.lambdaweb.model.WebFunctionEndpoint;
 import io.github.hectorvent.floci.services.s3.S3Service;
@@ -33,6 +35,7 @@ import org.mockito.ArgumentCaptor;
 
 import java.io.ByteArrayInputStream;
 import java.io.InputStream;
+import java.lang.reflect.Field;
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Instant;
@@ -1362,5 +1365,106 @@ class IamConditionContextResolverTest {
             }
         }
         return Decision.ALLOW;
+    }
+
+    /** A role's KMS policy scoped to one key by its alias, which also limits the grants it may create. */
+    private static final String ALIAS_SCOPED_KMS_POLICY = """
+            {"Version":"2012-10-17","Statement":[
+              {"Effect":"Allow","Action":["kms:CreateGrant","kms:Decrypt","kms:Describe*","kms:Encrypt"],
+               "Resource":"arn:aws:kms:us-east-1:123456789012:key/*",
+               "Condition":{"ForAnyValue:StringLike":{"kms:ResourceAliases":"alias/example-app-key"}}},
+              {"Effect":"Deny","Action":"kms:CreateGrant","Resource":"arn:aws:kms:us-east-1:123456789012:key/*",
+               "Condition":{"ForAnyValue:StringLike":{"kms:ResourceAliases":"alias/example-app-key"},
+                            "ForAnyValue:StringNotEquals":{"kms:GrantOperations":"Decrypt"}}}]}""";
+    private static final String ALIASED_KEY = "arn:aws:kms:us-east-1:123456789012:key/1234abcd-12ab-34cd-56ef-1234567890ab";
+
+    @SuppressWarnings("unchecked")
+    private KmsService kmsWithAliasedKey() {
+        KmsService kms = mock(KmsService.class);
+        Instance<KmsService> kmsInstance = mock(Instance.class);
+        when(kmsInstance.isResolvable()).thenReturn(true);
+        when(kmsInstance.get()).thenReturn(kms);
+        // Injected as CDI does (a field), through reflection so the case compiles, and fails, without it.
+        try {
+            Field field = IamConditionContextResolver.class.getDeclaredField("kmsService");
+            field.setAccessible(true);
+            field.set(resolver, kmsInstance);
+        } catch (ReflectiveOperationException e) {
+            throw new AssertionError("the resolver has no KMS service to read a key's aliases from", e);
+        }
+        KmsAlias alias = new KmsAlias("alias/example-app-key",
+                "arn:aws:kms:us-east-1:123456789012:alias/example-app-key", "1234abcd-12ab-34cd-56ef-1234567890ab");
+        for (String keyId : List.of("alias/example-app-key", "1234abcd-12ab-34cd-56ef-1234567890ab")) {
+            when(kms.listAliases(keyId, "us-east-1")).thenReturn(List.of(alias));
+        }
+        return kms;
+    }
+
+    private ContainerRequestContext kmsRequest(String body) {
+        ContainerRequestContext request = mock(ContainerRequestContext.class);
+        when(request.getProperty("floci.bufferedJsonBody")).thenReturn(json(body));
+        return request;
+    }
+
+    @Test
+    void aKmsPolicyScopedByAliasAllowsTheRequestsOnThatKey() {
+        // Red before KMS had a condition context: kms:ResourceAliases was never set, so a policy
+        // scoped to a key by its alias refused DescribeKey, Encrypt and CreateGrant.
+        kmsWithAliasedKey();
+        assertEquals(Decision.ALLOW, evaluator.simulateCustomPolicy(List.of(ALIAS_SCOPED_KMS_POLICY), "kms:DescribeKey",
+                ALIASED_KEY, resolver.resolve("kms", "kms:DescribeKey",
+                        kmsRequest("{\"KeyId\":\"alias/example-app-key\"}"))));
+        assertEquals(Decision.ALLOW, evaluator.simulateCustomPolicy(List.of(ALIAS_SCOPED_KMS_POLICY), "kms:Encrypt",
+                ALIASED_KEY, resolver.resolve("kms", "kms:Encrypt",
+                        kmsRequest("{\"KeyId\":\"1234abcd-12ab-34cd-56ef-1234567890ab\",\"Plaintext\":\"eA==\"}"))));
+        assertEquals(Decision.ALLOW, evaluator.simulateCustomPolicy(List.of(ALIAS_SCOPED_KMS_POLICY), "kms:CreateGrant",
+                ALIASED_KEY, resolver.resolve("kms", "kms:CreateGrant", kmsRequest(
+                        "{\"KeyId\":\"1234abcd-12ab-34cd-56ef-1234567890ab\",\"Operations\":[\"Decrypt\"]}"))));
+    }
+
+    @Test
+    void aKmsGrantForAnotherOperationIsDeniedByTheGrantOperationsCondition() {
+        kmsWithAliasedKey();
+        Map<String, List<String>> context = resolver.resolve("kms", "kms:CreateGrant", kmsRequest(
+                "{\"KeyId\":\"1234abcd-12ab-34cd-56ef-1234567890ab\",\"Operations\":[\"Decrypt\",\"Encrypt\"]}"));
+        assertEquals(List.of("alias/example-app-key"), context.get("kms:ResourceAliases"));
+        assertEquals(List.of("Decrypt", "Encrypt"), context.get("kms:GrantOperations"));
+        assertEquals(Decision.DENY, evaluator.simulateCustomPolicy(List.of(ALIAS_SCOPED_KMS_POLICY), "kms:CreateGrant",
+                ALIASED_KEY, context));
+    }
+
+    @Test
+    void aKmsRequestNamingItsKeyByAliasCarriesThatAliasAsTheRequestAlias() {
+        kmsWithAliasedKey();
+        Map<String, List<String>> byName = resolver.resolve("kms", "kms:DescribeKey",
+                kmsRequest("{\"KeyId\":\"alias/example-app-key\"}"));
+        assertEquals(List.of("alias/example-app-key"), byName.get("kms:RequestAlias"));
+        assertEquals(List.of("alias/example-app-key"), resolver.resolve("kms", "kms:DescribeKey",
+                kmsRequest("{\"KeyId\":\"arn:aws:kms:us-east-1:123456789012:alias/example-app-key\"}"))
+                .get("kms:RequestAlias"));
+        Map<String, List<String>> byId = resolver.resolve("kms", "kms:Encrypt",
+                kmsRequest("{\"KeyId\":\"1234abcd-12ab-34cd-56ef-1234567890ab\"}"));
+        assertFalse(byId.containsKey("kms:RequestAlias"));
+        Map<String, List<String>> byKeyArn = resolver.resolve("kms", "kms:DescribeKey",
+                kmsRequest("{\"KeyId\":\"" + ALIASED_KEY + "\"}"));
+        assertFalse(byKeyArn != null && byKeyArn.containsKey("kms:RequestAlias"));
+        String policy = """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"kms:DescribeKey","Resource":"*",
+                  "Condition":{"StringEquals":{"kms:RequestAlias":"alias/example-app-key"}}}]}""";
+        assertEquals(Decision.ALLOW, evaluator.simulateCustomPolicy(List.of(policy), "kms:DescribeKey", ALIASED_KEY, byName));
+        assertEquals(Decision.DENY, evaluator.simulateCustomPolicy(List.of(policy), "kms:DescribeKey", ALIASED_KEY,
+                resolver.resolve("kms", "kms:DescribeKey",
+                        kmsRequest("{\"KeyId\":\"1234abcd-12ab-34cd-56ef-1234567890ab\"}"))));
+    }
+
+    @Test
+    void aKmsKeyIdNamingNoKeyAddsNoAlias() {
+        KmsService kms = kmsWithAliasedKey();
+        when(kms.listAliases("alias/none", "us-east-1"))
+                .thenThrow(new AwsException("NotFoundException", "Alias alias/none is not found.", 400));
+        Map<String, List<String>> context = resolver.resolve("kms", "kms:DescribeKey",
+                kmsRequest("{\"KeyId\":\"alias/none\"}"));
+        // The request still names its alias; only the key's own aliases are unknown.
+        assertEquals(Map.of("kms:RequestAlias", List.of("alias/none")), context);
     }
 }

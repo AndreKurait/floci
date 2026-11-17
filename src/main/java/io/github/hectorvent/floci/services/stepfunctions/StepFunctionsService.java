@@ -1342,7 +1342,8 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
 
     // ──────────────────────────── Activities ────────────────────────────
 
-    public Activity createActivity(String name, String region, Map<String, String> tags) {
+    public synchronized Activity createActivity(String name, String region, Map<String, String> tags) {
+        validateActivityName(name);
         String arn = regionResolver.buildArn("states", region, "activity:" + name);
         if (activityStore.get(arn).isPresent()) {
             throw new AwsException("ActivityAlreadyExists", "Activity already exists: " + arn, 400);
@@ -1375,7 +1376,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
                 token -> new AwsException("InvalidToken", "Invalid nextToken.", 400));
     }
 
-    public void deleteActivity(String arn) {
+    public synchronized void deleteActivity(String arn) {
         activityStore.delete(arn);
         activityQueues.remove(arn);
     }
@@ -1618,7 +1619,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         throw new AwsException("ResourceNotFound", "Resource not found: " + arn, 400);
     }
 
-    public void tagResource(String arn, Map<String, String> tags) {
+    public synchronized void tagResource(String arn, Map<String, String> tags) {
         Optional<StateMachine> smOpt = stateMachineStore.get(arn);
         if (smOpt.isPresent()) {
             StateMachine sm = smOpt.get();
@@ -1636,7 +1637,7 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         throw new AwsException("ResourceNotFound", "Resource not found: " + arn, 400);
     }
 
-    public void untagResource(String arn, List<String> tagKeys) {
+    public synchronized void untagResource(String arn, List<String> tagKeys) {
         Optional<StateMachine> smOpt = stateMachineStore.get(arn);
         if (smOpt.isPresent()) {
             StateMachine sm = smOpt.get();
@@ -2172,6 +2173,19 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
         }
         return new Diagnostic("ERROR", code,
                 message.substring(0, locationMatcher.start()).trim(), locationMatcher.group(1));
+    }
+
+    public static void validateActivityName(String name) {
+        boolean invalidCharacter = name != null && name.codePoints().anyMatch(codePoint ->
+                Character.isWhitespace(codePoint)
+                        || Character.isSpaceChar(codePoint)
+                        || Character.isISOControl(codePoint)
+                        || codePoint >= 0xD800 && codePoint <= 0xDFFF
+                        || codePoint == 0xFFFE || codePoint == 0xFFFF || codePoint == 0x10FFFF
+                        || INVALID_STATE_MACHINE_NAME_CHARACTERS.indexOf(codePoint) >= 0);
+        if (name == null || name.isBlank() || name.length() > 80 || invalidCharacter) {
+            throw new AwsException("InvalidName", "Invalid activity name: '" + name + "'", 400);
+        }
     }
 
     private static void validateStateMachineName(String name) {
