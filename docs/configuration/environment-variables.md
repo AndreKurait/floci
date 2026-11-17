@@ -462,6 +462,8 @@ These services spawn Docker containers. They require access to the Docker socket
 | `FLOCI_SERVICES_ELASTICACHE_PROXY_BASE_PORT` | `6379` | First port in the ElastiCache proxy range |
 | `FLOCI_SERVICES_ELASTICACHE_PROXY_MAX_PORT` | `6399` | Last port in the ElastiCache proxy range |
 | `FLOCI_SERVICES_ELASTICACHE_DEFAULT_IMAGE` | `valkey/valkey:8` | Default Docker image for cache clusters |
+| `FLOCI_SERVICES_ELASTICACHE_SHELL_LESS_BACKEND` | `false` | Pass server flags as container arguments and take and restore snapshots without a shell or CLI in the image (`SAVE` over RESP, the Docker archive API, the snapshot file placed before the server starts). Never inferred from the image; see [ElastiCache](../services/elasticache.md#images-with-no-shell-or-cli) |
+| `FLOCI_SERVICES_ELASTICACHE_SHELL_LESS_BACKEND_DBFILENAME` | `dump.rdb` | Snapshot file name the server loads at startup; used only with `FLOCI_SERVICES_ELASTICACHE_SHELL_LESS_BACKEND` |
 | `FLOCI_SERVICES_ELASTICACHE_DOCKER_NETWORK` | _(none)_ | Docker network for ElastiCache containers (overrides `FLOCI_SERVICES_DOCKER_NETWORK`) |
 | `FLOCI_SERVICES_ELASTICACHE_CLUSTER_ANNOUNCE_HOSTNAME` | _(none)_ | Hostname cluster-mode nodes announce in `MOVED`/`ASK` redirects and topology responses, and report as the `ConfigurationEndpoint`. Set to a name every client resolves (e.g. `localhost.floci.io`) when `FLOCI_HOSTNAME` only resolves inside Floci's Docker network. Defaults to `FLOCI_HOSTNAME` |
 
@@ -561,6 +563,7 @@ These services spawn Docker containers. They require access to the Docker socket
 | `FLOCI_SERVICES_ECS_ENABLED` | `true` | Enable the ECS service |
 | `FLOCI_SERVICES_ECS_MOCK` | `false` | When `true`, tasks are registered but not actually run |
 | `FLOCI_SERVICES_ECS_PUBLISH_AWSVPC_PORTS_TO_HOST` | `false` | Publish `awsvpc` task ports on stable Docker host ports for host-side clients |
+| `FLOCI_SERVICES_ECS_SHARED_TASK_NETWORK` | `false` | Put an `awsvpc` task's containers in one network namespace, held by a helper container, so they reach each other on `localhost` as on Fargate. Applies while security-group enforcement is off and needs no privileges, so it works on rootless Docker and Podman |
 | `FLOCI_SERVICES_ECS_DEFAULT_MEMORY_MB` | `512` | Default task memory when not specified in the task definition |
 | `FLOCI_SERVICES_ECS_DEFAULT_CPU_UNITS` | `256` | Default task CPU units when not specified in the task definition |
 | `FLOCI_SERVICES_ECS_DOCKER_NETWORK` | _(none)_ | Docker network for ECS task containers |
@@ -644,6 +647,7 @@ See [Web Console](../ui/index.md) for running the console and swapping in a thir
 | `FLOCI_SERVICES_ROUTE53_ENABLED` | `true` | Enable the Route 53 service |
 | `FLOCI_SERVICES_ROUTE53_VPC_ASSOCIATION_CONTROL_PLANE_DELAY_MS` | `0` | Simulated processing window for Route 53 VPC association/auth mutations; positive values make documented overlap errors (`PriorRequestNotComplete` / `ConcurrentModification`) reproducible for retry tests |
 | `FLOCI_SERVICES_ELBV2_ENABLED` | `true` | Enable the ELBv2 (ALB/NLB) service |
+| `FLOCI_SERVICES_ELBV2_ALB_ZONE_RULE` | `aws` | ALB minimum-zone policy: `aws` requires two distinct ordinary Availability Zones in every region; `allow-single-zone` explicitly permits one. Per-region YAML overrides take precedence. |
 | `FLOCI_SERVICES_ELBV2_MOCK` | `false` | When `true`, load balancers are registered but no containers are spawned |
 | `FLOCI_SERVICES_ELBV2_BACKEND_KEEP_ALIVE` | `true` | Reuse backend HTTP/1.x connections for ordinary HTTP forwarding. Set to `false` for fresh connections per request; WebSocket and TCP transports are unaffected. See [backend connection reuse](../services/elb.md#backend-connection-reuse) |
 | `FLOCI_SERVICES_ELBV2_BACKEND_KEEP_ALIVE_TIMEOUT_SECONDS` | `60` | Default idle-pool timeout for backend HTTP/1.x connections, in non-negative seconds; `0` disables expiry. A target's advertised `Keep-Alive` timeout overrides it. Does not time out active responses or WebSockets |

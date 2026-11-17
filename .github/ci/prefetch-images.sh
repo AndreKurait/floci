@@ -13,6 +13,8 @@
 # so a test that pulled the image itself can be told apart from a prefetch that failed or was
 # still downloading. The lines go to a file because the pulls outlive the workflow step that
 # started them and the step's stdout is closed by then.
+# A nightly check, a *NightlyIntegrationTest class, keys its images on its own name: ci.yml leaves those names out
+# of the list it passes, so they are pulled only for nightly-checks.yml, which passes nothing else.
 # Usage: prefetch-images.sh <shard.txt>
 set -u
 SHARD_FILE="${1:-}"
@@ -111,13 +113,19 @@ starts SwfLambdaIntegrationTest && ecr public.ecr.aws/lambda/python:3.12
 starts ElbV2LambdaTargetDataPlaneIntegrationTest && ecr public.ecr.aws/lambda/python:3.14
 # EmrDockerRunnerDockerIntegrationTest runs EMR steps and EMR Serverless job runs in the emr-7.5.0 image the runner's
 # default template names (EmrServerlessSparkRunner), 3.5 GB, so it is queued last, behind the Lambda runtimes;
-# EmrHiveStepsDockerIntegrationTest runs a cluster's other steps in it.
-starts EmrDockerRunnerDockerIntegrationTest EmrHiveStepsDockerIntegrationTest \
+# EmrHiveStepsDockerIntegrationTest runs a cluster's other steps in it. Of the nightly checks,
+# EmrServerlessCustomImageNightlyIntegrationTest builds its custom image on it,
+# EmrFlociContainerNightlyIntegrationTest runs a cluster's steps in it from Floci in a container, and
+# EmrPigStepsNightlyIntegrationTest a cluster's Pig steps.
+starts EmrDockerRunnerDockerIntegrationTest EmrHiveStepsDockerIntegrationTest EmrServerlessCustomImageNightlyIntegrationTest \
+    EmrFlociContainerNightlyIntegrationTest EmrPigStepsNightlyIntegrationTest \
     && ecr public.ecr.aws/emr-serverless/spark/emr-7.5.0:latest
 # EmrServerlessHiveDockerIntegrationTest runs EMR Serverless Hive job runs, and EmrHiveStepsDockerIntegrationTest EMR
 # Hive steps, in the emr-7.5.0 Hive image the runner's default Hive template names, 2.7 GB; every EMR cluster runs its
-# HDFS in it, EmrDockerRunnerDockerIntegrationTest's included.
+# HDFS in it, EmrDockerRunnerDockerIntegrationTest's and the nightly EmrFlociContainerNightlyIntegrationTest's and
+# EmrPigStepsNightlyIntegrationTest's included.
 starts EmrServerlessHiveDockerIntegrationTest EmrHiveStepsDockerIntegrationTest EmrDockerRunnerDockerIntegrationTest \
+    EmrFlociContainerNightlyIntegrationTest EmrPigStepsNightlyIntegrationTest \
     && ecr public.ecr.aws/emr-serverless/hive/emr-7.5.0:latest
 
 # package token in shard.txt -> images its tests are known to launch

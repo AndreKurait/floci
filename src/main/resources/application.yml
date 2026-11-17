@@ -68,7 +68,8 @@ quarkus:
       # (bedrock/model-catalog.yaml), AppSync's GraphQL
       # parser reads its message bundles, Lambda Web Functions copy their
       # runtime (lambdaweb/index.mjs) into each environment, EMR writes its S3DistCp program
-      # (emr/s3-dist-cp.py) into a step's container, EC2 security group enforcement builds
+      # (emr/s3-dist-cp.py) into a step's container, DSQL renders its bootstrap
+      # (dsql/bootstrap.sql) for each cluster, EC2 security group enforcement builds
       # its helper image from docker/*.Dockerfile, and API Gateway's Velocity
       # engine reads its default properties at runtime via
       # ClassLoader#getResourceAsStream. Quarkus's static resource analysis
@@ -96,6 +97,7 @@ quarkus:
         - iam/service-linked-roles.tsv
         - cloudformation/*.json
         - redshift/*.sql
+        - dsql/*.sql
         - i18n/*.properties
         - floci/version.properties
         - org/apache/velocity/runtime/defaults/*.properties
@@ -304,6 +306,8 @@ floci:
       guardduty:
         flush-interval-ms: 5000
       emrserverless:
+        flush-interval-ms: 5000
+      emrcontainers:
         flush-interval-ms: 5000
       lakeformation:
         flush-interval-ms: 5000
@@ -563,6 +567,7 @@ floci:
       proxy-max-port: 6399
       default-image: "valkey/valkey:8"
       default-memcached-image: "memcached:1.6"
+      shell-less-backend: false
     memorydb:
       enabled: true
       mock: false
@@ -658,6 +663,10 @@ floci:
       yarn-node-memory-mb: 4096             # memory a cluster's NodeManager offers its YARN containers
       yarn-node-vcores: 4                   # virtual cores it offers them
       yarn-max-worker-nodes: 4              # the most core and task nodes a cluster runs as containers of their own
+      pig:
+        enabled: false                      # true = add Apache Pig, downloaded, to a docker cluster that installs Pig
+        # urls: https://dlcdn.apache.org/pig/pig-0.18.0/pig-0.18.0.tar.gz,https://archive.apache.org/dist/pig/pig-0.18.0/pig-0.18.0.tar.gz
+        # sha256: 6845adb936a3c3bcc71451765953cae4103e410ba2f6c5a47cc9becade0a434a
       # Remove the step drivers a previous run of this deployment left on the daemon, and the images
       # bootstrap actions left for clusters that are gone or have ended, when the EMR service starts.
       # Scoped to this deployment's own containers and images.
@@ -817,6 +826,9 @@ floci:
       publish-awsvpc-ports-to-host: false
       dynamic-awsvpc-host-ports: false
       host-port-bind-address: "127.0.0.1"
+      # Put an awsvpc task's containers in one network namespace, so they reach each other on
+      # localhost as on Fargate, without security-group enforcement.
+      shared-task-network: false               # FLOCI_SERVICES_ECS_SHARED_TASK_NETWORK
       host-volume-roots: []
       allow-unsafe-host-volumes: false
       allow-privileged-containers: false
@@ -927,6 +939,12 @@ floci:
       mock: false
       backend-keep-alive: true
       backend-keep-alive-timeout-seconds: 60
+
+      alb-zone-rule: ${FLOCI_SERVICES_ELBV2_ALB_ZONE_RULE:aws}
+      # Per-region entries override this global setting, including an explicit aws reset.
+      # alb-zone-rule-by-region:
+      #   ap-northeast-3: allow-single-zone
+      #   us-east-1: allow-single-zone
     codebuild:
       enabled: true
       # docker-network: floci-network
@@ -1078,6 +1096,9 @@ floci:
       # Remove the drivers and executors a previous run of this deployment left on the daemon before
       # the first job run starts. Scoped to this deployment's own containers.
       reconcile-containers-on-startup: true
+    emrcontainers:
+      enabled: true
+      job-run-duration-seconds: 0   # 0 = a job run completes as soon as it is submitted
     ssoadmin:
       enabled: true
     ssooidc:

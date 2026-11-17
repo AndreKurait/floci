@@ -3,6 +3,7 @@ package io.floci.aws.services.iam;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.cbor.CBORFactory;
+import io.floci.aws.services.ecr.registry.EcrRegistryManager;
 import io.floci.aws.services.redshift.model.Endpoint;
 import io.floci.aws.services.redshiftserverless.RedshiftServerlessRuntime;
 import io.floci.aws.testing.AwsTestClients;
@@ -93,6 +94,10 @@ class IamRequestResourceEnforcementIntegrationTest {
     /** A serverless workgroup's PostgreSQL container is not needed to check a request on it, so none starts. */
     @InjectMock
     RedshiftServerlessRuntime runtime;
+
+    /** ECR's backing registry is not needed to check a request on a repository's metadata, so none starts. */
+    @InjectMock
+    EcrRegistryManager ecrRegistry;
 
     @BeforeAll
     static void configureRestAssured() {
@@ -636,6 +641,39 @@ class IamRequestResourceEnforcementIntegrationTest {
                         + "\",\"tags\":[{\"Key\":\"a\",\"Value\":\"b\"}]}").post("/").then(), "ecr:TagResource");
     }
 
+    /**
+     * An {@code ecr:ResourceTag} or {@code aws:ResourceTag} condition reads the tags ECR holds on the repository a
+     * request names, so an allow on one team's tag lets the caller read that team's repository and not another's.
+     */
+    @Test
+    void anEcrResourceTagConditionReadsTheTagsOfTheRepository() {
+        String tagged = ecrRepository("res-tag-repo-" + suffix(), "data");
+        String other = ecrRepository("res-tag-repo-" + suffix(), "web");
+        String arns = "arn:aws:ecr:" + REGION + ":" + ACCOUNT + ":repository/";
+
+        User user = user("res-ecr-tags");
+        user.policy("{\"Effect\":\"Allow\",\"Action\":\"ecr:DescribeRepositories\",\"Resource\":\"*\","
+                + "\"Condition\":{\"StringEquals\":{\"ecr:ResourceTag/team\":\"data\"}}},"
+                + "{\"Effect\":\"Allow\",\"Action\":\"ecr:ListTagsForResource\",\"Resource\":\"*\","
+                + "\"Condition\":{\"StringEquals\":{\"aws:ResourceTag/team\":\"data\"}}}");
+        describeRepositories(user, tagged).statusCode(200);
+        refusedJson(describeRepositories(user, other), "ecr:DescribeRepositories");
+        send(user, "ecr", "AmazonEC2ContainerRegistry_V20150921.ListTagsForResource", "1.1",
+                "{\"resourceArn\":\"" + arns + tagged + "\"}").statusCode(200);
+        refusedJson(send(user, "ecr", "AmazonEC2ContainerRegistry_V20150921.ListTagsForResource", "1.1",
+                "{\"resourceArn\":\"" + arns + other + "\"}"), "ecr:ListTagsForResource");
+    }
+
+    /** An ECR repository of the name, tagged with the team, deleted afterwards. */
+    private String ecrRepository(String name, String team) {
+        adminJson("ecr", "AmazonEC2ContainerRegistry_V20150921.CreateRepository").body("{\"repositoryName\":\""
+                + name + "\",\"tags\":[{\"Key\":\"team\",\"Value\":\"" + team + "\"}]}").post("/").then()
+                .statusCode(200);
+        cleanup.register(() -> adminJson("ecr", "AmazonEC2ContainerRegistry_V20150921.DeleteRepository")
+                .body("{\"repositoryName\":\"" + name + "\",\"force\":true}").post("/"));
+        return name;
+    }
+
     @Test
     void aDeliveryStreamIsCheckedOnTheArnItsNameGives() {
         String name = "res-stream-" + suffix();
@@ -901,6 +939,51 @@ class IamRequestResourceEnforcementIntegrationTest {
                 .body(containsString("ResourceNotFoundException"));
     }
 
+    /**
+     * An {@code aws:ResourceTag} condition reads the tags CodeBuild holds on a project and a report group, so an allow
+     * on one team's tag lets the caller read that team's and not another's.
+     */
+    @Test
+    void aCodeBuildResourceTagConditionReadsTheTagsOfTheProjectAndTheReportGroup() {
+        String tagged = codeBuildProject("res-tag-project-" + suffix(), "data");
+        String other = codeBuildProject("res-tag-project-" + suffix(), "web");
+        String taggedGroup = codeBuildReportGroup("res-tag-group-" + suffix(), "data");
+        String otherGroup = codeBuildReportGroup("res-tag-group-" + suffix(), "web");
+
+        User user = user("res-codebuild-tags");
+        user.policy("{\"Effect\":\"Allow\",\"Action\":[\"codebuild:BatchGetProjects\","
+                + "\"codebuild:BatchGetReportGroups\"],\"Resource\":\"*\","
+                + "\"Condition\":{\"StringEquals\":{\"aws:ResourceTag/team\":\"data\"}}}");
+        codeBuild(user, "BatchGetProjects", "{\"names\":[\"" + tagged + "\"]}").statusCode(200);
+        refusedJson(codeBuild(user, "BatchGetProjects", "{\"names\":[\"" + other + "\"]}"),
+                "codebuild:BatchGetProjects");
+        codeBuild(user, "BatchGetReportGroups", "{\"reportGroupArns\":[\"" + taggedGroup + "\"]}").statusCode(200);
+        refusedJson(codeBuild(user, "BatchGetReportGroups", "{\"reportGroupArns\":[\"" + otherGroup + "\"]}"),
+                "codebuild:BatchGetReportGroups");
+    }
+
+    private String codeBuildProject(String name, String team) {
+        adminJson("codebuild", "CodeBuild_20161006.CreateProject").body("{\"name\":\"" + name
+                + "\",\"source\":{\"type\":\"NO_SOURCE\",\"buildspec\":\"version: 0.2\"},"
+                + "\"artifacts\":{\"type\":\"NO_ARTIFACTS\"},\"environment\":{\"type\":\"LINUX_CONTAINER\","
+                + "\"image\":\"aws/codebuild/standard:7.0\",\"computeType\":\"BUILD_GENERAL1_SMALL\"},"
+                + "\"serviceRole\":\"arn:aws:iam::" + ACCOUNT + ":role/codebuild-role\","
+                + "\"tags\":[{\"key\":\"team\",\"value\":\"" + team + "\"}]}").post("/").then().statusCode(200);
+        cleanup.register(() -> adminJson("codebuild", "CodeBuild_20161006.DeleteProject")
+                .body("{\"name\":\"" + name + "\"}").post("/"));
+        return name;
+    }
+
+    private String codeBuildReportGroup(String name, String team) {
+        String arn = adminJson("codebuild", "CodeBuild_20161006.CreateReportGroup").body("{\"name\":\"" + name
+                + "\",\"type\":\"TEST\",\"exportConfig\":{\"exportConfigType\":\"NO_EXPORT\"},"
+                + "\"tags\":[{\"key\":\"team\",\"value\":\"" + team + "\"}]}").post("/").then().statusCode(200)
+                .extract().path("reportGroup.arn");
+        cleanup.register(() -> adminJson("codebuild", "CodeBuild_20161006.DeleteReportGroup")
+                .body("{\"arn\":\"" + arn + "\"}").post("/"));
+        return arn;
+    }
+
     /** A Managed Service for Apache Flink application is checked on the ARN its name gives. */
     @Test
     void anApplicationIsCheckedOnTheArnItsNameGives() {
@@ -945,6 +1028,45 @@ class IamRequestResourceEnforcementIntegrationTest {
                 "athena:ListQueryExecutions");
         refusedJson(send(user, "athena", "AmazonAthena.StartQueryExecution", "1.1", "{\"QueryString\":\"SELECT 1\"}"),
                 "athena:StartQueryExecution");
+    }
+
+    /**
+     * An {@code aws:ResourceTag} condition reads the tags Athena holds on a workgroup and a data catalog, so an allow
+     * on one team's tag lets the caller read that team's and not another's.
+     */
+    @Test
+    void anAthenaResourceTagConditionReadsTheTagsOfTheWorkgroupAndTheDataCatalog() {
+        String workGroup = athenaTagged("CreateWorkGroup", "res-tag-wg-" + suffix(), "data");
+        String otherWorkGroup = athenaTagged("CreateWorkGroup", "res-tag-wg-" + suffix(), "web");
+        String catalog = athenaTagged("CreateDataCatalog", "res_tag_cat_" + suffix(), "data");
+        String otherCatalog = athenaTagged("CreateDataCatalog", "res_tag_cat_" + suffix(), "web");
+
+        User user = user("res-athena-tags");
+        user.policy("{\"Effect\":\"Allow\",\"Action\":[\"athena:GetWorkGroup\",\"athena:GetDataCatalog\"],"
+                + "\"Resource\":\"*\",\"Condition\":{\"StringEquals\":{\"aws:ResourceTag/team\":\"data\"}}}");
+        send(user, "athena", "AmazonAthena.GetWorkGroup", "1.1", "{\"WorkGroup\":\"" + workGroup + "\"}")
+                .statusCode(200);
+        refusedJson(send(user, "athena", "AmazonAthena.GetWorkGroup", "1.1", "{\"WorkGroup\":\"" + otherWorkGroup
+                + "\"}"), "athena:GetWorkGroup");
+        send(user, "athena", "AmazonAthena.GetDataCatalog", "1.1", "{\"Name\":\"" + catalog + "\"}").statusCode(200);
+        refusedJson(send(user, "athena", "AmazonAthena.GetDataCatalog", "1.1", "{\"Name\":\"" + otherCatalog
+                + "\"}"), "athena:GetDataCatalog");
+    }
+
+    /** An Athena workgroup or {@code LAMBDA} data catalog of the name, tagged with the team, deleted afterwards. */
+    private String athenaTagged(String operation, String name, String team) {
+        String body = "CreateWorkGroup".equals(operation) ? "{\"Name\":\"" + name + "\""
+                : "{\"Name\":\"" + name + "\",\"Type\":\"LAMBDA\"";
+        adminJson("athena", "AmazonAthena." + operation).body(body + ",\"Tags\":[{\"Key\":\"team\",\"Value\":\""
+                + team + "\"}]}").post("/").then().statusCode(200);
+        if ("CreateWorkGroup".equals(operation)) {
+            cleanup.register(() -> adminJson("athena", "AmazonAthena.DeleteWorkGroup")
+                    .body("{\"WorkGroup\":\"" + name + "\"}").post("/"));
+        } else {
+            cleanup.register(() -> adminJson("athena", "AmazonAthena.DeleteDataCatalog")
+                    .body("{\"Name\":\"" + name + "\"}").post("/"));
+        }
+        return name;
     }
 
     /**
@@ -1446,6 +1568,51 @@ class IamRequestResourceEnforcementIntegrationTest {
         }
     }
 
+    /**
+     * An {@code aws:ResourceTag} condition reads the tags Redshift Serverless holds on a namespace and a workgroup, so
+     * an allow on one team's tag lets the caller read that team's and not another's.
+     */
+    @Test
+    void aRedshiftServerlessResourceTagConditionReadsTheTagsOfTheNamespaceAndTheWorkgroup() {
+        when(runtime.start(any(String.class), any(String.class), any(String.class), any(String.class),
+                any(String.class), any(String.class), any(Endpoint.class), anyBoolean(), any()))
+                .thenReturn(new RedshiftServerlessRuntime.Backend("127.0.0.1", 55432));
+        String tagged = "res-tag-rss-" + suffix();
+        String other = "res-tag-rss-" + suffix();
+        taggedWorkgroup(tagged, "data");
+        taggedWorkgroup(other, "web");
+
+        User user = user("res-rss-tags");
+        user.policy("{\"Effect\":\"Allow\",\"Action\":[\"redshift-serverless:GetNamespace\","
+                + "\"redshift-serverless:GetWorkgroup\"],\"Resource\":\"*\","
+                + "\"Condition\":{\"StringEquals\":{\"aws:ResourceTag/team\":\"data\"}}}");
+        redshiftServerless(user, "GetNamespace", "{\"namespaceName\":\"" + tagged + "-ns\"}").statusCode(200);
+        refusedJson(redshiftServerless(user, "GetNamespace", "{\"namespaceName\":\"" + other + "-ns\"}"),
+                "redshift-serverless:GetNamespace");
+        redshiftServerless(user, "GetWorkgroup", "{\"workgroupName\":\"" + tagged + "\"}").statusCode(200);
+        refusedJson(redshiftServerless(user, "GetWorkgroup", "{\"workgroupName\":\"" + other + "\"}"),
+                "redshift-serverless:GetWorkgroup");
+    }
+
+    /** Creates a serverless workgroup and its namespace as the admin, both tagged with the team. */
+    private void taggedWorkgroup(String name, String team) {
+        String tags = ",\"tags\":[{\"key\":\"team\",\"value\":\"" + team + "\"}]";
+        adminJson("redshift-serverless", "RedshiftServerless.CreateNamespace")
+                .body("{\"namespaceName\":\"" + name + "-ns\",\"adminUsername\":\"admin\","
+                        + "\"adminUserPassword\":\"Secret123!\"" + tags + "}").post("/").then().statusCode(200);
+        cleanup.register(() -> adminJson("redshift-serverless", "RedshiftServerless.DeleteNamespace")
+                .body("{\"namespaceName\":\"" + name + "-ns\"}").post("/"));
+        adminJson("redshift-serverless", "RedshiftServerless.CreateWorkgroup")
+                .body("{\"workgroupName\":\"" + name + "\",\"namespaceName\":\"" + name + "-ns\"" + tags + "}")
+                .post("/").then().statusCode(200);
+        cleanup.register(() -> adminJson("redshift-serverless", "RedshiftServerless.DeleteWorkgroup")
+                .body("{\"workgroupName\":\"" + name + "\"}").post("/"));
+    }
+
+    private static ValidatableResponse redshiftServerless(User user, String operation, String body) {
+        return user.json("redshift-serverless", "RedshiftServerless." + operation, "1.1").body(body).post("/").then();
+    }
+
     /** Creates a serverless workgroup and its namespace as the admin and gives the workgroup's ARN. */
     private String createWorkgroup(String name) {
         adminJson("redshift-serverless", "RedshiftServerless.CreateNamespace")
@@ -1736,6 +1903,38 @@ class IamRequestResourceEnforcementIntegrationTest {
                         equalTo(arn));
     }
 
+    /**
+     * An {@code aws:ResourceTag} condition reads the tags Redshift holds on the parameter group a request names, so an
+     * allow on one team's tag lets the caller read that team's group and not another's.
+     */
+    @Test
+    void aRedshiftResourceTagConditionReadsTheTagsOfTheParameterGroup() {
+        String tagged = redshiftParameterGroup("res-tag-pg-" + suffix(), "data");
+        String other = redshiftParameterGroup("res-tag-pg-" + suffix(), "web");
+
+        User user = user("res-redshift-tags");
+        user.policy("{\"Effect\":\"Allow\",\"Action\":\"redshift:DescribeClusterParameters\",\"Resource\":\"*\","
+                + "\"Condition\":{\"StringEquals\":{\"aws:ResourceTag/team\":\"data\"}}}");
+        describeClusterParameters(user, tagged).statusCode(200);
+        refused(describeClusterParameters(user, other), "redshift:DescribeClusterParameters");
+    }
+
+    /** A Redshift parameter group of the name, tagged with the team, deleted afterwards. */
+    private String redshiftParameterGroup(String name, String team) {
+        admin("redshift").formParam("Action", "CreateClusterParameterGroup").formParam("Version", "2012-12-01")
+                .formParam("ParameterGroupName", name).formParam("ParameterGroupFamily", "redshift-1.0")
+                .formParam("Description", "d").formParam("Tags.Tag.1.Key", "team").formParam("Tags.Tag.1.Value", team)
+                .post("/").then().statusCode(200);
+        cleanup.register(() -> admin("redshift").formParam("Action", "DeleteClusterParameterGroup")
+                .formParam("Version", "2012-12-01").formParam("ParameterGroupName", name).post("/"));
+        return name;
+    }
+
+    private static ValidatableResponse describeClusterParameters(User user, String group) {
+        return user.query("redshift", "DescribeClusterParameters").formParam("Version", "2012-12-01")
+                .formParam("ParameterGroupName", group).post("/").then();
+    }
+
     /** A Redshift cluster is checked on {@code cluster:<identifier>}, before the cluster is looked up. */
     @Test
     void aRedshiftClusterIsCheckedOnItsIdentifier() {
@@ -1861,6 +2060,62 @@ class IamRequestResourceEnforcementIntegrationTest {
 
     /** The user's JSON-protocol request to the target, {@code <prefix>.<operation>}, with the body. */
     /**
+     * An {@code aws:ResourceTag} condition reads a Step Functions state machine's tags for the state machine, its
+     * version and its execution, and an activity's own, so an allow on one team's tag lets the caller read that
+     * team's and not another's.
+     */
+    @Test
+    void aStepFunctionsResourceTagConditionReadsTheStateMachineTagsAndTheActivityTags() {
+        String definition = "{\\\"StartAt\\\":\\\"Done\\\",\\\"States\\\":{\\\"Done\\\":{\\\"Type\\\":\\\"Pass\\\","
+                + "\\\"End\\\":true}}}";
+        String tagged = stateMachine("res-tag-sm-" + suffix(), definition, "data");
+        String other = stateMachine("res-tag-sm-" + suffix(), definition, "web");
+        String version = sfn("PublishStateMachineVersion", "{\"stateMachineArn\":\"" + tagged + "\"}")
+                .statusCode(200).extract().path("stateMachineVersionArn");
+        String execution = sfn("StartExecution", "{\"stateMachineArn\":\"" + tagged + "\"}")
+                .statusCode(200).extract().path("executionArn");
+        String otherExecution = sfn("StartExecution", "{\"stateMachineArn\":\"" + other + "\"}")
+                .statusCode(200).extract().path("executionArn");
+        String activity = activity("res-tag-act-" + suffix(), "data");
+        String otherActivity = activity("res-tag-act-" + suffix(), "web");
+
+        User user = user("res-sfn-tags");
+        user.policy("{\"Effect\":\"Allow\",\"Action\":[\"states:DescribeStateMachine\",\"states:DescribeExecution\","
+                + "\"states:DescribeActivity\"],\"Resource\":\"*\","
+                + "\"Condition\":{\"StringEquals\":{\"aws:ResourceTag/team\":\"data\"}}}");
+        describe(user, "DescribeStateMachine", "stateMachineArn", tagged).statusCode(200);
+        describe(user, "DescribeStateMachine", "stateMachineArn", version).statusCode(200);
+        refusedJson(describe(user, "DescribeStateMachine", "stateMachineArn", other), "states:DescribeStateMachine");
+        describe(user, "DescribeExecution", "executionArn", execution).statusCode(200);
+        refusedJson(describe(user, "DescribeExecution", "executionArn", otherExecution), "states:DescribeExecution");
+        describe(user, "DescribeActivity", "activityArn", activity).statusCode(200);
+        refusedJson(describe(user, "DescribeActivity", "activityArn", otherActivity), "states:DescribeActivity");
+    }
+
+    private String stateMachine(String name, String definition, String team) {
+        String arn = sfn("CreateStateMachine", "{\"name\":\"" + name + "\",\"definition\":\"" + definition
+                + "\",\"roleArn\":\"arn:aws:iam::" + ACCOUNT + ":role/sfn\",\"tags\":[{\"key\":\"team\",\"value\":\""
+                + team + "\"}]}").statusCode(200).extract().path("stateMachineArn");
+        cleanup.register(() -> sfn("DeleteStateMachine", "{\"stateMachineArn\":\"" + arn + "\"}"));
+        return arn;
+    }
+
+    private String activity(String name, String team) {
+        String arn = sfn("CreateActivity", "{\"name\":\"" + name + "\",\"tags\":[{\"key\":\"team\",\"value\":\""
+                + team + "\"}]}").statusCode(200).extract().path("activityArn");
+        cleanup.register(() -> sfn("DeleteActivity", "{\"activityArn\":\"" + arn + "\"}"));
+        return arn;
+    }
+
+    private static ValidatableResponse sfn(String operation, String body) {
+        return adminJson("states", "AWSStepFunctions." + operation, "1.0").body(body).post("/").then();
+    }
+
+    private static ValidatableResponse describe(User user, String operation, String member, String arn) {
+        return send(user, "states", "AWSStepFunctions." + operation, "1.0", "{\"" + member + "\":\"" + arn + "\"}");
+    }
+
+    /**
      * A Glue table is checked on the account's catalog, its database and itself, the types AWS gives
      * {@code glue:GetTable}, so a grant on all three allows it, the same grant refuses another table of the database,
      * a grant leaving out the catalog refuses it, and a deny scoped to the table holds under an allow on everything.
@@ -1910,6 +2165,78 @@ class IamRequestResourceEnforcementIntegrationTest {
                 "glue:GetDatabase");
         send(user, "glue", "AWSGlue.GetJob", "1.1", "{\"JobName\":\"" + job + "\"}").statusCode(200);
         refusedJson(send(user, "glue", "AWSGlue.GetJob", "1.1", "{\"JobName\":\"" + job + "-other\"}"), "glue:GetJob");
+    }
+
+    /**
+     * An {@code aws:ResourceTag} condition reads the tags Glue holds on the resource a request names, a job's and a
+     * schema registry's, so an allow on one team's tag lets the caller read that team's job and registry and not
+     * another's.
+     */
+    @Test
+    void aGlueResourceTagConditionReadsTheTagsOfTheJobAndTheRegistry() {
+        String tagged = "res-tag-job-" + suffix();
+        String other = "res-tag-job-" + suffix();
+        String jobRest = "\",\"Role\":\"arn:aws:iam::" + ACCOUNT + ":role/glue\","
+                + "\"Command\":{\"Name\":\"glueetl\",\"ScriptLocation\":\"s3://scripts/job.py\"}";
+        glue("CreateJob", "{\"Name\":\"" + tagged + jobRest + ",\"Tags\":{\"team\":\"data\"}}").statusCode(200);
+        cleanup.register(() -> glue("DeleteJob", "{\"JobName\":\"" + tagged + "\"}"));
+        glue("CreateJob", "{\"Name\":\"" + other + jobRest + ",\"Tags\":{\"team\":\"web\"}}").statusCode(200);
+        cleanup.register(() -> glue("DeleteJob", "{\"JobName\":\"" + other + "\"}"));
+        String taggedRegistry = "res-tag-reg-" + suffix();
+        String otherRegistry = "res-tag-reg-" + suffix();
+        glue("CreateRegistry", "{\"RegistryName\":\"" + taggedRegistry + "\",\"Tags\":{\"team\":\"data\"}}")
+                .statusCode(200);
+        cleanup.register(() -> glue("DeleteRegistry", "{\"RegistryId\":{\"RegistryName\":\"" + taggedRegistry
+                + "\"}}"));
+        glue("CreateRegistry", "{\"RegistryName\":\"" + otherRegistry + "\"}").statusCode(200);
+        cleanup.register(() -> glue("DeleteRegistry", "{\"RegistryId\":{\"RegistryName\":\"" + otherRegistry
+                + "\"}}"));
+
+        User user = user("res-glue-tags");
+        user.policy("{\"Effect\":\"Allow\",\"Action\":[\"glue:GetJob\",\"glue:GetRegistry\"],\"Resource\":\"*\","
+                + "\"Condition\":{\"StringEquals\":{\"aws:ResourceTag/team\":\"data\"}}}");
+        send(user, "glue", "AWSGlue.GetJob", "1.1", "{\"JobName\":\"" + tagged + "\"}").statusCode(200);
+        refusedJson(send(user, "glue", "AWSGlue.GetJob", "1.1", "{\"JobName\":\"" + other + "\"}"), "glue:GetJob");
+        send(user, "glue", "AWSGlue.GetRegistry", "1.1", "{\"RegistryId\":{\"RegistryName\":\"" + taggedRegistry
+                + "\"}}").statusCode(200);
+        refusedJson(send(user, "glue", "AWSGlue.GetRegistry", "1.1", "{\"RegistryId\":{\"RegistryName\":\""
+                + otherRegistry + "\"}}"), "glue:GetRegistry");
+    }
+
+    /**
+     * An {@code aws:ResourceTag} condition reads the tags DynamoDB holds on the table a request names, as created and
+     * as tagged later, so an allow on one team's tag lets the caller describe that team's tables and not another's.
+     */
+    @Test
+    void aDynamoDbResourceTagConditionReadsTheTagsOfTheTable() {
+        String tagged = dynamoDbTable("res-tag-ddb-" + suffix(), "data");
+        String other = dynamoDbTable("res-tag-ddb-" + suffix(), "web");
+
+        User user = user("res-ddb-tags");
+        user.policy("{\"Effect\":\"Allow\",\"Action\":\"dynamodb:DescribeTable\",\"Resource\":\"*\","
+                + "\"Condition\":{\"StringEquals\":{\"aws:ResourceTag/team\":\"data\"}}}");
+        send(user, "dynamodb", "DynamoDB_20120810.DescribeTable", "1.0", "{\"TableName\":\"" + tagged + "\"}")
+                .statusCode(200);
+        refusedJson(send(user, "dynamodb", "DynamoDB_20120810.DescribeTable", "1.0", "{\"TableName\":\"" + other
+                + "\"}"), "dynamodb:DescribeTable");
+
+        adminJson("dynamodb", "DynamoDB_20120810.TagResource", "1.0").body("{\"ResourceArn\":\"arn:aws:dynamodb:"
+                + REGION + ":" + ACCOUNT + ":table/" + other + "\",\"Tags\":[{\"Key\":\"team\",\"Value\":\"data\"}]}")
+                .post("/").then().statusCode(200);
+        send(user, "dynamodb", "DynamoDB_20120810.DescribeTable", "1.0", "{\"TableName\":\"" + other + "\"}")
+                .statusCode(200);
+    }
+
+    /** A DynamoDB table of the name, keyed on {@code id} and tagged with the team, deleted afterwards. */
+    private String dynamoDbTable(String name, String team) {
+        adminJson("dynamodb", "DynamoDB_20120810.CreateTable", "1.0").body("{\"TableName\":\"" + name + "\","
+                + "\"KeySchema\":[{\"AttributeName\":\"id\",\"KeyType\":\"HASH\"}],"
+                + "\"AttributeDefinitions\":[{\"AttributeName\":\"id\",\"AttributeType\":\"S\"}],"
+                + "\"BillingMode\":\"PAY_PER_REQUEST\",\"Tags\":[{\"Key\":\"team\",\"Value\":\"" + team + "\"}]}")
+                .post("/").then().statusCode(200);
+        cleanup.register(() -> adminJson("dynamodb", "DynamoDB_20120810.DeleteTable", "1.0")
+                .body("{\"TableName\":\"" + name + "\"}").post("/"));
+        return name;
     }
 
     /**

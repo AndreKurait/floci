@@ -854,15 +854,40 @@ the shape. The length wording follows the captures of real IAM length violations
 bound the value broke and leaving the value itself out of the message. Either simulation action
 accepts only one `PermissionsBoundaryPolicyInputList` document, matching AWS's own documented
 limit; extra documents beyond the first are ignored. Neither evaluates a resource-based policy
-(`ResourcePolicy`) or `OrderedOrganizationPolicyInputList`, and neither returns
-`MatchedStatements`, `ResourceSpecificResults`, or a `PermissionsBoundaryDecisionDetail`: only the
-top-level `EvalDecision` is populated, so which policy allowed an action is not reported even where
-AWS names one, `PolicyInputList.1` in its own example for the principal simulator.
-`ResourceHandlingOption` is accepted and read by neither action, so none of the EC2 scenarios it
-names has its required resources enforced.
+(`ResourcePolicy`), and neither returns `MatchedStatements`, `ResourceSpecificResults`, or a
+`PermissionsBoundaryDecisionDetail`: only the top-level `EvalDecision` is populated, so which
+policy allowed an action is not reported even where AWS names one, `PolicyInputList.1` in its own
+example for the principal simulator.
 `ContextEntries.member.N.ContextKeyType` is accepted but not read; the comparison is driven
 entirely by the policy's own condition operator (`Bool`, `NumericEquals`, `DateEquals`, and so on),
 not by the declared type.
+
+`OrderedOrganizationPolicyInputList` is read by both simulators, each member one level of an
+Organizations hierarchy from the root to the account, and the levels gate the simulation the way
+they gate the call it stands for: an action no level allows answers `implicitDeny`, a level that
+denies it answers `explicitDeny` whatever the levels below it allow, and a level carrying no
+statements is `FullAWSAccess` semantics and is skipped. A level whose document does not read as a
+policy is an `InvalidInput` naming the item's position. The levels a call hands in are the whole of
+the organization a simulation runs against: the SCPs the principal's own account sits under are not
+applied, matching the console, which includes SCPs only when "AWS Organizations SCPs" is ticked.
+One difference from AWS's simulator is known and open: AWS
+documents that "the policy simulator doesn't evaluate SCPs that have global conditions", while this
+walk evaluates a condition in an SCP exactly as the live evaluation does. So a simulation here can
+decide a level AWS's simulator passes over, and the published sentence does not say whether what
+AWS skips is the statement carrying the condition or the policy holding it.
+
+`ResourceHandlingOption` is read by both simulators, which hold a named scenario to the resources
+it requires, "to enforce the presence of the required resources to ensure reliable simulation
+results". All four published scenarios are VPC scenarios, so each needs an instance, an image, a
+security group and a network interface; the `EBS` forms need a volume as well, and the `-Subnet`
+forms a subnet. A resource `ResourceArns` does not name is an `InvalidInput` saying which type is
+missing.
+A value naming no published scenario is an `InvalidInput` as well, while a simulation that names no
+scenario is left alone, since "if your simulation does not match one of the following scenarios,
+then you can omit this parameter". Omitting the member is what is left alone rather than emptying
+it: a value of nothing but space names no scenario, and a value carried empty is answered by the
+member's declared minimum of one ahead of the operation. Both refusals are this emulator's wording:
+AWS publishes the requirement but no message for breaking it.
 
 `PolicyInputList` and `PermissionsBoundaryPolicyInputList` on `SimulatePrincipalPolicy` are read,
 the documents a simulation is handed beside the ones the principal holds. A `PolicyInputList`
@@ -1185,26 +1210,32 @@ hold reports that user instead.
 Hardware TOTP tokens and FIDO security keys are not modeled, so `ListMFADevices` returns only
 virtual devices where AWS would return every type.
 
-#### What a device does not yet affect
+#### What a device affects
 
-Enabling a device records state and nothing more. It does not change what a request is allowed to
-do:
+An enabled device is a device a session can be minted behind, and that session is what a statement
+conditioned on MFA reads:
 
-- **Policy evaluation ignores MFA.** `aws:MultiFactorAuthPresent` and `aws:MultiFactorAuthAge` are
-  never placed in the request context, so under [enforcement](#iam-enforcement-mode) a statement
-  conditioned on either key does not behave as it would on AWS. Both directions fail closed rather
-  than open: an `Allow` gated on `Bool: {"aws:MultiFactorAuthPresent": "true"}` never grants,
-  because a missing key fails the condition block; and the common
-  `Deny` + `BoolIfExists: {"aws:MultiFactorAuthPresent": "false"}` lockout idiom always denies,
-  because `IfExists` passes on a missing key. So an MFA-gated policy is stricter than AWS here, not
-  laxer, but a device being enabled will not unlock it.
-- **No MFA-authenticated credentials.** `GetSessionToken` and `AssumeRole` accept `SerialNumber`
-  and `TokenCode` on AWS and return credentials that carry the MFA context keys. Floci's
-  [STS](sts.md) implementations ignore both parameters, so there is no way to obtain a session that
-  would satisfy an MFA condition even once the keys are populated.
+- **Policy evaluation sees MFA.** `aws:MultiFactorAuthPresent` and `aws:MultiFactorAuthAge` are
+  placed in the request context from the credentials the request was signed with, as
+  [Condition keys floci populates](#condition-keys-floci-populates) describes: neither for a
+  long-term access key, the first alone and `false` for a session minted without a device, and both
+  for a session minted behind one. So under [enforcement](#iam-enforcement-mode) an `Allow` gated
+  on `Bool: {"aws:MultiFactorAuthPresent": "true"}` grants the MFA-authenticated requests and no
+  others, and the `Deny` + `BoolIfExists: {"aws:MultiFactorAuthPresent": "false"}` lockout idiom
+  denies everything else, long-term keys included, which is the behaviour the guide describes for
+  each shape.
+- **MFA-authenticated credentials.** `GetSessionToken` and `AssumeRole` read `SerialNumber` and
+  `TokenCode`, hold the code to the seed of the device that serial names, spend that code so it
+  mints nothing further, and refuse a claim that does not hold with `AccessDenied`; see
+  [STS MFA](sts.md#mfa). A trust policy that tests for `aws:MultiFactorAuthPresent`, and the
+  caller's own permission to make the call, are both satisfied by the device the call presents. What
+  the session then carries differs by operation, as it does on AWS: a `GetSessionToken` session is
+  MFA-authenticated on its own requests, while an assumed-role session is not, "once the user has
+  assumed the role, no further MFA checks are made".
 
-Both are out of scope here: this covers the device lifecycle only, and wiring MFA into
-authorization means touching the request context and STS session shape, which is separate work.
+What a device still does not reach is the console sign-in AWS also gates on one, there being no
+sign-in here, and the hardware and FIDO device types above, so the device behind a session is
+always a virtual one.
 
 ### Account
 
@@ -1301,12 +1332,13 @@ partition's. It is minted once per account and kept across a disable, so re-enab
 same URL. AWS does not document which way that goes; the reasoning is that a relying party
 verifying tokens will have pinned the URL, so regenerating it would break verification silently.
 
-Two things the feature references are not modeled. The issuer URL is documented as hosting OIDC
-discovery endpoints at `/.well-known/openid-configuration` and `/.well-known/jwks.json`, and the
-operation's description points at a `GetWebIdentityToken` API for obtaining JWTs. Neither is served
-here: these six are the management operations only. `JwtVendingEnabled` is therefore reported as
-true whenever the feature is enabled, which is the only reading available, since nothing in the API
-toggles it separately.
+The issuer URL is documented as hosting OIDC discovery endpoints at
+`/.well-known/openid-configuration` and `/.well-known/jwks.json`, and the operation's description
+points at STS's `GetWebIdentityToken` for obtaining JWTs. STS serves both: the token operation, and
+the two discovery documents under a Floci route keyed by the issuer's UUID, since the issuer's own
+host does not reach Floci (see [STS, Verifying a token](sts.md#verifying-a-token)).
+`JwtVendingEnabled` is reported as true whenever the feature is enabled, which is the only reading
+available, since nothing in the API toggles it separately.
 
 `SetSecurityTokenServicePreferences` stores the version, and `GetAccountSummary` reports it as
 `GlobalEndpointTokenVersion`, which the operation's own description requires. What does not follow
@@ -3118,8 +3150,17 @@ floci populates:
   reads from the Service Reference for every namespace it reads, valued from the tags the type's service
   holds on that resource (`StoredResourceArns.storedTags`); a service that holds none leaves them absent.
   Secrets Manager answers for its secrets, S3 Tables for its table buckets and tables, EventBridge Scheduler for
-  its schedule groups, and CloudFormation for its stacks, stack sets and change sets. Tag keys differing only in
-  case are one condition key holding every value.
+  its schedule groups, EventBridge for its event buses and rules, RDS for its resources and DocumentDB's,
+  CloudFormation for its stacks, stack sets and change sets, Lambda for its functions, their versions and aliases
+  (the function's tags), event source mappings, web functions, their revisions and endpoints (the web function's
+  tags), MicroVM images and network connectors, Glue for its schema registries and schemas and for the jobs,
+  crawlers, triggers, workflows, connections, databases, tables and other resources it tags, Step Functions for its
+  state machines, their versions and executions (the state machine's tags) and activities, CodeBuild for its
+  projects and report groups, Athena for its workgroups and data catalogs, Redshift Serverless for its namespaces,
+  workgroups and snapshots, DynamoDB for its tables and their indexes (the table's tags), ECR for its
+  repositories, and Redshift for its clusters, snapshots, parameter groups, subnet groups, snapshot copy grants,
+  snapshot schedules, event subscriptions and integrations. Tag keys differing only in case are one condition key
+  holding every value.
 - EC2 resource keys such as a network interface's `ec2:Vpc`, `ec2:Subnet`, `ec2:AvailabilityZone` and
   `ec2:NetworkInterfaceID`: for every action on a resource EC2 holds, the members of the resource the
   key names, an ARN for a key the Service Reference types as one. `resourceKeys` in
@@ -3209,6 +3250,29 @@ floci populates:
   session, a federated user or the account root it is absent, and a statement that matches on it
   cannot match: an absent key has no equal or like value. That absence is the enforcement rather
   than a gap in it.
+- `aws:MultiFactorAuthPresent` and `aws:MultiFactorAuthAge`: what the credentials the request was
+  signed with say about MFA. Both are "included in the request context only when the principal uses
+  temporary credentials to make the request", so a long-term access key carries **neither**, and a
+  statement matching on one cannot match such a request: that is why the guide recommends
+  `BoolIfExists` for a deny and warns that plain `Bool` on `false` "is not a reliable way to check
+  whether a request is authenticated using MFA". A session carries the first one either way, `true`
+  when it was minted behind an MFA device and `false` when it was not, the guide being explicit that
+  for temporary credentials without MFA "the `aws:MultiFactorAuthPresent` key is present in the
+  request and set to a value of `false`". The age is published only where there is an authentication
+  to measure, the key counting "the number of seconds since the requesting principal was authorized
+  using MFA", so a session that used no device carries no age rather than a zero one. Which sessions
+  can carry `true` is AWS's own line: "because temporary credentials returned by `GetSessionToken`
+  include MFA information, you can check for MFA in individual API operations made by the
+  credentials", while "the temporary credentials returned by `AssumeRole` do not include MFA
+  information in the context, so you cannot check individual API operations for MFA". So a role
+  session publishes `false` whatever device got it issued, since "once the user has assumed the role,
+  no further MFA checks are made", and a `GetFederationToken` session carries neither key, the guide
+  putting federated identities with the long-term keys: "This condition key is not present for
+  federated identities or requests made using access keys to sign AWS CLI, AWS API, or AWS SDK
+  requests." The device reaches a session through `SerialNumber` and `TokenCode` on
+  `GetSessionToken`, and decides an `AssumeRole` without outliving it; a call that presents one also
+  publishes the keys for that call itself, so the permission to make it can be conditioned on MFA.
+  See [STS MFA](sts.md#mfa).
 - `aws:TagKeys`: the case-sensitive requested tag keys for all 16 IAM tagging actions
   in the generated table (tag structures or a list of keys), EC2 `RunInstances` and
   `CreateTags`, S3 `PutBucketTagging`, S3 Control `TagResource` (its `Tags` body) and
