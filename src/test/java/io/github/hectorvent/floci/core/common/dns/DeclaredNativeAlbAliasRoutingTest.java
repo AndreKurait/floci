@@ -13,6 +13,7 @@ import io.github.hectorvent.floci.services.elbv2.ElbV2DnsRecordSource;
 import io.github.hectorvent.floci.services.elbv2.ElbV2FrontendManager;
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
 import io.github.hectorvent.floci.services.elbv2.ElbV2VpcNetworkManager;
+import io.github.hectorvent.floci.services.elbv2.model.Listener;
 import io.github.hectorvent.floci.services.elbv2.model.LoadBalancer;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -38,6 +39,7 @@ class DeclaredNativeAlbAliasRoutingTest {
     private static final ClientVpc ORIGIN = new ClientVpc("111111111111", "us-east-1", "vpc-caller");
     private static final ClientVpc OWNER = new ClientVpc("111111111111", "us-east-1", "vpc-load-balancer");
     private final List<DnsRecordSource> records = new ArrayList<>();
+    private final EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
     private final ElbV2Service service = mock(ElbV2Service.class);
     private final ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
     private final LoadBalancer target = new LoadBalancer();
@@ -49,7 +51,6 @@ class DeclaredNativeAlbAliasRoutingTest {
     void prepareNativeAlias() {
         dns = spy(new EmbeddedDnsServer(List.of(), records, List.of(), List.of(), true, List.of(HOST)));
         doReturn(Optional.of(CONTROL)).when(dns).getServerIp();
-        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.services().ec2().vpcNetworks().enabled()).thenReturn(true);
         when(config.services().ec2().awsFaithfulPrivateIp()).thenReturn(true);
         when(config.network().securityGroupEnforcement().enabled()).thenReturn(true);
@@ -97,6 +98,39 @@ class DeclaredNativeAlbAliasRoutingTest {
         assertEquals(List.of(CONTROL), answer.addresses());
         assertEquals(60, answer.ttlSeconds());
         verifyNoInteractions(lifecycle);
+    }
+
+    @Test
+    void declaredPublicHttpsAliasKeepsItsNativeAlbTransport() {
+        preparePublicHttpsListener();
+        DnsAnswer answer = dns.resolvePublicAliasTarget(HOST, TARGET, ZONE, 1, ORIGIN).orElseThrow();
+        assertEquals(List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS), answer.addresses());
+        assertEquals(60, answer.ttlSeconds());
+        assertEquals(0, answer.responseCode());
+        verifyNoInteractions(lifecycle);
+    }
+
+    @Test
+    void declaredPublicHttpsAliasKeepsTheConfiguredApiAndNonVpcTransports() {
+        preparePublicHttpsListener();
+        DnsAnswer outside = dns.resolvePublicAliasTarget(HOST, TARGET, ZONE, 1, null).orElseThrow();
+        assertTrue(outside.upstream());
+        assertEquals(List.of(CONTROL), outside.addresses());
+        when(config.network().vpcRouting().publicAwsApiNativeHttps()).thenReturn(true);
+        assertEquals(List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS),
+                dns.resolvePublicAliasTarget(HOST, TARGET, ZONE, 1, ORIGIN).orElseThrow().addresses());
+        verifyNoInteractions(lifecycle);
+    }
+
+    private void preparePublicHttpsListener() {
+        target.setScheme("internet-facing");
+        when(config.network().vpcRouting().enabled()).thenReturn(true);
+        when(config.network().vpcRouting().publicAwsApi()).thenReturn(true);
+        when(config.network().vpcRouting().publicAwsApiUpstreamHost()).thenReturn(Optional.of("172.18.0.9"));
+        Listener listener = new Listener();
+        listener.setProtocol("HTTPS");
+        listener.setPort(443);
+        ElbV2DnsOwnerFixture.listeners(service, target, listener);
     }
 
     @Test
