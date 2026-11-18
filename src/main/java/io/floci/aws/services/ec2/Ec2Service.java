@@ -65,6 +65,7 @@ import io.floci.aws.services.ec2.model.NetworkInterface;
 import io.floci.aws.services.ec2.model.NetworkInterfaceAssociation;
 import io.floci.aws.services.ec2.model.NetworkInterfaceAttachment;
 import io.floci.aws.services.ec2.model.NetworkInterfaceListResult;
+import io.floci.aws.services.ec2.model.NetworkInterfacePermission;
 import io.floci.aws.services.ec2.model.NetworkInterfacePrivateIpAddress;
 import io.floci.aws.services.ec2.model.Placement;
 import io.floci.aws.services.ec2.model.PrefixList;
@@ -15352,6 +15353,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 case "requester-managed" -> matchesValue(values, String.valueOf(ni.isRequesterManaged()));
                 case "attachment.instance-id" -> ni.getAttachment() != null
                         && matchesValue(values, ni.getAttachment().getInstanceId());
+                case "attachment.instance-owner-id" -> ni.getAttachment() != null
+                        && matchesValue(values, ni.getAttachment().getInstanceOwnerId());
                 case "association.ip-owner-id" -> ni.getPrivateIpAddresses().stream()
                         .anyMatch(ip -> ip.isPrimary() && ip.getAssociation() != null
                                 && ip.getAssociation().getIpOwnerId() != null
@@ -16187,6 +16190,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             for (InstanceNetworkInterface eni : inst.getNetworkInterfaces()) {
                 if (!networkInterfaceIds.isEmpty()
                         && !networkInterfaceIds.contains(eni.getNetworkInterfaceId())) {
+                    continue;
+                }
+                // Another account's interface, attached here under its INSTANCE-ATTACH grant, is
+                // that account's to describe, not a copy of this one's.
+                if (eni.getOwnerId() != null && !safeAccount.equals(eni.getOwnerId())
+                        && networkInterfaces instanceof AccountAwareStorageBackend<NetworkInterface> owners
+                        && owners.getForAccount(eni.getOwnerId(), key(region, eni.getNetworkInterfaceId())).isPresent()) {
                     continue;
                 }
                 // A standalone ENI attached to this instance is reported from its own record
@@ -17210,11 +17220,16 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * Attaches a standalone ENI to a running/stopped instance at the given device index,
      * the attach-eni example's runtime pattern (its user-data script calls this via the AWS CLI
      * after boot, rather than through the Terraform provider itself). floci-kt9.
+     *
+     * <p>The interface may be another account's when that account has granted the caller
+     * {@code INSTANCE-ATTACH} over it, which CreateNetworkInterfacePermission documents as
+     * permission "to attach the specified network interface to an instance in their account". The
+     * interface stays in its owner's account, and the attachment names the caller as
+     * {@code instanceOwnerId}.
      */
     public NetworkInterfaceAttachment attachNetworkInterface(String region, String networkInterfaceId,
                                                               String instanceId, int deviceIndex) {
-        // Under the topology lock, so the standalone record and the instance's copy change together for anything
-        // that reads both, ModifyNetworkInterfaceAttribute among them.
+        // Keep grant, attach and detach under the same region-wide topology lock.
         synchronized (attachmentTopologyLock(region)) {
             return attachNetworkInterfaceLocked(region, networkInterfaceId, instanceId, deviceIndex);
         }
@@ -17222,7 +17237,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     private NetworkInterfaceAttachment attachNetworkInterfaceLocked(String region, String networkInterfaceId,
                                                                     String instanceId, int deviceIndex) {
-        NetworkInterface ni = requireStandaloneNetworkInterface(region, networkInterfaceId);
+        AccountAwareStorageBackend.OwnedEntry<NetworkInterface> held =
+                requireAttachableNetworkInterface(region, networkInterfaceId);
+        NetworkInterface ni = held.value();
         if (ni.getAttachment() != null) {
             throw new AwsException("InvalidNetworkInterface.InUse",
                     "Interface: '" + networkInterfaceId + "' is currently in use.", 400);
@@ -17250,7 +17267,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
         ni.setAttachment(attachment);
         ni.setStatus("in-use");
-        networkInterfaces.put(key(region, networkInterfaceId), ni);
+        putNetworkInterface(held.account(), region, ni);
 
         // The instance must carry it as well, or DescribeInstances would deny an attachment
         // DescribeNetworkInterfaces reports, and the device-index check above, which reads this
@@ -17296,15 +17313,257 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         ni.setAttachment(null);
         ni.setStatus("available");
         networkInterfaces.put(key(region, ni.getNetworkInterfaceId()), ni);
-        detachFromInstance(region, detached.getInstanceId(), ni.getNetworkInterfaceId());
+        String hostAccount = detached.getInstanceOwnerId() != null ? detached.getInstanceOwnerId() : callerAccountId();
+        detachFromInstance(hostAccount, region, detached.getInstanceId(), ni.getNetworkInterfaceId());
         return detached;
     }
 
-    /** Removes an interface from an instance's own list, the mirror of attaching it. */
-    private void detachFromInstance(String region, String instanceId, String networkInterfaceId) {
-        detachFromInstance(callerAccountId(), region, instanceId, networkInterfaceId);
+    // ─── Network interface permissions ───────────────────────────────────────────────
+
+    /** The permission that lets another account attach an interface to an instance of its own. */
+    public static final String INSTANCE_ATTACH = "INSTANCE-ATTACH";
+    private static final String EIP_ASSOCIATE = "EIP-ASSOCIATE";
+    /** {@code NetworkInterfacePermissionState.State} once a permission applies. */
+    private static final String PERMISSION_GRANTED = "granted";
+    private static final String NETWORK_INTERFACE_PERMISSION_ID_PREFIX = "eni-perm-";
+    private static final Pattern ACCOUNT_ID = Pattern.compile("\\d{12}");
+    private static final Set<String> NETWORK_INTERFACE_PERMISSION_FILTERS = Set.of(
+            "network-interface-permission.network-interface-permission-id",
+            "network-interface-permission.network-interface-id",
+            "network-interface-permission.aws-account-id",
+            "network-interface-permission.aws-service",
+            "network-interface-permission.permission");
+
+    /** One page of DescribeNetworkInterfacePermissions. */
+    public record NetworkInterfacePermissionPage(List<NetworkInterfacePermission> permissions, String nextToken) {}
+
+    /**
+     * CreateNetworkInterfacePermission: the interface's owner records an {@code INSTANCE-ATTACH}
+     * grant for another account. Attachment execution consumes these grants.
+     * Only the owner can grant: the interface is looked up in the caller's account, and
+     * one another account owns is {@code InvalidNetworkInterfaceID.NotFound}, as it is to every
+     * other action of that account.
+     *
+     * <p>A second grant of the same permission to the same account answers the grant already in
+     * place rather than minting another: AWS documents no duplicate error for this action, and the
+     * permission either holds or it does not. {@code EIP-ASSOCIATE} is refused as unsupported, since
+     * nothing here would honour it, and so is {@code AwsService}, which AWS documents as "Currently
+     * not supported".
+     */
+    public NetworkInterfacePermission createNetworkInterfacePermission(String region, String networkInterfaceId,
+                                                                      String awsAccountId, String awsService,
+                                                                      String permission) {
+        if (!isSet(networkInterfaceId)) {
+            throw new AwsException("MissingParameter",
+                    "The request must contain the parameter NetworkInterfaceId", 400);
+        }
+        if (!isSet(permission)) {
+            throw new AwsException("MissingParameter", "The request must contain the parameter Permission", 400);
+        }
+        requireParameterValue("Permission", permission, INSTANCE_ATTACH, EIP_ASSOCIATE);
+        if (EIP_ASSOCIATE.equals(permission)) {
+            throw new AwsException("UnsupportedOperation",
+                    "The EIP-ASSOCIATE network interface permission is not supported.", 400);
+        }
+        if (isSet(awsService)) {
+            throw new AwsException("UnsupportedOperation",
+                    "Network interface permissions for an AwsService are not supported.", 400);
+        }
+        if (!isSet(awsAccountId)) {
+            throw new AwsException("MissingParameter", "The request must contain the parameter AwsAccountId", 400);
+        }
+        requireAccountId("AwsAccountId", awsAccountId);
+        ensureDefaultResources(region);
+        synchronized (attachmentTopologyLock(region)) {
+            synchronized (privateIpAllocationLock) {
+                NetworkInterface ni = requireStandaloneNetworkInterface(region, networkInterfaceId);
+                return grantInstanceAttach(callerAccountId(), region, ni, awsAccountId);
+            }
+        }
     }
 
+    /**
+     * DescribeNetworkInterfacePermissions: the permissions the caller has granted over the
+     * interfaces it owns in {@code region}, by id and by the five documented filters. MaxResults
+     * runs 5 to 255 and defaults to 50, as AWS documents.
+     */
+    public NetworkInterfacePermissionPage describeNetworkInterfacePermissions(
+            String region, List<String> permissionIds, List<Map.Entry<String, List<String>>> filters,
+            Integer maxResults, String nextToken) {
+        requireSupportedFilters(filterNames(filters), NETWORK_INTERFACE_PERMISSION_FILTERS);
+        if (maxResults != null && (maxResults < 5 || maxResults > 255)) {
+            throw new AwsException("InvalidParameterValue",
+                    "Value (" + maxResults + ") for parameter MaxResults is invalid. "
+                            + "Expecting a value between 5 and 255.", 400);
+        }
+        for (String id : permissionIds) {
+            if (!id.startsWith(NETWORK_INTERFACE_PERMISSION_ID_PREFIX)) {
+                throw new AwsException("InvalidNetworkInterfacePermissionID.Malformed",
+                        "Invalid id: \"" + id + "\" (expecting \"" + NETWORK_INTERFACE_PERMISSION_ID_PREFIX + "...\")",
+                        400);
+            }
+        }
+        ensureDefaultResources(region);
+        List<NetworkInterfacePermission> held = new ArrayList<>();
+        synchronized (attachmentTopologyLock(region)) {
+            for (NetworkInterface ni : networkInterfaces.scan(k -> k.startsWith(region + "::"))) {
+                held.addAll(ni.getPermissions());
+            }
+        }
+        for (String id : permissionIds) {
+            if (held.stream().noneMatch(perm -> id.equals(perm.getNetworkInterfacePermissionId()))) {
+                throw new AwsException("InvalidNetworkInterfacePermissionID.NotFound",
+                        "The NetworkInterfacePermission ID '" + id + "' does not exist", 400);
+            }
+        }
+        List<NetworkInterfacePermission> matching = held.stream()
+                .filter(perm -> permissionIds.isEmpty() || permissionIds.contains(perm.getNetworkInterfacePermissionId()))
+                .filter(perm -> matchesPermissionFilters(perm, filters))
+                .toList();
+        int offset = decodeToken(nextToken);
+        int pageSize = maxResults != null ? maxResults : 50;
+        int end = Math.min(offset + pageSize, matching.size());
+        List<NetworkInterfacePermission> page = offset < matching.size()
+                ? new ArrayList<>(matching.subList(offset, end)) : new ArrayList<>();
+        return new NetworkInterfacePermissionPage(page, end < matching.size() ? encodeToken(end) : null);
+    }
+
+    private boolean matchesPermissionFilters(NetworkInterfacePermission perm,
+                                             List<Map.Entry<String, List<String>>> filters) {
+        for (Map.Entry<String, List<String>> filter : filters == null ? List.<Map.Entry<String, List<String>>>of() : filters) {
+            List<String> values = filter.getValue();
+            boolean matches = switch (filter.getKey()) {
+                case "network-interface-permission.network-interface-permission-id" ->
+                        matchesValue(values, perm.getNetworkInterfacePermissionId());
+                case "network-interface-permission.network-interface-id" ->
+                        matchesValue(values, perm.getNetworkInterfaceId());
+                case "network-interface-permission.aws-account-id" -> matchesValue(values, perm.getAwsAccountId());
+                // No permission here is granted to a service, so none carries one to match.
+                case "network-interface-permission.aws-service" -> false;
+                case "network-interface-permission.permission" -> matchesValue(values, perm.getPermission());
+                default -> true;
+            };
+            if (!matches) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * DeleteNetworkInterfacePermission: the interface's owner removes a permission it granted. As
+     * AWS documents, "By default, you cannot delete the permission if the account for which you're
+     * removing the permission has attached the network interface to an instance. However, you can
+     * force delete the permission, regardless of any attachment." Force removes the permission only:
+     * the attachment stays.
+     *
+     * <p>Only the owner can delete, as only the owner is shown its permissions: another account's
+     * permission is {@code InvalidNetworkInterfacePermissionID.NotFound}. AWS documents no error
+     * code for a permission in use; {@code OperationNotPermitted} is Floci's choice.
+     */
+    public void deleteNetworkInterfacePermission(String region, String permissionId, boolean force) {
+        if (!isSet(permissionId)) {
+            throw new AwsException("MissingParameter",
+                    "The request must contain the parameter NetworkInterfacePermissionId", 400);
+        }
+        if (!permissionId.startsWith(NETWORK_INTERFACE_PERMISSION_ID_PREFIX)) {
+            throw new AwsException("InvalidNetworkInterfacePermissionID.Malformed",
+                    "Invalid id: \"" + permissionId + "\" (expecting \"" + NETWORK_INTERFACE_PERMISSION_ID_PREFIX
+                            + "...\")", 400);
+        }
+        ensureDefaultResources(region);
+        synchronized (attachmentTopologyLock(region)) {
+            for (NetworkInterface stored : networkInterfaces.scan(k -> k.startsWith(region + "::"))) {
+                Optional<NetworkInterfacePermission> held = stored.getPermissions().stream()
+                        .filter(perm -> permissionId.equals(perm.getNetworkInterfacePermissionId()))
+                        .findFirst();
+                if (held.isEmpty()) {
+                    continue;
+                }
+                NetworkInterface ni = releaseIfHostIsGone(region, stored);
+                NetworkInterfaceAttachment attachment = ni.getAttachment();
+                String grantee = held.get().getAwsAccountId();
+                if (!force && attachment != null && grantee.equals(attachment.getInstanceOwnerId())) {
+                    throw new AwsException("OperationNotPermitted",
+                            "The network interface permission '" + permissionId + "' cannot be deleted while account "
+                                    + grantee + " has the network interface attached to an instance. "
+                                    + "Specify Force to delete it regardless.", 400);
+                }
+                ni.getPermissions().removeIf(perm -> permissionId.equals(perm.getNetworkInterfacePermissionId()));
+                networkInterfaces.put(key(region, ni.getNetworkInterfaceId()), ni);
+                return;
+            }
+        }
+        throw new AwsException("InvalidNetworkInterfacePermissionID.NotFound",
+                "The NetworkInterfacePermission ID '" + permissionId + "' does not exist", 400);
+    }
+
+    /** The grant of {@code INSTANCE-ATTACH} to {@code grantee}, minted unless one is already in place. */
+    private NetworkInterfacePermission grantInstanceAttach(String ownerAccountId, String region, NetworkInterface ni,
+                                                           String grantee) {
+        Optional<NetworkInterfacePermission> existing = ni.getPermissions().stream()
+                .filter(perm -> grantee.equals(perm.getAwsAccountId()) && INSTANCE_ATTACH.equals(perm.getPermission()))
+                .findFirst();
+        if (existing.isPresent()) {
+            return existing.get();
+        }
+        NetworkInterfacePermission granted = new NetworkInterfacePermission(
+                NETWORK_INTERFACE_PERMISSION_ID_PREFIX + randomHex(17), ni.getNetworkInterfaceId(), grantee,
+                INSTANCE_ATTACH, PERMISSION_GRANTED);
+        ni.getPermissions().add(granted);
+        putNetworkInterface(ownerAccountId, region, ni);
+        return granted;
+    }
+
+    /**
+     * The interface AttachNetworkInterface names, with the account that holds it: the caller's
+     * own, or another account's that has granted the caller {@code INSTANCE-ATTACH} over it. Any
+     * other account's interface is {@code InvalidNetworkInterfaceID.NotFound}, as it is to every
+     * other action of the caller.
+     */
+    private AccountAwareStorageBackend.OwnedEntry<NetworkInterface> requireAttachableNetworkInterface(
+            String region, String networkInterfaceId) {
+        String caller = callerAccountId();
+        String storeKey = key(region, networkInterfaceId);
+        Optional<NetworkInterface> own = networkInterfaces.get(storeKey);
+        if (own.isPresent()) {
+            return new AccountAwareStorageBackend.OwnedEntry<>(caller, releaseIfHostIsGone(region, own.get()));
+        }
+        if (networkInterfaces instanceof AccountAwareStorageBackend<NetworkInterface> aware) {
+            for (AccountAwareStorageBackend.AccountEntry<NetworkInterface> entry : aware.findAllAccountEntries(storeKey)) {
+                if (!caller.equals(entry.accountId()) && grantsInstanceAttach(entry.value(), caller)) {
+                    return new AccountAwareStorageBackend.OwnedEntry<>(entry.accountId(),
+                            releaseIfHostIsGone(entry.accountId(), region, entry.value()));
+                }
+            }
+        }
+        throw new AwsException("InvalidNetworkInterfaceID.NotFound",
+                "The network interface ID '" + networkInterfaceId + "' does not exist", 400);
+    }
+
+    private static boolean grantsInstanceAttach(NetworkInterface ni, String accountId) {
+        return ni.getPermissions().stream().anyMatch(perm ->
+                INSTANCE_ATTACH.equals(perm.getPermission()) && accountId.equals(perm.getAwsAccountId()));
+    }
+
+    private static void requireAccountId(String parameter, String value) {
+        if (!ACCOUNT_ID.matcher(value).matches()) {
+            throw new AwsException("InvalidParameterValue",
+                    "Value (" + value + ") for parameter " + parameter + " is invalid. "
+                            + "Expecting a 12-digit AWS account ID.", 400);
+        }
+    }
+
+    /** Stores an interface in its owner's partition, whichever account is calling. */
+    private void putNetworkInterface(String accountId, String region, NetworkInterface ni) {
+        if (networkInterfaces instanceof AccountAwareStorageBackend<NetworkInterface> aware) {
+            aware.putForAccount(accountId, key(region, ni.getNetworkInterfaceId()), ni);
+        } else {
+            networkInterfaces.put(key(region, ni.getNetworkInterfaceId()), ni);
+        }
+    }
+
+    /** Removes an interface from an instance's own list, the mirror of attaching it. */
     private void detachFromInstance(String accountId, String region, String instanceId, String networkInterfaceId) {
         if (instanceId == null) {
             return;
@@ -17496,8 +17755,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             return ni;
         }
         String safeAccount = accountId != null ? accountId : (ni.getOwnerId() != null ? ni.getOwnerId() : callerAccountId());
+        String hostAccount = attachment.getInstanceOwnerId() != null ? attachment.getInstanceOwnerId() : safeAccount;
         Instance host = instances instanceof AccountAwareStorageBackend<Instance> aware
-                ? aware.getForAccount(safeAccount, key(region, attachment.getInstanceId())).orElse(null)
+                ? aware.getForAccount(hostAccount, key(region, attachment.getInstanceId())).orElse(null)
                 : instances.get(key(region, attachment.getInstanceId())).orElse(null);
         boolean hostIsGone = host == null || host.getState() == null
                 || "terminated".equals(host.getState().getName());
@@ -17515,7 +17775,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // record would leave the terminated instance still reporting the interface, so once it is
         // reused two instance records would claim it, and a real one is not the winner by any
         // rule DescribeInstances applies.
-        detachFromInstance(safeAccount, region, attachment.getInstanceId(), ni.getNetworkInterfaceId());
+        detachFromInstance(hostAccount, region, attachment.getInstanceId(), ni.getNetworkInterfaceId());
         return ni;
     }
 
