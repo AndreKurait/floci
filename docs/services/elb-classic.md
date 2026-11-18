@@ -59,8 +59,27 @@ fabricated result:
 `SetLoadBalancerPoliciesForBackendServer`, `SetLoadBalancerPoliciesOfListener`,
 `SetLoadBalancerListenerSSLCertificate`.
 
-Floci also does not run a Classic **data plane**: listener ports are recorded but no socket is
-opened and no traffic is forwarded. Only the control plane and health checking are emulated.
+## HTTP data plane
+
+With `FLOCI_SERVICES_ELB_MOCK=false`, Floci's shared HTTP edge forwards requests addressed to an
+existing Classic load balancer's DNS name or an unambiguous public Route53 alias/CNAME chain.
+The alias target DNS name and hosted-zone ID must match the load balancer. Public endpoints
+select the resource's account, independently of the client's API credentials.
+
+Requests stream to healthy registered EC2 instances using the same address as their health
+checks: the modeled container address, or the registered instance's DNS name for external compute.
+DNS resolution happens outside the HTTP event loop and each connection uses the validated IP.
+Requests use the listener's `InstancePort`. Host, method, raw path/query, authorization headers, request body
+and response status/body are preserved. No external DNS target is contacted. Deregistration,
+failed health checks, record changes and load-balancer deletion take effect without restarting.
+
+This serves HTTP backends for HTTP listeners and HTTPS listeners behind Floci's existing TLS
+edge. It does not install the listener's ACM certificate on that edge. TCP/SSL forwarding,
+HTTPS backends, cookie stickiness and connection draining remain unsupported. An owned endpoint
+with no healthy registered instance returns 503. Classic never forwards unresolved, deleted or
+ambiguous endpoints. Hosts without a current Classic resource binding continue through the shared
+edge's existing routing, including API Gateway and S3 custom domains. Multiple competing weighted
+records, latency/failover records and independent Route53 health checks are not selected.
 
 ## Behavior Notes
 
