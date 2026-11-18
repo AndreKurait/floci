@@ -22,6 +22,7 @@ import io.floci.aws.services.s3.S3ControlArnUtils;
 import io.floci.aws.services.s3.S3ObjectKeys;
 import io.floci.aws.services.s3.S3ResourceArns;
 import io.floci.aws.services.sqs.SqsService;
+import io.floci.aws.services.ssm.SsmSessionResources;
 import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
 import io.vertx.ext.web.RoutingContext;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -178,6 +179,13 @@ public class ResourceArnBuilder {
                                        String region, String accountId, String partition) {
         if (credentialScope == null) {
             return List.of("*");
+        }
+        if ("ssm".equals(credentialScope) && operation != null && operation.startsWith("ssm:")) {
+            List<String> sessions = SsmSessionResources.of(operation.substring(4), readJsonBody(ctx),
+                    region, accountId, partition);
+            if (sessions != null) {
+                return sessions;
+            }
         }
         if (operation != null && operation.startsWith(credentialScope + ":") && RequestResources.reads(operation)) {
             return namedResources(credentialScope, operation, ctx, region, accountId, partition);
