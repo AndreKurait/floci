@@ -1558,6 +1558,12 @@ public class Ec2ContainerManager {
     public Optional<String> plugNetworkInterface(Instance instance, InstanceNetworkInterface eni,
                                                  List<SecurityGroup> groups, Map<String, List<String>> prefixLists) {
         String reason = hotAttachBlocker(instance, eni);
+        if (reason == null && !vpcNetworkManager.isolatesAddressSpaces()) {
+            EmulatorConfig.VpcNetworksConfig networks = config == null ? null : config.services().ec2().vpcNetworks();
+            if (networks == null || !networks.hotAttachEnabled()) {
+                reason = "shared VPC hot attach is off (FLOCI_SERVICES_EC2_VPC_NETWORKS_HOT_ATTACH_ENABLED)";
+            }
+        }
         if (reason == null && isolatedHotAttach() && (groups == null || groups.isEmpty() || groups.stream().anyMatch(Objects::isNull))) {
             reason = "the interface's security groups are unknown";
         }

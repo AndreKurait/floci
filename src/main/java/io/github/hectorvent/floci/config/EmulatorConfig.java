@@ -3937,6 +3937,15 @@ public interface EmulatorConfig {
         boolean isolateAddressSpaces();
 
         /**
+         * Lets {@code AttachNetworkInterface} add a device to a running guest with shared VPC address spaces.
+         * Off by default to preserve record-only attachments. Isolated address spaces use
+         * {@link #hotAttachAcrossAddressSpaces()} instead.
+         * Env: {@code FLOCI_SERVICES_EC2_VPC_NETWORKS_HOT_ATTACH_ENABLED}.
+         */
+        @WithDefault("false")
+        boolean hotAttachEnabled();
+
+        /**
          * With {@link #isolateAddressSpaces}, lets {@code AttachNetworkInterface} plug an interface of another
          * VPC into a running instance's protected namespace (hot attach). The device gets the interface's own
          * native address, source-based return routing and the interface's own security groups, enforced on

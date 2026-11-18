@@ -73,10 +73,8 @@ final class Ec2Ipv6VpcRouter {
                 throw e;
             }
         }
-        if (isolated) {
-            address = transportAddress(id, network);
-        }
-        ContainerExec.Result result = ContainerExec.run(docker, id, joinCommand(address, vpcIpv6Block), 30);
+        String macAddress = endpointMacAddress(id, network);
+        ContainerExec.Result result = ContainerExec.run(docker, id, joinCommand(macAddress, vpcIpv6Block), 30);
         if (result.exitCode() != 0) {
             throw new IllegalStateException("Cannot route " + vpcIpv6Block + " on " + network + ": " + result.summary());
         }
@@ -135,14 +133,14 @@ final class Ec2Ipv6VpcRouter {
         return id;
     }
 
-    private String transportAddress(String id, String network) {
+    private String endpointMacAddress(String id, String network) {
         Map<String, ContainerNetwork> attached = docker.inspectContainerCmd(id).exec()
                 .getNetworkSettings().getNetworks();
         ContainerNetwork endpoint = attached == null ? null : attached.get(network);
-        if (endpoint == null || endpoint.getIpAddress() == null || endpoint.getIpAddress().isBlank()) {
-            throw new IllegalStateException("The IPv6 VPC router has no transport address on " + network);
+        if (endpoint == null || endpoint.getMacAddress() == null || endpoint.getMacAddress().isBlank()) {
+            throw new IllegalStateException("The IPv6 VPC router has no endpoint MAC address on " + network);
         }
-        return endpoint.getIpAddress();
+        return endpoint.getMacAddress();
     }
 
     /** The network a started helper sits on that the router leaves once joined: any but none, host or shared. */
@@ -155,17 +153,20 @@ final class Ec2Ipv6VpcRouter {
     }
 
     /**
-     * On the interface holding {@code address}: drop its IPv4 (no IPv4 between VPCs), hold the VPC router's link-local
-     * {@code fe80:ec2::1} and route the VPC's IPv6 block on it.
+     * On the interface with {@code macAddress}: drop its IPv4 (no IPv4 between VPCs), hold the VPC router's link-local
+     * {@code fe80:ec2::1} and route the VPC's IPv6 block on it. The MAC survives the IPv4 flush, so a retry
+     * or a second IPv6 block can configure the same interface.
      */
-    static String[] joinCommand(String address, String vpcIpv6Block) {
+    static String[] joinCommand(String macAddress, String vpcIpv6Block) {
         String script = String.join("\n",
                 "set -eu",
-                "dev=$(ip -o -4 addr show | awk -v a=\"$1\" '{split($4, p, \"/\"); sub(/@.*/, \"\", $2); if (p[1] == a) print $2}' | head -n1)",
-                "[ -n \"$dev\" ] || { echo \"no interface holds $1\" >&2; exit 3; }",
+                "dev=$(ip -o link show | awk -v a=\"$1\" '{for (i = 1; i < NF; i++)"
+                        + " if ($i == \"link/ether\" && tolower($(i+1)) == tolower(a))"
+                        + " {sub(/@.*/, \"\", $2); sub(/:$/, \"\", $2); print $2}}' | head -n1)",
+                "[ -n \"$dev\" ] || { echo \"no interface has MAC $1\" >&2; exit 3; }",
                 "ip -4 addr flush dev \"$dev\"",
                 "ip -6 addr replace fe80:ec2::1/64 dev \"$dev\" nodad",
                 "ip -6 route replace \"$2\" dev \"$dev\"");
-        return new String[] {"sh", "-c", script, "ipv6-router", address, vpcIpv6Block};
+        return new String[] {"sh", "-c", script, "ipv6-router", macAddress, vpcIpv6Block};
     }
 }

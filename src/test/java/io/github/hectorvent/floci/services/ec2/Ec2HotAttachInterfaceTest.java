@@ -57,6 +57,10 @@ class Ec2HotAttachInterfaceTest {
     private EmulatorConfig managerConfig;
 
     private Ec2ContainerManager manager() {
+        return manager(true);
+    }
+
+    private Ec2ContainerManager manager(boolean sharedHotAttach) {
         EmulatorConfig config = mock(EmulatorConfig.class);
         managerConfig = config;
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
@@ -64,6 +68,9 @@ class Ec2HotAttachInterfaceTest {
         when(config.services()).thenReturn(services);
         when(services.ec2()).thenReturn(ec2);
         when(ec2.nativePeerDependencies()).thenReturn("[]");
+        EmulatorConfig.VpcNetworksConfig networks = mock(EmulatorConfig.VpcNetworksConfig.class);
+        when(ec2.vpcNetworks()).thenReturn(networks);
+        when(networks.hotAttachEnabled()).thenReturn(sharedHotAttach);
         when(vpcNetworks.enabled()).thenReturn(true);
         InspectContainerCmd inspect = mock(InspectContainerCmd.class);
         InspectContainerResponse guest = mock(InspectContainerResponse.class);
@@ -106,6 +113,31 @@ class Ec2HotAttachInterfaceTest {
 
     private static InstanceNetworkInterface customer() {
         return device("eni-0customer", 1, "vpc-customer", "subnet-customer", "172.31.5.9", MAC);
+    }
+
+    @Test
+    void sharedAddressSpacesKeepAttachmentsRecordOnlyUnlessEnabled() {
+        Ec2ContainerManager manager = manager(false);
+        InstanceNetworkInterface attached = customer();
+        Instance instance = instanceWith(primary(), attached);
+
+        assertTrue(manager.plugNetworkInterface(instance, attached).orElseThrow()
+                .contains("FLOCI_SERVICES_EC2_VPC_NETWORKS_HOT_ATTACH_ENABLED"));
+        verify(vpcNetworks, never()).attachInterface(any(), any(), any(), any(), any(), any());
+        verify(docker, never()).inspectContainerCmd(anyString());
+        assertEquals(List.of(primary().getNetworkInterfaceId(), attached.getNetworkInterfaceId()),
+                instance.getNetworkInterfaces().stream().map(InstanceNetworkInterface::getNetworkInterfaceId).toList());
+    }
+
+    @Test
+    void disablingHotAttachStillAllowsAnExistingDeviceToBeDetached() {
+        Ec2ContainerManager manager = manager(false);
+        InstanceNetworkInterface attached = customer();
+
+        manager.unplugNetworkInterface(instanceWith(primary(), attached), attached);
+
+        verify(vpcNetworks).detachInterface(REGION, "vpc-customer", "helper-1");
+        verify(vpcNetworks, never()).attachInterface(any(), any(), any(), any(), any(), any());
     }
 
     @Test

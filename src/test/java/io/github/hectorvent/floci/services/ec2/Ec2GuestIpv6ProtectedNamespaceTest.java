@@ -80,6 +80,7 @@ class Ec2GuestIpv6ProtectedNamespaceTest {
     private static final String VPC_IPV6 = "2600:1f18:abcd:ef00::/56";
     private static final String ROUTER_ADDRESS = "10.0.0.3";
     private static final String ROUTER_TRANSPORT = "172.31.5.9";
+    private static final String ROUTER_MAC = "02:42:ac:12:00:03";
 
     @Test
     void aProtectedDualStackGuestGetsItsIpv6BeforeItsWorkloadStarts() throws Exception {
@@ -90,7 +91,7 @@ class Ec2GuestIpv6ProtectedNamespaceTest {
         Exec guest = only(launch.beforeStart(), HELPER, "guest-ipv6");
         assertEquals(List.of(PRIVATE_IP, IPV6, VPC_IPV6), guest.command().subList(4, 7));
         Exec router = only(launch.beforeStart(), ROUTER, "ipv6-router");
-        assertEquals(List.of(ROUTER_ADDRESS, VPC_IPV6), router.command().subList(4, 6));
+        assertEquals(List.of(ROUTER_MAC, VPC_IPV6), router.command().subList(4, 6));
     }
 
     @Test
@@ -106,8 +107,8 @@ class Ec2GuestIpv6ProtectedNamespaceTest {
         }
         only(launch.beforeStart(), HELPER, "guest-ipv6");
         Exec router = only(launch.beforeStart(), ROUTER, "ipv6-router");
-        assertEquals(List.of(ROUTER_TRANSPORT, VPC_IPV6), router.command().subList(4, 6),
-                "the router finds its interface by the transport address Docker gave it");
+        assertEquals(List.of(ROUTER_MAC, VPC_IPV6), router.command().subList(4, 6),
+                "the router finds its interface by Docker's MAC even after its IPv4 address is flushed");
         verify(launch.connect()).withContainerNetwork(argThat(endpoint -> endpoint.getIpamConfig() == null));
     }
 
@@ -191,7 +192,8 @@ class Ec2GuestIpv6ProtectedNamespaceTest {
                 : Map.of("bridge", new ContainerNetwork().withIpv4Address("172.18.0.12"),
                         VPC_NETWORK, new ContainerNetwork().withIpv4Address(PRIVATE_IP)));
         stubInspect(dockerClient, WORKLOAD, Map.of("bridge", new ContainerNetwork().withIpv4Address("172.18.0.12")));
-        stubInspect(dockerClient, ROUTER, Map.of(VPC_NETWORK, new ContainerNetwork().withIpv4Address(ROUTER_TRANSPORT)));
+        stubInspect(dockerClient, ROUTER, Map.of(VPC_NETWORK, new ContainerNetwork()
+                .withIpv4Address(ROUTER_TRANSPORT).withMacAddress(ROUTER_MAC)));
         ConnectToNetworkCmd connect = mock(ConnectToNetworkCmd.class, withSettings().defaultAnswer(Answers.RETURNS_SELF));
         when(dockerClient.connectToNetworkCmd()).thenReturn(connect);
         when(dockerClient.disconnectFromNetworkCmd()).thenReturn(

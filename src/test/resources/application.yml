@@ -403,6 +403,8 @@ floci:
       vpc-networks:
         enabled: false
         isolate-address-spaces: false
+        hot-attach-enabled: false                  # FLOCI_SERVICES_EC2_VPC_NETWORKS_HOT_ATTACH_ENABLED
+        hot-attach-across-address-spaces: false     # FLOCI_SERVICES_EC2_VPC_NETWORKS_HOT_ATTACH_ACROSS_ADDRESS_SPACES
     ecs:
       enabled: true
       mock: true
