@@ -12,6 +12,7 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.resource.ExplorerResource;
 import io.github.hectorvent.floci.core.resource.ResourceProvider;
 import io.github.hectorvent.floci.core.resource.SupportedResourceType;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
 import io.github.hectorvent.floci.services.acm.model.Certificate;
@@ -85,6 +86,9 @@ public class AcmService implements ResourceProvider {
     Instance<AcmCertificateReferenceProvider> referenceProviders;
     @Inject
     Instance<AcmPrivateCertificateAuthorities> privateAuthorities;
+    /** The EventBridge events ACM sends (Available, Approaching Expiration, Expired); absent in unit tests. */
+    @Inject
+    Instance<AcmEventPublisher> events;
 
     private final StorageBackend<String, Certificate> store;
     private final CertificateGenerator certificateGenerator;
@@ -93,6 +97,8 @@ public class AcmService implements ResourceProvider {
     private final int validationWaitSeconds;
     private final Clock clock;
     private final AtomicInteger accountDaysBeforeExpiry = new AtomicInteger(45);
+    /** Whether PutAccountConfiguration has set DaysBeforeExpiry; until then public certificates use 30. */
+    private final AtomicBoolean accountExpiryConfigured = new AtomicBoolean(false);
     private final AtomicBoolean securityWarningLogged = new AtomicBoolean(false);
 
     /**
@@ -269,6 +275,9 @@ public class AcmService implements ResourceProvider {
         }
 
         LOG.infov("Created certificate: {0} in region {1}", arn, region);
+        if (status == CertificateStatus.ISSUED) {
+            announce(cert, AcmEventPublisher.Action.ISSUANCE);
+        }
         return cert;
     }
 
@@ -528,6 +537,8 @@ public class AcmService implements ResourceProvider {
         if (existingArn != null && !existingArn.isEmpty()) {
             notifyCertificateReimported(cert.getArn(), region);
         }
+        announce(cert, existingArn != null && !existingArn.isEmpty()
+                ? AcmEventPublisher.Action.REIMPORT : AcmEventPublisher.Action.IMPORT);
         LOG.infov("Imported certificate: {0}", cert.getArn());
         return cert;
     }
@@ -558,6 +569,14 @@ public class AcmService implements ResourceProvider {
 
         // Encrypt the private key
         String encryptedKey = certificateGenerator.encryptPrivateKey(cert.getPrivateKey(), passphrase);
+
+        synchronized (this) {
+            store.get(regionKey(region, cert.extractCertificateId())).filter(current -> !current.isExported())
+                .ifPresent(current -> {
+                    current.setExported(true);
+                    store.put(regionKey(region, current.extractCertificateId()), current);
+                });
+        }
 
         // Return certificate with encrypted private key
         Certificate exportCert = new Certificate();
@@ -626,6 +645,49 @@ public class AcmService implements ResourceProvider {
                 "DaysBeforeExpiry must be between 1 and 90", 400);
         }
         this.accountDaysBeforeExpiry.set(daysBeforeExpiry);
+        this.accountExpiryConfigured.set(true);
+    }
+
+    /**
+     * Days before expiry that ACM starts its daily "Approaching Expiration" events for a certificate of
+     * {@code type}: 45 for private and imported certificates and 30 for public ones, unless
+     * PutAccountConfiguration has set DaysBeforeExpiry.
+     */
+    int expiryNoticeDays(CertificateType type) {
+        if (accountExpiryConfigured.get()) {
+            return accountDaysBeforeExpiry.get();
+        }
+        return type == CertificateType.AMAZON_ISSUED ? 30 : 45;
+    }
+
+    /** One stored certificate with the account and Region that hold it. */
+    public record StoredCertificate(String accountId, String region, Certificate certificate) {}
+
+    /** Every stored certificate of every account, for the expiry sweep (it has no request to scope it). */
+    public List<StoredCertificate> listAllCertificates() {
+        List<StoredCertificate> all = new ArrayList<>();
+        if (store instanceof AccountAwareStorageBackend<Certificate> aware) {
+            for (AccountAwareStorageBackend.AccountEntry<Certificate> entry
+                    : aware.scanAllAccountEntries(k -> k.contains("::"))) {
+                all.add(new StoredCertificate(entry.accountId(),
+                        entry.key().substring(0, entry.key().indexOf("::")), entry.value()));
+            }
+            return all;
+        }
+        for (String key : store.keys()) {
+            int separator = key.indexOf("::");
+            if (separator > 0) {
+                store.get(key).ifPresent(cert -> all.add(new StoredCertificate(
+                        AwsArnUtils.parse(cert.getArn()).accountId(), key.substring(0, separator), cert)));
+            }
+        }
+        return all;
+    }
+
+    private void announce(Certificate cert, AcmEventPublisher.Action action) {
+        if (events != null && events.isResolvable()) {
+            events.get().available(cert, action, clock.instant());
+        }
     }
 
     @Override
@@ -719,9 +781,13 @@ public class AcmService implements ResourceProvider {
             renewed.setInUseBy(cert.getInUseBy() != null ? new ArrayList<>(cert.getInUseBy()) : new ArrayList<>());
             renewed.setDomainValidationOptions(cert.getDomainValidationOptions() != null
                 ? new ArrayList<>(cert.getDomainValidationOptions()) : new ArrayList<>());
+            renewed.setExported(cert.isExported());
+            renewed.setRenewalStatus("SUCCESS");
+            renewed.setRenewalUpdatedAt(clock.instant());
             store.put(regionKey(region, cert.extractCertificateId()), renewed);
         }
         notifyCertificateReimported(renewed.getArn(), region);
+        announce(renewed, AcmEventPublisher.Action.RENEWAL);
         LOG.infov("Renewed certificate: {0}", renewed.getArn());
         return renewed;
     }
@@ -832,6 +898,7 @@ public class AcmService implements ResourceProvider {
             cert.setStatus(CertificateStatus.ISSUED);
             cert.setIssuedAt(now);
             LOG.debugv("Certificate {0} issued after the validation wait", cert.getArn());
+            announce(cert, AcmEventPublisher.Action.ISSUANCE);
             changed = true;
         }
         boolean issued = cert.getStatus() == CertificateStatus.ISSUED || cert.getIssuedAt() != null;

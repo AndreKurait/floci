@@ -273,6 +273,8 @@ floci:
     acm:
       enabled: true
       validation-wait-seconds: 0              # Seconds before transitioning PENDING_VALIDATION → ISSUED
+      expiry-sweep-enabled: false             # Opt in to managed renewal of private certificates and expiry events
+      expiry-sweep-seconds: 3600              # Seconds between expiry sweeps
 
     ses:
       enabled: true

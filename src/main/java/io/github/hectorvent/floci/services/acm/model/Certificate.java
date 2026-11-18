@@ -45,6 +45,11 @@ public class Certificate {
     private String failureReason;
     private List<DomainValidation> domainValidationOptions;
     private String idempotencyToken;
+    /** Whether ExportCertificate has returned this certificate's private key (the events' Exported). */
+    private boolean exported;
+    /** The RenewalSummary of the last managed or requested renewal; null before the first one. */
+    private String renewalStatus;
+    private Instant renewalUpdatedAt;
 
     public Certificate() {
         this.subjectAlternativeNames = new ArrayList<>();
@@ -282,5 +287,29 @@ public class Certificate {
     public static String idFromArn(String arn) {
         int lastSlash = arn.lastIndexOf('/');
         return lastSlash >= 0 ? arn.substring(lastSlash + 1) : arn;
+    }
+
+    public boolean isExported() {
+        return exported;
+    }
+
+    public void setExported(boolean exported) {
+        this.exported = exported;
+    }
+
+    public String getRenewalStatus() {
+        return renewalStatus;
+    }
+
+    public void setRenewalStatus(String renewalStatus) {
+        this.renewalStatus = renewalStatus;
+    }
+
+    public Instant getRenewalUpdatedAt() {
+        return renewalUpdatedAt;
+    }
+
+    public void setRenewalUpdatedAt(Instant renewalUpdatedAt) {
+        this.renewalUpdatedAt = renewalUpdatedAt;
     }
 }

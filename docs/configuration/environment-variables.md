@@ -390,6 +390,8 @@ See [Initialization Hooks](./initialization-hooks.md) for lifecycle phases and s
 |---|---|---|
 | `FLOCI_SERVICES_ACM_ENABLED` | `true` | Enable the ACM service |
 | `FLOCI_SERVICES_ACM_VALIDATION_WAIT_SECONDS` | `0` | Simulated delay before a requested certificate transitions to `ISSUED` |
+| `FLOCI_SERVICES_ACM_EXPIRY_SWEEP_ENABLED` | `false` | Opt in to renewing private certificates 60 days before they expire and sending the `ACM Certificate Approaching Expiration` and `ACM Certificate Expired` events |
+| `FLOCI_SERVICES_ACM_EXPIRY_SWEEP_SECONDS` | `3600` | Seconds between ACM expiry sweeps (a notice is still sent at most once a day per certificate) |
 
 ### SES (Simple Email Service)
 

@@ -1,5 +1,9 @@
 # ACM
 
+Automatic private-certificate renewal and expiry notifications are opt-in. Set
+`FLOCI_SERVICES_ACM_EXPIRY_SWEEP_ENABLED=true` to enable the background sweep; the
+default keeps the existing certificate lifecycle.
+
 **Protocol:** JSON 1.1 (`X-Amz-Target: CertificateManager.*`)
 **Endpoint:** `POST http://localhost:4566/`
 
