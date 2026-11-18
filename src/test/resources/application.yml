@@ -366,6 +366,8 @@ floci:
       proxy-base-port: 9400
       proxy-max-port: 9499
     ec2:
+      # Opt-in guest IPv6 routing. FLOCI_SERVICES_EC2_GUEST_IPV6
+      guest-ipv6: false
       native-peer-dependencies: '${FLOCI_EC2_NATIVE_PEER_DEPENDENCIES:[]}'
       # Opt-in Standard On-Demand vCPU admission. FLOCI_SERVICES_EC2_ENFORCE_VCPU_QUOTAS
       enforce-vcpu-quotas: false
