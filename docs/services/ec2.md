@@ -2025,11 +2025,12 @@ The `client-token` instance filter selects only matching launches.
 |--------|-------------|
 | CreateNetworkInterface | Creates a standalone elastic network interface (ENI) in a subnet, unattached. |
 | DescribeNetworkInterfaces | Lists network interfaces known to the local EC2 service, both an instance's implicit primary interface and standalone ENIs created via `CreateNetworkInterface`. |
-| AttachNetworkInterface | Attaches an available standalone ENI to a running or stopped instance at a device index. With VPC networks on and `FLOCI_SERVICES_EC2_VPC_NETWORKS_HOT_ATTACH_ENABLED=true`, an ENI in a VPC the instance holds no other interface in also becomes a device of the instance's container (hot attach): an endpoint on that VPC's network at the ENI's primary private IPv4, whose device the namespace owner gives the ENI's MAC address (Docker sets an endpoint MAC only when it creates a container, so this needs NET_ADMIN and `ip` in the namespace owner, as Floci's network helper has). With isolated VPC address spaces and `FLOCI_SERVICES_EC2_VPC_NETWORKS_HOT_ATTACH_ACROSS_ADDRESS_SPACES`, the device joins the instance's protected namespace instead (see below). The ENI stays record-only, and Floci logs why, when security-group enforcement is on without isolated address spaces, when isolated address spaces are on without that setting, when the instance already holds an interface in that VPC (Docker gives a container one endpoint per network), or in mock mode. |
+| AttachNetworkInterface | Attaches an available standalone ENI to a running or stopped instance at a device index. The ENI can be another account's that granted the caller `INSTANCE-ATTACH`. With VPC networks on and `FLOCI_SERVICES_EC2_VPC_NETWORKS_HOT_ATTACH_ENABLED=true`, an ENI in a VPC the instance holds no other interface in also becomes a device of the instance's container (hot attach): an endpoint on that VPC's network at the ENI's primary private IPv4, whose device the namespace owner gives the ENI's MAC address (Docker sets an endpoint MAC only when it creates a container, so this needs NET_ADMIN and `ip` in the namespace owner, as Floci's network helper has). With isolated VPC address spaces and `FLOCI_SERVICES_EC2_VPC_NETWORKS_HOT_ATTACH_ACROSS_ADDRESS_SPACES`, the device joins the instance's protected namespace instead (see below). The ENI stays record-only, and Floci logs why, when security-group enforcement is on without isolated address spaces, when isolated address spaces are on without that setting, when the instance already holds an interface in that VPC (Docker gives a container one endpoint per network), or in mock mode. |
 | DetachNetworkInterface | Detaches a standalone ENI by attachment ID, returning it to `available`, and removes the device a hot attach added. |
 | DeleteNetworkInterface | Deletes a standalone ENI. Fails while the ENI is still attached, matching AWS. |
 | CreateNetworkInterfacePermission | The interface's owner grants another account `INSTANCE-ATTACH` over it. `EIP-ASSOCIATE` and `AwsService` are `UnsupportedOperation`. |
 | DescribeNetworkInterfacePermissions | The permissions granted over the caller's interfaces, by `NetworkInterfacePermissionId.N` and the five `network-interface-permission.*` filters; `MaxResults` 5-255, default 50. |
+| DeleteNetworkInterfacePermission | The interface's owner deletes a permission. Refused while the account it names has the interface attached to an instance, unless `Force` is `true`. |
 
 A standalone ENI created via `CreateNetworkInterface` can also be handed to `RunInstances` as an instance's primary interface (`NetworkInterface.1.NetworkInterfaceId` / `NetworkInterface.1.DeviceIndex`) instead of letting the instance create its own implicit one, the pattern Terraform's `aws_instance` resource uses for `network_interface { network_interface_id = ... }`. AWS only allows this for a single instance per launch call; `RunInstances` rejects it otherwise with `InvalidParameterCombination`.
 
@@ -2060,7 +2061,27 @@ every other action of that account.
 
 A repeated grant of the same permission to the same account answers the grant already in place.
 AWS documents no duplicate error for it; this is Floci's choice. Grants are kept on the interface,
-so they go when it is deleted. `DeleteNetworkInterfacePermission` is not served.
+so they go when it is deleted.
+
+The account granted `INSTANCE-ATTACH` can then `AttachNetworkInterface` the interface to one of
+its own instances, as the [CreateNetworkInterfacePermission](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_CreateNetworkInterfacePermission.html)
+reference documents. The interface stays the owner's: the owner's `DescribeNetworkInterfaces`
+shows it `in-use`, with the attachment's `instanceOwnerId` naming the instance's account, and the
+`attachment.instance-owner-id` filter selects on it. The instance's `networkInterfaceSet` lists it
+with the owner's `ownerId`. An account without the grant is answered
+`InvalidNetworkInterfaceID.NotFound`, as before.
+
+`DeleteNetworkInterfacePermission` follows the
+[API reference](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DeleteNetworkInterfacePermission.html):
+while the account a permission names has the interface attached to an instance, the permission is
+deleted only with `Force`, and the attachment stays. AWS documents no error code for the refusal;
+Floci answers `OperationNotPermitted`.
+
+AWS documents nothing else about an interface attached across accounts (how the instance's account
+describes, detaches, tags or deletes it), so Floci keeps its account isolation there: to the
+instance's account it is still another account's interface, and `DescribeNetworkInterfaces` does
+not list it. The owner detaches it as any attachment of its interface, and terminating the
+instance returns it to `available`.
 
 `ModifyNetworkInterfaceAttribute` is not implemented: no example in the corpus that needed `CreateNetworkInterface` was found to need it. A route table's `CreateRoute` with a `NetworkInterfaceId` target is accepted but not recorded, since `Route` does not yet model an ENI target; a subsequent `plan` against such a route may show drift.
 
