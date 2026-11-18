@@ -238,8 +238,16 @@ public class DocDbContainerManager {
             throw new RuntimeException("MongoDB did not accept writes before the restore: "
                     + (probe != null ? probe.stderr() : ""));
         }
-        String[] cmd = {"bash", "-c", "mongorestore --quiet --host 127.0.0.1 --port " + MONGO_PORT + auth
-                + " --drop --nsExclude='config.*' --archive=/tmp/floci-docdb-restore.archive.gz --gzip"
+        String restore = "mongorestore --host 127.0.0.1 --port " + MONGO_PORT + auth
+                + " --drop --archive=/tmp/floci-docdb-restore.archive.gz --gzip";
+        // Replacing users invalidates the connection used to build indexes. Load authentication
+        // last, including its schema version, while preserving custom collections in admin.
+        String[] cmd = {"bash", "-c", restore
+                + " --nsExclude='config.*' --nsExclude='admin.system.users'"
+                + " --nsExclude='admin.system.roles' --nsExclude='admin.system.version'"
+                + " && " + restore
+                + " --nsInclude='admin.system.users' --nsInclude='admin.system.roles'"
+                + " --nsInclude='admin.system.version' --noIndexRestore"
                 + " && rm -f /tmp/floci-docdb-restore.archive.gz"};
         ContainerExec.Result result = ContainerExec.run(lifecycleManager.getDockerClient(), containerId, cmd, 600);
         if (result.exitCode() != 0) {
