@@ -2009,7 +2009,7 @@ The `client-token` instance filter selects only matching launches.
 |--------|-------------|
 | CreateNetworkInterface | Creates a standalone elastic network interface (ENI) in a subnet, unattached. |
 | DescribeNetworkInterfaces | Lists network interfaces known to the local EC2 service, both an instance's implicit primary interface and standalone ENIs created via `CreateNetworkInterface`. |
-| AttachNetworkInterface | Attaches an available standalone ENI to a running or stopped instance at a device index. With VPC networks on, an ENI in a VPC the instance holds no other interface in also becomes a device of the instance's container (hot attach): an endpoint on that VPC's network at the ENI's primary private IPv4, whose device the namespace owner gives the ENI's MAC address (Docker sets an endpoint MAC only when it creates a container, so this needs NET_ADMIN and `ip` in the namespace owner, as Floci's network helper has). The ENI stays record-only, and Floci logs why, when security-group enforcement or isolated VPC address spaces are on, when the instance already holds an interface in that VPC (Docker gives a container one endpoint per network), or in mock mode. |
+| AttachNetworkInterface | Attaches an available standalone ENI to a running or stopped instance at a device index. With VPC networks on, an ENI in a VPC the instance holds no other interface in also becomes a device of the instance's container (hot attach): an endpoint on that VPC's network at the ENI's primary private IPv4, whose device the namespace owner gives the ENI's MAC address (Docker sets an endpoint MAC only when it creates a container, so this needs NET_ADMIN and `ip` in the namespace owner, as Floci's network helper has). With isolated VPC address spaces and `FLOCI_SERVICES_EC2_VPC_NETWORKS_HOT_ATTACH_ACROSS_ADDRESS_SPACES`, the device joins the instance's protected namespace instead (see below). The ENI stays record-only, and Floci logs why, when security-group enforcement is on without isolated address spaces, when isolated address spaces are on without that setting, when the instance already holds an interface in that VPC (Docker gives a container one endpoint per network), or in mock mode. |
 | DetachNetworkInterface | Detaches a standalone ENI by attachment ID, returning it to `available`, and removes the device a hot attach added. |
 | DeleteNetworkInterface | Deletes a standalone ENI. Fails while the ENI is still attached, matching AWS. |
 
@@ -2275,6 +2275,7 @@ State is reported settled rather than transitional, as elsewhere in this service
 | `FLOCI_SERVICES_EC2_RECONCILE_CONTAINERS_ON_STARTUP` | `true` | On startup, remove instance containers this Floci left on the daemon whose record did not survive the restart or came back terminated; stopped instances are never swept |
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_ENABLED` | `true` | Back each VPC with a real Docker network (see [VPC Docker networks](#vpc-docker-networks)) |
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_ISOLATE_ADDRESS_SPACES` | `false` | Preserve overlapping native IPv4 ranges on separate, account-scoped bridges; requires protected namespaces, faithful private addresses and Docker Engine 28 or newer |
+| `FLOCI_SERVICES_EC2_VPC_NETWORKS_HOT_ATTACH_ACROSS_ADDRESS_SPACES` | `false` | With isolated address spaces, plug an interface of another VPC that `AttachNetworkInterface` attaches to a running instance into its protected namespace as its own device, with its own security groups and return route |
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_FALLBACK_POOL` | `10.240.0.0/12` | RFC 1918 pool that substituted CIDRs are drawn from |
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_FALLBACK_PREFIX_LENGTH` | `16` | Prefix length of each block handed out of that pool |
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_RECONCILE_ON_STARTUP` | `true` | Remove VPC networks left behind by a previous run of this same emulator. Whatever its value, the network a previous run created for a VPC that still exists is kept, and goes when that VPC is deleted |
@@ -2326,6 +2327,20 @@ including requests explicitly bound to the native private address, retain their
 account and VPC identity through the namespace's unique control address.
 Public NAT routing can connect overlapping VPCs through managed public frontends;
 this mode does not add peering or arbitrary internet access.
+
+With isolated address spaces, an interface `AttachNetworkInterface` attaches to a running instance stays
+record-only unless `FLOCI_SERVICES_EC2_VPC_NETWORKS_HOT_ATTACH_ACROSS_ADDRESS_SPACES=true`. Then an
+interface of another VPC (its ranges may overlap the instance's) becomes one more native device of the
+instance's protected namespace, carrying the interface's MAC address and primary private IPv4 with its
+subnet prefix. The device gets its own route table, selected by its address
+(`ip rule from <address> lookup <table>`), so a reply to a connection that arrived on it leaves through
+it. The main table gains that VPC's range only when no route the namespace holds overlaps it. The
+interface's own security groups are enforced on the device alone: the namespace's base chains send its
+traffic into a chain pair of its own and drop it if that pair returns, while the primary interface's
+rules are unchanged. Peers in the interface's VPC see it as one more interface of that VPC, by its
+address. The device carries IPv4 only and forwards nothing. Instance metadata, the VPC resolver and
+Floci's control connections stay on the primary interface. `DetachNetworkInterface` removes the device,
+its route table and its rules.
 
 Set `FLOCI_SERVICES_EC2_VPC_NETWORKS_INTERNAL=true` to create internal Docker VPC
 bridges. This deployment setting does not change EC2 request or response fields.

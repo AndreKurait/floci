@@ -5439,6 +5439,20 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         List<SecurityGroup> attached = instance.getSecurityGroups().stream()
                 .map(group -> getRequiredSecurityGroup(region, group.getGroupId())).toList();
         containerManager.restoreSecurityGroups(instance, region, attached, policyPrefixLists(region, attached));
+        // Hot-attached interfaces of a protected namespace get their devices and policies back, or lose them.
+        for (InstanceNetworkInterface eni : List.copyOf(instance.getNetworkInterfaces())) {
+            if (eni.getDeviceIndex() < 1) {
+                continue;
+            }
+            List<SecurityGroup> groups = networkInterfaces.get(key(region, eni.getNetworkInterfaceId()))
+                    .map(record -> record.getGroups().stream()
+                            .map(group -> securityGroups.get(key(region, group.getGroupId())).orElse(null))
+                            .toList())
+                    .orElse(List.of());
+            containerManager.restoreAttachedInterface(instance, eni, groups,
+                    groups.isEmpty() || groups.stream().anyMatch(Objects::isNull)
+                            ? Map.of() : policyPrefixLists(region, groups));
+        }
     }
 
     /**
@@ -18491,6 +18505,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                                                               String instanceId, int deviceIndex) {
         Instance pluggedInstance;
         InstanceNetworkInterface pluggedInterface;
+        List<SecurityGroup> pluggedGroups;
         NetworkInterfaceAttachment result;
         synchronized (privateIpAllocationLock) {
             NetworkInterface ni = requireStandaloneNetworkInterface(region, networkInterfaceId);
@@ -18549,11 +18564,16 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             }
             pluggedInstance = inst;
             pluggedInterface = attached;
+            // A protected namespace enforces the attached interface's own groups on its device.
+            pluggedGroups = ni.getGroups().stream()
+                    .map(group -> securityGroups.get(key(region, group.getGroupId())).orElse(null))
+                    .toList();
             result = attachment;
         }
         // Outside the allocation lock: the device is a Docker call.
         if (containerManager != null) {
-            containerManager.plugNetworkInterface(pluggedInstance, pluggedInterface);
+            containerManager.plugNetworkInterface(pluggedInstance, pluggedInterface, pluggedGroups,
+                    pluggedGroups.stream().anyMatch(Objects::isNull) ? Map.of() : policyPrefixLists(region, pluggedGroups));
         }
         return result;
     }

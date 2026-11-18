@@ -91,6 +91,10 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     private boolean peerPoliciesNeedRefresh;
     /** What each admitted helper's nftables table currently enforces, recorded only after it installed. */
     private final Map<String, Applied> applied = new HashMap<>();
+    /** Hot-attached interfaces, by the primary interface whose protected namespace holds their devices. */
+    private final Map<String, Map<String, AttachedPolicy>> attachedDevices = new HashMap<>();
+    /** Devices detached since their namespace's policy last installed; that policy's next install flushes them. */
+    private final Map<String, Set<SecurityGroupNftCompiler.AttachedDevice>> retiredDevices = new HashMap<>();
     /** Registrations that entered {@link #register} and have not installed their own policy yet. */
     private final AtomicInteger arriving = new AtomicInteger();
     /** Retirements queued for ownership capture or namespace quarantine. */
@@ -1091,6 +1095,8 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         if (owned) {
             endpoints.remove(eniId);
             applied.remove(eniId);
+            attachedDevices.remove(eniId);
+            retiredDevices.remove(eniId);
             removeDnsOrigin(current);
             pendingHelperCleanup.computeIfAbsent(eniId, ignored -> new HashSet<>()).add(current.helperId());
             peerPoliciesNeedRefresh = true;
@@ -1125,11 +1131,88 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         }
     }
 
+    /**
+     * Enforces a hot-attached interface's own security groups on its device in the protected namespace of
+     * {@code primaryEniId}: the device's traffic enters only that interface's chains, and peers of its VPC
+     * see it as one more interface of that VPC. Requires isolated address spaces and
+     * {@code hot-attach-across-address-spaces}; a failure leaves the namespace without the device's policy.
+     */
+    public synchronized void attachDevice(String primaryEniId, SecurityGroupNftCompiler.Endpoint attached,
+                                          String device, Map<String, List<String>> prefixLists) {
+        if (!isolatedAddressSpaces() || !config.services().ec2().vpcNetworks().hotAttachAcrossAddressSpaces()) {
+            throw new IllegalStateException("Hot attach across address spaces is not enabled");
+        }
+        ProtectedEndpoint primary = endpoints.get(primaryEniId);
+        if (primary == null) {
+            throw new IllegalStateException("Interface " + primaryEniId + " has no protected namespace");
+        }
+        if (endpoints.containsKey(attached.eniId())
+                || attachedDevices.values().stream().anyMatch(held -> held.containsKey(attached.eniId())
+                        && held != attachedDevices.get(primaryEniId))) {
+            throw new IllegalStateException("Interface " + attached.eniId() + " already has a device");
+        }
+        if (attached.groups() == null || attached.groups().isEmpty()
+                || attached.groups().stream().anyMatch(group -> group == null)) {
+            throw new IllegalArgumentException("An attached interface needs valid security groups");
+        }
+        if (attached.sameVpc(primary.endpoint())) {
+            throw new IllegalArgumentException("An attached interface in the primary interface's VPC has no own device");
+        }
+        SecurityGroupNftCompiler.AttachedDevice handle = new SecurityGroupNftCompiler.AttachedDevice(
+                device, attached.eniId());
+        Map<String, AttachedPolicy> held = attachedDevices.computeIfAbsent(primaryEniId, ignored -> new HashMap<>());
+        if (held.values().stream().anyMatch(policy -> policy.device().device().equals(device)
+                && !policy.device().eniId().equals(attached.eniId()))) {
+            throw new IllegalStateException("Device " + device + " already carries another interface");
+        }
+        AttachedPolicy previous = held.put(attached.eniId(), new AttachedPolicy(attached, handle, Map.copyOf(prefixLists)));
+        try {
+            reconcileAll();
+        } catch (RuntimeException failure) {
+            if (previous == null) {
+                held.remove(attached.eniId());
+            } else {
+                held.put(attached.eniId(), previous);
+            }
+            if (held.isEmpty()) {
+                attachedDevices.remove(primaryEniId);
+            }
+            throw failure;
+        }
+    }
+
+    /** Withdraws {@link #attachDevice}'s policy; the device's chains are flushed by the namespace's next install. */
+    public synchronized void detachDevice(String primaryEniId, String attachedEniId) {
+        Map<String, AttachedPolicy> held = attachedDevices.get(primaryEniId);
+        AttachedPolicy removed = held == null ? null : held.remove(attachedEniId);
+        if (removed == null) {
+            return;
+        }
+        if (held.isEmpty()) {
+            attachedDevices.remove(primaryEniId);
+        }
+        retiredDevices.computeIfAbsent(primaryEniId, ignored -> new LinkedHashSet<>()).add(removed.device());
+        reconcileAll();
+    }
+
+    /** The device {@link #attachDevice} enforces for {@code attachedEniId}, if any. */
+    public synchronized Optional<String> attachedDevice(String primaryEniId, String attachedEniId) {
+        Map<String, AttachedPolicy> held = attachedDevices.get(primaryEniId);
+        AttachedPolicy policy = held == null ? null : held.get(attachedEniId);
+        return policy == null ? Optional.empty() : Optional.of(policy.device().device());
+    }
+
+    private List<AttachedPolicy> attachedOf(String primaryEniId) {
+        return attachedDevices.getOrDefault(primaryEniId, Map.of()).values().stream()
+                .sorted(Comparator.comparing(policy -> policy.endpoint().eniId())).toList();
+    }
+
     public synchronized void updateGroups(String eniId, Set<String> groupIds,
                                           Map<String, SecurityGroup> groups,
                                           Map<String, List<String>> prefixLists) {
         ProtectedEndpoint current = endpoints.get(eniId);
         if (current == null) {
+            updateAttachedGroups(eniId, groupIds, groups, prefixLists);
             return;
         }
         SecurityGroupNftCompiler.Endpoint identity = current.endpoint();
@@ -1146,6 +1229,33 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         endpoints.put(eniId, new ProtectedEndpoint(updated, current.helperId(), Map.copyOf(prefixLists),
                 current.dnsOrigin()));
         reconcileAll();
+    }
+
+    private void updateAttachedGroups(String eniId, Set<String> groupIds, Map<String, SecurityGroup> groups,
+                                      Map<String, List<String>> prefixLists) {
+        for (Map.Entry<String, Map<String, AttachedPolicy>> entry : attachedDevices.entrySet()) {
+            AttachedPolicy policy = entry.getValue().get(eniId);
+            if (policy == null) {
+                continue;
+            }
+            List<SecurityGroup> resolved = groupIds.stream().map(groups::get).toList();
+            if (resolved.isEmpty() || resolved.stream().anyMatch(group -> group == null)) {
+                quarantine(endpoints.get(entry.getKey()).helperId());
+                throw new IllegalArgumentException("Protected endpoint needs valid security groups");
+            }
+            entry.getValue().put(eniId, new AttachedPolicy(withGroups(policy.endpoint(), Set.copyOf(groupIds), resolved),
+                    policy.device(), Map.copyOf(prefixLists)));
+            reconcileAll();
+            return;
+        }
+    }
+
+    private static SecurityGroupNftCompiler.Endpoint withGroups(SecurityGroupNftCompiler.Endpoint identity,
+                                                                Set<String> groupIds, List<SecurityGroup> groups) {
+        return new SecurityGroupNftCompiler.Endpoint(identity.accountId(), identity.region(), identity.vpcId(),
+                identity.eniId(), identity.logicalAddress(), identity.transportAddress(), groupIds, groups,
+                identity.controlConnections(), identity.instanceMetadataAllowed(),
+                identity.additionalTransportAddresses(), identity.controlListeners(), identity.nativePeerDependencies());
     }
 
     public synchronized void reconcileAll() {
@@ -1217,6 +1327,9 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     }
 
     private void convergePolicies(boolean force) {
+        // A namespace that left takes its hot-attached devices with it.
+        attachedDevices.keySet().retainAll(endpoints.keySet());
+        retiredDevices.keySet().retainAll(endpoints.keySet());
         List<String> vpcResolvers = vpcResolvers();
         List<SecurityGroupNftCompiler.EmulatorOrigin> origins = emulatorOrigins();
         List<SelfAddress> self = selfAddresses();
@@ -1259,6 +1372,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             }).toList());
             for (Installation plan : plans) {
                 applied.put(plan.eniId(), plan.state());
+                retiredDevices.remove(plan.eniId());
                 changed |= plan.changed();
             }
             if (!changed && endpoints.values().stream().allMatch(this::complete)) {
@@ -1270,8 +1384,12 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
 
     /** Every registered endpoint in ENI order, so a policy's text depends only on its inputs. */
     private List<SecurityGroupNftCompiler.Endpoint> peerEndpoints() {
-        return endpoints.values().stream().map(ProtectedEndpoint::endpoint)
-                .sorted(Comparator.comparing(SecurityGroupNftCompiler.Endpoint::eniId)).toList();
+        List<SecurityGroupNftCompiler.Endpoint> peers = new ArrayList<>();
+        endpoints.values().forEach(endpoint -> peers.add(endpoint.endpoint()));
+        // A hot-attached interface is one more peer of its own VPC.
+        attachedDevices.values().forEach(held -> held.values().forEach(policy -> peers.add(policy.endpoint())));
+        peers.sort(Comparator.comparing(SecurityGroupNftCompiler.Endpoint::eniId));
+        return List.copyOf(peers);
     }
 
     /** Installs {@code target}'s policy toward the peers that enforce its identity; true when Docker ran. */
@@ -1284,6 +1402,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             apply(plan.state().helperId(), plan.state().rules());
         }
         applied.put(plan.eniId(), plan.state());
+        retiredDevices.remove(plan.eniId());
         return plan.changed();
     }
 
@@ -1295,14 +1414,31 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 .filter(peer -> peer != target && knows(peer, target))
                 .map(peer -> peer.endpoint().eniId())
                 .collect(Collectors.toSet());
-        String rules = SecurityGroupNftCompiler.compile(target.endpoint(), peers, target.prefixLists(),
-                vpcResolvers, isolatedAddressSpaces(), peer -> admitted.contains(peer.eniId()),
+        // A hot-attached interface's policy lives in its primary interface's namespace: it is admitted
+        // exactly when that namespace is.
+        Set<String> admittedPeers = new HashSet<>(admitted);
+        admitted.forEach(primary -> attachedOf(primary).forEach(policy -> admittedPeers.add(policy.endpoint().eniId())));
+        List<AttachedPolicy> held = attachedOf(eniId);
+        StringBuilder compiled = new StringBuilder(SecurityGroupNftCompiler.compile(target.endpoint(), peers,
+                target.prefixLists(), vpcResolvers, isolatedAddressSpaces(), peer -> admittedPeers.contains(peer.eniId()),
                 origins, emulatorAddresses(target.endpoint(), self),
                 vpcRouting == null || vpcRouting.isUnsatisfied()
-                        ? Set.of() : vpcRouting.get().publicInstanceAddresses());
+                        ? Set.of() : vpcRouting.get().publicInstanceAddresses(),
+                held.stream().map(AttachedPolicy::device).toList()));
+        for (AttachedPolicy policy : held) {
+            compiled.append(SecurityGroupNftCompiler.compileAttached(policy.endpoint(), policy.device(), peers,
+                    policy.prefixLists(), peer -> admittedPeers.contains(peer.eniId())));
+        }
+        for (SecurityGroupNftCompiler.AttachedDevice retired : retiredDevices.getOrDefault(eniId, Set.of())) {
+            if (held.stream().noneMatch(policy -> policy.device().equals(retired))) {
+                compiled.append("flush chain inet floci_sg ").append(retired.ingressChain()).append('\n')
+                        .append("flush chain inet floci_sg ").append(retired.egressChain()).append('\n');
+            }
+        }
+        String rules = compiled.toString();
         Map<String, PeerView> known = endpoints.values().stream()
                 .filter(peer -> !peer.endpoint().eniId().equals(eniId))
-                .collect(Collectors.toMap(peer -> peer.endpoint().eniId(), PeerView::of));
+                .collect(Collectors.toMap(peer -> peer.endpoint().eniId(), this::peerView));
         Applied current = applied.get(eniId);
         boolean unchanged = current != null && current.helperId().equals(target.helperId())
                 && current.rules().equals(rules);
@@ -1316,7 +1452,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     private boolean knows(ProtectedEndpoint holder, ProtectedEndpoint subject) {
         Applied state = applied.get(holder.endpoint().eniId());
         return state != null && state.helperId().equals(holder.helperId())
-                && PeerView.of(subject).equals(state.known().get(subject.endpoint().eniId()));
+                && peerView(subject).equals(state.known().get(subject.endpoint().eniId()));
     }
 
     private boolean knownByAllPeers(ProtectedEndpoint target) {
@@ -1348,12 +1484,28 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     /** The parts of an endpoint's identity that its peers' compiled policies depend on. */
     private record PeerView(String helperId, String accountId, String region, String vpcId,
                             String transportAddress, List<String> transportAddresses,
-                            SecurityGroupPolicy.Peer peer) {
-        static PeerView of(ProtectedEndpoint endpoint) {
+                            SecurityGroupPolicy.Peer peer, List<AttachedView> attached) {
+        static PeerView of(ProtectedEndpoint endpoint, List<AttachedPolicy> attached) {
             SecurityGroupNftCompiler.Endpoint identity = endpoint.endpoint();
             return new PeerView(endpoint.helperId(), identity.accountId(), identity.region(), identity.vpcId(),
-                    identity.transportAddress(), identity.transportAddresses(), identity.peer());
+                    identity.transportAddress(), identity.transportAddresses(), identity.peer(),
+                    attached.stream().map(AttachedView::of).toList());
         }
+    }
+
+    /** The parts of a hot-attached interface's identity that peers' compiled policies depend on. */
+    private record AttachedView(String eniId, String device, String accountId, String region, String vpcId,
+                                List<String> transportAddresses, SecurityGroupPolicy.Peer peer) {
+        static AttachedView of(AttachedPolicy policy) {
+            SecurityGroupNftCompiler.Endpoint identity = policy.endpoint();
+            return new AttachedView(identity.eniId(), policy.device().device(), identity.accountId(),
+                    identity.region(), identity.vpcId(), identity.transportAddresses(), identity.peer());
+        }
+    }
+
+    /** A namespace's identity for its peers, its hot-attached interfaces included. */
+    private PeerView peerView(ProtectedEndpoint endpoint) {
+        return PeerView.of(endpoint, attachedOf(endpoint.endpoint().eniId()));
     }
 
     private record Applied(String helperId, String rules, Map<String, PeerView> known, Set<String> admitted) {}
@@ -1397,6 +1549,24 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                     identity.additionalTransportAddresses(), identity.controlListeners(), identity.nativePeerDependencies());
             endpoints.put(entry.getKey(), new ProtectedEndpoint(updated, current.helperId(),
                     Map.copyOf(prefixLists), current.dnsOrigin()));
+        }
+        for (Map.Entry<String, Map<String, AttachedPolicy>> held : attachedDevices.entrySet()) {
+            for (Map.Entry<String, AttachedPolicy> entry : held.getValue().entrySet()) {
+                SecurityGroupNftCompiler.Endpoint identity = entry.getValue().endpoint();
+                if (!accountId.equals(identity.accountId()) || !region.equals(identity.region())) {
+                    continue;
+                }
+                List<SecurityGroup> attached = identity.groupIds().stream().map(groups::get).toList();
+                if (attached.stream().anyMatch(group -> group == null)) {
+                    ProtectedEndpoint primary = endpoints.get(held.getKey());
+                    if (primary != null) {
+                        quarantine(primary.helperId());
+                    }
+                    throw new IllegalStateException("An attached interface's security group disappeared");
+                }
+                entry.setValue(new AttachedPolicy(withGroups(identity, identity.groupIds(), attached),
+                        entry.getValue().device(), Map.copyOf(prefixLists)));
+            }
         }
         retireStoppedHelpers();
         converge(false);
@@ -1719,4 +1889,8 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     public record Namespace(String helperId, String transportAddress) {}
     private record ProtectedEndpoint(SecurityGroupNftCompiler.Endpoint endpoint, String helperId,
                                      Map<String, List<String>> prefixLists, DnsOrigin dnsOrigin) {}
+
+    private record AttachedPolicy(SecurityGroupNftCompiler.Endpoint endpoint,
+                                  SecurityGroupNftCompiler.AttachedDevice device,
+                                  Map<String, List<String>> prefixLists) {}
 }

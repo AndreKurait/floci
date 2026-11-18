@@ -3118,7 +3118,13 @@ class Ec2ServiceTest {
 
         ArgumentCaptor<Instance> holder = ArgumentCaptor.forClass(Instance.class);
         ArgumentCaptor<InstanceNetworkInterface> device = ArgumentCaptor.forClass(InstanceNetworkInterface.class);
-        verify(manager).plugNetworkInterface(holder.capture(), device.capture());
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<SecurityGroup>> groups = ArgumentCaptor.forClass(List.class);
+        verify(manager).plugNetworkInterface(holder.capture(), device.capture(), groups.capture(), any());
+        // A protected namespace enforces the attached interface's own groups: its VPC's default group here.
+        assertEquals(extra.getGroups().stream().map(GroupIdentifier::getGroupId).toList(),
+                groups.getValue().stream().map(SecurityGroup::getGroupId).toList());
+        assertEquals(extra.getVpcId(), groups.getValue().getFirst().getVpcId());
         assertEquals(instance.getInstanceId(), holder.getValue().getInstanceId());
         assertEquals(extra.getNetworkInterfaceId(), device.getValue().getNetworkInterfaceId());
         assertEquals(1, device.getValue().getDeviceIndex());
