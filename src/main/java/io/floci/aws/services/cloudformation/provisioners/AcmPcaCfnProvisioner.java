@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.services.acmpca.AcmPcaService;
 import io.floci.aws.services.cloudformation.model.StackResource;
@@ -37,14 +38,26 @@ public class AcmPcaCfnProvisioner implements CfnResourceProvisioner {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final AcmPcaService acmPcaService;
+    private final EmulatorConfig config;
 
-    public AcmPcaCfnProvisioner(AcmPcaService acmPcaService) {
+    public AcmPcaCfnProvisioner(AcmPcaService acmPcaService, EmulatorConfig config) {
         this.acmPcaService = acmPcaService;
+        this.config = config;
     }
 
     @Override
     public Set<String> resourceTypes() {
         return Set.of(TYPE);
+    }
+
+    @Override
+    public boolean serviceDisabled() {
+        return config != null && !config.services().acmPca().enabled();
+    }
+
+    @Override
+    public String serviceEnabledFlag() {
+        return "floci.services.acm-pca.enabled";
     }
 
     @Override
