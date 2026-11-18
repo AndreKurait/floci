@@ -873,6 +873,58 @@ class IamConditionContextResolverTest {
     }
 
     @Test
+    void ec2MainPortAccountlessImageReadsCallerTags() {
+        when(ec2Service.resourceTags("us-east-1", "ami-0123456789"))
+                .thenReturn(List.of(new Tag("Team", "payments")));
+        Map<String, List<String>> context = resolver.withEc2ResourceContext("ec2", "ec2:ModifyImageAttribute",
+                "arn:aws:ec2:us-east-1::image/ami-0123456789", "us-east-1", "123456789012", Map.of());
+        assertEquals(List.of("payments"), context.get("aws:ResourceTag/Team"));
+    }
+
+    @Test
+    void ec2MainPortForeignArnCannotRetainCallerResourceTags() {
+        Map<String, List<String>> context = resolver.withEc2ResourceContext("ec2", "ec2:ModifyVpcEndpoint",
+                "arn:aws:ec2:eu-west-1:111111111111:vpc-endpoint/vpce-0123456789", "us-east-1",
+                "123456789012", Map.of("aws:ResourceTag/OpenSearchManaged", List.of("true")));
+        assertFalse(context.containsKey("aws:ResourceTag/OpenSearchManaged"));
+    }
+
+    @Test
+    void ec2MainPortForeignArnReadsItsAccountAndRegion() {
+        when(ec2Service.resourceTags("111111111111", "eu-west-1", "vpce-0123456789"))
+                .thenReturn(List.of(new Tag("OpenSearchManaged", "true")));
+        Map<String, List<String>> context = resolver.withEc2ResourceContext("ec2", "ec2:ModifyVpcEndpoint",
+                "arn:aws:ec2:eu-west-1:111111111111:vpc-endpoint/vpce-0123456789", "us-east-1",
+                "123456789012", Map.of("aws:ResourceTag/OpenSearchManaged", List.of("false")));
+        assertEquals(List.of("true"), context.get("aws:ResourceTag/OpenSearchManaged"));
+        verify(ec2Service).resourceTags("111111111111", "eu-west-1", "vpce-0123456789");
+        verify(ec2Service, never()).resourceTags(anyString(), anyString());
+    }
+
+    @Test
+    void ec2MainPortOwnUntaggedArnClearsEarlierResourceTags() {
+        Map<String, List<String>> context = resolver.withEc2ResourceContext("ec2", "ec2:ModifyVpcEndpoint",
+                "arn:aws:ec2:us-east-1:123456789012:vpc-endpoint/vpce-0123456789", "us-east-1",
+                "123456789012", Map.of("aws:ResourceTag/OpenSearchManaged", List.of("true")));
+        assertFalse(context.containsKey("aws:ResourceTag/OpenSearchManaged"));
+    }
+
+    @Test
+    void ec2MainPortNameBasedForeignArnRetainsItsExistingContext() {
+        Map<String, List<String>> original = Map.of("aws:ResourceTag/Team", List.of("payments"));
+        assertSame(original, resolver.withEc2ResourceContext("ec2", "ec2:ModifyInstancePlacement",
+                "arn:aws:ec2:eu-west-1:111111111111:placement-group/web", "us-east-1", "123456789012", original));
+        verify(ec2Service, never()).resourceTags(anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void ec2MainPortWildcardRetainsTheExistingContext() {
+        Map<String, List<String>> original = Map.of("aws:ResourceTag/Team", List.of("payments"));
+        assertSame(original, resolver.withEc2ResourceContext("ec2", "ec2:ModifyVpcEndpoint",
+                "arn:aws:ec2:us-east-1:123456789012:vpc-endpoint/*", "us-east-1", "123456789012", original));
+    }
+
+    @Test
     void resourceTagsAreTheGeneratedKeysOfTheArnsTypeValuedFromItsServicesStoredTags() {
         String secret = "arn:aws:secretsmanager:eu-west-1:123456789012:secret:app-AbCdEf";
         Map<String, String> held = new LinkedHashMap<>();

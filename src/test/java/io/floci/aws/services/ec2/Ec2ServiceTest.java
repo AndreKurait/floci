@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.ListNetworksCmd;
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.PaginatedResult;
 import io.floci.aws.core.common.RegionResolver;
@@ -33,6 +34,7 @@ import io.floci.aws.services.ec2.model.NatGatewayAddress;
 import io.floci.aws.services.ec2.model.NetworkAcl;
 import io.floci.aws.services.ec2.model.NetworkInterface;
 import io.floci.aws.services.ec2.model.NetworkInterfaceAssociation;
+import io.floci.aws.services.ec2.model.NetworkInterfaceAttachment;
 import io.floci.aws.services.ec2.model.NetworkInterfaceListResult;
 import io.floci.aws.services.ec2.model.NetworkInterfacePrivateIpAddress;
 import io.floci.aws.services.ec2.model.Placement;
@@ -124,6 +126,7 @@ import static io.floci.aws.services.ec2.Ec2KeyPairFixtures.ED25519_KEY;
 import static io.floci.aws.services.ec2.Ec2KeyPairFixtures.RSA_FINGERPRINT;
 import static io.floci.aws.services.ec2.Ec2KeyPairFixtures.RSA_KEY;
 import static io.floci.aws.services.ec2.Ec2KeyPairFixtures.TRUNCATED_RSA_KEY;
+import static io.floci.aws.testing.ParkingStoreAssertions.assertOperationWaitsForParkedStore;
 import static io.floci.aws.testing.ThreadStates.awaitBlockedOrDone;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -132,6 +135,7 @@ import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -660,6 +664,101 @@ class Ec2ServiceTest {
         return service.runInstances("us-east-1", "ami-test", "t3.micro", 1, 1, null, List.of(), null, null,
                 List.of(), null, null, null, null, 0, null, null, null, null, false, null, null,
                 List.of(data), false, null, null);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"us-east-1", "us-gov-west-1", "cn-north-1"})
+    void attachmentArnLookupStaysInTheCallerAccountAndRegion(String region) {
+        String owner = "000000000000";
+        String other = "111111111111";
+        AccountAwareStorageBackend<NetworkInterface> interfaces = AccountAwareStorageBackend.inMemory(owner);
+        Ec2Service service = spy(new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-network-interfaces.json", interfaces))));
+        NetworkInterface eni = new NetworkInterface();
+        eni.setNetworkInterfaceId("eni-11111111");
+        eni.setOwnerId(owner);
+        NetworkInterfaceAttachment attachment = new NetworkInterfaceAttachment();
+        attachment.setAttachmentId("eni-attach-11111111");
+        attachment.setInstanceId("i-11111111");
+        eni.setAttachment(attachment);
+        interfaces.putForAccount(owner, region + "::" + eni.getNetworkInterfaceId(), eni);
+        Ec2StoredResourceArns stored = new Ec2StoredResourceArns(service);
+
+        assertEquals(attachmentArns(region, owner, "i-11111111", "eni-11111111"),
+                stored.through("AttachmentId", attachment.getAttachmentId(), region));
+        assertEquals(Optional.of(attachmentArns(region, owner, "i-11111111", "eni-11111111").getFirst()),
+                stored.findByMembers("instance", List.of(attachment.getAttachmentId()), region));
+        assertEquals(Optional.of(attachmentArns(region, owner, "i-11111111", "eni-11111111").getLast()),
+                stored.findByMembers("network-interface", List.of(attachment.getAttachmentId()), region));
+        assertTrue(stored.findByMembers("instance", List.of("eni-attach-missing"), region).isEmpty());
+        assertTrue(stored.findByMembers("instance", List.of(), region).isEmpty());
+        assertSame(attachment, eni.getAttachment(), "authorization lookup must not detach the interface");
+        assertEquals(List.of(),
+                stored.through("AttachmentId", attachment.getAttachmentId(), "eu-west-1"));
+        assertEquals(List.of(),
+                stored.through("AttachmentId", "eni-attach-missing", region));
+        doReturn(other).when(service).callerAccountId();
+        assertEquals(List.of(),
+                stored.through("AttachmentId", attachment.getAttachmentId(), region));
+        assertTrue(stored.findByMembers("instance", List.of(attachment.getAttachmentId()), region).isEmpty());
+        assertTrue(stored.findByMembers("network-interface", List.of(attachment.getAttachmentId()), region).isEmpty());
+        assertTrue(stored.through("UnrelatedId", attachment.getAttachmentId(), region).isEmpty());
+        assertTrue(stored.through("AttachmentId", null, region).isEmpty());
+        assertTrue(stored.through("AttachmentId", "  ", region).isEmpty());
+        doReturn(owner).when(service).callerAccountId();
+        eni.setAttachment(null);
+        interfaces.putForAccount(owner, region + "::" + eni.getNetworkInterfaceId(), eni);
+        assertEquals(List.of(),
+                stored.through("AttachmentId", attachment.getAttachmentId(), region));
+    }
+
+    private static List<String> attachmentArns(String region, String account, String instance, String eni) {
+        return List.of(AwsArnUtils.Arn.of("ec2", region, account, "instance/" + instance).toString(),
+                AwsArnUtils.Arn.of("ec2", region, account, "network-interface/" + eni).toString());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"grant-before-detach", "detach-before-grant", "grant-before-describe"})
+    void interfacePermissionOperationsShareAttachmentSynchronization(String order) throws Exception {
+        String region = "us-east-1";
+        ParkingStore<NetworkInterface> interfaces = new ParkingStore<>();
+        AccountAwareStorageBackend<NetworkInterface> interfaceStore =
+                new AccountAwareStorageBackend<>(interfaces, null, "000000000000");
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-network-interfaces.json", interfaceStore)));
+        String subnet = publicSubnet(service, region, "10.243.0.0/24");
+        NetworkInterface eni = service.createNetworkInterface(region, subnet, null, "10.243.0.10",
+                List.of(), List.of(), List.of());
+        Instance instance = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null, null).getInstances().getFirst();
+        instance.setState(InstanceState.running());
+        NetworkInterfaceAttachment attachment = service.attachNetworkInterface(region,
+                eni.getNetworkInterfaceId(), instance.getInstanceId(), 1);
+        Runnable grant = () -> service.createNetworkInterfacePermission(region, eni.getNetworkInterfaceId(),
+                "111111111111", null, Ec2Service.INSTANCE_ATTACH);
+        Runnable detach = () -> service.detachNetworkInterface(region, attachment.getAttachmentId(), false);
+        Runnable describe = () -> assertEquals(1, service.describeNetworkInterfacePermissions(
+                region, List.of(), List.of(), null, null).permissions().size());
+        interfaces.parkNextWrite();
+
+        switch (order) {
+            case "grant-before-detach" -> assertOperationWaitsForParkedStore(interfaces, grant, detach);
+            case "detach-before-grant" -> assertOperationWaitsForParkedStore(interfaces, detach, grant);
+            case "grant-before-describe" -> assertOperationWaitsForParkedStore(interfaces, grant, describe);
+            default -> throw new IllegalArgumentException(order);
+        }
+
+        assertEquals(1, service.describeNetworkInterfacePermissions(
+                region, List.of(), List.of(), null, null).permissions().size());
+        if (!"grant-before-describe".equals(order)) {
+            assertNull(eni.getAttachment());
+            assertTrue(instance.getNetworkInterfaces().stream()
+                    .noneMatch(value -> eni.getNetworkInterfaceId().equals(value.getNetworkInterfaceId())));
+        }
     }
 
     @Test

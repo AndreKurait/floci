@@ -1303,10 +1303,44 @@ profile.
 | UnassignIpv6Addresses | Removes the named IPv6 addresses (`Ipv6Addresses.N`) from an interface; `unassignedIpv6Addresses` lists only the ones it held. `Ipv6Prefix` answers `UnsupportedOperation`. |
 | ModifyNetworkInterfaceAttribute | Changes a standalone ENI or an instance's launch-created interface: its security groups (`SecurityGroupId.N`), `Description`, `SourceDestCheck`, or its attachment's `DeleteOnTermination`. On an instance's primary interface the groups and the check are the instance's too. With security-group enforcement on, a group change reaches the interface's firewall before it is stored. The members Floci does not apply (`EnablePrimaryIpv6`, `EnaSrdSpecification`, `ConnectionTrackingSpecification`, `AssociatePublicIpAddress`, `AssociatedSubnetIds`, and the attachment's `DefaultEnaQueueCount` and `EnaQueueCount`) answer `UnsupportedOperation` rather than `true` with nothing changed. |
 | DeleteNetworkInterface | Deletes a standalone ENI. Fails while the ENI is still attached, matching AWS. |
+| CreateNetworkInterfacePermission | The interface's owner grants another account `INSTANCE-ATTACH` over it. `EIP-ASSOCIATE` and `AwsService` are `UnsupportedOperation`. |
+| DescribeNetworkInterfacePermissions | The permissions granted over the caller's interfaces, by `NetworkInterfacePermissionId.N` and the five `network-interface-permission.*` filters; `MaxResults` 5-255, default 50. |
 
 A standalone ENI created via `CreateNetworkInterface` can also be handed to `RunInstances` as an instance's primary interface (`NetworkInterface.1.NetworkInterfaceId` / `NetworkInterface.1.DeviceIndex`) instead of letting the instance create its own implicit one, the pattern Terraform's `aws_instance` resource uses for `network_interface { network_interface_id = ... }`. AWS only allows this for a single instance per launch call; `RunInstances` rejects it otherwise with `InvalidParameterCombination`.
 
 AWS takes one attribute per `ModifyNetworkInterfaceAttribute` call; Floci applies every attribute a call names. A route table's `CreateRoute` with a `NetworkInterfaceId` target is accepted but not recorded, since `Route` does not yet model an ENI target; a subsequent `plan` against such a route may show drift.
+
+#### Network interface permissions
+
+`CreateNetworkInterfacePermission` lets the account that owns an interface grant another account
+`INSTANCE-ATTACH` over it, which `DescribeNetworkInterfacePermissions` lists to the owner. Only the
+owner can grant: another account's interface is `InvalidNetworkInterfaceID.NotFound`, as it is to
+every other action of that account.
+
+A repeated grant of the same permission to the same account answers the grant already in place.
+AWS documents no duplicate error for it; this is Floci's choice. Grants are kept on the interface,
+so they go when it is deleted. `DeleteNetworkInterfacePermission` is not served.
+
+#### Interface and VPC endpoint IAM resources
+
+Resource-tag conditions use each concrete ID-bearing resource ARN's stored tags. The lookup follows the
+ARN's account and Region; an omitted account, as on an image ARN, uses the caller's account.
+An untagged resource does not inherit another resource's tags. Wildcard resources retain their
+existing request context. Name-based resources retain their existing lookup path. Generated tag
+prefixes and per-target checks remain in effect.
+
+
+With IAM enforcement enabled, the generated request-resource catalog checks interface and VPC
+endpoint operations on their resource ARNs. Creating an interface also names its subnet and security
+groups; creating an endpoint also names its VPC, subnets, security groups and route tables.
+`ModifyVpcEndpoint` includes both added and removed resources. Tag requests recognize `eni-` and
+`vpce-` IDs without treating attachment IDs or endpoint-service IDs as those resource types.
+
+`DetachNetworkInterface` resolves the attachment's instance and interface in the caller's account
+and Region, then checks both resources. An attachment that cannot be resolved uses the caller's
+`instance/*` and `network-interface/*` resources for authorization before the service reports it
+missing. `DescribeNetworkInterfaces` and `DescribeNetworkInterfacePermissions` remain checked on
+`*`. These authorization checks do not establish cross-account guest-network attachment support.
 
 ### Volumes
 
