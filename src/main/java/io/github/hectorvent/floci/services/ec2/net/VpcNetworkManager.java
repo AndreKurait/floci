@@ -762,14 +762,20 @@ public class VpcNetworkManager {
     }
 
     /** Unplugs the endpoint {@link #attachInterface} added; nothing when the container holds none. */
-    public void detachInterface(String region, String vpcId, String containerId) {
-        if (!enabled() || isolatesAddressSpaces() || containerId == null) {
+    public void detachInterface(String region, String vpcId, String containerId, String address, String macAddress) {
+        if (!enabled() || isolatesAddressSpaces() || containerId == null || address == null || macAddress == null) {
             return;
         }
         VpcBinding vpc = bindings.get(key(region, vpcId));
         if (vpc == null || !vpc.created) {
             return;
         }
+        ContainerNetwork endpoint = endpoints(containerId).get(vpc.networkName);
+        if (endpoint == null || !address.equals(endpoint.getIpAddress())) {
+            return;
+        }
+        // Docker inspect can retain the original MAC after the guest device has been repaired.
+        NativeVpcAddressSpace.deviceFor(links(containerId), macAddress);
         disconnect(vpc.networkName, containerId);
     }
 

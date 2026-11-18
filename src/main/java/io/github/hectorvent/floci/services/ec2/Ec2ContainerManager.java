@@ -1604,7 +1604,8 @@ public class Ec2ContainerManager {
                 vpcNetworkManager.detachInterfaceAcrossAddressSpaces(instance.getRegion(), eni.getVpcId(), helper,
                         eni.getPrivateIpAddress(), eni.getMacAddress(), interfaceAccount(instance, eni));
             } else {
-                vpcNetworkManager.detachInterface(instance.getRegion(), eni.getVpcId(), networkContainerOf(instance));
+                vpcNetworkManager.detachInterface(instance.getRegion(), eni.getVpcId(), networkContainerOf(instance),
+                        eni.getPrivateIpAddress(), eni.getMacAddress());
             }
         } catch (RuntimeException failure) {
             LOG.warnv("Could not unplug interface {0} from EC2 instance {1}: {2}",

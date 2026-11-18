@@ -26,8 +26,23 @@ import com.github.dockerjava.api.model.Network;
 import com.github.dockerjava.api.model.StreamType;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
+import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
+import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
+import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
+import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.CurrentContainerNetworkResolver;
+import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
+import io.github.hectorvent.floci.core.common.docker.PortAllocator;
+import io.github.hectorvent.floci.services.ec2.ContainerNetworkReachability;
+import io.github.hectorvent.floci.services.ec2.Ec2ContainerManager;
+import io.github.hectorvent.floci.services.ec2.Ec2MetadataServer;
+import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
+import io.github.hectorvent.floci.services.ec2.model.Instance;
+import io.github.hectorvent.floci.services.ec2.model.InstanceNetworkInterface;
+import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
+import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager;
 import io.github.hectorvent.floci.testing.TestTime;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -1138,8 +1153,9 @@ class VpcNetworkManagerTest {
         verify(docker.connectToNetworkCmd(), never()).exec();
     }
 
-    @Test
-    void unpluggingRemovesOnlyTheInterfacesVpcEndpoint() {
+    @ParameterizedTest
+    @ValueSource(strings = {INTERFACE_MAC, DOCKER_MAC})
+    void unpluggingRemovesOnlyTheInterfacesVpcEndpoint(String dockerMac) {
         manager.declareVpc(REGION, "vpc-2", "172.31.0.0/16");
         manager.declareSubnet(REGION, "vpc-2", "subnet-c", "172.31.5.0/24");
         String address = manager.allocatePrivateIp(REGION, "subnet-c").orElseThrow();
@@ -1147,11 +1163,56 @@ class VpcNetworkManagerTest {
         endpointsAcrossConnect(Map.of(), Map.of(networkName, endpointWith(address, INTERFACE_MAC)));
         manager.attachInterface(REGION, "vpc-2", "subnet-c", "helper-1", address, INTERFACE_MAC);
 
-        manager.detachInterface(REGION, "vpc-2", "helper-1");
-        manager.detachInterface(REGION, "vpc-never-created", "helper-1");
+        endpointsAcrossConnect(Map.of(networkName, endpointWith(address, dockerMac)),
+                Map.of(networkName, endpointWith(address, dockerMac)));
+        manager.namespaceCommand = (container, command) -> links(INTERFACE_MAC.toUpperCase());
+        manager.detachInterface(REGION, "vpc-2", "helper-1", address, INTERFACE_MAC);
+        manager.detachInterface(REGION, "vpc-never-created", "helper-1", address, INTERFACE_MAC);
 
         verify(docker.disconnectFromNetworkCmd(), times(1)).withNetworkId(networkName);
         verify(docker.disconnectFromNetworkCmd(), times(1)).exec();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"different address", "different MAC", "missing endpoint"})
+    void recordOnlyDetachPreservesAnUnrelatedSharedEndpoint(String mismatch) {
+        manager.declareVpc(REGION, "vpc-2", "172.31.0.0/16");
+        manager.declareSubnet(REGION, "vpc-2", "subnet-c", "172.31.5.0/24");
+        String address = manager.allocatePrivateIp(REGION, "subnet-c").orElseThrow();
+        String networkName = manager.networkName(REGION, "vpc-2");
+        ContainerNetwork occupied = endpointWith(mismatch.equals("different address") ? "172.31.5.99" : address,
+                DOCKER_MAC);
+        endpointsAcrossConnect(Map.of(networkName, occupied),
+                mismatch.equals("missing endpoint") ? Map.of() : Map.of(networkName, occupied));
+        manager.namespaceCommand = (container, command) -> links(DOCKER_MAC);
+        when(config.services().ec2().nativePeerDependencies()).thenReturn("[]");
+        when(config.services().ec2().vpcNetworks().hotAttachEnabled()).thenReturn(true);
+        Ec2ContainerManager containers = new Ec2ContainerManager(mock(ContainerBuilder.class),
+                mock(ContainerLifecycleManager.class), mock(ContainerLogStreamer.class), mock(ContainerDetector.class),
+                mock(DockerHostResolver.class), docker, mock(PortAllocator.class), config,
+                mock(Ec2MetadataServer.class), mock(Ec2PortForwardManager.class), mock(RegionResolver.class),
+                mock(ContainerNetworkReachability.class), manager, mock(ContainerReachableEndpoint.class),
+                mock(SecurityGroupFirewallManager.class));
+        InstanceNetworkInterface eni = new InstanceNetworkInterface();
+        eni.setNetworkInterfaceId("eni-record-only");
+        eni.setDeviceIndex(1);
+        eni.setVpcId("vpc-2");
+        eni.setSubnetId("subnet-c");
+        eni.setPrivateIpAddress(address);
+        eni.setMacAddress(INTERFACE_MAC);
+        Instance instance = new Instance();
+        instance.setInstanceId("i-guest");
+        instance.setRegion(REGION);
+        instance.setVpcId("vpc-home");
+        instance.setDockerContainerId("helper-1");
+        instance.setNetworkInterfaces(List.of(eni));
+        // Materialise the VPC, but fail the plug because this namespace is already on it.
+        assertThrows(IllegalStateException.class,
+                () -> manager.attachInterface(REGION, "vpc-2", "subnet-c", "helper-1", address, INTERFACE_MAC));
+
+        containers.unplugNetworkInterface(instance, eni);
+
+        verify(docker, never()).disconnectFromNetworkCmd();
     }
 
     private String prepareUncertainAttach() {

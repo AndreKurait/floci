@@ -136,7 +136,7 @@ class Ec2HotAttachInterfaceTest {
 
         manager.unplugNetworkInterface(instanceWith(primary(), attached), attached);
 
-        verify(vpcNetworks).detachInterface(REGION, "vpc-customer", "helper-1");
+        verify(vpcNetworks).detachInterface(REGION, "vpc-customer", "helper-1", "172.31.5.9", MAC);
         verify(vpcNetworks, never()).attachInterface(any(), any(), any(), any(), any(), any());
     }
 
@@ -152,7 +152,7 @@ class Ec2HotAttachInterfaceTest {
 
         verify(vpcNetworks).attachInterface(REGION, "vpc-customer", "subnet-customer", "helper-1", "172.31.5.9", MAC);
         manager.unplugNetworkInterface(instance, attached);
-        verify(vpcNetworks).detachInterface(REGION, "vpc-customer", "helper-1");
+        verify(vpcNetworks).detachInterface(REGION, "vpc-customer", "helper-1", "172.31.5.9", MAC);
     }
 
     @Test
@@ -168,7 +168,7 @@ class Ec2HotAttachInterfaceTest {
         manager.unplugNetworkInterface(instance, attached);
         verify(vpcNetworks, never()).attachInterface(anyString(), anyString(), anyString(), anyString(),
                 anyString(), anyString());
-        verify(vpcNetworks, never()).detachInterface(anyString(), anyString(), anyString());
+        verify(vpcNetworks, never()).detachInterface(anyString(), anyString(), anyString(), anyString(), anyString());
     }
 
     @Test
