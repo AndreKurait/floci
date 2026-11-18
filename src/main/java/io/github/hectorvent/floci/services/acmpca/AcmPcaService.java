@@ -130,6 +130,12 @@ public class AcmPcaService implements Resettable, AcmPrivateCertificateAuthoriti
             throw invalid("Only RootCACertificate/V1, SubordinateCACertificate_PathLen0/V1 to PathLen3/V1 "
                     + "and EndEntityCertificate/V1 templates are supported");
         }
+        Instant now = now();
+        String token = PrivateCaRequests.token(request);
+        IssueToken previous = token == null ? null : authority.issueTokens().get(token);
+        if (previous != null && previous.createdAt().plusSeconds(300).isAfter(now)) {
+            return mapper.createObjectNode().put("CertificateArn", previous.certificateArn());
+        }
         String status = status(authority);
         if (root ? !"PENDING_CERTIFICATE".equals(status) : !"ACTIVE".equals(status)) {
             throw state("The certificate authority is not in a state that permits this certificate template");
@@ -144,12 +150,6 @@ public class AcmPcaService implements Resettable, AcmPrivateCertificateAuthoriti
             if (pathLength != null && pathLength >= parent.getBasicConstraints()) {
                 throw invalid("The template path length must be less than the path length of the issuing CA");
             }
-        }
-        Instant now = now();
-        String token = PrivateCaRequests.token(request);
-        IssueToken previous = token == null ? null : authority.issueTokens().get(token);
-        if (previous != null && previous.createdAt().plusSeconds(300).isAfter(now)) {
-            return mapper.createObjectNode().put("CertificateArn", previous.certificateArn());
         }
         Instant notBefore = PrivateCaRequests.validity(request, now, true);
         Instant notAfter = PrivateCaRequests.validity(request, now, false);
@@ -400,6 +400,22 @@ public class AcmPcaService implements Resettable, AcmPrivateCertificateAuthoriti
         CertificateGenerator.Issuer issuer = new CertificateGenerator.Issuer(
                 PrivateCaCertificates.certificate(authority.certificatePem()), Pem.parsePrivateKey(authority.privateKeyPem()));
         return Optional.of(new PrivateCertificateAuthority(true, issuer, chainOf(authority)));
+    }
+
+    public synchronized Map<String, String> storedTags(String arn) {
+        if (!AwsArnUtils.isArnFor(arn, "acm-pca")) {
+            return Map.of();
+        }
+        AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+        if (!parsed.accountId().equals(regionResolver.getAccountId())
+                || !parsed.resource().startsWith("certificate-authority/")
+                || !parsed.partition().equals(regionResolver.partitionForRegion(parsed.region()))) {
+            return Map.of();
+        }
+        return store.scan(arn::equals).stream()
+                .filter(value -> arn.equals(value.arn()) && owned(value, parsed.region()))
+                .filter(value -> value.restorableUntil() == null || value.restorableUntil().isAfter(now()))
+                .findFirst().map(CertificateAuthority::tags).orElse(Map.of());
     }
 
     private CertificateAuthority authority(JsonNode request, String region) {

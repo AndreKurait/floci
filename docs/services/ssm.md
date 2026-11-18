@@ -259,7 +259,8 @@ undeclared parameters, missing required parameters and values outside
 With IAM enforcement enabled, `StartSession` checks the document ARN (AWS-owned
 documents have an empty account field) and the target's `ec2:...:instance/<id>` or
 `ssm:...:managed-instance/<id>` ARN. `ResumeSession` and `TerminateSession` check
-`ssm:...:session/<session-id>`; `DescribeSessions` and `GetConnectionStatus` check `*`.
+`ssm:...:session/<session-id>`; `GetConnectionStatus` checks the selected node ARN,
+and `DescribeSessions` checks `*`.
 
 The data channel is `/v1/data-channel/{session-id}?role=publish_subscribe` on the
 ssmmessages endpoint. The agent calls `CreateDataChannel` (SigV4, unscoped

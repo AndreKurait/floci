@@ -127,6 +127,46 @@ class IamConditionContextResolverTest {
     }
 
     @Test
+    void privateCaDefaultTemplateUsesDeploymentPartitionForUnknownRegion() {
+        assertPrivateCaTemplate("polygondwanaland-west-1", "{}", "aws-us-gov");
+    }
+
+    @Test
+    void privateCaDefaultTemplateUsesKnownRegionPartition() {
+        assertPrivateCaTemplate("us-east-1", "{}", "aws");
+        assertPrivateCaTemplate("cn-north-1", "{\"TemplateArn\":null}", "aws-cn");
+        assertPrivateCaTemplate("us-gov-west-1", "{}", "aws-us-gov");
+    }
+
+    @Test
+    void privateCaDefaultTemplateUsesConfiguredRegionWhenRequestRegionIsAbsent() {
+        when(config.defaultRegion()).thenReturn("polygondwanaland-west-1");
+        assertPrivateCaTemplate(null, "{}", "aws-us-gov");
+    }
+
+    @Test
+    void privateCaExplicitTemplateIsNotRewritten() {
+        String template = "arn:aws-cn:acm-pca:::template/RootCACertificate/V1";
+        ContainerRequestContext request = mock(ContainerRequestContext.class);
+        when(request.getProperty("floci.bufferedJsonBody"))
+                .thenReturn(json("{\"TemplateArn\":\"" + template + "\"}"));
+        assertEquals(Map.of("acm-pca:TemplateArn", List.of(template)),
+                resolver.resolve("acm-pca", "acm-pca:IssueCertificate", request));
+    }
+
+    private void assertPrivateCaTemplate(String region, String body, String partition) {
+        requestContext.setRegion(region);
+        EmulatorConfig.PartitionsConfig partitions = mock(EmulatorConfig.PartitionsConfig.class);
+        when(config.partitions()).thenReturn(partitions);
+        when(partitions.id()).thenReturn(Optional.of("aws-us-gov"));
+        ContainerRequestContext request = mock(ContainerRequestContext.class);
+        when(request.getProperty("floci.bufferedJsonBody")).thenReturn(json(body));
+        assertEquals(Map.of("acm-pca:TemplateArn", List.of("arn:" + partition
+                        + ":acm-pca:::template/EndEntityCertificate/V1")),
+                resolver.resolve("acm-pca", "acm-pca:IssueCertificate", request));
+    }
+
+    @Test
     void mqCreateReadsUncachedWireTagsAndRestoresTheBody() throws Exception {
         byte[] wire = "{\"name\":\"owned\",\"tags\":{\"owner\":\"one\"}}".getBytes(StandardCharsets.UTF_8);
         ContainerRequestContext ctx = mock(ContainerRequestContext.class);
