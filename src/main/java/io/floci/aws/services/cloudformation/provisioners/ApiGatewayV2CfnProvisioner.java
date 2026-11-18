@@ -826,6 +826,7 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
         req.put("authorizerType", ctx.resolveOptional(props, "AuthorizerType"));
         req.put("identitySource", resolveIdentitySource(props, "IdentitySource", engine));
         req.put("authorizerUri", ctx.resolveOptional(props, "AuthorizerUri"));
+        req.put("authorizerCredentialsArn", ctx.resolveOptional(props, "AuthorizerCredentialsArn"));
         req.put("authorizerPayloadFormatVersion", ctx.resolveOptional(props, "AuthorizerPayloadFormatVersion"));
 
         String ttl = ctx.resolveOptional(props, "AuthorizerResultTtlInSeconds");
@@ -870,6 +871,9 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
                                 ? null : authorizer.getAuthorizerResultTtlInSeconds(),
                         dropped.contains("EnableSimpleResponses")
                                 ? null : authorizer.getEnableSimpleResponses());
+            }
+            if (dropped.contains("AuthorizerCredentialsArn")) {
+                apiGatewayV2Service.replaceAuthorizerCredentials(region, apiId, r.getPhysicalId(), null);
             }
         }
         r.setPhysicalId(authorizer.getAuthorizerId());
@@ -924,6 +928,7 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
         req.put("integrationType", ctx.resolveOptional(props, "IntegrationType"));
         req.put("integrationSubtype", integrationSubtype);
         req.put("integrationUri", ctx.resolveOptional(props, "IntegrationUri"));
+        req.put("credentialsArn", ctx.resolveOptional(props, "CredentialsArn"));
         req.put("payloadFormatVersion", ctx.resolveOrDefault(props, "PayloadFormatVersion",
                 ApiGatewayV2Service.defaultPayloadFormatVersion(integrationSubtype)));
         String connectionType = ctx.resolveOptional(props, "ConnectionType");
@@ -961,8 +966,7 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
             Integration prior = apiGatewayV2Service.getIntegration(region, apiId, r.getPhysicalId());
             r.getAttributes().put(CfnRollback.INTEGRATION_CONNECTION_SNAPSHOT_ATTR,
                     integrationConnectionSnapshot(region, apiId, prior, req));
-            // The connection changes first, in one call. If the update after it fails, the connection
-            // is the only change to undo.
+            // Change the connection first; restore the tracked connection and credentials if a later call fails.
             try {
                 // A connection removed from the template is removed here too. INTERNET is the AWS default.
                 apiGatewayV2Service.replaceIntegrationConnection(region, apiId, r.getPhysicalId(),
@@ -977,6 +981,9 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
                     apiGatewayV2Service.replaceIntegrationSubtype(region, apiId, r.getPhysicalId(), null);
                 }
                 integration = apiGatewayV2Service.updateIntegration(region, apiId, r.getPhysicalId(), req);
+                if (ctx.droppedProperties(props).contains("CredentialsArn")) {
+                    apiGatewayV2Service.replaceIntegrationCredentials(region, apiId, r.getPhysicalId(), null);
+                }
             } catch (RuntimeException failure) {
                 // The stack skips rollbackUpdate for a resource whose own update failed, so undo it here.
                 try {
@@ -1017,6 +1024,7 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
         snapshot.set("requestParameters", objectMapper.valueToTree(prior.getRequestParameters()));
         snapshot.set("requestTemplates", objectMapper.valueToTree(prior.getRequestTemplates()));
         snapshot.put("integrationSubtype", prior.getIntegrationSubtype());
+        snapshot.put("credentialsArn", prior.getCredentialsArn());
         snapshot.put("otherFieldChanged", otherFieldChanged);
         return snapshot.toString();
     }
@@ -1026,7 +1034,7 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
     }
 
     /**
-     * Puts the connection and the settings back from the snapshot taken before the update. Answers
+     * Puts the connection, settings and credentials back from the snapshot taken before the update. Answers
      * true only when the update changed nothing else: this provisioner keeps no copy of the other
      * fields, so the stack must still report that their rollback is not implemented.
      */
@@ -1055,6 +1063,11 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
             apiGatewayV2Service.replaceIntegrationSubtype(snapshot.path("region").asText(),
                     snapshot.path("apiId").asText(), resource.getPhysicalId(),
                     textOrNull(snapshot, "integrationSubtype"));
+        }
+        if (snapshot.has("credentialsArn")) {
+            apiGatewayV2Service.replaceIntegrationCredentials(snapshot.path("region").asText(),
+                    snapshot.path("apiId").asText(), resource.getPhysicalId(),
+                    textOrNull(snapshot, "credentialsArn"));
         }
         // Spent only once the restore succeeded, so a restore that throws can be tried again.
         resource.getAttributes().remove(CfnRollback.INTEGRATION_CONNECTION_SNAPSHOT_ATTR);
