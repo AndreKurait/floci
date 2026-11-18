@@ -686,7 +686,8 @@ public class AcmService implements ResourceProvider {
 
     private void announce(Certificate cert, AcmEventPublisher.Action action) {
         if (events != null && events.isResolvable()) {
-            events.get().available(cert, action, clock.instant());
+            // InUse as DescribeCertificate's InUseBy reports it: recorded consumers and live references.
+            events.get().available(cert, action, clock.instant(), !certificateInUseBy(cert).isEmpty());
         }
     }
 
