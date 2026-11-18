@@ -375,10 +375,11 @@ jobs:
       - name: Start floci
         run: |
           DOCKER_GID=$(stat -c '%g' /var/run/docker.sock)
-          # sdk-test-java's HTTP Task regression calls a MOCK API on http://floci:4566; every
-          # other leg keeps the default rejection of plaintext http:invoke endpoints.
+          # sdk-test-java's HTTP Task regression calls a MOCK API on http://floci:4566, and its
+          # JWT authorizer test serves an issuer over http on a private address. Every other leg
+          # keeps the default rejection of plaintext http:invoke endpoints and private JWT issuers.
           docker run -d --name floci --network compat-net \
-            -p 4566:4566 \
+            -p 127.0.0.1:4566:4566 \
             -v /var/run/docker.sock:/var/run/docker.sock \
             --group-add "$DOCKER_GID" \
             -e FLOCI_BASE_URL=http://floci:4566 \
@@ -388,6 +389,7 @@ jobs:
             -e FLOCI_SERVICES_LAMBDA_HOT_RELOAD_ENABLED=true \
             -e FLOCI_TLS_ENABLED=true \
             -e FLOCI_SERVICES_STEPFUNCTIONS_ALLOW_PLAINTEXT_HTTP=${{ matrix.test == 'sdk-test-java' }} \
+            -e FLOCI_SECURITY_ALLOW_PRIVATE_JWT_TARGETS=${{ matrix.test == 'sdk-test-java' }} \
             -e FLOCI_SERVICES_EC2_MOCK=true \
             -e FLOCI_SERVICES_REDSHIFT_ENDPOINT_HOST=floci \
             -e FLOCI_SERVICES_RDS_ENDPOINT_HOST=floci \
@@ -576,7 +578,7 @@ jobs:
           docker network create compat-net
           cat > start-floci.sh <<'SH'
           docker run -d --name floci --network compat-net \
-            -p 4566:4566 \
+            -p 127.0.0.1:4566:4566 \
             -v /var/run/docker.sock:/var/run/docker.sock \
             --group-add "$(stat -c '%g' /var/run/docker.sock)" \
             -e FLOCI_BASE_URL=http://floci:4566 \
@@ -632,7 +634,7 @@ jobs:
           docker start floci
           bash wait-floci.sh
           # EC2 reconciles its networks when it first starts, which is on its first request.
-          curl -s -o /dev/null -X POST http://localhost:4566/ \
+          curl -s -o /dev/null -X POST http://127.0.0.1:4566/ \
             -H 'Authorization: AWS4-HMAC-SHA256 Credential=test/20260101/us-east-1/ec2/aws4_request, SignedHeaders=host, Signature=0' \
             -d 'Action=DescribeVpcs&Version=2016-11-15'
           docker logs floci 2>&1 | grep 'Reconciled orphaned VPC network'
