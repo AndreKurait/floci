@@ -17,6 +17,8 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/ci.yml
+    with:
+      release-validation: true
 
   build:
     if: github.repository == 'AndreKurait/floci' && github.ref == 'refs/heads/dev'
