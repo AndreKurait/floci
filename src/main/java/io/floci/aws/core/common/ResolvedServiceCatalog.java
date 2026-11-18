@@ -108,6 +108,8 @@ import io.floci.aws.services.ses.SesTemplateController;
 import io.floci.aws.services.ses.SesTenantController;
 import io.floci.aws.services.signer.SignerController;
 import io.floci.aws.services.signin.SigninController;
+import io.floci.aws.services.ssm.SsmDataChannelController;
+import io.floci.aws.services.ssm.SsmMessagesController;
 import io.floci.aws.services.ssooidc.SsoOidcController;
 import io.floci.aws.services.ssoportal.SsoPortalController;
 import io.floci.aws.services.swf.model.SwfConstants;
@@ -654,11 +656,16 @@ public class ResolvedServiceCatalog {
                 descriptor("ec2messages", "ec2messages", config.services().ssm().enabled(), false,
                         null, null, 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
-                        Set.of("AmazonSSMMessageDeliveryService."), Set.of("ec2messages"), Set.of(), Set.of()),
+                        Set.of("AmazonSSMMessageDeliveryService.", "EC2WindowsMessageDeliveryService."), Set.of("ec2messages"), Set.of(), Set.of()),
                 descriptor("ec2-instance-connect", "ec2-instance-connect", config.services().ec2instanceconnect().enabled(), false,
                         null, null, 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),
                         Set.of("AWSEC2InstanceConnectService."), Set.of("ec2-instance-connect"), Set.of(), Set.of()),
+                descriptor("ssmmessages", "ssm", config.services().ssm().enabled(), false,
+                        null, null, 5000L, null, ServiceProtocol.REST_XML,
+                        protocols(ServiceProtocol.REST_XML),
+                        Set.of(), Set.of("ssmmessages"), Set.of(),
+                        Set.of(SsmMessagesController.class, SsmDataChannelController.class)),
                 descriptor("transfer", "transfer", config.services().transfer().enabled(), true,
                         "transfer", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
                         protocols(ServiceProtocol.JSON),

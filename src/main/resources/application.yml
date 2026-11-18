@@ -443,6 +443,7 @@ floci:
   services:
     ssm:
       enabled: true
+      direct-command-execution-enabled: true
       max-parameter-history: 5
     sqs:
       enabled: true

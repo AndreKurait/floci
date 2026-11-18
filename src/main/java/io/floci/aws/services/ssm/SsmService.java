@@ -1619,6 +1619,17 @@ public class SsmService implements ResourceProvider, StoredResourceArns {
                         400));
     }
 
+    static String resolveDocumentVersion(SsmDocument document, String requestedVersion) {
+        String version = requestedVersion;
+        if (version == null || "$DEFAULT".equals(version) || "$LATEST".equals(version)) {
+            version = Long.toString(document.getDocumentVersion());
+        }
+        if (!document.hasRetainedContent(version)) {
+            throw new AwsException("InvalidDocumentVersion", "The document version does not exist.", 400);
+        }
+        return version;
+    }
+
     public SsmDocument getDocument(String name, String region) {
         SsmDocument document = documentStore.get(regionKey(region, name))
                 .orElseThrow(() -> new AwsException("InvalidDocument",
@@ -1646,6 +1657,11 @@ public class SsmService implements ResourceProvider, StoredResourceArns {
         document.setTags(tags);
         documentStore.put(storageKey, document);
         return document;
+    }
+
+    /** The built-in Session documents StartSession starts are owned by AWS; their ARNs have no account. */
+    public static boolean isAwsSessionDocument(String name) {
+        return SsmSessionDocument.isAwsSessionDocument(name);
     }
 
     public SsmDocument updateDocument(String name, String content, String region) {
