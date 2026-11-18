@@ -46,6 +46,7 @@ import io.github.hectorvent.floci.services.ec2.model.NatGateway;
 import io.github.hectorvent.floci.services.ec2.model.NatGatewayAddress;
 import io.github.hectorvent.floci.services.ec2.model.NetworkInterface;
 import io.github.hectorvent.floci.services.ec2.model.NetworkInterfaceAssociation;
+import io.github.hectorvent.floci.services.ec2.model.NetworkInterfaceAttachment;
 import io.github.hectorvent.floci.services.ec2.model.NetworkInterfaceListResult;
 import io.github.hectorvent.floci.services.ec2.model.NetworkInterfacePrivateIpAddress;
 import io.github.hectorvent.floci.services.ec2.model.Placement;
@@ -3074,6 +3075,33 @@ class Ec2ServiceTest {
     }
 
     /** Ec2Service in container mode, with a container manager whose containers answer on loopback. */
+    @Test
+    void attachingAndDetachingAnInterfaceGivesImdsTheInstancesCurrentInterfaces() {
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service service = containerModeService(manager);
+        String region = "us-east-1";
+        String subnetId = publicSubnet(service, region, "10.245.0.0/24");
+        Instance instance = runningContainerInstance(service, region, subnetId, null);
+        NetworkInterface extra = service.createNetworkInterface(region, subnetId, null, null, List.of(), List.of(),
+                List.of());
+
+        NetworkInterfaceAttachment attachment = service.attachNetworkInterface(
+                region, extra.getNetworkInterfaceId(), instance.getInstanceId(), 1);
+
+        ArgumentCaptor<Instance> refreshed = ArgumentCaptor.forClass(Instance.class);
+        verify(manager).refreshInstanceMetadata(refreshed.capture());
+        assertEquals(instance.getInstanceId(), refreshed.getValue().getInstanceId());
+        assertTrue(refreshed.getValue().getNetworkInterfaces().stream().anyMatch(eni ->
+                eni.getDeviceIndex() == 1 && extra.getNetworkInterfaceId().equals(eni.getNetworkInterfaceId())
+                        && extra.getMacAddress().equals(eni.getMacAddress())));
+
+        service.detachNetworkInterface(region, attachment.getAttachmentId(), false);
+
+        verify(manager, times(2)).refreshInstanceMetadata(refreshed.capture());
+        assertTrue(refreshed.getValue().getNetworkInterfaces().stream()
+                .noneMatch(eni -> extra.getNetworkInterfaceId().equals(eni.getNetworkInterfaceId())));
+    }
+
     private static Ec2Service containerModeService() {
         return containerModeService(mock(Ec2ContainerManager.class));
     }

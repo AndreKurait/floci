@@ -96,6 +96,32 @@ class ElbV2DnsRecordSourceTest {
     }
 
     @Test
+    void anUnknownNameInTheLoadBalancerZonesIsNxdomainWithTheAwsForm() {
+        when(service.awsDnsNames()).thenReturn(true);
+        for (String name : List.of("nobody-1234567890.eu-west-1.elb.amazonaws.com",
+                "internal-nobody-1234567890.eu-west-1.elb.amazonaws.com.",
+                "dualstack.nobody-0123456789abcdef.elb.eu-west-1.amazonaws.com",
+                "nobody-1234567890.cn-north-1.elb.amazonaws.com.cn")) {
+            when(service.findByDnsName(name)).thenReturn(List.of());
+            DnsAnswer answer = source.resolveAuthoritative(name, 1, null).orElseThrow();
+            assertTrue(answer.isEmpty(), name);
+            assertEquals(false, answer.nameExists(), name);
+        }
+        for (String name : List.of("elasticloadbalancing.eu-west-1.amazonaws.com", "elb.eu-west-1.amazonaws.com",
+                "nobody.elb.nowhere-1.amazonaws.com", "nobody.elb.example")) {
+            when(service.findByDnsName(name)).thenReturn(List.of());
+            assertTrue(source.resolveAuthoritative(name, 1, null).isEmpty(), name);
+        }
+        verifyNoInteractions(dns);
+    }
+
+    @Test
+    void theDefaultFormIsLeftToTheEmulatorSuffix() {
+        assertTrue(source.resolveAuthoritative("owned.elb.example", 1, null).isEmpty());
+        verifyNoInteractions(dns);
+    }
+
+    @Test
     void nonAddressAliasQueriesAreRefused() {
         assertEquals(5, source.resolveAliasTarget("owned.elb.example", "OWNED", 16).orElseThrow().responseCode());
         verifyNoInteractions(dns);

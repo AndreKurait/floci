@@ -120,13 +120,17 @@ class SecurityGroupFirewallParallelApplyTest extends SecurityGroupFirewallPeerFi
         installed.values().forEach(script -> assertFalse(script.contains("add rule")));
         List<Thread> firstWriter = Collections.synchronizedList(new ArrayList<>());
         Set<String> seen = ConcurrentHashMap.newKeySet();
+        List<String> firstHelpers = Collections.synchronizedList(new ArrayList<>());
         beforeInstall = (helper, script) -> {
             if (seen.add(helper)) {
                 firstWriter.add(Thread.currentThread());
+                firstHelpers.add(helper);
             }
         };
         Thread caller = Thread.currentThread();
         manager.reconcileAll();
+        assertEquals(List.of(helper(0), helper(1), helper(2), helper(3)), firstHelpers,
+                "unknown identities must withdraw in deterministic ENI order");
         assertEquals(4, firstWriter.size());
         firstWriter.forEach(writer -> assertEquals(caller, writer,
                 "an identity unknown at the round boundary must not be promoted to the parallel phase"));

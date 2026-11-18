@@ -1652,15 +1652,26 @@ class ResourceArnBuilderTest {
     }
 
     @Test
-    void sqsJsonNameOperationsIgnoreAnUnrelatedQueueUrlAndOwner() {
+    void sqsJsonNameOperationsIgnoreAnUnrelatedQueueUrl() {
         setJsonBody("""
                 {"QueueName":"orders","QueueUrl":"http://localhost/111122223333/decoy",
                  "QueueOwnerAWSAccountId":"111122223333"}
                 """);
-        for (String operation : List.of("sqs:GetQueueUrl", "sqs:CreateQueue")) {
-            assertEquals(List.of("arn:aws:sqs:us-east-1:" + ACCOUNT + ":orders"),
-                    builder.buildResources("sqs", operation, ctx, "us-east-1", ACCOUNT, "aws"));
-        }
+        // GetQueueUrl selects the named owner's queue, so that queue is authorized; CreateQueue has no owner.
+        assertEquals(List.of("arn:aws:sqs:us-east-1:111122223333:orders"),
+                builder.buildResources("sqs", "sqs:GetQueueUrl", ctx, "us-east-1", ACCOUNT, "aws"));
+        assertEquals(List.of("arn:aws:sqs:us-east-1:" + ACCOUNT + ":orders"),
+                builder.buildResources("sqs", "sqs:CreateQueue", ctx, "us-east-1", ACCOUNT, "aws"));
+    }
+
+    @Test
+    void sqsQueryGetQueueUrlAuthorizesTheNamedOwnersQueue() {
+        setFormBody("Action=GetQueueUrl&QueueName=orders&QueueOwnerAWSAccountId=111122223333");
+        assertEquals(List.of("arn:aws:sqs:us-east-1:111122223333:orders"),
+                builder.buildResources("sqs", "sqs:GetQueueUrl", ctx, "us-east-1", ACCOUNT, "aws"));
+        setFormBody("Action=GetQueueUrl&QueueName=orders&QueueOwnerAWSAccountId=not-an-account");
+        assertEquals(List.of("arn:aws:sqs:us-east-1:" + ACCOUNT + ":orders"),
+                builder.buildResources("sqs", "sqs:GetQueueUrl", ctx, "us-east-1", ACCOUNT, "aws"));
     }
 
     @Test

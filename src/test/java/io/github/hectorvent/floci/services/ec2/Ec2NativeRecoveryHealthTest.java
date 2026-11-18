@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.ContainerExecStubs;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
+import io.github.hectorvent.floci.core.common.docker.ContainerLiveness;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
@@ -78,6 +79,8 @@ class Ec2NativeRecoveryHealthTest {
         when(inspection.getState().getPidLong()).thenReturn(81L);
         when(docker.inspectContainerCmd(CONTAINER).exec()).thenReturn(inspection);
         when(lifecycle.isContainerRunning(CONTAINER)).thenAnswer(ignored -> running.get());
+        when(lifecycle.probeContainer(CONTAINER)).thenAnswer(ignored ->
+                running.get() ? ContainerLiveness.RUNNING : ContainerLiveness.NOT_RUNNING);
         InspectContainerResponse helper = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
         when(helper.getId()).thenReturn("owned-init-helper");
         when(helper.getState().getRunning()).thenReturn(true);

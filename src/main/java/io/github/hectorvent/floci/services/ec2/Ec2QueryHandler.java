@@ -5978,10 +5978,24 @@ public class Ec2QueryHandler {
                     .elem("primary", "true")
                     .raw(associationXml)
                     .end("item")
-                    .end("privateIpAddressesSet")
-                    .end("item");
+                    .end("privateIpAddressesSet");
+            if (!eni.getIpv6Addresses().isEmpty()) {
+                xml.start("ipv6AddressesSet");
+                for (String ipv6Address : eni.getIpv6Addresses()) {
+                    xml.start("item").elem("ipv6Address", ipv6Address).elem("isPrimaryIpv6", "false").end("item");
+                }
+                xml.end("ipv6AddressesSet");
+            }
+            xml.end("item");
         }
         xml.end("networkInterfaceSet");
+        // The instance's IPv6 address is its primary interface's first one, as DescribeInstances reports it.
+        for (InstanceNetworkInterface eni : inst.getNetworkInterfaces()) {
+            if (eni.getDeviceIndex() == 0 && !eni.getIpv6Addresses().isEmpty()) {
+                xml.elem("ipv6Address", eni.getIpv6Addresses().get(0));
+                break;
+            }
+        }
         xml.elem("clientToken", inst.getClientToken());
         if (inst.getStateReasonCode() != null || inst.getStateReasonMessage() != null) {
             xml.start("stateReason")

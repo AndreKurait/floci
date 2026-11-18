@@ -4,6 +4,7 @@ import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.InspectExecResponse;
+import com.github.dockerjava.api.exception.ConflictException;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.Container;
 import com.github.dockerjava.api.model.ContainerNetwork;
@@ -69,6 +70,7 @@ import java.util.stream.Collectors;
 public class SecurityGroupFirewallManager implements DnsClientVpcSource {
 
     private static final Logger LOG = Logger.getLogger(SecurityGroupFirewallManager.class);
+    private static final int MIN_NAMESPACE_SETUP_TIMEOUT_SECONDS = 10;
     private final DockerClient dockerClient;
     private final PolicyWriterJournal policyWriters;
     /** Never reuse a namespace whose remote policy writer has no proven terminal result. */
@@ -322,6 +324,9 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             return;
         }
         try {
+            if (vpcRouting != null && !vpcRouting.isUnsatisfied()) {
+                vpcRouting.get().prepareNamespaceRemoval(helper);
+            }
             lifecycleManager.removeIfExistsStrict(helper);
             synchronized (this) {
                 // Wait for policy batches and observer quarantine to release their writer leases.
@@ -626,12 +631,13 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 // this file, so finish configuring the VPC resolver before admitting any workload.
                 ContainerExec.Result result = ContainerExec.run(dockerClient, helperId, new String[]{
                         "sh", "-c", "printf 'nameserver %s\\noptions ndots:0\\n' \"$1\" > /etc/resolv.conf",
-                        "floci-vpc-dns", resolver}, 10).throwIfTimedOut(helperId);
+                        "floci-vpc-dns", resolver}, namespaceSetupTimeoutSeconds()).throwIfTimedOut(helperId);
                 if (result.exitCode() != 0) {
                     throw new IllegalStateException("Cannot configure namespace DNS: " + result.summary());
                 }
                 ContainerExec.Result routing = ContainerExec.run(dockerClient, helperId,
-                        new String[]{"sh", "-c", VpcResolverRouting.commands(resolver)}, 10).throwIfTimedOut(helperId);
+                        new String[]{"sh", "-c", VpcResolverRouting.commands(resolver)},
+                        namespaceSetupTimeoutSeconds()).throwIfTimedOut(helperId);
                 if (routing.exitCode() != 0) {
                     throw new IllegalStateException("Cannot route the VPC link-local resolver: " + routing.summary());
                 }
@@ -648,6 +654,16 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             }
             throw new IllegalStateException("Cannot prepare protected network namespace for " + resourceId, e);
         }
+    }
+
+    /**
+     * How long a namespace setup command may take. The commands themselves finish in milliseconds,
+     * so only a stalled daemon slows them, and it gets the API timeout every other Docker call gets.
+     * A shorter budget fails the namespace while the command still runs, and these commands are not
+     * safe to run again (the resolver route and its DNAT rules are added, not replaced).
+     */
+    private int namespaceSetupTimeoutSeconds() {
+        return Math.max(MIN_NAMESPACE_SETUP_TIMEOUT_SECONDS, config.docker().apiTimeoutSeconds());
     }
 
     private void ensureHelperImage() {
@@ -1170,7 +1186,10 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 return;
             } catch (RuntimeException failure) {
                 quarantineAll(endpoints.values().stream().map(ProtectedEndpoint::helperId).toList());
-                if (!(failure.getCause() instanceof NotFoundException)) {
+                // Docker answers 404 for a removed helper and 409 for a stopped one that still exists;
+                // either way retiring the helpers that no longer run may let the pass complete.
+                if (!(failure.getCause() instanceof NotFoundException)
+                        && !(failure.getCause() instanceof ConflictException)) {
                     throw failure;
                 }
                 int previousCount = endpoints.size();
@@ -1191,11 +1210,17 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         for (int round = 0; round < 3; round++) {
             List<SecurityGroupNftCompiler.Endpoint> peers = peerEndpoints();
             List<ProtectedEndpoint> order = new ArrayList<>(endpoints.values());
-            order.sort(Comparator.comparing((ProtectedEndpoint target) -> knownByAllPeers(target))
-                    .thenComparing(target -> target.endpoint().eniId()));
+            order.sort(Comparator.comparing(target -> target.endpoint().eniId()));
             // Freeze the partition before any install can teach a peer another identity.
-            List<ProtectedEndpoint> unknown = order.stream().filter(target -> !knownByAllPeers(target)).toList();
-            List<ProtectedEndpoint> stable = order.stream().filter(this::knownByAllPeers).toList();
+            List<ProtectedEndpoint> unknown = new ArrayList<>();
+            List<ProtectedEndpoint> stable = new ArrayList<>();
+            for (ProtectedEndpoint target : order) {
+                if (knownByAllPeers(target)) {
+                    stable.add(target);
+                } else {
+                    unknown.add(target);
+                }
+            }
             boolean changed = false;
             for (ProtectedEndpoint target : unknown) {
                 // Withdraw old accepts before any peer learns a changed identity.

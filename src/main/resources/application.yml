@@ -976,6 +976,7 @@ floci:
       enabled: true
       mock: false
       max-health-check-interval-millis: 0    # Local acceleration only; probe timeouts and success thresholds are unchanged
+      dns-name-strategy: ${FLOCI_SERVICES_ELBV2_DNS_NAME_STRATEGY:floci}
       # single-zone-alb-accounts: 123456789012   # Opt-in: these accounts' ALBs may use one Availability Zone (local single-zone setups)
       alb-zone-rule: ${FLOCI_SERVICES_ELBV2_ALB_ZONE_RULE:aws}
       # Per-region entries override this global setting, including an explicit aws reset.

@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.services.ec2;
 
 import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.exception.ConflictException;
 import com.github.dockerjava.api.model.Container;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
@@ -23,6 +24,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anyMap;
@@ -221,6 +223,49 @@ class SecurityGroupFirewallRetirementTest {
         verify(fixture.lifecycle, never()).removeIfExistsStrict(fixture.helper(2));
         assertFalse(fixture.installed.get(fixture.helper(2)).contains("172.18.0.2"));
         assertFalse(fixture.installed.get(fixture.helper(2)).contains("172.18.0.3"));
+    }
+
+    /**
+     * A helper container that has stopped but still exists answers Docker's exec with 409 "is not
+     * running", not 404. While another instance retires, that helper must be retired as a removed one
+     * is, and the surviving peers must end with their complete policies, not flushed chains.
+     */
+    @Test
+    void aHelperThatStopsDuringAnotherRetirementIsRetiredAndThePeersKeepTheirPolicies() {
+        SecurityGroupFirewallPeerFixture fixture = fixture();
+        SecurityGroupFirewallManager manager = fixture.manager();
+        for (int index = 0; index < 4; index++) {
+            manager.register(fixture.endpoint(index), fixture.helper(index), Map.of());
+        }
+        fixture.assertFinal(4);
+        fixture.beforeInstall = (helper, script) -> {
+            if (helper.equals(fixture.helper(1))) {
+                fixture.stoppedHelpers.add(helper);
+                throw new ConflictException("container " + helper + " is not running");
+            }
+        };
+
+        RuntimeException failure = null;
+        try {
+            manager.unregister("eni-3");
+        } catch (RuntimeException e) {
+            failure = e;
+        }
+
+        for (int index : new int[]{0, 2}) {
+            String survivor = fixture.helper(index);
+            assertFalse(QUARANTINE.equals(fixture.installed.get(survivor)),
+                    "helper " + index + " was left flushed because another helper stopped");
+        }
+        assertNull(failure, "the retirement failed because another helper stopped");
+        for (int index : new int[]{0, 2}) {
+            String survivor = fixture.helper(index);
+            assertFalse(fixture.installed.get(survivor).contains(" 172.18.0.3 "),
+                    "helper " + index + " still enforces the stopped helper's address");
+            assertFalse(fixture.installed.get(survivor).contains(" 172.18.0.5 "),
+                    "helper " + index + " still enforces the retired instance's address");
+        }
+        assertTrue(fixture.violations.isEmpty(), () -> String.join("\n", fixture.violations));
     }
 
     private static List<Throwable> retireTogether(SecurityGroupFirewallPeerFixture fixture,

@@ -191,6 +191,16 @@ public class CloudWatchMetricsService {
      */
     public void publishMetricForAccount(String accountId, String namespace, MetricDatum datum,
                                         String region, String publicationId) {
+        publishRepeatedMetricForAccount(accountId, namespace, datum, region, publicationId, 1);
+    }
+
+    /** Replace one internal publication with repeated identical samples, retaining recoverable percentiles. */
+    public void publishRepeatedMetricForAccount(String accountId, String namespace, MetricDatum datum,
+                                                String region, String publicationId, double sampleCount) {
+        if (!(sampleCount > 0) || !Double.isFinite(sampleCount)
+                || !Double.isFinite(datum.getValue() * sampleCount)) {
+            throw new IllegalArgumentException("Repeated publication requires a positive finite count and finite sum");
+        }
         if (accountId == null || accountId.isBlank() || publicationId == null || publicationId.isBlank()) {
             throw new IllegalArgumentException("Internal publication requires an explicit account and publication ID");
         }
@@ -201,8 +211,8 @@ public class CloudWatchMetricsService {
         sample.setDimensions(List.copyOf(datum.getDimensions()));
         sample.setTimestamp(datum.getTimestamp());
         sample.setValue(datum.getValue());
-        sample.setSampleCount(1);
-        sample.setSum(datum.getValue());
+        sample.setSampleCount(sampleCount);
+        sample.setSum(datum.getValue() * sampleCount);
         sample.setMinimum(datum.getValue());
         sample.setMaximum(datum.getValue());
         storeDatum(accountId, namespace, sample, region, "publication-" + publicationId);
@@ -362,7 +372,8 @@ public class CloudWatchMetricsService {
             if (parts.length < 6) return false;
             try {
                 long ts = Long.parseLong(parts[parts.length - 2]);
-                return ts >= startEpoch && ts <= endEpoch;
+                return ts >= startEpoch && (endTime == null || ts < endEpoch
+                        || ts == endEpoch && endTime.getNano() > 0);
             } catch (NumberFormatException e) {
                 return false;
             }
@@ -462,7 +473,7 @@ public class CloudWatchMetricsService {
         return plan.evaluate(startTime, endTime, stat -> {
             Map<Instant, Double> values = new LinkedHashMap<>();
             for (Datapoint point : getMetricStatistics(stat.namespace(), stat.metricName(), stat.dimensions(),
-                    startTime, endTime.minusNanos(1), stat.period(), List.of(stat.stat()), stat.unit(), region)) {
+                    startTime, endTime, stat.period(), List.of(stat.stat()), stat.unit(), region)) {
                 values.put(point.timestamp(), resolveStatValue(point, stat.stat()));
             }
             return values;

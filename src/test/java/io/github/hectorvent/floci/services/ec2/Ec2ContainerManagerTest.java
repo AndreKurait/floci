@@ -38,6 +38,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.ContainerExecStubs;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
+import io.github.hectorvent.floci.core.common.docker.ContainerLiveness;
 import io.github.hectorvent.floci.core.common.docker.ContainerLogStreamer;
 import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.core.common.docker.ContainerSpec;
@@ -268,6 +269,82 @@ class Ec2ContainerManagerTest {
             assertEquals(TestTime.DEFAULT_START.plusMillis(retried ? 1_500 : 500), time.now());
             assertEquals(time.clock().millis(), instance.getTerminatedAt());
         } finally {
+            manager.stop();
+        }
+    }
+
+    @Test
+    void terminationWaitsForPeerRefreshBeforeReportingItsAddressReusable() throws Exception {
+        DockerClient docker = mock(DockerClient.class);
+        SecurityGroupFirewallManager firewall = mock(SecurityGroupFirewallManager.class);
+        when(firewall.enabled()).thenReturn(true);
+        ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.port()).thenReturn(4566);
+        when(config.docker().resourceNamespace()).thenReturn(Optional.empty());
+        VpcNetworkManager vpc = mock(VpcNetworkManager.class);
+        TestTime time = TestTime.create();
+        Ec2ContainerManager manager = new Ec2ContainerManager(
+                mock(ContainerBuilder.class), lifecycle,
+                mock(ContainerLogStreamer.class), mock(ContainerDetector.class),
+                mock(DockerHostResolver.class), docker, mock(PortAllocator.class), config,
+                mock(Ec2MetadataServer.class), mock(Ec2PortForwardManager.class), mock(RegionResolver.class),
+                mock(ContainerNetworkReachability.class), vpc,
+                mock(ContainerReachableEndpoint.class), firewall, new Ec2InstanceTypeCatalog(),
+                timelinePause(time), time.newScheduler(), time::nanoTime, time.clock());
+        Instance instance = leasedInstance("i-slow-peer-refresh");
+        instance.setDockerContainerId(TEST_CONTAINER_ID);
+        InstanceNetworkInterface eni = new InstanceNetworkInterface();
+        eni.setNetworkInterfaceId("eni-slow-peer-refresh");
+        instance.setNetworkInterfaces(new ArrayList<>(List.of(eni)));
+        RemoveContainerCmd remove = mock(RemoveContainerCmd.class, RETURNS_SELF);
+        when(docker.removeContainerCmd(TEST_CONTAINER_ID)).thenReturn(remove);
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        InspectContainerResponse inspected = inspectResponse("172.18.0.12");
+        when(inspected.getHostConfig()).thenReturn(
+                HostConfig.newHostConfig().withNetworkMode("container:" + TEST_HELPER_ID));
+        when(inspect.exec()).thenReturn(inspected);
+        when(docker.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
+        InspectContainerCmd inspectHelper = mock(InspectContainerCmd.class);
+        InspectContainerResponse helper = inspectResponse("172.18.0.12");
+        when(helper.getConfig()).thenReturn(new ContainerConfig().withLabels(Map.of(
+                "io.floci.security-group.helper", "true",
+                "io.floci.service", "ec2",
+                "io.floci.resource-id", instance.getInstanceId(),
+                "io.floci.owner", "4566")));
+        when(inspectHelper.exec()).thenReturn(helper);
+        when(docker.inspectContainerCmd(TEST_HELPER_ID)).thenReturn(inspectHelper);
+        CountDownLatch refreshing = new CountDownLatch(1);
+        CountDownLatch finishRefresh = new CountDownLatch(1);
+        when(firewall.captureUnregister("eni-slow-peer-refresh")).thenReturn(() -> {
+            refreshing.countDown();
+            try {
+                assertTrue(finishRefresh.await(10, TimeUnit.SECONDS));
+            } catch (InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException(interrupted);
+            }
+        });
+        CountDownLatch completed = new CountDownLatch(1);
+        try {
+            manager.terminate(instance, completed::countDown);
+            assertTrue(refreshing.await(5, TimeUnit.SECONDS), "The peer refresh must start");
+
+            assertEquals("shutting-down", instance.getState().getName(),
+                    "Termination must not report address reuse before peer cleanup finishes");
+            assertEquals(0, instance.getTerminatedAt());
+            verify(vpc, never()).releasePrivateIp(any(), any(), any());
+            verify(lifecycle, never()).removeIfExistsStrict(TEST_HELPER_ID);
+            assertEquals(1, completed.getCount());
+
+            finishRefresh.countDown();
+            assertTrue(completed.await(5, TimeUnit.SECONDS), "Container teardown must finish");
+            verify(lifecycle).removeIfExistsStrict(TEST_HELPER_ID);
+            verify(vpc).releasePrivateIp("us-west-2", "subnet-lease", "10.0.1.10");
+            assertEquals("terminated", instance.getState().getName());
+            assertEquals(time.clock().millis(), instance.getTerminatedAt());
+        } finally {
+            finishRefresh.countDown();
             manager.stop();
         }
     }
@@ -2274,6 +2351,25 @@ class Ec2ContainerManagerTest {
         }
     }
 
+    @Test
+    void unknownContainerProbeDoesNotReportAnExitedEc2Guest() {
+        LaunchHarness harness = launchHarness();
+        Instance guest = instance("i-health-probe");
+        guest.setDockerContainerId(TEST_CONTAINER_ID);
+        guest.setState(InstanceState.running());
+        when(harness.lifecycleManager.isContainerRunning(TEST_CONTAINER_ID)).thenReturn(false);
+        doReturn(ContainerLiveness.UNKNOWN, ContainerLiveness.RUNNING, ContainerLiveness.NOT_RUNNING)
+                .when(harness.lifecycleManager).probeContainer(TEST_CONTAINER_ID);
+        try {
+            assertThrows(IllegalStateException.class, () -> harness.manager.isContainerRunning(guest));
+            assertTrue(harness.manager.isContainerRunning(guest));
+            assertFalse(harness.manager.isContainerRunning(guest));
+            assertEquals("running", guest.getState().getName());
+        } finally {
+            harness.manager.stop();
+        }
+    }
+
     private static final String TEST_INIT_HELPER_ID = "native-init-helper";
 
     @Test
@@ -2912,17 +3008,28 @@ class Ec2ContainerManagerTest {
 
     @Test
     void launchTerminatesBeforeCleanupFailure() throws Exception {
-        LaunchHarness harness = launchHarness();
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
         when(harness.lifecycleManager.startCreated(eq(TEST_CONTAINER_ID), any(ContainerSpec.class)))
                 .thenThrow(new RuntimeException("Docker daemon unavailable"));
-        doThrow(new RuntimeException("port-forward cleanup failed"))
-                .when(harness.portForwardManager).unpublishAll(any(Instance.class));
-
         Instance instance = instance("i-cleanup-failure");
-        harness.manager.launch(instance, "ubuntu:24.04", null, "us-west-2");
-
-        awaitUntil(() -> "terminated".equals(instance.getState().getName()), Duration.ofSeconds(2));
-        verify(harness.portForwardManager).unpublishAll(instance);
+        AtomicReference<String> stateAtCleanup = new AtomicReference<>();
+        doAnswer(invocation -> {
+            stateAtCleanup.compareAndSet(null, instance.getState().getName());
+            throw new RuntimeException("port-forward cleanup failed");
+        }).when(harness.portForwardManager).unpublishAll(instance);
+        try {
+            harness.manager.launch(instance, "ubuntu:24.04", null, "us-west-2");
+            executor.shutdown();
+            assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS), "launch worker should finish");
+            verify(harness.portForwardManager).unpublishAll(instance);
+            assertEquals("terminated", stateAtCleanup.get(),
+                    "the instance must become terminated before cleanup can fail");
+            assertEquals("terminated", instance.getState().getName());
+        } finally {
+            executor.shutdownNow();
+            harness.manager.stop();
+        }
     }
 
     @Test
@@ -3543,8 +3650,9 @@ class Ec2ContainerManagerTest {
         }
     }
 
-    @Test
-    void aRebootingInstanceCountsAsRunningWhileDockerRestartsIt() throws Exception {
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void aRebootingInstanceCountsAsRunningWhileDockerRestartsIt(boolean indeterminate) throws Exception {
         ExecutorService executor = Executors.newSingleThreadExecutor();
         LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(1));
         RestartContainerCmd restart = mock(RestartContainerCmd.class);
@@ -3558,6 +3666,8 @@ class Ec2ContainerManagerTest {
         });
         // Between Docker's stop and start the container is not running.
         when(harness.lifecycleManager.isContainerRunning(TEST_CONTAINER_ID)).thenReturn(false);
+        doReturn(indeterminate ? ContainerLiveness.UNKNOWN : ContainerLiveness.NOT_RUNNING)
+                .when(harness.lifecycleManager).probeContainer(TEST_CONTAINER_ID);
         InspectContainerCmd inspect = mock(InspectContainerCmd.class);
         when(harness.dockerClient.inspectContainerCmd(TEST_CONTAINER_ID)).thenReturn(inspect);
         InspectContainerResponse response = inspectResponse("172.18.0.99");
@@ -3570,10 +3680,16 @@ class Ec2ContainerManagerTest {
             assertTrue(entered.await(5, TimeUnit.SECONDS));
             assertTrue(harness.manager.isContainerRunning(guest),
                     "Auto Scaling must not replace an instance while EC2 reboots it");
+            verify(harness.lifecycleManager, never()).probeContainer(TEST_CONTAINER_ID);
             release.countDown();
             executor.shutdown();
             assertTrue(executor.awaitTermination(5, TimeUnit.SECONDS));
-            assertFalse(harness.manager.isContainerRunning(guest), "Once the reboot is over Docker answers again");
+            if (indeterminate) {
+                assertThrows(IllegalStateException.class, () -> harness.manager.isContainerRunning(guest),
+                        "an unknown probe must remain indeterminate after the reboot");
+            } else {
+                assertFalse(harness.manager.isContainerRunning(guest), "Once the reboot is over Docker answers again");
+            }
             assertEquals("running", guest.getState().getName());
         } finally {
             release.countDown();
@@ -3641,6 +3757,9 @@ class Ec2ContainerManagerTest {
         ContainerLifecycleManager lifecycleManager = mock(ContainerLifecycleManager.class);
         when(lifecycleManager.create(any(ContainerSpec.class))).thenReturn(TEST_CONTAINER_ID);
         when(lifecycleManager.isContainerRunning(TEST_CONTAINER_ID)).thenReturn(true);
+        lenient().when(lifecycleManager.probeContainer(TEST_CONTAINER_ID)).thenAnswer(ignored ->
+                lifecycleManager.isContainerRunning(TEST_CONTAINER_ID)
+                        ? ContainerLiveness.RUNNING : ContainerLiveness.NOT_RUNNING);
 
         DockerHostResolver dockerHostResolver = mock(DockerHostResolver.class);
         when(dockerHostResolver.resolve()).thenReturn("floci");

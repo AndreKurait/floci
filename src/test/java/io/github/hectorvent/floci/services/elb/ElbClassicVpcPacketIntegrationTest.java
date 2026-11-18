@@ -155,7 +155,7 @@ class ElbClassicVpcPacketIntegrationTest {
     void frontendIngressControlsTlsBeforeAnyBackendRequestAndUsesTheLoadBalancerAsBackendPeer() throws Exception {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
         String vpc = ec2.createVpc(request -> request.cidrBlock("10.88.0.0/16")).vpc().vpcId();
-        cleanup.addFirst(() -> ec2.deleteVpc(request -> request.vpcId(vpc)));
+        cleanup.addFirst(() -> deleteVpc(ec2, vpc));
         String subnet = ec2.createSubnet(request -> request.vpcId(vpc).cidrBlock("10.88.1.0/24"))
                 .subnet().subnetId();
         cleanup.addFirst(() -> ec2.deleteSubnet(request -> request.subnetId(subnet)));
@@ -264,6 +264,14 @@ class ElbClassicVpcPacketIntegrationTest {
         assertTrue(dns.resolveIpv4(hostname).isEmpty());
         assertTrue(ec2.describeNetworkInterfaces(request -> request.filters(filter ->
                 filter.name("description").values("Classic ELB " + name))).networkInterfaces().isEmpty());
+    }
+
+    void deleteVpc(Ec2Client client, String vpc) {
+        client.deleteVpc(request -> request.vpcId(vpc));
+        await("Packet VPC network removal").atMost(Duration.ofSeconds(30)).until(() ->
+                docker.listNetworksCmd().withFilter("label", List.of(
+                        ContainerStorageHelper.OWNER_LABEL + "=" + ContainerStorageHelper.ownerIdentity(config),
+                        ContainerStorageHelper.RESOURCE_ID_LABEL + "=" + vpc)).exec().isEmpty());
     }
 
     boolean healthy(String name, String instance) {

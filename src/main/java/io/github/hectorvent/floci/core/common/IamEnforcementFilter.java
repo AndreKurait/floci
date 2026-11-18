@@ -32,6 +32,7 @@ import io.github.hectorvent.floci.services.iam.StsSessionTags;
 import io.github.hectorvent.floci.services.iam.StsSourceIdentity;
 import io.github.hectorvent.floci.services.iam.model.CallerContext;
 import io.github.hectorvent.floci.services.iam.model.IamRole;
+import io.github.hectorvent.floci.services.kms.KmsService;
 import io.github.hectorvent.floci.services.memorydb.MemoryDbParameterGroupTarget;
 import io.github.hectorvent.floci.services.s3.S3ObjectActions;
 import io.github.hectorvent.floci.services.s3.S3ScratchSpace;
@@ -1502,6 +1503,11 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 if (decision != Decision.DENY) {
                     continue;
                 }
+                if (grantDecidesForeignKmsKey(credentialScope, action, resource, accountId)
+                        && !evaluator.deniesExplicitly(caller, action, resource, effectiveContext)) {
+                    // The KMS handler admits this request only through a grant on the key.
+                    continue;
+                }
                 LOG.infov("IAM enforcement DENY: akid={0} action={1} resource={2}", akid, action, resource);
                 String denyMessage = "User: " + AwsArnUtils.Arn.global(requestPartition(), "iam", accountId, "user/" + akid)
                         + " is not authorized to perform: " + action
@@ -1513,6 +1519,25 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             }
         }
         return false;
+    }
+
+    /**
+     * A KMS operation a grant can admit, on another account's key. KMS authorizes such a request
+     * through the key's grants, which need no identity policy in the caller's account: "users and
+     * roles in the external account cannot use the KMS key until you attach IAM policies that
+     * delegate those permissions, or use grants to manage access to the KMS key" (KMS Developer
+     * Guide, key-policy-modifying-external-accounts). The KMS handler checks the grant where the key
+     * lives and refuses without one; explicit denies are checked here and still win.
+     */
+    private static boolean grantDecidesForeignKmsKey(String credentialScope, String action, String resource,
+                                                     String accountId) {
+        if (!"kms".equals(credentialScope) || action == null || !action.startsWith("kms:")
+                || !KmsService.GRANT_ACTIONS.contains(action.substring("kms:".length()))
+                || resource == null || !AwsArnUtils.isArnFor(resource, "kms")) {
+            return false;
+        }
+        AwsArnUtils.Arn arn = AwsArnUtils.parse(resource);
+        return arn.resource().startsWith("key/") && !arn.accountId().equals(accountId);
     }
 
     /**

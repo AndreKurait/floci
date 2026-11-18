@@ -436,15 +436,24 @@ public class ContainerLifecycleManager implements ContainerTeardown {
                 try {
                     existing = findByNameStrict(spec.name());
                 } catch (RuntimeException lookupFailure) {
-                    // An unreadable inventory is not evidence that creation is still pending.
+                    // An unreadable inventory is not evidence that creation is still pending. The
+                    // stall that lost the create response can make the full list fail while the one
+                    // name still inspects, so adopt this call's own container if the name shows it.
                     e.addSuppressed(lookupFailure);
+                    Optional<String> own = ownContainerNamed(spec.name(), spec, createAttemptId);
+                    if (own.isPresent() && !Thread.currentThread().isInterrupted()) {
+                        LOG.infov("Create for {0} hit a name conflict and listing containers failed; "
+                                + "inspecting the name found this call''s container, adopting {1}",
+                                spec.name(), own.get());
+                        return own.get();
+                    }
                     throw e;
                 }
                 if (Thread.currentThread().isInterrupted()) {
                     break;
                 }
                 if (existing.isPresent()) {
-                    if (matchesSpec(existing.get(), spec, createAttemptId)) {
+                    if (matchesSpec(existing.get().getLabels(), spec, createAttemptId)) {
                         LOG.infov("Create for {0} hit a name conflict; an earlier attempt''s response "
                                 + "was lost but the container exists, adopting {1}",
                                 spec.name(), existing.get().getId());
@@ -573,17 +582,37 @@ public class ContainerLifecycleManager implements ContainerTeardown {
      * one part of the label set a different concurrent call could never coincidentally reproduce,
      * and on its own sufficient proof of ownership.
      *
-     * <p>Deliberately does NOT compare the image. The list API reports {@code getImage()} as an
-     * image ID/digest rather than the tag once that tag has been re-pulled, retagged, or removed, so
+     * <p>Deliberately does NOT compare the image. Docker reports a container's image as an image
+     * ID/digest rather than the tag once that tag has been re-pulled, retagged, or removed, so
      * a tag comparison would reject this call's own container and leak it untracked, the failure
      * this recovery exists to prevent, arising precisely under the daemon churn that makes a lost
      * create response likely. The attempt-id match already excludes every foreign container.
      */
-    private boolean matchesSpec(Container existing, ContainerSpec spec, String createAttemptId) {
+    private boolean matchesSpec(Map<String, String> actualLabels, ContainerSpec spec, String createAttemptId) {
         Map<String, String> expectedLabels = mergedLabels(spec.labels());
         expectedLabels.put(CREATE_ATTEMPT_LABEL, createAttemptId);
-        Map<String, String> actualLabels = existing.getLabels();
         return actualLabels != null && actualLabels.entrySet().containsAll(expectedLabels.entrySet());
+    }
+
+    /**
+     * The id of this call's own container under {@code name}, found by inspecting the name itself:
+     * one read that the transport replays like any other, so it can still answer when listing every
+     * container fails. Empty when the name is absent, foreign or cannot be inspected; an inspect
+     * failure is logged rather than suppressed, because the list failure already explains the conflict.
+     */
+    private Optional<String> ownContainerNamed(String name, ContainerSpec spec, String createAttemptId) {
+        try {
+            InspectContainerResponse inspect = dockerClient.inspectContainerCmd(name).exec();
+            ContainerConfig containerConfig = inspect.getConfig();
+            Map<String, String> labels = containerConfig == null ? null : containerConfig.getLabels();
+            return matchesSpec(labels, spec, createAttemptId) ? Optional.ofNullable(inspect.getId()) : Optional.empty();
+        } catch (NotFoundException e) {
+            return Optional.empty();
+        } catch (RuntimeException e) {
+            LOG.warnv("Create for {0} hit a name conflict, and inspecting that name failed: {1}",
+                    name, e.getMessage());
+            return Optional.empty();
+        }
     }
 
     /**

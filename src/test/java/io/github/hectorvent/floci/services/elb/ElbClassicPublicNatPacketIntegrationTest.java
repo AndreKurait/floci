@@ -250,7 +250,7 @@ class ElbClassicPublicNatPacketIntegrationTest extends ElbClassicVpcPacketIntegr
 
     Network network(Ec2Client client, String cidr, String publicCidr) {
         String vpc = client.createVpc(request -> request.cidrBlock(cidr)).vpc().vpcId();
-        cleanup.addFirst(() -> client.deleteVpc(request -> request.vpcId(vpc)));
+        cleanup.addFirst(() -> deleteVpc(client, vpc));
         String subnet = subnet(client, vpc, publicCidr);
         String gateway = client.createInternetGateway().internetGateway().internetGatewayId();
         cleanup.addFirst(() -> client.deleteInternetGateway(request -> request.internetGatewayId(gateway)));

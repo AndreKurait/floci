@@ -37,6 +37,7 @@ import java.util.List;
 import java.util.UUID;
 
 import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.emptyString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItem;
@@ -1247,10 +1248,12 @@ class KmsIntegrationTest {
                 .statusCode(400)
                 .body("__type", equalTo("NotFoundException"))
                 .body("message", equalTo("Alias " + ownerAliasArn + " is not found."));
+        // Another account's existing key, with no grant to this caller: AWS refuses access to it
+        // (only a grant can admit it here, as no key policy is evaluated).
         kmsAs(caller, "DescribeKey", "{\"KeyId\":\"%s\"}".formatted(ownerKeyArn)).then()
                 .statusCode(400)
-                .body("__type", equalTo("NotFoundException"))
-                .body("message", equalTo("Key '" + ownerKeyArn + "' does not exist"));
+                .body("__type", equalTo("AccessDeniedException"))
+                .body("message", containsString("kms:DescribeKey on resource: " + ownerKeyArn));
         kmsAs(caller, "DescribeKey", "{\"KeyId\":\"%s\"}".formatted(callerAliasArn)).then()
                 .statusCode(200)
                 .body("KeyMetadata.Arn", equalTo(callerKeyArn));

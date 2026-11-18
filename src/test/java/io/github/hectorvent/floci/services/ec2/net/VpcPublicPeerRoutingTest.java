@@ -6,6 +6,7 @@ import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.ExecCreateCmd;
 import com.github.dockerjava.api.command.ExecCreateCmdResponse;
 import com.github.dockerjava.api.command.InspectContainerCmd;
+import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.exception.ConflictException;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.Container;
@@ -20,6 +21,8 @@ import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.NetworkNamespaceLease;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.SecurityGroupDnsFixture;
+import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler;
 import io.github.hectorvent.floci.services.ec2.model.InternetGateway;
 import io.github.hectorvent.floci.services.ec2.model.InternetGatewayAttachment;
@@ -250,6 +253,114 @@ class VpcPublicPeerRoutingTest {
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
+    void failedPolicyExecWithdrawsAHelperStoppedDuringTheCommand(boolean absent) {
+        admit("first", 2, true);
+        admit("second", 3, true);
+        InspectContainerResponse inspection = docker.inspectContainerCmd("second").exec();
+        AtomicBoolean commandFailed = new AtomicBoolean();
+        when(inspection.getState().getRunning()).thenAnswer(invocation -> !commandFailed.get());
+        when(docker.inspectContainerCmd("second").exec()).thenAnswer(invocation -> {
+            if (absent && commandFailed.get()) {
+                throw new NotFoundException("namespace removed during exec");
+            }
+            return inspection;
+        });
+        when(docker.inspectExecCmd("second-exec").exec().getExitCodeLong()).thenAnswer(invocation -> {
+            commandFailed.set(true);
+            return 137L;
+        });
+        gateway.setAttachments(List.of());
+
+        assertDoesNotThrow(manager::reconcile);
+
+        assertTrue(commandFailed.get(), "The helper must stop after its routing command starts");
+        assertEquals(Set.of("172.18.0.2"), manager.publicInstanceAddresses());
+        assertTrue(latest("first").contains("accept"), "The healthy helper must retain its local route policy");
+        assertFalse(latest("first").contains("via 240.0.0.3"));
+        verify(docker, never()).stopContainerCmd("first");
+        verify(docker, never()).startContainerCmd("second");
+        verify(docker, never()).removeContainerCmd("second");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void failedPolicyExecStillFailsForRunningOrIndeterminateHelpers(boolean indeterminate) {
+        admit("first", 2, true);
+        admit("second", 3, true);
+        when(docker.inspectContainerCmd("second").exec().getState().getRunning())
+                .thenReturn(indeterminate ? null : true);
+        when(docker.inspectExecCmd("second-exec").exec().getExitCodeLong()).thenReturn(137L);
+        gateway.setAttachments(List.of());
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class, manager::reconcile);
+
+        assertTrue(failure.getMessage().startsWith("Cannot reconcile native VPC routing:"));
+        assertEquals(Set.of("172.18.0.2", "172.18.0.3"), manager.publicInstanceAddresses());
+        assertFalse(latest("first").contains("accept"), "An unconfirmed exec failure must retain quarantine");
+        assertFalse(latest("second").contains("accept"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"single", "batch", "strict"})
+    void routeUpdatesExcludeHelpersWhoseOwnerHasStartedRemoval(String removal) {
+        SecurityGroupFirewallManager firewall = SecurityGroupDnsFixture.manager(
+                mock(DockerClient.class), config, lifecycle, manager);
+        admit("first", 2, true);
+        admit("second", 3, true);
+        firewall.register(identity("second", 3), "second", Map.of());
+        AtomicBoolean removalStarted = new AtomicBoolean();
+        doAnswer(invocation -> {
+            removalStarted.set(true);
+            // Docker can still report RUNNING while removal interrupts a namespace exec.
+            when(docker.inspectExecCmd("second-exec").exec().getExitCodeLong()).thenReturn(137L);
+            gateway.setAttachments(List.of());
+
+            assertDoesNotThrow(manager::reconcile);
+            assertTrue(docker.inspectContainerCmd("second").exec().getState().getRunning());
+            assertEquals(Set.of("172.18.0.2"), manager.publicInstanceAddresses());
+            assertTrue(latest("first").contains("accept"), "The surviving helper keeps its local routes");
+            assertFalse(latest("first").contains("via 240.0.0.3"));
+            missing("second");
+            return null;
+        }).when(lifecycle).removeIfExistsStrict("second");
+
+        switch (removal) {
+            case "single" -> firewall.unregister("second");
+            case "batch" -> firewall.unregisterAll(List.of("second"));
+            case "strict" -> firewall.removeNamespaceStrict("second");
+            default -> fail("Unknown removal path");
+        }
+
+        assertTrue(removalStarted.get());
+        verify(lifecycle).removeIfExistsStrict("second");
+        verify(docker, never()).stopContainerCmd("first");
+    }
+
+    @Test
+    void failedRouteWithdrawalRetainsOwnerCleanupAndRetriesBeforeRemovingItsHelper() {
+        SecurityGroupFirewallManager firewall = SecurityGroupDnsFixture.manager(
+                mock(DockerClient.class), config, lifecycle, manager);
+        admit("first", 2, true);
+        admit("second", 3, true);
+        firewall.register(identity("second", 3), "second", Map.of());
+        gateway.setAttachments(List.of());
+        when(docker.inspectExecCmd("first-exec").exec().getExitCodeLong()).thenReturn(137L);
+        doAnswer(invocation -> {
+            missing("second");
+            return null;
+        }).when(lifecycle).removeIfExistsStrict("second");
+
+        assertThrows(IllegalStateException.class, () -> firewall.unregister("second"));
+        verify(lifecycle, never()).removeIfExistsStrict("second");
+
+        when(docker.inspectExecCmd("first-exec").exec().getExitCodeLong()).thenReturn(0L);
+        assertDoesNotThrow(() -> firewall.unregister("second"));
+        verify(lifecycle).removeIfExistsStrict("second");
+        assertTrue(latest("first").contains("accept"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
     void runningCallerWithoutItsPublicInterfaceStillFailsEvenWhenAnotherCallerRetires(boolean retiredPeer) {
         prepareSharedUpstream();
         admit("first", 2, true);
@@ -416,7 +527,8 @@ class VpcPublicPeerRoutingTest {
         admit("second", 3, true);
 
         List<String> updates = scripts.get("first");
-        String guard = updates.get(updates.size() - 2);
+        assertEquals(1, updates.size(), "The guard and replacement policy must share one exec");
+        String guard = updateGuard(updates.getFirst());
         assertTrue(guard.contains("policy drop;"));
         assertEquals(1, guard.lines().filter(line -> line.startsWith("nft ")).count(),
                 "Replacing the guard must install resolver permits in the same nft transaction");
@@ -487,14 +599,15 @@ class VpcPublicPeerRoutingTest {
         assertNull(failure.get());
         assertEquals(Math.min(4, count), maximum.get());
         for (List<String> updates : scripts.values()) {
-            assertEquals(2, updates.size());
-            assertTrue(updates.getFirst().contains("policy drop;"));
-            assertFalse(updates.getFirst().contains("ip -4 route"));
-            assertTrue(updates.getLast().contains("ip -4 route"));
+            assertEquals(1, updates.size());
+            String guard = updateGuard(updates.getFirst());
+            assertTrue(guard.contains("policy drop;"));
+            assertFalse(guard.contains("ip -4 route"));
+            assertTrue(updates.getFirst().substring(guard.length()).contains("ip -4 route"));
         }
         manager.reconcile();
         for (List<String> updates : scripts.values()) {
-            assertEquals(2, updates.size(), "Unchanged policies must not be installed again");
+            assertEquals(1, updates.size(), "Unchanged policies must not be installed again");
         }
     }
 
@@ -540,12 +653,23 @@ class VpcPublicPeerRoutingTest {
         }
         assertFalse(caller.isAlive());
         assertSame(expected, failure.get());
-        assertEquals(3, scripts.get("first").size(), "Guard, route update, then failure quarantine");
+        assertEquals(2, scripts.get("first").size(), "Combined guard and route update, then failure quarantine");
+        String firstUpdate = scripts.get("first").getFirst();
+        String guard = updateGuard(firstUpdate);
+        assertTrue(guard.contains("policy drop;"));
+        assertTrue(firstUpdate.substring(guard.length()).contains("ip -4 route"));
         assertEquals(1, scripts.get("second").size());
         for (String helper : List.of("first", "second")) {
             assertFalse(latest(helper).contains("accept"),
                     "No writer may replace the final failure quarantine");
         }
+    }
+
+    private String updateGuard(String script) {
+        String delimiter = "\nFLOCI_RULES\n";
+        int guardEnd = script.indexOf(delimiter);
+        assertTrue(guardEnd >= 0, "The guard transaction must end before the replacement policy");
+        return script.substring(0, guardEnd + delimiter.length());
     }
 
     private Thread reconcileInBackground(AtomicReference<Throwable> failure) {

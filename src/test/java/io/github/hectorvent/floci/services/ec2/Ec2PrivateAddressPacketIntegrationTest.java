@@ -5,6 +5,8 @@ import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.BuildImageResultCallback;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.model.Frame;
+import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.services.ec2.model.Instance;
 import io.github.hectorvent.floci.testing.DockerAvailability;
 import io.github.hectorvent.floci.testing.TestImages;
@@ -70,6 +72,7 @@ class Ec2PrivateAddressPacketIntegrationTest {
     @Inject Ec2Service service;
     @Inject SecurityGroupFirewallManager firewall;
     @Inject DockerClient docker;
+    @Inject EmulatorConfig config;
     @InjectMock AmiImageResolver images;
     @TestHTTPResource URI endpoint;
     @TempDir Path imageContext;
@@ -102,7 +105,13 @@ class Ec2PrivateAddressPacketIntegrationTest {
         cleanup.addFirst(sdk::close);
         String suffix = UUID.randomUUID().toString().substring(0, 8);
         String vpc = sdk.createVpc(request -> request.cidrBlock("10.87.0.0/16")).vpc().vpcId();
-        cleanup.addFirst(() -> sdk.deleteVpc(request -> request.vpcId(vpc)));
+        cleanup.addFirst(() -> {
+            sdk.deleteVpc(request -> request.vpcId(vpc));
+            await("Private-address VPC network removal").atMost(Duration.ofSeconds(30)).until(() ->
+                    docker.listNetworksCmd().withFilter("label", List.of(
+                            ContainerStorageHelper.OWNER_LABEL + "=" + ContainerStorageHelper.ownerIdentity(config),
+                            ContainerStorageHelper.RESOURCE_ID_LABEL + "=" + vpc)).exec().isEmpty());
+        });
         String subnet = sdk.createSubnet(request -> request.vpcId(vpc).cidrBlock("10.87.1.0/24"))
                 .subnet().subnetId();
         cleanup.addFirst(() -> sdk.deleteSubnet(request -> request.subnetId(subnet)));

@@ -95,12 +95,12 @@ on one target; weighted aliases to different targets remain ambiguous. This serv
 HTTPS listener; it does not open arbitrary load-balancer ports on the bridge.
 
 When an explicit API upstream is configured and native API HTTPS routing is
-disabled, undeclared validated public ALB aliases use `192.0.2.2` for known VPC
+disabled, validated public ALB aliases use `192.0.2.2` for known VPC
 callers when every listener uses HTTP port 80 or HTTPS port 443. An ALB with no
 listeners or a custom-port listener retains its existing DNS address. Listener changes
-take effect on the next DNS lookup. Explicit `FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API_HOSTS` declarations
-retain their selected API front door and `192.0.2.1` destination after alias
-validation. The existing bridge serves HTTP port 80 and TLS port 443 on the separate ALB
+take effect on the next DNS lookup. Exact `FLOCI_NETWORK_VPC_ROUTING_PUBLIC_AWS_API_HOSTS` declarations
+also retain that native ALB destination after alias validation, so TLS reaches the
+load balancer certificate rather than the emulator API certificate. The existing bridge serves HTTP port 80 and TLS port 443 on the separate ALB
 destination and forwards both through Floci's guarded port 443 proxy. API requests
 retain their configured upstream and `192.0.2.1` route. Each destination follows
 its own longest-prefix route, NAT and internet-gateway admission; security groups
@@ -164,8 +164,8 @@ usual emulator address. This configuration supplies a transport
 destination, not an implementation of any peer protocol or authorization.
 
 For an explicitly declared public hostname, a public Route 53 alias to an owned
-listener also uses the configured public transport for known VPC clients. The
-alias target and canonical zone must validate before its emulator listener
+listener uses its native public ALB transport when available for known VPC clients;
+other owned listener addresses use the configured public transport. The alias target and canonical zone must validate before its emulator listener
 address is translated. This preserves the caller's NAT and security-group
 checks. Undeclared aliases, literal address records, private-zone answers and
 failed alias lookups retain their existing behavior. This configured front-door

@@ -11,6 +11,28 @@ removal stays visible and does not prevent cleanup of the other owned helpers.
 Startup restores the persisted VPC and subnet address plans before reconnecting
 the load balancers and starting dependent ECS tasks.
 
+### DNS names
+
+By default a load balancer's `DNSName` is `<name>-<id>.elb.<FLOCI_HOSTNAME>`, which resolves to Floci
+under the emulator's own DNS suffix. With `FLOCI_SERVICES_ELBV2_DNS_NAME_STRATEGY=aws` a new load
+balancer gets the form AWS documents instead, for clients that check it:
+
+| Type | `DNSName` |
+|---|---|
+| Application, internet-facing | `<name>-<digits>.<region>.elb.<dns-suffix>` |
+| Application, internal | `internal-<name>-<digits>.<region>.elb.<dns-suffix>` |
+| Network or Gateway | `<name>-<id>.elb.<region>.<dns-suffix>`, where `<id>` is the id in the ARN |
+
+`<dns-suffix>` is the region's partition suffix, for example `amazonaws.com` or `amazonaws.com.cn`.
+Floci's DNS answers such a name, and the same name with `dualstack.` in front, with the address the
+default form resolves to. That answer comes ahead of `FLOCI_DNS_SPOOF_AWS_ENDPOINTS`, which would
+otherwise give it the AWS API address. A name in those zones (`<region>.elb.<dns-suffix>` and
+`elb.<region>.<dns-suffix>`) that no load balancer has gets NXDOMAIN, as on AWS, rather than being spoofed or
+forwarded upstream; names outside them resolve as before. A client that uses another resolver needs those zones
+forwarded to Floci's DNS. Listener selection by DNS
+name and Route 53 aliases work the same with either form. A load balancer keeps the name it was
+created with when the setting changes.
+
 ### Route 53 aliases
 
 A public Route 53 `A` alias to an existing Application Load Balancer resolves to
@@ -471,7 +493,8 @@ on port 80 is correct for AWS and stays accepted here, but the request has to na
 
 A listener is chosen in this order:
 
-1. The Host header equals a load balancer's own DNS name (`{name}-{id}.elb.localhost.floci.io`).
+1. The Host header equals a load balancer's own DNS name (`{name}-{id}.elb.localhost.floci.io`, or the
+   AWS form; see [DNS names](#dns-names)).
 2. A public Route 53 A/AAAA alias or CNAME chain resolves the Host to a load balancer on the port.
    A and AAAA aliases can coexist when they identify the same target. Alias target hosted-zone
    IDs, with or without `/hostedzone/`, must match that load balancer's canonical zone.

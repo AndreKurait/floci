@@ -66,6 +66,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
     private final Map<String, Endpoint> endpoints = new LinkedHashMap<>();
     private final Map<String, PublicAddress> publicAddresses = new LinkedHashMap<>();
     private final Map<String, NatRuntime> nats = new LinkedHashMap<>();
+    /** Includes exact namespaces whose owners have begun removal but Docker still reports as running. */
     private final Set<String> unavailableNamespaces = new HashSet<>();
     private String publicNetwork;
     private boolean draining;
@@ -155,6 +156,20 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
             run(helper, VpcRoutingCommands.endpointGuard());
             reconcile();
         });
+    }
+
+    /** Stops routing to an owner's captured helper before Docker removal can interrupt a policy command. */
+    public synchronized void prepareNamespaceRemoval(String helper) {
+        if (!enabled()) {
+            return;
+        }
+        boolean owned = endpoints.values().stream().anyMatch(endpoint -> helper.equals(endpoint.helper))
+                || publicAddresses.values().stream().anyMatch(address -> helper.equals(address.namespace.id()));
+        if (owned) {
+            // Retain the endpoint and its address until the owner confirms removal through unregister.
+            unavailableNamespaces.add(helper);
+            reconcile();
+        }
     }
 
     /** The owning service removes the namespace before releasing its native interface. */
@@ -441,7 +456,8 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
                 try {
                     reconcilePresentNamespaces();
                     return;
-                } catch (NotFoundException | ConflictException | InvalidPublicInterfaceException unavailable) {
+                } catch (NotFoundException | ConflictException | InvalidPublicInterfaceException
+                        | RoutingCommandException unavailable) {
                     boolean retired;
                     try {
                         retired = withdrawUnavailableNamespaces();
@@ -504,8 +520,8 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         PolicyApplyBatch.run(byHelper.values().stream().<Runnable>map(batch -> () -> {
             for (EndpointPolicy policy : batch) {
                 Endpoint endpoint = policy.endpoint();
-                run(endpoint.helper, VpcRoutingCommands.endpointGuard(endpoint.resolvers));
-                run(endpoint.helper, policy.script());
+                // Retain the combined budget of the two former 20-second exec calls.
+                run(endpoint.helper, VpcRoutingCommands.guardedEndpoint(endpoint.resolvers, policy.script()), 40);
             }
         }).toList());
         for (EndpointPolicy policy : policies) {
@@ -953,10 +969,14 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
     }
 
     private void run(String helper, String script) {
-        ContainerExec.Result result = ContainerExec.run(docker, helper, new String[]{"sh", "-c", script}, 20)
+        run(helper, script, 20);
+    }
+
+    private void run(String helper, String script, int timeoutSeconds) {
+        ContainerExec.Result result = ContainerExec.run(docker, helper, new String[]{"sh", "-c", script}, timeoutSeconds)
                 .throwIfTimedOut(helper);
         if (result.exitCode() != 0) {
-            throw new IllegalStateException("Cannot reconcile native VPC routing: " + result.summary());
+            throw new RoutingCommandException(result.summary());
         }
     }
 
@@ -1048,6 +1068,12 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
     private static final class InvalidPublicInterfaceException extends IllegalStateException {
         private InvalidPublicInterfaceException() {
             super("Native public API caller lost its unique public interface");
+        }
+    }
+
+    private static final class RoutingCommandException extends IllegalStateException {
+        private RoutingCommandException(String summary) {
+            super("Cannot reconcile native VPC routing: " + summary);
         }
     }
 

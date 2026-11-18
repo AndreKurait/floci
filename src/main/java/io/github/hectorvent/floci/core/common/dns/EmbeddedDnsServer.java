@@ -495,6 +495,11 @@ public class EmbeddedDnsServer {
             if (ownedListener && origin == null) {
                 return answer.viaUpstream();
             }
+            // The native ALB transport owns its certificate and listener admission. Routing
+            // that address through the API bridge would select the emulator API certificate.
+            if (nativeAlb) {
+                return answer;
+            }
             return ownedListener ? new DnsAnswer(
                     List.of(new DnsRecord.Address(1, EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS)),
                     answer.ttlSeconds(), answer.nameExists(), answer.authority(), answer.responseCode()) : answer;
@@ -516,7 +521,8 @@ public class EmbeddedDnsServer {
     private Optional<DnsAnswer> resolveRecordWithOwnership(String name, String myIp, int type) {
         Optional<DnsAnswer> stored = resolveFromRecordSources(name, type, true);
         if (hasAuthoritativeSuffix(name)) {
-            return Optional.of(authoritativeAnswer(stored.or(() -> resolveFromRecordSources(name, type))));
+            return Optional.of(authoritativeAnswer(stored.or(() -> resolveFromRecordSources(name, type))
+                    .or(() -> ec2PublicAnswer(name, type))));
         }
         if (stored.isPresent()) {
             return stored;
@@ -602,7 +608,8 @@ public class EmbeddedDnsServer {
         }
         Optional<DnsAnswer> resource = stored.or(() -> resolveFromRecordSources(name, type, false, origin));
         if (authoritative) {
-            return QueryPlan.answering(authoritativeAnswer(resource));
+            // An EC2 public DNS name is backed by the address it carries, so it still answers inside a scope.
+            return QueryPlan.answering(authoritativeAnswer(resource.or(() -> ec2PublicAnswer(name, type))));
         }
         QueryPlan upstream = publicApiDnsResponse != null && origin != null ? QueryPlan.ROUTED_UPSTREAM
                 : QueryPlan.UPSTREAM;
@@ -623,6 +630,12 @@ public class EmbeddedDnsServer {
         }
         String query = normalized;
         return authoritativeSuffixes.stream().anyMatch(suffix -> DomainNames.isWithin(query, suffix));
+    }
+
+    /** An EC2 public DNS name's own address, in the exact form AwsEndpoints.ec2PublicDns gives it, or empty. */
+    private Optional<DnsAnswer> ec2PublicAnswer(String name, int type) {
+        return resolveEc2PublicDnsName(name).map(address -> type == 1
+                ? DnsAnswer.records(List.of(address), DnsAnswer.DEFAULT_TTL_SECONDS) : DnsAnswer.noData());
     }
 
     private static DnsAnswer authoritativeAnswer(Optional<DnsAnswer> resource) {
