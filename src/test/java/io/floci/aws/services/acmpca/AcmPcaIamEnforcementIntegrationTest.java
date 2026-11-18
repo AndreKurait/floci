@@ -88,8 +88,7 @@ class AcmPcaIamEnforcementIntegrationTest {
                     assertEquals(2, root.listCertificateAuthorities().certificateAuthorities().stream()
                             .filter(value -> marker.equals(value.certificateAuthorityConfiguration().subject().commonName()))
                             .count());
-                    explicitDeny.deleteCertificateAuthority(request -> request.certificateAuthorityArn(second)
-                            .permanentDeletionTimeInDays(7));
+                    resourceTagConditions(root, first, second);
                     assertEquals("DELETED", describe(root, second).statusAsString());
                     assertEquals(original, describe(root, first));
                     String issued = templateConditions(root, first);
@@ -168,6 +167,42 @@ class AcmPcaIamEnforcementIntegrationTest {
             assertTrue(tokens.add(token), "CA cleanup pagination token repeated");
         }
         fail("CA cleanup discovery exceeded ten pages");
+    }
+
+    private void resourceTagConditions(AcmPcaClient root, String first, String second) {
+        root.tagCertificateAuthority(request -> request.certificateAuthorityArn(first)
+                .tags(tag -> tag.key("Environment").value("prod")));
+        String allowKey = user("""
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+                "Action":"acm-pca:DescribeCertificateAuthority","Resource":"*",
+                "Condition":{"StringEquals":{"aws:ResourceTag/Environment":"prod"}}}]}
+                """);
+        String denyKey = user("""
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+                "Action":"acm-pca:*","Resource":"*"},{"Effect":"Deny",
+                "Action":"acm-pca:DeleteCertificateAuthority","Resource":"*",
+                "Condition":{"StringEquals":{"aws:ResourceTag/Environment":"prod"}}}]}
+                """);
+        try (AcmPcaClient allowed = client(allowKey); AcmPcaClient denied = client(denyKey)) {
+            CertificateAuthority original = describe(root, first);
+            forbidden(() -> denied.deleteCertificateAuthority(request -> request
+                    .certificateAuthorityArn(first).permanentDeletionTimeInDays(7)));
+            assertEquals(original, describe(root, first));
+            assertEquals(original, describe(allowed, first));
+            forbidden(() -> describe(allowed, second));
+            root.tagCertificateAuthority(request -> request.certificateAuthorityArn(first)
+                    .tags(tag -> tag.key("Environment").value("dev")));
+            forbidden(() -> describe(allowed, first));
+            root.tagCertificateAuthority(request -> request.certificateAuthorityArn(second)
+                    .tags(tag -> tag.key("Environment").value("prod")));
+            forbidden(() -> denied.deleteCertificateAuthority(request -> request
+                    .certificateAuthorityArn(second).permanentDeletionTimeInDays(7)));
+            root.untagCertificateAuthority(request -> request.certificateAuthorityArn(second)
+                    .tags(tag -> tag.key("Environment")));
+            denied.deleteCertificateAuthority(request -> request.certificateAuthorityArn(second)
+                    .permanentDeletionTimeInDays(7));
+            assertEquals("DELETED", describe(root, second).statusAsString());
+        }
     }
 
     private String templateConditions(AcmPcaClient root, String arn) {
