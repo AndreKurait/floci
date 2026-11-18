@@ -402,6 +402,7 @@ public class Ec2QueryHandler {
                 case "CreateNetworkInterfacePermission" -> handleCreateNetworkInterfacePermission(params, region);
                 case "DescribeNetworkInterfacePermissions" ->
                         handleDescribeNetworkInterfacePermissions(params, region);
+                case "DeleteNetworkInterfacePermission" -> handleDeleteNetworkInterfacePermission(params, region);
                 // Volumes
                 case "CreateVolume" -> handleCreateVolume(params, region);
                 case "DescribeVolumes" -> handleDescribeVolumes(params, region);
@@ -5906,6 +5907,13 @@ public class Ec2QueryHandler {
             xml.elem("nextToken", page.nextToken());
         }
         return endResponse(xml, "DescribeNetworkInterfacePermissions");
+    }
+
+    private Response handleDeleteNetworkInterfacePermission(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
+        service.deleteNetworkInterfacePermission(region, p.getFirst("NetworkInterfacePermissionId"),
+                "true".equalsIgnoreCase(p.getFirst("Force")));
+        return booleanResponse("DeleteNetworkInterfacePermission");
     }
 
     private static String networkInterfacePermissionXml(NetworkInterfacePermission permission) {
