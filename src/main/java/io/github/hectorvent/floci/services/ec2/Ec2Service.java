@@ -2673,12 +2673,20 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * service.
      */
     private void carrySubnetIpv6Blocks(String region, String subnetId, InstanceNetworkInterface eni) {
-        Subnet subnet = subnetId == null ? null : subnets.get(key(region, subnetId)).orElse(null);
+        carrySubnetIpv6Blocks(callerAccountId(), region, subnetId, eni);
+    }
+
+    private void carrySubnetIpv6Blocks(String account, String region, String subnetId, InstanceNetworkInterface eni) {
+        Subnet subnet = subnetId == null ? null
+                : (subnets instanceof AccountAwareStorageBackend<Subnet> aware && !account.equals(callerAccountId())
+                ? aware.getForAccount(account, key(region, subnetId)) : subnets.get(key(region, subnetId))).orElse(null);
         if (subnet == null) {
             return;
         }
         eni.setSubnetIpv6CidrBlocks(new ArrayList<>(associatedIpv6Blocks(subnet)));
-        Vpc vpc = vpcs.get(key(region, subnet.getVpcId())).orElse(null);
+        Vpc vpc = (vpcs instanceof AccountAwareStorageBackend<Vpc> aware && !account.equals(callerAccountId())
+                ? aware.getForAccount(account, key(region, subnet.getVpcId()))
+                : vpcs.get(key(region, subnet.getVpcId()))).orElse(null);
         if (vpc != null) {
             eni.setVpcIpv6CidrBlocks(new ArrayList<>(vpc.getIpv6CidrBlockAssociationSet().stream()
                     .filter(assoc -> "associated".equalsIgnoreCase(assoc.getIpv6CidrBlockState()))
@@ -5431,6 +5439,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     private Map<String, List<String>> policyPrefixLists(String region, List<SecurityGroup> groups) {
+        return policyPrefixLists(callerAccountId(), region, groups);
+    }
+
+    private Map<String, List<String>> policyPrefixLists(String accountId, String region, List<SecurityGroup> groups) {
         Map<String, ManagedPrefixList> awsLists = awsManagedPrefixLists(region).stream()
                 .collect(Collectors.toMap(ManagedPrefixList::getPrefixListId, Function.identity()));
         Map<String, List<String>> resolved = new LinkedHashMap<>();
@@ -5440,13 +5452,23 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     .flatMap(permission -> permission.getPrefixListIds().stream())
                     .map(PrefixListId::getPrefixListId).distinct()
                     .forEach(id -> {
-                        ManagedPrefixList list = managedPrefixLists.get(key(region, id))
+                        ManagedPrefixList list = (managedPrefixLists instanceof AccountAwareStorageBackend<ManagedPrefixList> aware
+                                && !accountId.equals(callerAccountId())
+                                ? aware.getForAccount(accountId, key(region, id)) : managedPrefixLists.get(key(region, id)))
                                 .orElseGet(() -> awsLists.get(id));
                         resolved.put(id, list == null ? List.of() : list.currentEntries().stream()
                                 .map(PrefixListEntry::getCidr).toList());
                     });
         }
         return resolved;
+    }
+
+    private List<SecurityGroup> networkInterfacePolicyGroups(String accountId, String region,
+                                                             List<GroupIdentifier> groups) {
+        return groups.stream().map(group -> (securityGroups instanceof AccountAwareStorageBackend<SecurityGroup> aware
+                && !accountId.equals(callerAccountId())
+                ? aware.getForAccount(accountId, key(region, group.getGroupId()))
+                : securityGroups.get(key(region, group.getGroupId()))).orElse(null)).toList();
     }
 
     public boolean isSecurityGroupEnforcementEnabled() {
@@ -5481,14 +5503,16 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             if (eni.getDeviceIndex() < 1) {
                 continue;
             }
-            List<SecurityGroup> groups = networkInterfaces.get(key(region, eni.getNetworkInterfaceId()))
-                    .map(record -> record.getGroups().stream()
-                            .map(group -> securityGroups.get(key(region, group.getGroupId())).orElse(null))
-                            .toList())
+            String owner = eni.getOwnerId() != null ? eni.getOwnerId() : callerAccountId();
+            List<SecurityGroup> groups = (networkInterfaces instanceof AccountAwareStorageBackend<NetworkInterface> aware
+                    && !owner.equals(callerAccountId())
+                    ? aware.getForAccount(owner, key(region, eni.getNetworkInterfaceId()))
+                    : networkInterfaces.get(key(region, eni.getNetworkInterfaceId())))
+                    .map(record -> networkInterfacePolicyGroups(owner, region, record.getGroups()))
                     .orElse(List.of());
             containerManager.restoreAttachedInterface(instance, eni, groups,
                     groups.isEmpty() || groups.stream().anyMatch(Objects::isNull)
-                            ? Map.of() : policyPrefixLists(region, groups));
+                            ? Map.of() : policyPrefixLists(owner, region, groups));
         }
     }
 
@@ -18625,6 +18649,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         Instance pluggedInstance;
         InstanceNetworkInterface pluggedInterface;
         List<SecurityGroup> pluggedGroups;
+        String interfaceOwner;
         NetworkInterfaceAttachment result;
         synchronized (privateIpAllocationLock) {
             AccountAwareStorageBackend.OwnedEntry<NetworkInterface> held =
@@ -18675,7 +18700,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             attached.setGroups(new ArrayList<>(ni.getGroups()));
             if (!ni.getIpv6Addresses().isEmpty()) {
                 attached.setIpv6Addresses(new ArrayList<>(ni.getIpv6Addresses()));
-                carrySubnetIpv6Blocks(region, ni.getSubnetId(), attached);
+                carrySubnetIpv6Blocks(held.account(), region, ni.getSubnetId(), attached);
             }
             attached.setAttachmentId(attachment.getAttachmentId());
             attached.setDeviceIndex(deviceIndex);
@@ -18690,15 +18715,15 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             pluggedInstance = inst;
             pluggedInterface = attached;
             // A protected namespace enforces the attached interface's own groups on its device.
-            pluggedGroups = ni.getGroups().stream()
-                    .map(group -> securityGroups.get(key(region, group.getGroupId())).orElse(null))
-                    .toList();
+            interfaceOwner = held.account();
+            pluggedGroups = networkInterfacePolicyGroups(interfaceOwner, region, ni.getGroups());
             result = attachment;
         }
         // Outside the allocation lock: the device is a Docker call.
         if (containerManager != null) {
             containerManager.plugNetworkInterface(pluggedInstance, pluggedInterface, pluggedGroups,
-                    pluggedGroups.stream().anyMatch(Objects::isNull) ? Map.of() : policyPrefixLists(region, pluggedGroups));
+                    pluggedGroups.stream().anyMatch(Objects::isNull)
+                            ? Map.of() : policyPrefixLists(interfaceOwner, region, pluggedGroups));
         }
         return result;
     }
@@ -18845,8 +18870,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
         ensureDefaultResources(region);
         List<NetworkInterfacePermission> held = new ArrayList<>();
-        for (NetworkInterface ni : networkInterfaces.scan(k -> k.startsWith(region + "::"))) {
-            held.addAll(ni.getPermissions());
+        synchronized (privateIpAllocationLock) {
+            for (NetworkInterface ni : networkInterfaces.scan(k -> k.startsWith(region + "::"))) {
+                held.addAll(ni.getPermissions());
+            }
         }
         for (String id : permissionIds) {
             if (held.stream().noneMatch(perm -> id.equals(perm.getNetworkInterfacePermissionId()))) {

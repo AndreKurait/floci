@@ -1,8 +1,10 @@
 package io.github.hectorvent.floci.services.ec2;
 
+import io.github.hectorvent.floci.services.ec2.model.InstanceNetworkInterface;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.ValidatableResponse;
 import io.restassured.specification.RequestSpecification;
+import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
@@ -14,6 +16,7 @@ import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.hasItem;
 import static org.hamcrest.Matchers.not;
 import static org.hamcrest.Matchers.startsWith;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 
 /**
  * Attaching a network interface owned by another account, as the EC2 API Reference documents it.
@@ -31,6 +34,8 @@ import static org.hamcrest.Matchers.startsWith;
  */
 @QuarkusTest
 class Ec2NetworkInterfaceCrossAccountAttachIntegrationTest {
+
+    @Inject Ec2Service service;
 
     private static final String OWNER = "000000003521";
     private static final String GRANTEE = "000000003522";
@@ -105,6 +110,29 @@ class Ec2NetworkInterfaceCrossAccountAttachIntegrationTest {
                 .statusCode(200)
                 .body("AttachNetworkInterfaceResponse.attachmentId", startsWith("eni-attach-"))
                 .extract().path("AttachNetworkInterfaceResponse.attachmentId");
+    }
+
+    @Test
+    void foreignInterfaceCarriesItsOwnersIpv6SubnetAndVpcMetadata() {
+        ValidatableResponse vpc = call(OWNER, "CreateVpc", "CidrBlock", "10.117.0.0/16",
+                "AmazonProvidedIpv6CidrBlock", "true").statusCode(200);
+        String vpcId = vpc.extract().path("CreateVpcResponse.vpc.vpcId");
+        String vpcBlock = vpc.extract().path("CreateVpcResponse.vpc.ipv6CidrBlockAssociationSet.item.ipv6CidrBlock");
+        String subnetBlock = vpcBlock.replace("/56", "/64");
+        String subnet = call(OWNER, "CreateSubnet", "VpcId", vpcId, "CidrBlock", "10.117.1.0/24",
+                "Ipv6CidrBlock", subnetBlock).statusCode(200).extract().path("CreateSubnetResponse.subnet.subnetId");
+        String eni = call(OWNER, "CreateNetworkInterface", "SubnetId", subnet, "Ipv6AddressCount", "1")
+                .statusCode(200).extract().path("CreateNetworkInterfaceResponse.networkInterface.networkInterfaceId");
+        grantInstanceAttach(eni, GRANTEE);
+        String instance = runningInstance(GRANTEE);
+        attach(GRANTEE, eni, instance);
+        InstanceNetworkInterface device = service.findInstanceForAccount(GRANTEE, "us-east-1", instance).orElseThrow()
+                .getNetworkInterfaces().stream().filter(value -> eni.equals(value.getNetworkInterfaceId()))
+                .findFirst().orElseThrow();
+        assertEquals(1, device.getIpv6Addresses().size());
+        assertEquals(List.of(subnetBlock), device.getSubnetIpv6CidrBlocks());
+        assertEquals(List.of(vpcBlock), device.getVpcIpv6CidrBlocks());
+        assertEquals(OWNER, device.getOwnerId());
     }
 
     @Test

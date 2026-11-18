@@ -782,11 +782,18 @@ public class VpcNetworkManager {
     public Optional<String> attachInterfaceAcrossAddressSpaces(String region, String vpcId, String subnetId,
                                                                String helper, String instanceAccount,
                                                                String address, String macAddress) {
+        return attachInterfaceAcrossAddressSpaces(region, vpcId, subnetId, helper, instanceAccount, address, macAddress, null);
+    }
+
+    /** Uses the interface owner for its native VPC, independently of the namespace owner. */
+    public Optional<String> attachInterfaceAcrossAddressSpaces(String region, String vpcId, String subnetId,
+                                                               String helper, String instanceAccount,
+                                                               String address, String macAddress, String interfaceAccount) {
         if (!enabled() || !isolatesAddressSpaces() || helper == null || address == null || macAddress == null) {
             return Optional.empty();
         }
-        VpcBinding vpc = plannedVpc(region, vpcId);
-        SubnetBinding subnet = subnetBinding(region, subnetId);
+        VpcBinding vpc = plannedVpc(bindings.get(key(interfaceAccount, region, vpcId)));
+        SubnetBinding subnet = vpc == null ? null : vpc.subnets.get(subnetId);
         Optional<Cidr4> parsed = Cidr4.parse(address + "/32");
         if (vpc == null || vpc.effective == null || subnet == null || subnet.effective == null
                 || parsed.isEmpty() || !subnet.effective.containsAddress(parsed.get().network())) {
@@ -806,11 +813,18 @@ public class VpcNetworkManager {
     /** Re-configures a device {@link #attachInterfaceAcrossAddressSpaces} left after a restart, if any. */
     public Optional<String> restoreInterfaceAcrossAddressSpaces(String region, String vpcId, String subnetId,
                                                                 String helper, String address, String macAddress) {
+        return restoreInterfaceAcrossAddressSpaces(region, vpcId, subnetId, helper, address, macAddress, null);
+    }
+
+    /** Uses the interface owner for its native VPC, independently of the namespace owner. */
+    public Optional<String> restoreInterfaceAcrossAddressSpaces(String region, String vpcId, String subnetId,
+                                                                String helper, String address, String macAddress,
+                                                                String interfaceAccount) {
         if (!enabled() || !isolatesAddressSpaces() || helper == null || address == null || macAddress == null) {
             return Optional.empty();
         }
-        VpcBinding vpc = plannedVpc(region, vpcId);
-        SubnetBinding subnet = subnetBinding(region, subnetId);
+        VpcBinding vpc = plannedVpc(bindings.get(key(interfaceAccount, region, vpcId)));
+        SubnetBinding subnet = vpc == null ? null : vpc.subnets.get(subnetId);
         if (vpc == null || vpc.effective == null || subnet == null || subnet.effective == null) {
             return Optional.empty();
         }
@@ -821,11 +835,17 @@ public class VpcNetworkManager {
     /** Unplugs what {@link #attachInterfaceAcrossAddressSpaces} added; nothing when it holds none. */
     public void detachInterfaceAcrossAddressSpaces(String region, String vpcId, String helper, String address,
                                                    String macAddress) {
+        detachInterfaceAcrossAddressSpaces(region, vpcId, helper, address, macAddress, null);
+    }
+
+    /** Uses the interface owner for its native VPC, independently of the namespace owner. */
+    public void detachInterfaceAcrossAddressSpaces(String region, String vpcId, String helper, String address,
+                                                   String macAddress, String interfaceAccount) {
         if (!enabled() || !isolatesAddressSpaces() || helper == null || macAddress == null) {
             return;
         }
-        VpcBinding vpc = bindings.get(key(region, vpcId));
-        if (vpc == null || !vpc.created) {
+        VpcBinding vpc = bindings.get(key(interfaceAccount, region, vpcId));
+        if (vpc == null) {
             return;
         }
         NativeVpcAddressSpace.detachAdditional(dockerClient, helper, vpc.networkName, macAddress, address);
@@ -1483,7 +1503,14 @@ public class VpcNetworkManager {
     }
 
     private String key(String region, String id) {
-        return identityKey(isolatesAddressSpaces() ? accountId() : null, region, id);
+        return key(null, region, id);
+    }
+
+    private String key(String ownerAccount, String region, String id) {
+        if (!isolatesAddressSpaces()) {
+            return identityKey(null, region, id);
+        }
+        return identityKey(ownerAccount == null ? accountId() : ownerAccount, region, id);
     }
 
     private String accountId() {

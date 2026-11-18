@@ -1602,7 +1602,7 @@ public class Ec2ContainerManager {
                     firewallManager.detachDevice(primary, eni.getNetworkInterfaceId());
                 }
                 vpcNetworkManager.detachInterfaceAcrossAddressSpaces(instance.getRegion(), eni.getVpcId(), helper,
-                        eni.getPrivateIpAddress(), eni.getMacAddress());
+                        eni.getPrivateIpAddress(), eni.getMacAddress(), interfaceAccount(instance, eni));
             } else {
                 vpcNetworkManager.detachInterface(instance.getRegion(), eni.getVpcId(), networkContainerOf(instance));
             }
@@ -1625,7 +1625,7 @@ public class Ec2ContainerManager {
         }
         Optional<String> device = vpcNetworkManager.attachInterfaceAcrossAddressSpaces(instance.getRegion(),
                 eni.getVpcId(), eni.getSubnetId(), helper, instanceAccount(instance), eni.getPrivateIpAddress(),
-                eni.getMacAddress());
+                eni.getMacAddress(), interfaceAccount(instance, eni));
         if (device.isEmpty()) {
             return "its address is not on a native VPC network Floci created";
         }
@@ -1634,7 +1634,7 @@ public class Ec2ContainerManager {
         } catch (RuntimeException failure) {
             try {
                 vpcNetworkManager.detachInterfaceAcrossAddressSpaces(instance.getRegion(), eni.getVpcId(), helper,
-                        eni.getPrivateIpAddress(), eni.getMacAddress());
+                        eni.getPrivateIpAddress(), eni.getMacAddress(), interfaceAccount(instance, eni));
             } catch (RuntimeException cleanup) {
                 failure.addSuppressed(cleanup);
             }
@@ -1661,11 +1661,12 @@ public class Ec2ContainerManager {
                     && groups != null && !groups.isEmpty() && groups.stream().noneMatch(Objects::isNull);
             if (!usable) {
                 vpcNetworkManager.detachInterfaceAcrossAddressSpaces(instance.getRegion(), eni.getVpcId(), helper,
-                        eni.getPrivateIpAddress(), eni.getMacAddress());
+                        eni.getPrivateIpAddress(), eni.getMacAddress(), interfaceAccount(instance, eni));
                 return;
             }
             Optional<String> device = vpcNetworkManager.restoreInterfaceAcrossAddressSpaces(instance.getRegion(),
-                    eni.getVpcId(), eni.getSubnetId(), helper, eni.getPrivateIpAddress(), eni.getMacAddress());
+                    eni.getVpcId(), eni.getSubnetId(), helper, eni.getPrivateIpAddress(), eni.getMacAddress(),
+                    interfaceAccount(instance, eni));
             if (device.isEmpty()) {
                 plugNetworkInterface(instance, eni, groups, prefixLists);
                 return;
@@ -1676,7 +1677,8 @@ public class Ec2ContainerManager {
                     eni.getNetworkInterfaceId(), instance.getInstanceId(), failure.getMessage());
             try {
                 vpcNetworkManager.detachInterfaceAcrossAddressSpaces(instance.getRegion(), eni.getVpcId(),
-                        networkContainerOf(instance), eni.getPrivateIpAddress(), eni.getMacAddress());
+                        networkContainerOf(instance), eni.getPrivateIpAddress(), eni.getMacAddress(),
+                        interfaceAccount(instance, eni));
             } catch (RuntimeException cleanup) {
                 LOG.warnv("Could not remove the device of interface {0}: {1}", eni.getNetworkInterfaceId(),
                         cleanup.getMessage());
@@ -1690,10 +1692,14 @@ public class Ec2ContainerManager {
                 .orElse(regionResolver.getAccountId());
     }
 
+    private String interfaceAccount(Instance instance, InstanceNetworkInterface eni) {
+        return eni.getOwnerId() != null ? eni.getOwnerId() : instanceAccount(instance);
+    }
+
     /** The attached interface as its VPC's peers and its own policy see it: its own account, address and groups. */
     private SecurityGroupNftCompiler.Endpoint attachedIdentity(Instance instance, InstanceNetworkInterface eni,
                                                                List<SecurityGroup> groups) {
-        String account = eni.getOwnerId() != null ? eni.getOwnerId() : instanceAccount(instance);
+        String account = interfaceAccount(instance, eni);
         return new SecurityGroupNftCompiler.Endpoint(account, instance.getRegion(), eni.getVpcId(),
                 eni.getNetworkInterfaceId(), eni.getPrivateIpAddress(), eni.getPrivateIpAddress(),
                 groups.stream().map(SecurityGroup::getGroupId).collect(Collectors.toSet()), List.copyOf(groups),

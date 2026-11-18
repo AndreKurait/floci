@@ -219,7 +219,8 @@ class Ec2HotAttachInterfaceTest {
 
         assertTrue(reason.orElseThrow().contains("FLOCI_SERVICES_EC2_VPC_NETWORKS_HOT_ATTACH_ACROSS_ADDRESS_SPACES"),
                 reason.toString());
-        verify(vpcNetworks, never()).attachInterfaceAcrossAddressSpaces(any(), any(), any(), any(), any(), any(), any());
+        verify(vpcNetworks, never()).attachInterfaceAcrossAddressSpaces(any(), any(), any(), any(),
+                any(), any(), any(), any());
         verify(firewall, never()).attachDevice(any(), any(), any(), any());
     }
 
@@ -230,7 +231,7 @@ class Ec2HotAttachInterfaceTest {
         Instance instance = protectedInstance(attached);
         Map<String, List<String>> prefixLists = Map.of("pl-0customer", List.of("172.31.0.0/16"));
         when(vpcNetworks.attachInterfaceAcrossAddressSpaces(REGION, "vpc-customer", "subnet-customer", "helper-1",
-                "111111111111", "172.31.5.9", MAC)).thenReturn(Optional.of("eth2"));
+                "111111111111", "172.31.5.9", MAC, "222222222222")).thenReturn(Optional.of("eth2"));
 
         assertEquals(Optional.empty(), manager.plugNetworkInterface(instance, attached, List.of(customerGroup()),
                 prefixLists));
@@ -253,7 +254,7 @@ class Ec2HotAttachInterfaceTest {
         manager.unplugNetworkInterface(instance, attached);
 
         verify(firewall).detachDevice("eni-0primary", "eni-0customer");
-        verify(vpcNetworks).detachInterfaceAcrossAddressSpaces(REGION, "vpc-customer", "helper-1", "172.31.5.9", MAC);
+        verify(vpcNetworks).detachInterfaceAcrossAddressSpaces(REGION, "vpc-customer", "helper-1", "172.31.5.9", MAC, "222222222222");
     }
 
     @Test
@@ -265,21 +266,22 @@ class Ec2HotAttachInterfaceTest {
         when(firewall.enabled()).thenReturn(false);
         assertTrue(manager.plugNetworkInterface(protectedInstance(attached), attached, List.of(customerGroup()),
                 Map.of()).orElseThrow().contains("need security-group enforcement"));
-        verify(vpcNetworks, never()).attachInterfaceAcrossAddressSpaces(any(), any(), any(), any(), any(), any(), any());
+        verify(vpcNetworks, never()).attachInterfaceAcrossAddressSpaces(any(), any(), any(), any(),
+                any(), any(), any(), any());
     }
 
     @Test
     void aPolicyThatCannotBeInstalledUnplugsTheDeviceAgain() {
         Ec2ContainerManager manager = isolatedManager(true);
         InstanceNetworkInterface attached = customer();
-        when(vpcNetworks.attachInterfaceAcrossAddressSpaces(any(), any(), any(), any(), any(), any(), any()))
+        when(vpcNetworks.attachInterfaceAcrossAddressSpaces(any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenReturn(Optional.of("eth2"));
         doThrow(new IllegalStateException("Security-group policies did not converge"))
                 .when(firewall).attachDevice(any(), any(), any(), any());
 
         assertEquals(Optional.of("Security-group policies did not converge"), manager.plugNetworkInterface(
                 protectedInstance(attached), attached, List.of(customerGroup()), Map.of()));
-        verify(vpcNetworks).detachInterfaceAcrossAddressSpaces(REGION, "vpc-customer", "helper-1", "172.31.5.9", MAC);
+        verify(vpcNetworks).detachInterfaceAcrossAddressSpaces(REGION, "vpc-customer", "helper-1", "172.31.5.9", MAC, "222222222222");
     }
 
     @Test
@@ -288,16 +290,16 @@ class Ec2HotAttachInterfaceTest {
         InstanceNetworkInterface attached = customer();
         Instance instance = protectedInstance(attached);
         when(vpcNetworks.restoreInterfaceAcrossAddressSpaces(REGION, "vpc-customer", "subnet-customer", "helper-1",
-                "172.31.5.9", MAC)).thenReturn(Optional.of("eth2"));
+                "172.31.5.9", MAC, "222222222222")).thenReturn(Optional.of("eth2"));
 
         manager.restoreAttachedInterface(instance, attached, List.of(customerGroup()), Map.of());
 
         verify(firewall).attachDevice(eq("eni-0primary"), any(), eq("eth2"), eq(Map.of()));
-        verify(vpcNetworks, never()).detachInterfaceAcrossAddressSpaces(any(), any(), any(), any(), any());
+        verify(vpcNetworks, never()).detachInterfaceAcrossAddressSpaces(any(), any(), any(), any(), any(), any());
 
         Ec2ContainerManager off = isolatedManager(false);
         off.restoreAttachedInterface(instance, attached, List.of(customerGroup()), Map.of());
-        verify(vpcNetworks).detachInterfaceAcrossAddressSpaces(REGION, "vpc-customer", "helper-1", "172.31.5.9", MAC);
+        verify(vpcNetworks).detachInterfaceAcrossAddressSpaces(REGION, "vpc-customer", "helper-1", "172.31.5.9", MAC, "222222222222");
         verify(firewall).attachDevice(any(), any(), any(), any());
     }
 

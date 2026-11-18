@@ -3,21 +3,30 @@ package io.github.hectorvent.floci.services.ec2.net;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.ConnectToNetworkCmd;
 import com.github.dockerjava.api.command.CreateNetworkCmd;
 import com.github.dockerjava.api.command.CreateNetworkResponse;
 import com.github.dockerjava.api.command.DisconnectFromNetworkCmd;
+import com.github.dockerjava.api.command.ExecCreateCmd;
+import com.github.dockerjava.api.command.ExecCreateCmdResponse;
+import com.github.dockerjava.api.command.ExecStartCmd;
 import com.github.dockerjava.api.command.InspectContainerCmd;
 import com.github.dockerjava.api.command.InspectContainerResponse;
+import com.github.dockerjava.api.command.InspectExecCmd;
+import com.github.dockerjava.api.command.InspectExecResponse;
 import com.github.dockerjava.api.command.InspectNetworkCmd;
 import com.github.dockerjava.api.command.ListNetworksCmd;
 import com.github.dockerjava.api.command.RemoveNetworkCmd;
 import com.github.dockerjava.api.exception.ConflictException;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.ContainerNetwork;
+import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.Network;
+import com.github.dockerjava.api.model.StreamType;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.CurrentContainerNetworkResolver;
 import io.github.hectorvent.floci.testing.TestTime;
 import org.junit.jupiter.api.BeforeEach;
@@ -26,6 +35,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -233,6 +243,120 @@ class VpcNetworkManagerTest {
         when(resolver.getAccountId()).thenReturn("222222222222");
         assertEquals(Optional.of(secondNetwork), manager.networkNameFor(REGION, "vpc-default"));
         assertEquals(Optional.of("10.0.1.11"), manager.allocatePrivateIp(REGION, "subnet-default"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"111111111111", "222222222222"})
+    void nativeDeviceLifecycleUsesInterfaceOwnerInsteadOfRequestAccount(String interfaceAccount) {
+        nativeDeviceLifecycle(interfaceAccount, false, true);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"111111111111", "222222222222"})
+    void restoredNativeDeviceCanBeDetachedAfterManagerRecreation(String interfaceAccount) {
+        nativeDeviceLifecycle(interfaceAccount, true, true);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"111111111111", "222222222222"})
+    void nativeDeviceCanBeDetachedBeforeRestorationAfterManagerRecreation(String interfaceAccount) {
+        nativeDeviceLifecycle(interfaceAccount, true, false);
+    }
+
+    private void nativeDeviceLifecycle(String interfaceAccount, boolean recreateManager, boolean restoreDevice) {
+        enableAddressSpaceIsolation();
+        RegionResolver resolver = mock(RegionResolver.class);
+        when(resolver.getAccountId()).thenReturn(interfaceAccount);
+        manager = new VpcNetworkManager(config, docker, null, resolver);
+        manager.declareVpc(REGION, "vpc-default", "10.0.0.0/16");
+        manager.declareSubnet(REGION, "vpc-default", "subnet-default", "10.0.1.0/24");
+        String network = manager.networkNameFor(REGION, "vpc-default").orElseThrow();
+        when(resolver.getAccountId()).thenReturn("111111111111");
+        if (!interfaceAccount.equals("111111111111")) {
+            manager.declareVpc(REGION, "vpc-default", "192.168.0.0/16");
+            manager.declareSubnet(REGION, "vpc-default", "subnet-default", "192.168.1.0/24");
+        }
+        CreateNetworkCmd create = docker.createNetworkCmd();
+        Map<String, String> networkLabels = new LinkedHashMap<>();
+        when(create.withLabels(any())).thenAnswer(call -> {
+            networkLabels.putAll(call.getArgument(0));
+            return create;
+        });
+        when(create.exec()).thenAnswer(call -> {
+            existingNetwork(network, "172.20.0.0/16", networkLabels);
+            Network actual = existingNetworks.getLast();
+            when(actual.getDriver()).thenReturn("bridge");
+            when(actual.getOptions()).thenReturn(Map.of(
+                    "com.docker.network.bridge.enable_icc", "true",
+                    "com.docker.network.bridge.enable_ip_masquerade", "false"));
+            return new CreateNetworkResponse();
+        });
+        String address = "10.0.1.10";
+        String mac = "02:11:22:33:44:55";
+        Map<String, ContainerNetwork> endpoints = new LinkedHashMap<>();
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(docker.inspectContainerCmd("helper")).thenReturn(inspect);
+        when(inspect.exec()).thenAnswer(call -> new ObjectMapper().convertValue(Map.of(
+                "Config", Map.of("Labels", Map.of(
+                        ContainerStorageHelper.OWNER_LABEL, ContainerStorageHelper.ownerIdentity(config),
+                        ContainerStorageHelper.ACCOUNT_LABEL, "111111111111",
+                        ContainerStorageHelper.REGION_LABEL, REGION,
+                        ContainerStorageHelper.SECURITY_GROUP_HELPER_LABEL, "true")),
+                "HostConfig", Map.of("NetworkMode", "bridge"),
+                "NetworkSettings", Map.of("Networks", endpoints)), InspectContainerResponse.class));
+        ConnectToNetworkCmd connect = docker.connectToNetworkCmd();
+        when(connect.exec()).thenAnswer(call -> {
+            endpoints.put(network, new ObjectMapper().convertValue(Map.of("MacAddress", mac,
+                    "NetworkID", network, "IPAddress", "172.20.0.2", "IPPrefixLen", 16), ContainerNetwork.class));
+            return null;
+        });
+        stubNativeDeviceCommands(mac, address);
+
+        assertEquals(Optional.of("eth2"), manager.attachInterfaceAcrossAddressSpaces(REGION, "vpc-default",
+                "subnet-default", "helper", "111111111111", address, mac, interfaceAccount));
+        if (recreateManager) {
+            manager = new VpcNetworkManager(config, docker, null, resolver);
+            when(resolver.getAccountId()).thenReturn(interfaceAccount);
+            manager.declareVpc(REGION, "vpc-default", "10.0.0.0/16");
+            manager.declareSubnet(REGION, "vpc-default", "subnet-default", "10.0.1.0/24");
+            when(resolver.getAccountId()).thenReturn("111111111111");
+        }
+        if (restoreDevice) {
+            assertEquals(Optional.of("eth2"), manager.restoreInterfaceAcrossAddressSpaces(REGION, "vpc-default",
+                    "subnet-default", "helper", address, mac, interfaceAccount));
+        }
+        manager.detachInterfaceAcrossAddressSpaces(REGION, "vpc-default", "helper", address, mac,
+                interfaceAccount);
+
+        verify(connect).withNetworkId(network);
+        verify(create).exec();
+        verify(docker.disconnectFromNetworkCmd()).withNetworkId(network);
+        assertEquals("111111111111", resolver.getAccountId());
+    }
+
+    private void stubNativeDeviceCommands(String mac, String address) {
+        ExecCreateCmd create = mock(ExecCreateCmd.class, RETURNS_SELF);
+        ExecCreateCmdResponse created = mock(ExecCreateCmdResponse.class);
+        when(created.getId()).thenReturn("native-device-exec");
+        when(create.exec()).thenReturn(created);
+        when(docker.execCreateCmd("helper")).thenReturn(create);
+        InspectExecCmd inspect = mock(InspectExecCmd.class);
+        InspectExecResponse inspected = mock(InspectExecResponse.class);
+        when(inspected.getExitCodeLong()).thenReturn(0L);
+        when(inspect.exec()).thenReturn(inspected);
+        when(docker.inspectExecCmd("native-device-exec")).thenReturn(inspect);
+        ExecStartCmd start = mock(ExecStartCmd.class, RETURNS_SELF);
+        when(docker.execStartCmd("native-device-exec")).thenReturn(start);
+        when(start.exec(any())).thenAnswer(call -> {
+            ResultCallback.Adapter<Frame> callback = call.getArgument(0);
+            String output = """
+                    [{"ifname":"eth2","ifindex":2,"address":"%s",
+                      "addr_info":[{"family":"inet","local":"%s","prefixlen":24}]}]
+                    """.formatted(mac, address);
+            callback.onNext(new Frame(StreamType.STDOUT, output.getBytes(StandardCharsets.UTF_8)));
+            callback.onComplete();
+            return callback;
+        });
     }
 
     @Test

@@ -143,6 +143,7 @@ import static io.github.hectorvent.floci.services.ec2.Ec2KeyPairFixtures.ED25519
 import static io.github.hectorvent.floci.services.ec2.Ec2KeyPairFixtures.RSA_FINGERPRINT;
 import static io.github.hectorvent.floci.services.ec2.Ec2KeyPairFixtures.RSA_KEY;
 import static io.github.hectorvent.floci.services.ec2.Ec2KeyPairFixtures.TRUNCATED_RSA_KEY;
+import static io.github.hectorvent.floci.testing.ParkingStoreAssertions.assertOperationWaitsForParkedStore;
 import static io.github.hectorvent.floci.testing.ThreadStates.awaitBlockedOrDone;
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
@@ -401,6 +402,48 @@ class Ec2ServiceTest {
             for (Instance instance : reservation.getInstances()) {
                 assertEquals(original, instance.getTags());
             }
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"grant-before-detach", "detach-before-grant", "grant-before-describe"})
+    void interfacePermissionOperationsShareAttachmentSynchronization(String order) throws Exception {
+        String region = "us-east-1";
+        ParkingStore<NetworkInterface> interfaces = new ParkingStore<>();
+        AccountAwareStorageBackend<NetworkInterface> interfaceStore =
+                new AccountAwareStorageBackend<>(interfaces, null, "000000000000");
+        Ec2Service service = new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-network-interfaces.json", interfaceStore)));
+        String subnet = publicSubnet(service, region, "10.243.0.0/24");
+        NetworkInterface eni = service.createNetworkInterface(region, subnet, null, "10.243.0.10",
+                List.of(), List.of(), List.of());
+        Instance instance = service.runInstances(region, "ami-1234567890abcdef0", "t3.micro",
+                1, 1, null, List.of(), subnet, null, List.of(), null, null, null).getInstances().getFirst();
+        instance.setState(InstanceState.running());
+        NetworkInterfaceAttachment attachment = service.attachNetworkInterface(region,
+                eni.getNetworkInterfaceId(), instance.getInstanceId(), 1);
+        Runnable grant = () -> service.createNetworkInterfacePermission(region, eni.getNetworkInterfaceId(),
+                "111111111111", null, Ec2Service.INSTANCE_ATTACH);
+        Runnable detach = () -> service.detachNetworkInterface(region, attachment.getAttachmentId(), false);
+        Runnable describe = () -> assertEquals(1, service.describeNetworkInterfacePermissions(
+                region, List.of(), List.of(), null, null).permissions().size());
+        interfaces.parkNextWrite();
+
+        switch (order) {
+            case "grant-before-detach" -> assertOperationWaitsForParkedStore(interfaces, grant, detach);
+            case "detach-before-grant" -> assertOperationWaitsForParkedStore(interfaces, detach, grant);
+            case "grant-before-describe" -> assertOperationWaitsForParkedStore(interfaces, grant, describe);
+            default -> throw new IllegalArgumentException(order);
+        }
+
+        assertEquals(1, service.describeNetworkInterfacePermissions(
+                region, List.of(), List.of(), null, null).permissions().size());
+        if (!"grant-before-describe".equals(order)) {
+            assertNull(eni.getAttachment());
+            assertTrue(instance.getNetworkInterfaces().stream()
+                    .noneMatch(value -> eni.getNetworkInterfaceId().equals(value.getNetworkInterfaceId())));
         }
     }
 
@@ -3140,6 +3183,70 @@ class Ec2ServiceTest {
         assertEquals(instance.getInstanceId(), holder.getValue().getInstanceId());
         assertEquals(extra.getNetworkInterfaceId(), device.getValue().getNetworkInterfaceId());
         assertEquals(extra.getMacAddress(), device.getValue().getMacAddress());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"false,false", "true,false", "false,true", "true,true"})
+    void attachedInterfacePolicyUsesItsOwnerAccount(boolean foreign, boolean restore) throws Exception {
+        String owner = "111111111111";
+        String hostAccount = foreign ? "222222222222" : owner;
+        String region = "us-east-1";
+        RequestContext context = new RequestContext();
+        context.setAccountId(owner);
+        // The EC2 model Instance is imported; this is CDI's Instance type.
+        jakarta.enterprise.inject.Instance<RequestContext> contexts = requestContexts(context);
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        EmulatorConfig config = mockConfig(true);
+        Ec2Service service = new Ec2Service(config, manager, mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(contexts), contexts);
+        String subnet = privateSubnet(service, region, "10.233.0.0/24");
+        NetworkInterface extra = service.createNetworkInterface(region, subnet, null, null,
+                List.of(), List.of(), List.of());
+        SecurityGroup group = service.describeSecurityGroups(region,
+                List.of(extra.getGroups().getFirst().getGroupId()), List.of(), Map.of()).getFirst();
+        ManagedPrefixList prefix = service.createManagedPrefixList(region, "interface-owner-prefix", "IPv4", 1,
+                List.of(new PrefixListEntry("192.0.2.0/24", "owner")), List.of());
+        IpPermission permission = new IpPermission();
+        permission.setIpProtocol("-1");
+        permission.getPrefixListIds().add(new PrefixListId(prefix.getPrefixListId(), null));
+        group.getIpPermissions().add(permission);
+        service.createNetworkInterfacePermission(region, extra.getNetworkInterfaceId(), hostAccount, null,
+                Ec2Service.INSTANCE_ATTACH);
+        context.setAccountId(hostAccount);
+        String hostSubnet = privateSubnet(service, region, "10.234.0.0/24");
+        Instance host = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(), hostSubnet, null, List.of(), null, null).getInstances().getFirst();
+        host.setState(InstanceState.running());
+
+        NetworkInterfaceAttachment attachment = service.attachNetworkInterface(region,
+                extra.getNetworkInterfaceId(), host.getInstanceId(), 1);
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<SecurityGroup>> groups = ArgumentCaptor.forClass(List.class);
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Map<String, List<String>>> prefixes = ArgumentCaptor.forClass(Map.class);
+        if (restore) {
+            EmulatorConfig.NetworkConfig network = mock(EmulatorConfig.NetworkConfig.class, RETURNS_DEEP_STUBS);
+            when(config.network()).thenReturn(network);
+            when(network.securityGroupEnforcement().enabled()).thenReturn(true);
+            Method restoreFirewall = Ec2Service.class.getDeclaredMethod("restoreInstanceFirewall", Instance.class);
+            restoreFirewall.setAccessible(true);
+            restoreFirewall.invoke(service, host);
+            verify(manager).restoreAttachedInterface(eq(host), any(), groups.capture(), prefixes.capture());
+        } else {
+            verify(manager).plugNetworkInterface(eq(host), any(), groups.capture(), prefixes.capture());
+        }
+        assertEquals(List.of(group), groups.getValue(), "The attached policy belongs to the interface owner");
+        assertEquals(Map.of(prefix.getPrefixListId(), List.of("192.0.2.0/24")), prefixes.getValue());
+        assertEquals(hostAccount, context.getAccountId(), "Policy resolution must not change the request owner");
+        context.setAccountId(owner);
+        service.detachNetworkInterface(region, attachment.getAttachmentId(), false);
+        ArgumentCaptor<InstanceNetworkInterface> detached = ArgumentCaptor.forClass(InstanceNetworkInterface.class);
+        verify(manager).unplugNetworkInterface(eq(host), detached.capture());
+        assertEquals(extra.getNetworkInterfaceId(), detached.getValue().getNetworkInterfaceId());
+        assertTrue(host.getNetworkInterfaces().stream()
+                .noneMatch(eni -> extra.getNetworkInterfaceId().equals(eni.getNetworkInterfaceId())));
     }
 
     private static Ec2Service containerModeService() {
