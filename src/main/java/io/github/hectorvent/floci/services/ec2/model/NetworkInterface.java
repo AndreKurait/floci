@@ -41,6 +41,8 @@ public class NetworkInterface {
     private List<NetworkInterfacePrivateIpAddress> privateIpAddresses = new ArrayList<>();
     /** The permissions this interface's owner has granted other accounts over it. */
     private List<NetworkInterfacePermission> permissions = new ArrayList<>();
+    /** The interface's IPv6 addresses, from its subnet's IPv6 block (CreateNetworkInterface Ipv6AddressCount). */
+    private List<String> ipv6Addresses = new ArrayList<>();
 
     public NetworkInterface() {}
 
@@ -100,4 +102,9 @@ public class NetworkInterface {
 
     public List<NetworkInterfacePermission> getPermissions() { return permissions; }
     public void setPermissions(List<NetworkInterfacePermission> permissions) { this.permissions = permissions; }
+
+    public List<String> getIpv6Addresses() { return ipv6Addresses; }
+    public void setIpv6Addresses(List<String> ipv6Addresses) {
+        this.ipv6Addresses = ipv6Addresses != null ? ipv6Addresses : new ArrayList<>();
+    }
 }

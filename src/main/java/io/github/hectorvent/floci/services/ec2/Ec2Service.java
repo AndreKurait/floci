@@ -2654,21 +2654,29 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (subnetBlocks.isEmpty()) {
             return;
         }
-        Set<String> held = new HashSet<>();
-        for (Instance other : instances.scan(k -> true)) {
-            String state = other.getState() == null ? null : other.getState().getName();
-            // A terminated instance has released its interface; every other one still holds its addresses.
-            if (region.equals(other.getRegion()) && !"terminated".equals(state)) {
-                for (InstanceNetworkInterface otherEni : other.getNetworkInterfaces()) {
-                    if (subnet.getSubnetId().equals(otherEni.getSubnetId())) {
-                        held.addAll(otherEni.getIpv6Addresses());
-                    }
-                }
-            }
-        }
-        String address = randomIpv6InBlock(subnetBlocks.get(0), held);
+        String address = randomIpv6InBlock(subnetBlocks.get(0), ipv6AddressesHeld(region, subnet.getSubnetId()));
         eni.setIpv6Addresses(new ArrayList<>(List.of(address)));
-        eni.setSubnetIpv6CidrBlocks(new ArrayList<>(subnetBlocks));
+        carrySubnetIpv6Blocks(region, subnet.getSubnetId(), eni);
+    }
+
+    /** The subnet's associated IPv6 blocks, in association order. */
+    private static List<String> associatedIpv6Blocks(Subnet subnet) {
+        return subnet.getIpv6CidrBlockAssociationSet().stream()
+                .filter(assoc -> "associated".equalsIgnoreCase(assoc.getIpv6CidrBlockState()))
+                .map(VpcIpv6CidrBlockAssociation::getIpv6CidrBlock)
+                .toList();
+    }
+
+    /**
+     * Records the subnet's and VPC's associated IPv6 blocks on an instance's interface, for the instance metadata
+     * service.
+     */
+    private void carrySubnetIpv6Blocks(String region, String subnetId, InstanceNetworkInterface eni) {
+        Subnet subnet = subnetId == null ? null : subnets.get(key(region, subnetId)).orElse(null);
+        if (subnet == null) {
+            return;
+        }
+        eni.setSubnetIpv6CidrBlocks(new ArrayList<>(associatedIpv6Blocks(subnet)));
         Vpc vpc = vpcs.get(key(region, subnet.getVpcId())).orElse(null);
         if (vpc != null) {
             eni.setVpcIpv6CidrBlocks(new ArrayList<>(vpc.getIpv6CidrBlockAssociationSet().stream()
@@ -2676,6 +2684,30 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     .map(VpcIpv6CidrBlockAssociation::getIpv6CidrBlock)
                     .toList()));
         }
+    }
+
+    /**
+     * The IPv6 addresses the subnet's interfaces hold: those of every instance interface in it (a terminated
+     * instance has released its interface) and of every standalone interface in it.
+     */
+    private Set<String> ipv6AddressesHeld(String region, String subnetId) {
+        Set<String> held = new HashSet<>();
+        for (Instance other : instances.scan(k -> true)) {
+            String state = other.getState() == null ? null : other.getState().getName();
+            if (region.equals(other.getRegion()) && !"terminated".equals(state)) {
+                for (InstanceNetworkInterface otherEni : other.getNetworkInterfaces()) {
+                    if (subnetId.equals(otherEni.getSubnetId())) {
+                        held.addAll(otherEni.getIpv6Addresses());
+                    }
+                }
+            }
+        }
+        for (NetworkInterface standalone : networkInterfaces.scan(k -> k.startsWith(region + "::"))) {
+            if (subnetId.equals(standalone.getSubnetId())) {
+                held.addAll(standalone.getIpv6Addresses());
+            }
+        }
+        return held;
     }
 
     /** A random address in an IPv6 /64 (or larger) block, outside its first four addresses and {@code held}. */
@@ -4945,6 +4977,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             }
                             if (suppliedEni == null) {
                                 assignLaunchIpv6(region, finalSubnetId, eni);
+                            } else if (!suppliedEni.getIpv6Addresses().isEmpty()) {
+                                eni.setIpv6Addresses(new ArrayList<>(suppliedEni.getIpv6Addresses()));
+                                carrySubnetIpv6Blocks(region, finalSubnetId, eni);
                             }
                             inst.getNetworkInterfaces().add(eni);
                             if (suppliedEni != null) {
@@ -17270,6 +17305,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 // every interface instead and the filter would read as doing nothing.
                 case "interface-type" -> matchesValue(values, ni.getInterfaceType());
                 case "requester-managed" -> matchesValue(values, String.valueOf(ni.isRequesterManaged()));
+                case "ipv6-addresses.ipv6-address" -> ni.getIpv6Addresses().stream()
+                        .anyMatch(address -> matchesValue(values, address));
                 case "attachment.instance-id" -> ni.getAttachment() != null
                         && matchesValue(values, ni.getAttachment().getInstanceId());
                 case "attachment.instance-owner-id" -> ni.getAttachment() != null
@@ -18367,6 +18404,26 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     public NetworkInterface createNetworkInterface(String region, String subnetId, String description,
                                                     String privateIpAddress, List<String> privateIpAddresses,
                                                     List<String> securityGroupIds, List<Tag> tagList) {
+        return createNetworkInterface(region, subnetId, description, privateIpAddress, privateIpAddresses,
+                securityGroupIds, tagList, null);
+    }
+
+    /**
+     * {@link #createNetworkInterface(String, String, String, String, List, List, List)} with CreateNetworkInterface's
+     * {@code Ipv6AddressCount}: that many addresses from the subnet's IPv6 block. Without a count, a subnet with
+     * AssignIpv6AddressOnCreation gives one, and a count of 0 overrides that. Each address is a random interface id
+     * inside the subnet's /64, never one of the four AWS reserves at the start of the block and never one another
+     * interface in the subnet holds.
+     */
+    public NetworkInterface createNetworkInterface(String region, String subnetId, String description,
+                                                    String privateIpAddress, List<String> privateIpAddresses,
+                                                    List<String> securityGroupIds, List<Tag> tagList,
+                                                    Integer ipv6AddressCount) {
+        if (ipv6AddressCount != null && ipv6AddressCount < 0) {
+            throw new AwsException("InvalidParameterValue",
+                    "Value (" + ipv6AddressCount + ") for parameter Ipv6AddressCount is invalid. "
+                            + "The value must not be negative.", 400);
+        }
         if (subnetId == null || subnetId.isBlank()) {
             throw new AwsException("MissingParameter",
                     "The request must contain the parameter SubnetId", 400);
@@ -18390,6 +18447,23 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     String ip = canonicalIpv4(extra).orElse(extra);
                     if (!ip.equals(requestedIp) && secondaries.add(ip)) {
                         requireRequestedPrivateIpFree(region, subnetId, ip);
+                    }
+                }
+                List<String> ipv6Blocks = associatedIpv6Blocks(subnet);
+                int ipv6Count = ipv6AddressCount != null ? ipv6AddressCount
+                        : subnet.isAssignIpv6AddressOnCreation() && !ipv6Blocks.isEmpty() ? 1 : 0;
+                if (ipv6Count > 0 && ipv6Blocks.isEmpty()) {
+                    throw new AwsException("InvalidParameterValue",
+                            "Subnet '" + subnetId + "' has no associated IPv6 CIDR block to assign "
+                                    + ipv6Count + " IPv6 address(es) from.", 400);
+                }
+                List<String> ipv6Addresses = new ArrayList<>();
+                if (ipv6Count > 0) {
+                    Set<String> held = ipv6AddressesHeld(region, subnetId);
+                    for (int i = 0; i < ipv6Count; i++) {
+                        String address = randomIpv6InBlock(ipv6Blocks.get(0), held);
+                        held.add(address);
+                        ipv6Addresses.add(address);
                     }
                 }
                 String eniId = "eni-" + randomHex(17);
@@ -18431,6 +18505,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     }
                 }
                 ni.setPrivateIpAddresses(ipList);
+                ni.setIpv6Addresses(ipv6Addresses);
 
                 networkInterfaces.put(key(region, eniId), ni);
                 return ni;
@@ -18575,6 +18650,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             attached.setPrivateIpAddress(ni.getPrivateIpAddress());
             attached.setPrivateDnsName(ni.getPrivateDnsName());
             attached.setGroups(new ArrayList<>(ni.getGroups()));
+            if (!ni.getIpv6Addresses().isEmpty()) {
+                attached.setIpv6Addresses(new ArrayList<>(ni.getIpv6Addresses()));
+                carrySubnetIpv6Blocks(region, ni.getSubnetId(), attached);
+            }
             attached.setAttachmentId(attachment.getAttachmentId());
             attached.setDeviceIndex(deviceIndex);
             attached.setAttachTime(attachment.getAttachTime());
