@@ -2177,12 +2177,19 @@ public class ResourceArnBuilder {
     /**
      * Session Manager, as its permissions reference gives it: StartSession is authorized on the Session document
      * (an AWS-owned one has no account, and an omitted name is the account's SSM-SessionManagerRunShell) and on
-     * the target node; ResumeSession and TerminateSession on the session; DescribeSessions and
-     * GetConnectionStatus name no resource.
+     * the target node; ResumeSession and TerminateSession on the session; GetConnectionStatus on its
+     * selected node; DescribeSessions names no resource.
      */
     private static List<String> ssmSessionResources(String action, JsonNode json, String region,
                                                     String accountId, String partition) {
-        if ("DescribeSessions".equals(action) || "GetConnectionStatus".equals(action)) {
+        if ("GetConnectionStatus".equals(action)) {
+            String target = json == null ? "" : json.path("Target").asText("");
+            boolean managed = target.startsWith("mi-");
+            return List.of(target.isEmpty() ? "*"
+                    : new AwsArnUtils.Arn(partition, managed ? "ssm" : "ec2", region, accountId,
+                            (managed ? "managed-instance/" : "instance/") + target).toString());
+        }
+        if ("DescribeSessions".equals(action)) {
             return List.of("*");
         }
         if ("ResumeSession".equals(action) || "TerminateSession".equals(action)) {

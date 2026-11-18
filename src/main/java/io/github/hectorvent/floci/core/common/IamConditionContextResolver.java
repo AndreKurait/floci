@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.core.common;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.services.acmpca.AcmPcaService;
 import io.github.hectorvent.floci.services.amazonmq.AmazonMqConfigurationService;
 import io.github.hectorvent.floci.services.apigateway.ApiGatewayDocumentationIamConditions;
 import io.github.hectorvent.floci.services.athena.AthenaBatchQueryService;
@@ -127,6 +128,9 @@ public class IamConditionContextResolver {
 
     @Inject
     Instance<BackupFrameworkService> backupFrameworks;
+
+    @Inject
+    Instance<AcmPcaService> privateAuthorities;
 
     @Inject
     Instance<ApiGatewayDocumentationIamConditions> documentationConditions;
@@ -815,22 +819,29 @@ public class IamConditionContextResolver {
     }
 
     private Map<String, List<String>> privateCaConditionContext(String action, ContainerRequestContext ctx) {
-        if (!"acm-pca:IssueCertificate".equals(action)) {
-            return null;
-        }
         JsonNode body = bufferedJsonBody(ctx);
         if (body == null) {
             return null;
         }
-        JsonNode template = body.path("TemplateArn");
-        if (!template.isMissingNode() && !template.isNull() && !template.isTextual()) {
-            return null;
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        if (privateAuthorities != null && privateAuthorities.isResolvable()
+                && body.path("CertificateAuthorityArn").isTextual()) {
+            privateAuthorities.get().storedTags(body.path("CertificateAuthorityArn").textValue())
+                    .forEach((key, value) -> conditions.put(RESOURCE_TAG_PREFIX + key, List.of(value)));
         }
-        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
-        String value = template.isTextual() ? template.textValue()
-                : AwsArnUtils.Arn.global(AwsRegions.partitionFor(region), "acm-pca", "",
-                        "template/EndEntityCertificate/V1").toString();
-        return Map.of("acm-pca:TemplateArn", List.of(value));
+        if ("acm-pca:IssueCertificate".equals(action)) {
+            JsonNode template = body.path("TemplateArn");
+            if (template.isMissingNode() || template.isNull() || template.isTextual()) {
+                String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+                String value = template.isTextual() ? template.textValue()
+                        : AwsArnUtils.Arn.global(AwsPartitions.forRegion(region).map(AwsPartition::id)
+                                .orElseGet(() -> RegionResolver.effectivePartition(
+                                        config.defaultRegion(), config.partitions().id())), "acm-pca", "",
+                                "template/EndEntityCertificate/V1").toString();
+                conditions.put("acm-pca:TemplateArn", List.of(value));
+            }
+        }
+        return conditions.isEmpty() ? null : conditions;
     }
 
     private Map<String, List<String>> iamConditionContext(String action, ContainerRequestContext ctx) {

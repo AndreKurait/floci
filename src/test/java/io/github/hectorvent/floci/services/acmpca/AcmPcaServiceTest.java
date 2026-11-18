@@ -158,6 +158,44 @@ class AcmPcaServiceTest {
     }
 
     @Test
+    void rootIssuanceReplaySurvivesActivationUntilTokenExpiry() {
+        AdjustableClock clock = new AdjustableClock();
+        InMemoryStorage<String, CertificateAuthority> store = new InMemoryStorage<>();
+        AcmPcaService service = service(store, clock);
+        String ca = create(service, null);
+        ObjectNode request = issueRequest(ca, store.get(ca).orElseThrow().csrPem(), true);
+        String issued = service.issue(request, REGION).path("CertificateArn").asText();
+        service.importCertificate(importRequest(ca, service.certificate(
+                arn(ca).put("CertificateArn", issued), REGION).path("Certificate").asText()), REGION);
+        clock.advance(299);
+        assertEquals(issued, service.issue(request, REGION).path("CertificateArn").asText());
+        assertEquals(1, store.get(ca).orElseThrow().certificates().size());
+        clock.advance(1);
+        error("InvalidStateException", () -> service.issue(request, REGION));
+        assertEquals(1, store.get(ca).orElseThrow().certificates().size());
+    }
+
+    @Test
+    void rootIssuanceReplayDoesNotPermitFreshIssuanceOrDeletedAuthority() {
+        AdjustableClock clock = new AdjustableClock();
+        InMemoryStorage<String, CertificateAuthority> store = new InMemoryStorage<>();
+        AcmPcaService service = service(store, clock);
+        String ca = create(service, null);
+        ObjectNode request = issueRequest(ca, store.get(ca).orElseThrow().csrPem(), true);
+        String issued = service.issue(request, REGION).path("CertificateArn").asText();
+        service.importCertificate(importRequest(ca, service.certificate(
+                arn(ca).put("CertificateArn", issued), REGION).path("Certificate").asText()), REGION);
+        error("InvalidStateException", () -> service.issue(request.deepCopy().put("IdempotencyToken", "fresh"), REGION));
+        ObjectNode withoutToken = request.deepCopy();
+        withoutToken.remove("IdempotencyToken");
+        error("InvalidStateException", () -> service.issue(withoutToken, REGION));
+        service.update(arn(ca).put("Status", "DISABLED"), REGION);
+        service.delete(arn(ca).put("PermanentDeletionTimeInDays", 7), REGION);
+        error("InvalidStateException", () -> service.issue(request, REGION));
+        assertEquals(1, store.get(ca).orElseThrow().certificates().size());
+    }
+
+    @Test
     void deletionExpiresOnlyAtItsDeadlineAndTokensExpireAfterFiveMinutes() {
         AdjustableClock clock = new AdjustableClock();
         InMemoryStorage<String, CertificateAuthority> store = new InMemoryStorage<>();
@@ -417,6 +455,39 @@ class AcmPcaServiceTest {
         } else if (backend instanceof HybridStorage<String, CertificateAuthority> hybrid) {
             hybrid.shutdown();
         }
+    }
+
+    @Test
+    void storedTagsReadOnlyTheExactOwnedAuthority() {
+        InMemoryStorage<String, CertificateAuthority> store = new InMemoryStorage<>();
+        AdjustableClock clock = new AdjustableClock();
+        AcmPcaService service = service(store, clock);
+        String ca = create(service, null);
+        CertificateAuthority original = store.get(ca).orElseThrow();
+        store.put(ca, original.tagged(Map.of("Environment", "prod")));
+        assertEquals(Map.of("Environment", "prod"), service.storedTags(ca));
+        assertEquals(Map.of(), service.storedTags(ca + "/certificate/leaf"));
+        assertEquals(Map.of(), service.storedTags(ca.replace(REGION, "us-west-2")));
+        assertEquals(Map.of(), service.storedTags(ca.replace("arn:aws:", "arn:aws-us-gov:")));
+        assertEquals(Map.of(), service.storedTags("not-an-arn"));
+        AcmPcaService foreign = new AcmPcaService(store, new RegionResolver(REGION, "999999999999"), MAPPER, clock);
+        assertEquals(Map.of(), foreign.storedTags(ca));
+        store.put(ca, original.tagged(Map.of("Environment", "dev")));
+        assertEquals(Map.of("Environment", "dev"), service.storedTags(ca));
+        assertEquals(original.tagged(Map.of("Environment", "dev")), store.get(ca).orElseThrow());
+    }
+
+    @Test
+    void expiredAuthorityTagLookupDoesNotMutateStorage() {
+        InMemoryStorage<String, CertificateAuthority> store = new InMemoryStorage<>();
+        AdjustableClock clock = new AdjustableClock();
+        AcmPcaService service = service(store, clock);
+        String ca = create(service, null);
+        CertificateAuthority expired = store.get(ca).orElseThrow().tagged(Map.of("Environment", "prod"))
+                .transition("DELETED", null, clock.instant(), clock.instant());
+        store.put(ca, expired);
+        assertEquals(Map.of(), service.storedTags(ca));
+        assertEquals(expired, store.get(ca).orElseThrow());
     }
 
     private static AcmPcaService service(StorageBackend<String, CertificateAuthority> backend, Clock clock) {
