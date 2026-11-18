@@ -131,6 +131,12 @@ public class AcmPcaService implements Resettable, AcmPrivateCertificateAuthoriti
             throw invalid("Only RootCACertificate/V1, SubordinateCACertificate_PathLen0/V1 to PathLen3/V1 "
                     + "and EndEntityCertificate/V1 templates are supported");
         }
+        Instant now = now();
+        String token = PrivateCaRequests.token(request);
+        IssueToken previous = token == null ? null : authority.issueTokens().get(token);
+        if (previous != null && previous.createdAt().plusSeconds(300).isAfter(now)) {
+            return mapper.createObjectNode().put("CertificateArn", previous.certificateArn());
+        }
         String status = status(authority);
         if (root ? !"PENDING_CERTIFICATE".equals(status) : !"ACTIVE".equals(status)) {
             throw state("The certificate authority is not in a state that permits this certificate template");
@@ -145,12 +151,6 @@ public class AcmPcaService implements Resettable, AcmPrivateCertificateAuthoriti
             if (pathLength != null && pathLength >= parent.getBasicConstraints()) {
                 throw invalid("The template path length must be less than the path length of the issuing CA");
             }
-        }
-        Instant now = now();
-        String token = PrivateCaRequests.token(request);
-        IssueToken previous = token == null ? null : authority.issueTokens().get(token);
-        if (previous != null && previous.createdAt().plusSeconds(300).isAfter(now)) {
-            return mapper.createObjectNode().put("CertificateArn", previous.certificateArn());
         }
         Instant notBefore = PrivateCaRequests.validity(request, now, true);
         Instant notAfter = PrivateCaRequests.validity(request, now, false);

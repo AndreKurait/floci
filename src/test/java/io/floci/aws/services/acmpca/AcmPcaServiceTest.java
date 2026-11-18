@@ -158,6 +158,44 @@ class AcmPcaServiceTest {
     }
 
     @Test
+    void rootIssuanceReplaySurvivesActivationUntilTokenExpiry() {
+        AdjustableClock clock = new AdjustableClock();
+        InMemoryStorage<String, CertificateAuthority> store = new InMemoryStorage<>();
+        AcmPcaService service = service(store, clock);
+        String ca = create(service, null);
+        ObjectNode request = issueRequest(ca, store.get(ca).orElseThrow().csrPem(), true);
+        String issued = service.issue(request, REGION).path("CertificateArn").asText();
+        service.importCertificate(importRequest(ca, service.certificate(
+                arn(ca).put("CertificateArn", issued), REGION).path("Certificate").asText()), REGION);
+        clock.advance(299);
+        assertEquals(issued, service.issue(request, REGION).path("CertificateArn").asText());
+        assertEquals(1, store.get(ca).orElseThrow().certificates().size());
+        clock.advance(1);
+        error("InvalidStateException", () -> service.issue(request, REGION));
+        assertEquals(1, store.get(ca).orElseThrow().certificates().size());
+    }
+
+    @Test
+    void rootIssuanceReplayDoesNotPermitFreshIssuanceOrDeletedAuthority() {
+        AdjustableClock clock = new AdjustableClock();
+        InMemoryStorage<String, CertificateAuthority> store = new InMemoryStorage<>();
+        AcmPcaService service = service(store, clock);
+        String ca = create(service, null);
+        ObjectNode request = issueRequest(ca, store.get(ca).orElseThrow().csrPem(), true);
+        String issued = service.issue(request, REGION).path("CertificateArn").asText();
+        service.importCertificate(importRequest(ca, service.certificate(
+                arn(ca).put("CertificateArn", issued), REGION).path("Certificate").asText()), REGION);
+        error("InvalidStateException", () -> service.issue(request.deepCopy().put("IdempotencyToken", "fresh"), REGION));
+        ObjectNode withoutToken = request.deepCopy();
+        withoutToken.remove("IdempotencyToken");
+        error("InvalidStateException", () -> service.issue(withoutToken, REGION));
+        service.update(arn(ca).put("Status", "DISABLED"), REGION);
+        service.delete(arn(ca).put("PermanentDeletionTimeInDays", 7), REGION);
+        error("InvalidStateException", () -> service.issue(request, REGION));
+        assertEquals(1, store.get(ca).orElseThrow().certificates().size());
+    }
+
+    @Test
     void deletionExpiresOnlyAtItsDeadlineAndTokensExpireAfterFiveMinutes() {
         AdjustableClock clock = new AdjustableClock();
         InMemoryStorage<String, CertificateAuthority> store = new InMemoryStorage<>();
