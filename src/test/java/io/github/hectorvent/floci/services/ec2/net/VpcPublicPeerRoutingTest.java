@@ -21,6 +21,8 @@ import io.github.hectorvent.floci.core.common.docker.ContainerReachableEndpoint;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 import io.github.hectorvent.floci.core.common.docker.NetworkNamespaceLease;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
+import io.github.hectorvent.floci.services.ec2.SecurityGroupDnsFixture;
+import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler;
 import io.github.hectorvent.floci.services.ec2.model.InternetGateway;
 import io.github.hectorvent.floci.services.ec2.model.InternetGatewayAttachment;
@@ -296,6 +298,65 @@ class VpcPublicPeerRoutingTest {
         assertEquals(Set.of("172.18.0.2", "172.18.0.3"), manager.publicInstanceAddresses());
         assertFalse(latest("first").contains("accept"), "An unconfirmed exec failure must retain quarantine");
         assertFalse(latest("second").contains("accept"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"single", "batch", "strict"})
+    void routeUpdatesExcludeHelpersWhoseOwnerHasStartedRemoval(String removal) {
+        SecurityGroupFirewallManager firewall = SecurityGroupDnsFixture.manager(
+                mock(DockerClient.class), config, lifecycle, manager);
+        admit("first", 2, true);
+        admit("second", 3, true);
+        firewall.register(identity("second", 3), "second", Map.of());
+        AtomicBoolean removalStarted = new AtomicBoolean();
+        doAnswer(invocation -> {
+            removalStarted.set(true);
+            // Docker can still report RUNNING while removal interrupts a namespace exec.
+            when(docker.inspectExecCmd("second-exec").exec().getExitCodeLong()).thenReturn(137L);
+            gateway.setAttachments(List.of());
+
+            assertDoesNotThrow(manager::reconcile);
+            assertTrue(docker.inspectContainerCmd("second").exec().getState().getRunning());
+            assertEquals(Set.of("172.18.0.2"), manager.publicInstanceAddresses());
+            assertTrue(latest("first").contains("accept"), "The surviving helper keeps its local routes");
+            assertFalse(latest("first").contains("via 240.0.0.3"));
+            missing("second");
+            return null;
+        }).when(lifecycle).removeIfExistsStrict("second");
+
+        switch (removal) {
+            case "single" -> firewall.unregister("second");
+            case "batch" -> firewall.unregisterAll(List.of("second"));
+            case "strict" -> firewall.removeNamespaceStrict("second");
+            default -> fail("Unknown removal path");
+        }
+
+        assertTrue(removalStarted.get());
+        verify(lifecycle).removeIfExistsStrict("second");
+        verify(docker, never()).stopContainerCmd("first");
+    }
+
+    @Test
+    void failedRouteWithdrawalRetainsOwnerCleanupAndRetriesBeforeRemovingItsHelper() {
+        SecurityGroupFirewallManager firewall = SecurityGroupDnsFixture.manager(
+                mock(DockerClient.class), config, lifecycle, manager);
+        admit("first", 2, true);
+        admit("second", 3, true);
+        firewall.register(identity("second", 3), "second", Map.of());
+        gateway.setAttachments(List.of());
+        when(docker.inspectExecCmd("first-exec").exec().getExitCodeLong()).thenReturn(137L);
+        doAnswer(invocation -> {
+            missing("second");
+            return null;
+        }).when(lifecycle).removeIfExistsStrict("second");
+
+        assertThrows(IllegalStateException.class, () -> firewall.unregister("second"));
+        verify(lifecycle, never()).removeIfExistsStrict("second");
+
+        when(docker.inspectExecCmd("first-exec").exec().getExitCodeLong()).thenReturn(0L);
+        assertDoesNotThrow(() -> firewall.unregister("second"));
+        verify(lifecycle).removeIfExistsStrict("second");
+        assertTrue(latest("first").contains("accept"));
     }
 
     @ParameterizedTest

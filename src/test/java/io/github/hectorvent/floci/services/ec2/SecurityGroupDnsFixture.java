@@ -12,6 +12,8 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.dns.EmbeddedDnsServer;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
+import io.github.hectorvent.floci.services.ec2.net.VpcRoutingManager;
+import jakarta.enterprise.inject.Instance;
 
 import java.util.List;
 
@@ -31,11 +33,22 @@ public final class SecurityGroupDnsFixture {
     }
 
     public static SecurityGroupFirewallManager manager(DockerClient dockerClient, EmulatorConfig config) {
+        return manager(dockerClient, config, mock(ContainerLifecycleManager.class), null);
+    }
+
+    @SuppressWarnings("unchecked")
+    public static SecurityGroupFirewallManager manager(DockerClient dockerClient, EmulatorConfig config,
+                                                        ContainerLifecycleManager lifecycle, VpcRoutingManager routing) {
         SecurityGroupFirewallManager manager = spy(rawManager(policyDocker(dockerClient),
-                mock(ContainerBuilder.class), mock(ContainerLifecycleManager.class), config,
+                mock(ContainerBuilder.class), lifecycle, config,
                 mock(EmbeddedDnsServer.class)));
         doNothing().when(manager).reconcileAll();
         doNothing().when(manager).admit(anyString(), anyBoolean());
+        if (routing != null) {
+            Instance<VpcRoutingManager> reference = mock(Instance.class);
+            when(reference.get()).thenReturn(routing);
+            manager.vpcRouting = reference;
+        }
         return manager;
     }
 

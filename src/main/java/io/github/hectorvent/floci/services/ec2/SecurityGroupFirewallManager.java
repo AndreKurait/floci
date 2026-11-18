@@ -324,6 +324,9 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             return;
         }
         try {
+            if (vpcRouting != null && !vpcRouting.isUnsatisfied()) {
+                vpcRouting.get().prepareNamespaceRemoval(helper);
+            }
             lifecycleManager.removeIfExistsStrict(helper);
             synchronized (this) {
                 // Wait for policy batches and observer quarantine to release their writer leases.

@@ -66,6 +66,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
     private final Map<String, Endpoint> endpoints = new LinkedHashMap<>();
     private final Map<String, PublicAddress> publicAddresses = new LinkedHashMap<>();
     private final Map<String, NatRuntime> nats = new LinkedHashMap<>();
+    /** Includes exact namespaces whose owners have begun removal but Docker still reports as running. */
     private final Set<String> unavailableNamespaces = new HashSet<>();
     private String publicNetwork;
     private boolean draining;
@@ -155,6 +156,20 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
             run(helper, VpcRoutingCommands.endpointGuard());
             reconcile();
         });
+    }
+
+    /** Stops routing to an owner's captured helper before Docker removal can interrupt a policy command. */
+    public synchronized void prepareNamespaceRemoval(String helper) {
+        if (!enabled()) {
+            return;
+        }
+        boolean owned = endpoints.values().stream().anyMatch(endpoint -> helper.equals(endpoint.helper))
+                || publicAddresses.values().stream().anyMatch(address -> helper.equals(address.namespace.id()));
+        if (owned) {
+            // Retain the endpoint and its address until the owner confirms removal through unregister.
+            unavailableNamespaces.add(helper);
+            reconcile();
+        }
     }
 
     /** The owning service removes the namespace before releasing its native interface. */
