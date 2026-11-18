@@ -88,6 +88,7 @@ public class AcmPcaCfnProvisioner implements CfnResourceProvisioner {
         JsonNode existing = ctx.isUpdate() ? findExisting(ctx.priorPhysicalId(), ctx.region()) : null;
         String arn;
         if (existing != null && !"DELETED".equals(existing.path("Status").asText())
+                && !ctx.changes(TYPE, props).requiresReplacement()
                 && sameCreateOnlyProperties(existing, create)) {
             arn = existing.path("Arn").asText();
             acmPcaService.validateRevocationConfiguration(create);
