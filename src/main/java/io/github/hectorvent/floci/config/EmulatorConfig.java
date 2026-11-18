@@ -3754,6 +3754,15 @@ public interface EmulatorConfig {
         boolean guestTlsEndpoint();
 
         /**
+         * Carry IPv6 inside guest network namespaces (FLOCI_SERVICES_EC2_GUEST_IPV6). When true, an instance whose
+         * primary interface holds an IPv6 address gets a namespace with IPv6 enabled, that address on its VPC
+         * interface, the VPC's IPv6 block routed on that interface and a default route to the VPC router. When
+         * false (the default), addresses are still assigned and reported, and no namespace changes.
+         */
+        @WithDefault("false")
+        boolean guestIpv6();
+
+        /**
          * Whether an EC2 instance's Docker container IP is routable from the machines that
          * consume Floci's API responses (Terraform, Terratest, your shell). When true,
          * DescribeInstances / DescribeAddresses report the container IP, so the address they
