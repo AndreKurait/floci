@@ -11,6 +11,7 @@ import io.floci.aws.core.common.Pem;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.ReservedTags;
 import io.floci.aws.core.common.Resettable;
+import io.floci.aws.core.common.StoredResourceArns;
 import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.acm.AcmPrivateCertificateAuthorities;
@@ -45,7 +46,7 @@ import static io.floci.aws.services.acmpca.PrivateCaRequests.optionalText;
 import static io.floci.aws.services.acmpca.PrivateCaRequests.text;
 
 @ApplicationScoped
-public class AcmPcaService implements Resettable, AcmPrivateCertificateAuthorities {
+public class AcmPcaService implements Resettable, AcmPrivateCertificateAuthorities, StoredResourceArns {
 
     private final StorageBackend<String, CertificateAuthority> store;
     private final RegionResolver regionResolver;
@@ -400,6 +401,33 @@ public class AcmPcaService implements Resettable, AcmPrivateCertificateAuthoriti
         CertificateGenerator.Issuer issuer = new CertificateGenerator.Issuer(
                 PrivateCaCertificates.certificate(authority.certificatePem()), Pem.parsePrivateKey(authority.privateKeyPem()));
         return Optional.of(new PrivateCertificateAuthority(true, issuer, chainOf(authority)));
+    }
+
+    @Override
+    public String namespace() {
+        return "acm-pca";
+    }
+
+    @Override
+    public Optional<String> find(String type, List<String> names, String region) {
+        return Optional.empty();
+    }
+
+    @Override
+    public synchronized Map<String, String> storedTags(String arn) {
+        if (!AwsArnUtils.isArnFor(arn, namespace())) {
+            return Map.of();
+        }
+        AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+        if (!parsed.accountId().equals(regionResolver.getAccountId())
+                || !parsed.resource().startsWith("certificate-authority/")
+                || !parsed.partition().equals(regionResolver.partitionForRegion(parsed.region()))) {
+            return Map.of();
+        }
+        return store.scan(arn::equals).stream()
+                .filter(value -> arn.equals(value.arn()) && owned(value, parsed.region()))
+                .filter(value -> value.restorableUntil() == null || value.restorableUntil().isAfter(now()))
+                .findFirst().map(CertificateAuthority::tags).orElse(Map.of());
     }
 
     private CertificateAuthority authority(JsonNode request, String region) {

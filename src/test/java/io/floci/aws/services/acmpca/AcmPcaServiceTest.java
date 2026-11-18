@@ -419,6 +419,41 @@ class AcmPcaServiceTest {
         }
     }
 
+    @Test
+    void storedTagsReadOnlyTheExactOwnedAuthority() {
+        InMemoryStorage<String, CertificateAuthority> store = new InMemoryStorage<>();
+        AdjustableClock clock = new AdjustableClock();
+        AcmPcaService service = service(store, clock);
+        String ca = create(service, null);
+        CertificateAuthority original = store.get(ca).orElseThrow();
+        store.put(ca, original.tagged(Map.of("Environment", "prod")));
+        assertEquals("acm-pca", service.namespace());
+        assertEquals(Map.of("Environment", "prod"), service.storedTags(ca));
+        assertTrue(service.find("certificate-authority", List.of(ca), REGION).isEmpty());
+        assertEquals(Map.of(), service.storedTags(ca + "/certificate/leaf"));
+        assertEquals(Map.of(), service.storedTags(ca.replace(REGION, "us-west-2")));
+        assertEquals(Map.of(), service.storedTags(ca.replace("arn:aws:", "arn:aws-us-gov:")));
+        assertEquals(Map.of(), service.storedTags("not-an-arn"));
+        AcmPcaService foreign = new AcmPcaService(store, new RegionResolver(REGION, "999999999999"), MAPPER, clock);
+        assertEquals(Map.of(), foreign.storedTags(ca));
+        store.put(ca, original.tagged(Map.of("Environment", "dev")));
+        assertEquals(Map.of("Environment", "dev"), service.storedTags(ca));
+        assertEquals(original.tagged(Map.of("Environment", "dev")), store.get(ca).orElseThrow());
+    }
+
+    @Test
+    void expiredAuthorityTagLookupDoesNotMutateStorage() {
+        InMemoryStorage<String, CertificateAuthority> store = new InMemoryStorage<>();
+        AdjustableClock clock = new AdjustableClock();
+        AcmPcaService service = service(store, clock);
+        String ca = create(service, null);
+        CertificateAuthority expired = store.get(ca).orElseThrow().tagged(Map.of("Environment", "prod"))
+                .transition("DELETED", null, clock.instant(), clock.instant());
+        store.put(ca, expired);
+        assertEquals(Map.of(), service.storedTags(ca));
+        assertEquals(expired, store.get(ca).orElseThrow());
+    }
+
     private static AcmPcaService service(StorageBackend<String, CertificateAuthority> backend, Clock clock) {
         return new AcmPcaService(backend, new RegionResolver(REGION, ACCOUNT), MAPPER, clock);
     }
