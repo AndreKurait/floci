@@ -14,6 +14,7 @@ import io.floci.aws.core.resource.ResourceProvider;
 import io.floci.aws.core.resource.SupportedResourceType;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
+import io.floci.aws.services.acm.AcmCertificateReferenceProvider.CertificateReference;
 import io.floci.aws.services.opensearch.model.AdvancedSecurityOptions;
 import io.floci.aws.services.opensearch.model.ClusterConfig;
 import io.floci.aws.services.opensearch.model.Domain;
@@ -992,5 +993,22 @@ public class OpenSearchService implements ResourceProvider, StoredResourceArns {
     @Override
     public Set<SupportedResourceType> getSupportedResourceTypes() {
         return Set.of(new SupportedResourceType("es:domain", "es", true));
+    }
+
+    /** Reads live certificate references without acquiring this service's mutation lock. */
+    public List<CertificateReference> acmCertificateReferences() {
+        List<CertificateReference> references = new ArrayList<>();
+        for (Domain domain : domainStore.scan(k -> true)) {
+            DomainEndpointOptions endpoint = domain.getDomainEndpointOptions();
+            if (domain.isDeleted() || domain.getArn() == null || endpoint == null
+                    || !endpoint.isCustomEndpointEnabled()) {
+                continue;
+            }
+            String certificateArn = endpoint.getCustomEndpointCertificateArn();
+            if (certificateArn != null && !certificateArn.isBlank()) {
+                references.add(new CertificateReference(certificateArn, domain.getArn()));
+            }
+        }
+        return references;
     }
 }
