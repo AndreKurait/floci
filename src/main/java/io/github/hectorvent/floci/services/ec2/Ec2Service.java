@@ -18489,6 +18489,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      */
     public NetworkInterfaceAttachment attachNetworkInterface(String region, String networkInterfaceId,
                                                               String instanceId, int deviceIndex) {
+        Instance pluggedInstance;
+        InstanceNetworkInterface pluggedInterface;
+        NetworkInterfaceAttachment result;
         synchronized (privateIpAllocationLock) {
             NetworkInterface ni = requireStandaloneNetworkInterface(region, networkInterfaceId);
             if (ni.getAttachment() != null || "in-use".equals(ni.getStatus())) {
@@ -18544,12 +18547,22 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             if (containerManager != null) {
                 containerManager.refreshInstanceMetadata(inst);
             }
-            return attachment;
+            pluggedInstance = inst;
+            pluggedInterface = attached;
+            result = attachment;
         }
+        // Outside the allocation lock: the device is a Docker call.
+        if (containerManager != null) {
+            containerManager.plugNetworkInterface(pluggedInstance, pluggedInterface);
+        }
+        return result;
     }
 
     /** Detaches a standalone ENI by attachment id, floci-kt9. */
     public NetworkInterfaceAttachment detachNetworkInterface(String region, String attachmentId, boolean force) {
+        Instance unpluggedInstance;
+        InstanceNetworkInterface unpluggedInterface;
+        NetworkInterfaceAttachment result;
         synchronized (privateIpAllocationLock) {
             if (attachmentId == null || attachmentId.isBlank()) {
                 throw new AwsException("MissingParameter", "The request must contain the parameter AttachmentId", 400);
@@ -18564,12 +18577,23 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 throw new AwsException("OperationNotPermitted",
                         "The primary network interface of an instance cannot be detached", 400);
             }
+            Instance holder = instances.get(key(region, detached.getInstanceId())).orElse(null);
+            InstanceNetworkInterface device = holder == null ? null : holder.getNetworkInterfaces().stream()
+                    .filter(e -> ni.getNetworkInterfaceId().equals(e.getNetworkInterfaceId()))
+                    .findFirst().orElse(null);
             ni.setAttachment(null);
             ni.setStatus("available");
             networkInterfaces.put(key(region, ni.getNetworkInterfaceId()), ni);
             detachFromInstance(region, detached.getInstanceId(), ni.getNetworkInterfaceId());
-            return detached;
+            unpluggedInstance = holder;
+            unpluggedInterface = device;
+            result = detached;
         }
+        // Outside the allocation lock: removing the device is a Docker call.
+        if (containerManager != null && unpluggedInstance != null && unpluggedInterface != null) {
+            containerManager.unplugNetworkInterface(unpluggedInstance, unpluggedInterface);
+        }
+        return result;
     }
 
     /** Removes an interface from an instance's own list, the mirror of attaching it. */
