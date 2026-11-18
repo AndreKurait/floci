@@ -14,6 +14,8 @@ import io.floci.aws.core.storage.PersistentStorage;
 import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.core.storage.WalStorage;
 import io.floci.aws.services.acmpca.model.CertificateAuthority;
+import io.floci.aws.testing.ParkingStore;
+import io.floci.aws.testing.ThreadStates;
 import org.bouncycastle.asn1.ASN1ObjectIdentifier;
 import org.bouncycastle.asn1.ASN1String;
 import org.bouncycastle.asn1.DERUTF8String;
@@ -47,6 +49,11 @@ import java.util.Date;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -490,6 +497,86 @@ class AcmPcaServiceTest {
         store.put(ca, expired);
         assertEquals(Map.of(), service.storedTags(ca));
         assertEquals(expired, store.get(ca).orElseThrow());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"create", "issue", "import", "update", "delete", "restore", "tag", "untag"})
+    void resetRejectsWritesBeforeAndAfterStorageClear(String operation) {
+        StorageBackend<String, CertificateAuthority> store = new InMemoryStorage<>();
+        AcmPcaService service = service(store, new AdjustableClock());
+        String ca = create(service, null);
+        CertificateAuthority original = store.get(ca).orElseThrow();
+        Runnable write = switch (operation) {
+            case "create" -> () -> create(service, "during-reset");
+            case "issue" -> () -> root(service, original);
+            case "import" -> () -> service.importCertificate(arn(ca), REGION);
+            case "update" -> () -> service.update(arn(ca).put("Status", "DISABLED"), REGION);
+            case "delete" -> () -> service.delete(arn(ca).put("PermanentDeletionTimeInDays", 7), REGION);
+            case "restore" -> () -> service.restore(arn(ca), REGION);
+            case "tag" -> () -> service.tag(arn(ca), REGION);
+            case "untag" -> () -> service.untag(arn(ca), REGION);
+            default -> throw new IllegalArgumentException(operation);
+        };
+        service.beforeReset();
+        try {
+            error("RequestFailedException", write);
+            assertEquals(original, store.get(ca).orElseThrow());
+            assertEquals(ca, service.describe(arn(ca), REGION).path("CertificateAuthority").path("Arn").asText());
+            service.clear();
+            error("RequestFailedException", write);
+            assertTrue(store.scan(key -> true).isEmpty());
+        } finally {
+            service.afterReset();
+        }
+        String replacement = create(service, "after-reset");
+        assertTrue(store.get(replacement).isPresent());
+        assertTrue(store.get(ca).isEmpty());
+    }
+
+    @Test
+    void beforeResetDrainsTheActiveWriteBeforeClearing() throws Exception {
+        ParkingStore<CertificateAuthority> store = new ParkingStore<>();
+        AcmPcaService service = service(store, new AdjustableClock());
+        ExecutorService workers = Executors.newFixedThreadPool(2);
+        AtomicReference<Thread> resetThread = new AtomicReference<>();
+        store.parkNextAtomicWrite();
+        try {
+            Future<String> creating = workers.submit(() -> create(service, "in-flight"));
+            assertTrue(store.awaitParked(), "create reached the store write");
+            Future<?> resetting = workers.submit(() -> {
+                resetThread.set(Thread.currentThread());
+                service.beforeReset();
+            });
+            ThreadStates.awaitBlockedOrDone(resetThread, resetting);
+            if (resetting.isDone()) {
+                resetting.get(5, TimeUnit.SECONDS);
+            }
+            assertFalse(resetting.isDone(), "reset must drain the active authority write");
+            store.release();
+            String ca = creating.get(5, TimeUnit.SECONDS);
+            resetting.get(5, TimeUnit.SECONDS);
+            assertTrue(store.get(ca).isPresent());
+            service.clear();
+            error("RequestFailedException", () -> create(service, "after-clear"));
+            assertTrue(store.scan(key -> true).isEmpty());
+        } finally {
+            store.release();
+            workers.shutdownNow();
+            assertTrue(workers.awaitTermination(5, TimeUnit.SECONDS));
+            service.afterReset();
+        }
+    }
+
+    @Test
+    void afterResetWithoutAdmissionAndAfterFailedResetAllowsWrites() {
+        StorageBackend<String, CertificateAuthority> store = new InMemoryStorage<>();
+        AcmPcaService service = service(store, new AdjustableClock());
+        service.afterReset();
+        String ca = create(service, "before-reset");
+        service.beforeReset();
+        service.afterReset();
+        assertEquals(ca, create(service, "before-reset"));
+        assertTrue(store.get(create(service, "after-reset")).isPresent());
     }
 
     private static AcmPcaService service(StorageBackend<String, CertificateAuthority> backend, Clock clock) {
