@@ -1,0 +1,264 @@
+diff --git a/docs/design/vpc-public-routing.md b/docs/design/vpc-public-routing.md
+index df56827793..23a3cd2c2f 100644
+--- a/docs/design/vpc-public-routing.md
++++ b/docs/design/vpc-public-routing.md
+@@ -230,6 +230,10 @@ port 53 only to the endpoint's declared resolvers, with connection-tracked repli
+ The guard and its resolver permits are installed in one nftables transaction.
+ Peer traffic remains withdrawn until the new routes and policy are installed;
+ initial admission and failure quarantine still deny all traffic.
++Routing reconciliation plans changes under its topology lock and applies changed
++helpers with at most four concurrent workers. Each helper's guard and route writes
++remain ordered, unchanged policies are skipped, and all writers finish before
++successful state is published or failure quarantine begins.
+ While that guard is active, endpoint route installation refreshes dynamic
+ neighbors for only the distinct managed next-hop IPv4 addresses and interfaces.
+ Each selector is an exact `/32`. This lets a retained guest learn a recreated
+diff --git a/src/main/java/io/github/hectorvent/floci/services/ec2/PolicyApplyBatch.java b/src/main/java/io/github/hectorvent/floci/services/ec2/PolicyApplyBatch.java
+index 566f71769e..aa123b8559 100644
+--- a/src/main/java/io/github/hectorvent/floci/services/ec2/PolicyApplyBatch.java
++++ b/src/main/java/io/github/hectorvent/floci/services/ec2/PolicyApplyBatch.java
+@@ -6,12 +6,12 @@ import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.atomic.AtomicReference;
+ 
+ /** Bounded Docker operations that must all finish before failure handling can quarantine helpers. */
+-final class PolicyApplyBatch {
++public final class PolicyApplyBatch {
+     private static final int MAX_WORKERS = 4;
+ 
+     private PolicyApplyBatch() {}
+ 
+-    static void run(List<Runnable> operations) {
++    public static void run(List<Runnable> operations) {
+         AtomicInteger next = new AtomicInteger();
+         AtomicReference<Throwable> failure = new AtomicReference<>();
+         List<Thread> workers = new ArrayList<>(MAX_WORKERS);
+diff --git a/src/main/java/io/github/hectorvent/floci/services/ec2/net/VpcRoutingManager.java b/src/main/java/io/github/hectorvent/floci/services/ec2/net/VpcRoutingManager.java
+index aa80efaa0a..92de6b2825 100644
+--- a/src/main/java/io/github/hectorvent/floci/services/ec2/net/VpcRoutingManager.java
++++ b/src/main/java/io/github/hectorvent/floci/services/ec2/net/VpcRoutingManager.java
+@@ -23,6 +23,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
+ import io.github.hectorvent.floci.core.common.docker.LocallyBuiltHelperImage;
+ import io.github.hectorvent.floci.core.common.docker.NetworkNamespaceLease;
+ import io.github.hectorvent.floci.services.ec2.Ec2Service;
++import io.github.hectorvent.floci.services.ec2.PolicyApplyBatch;
+ import io.github.hectorvent.floci.services.ec2.SecurityGroupNftCompiler;
+ import io.github.hectorvent.floci.services.ec2.model.InternetGateway;
+ import io.github.hectorvent.floci.services.ec2.model.NatGateway;
+@@ -483,9 +484,29 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
+         for (NatRuntime nat : activeNats()) {
+             RequestScopes.runAs(nat.account, nat.region, () -> configureNat(nat, topology(nat.region)));
+         }
++        List<EndpointPolicy> policies = new ArrayList<>();
++        Map<String, List<EndpointPolicy>> byHelper = new LinkedHashMap<>();
+         for (Endpoint endpoint : activeEndpoints()) {
+-            RequestScopes.runAs(endpoint.identity.accountId(), endpoint.identity.region(),
+-                    () -> configureEndpoint(endpoint, topology(endpoint.identity.region())));
++            EndpointPolicy policy = RequestScopes.callAs(endpoint.identity.accountId(), endpoint.identity.region(),
++                    () -> planEndpoint(endpoint, topology(endpoint.identity.region())));
++            if (policy != null) {
++                policies.add(policy);
++                byHelper.computeIfAbsent(endpoint.helper, ignored -> new ArrayList<>()).add(policy);
++            }
++        }
++        for (EndpointPolicy policy : policies) {
++            policy.endpoint().applied = null;
++        }
++        // Keep topology and identities fixed while independent helpers perform Docker I/O.
++        PolicyApplyBatch.run(byHelper.values().stream().<Runnable>map(batch -> () -> {
++            for (EndpointPolicy policy : batch) {
++                Endpoint endpoint = policy.endpoint();
++                run(endpoint.helper, VpcRoutingCommands.endpointGuard(endpoint.resolvers));
++                run(endpoint.helper, policy.script());
++            }
++        }).toList());
++        for (EndpointPolicy policy : policies) {
++            policy.endpoint().applied = policy.script();
+         }
+     }
+ 
+@@ -566,7 +587,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
+         }
+     }
+ 
+-    private void configureEndpoint(Endpoint endpoint, Topology topology) {
++    private EndpointPolicy planEndpoint(Endpoint endpoint, Topology topology) {
+         SecurityGroupNftCompiler.Endpoint identity = endpoint.identity;
+         String account = identity.accountId();
+         String region = identity.region();
+@@ -671,14 +692,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
+         if (nativeAddress != null) {
+             script += VpcRoutingCommands.nativePublicApi(identity.logicalAddress(), nativeAddress.address(), directApi);
+         }
+-        if (!script.equals(endpoint.applied)) {
+-            // Resolver access is independent of VPC routes. Keep it available while
+-            // withdrawing peer traffic before changing kernel routes and source NAT.
+-            run(endpoint.helper, VpcRoutingCommands.endpointGuard(endpoint.resolvers));
+-            endpoint.applied = null;
+-            run(endpoint.helper, script);
+-            endpoint.applied = script;
+-        }
++        return script.equals(endpoint.applied) ? null : new EndpointPolicy(endpoint, script);
+     }
+ 
+     private VpcRoutingCommands.NativeApi nativePublicApi(Endpoint endpoint) {
+@@ -1027,6 +1041,8 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
+ 
+     private record Topology(List<RouteTable> tables, List<NatGateway> nats, List<InternetGateway> gateways) {}
+ 
++    private record EndpointPolicy(Endpoint endpoint, String script) {}
++
+     private record NativePublicAddress(String address, String network, String device, String transport,
+                                        boolean separateTransport, String apiNetwork, String apiDevice) {}
+ 
+diff --git a/src/test/java/io/github/hectorvent/floci/services/ec2/net/VpcPublicPeerRoutingTest.java b/src/test/java/io/github/hectorvent/floci/services/ec2/net/VpcPublicPeerRoutingTest.java
+index 4885cca475..bf55825592 100644
+--- a/src/test/java/io/github/hectorvent/floci/services/ec2/net/VpcPublicPeerRoutingTest.java
++++ b/src/test/java/io/github/hectorvent/floci/services/ec2/net/VpcPublicPeerRoutingTest.java
+@@ -43,7 +43,10 @@ import java.util.List;
+ import java.util.Map;
+ import java.util.Optional;
+ import java.util.Set;
++import java.util.concurrent.CountDownLatch;
++import java.util.concurrent.TimeUnit;
+ import java.util.concurrent.atomic.AtomicBoolean;
++import java.util.concurrent.atomic.AtomicInteger;
+ import java.util.concurrent.atomic.AtomicReference;
+ 
+ import static org.junit.jupiter.api.Assertions.*;
+@@ -385,6 +388,120 @@ class VpcPublicPeerRoutingTest {
+                 "Failure quarantine must not reuse the temporary update guard");
+     }
+ 
++    @ParameterizedTest
++    @ValueSource(ints = {2, 6})
++    void changedHelpersApplyConcurrentlyWithinABoundedBatch(int count) throws Exception {
++        for (int index = 0; index < count; index++) {
++            admit("helper-" + index, index + 2, true);
++        }
++        gateway.setAttachments(List.of());
++        CountDownLatch writing = new CountDownLatch(Math.min(4, count));
++        CountDownLatch release = new CountDownLatch(1);
++        AtomicInteger active = new AtomicInteger();
++        AtomicInteger maximum = new AtomicInteger();
++        for (int index = 0; index < count; index++) {
++            String helper = "helper-" + index;
++            scripts.get(helper).clear();
++            ExecCreateCmd ordinary = docker.execCreateCmd(helper);
++            AtomicBoolean first = new AtomicBoolean(true);
++            when(docker.execCreateCmd(helper)).thenAnswer(invocation -> {
++                if (first.compareAndSet(true, false)) {
++                    maximum.accumulateAndGet(active.incrementAndGet(), Math::max);
++                    writing.countDown();
++                    try {
++                        assertTrue(release.await(10, TimeUnit.SECONDS));
++                    } finally {
++                        active.decrementAndGet();
++                    }
++                }
++                return ordinary;
++            });
++        }
++        AtomicReference<Throwable> failure = new AtomicReference<>();
++        Thread caller = reconcileInBackground(failure);
++        try {
++            assertTrue(writing.await(5, TimeUnit.SECONDS),
++                    "Independent helper writes must overlap instead of serializing the whole fleet");
++            assertEquals(Math.min(4, count), active.get());
++        } finally {
++            release.countDown();
++            caller.join(10000);
++        }
++        assertFalse(caller.isAlive());
++        assertNull(failure.get());
++        assertEquals(Math.min(4, count), maximum.get());
++        for (List<String> updates : scripts.values()) {
++            assertEquals(2, updates.size());
++            assertTrue(updates.getFirst().contains("policy drop;"));
++            assertFalse(updates.getFirst().contains("ip -4 route"));
++            assertTrue(updates.getLast().contains("ip -4 route"));
++        }
++        manager.reconcile();
++        for (List<String> updates : scripts.values()) {
++            assertEquals(2, updates.size(), "Unchanged policies must not be installed again");
++        }
++    }
++
++    @Test
++    void failedBatchDrainsOtherWritersBeforeQuarantiningHelpers() throws Exception {
++        admit("first", 2, true);
++        admit("second", 3, true);
++        gateway.setAttachments(List.of());
++        scripts.values().forEach(List::clear);
++        CountDownLatch writing = new CountDownLatch(1);
++        CountDownLatch release = new CountDownLatch(1);
++        CountDownLatch failed = new CountDownLatch(1);
++        ExecCreateCmd firstCommand = docker.execCreateCmd("first");
++        AtomicBoolean firstWrite = new AtomicBoolean(true);
++        when(docker.execCreateCmd("first")).thenAnswer(invocation -> {
++            if (firstWrite.compareAndSet(true, false)) {
++                writing.countDown();
++                assertTrue(release.await(10, TimeUnit.SECONDS));
++            }
++            return firstCommand;
++        });
++        ExecCreateCmd secondCommand = docker.execCreateCmd("second");
++        AtomicBoolean secondWrite = new AtomicBoolean(true);
++        IllegalStateException expected = new IllegalStateException("route installation failed");
++        when(docker.execCreateCmd("second")).thenAnswer(invocation -> {
++            if (secondWrite.compareAndSet(true, false)) {
++                assertTrue(writing.await(5, TimeUnit.SECONDS));
++                failed.countDown();
++                throw expected;
++            }
++            return secondCommand;
++        });
++        AtomicReference<Throwable> failure = new AtomicReference<>();
++        Thread caller = reconcileInBackground(failure);
++        try {
++            assertTrue(failed.await(5, TimeUnit.SECONDS));
++            assertTrue(caller.isAlive(), "A failed batch must wait for its outstanding writer");
++            assertTrue(scripts.values().stream().allMatch(List::isEmpty),
++                    "Quarantine must not race an outstanding policy write");
++        } finally {
++            release.countDown();
++            caller.join(10000);
++        }
++        assertFalse(caller.isAlive());
++        assertSame(expected, failure.get());
++        assertEquals(3, scripts.get("first").size(), "Guard, route update, then failure quarantine");
++        assertEquals(1, scripts.get("second").size());
++        for (String helper : List.of("first", "second")) {
++            assertFalse(latest(helper).contains("accept"),
++                    "No writer may replace the final failure quarantine");
++        }
++    }
++
++    private Thread reconcileInBackground(AtomicReference<Throwable> failure) {
++        return Thread.ofPlatform().start(() -> {
++            try {
++                manager.reconcile();
++            } catch (Throwable error) {
++                failure.set(error);
++            }
++        });
++    }
++
+     @Test
+     void missingPeerDoesNotBlockAnotherOwnersRetirementOrForgetItsOwnCleanup() {
+         admit("first", 2, true);
+diff --git a/src/test/resources/cloudformation/writable-property-gaps.tsv b/src/test/resources/cloudformation/writable-property-gaps.tsv
+index 2ff98458d1..83293ce236 100644
+--- a/src/test/resources/cloudformation/writable-property-gaps.tsv
++++ b/src/test/resources/cloudformation/writable-property-gaps.tsv
+@@ -355,11 +355,6 @@ AWS::IAM::Role	Tags	accepted and ignored
+ AWS::IAM::User	LoginProfile	documented as ignored (docs/services/cloudformation.md, IAM)
+ AWS::KMS::Key	BypassPolicyLockoutSafetyCheck	accepted and ignored
+ AWS::KMS::Key	EnableKeyRotation	accepted and ignored
+-AWS::KMS::Key	Enabled	accepted and ignored
+-AWS::KMS::Key	KeyPolicy	accepted and ignored
+-AWS::KMS::Key	KeySpec	accepted and ignored
+-AWS::KMS::Key	KeyUsage	accepted and ignored
+-AWS::KMS::Key	MultiRegion	accepted and ignored
+ AWS::KMS::Key	Origin	accepted and ignored
+ AWS::KMS::Key	PendingWindowInDays	accepted and ignored
+ AWS::KMS::Key	RotationPeriodInDays	accepted and ignored
