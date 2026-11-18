@@ -17346,9 +17346,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     public record NetworkInterfacePermissionPage(List<NetworkInterfacePermission> permissions, String nextToken) {}
 
     /**
-     * CreateNetworkInterfacePermission: the interface's owner grants another account
-     * {@code INSTANCE-ATTACH}, which {@link #attachNetworkInterface} then honours for that account's
-     * instances. Only the owner can grant: the interface is looked up in the caller's account, and
+     * CreateNetworkInterfacePermission: the interface's owner records an {@code INSTANCE-ATTACH}
+     * grant for another account. Attachment execution does not yet consume these grants.
+     * Only the owner can grant: the interface is looked up in the caller's account, and
      * one another account owns is {@code InvalidNetworkInterfaceID.NotFound}, as it is to every
      * other action of that account.
      *
@@ -17382,9 +17382,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
         requireAccountId("AwsAccountId", awsAccountId);
         ensureDefaultResources(region);
-        synchronized (privateIpAllocationLock) {
-            NetworkInterface ni = requireStandaloneNetworkInterface(region, networkInterfaceId);
-            return grantInstanceAttach(callerAccountId(), region, ni, awsAccountId);
+        synchronized (attachmentTopologyLock(region)) {
+            synchronized (privateIpAllocationLock) {
+                NetworkInterface ni = requireStandaloneNetworkInterface(region, networkInterfaceId);
+                return grantInstanceAttach(callerAccountId(), region, ni, awsAccountId);
+            }
         }
     }
 
@@ -17411,8 +17413,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
         ensureDefaultResources(region);
         List<NetworkInterfacePermission> held = new ArrayList<>();
-        for (NetworkInterface ni : networkInterfaces.scan(k -> k.startsWith(region + "::"))) {
-            held.addAll(ni.getPermissions());
+        synchronized (attachmentTopologyLock(region)) {
+            for (NetworkInterface ni : networkInterfaces.scan(k -> k.startsWith(region + "::"))) {
+                held.addAll(ni.getPermissions());
+            }
         }
         for (String id : permissionIds) {
             if (held.stream().noneMatch(perm -> id.equals(perm.getNetworkInterfacePermissionId()))) {
