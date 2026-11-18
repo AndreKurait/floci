@@ -115,6 +115,7 @@ import io.github.hectorvent.floci.services.ec2.net.VpcRoutingManager;
 import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager;
 import io.github.hectorvent.floci.services.iam.IamPolicyEvaluator;
 import io.github.hectorvent.floci.services.iam.IamService;
+import io.github.hectorvent.floci.services.iam.ServiceLinkedRoles;
 import io.github.hectorvent.floci.services.iam.model.InstanceProfile;
 import io.github.hectorvent.floci.services.ram.RamService;
 import io.github.hectorvent.floci.services.resourcegroups.ResourceGroupsService;
@@ -18477,6 +18478,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 ni.setAvailabilityZone(subnet.getAvailabilityZone());
                 ni.setDescription(description);
                 ni.setOwnerId(callerAccountId());
+                ni.setRequesterManaged(callerIsServiceLinkedRole());
                 ni.setStatus("available");
                 ni.setMacAddress(randomMac());
                 ni.setPrivateIpAddress(primaryIp);
@@ -18511,6 +18513,27 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 return ni;
             }
         }
+    }
+
+    /**
+     * Whether the request is a session of a service-linked role: an AWS service acting in the account through the
+     * role linked to it. A network interface such a session creates is one "that an AWS service creates in your VPC
+     * on your behalf", which the EC2 User Guide calls requester-managed.
+     */
+    private boolean callerIsServiceLinkedRole() {
+        if (requestContextInstance == null || iamService == null) {
+            return false;
+        }
+        String accessKeyId;
+        try {
+            accessKeyId = requestContextInstance.get().getAccessKeyId();
+        } catch (ContextNotActiveException e) {
+            return false;
+        }
+        return iamService.resolveCallerArns(accessKeyId)
+                .map(IamService.CallerArns::principalArn)
+                .filter(arn -> arn != null && arn.contains(":role" + ServiceLinkedRoles.PATH))
+                .isPresent();
     }
 
     /**
