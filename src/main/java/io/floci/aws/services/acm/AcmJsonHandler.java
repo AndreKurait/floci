@@ -11,6 +11,7 @@ import io.floci.aws.core.common.SmithyValidationErrors;
 import io.floci.aws.services.acm.model.Certificate;
 import io.floci.aws.services.acm.model.CertificateOptions;
 import io.floci.aws.services.acm.model.CertificateStatus;
+import io.floci.aws.services.acm.model.CertificateType;
 import io.floci.aws.services.acm.model.DomainValidation;
 import io.floci.aws.services.acm.model.KeyAlgorithm;
 import io.floci.aws.services.acm.model.ListResult;
@@ -144,6 +145,9 @@ public class AcmJsonHandler {
                 "RequestInProgressException",
                 "The certificate request is in progress. The certificate body is not yet available.",
                 400);
+        }
+        if (cert.getCertificateBody() == null) {
+            throw AcmService.notIssued(cert);
         }
 
         ObjectNode response = objectMapper.createObjectNode();
@@ -368,6 +372,12 @@ public class AcmJsonHandler {
 
         node.put("Status", cert.getStatus().name());
         node.put("Type", cert.getType().name());
+        if (cert.getFailureReason() != null) {
+            node.put("FailureReason", cert.getFailureReason());
+        }
+        if (cert.getCertAuthorityArn() != null && !cert.getCertAuthorityArn().isEmpty()) {
+            node.put("CertificateAuthorityArn", cert.getCertAuthorityArn());
+        }
 
         if (cert.getKeyAlgorithm() != null) {
             node.put("KeyAlgorithm", cert.getKeyAlgorithm().getAwsName());
@@ -430,7 +440,15 @@ public class AcmJsonHandler {
             node.set("DomainValidationOptions", validations);
         }
 
-        node.put("RenewalEligibility", "INELIGIBLE");
+        node.put("RenewalEligibility", renewalEligibility(cert));
+        if (cert.getRenewalStatus() != null) {
+            ObjectNode renewal = objectMapper.createObjectNode();
+            renewal.put("RenewalStatus", cert.getRenewalStatus());
+            if (cert.getRenewalUpdatedAt() != null) {
+                renewal.put("UpdatedAt", EpochSeconds.fromInstant(cert.getRenewalUpdatedAt()));
+            }
+            node.set("RenewalSummary", renewal);
+        }
 
         ArrayNode keyUsages = objectMapper.createArrayNode();
         ObjectNode ku1 = objectMapper.createObjectNode();
@@ -508,7 +526,7 @@ public class AcmJsonHandler {
             node.put("NotAfter", EpochSeconds.fromInstant(cert.getNotAfter()));
         }
 
-        node.put("RenewalEligibility", "INELIGIBLE");
+        node.put("RenewalEligibility", renewalEligibility(cert));
         node.put("InUse", !consumers.isEmpty());
 
         return node;
@@ -615,5 +633,15 @@ public class AcmJsonHandler {
             }
         }
         return list.isEmpty() ? null : list;
+    }
+
+    /**
+     * ELIGIBLE for a private certificate ACM requested from a private CA, which ACM renews 60 days before it
+     * expires (and on RenewCertificate); INELIGIBLE otherwise, as imported certificates and the public ones
+     * Floci cannot validate again are not renewed.
+     */
+    private static String renewalEligibility(Certificate cert) {
+        return cert.getType() == CertificateType.PRIVATE && cert.getCertAuthorityArn() != null
+                && !cert.getCertAuthorityArn().isEmpty() ? "ELIGIBLE" : "INELIGIBLE";
     }
 }

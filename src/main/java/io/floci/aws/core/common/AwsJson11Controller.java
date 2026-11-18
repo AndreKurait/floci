@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.ObjectReader;
 import io.floci.aws.services.acm.AcmJsonHandler;
+import io.floci.aws.services.acmpca.AcmPcaJsonHandler;
 import io.floci.aws.services.apigatewayv2.ApiGatewayV2JsonHandler;
 import io.floci.aws.services.applicationautoscaling.ApplicationAutoScalingJsonHandler;
 import io.floci.aws.services.athena.AthenaJsonHandler;
@@ -104,6 +105,7 @@ public class AwsJson11Controller {
     private final KmsJsonHandler kmsJsonHandler;
     private final CognitoJsonHandler cognitoJsonHandler;
     private final AcmJsonHandler acmJsonHandler;
+    private final AcmPcaJsonHandler acmPcaJsonHandler;
     private final EcsJsonHandler ecsJsonHandler;
     private final EcrJsonHandler ecrJsonHandler;
     private final GlueJsonHandler glueJsonHandler;
@@ -163,7 +165,8 @@ public class AwsJson11Controller {
                                KinesisAnalyticsV2JsonHandler kinesisAnalyticsV2JsonHandler,
                                ApiGatewayV2JsonHandler apigwV2JsonHandler,
                                KmsJsonHandler kmsJsonHandler, CognitoJsonHandler cognitoJsonHandler,
-                               AcmJsonHandler acmJsonHandler, EcsJsonHandler ecsJsonHandler,
+                               AcmJsonHandler acmJsonHandler, AcmPcaJsonHandler acmPcaJsonHandler,
+                               EcsJsonHandler ecsJsonHandler,
                                EcrJsonHandler ecrJsonHandler, GlueJsonHandler glueJsonHandler,
                                AthenaJsonHandler athenaJsonHandler,
                                RedshiftDataJsonHandler redshiftDataJsonHandler,
@@ -224,6 +227,7 @@ public class AwsJson11Controller {
         this.kmsJsonHandler = kmsJsonHandler;
         this.cognitoJsonHandler = cognitoJsonHandler;
         this.acmJsonHandler = acmJsonHandler;
+        this.acmPcaJsonHandler = acmPcaJsonHandler;
         this.ecsJsonHandler = ecsJsonHandler;
         this.ecrJsonHandler = ecrJsonHandler;
         this.glueJsonHandler = glueJsonHandler;
@@ -330,6 +334,7 @@ public class AwsJson11Controller {
                 case "kms" -> kmsJsonHandler.handle(action, request, region);
                 case "cognito-idp" -> cognitoJsonHandler.handle(action, request, region);
                 case "acm" -> acmJsonHandler.handle(action, request, region);
+                case "acm-pca" -> acmPcaJsonHandler.handle(action, request, region);
                 case "ecs" -> ecsJsonHandler.handle(action, request, region, uriInfo.getBaseUri());
                 case "ecr" -> ecrJsonHandler.handle(action, request, region);
                 case "glue" -> glueJsonHandler.handle(action, request, region);
