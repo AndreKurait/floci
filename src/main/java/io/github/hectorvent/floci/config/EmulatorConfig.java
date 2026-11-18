@@ -2488,7 +2488,7 @@ public interface EmulatorConfig {
          * Whether ACM's expiry sweep runs: managed renewal of private certificates 60 days before they
          * expire, and the daily "Approaching Expiration" and the "Expired" EventBridge events.
          */
-        @WithDefault("true")
+        @WithDefault("false")
         boolean expirySweepEnabled();
 
         /** Seconds between expiry sweeps; a notice is still sent at most once a day per certificate. */

@@ -740,7 +740,7 @@ floci:
     acm:
       enabled: true
       validation-wait-seconds: 0
-      expiry-sweep-enabled: true
+      expiry-sweep-enabled: false
       expiry-sweep-seconds: 3600
     athena:
       enabled: true
