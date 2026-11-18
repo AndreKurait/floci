@@ -124,7 +124,7 @@ class Ec2StartRequestScopeIntegrationTest {
                 when(networks.isolatesAddressSpaces()).thenReturn(true);
                 CompletableFuture<Scope> observed = new CompletableFuture<>();
                 when(networks.requireNativePrivateAddress(expected.region(), "vpc-protected", "subnet-protected",
-                        "helper", "10.0.0.7")).thenAnswer(invocation -> {
+                        "helper", "10.0.0.7", null)).thenAnswer(invocation -> {
                             observed.complete(scope());
                             throw new IllegalStateException("account-scoped VPC lookup refused");
                         });

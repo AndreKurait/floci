@@ -891,6 +891,7 @@ public class Ec2ContainerManager {
             boolean recorded = false;
             boolean nativeReleaseStarted = false;
             try {
+                boolean ipv6 = guestIpv6(instance) != null;
                 if (firewallManager != null && firewallManager.enabled()) {
                     if (instance.getNetworkInterfaces() == null || instance.getNetworkInterfaces().isEmpty()) {
                         throw new IllegalStateException("EC2 instance has no network interface to protect");
@@ -900,15 +901,15 @@ public class Ec2ContainerManager {
                     instance.setLogicalPrivateIpAddress(eni.getPrivateIpAddress());
                     namespace = firewallManager.createNamespace("ec2", instanceId,
                             regionResolver.getAccountId(), region, Optional.empty(), Map.of(22, sshHostPort),
-                            Map.of(), metadataNamespaces.sshHostBindAddress());
+                            Map.of(), metadataNamespaces.sshHostBindAddress(), null, ipv6);
                     helperId = namespace.helperId();
                 } else {
                     helperId = metadataNamespaces.create(instanceId, regionResolver.getAccountId(), region, sshHostPort,
-                            guestIpv6(instance) != null);
+                            ipv6);
                 }
                 networkHelpers.put(instanceId, helperId);
                 Optional<String> vpcNetwork = vpcNetworkManager.attach(region, instance.getVpcId(),
-                        instance.getSubnetId(), helperId, leasedPrivateIp);
+                        instance.getSubnetId(), helperId, leasedPrivateIp, ipv6);
                 String vpcAddress = vpcNetwork.map(network -> leasedPrivateIp).orElse(null);
                 if (namespace != null && vpcNetworkManager.enabled() && vpcAddress == null) {
                     throw new IllegalStateException("Protected EC2 namespace could not attach to its VPC");
@@ -935,7 +936,7 @@ public class Ec2ContainerManager {
                             List.of(), nativePeerDependencies.dependencies()),
                             helperId, prefixLists);
                 }
-                if (vpcAddress != null && namespace == null) {
+                if (vpcAddress != null) {
                     configureGuestIpv6(helperId, instance, region, vpcNetwork.get(), vpcAddress);
                 }
                 instance.setContainerBridgeIp(containerIp);
@@ -2209,8 +2210,10 @@ public class Ec2ContainerManager {
     private String namespacePrivateAddress(Instance instance, String namespaceId,
                                             InspectContainerResponse namespace) {
         if (vpcNetworkManager != null && vpcNetworkManager.isolatesAddressSpaces()) {
+            InstanceNetworkInterface ipv6 = guestIpv6(instance);
             return vpcNetworkManager.requireNativePrivateAddress(instance.getRegion(), instance.getVpcId(),
-                    instance.getSubnetId(), namespaceId, instance.getContainerBridgeIp());
+                    instance.getSubnetId(), namespaceId, instance.getContainerBridgeIp(),
+                    ipv6 == null ? null : ipv6.getIpv6Addresses().get(0));
         }
         return Ec2PublicAddressRouting.privateAddress(namespace, instance.getContainerBridgeIp());
     }

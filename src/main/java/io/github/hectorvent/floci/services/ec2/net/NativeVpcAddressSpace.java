@@ -12,6 +12,7 @@ import io.github.hectorvent.floci.core.common.docker.ContainerExec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 
 import java.io.IOException;
+import java.net.InetAddress;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -24,6 +25,12 @@ final class NativeVpcAddressSpace {
 
     static void attach(DockerClient docker, EmulatorConfig config, String account, String region,
                        String network, Cidr4 vpc, Cidr4 subnet, String helper, String address) {
+        attach(docker, config, account, region, network, vpc, subnet, helper, address, false);
+    }
+
+    /** With {@code ipv6}, the interface's IPv6 traffic is not blocked, so the guest can carry its own address. */
+    static void attach(DockerClient docker, EmulatorConfig config, String account, String region,
+                       String network, Cidr4 vpc, Cidr4 subnet, String helper, String address, boolean ipv6) {
         InspectContainerResponse before = docker.inspectContainerCmd(helper).exec();
         String guard = guardTable(before, ContainerStorageHelper.ownerIdentity(config), account, region);
         run(docker, helper, "nft", "list", "table", "inet", guard);
@@ -53,7 +60,7 @@ final class NativeVpcAddressSpace {
             rejectTransportOverlap(vpc, attached);
             JsonNode links = parse(run(docker, helper, "ip", "-j", "link"));
             String device = deviceFor(links, attached.getMacAddress());
-            run(docker, helper, "sh", "-c", commands(device, address, subnet, vpc));
+            run(docker, helper, "sh", "-c", commands(device, address, subnet, vpc, ipv6));
             JsonNode actual = parse(run(docker, helper, "ip", "-j", "address", "show", "dev", device));
             verifyAddress(actual, address, subnet.prefix());
         } catch (RuntimeException failure) {
@@ -72,12 +79,19 @@ final class NativeVpcAddressSpace {
     /** Reads the real namespace address on restoration; Docker IPAM does not own this address. */
     static void verify(DockerClient docker, EmulatorConfig config, String account, String region,
                        String network, String helper, String address, int prefix) {
+        verify(docker, config, account, region, network, helper, address, prefix, null);
+    }
+
+    /** As above, and admits {@code ipv6Address}/64, a dual-stack guest's own address, when it is not null. */
+    static void verify(DockerClient docker, EmulatorConfig config, String account, String region,
+                       String network, String helper, String address, int prefix, String ipv6Address) {
         InspectContainerResponse inspection = docker.inspectContainerCmd(helper).exec();
         String guard = guardTable(inspection, ContainerStorageHelper.ownerIdentity(config), account, region);
         run(docker, helper, "nft", "list", "table", "inet", guard);
         ContainerNetwork attached = nativeAttachment(inspection, network);
         String device = deviceFor(parse(run(docker, helper, "ip", "-j", "link")), attached.getMacAddress());
-        verifyAddress(parse(run(docker, helper, "ip", "-j", "address", "show", "dev", device)), address, prefix);
+        verifyAddress(parse(run(docker, helper, "ip", "-j", "address", "show", "dev", device)), address, prefix,
+                ipv6Address);
     }
 
     static ContainerNetwork nativeAttachment(InspectContainerResponse helper, String network) {
@@ -136,12 +150,22 @@ final class NativeVpcAddressSpace {
     }
 
     static String commands(String device, String address, Cidr4 subnet, Cidr4 vpc) {
+        return commands(device, address, subnet, vpc, false);
+    }
+
+    static String commands(String device, String address, Cidr4 subnet, Cidr4 vpc, boolean ipv6) {
         device = VpcRoutingCommands.device(device);
         address = VpcRouteSelection.ipv4(address);
         Cidr4 host = VpcRouteSelection.cidr(address + "/32");
         if (!vpc.contains(subnet) || !subnet.contains(host)) {
             throw new IllegalArgumentException("The native address must be inside its subnet and VPC");
         }
+        String ipv6Drop = ipv6 ? "" : """
+                add rule inet floci_vpc_address_space ingress iifname "%1$s" meta nfproto ipv6 drop
+                add rule inet floci_vpc_address_space egress oifname "%1$s" meta nfproto ipv6 drop
+                add rule inet floci_vpc_address_space forwarding iifname "%1$s" meta nfproto ipv6 drop
+                add rule inet floci_vpc_address_space forwarding oifname "%1$s" meta nfproto ipv6 drop
+                """.formatted(device);
         return """
                 set -eu
                 ip link set dev %1$s addrgenmode none
@@ -156,21 +180,25 @@ final class NativeVpcAddressSpace {
                 flush chain inet floci_vpc_address_space ingress
                 flush chain inet floci_vpc_address_space egress
                 flush chain inet floci_vpc_address_space forwarding
-                add rule inet floci_vpc_address_space ingress iifname "%1$s" meta nfproto ipv6 drop
-                add rule inet floci_vpc_address_space egress oifname "%1$s" meta nfproto ipv6 drop
-                add rule inet floci_vpc_address_space forwarding iifname "%1$s" meta nfproto ipv6 drop
-                add rule inet floci_vpc_address_space forwarding oifname "%1$s" meta nfproto ipv6 drop
-                FLOCI_RULES
+                %5$sFLOCI_RULES
                 ip -4 address replace %2$s/%3$d dev %1$s
                 ip -4 route replace %4$s dev %1$s src %2$s proto 185
-                """.formatted(device, address, subnet.prefix(), vpc);
+                """.formatted(device, address, subnet.prefix(), vpc, ipv6Drop);
     }
 
     static void verifyAddress(JsonNode links, String address, int prefix) {
+        verifyAddress(links, address, prefix, null);
+    }
+
+    static void verifyAddress(JsonNode links, String address, int prefix, String ipv6Address) {
         boolean found = false;
         for (JsonNode link : links) {
             for (JsonNode item : link.path("addr_info")) {
                 if ("inet6".equals(item.path("family").asText())) {
+                    if (ipv6Address != null && item.path("prefixlen").asInt() == 64
+                            && sameIpv6(ipv6Address, item.path("local").asText())) {
+                        continue;
+                    }
                     throw new IllegalStateException("The native IPv4 VPC interface still has an IPv6 address");
                 }
                 if ("inet".equals(item.path("family").asText())) {
@@ -183,6 +211,14 @@ final class NativeVpcAddressSpace {
         }
         if (!found) {
             throw new IllegalStateException("The native VPC interface does not hold its declared IPv4 address");
+        }
+    }
+
+    private static boolean sameIpv6(String expected, String actual) {
+        try {
+            return InetAddress.ofLiteral(expected).equals(InetAddress.ofLiteral(actual));
+        } catch (IllegalArgumentException notAnAddress) {
+            return false;
         }
     }
 

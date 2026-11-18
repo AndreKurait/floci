@@ -220,6 +220,12 @@ public final class SecurityGroupNftCompiler {
         }
         rules.append("add rule inet floci_sg egress udp sport 68 udp dport 67 accept\n")
                 .append("add rule inet floci_sg ingress udp sport 67 udp dport 68 accept\n");
+        // IPv6 neighbor discovery is the link layer's address resolution, as ARP is for IPv4. Conntrack
+        // leaves it untracked, so without these an IPv6 address on the VPC interface never resolves a neighbor.
+        rules.append("add rule inet floci_sg egress ip6 hoplimit 255 icmpv6 type { nd-neighbor-solicit,"
+                        + " nd-neighbor-advert } accept\n")
+                .append("add rule inet floci_sg ingress ip6 hoplimit 255 icmpv6 type { nd-neighbor-solicit,"
+                        + " nd-neighbor-advert } accept\n");
         if (target.instanceMetadataAllowed()) {
             rules.append("add rule inet floci_sg egress ip daddr 169.254.169.254 accept\n")
                 // OUTPUT DNAT runs before this filter. Exempt only traffic originally sent to

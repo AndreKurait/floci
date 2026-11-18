@@ -2319,7 +2319,8 @@ Malformed declarations and collisions with that control network fail attachment;
 this mode never substitutes a fallback CIDR.
 
 The native interface carries IPv4 only. Its IPv6 addresses and routes are removed
-before workload admission, and its IPv6 traffic is blocked. Existing control
+before workload admission, and its IPv6 traffic is blocked, except for an instance
+that carries its own IPv6 address (see Guest IPv6). Existing control
 connections keep their own addresses and default gateway. Private DNS requests,
 including requests explicitly bound to the native private address, retain their
 account and VPC identity through the namespace's unique control address.
@@ -2418,20 +2419,25 @@ scale-out uses this count when selecting among subnets in the same zone.
 ### Guest IPv6
 
 Set `FLOCI_SERVICES_EC2_GUEST_IPV6=true` to carry IPv6 between instances whose primary interface holds an
-IPv6 address (see RunInstances). It applies to shared address spaces without security-group enforcement;
-isolated address spaces keep their IPv4-only native interface. With it, Floci:
+IPv6 address (see RunInstances). It applies with or without security-group enforcement, in shared and isolated
+address spaces. With it, Floci:
 
-- creates the instance's network namespace with IPv6 enabled;
+- creates the instance's network namespace with IPv6 enabled, including the protected namespace of
+  security-group enforcement;
+- in an isolated address space, leaves IPv6 unblocked on the instance's native interface and accepts exactly
+  that address on it when it verifies the interface;
 - puts the interface's address on its VPC interface (the one holding its private IPv4), routes the VPC's IPv6
   block on that interface and sets the default IPv6 route to `fe80:ec2::1`;
 - removes IPv6 from the namespace's other interfaces;
 - runs one IPv6 VPC router per deployment. It joins each VPC network a dual-stack instance attaches to at the
-  subnet's reserved base + 3 address, drops its IPv4 there, holds `fe80:ec2::1`, the link-local address the VPC User Guide lists as reserved for the VPC router ("The link-local IPv6 address FE80:ec2::1", "Subnet CIDR blocks"), and routes that VPC's IPv6 block.
+  subnet's reserved base + 3 address (in an isolated address space, at a Docker transport address), drops its IPv4 there, holds `fe80:ec2::1`, the link-local address the VPC User Guide lists as reserved for the VPC router ("The link-local IPv6 address FE80:ec2::1", "Subnet CIDR blocks"), and routes that VPC's IPv6 block.
   IPv6 therefore reaches instances in other dual-stack VPCs and nothing else: the router has no default route,
   and the host gets no IPv6 address or route.
 
-Docker networks stay IPv4-only, and the Docker daemon needs no IPv6 setting. Not modelled: the router joins a VPC
-without checking for an internet gateway or a `::/0` route, and security groups do not filter this IPv6 traffic.
+Docker networks stay IPv4-only, and the Docker daemon needs no IPv6 setting. With security-group enforcement, the
+instance's groups filter its IPv6 traffic by their IPv6 ranges, and IPv6 neighbor discovery is exempt, as DHCP is.
+Not modelled: the router joins a VPC without checking for an internet gateway or a `::/0` route, and a rule that
+references a security group admits only its members' IPv4 addresses.
 With the setting off (the default), addresses are assigned and reported, and no namespace changes.
 
 ## Requirements

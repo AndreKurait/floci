@@ -55,19 +55,26 @@ final class Ec2Ipv6VpcRouter {
         if (joined.contains(network + "|" + vpcIpv6Block)) {
             return;
         }
-        String address = networks.ipv6RouterAddress(region, subnetId)
+        // Docker's IPAM holds no VPC range in an isolated address space: there the router takes a transport address.
+        boolean isolated = networks.isolatesAddressSpaces();
+        String address = isolated ? null : networks.ipv6RouterAddress(region, subnetId)
                 .orElseThrow(() -> new IllegalStateException("No IPv6 router address for subnet " + subnetId));
         String id = ensureStarted();
         try {
-            docker.connectToNetworkCmd().withContainerId(id).withNetworkId(network)
-                    .withContainerNetwork(new ContainerNetwork()
-                            .withIpamConfig(new ContainerNetwork.Ipam().withIpv4Address(address)))
+            ContainerNetwork endpoint = new ContainerNetwork();
+            if (!isolated) {
+                endpoint.withIpamConfig(new ContainerNetwork.Ipam().withIpv4Address(address));
+            }
+            docker.connectToNetworkCmd().withContainerId(id).withNetworkId(network).withContainerNetwork(endpoint)
                     .exec();
         } catch (RuntimeException e) {
             String message = String.valueOf(e.getMessage());
             if (!message.contains("already exists")) {
                 throw e;
             }
+        }
+        if (isolated) {
+            address = transportAddress(id, network);
         }
         ContainerExec.Result result = ContainerExec.run(docker, id, joinCommand(address, vpcIpv6Block), 30);
         if (result.exitCode() != 0) {
@@ -126,6 +133,16 @@ final class Ec2Ipv6VpcRouter {
         containerId = id;
         networks.setIpv6RouterContainer(id);
         return id;
+    }
+
+    private String transportAddress(String id, String network) {
+        Map<String, ContainerNetwork> attached = docker.inspectContainerCmd(id).exec()
+                .getNetworkSettings().getNetworks();
+        ContainerNetwork endpoint = attached == null ? null : attached.get(network);
+        if (endpoint == null || endpoint.getIpAddress() == null || endpoint.getIpAddress().isBlank()) {
+            throw new IllegalStateException("The IPv6 VPC router has no transport address on " + network);
+        }
+        return endpoint.getIpAddress();
     }
 
     /** The network a started helper sits on that the router leaves once joined: any but none, host or shared. */

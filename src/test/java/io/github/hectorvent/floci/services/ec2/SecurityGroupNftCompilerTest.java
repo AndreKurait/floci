@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.ec2;
 
 import io.github.hectorvent.floci.services.ec2.model.IpPermission;
 import io.github.hectorvent.floci.services.ec2.model.IpRange;
+import io.github.hectorvent.floci.services.ec2.model.Ipv6Range;
 import io.github.hectorvent.floci.services.ec2.model.PrefixListId;
 import io.github.hectorvent.floci.services.ec2.model.SecurityGroup;
 import io.github.hectorvent.floci.services.ec2.model.UserIdGroupPair;
@@ -233,6 +234,27 @@ class SecurityGroupNftCompilerTest {
         assertTrue(nft.contains("egress ip daddr 172.18.0.2 tcp dport 53 accept"));
         assertTrue(nft.contains("egress ip6 daddr fd00::53 udp dport 53 accept"));
         assertFalse(nft.contains("daddr 172.18.0.2 accept"), "only DNS is allowed to the resolver");
+    }
+
+    @Test
+    void ipv6NeighborDiscoveryStaysOpenWhileTheGroupsFilterIpv6ByTheirRanges() {
+        SecurityGroup group = new SecurityGroup();
+        IpPermission transport = new IpPermission();
+        transport.setIpProtocol("6");
+        transport.setFromPort(9300);
+        transport.setToPort(9300);
+        transport.getIpv6Ranges().add(new Ipv6Range("2600:1f18:abcd:ef00::/56"));
+        group.getIpPermissions().add(transport);
+
+        String nft = SecurityGroupNftCompiler.compile(endpoint("eni-a", "10.0.0.2", "172.17.0.2", group),
+                List.of(), Map.of());
+
+        for (String chain : List.of("ingress", "egress")) {
+            assertTrue(nft.contains("add rule inet floci_sg " + chain
+                    + " ip6 hoplimit 255 icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert } accept\n"), nft);
+        }
+        assertTrue(nft.contains("ingress ip6 saddr 2600:1f18:abcd:ef00::/56 tcp dport 9300 accept"), nft);
+        assertFalse(nft.contains("meta l4proto icmpv6 accept"), "no other ICMPv6 is admitted");
     }
 
     @Test
