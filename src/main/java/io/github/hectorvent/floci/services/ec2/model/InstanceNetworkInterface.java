@@ -25,6 +25,8 @@ public class InstanceNetworkInterface {
     private int deviceIndex;
     private String attachTime;
     private boolean deleteOnTermination = true;
+    // Only a successfully materialised shared-network attachment owns a device in this container.
+    private String sharedNetworkContainerId;
     // IPv6: the interface's addresses (from its subnet's /64) and, for the metadata service, the IPv6 blocks of
     // its subnet and VPC when the interface was attached.
     private List<String> ipv6Addresses = new ArrayList<>();
@@ -77,6 +79,11 @@ public class InstanceNetworkInterface {
 
     public boolean isDeleteOnTermination() { return deleteOnTermination; }
     public void setDeleteOnTermination(boolean deleteOnTermination) { this.deleteOnTermination = deleteOnTermination; }
+
+    public String getSharedNetworkContainerId() { return sharedNetworkContainerId; }
+    public void setSharedNetworkContainerId(String sharedNetworkContainerId) {
+        this.sharedNetworkContainerId = sharedNetworkContainerId;
+    }
 
     public List<String> getIpv6Addresses() { return ipv6Addresses; }
     public void setIpv6Addresses(List<String> ipv6Addresses) {

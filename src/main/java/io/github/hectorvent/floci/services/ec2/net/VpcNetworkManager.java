@@ -761,13 +761,51 @@ public class VpcNetworkManager {
         }
     }
 
+    /** Repairs a known attachment's existing endpoint; never reconnects a missing endpoint. */
+    public void restoreInterface(String region, String vpcId, String containerId, String address, String macAddress) {
+        if (!enabled() || isolatesAddressSpaces() || containerId == null || address == null || macAddress == null) {
+            return;
+        }
+        VpcBinding vpc = plannedVpc(region, vpcId);
+        if (vpc == null || !existingSharedNetworkBelongsTo(vpc)) {
+            return;
+        }
+        ContainerNetwork endpoint = endpoints(containerId).get(vpc.networkName);
+        if (endpoint == null || !address.equals(endpoint.getIpAddress())) {
+            return;
+        }
+        for (JsonNode link : links(containerId)) {
+            if (macAddress.equalsIgnoreCase(link.path("address").asText())) {
+                return;
+            }
+        }
+        giveDeviceItsMac(containerId, endpoint.getMacAddress(), macAddress);
+    }
+
+    private boolean existingSharedNetworkBelongsTo(VpcBinding vpc) {
+        Network network;
+        try {
+            network = dockerClient.inspectNetworkCmd().withNetworkId(vpc.networkName).exec();
+        } catch (NotFoundException missing) {
+            return false;
+        }
+        Map<String, String> labels = network.getLabels() == null ? Map.of() : network.getLabels();
+        return ALIASES.consistent(network.getName(), labels)
+                && ownedByThisDeployment(labels)
+                && ALIASES.matches(labels, ContainerStorageHelper.SERVICE_LABEL, SERVICE_VALUE)
+                && ALIASES.matches(labels, ContainerStorageHelper.COMPONENT_LABEL, COMPONENT_VALUE)
+                && ALIASES.matches(labels, ContainerStorageHelper.RESOURCE_ID_LABEL, vpc.vpcId)
+                && ALIASES.matches(labels, ContainerStorageHelper.REGION_LABEL, vpc.region)
+                && ipamSubnets(network).contains(vpc.effective);
+    }
+
     /** Unplugs the endpoint {@link #attachInterface} added; nothing when the container holds none. */
     public void detachInterface(String region, String vpcId, String containerId, String address, String macAddress) {
         if (!enabled() || isolatesAddressSpaces() || containerId == null || address == null || macAddress == null) {
             return;
         }
-        VpcBinding vpc = bindings.get(key(region, vpcId));
-        if (vpc == null || !vpc.created) {
+        VpcBinding vpc = plannedVpc(region, vpcId);
+        if (vpc == null || (!vpc.created && !existingSharedNetworkBelongsTo(vpc))) {
             return;
         }
         ContainerNetwork endpoint = endpoints(containerId).get(vpc.networkName);

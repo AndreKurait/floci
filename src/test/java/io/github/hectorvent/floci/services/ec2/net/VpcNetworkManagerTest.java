@@ -1154,6 +1154,38 @@ class VpcNetworkManagerTest {
     }
 
     @ParameterizedTest
+    @ValueSource(strings = {"owned", "foreign deployment", "different subnet", "missing network",
+            "different address", "missing endpoint"})
+    void restoringAnAttachedMacUsesOnlyTheExistingOwnedNetwork(String scenario) {
+        manager.declareVpc(REGION, "vpc-2", "172.31.0.0/16");
+        manager.declareSubnet(REGION, "vpc-2", "subnet-c", "172.31.5.0/24");
+        String address = "172.31.5.10";
+        String networkName = manager.networkName(REGION, "vpc-2");
+        if (!scenario.equals("missing network")) {
+            existingNetwork(networkName, scenario.equals("different subnet") ? "10.20.0.0/16" : "172.31.0.0/16",
+                    ourLabels("vpc-2", scenario.equals("foreign deployment") ? "9999" : "4650"), Map.of());
+        }
+        Map<String, ContainerNetwork> endpoints = scenario.equals("missing endpoint") ? Map.of()
+                : Map.of(networkName, endpointWith(scenario.equals("different address") ? "172.31.5.99" : address,
+                        DOCKER_MAC));
+        endpointsAcrossConnect(endpoints, endpoints);
+        AtomicBoolean repaired = new AtomicBoolean();
+        manager.namespaceCommand = (container, command) -> {
+            if (command[0].equals("sh")) {
+                repaired.set(true);
+            }
+            return links(repaired.get() ? INTERFACE_MAC : DOCKER_MAC);
+        };
+
+        manager.restoreInterface(REGION, "vpc-2", "helper-1", address, INTERFACE_MAC);
+
+        assertEquals(scenario.equals("owned"), repaired.get());
+        verify(docker.createNetworkCmd(), never()).exec();
+        verify(docker.connectToNetworkCmd(), never()).exec();
+        verify(docker, never()).disconnectFromNetworkCmd();
+    }
+
+    @ParameterizedTest
     @ValueSource(strings = {INTERFACE_MAC, DOCKER_MAC})
     void unpluggingRemovesOnlyTheInterfacesVpcEndpoint(String dockerMac) {
         manager.declareVpc(REGION, "vpc-2", "172.31.0.0/16");

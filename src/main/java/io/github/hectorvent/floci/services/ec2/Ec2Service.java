@@ -18736,6 +18736,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             containerManager.plugNetworkInterface(pluggedInstance, pluggedInterface, pluggedGroups,
                     pluggedGroups.stream().anyMatch(Objects::isNull)
                             ? Map.of() : policyPrefixLists(interfaceOwner, region, pluggedGroups));
+            if (pluggedInterface.getSharedNetworkContainerId() != null) {
+                instances.persistIfCurrent(key(region, instanceId), pluggedInstance);
+            }
         }
         return result;
     }

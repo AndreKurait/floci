@@ -29,6 +29,7 @@ import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -125,6 +126,7 @@ class Ec2HotAttachInterfaceTest {
                 .contains("FLOCI_SERVICES_EC2_VPC_NETWORKS_HOT_ATTACH_ENABLED"));
         verify(vpcNetworks, never()).attachInterface(any(), any(), any(), any(), any(), any());
         verify(docker, never()).inspectContainerCmd(anyString());
+        assertNull(attached.getSharedNetworkContainerId());
         assertEquals(List.of(primary().getNetworkInterfaceId(), attached.getNetworkInterfaceId()),
                 instance.getNetworkInterfaces().stream().map(InstanceNetworkInterface::getNetworkInterfaceId).toList());
     }
@@ -149,6 +151,7 @@ class Ec2HotAttachInterfaceTest {
                 .thenReturn(Optional.of("customer-network"));
 
         assertEquals(Optional.empty(), manager.plugNetworkInterface(instance, attached));
+        assertEquals("helper-1", attached.getSharedNetworkContainerId());
 
         verify(vpcNetworks).attachInterface(REGION, "vpc-customer", "subnet-customer", "helper-1", "172.31.5.9", MAC);
         manager.unplugNetworkInterface(instance, attached);
@@ -165,6 +168,7 @@ class Ec2HotAttachInterfaceTest {
         Optional<String> reason = manager.plugNetworkInterface(instance, attached);
 
         assertTrue(reason.orElseThrow().contains("security-group enforcement"), reason.toString());
+        assertNull(attached.getSharedNetworkContainerId());
         manager.unplugNetworkInterface(instance, attached);
         verify(vpcNetworks, never()).attachInterface(anyString(), anyString(), anyString(), anyString(),
                 anyString(), anyString());
