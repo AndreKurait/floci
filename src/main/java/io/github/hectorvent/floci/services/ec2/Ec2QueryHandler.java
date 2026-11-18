@@ -5796,6 +5796,13 @@ public class Ec2QueryHandler {
             }
             xml.end("privateIpAddressesSet");
         }
+        if (!ni.getIpv6Addresses().isEmpty()) {
+            xml.start("ipv6AddressesSet");
+            for (String ipv6Address : ni.getIpv6Addresses()) {
+                xml.start("item").elem("ipv6Address", ipv6Address).elem("isPrimaryIpv6", "false").end("item");
+            }
+            xml.end("ipv6AddressesSet");
+        }
         return xml.build();
     }
 
@@ -5844,9 +5851,20 @@ public class Ec2QueryHandler {
             securityGroupIds = getList(p, "Groups.SecurityGroupId");
         }
         List<Tag> tagList = parseTagsForResource(p, "network-interface");
+        Integer ipv6AddressCount = intParam(p, "Ipv6AddressCount");
+        // AWS: "You can't specify a count of IPv6 addresses using this parameter if you've specified one of the
+        // following: specific IPv6 addresses, specific IPv6 prefixes, or a count of IPv6 prefixes."
+        if (ipv6AddressCount != null) {
+            for (String other : List.of("Ipv6Addresses.1.Ipv6Address", "Ipv6Prefix.1.Ipv6Prefix", "Ipv6PrefixCount")) {
+                if (p.getFirst(other) != null) {
+                    throw new AwsException("InvalidParameterCombination",
+                            "Ipv6AddressCount cannot be combined with " + other.split("\\.", 2)[0] + ".", 400);
+                }
+            }
+        }
 
         NetworkInterface ni = service.createNetworkInterface(region, subnetId, description,
-                privateIpAddress, privateIpAddresses, securityGroupIds, tagList);
+                privateIpAddress, privateIpAddresses, securityGroupIds, tagList, ipv6AddressCount);
 
         XmlBuilder xml = new XmlBuilder()
                 .start("CreateNetworkInterfaceResponse", AwsNamespaces.EC2)
