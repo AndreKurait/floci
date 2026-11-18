@@ -861,11 +861,17 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
                     || dropped.contains("EnableSimpleResponses")) {
                 // UpdateAuthorizer keeps a field it is not given, so a dropped one is cleared here and
                 // the others keep what the update left, a value set outside the stack included.
+                boolean requestAuthorizer = "REQUEST".equals(authorizer.getAuthorizerType());
+                boolean httpRequestAuthorizer = requestAuthorizer
+                        && "HTTP".equals(apiGatewayV2Service.getApi(region, apiId).getProtocolType());
+                boolean jwtAuthorizer = "JWT".equals(authorizer.getAuthorizerType());
                 authorizer = apiGatewayV2Service.replaceAuthorizerSettings(region, apiId, r.getPhysicalId(),
-                        dropped.contains("AuthorizerUri") ? null : authorizer.getAuthorizerUri(),
-                        dropped.contains("AuthorizerPayloadFormatVersion")
+                        dropped.contains("AuthorizerUri") && !requestAuthorizer
+                                ? null : authorizer.getAuthorizerUri(),
+                        dropped.contains("AuthorizerPayloadFormatVersion") && !httpRequestAuthorizer
                                 ? null : authorizer.getAuthorizerPayloadFormatVersion(),
-                        dropped.contains("JwtConfiguration") ? null : authorizer.getJwtConfiguration(),
+                        dropped.contains("JwtConfiguration") && !jwtAuthorizer
+                                ? null : authorizer.getJwtConfiguration(),
                         dropped.contains("AuthorizerResultTtlInSeconds")
                                 ? null : authorizer.getAuthorizerResultTtlInSeconds(),
                         dropped.contains("EnableSimpleResponses")
