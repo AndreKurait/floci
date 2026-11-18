@@ -19,6 +19,7 @@ import io.floci.aws.services.ec2.model.EgressOnlyInternetGateway;
 import io.floci.aws.services.ec2.model.GroupIdentifier;
 import io.floci.aws.services.ec2.model.Image;
 import io.floci.aws.services.ec2.model.Instance;
+import io.floci.aws.services.ec2.model.InstanceNetworkInterface;
 import io.floci.aws.services.ec2.model.InstanceState;
 import io.floci.aws.services.ec2.model.InternetGateway;
 import io.floci.aws.services.ec2.model.IpPermission;
@@ -33,6 +34,7 @@ import io.floci.aws.services.ec2.model.NatGatewayAddress;
 import io.floci.aws.services.ec2.model.NetworkAcl;
 import io.floci.aws.services.ec2.model.NetworkInterface;
 import io.floci.aws.services.ec2.model.NetworkInterfaceAssociation;
+import io.floci.aws.services.ec2.model.NetworkInterfaceAttachment;
 import io.floci.aws.services.ec2.model.NetworkInterfaceListResult;
 import io.floci.aws.services.ec2.model.NetworkInterfacePrivateIpAddress;
 import io.floci.aws.services.ec2.model.Placement;
@@ -2433,8 +2435,94 @@ class Ec2ServiceTest {
     }
 
     /** Ec2Service in container mode, with a container manager whose containers answer on loopback. */
+    @Test
+    void attachingPlugsTheInterfaceAsADeviceAndDetachingUnplugsIt() {
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service service = containerModeService(manager);
+        String region = "us-east-1";
+        String subnetId = publicSubnet(service, region, "10.246.0.0/24");
+        String otherSubnet = publicSubnet(service, region, "10.247.0.0/24");
+        Instance instance = runningContainerInstance(service, region, subnetId, null);
+        NetworkInterface extra = service.createNetworkInterface(region, otherSubnet, null, null, List.of(), List.of(),
+                List.of());
+
+        NetworkInterfaceAttachment attachment = service.attachNetworkInterface(
+                region, extra.getNetworkInterfaceId(), instance.getInstanceId(), 1);
+
+        ArgumentCaptor<Instance> holder = ArgumentCaptor.forClass(Instance.class);
+        ArgumentCaptor<InstanceNetworkInterface> device = ArgumentCaptor.forClass(InstanceNetworkInterface.class);
+        verify(manager).plugNetworkInterface(holder.capture(), device.capture());
+        assertEquals(instance.getInstanceId(), holder.getValue().getInstanceId());
+        assertEquals(extra.getNetworkInterfaceId(), device.getValue().getNetworkInterfaceId());
+        assertEquals(1, device.getValue().getDeviceIndex());
+        assertEquals(extra.getVpcId(), device.getValue().getVpcId());
+        assertEquals(extra.getSubnetId(), device.getValue().getSubnetId());
+        assertEquals(extra.getPrivateIpAddress(), device.getValue().getPrivateIpAddress());
+        assertEquals(extra.getMacAddress(), device.getValue().getMacAddress());
+        verify(manager, never()).unplugNetworkInterface(any(), any());
+
+        service.detachNetworkInterface(region, attachment.getAttachmentId(), false);
+
+        verify(manager).unplugNetworkInterface(holder.capture(), device.capture());
+        verify(manager, times(2)).refreshInstanceMetadata(any(Instance.class));
+        assertEquals(instance.getInstanceId(), holder.getValue().getInstanceId());
+        assertEquals(extra.getNetworkInterfaceId(), device.getValue().getNetworkInterfaceId());
+        assertEquals(extra.getMacAddress(), device.getValue().getMacAddress());
+    }
+
+    @Test
+    void detachWaitsForTheAdmittedPlugButVpcTopologyRemainsAvailable() throws Exception {
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service service = containerModeService(manager);
+        String region = "us-east-1";
+        String home = publicSubnet(service, region, "10.246.0.0/24");
+        String customer = publicSubnet(service, region, "10.247.0.0/24");
+        Instance instance = runningContainerInstance(service, region, home, null);
+        NetworkInterface extra = service.createNetworkInterface(region, customer, null, null,
+                List.of(), List.of(), List.of());
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicReference<String> attachment = new AtomicReference<>();
+        AtomicReference<Thread> detaching = new AtomicReference<>();
+        doAnswer(call -> {
+            InstanceNetworkInterface device = call.getArgument(1);
+            attachment.set(device.getAttachmentId());
+            entered.countDown();
+            assertTrue(release.await(15, TimeUnit.SECONDS));
+            return Optional.empty();
+        }).when(manager).plugNetworkInterface(any(), any());
+        ExecutorService workers = Executors.newFixedThreadPool(3);
+        try {
+            Future<NetworkInterfaceAttachment> attaching = workers.submit(() -> service.attachNetworkInterface(
+                    region, extra.getNetworkInterfaceId(), instance.getInstanceId(), 1));
+            assertTrue(entered.await(5, TimeUnit.SECONDS));
+            Future<NetworkInterfaceAttachment> detached = workers.submit(() -> {
+                detaching.set(Thread.currentThread());
+                return service.detachNetworkInterface(region, attachment.get(), false);
+            });
+            awaitBlockedOrDone(detaching, detached);
+            assertFalse(detached.isDone(), "Detach must not race ahead of the admitted Docker plug");
+            assertNotNull(workers.submit(() -> service.createVpc(region, "10.248.0.0/24", false))
+                    .get(5, TimeUnit.SECONDS), "Unrelated topology changes must not wait for Docker");
+            verify(manager, never()).unplugNetworkInterface(any(), any());
+            release.countDown();
+            assertEquals(attaching.get(5, TimeUnit.SECONDS).getAttachmentId(),
+                    detached.get(5, TimeUnit.SECONDS).getAttachmentId());
+            InOrder order = inOrder(manager);
+            order.verify(manager).plugNetworkInterface(any(), any());
+            order.verify(manager).unplugNetworkInterface(any(), any());
+        } finally {
+            release.countDown();
+            workers.shutdownNow();
+            assertTrue(workers.awaitTermination(5, TimeUnit.SECONDS));
+        }
+    }
+
     private static Ec2Service containerModeService() {
-        Ec2ContainerManager containerManager = mock(Ec2ContainerManager.class);
+        return containerModeService(mock(Ec2ContainerManager.class));
+    }
+
+    private static Ec2Service containerModeService(Ec2ContainerManager containerManager) {
         when(containerManager.reachablePublicAddress(any())).thenAnswer(invocation -> {
             Instance instance = invocation.getArgument(0);
             return instance.getDockerContainerId() == null ? null : "127.0.0.1";

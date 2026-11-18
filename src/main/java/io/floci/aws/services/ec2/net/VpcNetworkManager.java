@@ -1,11 +1,14 @@
 package io.floci.aws.services.ec2.net;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.Network;
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.core.common.docker.ContainerExec;
 import io.floci.aws.core.common.docker.ContainerStorageHelper;
 import io.floci.aws.core.common.docker.CurrentContainerNetworkResolver;
 import jakarta.annotation.PreDestroy;
@@ -13,11 +16,13 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
@@ -27,6 +32,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Pattern;
 
 /**
  * Gives every VPC a real Docker network, so an EC2 instance's private address is an address
@@ -89,6 +95,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class VpcNetworkManager {
 
     private static final Logger LOG = Logger.getLogger(VpcNetworkManager.class);
+    private static final ObjectMapper LINKS_JSON = new ObjectMapper();
+    private static final Pattern UNICAST_MAC = Pattern.compile("[0-9a-f][02468ace](?::[0-9a-f]{2}){5}");
 
     /**
      * With {@code io.floci.service=ec2}, marks a Docker network as a Floci VPC network, for
@@ -652,6 +660,202 @@ public class VpcNetworkManager {
             return;
         }
         disconnect(vpc.networkName, containerId);
+    }
+
+    /**
+     * Plugs an additional network interface into a running container's namespace, as attaching an
+     * interface to a running instance (hot attach) adds a device to it: an endpoint on the
+     * interface's VPC network at its primary private address, carrying the interface's MAC
+     * address. Docker (Engine 25) applies an endpoint MAC when it creates a container, not when it
+     * connects a running one, so the namespace owner gives the new device the interface's MAC
+     * itself ({@code ip link set ... address}), which needs NET_ADMIN and {@code ip} in that
+     * container. An endpoint that ends up with any other MAC or address is disconnected again, so
+     * the guest never holds a device its instance metadata does not describe.
+     *
+     * <p>This component serves the current shared Docker-network backend.
+     * Docker gives a container one endpoint per network, so the container must not be on this
+     * VPC's network already (an interface in the VPC of an interface it already holds).
+     *
+     * @return the network name once plugged; empty when the address is not on a network this
+     *         manager planned, or the backend cannot plug it
+     */
+    public Optional<String> attachInterface(String accountId, String region, String vpcId, String subnetId, String containerId,
+                                            String address, String macAddress) {
+        if (!enabled() || containerId == null || address == null
+                || macAddress == null) {
+            return Optional.empty();
+        }
+        VpcBinding vpc = plannedVpc(accountId, region, vpcId);
+        SubnetBinding subnet = subnetBinding(accountId, region, subnetId);
+        Optional<Cidr4> parsed = Cidr4.parse(address + "/32");
+        if (vpc == null || vpc.effective == null || subnet == null || subnet.effective == null
+                || parsed.isEmpty() || !subnet.effective.containsAddress(parsed.get().network())) {
+            return Optional.empty();
+        }
+        String networkName = materialise(vpc);
+        if (networkName == null) {
+            return Optional.empty();
+        }
+        Map<String, ContainerNetwork> before = endpoints(containerId);
+        if (before.containsKey(networkName)) {
+            throw new IllegalStateException("Container " + containerId + " already holds an endpoint on VPC network "
+                    + networkName + "; Docker gives a container one endpoint per network");
+        }
+        dockerClient.connectToNetworkCmd()
+                .withContainerId(containerId)
+                .withNetworkId(networkName)
+                .withContainerNetwork(new ContainerNetwork()
+                        .withIpamConfig(new ContainerNetwork.Ipam().withIpv4Address(address))
+                        .withMacAddress(macAddress))
+                .exec();
+        ContainerNetwork endpoint = endpoints(containerId).get(networkName);
+        if (endpoint == null || !address.equals(endpoint.getIpAddress())) {
+            disconnect(networkName, containerId);
+            throw new IllegalStateException("Docker did not give container " + containerId + " the interface's "
+                    + "address " + address + " on " + networkName);
+        }
+        if (!macAddress.equalsIgnoreCase(String.valueOf(endpoint.getMacAddress()))) {
+            try {
+                giveDeviceItsMac(containerId, endpoint.getMacAddress(), macAddress);
+            } catch (RuntimeException failure) {
+                disconnect(networkName, containerId);
+                throw new IllegalStateException("Container " + containerId + " could not give the attached device "
+                        + "the interface's MAC " + macAddress + " on " + networkName + ": " + failure.getMessage(),
+                        failure);
+            }
+        }
+        LOG.infov("Plugged an attached interface into container {0}: VPC network {1}, {2}, {3}",
+                containerId, networkName, address, macAddress);
+        return Optional.of(networkName);
+    }
+
+    /** Runs a command in a container and returns its stdout; a non-zero exit is an exception. */
+    @FunctionalInterface
+    interface NamespaceCommand {
+        String run(String containerId, String... command);
+    }
+
+    /** Runs namespace commands in tests; null runs them through Docker exec. */
+    NamespaceCommand namespaceCommand;
+
+    private String runInNamespace(String containerId, String... command) {
+        if (namespaceCommand != null) {
+            return namespaceCommand.run(containerId, command);
+        }
+        ContainerExec.Result result = ContainerExec.run(dockerClient, containerId, command, 15)
+                .throwIfTimedOut(containerId);
+        if (result.exitCode() != 0) {
+            throw new IllegalStateException("Command failed in " + containerId + ": " + result.summary());
+        }
+        return result.stdout();
+    }
+
+    /** Sets the device Docker created (found by Docker's MAC) to the interface's MAC, and reads it back. */
+    private void giveDeviceItsMac(String containerId, String dockerMac, String macAddress) {
+        String mac = macAddress.toLowerCase(Locale.ROOT);
+        if (!UNICAST_MAC.matcher(mac).matches()) {
+            throw new IllegalArgumentException("Expected a unicast MAC address");
+        }
+        if (dockerMac == null || dockerMac.isBlank()) {
+            throw new IllegalStateException("Docker reported no MAC for the new endpoint");
+        }
+        String device = deviceFor(links(containerId), dockerMac);
+        runInNamespace(containerId, "sh", "-c", "ip link set dev " + device + " down && ip link set dev "
+                + device + " address " + mac + " && ip link set dev " + device + " up");
+        if (!device.equals(deviceFor(links(containerId), mac))) {
+            throw new IllegalStateException("The attached device did not take the interface's MAC");
+        }
+    }
+
+    private JsonNode links(String containerId) {
+        try {
+            JsonNode links = LINKS_JSON.readTree(runInNamespace(containerId, "ip", "-j", "link"));
+            if (!links.isArray()) {
+                throw new IllegalStateException("Expected a network interface array");
+            }
+            return links;
+        } catch (IOException failure) {
+            throw new IllegalStateException("Cannot read the namespace's network interfaces", failure);
+        }
+    }
+
+    /** Unplugs the endpoint {@link #attachInterface} added; nothing when the container holds none. */
+    public void detachInterface(String accountId, String region, String vpcId, String containerId) {
+        if (!enabled() || containerId == null) {
+            return;
+        }
+        VpcBinding vpc = bindings.get(key(accountId, region, vpcId));
+        if (vpc == null || !vpc.created) {
+            return;
+        }
+        disconnect(vpc.networkName, containerId);
+    }
+
+    /** Repairs an existing endpoint after Docker restart; never reconnects a detached device. */
+    public void restoreInterface(String accountId, String region, String vpcId, String containerId,
+                                 String address, String macAddress) {
+        if (!enabled() || containerId == null || address == null || macAddress == null) {
+            return;
+        }
+        VpcBinding vpc = bindings.get(key(accountId, region, vpcId));
+        if (vpc == null) {
+            return;
+        }
+        ContainerNetwork endpoint = endpoints(containerId).get(vpc.networkName);
+        if (endpoint == null || !address.equals(endpoint.getIpAddress())) {
+            return;
+        }
+        JsonNode current = links(containerId);
+        for (JsonNode link : current) {
+            if (macAddress.equalsIgnoreCase(link.path("address").asText())) {
+                return;
+            }
+        }
+        giveDeviceItsMac(containerId, endpoint.getMacAddress(), macAddress);
+    }
+
+    /** A record-only attachment must never remove another device already on this VPC network. */
+    public void detachInterface(String accountId, String region, String vpcId, String containerId,
+                                String address, String macAddress) {
+        if (!enabled() || containerId == null || address == null || macAddress == null) {
+            return;
+        }
+        VpcBinding vpc = bindings.get(key(accountId, region, vpcId));
+        if (vpc == null || !vpc.created) {
+            return;
+        }
+        ContainerNetwork endpoint = endpoints(containerId).get(vpc.networkName);
+        if (endpoint == null || !address.equals(endpoint.getIpAddress())) {
+            return;
+        }
+        // Docker 25 retains its original MAC in inspect after the namespace MAC is repaired.
+        // Read the device itself before allowing a detach to remove the shared network endpoint.
+        deviceFor(links(containerId), macAddress);
+        disconnect(vpc.networkName, containerId);
+    }
+
+    private Map<String, ContainerNetwork> endpoints(String containerId) {
+        InspectContainerResponse inspection = dockerClient.inspectContainerCmd(containerId).exec();
+        Map<String, ContainerNetwork> networks = inspection.getNetworkSettings() == null
+                ? null : inspection.getNetworkSettings().getNetworks();
+        return networks == null ? Map.of() : networks;
+    }
+
+    private static String deviceFor(JsonNode links, String mac) {
+        List<String> matches = new ArrayList<>();
+        for (JsonNode link : links) {
+            if (mac.equalsIgnoreCase(link.path("address").asText())) {
+                matches.add(link.path("ifname").asText());
+            }
+        }
+        if (matches.size() != 1) {
+            throw new IllegalStateException("Cannot identify exactly one attached VPC interface");
+        }
+        String device = matches.getFirst();
+        if (!device.matches("[a-zA-Z0-9_.:-]{1,15}")) {
+            throw new IllegalArgumentException("Invalid network device name");
+        }
+        return device;
     }
 
     private void disconnect(String networkId, String containerId) {
