@@ -10,6 +10,9 @@ import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.UriInfo;
+import org.jboss.resteasy.reactive.server.core.CurrentRequestManager;
+import org.jboss.resteasy.reactive.server.core.ResteasyReactiveRequestContext;
+import org.jboss.resteasy.reactive.server.spi.ServerHttpRequest;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -27,6 +30,8 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -256,6 +261,73 @@ class ExecuteApiSigV4AuthorizerTest {
                 "GET", PATH, HOST, "AKIALONGTERM", "s3cr3t", REGION, Instant.now(), 900);
         assertTrue(authorizer.authorize("GET", headers(Map.of("X-Amz-Security-Token", "bogus")),
                 uriInfo(PATH, presigned), null, null).authorized());
+    }
+
+    @Test
+    void headerSignedRequestWithoutQuerySkipsQueryMap() throws Exception {
+        Map<String, String> signed = ExecuteApiRequestSigner.signedHeaders(
+                "GET", PATH, Map.of(), HOST, null, "test", "test", REGION, Instant.now());
+        UriInfo uri = uriInfo(PATH, null);
+        CurrentRequestManager.set(requestContext(null));
+        try {
+            assertTrue(authorizer.authorize("GET", headers(signed), uri, null, null).authorized());
+            verify(uri, never()).getQueryParameters();
+        } finally {
+            CurrentRequestManager.set(null);
+        }
+    }
+
+    @Test
+    void unsignedRequestWithoutQueryStillRejectsWithoutQueryMap() {
+        UriInfo uri = uriInfo(PATH, null);
+        CurrentRequestManager.set(requestContext(null));
+        try {
+            assertEquals(ExecuteApiSigV4Authorizer.Failure.MISSING,
+                    authorizer.authorize("GET", headers(Map.of()), uri, null, null).failure());
+            verify(uri, never()).getQueryParameters();
+        } finally {
+            CurrentRequestManager.set(null);
+        }
+    }
+
+    @Test
+    void headerSignedRequestWithQueryStillChecksRawQuery() throws Exception {
+        Map<String, String> signed = ExecuteApiRequestSigner.signedHeaders(
+                "GET", PATH, Map.of("limit", "10"), HOST, null, "test", "test", REGION, Instant.now());
+        UriInfo uri = uriInfo(PATH, "limit=10&admin=true");
+        CurrentRequestManager.set(requestContext("limit=10&admin=true"));
+        try {
+            assertEquals(ExecuteApiSigV4Authorizer.Failure.MISMATCH,
+                    authorizer.authorize("GET", headers(signed), uri, null, null).failure());
+            verify(uri).getQueryParameters();
+        } finally {
+            CurrentRequestManager.set(null);
+        }
+    }
+
+    @Test
+    void presignedRequestWithQueryStillChecksSessionToken() throws Exception {
+        liveSession("ASIAPRESIGNED", ISSUED_TOKEN);
+        String query = ExecuteApiRequestSigner.presignedQueryString(
+                "GET", PATH, HOST, "ASIAPRESIGNED", "session-secret", REGION,
+                Instant.now(), 900, "forged-session-token");
+        UriInfo uri = uriInfo(PATH, query);
+        CurrentRequestManager.set(requestContext(query));
+        try {
+            assertEquals(ExecuteApiSigV4Authorizer.Failure.INVALID_TOKEN,
+                    authorizer.authorize("GET", headers(Map.of()), uri, null, null).failure());
+            verify(uri).getQueryParameters();
+        } finally {
+            CurrentRequestManager.set(null);
+        }
+    }
+
+    private static ResteasyReactiveRequestContext requestContext(String query) {
+        ResteasyReactiveRequestContext request = mock(ResteasyReactiveRequestContext.class);
+        ServerHttpRequest serverRequest = mock(ServerHttpRequest.class);
+        when(serverRequest.query()).thenReturn(query);
+        when(request.serverRequest()).thenReturn(serverRequest);
+        return request;
     }
 
     private void liveSession(String accessKeyId, String issuedToken) {
