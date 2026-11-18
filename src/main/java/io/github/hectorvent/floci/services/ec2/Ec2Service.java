@@ -12956,6 +12956,11 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return List.copyOf(tagsOf(region, resourceId).orElse(List.of()));
     }
 
+    /** The tags on one resource in an account's partition, for IAM authorization of the resource an ARN names. */
+    public List<Tag> resourceTags(String accountId, String region, String resourceId) {
+        return List.copyOf(tagsOf(accountId, region, resourceId).orElse(List.of()));
+    }
+
     /** Every tag in {@code region} that matches {@code filters}, unpaged. */
     public List<Map<String, String>> describeTags(String region, Map<String, List<String>> filters) {
         List<Map.Entry<String, List<String>>> filterList = filters != null

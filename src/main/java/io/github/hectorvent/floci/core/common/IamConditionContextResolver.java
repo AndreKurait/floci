@@ -76,6 +76,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 
 /**
@@ -1434,6 +1435,43 @@ public class IamConditionContextResolver {
                     partition, "ec2", region, account, "launch-template/" + template.getLaunchTemplateId()).toString()));
         }
         return conditions.isEmpty() ? null : conditions;
+    }
+
+    /** EC2 resource types whose ARN names the resource by the id the EC2 tag store keys its tags by. */
+    static final Set<String> TAG_STORE_ID_TYPES = Set.of("vpc-endpoint", "network-interface", "subnet",
+            "security-group", "vpc", "route-table", "image", "snapshot", "instance", "volume");
+
+    /**
+     * {@code aws:ResourceTag/<key>} for one EC2 resource being authorized, from that resource's own
+     * stored tags, as AWS evaluates each resource a request acts on with its own tags: present (an
+     * empty map for an untagged resource, which leaves every key absent so a condition on one does not
+     * match) for an EC2 ARN naming one resource of a type whose ARN carries the id the EC2 tag store
+     * keys its tags by ({@link #TAG_STORE_ID_TYPES}); empty for anything else (a type wildcard such as
+     * {@code vpc-endpoint/*}, a type whose ARN names the resource another way, such as a placement
+     * group by name, a non-EC2 ARN, {@code *}), whose context is left as the request built it. An ARN
+     * without an account (an image, a snapshot) is read in the caller's account, the ARN's region
+     * otherwise the request's.
+     */
+    public Optional<Map<String, List<String>>> ec2ResourceTags(String resource) {
+        if (!AwsArnUtils.isArnFor(resource, "ec2") || !ec2Service.isResolvable()) {
+            return Optional.empty();
+        }
+        AwsArnUtils.Arn arn = AwsArnUtils.parse(resource);
+        int slash = arn.resource().indexOf('/');
+        String type = slash < 0 ? arn.resource() : arn.resource().substring(0, slash);
+        String id = slash < 0 ? "" : arn.resource().substring(slash + 1);
+        if (!TAG_STORE_ID_TYPES.contains(type) || id.isEmpty() || id.contains("*") || id.contains("?")) {
+            return Optional.empty();
+        }
+        String region = !arn.region().isEmpty() ? arn.region()
+                : requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        String account = !arn.accountId().isEmpty() ? arn.accountId()
+                : requestContext.getAccountId() == null ? config.defaultAccountId() : requestContext.getAccountId();
+        Map<String, List<String>> tags = new LinkedHashMap<>();
+        for (Tag tag : ec2Service.get().resourceTags(account, region, id)) {
+            tags.put(RESOURCE_TAG_PREFIX + tag.getKey(), List.of(tag.getValue() == null ? "" : tag.getValue()));
+        }
+        return Optional.of(tags);
     }
 
     /** A termination batch pairs each instance ARN with that instance's own tags. */

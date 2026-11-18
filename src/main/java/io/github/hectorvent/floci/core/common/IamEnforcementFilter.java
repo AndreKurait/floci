@@ -1471,6 +1471,16 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             if ("ec2:TerminateInstances".equals(action)) {
                 resourceContexts = List.of(conditionContextResolver.ec2TerminationContext(
                         resource, targetContexts.isEmpty() ? null : targetContexts.getFirst()));
+            } else if ("ec2".equals(credentialScope)) {
+                // Each EC2 resource is checked with its own aws:ResourceTag keys, as on AWS, rather
+                // than the first target's (ModifyVpcEndpoint, DeleteVpcEndpoints and the rest).
+                Optional<Map<String, List<String>>> ownTags = conditionContextResolver.ec2ResourceTags(resource);
+                if (ownTags.isPresent()) {
+                    resourceContexts = targetContexts.stream()
+                            .map(base -> withResourceTags(base, ownTags.get()))
+                            .distinct()
+                            .toList();
+                }
             } else if ("ssm:SendCommand".equals(action)) {
                 resourceContexts = targetContexts.stream().map(base ->
                         conditionContextResolver.ssmCommandResourceContext(resource, base, region, accountId)).toList();
@@ -1519,6 +1529,15 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             }
         }
         return false;
+    }
+
+    /** {@code base} with its {@code aws:ResourceTag/} keys replaced by {@code tags}. */
+    private static Map<String, List<String>> withResourceTags(Map<String, List<String>> base,
+                                                              Map<String, List<String>> tags) {
+        Map<String, List<String>> context = base == null ? new HashMap<>() : new HashMap<>(base);
+        context.keySet().removeIf(key -> key.startsWith("aws:ResourceTag/"));
+        context.putAll(tags);
+        return context;
     }
 
     /**
