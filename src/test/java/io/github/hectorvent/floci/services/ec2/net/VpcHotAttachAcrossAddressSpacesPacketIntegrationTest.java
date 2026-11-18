@@ -166,8 +166,8 @@ class VpcHotAttachAcrossAddressSpacesPacketIntegrationTest {
         NetworkNamespaceLease lease = new NetworkNamespaceLease(helper, docker.inspectContainerCmd(helper).exec().getName());
         cleanup.addFirst(() -> RequestScopes.runAs(ACCOUNT, REGION, () -> {
             lease.requireUnused(docker);
-            lifecycle.removeIfExistsStrict(helper);
             firewall.unregister(eni);
+            lifecycle.removeIfExistsStrict(helper);
             routing.unregister(ACCOUNT, REGION, eni);
         }));
         RequestScopes.runAs(ACCOUNT, REGION, () -> {
