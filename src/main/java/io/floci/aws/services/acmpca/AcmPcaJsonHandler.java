@@ -29,6 +29,9 @@ public class AcmPcaJsonHandler {
             case "DeleteCertificateAuthority" -> service.delete(request, region);
             case "RestoreCertificateAuthority" -> service.restore(request, region);
             case "ListCertificateAuthorities" -> service.list(request, region);
+            case "TagCertificateAuthority" -> service.tag(request, region);
+            case "UntagCertificateAuthority" -> service.untag(request, region);
+            case "ListTags" -> service.listTags(request, region);
             default -> throw new AwsException("UnsupportedOperation",
                     "Operation " + action + " is not supported", 400);
         }).build();
