@@ -11,6 +11,7 @@ import io.floci.aws.core.common.SignedServiceRoute;
 import io.floci.aws.core.common.WireProtocol;
 import io.floci.aws.services.dynamodb.DynamoDbPartiQLParser;
 import io.floci.aws.services.eks.EksController;
+import io.floci.aws.services.iot.IotController;
 import io.floci.aws.services.s3.S3BucketSubresources;
 import io.floci.aws.services.s3.S3ObjectActions;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -91,6 +92,8 @@ public class IamActionRegistry {
      * type, so IAM checks them against the wildcard rather than a bucket.
      */
     private static final List<ActionRule> RULES = List.of(
+        rule("iot", "DELETE", "^/jobs/[^/]+/?$", "iot:DeleteJob"),
+
         // ── S3 Control ───────────────────────────────────────────────────────────
         s3ControlRule("GET",    "^/v20180820/tags/.+",        "s3:ListTagsForResource"),
         s3ControlRule("POST",   "^/v20180820/tags/.+",        "s3:TagResource"),
@@ -649,6 +652,12 @@ public class IamActionRegistry {
 
     /** The serving method identifies these actions even when path encoding or matrix parameters vary. */
     public String resolveMatchedRoute(String credentialScope, ResourceInfo resourceInfo) {
+        if ("iot".equals(credentialScope) && resourceInfo != null
+                && IotController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && "deleteJob".equals(resourceInfo.getResourceMethod().getName())) {
+            return "iot:DeleteJob";
+        }
         if (resourceInfo == null || resourceInfo.getResourceClass() == null) {
             return null;
         }
