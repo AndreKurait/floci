@@ -105,7 +105,7 @@ class Ec2PublicPeerPacketIntegrationTest {
                 .build();
         cleanup.addFirst(sdk::close);
         String vpc = sdk.createVpc(request -> request.cidrBlock("10.87.0.0/16")).vpc().vpcId();
-        cleanup.addFirst(() -> sdk.deleteVpc(request -> request.vpcId(vpc)));
+        cleanup.addFirst(() -> deleteVpc(sdk, vpc));
         String firstSubnet = subnet(sdk, vpc, "10.87.1.0/24");
         String secondSubnet = subnet(sdk, vpc, "10.87.2.0/24");
         String gateway = sdk.createInternetGateway().internetGateway().internetGatewayId();
@@ -306,7 +306,7 @@ class Ec2PublicPeerPacketIntegrationTest {
 
     private String routedVpc(Ec2Client sdk, String cidr) {
         String vpc = sdk.createVpc(request -> request.cidrBlock(cidr)).vpc().vpcId();
-        cleanup.addFirst(() -> sdk.deleteVpc(request -> request.vpcId(vpc)));
+        cleanup.addFirst(() -> deleteVpc(sdk, vpc));
         String gateway = sdk.createInternetGateway().internetGateway().internetGatewayId();
         cleanup.addFirst(() -> sdk.deleteInternetGateway(request -> request.internetGatewayId(gateway)));
         sdk.attachInternetGateway(request -> request.vpcId(vpc).internetGatewayId(gateway));
@@ -316,6 +316,14 @@ class Ec2PublicPeerPacketIntegrationTest {
                 filter -> filter.name("association.main").values("true"))).routeTables().getFirst().routeTableId();
         sdk.createRoute(request -> request.routeTableId(table).destinationCidrBlock("0.0.0.0/0").gatewayId(gateway));
         return vpc;
+    }
+
+    private void deleteVpc(Ec2Client sdk, String vpc) {
+        sdk.deleteVpc(request -> request.vpcId(vpc));
+        await("Packet VPC network removal").atMost(Duration.ofSeconds(30)).until(() ->
+                docker.listNetworksCmd().withFilter("label", List.of(
+                        ContainerStorageHelper.OWNER_LABEL + "=" + ContainerStorageHelper.ownerIdentity(config),
+                        ContainerStorageHelper.RESOURCE_ID_LABEL + "=" + vpc)).exec().isEmpty());
     }
 
     private String packetGroup(Ec2Client sdk, String vpc, String name) {
