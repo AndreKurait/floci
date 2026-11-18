@@ -170,6 +170,29 @@ class Ec2InstanceCredentialsTest {
         }
     }
 
+    @Test
+    void refreshKeepsProfileCredentialGenerationsAndTheirCleanupOwnership() {
+        Fixture fixture = fixture();
+        SessionCredential first = fixture.get(NOW);
+        SessionCredential second = fixture.get(NOW.plusSeconds(3300));
+        Instance refreshed = new Instance();
+        refreshed.setInstanceId(fixture.instance.getInstanceId());
+        refreshed.setRegion(fixture.instance.getRegion());
+        refreshed.setIamInstanceProfileArn(PROFILE);
+
+        fixture.credentials.refresh(fixture.instance, refreshed);
+        fixture.credentials.refresh(refreshed, refreshed);
+        fixture.credentials.unregister(fixture.instance);
+
+        assertSame(second, fixture.credentials.get(refreshed, "worker", NOW.plusSeconds(3300)).orElseThrow());
+        verify(fixture.iam, never()).unregisterSession(ACCOUNT, first.getAccessKeyId());
+        verify(fixture.iam, never()).unregisterSession(ACCOUNT, second.getAccessKeyId());
+        fixture.credentials.unregister(refreshed);
+        verify(fixture.iam).unregisterSession(ACCOUNT, first.getAccessKeyId());
+        verify(fixture.iam).unregisterSession(ACCOUNT, second.getAccessKeyId());
+        assertTrue(fixture.credentials.get(refreshed, "worker", NOW).isEmpty());
+    }
+
     private static Fixture fixture() {
         return fixture(ACCOUNT);
     }

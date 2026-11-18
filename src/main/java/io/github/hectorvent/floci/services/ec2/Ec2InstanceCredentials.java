@@ -36,6 +36,20 @@ final class Ec2InstanceCredentials {
         sessions.computeIfAbsent(instance, ignored -> new ArrayList<>());
     }
 
+    synchronized void refresh(Instance previous, Instance current) {
+        if (previous == current) {
+            return;
+        }
+        List<Issued> issued = sessions.remove(previous);
+        if (issued != null) {
+            sessions.computeIfAbsent(current, ignored -> new ArrayList<>()).addAll(issued);
+        }
+        List<SessionCredential> identities = identitySessions.remove(previous);
+        if (identities != null) {
+            identitySessions.computeIfAbsent(current, ignored -> new ArrayList<>()).addAll(identities);
+        }
+    }
+
     synchronized void unregister(Instance instance) {
         List<Issued> issued = sessions.remove(instance);
         if (issued != null) {
