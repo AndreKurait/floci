@@ -123,3 +123,22 @@ def test_an_incomplete_read_is_a_read_failure(tmp_path, monkeypatch, capsys):
     args, _ = _setup(tmp_path, {})
     assert r.main(args[2:]) == 2
     assert "could not read" in capsys.readouterr().err
+
+
+def test_verify_reports_changed_rows_without_rewriting_output(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(r, "SCHEMALESS", frozenset({"Custom::NoSchema"}))
+    args, output = _setup(tmp_path, {
+        "aws-test-thing.json": json.dumps(SCHEMA),
+        "aws-test-other.json": json.dumps({"properties": {"Id": {}}}),
+    })
+    assert r.main(args) == 0
+    original = output.read_text(encoding="utf-8").replace("Name,Nested,Secret", "Name")
+    output.write_text(original, encoding="utf-8")
+    capsys.readouterr()
+
+    assert r.main(args + ["--verify"]) == 1
+    error = capsys.readouterr().err
+    assert "-AWS::Test::Thing\tArn\tName\n" in error
+    assert "+AWS::Test::Thing\tArn\tName,Nested,Secret\n" in error
+    assert "no longer matches" in error
+    assert output.read_text(encoding="utf-8") == original
