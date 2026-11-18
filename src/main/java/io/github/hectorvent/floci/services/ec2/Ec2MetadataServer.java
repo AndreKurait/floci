@@ -191,10 +191,29 @@ public class Ec2MetadataServer {
         if (instance == null || instance.getInstanceId() == null) {
             return;
         }
-        String id = instance.getInstanceId();
-        containerIpToInstance.replaceAll((address, known) -> id.equals(known.getInstanceId()) ? instance : known);
-        tokens.replaceAll((token, session) -> id.equals(session.instance().getInstanceId())
+        Set<Instance> previous = ConcurrentHashMap.newKeySet();
+        containerIpToInstance.values().stream().filter(known -> sameInstance(known, instance)).forEach(previous::add);
+        tokens.values().stream().map(SessionToken::instance)
+                .filter(known -> sameInstance(known, instance)).forEach(previous::add);
+        pendingContainers.values().stream().map(PendingContainer::instance)
+                .filter(known -> sameInstance(known, instance)).forEach(previous::add);
+        for (Instance known : previous) {
+            credentials.refresh(known, instance);
+            if (known != instance && synthesizedProfiles.remove(known)) {
+                synthesizedProfiles.add(instance);
+            }
+        }
+        containerIpToInstance.replaceAll((address, known) -> sameInstance(known, instance) ? instance : known);
+        tokens.replaceAll((token, session) -> sameInstance(session.instance(), instance)
                 ? new SessionToken(instance, session.expiresAt()) : session);
+        pendingContainers.replaceAll((id, pending) -> sameInstance(pending.instance(), instance)
+                ? new PendingContainer(pending.owner(), pending.address(), instance) : pending);
+    }
+
+    private static boolean sameInstance(Instance known, Instance current) {
+        return Objects.equals(known.getInstanceId(), current.getInstanceId())
+                && Objects.equals(known.getOwnerId(), current.getOwnerId())
+                && Objects.equals(known.getRegion(), current.getRegion());
     }
 
     /** Called by Ec2ContainerManager when a container is terminated. */
