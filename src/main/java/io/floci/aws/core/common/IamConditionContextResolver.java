@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.services.amazonmq.AmazonMqConfigurationService;
 import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsCrossAccountService;
 import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsDeliveryService;
 import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsService;
@@ -108,6 +109,7 @@ public class IamConditionContextResolver {
     static final String REQUEST_AUTH_TYPE = "lambda:Request/WebFunctionAuthType";
     static final String RESOURCE_AUTH_TYPE = "lambda:Resource/WebFunctionAuthType";
 
+    private final Instance<AmazonMqConfigurationService> mqConfigurations;
     private final Instance<DynamoDbFacade> dynamoDbFacade;
     private final Instance<Ec2Service> ec2Service;
     private final Instance<S3Service> s3Service;
@@ -142,6 +144,23 @@ public class IamConditionContextResolver {
                                        RegionResolver regionResolver,
                                        EmulatorConfig config,
                                        CurrentVertxRequest currentVertxRequest,
+                                       ResolvedServiceCatalog serviceCatalog,
+                                       Instance<AmazonMqConfigurationService> mqConfigurations) {
+        this(dynamoDbFacade, ec2Service, s3Service, logsService, crossAccountService, iamService,
+                lambdaWebService, requestContext,
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), mqConfigurations);
+    }
+
+    public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                       Instance<Ec2Service> ec2Service,
+                                       Instance<S3Service> s3Service,
+                                       Instance<CloudWatchLogsService> logsService,
+                                       Instance<CloudWatchLogsCrossAccountService> crossAccountService,
+                                       Instance<IamService> iamService,
+                                       Instance<LambdaWebService> lambdaWebService,
+                                       RequestContext requestContext,
+                                       EmulatorConfig config,
+                                       CurrentVertxRequest currentVertxRequest,
                                        ResolvedServiceCatalog serviceCatalog) {
         this(dynamoDbFacade, ec2Service, s3Service, logsService, crossAccountService, iamService,
                 lambdaWebService, requestConditionSpellings, storedResourceArns, requestContext, regionResolver,
@@ -162,6 +181,23 @@ public class IamConditionContextResolver {
                                 EmulatorConfig config,
                                 CurrentVertxRequest currentVertxRequest,
                                 ResolvedServiceCatalog serviceCatalog, Clock clock) {
+        this(dynamoDbFacade, ec2Service, s3Service, logsService, crossAccountService, iamService,
+                lambdaWebService, requestContext, config, currentVertxRequest, serviceCatalog, clock, null);
+    }
+
+    private IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                Instance<Ec2Service> ec2Service,
+                                Instance<S3Service> s3Service,
+                                Instance<CloudWatchLogsService> logsService,
+                                Instance<CloudWatchLogsCrossAccountService> crossAccountService,
+                                Instance<IamService> iamService,
+                                Instance<LambdaWebService> lambdaWebService,
+                                RequestContext requestContext,
+                                EmulatorConfig config,
+                                CurrentVertxRequest currentVertxRequest,
+                                ResolvedServiceCatalog serviceCatalog, Clock clock,
+                                Instance<AmazonMqConfigurationService> mqConfigurations) {
+        this.mqConfigurations = mqConfigurations;
         this.dynamoDbFacade = dynamoDbFacade;
         this.ec2Service = ec2Service;
         this.s3Service = s3Service;
@@ -293,9 +329,30 @@ public class IamConditionContextResolver {
             case "dynamodb" -> dynamoDbConditionContext(action, ctx);
             case "iam" -> iamConditionContext(action, ctx);
             case "logs" -> logsConditionContext(action, ctx);
+            case "mq" -> mqConfigurationConditions(action, ctx);
             case "lambda" -> lambdaConditionContext(action, ctx);
             default -> requestMemberConditions(action, ctx);
         };
+    }
+
+    private Map<String, List<String>> mqConfigurationConditions(String action, ContainerRequestContext ctx) {
+        if ("mq:CreateConfiguration".equals(action)) {
+            JsonNode body = PassedRoles.jsonBody(ctx);
+            return body == null ? null : AmazonMqConfigurationService.requestTagConditions(
+                    AmazonMqConfigurationService.requestTags(body.get("tags")));
+        }
+        if (mqConfigurations == null || !mqConfigurations.isResolvable() || action == null || !switch (action) {
+            case "mq:DescribeConfiguration", "mq:UpdateConfiguration", "mq:DeleteConfiguration",
+                    "mq:DescribeConfigurationRevision", "mq:ListConfigurationRevisions" -> true;
+            default -> false;
+        }) {
+            return null;
+        }
+        String id = ctx.getUriInfo().getPathParameters().getFirst("configurationId");
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        mqConfigurations.get().tagsForAuthorization(id).forEach((key, value) ->
+                conditions.put(RESOURCE_TAG_PREFIX + key, List.of(value)));
+        return conditions;
     }
 
     /** Logs tag operations and group mutations use the handler's resource and request scope. */

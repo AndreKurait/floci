@@ -9,6 +9,7 @@ import io.floci.aws.core.common.RequestResources;
 import io.floci.aws.core.common.ResteasyRequests;
 import io.floci.aws.core.common.SignedServiceRoute;
 import io.floci.aws.core.common.WireProtocol;
+import io.floci.aws.services.amazonmq.AmazonMqConfigurationController;
 import io.floci.aws.services.dynamodb.DynamoDbPartiQLParser;
 import io.floci.aws.services.eks.EksController;
 import io.floci.aws.services.s3.S3BucketSubresources;
@@ -42,6 +43,15 @@ import java.util.regex.Pattern;
  */
 @ApplicationScoped
 public class IamActionRegistry {
+
+    private static final Map<String, String> MQ_CONFIGURATION_ACTIONS = Map.of(
+            "createConfiguration", "mq:CreateConfiguration",
+            "describeConfiguration", "mq:DescribeConfiguration",
+            "updateConfiguration", "mq:UpdateConfiguration",
+            "deleteConfiguration", "mq:DeleteConfiguration",
+            "describeConfigurationRevision", "mq:DescribeConfigurationRevision",
+            "listConfigurationRevisions", "mq:ListConfigurationRevisions",
+            "listConfigurations", "mq:ListConfigurations");
 
     private static final Logger LOG = Logger.getLogger(IamActionRegistry.class);
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -649,6 +659,11 @@ public class IamActionRegistry {
 
     /** The serving method identifies these actions even when path encoding or matrix parameters vary. */
     public String resolveMatchedRoute(String credentialScope, ResourceInfo resourceInfo) {
+        if ("mq".equals(credentialScope) && resourceInfo != null
+                && AmazonMqConfigurationController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            return MQ_CONFIGURATION_ACTIONS.get(resourceInfo.getResourceMethod().getName());
+        }
         if (resourceInfo == null || resourceInfo.getResourceClass() == null) {
             return null;
         }
