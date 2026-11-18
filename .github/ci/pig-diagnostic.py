@@ -5,17 +5,16 @@ import json
 import os
 import signal
 import subprocess
+import sys
 import time
 
 out = Path("diagnostics")
 out.mkdir(exist_ok=True)
-downloads = Path(os.environ["RUNNER_TEMP"]) / "pig-downloads"
-downloads.mkdir(exist_ok=True)
+downloads = Path("/tmp")
 env = dict(os.environ)
-env["JAVA_TOOL_OPTIONS"] = env.get("JAVA_TOOL_OPTIONS", "") + f" -Djava.io.tmpdir={downloads}"
-command = ["./mvnw", "-B", "test", "-Dtest=EmrPigStepsNightlyIntegrationTest",
-           "-Dnightly.checks.enabled=true", "-DfailIfNoTests=true",
-           "-Dfloci.docker.resource-namespace=pig-diagnostic-" + os.environ["GITHUB_RUN_ID"]]
+command = sys.argv[1:]
+if not command:
+    raise SystemExit("Pass the unchanged nightly test command")
 started = time.monotonic()
 process = subprocess.Popen(command, env=env, start_new_session=True)
 try:
@@ -45,13 +44,18 @@ try:
                 dump = subprocess.run(["jcmd", pid, "Thread.print", "-l"],
                                       capture_output=True, text=True, timeout=10)
                 (out / f"threads-{stamp}-{pid}.txt").write_text(dump.stdout + dump.stderr)
+                heap = subprocess.run(["jcmd", pid, "GC.heap_info"],
+                                      capture_output=True, text=True, timeout=10)
+                (out / f"heap-{stamp}-{pid}.txt").write_text(heap.stdout + heap.stderr)
             containers = subprocess.run(["docker", "ps", "-a", "--format", "{{.Names}} {{.Status}}"],
                                         capture_output=True, text=True, timeout=10)
             (out / f"containers-{stamp}.txt").write_text(containers.stdout)
+            disk = subprocess.run(["df", "-B1", "/"], capture_output=True, text=True, timeout=10)
+            (out / f"disk-{stamp}.txt").write_text(disk.stdout)
         except (OSError, subprocess.SubprocessError) as error:
             (out / f"diagnostic-error-{stamp}.txt").write_text(type(error).__name__)
-        if time.monotonic() - started > 900:
-            raise TimeoutError("Diagnostic test process exceeded fifteen minutes")
+        if time.monotonic() - started > 1800:
+            raise TimeoutError("Diagnostic test process exceeded thirty minutes")
     raise SystemExit(process.returncode)
 finally:
     if process.poll() is None:
