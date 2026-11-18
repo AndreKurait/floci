@@ -60,6 +60,10 @@ jobs:
     name: compat / aws CLI endpoint resolution
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 10
+    concurrency:
+      group: floci-compat-slot-3
+      cancel-in-progress: false
+      queue: max
     # Same draft condition as docker-runner-regression above.
     if: >-
       github.event_name != 'pull_request' || (
@@ -179,8 +183,15 @@ jobs:
     # Both published architectures. The native image is the only place an
     # arch-specific resource can go missing (snappy-java's JNI library is
     # registered per platform), and one arch cannot prove the other.
+    # Serialize PR native builds across runs. Release builders use a separate
+    # workflow and do not take this slot.
+    concurrency:
+      group: floci-compat-native-build
+      cancel-in-progress: false
+      queue: max
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         include:
           - arch: arm64
@@ -309,8 +320,15 @@ jobs:
     # the Firehose compression delivery test that proves the x86_64 snappy JNI
     # library survived the native build (the resource that can go missing per
     # platform, see the build-native comment).
+    # All PRs share three compatibility slots, including the standalone
+    # container suites below. Keep every suite pending until its slot is free.
+    concurrency:
+      group: floci-compat-slot-${{ matrix.slot }}
+      cancel-in-progress: false
+      queue: max
     strategy:
       fail-fast: false
+      max-parallel: 3
       matrix:
         arch:
           - arm64
@@ -326,9 +344,26 @@ jobs:
         include:
           - arch: arm64
             runner: ubuntu-24.04-arm
+          - test: sdk-test-node
+            slot: 1
+          - test: sdk-test-python
+            slot: 2
+          - test: sdk-test-java
+            slot: 3
+          - test: sdk-test-go
+            slot: 1
+          - test: sdk-test-awscli
+            slot: 2
+          - test: compat-cdk
+            slot: 3
+          - test: compat-terraform
+            slot: 1
+          - test: compat-opentofu
+            slot: 2
           - arch: amd64
             test: sdk-test-python
             runner: ubuntu-latest
+            slot: 3
 
     steps:
       - name: Reserve time for Java SDK failure reports
@@ -579,6 +614,10 @@ jobs:
     needs: build-native
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    concurrency:
+      group: floci-compat-slot-1
+      cancel-in-progress: false
+      queue: max
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -641,6 +680,10 @@ jobs:
     needs: build-native
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 20
+    concurrency:
+      group: floci-compat-slot-2
+      cancel-in-progress: false
+      queue: max
     # The suites above run EC2 in mock mode, so no native test reached the Docker calls that only
     # container-backed EC2 makes: building the security group helper image, committing an instance
     # as an AMI and removing that image, and the VPC networks. An instance under security group

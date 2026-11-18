@@ -2,6 +2,11 @@ name: CI
 
 on:
   workflow_call:
+    inputs:
+      release-validation:
+        description: Use separate capacity for image publication qualification.
+        type: boolean
+        default: false
   push:
     branches:
       - main
@@ -64,10 +69,35 @@ jobs:
         github.event.pull_request.state != 'closed' &&
         github.event.action != 'edited'
       )
+    # Share four ordinary test slots across PRs and main. Queue every shard;
+    # the default single pending job would cancel another PR's required tests.
+    # The image publisher opts into separate slots so PR traffic cannot block it.
+    concurrency:
+      group: ${{ inputs.release-validation && format('floci-release-ci-{0}-{1}', github.run_id, matrix.shard) || format('floci-ci-slot-{0}', matrix.slot) }}
+      cancel-in-progress: false
+      queue: max
     strategy:
       fail-fast: false
+      max-parallel: ${{ inputs.release-validation && 8 || 4 }}
       matrix:
         shard: [1, 2, 3, 4, 5, 6, 7, 8]
+        include:
+          - shard: 1
+            slot: 1
+          - shard: 2
+            slot: 2
+          - shard: 3
+            slot: 3
+          - shard: 4
+            slot: 4
+          - shard: 5
+            slot: 1
+          - shard: 6
+            slot: 2
+          - shard: 7
+            slot: 3
+          - shard: 8
+            slot: 4
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
