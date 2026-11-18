@@ -39,6 +39,8 @@ public class NetworkInterface {
     private NetworkInterfaceAttachment attachment;
     private List<Tag> tagSet = new ArrayList<>();
     private List<NetworkInterfacePrivateIpAddress> privateIpAddresses = new ArrayList<>();
+    /** The permissions this interface's owner has granted other accounts over it. */
+    private List<NetworkInterfacePermission> permissions = new ArrayList<>();
 
     public NetworkInterface() {}
 
@@ -95,4 +97,7 @@ public class NetworkInterface {
 
     public List<NetworkInterfacePrivateIpAddress> getPrivateIpAddresses() { return privateIpAddresses; }
     public void setPrivateIpAddresses(List<NetworkInterfacePrivateIpAddress> privateIpAddresses) { this.privateIpAddresses = privateIpAddresses; }
+
+    public List<NetworkInterfacePermission> getPermissions() { return permissions; }
+    public void setPermissions(List<NetworkInterfacePermission> permissions) { this.permissions = permissions; }
 }

@@ -28,9 +28,11 @@ import java.util.function.Consumer;
 
 import static io.github.hectorvent.floci.services.ec2.Ec2QueryProtocol.boolParam;
 import static io.github.hectorvent.floci.services.ec2.Ec2QueryProtocol.booleanResponse;
+import static io.github.hectorvent.floci.services.ec2.Ec2QueryProtocol.endResponse;
 import static io.github.hectorvent.floci.services.ec2.Ec2QueryProtocol.getFiltersList;
 import static io.github.hectorvent.floci.services.ec2.Ec2QueryProtocol.getList;
 import static io.github.hectorvent.floci.services.ec2.Ec2QueryProtocol.intParam;
+import static io.github.hectorvent.floci.services.ec2.Ec2QueryProtocol.startResponse;
 import static io.github.hectorvent.floci.services.ec2.Ec2QueryProtocol.tagSetXml;
 import static io.github.hectorvent.floci.services.ec2.Ec2QueryProtocol.xmlResponse;
 
@@ -397,6 +399,9 @@ public class Ec2QueryHandler {
                 case "DeleteNetworkInterface" -> handleDeleteNetworkInterface(params, region);
                 case "AttachNetworkInterface" -> handleAttachNetworkInterface(params, region);
                 case "DetachNetworkInterface" -> handleDetachNetworkInterface(params, region);
+                case "CreateNetworkInterfacePermission" -> handleCreateNetworkInterfacePermission(params, region);
+                case "DescribeNetworkInterfacePermissions" ->
+                        handleDescribeNetworkInterfacePermissions(params, region);
                 // Volumes
                 case "CreateVolume" -> handleCreateVolume(params, region);
                 case "DescribeVolumes" -> handleDescribeVolumes(params, region);
@@ -5876,6 +5881,41 @@ public class Ec2QueryHandler {
         boolean force = "true".equalsIgnoreCase(p.getFirst("Force"));
         service.detachNetworkInterface(region, attachmentId, force);
         return booleanResponse("DetachNetworkInterface");
+    }
+
+    private Response handleCreateNetworkInterfacePermission(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
+        NetworkInterfacePermission permission = service.createNetworkInterfacePermission(region,
+                p.getFirst("NetworkInterfaceId"), p.getFirst("AwsAccountId"), p.getFirst("AwsService"),
+                p.getFirst("Permission"));
+        XmlBuilder xml = startResponse("CreateNetworkInterfacePermission")
+                .start("interfacePermission").raw(networkInterfacePermissionXml(permission)).end("interfacePermission");
+        return endResponse(xml, "CreateNetworkInterfacePermission");
+    }
+
+    private Response handleDescribeNetworkInterfacePermissions(MultivaluedMap<String, String> p, String region) {
+        Ec2Service.NetworkInterfacePermissionPage page = service.describeNetworkInterfacePermissions(region,
+                getList(p, "NetworkInterfacePermissionId"), getFiltersList(p),
+                parseOptionalInt(p.getFirst("MaxResults"), "MaxResults"), p.getFirst("NextToken"));
+        XmlBuilder xml = startResponse("DescribeNetworkInterfacePermissions").start("networkInterfacePermissions");
+        for (NetworkInterfacePermission permission : page.permissions()) {
+            xml.start("item").raw(networkInterfacePermissionXml(permission)).end("item");
+        }
+        xml.end("networkInterfacePermissions");
+        if (page.nextToken() != null) {
+            xml.elem("nextToken", page.nextToken());
+        }
+        return endResponse(xml, "DescribeNetworkInterfacePermissions");
+    }
+
+    private static String networkInterfacePermissionXml(NetworkInterfacePermission permission) {
+        return new XmlBuilder()
+                .elem("networkInterfacePermissionId", permission.getNetworkInterfacePermissionId())
+                .elem("networkInterfaceId", permission.getNetworkInterfaceId())
+                .elem("awsAccountId", permission.getAwsAccountId())
+                .elem("permission", permission.getPermission())
+                .start("permissionState").elem("state", permission.getState()).end("permissionState")
+                .build();
     }
 
     // ─── XML fragment builders ────────────────────────────────────────────────

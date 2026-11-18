@@ -2012,6 +2012,8 @@ The `client-token` instance filter selects only matching launches.
 | AttachNetworkInterface | Attaches an available standalone ENI to a running or stopped instance at a device index. With VPC networks on, an ENI in a VPC the instance holds no other interface in also becomes a device of the instance's container (hot attach): an endpoint on that VPC's network at the ENI's primary private IPv4, whose device the namespace owner gives the ENI's MAC address (Docker sets an endpoint MAC only when it creates a container, so this needs NET_ADMIN and `ip` in the namespace owner, as Floci's network helper has). With isolated VPC address spaces and `FLOCI_SERVICES_EC2_VPC_NETWORKS_HOT_ATTACH_ACROSS_ADDRESS_SPACES`, the device joins the instance's protected namespace instead (see below). The ENI stays record-only, and Floci logs why, when security-group enforcement is on without isolated address spaces, when isolated address spaces are on without that setting, when the instance already holds an interface in that VPC (Docker gives a container one endpoint per network), or in mock mode. |
 | DetachNetworkInterface | Detaches a standalone ENI by attachment ID, returning it to `available`, and removes the device a hot attach added. |
 | DeleteNetworkInterface | Deletes a standalone ENI. Fails while the ENI is still attached, matching AWS. |
+| CreateNetworkInterfacePermission | The interface's owner grants another account `INSTANCE-ATTACH` over it. `EIP-ASSOCIATE` and `AwsService` are `UnsupportedOperation`. |
+| DescribeNetworkInterfacePermissions | The permissions granted over the caller's interfaces, by `NetworkInterfacePermissionId.N` and the five `network-interface-permission.*` filters; `MaxResults` 5-255, default 50. |
 
 A standalone ENI created via `CreateNetworkInterface` can also be handed to `RunInstances` as an instance's primary interface (`NetworkInterface.1.NetworkInterfaceId` / `NetworkInterface.1.DeviceIndex`) instead of letting the instance create its own implicit one, the pattern Terraform's `aws_instance` resource uses for `network_interface { network_interface_id = ... }`. AWS only allows this for a single instance per launch call; `RunInstances` rejects it otherwise with `InvalidParameterCombination`.
 
@@ -2032,6 +2034,17 @@ Launch-template `network-interface` tags apply to the primary interface created 
 the launch. Request tags override matching template keys. Template interface tags
 do not retag a supplied interface or propagate to secondary interfaces. Tags stay
 visible through `DescribeTags` and `DescribeNetworkInterfaces` after retention.
+
+#### Network interface permissions
+
+`CreateNetworkInterfacePermission` lets the account that owns an interface grant another account
+`INSTANCE-ATTACH` over it, which `DescribeNetworkInterfacePermissions` lists to the owner. Only the
+owner can grant: another account's interface is `InvalidNetworkInterfaceID.NotFound`, as it is to
+every other action of that account.
+
+A repeated grant of the same permission to the same account answers the grant already in place.
+AWS documents no duplicate error for it; this is Floci's choice. Grants are kept on the interface,
+so they go when it is deleted. `DeleteNetworkInterfacePermission` is not served.
 
 `ModifyNetworkInterfaceAttribute` is not implemented: no example in the corpus that needed `CreateNetworkInterface` was found to need it. A route table's `CreateRoute` with a `NetworkInterfaceId` target is accepted but not recorded, since `Route` does not yet model an ENI target; a subsequent `plan` against such a route may show drift.
 
