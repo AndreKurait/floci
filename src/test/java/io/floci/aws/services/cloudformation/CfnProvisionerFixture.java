@@ -495,7 +495,7 @@ final class CfnProvisionerFixture {
                 discovered.add(new AcmCfnProvisioner(acmService));
             }
             if (acmPcaService != null) {
-                discovered.add(new AcmPcaCfnProvisioner(acmPcaService));
+                discovered.add(new AcmPcaCfnProvisioner(acmPcaService, config));
             }
             if (appSyncService != null) {
                 discovered.add(new AppSyncCfnProvisioner(appSyncService));
