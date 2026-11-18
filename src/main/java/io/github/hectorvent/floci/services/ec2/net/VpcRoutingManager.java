@@ -441,7 +441,8 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
                 try {
                     reconcilePresentNamespaces();
                     return;
-                } catch (NotFoundException | ConflictException | InvalidPublicInterfaceException unavailable) {
+                } catch (NotFoundException | ConflictException | InvalidPublicInterfaceException
+                        | RoutingCommandException unavailable) {
                     boolean retired;
                     try {
                         retired = withdrawUnavailableNamespaces();
@@ -960,7 +961,7 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
         ContainerExec.Result result = ContainerExec.run(docker, helper, new String[]{"sh", "-c", script}, timeoutSeconds)
                 .throwIfTimedOut(helper);
         if (result.exitCode() != 0) {
-            throw new IllegalStateException("Cannot reconcile native VPC routing: " + result.summary());
+            throw new RoutingCommandException(result.summary());
         }
     }
 
@@ -1052,6 +1053,12 @@ public class VpcRoutingManager implements ContainerTeardown, Resettable {
     private static final class InvalidPublicInterfaceException extends IllegalStateException {
         private InvalidPublicInterfaceException() {
             super("Native public API caller lost its unique public interface");
+        }
+    }
+
+    private static final class RoutingCommandException extends IllegalStateException {
+        private RoutingCommandException(String summary) {
+            super("Cannot reconcile native VPC routing: " + summary);
         }
     }
 

@@ -6,6 +6,7 @@ import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.ExecCreateCmd;
 import com.github.dockerjava.api.command.ExecCreateCmdResponse;
 import com.github.dockerjava.api.command.InspectContainerCmd;
+import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.exception.ConflictException;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.Container;
@@ -246,6 +247,55 @@ class VpcPublicPeerRoutingTest {
         verify(docker, never()).startContainerCmd("second");
         verify(docker, never()).removeContainerCmd("second");
         verify(docker, never()).stopContainerCmd("first");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void failedPolicyExecWithdrawsAHelperStoppedDuringTheCommand(boolean absent) {
+        admit("first", 2, true);
+        admit("second", 3, true);
+        InspectContainerResponse inspection = docker.inspectContainerCmd("second").exec();
+        AtomicBoolean commandFailed = new AtomicBoolean();
+        when(inspection.getState().getRunning()).thenAnswer(invocation -> !commandFailed.get());
+        when(docker.inspectContainerCmd("second").exec()).thenAnswer(invocation -> {
+            if (absent && commandFailed.get()) {
+                throw new NotFoundException("namespace removed during exec");
+            }
+            return inspection;
+        });
+        when(docker.inspectExecCmd("second-exec").exec().getExitCodeLong()).thenAnswer(invocation -> {
+            commandFailed.set(true);
+            return 137L;
+        });
+        gateway.setAttachments(List.of());
+
+        assertDoesNotThrow(manager::reconcile);
+
+        assertTrue(commandFailed.get(), "The helper must stop after its routing command starts");
+        assertEquals(Set.of("172.18.0.2"), manager.publicInstanceAddresses());
+        assertTrue(latest("first").contains("accept"), "The healthy helper must retain its local route policy");
+        assertFalse(latest("first").contains("via 240.0.0.3"));
+        verify(docker, never()).stopContainerCmd("first");
+        verify(docker, never()).startContainerCmd("second");
+        verify(docker, never()).removeContainerCmd("second");
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void failedPolicyExecStillFailsForRunningOrIndeterminateHelpers(boolean indeterminate) {
+        admit("first", 2, true);
+        admit("second", 3, true);
+        when(docker.inspectContainerCmd("second").exec().getState().getRunning())
+                .thenReturn(indeterminate ? null : true);
+        when(docker.inspectExecCmd("second-exec").exec().getExitCodeLong()).thenReturn(137L);
+        gateway.setAttachments(List.of());
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class, manager::reconcile);
+
+        assertTrue(failure.getMessage().startsWith("Cannot reconcile native VPC routing:"));
+        assertEquals(Set.of("172.18.0.2", "172.18.0.3"), manager.publicInstanceAddresses());
+        assertFalse(latest("first").contains("accept"), "An unconfirmed exec failure must retain quarantine");
+        assertFalse(latest("second").contains("accept"));
     }
 
     @ParameterizedTest
