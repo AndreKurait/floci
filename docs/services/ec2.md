@@ -56,6 +56,21 @@ Omitted spread/partition defaults and simultaneous name/ID selectors are outside
 and return an error. Unknown or empty filters are rejected. These local limits and the refusal after
 a concurrent replacement do not establish AWS's error precedence, defaults, or concurrency behavior.
 
+Network interface and VPC endpoint actions are checked on the resources the Service Authorization
+Reference gives them, as named by the request: `CreateNetworkInterface` on
+`network-interface/*`, the `SubnetId` and each `SecurityGroupId.N`; `DeleteNetworkInterface` and
+`CreateNetworkInterfacePermission` on the interface; `AttachNetworkInterface` on the instance and
+the interface; `DetachNetworkInterface` on the instance and the interface its `AttachmentId` joins
+(any instance and interface of the account when the attachment is unknown); `CreateVpcEndpoint` on
+`vpc-endpoint/*`, the VPC, and each subnet, group and route table; `ModifyVpcEndpoint` on the
+endpoint and each subnet, group and route table it adds or removes; `DeleteVpcEndpoints` on each
+endpoint; and `CreateTags`/`DeleteTags` on a named interface or endpoint. A policy scoped to these
+ARNs, such as an AWS managed service-linked role policy, then authorizes them as on AWS.
+`DescribeNetworkInterfaces` and `DescribeNetworkInterfacePermissions` act on no resource type and
+stay on `*`. Outside `CreateTags` and `DeleteTags`, `aws:ResourceTag` is not read for these actions,
+so a statement conditioned on it (`ModifyVpcEndpoint` and `DeleteVpcEndpoints` in
+`AmazonOpenSearchServiceRolePolicy`) does not match.
+
 ## Instance Execution Model
 
 `RunInstances` launches a **real Docker container** for each instance. By default, the `minimal` guest runtime overrides the image's CMD with `tail -f /dev/null`. Catalog entries can instead select `systemd`, which starts `/sbin/init` with the mounts needed for a systemd-based cloud-image guest, or `image`, which preserves the image's own ENTRYPOINT and CMD.
