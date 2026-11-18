@@ -4,10 +4,12 @@ import io.quarkus.runtime.Startup;
 import io.vertx.core.Future;
 import io.vertx.core.Handler;
 import io.vertx.core.Vertx;
+import io.vertx.core.buffer.Buffer;
 import io.vertx.core.net.NetClient;
 import io.vertx.core.net.NetServer;
 import io.vertx.core.net.NetServerOptions;
 import io.vertx.core.net.NetSocket;
+import io.vertx.core.net.SocketAddress;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
@@ -21,6 +23,7 @@ import java.util.Set;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.function.Function;
 import java.util.function.IntConsumer;
 
 /**
@@ -68,6 +71,8 @@ public class TlsProxyServer {
     private final String host;
     private final int httpBackendPort;
     private final int httpsBackendPort;
+    private final PublicApiProxySources publicSources;
+    private final LoadBalancerProxySources loadBalancerSources;
     private final List<NetServer> proxyServers = new ArrayList<>();
     /**
      * Ports whose bind definitively failed. Absent means bound, or not resolved yet: callers
@@ -91,17 +96,31 @@ public class TlsProxyServer {
     private NetClient client;
 
     @Inject
+    public TlsProxyServer(Vertx vertx, EmulatorConfig config, Config mpConfig, PublicApiProxySources publicSources,
+                          LoadBalancerProxySources loadBalancerSources) {
+        this(vertx, config, NetworkExposureGuard.publicHost(mpConfig), HTTP_BACKEND_PORT, HTTPS_BACKEND_PORT,
+                publicSources, loadBalancerSources);
+    }
+
     public TlsProxyServer(Vertx vertx, EmulatorConfig config, Config mpConfig) {
-        this(vertx, config, NetworkExposureGuard.publicHost(mpConfig), HTTP_BACKEND_PORT, HTTPS_BACKEND_PORT);
+        this(vertx, config, mpConfig, new PublicApiProxySources(), new LoadBalancerProxySources());
     }
 
     /** Visible for testing — lets tests point the proxy at backends on non-default ports. */
     TlsProxyServer(Vertx vertx, EmulatorConfig config, String host, int httpBackendPort, int httpsBackendPort) {
+        this(vertx, config, host, httpBackendPort, httpsBackendPort,
+                new PublicApiProxySources(), new LoadBalancerProxySources());
+    }
+
+    TlsProxyServer(Vertx vertx, EmulatorConfig config, String host, int httpBackendPort, int httpsBackendPort,
+                   PublicApiProxySources publicSources, LoadBalancerProxySources loadBalancerSources) {
         this.vertx = vertx;
         this.config = config;
         this.host = host;
         this.httpBackendPort = httpBackendPort;
         this.httpsBackendPort = httpsBackendPort;
+        this.publicSources = publicSources;
+        this.loadBalancerSources = loadBalancerSources;
         startIfTlsEnabled();
     }
 
@@ -191,6 +210,18 @@ public class TlsProxyServer {
         return frontSocket -> {
             // Pause incoming data until we've peeked at the first byte
             frontSocket.pause();
+            int port = frontSocket.localAddress().port();
+            LoadBalancerProxySources.Ticket listener = port == config.tls().awsHttpsPort()
+                    ? loadBalancerSources.ticket(frontSocket.remoteAddress().hostAddress()) : null;
+            if (listener != null) {
+                if (publicSources.ticket(frontSocket.remoteAddress().hostAddress()) != null) {
+                    frontSocket.close();
+                    return;
+                }
+                readLoadBalancerProxy(frontSocket, listener);
+                frontSocket.resume();
+                return;
+            }
 
             frontSocket.handler(buffer -> {
                 // Remove handler and keep socket paused to prevent data loss
@@ -231,6 +262,89 @@ public class TlsProxyServer {
             // Resume to receive the first buffer
             frontSocket.resume();
         };
+    }
+
+    private void readLoadBalancerProxy(NetSocket socket, LoadBalancerProxySources.Ticket ticket) {
+        readProxy(socket, preface -> {
+            LoadBalancerProxySources.Route route = loadBalancerSources.decode(ticket, preface);
+            return buffer -> {
+                socket.handler(null);
+                socket.pause();
+                boolean tls = buffer.length() > 0 && buffer.getByte(0) == TLS_HANDSHAKE;
+                if (!loadBalancerSources.current(ticket) || !route.backend().current().getAsBoolean()
+                        || route.backend().tls() != tls) {
+                    socket.close();
+                    return;
+                }
+                // Destination ownership selects the listener before TLS. SNI is left intact for
+                // that listener's native certificate selection, including its default certificate.
+                connectBackend(socket, buffer, route.backend().port(), route.addresses());
+            };
+        });
+    }
+
+    private void readProxy(NetSocket socket, Function<String, Handler<Buffer>> decoder) {
+        StringBuilder header = new StringBuilder();
+        long timer = vertx.setTimer(5000, ignored -> socket.close());
+        socket.closeHandler(ignored -> vertx.cancelTimer(timer));
+        socket.handler(buffer -> {
+            try {
+                for (int index = 0; index < buffer.length(); index++) {
+                    int value = Byte.toUnsignedInt(buffer.getByte(index));
+                    if (value > 127 || header.length() == 108) {
+                        throw new IllegalArgumentException("Invalid public bridge preface");
+                    }
+                    header.append((char) value);
+                    if (value == '\n') {
+                        Handler<Buffer> dispatch = decoder.apply(header.toString());
+                        vertx.cancelTimer(timer);
+                        if (index + 1 < buffer.length()) {
+                            dispatch.handle(buffer.getBuffer(index + 1, buffer.length()));
+                        } else {
+                            socket.handler(dispatch);
+                        }
+                        return;
+                    }
+                }
+            } catch (IllegalArgumentException failure) {
+                LOG.debug("TLS proxy: rejected managed proxy preface");
+                socket.close();
+            }
+        });
+    }
+
+    private void connectBackend(NetSocket frontSocket, Buffer buffer, int backendPort,
+                                PublicApiProxySources.Addresses addresses) {
+        connectBackend(frontSocket, buffer, "127.0.0.1", backendPort, true, addresses);
+    }
+
+    private void connectBackend(NetSocket frontSocket, Buffer buffer, String backendHost,
+                                int backendPort, boolean proxyPreface, PublicApiProxySources.Addresses addresses) {
+        client.connect(backendPort, backendHost).onComplete(ar -> {
+            if (ar.succeeded()) {
+                NetSocket backSocket = ar.result();
+
+                Buffer initial = Buffer.buffer();
+                if (proxyPreface) {
+                    SocketAddress source = addresses.source();
+                    SocketAddress destination = addresses.destination();
+                    String family = source.hostAddress().contains(":") ? "TCP6" : "TCP4";
+                    initial.appendString("PROXY " + family + " " + source.hostAddress() + " "
+                            + destination.hostAddress() + " " + source.port() + " " + destination.port() + "\r\n");
+                }
+                backSocket.write(initial.appendBuffer(buffer));
+
+                // pipeTo propagates end-of-stream and resumes the paused client.
+                frontSocket.pipeTo(backSocket).onFailure(err ->
+                        LOG.debugv("TLS proxy: pipe front→back failed: {0}", err.getMessage()));
+                backSocket.pipeTo(frontSocket).onFailure(err ->
+                        LOG.debugv("TLS proxy: pipe back→front failed: {0}", err.getMessage()));
+            } else {
+                LOG.warnv("TLS proxy: failed to connect to backend port {0}: {1}",
+                        String.valueOf(backendPort), ar.cause().getMessage());
+                frontSocket.close();
+            }
+        });
     }
 
     @PreDestroy
