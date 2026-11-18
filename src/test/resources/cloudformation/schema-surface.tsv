@@ -1,3 +1,4 @@
+AWS::ACMPCA::CertificateAuthority	Arn,CertificateSigningRequest	CsrExtensions,KeyAlgorithm,KeyStorageSecurityStandard,RevocationConfiguration,SigningAlgorithm,Subject,Tags,Type,UsageMode
 AWS::ApiGateway::Account	Id	CloudWatchRoleArn
 AWS::ApiGateway::ApiKey	APIKeyId	CustomerId,Description,Enabled,GenerateDistinctId,Name,StageKeys,Tags,Value
 AWS::ApiGateway::Authorizer	AuthorizerId	AuthType,AuthorizerCredentials,AuthorizerResultTtlInSeconds,AuthorizerUri,IdentitySource,IdentityValidationExpression,JwtConfiguration,Name,ProviderARNs,RestApiId,Type

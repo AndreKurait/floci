@@ -348,7 +348,7 @@ class AcmPcaIntegrationTest {
             error("InvalidArgsException", () -> owned.issue(owned.client, ca, csr, null, null, 500));
             error("InvalidArgsException", () -> owned.issue(owned.client, ca, csr, null, null, -1));
             error("InvalidArgsException", () -> owned.issue(owned.client, ca, csr,
-                    owned.rootTemplate().replace("RootCACertificate", "SubordinateCACertificate_PathLen0"), null, 1));
+                    owned.rootTemplate().replace("RootCACertificate", "SubordinateCACertificate_PathLen4"), null, 1));
             assertEquals(before, owned.describe(ca));
             assertEquals(certificate, owned.client.getCertificate(input -> input
                     .certificateAuthorityArn(ca).certificateArn(existing)).certificate());
@@ -402,19 +402,16 @@ class AcmPcaIntegrationTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"subordinate", "elliptic", "short-lived", "crl", "ocsp", "tags", "key-storage", "csr-extensions"})
+    @ValueSource(strings = {"elliptic", "short-lived", "crl", "ocsp", "csr-extensions"})
     void unsupportedCreateFeaturesDoNotCreateAnAuthority(String feature) {
         try (Owned owned = new Owned("unsupported-" + feature, "us-east-1")) {
             CreateCertificateAuthorityRequest.Builder request = owned.createRequest(null);
             switch (feature) {
-                case "subordinate" -> request.certificateAuthorityType("SUBORDINATE");
                 case "elliptic" -> request.certificateAuthorityConfiguration(config -> config.keyAlgorithm("EC_prime256v1")
                         .signingAlgorithm("SHA256WITHECDSA").subject(subject -> subject.commonName(owned.marker)));
                 case "short-lived" -> request.usageMode("SHORT_LIVED_CERTIFICATE");
                 case "crl" -> request.revocationConfiguration(config -> config.crlConfiguration(crl -> crl.enabled(true)));
                 case "ocsp" -> request.revocationConfiguration(config -> config.ocspConfiguration(ocsp -> ocsp.enabled(true)));
-                case "tags" -> request.tags(tag -> tag.key("scope").value("test"));
-                case "key-storage" -> request.keyStorageSecurityStandard("FIPS_140_2_LEVEL_3_OR_HIGHER");
                 case "csr-extensions" -> request.certificateAuthorityConfiguration(config -> config.keyAlgorithm("RSA_2048")
                         .signingAlgorithm("SHA256WITHRSA").subject(subject -> subject.commonName(owned.marker))
                         .csrExtensions(extensions -> extensions.keyUsage(usage -> usage.keyCertSign(true))));
