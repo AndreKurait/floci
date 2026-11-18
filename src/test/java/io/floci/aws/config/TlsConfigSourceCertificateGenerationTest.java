@@ -306,6 +306,8 @@ class TlsConfigSourceCertificateGenerationTest {
             "Certificate SANs should cover dualstack virtual-hosted S3 endpoints");
         assertTrue(sans.contains("*.s3-control.us-east-1.amazonaws.com"),
             "Certificate SANs should cover S3 Control <account>.s3-control endpoints");
+        assertTrue(sans.contains("*.ddb.us-east-1.amazonaws.com"),
+            "Certificate SANs should cover DynamoDB <account>.ddb endpoints");
     }
 
     @Test
@@ -331,6 +333,7 @@ class TlsConfigSourceCertificateGenerationTest {
         assertTrue(sans.contains("*.amazonaws.com.cn"), "China global endpoints");
         assertTrue(sans.contains("*.cn-north-1.amazonaws.com.cn"), "China regional endpoints");
         assertTrue(sans.contains("*.execute-api.cn-north-1.amazonaws.com.cn"), "China multi-label endpoints");
+        assertTrue(sans.contains("*.ddb.cn-north-1.amazonaws.com.cn"), "China account-based DynamoDB endpoints");
         assertTrue(sans.contains("*.s3-website-cn-north-1.amazonaws.com.cn"), "China hyphenated S3 endpoints");
         assertTrue(sans.contains("*.us-iso-east-1.c2s.ic.gov"), "ISO regional endpoints");
         assertTrue(sans.contains("*.amazonaws.eu"), "EUSC global endpoints");
@@ -383,6 +386,8 @@ class TlsConfigSourceCertificateGenerationTest {
             "Certificate SANs should not include '*.amazonaws.com' when spoofing is disabled");
         assertFalse(sans.contains("*.us-east-1.amazonaws.com"),
             "Certificate SANs should not include '*.us-east-1.amazonaws.com' when spoofing is disabled");
+        assertFalse(sans.contains("*.ddb.us-east-1.amazonaws.com"),
+            "Account-based DynamoDB SANs are only enabled with AWS endpoint spoofing");
     }
 
     /**
