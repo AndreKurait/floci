@@ -1409,6 +1409,11 @@ public class SsmService implements ResourceProvider {
                         "Document " + name + " does not exist.", 400));
     }
 
+    /** The built-in Session documents StartSession starts are owned by AWS; their ARNs have no account. */
+    public static boolean isAwsSessionDocument(String name) {
+        return SsmSessionDocument.isAwsSessionDocument(name);
+    }
+
     /** The built-in command documents this emulator executes are owned by AWS. */
     public static boolean isAwsCommandDocument(String name) {
         return "AWS-RunShellScript".equals(name) || "AWS-RunPowerShellScript".equals(name);

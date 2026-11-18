@@ -482,6 +482,13 @@ public class SsmCommandService implements Resettable {
         }
     }
 
+    /** Whether the node in the current account holds an authenticated control channel. */
+    boolean messageGatewayConnected(String instanceId, String region) {
+        synchronized (messageGatewayConnections) {
+            return messageGatewayConnections.containsKey(messageOwner(region, instanceId));
+        }
+    }
+
     public List<Map<String, Object>> getMessages(String instanceId, String messagesRequestId, int visibilityTimeout) {
         MessageOwner owner = messageOwner(regionResolver.getRegion(), instanceId);
         List<Map<String, Object>> result = new ArrayList<>();

@@ -222,8 +222,74 @@ verify SigV4, session credentials and IAM authorization. A one-use token binds
 the connection to its account, region, node and caller. EC2 instance credentials
 can open only their own node's channel.
 
-The channel carries the agent's binary job, acknowledgement and result messages.
-These are Run Command control channels; Session Manager data channels are not implemented.
+The channel carries the agent's binary job, acknowledgement and result messages,
+and the Session Manager session starts and terminations described below.
+
+### Session Manager
+
+| Action | Description |
+|---|---|
+| `StartSession` | Start a session on a managed node whose agent holds a control channel; returns `SessionId`, `StreamUrl` and a one-use `TokenValue` |
+| `ResumeSession` | Return a new `TokenValue` and `StreamUrl` for an active session |
+| `TerminateSession` | End a session: both data channels receive `channel_closed` and the agent is told over its control channel |
+| `DescribeSessions` | List `Active` or `History` sessions in the caller's account and region, with the documented filters and pagination |
+| `GetConnectionStatus` | `connected` while the node's agent holds an authenticated control channel |
+
+`StartSession` requires a registered node in the caller's account and region whose
+agent holds an authenticated control channel; otherwise it fails with
+`TargetNotConnected`. The session starts on the agent as the agent's
+`interactive_shell` message with the Session document's content and the resolved
+parameter values; the agent substitutes the parameters itself. Session IDs have the
+documented `prefix-random-suffix` form, where the prefix is the caller's user name,
+role session name, federated user name or `root`.
+
+Session documents: a stored `DocumentType` `Session` document of the caller's account,
+or one of the built-in definitions of `AWS-StartNonInteractiveCommand` (`command`, and
+`separateOutputStream`, `true` or `false`, default `false`, passed to the agent's shell properties so it
+delivers stderr and the exit code apart from stdout) and `AWS-StartInteractiveCommand` (`command`),
+`AWS-StartPortForwardingSession` (`portNumber`, default `80`, and `localPortNumber`) and
+`AWS-StartPortForwardingSessionToRemoteHost` (adds `host`). An omitted `DocumentName`
+uses the account's stored `SSM-SessionManagerRunShell`, or the documented defaults
+(a `Standard_Stream` shell without logging, KMS encryption or Run As) when there is
+none. The built-in definitions are Floci's; `GetDocument` and `ListDocuments` do not
+return them. `String` parameters take one value and `StringList` parameters a list;
+undeclared parameters, missing required parameters and values outside
+`allowedValues` or `allowedPattern` fail with `ValidationException`.
+
+With IAM enforcement enabled, `StartSession` checks the document ARN (AWS-owned
+documents have an empty account field) and the target's `ec2:...:instance/<id>` or
+`ssm:...:managed-instance/<id>` ARN. `ResumeSession` and `TerminateSession` check
+`ssm:...:session/<session-id>`; `DescribeSessions` and `GetConnectionStatus` check `*`.
+
+The data channel is `/v1/data-channel/{session-id}?role=publish_subscribe` on the
+ssmmessages endpoint. The agent calls `CreateDataChannel` (SigV4, unscoped
+`ssmmessages:CreateDataChannel`) for a one-use token, then opens the signed WebSocket
+and sends `OpenDataChannel` with it; EC2 instance credentials can open only their own
+node's sessions. The client opens the `StreamUrl` and sends the `TokenValue` in its
+`OpenDataChannel` frame. A client upgrade may carry a SigV4 signature (headers or a
+presigned URL), which must then verify for the session's account. Both sides are
+authorized for `ssmmessages:OpenDataChannel` on the session ARN. Tokens are valid for
+60 seconds and only once; a reconnecting client calls `ResumeSession`.
+
+The `StreamUrl` is `wss://ssmmessages.<region>.<dns-suffix>/v1/data-channel/<session-id>?role=publish_subscribe`
+when `StartSession` reached the regional AWS host name, and the same path on the
+host the request addressed otherwise (`ws://` without TLS).
+
+The service relays the agent's and the client's binary messages unchanged; the
+handshake, acknowledgements, sequence numbers, retransmission and payloads are
+end to end between them. It reads the agent's `agent_session_state`, which is
+addressed to the service and not relayed, sends `pause_publication` to the agent
+while no client is attached and `start_publication` when one attaches, and buffers
+at most 256 messages (4 MiB) in each direction until both are attached. When the
+agent reports the session finished (`agent_task_complete` on its control channel,
+acknowledged with `agent_task_acknowledge`) the client receives `channel_closed`
+with the agent's output and the session moves to `History` as `Terminated`.
+
+Not implemented: idle and maximum session duration timeouts, session logging to
+S3 or CloudWatch Logs, `JustInTime` access, the `Failed` status, session tags and
+`ssm:resourceTag/aws:ssmmessages:session-id` conditions, and session preferences
+applied to sessions that name another document. KMS-encrypted sessions are relayed
+unchanged but not tested.
 
 ## Document versions
 

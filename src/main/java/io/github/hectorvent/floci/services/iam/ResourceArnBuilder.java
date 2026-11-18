@@ -2150,6 +2150,10 @@ public class ResourceArnBuilder {
             return List.of(new AwsArnUtils.Arn(partition, "ssm", region, accountId,
                     "document/" + json.path("ResourceId").asText()).toString());
         }
+        List<String> sessionResources = ssmSessionResources(action, json, region, accountId, partition);
+        if (sessionResources != null) {
+            return sessionResources;
+        }
         if (!"SendCommand".equals(action)) {
             return List.of(buildSsmArn(ctx, region, accountId));
         }
@@ -2166,6 +2170,45 @@ public class ResourceArnBuilder {
             boolean managed = id.startsWith("mi-");
             resources.add(new AwsArnUtils.Arn(partition, managed ? "ssm" : "ec2", region, accountId,
                     (managed ? "managed-instance/" : "instance/") + id).toString());
+        }
+        return List.copyOf(resources);
+    }
+
+    /**
+     * Session Manager, as its permissions reference gives it: StartSession is authorized on the Session document
+     * (an AWS-owned one has no account, and an omitted name is the account's SSM-SessionManagerRunShell) and on
+     * the target node; ResumeSession and TerminateSession on the session; DescribeSessions and
+     * GetConnectionStatus name no resource.
+     */
+    private static List<String> ssmSessionResources(String action, JsonNode json, String region,
+                                                    String accountId, String partition) {
+        if ("DescribeSessions".equals(action) || "GetConnectionStatus".equals(action)) {
+            return List.of("*");
+        }
+        if ("ResumeSession".equals(action) || "TerminateSession".equals(action)) {
+            String sessionId = json == null ? "" : json.path("SessionId").asText("");
+            return List.of(sessionId.isEmpty() ? "*"
+                    : new AwsArnUtils.Arn(partition, "ssm", region, accountId, "session/" + sessionId).toString());
+        }
+        if (!"StartSession".equals(action)) {
+            return null;
+        }
+        if (json == null) {
+            return List.of("*");
+        }
+        String name = json.path("DocumentName").asText("");
+        if (name.isEmpty()) {
+            name = "SSM-SessionManagerRunShell";
+        }
+        Set<String> resources = new LinkedHashSet<>();
+        resources.add(AwsArnUtils.isArnFor(name, "ssm") ? name
+                : new AwsArnUtils.Arn(partition, "ssm", region,
+                        SsmService.isAwsSessionDocument(name) ? "" : accountId, "document/" + name).toString());
+        String target = json.path("Target").asText("");
+        if (!target.isEmpty()) {
+            boolean managed = target.startsWith("mi-");
+            resources.add(new AwsArnUtils.Arn(partition, managed ? "ssm" : "ec2", region, accountId,
+                    (managed ? "managed-instance/" : "instance/") + target).toString());
         }
         return List.copyOf(resources);
     }

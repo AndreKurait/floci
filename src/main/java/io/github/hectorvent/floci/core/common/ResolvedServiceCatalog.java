@@ -113,6 +113,7 @@ import io.github.hectorvent.floci.services.ses.SesTagController;
 import io.github.hectorvent.floci.services.ses.SesTemplateController;
 import io.github.hectorvent.floci.services.ses.SesTenantController;
 import io.github.hectorvent.floci.services.signin.SigninController;
+import io.github.hectorvent.floci.services.ssm.SsmDataChannelController;
 import io.github.hectorvent.floci.services.ssm.SsmMessagesController;
 import io.github.hectorvent.floci.services.ssooidc.SsoOidcController;
 import io.github.hectorvent.floci.services.ssoportal.SsoPortalController;
@@ -695,7 +696,8 @@ public class ResolvedServiceCatalog {
                 descriptor("ssmmessages", "ssm", config.services().ssm().enabled(), false,
                         null, null, 5000L, null, ServiceProtocol.REST_XML,
                         protocols(ServiceProtocol.REST_XML),
-                        Set.of(), Set.of("ssmmessages"), Set.of(), Set.of(SsmMessagesController.class))
+                        Set.of(), Set.of("ssmmessages"), Set.of(),
+                        Set.of(SsmMessagesController.class, SsmDataChannelController.class))
                         .withRequiredRestAuthentication(),
                 descriptor("transfer", "transfer", config.services().transfer().enabled(), true,
                         "transfer", config.storage().mode(), 5000L, null, ServiceProtocol.JSON,
