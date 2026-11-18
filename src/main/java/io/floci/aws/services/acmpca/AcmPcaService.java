@@ -52,6 +52,7 @@ public class AcmPcaService implements Resettable, AcmPrivateCertificateAuthoriti
     private final RegionResolver regionResolver;
     private final ObjectMapper mapper;
     private final Clock clock;
+    private boolean resetting;
 
     @Inject
     public AcmPcaService(StorageFactory factory, RegionResolver regionResolver, ObjectMapper mapper) {
@@ -68,6 +69,7 @@ public class AcmPcaService implements Resettable, AcmPrivateCertificateAuthoriti
     }
 
     public synchronized ObjectNode create(JsonNode request, String region) {
+        requireAcceptingWrites();
         Map<String, String> subject = PrivateCaRequests.configuration(request);
         Map<String, String> tags = request.hasNonNull("Tags")
                 ? tagMap(PrivateCaRequests.tags(request, true)) : new LinkedHashMap<>();
@@ -106,6 +108,7 @@ public class AcmPcaService implements Resettable, AcmPrivateCertificateAuthoriti
     }
 
     public synchronized ObjectNode issue(JsonNode request, String region) {
+        requireAcceptingWrites();
         fields(request, "request", Set.of("CertificateAuthorityArn", "Csr", "SigningAlgorithm",
                 "TemplateArn", "Validity", "ValidityNotBefore", "IdempotencyToken", "ApiPassthrough"));
         if (request.hasNonNull("ApiPassthrough") && !request.path("ApiPassthrough").isObject()) {
@@ -181,6 +184,7 @@ public class AcmPcaService implements Resettable, AcmPrivateCertificateAuthoriti
     }
 
     public synchronized ObjectNode importCertificate(JsonNode request, String region) {
+        requireAcceptingWrites();
         fields(request, "request", Set.of("CertificateAuthorityArn", "Certificate", "CertificateChain"));
         CertificateAuthority authority = authority(request, region);
         if (!"PENDING_CERTIFICATE".equals(status(authority))) {
@@ -216,6 +220,7 @@ public class AcmPcaService implements Resettable, AcmPrivateCertificateAuthoriti
     }
 
     public synchronized ObjectNode update(JsonNode request, String region) {
+        requireAcceptingWrites();
         fields(request, "request", Set.of("CertificateAuthorityArn", "Status", "RevocationConfiguration"));
         PrivateCaRequests.revocation(request);
         String requested = optionalText(request, "Status");
@@ -233,6 +238,7 @@ public class AcmPcaService implements Resettable, AcmPrivateCertificateAuthoriti
     }
 
     public synchronized ObjectNode delete(JsonNode request, String region) {
+        requireAcceptingWrites();
         fields(request, "request", Set.of("CertificateAuthorityArn", "PermanentDeletionTimeInDays"));
         long days = request.hasNonNull("PermanentDeletionTimeInDays")
                 ? PrivateCaRequests.integer(request, "PermanentDeletionTimeInDays", 7, 30) : 30;
@@ -246,6 +252,7 @@ public class AcmPcaService implements Resettable, AcmPrivateCertificateAuthoriti
     }
 
     public synchronized ObjectNode restore(JsonNode request, String region) {
+        requireAcceptingWrites();
         CertificateAuthority authority = authority(request, region);
         if (!"DELETED".equals(authority.status())) {
             throw state("Only a deleted certificate authority within its restoration period can be restored");
@@ -281,6 +288,7 @@ public class AcmPcaService implements Resettable, AcmPrivateCertificateAuthoriti
     }
 
     public synchronized ObjectNode tag(JsonNode request, String region) {
+        requireAcceptingWrites();
         fields(request, "request", Set.of("CertificateAuthorityArn", "Tags"));
         Map<String, String> tags = tagMap(PrivateCaRequests.tags(request));
         CertificateAuthority authority = authority(request, region);
@@ -297,6 +305,7 @@ public class AcmPcaService implements Resettable, AcmPrivateCertificateAuthoriti
 
     /** Removes each named tag; a tag given with a value is removed only while it has that value. */
     public synchronized ObjectNode untag(JsonNode request, String region) {
+        requireAcceptingWrites();
         fields(request, "request", Set.of("CertificateAuthorityArn", "Tags"));
         List<PrivateCaRequests.Tag> tags = PrivateCaRequests.tags(request);
         CertificateAuthority authority = authority(request, region);
@@ -345,6 +354,23 @@ public class AcmPcaService implements Resettable, AcmPrivateCertificateAuthoriti
             result.put("NextToken", Base64.getEncoder().encodeToString(cursor.getBytes(StandardCharsets.UTF_8)));
         }
         return result;
+    }
+
+    @Override
+    public synchronized void beforeReset() {
+        resetting = true;
+    }
+
+    @Override
+    public synchronized void afterReset() {
+        resetting = false;
+    }
+
+    private void requireAcceptingWrites() {
+        if (resetting) {
+            throw new AwsException("RequestFailedException",
+                    "Certificate authority writes are not accepted while the emulator is resetting", 400);
+        }
     }
 
     @Override
