@@ -248,7 +248,8 @@ class EmrDockerRunnerDockerIntegrationTest {
     }
 
     @Test
-    @Timeout(value = 6, unit = TimeUnit.MINUTES)
+    // Two five-minute step waits + five-minute decommission + one minute for API calls and assertions.
+    @Timeout(value = 16, unit = TimeUnit.MINUTES)
     void aClustersCoreAndTaskNodesRunItsExecutorsAndAShrinkKeepsItsHdfsData() {
         put("side/nodes.py", """
                 import socket
