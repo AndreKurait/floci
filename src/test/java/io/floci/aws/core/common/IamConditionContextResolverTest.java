@@ -160,6 +160,49 @@ class IamConditionContextResolverTest {
     }
 
     @Test
+    void privateCaDefaultTemplateUsesDeploymentPartitionForUnknownRegion() {
+        assertPrivateCaTemplate("polygondwanaland-west-1", "{}", "aws-us-gov");
+    }
+
+    @Test
+    void privateCaDefaultTemplateUsesKnownRegionPartition() {
+        assertPrivateCaTemplate("us-east-1", "{}", "aws");
+        assertPrivateCaTemplate("cn-north-1", "{\"TemplateArn\":null}", "aws-cn");
+        assertPrivateCaTemplate("us-gov-west-1", "{}", "aws-us-gov");
+    }
+
+    @Test
+    void privateCaDefaultTemplateUsesConfiguredRegionWhenRequestRegionIsAbsent() {
+        when(config.defaultRegion()).thenReturn("polygondwanaland-west-1");
+        assertPrivateCaTemplate(null, "{}", "aws-us-gov");
+    }
+
+    @Test
+    void privateCaExplicitTemplateIsNotRewritten() {
+        String template = "arn:aws-cn:acm-pca:::template/RootCACertificate/V1";
+        ContainerRequestContext request = mock(ContainerRequestContext.class);
+        when(request.getProperty("floci.bufferedJsonBody"))
+                .thenReturn(json("{\"TemplateArn\":\"" + template + "\"}"));
+        assertEquals(Map.of("acm-pca:TemplateArn", List.of(template)),
+                resolver.resolve("acm-pca", "acm-pca:IssueCertificate", request));
+    }
+
+    @SuppressWarnings("unchecked")
+    private void assertPrivateCaTemplate(String region, String body, String partition) {
+        requestContext.setRegion(region);
+        RegionResolver regions = new RegionResolver("us-gov-west-1", "123456789012", "aws-us-gov");
+        IamConditionContextResolver conditions = new IamConditionContextResolver(
+                mock(Instance.class), mock(Instance.class), mock(Instance.class), mock(Instance.class),
+                mock(Instance.class), mock(Instance.class), mock(Instance.class), spellings(), mock(Instance.class),
+                requestContext, regions, config, null, serviceCatalog);
+        ContainerRequestContext request = mock(ContainerRequestContext.class);
+        when(request.getProperty("floci.bufferedJsonBody")).thenReturn(json(body));
+        assertEquals(Map.of("acm-pca:TemplateArn", List.of("arn:" + partition
+                        + ":acm-pca:::template/EndEntityCertificate/V1")),
+                conditions.resolve("acm-pca", "acm-pca:IssueCertificate", request));
+    }
+
+    @Test
     void aWebFunctionEndpointRequestCarriesTheAuthTypeItNamesAndTheOneItHas() throws Exception {
         String function = "arn:aws:lambda:us-east-1:123456789012:web-function/app";
         WebFunctionEndpoint stored = new WebFunctionEndpoint();

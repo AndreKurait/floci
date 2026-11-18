@@ -313,7 +313,7 @@ public class IamConditionContextResolver {
         }
         String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
         String value = template.isTextual() ? template.textValue()
-                : AwsArnUtils.Arn.global(AwsRegions.partitionFor(region), "acm-pca", "",
+                : AwsArnUtils.Arn.global(regionResolver.partitionForRegion(region), "acm-pca", "",
                         "template/EndEntityCertificate/V1").toString();
         return Map.of("acm-pca:TemplateArn", List.of(value));
     }
