@@ -2583,6 +2583,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     // sharing a monitor on hash collision.
     private static final int LOCK_STRIPES = 512;
     private final StripedLocks resourceLocks = new StripedLocks(LOCK_STRIPES);
+    private final StripedLocks interfaceDeviceLocks = new StripedLocks(LOCK_STRIPES);
 
     /** The AMI state a deregistered image is tombstoned with; one of EC2's documented ImageState values. */
     private static final String DEREGISTERED_STATE = "deregistered";
@@ -18646,6 +18647,17 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      */
     public NetworkInterfaceAttachment attachNetworkInterface(String region, String networkInterfaceId,
                                                               String instanceId, int deviceIndex) {
+        synchronized (interfaceDeviceLock(callerAccountId(), region, instanceId)) {
+            return attachNetworkInterfaceAndPlug(region, networkInterfaceId, instanceId, deviceIndex);
+        }
+    }
+
+    private Object interfaceDeviceLock(String account, String region, String instanceId) {
+        return interfaceDeviceLocks.lockFor(Objects.hash(account, region, instanceId));
+    }
+
+    private NetworkInterfaceAttachment attachNetworkInterfaceAndPlug(String region, String networkInterfaceId,
+                                                                     String instanceId, int deviceIndex) {
         Instance pluggedInstance;
         InstanceNetworkInterface pluggedInterface;
         List<SecurityGroup> pluggedGroups;
@@ -18744,18 +18756,34 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     public NetworkInterfaceAttachment detachNetworkInterface(String region, String attachmentId, boolean force) {
+        NetworkInterfaceAttachment observed;
+        synchronized (privateIpAllocationLock) {
+            observed = attachedNetworkInterface(region, attachmentId).getAttachment();
+        }
+        String hostAccount = observed.getInstanceOwnerId() != null ? observed.getInstanceOwnerId() : callerAccountId();
+        // Match attach's lock order: do not wait for a device while holding the allocation monitor.
+        synchronized (interfaceDeviceLock(hostAccount, region, observed.getInstanceId())) {
+            return detachNetworkInterfaceAndUnplug(region, attachmentId);
+        }
+    }
+
+    private NetworkInterface attachedNetworkInterface(String region, String attachmentId) {
+        if (attachmentId == null || attachmentId.isBlank()) {
+            throw new AwsException("MissingParameter", "The request must contain the parameter AttachmentId", 400);
+        }
+        return networkInterfaces.scan(k -> k.startsWith(region + "::")).stream()
+                .filter(n -> n.getAttachment() != null && attachmentId.equals(n.getAttachment().getAttachmentId()))
+                .findFirst()
+                .orElseThrow(() -> new AwsException("InvalidAttachmentID.NotFound",
+                        "The attachment ID '" + attachmentId + "' does not exist", 400));
+    }
+
+    private NetworkInterfaceAttachment detachNetworkInterfaceAndUnplug(String region, String attachmentId) {
         Instance unpluggedInstance;
         InstanceNetworkInterface unpluggedInterface;
         NetworkInterfaceAttachment result;
         synchronized (privateIpAllocationLock) {
-            if (attachmentId == null || attachmentId.isBlank()) {
-                throw new AwsException("MissingParameter", "The request must contain the parameter AttachmentId", 400);
-            }
-            NetworkInterface ni = networkInterfaces.scan(k -> k.startsWith(region + "::")).stream()
-                    .filter(n -> n.getAttachment() != null && attachmentId.equals(n.getAttachment().getAttachmentId()))
-                    .findFirst()
-                    .orElseThrow(() -> new AwsException("InvalidAttachmentID.NotFound",
-                            "The attachment ID '" + attachmentId + "' does not exist", 400));
+            NetworkInterface ni = attachedNetworkInterface(region, attachmentId);
             NetworkInterfaceAttachment detached = ni.getAttachment();
             if (detached.getDeviceIndex() == 0) {
                 throw new AwsException("OperationNotPermitted",

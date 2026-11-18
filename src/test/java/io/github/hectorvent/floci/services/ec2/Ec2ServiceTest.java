@@ -3249,6 +3249,80 @@ class Ec2ServiceTest {
                 .noneMatch(eni -> extra.getNetworkInterfaceId().equals(eni.getNetworkInterfaceId())));
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void detachWaitsForTheAdmittedPlugButVpcTopologyRemainsAvailable(boolean foreign) throws Exception {
+        String owner = "111111111111";
+        String hostAccount = foreign ? "222222222222" : owner;
+        String region = "us-east-1";
+        ThreadLocal<String> current = ThreadLocal.withInitial(() -> owner);
+        // Account-aware storage caches the CDI proxy, whose values follow the current request.
+        RequestContext context = mock(RequestContext.class);
+        when(context.getAccountId()).thenAnswer(call -> current.get());
+        // CDI Instance and the imported EC2 model Instance have the same simple name.
+        jakarta.enterprise.inject.Instance<RequestContext> contexts = requestContexts(context);
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service service = new Ec2Service(mockConfig(true), manager, mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(contexts), contexts);
+        String customer = privateSubnet(service, region, "10.247.0.0/24");
+        NetworkInterface extra = service.createNetworkInterface(region, customer, null, null,
+                List.of(), List.of(), List.of());
+        if (foreign) {
+            service.createNetworkInterfacePermission(region, extra.getNetworkInterfaceId(), hostAccount, null,
+                    Ec2Service.INSTANCE_ATTACH);
+        }
+        current.set(hostAccount);
+        String home = privateSubnet(service, region, "10.246.0.0/24");
+        Instance instance = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(), home, null, List.of(), null, null).getInstances().getFirst();
+        instance.setState(InstanceState.running());
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicReference<String> attachment = new AtomicReference<>();
+        AtomicReference<Thread> detaching = new AtomicReference<>();
+        doAnswer(call -> {
+            InstanceNetworkInterface device = call.getArgument(1);
+            attachment.set(device.getAttachmentId());
+            entered.countDown();
+            assertTrue(release.await(15, TimeUnit.SECONDS));
+            return Optional.empty();
+        }).when(manager).plugNetworkInterface(any(), any(), any(), any());
+        ExecutorService workers = Executors.newFixedThreadPool(3);
+        try {
+            Future<NetworkInterfaceAttachment> attaching = workers.submit(() -> {
+                current.set(hostAccount);
+                return service.attachNetworkInterface(region, extra.getNetworkInterfaceId(), instance.getInstanceId(), 1);
+            });
+            assertTrue(entered.await(5, TimeUnit.SECONDS));
+            Future<NetworkInterfaceAttachment> detached = workers.submit(() -> {
+                detaching.set(Thread.currentThread());
+                return service.detachNetworkInterface(region, attachment.get(), false);
+            });
+            awaitBlockedOrDone(detaching, detached);
+            if (detached.isDone()) {
+                detached.get(5, TimeUnit.SECONDS);
+            }
+            assertFalse(detached.isDone(), "Detach must not race ahead of the admitted Docker plug");
+            assertNotNull(workers.submit(() -> service.createVpc(region, "10.248.0.0/24", false))
+                    .get(5, TimeUnit.SECONDS), "Unrelated topology changes must not wait for Docker");
+            verify(manager, never()).unplugNetworkInterface(any(), any());
+            release.countDown();
+            assertEquals(attaching.get(5, TimeUnit.SECONDS).getAttachmentId(),
+                    detached.get(5, TimeUnit.SECONDS).getAttachmentId());
+            InOrder order = inOrder(manager);
+            order.verify(manager).plugNetworkInterface(any(), any(), any(), any());
+            order.verify(manager).unplugNetworkInterface(any(), any());
+            assertTrue(instance.getNetworkInterfaces().stream()
+                    .noneMatch(eni -> extra.getNetworkInterfaceId().equals(eni.getNetworkInterfaceId())));
+        } finally {
+            release.countDown();
+            workers.shutdownNow();
+            assertTrue(workers.awaitTermination(5, TimeUnit.SECONDS));
+            current.remove();
+        }
+    }
+
     private static Ec2Service containerModeService() {
         return containerModeService(mock(Ec2ContainerManager.class));
     }
