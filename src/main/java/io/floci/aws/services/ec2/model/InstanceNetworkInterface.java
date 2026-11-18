@@ -22,6 +22,8 @@ public class InstanceNetworkInterface {
     private boolean sourceDestCheck = true;
     private List<GroupIdentifier> groups = new ArrayList<>();
     private List<String> ipv6Addresses = new ArrayList<>();
+    private List<String> subnetIpv6CidrBlocks = new ArrayList<>();
+    private List<String> vpcIpv6CidrBlocks = new ArrayList<>();
     private String attachmentId;
     private int deviceIndex;
     private String attachTime;
@@ -75,5 +77,17 @@ public class InstanceNetworkInterface {
     public void setDeleteOnTermination(boolean deleteOnTermination) { this.deleteOnTermination = deleteOnTermination; }
 
     public List<String> getIpv6Addresses() { return ipv6Addresses; }
-    public void setIpv6Addresses(List<String> ipv6Addresses) { this.ipv6Addresses = ipv6Addresses; }
+    public void setIpv6Addresses(List<String> ipv6Addresses) {
+        this.ipv6Addresses = ipv6Addresses != null ? ipv6Addresses : new ArrayList<>();
+    }
+
+    public List<String> getSubnetIpv6CidrBlocks() { return subnetIpv6CidrBlocks; }
+    public void setSubnetIpv6CidrBlocks(List<String> subnetIpv6CidrBlocks) {
+        this.subnetIpv6CidrBlocks = subnetIpv6CidrBlocks != null ? subnetIpv6CidrBlocks : new ArrayList<>();
+    }
+
+    public List<String> getVpcIpv6CidrBlocks() { return vpcIpv6CidrBlocks; }
+    public void setVpcIpv6CidrBlocks(List<String> vpcIpv6CidrBlocks) {
+        this.vpcIpv6CidrBlocks = vpcIpv6CidrBlocks != null ? vpcIpv6CidrBlocks : new ArrayList<>();
+    }
 }
