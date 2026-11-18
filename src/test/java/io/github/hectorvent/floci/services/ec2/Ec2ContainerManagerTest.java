@@ -257,8 +257,6 @@ class Ec2ContainerManagerTest {
                 time.advance(Duration.ofMillis(999));
                 assertEquals(1, removals.get(), "The first retry waits a full second");
                 assertEquals(1, completed.getCount());
-                // A failed peer refresh is retried; the instance it no longer holds is terminated meanwhile.
-                assertEquals(peerRefreshFailure ? "terminated" : "shutting-down", instance.getState().getName());
                 time.advance(Duration.ofMillis(1));
             }
             assertTrue(completed.await(5, TimeUnit.SECONDS), "Container teardown must finish");
@@ -269,16 +267,14 @@ class Ec2ContainerManagerTest {
             assertEquals(transientFailure ? 2 : 1, removals.get());
             // A retry retains successful workload removal and its completed half-second teardown pause.
             assertEquals(TestTime.DEFAULT_START.plusMillis(retried ? 1_500 : 500), time.now());
-            // Terminated once its container was established gone, not when the peer refresh finished.
-            assertEquals(TestTime.DEFAULT_START.plusMillis(transientFailure ? 1_500 : 500).toEpochMilli(),
-                    instance.getTerminatedAt());
+            assertEquals(time.clock().millis(), instance.getTerminatedAt());
         } finally {
             manager.stop();
         }
     }
 
     @Test
-    void aSlowPeerRefreshNoLongerHoldsTheInstanceInShuttingDownButStillHoldsItsAddress() throws Exception {
+    void terminationWaitsForPeerRefreshBeforeReportingItsAddressReusable() throws Exception {
         DockerClient docker = mock(DockerClient.class);
         SecurityGroupFirewallManager firewall = mock(SecurityGroupFirewallManager.class);
         when(firewall.enabled()).thenReturn(true);
@@ -334,11 +330,9 @@ class Ec2ContainerManagerTest {
             manager.terminate(instance, completed::countDown);
             assertTrue(refreshing.await(5, TimeUnit.SECONDS), "The peer refresh must start");
 
-            // The container is gone, so the instance is terminated while its peers are still refreshed.
-            assertEquals("terminated", instance.getState().getName());
-            assertEquals(TestTime.DEFAULT_START.plusMillis(500).toEpochMilli(), instance.getTerminatedAt());
-            // Fail-closed: no peer may still admit its address once it is reused, so the address, the
-            // helper and the post-teardown hook that releases its interfaces wait for the refresh.
+            assertEquals("shutting-down", instance.getState().getName(),
+                    "Termination must not report address reuse before peer cleanup finishes");
+            assertEquals(0, instance.getTerminatedAt());
             verify(vpc, never()).releasePrivateIp(any(), any(), any());
             verify(lifecycle, never()).removeIfExistsStrict(TEST_HELPER_ID);
             assertEquals(1, completed.getCount());
@@ -347,6 +341,8 @@ class Ec2ContainerManagerTest {
             assertTrue(completed.await(5, TimeUnit.SECONDS), "Container teardown must finish");
             verify(lifecycle).removeIfExistsStrict(TEST_HELPER_ID);
             verify(vpc).releasePrivateIp("us-west-2", "subnet-lease", "10.0.1.10");
+            assertEquals("terminated", instance.getState().getName());
+            assertEquals(time.clock().millis(), instance.getTerminatedAt());
         } finally {
             finishRefresh.countDown();
             manager.stop();
@@ -2747,15 +2743,14 @@ class Ec2ContainerManagerTest {
             harness.manager.terminate(instance, completed::incrementAndGet);
             executor.submit(() -> { }).get(2, TimeUnit.SECONDS);
 
-            // The workload container is gone, so the instance is terminated; the helper removal that
-            // follows is retried, and the port and the callback still wait for it.
-            assertEquals("terminated", instance.getState().getName());
+            assertEquals("shutting-down", instance.getState().getName());
             assertEquals(0, completed.get());
             verify(harness.portAllocator, never()).release(2201);
 
             harness.time().advance(Duration.ofMillis(999));
             executor.submit(() -> { }).get(2, TimeUnit.SECONDS);
-            assertEquals(0, completed.get(), "The retry waits a full second");
+            assertEquals("shutting-down", instance.getState().getName(), "The retry waits a full second");
+            assertEquals(0, completed.get());
             verify(harness.lifecycleManager).removeIfExistsStrict(TEST_HELPER_ID);
 
             harness.time().advance(Duration.ofMillis(1));

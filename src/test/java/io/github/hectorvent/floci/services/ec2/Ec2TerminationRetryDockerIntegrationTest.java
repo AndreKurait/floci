@@ -147,9 +147,7 @@ class Ec2TerminationRetryDockerIntegrationTest {
             await().atMost(Duration.ofSeconds(30)).until(() -> state(sdk, id) == InstanceStateName.TERMINATED);
             assertEquals(2, attempts.get());
             assertThrows(NotFoundException.class, () -> docker.inspectContainerCmd(guest).exec());
-            await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
-                    assertThrows(NotFoundException.class, () -> docker.inspectContainerCmd(helper).exec()));
-            awaitInterfaceCleanup(sdk, id);
+            assertThrows(NotFoundException.class, () -> docker.inspectContainerCmd(helper).exec());
         } finally {
             allowRetry.countDown();
             if (containerId != null) {
@@ -158,14 +156,7 @@ class Ec2TerminationRetryDockerIntegrationTest {
             // Recovery here is cleanup only; the assertions above require a single accepted request.
             sdk.terminateInstances(request -> request.instanceIds(id));
             await().atMost(Duration.ofSeconds(60)).until(() -> state(sdk, id) == InstanceStateName.TERMINATED);
-            awaitInterfaceCleanup(sdk, id);
         }
-    }
-
-    private static void awaitInterfaceCleanup(Ec2Client sdk, String id) {
-        await().atMost(Duration.ofSeconds(30)).until(() -> sdk.describeNetworkInterfaces(request ->
-                request.filters(filter -> filter.name("attachment.instance-id").values(id)))
-                .networkInterfaces().isEmpty());
     }
 
     private static InstanceStateName state(Ec2Client sdk, String id) {

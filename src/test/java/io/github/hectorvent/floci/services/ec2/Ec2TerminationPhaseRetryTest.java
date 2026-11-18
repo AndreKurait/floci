@@ -252,10 +252,8 @@ class Ec2TerminationPhaseRetryTest {
         }
 
         private void assertLateFailure() {
-            // The late phase fails after the workload is gone: the instance already reports terminated, as AWS
-            // reports it, and only the internal cleanup is retried.
-            assertEquals("terminated", instance.getState().getName());
-            assertTrue(instance.getTerminatedAt() > 0);
+            assertEquals("shutting-down", instance.getState().getName());
+            assertEquals(0, instance.getTerminatedAt());
             assertEquals(1, removals.get());
             assertEquals(1, sshReleases.get());
             assertEquals(1, metadataAttempts.get());

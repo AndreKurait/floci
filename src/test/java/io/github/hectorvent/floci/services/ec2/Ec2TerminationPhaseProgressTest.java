@@ -71,13 +71,9 @@ class Ec2TerminationPhaseProgressTest {
             harness.failOnce = failedPhase;
             harness.terminate(null);
             harness.drain("after-first-failure");
+            assertEquals("shutting-down", harness.instance.getState().getName());
+            assertEquals(0, harness.instance.getTerminatedAt());
             int failedIndex = PHASES.indexOf(failedPhase);
-            // Once its workload is gone the instance is terminated, as AWS reports it; only the internal
-            // cleanup phases are left to retry.
-            boolean workloadGone = failedIndex > PHASES.indexOf("workload");
-            assertEquals(workloadGone ? "terminated" : "shutting-down", harness.instance.getState().getName());
-            assertEquals(workloadGone, harness.instance.getTerminatedAt() > 0);
-            long terminatedAt = harness.instance.getTerminatedAt();
             for (int index = 0; index < PHASES.size(); index++) {
                 assertEquals(index <= failedIndex ? 1 : 0, harness.count(PHASES.get(index)));
             }
@@ -89,9 +85,6 @@ class Ec2TerminationPhaseProgressTest {
             harness.time.advance(Duration.ofMillis(1));
             harness.drain("after-scheduled-retry");
             harness.assertCompleted(1);
-            if (workloadGone) {
-                assertEquals(terminatedAt, harness.instance.getTerminatedAt(), "The retry must not terminate again");
-            }
             for (String phase : PHASES) {
                 assertEquals(phase.equals(failedPhase) ? 2 : 1, harness.count(phase), phase);
             }
@@ -150,10 +143,8 @@ class Ec2TerminationPhaseProgressTest {
             harness.failOnce = "metadata-imds";
             assertThrows(IllegalStateException.class, () -> harness.manager.terminateForShutdown(harness.instance));
             harness.snapshot("shutdown-failed");
-            // The failed phase runs after the workload is gone, so the instance already reports terminated.
-            assertEquals("terminated", harness.instance.getState().getName());
-            assertTrue(harness.instance.getTerminatedAt() > 0);
-            long terminatedAt = harness.instance.getTerminatedAt();
+            assertEquals("shutting-down", harness.instance.getState().getName());
+            assertEquals(0, harness.instance.getTerminatedAt());
             assertEquals(1, harness.count("ssh"));
             assertEquals(1, harness.count("metadata-bridge"));
             assertEquals(0, harness.count("metadata-instance"));
@@ -161,7 +152,6 @@ class Ec2TerminationPhaseProgressTest {
             harness.manager.terminateForShutdown(harness.instance);
             harness.snapshot("shutdown-retried");
             harness.assertCompleted(0);
-            assertEquals(terminatedAt, harness.instance.getTerminatedAt(), "The retry must not terminate again");
             for (String phase : PHASES) {
                 assertEquals("metadata-imds".equals(phase) ? 2 : 1, harness.count(phase), phase);
             }
