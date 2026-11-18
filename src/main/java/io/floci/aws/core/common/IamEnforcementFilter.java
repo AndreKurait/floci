@@ -455,6 +455,11 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         if (action == null) {
             return; // unknown action → ALLOW for ordinary credentials (permissive)
         }
+        if ("ssm:RegisterManagedInstance".equals(action)
+                && iamService.ec2InstanceIdentitySession(akid).isPresent()) {
+            // Registration separately binds the signed request to this live EC2 instance.
+            return;
+        }
         if ("sts:GetCallerIdentity".equals(action)) {
             return; // AWS returns caller identity even when an identity policy explicitly denies it
         }
@@ -1922,7 +1927,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
      *   <li>{@code application/x-www-form-urlencoded} body → AWS Query
      *       {@code <ErrorResponse>...</ErrorResponse>} (IAM/STS/EC2/SQS/SNS/...), with the code
      *       {@link #queryAccessDeniedCode} gives the service that serves the request</li>
-     *   <li>JSON 1.x: JSON with HTTP 400; REST-JSON: JSON with its modelled denial status, defaulting to HTTP 403</li>
+     *   <li>JSON 1.x: JSON with HTTP 400, except KMS with HTTP 403; REST-JSON uses its modelled denial status</li>
      *   <li>CBOR: the request's own encoding with HTTP 403, from {@link #accessDeniedForRequest},
      *       which has the request to read it from</li>
      * </ul>
@@ -1982,7 +1987,9 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 || ProtocolErrorResponses.isFormEncoded(requestMediaType)) {
             return queryXmlError(queryAccessDeniedCode(credentialScope), message);
         }
-        int status = protocol == WireProtocol.AWS_JSON_1_0 || protocol == WireProtocol.AWS_JSON_1_1
+        // KMS documents AccessDeniedException as 403 despite using AWS JSON 1.1.
+        boolean jsonProtocol = protocol == WireProtocol.AWS_JSON_1_0 || protocol == WireProtocol.AWS_JSON_1_1;
+        int status = jsonProtocol && !"kms".equals(credentialScope)
                 ? 400 : IamActionRegistry.accessDeniedStatus(credentialScope, 403);
         return jsonAccessDenied(message, status);
     }

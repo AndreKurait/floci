@@ -87,6 +87,7 @@ without a label filter continue to return the latest version of each parameter.
 
 | Action | Description |
 |---|---|
+| `RegisterManagedInstance` | Register an EC2 agent public key using its signed, live instance identity credentials |
 | `UpdateInstanceInformation` | Register or update an SSM agent record for an instance. Does not create an EC2 instance or register the container with IMDS (see [Run Command Execution](#run-command-execution)) |
 | `DescribeInstanceInformation` | List registered SSM managed instances |
 | `SendCommand` | Create command invocations for target instances |
@@ -345,3 +346,9 @@ Parameters a CloudFormation stack creates or deletes publish the same events. A 
 such as a `PutParameter` on an existing name without `Overwrite`, publishes nothing, and so do
 `AddTagsToResource`, a label already on the requested version and an invalid label. Publishing
 is best effort: a delivery failure is logged and never fails or undoes the write.
+
+### EC2 agent registration
+
+EC2 `RegisterManagedInstance` authenticates the running instance through its live IMDS instance-identity credentials and a valid SigV4 signature, even when global signature validation is disabled. The signed account and region must match the instance owner. These credentials gain no general IAM or SSM permissions. The signature must bind the request body: an explicit payload hash must match the body, and `UNSIGNED-PAYLOAD` is rejected for this registration path.
+
+The EC2 agent sends its instance ID as `Fingerprint`, `PublicKeyType=Rsa`, and an RSA `PublicKey` of at least 2048 bits encoded as base64 X.509 DER or a `PUBLIC KEY` PEM block. The existing lowercase `rsa` key type remains supported; other spellings and key algorithms are rejected. The fingerprint must match the authenticated instance. Registration persists through the configured SSM storage mode, preserves its timestamp on sequential or concurrent identical retries, and does not report the agent online before its heartbeat. Hybrid activation and managed-instance role token issuance are outside this registration path.
