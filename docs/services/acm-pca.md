@@ -40,8 +40,11 @@ same CSR, validity and CA profile checks as a root import.
 `GetCertificateAuthorityCertificate` returns a subordinate's chain, and every certificate
 a subordinate issues is returned with the subordinate's certificate followed by that
 chain. `IssueCertificate` refuses a `SubordinateCACertificate_PathLen` template whose
-path length is not less than the path length of the issuer's own certificate with
-`InvalidArgsException`; a root certificate has no path length and allows any.
+path length exceeds the remaining allowance of any certificate in the issuer
+chain with `InvalidArgsException`. Non-self-issued intermediate CAs consume
+that allowance; self-issued rollover certificates do not. A CA with a zero
+remaining allowance can still issue end-entity certificates. A certificate
+without a path-length constraint does not impose a limit.
 
 CSRs must prove possession of their private key and contain a subject or subject
 alternative name. End-entity CSRs may use RSA 2048, 3072 or 4096 bit keys. Issuance
