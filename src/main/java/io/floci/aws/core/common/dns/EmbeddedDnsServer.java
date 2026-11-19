@@ -34,6 +34,7 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Locale;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.SequencedSet;
@@ -501,6 +502,80 @@ public class EmbeddedDnsServer {
 
     private static boolean isPresent(String value) {
         return value != null && !value.isBlank();
+    }
+
+    /** Resolves only resource-backed alias targets, without recursive or upstream DNS lookups. */
+    public Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type) {
+        return resolveAliasTarget(name, hostedZoneId, type, null);
+    }
+
+    public Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type,
+                                                 DnsClientVpcSource.ClientVpc origin) {
+        return resolveAliasTarget(name, hostedZoneId, type, origin, false);
+    }
+
+    private Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type,
+                                                   DnsClientVpcSource.ClientVpc origin, boolean declaredPublicPeer) {
+        DnsAnswer resolved = null;
+        if (recordSources != null) {
+            for (DnsRecordSource source : recordSources) {
+                try {
+                    Optional<DnsAnswer> candidate = declaredPublicPeer
+                            ? source.resolveDeclaredPublicAliasTarget(name, hostedZoneId, type, origin)
+                            : source.resolveAliasTarget(name, hostedZoneId, type, origin);
+                    if (candidate.isPresent()) {
+                        if (resolved != null) {
+                            return Optional.of(DnsAnswer.refused());
+                        }
+                        resolved = candidate.orElseThrow();
+                    }
+                } catch (RuntimeException failure) {
+                    LOG.debugv("DNS alias source {0} failed to resolve {1}: {2}",
+                            source.getClass().getSimpleName(), name, failure.getMessage());
+                    return Optional.of(DnsAnswer.refused());
+                }
+            }
+        }
+        return Optional.ofNullable(resolved);
+    }
+
+    /** A declared public front door keeps its routed transport after validating its owned alias. */
+    public Optional<DnsAnswer> resolvePublicAliasTarget(String publicName, String target, String hostedZoneId,
+                                                        int type, DnsClientVpcSource.ClientVpc origin) {
+        String normalized = publicName.toLowerCase(Locale.ROOT);
+        if (normalized.endsWith(".")) {
+            normalized = normalized.substring(0, normalized.length() - 1);
+        }
+        if (!publicAwsApi || origin != null && !isUsableOrigin(origin) || type != 1
+                || !publicApiHosts.contains(normalized)) {
+            return resolveAliasTarget(target, hostedZoneId, type, origin);
+        }
+        Optional<DnsAnswer> resolved = resolveAliasTarget(target, hostedZoneId, type, origin, true);
+        return resolved.map(answer -> {
+            boolean localListener = getServerIp().map(address ->
+                    answer.records().equals(List.of(new DnsRecord.Address(1, address)))).orElse(false);
+            boolean nativeAlb = answer.records().equals(List.of(
+                    new DnsRecord.Address(1, EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS)));
+            boolean ownedListener = answer.responseCode() == 0 && (localListener || nativeAlb);
+            if (ownedListener && origin == null) {
+                return answer.viaUpstream();
+            }
+            return ownedListener ? new DnsAnswer(
+                    List.of(new DnsRecord.Address(1, EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS)),
+                    answer.ttlSeconds(), answer.nameExists(), answer.authority(), answer.responseCode()) : answer;
+        });
+    }
+
+    /** The owned API listener remains subject to the caller's ordinary public routing. */
+    public Optional<String> publicApiAddress(DnsClientVpcSource.ClientVpc origin) {
+        return publicAwsApi && origin != null && isUsableOrigin(origin)
+                ? Optional.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS) : getServerIp();
+    }
+
+    /** A native public ALB keeps its own TLS transport when API traffic uses an external front door. */
+    public Optional<String> publicAlbHttpsAddress(DnsClientVpcSource.ClientVpc origin) {
+        return publicAwsApi && origin != null && isUsableOrigin(origin)
+                ? Optional.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_ALB_HTTPS_ADDRESS) : getServerIp();
     }
 
     /**
