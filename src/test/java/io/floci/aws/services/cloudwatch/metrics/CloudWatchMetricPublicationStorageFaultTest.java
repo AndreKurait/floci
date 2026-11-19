@@ -83,6 +83,7 @@ class CloudWatchMetricPublicationStorageFaultTest {
             assertEquals(4, before.getFirst().sampleCount());
             assertEquals(3, before.getFirst().minimum());
             assertEquals(11, before.getFirst().maximum());
+            assertEquals(Map.of("p0", 3.0, "p100", 11.0), before.getFirst().extendedStatistics());
             actual.flush();
         } finally { StorageTestBackends.close(actual); }
         StorageBackend<String, MetricDatum> reloaded = backend(mode);
@@ -95,7 +96,7 @@ class CloudWatchMetricPublicationStorageFaultTest {
 
     private static List<CloudWatchMetricsService.Datapoint> packedStatistics(CloudWatchMetricsService service) {
         return service.getMetricStatistics("App", "Value", List.of(), Instant.ofEpochSecond(120),
-                Instant.ofEpochSecond(179), 60, List.of("Sum", "SampleCount", "Minimum", "Maximum"), "Count", REGION);
+                Instant.ofEpochSecond(179), 60, List.of("Sum", "SampleCount", "p0", "p100"), "Count", REGION);
     }
 
     private StorageBackend<String, MetricDatum> backend(String mode) {

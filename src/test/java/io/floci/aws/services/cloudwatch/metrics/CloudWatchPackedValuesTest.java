@@ -107,9 +107,9 @@ class CloudWatchPackedValuesTest {
         CloudWatchMetricsService reloaded = new CloudWatchMetricsService(
                 new InMemoryStorage<>(), new InMemoryStorage<>(), new RegionResolver(REGION, "123456789012"));
         reloaded.putMetricData(NAMESPACE, List.of(restored), REGION);
-        assertEquals(statistics("Sum", "SampleCount", "Minimum", "Maximum"), reloaded.getMetricStatistics(
+        assertEquals(statistics("Sum", "p0", "p50", "p100"), reloaded.getMetricStatistics(
                 NAMESPACE, "Latency", List.of(), START.minusSeconds(1), START.plusSeconds(1),
-                60, List.of("Sum", "SampleCount", "Minimum", "Maximum"), "Milliseconds", REGION));
+                60, List.of("Sum", "p0", "p50", "p100"), "Milliseconds", REGION));
         assertEquals(300, statistics("Sum").getFirst().sampleCount());
         assertEquals(22650, statistics("Sum").getFirst().sum());
     }
@@ -144,9 +144,9 @@ class CloudWatchPackedValuesTest {
             assertFalse(serialized.has("sampleWeights"));
         }
         publish(false, weighted());
-        assertEquals(statistics("Sum", "SampleCount"), legacy.getMetricStatistics(
+        assertEquals(statistics("Sum", "p50", "p90"), legacy.getMetricStatistics(
                 NAMESPACE, "Latency", List.of(), START.minusSeconds(1), START.plusSeconds(1),
-                60, List.of("Sum", "SampleCount"), "Milliseconds", REGION));
+                60, List.of("Sum", "p50", "p90"), "Milliseconds", REGION));
     }
 
     @ParameterizedTest
@@ -194,6 +194,17 @@ class CloudWatchPackedValuesTest {
                 START.minusSeconds(1), START.plusSeconds(1), REGION);
         assertEquals(List.of(43.0), results.getFirst().values());
         assertEquals(List.of(5.0), results.getLast().values());
+    }
+
+    @Test
+    void packedValuesRetainGetMetricDataPercentiles() {
+        publish(false, weighted());
+        CloudWatchMetricsService.MetricStat percentile = new CloudWatchMetricsService.MetricStat(
+                NAMESPACE, "Latency", List.of(), 60, "p90", "Milliseconds");
+        List<CloudWatchMetricsService.MetricDataResult> results = service.getMetricData(List.of(
+                new CloudWatchMetricsService.MetricDataQuery("p", percentile, null, null, true)),
+                START.minusSeconds(1), START.plusSeconds(1), REGION);
+        assertEquals(List.of(11.0), results.getFirst().values());
     }
 
 }

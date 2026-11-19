@@ -5,6 +5,7 @@ import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.Test;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.cloudwatch.CloudWatchClient;
+import software.amazon.awssdk.services.cloudwatch.model.ComparisonOperator;
 import software.amazon.awssdk.services.cloudwatch.model.Datapoint;
 import software.amazon.awssdk.services.cloudwatch.model.MetricDatum;
 import software.amazon.awssdk.services.cloudwatch.model.Statistic;
@@ -35,6 +36,17 @@ class CloudWatchWeightedSummaryIntegrationTest {
             assertEquals(7.0, point.minimum());
             assertEquals(11.0, point.maximum());
             assertEquals(8.6, point.average());
+            assertEquals(7.0, client.getMetricStatistics(request -> request.namespace(namespace)
+                    .metricName("Latency").startTime(timestamp.minusSeconds(1)).endTime(timestamp.plusSeconds(1))
+                    .period(60).extendedStatistics("p50")).datapoints().getFirst().extendedStatistics().get("p50"));
+            String alarmName = "WeightedPercentile/" + UUID.randomUUID();
+            client.putMetricAlarm(request -> request.alarmName(alarmName).namespace(namespace)
+                    .metricName("Latency").extendedStatistic("p90").period(60).evaluationPeriods(1)
+                    .threshold(10.0).comparisonOperator(ComparisonOperator.GREATER_THAN_THRESHOLD)
+                    .actionsEnabled(false));
+            assertEquals("p90", client.describeAlarms(request -> request.alarmNames(alarmName))
+                    .metricAlarms().getFirst().extendedStatistic());
+            client.deleteAlarms(request -> request.alarmNames(alarmName));
         }
     }
 }
