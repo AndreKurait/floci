@@ -91,7 +91,12 @@ final class ElbV2CfnTargets {
             return true;
         }
         String arn = resource.getPhysicalId();
-        reconcile(AwsArnUtils.parse(arn).region(), arn, read(snapshot.get("targets")), read(snapshot.get("scope")));
+        String region = AwsArnUtils.parse(arn).region();
+        TargetGroup group = service.describeTargetGroups(region, null, List.of(arn), null).getFirst();
+        Set<Key> scope = keys(read(snapshot.get("scope")));
+        List<TargetDescription> current = normalize(group.getTargets(), group).stream()
+                .filter(target -> scope.contains(key(target))).toList();
+        reconcile(region, arn, read(snapshot.get("targets")), current);
         storeManaged(resource, read(snapshot.get("managed")));
         resource.getAttributes().remove(CfnRollback.TARGET_GROUP_TARGETS_UPDATE_SNAPSHOT_ATTR);
         return true;

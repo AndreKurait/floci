@@ -1,6 +1,8 @@
 package io.github.hectorvent.floci.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
@@ -32,6 +34,7 @@ import java.util.UUID;
 public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
 
     private static final Logger LOG = Logger.getLogger(ElbV2CfnProvisioner.class);
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private static final String LOAD_BALANCER = "AWS::ElasticLoadBalancingV2::LoadBalancer";
     private static final String TARGET_GROUP = "AWS::ElasticLoadBalancingV2::TargetGroup";
@@ -39,11 +42,13 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
     private static final String LISTENER_RULE = "AWS::ElasticLoadBalancingV2::ListenerRule";
     /** Prefixes one uses attribute per subnet a load balancer is on, numbered from 1. */
     private static final String USED_SUBNET_ATTR_PREFIX = CfnRollback.USES_ATTR_PREFIX + "Subnet.";
+    private static final String HEALTH_UPDATE_SNAPSHOT_ATTR = "__FlociTargetGroupHealthUpdateSnapshot";
     private static final List<String> UPDATE_SNAPSHOTS = List.of(
             CfnRollback.LOAD_BALANCER_SUBNETS_UPDATE_SNAPSHOT_ATTR,
             CfnRollback.LOAD_BALANCER_ATTRIBUTES_UPDATE_SNAPSHOT_ATTR,
             CfnRollback.TARGET_GROUP_ATTRIBUTES_UPDATE_SNAPSHOT_ATTR,
-            CfnRollback.TARGET_GROUP_TARGETS_UPDATE_SNAPSHOT_ATTR);
+            CfnRollback.TARGET_GROUP_TARGETS_UPDATE_SNAPSHOT_ATTR,
+            HEALTH_UPDATE_SNAPSHOT_ATTR);
 
     private final ElbV2Service elbV2Service;
     private final ElbV2CfnTargets targets;
@@ -145,8 +150,8 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
 
     /**
      * A replacement is undone through the cleanup record. Without one, a load balancer is moved
-     * back to the subnets an update took it off, and a target group's affected registrations are
-     * restored from its snapshot. A listener
+     * back to the subnets an update took it off, and a target group's affected registrations,
+     * attributes and health settings are restored independently from their snapshots. A listener
      * or rule without a record was modified in place, and putting that back needs a snapshot this
      * provisioner does not keep, so the engine reports it as not rolled back, as it did for the switch.
      */
@@ -160,10 +165,51 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
             return restorePriorSubnets(resource);
         }
         if (TARGET_GROUP.equals(resource.getResourceType())) {
-            targetGroupAttributes.restore(resource);
-            return targets.restore(resource);
+            restorePriorTargetGroup(resource);
+            return true;
         }
         return false;
+    }
+
+    private void restorePriorTargetGroup(StackResource resource) {
+        RuntimeException failure = null;
+        for (Runnable restore : List.<Runnable>of(() -> targetGroupAttributes.restore(resource),
+                () -> targets.restore(resource), () -> restorePriorHealth(resource))) {
+            try {
+                restore.run();
+            } catch (RuntimeException e) {
+                if (failure == null) {
+                    failure = e;
+                } else if (failure != e) {
+                    failure.addSuppressed(e);
+                }
+            }
+        }
+        if (failure != null) {
+            throw failure;
+        }
+    }
+
+    private static void recordPriorHealth(StackResource resource, TargetGroup group) {
+        ObjectNode saved = MAPPER.valueToTree(group);
+        saved.retain("healthCheckProtocol", "healthCheckPort", "healthCheckEnabled", "healthCheckPath",
+                "healthCheckIntervalSeconds", "healthCheckTimeoutSeconds", "healthyThresholdCount",
+                "unhealthyThresholdCount", "matcher");
+        resource.getAttributes().put(HEALTH_UPDATE_SNAPSHOT_ATTR, saved.toString());
+    }
+
+    private void restorePriorHealth(StackResource resource) {
+        JsonNode saved = CfnRollback.updateSnapshot(resource, HEALTH_UPDATE_SNAPSHOT_ATTR);
+        if (saved == null) {
+            return;
+        }
+        TargetGroup prior = MAPPER.convertValue(saved, TargetGroup.class);
+        String arn = resource.getPhysicalId();
+        elbV2Service.modifyTargetGroup(AwsArnUtils.parse(arn).region(), arn, prior.getHealthCheckProtocol(),
+                prior.getHealthCheckPort(), prior.getHealthCheckEnabled(), prior.getHealthCheckPath(),
+                prior.getHealthCheckIntervalSeconds(), prior.getHealthCheckTimeoutSeconds(),
+                prior.getHealthyThresholdCount(), prior.getUnhealthyThresholdCount(), prior.getMatcher());
+        resource.getAttributes().remove(HEALTH_UPDATE_SNAPSHOT_ATTR);
     }
 
     /**
@@ -339,8 +385,26 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
         // A list-valued attribute, joined the way Route53's NameServers is. Empty until a listener
         // forwards to the group, as on AWS.
         r.getAttributes().put("LoadBalancerArns", String.join(",", tg.getLoadBalancerArns()));
-        targetGroupAttributes.apply(r, declaredAttributes, ctx, created);
-        targets.apply(r, tg, requestedTargets, ctx, created);
+        if (!created && ctx.reusesPriorEntity(tg.getTargetGroupArn())
+                && (hcProtocol != null || hcPort != null || hcEnabled != null || hcPath != null
+                || hcInterval != null || hcTimeout != null || healthyThreshold != null
+                || unhealthyThreshold != null || matcher != null)) {
+            TargetGroup group = tg;
+            CfnRollback.guarded(r, ctx, false,
+                    () -> elbV2Service.deleteTargetGroup(ctx.region(), group.getTargetGroupArn()),
+                    () -> restorePriorHealth(r),
+                    () -> {
+                        recordPriorHealth(r, group);
+                        elbV2Service.modifyTargetGroup(ctx.region(), group.getTargetGroupArn(),
+                                hcProtocol, hcPort, hcEnabled, hcPath, hcInterval, hcTimeout,
+                                healthyThreshold, unhealthyThreshold, matcher);
+                        targetGroupAttributes.apply(r, declaredAttributes, ctx, false);
+                        targets.apply(r, group, requestedTargets, ctx, false);
+                    });
+        } else {
+            targetGroupAttributes.apply(r, declaredAttributes, ctx, created);
+            targets.apply(r, tg, requestedTargets, ctx, created);
+        }
     }
 
     /**

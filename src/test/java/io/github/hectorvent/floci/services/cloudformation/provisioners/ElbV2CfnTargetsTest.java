@@ -34,6 +34,7 @@ class ElbV2CfnTargetsTest {
         group.setTargetGroupArn(ARN);
         group.setPort(8080);
         group.setTargetType("ip");
+        when(service.describeTargetGroups(REGION, null, List.of(ARN), null)).thenReturn(List.of(group));
         resource.setPhysicalId(ARN);
         resource.setResourceType("AWS::ElasticLoadBalancingV2::TargetGroup");
         resource.setLogicalId("Targets");
@@ -168,6 +169,16 @@ class ElbV2CfnTargetsTest {
         assertEquals(8080, declared.getFirst().getPort());
         assertEquals("all", declared.getFirst().getAvailabilityZone());
         verifyNoInteractions(service);
+    }
+
+    @Test
+    void rejectedRegistrationDoesNotDeregisterAnUnregisteredTarget() {
+        AwsException failure = new AwsException("ValidationError", "invalid port", 400);
+        doThrow(failure).when(service).registerTargets(eq(REGION), eq(ARN), anyList());
+        assertSame(failure, assertThrows(AwsException.class,
+                () -> apply(List.of(target("10.0.0.8", 70000, null)), true)));
+        verify(service, never()).deregisterTargets(any(), any(), any());
+        assertFalse(resource.getAttributes().containsKey(CfnRollback.TARGET_GROUP_TARGETS_UPDATE_SNAPSHOT_ATTR));
     }
 
     private void apply(List<TargetDescription> requested, boolean update) {
