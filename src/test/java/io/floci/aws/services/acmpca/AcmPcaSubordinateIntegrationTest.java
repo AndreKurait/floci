@@ -85,6 +85,11 @@ class AcmPcaSubordinateIntegrationTest {
                     .certificateChain(SdkBytes.fromUtf8String(unrelatedPem))));
             assertEquals("PENDING_CERTIFICATE", describe(client, issuing).statusAsString());
 
+            error("InvalidRequestException", () -> client.importCertificateAuthorityCertificate(request -> request
+                    .certificateAuthorityArn(issuing).certificate(SdkBytes.fromUtf8String(signed.certificate()))
+                    .certificateChain(SdkBytes.fromUtf8String(signed.certificate() + signed.certificateChain()))));
+            assertEquals(pending, describe(client, issuing));
+
             client.importCertificateAuthorityCertificate(request -> request.certificateAuthorityArn(issuing)
                     .certificate(SdkBytes.fromUtf8String(signed.certificate()))
                     .certificateChain(SdkBytes.fromUtf8String(signed.certificateChain())));
