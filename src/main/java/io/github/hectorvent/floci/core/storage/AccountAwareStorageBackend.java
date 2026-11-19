@@ -735,6 +735,10 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
     // ---
 
     /** Returns the account ID that keys are currently being prefixed with. */
+    public String defaultAccountId() {
+        return defaultAccountId;
+    }
+
     public String accountId() {
         return prefix();
     }

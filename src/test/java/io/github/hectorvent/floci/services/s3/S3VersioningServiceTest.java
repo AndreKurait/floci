@@ -347,7 +347,7 @@ class S3VersioningServiceTest {
         service.putObject("versioned-bucket", "key",
                 "newer null".getBytes(StandardCharsets.UTF_8), "text/plain", null);
         Instant tied = Instant.parse("2026-10-21T00:00:00Z");
-        objectStore.get("versioned-bucket/key#v#" + older.getVersionId()).orElseThrow().setLastModified(tied);
+        objectStore.get(S3HistoryKeys.key("versioned-bucket", "key", older.getVersionId())).orElseThrow().setLastModified(tied);
         objectStore.get("versioned-bucket/key").orElseThrow().setLastModified(tied);
         service.putBucketVersioning("versioned-bucket", "Enabled");
         S3Object current = service.putObject("versioned-bucket", "key",
