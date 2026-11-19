@@ -20,6 +20,7 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 
+import static io.floci.aws.testing.EcsTaskWaits.awaitLastStatus;
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
@@ -68,12 +69,13 @@ class EcsBackgroundTaskLaunchIntegrationTest {
 
         String taskArn = RequestScopes.callAs(ACCOUNT, () -> ecsService.runTask(cluster, cluster, 1,
                 LaunchType.FARGATE, null, null, List.of(), null, REGION).getFirst().getTaskArn());
-        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> RequestScopes.runAs(ACCOUNT, () -> {
-            assertEquals("RUNNING",
-                    ecsService.describeTasks(cluster, List.of(taskArn), REGION).getFirst().getLastStatus());
-            assertEquals(1, ecsService.describeClusters(List.of(cluster), REGION).getFirst().getRunningTasksCount());
-        }));
+        awaitLastStatus(() -> RequestScopes.callAs(ACCOUNT, () ->
+                        ecsService.describeTasks(cluster, List.of(taskArn), REGION).getFirst()),
+                EcsTask::getLastStatus, Duration.ofSeconds(10), "RUNNING");
 
         assertEquals(ACCOUNT, startedAs.get(), "the launch must start the task in its own account");
+        await().atMost(Duration.ofSeconds(10)).untilAsserted(() -> assertEquals(1,
+                RequestScopes.callAs(ACCOUNT, () -> ecsService.describeClusters(List.of(cluster), REGION)
+                        .getFirst().getRunningTasksCount())));
     }
 }
