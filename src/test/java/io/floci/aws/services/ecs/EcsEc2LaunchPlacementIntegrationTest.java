@@ -11,8 +11,7 @@ import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 
 /**
- * EC2 launch type placement as real ECS does it: a task with no launch type and no capacity
- * provider strategy (on a cluster without a default strategy) is an EC2 task; an EC2 task is
+ * Explicit EC2 launch type placement: an EC2 task is
  * placed on a registered ACTIVE container instance and carries its ARN and Availability Zone; with
  * no container instance there is nowhere to place it and RunTask fails; and a container instance
  * is the EC2 instance its agent's instance identity document names.
@@ -70,10 +69,11 @@ class EcsEc2LaunchPlacementIntegrationTest {
     }
 
     @Test
-    void runTaskWithoutLaunchTypeIsPlacedOnARegisteredContainerInstanceAsEc2() {
-        String cluster = newCluster("ec2-default");
+    void explicitEc2TaskIsPlacedOnARegisteredContainerInstance() {
+        String cluster = newCluster("ec2-placement");
         String arn = registerInstance(cluster, "i-0aaaaaaaaaaaaaaa1", "us-east-1c");
-        ecs("RunTask").body("{\"cluster\": \"" + cluster + "\", \"taskDefinition\": \"" + cluster + "\"}")
+        ecs("RunTask").body("{\"cluster\": \"" + cluster + "\", \"taskDefinition\": \"" + cluster
+                + "\", \"launchType\": \"EC2\"}")
         .when().post("/")
         .then().statusCode(200)
             .body("tasks[0].launchType", equalTo("EC2"))

@@ -2048,7 +2048,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
      *
      * <p>A capacity provider strategy wins over a launch type (the two are mutually exclusive on
      * the wire), and an absent strategy falls back to the cluster's default one. With neither,
-     * the task is an EC2 task, as on ECS, and is placed on a registered container instance.
+     * the task keeps Floci's FARGATE default. Explicit EC2 tasks use registered container instances.
      */
     private List<Placement> resolvePlacements(EcsCluster cluster, RunTaskRequest request, int count) {
         List<CapacityProviderStrategyItem> strategy = request.getCapacityProviderStrategy();
@@ -2061,7 +2061,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
             strategy = clusterDefaultStrategy(cluster);
         }
         if (strategy == null || strategy.isEmpty()) {
-            LaunchType launchType = request.getLaunchType() != null ? request.getLaunchType() : LaunchType.EC2;
+            LaunchType launchType = request.getLaunchType() != null ? request.getLaunchType() : LaunchType.FARGATE;
             return Collections.nCopies(count, new Placement(launchType, null));
         }
         return distribute(strategy, count);
