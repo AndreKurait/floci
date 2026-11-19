@@ -61,7 +61,7 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
  */
 @QuarkusTest
 @TestProfile(RdsMockProfile.class)
-// Bounded cluster/workload waits total 285 s; allow Docker setup and cleanup as well.
+// Bounded cluster/workload waits total 315 s; allow Docker setup and cleanup as well.
 @Timeout(value = 6, unit = TimeUnit.MINUTES)
 class EksRegistryHostsDockerIntegrationTest {
 
@@ -123,6 +123,7 @@ class EksRegistryHostsDockerIntegrationTest {
         assertNotNull(cluster.getContainerId(), "Container ID must not be null");
         waitUntilReady(cluster);
         eksClusterManager.finalizeCluster(cluster);
+        awaitNodeInitialized(EksTestNode.of(dockerClient, eksClusterManager, cluster), Instant.EPOCH);
 
         // Verify symlink was created before container started
         assertEquals(EksClusterManager.CONTAINERD_CERTS_TARGET, EksTestNode.of(dockerClient, eksClusterManager, cluster)
@@ -187,21 +188,12 @@ class EksRegistryHostsDockerIntegrationTest {
         assertEquals(hostsToml, node.execOutput("cat", hostsTomlPath),
                 "the user data's hosts.toml must be in the container's certs.d via the symlink");
 
-        // Verify hosts.toml survives container restart
+        awaitNodeInitialized(node, Instant.EPOCH);
         dockerClient.restartContainerCmd(node.containerId()).exec();
         Instant restartCompletedAt = Instant.now();
         waitUntilReady(cluster);
-        await("hosts.toml after the restart").atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofSeconds(1))
-                .ignoreExceptions()
-                .untilAsserted(() -> assertEquals(hostsToml, node.execOutput("cat", hostsTomlPath),
-                        "hosts.toml must survive container restart"));
-
-        await("serviceaccount and Ready nodes with renewed Leases").atMost(Duration.ofSeconds(30))
-                .pollInterval(Duration.ofSeconds(1))
-                .until(() -> node.kubectl("--request-timeout=2s", "get", "serviceaccount", "default").exitCode() == 0
-                        && node.kubectl("--request-timeout=2s", "wait", "--for=condition=Ready", "nodes", "--all",
-                                "--timeout=1s").exitCode() == 0
-                        && leasesRenewedAfter(node, restartCompletedAt));
+        awaitNodeInitialized(node, restartCompletedAt);
+        assertEquals(hostsToml, node.execOutput("cat", hostsTomlPath), "hosts.toml must survive container restart");
 
         node.apply("""
                 apiVersion: v1
@@ -221,6 +213,22 @@ class EksRegistryHostsDockerIntegrationTest {
             throw e;
         }
         node.kubectl("delete", "pod", POD, "--now");
+    }
+
+    private static void awaitNodeInitialized(EksTestNode node, Instant renewedAfter) {
+        await("serviceaccount and initialized Ready nodes with renewed Leases").atMost(Duration.ofSeconds(30))
+                .pollInterval(Duration.ofSeconds(1))
+                .until(() -> node.kubectl("--request-timeout=2s", "get", "serviceaccount", "default").exitCode() == 0
+                        && node.kubectl("--request-timeout=2s", "wait", "--for=condition=Ready", "nodes", "--all",
+                                "--timeout=1s").exitCode() == 0
+                        && leasesRenewedAfter(node, renewedAfter)
+                        && cloudProviderInitialized(node));
+    }
+
+    private static boolean cloudProviderInitialized(EksTestNode node) {
+        ContainerExec.Result result = node.kubectl("--request-timeout=2s", "get", "nodes", "-o",
+                "jsonpath={.items[*].spec.taints[?(@.key==\"node.cloudprovider.kubernetes.io/uninitialized\")].key}");
+        return result.exitCode() == 0 && result.stdout().isBlank();
     }
 
     /** Whether every node's Lease was renewed after {@code restart}. */
