@@ -50,6 +50,15 @@ public class HybridStorage<K, V> implements StorageBackend<K, V> {
     }
 
     @Override
+    public synchronized boolean persistIfCurrent(K key, V value) {
+        if (value == null || store.get(key) != value) {
+            return false;
+        }
+        dirty.set(true);
+        return true;
+    }
+
+    @Override
     public synchronized void putAllAtomically(Map<K, V> entries) {
         ConcurrentHashMap<K, V> candidate = new ConcurrentHashMap<>(store);
         candidate.putAll(Map.copyOf(entries));

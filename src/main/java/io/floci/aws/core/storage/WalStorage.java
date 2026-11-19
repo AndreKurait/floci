@@ -109,6 +109,21 @@ public class WalStorage<K, V> implements StorageBackend<K, V> {
         }
     }
 
+    @Override
+    public boolean persistIfCurrent(K key, V value) {
+        compactionLock.writeLock().lock();
+        try {
+            if (value == null || store.get(key) != value) {
+                return false;
+            }
+            commitBufferedRecord(encodePuts(Map.of(key, value)));
+            dirty = true;
+            return true;
+        } finally {
+            compactionLock.writeLock().unlock();
+        }
+    }
+
     /** Encodes every entry before publishing or appending any of the batch. */
     @Override
     public void putAll(Map<K, V> entries) {

@@ -46,6 +46,15 @@ public class PersistentStorage<K, V> implements StorageBackend<K, V> {
     }
 
     @Override
+    public synchronized boolean persistIfCurrent(K key, V value) {
+        if (value == null || store.get(key) != value) {
+            return false;
+        }
+        persistToDisk();
+        return true;
+    }
+
+    @Override
     public synchronized void putAll(Map<K, V> entries) {
         if (entries.isEmpty()) {
             return;

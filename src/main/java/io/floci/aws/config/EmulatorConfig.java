@@ -3793,6 +3793,10 @@ public interface EmulatorConfig {
         @WithDefault("false")
         boolean awsFaithfulPrivateIp();
 
+        /** Add Docker devices for supported secondary interface attachments. Default preserves record-only attachment. */
+        @WithDefault("false")
+        boolean hotAttachNetworkInterfaces();
+
         /**
          * Whether an EC2 instance's Docker container IP is routable from the machines that
          * consume Floci's API responses (Terraform, Terratest, your shell). When true,
