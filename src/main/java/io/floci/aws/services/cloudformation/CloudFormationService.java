@@ -1844,6 +1844,7 @@ public class CloudFormationService implements ResourceProvider {
     private record ChangeSetState(String status, String executionStatus) {}
 
     private record StackMutationSnapshot(String status, Instant lastUpdatedTime,
+                                         String clientRequestToken,
                                          List<StackEvent> events,
                                          Map<String, ChangeSet> changeSets,
                                          Map<ChangeSet, ChangeSetState> changeSetStates,
@@ -2181,16 +2182,19 @@ public class CloudFormationService implements ResourceProvider {
         String stackName = found.getStackName();
         List<String> skips = List.copyOf(resourcesToSkip);
         StackMutationSnapshot[] snapshot = new StackMutationSnapshot[1];
+        CompletableFuture<Void> done = new CompletableFuture<>();
         Stack stack = stacks.compute(stackKey(accountId, stackName, region), (k, existing) -> {
             if (existing == null) {
                 throw new AwsException("ValidationError", CONTINUE_STACK_MISSING.formatted(stackNameOrArn), 400);
             }
-            if (!"UPDATE_ROLLBACK_FAILED".equals(existing.getStatus())) {
+            if (!"UPDATE_ROLLBACK_FAILED".equals(existing.getStatus())
+                    || deferredDeletes.containsKey(existing.getStackId())) {
                 throw new AwsException("ValidationError", CONTINUE_ROLLBACK_REFUSED, 400);
             }
             snapshot[0] = snapshot(existing);
             existing.setClientRequestToken(clientRequestToken);
             existing.setStatus("UPDATE_ROLLBACK_IN_PROGRESS");
+            runningExecutions.put(existing.getStackId(), done);
             recordEvent(existing, existing.getStackName(), existing.getStackId(),
                     "AWS::CloudFormation::Stack", "UPDATE_ROLLBACK_IN_PROGRESS", "User Initiated");
             return existing;
@@ -2198,15 +2202,23 @@ public class CloudFormationService implements ResourceProvider {
         try {
             persistStack(stack);
             return submitOperation(() -> RequestScopes.runAs(accountId, region, () -> {
-                publishStackStatus(stack, "UPDATE_ROLLBACK_IN_PROGRESS", "User Initiated");
-                resumeUpdateRollback(stack, skips, forceRollback, region);
-            }));
-        } catch (AwsException e) {
-            if ("LimitExceededException".equals(e.getErrorCode())) {
-                Stack restored = restoreStack(accountId, stackName, region, snapshot[0]);
-                if (restored != null) {
-                    persistStack(restored);
+                try {
+                    publishStackStatus(stack, "UPDATE_ROLLBACK_IN_PROGRESS", "User Initiated");
+                    resumeUpdateRollback(stack, skips, forceRollback, region);
+                } finally {
+                    endExecution(stack, done, region, accountId);
                 }
+            }));
+        } catch (RuntimeException e) {
+            try {
+                if (e instanceof AwsException aws && "LimitExceededException".equals(aws.getErrorCode())) {
+                    Stack restored = restoreStack(accountId, stackName, region, snapshot[0]);
+                    if (restored != null) {
+                        persistStack(restored);
+                    }
+                }
+            } finally {
+                endExecution(stack, done, region, accountId);
             }
             throw e;
         }
@@ -2260,13 +2272,15 @@ public class CloudFormationService implements ResourceProvider {
             states.put(changeSet, new ChangeSetState(changeSet.getStatus(), changeSet.getExecutionStatus()));
         }
         return new StackMutationSnapshot(stack.getStatus(), stack.getLastUpdatedTime(),
-                stack.eventsSnapshot(), stack.changeSetsSnapshot(), states, stack.getStackPolicyBody());
+                stack.getClientRequestToken(), stack.eventsSnapshot(), stack.changeSetsSnapshot(), states,
+                stack.getStackPolicyBody());
     }
 
     private void restore(Stack stack, StackMutationSnapshot snapshot) {
         if (snapshot == null) {
             return;
         }
+        stack.setClientRequestToken(snapshot.clientRequestToken());
         stack.setStatus(snapshot.status());
         stack.setLastUpdatedTime(snapshot.lastUpdatedTime());
         stack.setStackPolicyBody(snapshot.stackPolicyBody());
@@ -4639,12 +4653,9 @@ public class CloudFormationService implements ResourceProvider {
             if (!failedResources.isEmpty()) {
                 String reason = "The following resource(s) failed to delete: ["
                         + String.join(", ", failedResources) + "].";
-                stack.setStatus("DELETE_FAILED");
-                stack.setStatusReason(reason);
+                // Keep retry admission closed until this operation has captured and published its token.
                 addEvent(stack, stack.getStackName(), stack.getStackId(),
                         "AWS::CloudFormation::Stack", "DELETE_FAILED", reason);
-                persistStack(stack);
-                LOG.errorv("Stack {0} delete failed: {1}", stack.getStackName(), reason);
                 throw new IllegalStateException(reason);
             }
 
@@ -4672,9 +4683,12 @@ public class CloudFormationService implements ResourceProvider {
 
         } catch (Exception e) {
             LOG.errorv("Stack {0} delete failed: {1}", stack.getStackName(), e.getMessage());
-            stack.setStatus("DELETE_FAILED");
-            stack.setStatusReason(e.getMessage());
-            persistStack(stack);
+            stacks.compute(stackKey(ownerAccount(stack), stack.getStackName(), region), (key, existing) -> {
+                stack.setStatusReason(e.getMessage());
+                stack.setStatus("DELETE_FAILED");
+                persistStack(stack);
+                return existing;
+            });
             throw (e instanceof RuntimeException re ? re : new RuntimeException(e));
         }
     }
@@ -5252,6 +5266,7 @@ public class CloudFormationService implements ResourceProvider {
             stacks.put(stackKey(accountId, childStackName, region), childStack);
         } else {
             childStack.setStatus("UPDATE_IN_PROGRESS");
+            childStack.setClientRequestToken(null);
         }
         addEvent(childStack, childStack.getStackName(), childStack.getStackId(),
                 "AWS::CloudFormation::Stack", childCreate ? "CREATE_IN_PROGRESS" : "UPDATE_IN_PROGRESS", null);
@@ -5434,6 +5449,7 @@ public class CloudFormationService implements ResourceProvider {
         StackEvent event = new StackEvent();
         event.setStackId(stack.getStackId());
         event.setStackName(stack.getStackName());
+        event.setClientRequestToken(stack.getClientRequestToken());
         event.setLogicalResourceId(logicalId);
         event.setPhysicalResourceId(physicalId);
         event.setResourceType(resourceType);

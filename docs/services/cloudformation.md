@@ -19,6 +19,18 @@ uses 3,600 seconds. Updates preserve the role's identity, and failed updates
 restore its previous duration. The limit controls new STS sessions without
 changing credentials already issued.
 
+## Stack event request tokens
+
+`DescribeStackEvents` returns the supplied `ClientRequestToken` captured when each
+stack or resource event was recorded. Later operations keep their own tokens, and
+historical event tokens survive storage reloads. This includes progress, rollback,
+and deletion events produced by the operation.
+
+`CreateChangeSet` uses a separate `ClientToken`. The existing internal
+`REVIEW_IN_PROGRESS` placeholder has no operation token. An omitted
+`ClientRequestToken` remains absent, including on legacy stored events. This
+support does not add token generation, request deduplication, or token expiry.
+
 ## Supported Actions
 
 <!-- floci:actions:start -->
