@@ -264,6 +264,7 @@ class AcmPcaIntegrationTest {
                                         .keyCertSign(false).crlSign(false).dataEncipherment(true))
                                 .extendedKeyUsage(usage -> usage.extendedKeyUsageType("CODE_SIGNING")))).build())
                 .certificateArn();
+        assertNotEquals(originalArn, overriddenArn);
         GetCertificateResponse original = owned.client.getCertificate(input -> input
                 .certificateAuthorityArn(ca).certificateArn(originalArn));
         GetCertificateResponse overridden = owned.client.getCertificate(input -> input
