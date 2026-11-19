@@ -6816,6 +6816,7 @@ public class S3Service implements Resettable, ResourceProvider {
     public void putBucketEncryption(String bucketName, String encryptionXml) {
         Bucket bucket = bucketStore.get(bucketName)
                 .orElseThrow(() -> new AwsException("NoSuchBucket", "The specified bucket does not exist.", 404));
+        S3ObjectEncryption.fromConfiguration(encryptionXml);
         bucket.setEncryptionConfiguration(encryptionXml);
         bucketStore.put(bucketName, bucket);
     }
