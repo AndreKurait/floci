@@ -138,6 +138,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     private final LambdaLayerService layerService;
     private final LaunchedContainerAwsEnv awsEnv;
     private final LambdaExecutionRoleCredentials executionRoleCredentials;
+    private final LambdaImagePullService imagePulls;
     private final LambdaFunctionStore functionStore;
     private final LambdaVpcNetworkManager vpcNetworkManager;
     /** Monotonic nanoseconds: every elapsed-time measurement in this class reads it. */
@@ -178,7 +179,6 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 executionRoleCredentials, functionStore, null);
     }
 
-    @Inject
     public ContainerLauncher(ContainerBuilder containerBuilder,
                              ContainerLifecycleManager lifecycleManager,
                              ContainerLogStreamer logStreamer,
@@ -194,7 +194,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                              LambdaVpcNetworkManager vpcNetworkManager) {
         this(containerBuilder, lifecycleManager, logStreamer, imageResolver, runtimeApiServerFactory,
                 dockerHostResolver, config, ecrRegistryManager, layerService, awsEnv,
-                executionRoleCredentials, functionStore, vpcNetworkManager, System::nanoTime);
+                executionRoleCredentials, functionStore, vpcNetworkManager, System::nanoTime, null);
     }
 
     ContainerLauncher(ContainerBuilder containerBuilder,
@@ -211,6 +211,46 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                       LambdaFunctionStore functionStore,
                       LambdaVpcNetworkManager vpcNetworkManager,
                       LongSupplier nanoTime) {
+        this(containerBuilder, lifecycleManager, logStreamer, imageResolver, runtimeApiServerFactory,
+                dockerHostResolver, config, ecrRegistryManager, layerService, awsEnv,
+                executionRoleCredentials, functionStore, vpcNetworkManager, nanoTime, null);
+    }
+
+    @Inject
+    public ContainerLauncher(ContainerBuilder containerBuilder,
+                             ContainerLifecycleManager lifecycleManager,
+                             ContainerLogStreamer logStreamer,
+                             ImageResolver imageResolver,
+                             RuntimeApiServerFactory runtimeApiServerFactory,
+                             DockerHostResolver dockerHostResolver,
+                             EmulatorConfig config,
+                             EcrRegistryManager ecrRegistryManager,
+                             LambdaLayerService layerService,
+                             LaunchedContainerAwsEnv awsEnv,
+                             LambdaExecutionRoleCredentials executionRoleCredentials,
+                             LambdaFunctionStore functionStore,
+                             LambdaVpcNetworkManager vpcNetworkManager,
+                             LambdaImagePullService imagePulls) {
+        this(containerBuilder, lifecycleManager, logStreamer, imageResolver, runtimeApiServerFactory,
+                dockerHostResolver, config, ecrRegistryManager, layerService, awsEnv,
+                executionRoleCredentials, functionStore, vpcNetworkManager, System::nanoTime, imagePulls);
+    }
+
+    ContainerLauncher(ContainerBuilder containerBuilder,
+                      ContainerLifecycleManager lifecycleManager,
+                      ContainerLogStreamer logStreamer,
+                      ImageResolver imageResolver,
+                      RuntimeApiServerFactory runtimeApiServerFactory,
+                      DockerHostResolver dockerHostResolver,
+                      EmulatorConfig config,
+                      EcrRegistryManager ecrRegistryManager,
+                      LambdaLayerService layerService,
+                      LaunchedContainerAwsEnv awsEnv,
+                      LambdaExecutionRoleCredentials executionRoleCredentials,
+                      LambdaFunctionStore functionStore,
+                      LambdaVpcNetworkManager vpcNetworkManager,
+                      LongSupplier nanoTime,
+                      LambdaImagePullService imagePulls) {
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.dnsResolver = new LambdaDnsResolver(containerBuilder, lifecycleManager, config);
@@ -226,6 +266,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         this.functionStore = functionStore;
         this.vpcNetworkManager = vpcNetworkManager;
         this.nanoTime = nanoTime;
+        this.imagePulls = imagePulls;
         this.populateSemaphore = new Semaphore(resolvePopulateConcurrency(config));
     }
 
@@ -719,6 +760,14 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         if (platform.isEmpty() && config.services().lambda().honourArchitectures()) {
             throw new IllegalStateException("Invalid persisted architectures "
                     + fn.getArchitectures() + " for function '" + fn.getFunctionName() + "'");
+        }
+        if ("Image".equals(fn.getPackageType()) && config.services().iam().enforcementEnabled()
+                && EcrRegistryManager.ecrImage(spec.image()).isPresent()) {
+            if (imagePulls == null) {
+                throw new IllegalStateException("The image-pull authorizer is unavailable");
+            }
+            return imagePulls.pull(fn, spec.image(),
+                    credentials -> lifecycleManager.create(spec, platform.orElse(null), credentials));
         }
         return platform.map(value -> lifecycleManager.create(spec, value))
                 .orElseGet(() -> lifecycleManager.create(spec));

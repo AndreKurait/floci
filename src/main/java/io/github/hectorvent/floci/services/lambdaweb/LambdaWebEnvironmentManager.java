@@ -9,6 +9,7 @@ import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.StreamType;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.ContainerTeardown;
 import io.github.hectorvent.floci.core.common.FileTrees;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
@@ -22,6 +23,7 @@ import io.github.hectorvent.floci.core.common.docker.LaunchedContainerAwsEnv;
 import io.github.hectorvent.floci.core.common.docker.RetryingTarCopier;
 import io.github.hectorvent.floci.core.common.docker.StreamingDocker;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
+import io.github.hectorvent.floci.services.ecr.registry.EcrWorkloadImagePull;
 import io.github.hectorvent.floci.services.iam.model.SessionCreds;
 import io.github.hectorvent.floci.services.lambda.launcher.ImageResolver;
 import io.github.hectorvent.floci.services.lambda.launcher.LambdaExecutionRoleCredentials;
@@ -273,6 +275,7 @@ public class LambdaWebEnvironmentManager implements ContainerTeardown {
     private final LambdaWebMetadataServer metadata;
     private final LambdaWebLogs logs;
     private final LambdaWebMetrics metrics;
+    private final EcrWorkloadImagePull imagePulls;
     private final byte[] runtime;
     /** The environments of each endpoint in each region. A list is only touched inside a map operation on its key. */
     private final ConcurrentHashMap<String, List<Environment>> pools = new ConcurrentHashMap<>();
@@ -290,7 +293,7 @@ public class LambdaWebEnvironmentManager implements ContainerTeardown {
                                        ZipExtractor zipExtractor, LaunchedContainerAwsEnv awsEnv,
                                        LambdaExecutionRoleCredentials executionRoleCredentials,
                                        LambdaWebExecutionRole executionRole, LambdaWebMetadataServer metadata,
-                                       LambdaWebLogs logs, LambdaWebMetrics metrics) {
+                                       LambdaWebLogs logs, LambdaWebMetrics metrics, EcrWorkloadImagePull imagePulls) {
         this.config = config;
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
@@ -305,9 +308,22 @@ public class LambdaWebEnvironmentManager implements ContainerTeardown {
         this.metadata = metadata;
         this.logs = logs;
         this.metrics = metrics;
+        this.imagePulls = imagePulls;
         this.runtime = runtimeScript();
         long period = Math.max(1, Math.min(30, config.services().lambda().containerIdleTimeoutSeconds() / 2 + 1));
         reaper.scheduleWithFixedDelay(this::reapIdle, period, period, TimeUnit.SECONDS);
+    }
+
+    public LambdaWebEnvironmentManager(EmulatorConfig config, ContainerBuilder containerBuilder,
+                                       ContainerLifecycleManager lifecycleManager,
+                                       DockerClient streamingDocker, ImageResolver imageResolver,
+                                       EcrRegistryManager ecrRegistryManager, LambdaWebCode code,
+                                       ZipExtractor zipExtractor, LaunchedContainerAwsEnv awsEnv,
+                                       LambdaExecutionRoleCredentials executionRoleCredentials,
+                                       LambdaWebExecutionRole executionRole, LambdaWebMetadataServer metadata,
+                                       LambdaWebLogs logs, LambdaWebMetrics metrics) {
+        this(config, containerBuilder, lifecycleManager, streamingDocker, imageResolver, ecrRegistryManager, code,
+                zipExtractor, awsEnv, executionRoleCredentials, executionRole, metadata, logs, metrics, null);
     }
 
     /**
@@ -590,7 +606,15 @@ public class LambdaWebEnvironmentManager implements ContainerTeardown {
                 .build();
         String containerId;
         try {
-            containerId = lifecycleManager.create(spec);
+            if (config.services().iam().enforcementEnabled() && EcrRegistryManager.ecrImage(image).isPresent()) {
+                if (imagePulls == null || !AwsArnUtils.parse(fn.functionArn).accountId().equals(accountId)) {
+                    throw new AwsException("AccessDeniedException", "The runtime image-pull identity is unavailable", 403);
+                }
+                containerId = imagePulls.withRolePull(image, revision.serviceConfig.executionRoleArn, fn.functionArn,
+                        credential -> lifecycleManager.create(spec, null, credential));
+            } else {
+                containerId = lifecycleManager.create(spec);
+            }
         } catch (RuntimeException e) {
             roleCredentials.ifPresent(creds -> executionRoleCredentials.unregister(accountId, creds.accessKeyId()));
             metadata.forget(metadataToken);

@@ -576,7 +576,7 @@ public class EmrServerlessJobRunService implements Resettable {
         }
         executing.add(run.getJobRunId());
         long launchedIn = generation;
-        runExecutor.execute(() -> execute(job, launchedIn));
+        runExecutor.execute(() -> execute(job.withImagePullSourceArn(app.getArn()), launchedIn));
     }
 
     private void execute(SparkJobRunner.Job job, long launchedIn) {

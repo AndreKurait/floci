@@ -97,7 +97,13 @@ public class EcrRegistryDataPlane {
         RegistryRequest selected = request.get();
         try {
             if (config.services().iam().enforcementEnabled()) {
-                EcrRegistryAuthorization.Identity identity = authorization.authenticate(context.request().getHeader("Authorization"));
+                String header = context.request().getHeader("Authorization");
+                boolean regionlessLogin = selected.region().isEmpty() && selected.repositoryName().isEmpty()
+                        && context.request().method() == HttpMethod.GET
+                        && ("/v2".equals(context.request().path()) || "/v2/".equals(context.request().path()));
+                EcrRegistryAuthorization.Identity identity = regionlessLogin
+                        ? authorization.authenticateLoginProbe(header)
+                        : authorization.authenticate(header, selected.region());
                 selected = requireRepositoryActions(context, selected, identity);
             }
         } catch (AwsException denied) {
@@ -556,6 +562,9 @@ public class EcrRegistryDataPlane {
             conditions.put("ecr:ResourceTag/" + key, List.of(value));
         });
         authorization.requirePermission(identity, action, arn, metadata.getRepositoryPolicyText(), conditions);
+        if (identity.pullScope() != null) {
+            authorization.requirePullPermissions(identity, arn, metadata.getRepositoryPolicyText(), conditions);
+        }
     }
 
     static List<String> actions(String method, String backendUri, String storageRepository) {

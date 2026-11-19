@@ -161,6 +161,7 @@ public class EcsContainerManager {
     private final EcsTaskLinkLocalAddresses linkLocalAddresses;
     private final EfsService efsService;
     private EcsHostAlias hostAlias;
+    private final EcsImagePullService imagePulls;
     // Stamped as RUN_LABEL on every container this process creates, so a sweep can tell its own apart.
     private final String runId = UUID.randomUUID().toString();
     // A sweep failure is retried before each task launch; each distinct failure is a WARN once.
@@ -188,7 +189,8 @@ public class EcsContainerManager {
                                EcsCredentialsProxy credentialsProxy,
                                EcsTaskLinkLocalAddresses linkLocalAddresses,
                                EfsService efsService,
-                               VpcNetworkManager vpcNetworks) {
+                               VpcNetworkManager vpcNetworks,
+                               EcsImagePullService imagePulls) {
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.logStreamer = logStreamer;
@@ -208,6 +210,7 @@ public class EcsContainerManager {
         this.credentialsProxy = credentialsProxy;
         this.linkLocalAddresses = linkLocalAddresses;
         this.efsService = efsService;
+        this.imagePulls = imagePulls;
         this.hostAlias = new EcsHostAlias(lifecycleManager::getDockerClient, EcsContainerManager::linuxJvm);
     }
 
@@ -232,7 +235,32 @@ public class EcsContainerManager {
         this(containerBuilder, lifecycleManager, logStreamer, containerDetector, config, regionResolver,
                 awsEnv, ssmService, secretsManagerService, s3Service, ecrRegistryManager, hostVolumePolicy,
                 ec2Service, firewallManager, taskRoleCredentials, credentialsProxy, linkLocalAddresses,
-                efsService, null);
+                efsService, null, null);
+    }
+
+    public EcsContainerManager(ContainerBuilder containerBuilder,
+                               ContainerLifecycleManager lifecycleManager,
+                               ContainerLogStreamer logStreamer,
+                               ContainerDetector containerDetector,
+                               EmulatorConfig config,
+                               RegionResolver regionResolver,
+                               LaunchedContainerAwsEnv awsEnv,
+                               SsmService ssmService,
+                               SecretsManagerService secretsManagerService,
+                               S3Service s3Service,
+                               EcrRegistryManager ecrRegistryManager,
+                               HostVolumePolicy hostVolumePolicy,
+                               Ec2Service ec2Service,
+                               SecurityGroupFirewallManager firewallManager,
+                               EcsTaskRoleCredentials taskRoleCredentials,
+                               EcsCredentialsProxy credentialsProxy,
+                               EcsTaskLinkLocalAddresses linkLocalAddresses,
+                               EfsService efsService,
+                               VpcNetworkManager vpcNetworks) {
+        this(containerBuilder, lifecycleManager, logStreamer, containerDetector, config, regionResolver,
+                awsEnv, ssmService, secretsManagerService, s3Service, ecrRegistryManager, hostVolumePolicy,
+                ec2Service, firewallManager, taskRoleCredentials, credentialsProxy, linkLocalAddresses,
+                efsService, vpcNetworks, null);
     }
 
     /** Replaces how a task's containers reach a Floci URL naming host.docker.internal. */
@@ -295,11 +323,22 @@ public class EcsContainerManager {
      */
     public EcsTaskHandle startTask(EcsTask task, TaskDefinition taskDef,
                                    List<ContainerOverride> containerOverrides, String region) {
-        return startTask(task, taskDef, containerOverrides, region, RetryingTarCopier.DEFAULT_BACKOFF_MS);
+        return startTask(task, taskDef, containerOverrides, region, null, RetryingTarCopier.DEFAULT_BACKOFF_MS);
+    }
+
+    public EcsTaskHandle startTask(EcsTask task, TaskDefinition taskDef,
+                                   List<ContainerOverride> containerOverrides, String region, String containerInstanceId) {
+        return startTask(task, taskDef, containerOverrides, region, containerInstanceId, RetryingTarCopier.DEFAULT_BACKOFF_MS);
     }
 
     EcsTaskHandle startTask(EcsTask task, TaskDefinition taskDef,
                             List<ContainerOverride> containerOverrides, String region, long firelensBackoffMillis) {
+        return startTask(task, taskDef, containerOverrides, region, null, firelensBackoffMillis);
+    }
+
+    private EcsTaskHandle startTask(EcsTask task, TaskDefinition taskDef,
+                                   List<ContainerOverride> containerOverrides, String region,
+                                   String containerInstanceId, long firelensBackoffMillis) {
         if (!config.services().ecs().allowPrivilegedContainers()
                 && taskDef.getContainerDefinitions().stream()
                         .anyMatch(def -> Boolean.TRUE.equals(def.getPrivileged()))) {
@@ -391,8 +430,8 @@ public class EcsContainerManager {
             // created from the image id its pull resolved to, so a concurrent launch that moves the
             // tag again cannot swap the image under this task's reported digest.
             for (ContainerDefinition def : launchOrder) {
-                LaunchImage launchImage = lifecycleManager.resolveImageForLaunch(imagesByContainer.get(def),
-                        config.services().ecs().imagePullBehavior(), platform);
+                LaunchImage launchImage = resolveTaskImage(task, taskDef, containerInstanceId,
+                        imagesByContainer.get(def), platform);
                 imagesByContainer.put(def, launchImage.imageId());
                 if (launchImage.manifestDigest() != null) {
                     imageDigestsByContainer.put(def.getName(), launchImage.manifestDigest());
@@ -755,6 +794,19 @@ public class EcsContainerManager {
                 firelensVolumeName,
                 protectedNetwork == null ? null : protectedNetwork.eni().getNetworkInterfaceId(), region,
                 stopTimeouts, taskVolumeNames);
+    }
+
+    private LaunchImage resolveTaskImage(EcsTask task, TaskDefinition definition, String containerInstanceId,
+                                         String image, String platform) {
+        if (EcrRegistryManager.ecrImage(image).isEmpty() || !config.services().iam().enforcementEnabled()) {
+            return lifecycleManager.resolveImageForLaunch(image, config.services().ecs().imagePullBehavior(), platform);
+        }
+        if (imagePulls == null) {
+            throw new AwsException("ResourceInitializationError", "The image-pull authorizer is unavailable.", 400);
+        }
+        return imagePulls.pull(task, definition, containerInstanceId, image, credentials ->
+                lifecycleManager.resolveImageForLaunch(image,
+                        config.services().ecs().imagePullBehavior(), platform, credentials));
     }
 
     private String taskVolumeName(EcsTask task, Volume volume) {

@@ -1,8 +1,10 @@
 package io.github.hectorvent.floci.services.ecs.container;
 
 import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.AuthConfig;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.EmulatorConfig.EcsServiceConfig.ImagePullBehavior;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
@@ -26,6 +28,7 @@ import org.mockito.InOrder;
 
 import java.util.List;
 import java.util.Map;
+import java.util.function.Function;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -36,6 +39,8 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.RETURNS_SELF;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -58,6 +63,7 @@ class EcsContainerManagerImagePullTest {
     private ContainerBuilder containerBuilder;
     private ContainerLifecycleManager lifecycleManager;
     private EcsContainerManager manager;
+    private EmulatorConfig config;
 
     @BeforeEach
     void setUp() {
@@ -69,7 +75,7 @@ class EcsContainerManagerImagePullTest {
         lifecycleManager = mock(ContainerLifecycleManager.class);
         when(lifecycleManager.createAndStartEphemeral(any(), any())).thenReturn(new ContainerInfo("docker-id", Map.of()));
 
-        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.services().ecs().imagePullBehavior()).thenReturn(ImagePullBehavior.ALWAYS);
         LaunchedContainerAwsEnv awsEnv = mock(LaunchedContainerAwsEnv.class);
         when(awsEnv.sdkBaselineEnv(any(), any())).thenReturn(List.of());
@@ -170,6 +176,60 @@ class EcsContainerManagerImagePullTest {
 
         verify(lifecycleManager, times(2)).resolveImageForLaunch(anyString(), any(), isNull());
         verify(lifecycleManager, times(2)).createAndStartEphemeral(any(), isNull());
+    }
+
+    @Test
+    void enforcedEcrRoleDenialDoesNotFallBackToUncredentialedPullOrCreateAnyContainer() {
+        when(config.services().iam().enforcementEnabled()).thenReturn(true);
+        EcsImagePullService imagePulls = mock(EcsImagePullService.class);
+        doThrow(new AwsException("DENIED", "Image pull denied", 403)).when(imagePulls)
+                .pull(any(), any(), any(), anyString(), any());
+        manager = authorizedManager(imagePulls);
+        TaskDefinition definition = taskDefinition();
+        definition.getContainerDefinitions().getFirst().setImage(
+                "111111111111.dkr.ecr.us-east-1.amazonaws.com/image:latest");
+
+        assertThrows(AwsException.class, () -> manager.startTask(task(), definition, List.of(), "us-east-1"));
+
+        verify(lifecycleManager, never()).resolveImageForLaunch(anyString(), any(), any());
+        verify(lifecycleManager, never()).createAndStartEphemeral(any(), any());
+    }
+
+    @Test
+    void nativeEcrPullReceivesTheResolvedContainerInstanceAndPerPullCredential() {
+        when(config.services().iam().enforcementEnabled()).thenReturn(true);
+        EcsImagePullService imagePulls = mock(EcsImagePullService.class);
+        String image = "111111111111.dkr.ecr.us-east-1.amazonaws.com/image:latest";
+        AuthConfig credentials = new AuthConfig().withRegistryAddress("111111111111.dkr.ecr.us-east-1.amazonaws.com")
+                .withUsername("AWS").withPassword("per-pull");
+        doAnswer(invocation -> {
+            Function<AuthConfig, LaunchImage> operation = invocation.getArgument(4);
+            return operation.apply(credentials);
+        }).when(imagePulls).pull(any(), any(), eq("i-owned"), eq(image), any());
+        when(lifecycleManager.resolveImageForLaunch(image, ImagePullBehavior.ALWAYS, null, credentials))
+                .thenReturn(new LaunchImage(APP_IMAGE_ID, "sha256:new-manifest"));
+        when(lifecycleManager.resolveImageForLaunch(SIDECAR_IMAGE, ImagePullBehavior.ALWAYS, null))
+                .thenReturn(new LaunchImage(SIDECAR_IMAGE_ID, null));
+        manager = authorizedManager(imagePulls);
+        TaskDefinition definition = taskDefinition();
+        definition.getContainerDefinitions().getFirst().setImage(image);
+
+        manager.startTask(task(), definition, List.of(), "us-east-1", "i-owned");
+
+        verify(lifecycleManager, never()).resolveImageForLaunch(image, ImagePullBehavior.ALWAYS, null);
+        verify(lifecycleManager).resolveImageForLaunch(image, ImagePullBehavior.ALWAYS, null, credentials);
+        verify(containerBuilder).newContainer(APP_IMAGE_ID);
+    }
+
+    private EcsContainerManager authorizedManager(EcsImagePullService imagePulls) {
+        LaunchedContainerAwsEnv awsEnv = mock(LaunchedContainerAwsEnv.class);
+        when(awsEnv.sdkBaselineEnv(any(), any())).thenReturn(List.of());
+        EcrRegistryManager registry = mock(EcrRegistryManager.class);
+        when(registry.rewriteImageUri(anyString())).thenAnswer(invocation -> invocation.getArgument(0));
+        return new EcsContainerManager(containerBuilder, lifecycleManager, mock(ContainerLogStreamer.class),
+                mock(ContainerDetector.class), config, mock(RegionResolver.class), awsEnv,
+                mock(SsmService.class), mock(SecretsManagerService.class), mock(S3Service.class), registry,
+                mock(HostVolumePolicy.class), null, null, null, null, null, null, null, imagePulls);
     }
 
     private static TaskDefinition taskDefinition() {

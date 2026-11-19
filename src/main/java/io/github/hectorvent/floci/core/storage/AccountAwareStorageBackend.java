@@ -70,6 +70,14 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
         return new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, defaultAccountId);
     }
 
+    /** Reads the explicit account or its default-account legacy entry without migrating it. */
+    public static <V> Optional<V> readInAccount(StorageBackend<String, V> store, String accountId, String key) {
+        if (accountId != null && store instanceof AccountAwareStorageBackend<V> aware) {
+            return aware.getForAccount(accountId, key).or(() -> aware.getLegacyForAccount(accountId, key));
+        }
+        return store.get(key);
+    }
+
     @Override
     public boolean persistIfCurrent(String key, V value) {
         return persistIfCurrentForAccount(prefix(), key, value);
