@@ -150,7 +150,7 @@ public class CloudWatchMetricsService {
                 datum.setTimestamp(nowSeconds);
             }
             // Synthesize StatisticValues if only a scalar value was provided
-            if (datum.getSampleCount() == 0 && datum.getSum() == 0) {
+            if (!datum.hasSampleCount() && datum.getSum() == 0) {
                 datum.setSampleCount(1);
                 datum.setSum(datum.getValue());
                 datum.setMinimum(datum.getValue());
@@ -596,6 +596,19 @@ public class CloudWatchMetricsService {
             return Optional.of(alarm);
         }
         return Optional.empty();
+    }
+
+    public record OwnedAlarm(String accountId, MetricAlarm alarm) {}
+
+    /** Background evaluation must retain the stored owner instead of using the default account. */
+    public List<OwnedAlarm> allOwnedAlarms() {
+        if (alarmStore instanceof AccountAwareStorageBackend<Alarm> aware) {
+            return aware.scanAllAccountEntries(ignored -> true).stream()
+                    .filter(entry -> entry.value() instanceof MetricAlarm)
+                    .map(entry -> new OwnedAlarm(entry.accountId(), (MetricAlarm) entry.value())).toList();
+        }
+        return allAlarms().stream()
+                .map(alarm -> new OwnedAlarm(regionResolver.getAccountId(), alarm)).toList();
     }
 
     public List<MetricAlarm> describeAlarms(List<String> names, String prefix, String region) {
