@@ -8,16 +8,20 @@ import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.DockerObjectAccessor;
 import com.github.dockerjava.api.model.Network;
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.core.common.StripedLocks;
 import io.github.hectorvent.floci.core.common.docker.ContainerExec;
 import io.github.hectorvent.floci.core.common.docker.ContainerStorageHelper;
 
 import java.io.IOException;
 import java.net.InetAddress;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.OptionalInt;
+import java.util.Set;
 import java.util.regex.Pattern;
 
 /** Assigns native IPv4 addresses inside owned helpers, outside Docker's global IPv4 IPAM. */
@@ -123,10 +127,9 @@ final class NativeVpcAddressSpace {
                     throw new IllegalStateException("The attached interface's device did not take its MAC");
                 }
             }
-            int table = routeTable(links, device);
             boolean mainRoute = mainRouteFree(
                     parse(run(docker, helper, "ip", "-j", "-4", "route", "show", "table", "main")), vpc, device);
-            run(docker, helper, "sh", "-c", attachedCommands(device, address, subnet, vpc, table, mainRoute));
+            configureAttached(docker, helper, device, address, subnet, vpc, mainRoute);
             verifyAddress(parse(run(docker, helper, "ip", "-j", "address", "show", "dev", device)),
                     address, subnet.prefix());
             return device;
@@ -154,10 +157,9 @@ final class NativeVpcAddressSpace {
         }
         JsonNode links = parse(run(docker, helper, "ip", "-j", "link"));
         String device = deviceFor(links, macAddress);
-        int table = routeTable(links, device);
         boolean mainRoute = mainRouteFree(
                 parse(run(docker, helper, "ip", "-j", "-4", "route", "show", "table", "main")), vpc, device);
-        run(docker, helper, "sh", "-c", attachedCommands(device, address, subnet, vpc, table, mainRoute));
+        configureAttached(docker, helper, device, address, subnet, vpc, mainRoute);
         verifyAddress(parse(run(docker, helper, "ip", "-j", "address", "show", "dev", device)), address, subnet.prefix());
         return Optional.of(device);
     }
@@ -173,18 +175,60 @@ final class NativeVpcAddressSpace {
         }
         JsonNode links = parse(run(docker, helper, "ip", "-j", "link"));
         String device = deviceFor(links, macAddress);
-        run(docker, helper, "sh", "-c", detachedCommands(device, address, routeTable(links, device)));
+        synchronized (NAMESPACES.lockFor(helper)) {
+            OptionalInt table = heldRouteTable(parse(run(docker, helper, "ip", "-j", "-4", "rule", "show")), address);
+            if (table.isPresent()) {
+                run(docker, helper, "sh", "-c", detachedCommands(device, address, table.getAsInt()));
+            }
+        }
         docker.disconnectFromNetworkCmd().withContainerId(helper).withNetworkId(network).withForce(true).exec();
     }
 
-    /** The attached device's own route table and rule priority: above every table the kernel names. */
-    static int routeTable(JsonNode links, String device) {
-        for (JsonNode link : links) {
-            if (device.equals(link.path("ifname").asText()) && link.path("ifindex").canConvertToInt()) {
-                return ATTACHED_TABLE_BASE + link.path("ifindex").asInt();
+    /** Serializes choosing and claiming a route table, so two devices of one namespace never share one. */
+    private static final StripedLocks NAMESPACES = new StripedLocks(64);
+
+    private static void configureAttached(DockerClient docker, String helper, String device, String address,
+                                          Cidr4 subnet, Cidr4 vpc, boolean mainRoute) {
+        synchronized (NAMESPACES.lockFor(helper)) {
+            int table = routeTable(parse(run(docker, helper, "ip", "-j", "-4", "rule", "show")), address);
+            run(docker, helper, "sh", "-c", attachedCommands(device, address, subnet, vpc, table, mainRoute));
+        }
+    }
+
+    /**
+     * The attached address's own route table and rule priority: the one its source rule already names, else the
+     * lowest one no rule of the namespace holds. All of them are above every table the kernel names and ahead of
+     * its main rule, so the address's rule is consulted first, and detach frees the table. The device's interface
+     * index plays no part: on a host whose containers have come and gone it passes any fixed bound.
+     */
+    static int routeTable(JsonNode rules, String address) {
+        OptionalInt held = heldRouteTable(rules, address);
+        if (held.isPresent()) {
+            return held.getAsInt();
+        }
+        Set<Integer> taken = new HashSet<>();
+        for (JsonNode rule : rules) {
+            taken.add(rule.path("priority").asInt());
+        }
+        for (int table = ATTACHED_TABLE_BASE + 1; table <= ATTACHED_TABLE_LAST; table++) {
+            if (!taken.contains(table)) {
+                return table;
             }
         }
-        throw new IllegalStateException("Cannot identify the attached interface's index");
+        throw new IllegalStateException("Every route table for attached interfaces is in use in the namespace");
+    }
+
+    /** The table of the address's source rule, which attach or a restore left; empty when it has none. */
+    static OptionalInt heldRouteTable(JsonNode rules, String address) {
+        for (JsonNode rule : rules) {
+            int priority = rule.path("priority").asInt();
+            if (priority > ATTACHED_TABLE_BASE && priority <= ATTACHED_TABLE_LAST
+                    && rule.path("src").asText().equals(address) && rule.path("srclen").asInt(32) == 32
+                    && rule.path("table").asText().equals(Integer.toString(priority))) {
+                return OptionalInt.of(priority);
+            }
+        }
+        return OptionalInt.empty();
     }
 
     private static final Pattern MAC = Pattern.compile("(?:[0-9a-f]{2}:){5}[0-9a-f]{2}");
@@ -204,6 +248,8 @@ final class NativeVpcAddressSpace {
     }
 
     static final int ATTACHED_TABLE_BASE = 10_000;
+    /** The last attached table: one below the kernel's main rule (32766), which a source rule must come before. */
+    static final int ATTACHED_TABLE_LAST = 32_765;
 
     /**
      * Whether the device's VPC range may also go in the main table: no route through any other device overlaps
@@ -231,7 +277,7 @@ final class NativeVpcAddressSpace {
         if (!vpc.contains(subnet) || !subnet.contains(host)) {
             throw new IllegalArgumentException("The native address must be inside its subnet and VPC");
         }
-        if (table <= ATTACHED_TABLE_BASE || table > ATTACHED_TABLE_BASE + 65_535) {
+        if (table <= ATTACHED_TABLE_BASE || table > ATTACHED_TABLE_LAST) {
             throw new IllegalArgumentException("The attached interface needs its own route table");
         }
         return """
