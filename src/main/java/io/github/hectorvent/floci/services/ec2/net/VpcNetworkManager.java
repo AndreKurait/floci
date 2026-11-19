@@ -698,7 +698,7 @@ public class VpcNetworkManager {
         }
         if (!macAddress.equalsIgnoreCase(String.valueOf(endpoint.getMacAddress()))) {
             try {
-                giveDeviceItsMac(containerId, endpoint.getMacAddress(), macAddress);
+                giveDeviceItsMac(containerId, endpoint.getMacAddress(), macAddress, address);
             } catch (RuntimeException failure) {
                 disconnect(networkName, containerId);
                 throw new IllegalStateException("Container " + containerId + " could not give the attached device "
@@ -733,7 +733,7 @@ public class VpcNetworkManager {
     }
 
     /** Sets the device Docker created (found by Docker's MAC) to the interface's MAC, and reads it back. */
-    private void giveDeviceItsMac(String containerId, String dockerMac, String macAddress) {
+    private void giveDeviceItsMac(String containerId, String dockerMac, String macAddress, String address) {
         String mac = macAddress.toLowerCase(Locale.ROOT);
         if (!UNICAST_MAC.matcher(mac).matches()) {
             throw new IllegalArgumentException("Expected a unicast MAC address");
@@ -746,6 +746,12 @@ public class VpcNetworkManager {
                 + device + " address " + mac + " && ip link set dev " + device + " up");
         if (!device.equals(NativeVpcAddressSpace.deviceFor(links(containerId), mac))) {
             throw new IllegalStateException("The attached device did not take the interface's MAC");
+        }
+        try {
+            runInNamespace(containerId, "arping", "-U", "-c", "1", "-w", "1", "-I", device, address);
+        } catch (RuntimeException failure) {
+            LOG.warnv(failure, "Could not announce the corrected MAC for {0} in container {1}; "
+                    + "peer neighbor caches may retain the previous MAC until they expire", address, containerId);
         }
     }
 
@@ -779,7 +785,7 @@ public class VpcNetworkManager {
                 return;
             }
         }
-        giveDeviceItsMac(containerId, endpoint.getMacAddress(), macAddress);
+        giveDeviceItsMac(containerId, endpoint.getMacAddress(), macAddress, address);
     }
 
     private boolean existingSharedNetworkBelongsTo(VpcBinding vpc) {

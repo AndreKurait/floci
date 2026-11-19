@@ -26,7 +26,6 @@ import io.github.hectorvent.floci.services.ec2.net.Cidr4;
 import io.github.hectorvent.floci.services.ec2.net.VpcNetworkManager;
 import io.github.hectorvent.floci.services.ec2.portforward.Ec2PortForwardManager;
 import io.github.hectorvent.floci.testing.DockerAvailability;
-import io.github.hectorvent.floci.testing.TestImages;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
@@ -141,7 +140,8 @@ class Ec2HotAttachedRestartDockerIntegrationTest {
             assertTrue(addressFound, device.toString());
             String peer = namespace + "-peer";
             containers.add(peer);
-            lifecycle.createAndStart(builder.newContainer(TestImages.BUSYBOX).withName(peer).withNetworkMode(network)
+            lifecycle.createAndStart(builder.newContainer(helperImage).withName(peer).withNetworkMode(network)
+                    .withCapAdd("NET_ADMIN")
                     .withLabels(Map.of(OWNER_LABEL, namespace)).withCmd(List.of("sleep", "120")).build());
             assertEquals(0L, ContainerExec.run(docker, peer, new String[]{"ping", "-c", "1", "-W", "2", address}, 5)
                     .throwIfTimedOut(peer).exitCode());
@@ -161,7 +161,7 @@ class Ec2HotAttachedRestartDockerIntegrationTest {
             assertEquals(originalDefaultRoute, run(guest, "ip", "-4", "route", "show", "default"));
             docker.stopContainerCmd(guest).withTimeout(1).exec();
             docker.startContainerCmd(guest).exec();
-            recreateAttachedEndpoint(guest, network, address);
+            recreateAttachedEndpoint(guest, network, address, peer);
             assertFalse(run(guest, "ip", "-j", "link").contains(MAC));
             ObjectMapper mapper = new ObjectMapper();
             InstanceNetworkInterface restored = mapper.readValue(mapper.writeValueAsBytes(eni),
@@ -181,7 +181,7 @@ class Ec2HotAttachedRestartDockerIntegrationTest {
                     .throwIfTimedOut(peer).exitCode());
             docker.stopContainerCmd(guest).withTimeout(1).exec();
             docker.startContainerCmd(guest).exec();
-            recreateAttachedEndpoint(guest, network, address);
+            recreateAttachedEndpoint(guest, network, address, peer);
             VpcNetworkManager recoveredNetworks = new VpcNetworkManager(config, docker, resolver);
             recoveredNetworks.declareVpc(REGION, "vpc-attached", cidr.toString());
             recoveredNetworks.declareSubnet(REGION, "vpc-attached", "subnet-attached", cidr.toString());
@@ -229,7 +229,7 @@ class Ec2HotAttachedRestartDockerIntegrationTest {
         }
     }
 
-    private void recreateAttachedEndpoint(String guest, String network, String address) {
+    private void recreateAttachedEndpoint(String guest, String network, String address, String peer) {
         docker.disconnectFromNetworkCmd().withContainerId(guest).withNetworkId(network).exec();
         docker.connectToNetworkCmd().withContainerId(guest).withNetworkId(network)
                 .withContainerNetwork(new ContainerNetwork()
@@ -237,6 +237,12 @@ class Ec2HotAttachedRestartDockerIntegrationTest {
                         .withMacAddress("02:66:77:88:99:aa"))
                 .exec();
         assertFalse(run(guest, "ip", "-j", "link").contains(MAC));
+        run(peer, "ip", "neigh", "flush", "to", address);
+        run(peer, "ping", "-c", "1", "-W", "2", address);
+        String temporaryMac = docker.inspectContainerCmd(guest).exec().getNetworkSettings()
+                .getNetworks().get(network).getMacAddress();
+        String neighbor = run(peer, "ip", "neigh", "show", "to", address);
+        assertTrue(neighbor.contains(temporaryMac), neighbor);
     }
 
     private Ec2ContainerManager runtime(EmulatorConfig config, VpcNetworkManager manager) {
