@@ -1,8 +1,11 @@
 package io.floci.aws.services.cloudformation.provisioners;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.floci.aws.core.common.AwsException;
 import io.floci.aws.services.cloudformation.model.StackResource;
 import io.floci.aws.services.cloudwatch.metrics.CloudWatchMetricsService;
+import io.floci.aws.services.cloudwatch.metrics.model.AlarmMetricDataQuery;
 import io.floci.aws.services.cloudwatch.metrics.model.Dimension;
 import io.floci.aws.services.cloudwatch.metrics.model.MetricAlarm;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -18,6 +21,7 @@ public class CloudWatchCfnProvisioner implements CfnResourceProvisioner {
     private static final int ALARM_NAME_MAX_LENGTH = 255;
     private static final int DEFAULT_PERIOD_SECONDS = 60;
     private static final int DEFAULT_EVALUATION_PERIODS = 1;
+    private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final CloudWatchMetricsService cloudWatchMetricsService;
 
@@ -41,9 +45,25 @@ public class CloudWatchCfnProvisioner implements CfnResourceProvisioner {
         alarm.setMetricName(ctx.resolveOptional(props, "MetricName"));
         alarm.setNamespace(ctx.resolveOptional(props, "Namespace"));
         alarm.setStatistic(ctx.resolveOptional(props, "Statistic"));
+        alarm.setExtendedStatistic(ctx.resolveOptional(props, "ExtendedStatistic"));
+        alarm.setEvaluateLowSampleCountPercentile(ctx.resolveOptional(props, "EvaluateLowSampleCountPercentile"));
+        if (alarm.getExtendedStatistic() != null && props.hasNonNull("Metrics")) {
+            throw new AwsException("InvalidParameterCombination",
+                    "ExtendedStatistic cannot be combined with Metrics.", 400);
+        }
+        if (props.hasNonNull("Metrics")) {
+            JsonNode queries = ctx.engine().resolveNode(props.get("Metrics"));
+            if (!queries.isArray() || queries.isEmpty()) {
+                throw new AwsException("InvalidParameterValue", "Metrics must be a nonempty list.", 400);
+            }
+            for (JsonNode query : queries) {
+                alarm.getMetrics().add(MAPPER.convertValue(query, AlarmMetricDataQuery.class));
+            }
+        }
         alarm.setUnit(ctx.resolveOptional(props, "Unit"));
         alarm.setComparisonOperator(ctx.resolveOptional(props, "ComparisonOperator"));
-        alarm.setPeriod(parseIntProp(props, "Period", ctx, DEFAULT_PERIOD_SECONDS));
+        alarm.setPeriod(alarm.getMetrics().isEmpty()
+                ? parseIntProp(props, "Period", ctx, DEFAULT_PERIOD_SECONDS) : null);
         alarm.setEvaluationPeriods(parseIntProp(props, "EvaluationPeriods", ctx, DEFAULT_EVALUATION_PERIODS));
         // Left null when the template omits it, for the same reason the request handlers do: an
         // alarm that never carried an M must not report one back through DescribeAlarms.
