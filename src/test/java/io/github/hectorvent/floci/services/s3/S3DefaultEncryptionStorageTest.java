@@ -12,9 +12,12 @@ import io.github.hectorvent.floci.services.kms.KmsService;
 import io.github.hectorvent.floci.services.s3.model.S3Object;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -41,15 +44,53 @@ class S3DefaultEncryptionStorageTest {
     Path directory;
 
     @ParameterizedTest
+    @MethodSource("streamVariants")
+    void objectStreamsReturnPlaintextForEveryVersionForm(String mode, String versionForm, boolean encrypted)
+            throws IOException {
+        EmulatorConfig config = storageConfig(mode);
+        ServiceConfigAccess access = mock(ServiceConfigAccess.class);
+        when(access.storageMode(anyString())).thenReturn(mode);
+        when(access.storageFlushInterval(anyString())).thenReturn(3_600_000L);
+        StorageFactory factory = new StorageFactory(config, access);
+        try {
+            S3Service service = service(factory, config);
+            service.createBucket(BUCKET, "us-east-1");
+            if (encrypted) {
+                String keyArn = new KmsService(factory, new RegionResolver("us-east-1", "000000000000"))
+                        .createKey("stream wrapping key", "us-east-1").getArn();
+                service.putBucketEncryption(BUCKET, kmsDefault(keyArn));
+            }
+            if (!"null".equals(versionForm)) {
+                service.putBucketVersioning(BUCKET, "Enabled");
+            }
+            S3Object original = service.putObject(BUCKET, "stream", DATA, "text/plain", Map.of());
+            byte[] replacement = "replacement inventory".getBytes(StandardCharsets.UTF_8);
+            service.putObject(BUCKET, "stream", replacement, "text/plain", Map.of());
+            String versionId = switch (versionForm) {
+                case "version" -> original.getVersionId();
+                case "null" -> "null";
+                default -> null;
+            };
+            byte[] expected = "version".equals(versionForm) ? DATA : replacement;
+            try (InputStream stream = service.openObjectStream(BUCKET, "stream", versionId)) {
+                assertArrayEquals(expected, stream.readAllBytes());
+            }
+        } finally {
+            factory.shutdownAll();
+        }
+    }
+
+    private static Stream<Arguments> streamVariants() {
+        return Stream.of("memory", "persistent", "hybrid", "wal")
+                .flatMap(mode -> Stream.of("current", "null", "version")
+                        .flatMap(version -> Stream.of(false, true)
+                                .map(encrypted -> Arguments.of(mode, version, encrypted))));
+    }
+
+    @ParameterizedTest
     @ValueSource(strings = {"memory", "persistent", "hybrid", "wal"})
     void defaultsAndObjectMetadataFollowTheStorageLifetime(String mode) throws IOException {
-        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
-        when(config.defaultAccountId()).thenReturn("000000000000");
-        when(config.storage().persistentPath()).thenReturn(directory.toString());
-        when(config.storage().mode()).thenReturn(mode);
-        when(config.storage().services().s3().mode()).thenReturn(Optional.of(mode));
-        when(config.storage().wal().compactionIntervalMs()).thenReturn(3_600_000L);
-        when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
+        EmulatorConfig config = storageConfig(mode);
         ServiceConfigAccess access = mock(ServiceConfigAccess.class);
         when(access.storageMode(anyString())).thenReturn(mode);
         when(access.storageFlushInterval(anyString())).thenReturn(3_600_000L);
@@ -61,14 +102,7 @@ class S3DefaultEncryptionStorageTest {
                     .createKey("persistent wrapping key", "us-east-1").getArn();
             S3Service service = service(first, config);
             service.createBucket(BUCKET, "us-east-1");
-            service.putBucketEncryption(BUCKET, """
-                    <ServerSideEncryptionConfiguration><Rule>
-                        <ApplyServerSideEncryptionByDefault>
-                            <SSEAlgorithm>aws:kms</SSEAlgorithm>
-                            <KMSMasterKeyID>%s</KMSMasterKeyID>
-                        </ApplyServerSideEncryptionByDefault>
-                    </Rule></ServerSideEncryptionConfiguration>
-                    """.formatted(keyArn));
+            service.putBucketEncryption(BUCKET, kmsDefault(keyArn));
             S3Object object = service.putObject(BUCKET, "before", DATA, "text/plain", Map.of());
             assertEquals("aws:kms", object.getServerSideEncryption());
             assertEquals(keyArn, object.getSseKmsKeyId());
@@ -104,6 +138,26 @@ class S3DefaultEncryptionStorageTest {
         } finally {
             second.shutdownAll();
         }
+    }
+
+    private EmulatorConfig storageConfig(String mode) {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.defaultAccountId()).thenReturn("000000000000");
+        when(config.storage().persistentPath()).thenReturn(directory.toString());
+        when(config.storage().mode()).thenReturn(mode);
+        when(config.storage().services().s3().mode()).thenReturn(Optional.of(mode));
+        when(config.storage().wal().compactionIntervalMs()).thenReturn(3_600_000L);
+        when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
+        return config;
+    }
+
+    private static String kmsDefault(String keyArn) {
+        return """
+                <ServerSideEncryptionConfiguration><Rule><ApplyServerSideEncryptionByDefault>
+                    <SSEAlgorithm>aws:kms</SSEAlgorithm>
+                    <KMSMasterKeyID>%s</KMSMasterKeyID>
+                </ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>
+                """.formatted(keyArn);
     }
 
     private static S3Service service(StorageFactory factory, EmulatorConfig config) {

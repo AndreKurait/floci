@@ -2504,31 +2504,7 @@ public class S3Service implements Resettable, ResourceProvider {
     }
 
     public InputStream openObjectStream(String bucketName, String key, String versionId) {
-        if ("null".equals(versionId)) {
-            return openObject(bucketName, key, versionId).body();
-        }
-        getObjectMetadata(bucketName, key, versionId);
-        String bucketOwnerAccount = resolveBucketEntry(bucketName)
-                .orElseThrow(() -> new AwsException("NoSuchBucket",
-                        "The specified bucket does not exist.", 404))
-                .account();
-        if (inMemory) {
-            byte[] data = versionId != null
-                    ? memoryDataStore.get(physicalVersionedKey(bucketOwnerAccount, bucketName, key, versionId))
-                    : memoryDataStore.get(physicalKey(bucketOwnerAccount, bucketName, key));
-            if (data == null) {
-                throw new IllegalStateException("S3 object data is missing for " + bucketName + "/" + key);
-            }
-            return new ByteArrayInputStream(data);
-        }
-        try {
-            Path path = versionId != null
-                    ? resolveVersionedPathForRead(bucketOwnerAccount, bucketName, key, versionId)
-                    : resolveObjectPathForRead(bucketOwnerAccount, bucketName, key);
-            return Files.newInputStream(path);
-        } catch (IOException e) {
-            throw new UncheckedIOException("Failed to open S3 object stream", e);
-        }
+        return openObject(bucketName, key, versionId).body();
     }
 
     public S3Object getObjectMetadata(String bucketName, String key, String versionId) {
