@@ -1576,6 +1576,8 @@ public class Ec2ContainerManager {
                     if (vpcNetworkManager.attachInterface(instance.getRegion(), eni.getVpcId(), eni.getSubnetId(),
                             helper, eni.getPrivateIpAddress(), eni.getMacAddress()).isEmpty()) {
                         reason = "its address is not on a VPC network Floci created";
+                    } else {
+                        eni.setSharedNetworkContainerId(helper);
                     }
                 }
             } catch (RuntimeException failure) {
@@ -1604,7 +1606,8 @@ public class Ec2ContainerManager {
                 vpcNetworkManager.detachInterfaceAcrossAddressSpaces(instance.getRegion(), eni.getVpcId(), helper,
                         eni.getPrivateIpAddress(), eni.getMacAddress(), interfaceAccount(instance, eni));
             } else {
-                vpcNetworkManager.detachInterface(instance.getRegion(), eni.getVpcId(), networkContainerOf(instance));
+                vpcNetworkManager.detachInterface(instance.getRegion(), eni.getVpcId(), networkContainerOf(instance),
+                        eni.getPrivateIpAddress(), eni.getMacAddress());
             }
         } catch (RuntimeException failure) {
             LOG.warnv("Could not unplug interface {0} from EC2 instance {1}: {2}",
@@ -1762,6 +1765,28 @@ public class Ec2ContainerManager {
         return owner != null ? owner : instance.getDockerContainerId();
     }
 
+    private void restoreSharedNetworkInterfaces(Instance instance) {
+        if (vpcNetworkManager == null || vpcNetworkManager.isolatesAddressSpaces()) {
+            return;
+        }
+        for (InstanceNetworkInterface eni : List.copyOf(instance.getNetworkInterfaces())) {
+            if (eni.getDeviceIndex() < 1 || eni.getSharedNetworkContainerId() == null
+                    || hotAttachBlocker(instance, eni) != null) {
+                continue;
+            }
+            try {
+                String owner = networkContainerOf(instance);
+                if (eni.getSharedNetworkContainerId().equals(owner)) {
+                    vpcNetworkManager.restoreInterface(instance.getRegion(), eni.getVpcId(), owner,
+                            eni.getPrivateIpAddress(), eni.getMacAddress());
+                }
+            } catch (RuntimeException failure) {
+                LOG.warnv(failure, "Could not restore interface {0} of EC2 instance {1}",
+                        eni.getNetworkInterfaceId(), instance.getInstanceId());
+            }
+        }
+    }
+
     /** Serves the instance's current record from IMDS after its network interfaces change. */
     public void refreshInstanceMetadata(Instance instance) {
         if (metadataServer != null) {
@@ -1894,6 +1919,7 @@ public class Ec2ContainerManager {
      */
     private boolean refreshStartedContainerAddresses(Instance instance, String containerId,
                                                      ProtectedNamespace namespace) throws InterruptedException {
+        restoreSharedNetworkInterfaces(instance);
         String instanceId = instance.getInstanceId();
         // A protected workload shares the helper's namespace, so it has no Docker network
         // attachment of its own to rediscover: the helper keeps its private address
@@ -2124,6 +2150,9 @@ public class Ec2ContainerManager {
         metadataServer.registerContainer(containerIp, instance.getInstanceId(), instance);
         refreshImdsSourceRegistration(instance, networkContainer, containerIp);
         refreshMetadataAddresses(instance, networkContainer);
+        if (running) {
+            restoreSharedNetworkInterfaces(instance);
+        }
         if (namespace != null) {
             preparePublicAddressRouting(networkContainer, instance);
         }

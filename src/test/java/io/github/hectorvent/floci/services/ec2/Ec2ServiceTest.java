@@ -15,6 +15,7 @@ import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.PaginatedResult;
 import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.RequestContext;
+import io.github.hectorvent.floci.core.common.ServiceConfigAccess;
 import io.github.hectorvent.floci.core.common.docker.ContainerBuilder;
 import io.github.hectorvent.floci.core.common.docker.ContainerDetector;
 import io.github.hectorvent.floci.core.common.docker.ContainerLifecycleManager;
@@ -3145,6 +3146,96 @@ class Ec2ServiceTest {
                 .noneMatch(eni -> extra.getNetworkInterfaceId().equals(eni.getNetworkInterfaceId())));
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"current", "record-only", "deleted", "replaced"})
+    void attachingPersistsOwnershipOnlyOnTheCurrentInstance(String scenario, @TempDir Path directory) {
+        EmulatorConfig config = mockConfig(false);
+        when(config.storage().persistentPath()).thenReturn(directory.toString());
+        ServiceConfigAccess access = mock(ServiceConfigAccess.class);
+        when(access.storageMode("ec2")).thenReturn("persistent");
+        StorageFactory disk = new StorageFactory(config, access);
+        AccountAwareStorageBackend<Instance> store = disk.create("ec2", "ec2-instances.json",
+                new TypeReference<Map<String, Instance>>() {});
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service service = containerModeService(manager,
+                new InMemoryStorageFactory(Map.of("ec2-instances.json", store)));
+        String region = "us-east-1";
+        String subnetId = publicSubnet(service, region, "10.246.0.0/24");
+        String otherSubnet = publicSubnet(service, region, "10.247.0.0/24");
+        Instance instance = runningContainerInstance(service, region, subnetId, null);
+        NetworkInterface extra = service.createNetworkInterface(region, otherSubnet, null, null, List.of(), List.of(),
+                List.of());
+        String storageKey = region + "::" + instance.getInstanceId();
+        doAnswer(call -> {
+            InstanceNetworkInterface attached = call.getArgument(1);
+            if (scenario.equals("record-only")) {
+                return Optional.of("physical attachment disabled");
+            }
+            attached.setSharedNetworkContainerId(instance.getDockerContainerId());
+            if (scenario.equals("deleted")) {
+                store.delete(storageKey);
+            } else if (scenario.equals("replaced")) {
+                Instance replacement = new Instance();
+                replacement.setInstanceId(instance.getInstanceId());
+                replacement.setOwnerId(instance.getOwnerId());
+                replacement.setRegion(region);
+                replacement.setDockerContainerId("replacement-container");
+                store.put(storageKey, replacement);
+            }
+            return Optional.empty();
+        }).when(manager).plugNetworkInterface(any(), any(), any(), any());
+
+        service.attachNetworkInterface(region, extra.getNetworkInterfaceId(), instance.getInstanceId(), 1);
+
+        StorageFactory recoveredDisk = new StorageFactory(config, access);
+        AccountAwareStorageBackend<Instance> recovered = recoveredDisk.create("ec2", "ec2-instances.json",
+                new TypeReference<Map<String, Instance>>() {});
+        if (scenario.equals("deleted")) {
+            assertTrue(recovered.get(storageKey).isEmpty());
+        } else if (scenario.equals("replaced")) {
+            assertEquals("replacement-container", recovered.get(storageKey).orElseThrow().getDockerContainerId());
+            assertTrue(recovered.get(storageKey).orElseThrow().getNetworkInterfaces().isEmpty());
+        } else {
+            InstanceNetworkInterface attached = recovered.get(storageKey).orElseThrow().getNetworkInterfaces().stream()
+                    .filter(eni -> eni.getDeviceIndex() == 1).findFirst().orElseThrow();
+            assertEquals(scenario.equals("current") ? instance.getDockerContainerId() : null,
+                    attached.getSharedNetworkContainerId());
+        }
+    }
+
+    @Test
+    void failedOwnershipPersistenceRetainsTheAttachmentForCleanup() {
+        AccountAwareStorageBackend<Instance> store = spy(AccountAwareStorageBackend.inMemory("000000000000"));
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service service = containerModeService(manager,
+                new InMemoryStorageFactory(Map.of("ec2-instances.json", store)));
+        String region = "us-east-1";
+        String subnetId = publicSubnet(service, region, "10.246.0.0/24");
+        String otherSubnet = publicSubnet(service, region, "10.247.0.0/24");
+        Instance instance = runningContainerInstance(service, region, subnetId, null);
+        NetworkInterface extra = service.createNetworkInterface(region, otherSubnet, null, null, List.of(), List.of(),
+                List.of());
+        doAnswer(call -> {
+            InstanceNetworkInterface attached = call.getArgument(1);
+            attached.setSharedNetworkContainerId(instance.getDockerContainerId());
+            return Optional.empty();
+        }).when(manager).plugNetworkInterface(any(), any(), any(), any());
+        doThrow(new IllegalStateException("ownership write failed")).when(store).persistIfCurrent(anyString(), any());
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class, () ->
+                service.attachNetworkInterface(region, extra.getNetworkInterfaceId(), instance.getInstanceId(), 1));
+
+        assertEquals("ownership write failed", failure.getMessage());
+        assertSame(instance, store.get(region + "::" + instance.getInstanceId()).orElseThrow());
+        InstanceNetworkInterface attached = instance.getNetworkInterfaces().stream()
+                .filter(eni -> eni.getDeviceIndex() == 1).findFirst().orElseThrow();
+        assertEquals(instance.getDockerContainerId(), attached.getSharedNetworkContainerId());
+        assertNotNull(extra.getAttachment());
+        service.detachNetworkInterface(region, extra.getAttachment().getAttachmentId(), false);
+        verify(manager).unplugNetworkInterface(instance, attached);
+        assertNull(extra.getAttachment());
+    }
+
     @Test
     void attachingPlugsTheInterfaceAsADeviceAndDetachingUnplugsIt() {
         Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
@@ -3249,11 +3340,89 @@ class Ec2ServiceTest {
                 .noneMatch(eni -> extra.getNetworkInterfaceId().equals(eni.getNetworkInterfaceId())));
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void detachWaitsForTheAdmittedPlugButVpcTopologyRemainsAvailable(boolean foreign) throws Exception {
+        String owner = "111111111111";
+        String hostAccount = foreign ? "222222222222" : owner;
+        String region = "us-east-1";
+        ThreadLocal<String> current = ThreadLocal.withInitial(() -> owner);
+        // Account-aware storage caches the CDI proxy, whose values follow the current request.
+        RequestContext context = mock(RequestContext.class);
+        when(context.getAccountId()).thenAnswer(call -> current.get());
+        // CDI Instance and the imported EC2 model Instance have the same simple name.
+        jakarta.enterprise.inject.Instance<RequestContext> contexts = requestContexts(context);
+        Ec2ContainerManager manager = mock(Ec2ContainerManager.class);
+        Ec2Service service = new Ec2Service(mockConfig(true), manager, mock(Ec2PortForwardManager.class),
+                mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(contexts), contexts);
+        String customer = privateSubnet(service, region, "10.247.0.0/24");
+        NetworkInterface extra = service.createNetworkInterface(region, customer, null, null,
+                List.of(), List.of(), List.of());
+        if (foreign) {
+            service.createNetworkInterfacePermission(region, extra.getNetworkInterfaceId(), hostAccount, null,
+                    Ec2Service.INSTANCE_ATTACH);
+        }
+        current.set(hostAccount);
+        String home = privateSubnet(service, region, "10.246.0.0/24");
+        Instance instance = service.runInstances(region, "ami-test", "t3.micro", 1, 1, null,
+                List.of(), home, null, List.of(), null, null).getInstances().getFirst();
+        instance.setState(InstanceState.running());
+        CountDownLatch entered = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        AtomicReference<String> attachment = new AtomicReference<>();
+        AtomicReference<Thread> detaching = new AtomicReference<>();
+        doAnswer(call -> {
+            InstanceNetworkInterface device = call.getArgument(1);
+            attachment.set(device.getAttachmentId());
+            entered.countDown();
+            assertTrue(release.await(15, TimeUnit.SECONDS));
+            return Optional.empty();
+        }).when(manager).plugNetworkInterface(any(), any(), any(), any());
+        ExecutorService workers = Executors.newFixedThreadPool(3);
+        try {
+            Future<NetworkInterfaceAttachment> attaching = workers.submit(() -> {
+                current.set(hostAccount);
+                return service.attachNetworkInterface(region, extra.getNetworkInterfaceId(), instance.getInstanceId(), 1);
+            });
+            assertTrue(entered.await(5, TimeUnit.SECONDS));
+            Future<NetworkInterfaceAttachment> detached = workers.submit(() -> {
+                detaching.set(Thread.currentThread());
+                return service.detachNetworkInterface(region, attachment.get(), false);
+            });
+            awaitBlockedOrDone(detaching, detached);
+            if (detached.isDone()) {
+                detached.get(5, TimeUnit.SECONDS);
+            }
+            assertFalse(detached.isDone(), "Detach must not race ahead of the admitted Docker plug");
+            assertNotNull(workers.submit(() -> service.createVpc(region, "10.248.0.0/24", false))
+                    .get(5, TimeUnit.SECONDS), "Unrelated topology changes must not wait for Docker");
+            verify(manager, never()).unplugNetworkInterface(any(), any());
+            release.countDown();
+            assertEquals(attaching.get(5, TimeUnit.SECONDS).getAttachmentId(),
+                    detached.get(5, TimeUnit.SECONDS).getAttachmentId());
+            InOrder order = inOrder(manager);
+            order.verify(manager).plugNetworkInterface(any(), any(), any(), any());
+            order.verify(manager).unplugNetworkInterface(any(), any());
+            assertTrue(instance.getNetworkInterfaces().stream()
+                    .noneMatch(eni -> extra.getNetworkInterfaceId().equals(eni.getNetworkInterfaceId())));
+        } finally {
+            release.countDown();
+            workers.shutdownNow();
+            assertTrue(workers.awaitTermination(5, TimeUnit.SECONDS));
+            current.remove();
+        }
+    }
+
     private static Ec2Service containerModeService() {
         return containerModeService(mock(Ec2ContainerManager.class));
     }
 
     private static Ec2Service containerModeService(Ec2ContainerManager containerManager) {
+        return containerModeService(containerManager, new InMemoryStorageFactory());
+    }
+
+    private static Ec2Service containerModeService(Ec2ContainerManager containerManager, StorageFactory storageFactory) {
         when(containerManager.reachablePublicAddress(any())).thenAnswer(invocation -> {
             Instance instance = invocation.getArgument(0);
             return instance.getDockerContainerId() == null ? null : "127.0.0.1";
@@ -3261,7 +3430,7 @@ class Ec2ServiceTest {
         AmiImageResolver images = mock(AmiImageResolver.class);
         when(images.resolveImage(any())).thenReturn(ResolvedAmiImage.minimal("floci/base:latest"));
         return new Ec2Service(mockConfig(false), containerManager, mock(Ec2PortForwardManager.class), images,
-                mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(), new InMemoryStorageFactory());
+                mock(Ec2ImageCatalog.class), new Ec2InstanceTypeCatalog(), storageFactory);
     }
 
     private static String publicSubnet(Ec2Service service, String region, String cidr) {

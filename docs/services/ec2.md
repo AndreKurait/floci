@@ -2383,6 +2383,12 @@ Hot attachment stays record-only by default. With shared VPC address spaces, set
 `FLOCI_SERVICES_EC2_VPC_NETWORKS_HOT_ATTACH_ENABLED=true` to add a real device to the guest.
 This setting does not enable hot attachment with isolated address spaces, which has its own opt-in.
 
+Successful shared-network attachments retain their container ownership in the instance record.
+Floci restores their MAC after stop/start, reboot, or recovery, using the existing endpoint on a
+matching deployment-owned VPC network. Recovery never reconnects a missing endpoint or changes
+a record-only attachment. Older records without physical ownership are not inferred from an IP
+address match: detach and reattach with hot attachment enabled to establish that ownership.
+
 With isolated address spaces, an interface `AttachNetworkInterface` attaches to a running instance stays
 record-only unless `FLOCI_SERVICES_EC2_VPC_NETWORKS_HOT_ATTACH_ACROSS_ADDRESS_SPACES=true`. Then an
 interface of another VPC (its ranges may overlap the instance's) becomes one more native device of the
