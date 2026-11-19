@@ -72,6 +72,7 @@ class EcsServiceRestartLeftoversTest {
         });
         EcsService restarted = service(storage, false, manager, mock(EcsLoadBalancerRegistrar.class), null);
         restarted.releasePreviousRunLeftovers();
+        restarted.registerContainerInstance("app-cluster", null, null, REGION);
         String taskArn = restarted.runTask("app-cluster", "web", 1,
                 LaunchType.EC2, null, null, null, null, REGION).getFirst().getTaskArn();
         EcsTask task = awaitLastStatus(
@@ -110,6 +111,7 @@ class EcsServiceRestartLeftoversTest {
         definition.setImage("busybox:stable");
         restarted.registerTaskDefinition("web", List.of(definition), NetworkMode.bridge, null, null,
                 null, null, List.of(), REGION);
+        restarted.registerContainerInstance(null, null, null, REGION);
         String taskArn = restarted.runTask(null, "web", 1, LaunchType.EC2, null, null, null, null, REGION)
                 .getFirst().getTaskArn();
         awaitLastStatus(() -> restarted.describeTasks(null, List.of(taskArn), REGION).getFirst(),
@@ -179,6 +181,7 @@ class EcsServiceRestartLeftoversTest {
                 null, null, List.of(), REGION);
 
         restarted.releasePreviousRunLeftovers();
+        restarted.registerContainerInstance("app-cluster", null, null, REGION);
         String blockedArn = restarted.runTask("app-cluster", "web", 1,
                 LaunchType.EC2, null, null, null, null, REGION).getFirst().getTaskArn();
         EcsTask blocked = awaitLastStatus(
@@ -189,6 +192,7 @@ class EcsServiceRestartLeftoversTest {
         assertThat(blocked.getStoppedReason(), containsString("previous run"));
         verify(containerManager, never()).startTask(any(), any(), any(), anyString());
 
+        restarted.registerContainerInstance("app-cluster", null, null, REGION);
         String taskArn = restarted.runTask("app-cluster", "web", 1, LaunchType.EC2, null, null, null, null, REGION)
                 .getFirst().getTaskArn();
         awaitLastStatus(() -> restarted.describeTasks("app-cluster", List.of(taskArn), REGION).getFirst(),
@@ -234,6 +238,7 @@ class EcsServiceRestartLeftoversTest {
                 null, null, List.of(), REGION);
 
         restarted.releasePreviousRunLeftovers();
+        restarted.registerContainerInstance("app-cluster", null, null, REGION);
         String taskArn = restarted.runTask("app-cluster", "web", 1, LaunchType.EC2, null, null, null, null, REGION)
                 .getFirst().getTaskArn();
         awaitLastStatus(() -> restarted.describeTasks("app-cluster", List.of(taskArn), REGION).getFirst(),
@@ -297,6 +302,7 @@ class EcsServiceRestartLeftoversTest {
         ecs.createService("app-cluster", "alpha", "web", 0, LaunchType.EC2, List.of(lb), null, REGION);
 
         // A task of no service at all: any container can take the address a stale entry points at.
+        ecs.registerContainerInstance("app-cluster", null, null, REGION);
         String taskArn = ecs.runTask("app-cluster", "web", 1, LaunchType.EC2, null, null, null, null, REGION)
                 .getFirst().getTaskArn();
         EcsTask task = awaitLastStatus(
