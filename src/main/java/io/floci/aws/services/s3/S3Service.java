@@ -479,6 +479,7 @@ public class S3Service implements Resettable, ResourceProvider {
         this.policyEvaluator = new IamPolicyEvaluator(objectMapper);
         this.clock = clock;
         this.restoreCompletionDelaySeconds = Math.max(0, restoreCompletionDelaySeconds);
+        S3HistoryKeys.migrate(objectStore);
         if (!inMemory) {
             try {
                 Files.createDirectories(dataRoot);
@@ -2812,13 +2813,13 @@ public class S3Service implements Resettable, ResourceProvider {
             String account = globalBucketNamespace ? bucketOwnerAccount : typed.accountId();
             String rawPrefix = AccountAwareStorageBackend.rawKey(account, fullPrefix);
             String rawNullPrefix = AccountAwareStorageBackend.rawKey(account, nullPrefix);
-            int keyStart = account.length() + 1;
+            String rawHistoryPrefix = AccountAwareStorageBackend.rawKey(account, S3HistoryKeys.prefix(bucketName));
             return typed.scanRaw(raw -> raw.startsWith(rawPrefix)
-                    && raw.indexOf("#v#", keyStart) < 0
+                    && !raw.startsWith(rawHistoryPrefix)
                     && !raw.startsWith(rawNullPrefix));
         }
         return objectStore.scan(key -> key.startsWith(fullPrefix)
-                && !key.contains("#v#")
+                && !key.startsWith(S3HistoryKeys.prefix(bucketName))
                 && !key.startsWith(nullPrefix));
     }
 
@@ -3246,21 +3247,23 @@ public class S3Service implements Resettable, ResourceProvider {
         String versionPrefix = bucketName + "/";
         String fullPrefix = prefix != null ? versionPrefix + prefix : versionPrefix;
 
-        // Scan for versioned entries (contain #v#)
+        // History uses a reserved namespace; filter its public keys after reading the metadata.
         List<S3Object> versions = new ArrayList<>(objectStore.scan(key ->
-                key.startsWith(fullPrefix)
-                        && key.contains("#v#")
-                        && !key.startsWith(nullVersionPrefix(bucketName))));
+                key.startsWith(S3HistoryKeys.prefix(bucketName))).stream()
+                .filter(object -> prefix == null || object.getKey().startsWith(prefix))
+                .toList());
         objectStore.scan(key -> key.startsWith(nullVersionPrefix(bucketName)))
                 .stream()
                 .filter(object -> prefix == null || object.getKey().startsWith(prefix))
                 .forEach(versions::add);
 
-        // Also include non-versioned objects (no #v# in storage key, versionId == null).
+        // Also include non-versioned current objects (versionId == null).
         // These are objects uploaded when versioning was disabled or before versioning was enabled.
         // Versioned latest-pointer entries (also stored at the plain key) are excluded because
-        // they have a non-null versionId; their #v# entry is already captured above.
-        objectStore.scan(key -> key.startsWith(fullPrefix) && !key.contains("#v#"))
+        // they have a non-null versionId; their history entry is already captured above.
+        objectStore.scan(key -> key.startsWith(fullPrefix)
+                        && !key.startsWith(S3HistoryKeys.prefix(bucketName))
+                        && !key.startsWith(nullVersionPrefix(bucketName)))
                 .stream()
                 .filter(obj -> obj.getVersionId() == null)
                 // A promoted null version is indexed under both the plain latest key and its
@@ -8077,13 +8080,11 @@ public class S3Service implements Resettable, ResourceProvider {
         return bucketName + "/" + key;
     }
 
-    // S3 object keys can contain "#v#", so the legacy version-key suffix can collide with a
-    // plain object. Null-version history is new and needs no migration; keep it in a namespace
-    // that no path-safe bucket/object key can reach instead of widening that collision surface.
+    // Keep the existing null-version namespace readable alongside numbered version history.
     private static final String NULL_VERSION_STORAGE_PREFIX = "\0null-version/";
 
     private static void requirePublicObjectKey(String key) {
-        if (key.startsWith(NULL_VERSION_STORAGE_PREFIX)) {
+        if (key.startsWith(NULL_VERSION_STORAGE_PREFIX) || key.startsWith(S3HistoryKeys.RESERVED_PREFIX)) {
             throw new AwsException("InvalidArgument", "The specified object key is not valid.", 400);
         }
     }
@@ -8097,7 +8098,7 @@ public class S3Service implements Resettable, ResourceProvider {
         if ("null".equals(versionId)) {
             return nullVersionPrefix(bucketName) + key;
         }
-        return bucketName + "/" + key + "#v#" + versionId;
+        return S3HistoryKeys.key(bucketName, key, versionId);
     }
 
     private static String storedVersionId(S3Object object) {
