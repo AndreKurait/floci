@@ -347,4 +347,16 @@ Explicitly disabling IAM enforcement retains the existing unauthenticated emulat
 
 Upload-status queries and cancellation (`GET`, `HEAD`, or `DELETE` on `/blobs/uploads/`) are explicitly unsupported in enforced mode; ordinary layer upload `POST`, `PATCH`, and `PUT` are supported.
 
-The underlying-session expiry cap is a conservative emulator constraint; it has not been validated against AWS in a differential test. Main retains its existing registry endpoint format and API behavior.
+The underlying-session expiry cap is a conservative emulator constraint; it has not been validated against AWS in a differential test.
+
+### Native registry addresses
+
+Set `FLOCI_SERVICES_ECR_NATIVE_URI=true` to return partition-aware AWS registry
+hostnames for repository URIs and authorization proxy endpoints. The endpoint uses
+HTTPS on port 443, matching native container-image references. This option changes
+advertised addresses only: supply private DNS and a trusted TLS route from every
+Docker client/daemon to Floci. It does not publish ports, install certificates,
+change public DNS, or disable TLS verification. The default remains the existing
+localhost registry addresses; native addresses take precedence over URI style.
+`GetAuthorizationToken` returns an endpoint for each requested `registryIds` account
+in the request region; omitting the list selects the caller's registry.

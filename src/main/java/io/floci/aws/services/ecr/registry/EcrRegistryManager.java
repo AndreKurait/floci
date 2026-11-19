@@ -10,6 +10,7 @@ import com.github.dockerjava.api.model.ContainerPort;
 import com.github.dockerjava.api.model.Frame;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsPartitions;
+import io.floci.aws.core.common.AwsRegions;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.docker.ContainerBuilder;
 import io.floci.aws.core.common.docker.ContainerDetector;
@@ -301,6 +302,9 @@ public class EcrRegistryManager {
 
     /** Returns the docker-pullable repository URI for the given account/region/name. */
     public String getRepositoryUri(String accountId, String region, String repoName) {
+        if (config.services().ecr().nativeUri()) {
+            return nativeRegistryHost(accountId, region) + "/" + repoName;
+        }
         return repositoryUri(accountId, region, repoName, tlsUriEnabled() ? "localhost.floci.io" : "localhost");
     }
 
@@ -311,6 +315,10 @@ public class EcrRegistryManager {
             return domain + ":" + port + "/" + accountId + "/" + region + "/" + repoName;
         }
         return accountId + ".dkr.ecr." + region + "." + domain + ":" + port + "/" + repoName;
+    }
+
+    private static String nativeRegistryHost(String accountId, String region) {
+        return accountId + ".dkr.ecr." + region + "." + AwsRegions.dnsSuffixFor(region);
     }
 
     private boolean tlsUriEnabled() {
@@ -338,16 +346,23 @@ public class EcrRegistryManager {
      * the two must name the same host.
      */
     public String getProxyEndpoint() {
+        return getProxyEndpoint(regionResolver.getAccountId(), regionResolver.getRegion());
+    }
+
+    public String getProxyEndpoint(String accountId, String region) {
+        if (config.services().ecr().nativeUri()) {
+            return "https://" + nativeRegistryHost(accountId, region);
+        }
         if (tlsUriEnabled()) {
             String host = "path".equalsIgnoreCase(config.services().ecr().uriStyle())
                     ? "localhost.floci.io"
-                    : regionResolver.getAccountId() + ".dkr.ecr."
-                            + regionResolver.getRegion() + ".localhost.floci.io";
+                    : accountId + ".dkr.ecr."
+                            + region + ".localhost.floci.io";
             return "https://" + host + ":" + advertisedPort();
         }
         String scheme = config.services().ecr().tlsEnabled() ? "https" : "http";
-        return scheme + "://" + regionResolver.getAccountId() + ".dkr.ecr."
-                + regionResolver.getRegion() + ".localhost:" + advertisedPort();
+        return scheme + "://" + accountId + ".dkr.ecr."
+                + region + ".localhost:" + advertisedPort();
     }
 
     /**
