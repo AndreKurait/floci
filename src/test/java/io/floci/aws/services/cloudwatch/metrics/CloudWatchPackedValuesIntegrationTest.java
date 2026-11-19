@@ -10,7 +10,10 @@ import org.junit.jupiter.api.Test;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.cloudwatch.CloudWatchClient;
 import software.amazon.awssdk.services.cloudwatch.model.Datapoint;
+import software.amazon.awssdk.services.cloudwatch.model.Metric;
+import software.amazon.awssdk.services.cloudwatch.model.MetricDataQuery;
 import software.amazon.awssdk.services.cloudwatch.model.MetricDatum;
+import software.amazon.awssdk.services.cloudwatch.model.MetricStat;
 import software.amazon.awssdk.services.cloudwatch.model.Statistic;
 
 import java.time.Instant;
@@ -58,6 +61,14 @@ class CloudWatchPackedValuesIntegrationTest {
                     .period(60).extendedStatistics("p0", "p50", "p100"))
                     .datapoints().getFirst().extendedStatistics();
             assertEquals(Map.of("p0", 1.0, "p50", 75.0, "p100", 150.0), percentiles);
+            List<Double> scaledPercentiles = client.getMetricData(request -> request
+                    .startTime(timestamp.minusSeconds(1)).endTime(timestamp.plusSeconds(1)).metricDataQueries(
+                            MetricDataQuery.builder().id("scaled").expression("p * 2").returnData(true).build(),
+                            MetricDataQuery.builder().id("p").returnData(false).metricStat(MetricStat.builder()
+                                    .metric(Metric.builder().namespace(namespace).metricName("Latency").build())
+                                    .period(60).stat("p50").build()).build()))
+                    .metricDataResults().getFirst().values();
+            assertEquals(List.of(150.0), scaledPercentiles);
         }
     }
 
