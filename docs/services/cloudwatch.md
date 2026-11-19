@@ -494,6 +494,15 @@ shape names. `Values` accepts 1 to 150 numeric samples with optional matching, n
 `Counts`; omitted counts default to one. The public JSON and Query APIs normalize these weighted
 samples without expanding their counts. A `StatisticValues` set sent with `Values` summarizes the same
 distribution and is not counted again. Combining `Value` and `Values` is rejected.
+
+Set `FLOCI_SERVICES_CLOUDWATCHMETRICS_PACK_WEIGHTED_VALUES=true`
+(`floci.services.cloudwatchmetrics.pack-weighted-values`, default `false`) to store a multi-value
+batch in one record and reduce its retained memory. Queries reconstruct the per-value distribution.
+Scalar metrics and single-value batches keep the existing record format.
+
+Packed records require a reader that understands their sample arrays. Disabling the option changes
+future writes only; it does not convert existing packed records. Keep a compatible reader for storage
+written while this option was enabled.
 The console's supported numeric values use the same bounds.
 
 **Endpoint:** `http://localhost:4566/`. Query: GET or POST; JSON: POST.
