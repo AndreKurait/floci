@@ -454,6 +454,8 @@ floci:
     elbv2:
       enabled: true
       mock: true
+      backend-keep-alive: true
+      backend-keep-alive-timeout-seconds: 60
       max-health-check-interval-millis: 0
       dns-name-strategy: floci
       alb-zone-rule: aws
