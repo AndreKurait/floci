@@ -10,6 +10,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.NullNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.databind.node.TextNode;
+import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.Digests;
@@ -90,6 +91,7 @@ public class CloudWatchMetricsService {
     private final RegionResolver regionResolver;
     private final AlarmSnsNotifier alarmSnsNotifier;
     private final ServiceQuotasService serviceQuotas;
+    private final boolean packWeightedValues;
     private long lastHistorySequence;
     private Instant nextHistoryPrune = Instant.MIN;
 
@@ -102,9 +104,22 @@ public class CloudWatchMetricsService {
         this(storageFactory, regionResolver, alarmSnsNotifier, null);
     }
 
-    @Inject
     public CloudWatchMetricsService(StorageFactory storageFactory, RegionResolver regionResolver,
                                     AlarmSnsNotifier alarmSnsNotifier, ServiceQuotasService serviceQuotas) {
+        this(storageFactory, regionResolver, alarmSnsNotifier, serviceQuotas, false);
+    }
+
+    @Inject
+    public CloudWatchMetricsService(StorageFactory storageFactory, RegionResolver regionResolver,
+                                    AlarmSnsNotifier alarmSnsNotifier, ServiceQuotasService serviceQuotas,
+                                    EmulatorConfig config) {
+        this(storageFactory, regionResolver, alarmSnsNotifier, serviceQuotas,
+                config.services().cloudwatchmetrics().packWeightedValues());
+    }
+
+    private CloudWatchMetricsService(StorageFactory storageFactory, RegionResolver regionResolver,
+                                     AlarmSnsNotifier alarmSnsNotifier, ServiceQuotasService serviceQuotas,
+                                     boolean packWeightedValues) {
         // Services publish into this store every minute, SQS for every active queue, so under
         // persistent mode it is journaled rather than rewritten in full on every datum.
         this.metricStore = storageFactory.create("cloudwatchmetrics", "cwmetrics.json",
@@ -116,12 +131,19 @@ public class CloudWatchMetricsService {
         this.regionResolver = regionResolver;
         this.alarmSnsNotifier = alarmSnsNotifier;
         this.serviceQuotas = serviceQuotas;
+        this.packWeightedValues = packWeightedValues;
     }
 
     CloudWatchMetricsService(StorageBackend<String, MetricDatum> metricStore,
                              StorageBackend<String, Alarm> alarmStore,
                              RegionResolver regionResolver) {
         this(metricStore, alarmStore, regionResolver, null);
+    }
+
+    CloudWatchMetricsService(StorageBackend<String, MetricDatum> metricStore,
+                             StorageBackend<String, Alarm> alarmStore,
+                             RegionResolver regionResolver, boolean packWeightedValues) {
+        this(metricStore, alarmStore, new InMemoryStorage<>(), regionResolver, null, packWeightedValues);
     }
 
     CloudWatchMetricsService(StorageBackend<String, MetricDatum> metricStore,
@@ -134,12 +156,21 @@ public class CloudWatchMetricsService {
                              StorageBackend<String, Alarm> alarmStore,
                              StorageBackend<String, AlarmHistoryItem> historyStore,
                              RegionResolver regionResolver, AlarmSnsNotifier alarmSnsNotifier) {
+        this(metricStore, alarmStore, historyStore, regionResolver, alarmSnsNotifier, false);
+    }
+
+    private CloudWatchMetricsService(StorageBackend<String, MetricDatum> metricStore,
+                                     StorageBackend<String, Alarm> alarmStore,
+                                     StorageBackend<String, AlarmHistoryItem> historyStore,
+                                     RegionResolver regionResolver, AlarmSnsNotifier alarmSnsNotifier,
+                                     boolean packWeightedValues) {
         this.metricStore = metricStore;
         this.alarmStore = alarmStore;
         this.historyStore = historyStore;
         this.regionResolver = regionResolver;
         this.alarmSnsNotifier = alarmSnsNotifier;
         this.serviceQuotas = null;
+        this.packWeightedValues = packWeightedValues;
     }
 
     public void putMetricData(String namespace, List<MetricDatum> datums, String region) {
@@ -152,6 +183,9 @@ public class CloudWatchMetricsService {
      * streamed on another account's behalf. A null account is the caller's own.
      */
     public void putMetricDataForAccount(String accountId, String namespace, List<MetricDatum> datums, String region) {
+        if (!packWeightedValues && datums.stream().anyMatch(MetricDatum::hasPackedSamples)) {
+            datums = datums.stream().flatMap(MetricValues::expand).toList();
+        }
         long nowSeconds = Instant.now().getEpochSecond();
         for (MetricDatum datum : datums) {
             datum.setNamespace(namespace);
@@ -362,6 +396,8 @@ public class CloudWatchMetricsService {
                     .filter(d -> unit.equals(d.getUnit()))
                     .collect(Collectors.toList());
         }
+
+        matching = matching.stream().flatMap(MetricValues::expand).toList();
 
         // Group by period bucket
         Map<Long, List<MetricDatum>> buckets = new LinkedHashMap<>();
@@ -641,18 +677,6 @@ public class CloudWatchMetricsService {
                 .map(MetricAlarm.class::cast).toList();
     }
 
-    /**
-     * Reads current action settings after metric evaluation. Handlers run outside this monitor;
-     * disabling actions does not cancel work already admitted by this lookup.
-     */
-    public synchronized Optional<MetricAlarm> enabledMetricAlarm(String name, String region) {
-        Alarm current = alarmStore.get(region + "::" + name).orElse(null);
-        if (current instanceof MetricAlarm alarm && alarm.isActionsEnabled()) {
-            return Optional.of(alarm);
-        }
-        return Optional.empty();
-    }
-
     public record OwnedAlarm(String accountId, MetricAlarm alarm) {}
 
     /** Background evaluation must retain the stored owner instead of using the default account. */
@@ -664,6 +688,18 @@ public class CloudWatchMetricsService {
         }
         return allAlarms().stream()
                 .map(alarm -> new OwnedAlarm(regionResolver.getAccountId(), alarm)).toList();
+    }
+
+    /**
+     * Reads current action settings after metric evaluation. Handlers run outside this monitor;
+     * disabling actions does not cancel work already admitted by this lookup.
+     */
+    public synchronized Optional<MetricAlarm> enabledMetricAlarm(String name, String region) {
+        Alarm current = alarmStore.get(region + "::" + name).orElse(null);
+        if (current instanceof MetricAlarm alarm && alarm.isActionsEnabled()) {
+            return Optional.of(alarm);
+        }
+        return Optional.empty();
     }
 
     public List<MetricAlarm> describeAlarms(List<String> names, String prefix, String region) {

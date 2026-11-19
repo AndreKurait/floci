@@ -20,9 +20,11 @@ class MetricValuesTest {
     @Test
     void querySamplesPreserveZeroWeightsAndDefaultCounts() {
         MetricDatum template = MetricDatum.of("Latency", "Milliseconds", 0, List.of(), 123);
-        List<MetricDatum> weighted = MetricValues.fromQuery(Map.of(
+        List<MetricDatum> packed = MetricValues.fromQuery(Map.of(
                 "Values.member.1", List.of("7"), "Values.member.2", List.of("11"),
                 "Counts.member.1", List.of("0"), "Counts.member.2", List.of("2")), "", template);
+        assertEquals(1, packed.size());
+        List<MetricDatum> weighted = MetricValues.expand(packed.getFirst()).toList();
         assertEquals(2, weighted.size());
         assertTrue(weighted.getFirst().hasSampleCount());
         assertEquals(0, weighted.getFirst().getSampleCount());
