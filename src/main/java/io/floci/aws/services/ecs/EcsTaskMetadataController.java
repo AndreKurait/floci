@@ -340,14 +340,9 @@ public class EcsTaskMetadataController {
     }
 
     private ObjectNode labelsNode(EcsTask task, TaskDefinition taskDef, Container container) {
+        // The labels the task's Docker containers carry (EcsContainerManager sets the same ones).
         ObjectNode labels = objectMapper.createObjectNode();
-        labels.put("com.amazonaws.ecs.cluster", task.getClusterArn());
-        labels.put("com.amazonaws.ecs.container-name", container.getName());
-        labels.put("com.amazonaws.ecs.task-arn", task.getTaskArn());
-        if (taskDef != null) {
-            labels.put("com.amazonaws.ecs.task-definition-family", taskDef.getFamily());
-            labels.put("com.amazonaws.ecs.task-definition-version", String.valueOf(taskDef.getRevision()));
-        }
+        EcsAgentLabels.of(task, taskDef, container.getName()).forEach(labels::put);
         return labels;
     }
 
