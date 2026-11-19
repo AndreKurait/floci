@@ -1741,10 +1741,7 @@ public class EcrService implements ResourceProvider, Resettable {
     /** Returns the physical registry namespace selected for an ECR repository. */
     public Optional<Repository> registryRepository(String name, String account, String region) {
         String repositoryKey = key(region, account, name);
-        if (repoStore instanceof AccountAwareStorageBackend<Repository> aware) {
-            return aware.getForAccount(account, repositoryKey);
-        }
-        return repoStore.get(repositoryKey);
+        return AccountAwareStorageBackend.readInAccount(repoStore, account, repositoryKey);
     }
 
     public String registryRepositoryName(String repositoryName, String registryId, String region) {
