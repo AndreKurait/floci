@@ -62,6 +62,11 @@ class ImageCacheServiceTest {
 
         assertEquals("sha256:authorized", service.ensureImageExists(REGISTRY_IMAGE, null, credential));
         assertEquals(1, daemon.pulls.get());
+        assertEquals(1, daemon.pullCredentials.size());
+        AuthConfig forwarded = daemon.pullCredentials.getFirst();
+        assertEquals(credential.getUsername(), forwarded.getUsername());
+        assertEquals(credential.getPassword(), forwarded.getPassword());
+        assertEquals(credential.getRegistryAddress(), forwarded.getRegistryAddress());
     }
 
     @Test
@@ -748,6 +753,7 @@ class ImageCacheServiceTest {
         final Set<String> hangingPulls = new HashSet<>();
         final AtomicInteger pulls = new AtomicInteger();
         final List<String> pullPlatforms = new ArrayList<>();
+        final List<AuthConfig> pullCredentials = new ArrayList<>();
 
         FakeDaemon() {
             when(client.inspectImageCmd(anyString())).thenAnswer(invocation -> {
@@ -765,7 +771,10 @@ class ImageCacheServiceTest {
             when(client.pullImageCmd(anyString())).thenAnswer(invocation -> {
                 String reference = invocation.getArgument(0);
                 PullImageCmd pull = mock(PullImageCmd.class);
-                when(pull.withAuthConfig(any())).thenReturn(pull);
+                when(pull.withAuthConfig(any())).thenAnswer(auth -> {
+                    pullCredentials.add(auth.getArgument(0));
+                    return pull;
+                });
                 when(pull.withPlatform(anyString())).thenAnswer(platform -> {
                     pullPlatforms.add(platform.getArgument(0));
                     return pull;

@@ -174,7 +174,14 @@ class EcrServicePullAuthorizationTest {
             "arn:aws:emr-serverless:us-west-2:111111111111:/applications/app",
             "arn:aws-cn:emr-serverless:cn-north-1:111111111111:/applications/app"})
     void onlySameRegionApplicationArnCanIssueServiceCredential(String source) {
-        assertThrows(AwsException.class, () -> issue(source, REPOSITORY, POLICY, Map.of()));
+        String unconditional = """
+                {"Statement":{"Effect":"Allow","Principal":{"Service":"emr-serverless.amazonaws.com"},
+                "Action":["ecr:BatchGetImage","ecr:GetDownloadUrlForLayer","ecr:DescribeImages"],"Resource":"*"}}
+                """;
+        try (EcrRegistryAuthorization.PullLease lease = issue(SOURCE, REPOSITORY, unconditional, Map.of())) {
+            assertNotNull(authorization.authenticate(header(lease), REGION));
+        }
+        assertThrows(AwsException.class, () -> issue(source, REPOSITORY, unconditional, Map.of()));
     }
 
     private EcrRegistryAuthorization authorization(EmulatorConfig config, Clock clock) {

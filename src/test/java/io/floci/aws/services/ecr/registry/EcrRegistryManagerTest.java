@@ -670,9 +670,9 @@ class EcrRegistryManagerTest {
             "hostname, true, false, 000000000000.dkr.ecr.us-east-1.localhost:4566/app, http://000000000000.dkr.ecr.us-east-1.localhost:4566",
             "hostname, false, true, 000000000000.dkr.ecr.us-east-1.localhost:4566/app, http://000000000000.dkr.ecr.us-east-1.localhost:4566",
             "hostname, true, true, 000000000000.dkr.ecr.us-east-1.localhost.floci.io:4566/app, https://000000000000.dkr.ecr.us-east-1.localhost.floci.io:4566",
-            "path, false, false, localhost:4566/000000000000/us-east-1/app, http://000000000000.dkr.ecr.us-east-1.localhost:4566",
-            "path, true, false, localhost:4566/000000000000/us-east-1/app, http://000000000000.dkr.ecr.us-east-1.localhost:4566",
-            "path, false, true, localhost:4566/000000000000/us-east-1/app, http://000000000000.dkr.ecr.us-east-1.localhost:4566",
+            "path, false, false, localhost:4566/000000000000/us-east-1/app, http://localhost:4566",
+            "path, true, false, localhost:4566/000000000000/us-east-1/app, http://localhost:4566",
+            "path, false, true, localhost:4566/000000000000/us-east-1/app, http://localhost:4566",
             "path, true, true, localhost.floci.io:4566/000000000000/us-east-1/app, https://localhost.floci.io:4566"
     })
     void advertisedUrisRequireBothTlsAndOptIn(String style, boolean globalTls, boolean tlsUris,
@@ -731,7 +731,7 @@ class EcrRegistryManagerTest {
     @ParameterizedTest
     @CsvSource({
             "hostname, false, 000000000000.dkr.ecr.us-east-1.localhost:54321/app, http://000000000000.dkr.ecr.us-east-1.localhost:54321",
-            "path, false, localhost:54321/000000000000/us-east-1/app, http://000000000000.dkr.ecr.us-east-1.localhost:54321",
+            "path, false, localhost:54321/000000000000/us-east-1/app, http://localhost:54321",
             "hostname, true, 000000000000.dkr.ecr.us-east-1.localhost.floci.io:54321/app, https://000000000000.dkr.ecr.us-east-1.localhost.floci.io:54321",
             "path, true, localhost.floci.io:54321/000000000000/us-east-1/app, https://localhost.floci.io:54321"
     })
@@ -1081,7 +1081,10 @@ class EcrRegistryManagerTest {
             "000000000000.dkr.ecr.us-east-1.localhost:4566/spark/custom:7.5.0, us-east-1",
             "000000000000.dkr.ecr.us-east-1.localhost.floci.io:4566/spark/custom:7.5.0, us-east-1",
             "localhost:4566/000000000000/us-west-2/spark/custom:7.5.0, us-west-2",
-            "localhost.floci.io:4566/000000000000/us-west-2/spark/custom:7.5.0, us-west-2"
+            "localhost.floci.io:4566/000000000000/us-west-2/spark/custom:7.5.0, us-west-2",
+            "127.0.0.1:4566/000000000000/us-west-2/spark/custom:7.5.0, us-west-2",
+            "[::1]:4566/000000000000/us-west-2/spark/custom:7.5.0, us-west-2",
+            "123456789012.dkr.ecr.eu-west-1.amazonaws.com:443/spark/custom:7.5.0, eu-west-1"
     })
     void anImageInAnEcrRepositoryHasItsRepositorysRegion(String image, String region) {
         assertEquals(Optional.of(region), EcrRegistryManager.imageRegion(image));

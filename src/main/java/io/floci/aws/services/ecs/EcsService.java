@@ -1707,6 +1707,12 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
             task.setMemory(effectiveMemory(taskDef, request));
             task.setCreatedAt(Instant.now());
             task.setContainerInstanceArn(containerInstanceArn);
+            if (containerInstanceArn == null && placement.launchType() == LaunchType.EC2
+                    && taskDef.getContainerDefinitions().stream()
+                    .anyMatch(def -> EcrRegistryManager.ecrImage(def.getImage()).isPresent())
+                    && config.services().iam().enforcementEnabled()) {
+                task.setContainerInstanceArn(containerInstanceFor(cluster, placement));
+            }
             task.setNetworkConfiguration(networkConfiguration);
             task.setOverrides(request.getOverrides());
             task.setEnableExecuteCommand(request.isEnableExecuteCommand());
@@ -1777,11 +1783,12 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                 }
                 task.setPullStartedAt(Instant.now());
                 EcsTaskHandle handle;
-                if (task.getLaunchType() == LaunchType.EC2 && task.getContainerInstanceArn() != null
+                if (task.getLaunchType() == LaunchType.EC2
                         && taskDef.getContainerDefinitions().stream()
                         .anyMatch(def -> EcrRegistryManager.ecrImage(def.getImage()).isPresent())
                         && config.services().iam().enforcementEnabled()) {
-                    ContainerInstance instance = resolveContainerInstance(cluster.getClusterArn(), task.getContainerInstanceArn());
+                    ContainerInstance instance = task.getContainerInstanceArn() == null ? null
+                            : resolveContainerInstance(cluster.getClusterArn(), task.getContainerInstanceArn());
                     if (instance == null || instance.getEc2InstanceId() == null) {
                         throw new AwsException("ResourceInitializationError", "The container instance is unavailable.", 400);
                     }

@@ -18,6 +18,8 @@ import java.time.Clock;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -34,6 +36,57 @@ class EcsServiceEcrPullIdentityTest {
     @AfterEach
     void stopOwnedExecutorsAndMockTasks() {
         services.forEach(EcsService::stopManagedContainers);
+    }
+
+    @Test
+    void enforcedEc2RunTaskSelectsItsRegisteredInstanceBeforeLaunching() throws Exception {
+        EcsService service = service(true, NATIVE_IMAGE);
+        CountDownLatch launched = new CountDownLatch(1);
+        when(manager.startTask(any(), any(), any(), eq(REGION), eq("i-owned"))).thenAnswer(invocation -> {
+            launched.countDown();
+            return started(invocation.getArgument(0));
+        });
+
+        EcsTask response = service.runTask("cluster", "family", 1, LaunchType.EC2,
+                null, null, List.of(), null, REGION).getFirst();
+
+        assertEquals(instance.getContainerInstanceArn(), response.getContainerInstanceArn());
+        assertTrue(launched.await(5, TimeUnit.SECONDS));
+        verify(manager, never()).startTask(any(), any(), any(), anyString());
+    }
+
+    @Test
+    void iamOffEc2RunTaskKeepsItsExistingPlacementAndManagerPath() throws Exception {
+        EcsService service = service(false, NATIVE_IMAGE);
+        CountDownLatch launched = new CountDownLatch(1);
+        when(manager.startTask(any(), any(), any(), eq(REGION))).thenAnswer(invocation -> {
+            launched.countDown();
+            return started(invocation.getArgument(0));
+        });
+
+        EcsTask response = service.runTask("cluster", "family", 1, LaunchType.EC2,
+                null, null, List.of(), null, REGION).getFirst();
+
+        assertNull(response.getContainerInstanceArn());
+        assertTrue(launched.await(5, TimeUnit.SECONDS));
+        verify(manager, never()).startTask(any(), any(), any(), anyString(), anyString());
+    }
+
+    @Test
+    void enforcedFargateRunTaskKeepsItsExecutionRolePath() throws Exception {
+        EcsService service = service(true, NATIVE_IMAGE);
+        CountDownLatch launched = new CountDownLatch(1);
+        when(manager.startTask(any(), any(), any(), eq(REGION))).thenAnswer(invocation -> {
+            launched.countDown();
+            return started(invocation.getArgument(0));
+        });
+
+        EcsTask response = service.runTask("cluster", "family", 1, LaunchType.FARGATE,
+                null, null, List.of(), null, REGION).getFirst();
+
+        assertNull(response.getContainerInstanceArn());
+        assertTrue(launched.await(5, TimeUnit.SECONDS));
+        verify(manager, never()).startTask(any(), any(), any(), anyString(), anyString());
     }
 
     @Test
