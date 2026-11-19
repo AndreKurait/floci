@@ -11,6 +11,8 @@ import java.util.List;
 @RegisterForReflection
 public class Part {
 
+    private S3KmsEnvelope kmsEnvelope;
+
     private int partNumber;
     private String eTag;
     private long size;
@@ -70,4 +72,7 @@ public class Part {
 
     public String getStorageId() { return storageId; }
     public void setStorageId(String storageId) { this.storageId = storageId; }
+    public S3KmsEnvelope getKmsEnvelope() { return kmsEnvelope; }
+    public void setKmsEnvelope(S3KmsEnvelope envelope) { this.kmsEnvelope = envelope; }
+
 }

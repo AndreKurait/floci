@@ -11,6 +11,8 @@ import java.util.concurrent.ConcurrentHashMap;
 @RegisterForReflection
 public class MultipartUpload {
 
+    private S3KmsEnvelope kmsEnvelope;
+
     private String uploadId;
     private String bucket;
     private String key;
@@ -142,4 +144,7 @@ public class MultipartUpload {
     public void setInitiated(Instant initiated) { this.initiated = initiated; }
 
     public Map<Integer, Part> getParts() { return parts; }
+    public S3KmsEnvelope getKmsEnvelope() { return kmsEnvelope; }
+    public void setKmsEnvelope(S3KmsEnvelope envelope) { this.kmsEnvelope = envelope; }
+
 }
