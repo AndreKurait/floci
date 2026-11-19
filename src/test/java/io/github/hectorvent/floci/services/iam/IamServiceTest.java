@@ -2727,6 +2727,17 @@ class IamServiceTest {
     }
 
     @Test
+    void inspectedAssumeRoleSessionRetainsTokenIssueTime() {
+        Instant issuedAt = Instant.parse("2026-11-19T10:00:00Z");
+        IamService service = iamServiceOn(Clock.fixed(issuedAt, ZoneOffset.UTC));
+        service.registerAssumeRoleSession("ASIAISSUEDTIME", "secret", "token",
+                "arn:aws:iam::000000000000:role/worker", issuedAt.plusSeconds(3600),
+                null, "000000000000", "worker", "AROAEXAMPLE:worker", false);
+
+        assertEquals(issuedAt, service.issuedSessionCandidates("ASIAISSUEDTIME").getFirst().getIssuedAt());
+    }
+
+    @Test
     void lambdaSessionBindingUsesUniqueExactKeysBeyondThePrincipalScanLimit() {
         String account = "222233334444";
         String role = "arn:aws:iam::222233334444:role/LambdaRole";
