@@ -74,7 +74,7 @@ class S3GlobalBucketNamespaceTest {
         service.putObjectRetention("legacy-retention-bucket", "object.txt", version,
                 "GOVERNANCE", Instant.parse("2035-01-01T00:00:00Z"), true);
         String currentKey = "legacy-retention-bucket/object.txt";
-        String versionKey = currentKey + "#v#" + version;
+        String versionKey = S3HistoryKeys.key("legacy-retention-bucket", "object.txt", version);
         for (String key : List.of(currentKey, versionKey)) {
             rawObjects.put(key, objects.getForAccount(DEFAULT_ACCT, key).orElseThrow());
             rawObjects.delete(DEFAULT_ACCT + "/" + key);
@@ -486,7 +486,8 @@ class S3GlobalBucketNamespaceTest {
         assertTrue(globalNs.getObjectTagging("shared-metadata-bucket", "object.txt").isEmpty());
 
         String currentKey = "shared-metadata-bucket/object.txt";
-        String versionKey = currentKey + "#v#" + versionId;
+        String versionKey = S3HistoryKeys.key(currentKey.substring(0, currentKey.indexOf('/')),
+                currentKey.substring(currentKey.indexOf('/') + 1), versionId);
         S3Object ownerVersion = objects.getForAccount(ACCOUNT_A, versionKey)
                 .orElseThrow(() -> new AssertionError("version vanished from owner partition"));
         assertEquals(retainUntil, ownerVersion.getRetainUntilDate());
@@ -521,7 +522,8 @@ class S3GlobalBucketNamespaceTest {
                 upload.getUploadId(), List.of(1), null, null).getVersionId();
 
         String currentKey = "shared-multipart-bucket/object.bin";
-        String versionKey = currentKey + "#v#" + versionId;
+        String versionKey = S3HistoryKeys.key(currentKey.substring(0, currentKey.indexOf('/')),
+                currentKey.substring(currentKey.indexOf('/') + 1), versionId);
         assertTrue(objects.getForAccount(ACCOUNT_A, currentKey).isPresent());
         assertTrue(objects.getForAccount(ACCOUNT_A, versionKey).isPresent());
         assertTrue(objects.getForAccount(ACCOUNT_B, currentKey).isEmpty(),
