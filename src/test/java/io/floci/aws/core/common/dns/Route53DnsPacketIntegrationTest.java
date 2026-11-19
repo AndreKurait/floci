@@ -282,6 +282,9 @@ class Route53DnsPacketIntegrationTest {
         weighted.setSetIdentifier("one");
         weighted.setWeight(1L);
         change(id, "CREATE", weighted);
+        assertHeader(query(DnsTestQuery.query("weighted." + name, 16, 0x1234)), 0, true, 1, 0);
+        weighted.setHealthCheckId("requires-health-evaluation");
+        change(id, "UPSERT", weighted);
         change(id, "CREATE", record("alias." + name, "CNAME", 60, "target.example."));
         change(id, "CREATE", record("delegated." + name, "NS", 60, "other.example."));
         for (int type : List.of(15, 5)) {
