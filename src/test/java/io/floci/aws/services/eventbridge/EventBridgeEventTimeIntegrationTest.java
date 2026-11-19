@@ -73,12 +73,12 @@ class EventBridgeEventTimeIntegrationTest {
     }
 
     @Test
-    void deliveredEventReportsTheEntryTimeToTheSecond() throws Exception {
+    void deliveredEventPreservesTheEntryTimePrecision() throws Exception {
         String time = deliveredTime(PutEventsRequestEntry.builder()
                 .source(source).detailType("with-time").detail("{}")
                 .time(Instant.parse("2026-01-02T03:04:05.678Z")).build());
 
-        assertEquals("2026-01-02T03:04:05Z", time);
+        assertEquals("2026-01-02T03:04:05.678Z", time);
     }
 
     @Test
