@@ -39,6 +39,7 @@ class EcrRegistryAuthenticationHttpTest {
     private HttpServer frontend;
     private EcrRegistryManager manager;
     private EcrRegistryAuthorization auth;
+    private EmulatorConfig config;
     private IamService iam;
     private final AtomicInteger backendRequests = new AtomicInteger();
     private final AtomicReference<String> forwardedAuthorization = new AtomicReference<>();
@@ -56,7 +57,7 @@ class EcrRegistryAuthenticationHttpTest {
         }).listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
         manager = mock(EcrRegistryManager.class);
         when(manager.httpClient()).thenReturn(new RegistryHttpClient("http://127.0.0.1:" + backend.actualPort()));
-        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.services().ecr().enabled()).thenReturn(true);
         when(config.services().ecr().uriStyle()).thenReturn("hostname");
         when(config.services().iam().enforcementEnabled()).thenReturn(true);
@@ -95,11 +96,19 @@ class EcrRegistryAuthenticationHttpTest {
     }
 
     private int request(HttpMethod method, String path, String token) throws Exception {
+        return request(method, path, token, "us-east-1");
+    }
+
+    private int request(HttpMethod method, String path, String token, String region) throws Exception {
+        return requestToHost(method, path, token, "111111111111.dkr.ecr." + region + ".localhost:4566");
+    }
+
+    private int requestToHost(HttpMethod method, String path, String token, String host) throws Exception {
         HttpClient client = vertx.createHttpClient();
         try {
             HttpClientRequest req = client.request(new RequestOptions().setHost("127.0.0.1").setPort(frontend.actualPort())
                     .setMethod(method).setURI(path)).toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
-            req.putHeader("Host", "111111111111.dkr.ecr.us-east-1.amazonaws.com");
+            req.putHeader("Host", host);
             if (token != null) {
                 req.putHeader("Authorization", token);
             }
@@ -124,7 +133,7 @@ class EcrRegistryAuthenticationHttpTest {
 
     @Test
     void uploadStatusAndCancellationAreUnsupportedBeforeBackend() throws Exception {
-        String token = "Basic " + auth.issue().authorizationToken();
+        String token = "Basic " + auth.issue("us-east-1").authorizationToken();
         for (HttpMethod method : List.of(HttpMethod.GET, HttpMethod.HEAD, HttpMethod.DELETE)) {
             assertEquals(403, request(method, "/v2/app/blobs/uploads/id", token));
         }
@@ -134,7 +143,7 @@ class EcrRegistryAuthenticationHttpTest {
 
     @Test
     void issuedTokenPermitsOrdinaryUploadPostAndIsNeverForwarded() throws Exception {
-        String token = "Basic " + auth.issue().authorizationToken();
+        String token = "Basic " + auth.issue("us-east-1").authorizationToken();
         assertEquals(200, request(HttpMethod.GET, "/v2/", token));
         assertEquals(200, request(HttpMethod.POST, "/v2/app/blobs/uploads/", token));
         assertEquals("/v2/111111111111/us-east-1/app/blobs/uploads/", forwardedUri.get());
@@ -142,8 +151,50 @@ class EcrRegistryAuthenticationHttpTest {
     }
 
     @Test
+    void crossRegionPasswordCannotReachRegistryButRemainsUsableInItsRegion() throws Exception {
+        String token = "Basic " + auth.issue("us-east-1").authorizationToken();
+        assertEquals(401, request(HttpMethod.GET, "/v2/", token, "us-west-2"));
+        assertEquals(401, request(HttpMethod.PUT, "/v2/app/manifests/latest", token, "us-west-2"));
+        assertEquals(0, backendRequests.get());
+        verifyNoInteractions(manager);
+        assertEquals(200, request(HttpMethod.GET, "/v2/", token));
+        assertNull(forwardedAuthorization.get());
+    }
+
+    @Test
+    void pathStyleLoginAcceptsRegionalPasswordWithoutWeakeningRepositoryScope() throws Exception {
+        when(config.services().ecr().uriStyle()).thenReturn("path");
+        String token = "Basic " + auth.issue("us-west-2").authorizationToken();
+        String host = "localhost.floci.io:4566";
+        assertEquals(200, requestToHost(HttpMethod.GET, "/v2/", token, host));
+        assertEquals(200, requestToHost(HttpMethod.GET, "/v2", token, host));
+        assertNull(forwardedAuthorization.get());
+        assertEquals(2, backendRequests.get());
+        assertEquals(401, requestToHost(HttpMethod.PUT,
+                "/v2/111111111111/us-east-1/app/manifests/latest", token, host));
+        assertEquals(401, requestToHost(HttpMethod.POST, "/v2/", token, host));
+        assertEquals(2, backendRequests.get());
+        assertEquals(200, requestToHost(HttpMethod.GET,
+                "/v2/111111111111/us-west-2/app/manifests/latest", token, host));
+        assertNull(forwardedAuthorization.get());
+    }
+
+    @Test
+    void pathStyleLoginStillRejectsMissingWrongAndRevokedPasswords() throws Exception {
+        when(config.services().ecr().uriStyle()).thenReturn("path");
+        String host = "localhost.floci.io:4566";
+        assertEquals(401, requestToHost(HttpMethod.GET, "/v2/", null, host));
+        assertEquals(401, requestToHost(HttpMethod.GET, "/v2/", "Basic QVdTOmZsb2Np", host));
+        String token = "Basic " + auth.issue("us-west-2").authorizationToken();
+        when(iam.isInactiveAccessKey("ISSUED")).thenReturn(true);
+        assertEquals(401, requestToHost(HttpMethod.GET, "/v2/", token, host));
+        assertEquals(0, backendRequests.get());
+        verifyNoInteractions(manager);
+    }
+
+    @Test
     void currentExplicitDenyBlocksManifestMutationBeforeBackend() throws Exception {
-        String token = "Basic " + auth.issue().authorizationToken();
+        String token = "Basic " + auth.issue("us-east-1").authorizationToken();
         when(iam.resolveCallerContext(eq("ISSUED"), any())).thenReturn(CallerContext.of(List.of(
                 "{\"Statement\":{\"Effect\":\"Deny\",\"Action\":\"ecr:PutImage\",\"Resource\":\"*\"}}")));
         assertEquals(403, request(HttpMethod.PUT, "/v2/app/manifests/latest", token));
@@ -152,7 +203,7 @@ class EcrRegistryAuthenticationHttpTest {
     }
     @Test
     void optionalMountDeniedSourceFallsBackToAuthorizedOrdinaryUpload() throws Exception {
-        String token = "Basic " + auth.issue().authorizationToken();
+        String token = "Basic " + auth.issue("us-east-1").authorizationToken();
         when(iam.resolveCallerContext(eq("ISSUED"), any())).thenReturn(CallerContext.of(List.of(
                 "{\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"ecr:InitiateLayerUpload\",\"Resource\":\"*\"},"
                         + "{\"Effect\":\"Deny\",\"Action\":\"ecr:GetDownloadUrlForLayer\",\"Resource\":\"*\"}]}")));
@@ -164,7 +215,7 @@ class EcrRegistryAuthenticationHttpTest {
 
     @Test
     void permittedMountUsesTheExactAuthorizedSourceStorageNamespace() throws Exception {
-        String token = "Basic " + auth.issue().authorizationToken();
+        String token = "Basic " + auth.issue("us-east-1").authorizationToken();
         assertEquals(200, request(HttpMethod.POST, "/v2/app/blobs/uploads/?mount=sha256:abc&from=team/source", token));
         assertTrue(forwardedUri.get().contains("from=111111111111%2Fus-east-1%2Fteam%2Fsource"));
         assertNull(forwardedAuthorization.get());

@@ -18,6 +18,7 @@ import io.github.hectorvent.floci.services.ecr.model.PullThroughCacheRule;
 import io.github.hectorvent.floci.services.ecr.model.RegistrySettings;
 import io.github.hectorvent.floci.services.ecr.model.Repository;
 import io.github.hectorvent.floci.services.ecr.model.RepositoryCreationTemplate;
+import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryAuthorization;
 import io.github.hectorvent.floci.services.ecr.registry.EcrRegistryManager;
 import io.github.hectorvent.floci.services.ecr.registry.RegistryHttpClient;
 import io.github.hectorvent.floci.testing.ParkingStore;
@@ -100,9 +101,9 @@ class EcrServiceTest {
                 config,
                 regionResolver);
         service.registryAuthorization = Mockito.mock(
-                io.github.hectorvent.floci.services.ecr.registry.EcrRegistryAuthorization.class);
-        when(service.registryAuthorization.issue()).thenReturn(
-                new io.github.hectorvent.floci.services.ecr.registry.EcrRegistryAuthorization.IssuedToken(
+                EcrRegistryAuthorization.class);
+        when(service.registryAuthorization.issue(REGION)).thenReturn(
+                new EcrRegistryAuthorization.IssuedToken(
                         Base64.getEncoder().encodeToString("AWS:issued-test-token".getBytes(StandardCharsets.UTF_8)),
                         Instant.now().plusSeconds(43200)));
     }
@@ -359,6 +360,59 @@ class EcrServiceTest {
         service.createRepository(REPO, null, "MUTABLE", null, null, null, null, REGION);
 
         assertFalse(service.isImageTagImmutable(REPO, ACCOUNT, REGION));
+    }
+
+    @Test
+    void registryLookupReadsDefaultAccountLegacyEntryWithoutMigratingIt() {
+        InMemoryStorage<String, Repository> delegate = new InMemoryStorage<>();
+        Repository legacy = new Repository();
+        String key = REGION + "::" + ACCOUNT + "::" + REPO;
+        delegate.put(key, legacy);
+        EcrService accountAwareService = registryLookupService(delegate);
+
+        assertSame(legacy, accountAwareService.registryRepository(REPO, ACCOUNT, REGION).orElseThrow());
+        assertEquals(List.of(key), List.copyOf(delegate.keys()));
+        assertSame(legacy, delegate.get(key).orElseThrow());
+    }
+
+    @Test
+    void registryLookupPrefersExplicitAccountEntryOverLegacyEntry() {
+        InMemoryStorage<String, Repository> delegate = new InMemoryStorage<>();
+        Repository legacy = new Repository();
+        Repository scoped = new Repository();
+        String key = REGION + "::" + ACCOUNT + "::" + REPO;
+        delegate.put(key, legacy);
+        delegate.put(ACCOUNT + "/" + key, scoped);
+        EcrService accountAwareService = registryLookupService(delegate);
+
+        assertSame(scoped, accountAwareService.registryRepository(REPO, ACCOUNT, REGION).orElseThrow());
+        assertSame(legacy, delegate.get(key).orElseThrow());
+        assertEquals(2, delegate.keys().size());
+    }
+
+    @Test
+    void registryLookupRejectsForeignLegacyEntryButReadsItsExplicitAccountEntry() {
+        String foreign = "111111111111";
+        InMemoryStorage<String, Repository> delegate = new InMemoryStorage<>();
+        Repository legacy = new Repository();
+        Repository scoped = new Repository();
+        String key = REGION + "::" + foreign + "::" + REPO;
+        delegate.put(key, legacy);
+        EcrService accountAwareService = registryLookupService(delegate);
+
+        assertTrue(accountAwareService.registryRepository(REPO, foreign, REGION).isEmpty());
+        delegate.put(foreign + "/" + key, scoped);
+        assertSame(scoped, accountAwareService.registryRepository(REPO, foreign, REGION).orElseThrow());
+        assertTrue(accountAwareService.registryRepository(REPO, ACCOUNT, REGION).isEmpty());
+        assertTrue(accountAwareService.registryRepository(REPO, foreign, "eu-west-1").isEmpty());
+        assertSame(legacy, delegate.get(key).orElseThrow());
+        assertEquals(2, delegate.keys().size());
+    }
+
+    private EcrService registryLookupService(InMemoryStorage<String, Repository> delegate) {
+        return new EcrService(new AccountAwareStorageBackend<>(delegate, null, ACCOUNT),
+                new InMemoryStorage<>(), new InMemoryStorage<>(), registryManager,
+                Mockito.mock(EmulatorConfig.class), new RegionResolver(REGION, ACCOUNT));
     }
 
     @Test
