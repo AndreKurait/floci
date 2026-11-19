@@ -5803,6 +5803,9 @@ public class Ec2QueryHandler {
                 xml.start("item").elem("ipv6Address", ipv6Address).elem("isPrimaryIpv6", "false").end("item");
             }
             xml.end("ipv6AddressesSet");
+            // NetworkInterface's own ipv6Address, "the IPv6 globally unique address associated with the network
+            // interface": its first one, as an instance's ipv6Address is its primary interface's first one.
+            xml.elem("ipv6Address", ni.getIpv6Addresses().get(0));
         }
         return xml.build();
     }
