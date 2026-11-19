@@ -222,6 +222,11 @@ final class PrivateCaCertificates {
             }
             root.verify(root.getPublicKey());
             requireCaSigningProfile(root);
+            for (X509Certificate issuer : chain) {
+                if (issuer.getExtensionValue(Extension.nameConstraints.getId()) != null) {
+                    throw new IllegalArgumentException("Imported issuer name constraints are not supported");
+                }
+            }
             List<X509Certificate> path = new ArrayList<>();
             path.add(certificate);
             path.addAll(chain.subList(0, chain.size() - 1));
