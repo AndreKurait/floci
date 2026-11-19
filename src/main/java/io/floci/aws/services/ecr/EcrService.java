@@ -734,7 +734,7 @@ public class EcrService implements ResourceProvider, Resettable {
                 || registryIds.stream().anyMatch(id -> id == null || !id.matches("[0-9]{12}"))) {
             throw new AwsException("InvalidParameterException", "registryIds must contain 1 to 10 twelve-digit account IDs", 400);
         }
-        EcrRegistryAuthorization.IssuedToken issued = registryAuthorization.issue();
+        EcrRegistryAuthorization.IssuedToken issued = registryAuthorization.issue(regionResolver.getRegion());
         return registryIds.stream().map(account -> new AuthorizationData(issued.authorizationToken(), issued.expiresAt(),
                 registryManager.getProxyEndpoint(account, regionResolver.getRegion()))).toList();
     }
@@ -743,7 +743,7 @@ public class EcrService implements ResourceProvider, Resettable {
         // Deliberately not gated on the backing registry: AWS answers this call from the
         // control plane, and both values here are computed without Docker. Gating it made
         // every SDK client retry a 500 before its first repository call.
-        EcrRegistryAuthorization.IssuedToken issued = registryAuthorization.issue();
+        EcrRegistryAuthorization.IssuedToken issued = registryAuthorization.issue(regionResolver.getRegion());
         String proxy = registryManager.getProxyEndpoint();
         return new AuthorizationData(issued.authorizationToken(), issued.expiresAt(), proxy);
     }

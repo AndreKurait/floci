@@ -96,11 +96,15 @@ class EcrRegistryAuthenticationHttpTest {
     }
 
     private int request(HttpMethod method, String path, String token) throws Exception {
+        return request(method, path, token, "us-east-1");
+    }
+
+    private int request(HttpMethod method, String path, String token, String region) throws Exception {
         HttpClient client = vertx.createHttpClient();
         try {
             HttpClientRequest req = client.request(new RequestOptions().setHost("127.0.0.1").setPort(frontend.actualPort())
                     .setMethod(method).setURI(path)).toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
-            req.putHeader("Host", "111111111111.dkr.ecr.us-east-1.localhost:4566");
+            req.putHeader("Host", "111111111111.dkr.ecr." + region + ".localhost:4566");
             if (token != null) {
                 req.putHeader("Authorization", token);
             }
@@ -125,7 +129,7 @@ class EcrRegistryAuthenticationHttpTest {
 
     @Test
     void uploadStatusAndCancellationAreUnsupportedBeforeBackend() throws Exception {
-        String token = "Basic " + auth.issue().authorizationToken();
+        String token = "Basic " + auth.issue("us-east-1").authorizationToken();
         for (HttpMethod method : List.of(HttpMethod.GET, HttpMethod.HEAD, HttpMethod.DELETE)) {
             assertEquals(403, request(method, "/v2/app/blobs/uploads/id", token));
         }
@@ -135,7 +139,7 @@ class EcrRegistryAuthenticationHttpTest {
 
     @Test
     void issuedTokenPermitsOrdinaryUploadPostAndIsNeverForwarded() throws Exception {
-        String token = "Basic " + auth.issue().authorizationToken();
+        String token = "Basic " + auth.issue("us-east-1").authorizationToken();
         assertEquals(200, request(HttpMethod.GET, "/v2/", token));
         assertEquals(200, request(HttpMethod.POST, "/v2/app/blobs/uploads/", token));
         assertEquals("/v2/111111111111/us-east-1/app/blobs/uploads/", forwardedUri.get());
@@ -143,8 +147,19 @@ class EcrRegistryAuthenticationHttpTest {
     }
 
     @Test
+    void crossRegionPasswordCannotReachRegistryButRemainsUsableInItsRegion() throws Exception {
+        String token = "Basic " + auth.issue("us-east-1").authorizationToken();
+        assertEquals(401, request(HttpMethod.GET, "/v2/", token, "us-west-2"));
+        assertEquals(401, request(HttpMethod.PUT, "/v2/app/manifests/latest", token, "us-west-2"));
+        assertEquals(0, backendRequests.get());
+        verifyNoInteractions(manager);
+        assertEquals(200, request(HttpMethod.GET, "/v2/", token));
+        assertNull(forwardedAuthorization.get());
+    }
+
+    @Test
     void currentExplicitDenyBlocksManifestMutationBeforeBackend() throws Exception {
-        String token = "Basic " + auth.issue().authorizationToken();
+        String token = "Basic " + auth.issue("us-east-1").authorizationToken();
         when(iam.resolveCallerContext(eq("ISSUED"), any())).thenReturn(CallerContext.of(List.of(
                 "{\"Statement\":{\"Effect\":\"Deny\",\"Action\":\"ecr:PutImage\",\"Resource\":\"*\"}}")));
         assertEquals(403, request(HttpMethod.PUT, "/v2/app/manifests/latest", token));
@@ -153,7 +168,7 @@ class EcrRegistryAuthenticationHttpTest {
     }
     @Test
     void optionalMountDeniedSourceFallsBackToAuthorizedOrdinaryUpload() throws Exception {
-        String token = "Basic " + auth.issue().authorizationToken();
+        String token = "Basic " + auth.issue("us-east-1").authorizationToken();
         when(iam.resolveCallerContext(eq("ISSUED"), any())).thenReturn(CallerContext.of(List.of(
                 "{\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"ecr:InitiateLayerUpload\",\"Resource\":\"*\"},"
                         + "{\"Effect\":\"Deny\",\"Action\":\"ecr:GetDownloadUrlForLayer\",\"Resource\":\"*\"}]}")));
@@ -165,7 +180,7 @@ class EcrRegistryAuthenticationHttpTest {
 
     @Test
     void permittedMountUsesTheExactAuthorizedSourceStorageNamespace() throws Exception {
-        String token = "Basic " + auth.issue().authorizationToken();
+        String token = "Basic " + auth.issue("us-east-1").authorizationToken();
         assertEquals(200, request(HttpMethod.POST, "/v2/app/blobs/uploads/?mount=sha256:abc&from=team/source", token));
         assertTrue(forwardedUri.get().contains("from=111111111111%2Fus-east-1%2Fteam%2Fsource"));
         assertNull(forwardedAuthorization.get());

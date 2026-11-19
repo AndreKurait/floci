@@ -98,7 +98,7 @@ class EcrServiceTest {
                 config,
                 regionResolver);
         service.registryAuthorization = Mockito.mock(EcrRegistryAuthorization.class);
-        when(service.registryAuthorization.issue()).thenReturn(new EcrRegistryAuthorization.IssuedToken(
+        when(service.registryAuthorization.issue(REGION)).thenReturn(new EcrRegistryAuthorization.IssuedToken(
                 Base64.getEncoder().encodeToString("AWS:issued-test-token".getBytes()), Instant.now().plusSeconds(43200)));
     }
 

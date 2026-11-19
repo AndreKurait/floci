@@ -101,7 +101,8 @@ public class EcrRegistryDataPlane {
         RegistryRequest selected = request.get();
         try {
             if (config.services().iam().enforcementEnabled()) {
-                EcrRegistryAuthorization.Identity identity = authorization.authenticate(context.request().getHeader("Authorization"));
+                EcrRegistryAuthorization.Identity identity = authorization.authenticate(
+                        context.request().getHeader("Authorization"), selected.region());
                 selected = requireRepositoryActions(context, selected, identity);
             }
         } catch (AwsException denied) {
