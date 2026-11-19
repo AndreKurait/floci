@@ -39,6 +39,7 @@ class EcrRegistryAuthenticationHttpTest {
     private HttpServer frontend;
     private EcrRegistryManager manager;
     private EcrRegistryAuthorization auth;
+    private EmulatorConfig config;
     private IamService iam;
     private final AtomicInteger backendRequests = new AtomicInteger();
     private final AtomicReference<String> forwardedAuthorization = new AtomicReference<>();
@@ -57,7 +58,7 @@ class EcrRegistryAuthenticationHttpTest {
         manager = mock(EcrRegistryManager.class);
         when(manager.tryAcquireWriteAdmission()).thenReturn(true);
         when(manager.httpClient()).thenReturn(new RegistryHttpClient("http://127.0.0.1:" + backend.actualPort()));
-        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.services().ecr().enabled()).thenReturn(true);
         when(config.services().ecr().uriStyle()).thenReturn("hostname");
         when(config.services().iam().enforcementEnabled()).thenReturn(true);
@@ -100,11 +101,15 @@ class EcrRegistryAuthenticationHttpTest {
     }
 
     private int request(HttpMethod method, String path, String token, String region) throws Exception {
+        return requestToHost(method, path, token, "111111111111.dkr.ecr." + region + ".localhost:4566");
+    }
+
+    private int requestToHost(HttpMethod method, String path, String token, String host) throws Exception {
         HttpClient client = vertx.createHttpClient();
         try {
             HttpClientRequest req = client.request(new RequestOptions().setHost("127.0.0.1").setPort(frontend.actualPort())
                     .setMethod(method).setURI(path)).toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
-            req.putHeader("Host", "111111111111.dkr.ecr." + region + ".localhost:4566");
+            req.putHeader("Host", host);
             if (token != null) {
                 req.putHeader("Authorization", token);
             }
@@ -155,6 +160,37 @@ class EcrRegistryAuthenticationHttpTest {
         verifyNoInteractions(manager);
         assertEquals(200, request(HttpMethod.GET, "/v2/", token));
         assertNull(forwardedAuthorization.get());
+    }
+
+    @Test
+    void pathStyleLoginAcceptsRegionalPasswordWithoutWeakeningRepositoryScope() throws Exception {
+        when(config.services().ecr().uriStyle()).thenReturn("path");
+        String token = "Basic " + auth.issue("us-west-2").authorizationToken();
+        String host = "localhost.floci.io:4566";
+        assertEquals(200, requestToHost(HttpMethod.GET, "/v2/", token, host));
+        assertEquals(200, requestToHost(HttpMethod.GET, "/v2", token, host));
+        assertNull(forwardedAuthorization.get());
+        assertEquals(2, backendRequests.get());
+        assertEquals(401, requestToHost(HttpMethod.PUT,
+                "/v2/111111111111/us-east-1/app/manifests/latest", token, host));
+        assertEquals(401, requestToHost(HttpMethod.POST, "/v2/", token, host));
+        assertEquals(2, backendRequests.get());
+        assertEquals(200, requestToHost(HttpMethod.GET,
+                "/v2/111111111111/us-west-2/app/manifests/latest", token, host));
+        assertNull(forwardedAuthorization.get());
+    }
+
+    @Test
+    void pathStyleLoginStillRejectsMissingWrongAndRevokedPasswords() throws Exception {
+        when(config.services().ecr().uriStyle()).thenReturn("path");
+        String host = "localhost.floci.io:4566";
+        assertEquals(401, requestToHost(HttpMethod.GET, "/v2/", null, host));
+        assertEquals(401, requestToHost(HttpMethod.GET, "/v2/", "Basic QVdTOmZsb2Np", host));
+        String token = "Basic " + auth.issue("us-west-2").authorizationToken();
+        when(iam.isInactiveAccessKey("ISSUED")).thenReturn(true);
+        assertEquals(401, requestToHost(HttpMethod.GET, "/v2/", token, host));
+        assertEquals(0, backendRequests.get());
+        verifyNoInteractions(manager);
     }
 
     @Test
