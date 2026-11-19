@@ -138,7 +138,10 @@ or a production certificate authority.
 CSR. `Tags` and `RevocationConfiguration` update in place; a change to any other
 property replaces the authority. In-place tag updates retain the previous tags until
 the stack commits; a failed update restores them, including failures in later resources.
-A failed tag restoration keeps its snapshot for rollback retry. Deleting the resource disables an `ACTIVE`
+A failed tag restoration keeps its snapshot for rollback retry. Replacements keep the prior
+authority until the stack update commits. Rollback restores its ARN and CSR and deletes
+the replacement; failed deletion remains tracked for retry. `UpdateReplacePolicy: Retain`
+keeps the prior authority after commit, while the default policy deletes it. Deleting the resource disables an `ACTIVE`
 authority, then deletes it. `AWS::ACMPCA::Certificate` and
 `AWS::ACMPCA::CertificateAuthorityActivation` are not provisioned: activate the
 authority with the API calls above.
