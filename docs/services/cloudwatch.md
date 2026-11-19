@@ -484,6 +484,15 @@ the weighted samples are stored without counting that summary again. Combining `
 is rejected. The console's
 supported numeric values use the same bounds.
 
+Set `FLOCI_SERVICES_CLOUDWATCHMETRICS_PACK_WEIGHTED_VALUES=true`
+(`floci.services.cloudwatchmetrics.pack-weighted-values`, default `false`) to store a multi-value
+batch in one record and reduce its retained memory. Queries preserve the per-value distribution.
+Scalar metrics and single-value batches keep the existing record format.
+
+Packed records require a reader that supports this option: older readers cannot recover their percentiles.
+Disabling the option changes future writes only; it does not convert existing packed records.
+Keep a compatible reader for storage written while this option was enabled.
+
 **Endpoint:** `http://localhost:4566/`. Query: GET or POST; JSON: POST.
 
 JSON 1.0 requests name their operation in `X-Amz-Target` with the `GraniteServiceVersion20100801.`
