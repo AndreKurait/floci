@@ -133,6 +133,74 @@ class EcrRegistryAuthenticationHttpTest {
     }
 
     @Test
+    void malformedQueryNamesRetainTheLoginChallenge() throws Exception {
+        for (String name : List.of("%zz", "%", "%2")) {
+            assertEquals(401, requestToHost(HttpMethod.GET, "/v2/?" + name + "=1", null, "localhost:4566"));
+        }
+        assertEquals(0, backendRequests.get());
+        verifyNoInteractions(manager);
+    }
+
+    @Test
+    void malformedNamespaceValuesRetainTheLoginChallenge() throws Exception {
+        for (String value : List.of("%zz", "%", "%2")) {
+            assertEquals(401, requestToHost(HttpMethod.GET, "/v2/?ns=" + value, null, "localhost:4566"));
+        }
+        assertEquals(0, backendRequests.get());
+        verifyNoInteractions(manager);
+    }
+
+    @Test
+    void malformedQueryNamesDoNotBreakIamOffRequests() throws Exception {
+        when(config.services().iam().enforcementEnabled()).thenReturn(false);
+        for (String name : List.of("%zz", "%", "%2")) {
+            assertEquals(200, requestToHost(HttpMethod.GET, "/v2/?" + name + "=1", null, "localhost:4566"));
+        }
+        assertEquals(3, backendRequests.get());
+    }
+
+    @Test
+    void malformedMountQueryNamesDoNotBreakAuthorizedUploads() throws Exception {
+        String token = "Basic " + auth.issue("us-east-1").authorizationToken();
+        for (String name : List.of("%zz", "%", "%2")) {
+            assertEquals(200, request(HttpMethod.POST,
+                    "/v2/app/blobs/uploads/?" + name + "=1&from=source&mount=sha256%3Aabc", token));
+            assertEquals("/v2/111111111111/us-east-1/app/blobs/uploads/"
+                    + "?from=111111111111%2Fus-east-1%2Fsource&mount=sha256%3Aabc", forwardedUri.get());
+        }
+        assertEquals(3, backendRequests.get());
+        assertNull(forwardedAuthorization.get());
+    }
+
+    @Test
+    void encodedNamespaceNameStillSelectsTheRegistry() throws Exception {
+        String token = "Basic " + auth.issue("us-east-1").authorizationToken();
+        assertEquals(200, requestToHost(HttpMethod.GET,
+                "/v2/app/manifests/latest?%6es=111111111111.dkr.ecr.us-east-1.localhost",
+                token, "localhost:4566"));
+        assertEquals(1, backendRequests.get());
+        assertNull(forwardedAuthorization.get());
+    }
+
+    @Test
+    void encodedMountNamesStillUseTheAuthorizedStorageNamespace() throws Exception {
+        String token = "Basic " + auth.issue("us-east-1").authorizationToken();
+        assertEquals(200, request(HttpMethod.POST,
+                "/v2/app/blobs/uploads/?%66rom=source&%6dount=sha256%3Aabc", token));
+        assertEquals("/v2/111111111111/us-east-1/app/blobs/uploads/"
+                + "?from=111111111111%2Fus-east-1%2Fsource&mount=sha256%3Aabc", forwardedUri.get());
+        assertNull(forwardedAuthorization.get());
+    }
+
+    @Test
+    void manifestDeletionIsUnsupportedBeforeBackendInEnforcedMode() throws Exception {
+        String token = "Basic " + auth.issue("us-east-1").authorizationToken();
+        assertEquals(403, request(HttpMethod.DELETE, "/v2/app/manifests/latest", token));
+        assertEquals(0, backendRequests.get());
+        verifyNoInteractions(manager);
+    }
+
+    @Test
     void uploadStatusAndCancellationAreUnsupportedBeforeBackend() throws Exception {
         String token = "Basic " + auth.issue("us-east-1").authorizationToken();
         for (HttpMethod method : List.of(HttpMethod.GET, HttpMethod.HEAD, HttpMethod.DELETE)) {
