@@ -77,6 +77,25 @@ class AcmPcaIntegrationTest {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     @Test
+    void supplementaryTagCharactersRoundTripAtTheLimits() {
+        try (Owned owned = new Owned("unicode-tags", "us-east-1")) {
+            String ca = owned.create(owned.client, UUID.randomUUID().toString());
+            String key = "𐐀".repeat(128);
+            String value = "𐐀".repeat(256);
+            owned.client.tagCertificateAuthority(input -> input.certificateAuthorityArn(ca)
+                    .tags(tag -> tag.key(key).value(value)));
+            assertTrue(owned.client.listTags(input -> input.certificateAuthorityArn(ca)).tags().stream()
+                    .anyMatch(tag -> key.equals(tag.key()) && value.equals(tag.value())));
+            error("InvalidTagException", () -> owned.client.tagCertificateAuthority(input -> input
+                    .certificateAuthorityArn(ca).tags(tag -> tag.key(key + "𐐀").value(value))));
+            error("InvalidTagException", () -> owned.client.tagCertificateAuthority(input -> input
+                    .certificateAuthorityArn(ca).tags(tag -> tag.key(key).value(value + "𐐀"))));
+            assertTrue(owned.client.listTags(input -> input.certificateAuthorityArn(ca)).tags().stream()
+                    .anyMatch(tag -> key.equals(tag.key()) && value.equals(tag.value())));
+        }
+    }
+
+    @Test
     void activatedAuthorityReplaysRootIssuanceToken() {
         try (Owned owned = new Owned("activation-replay", "us-east-1")) {
             String ca = owned.create(owned.client, UUID.randomUUID().toString());

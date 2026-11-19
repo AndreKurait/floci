@@ -154,8 +154,8 @@ final class PrivateCaRequests {
             fields(tag, "Tag", Set.of("Key", "Value"));
             String key = tag.path("Key").isTextual() ? tag.path("Key").textValue() : null;
             String value = tag.hasNonNull("Value") && tag.path("Value").isTextual() ? tag.path("Value").textValue() : null;
-            if (key == null || key.isEmpty() || key.length() > 128 || !TAG_TEXT.matcher(key).matches()
-                    || tag.hasNonNull("Value") && (value == null || value.length() > 256
+            if (key == null || key.isEmpty() || key.codePointCount(0, key.length()) > 128 || !TAG_TEXT.matcher(key).matches()
+                    || tag.hasNonNull("Value") && (value == null || value.codePointCount(0, value.length()) > 256
                     || !TAG_TEXT.matcher(value).matches())) {
                 throw tagError("Each tag needs a Key of 1 to 128 and a Value of at most 256 supported characters");
             }
