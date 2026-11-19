@@ -25,9 +25,12 @@ import java.time.Clock;
 import java.time.Instant;
 import java.util.Base64;
 import java.util.HexFormat;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /** Native ECR passwords identify their issuing caller; registryIds never grant permissions. */
 @ApplicationScoped
@@ -99,16 +102,19 @@ public class EcrRegistryAuthorization {
     /** Bounded sweep; expired records are never accepted even before their sweep turn. */
     private synchronized void pruneExpired() {
         Map<String, AccountAwareStorageBackend.AccountEntry<TokenRecord>> page = tokens.scanAllAccountEntriesAfter(pruneCursor, 128);
+        Map<String, Set<String>> expiredByAccount = new LinkedHashMap<>();
+        String nextCursor = pruneCursor;
         for (Map.Entry<String, AccountAwareStorageBackend.AccountEntry<TokenRecord>> entry : page.entrySet()) {
-            pruneCursor = entry.getKey();
+            nextCursor = entry.getKey();
             AccountAwareStorageBackend.AccountEntry<TokenRecord> item = entry.getValue();
             if (!item.value().expiresAt().isAfter(clock.instant())) {
-                tokens.deleteForAccount(item.accountId(), item.key());
+                expiredByAccount.computeIfAbsent(item.accountId(), account -> new LinkedHashSet<>()).add(item.key());
             }
         }
-        if (page.size() < 128) {
-            pruneCursor = null;
+        if (!expiredByAccount.isEmpty()) {
+            tokens.deleteAllAtomicallyForAccounts(expiredByAccount);
         }
+        pruneCursor = page.size() < 128 ? null : nextCursor;
     }
 
     @ActivateRequestContext

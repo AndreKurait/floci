@@ -20,15 +20,19 @@ import org.junit.jupiter.params.provider.NullAndEmptySource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.InOrder;
 
+import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Clock;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.ZoneOffset;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -256,6 +260,95 @@ class EcrRegistryAuthorizationTest {
         EcrRegistryAuthorization.IssuedToken replacement = reader.issue(REGION);
         assertEquals(ARN, reader.authenticate("Basic " + replacement.authorizationToken(), REGION)
                 .caller().principalArn());
+    }
+
+    @Test
+    void expiredPageUsesOnePersistentDeletionAndPreservesUnexpiredRecords(@TempDir Path directory) throws Exception {
+        Path file = directory.resolve("bounded-sweep.json");
+        PersistentStorage<String, EcrRegistryAuthorization.TokenRecord> disk = spy(
+                new PersistentStorage<>(file, new TypeReference<Map<String, EcrRegistryAuthorization.TokenRecord>>() {}));
+        Set<String> firstPage = seedExpiredPage(disk);
+        String retained = "333333333333/" + "f".repeat(64);
+        EcrRegistryAuthorization.TokenRecord live = new EcrRegistryAuthorization.TokenRecord(
+                null, "333333333333", null, null, clock.instant().plusSeconds(3600), false, REGION);
+        disk.put(retained, live);
+        EcrRegistryAuthorization writer = persistentAuthorization(disk);
+        clearInvocations(disk);
+
+        EcrRegistryAuthorization.IssuedToken token = writer.issue(REGION);
+
+        verify(disk, times(1)).deleteAllAtomically(firstPage);
+        verify(disk, never()).delete(anyString());
+        assertEquals(3, disk.keys().size());
+        assertEquals(live, disk.get(retained).orElseThrow());
+        assertEquals(ARN, writer.authenticate("Basic " + token.authorizationToken(), REGION).caller().principalArn());
+        PersistentStorage<String, EcrRegistryAuthorization.TokenRecord> reloaded = new PersistentStorage<>(
+                file, new TypeReference<Map<String, EcrRegistryAuthorization.TokenRecord>>() {});
+        reloaded.load();
+        assertEquals(disk.keys(), reloaded.keys());
+        assertEquals(live, reloaded.get(retained).orElseThrow());
+        for (String key : firstPage) {
+            assertTrue(reloaded.get(key).isEmpty(), key);
+        }
+        clearInvocations(disk);
+        writer.issue(REGION);
+        verify(disk, times(1)).deleteAllAtomically(Set.of(expiredKey(128)));
+        verify(disk, never()).delete(anyString());
+        assertEquals(3, disk.keys().size());
+        assertEquals(live, disk.get(retained).orElseThrow());
+    }
+
+    @Test
+    void failedPersistentDeletionRetainsPageAndRetriesWithoutAdvancingCursor(@TempDir Path directory) throws Exception {
+        Path file = directory.resolve("retry-sweep.json");
+        PersistentStorage<String, EcrRegistryAuthorization.TokenRecord> disk = spy(
+                new PersistentStorage<>(file, new TypeReference<Map<String, EcrRegistryAuthorization.TokenRecord>>() {}));
+        Set<String> firstPage = seedExpiredPage(disk);
+        String before = Files.readString(file);
+        EcrRegistryAuthorization writer = persistentAuthorization(disk);
+        clearInvocations(disk);
+        UncheckedIOException failure = new UncheckedIOException(new IOException("injected token storage failure"));
+        doThrow(failure).when(disk).deleteAllAtomically(anySet());
+
+        assertSame(failure, assertThrows(UncheckedIOException.class, () -> writer.issue(REGION)));
+
+        verify(disk, never()).put(anyString(), any());
+        assertEquals(129, disk.keys().size());
+        assertEquals(before, Files.readString(file));
+        doCallRealMethod().when(disk).deleteAllAtomically(anySet());
+        clearInvocations(disk);
+        EcrRegistryAuthorization.IssuedToken token = writer.issue(REGION);
+        verify(disk, times(1)).deleteAllAtomically(firstPage);
+        verify(disk, never()).delete(anyString());
+        assertEquals(2, disk.keys().size());
+        assertEquals(ARN, writer.authenticate("Basic " + token.authorizationToken(), REGION).caller().principalArn());
+        clearInvocations(disk);
+        writer.issue(REGION);
+        verify(disk, times(1)).deleteAllAtomically(Set.of(expiredKey(128)));
+    }
+
+    private EcrRegistryAuthorization persistentAuthorization(
+            PersistentStorage<String, EcrRegistryAuthorization.TokenRecord> disk) {
+        return new EcrRegistryAuthorization(new AccountAwareStorageBackend<>(disk, null, ACCOUNT), iam,
+                new IamPolicyEvaluator(new ObjectMapper()), request, config, clock);
+    }
+
+    private Set<String> seedExpiredPage(PersistentStorage<String, EcrRegistryAuthorization.TokenRecord> disk) {
+        Set<String> page = new LinkedHashSet<>();
+        for (int i = 0; i < 129; i++) {
+            String account = i < 64 ? ACCOUNT : "222222222222";
+            String rawKey = expiredKey(i);
+            disk.put(rawKey, new EcrRegistryAuthorization.TokenRecord(
+                    null, account, null, null, clock.instant().minusSeconds(1), false, REGION));
+            if (i < 128) {
+                page.add(rawKey);
+            }
+        }
+        return page;
+    }
+
+    private static String expiredKey(int index) {
+        return (index < 64 ? ACCOUNT : "222222222222") + "/" + String.format("%064x", index);
     }
 
 }
