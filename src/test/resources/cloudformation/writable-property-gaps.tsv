@@ -141,6 +141,7 @@ AWS::Cognito::UserPoolClient	AuthSessionValidity	accepted and ignored
 AWS::Cognito::UserPoolClient	EnablePropagateAdditionalUserContextData	accepted and ignored
 AWS::Cognito::UserPoolDomain	Routing	accepted and ignored, as the CognitoCfnProvisioner javadoc records
 AWS::Config::ConfigRule	Compliance	accepted and ignored
+AWS::DSQL::Cluster	MetricGroups	accepted and ignored
 AWS::DynamoDB::GlobalTable	BillingMode	accepted and ignored
 AWS::DynamoDB::GlobalTable	GlobalTableSourceArn	accepted and ignored
 AWS::DynamoDB::GlobalTable	GlobalTableWitnesses	accepted and ignored
@@ -238,6 +239,7 @@ AWS::EC2::VPCEndpoint	Tags	accepted and ignored
 AWS::EC2::VPCEndpointService	ContributorInsightsEnabled	accepted and ignored: Floci keeps no Contributor Insights rules
 AWS::EC2::VPCEndpointService	PayerResponsibility	accepted and ignored: Floci does not bill endpoints
 AWS::EC2::VPCEndpointService	PrivateDnsNameConfiguration	read-only members only; Floci generates them from PrivateDnsName
+AWS::EC2::VPCEndpointServicePermissions	TransitGatewayAttachmentAllowedPrincipals	accepted and ignored
 AWS::ECR::Repository	EmptyOnDelete	accepted and ignored
 AWS::ECR::Repository	EncryptionConfiguration	accepted and ignored
 AWS::ECR::Repository	ImageScanningConfiguration	accepted and ignored

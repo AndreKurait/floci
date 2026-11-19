@@ -2,7 +2,7 @@
   "_source": {
     "generator": "tools/aws/regen_cfn_property_types.py",
     "schemas": "https://schema.cloudformation.us-east-1.amazonaws.com/CloudformationSchema.zip",
-    "retrieved": "2026-11-15",
+    "retrieved": "2026-11-19",
     "note": "make cfn-property-types-verify checks the file against AWS."
   },
   "operations": {
@@ -96,35 +96,40 @@
     "AWS::DSQL::Cluster": {
       "type": "structure",
       "members": {
-        "Status": "String",
-        "PolicyVersion": "String",
-        "EncryptionDetails": "AWS::DSQL::Cluster.EncryptionDetails",
-        "KmsEncryptionKey": "String",
-        "MultiRegionProperties": "AWS::DSQL::Cluster.MultiRegionProperties",
+        "DeletionProtectionEnabled": "Boolean",
+        "Tags": "AWS::DSQL::Cluster.Tags",
         "ResourceArn": "String",
         "Identifier": "String",
-        "VpcEndpointServiceName": "String",
-        "VpcEndpoint": "String",
-        "Endpoint": "String",
         "CreationTime": "String",
+        "Status": "String",
+        "VpcEndpointServiceName": "String",
+        "MultiRegionProperties": "AWS::DSQL::Cluster.MultiRegionProperties",
+        "KmsEncryptionKey": "String",
+        "EncryptionDetails": "AWS::DSQL::Cluster.EncryptionDetails",
+        "Endpoint": "String",
+        "VpcEndpoint": "String",
+        "PolicyVersion": "String",
         "PolicyDocument": "String",
-        "DeletionProtectionEnabled": "Boolean",
-        "Tags": "AWS::DSQL::Cluster.Tags"
+        "MetricGroups": "AWS::DSQL::Cluster.MetricGroups"
       }
     },
     "AWS::DSQL::Cluster.EncryptionDetails": {
       "type": "structure",
       "members": {
-        "EncryptionType": "String",
         "EncryptionStatus": "String",
+        "EncryptionType": "String",
         "KmsKeyArn": "String"
       }
+    },
+    "AWS::DSQL::Cluster.MetricGroups": {
+      "type": "list",
+      "member": "AWS::DSQL::Cluster/MetricGroup"
     },
     "AWS::DSQL::Cluster.MultiRegionProperties": {
       "type": "structure",
       "members": {
-        "Clusters": "AWS::DSQL::Cluster.MultiRegionProperties.Clusters",
-        "WitnessRegion": "String"
+        "WitnessRegion": "String",
+        "Clusters": "AWS::DSQL::Cluster.MultiRegionProperties.Clusters"
       }
     },
     "AWS::DSQL::Cluster.MultiRegionProperties.Clusters": {
@@ -135,11 +140,20 @@
       "type": "list",
       "member": "AWS::DSQL::Cluster/Tag"
     },
+    "AWS::DSQL::Cluster/MetricGroup": {
+      "type": "structure",
+      "members": {
+        "MetricGroup": "String"
+      },
+      "required": [
+        "MetricGroup"
+      ]
+    },
     "AWS::DSQL::Cluster/Tag": {
       "type": "structure",
       "members": {
-        "Value": "String",
-        "Key": "String"
+        "Key": "String",
+        "Value": "String"
       },
       "required": [
         "Key",
