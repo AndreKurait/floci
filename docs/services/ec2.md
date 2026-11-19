@@ -2389,6 +2389,12 @@ matching deployment-owned VPC network. Recovery never reconnects a missing endpo
 a record-only attachment. Older records without physical ownership are not inferred from an IP
 address match: detach and reattach with hot attachment enabled to establish that ownership.
 
+After changing a device's MAC, Floci attempts a one-second `arping` announcement
+from the namespace owner so peers replace the temporary Docker MAC in their
+neighbor caches. Existing guests without `arping` or permission to send ARP remain
+supported: Floci logs the announcement failure and leaves the repaired device
+attached, but peers may need to expire their old neighbor entries.
+
 With isolated address spaces, an interface `AttachNetworkInterface` attaches to a running instance stays
 record-only unless `FLOCI_SERVICES_EC2_VPC_NETWORKS_HOT_ATTACH_ACROSS_ADDRESS_SPACES=true`. Then an
 interface of another VPC (its ranges may overlap the instance's) becomes one more native device of the

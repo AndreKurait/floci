@@ -1055,8 +1055,9 @@ class VpcNetworkManagerTest {
                 + "{\"ifname\":\"eth1\",\"address\":\"" + deviceMac + "\"}]";
     }
 
-    @Test
-    void whereDockerKeepsItsOwnMacTheNamespaceOwnerGivesTheDeviceTheInterfacesMac() {
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void whereDockerKeepsItsOwnMacTheNamespaceOwnerGivesTheDeviceTheInterfacesMac(boolean announcementAvailable) {
         manager.declareVpc(REGION, "vpc-2", "172.31.0.0/16");
         manager.declareSubnet(REGION, "vpc-2", "subnet-c", "172.31.5.0/24");
         String address = manager.allocatePrivateIp(REGION, "subnet-c").orElseThrow();
@@ -1072,6 +1073,9 @@ class VpcNetworkManagerTest {
                 device[0] = INTERFACE_MAC;
                 return "";
             }
+            if (command[0].equals("arping") && !announcementAvailable) {
+                throw new IllegalStateException("arping unavailable in this namespace");
+            }
             return links(device[0]);
         };
 
@@ -1081,7 +1085,7 @@ class VpcNetworkManagerTest {
         assertEquals(List.of("ip -j link",
                 "sh -c ip link set dev eth1 down && ip link set dev eth1 address " + INTERFACE_MAC
                         + " && ip link set dev eth1 up",
-                "ip -j link"), commands);
+                "ip -j link", "arping -U -c 1 -w 1 -I eth1 " + address), commands);
         verify(docker, never()).disconnectFromNetworkCmd();
     }
 
