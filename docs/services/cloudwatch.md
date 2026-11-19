@@ -479,7 +479,9 @@ invalid values and non-object statistics return `InvalidParameterValue`; combini
 statistics returns `InvalidParameterCombination`. JSON bodies use the corresponding SDK exception
 shape names. `Values` accepts 1 to 150 numeric samples with optional matching, nonnegative
 `Counts`; omitted counts default to one. JSON and Query normalize these weighted samples without
-expanding their counts, and reject combinations with `Value` or `StatisticValues`. The console's
+expanding their counts. A `StatisticValues` set sent with `Values` summarizes the same distribution:
+the weighted samples are stored without counting that summary again. Combining `Value` and `Values`
+is rejected. The console's
 supported numeric values use the same bounds.
 
 **Endpoint:** `http://localhost:4566/`. Query: GET or POST; JSON: POST.

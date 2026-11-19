@@ -19,15 +19,13 @@ final class MetricValues {
     static List<MetricDatum> fromJson(JsonNode input, MetricDatum datum) {
         List<Double> values = jsonNumbers(input.get("Values"), "Values");
         List<Double> counts = jsonNumbers(input.get("Counts"), "Counts");
-        return normalize(datum, values, counts, input.hasNonNull("Value") || input.hasNonNull("StatisticValues"));
+        return normalize(datum, values, counts, input.hasNonNull("Value"));
     }
 
     static List<MetricDatum> fromQuery(Map<String, List<String>> input, String prefix, MetricDatum datum) {
         List<Double> values = queryNumbers(input, prefix + "Values");
         List<Double> counts = queryNumbers(input, prefix + "Counts");
-        boolean otherFormat = input.containsKey(prefix + "Value")
-                || input.keySet().stream().anyMatch(key -> key.startsWith(prefix + "StatisticValues."));
-        return normalize(datum, values, counts, otherFormat);
+        return normalize(datum, values, counts, input.containsKey(prefix + "Value"));
     }
 
     private static List<Double> jsonNumbers(JsonNode input, String field) {
@@ -78,17 +76,21 @@ final class MetricValues {
         return new ArrayList<>(numbers.values());
     }
 
+    /**
+     * A {@code StatisticValues} set sent beside {@code Values} summarizes the same samples (the CloudWatch
+     * agent publishes a distribution that way), so the weighted samples are kept and the set is not counted
+     * again. {@code Value} and {@code Values} are alternative forms and stay mutually exclusive.
+     */
     private static List<MetricDatum> normalize(MetricDatum template, List<Double> values,
-                                               List<Double> counts, boolean otherFormat) {
+                                               List<Double> counts, boolean scalarValue) {
         if (values == null) {
             if (counts != null) {
                 throw CloudWatchMetricsException.invalidParameterCombination("Counts requires Values.");
             }
             return List.of(template);
         }
-        if (otherFormat) {
-            throw CloudWatchMetricsException.invalidParameterCombination(
-                    "Values cannot be combined with Value or StatisticValues.");
+        if (scalarValue) {
+            throw CloudWatchMetricsException.invalidParameterCombination("Values cannot be combined with Value.");
         }
         if (counts != null && counts.size() != values.size()) {
             throw CloudWatchMetricsException.invalidParameterValue("Counts and Values must have the same length.");

@@ -242,6 +242,22 @@ class CloudWatchMetricValuesTest {
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
+    void statisticValuesBesideValuesAreAcceptedAndTheDistributionIsCountedOnce(boolean useQuery) {
+        // A distribution's summary sent with its own Values and Counts, as the CloudWatch agent publishes it.
+        ObjectNode datum = weighted();
+        datum.putObject("StatisticValues").put("SampleCount", 5).put("Sum", 43)
+                .put("Minimum", 7).put("Maximum", 11);
+        publish(useQuery, datum);
+        CloudWatchMetricsService.Datapoint point = statistics("SampleCount").getFirst();
+        assertEquals(5, point.sampleCount());
+        assertEquals(43, point.sum());
+        assertEquals(7, point.minimum());
+        assertEquals(11, point.maximum());
+        assertEquals(Map.of("p50", 7.0, "p90", 11.0), statistics("p50", "p90").getFirst().extendedStatistics());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
     void oneHundredFiftyValuesAreAcceptedAndTheNextIsRejected(boolean useQuery) {
         ObjectNode datum = datum();
         ArrayNode values = datum.putArray("Values");
