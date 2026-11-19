@@ -116,7 +116,7 @@ public class KmsCfnProvisioner implements CfnResourceProvisioner {
                 });
     }
 
-    /** The template's KeyPolicy as JSON, or null when it has none, which keeps the key's current policy. */
+    /** The template's KeyPolicy as JSON, or null when it has none. The update path handles a dropped policy. */
     private static String keyPolicy(JsonNode props, ProvisionContext ctx) {
         String policy = props == null ? null : ctx.engine().resolveJsonAttributeStrict(props.path("KeyPolicy"));
         return policy == null || policy.isBlank() ? null : policy;
@@ -168,14 +168,22 @@ public class KmsCfnProvisioner implements CfnResourceProvisioner {
         if (rotation == null && dropped.contains("EnableKeyRotation")) {
             rotation = Boolean.FALSE;
         }
-        Map<String, String> desiredTags = ReservedTags.stripReservedTags(
-                parseCfnTags(props != null ? props.get("Tags") : null, ctx));
+        Map<String, String> desiredTags = parseCfnTags(props != null ? props.get("Tags") : null, ctx);
+        String overrideId = ReservedTags.extractOverrideKeyId(desiredTags);
+        if (overrideId != null && !overrideId.equals(keyId)) {
+            throw new AwsException("InvalidRequest", "The key ID override cannot be changed.", 400);
+        }
+        desiredTags.remove(ReservedTags.OVERRIDE_ID_KEY);
+        ReservedTags.rejectReservedTagsOnUpdate(desiredTags);
         // Only the keys the previous template or this one sets are the stack's to change or drop.
         Set<String> priorTagKeys = Ec2Tags.ownedKeys(r, TAG_KEYS_ATTR, ctx);
         Set<String> managedTagKeys = new TreeSet<>(priorTagKeys);
         managedTagKeys.addAll(desiredTags.keySet());
         // Resolved before the snapshot: a template that cannot be read changes nothing.
         String policy = keyPolicy(props, ctx);
+        if (policy == null && dropped.contains("KeyPolicy")) {
+            policy = kmsService.buildDefaultKeyPolicy();
+        }
         ObjectNode snapshot = MAPPER.createObjectNode();
         snapshot.put("keyId", keyId);
         snapshot.put("region", region);
@@ -191,9 +199,9 @@ public class KmsCfnProvisioner implements CfnResourceProvisioner {
         String finalDescription = description;
         Boolean finalEnabled = enabled;
         Boolean finalRotation = rotation;
-        // A dropped KeyPolicy keeps the current policy: no AWS documentation says it resets to the default.
+        String finalPolicy = policy;
         CfnRollback.guarded(r, ctx, false, () -> { }, () -> restore(snapshot), () ->
-                converge(key, finalDescription, policy, finalEnabled, finalRotation, desiredTags,
+                converge(key, finalDescription, finalPolicy, finalEnabled, finalRotation, desiredTags,
                         managedTagKeys, region));
         Ec2Tags.recordKeys(r, TAG_KEYS_ATTR, desiredTags);
     }
