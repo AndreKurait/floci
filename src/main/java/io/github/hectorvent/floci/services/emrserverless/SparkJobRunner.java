@@ -88,22 +88,44 @@ public interface SparkJobRunner {
                String logFolder, CloudWatchLogs cloudWatchLogs, Map<String, String> environment,
                List<String> archives, Storage storage, Map<String, String> coreSite,
                Map<String, String> sparkLog4j2, Map<String, String> mapredSite, Map<String, String> hadoopLog4j,
+               Map<String, String> hadoopEnvironment, String imagePullSourceArn) {
+
+        public Job(String service, String runId, String accountId, String region, String releaseLabel, Engine engine,
+               String imageTemplate, String customImage, String dockerNetwork, String executionRole,
+               Map<String, String> sparkDefaults, List<String> application, List<String> command, Duration timeout,
+               String logFolder, CloudWatchLogs cloudWatchLogs, Map<String, String> environment,
+               List<String> archives, Storage storage, Map<String, String> coreSite,
+               Map<String, String> sparkLog4j2, Map<String, String> mapredSite, Map<String, String> hadoopLog4j,
                Map<String, String> hadoopEnvironment) {
+            this(service, runId, accountId, region, releaseLabel, engine, imageTemplate, customImage,
+                    dockerNetwork, executionRole, sparkDefaults, application, command, timeout, logFolder,
+                    cloudWatchLogs, environment, archives, storage, coreSite, sparkLog4j2, mapredSite,
+                    hadoopLog4j, hadoopEnvironment, null);
+        }
 
         /** This job, on {@code storage}. */
         public Job onStorage(Storage storage) {
             return new Job(service, runId, accountId, region, releaseLabel, engine, imageTemplate, customImage,
                     dockerNetwork, executionRole, sparkDefaults, application, command, timeout, logFolder,
                     cloudWatchLogs, environment, archives, storage, coreSite, sparkLog4j2, mapredSite, hadoopLog4j,
-                    hadoopEnvironment);
+                    hadoopEnvironment, imagePullSourceArn);
         }
 
         /** This job, run in {@code image}. */
         public Job inImage(String image) {
             return new Job(service, runId, accountId, region, releaseLabel, engine, image, customImage, dockerNetwork,
                     executionRole, sparkDefaults, application, command, timeout, logFolder, cloudWatchLogs, environment,
-                    archives, storage, coreSite, sparkLog4j2, mapredSite, hadoopLog4j, hadoopEnvironment);
+                    archives, storage, coreSite, sparkLog4j2, mapredSite, hadoopLog4j, hadoopEnvironment, imagePullSourceArn);
         }
+
+        /** The owning application's identity for pulling its custom image. */
+        public Job withImagePullSourceArn(String sourceArn) {
+            return new Job(service, runId, accountId, region, releaseLabel, engine, imageTemplate, customImage,
+                    dockerNetwork, executionRole, sparkDefaults, application, command, timeout, logFolder,
+                    cloudWatchLogs, environment, archives, storage, coreSite, sparkLog4j2, mapredSite, hadoopLog4j,
+                    hadoopEnvironment, sourceArn);
+        }
+
     }
 
     /**

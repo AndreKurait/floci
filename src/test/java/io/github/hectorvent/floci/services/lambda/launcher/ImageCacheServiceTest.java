@@ -11,6 +11,7 @@ import com.github.dockerjava.api.exception.DockerException;
 import com.github.dockerjava.api.exception.InternalServerErrorException;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.exception.UnauthorizedException;
+import com.github.dockerjava.api.model.AuthConfig;
 import com.github.dockerjava.api.model.Info;
 import com.github.dockerjava.api.model.PullResponseItem;
 import io.github.hectorvent.floci.config.EmulatorConfig;
@@ -48,6 +49,37 @@ class ImageCacheServiceTest {
     private static final String REGISTRY_REPO = "registry.example:5000/app";
     private static final String REGISTRY_IMAGE = REGISTRY_REPO + ":latest";
     private static final String LOCAL_IMAGE = "app-local:latest";
+
+    @Test
+    void suppliedCredentialReachesRegistryEvenWhenImageWasAlreadyResolved() {
+        FakeDaemon daemon = new FakeDaemon();
+        daemon.store(REGISTRY_IMAGE, image("sha256:cached"));
+        daemon.registry.put(REGISTRY_IMAGE, image("sha256:authorized"));
+        ImageCacheService service = newService(daemon.client);
+        assertEquals("sha256:cached", service.ensureImageExists(REGISTRY_IMAGE));
+        AuthConfig credential = new AuthConfig().withRegistryAddress("registry.example:5000")
+                .withUsername("AWS").withPassword("per-pull");
+
+        assertEquals("sha256:authorized", service.ensureImageExists(REGISTRY_IMAGE, null, credential));
+        assertEquals(1, daemon.pulls.get());
+    }
+
+    @Test
+    void suppliedCredentialCannotFallBackToLocalImageAfterRegistryDenial() {
+        FakeDaemon daemon = new FakeDaemon();
+        daemon.store(REGISTRY_IMAGE, image("sha256:cached"));
+        ImageCacheService service = newService(daemon.client);
+        AuthConfig credential = new AuthConfig().withRegistryAddress("registry.example:5000")
+                .withUsername("AWS").withPassword("per-pull");
+        when(daemon.client.pullImageCmd(REGISTRY_IMAGE)).thenThrow(new UnauthorizedException("denied"));
+
+        for (ImagePullBehavior behavior : ImagePullBehavior.values()) {
+            assertThrows(UnauthorizedException.class,
+                    () -> service.resolveForLaunch(REGISTRY_IMAGE, behavior, null, credential));
+        }
+        assertThrows(UnauthorizedException.class,
+                () -> service.ensureImageExists(REGISTRY_IMAGE, null, credential));
+    }
 
     @Test
     void pullsImageWhenInspectionReportsNotFound() throws Exception {

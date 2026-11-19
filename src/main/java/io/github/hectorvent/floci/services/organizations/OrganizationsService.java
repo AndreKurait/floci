@@ -10,6 +10,7 @@ import io.github.hectorvent.floci.core.common.RegionResolver;
 import io.github.hectorvent.floci.core.common.ServicePrincipals;
 import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.services.iam.PrincipalOrganization;
 import io.github.hectorvent.floci.services.iam.RootAccessOrganization;
 import io.github.hectorvent.floci.services.iam.ScpProvider;
 import io.github.hectorvent.floci.services.organizations.model.CreateAccountStatus;
@@ -59,7 +60,7 @@ import java.util.regex.Pattern;
  * @see <a href="https://docs.aws.amazon.com/organizations/latest/APIReference/Welcome.html">AWS Organizations API Reference</a>
  */
 @ApplicationScoped
-public class OrganizationsService implements ScpProvider, RootAccessOrganization {
+public class OrganizationsService implements ScpProvider, RootAccessOrganization, PrincipalOrganization {
 
     private static final Logger LOG = Logger.getLogger(OrganizationsService.class);
 
@@ -1104,6 +1105,52 @@ public class OrganizationsService implements ScpProvider, RootAccessOrganization
     }
 
     // ──────────────────────────── Tags ────────────────────────────
+
+    @Override
+    public Optional<OrganizationContext> organizationContextOf(String accountId) {
+        if (accountId == null || accountId.isBlank() || organizations.isEmptyInAllAccounts()) {
+            return Optional.empty();
+        }
+        OrganizationAccount member = accounts.scanAllAccounts().stream()
+                .filter(account -> accountId.equals(account.getId()))
+                .findFirst()
+                .orElse(null);
+        Optional<Organization> organization = member == null
+                ? organizationManagedBy(accountId)
+                : organizationById(member.getOrganizationId());
+        return organization.map(found -> new OrganizationContext(
+                found.getId(), found.getMasterAccountId(), parentPath(found, member)));
+    }
+
+    /** The organization this account manages, which is the one holding no member row for it. */
+    private Optional<Organization> organizationManagedBy(String accountId) {
+        return organizations.scanAllAccounts().stream()
+                .filter(organization -> accountId.equals(organization.getMasterAccountId()))
+                .findFirst();
+    }
+
+    /**
+     * The path an account's principals carry, which stops at the account's parent rather than at
+     * the account: the published condition for the key compares a path ending in an OU. An
+     * account the organization holds no row for is at its root, which is where the management
+     * account sits.
+     *
+     * <p>A chain that cannot be walked, an account naming a parent the organization no longer
+     * holds, is no path rather than a failed call: the caller asked for an authorization decision,
+     * and a key with no value is answered by every condition written on it. {@link
+     * #effectiveScpLevels} answers an organization it cannot resolve the same way.
+     */
+    private String parentPath(Organization organization, OrganizationAccount member) {
+        String rootId = organization.getRoot().getId();
+        String parentId = member == null || member.getParentId() == null || member.getParentId().isBlank()
+                ? rootId : member.getParentId();
+        try {
+            return organizationPath(organization.getId(), rootId, parentId,
+                    id -> parentOf(organization, id));
+        } catch (AwsException e) {
+            return null;
+        }
+    }
 
     public Map<String, String> listTagsForResource(String callerAccountId, String resourceId) {
         Organization organization = requireOrganizationForCaller(callerAccountId);

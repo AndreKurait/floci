@@ -39,9 +39,12 @@ class EcrRegistryIssuedTokenSdkIntegrationTest {
             assertThrows(EcrException.class, () -> forged.getAuthorizationToken());
             AuthorizationData token = client.getAuthorizationToken(r -> r.registryIds("137112412989")).authorizationData().getFirst();
             assertEquals("https://137112412989.dkr.ecr.us-west-2.amazonaws.com", token.proxyEndpoint());
-            EcrRegistryAuthorization.Identity caller = authorization.authenticate("Basic " + token.authorizationToken());
+            EcrRegistryAuthorization.Identity caller = authorization.authenticate("Basic " + token.authorizationToken(), "us-west-2");
             assertTrue(caller.caller().principalArn().endsWith(":user/" + user.name()));
             assertEquals(user.accessKeyId(), caller.token().accessKeyId());
+            assertEquals("us-west-2", caller.token().region());
+            assertEquals(401, assertThrows(AwsException.class, () -> authorization.authenticate(
+                    "Basic " + token.authorizationToken(), "us-east-1")).getHttpStatus());
             assertThrows(AwsException.class,
                     () -> authorization.requirePermission(caller, "ecr:BatchGetImage",
                             "arn:aws:ecr:us-west-2:137112412989:repository/amazonlinux", null));

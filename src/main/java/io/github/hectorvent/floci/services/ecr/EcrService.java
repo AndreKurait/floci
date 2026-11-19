@@ -722,7 +722,7 @@ public class EcrService implements ResourceProvider {
                 || registryIds.stream().anyMatch(id -> id == null || !id.matches("[0-9]{12}"))) {
             throw new AwsException("InvalidParameterException", "registryIds must contain 1 to 10 twelve-digit account IDs", 400);
         }
-        EcrRegistryAuthorization.IssuedToken issued = registryAuthorization.issue();
+        EcrRegistryAuthorization.IssuedToken issued = registryAuthorization.issue(regionResolver.getRegion());
         String token = issued.authorizationToken();
         Instant expires = issued.expiresAt();
         return registryIds.stream().map(account -> new AuthorizationData(token, expires,
@@ -733,7 +733,7 @@ public class EcrService implements ResourceProvider {
         // Deliberately not gated on the backing registry: AWS answers this call from the
         // control plane, and both values here are computed without Docker. Gating it made
         // every SDK client retry a 500 before its first repository call.
-        EcrRegistryAuthorization.IssuedToken issued = registryAuthorization.issue();
+        EcrRegistryAuthorization.IssuedToken issued = registryAuthorization.issue(regionResolver.getRegion());
         String token = issued.authorizationToken();
         Instant expires = issued.expiresAt();
         String proxy = registryManager.getProxyEndpoint();
@@ -2095,10 +2095,7 @@ public class EcrService implements ResourceProvider {
     /** Read the selected registry owner without trusting the HTTP caller's account namespace. */
     public Optional<Repository> registryRepository(String name, String account, String region) {
         String repositoryKey = key(region, account, name);
-        if (repoStore instanceof AccountAwareStorageBackend<Repository> aware) {
-            return aware.getForAccount(account, repositoryKey);
-        }
-        return repoStore.get(repositoryKey);
+        return AccountAwareStorageBackend.readInAccount(repoStore, account, repositoryKey);
     }
 
     private Repository requireRepo(String name, String registryId, String region) {

@@ -458,12 +458,22 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
      * IAM). Null when the service is built by hand, where no organization exists.
      */
     @Inject
+    Instance<PrincipalOrganization> principalOrganizations;
+
+    @Inject
     Instance<ScpProvider> scpProvider;
 
     /**
-     * The service control policy levels that cap {@code accountId}, or null when SCPs do not apply
-     * to it, for callers that evaluate a principal outside the request filter.
+     * Current organization context for a principal's own account, absent when Organizations
+     * is not deployed or the account belongs to no organization.
      */
+    public Optional<PrincipalOrganization.OrganizationContext> organizationContextOf(String accountId) {
+        return principalOrganizations != null && principalOrganizations.isResolvable()
+                ? principalOrganizations.get().organizationContextOf(accountId)
+                : Optional.empty();
+    }
+
+    /** Current service control policy ceilings, absent when SCPs do not apply to the account. */
     public List<List<String>> effectiveScpLevels(String accountId) {
         return scpProvider != null && scpProvider.isResolvable()
                 ? scpProvider.get().effectiveScpLevels(accountId) : null;
