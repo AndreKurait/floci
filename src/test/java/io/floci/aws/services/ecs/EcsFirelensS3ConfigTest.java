@@ -118,6 +118,7 @@ class EcsFirelensS3ConfigTest {
         service.registerTaskDefinition("ec2-s3", List.of(firelensRouter("fluentbit", S3_CONFIG_ARN)),
                 NetworkMode.bridge, null, null, null, null, List.of("EC2"), "us-east-1");
 
+        service.registerContainerInstance("test-cluster", null, null, "us-east-1");
         List<EcsTask> tasks = service.runTask("test-cluster", "ec2-s3", 1,
                 LaunchType.EC2, null, null, List.of(), null, "us-east-1");
 

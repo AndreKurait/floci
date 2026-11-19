@@ -34,6 +34,34 @@ class Ec2MetadataServerTest {
     }
 
     @Test
+    void aPendingContainerWhoseAddressIsUnknownMatchesNoRequest() {
+        Ec2MetadataServer server = new Ec2MetadataServer(null, null, null, (InstanceConnectKeys) null);
+        Instance instance = new Instance();
+        instance.setInstanceId("i-host");
+        // Docker inspection failed or the container has no address yet: nothing to match.
+        server.registerPendingContainer("starting", "task/a", () -> null, instance);
+        assertTrue(server.instanceForAddress("127.0.0.1") == null);
+        assertEquals(1, server.pendingContainerCount());
+        server.registerPendingContainer("running", "task/b", () -> "192.0.2.10", instance);
+        assertEquals(instance, server.instanceForAddress("192.0.2.10"));
+        assertEquals(1, server.pendingContainerCount());
+    }
+
+    @Test
+    void releasingATaskUnmapsItsAddressWhicheverInstanceIsAskedFirst() {
+        Ec2MetadataServer server = new Ec2MetadataServer(null, null, null, (InstanceConnectKeys) null);
+        Instance other = new Instance();
+        other.setInstanceId("i-other");
+        Instance owning = new Instance();
+        owning.setInstanceId("i-owning");
+        server.registerContainer("192.0.2.20", "i-owning", owning, "task/a");
+        // The manager asks every instance it knows; the first one asked does not hold the address.
+        server.unregisterContainer("192.0.2.20", other, "task/a");
+        server.unregisterContainer("192.0.2.20", owning, "task/a");
+        assertTrue(server.registeredContainer("192.0.2.20").isEmpty());
+    }
+
+    @Test
     void instanceMetadataListsTagKeys() {
         Instance instance = new Instance();
         instance.setTags(List.of(
