@@ -1,3 +1,4 @@
+AWS::ACMPCA::CertificateAuthority	AcmPcaCfnProvisioner
 AWS::ApiGateway::Account	ApiGatewayAccountCfnProvisioner
 AWS::ApiGateway::ApiKey	ApiGatewayApiKeyCfnProvisioner
 AWS::ApiGateway::Authorizer	ApiGatewayRestApiCfnProvisioner

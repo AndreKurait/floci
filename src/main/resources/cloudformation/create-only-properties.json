@@ -1,4 +1,13 @@
 {
+  "AWS::ACMPCA::CertificateAuthority": [
+    "Type",
+    "KeyAlgorithm",
+    "SigningAlgorithm",
+    "Subject",
+    "CsrExtensions",
+    "KeyStorageSecurityStandard",
+    "UsageMode"
+  ],
   "AWS::ApiGateway::Account": [],
   "AWS::ApiGateway::ApiKey": [
     "GenerateDistinctId",

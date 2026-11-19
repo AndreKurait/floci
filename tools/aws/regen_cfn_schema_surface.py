@@ -29,6 +29,7 @@ Run from anywhere in the repo:
 from __future__ import annotations
 
 import argparse
+import difflib
 import http.client
 import io
 import json
@@ -147,7 +148,11 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     if args.verify:
-        if not args.output.exists() or args.output.read_text(encoding="utf-8") != document:
+        committed = args.output.read_text(encoding="utf-8") if args.output.exists() else ""
+        if not args.output.exists() or committed != document:
+            sys.stderr.writelines(difflib.unified_diff(
+                committed.splitlines(keepends=True), document.splitlines(keepends=True),
+                fromfile=str(_shown(args.output)), tofile="generated schema surface"))
             print(f"error: {_shown(args.output)} no longer matches {provenance}; run "
                   f"'make cfn-schema-surface-sync' and commit the result.", file=sys.stderr)
             return 1

@@ -4,6 +4,7 @@ Run with: pytest tools/aws -q  (or: make iam-request-resources-test)
 """
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 from pathlib import Path
 
@@ -28,6 +29,43 @@ def members(*names: str) -> dict[str, str]:
 def test_a_member_holding_an_arn_names_any_type_the_action_acts_on():
     assert r.resources_for("svc:DescribeThing", ["thing", "pool"], FORMATS, members("ThingArn", "ResourceArns[]")) == [
         {"types": ["thing", "pool"], "arn": "ResourceArns[]"}, {"types": ["thing", "pool"], "arn": "ThingArn"}]
+
+
+@pytest.mark.parametrize("required,variable,suffix,mandatory,omit_parent,removed", [
+    (True, "PoolId", "/child/serial", True, False, True),
+    (False, "PoolId", "/child/serial", True, False, False),
+    (True, "PoolName", "/child/serial", True, False, False),
+    (True, "PoolId", ":alias", True, False, False),
+    (True, "PoolId", "/child/serial", False, False, False),
+    (True, "PoolId", "/child/serial", True, True, False),
+])
+def test_documented_child_arn_is_not_a_second_parent_id(
+        required, variable, suffix, mandatory, omit_parent, removed):
+    parent = "arn:aws:svc:region:account:pool/<i>parent-id</i>"
+    phrase = "This must be of the form:" if mandatory else "For example:"
+    model = {"operations": {"GetChild": {"input": {"shape": "Request"}}},
+             "shapes": {"Request": {
+                 "required": ["PoolArn"] if required else [],
+                 "members": {
+                     "PoolArn": {"documentation": f"<p>{phrase} <code>{parent}</code></p>"},
+                     "ChildArn": {"documentation": f"<p>{phrase} <code>{parent}{suffix}</code></p>"},
+                     "OtherPoolArn": {"documentation": f"<p>{phrase} <code>{parent}</code></p>"},
+                 }}}}
+    resources = [{"types": ["pool"], "arn": name}
+                 for name in (["ChildArn", "OtherPoolArn"] if omit_parent
+                              else ["ChildArn", "OtherPoolArn", "PoolArn"])]
+    result = r.without_documented_descendant_arns(
+        resources, {"pool": FORMATS["pool"].replace("PoolId", variable)}, {"svc": model}, "GetChild")
+    assert result == ([resource for resource in resources if resource["arn"] != "ChildArn"]
+                      if removed else resources)
+
+    # Evidence split across two clients cannot establish a parent/child relationship in either request.
+    parent_only, child_only = deepcopy(model), deepcopy(model)
+    del parent_only["shapes"]["Request"]["members"]["ChildArn"]["documentation"]
+    del child_only["shapes"]["Request"]["members"]["PoolArn"]["documentation"]
+    assert r.without_documented_descendant_arns(
+        resources, {"pool": FORMATS["pool"].replace("PoolId", variable)},
+        {"first": parent_only, "second": child_only}, "GetChild") == resources
 
 
 def test_a_member_fills_a_variable_its_stem_relates_to_and_of_its_kind():
