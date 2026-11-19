@@ -16,7 +16,9 @@ import io.github.hectorvent.floci.services.eventbridge.model.Target;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.ArgumentMatchers;
 import org.mockito.Mockito;
@@ -36,6 +38,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -125,6 +128,79 @@ class EventsCfnProvisionerTest {
         assertEquals("orders", r.getPhysicalId());
         assertEquals(RULE_ARN, r.getAttributes().get("Arn"));
         assertEquals("orders", r.getAttributes().get("RuleName"));
+    }
+
+    // ── the physical id names a custom bus the way CloudFormation's does ─────
+
+    @ParameterizedTest(name = "{0}")
+    @CsvSource(nullValues = "-", value = {
+            "no bus, -, orders",
+            "a blank bus, ' ', orders",
+            "the default bus by name, default, orders",
+            "the default bus by ARN, arn:aws:events:us-east-1:000000000000:event-bus/default, orders",
+            "a custom bus by name, orders-bus, orders-bus|orders",
+            "a custom bus by ARN, arn:aws:events:us-east-1:000000000000:event-bus/orders-bus, orders-bus|orders",
+            "a custom bus by ARN in another partition,"
+                    + " arn:aws-us-gov:events:us-gov-west-1:000000000000:event-bus/orders-bus, orders-bus|orders",
+            "a bus of another account, arn:aws:events:us-east-1:111122223333:event-bus/orders-bus,"
+                    + " arn:aws:events:us-east-1:111122223333:event-bus/orders-bus|orders",
+            "a bus of another account in another partition,"
+                    + " arn:aws-us-gov:events:us-gov-west-1:111122223333:event-bus/orders-bus,"
+                    + " arn:aws-us-gov:events:us-gov-west-1:111122223333:event-bus/orders-bus|orders"})
+    void aRulesPhysicalIdNamesItsBusUnlessItIsTheDefaultBus(String label, String bus, String physicalId) {
+        stubPutRule();
+        StackResource r = resource("AWS::Events::Rule", "Rule");
+        ObjectNode props = mapper.createObjectNode().put("Name", "orders");
+        if (bus != null) {
+            props.put("EventBusName", bus);
+        }
+
+        provisioner.provision(r, props, ctx(null));
+
+        assertEquals(physicalId, r.getPhysicalId());
+    }
+
+    @Test
+    void anUnnamedRuleOnACustomBusKeepsItsNameAcrossUpdates() {
+        stubPutRule();
+        StackResource r = resource("AWS::Events::Rule", "Rule");
+
+        provisioner.provision(r, mapper.createObjectNode().put("EventBusName", "orders-bus"),
+                ctx("orders-bus|my-stack-Rule-ab12cd"));
+
+        assertEquals("orders-bus|my-stack-Rule-ab12cd", r.getPhysicalId());
+        verify(events).putRule(eq("my-stack-Rule-ab12cd"), eq("orders-bus"), any(), any(), any(), any(), any(),
+                any(), anyString());
+    }
+
+    @ParameterizedTest(name = "{0}")
+    @CsvSource(nullValues = "-", value = {
+            "a custom bus in the id, orders-bus|orders, -, orders-bus",
+            "a bus ARN in the id, arn:aws:events:us-east-1:111122223333:event-bus/orders-bus|orders, -,"
+                    + " arn:aws:events:us-east-1:111122223333:event-bus/orders-bus",
+            "a bare id and the stored bus, orders, orders-bus, orders-bus"})
+    void deletingARuleTakesItsBusFromTheIdOrFromTheBusItStored(String label, String physicalId, String storedBus,
+                                                               String bus) {
+        when(events.listTargetsByRule("orders", bus, REGION)).thenReturn(List.of(storedTarget("t1")));
+        StackResource r = resource("AWS::Events::Rule", "Rule");
+        r.setPhysicalId(physicalId);
+        if (storedBus != null) {
+            r.getAttributes().put("EventBusName", storedBus);
+        }
+
+        provisioner.delete(r, REGION);
+
+        verify(events).removeTargets("orders", bus, List.of("t1"), REGION);
+        verify(events).deleteRule("orders", bus, REGION);
+    }
+
+    @Test
+    void deletingByTheIdAloneFindsTheCustomBusInTheId() {
+        when(events.listTargetsByRule("orders", "orders-bus", REGION)).thenReturn(List.of());
+
+        provisioner.delete("AWS::Events::Rule", "orders-bus|orders", REGION);
+
+        verify(events).deleteRule("orders", "orders-bus", REGION);
     }
 
     // ── targets are driven to the template's desired state ───────────────────
@@ -535,6 +611,106 @@ class EventsCfnProvisionerTest {
     // ── a failed stack update puts the rule's targets back ────────────────────
 
     private static final String RULE_TARGETS_SNAPSHOT_ATTR = CfnRollback.RULE_TARGETS_SNAPSHOT_ATTR;
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void rollbackRestoresThePriorIdentityIncludingAbsentAttributes(boolean customBus) {
+        stubPutRule();
+        StackResource r = priorRule(customBus);
+        String priorId = r.getPhysicalId();
+        String priorArn = r.getAttributes().get("Arn");
+        ObjectNode props = ruleProps();
+        if (!customBus) {
+            props.put("EventBusName", "new-bus");
+        }
+        provisioner.provision(r, props, ctx(priorId));
+
+        assertTrue(provisioner.rollbackUpdate(r));
+
+        assertEquals(priorId, r.getPhysicalId());
+        assertEquals(priorArn, r.getAttributes().get("Arn"));
+        assertEquals("original", r.getAttributes().get("RuleName"));
+        assertEquals(customBus ? "old-bus" : null, r.getAttributes().get("EventBusName"));
+    }
+
+    @Test
+    void aFailedTargetRestoreCarriesTheCurrentSnapshotForRetry() {
+        stubPutRule();
+        when(events.listTargetsByRule(anyString(), any(), anyString()))
+                .thenReturn(List.of(storedTarget("keep")));
+        AwsException failure = new AwsException("InternalException", "restore unavailable", 500);
+        doThrow(failure).when(events).putTargets(anyString(), any(), any(), anyString());
+        doThrow(failure).when(events).restoreAcceptedTargets(anyString(), any(), any(), anyString());
+        StackResource previous = priorRule(true);
+        previous.getAttributes().put(RULE_TARGETS_SNAPSHOT_ATTR, "stale committed snapshot");
+        StackResource attempted = priorRule(true);
+
+        assertThrows(AwsException.class,
+                () -> provisioner.provision(attempted, ruleProps("keep"), ctx(previous.getPhysicalId())));
+        String currentSnapshot = attempted.getAttributes().get(RULE_TARGETS_SNAPSHOT_ATTR);
+        provisioner.mergeFailedUpdateResourceTracking(previous, attempted);
+        assertEquals(currentSnapshot, previous.getAttributes().get(RULE_TARGETS_SNAPSHOT_ATTR));
+
+        doReturn(0).when(events).restoreAcceptedTargets(anyString(), any(), any(), anyString());
+        assertTrue(provisioner.rollbackUpdate(previous));
+        assertEquals("old-bus|original", previous.getPhysicalId());
+        assertEquals("old-bus", previous.getAttributes().get("EventBusName"));
+        assertNull(previous.getAttributes().get(RULE_TARGETS_SNAPSHOT_ATTR));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void aFailedUpdateWithNoPendingRestoreDiscardsTheCommittedSnapshot(boolean hasAttemptSnapshot) {
+        StackResource previous = priorRule(true);
+        previous.getAttributes().put(RULE_TARGETS_SNAPSHOT_ATTR, "stale committed snapshot");
+        StackResource attempted = priorRule(true);
+        if (hasAttemptSnapshot) {
+            attempted.getAttributes().put(RULE_TARGETS_SNAPSHOT_ATTR, "spent attempted snapshot");
+        }
+
+        provisioner.mergeFailedUpdateResourceTracking(previous, attempted);
+
+        assertNull(previous.getAttributes().get(RULE_TARGETS_SNAPSHOT_ATTR));
+        assertEquals("old-bus|original", previous.getPhysicalId());
+    }
+
+    @Test
+    void aFailedRollbackWithoutAnAttemptSnapshotDoesNotReviveACommittedSnapshot() {
+        StackResource previous = priorRule(true);
+        previous.getAttributes().put(RULE_TARGETS_SNAPSHOT_ATTR, "stale committed snapshot");
+        StackResource attempted = priorRule(true);
+        attempted.getAttributes().put(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR, "failed before snapshot");
+
+        provisioner.mergeFailedUpdateResourceTracking(previous, attempted);
+
+        assertNull(previous.getAttributes().get(RULE_TARGETS_SNAPSHOT_ATTR));
+    }
+
+    @Test
+    void aLegacyTargetSnapshotDoesNotClearIdentityItDidNotCapture() {
+        StackResource r = priorRule(true);
+        r.getAttributes().put(RULE_TARGETS_SNAPSHOT_ATTR, """
+                {"ruleName":"original","busName":"old-bus","region":"us-east-1","targets":[]}
+                """);
+
+        assertTrue(provisioner.rollbackUpdate(r));
+
+        assertEquals("old-bus|original", r.getPhysicalId());
+        assertEquals("old-bus", r.getAttributes().get("EventBusName"));
+        assertEquals("original", r.getAttributes().get("RuleName"));
+        assertEquals(RULE_ARN, r.getAttributes().get("Arn"));
+    }
+
+    private StackResource priorRule(boolean customBus) {
+        StackResource r = resource("AWS::Events::Rule", "Rule");
+        r.setPhysicalId(customBus ? "old-bus|original" : "original");
+        r.getAttributes().put("Arn", RULE_ARN);
+        r.getAttributes().put("RuleName", "original");
+        if (customBus) {
+            r.getAttributes().put("EventBusName", "old-bus");
+        }
+        return r;
+    }
 
     @Test
     void aRollbackPutsBackATargetTheUpdateDropped() {
