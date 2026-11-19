@@ -25,8 +25,9 @@ or instance-type restrictions.
 
 Network interface and VPC endpoint actions are checked on the resources the Service Authorization
 Reference gives them, as named by the request: `CreateNetworkInterface` on
-`network-interface/*`, the `SubnetId` and each `SecurityGroupId.N`; `DeleteNetworkInterface` and
-`CreateNetworkInterfacePermission` on the interface; `AttachNetworkInterface` on the instance and
+`network-interface/*`, the `SubnetId` and each `SecurityGroupId.N`; `DeleteNetworkInterface`,
+`CreateNetworkInterfacePermission`, `AssignIpv6Addresses` and `UnassignIpv6Addresses` on the
+interface; `AttachNetworkInterface` on the instance and
 the interface; `DetachNetworkInterface` on the instance and the interface its `AttachmentId` joins
 (any instance and interface of the account when the attachment is unknown); `CreateVpcEndpoint` on
 `vpc-endpoint/*`, the VPC, and each subnet, group and route table; `ModifyVpcEndpoint` on the
