@@ -14,6 +14,7 @@ import org.junit.jupiter.api.Timeout;
 import org.mockito.Mockito;
 
 import java.io.ByteArrayOutputStream;
+import java.io.FilterOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -22,7 +23,11 @@ import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.UnaryOperator;
 
 import static io.github.hectorvent.floci.testing.InlineMocks.inlineMock;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
@@ -30,6 +35,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.AdditionalAnswers.delegatesTo;
 import static org.mockito.Mockito.*;
 
 class RedshiftInterceptingBridgeTest {
@@ -67,6 +73,11 @@ class RedshiftInterceptingBridgeTest {
     }
 
     private void startBridge(SpectrumInterceptor spectrumInterceptor, RedshiftAuditLogPublisher audit) throws IOException {
+        startBridge(spectrumInterceptor, audit, null);
+    }
+
+    private void startBridge(SpectrumInterceptor spectrumInterceptor, RedshiftAuditLogPublisher audit,
+                             UnaryOperator<OutputStream> clientOutput) throws IOException {
         clientListener = new ServerSocket(0);
         testClientEnd = new Socket("localhost", clientListener.getLocalPort());
         bridgeClientEnd = clientListener.accept();
@@ -75,9 +86,14 @@ class RedshiftInterceptingBridgeTest {
         bridgeBackendEnd = new Socket("localhost", backendListener.getLocalPort());
         testBackendEnd = backendListener.accept();
 
+        Socket transport = bridgeClientEnd;
+        if (clientOutput != null) {
+            transport = mock(Socket.class, delegatesTo(bridgeClientEnd));
+            doReturn(clientOutput.apply(bridgeClientEnd.getOutputStream())).when(transport).getOutputStream();
+        }
         s3Stub = Mockito.mock(S3Service.class);
         RedshiftInterceptingBridge bridge = new RedshiftInterceptingBridge(
-                bridgeClientEnd, bridgeBackendEnd, s3Stub, Mockito.mock(IamService.class), "000000000000", List.of(),
+                transport, bridgeBackendEnd, s3Stub, Mockito.mock(IamService.class), "000000000000", List.of(),
                 spectrumInterceptor, "000000000000:c", "dev", null, audit, "analyst", null);
         bridgeThread = Thread.ofVirtual().name("bridge-under-test").start(bridge::run);
     }
@@ -388,6 +404,102 @@ class RedshiftInterceptingBridgeTest {
         }
     }
 
+
+    @Test
+    @Timeout(10)
+    void copyAfterVisibleErrorRecoveryRetainsItsPreparedStatement() throws Exception {
+        CountDownLatch nextParseForwarded = new CountDownLatch(1);
+        CountDownLatch errorObserved = new CountDownLatch(1);
+        AtomicBoolean heldReady = new AtomicBoolean();
+        startBridge(null, null, output -> new FilterOutputStream(output) {
+            private final RedshiftInterceptingBridge.WireFrameTracker visible =
+                    new RedshiftInterceptingBridge.WireFrameTracker((type, body) -> {
+                        if (type == 'Z' && heldReady.compareAndSet(false, true)) {
+                            try {
+                                assertTrue(nextParseForwarded.await(3, TimeUnit.SECONDS),
+                                        "the client must be able to start its next query after ReadyForQuery");
+                            } catch (InterruptedException exception) {
+                                Thread.currentThread().interrupt();
+                                throw new AssertionError(exception);
+                            }
+                        }
+                    });
+
+            @Override
+            public void write(byte[] bytes, int offset, int length) throws IOException {
+                out.write(bytes, offset, length);
+                out.flush();
+                visible.consume(bytes, offset, length);
+            }
+        });
+        when(s3Stub.objectExists("b", "in/data")).thenReturn(true);
+        when(s3Stub.getObject("b", "in/data")).thenReturn(
+                new S3Object("b", "in/data", "1|a\n".getBytes(StandardCharsets.US_ASCII), "text/plain"));
+        testClientEnd.setSoTimeout(3000);
+        testBackendEnd.setSoTimeout(3000);
+        AtomicReference<Throwable> backendFailure = new AtomicReference<>();
+        Thread backend = Thread.ofVirtual().start(() -> {
+            try {
+                PostgresWireDecoder decoder = new PostgresWireDecoder(testBackendEnd.getInputStream());
+                assertEquals('P', decoder.nextMessage().type());
+                assertEquals('S', decoder.nextMessage().type());
+                writeBackendFrame('E', "SERROR\0C42601\0Mbad query\0\0".getBytes(StandardCharsets.US_ASCII));
+                assertTrue(errorObserved.await(3, TimeUnit.SECONDS));
+                writeBackendFrame('Z', new byte[]{'I'});
+                PostgresWireDecoder.ParseMessage parse = decoder.decodeParse(decoder.nextMessage());
+                nextParseForwarded.countDown();
+                assertTrue(parse.sql().contains("FROM STDIN"));
+                writeBackendFrame('1', new byte[0]);
+                assertEquals('B', decoder.nextMessage().type());
+                writeBackendFrame('2', new byte[0]);
+                assertEquals('D', decoder.nextMessage().type());
+                writeBackendFrame('n', new byte[0]);
+                PostgresWireDecoder.FrontendMessage execute = decoder.nextMessage();
+                if (execute.type() == 'H') {
+                    execute = decoder.nextMessage();
+                }
+                assertEquals('E', execute.type());
+                writeBackendFrame('G', new byte[]{0, 0, 0});
+                while (decoder.nextMessage().type() != 'c') {
+                    // Consume the bridge's COPY stream.
+                }
+                assertEquals('S', decoder.nextMessage().type());
+                writeBackendFrame('C', "COPY 1\0".getBytes(StandardCharsets.US_ASCII));
+                writeBackendFrame('Z', new byte[]{'I'});
+            } catch (Throwable failure) {
+                backendFailure.set(failure);
+            }
+        });
+        try {
+            PostgresWireDecoder.ParseMessage invalid = new PostgresWireDecoder.ParseMessage("bad", "invalid", List.of());
+            testClientEnd.getOutputStream().write(concat(
+                    PostgresWireDecoder.encodeParse(invalid, invalid.sql()), frame('S', new byte[0])));
+            PostgresWireDecoder client = new PostgresWireDecoder(testClientEnd.getInputStream());
+            assertEquals('E', client.nextMessage().type());
+            errorObserved.countDown();
+            assertEquals('Z', client.nextMessage().type());
+            PostgresWireDecoder.ParseMessage copy = new PostgresWireDecoder.ParseMessage(
+                    "copy-s", "COPY t FROM 's3://b/in/data'", List.of());
+            testClientEnd.getOutputStream().write(concat(PostgresWireDecoder.encodeParse(copy, copy.sql()),
+                    frame('B', concat(cString("copy-p"), cString("copy-s"), new byte[6])),
+                    frame('D', concat(new byte[]{'P'}, cString("copy-p"))),
+                    frame('E', concat(cString("copy-p"), new byte[4])), frame('S', new byte[0])));
+            assertEquals('1', client.nextMessage().type());
+            assertEquals('2', client.nextMessage().type());
+            assertEquals('n', client.nextMessage().type());
+            assertEquals('C', client.nextMessage().type(), "COPY must stay intercepted after error recovery");
+            assertEquals('Z', client.nextMessage().type());
+        } finally {
+            errorObserved.countDown();
+            nextParseForwarded.countDown();
+            testBackendEnd.close();
+            backend.join(3000);
+        }
+        if (backendFailure.get() != null) {
+            throw new AssertionError("fake backend failed", backendFailure.get());
+        }
+    }
+
     @Test
     void pipelinedExtendedCopyPreservesResponseOrderAndSyncReadyForQuery() throws Exception {
         startBridge();
@@ -438,6 +550,70 @@ class RedshiftInterceptingBridgeTest {
         if (backendFailure.get() != null) {
             throw new AssertionError("fake backend failed", backendFailure.get());
         }
+    }
+
+    @Test
+    @Timeout(10)
+    void failedCopyAllowsTheNextQueryAfterSyncBeforeReadyForQuery() throws Exception {
+        startBridge();
+        testClientEnd.setSoTimeout(3000);
+        testBackendEnd.setSoTimeout(3000);
+        when(s3Stub.objectExists("b", "in/data")).thenReturn(true);
+        when(s3Stub.getObject("b", "in/data")).thenReturn(
+                new S3Object("b", "in/data", "bad|a\n".getBytes(StandardCharsets.US_ASCII), "text/plain"));
+        PostgresWireDecoder backendDecoder = new PostgresWireDecoder(testBackendEnd.getInputStream());
+        PostgresWireDecoder clientDecoder = new PostgresWireDecoder(testClientEnd.getInputStream());
+
+        sendUnnamedExtendedQuery("COPY t FROM 's3://b/in/data'");
+        assertEquals('P', backendDecoder.nextMessage().type());
+        writeBackendFrame('1', new byte[0]);
+        assertEquals('B', backendDecoder.nextMessage().type());
+        writeBackendFrame('2', new byte[0]);
+        assertEquals('D', backendDecoder.nextMessage().type());
+        writeBackendFrame('n', new byte[0]);
+        assertEquals('E', backendDecoder.nextMessage().type());
+        writeBackendFrame('G', new byte[]{0, 0, 0});
+        while (backendDecoder.nextMessage().type() != 'c') {
+            // Consume CopyData until the bridge completes CopyIn.
+        }
+        assertEquals('S', backendDecoder.nextMessage().type());
+        writeBackendFrame('E', "SERROR\0C22P02\0Minvalid integer\0\0".getBytes(StandardCharsets.US_ASCII));
+        for (char expected : new char[]{'1', '2', 'n', 'E'}) {
+            assertEquals(expected, clientDecoder.nextMessage().type());
+        }
+
+        // Hold the prior ReadyForQuery so the next cycle always reaches the proxy during recovery.
+        sendUnnamedExtendedQuery("SELECT 1");
+        PostgresWireDecoder.FrontendMessage nextParse = backendDecoder.nextMessage();
+        assertEquals('P', nextParse.type());
+        assertEquals("SELECT 1", backendDecoder.decodeParse(nextParse).sql());
+        for (char expected : new char[]{'B', 'D', 'E', 'S'}) {
+            assertEquals(expected, backendDecoder.nextMessage().type());
+        }
+        writeBackendFrame('Z', new byte[]{'I'});
+        writeBackendFrame('1', new byte[0]);
+        writeBackendFrame('2', new byte[0]);
+        writeBackendFrame('T', concat(new byte[]{0, 1}, cString("id"),
+                ByteBuffer.allocate(18).putInt(0).putShort((short) 0).putInt(23)
+                        .putShort((short) 4).putInt(-1).putShort((short) 0).array()));
+        writeBackendFrame('D', new byte[]{0, 1, 0, 0, 0, 1, '1'});
+        writeBackendFrame('C', cString("SELECT 1"));
+        writeBackendFrame('Z', new byte[]{'I'});
+        for (char expected : new char[]{'Z', '1', '2', 'T', 'D', 'C', 'Z'}) {
+            assertEquals(expected, clientDecoder.nextMessage().type());
+        }
+    }
+
+    private void sendUnnamedExtendedQuery(String sql) throws IOException {
+        PostgresWireDecoder.ParseMessage parse = new PostgresWireDecoder.ParseMessage("", sql, List.of());
+        ByteArrayOutputStream pipeline = new ByteArrayOutputStream();
+        pipeline.write(PostgresWireDecoder.encodeParse(parse, sql));
+        pipeline.write(frame('B', new byte[8]));
+        pipeline.write(frame('D', new byte[]{'P', 0}));
+        pipeline.write(frame('E', new byte[5]));
+        pipeline.write(frame('S', new byte[0]));
+        testClientEnd.getOutputStream().write(pipeline.toByteArray());
+        testClientEnd.getOutputStream().flush();
     }
 
     @Test
