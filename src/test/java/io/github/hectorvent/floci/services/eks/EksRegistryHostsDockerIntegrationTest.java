@@ -3,6 +3,7 @@ package io.github.hectorvent.floci.services.eks;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.exception.NotFoundException;
 import io.github.hectorvent.floci.core.common.Digests;
+import io.github.hectorvent.floci.core.common.RequestScopes;
 import io.github.hectorvent.floci.core.common.docker.ContainerExec;
 import io.github.hectorvent.floci.core.common.docker.DockerHostResolver;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
@@ -63,12 +64,13 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 @QuarkusTest
 @TestProfile(RealEksProfile.class)
-// Bounded cluster/workload waits total 285 s; allow Docker setup and cleanup as well.
+// Bounded cluster/workload waits total 315 s; allow Docker setup and cleanup as well.
 @Timeout(value = 6, unit = TimeUnit.MINUTES)
 class EksRegistryHostsDockerIntegrationTest {
 
     private static final Logger LOG = Logger.getLogger(EksRegistryHostsDockerIntegrationTest.class);
     private static final String JSON = "application/json";
+    private static final String REGISTRY_ACCOUNT = "111122223333";
 
     @RegisterExtension
     final PartitionCleanup cleanup = new PartitionCleanup();
@@ -111,12 +113,14 @@ class EksRegistryHostsDockerIntegrationTest {
         String repo = "reg-hosts-it-" + suffix;
         // Not "000000000000": the generated ECR mirror only covers the default account, so this
         // hostname is only reachable at all because of the registry-hosts configuration below.
-        String host = "111122223333.dkr.ecr.us-east-1.localhost:" + httpPort;
+        String host = REGISTRY_ACCOUNT + ".dkr.ecr.us-east-1.localhost:" + httpPort;
         String imageRef = host + "/" + repo + ":v1";
         Set<String> clusterVolumes = new HashSet<>();
 
-        ecrService.createRepository(repo, "111122223333", "MUTABLE", false, "AES256", null, Map.of(), "us-east-1");
-        cleanup.register(() -> ecrService.deleteRepository(repo, "111122223333", true, "us-east-1"));
+        RequestScopes.runAs(REGISTRY_ACCOUNT, () -> ecrService.createRepository(repo, REGISTRY_ACCOUNT,
+                "MUTABLE", false, "AES256", null, Map.of(), "us-east-1"));
+        cleanup.register(() -> RequestScopes.runAs(REGISTRY_ACCOUNT,
+                () -> ecrService.deleteRepository(repo, REGISTRY_ACCOUNT, true, "us-east-1")));
         pushMinimalImage(host, repo);
 
         given().contentType(JSON)
@@ -137,6 +141,7 @@ class EksRegistryHostsDockerIntegrationTest {
         waitUntilReady(cluster);
         eksClusterManager.finalizeCluster(cluster);
         String containerId = cluster.getContainerId();
+        waitUntilNodeInitialized(containerId, Instant.EPOCH);
         assertEquals(0, execInContainerWithExitCode(containerId,
                 new String[]{"kubectl", "--request-timeout=2s", "create", "configmap",
                         "storage-continuity", "--from-literal=value=" + suffix}).exitCode());
@@ -210,47 +215,15 @@ class EksRegistryHostsDockerIntegrationTest {
         assertTrue(hostsToml.contains("\"X-Floci-Test\" = \"registry-hosts\""),
                 "the configured header must be present in the container's hosts.toml via the certs.d symlink");
 
-        // Verify hosts.toml survives container restart
+        waitUntilNodeInitialized(containerId, Instant.EPOCH);
         dockerClient.restartContainerCmd(containerId).exec();
         Instant restartCompletedAt = Instant.now();
         waitUntilReady(cluster);
-        String hostsTomlAfterRestart = null;
-        long restartDeadline = System.currentTimeMillis() + 30000;
-        while (System.currentTimeMillis() < restartDeadline) {
-            try {
-                hostsTomlAfterRestart = execInContainer(containerId, new String[]{"cat",
-                        EksClusterManager.CONTAINERD_CERTS_TARGET + "/" + host + "/hosts.toml"});
-                break;
-            } catch (Exception ignored) {
-                Thread.sleep(1000);
-            }
-        }
-        assertNotNull(hostsTomlAfterRestart, "hosts.toml must survive container restart");
+        waitUntilNodeInitialized(containerId, restartCompletedAt);
+        String hostsTomlAfterRestart = execInContainer(containerId, new String[]{"cat",
+                EksClusterManager.CONTAINERD_CERTS_TARGET + "/" + host + "/hosts.toml"});
         assertTrue(hostsTomlAfterRestart.contains("\"X-Floci-Test\" = \"registry-hosts\""),
                 "the configured header must survive container restart");
-
-        long saDeadline = System.currentTimeMillis() + 30000;
-        boolean ready = false;
-        while (System.currentTimeMillis() < saDeadline) {
-            ContainerExec.Result saResult = execInContainerWithExitCode(containerId,
-                    new String[]{"kubectl", "--request-timeout=2s", "get", "serviceaccount", "default"});
-            ContainerExec.Result nodeReady = execInContainerWithExitCode(containerId,
-                    new String[]{"kubectl", "--request-timeout=2s", "wait",
-                            "--for=condition=Ready", "nodes", "--all", "--timeout=1s"});
-            ContainerExec.Result leases = execInContainerWithExitCode(containerId,
-                    new String[]{"kubectl", "--request-timeout=2s", "get", "leases", "-n", "kube-node-lease",
-                            "-o", "jsonpath={.items[*].spec.renewTime}"});
-            String renewals = leases.stdout().trim();
-            boolean freshHeartbeat = leases.exitCode() == 0 && !renewals.isEmpty()
-                    && Arrays.stream(renewals.split("\\s+"))
-                            .allMatch(renewal -> Instant.parse(renewal).isAfter(restartCompletedAt));
-            if (saResult.exitCode() == 0 && nodeReady.exitCode() == 0 && freshHeartbeat) {
-                ready = true;
-                break;
-            }
-            Thread.sleep(1000);
-        }
-        assertTrue(ready, "serviceaccount and Ready nodes with renewed Leases must be available within 30 seconds");
         assertEquals(suffix, execInContainer(containerId,
                 new String[]{"kubectl", "--request-timeout=2s", "get", "configmap",
                         "storage-continuity", "-o", "jsonpath={.data.value}"}).trim(),
@@ -300,6 +273,37 @@ class EksRegistryHostsDockerIntegrationTest {
             assertThrows(NotFoundException.class, () -> dockerClient.inspectVolumeCmd(volume).exec(),
                     "Deleted cluster retained mounted volume " + volume);
         }
+    }
+
+    private void waitUntilNodeInitialized(String containerId, Instant renewedAfter) throws Exception {
+        long saDeadline = System.currentTimeMillis() + 30000;
+        boolean ready = false;
+        while (System.currentTimeMillis() < saDeadline) {
+            ContainerExec.Result saResult = execInContainerWithExitCode(containerId,
+                    new String[]{"kubectl", "--request-timeout=2s", "get", "serviceaccount", "default"});
+            ContainerExec.Result nodeReady = execInContainerWithExitCode(containerId,
+                    new String[]{"kubectl", "--request-timeout=2s", "wait",
+                            "--for=condition=Ready", "nodes", "--all", "--timeout=1s"});
+            ContainerExec.Result leases = execInContainerWithExitCode(containerId,
+                    new String[]{"kubectl", "--request-timeout=2s", "get", "leases", "-n", "kube-node-lease",
+                            "-o", "jsonpath={.items[*].spec.renewTime}"});
+            String renewals = leases.stdout().trim();
+            boolean freshHeartbeat = leases.exitCode() == 0 && !renewals.isEmpty()
+                    && Arrays.stream(renewals.split("\\s+"))
+                            .allMatch(renewal -> Instant.parse(renewal).isAfter(renewedAfter));
+            ContainerExec.Result initializing = execInContainerWithExitCode(containerId,
+                    new String[]{"kubectl", "--request-timeout=2s", "get", "nodes", "-o",
+                            "jsonpath={.items[*].spec.taints[?(@.key==\"node.cloudprovider.kubernetes.io/uninitialized\")].key}"});
+            if (saResult.exitCode() == 0 && nodeReady.exitCode() == 0 && freshHeartbeat
+                    && initializing.exitCode() == 0 && initializing.stdout().isBlank()) {
+                ready = true;
+                break;
+            }
+            Thread.sleep(1000);
+        }
+        assertTrue(ready, () -> "serviceaccount and initialized Ready nodes with renewed Leases must be available"
+                + " within 30 seconds: " + execInContainerWithExitCode(containerId,
+                new String[]{"kubectl", "--request-timeout=2s", "get", "nodes", "-o", "json"}));
     }
 
     private List<String> containerVolumes(String containerId) {
