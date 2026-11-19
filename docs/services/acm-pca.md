@@ -179,3 +179,5 @@ with an external certificate broker. ACM's `RequestCertificate` with the
 from it when it is `ACTIVE`, and fails it with `PCA_INVALID_STATE` otherwise; see
 [ACM](acm.md). The AWS Private CA API is exposed through JSON 1.1; Smithy RPC v2
 CBOR is not supported.
+
+ACM renewal preserves an existing managed private certificate when its issuing CA is no longer available, and records a failed renewal. Managed issuer origin is retained in stored certificate records, including when the managed CA uses the local CA key. The local signing fallback remains available only for certificates not marked as managed whose existing signature verifies against the local CA.
