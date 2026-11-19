@@ -50,7 +50,7 @@ class EcsLoadBalancerRegistrarTest {
     private String createTargetGroup(String name) {
         TargetGroup tg = elbV2Service.createTargetGroup(REGION, name, "HTTP", "HTTP1",
                 8080, "vpc-regtest", "ip",
-                null, null, false, null, null, null, null, null, null, null, Map.of());
+                null, null, true, null, null, null, null, null, null, null, Map.of());
         return tg.getTargetGroupArn();
     }
 
@@ -289,7 +289,7 @@ class EcsLoadBalancerRegistrarTest {
         String local = createTargetGroup("reg-tg-vpc-local");
         TargetGroup foreign = elbV2Service.createTargetGroup(REGION, "reg-tg-vpc-foreign", "HTTP", "HTTP1",
                 8080, "vpc-other", "ip",
-                null, null, false, null, null, null, null, null, null, null, Map.of());
+                null, null, true, null, null, null, null, null, null, null, Map.of());
         String foreignArn = foreign.getTargetGroupArn();
         elbV2Service.registerTargets(REGION, local, List.of(target("10.0.0.10", 8080)));
         elbV2Service.registerTargets(REGION, foreignArn, List.of(target("10.0.0.10", 8080)));

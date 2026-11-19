@@ -40,6 +40,7 @@ import static io.github.hectorvent.floci.testing.AlbFixtures.deleteLoadBalancer;
 import static io.github.hectorvent.floci.testing.AlbFixtures.deleteTargetGroup;
 import static io.github.hectorvent.floci.testing.AlbFixtures.exchange;
 import static io.github.hectorvent.floci.testing.AlbFixtures.registerTarget;
+import static io.github.hectorvent.floci.testing.AlbFixtures.withHealthCheck;
 import static io.restassured.RestAssured.given;
 import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.equalTo;
@@ -93,7 +94,7 @@ class CloudFrontWebSocketIntegrationTest {
     @BeforeEach
     void startAlbOrigin() throws Exception {
         backend = vertx.createHttpServer()
-                .requestHandler(request -> {
+                .requestHandler(withHealthCheck(request -> {
                     originCustomHeader.set(request.getHeader("X-Origin-Verify"));
                     if (!"websocket".equalsIgnoreCase(request.getHeader("Upgrade"))) {
                         request.response().setStatusCode(400).end("not an upgrade");
@@ -112,7 +113,7 @@ class CloudFrontWebSocketIntegrationTest {
                         request.toWebSocket().onSuccess(socket -> socket.textMessageHandler(
                                 text -> socket.writeTextMessage(query + ":" + text)));
                     }
-                })
+                }))
                 .listen(0, "127.0.0.1")
                 .toCompletionStage()
                 .toCompletableFuture()
