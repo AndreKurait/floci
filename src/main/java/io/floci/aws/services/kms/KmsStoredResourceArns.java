@@ -67,6 +67,7 @@ public class KmsStoredResourceArns implements StoredResourceArns {
         Optional<String> key = switch (member) {
             case "AliasName" -> kms.findKeyArn(value, region);
             case "GrantId" -> kms.findGrantKeyArn(null, value, region);
+            case "GrantToken" -> kms.findGrantKeyArn(value, null, region);
             case "CiphertextBlob" -> ciphertextKey(value, region);
             default -> Optional.empty();
         };

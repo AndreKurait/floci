@@ -1,5 +1,6 @@
 package io.floci.aws.services.s3;
 
+import io.floci.aws.services.kms.KmsService;
 import io.floci.aws.testing.EnforcementFixtures.UserCredentials;
 import io.floci.aws.testing.PartitionCleanup;
 import io.floci.aws.testing.S3IamEnforcementProfile;
@@ -8,6 +9,7 @@ import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.specification.RequestSpecification;
+import jakarta.inject.Inject;
 import org.hamcrest.Matchers;
 import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
@@ -48,6 +50,9 @@ import static org.hamcrest.Matchers.notNullValue;
 @TestProfile(S3IamEnforcementProfile.class)
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class S3PresignedPostAuthEnforcementIntegrationTest {
+
+    @Inject
+    KmsService kms;
 
     private static final String BUCKET = "presigned-post-auth-bucket";
     // Matches the "20260101" date embedded in every credential scope built by this test class.
@@ -556,7 +561,9 @@ class S3PresignedPostAuthEnforcementIntegrationTest {
         String bucket = "presigned-post-encryption-" + expectedStatus + "-"
                 + (field.endsWith("key-id") ? "key" : "method");
         String key = "uploads/encrypted.txt";
-        String value = field.endsWith("key-id") ? "approved-key" : "aws:kms";
+        String kmsKey = kms.createKey(null, "us-east-1").getArn();
+        cleanup.register(() -> kms.scheduleKeyDeletion(kmsKey, 7, "us-east-1"));
+        String value = field.endsWith("key-id") ? kmsKey : "aws:kms";
         createBucket(bucket);
         putBucketPolicy(bucket, """
                 {"Version":"2012-10-17","Statement":[
@@ -567,8 +574,8 @@ class S3PresignedPostAuthEnforcementIntegrationTest {
                 {"expiration":"%s","conditions":[
                   {"bucket":"%s"},{"key":"%s"},
                   {"x-amz-server-side-encryption":"aws:kms"},
-                  {"x-amz-server-side-encryption-aws-kms-key-id":"approved-key"}
-                ]}""".formatted(Instant.now().plusSeconds(3600), bucket, key);
+                  {"x-amz-server-side-encryption-aws-kms-key-id":"%s"}
+                ]}""".formatted(Instant.now().plusSeconds(3600), bucket, key, kmsKey);
         String policyBase64 = Base64.getEncoder().encodeToString(policy.getBytes(StandardCharsets.UTF_8));
         String credential = LEGACY_ACCESS_KEY_ID + "/20260101/us-east-1/s3/aws4_request";
 
@@ -581,7 +588,7 @@ class S3PresignedPostAuthEnforcementIntegrationTest {
             .multiPart("x-amz-date", AMZ_DATE)
             .multiPart("x-amz-signature", signPolicy(policyBase64, credential, LEGACY_SECRET_KEY))
             .multiPart("X-Amz-Server-Side-Encryption", "aws:kms")
-            .multiPart("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id", "approved-key")
+            .multiPart("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id", kmsKey)
             .multiPart("file", "encrypted.txt", "encrypted".getBytes(StandardCharsets.UTF_8), "text/plain")
         .when()
             .post("/" + bucket)

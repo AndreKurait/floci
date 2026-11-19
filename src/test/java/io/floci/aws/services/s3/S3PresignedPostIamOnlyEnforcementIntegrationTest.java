@@ -3,7 +3,9 @@ package io.floci.aws.services.s3;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.services.cloudtrail.CloudTrailLogWriter;
+import io.floci.aws.services.kms.KmsService;
 import io.floci.aws.testing.IamEnforcementProfile;
+import io.floci.aws.testing.PartitionCleanup;
 import io.floci.aws.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
@@ -11,6 +13,7 @@ import io.restassured.specification.RequestSpecification;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
@@ -45,6 +48,12 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @QuarkusTest
 @TestProfile(IamEnforcementProfile.class)
 class S3PresignedPostIamOnlyEnforcementIntegrationTest {
+
+    @Inject
+    KmsService kms;
+
+    @RegisterExtension
+    final PartitionCleanup cleanup = new PartitionCleanup();
 
     private static final String REGION = "us-east-1";
     /** A non-default account, distinct from the configured {@code 000000000000} default. */
@@ -279,10 +288,14 @@ class S3PresignedPostIamOnlyEnforcementIntegrationTest {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
         String bucket = "presigned-post-encryption-" + suffix;
         String userName = "presigned-post-encryption-user-" + suffix;
-        String value = field.endsWith("key-id") ? "approved-key" : "aws:kms";
+        String kmsKey = kms.createKey(null, "us-east-1").getArn();
+        cleanup.register(() -> kms.scheduleKeyDeletion(kmsKey, 7, "us-east-1"));
+        String value = field.endsWith("key-id") ? kmsKey : "aws:kms";
         boolean isDenied = "Deny".equals(effect);
         createBucketAsRoot(bucket);
         String accessKeyId = createUser(userName);
+        putUserPolicy(userName, "Kms", "{\"Statement\":[{\"Effect\":\"Allow\","
+            + "\"Action\":\"kms:GenerateDataKey\",\"Resource\":\"*\"}]}");
         if (isDenied) {
             putUserPolicy(userName, "AllowPutObject", """
                     {"Version":"2012-10-17","Statement":[
@@ -300,7 +313,7 @@ class S3PresignedPostIamOnlyEnforcementIntegrationTest {
                 .multiPart("key", "encrypted.txt")
                 .multiPart("x-amz-credential", presignedCredential(accessKeyId))
                 .multiPart("X-Amz-Server-Side-Encryption", encryption)
-                .multiPart("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id", "approved-key")
+                .multiPart("X-Amz-Server-Side-Encryption-Aws-Kms-Key-Id", kmsKey)
                 .multiPart("file", "encrypted.txt", "encrypted".getBytes(StandardCharsets.UTF_8), "text/plain")
         .when()
                 .post("/" + bucket)
