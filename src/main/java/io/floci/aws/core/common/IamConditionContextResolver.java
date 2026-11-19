@@ -21,6 +21,7 @@ import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.iam.ResourceArnBuilder;
 import io.floci.aws.services.iam.model.IamRole;
 import io.floci.aws.services.iam.model.IamUser;
+import io.floci.aws.services.kms.KmsGrantConditions;
 import io.floci.aws.services.lambdaweb.LambdaWebService;
 import io.floci.aws.services.lambdaweb.model.WebFunctionEndpoint;
 import io.floci.aws.services.s3.S3ConditionKeys;
@@ -285,10 +286,49 @@ public class IamConditionContextResolver {
         return null;
     }
 
+    private Map<String, List<String>> kmsConditionContext(ContainerRequestContext ctx, String action) {
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        String account = requestContext.getAccountId();
+        if (account != null) {
+            conditions.put("kms:CallerAccount", List.of(account));
+        }
+        JsonNode body = bufferedJsonBody(ctx);
+        if ("kms:RetireGrant".equals(action)) {
+            conditions.putAll(KmsGrantConditions.retirementContext(body));
+            return conditions;
+        }
+        if ("kms:CreateGrant".equals(action)) {
+            conditions.putAll(KmsGrantConditions.requestContext(body));
+            return conditions;
+        }
+        String member = switch (action) {
+            case "kms:ReEncryptFrom" -> "SourceEncryptionContext";
+            case "kms:ReEncryptTo" -> "DestinationEncryptionContext";
+            default -> "EncryptionContext";
+        };
+        if (body == null || !body.path(member).isObject()) {
+            return conditions;
+        }
+        List<String> keys = new ArrayList<>();
+        body.path(member).properties().forEach(entry -> {
+            if (entry.getValue().isTextual()) {
+                keys.add(entry.getKey());
+                conditions.put("kms:EncryptionContext:" + entry.getKey(), List.of(entry.getValue().textValue()));
+                conditions.put(KmsGrantConditions.encryptionContextKey(entry.getKey()),
+                        List.of(entry.getValue().textValue()));
+            }
+        });
+        if (!keys.isEmpty()) {
+            conditions.put("kms:EncryptionContextKeys", keys);
+        }
+        return conditions;
+    }
+
     public Map<String, List<String>> resolve(String credentialScope, String action,
                                              ContainerRequestContext ctx) {
         return switch (credentialScope) {
             case "s3" -> s3ConditionContext(action, ctx);
+            case "kms" -> kmsConditionContext(ctx, action);
             case "ec2" -> ec2ConditionContext(action, ctx);
             case "dynamodb" -> dynamoDbConditionContext(action, ctx);
             case "iam" -> iamConditionContext(action, ctx);

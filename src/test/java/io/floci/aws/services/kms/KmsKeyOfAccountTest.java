@@ -76,9 +76,10 @@ class KmsKeyOfAccountTest {
         List<ResourcePolicy> policies = provider.getResourcePolicies("redshift-serverless", key.getArn());
         assertEquals(1, policies.size());
         assertEquals(OWNER, policies.getFirst().ownerAccountId());
+        assertTrue(policies.getFirst().grantRequired());
         assertThat(policies.getFirst().policyDocument(), containsString("kms:*"));
         String missing = "arn:aws:kms:" + REGION + ":777788889999:key/" + key.getKeyId();
-        assertEquals(List.of(new ResourcePolicy(null, "777788889999")), provider.getResourcePolicies("kms", missing));
+        assertEquals(List.of(new ResourcePolicy(null, "777788889999", true)), provider.getResourcePolicies("kms", missing));
         assertTrue(provider.getResourcePolicies("kms", "arn:aws:kms:" + REGION + ":" + OWNER + ":alias/snapshots")
                 .isEmpty());
         assertTrue(provider.getResourcePolicies("kms", "arn:aws:kms:" + REGION + ":" + OWNER + ":key/*").isEmpty());

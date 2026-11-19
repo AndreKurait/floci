@@ -1700,11 +1700,19 @@ class ResourceArnBuilderTest {
         setJsonBody("{\"CiphertextBlob\":\"" + encoded + "\",\"DestinationKeyId\":\"alias/destination\"}");
         assertEquals(List.of(KMS_KEY_ARN, KMS_OTHER_KEY_ARN),
                 backed.buildKmsResources("kms:ReEncrypt", ctx, "us-east-1", ACCOUNT, "aws"));
+        assertEquals(List.of(KMS_KEY_ARN),
+                backed.buildKmsResources("kms:ReEncryptFrom", ctx, "us-east-1", ACCOUNT, "aws"));
+        assertEquals(List.of(KMS_OTHER_KEY_ARN),
+                backed.buildKmsResources("kms:ReEncryptTo", ctx, "us-east-1", ACCOUNT, "aws"));
 
         when(kms.findKeyArn("alias/source", "us-east-1")).thenReturn(Optional.of(KMS_KEY_ARN));
         setJsonBody("{\"SourceKeyId\":\"alias/source\",\"DestinationKeyId\":\"alias/destination\"}");
         assertEquals(List.of(KMS_KEY_ARN, KMS_OTHER_KEY_ARN),
                 backed.buildKmsResources("kms:ReEncrypt", ctx, "us-east-1", ACCOUNT, "aws"));
+        assertEquals(List.of(KMS_KEY_ARN),
+                backed.buildKmsResources("kms:ReEncryptFrom", ctx, "us-east-1", ACCOUNT, "aws"));
+        assertEquals(List.of(KMS_OTHER_KEY_ARN),
+                backed.buildKmsResources("kms:ReEncryptTo", ctx, "us-east-1", ACCOUNT, "aws"));
     }
 
     /**
@@ -1728,6 +1736,10 @@ class ResourceArnBuilderTest {
                 + "\",\"KeyId\":\"alias/claimed\",\"DestinationKeyId\":\"" + KMS_OTHER_KEY_ARN + "\"}");
         assertEquals(List.of(KMS_KEY_ARN, KMS_OTHER_KEY_ARN),
                 backed.buildKmsResources("kms:ReEncrypt", ctx, "us-east-1", ACCOUNT, "aws"));
+        assertEquals(List.of(KMS_KEY_ARN),
+                backed.buildKmsResources("kms:ReEncryptFrom", ctx, "us-east-1", ACCOUNT, "aws"));
+        assertEquals(List.of(KMS_OTHER_KEY_ARN),
+                backed.buildKmsResources("kms:ReEncryptTo", ctx, "us-east-1", ACCOUNT, "aws"));
     }
 
     /**

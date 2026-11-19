@@ -172,8 +172,8 @@ class KmsKeyArnEnforcementIntegrationTest {
                 .then().statusCode(200).extract().path("CiphertextBlob");
         Session session = assumeRoleWith("""
                 {"Version":"2012-10-17","Statement":[
-                  {"Effect":"Allow","Action":"kms:ReEncrypt","Resource":"%s*"},
-                  {"Effect":"Deny","Action":"kms:ReEncrypt","Resource":"%s"}]}"""
+                  {"Effect":"Allow","Action":"kms:ReEncrypt*","Resource":"%s*"},
+                  {"Effect":"Deny","Action":"kms:ReEncrypt*","Resource":"%s"}]}"""
                 .formatted(KEY_ARN_PREFIX, deniedArn));
 
         keyCall(session, "ReEncrypt",
