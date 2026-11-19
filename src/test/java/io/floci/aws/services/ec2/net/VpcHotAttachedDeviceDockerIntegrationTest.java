@@ -11,6 +11,7 @@ import io.floci.aws.core.common.docker.ContainerExec;
 import io.floci.aws.core.common.docker.ContainerLifecycleManager;
 import io.floci.aws.core.common.docker.ContainerStorageHelper;
 import io.floci.aws.core.common.docker.CurrentContainerNetworkResolver;
+import io.floci.aws.core.common.docker.LocallyBuiltHelperImage;
 import io.floci.aws.testing.DockerAvailability;
 import io.floci.aws.testing.TestImages;
 import io.quarkus.test.junit.QuarkusTest;
@@ -79,6 +80,8 @@ class VpcHotAttachedDeviceDockerIntegrationTest {
             String guest = namespace + "-guest";
             containers.add(guest);
             String helperImage = emulatorConfig.network().securityGroupEnforcement().helperImage();
+            LocallyBuiltHelperImage.ensureBuilt(docker, builder, helperImage, "floci/network-helper:local",
+                    "/docker/network-helper.Dockerfile");
             lifecycle.createAndStart(builder.newContainer(helperImage)
                     .withName(guest).withNetworkMode("bridge").withCapAdd("NET_ADMIN")
                     .withLabels(Map.of(OWNER_LABEL, namespace)).withCmd(List.of("sleep", "120")).build());

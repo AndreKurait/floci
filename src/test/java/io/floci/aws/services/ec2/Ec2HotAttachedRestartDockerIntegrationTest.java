@@ -16,6 +16,7 @@ import io.floci.aws.core.common.docker.ContainerReachableEndpoint;
 import io.floci.aws.core.common.docker.ContainerStorageHelper;
 import io.floci.aws.core.common.docker.CurrentContainerNetworkResolver;
 import io.floci.aws.core.common.docker.DockerHostResolver;
+import io.floci.aws.core.common.docker.LocallyBuiltHelperImage;
 import io.floci.aws.core.common.docker.PortAllocator;
 import io.floci.aws.services.ec2.model.Instance;
 import io.floci.aws.services.ec2.model.InstanceNetworkInterface;
@@ -98,6 +99,8 @@ class Ec2HotAttachedRestartDockerIntegrationTest {
             String guest = namespace + "-guest";
             containers.add(guest);
             String helperImage = emulatorConfig.network().securityGroupEnforcement().helperImage();
+            LocallyBuiltHelperImage.ensureBuilt(docker, builder, helperImage, "floci/network-helper:local",
+                    "/docker/network-helper.Dockerfile");
             lifecycle.createAndStart(builder.newContainer(helperImage)
                     .withName(guest).withNetworkMode("bridge").withCapAdd("NET_ADMIN")
                     .withLabels(Map.of(OWNER_LABEL, namespace)).withCmd(List.of("sleep", "120")).build());
