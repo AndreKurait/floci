@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.acmpca.AcmPcaService;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
@@ -23,7 +24,7 @@ import java.util.Set;
  * installs with {@code AWS::ACMPCA::Certificate} and {@code AWS::ACMPCA::CertificateAuthorityActivation} on
  * AWS, or the same API calls made afterwards. {@code Ref} and {@code Arn} are its ARN, and
  * {@code CertificateSigningRequest} is its CSR. {@code Tags} update in place, and so does
- * {@code RevocationConfiguration}, which is checked again through {@code UpdateCertificateAuthority} once the
+ * {@code RevocationConfiguration}, which is validated before any tag changes, and applied through {@code UpdateCertificateAuthority} once the
  * authority is ACTIVE or DISABLED; another value of a create-only property replaces the authority. Deletion disables an ACTIVE
  * authority first: on AWS the resource reference says to disable it before removing the resource
  * ("Otherwise, the action will fail."), which a template does with
@@ -37,14 +38,26 @@ public class AcmPcaCfnProvisioner implements CfnResourceProvisioner {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     private final AcmPcaService acmPcaService;
+    private final EmulatorConfig config;
 
-    public AcmPcaCfnProvisioner(AcmPcaService acmPcaService) {
+    public AcmPcaCfnProvisioner(AcmPcaService acmPcaService, EmulatorConfig config) {
         this.acmPcaService = acmPcaService;
+        this.config = config;
     }
 
     @Override
     public Set<String> resourceTypes() {
         return Set.of(TYPE);
+    }
+
+    @Override
+    public boolean serviceDisabled() {
+        return config != null && !config.services().acmPca().enabled();
+    }
+
+    @Override
+    public String serviceEnabledFlag() {
+        return "floci.services.acm-pca.enabled";
     }
 
     @Override
@@ -77,6 +90,7 @@ public class AcmPcaCfnProvisioner implements CfnResourceProvisioner {
         if (existing != null && !"DELETED".equals(existing.path("Status").asText())
                 && sameCreateOnlyProperties(existing, create)) {
             arn = existing.path("Arn").asText();
+            acmPcaService.validateRevocationConfiguration(create);
             reconcileTags(arn, tags, ctx.region());
             if (revocation != null && Set.of("ACTIVE", "DISABLED").contains(existing.path("Status").asText())) {
                 ObjectNode update = request(arn);
@@ -148,6 +162,7 @@ public class AcmPcaCfnProvisioner implements CfnResourceProvisioner {
                 && wanted.path("KeyAlgorithm").asText().equals(stored.path("KeyAlgorithm").asText())
                 && wanted.path("SigningAlgorithm").asText().equals(stored.path("SigningAlgorithm").asText())
                 && wanted.path("Subject").equals(stored.path("Subject"))
+                && wanted.path("CsrExtensions").equals(stored.path("CsrExtensions"))
                 && desired.path("KeyStorageSecurityStandard").asText("FIPS_140_2_LEVEL_3_OR_HIGHER")
                         .equals(existing.path("KeyStorageSecurityStandard").asText("FIPS_140_2_LEVEL_3_OR_HIGHER"))
                 && desired.path("UsageMode").asText("GENERAL_PURPOSE").equals(existing.path("UsageMode").asText());
