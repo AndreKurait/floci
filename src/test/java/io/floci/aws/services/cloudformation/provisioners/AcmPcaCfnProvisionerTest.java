@@ -1,7 +1,10 @@
 package io.floci.aws.services.cloudformation.provisioners;
 
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.core.common.AwsException;
 import io.floci.aws.services.acmpca.AcmPcaService;
 import io.floci.aws.services.cloudformation.CloudFormationTemplateEngine;
 import io.floci.aws.services.cloudformation.model.StackResource;
@@ -57,6 +60,79 @@ class AcmPcaCfnProvisionerTest {
         assertEquals("existing-authority", resource.getPhysicalId());
         assertTrue(resource.getStatusReason().contains("cannot be updated"));
         verifyNoInteractions(service);
+    }
+
+    @Test
+    void failedTagRestoreRetainsSnapshotForRetry() throws Exception {
+        StackResource resource = updatedAuthority();
+        assertTrue(provisioner.retainsFailedUpdateState(resource));
+        AwsException failure = new AwsException("InternalFailure", "tag storage unavailable", 500);
+        when(service.tag(any(), eq("us-east-1"))).thenThrow(failure).thenReturn(mapper.createObjectNode());
+        assertSame(failure, assertThrows(AwsException.class, () -> provisioner.rollbackUpdate(resource)));
+        assertTrue(provisioner.retainsFailedUpdateState(resource));
+        assertTrue(provisioner.rollbackUpdate(resource));
+        assertFalse(provisioner.retainsFailedUpdateState(resource));
+        verify(service, times(2)).tag(argThat(request -> "original".equals(
+                request.path("Tags").path(0).path("Value").asText())), eq("us-east-1"));
+    }
+
+    @Test
+    void committedTagUpdateDiscardsSnapshot() throws Exception {
+        StackResource resource = updatedAuthority();
+        assertTrue(provisioner.retainsFailedUpdateState(resource));
+        provisioner.completeUpdate(resource);
+        assertFalse(provisioner.retainsFailedUpdateState(resource));
+        assertFalse(provisioner.rollbackUpdate(resource));
+    }
+
+    @Test
+    void ownUpdateFailureKeepsTagSnapshotForRollback() throws Exception {
+        when(service.csr(any(), anyString())).thenThrow(new AwsException("InternalFailure", "CSR read failed", 500));
+        StackResource resource = new StackResource();
+        assertThrows(AwsException.class, () -> updateAuthority(resource, false));
+        assertTrue(provisioner.retainsFailedUpdateState(resource));
+        when(service.listTags(any(), anyString())).thenReturn((ObjectNode) mapper.readTree("""
+                {"Tags":[{"Key":"team","Value":"updated"}]}
+                """));
+        assertTrue(provisioner.rollbackUpdate(resource));
+        verify(service).tag(argThat(request -> "original".equals(
+                request.path("Tags").path(0).path("Value").asText())), eq("us-east-1"));
+    }
+
+    private StackResource updatedAuthority() throws Exception {
+        StackResource resource = new StackResource();
+        updateAuthority(resource, true);
+        return resource;
+    }
+
+    private void updateAuthority(StackResource resource, boolean csrSucceeds) throws Exception {
+        String arn = "arn:aws:acm-pca:us-east-1:000000000000:certificate-authority/test";
+        resource.setResourceType(TYPE);
+        resource.setPhysicalId(arn);
+        CloudFormationTemplateEngine engine = mock(CloudFormationTemplateEngine.class);
+        when(engine.resolve(any())).thenAnswer(call -> ((JsonNode) call.getArgument(0)).asText());
+        when(engine.resolveNodeOmittingNoValue(any())).thenAnswer(call -> call.getArgument(0));
+        when(engine.resolveNode(any())).thenAnswer(call -> call.getArgument(0));
+        ObjectNode props = (ObjectNode) mapper.readTree("""
+                {"Type":"SUBORDINATE","KeyAlgorithm":"RSA_2048","SigningAlgorithm":"SHA256WITHRSA",
+                 "Subject":{"CommonName":"Test"},"Tags":[{"Key":"team","Value":"updated"}]}
+                """);
+        ObjectNode authority = props.deepCopy().put("Arn", arn).put("Status", "PENDING_CERTIFICATE")
+                .put("KeyStorageSecurityStandard", "FIPS_140_2_LEVEL_3_OR_HIGHER").put("UsageMode", "GENERAL_PURPOSE");
+        authority.set("CertificateAuthorityConfiguration", props.deepCopy());
+        when(service.describe(any(), anyString())).thenReturn(mapper.createObjectNode()
+                .set("CertificateAuthority", authority));
+        when(service.listTags(any(), anyString())).thenReturn((ObjectNode) mapper.readTree("""
+                {"Tags":[{"Key":"team","Value":"original"}]}
+                """));
+        if (csrSucceeds) {
+            when(service.csr(any(), anyString())).thenReturn(mapper.createObjectNode().put("Csr", "csr"));
+        }
+        provisioner.provision(resource, props, new ProvisionContext(engine, "us-east-1", "000000000000",
+                "stack", arn));
+        when(service.listTags(any(), anyString())).thenReturn((ObjectNode) mapper.readTree("""
+                {"Tags":[{"Key":"team","Value":"updated"},{"Key":"added","Value":"remove"}]}
+                """));
     }
 
     private StackResource create() {
