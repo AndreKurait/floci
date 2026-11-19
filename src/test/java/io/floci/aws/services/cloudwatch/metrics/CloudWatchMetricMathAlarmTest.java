@@ -61,6 +61,17 @@ class CloudWatchMetricMathAlarmTest {
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
+    void fillExpressionsAreAcceptedAndRoundTripThroughBothProtocols(boolean queryProtocol) throws Exception {
+        ObjectNode request = metricMathRequest();
+        ((ObjectNode) request.path("Metrics").get(0)).put("Expression", "FILL(errors, 0) + FILL(requests, 0)");
+        put(request, queryProtocol);
+        assertMetricMathAlarm(request);
+        assertEquals("FILL(errors, 0) + FILL(requests, 0)",
+                describeJson().path("Metrics").get(0).path("Expression").asText());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
     void metricMathQueriesSurvivePersistentStorageReload(boolean queryProtocol, @TempDir Path directory)
             throws Exception {
         Path storageFile = directory.resolve("alarms.json");
