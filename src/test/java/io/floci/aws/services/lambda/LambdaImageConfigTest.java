@@ -239,6 +239,7 @@ class LambdaImageConfigTest {
 
             when(config.services()).thenReturn(services);
             when(services.lambda()).thenReturn(lambda);
+            lenient().when(services.iam()).thenReturn(mock(EmulatorConfig.IamServiceConfig.class));
             when(lambda.dockerNetwork()).thenReturn(Optional.empty());
             when(config.docker()).thenReturn(docker);
             when(docker.logMaxSize()).thenReturn("10m");
