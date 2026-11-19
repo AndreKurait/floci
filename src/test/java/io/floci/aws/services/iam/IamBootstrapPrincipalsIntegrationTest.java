@@ -9,6 +9,7 @@ import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.retries.api.BackoffStrategy;
 import software.amazon.awssdk.services.cloudformation.CloudFormationClient;
 import software.amazon.awssdk.services.cloudformation.model.CloudFormationException;
 import software.amazon.awssdk.services.iam.IamClient;
@@ -91,7 +92,9 @@ class IamBootstrapPrincipalsIntegrationTest {
             assertTrue(stackId.startsWith("arn:aws:cloudformation:eu-west-1:222222222222:stack/"));
             try {
                 assertTrue(cfn.waiter().waitUntilStackCreateComplete(request -> request.stackName(name),
-                        configuration -> configuration.waitTimeout(Duration.ofSeconds(60))).matched().response().isPresent());
+                        configuration -> configuration.waitTimeout(Duration.ofSeconds(60))
+                                .backoffStrategyV2(BackoffStrategy.fixedDelayWithoutJitter(Duration.ofMillis(100))))
+                        .matched().response().isPresent());
                 assertThrows(CloudFormationException.class, () -> other.describeStacks(request -> request.stackName(name)));
                 s3.putObject(request -> request.bucket(name).key("proof"), RequestBody.fromString("authenticated"));
                 assertEquals("authenticated", s3.getObjectAsBytes(request -> request.bucket(name).key("proof")).asUtf8String());
