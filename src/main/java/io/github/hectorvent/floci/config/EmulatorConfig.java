@@ -2272,6 +2272,9 @@ public interface EmulatorConfig {
     interface CloudWatchMetricsServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        @WithDefault("false")
+        boolean packWeightedValues();
     }
 
     interface PaymentCryptographyServiceConfig {

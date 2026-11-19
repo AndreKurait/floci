@@ -4,11 +4,14 @@ import com.fasterxml.jackson.databind.JsonNode;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricDatum;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
+import java.util.stream.IntStream;
+import java.util.stream.Stream;
 
-/** Normalize each distinct value to a recoverable statistic set without expanding its count. */
+/** Store weighted arrays once; reconstruct recoverable statistic sets only for a query. */
 final class MetricValues {
     private static final int MAX_VALUES = 150;
     private static final double MAX_VALUE = Math.scalb(1.0, 360);
@@ -95,7 +98,9 @@ final class MetricValues {
         if (counts != null && counts.size() != values.size()) {
             throw CloudWatchMetricsException.invalidParameterValue("Counts and Values must have the same length.");
         }
-        List<MetricDatum> result = new ArrayList<>(values.size());
+        double[] packedValues = new double[values.size()];
+        double[] packedWeights = new double[values.size()];
+        double[] sums = new double[values.size()];
         for (int i = 0; i < values.size(); i++) {
             double value = values.get(i);
             double count = counts == null ? 1 : counts.get(i);
@@ -107,14 +112,44 @@ final class MetricValues {
                 throw CloudWatchMetricsException.invalidParameterValue(
                         "Counts must be nonnegative finite numbers with a finite weighted sum.");
             }
-            MetricDatum sample = MetricDatum.of(template.getMetricName(), template.getUnit(), value,
-                    List.copyOf(template.getDimensions()), template.getTimestamp());
-            sample.setSampleCount(count);
-            sample.setSum(value * count);
-            sample.setMinimum(value);
-            sample.setMaximum(value);
-            result.add(sample);
+            packedValues[i] = value;
+            packedWeights[i] = count;
+            sums[i] = value * count;
         }
-        return result;
+        if (values.size() == 1) {
+            return List.of(sample(template, packedValues[0], packedWeights[0]));
+        }
+        MetricDatum packed = MetricDatum.of(template.getMetricName(), template.getUnit(), 0,
+                List.copyOf(template.getDimensions()), template.getTimestamp());
+        packed.setSampleValues(packedValues);
+        packed.setSampleWeights(packedWeights);
+        packed.setSampleCount(Arrays.stream(packedWeights).sum());
+        packed.setSum(Arrays.stream(sums).sum());
+        packed.setMinimum(Arrays.stream(packedValues).min().orElseThrow());
+        packed.setMaximum(Arrays.stream(packedValues).max().orElseThrow());
+        return List.of(packed);
+    }
+
+    static Stream<MetricDatum> expand(MetricDatum stored) {
+        double[] values = stored.getSampleValues();
+        double[] weights = stored.getSampleWeights();
+        if (values == null && weights == null) {
+            return Stream.of(stored);
+        }
+        if (values == null || weights == null || values.length != weights.length || values.length == 0) {
+            throw new IllegalStateException("Stored weighted metric has inconsistent values and weights");
+        }
+        return IntStream.range(0, values.length).mapToObj(index -> sample(stored, values[index], weights[index]));
+    }
+
+    private static MetricDatum sample(MetricDatum template, double value, double weight) {
+        MetricDatum sample = MetricDatum.of(template.getMetricName(), template.getUnit(), value,
+                List.copyOf(template.getDimensions()), template.getTimestamp());
+        sample.setNamespace(template.getNamespace());
+        sample.setSampleCount(weight);
+        sample.setSum(value * weight);
+        sample.setMinimum(value);
+        sample.setMaximum(value);
+        return sample;
     }
 }

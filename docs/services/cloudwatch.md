@@ -742,10 +742,19 @@ including an all-zero batch. Explicit statistic sets with zero sample count and 
 sets rather than becoming scalar samples. A `StatisticValues` set sent with `Values`, as the CloudWatch
 agent publishes a distribution, is accepted: the weighted samples are stored and the set, which
 summarizes them, is not counted again. `Value` with `Values` is rejected.
-Both arrays must have matching lengths and contain at most 150 entries. Each distinct value becomes
+Both arrays must have matching lengths and contain at most 150 entries. By default, each distinct value becomes
 one existing statistic set with equal minimum and maximum; large occurrence counts are not expanded
 into individual samples. Malformed weighted data rejects the request before any of its samples are
 published. See the [MetricDatum contract](https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_MetricDatum.html).
+
+Set `FLOCI_SERVICES_CLOUDWATCHMETRICS_PACK_WEIGHTED_VALUES=true`
+(`floci.services.cloudwatchmetrics.pack-weighted-values`, default `false`) to store a multi-value
+batch in one record and reduce its retained memory. Queries preserve the per-value distribution.
+Scalar metrics and single-value batches keep the existing record format.
+
+Packed records require a reader that supports this option: older readers cannot recover their percentiles.
+Disabling the option changes future writes only; it does not convert existing packed records.
+Keep a compatible reader for storage written while this option was enabled.
 
 Floci computes weighted nearest-rank percentiles from nonnegative scalar samples and statistic
 sets whose minimum and maximum are equal and whose sum agrees with the sample count.
