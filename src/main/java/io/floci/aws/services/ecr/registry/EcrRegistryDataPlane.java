@@ -714,6 +714,9 @@ public class EcrRegistryDataPlane {
             conditions.put("ecr:ResourceTag/" + key, List.of(value));
         });
         authorization.requirePermission(identity, action, arn, metadata.getRepositoryPolicyText(), conditions);
+        if (identity.pullScope() != null) {
+            authorization.requirePullPermissions(identity, arn, metadata.getRepositoryPolicyText(), conditions);
+        }
     }
 
     static List<String> actions(String method, String backendUri, String storageRepository) {

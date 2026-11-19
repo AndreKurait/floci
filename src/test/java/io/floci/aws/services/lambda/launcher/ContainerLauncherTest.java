@@ -13,6 +13,7 @@ import com.github.dockerjava.api.command.ListContainersCmd;
 import com.github.dockerjava.api.command.WaitContainerCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.AccessMode;
+import com.github.dockerjava.api.model.AuthConfig;
 import com.github.dockerjava.api.model.ContainerConfig;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.Mount;
@@ -20,6 +21,7 @@ import com.github.dockerjava.api.model.MountType;
 import com.github.dockerjava.api.model.StreamType;
 import com.github.dockerjava.api.model.VersionComponent;
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.dns.EmbeddedDnsServer;
 import io.floci.aws.core.common.docker.ContainerBuilder;
@@ -77,6 +79,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Function;
 import java.util.stream.Stream;
 
 import static io.floci.aws.testing.DockerDaemonVersionFixtures.stubDaemonVersion;
@@ -132,6 +135,7 @@ class ContainerLauncherTest {
 
         when(config.services()).thenReturn(services);
         when(services.lambda()).thenReturn(lambda);
+        lenient().when(services.iam()).thenReturn(mock(EmulatorConfig.IamServiceConfig.class));
         lenient().when(lambda.reconcileContainersOnStartup()).thenReturn(true);
         when(lambda.dockerNetwork()).thenReturn(Optional.empty());
         lenient().when(lambda.extraHosts()).thenReturn(Optional.empty());
@@ -1367,6 +1371,67 @@ class ContainerLauncherTest {
         verify(ecrRegistryManager).rewriteImageUri("123456789012.dkr.ecr.us-east-1.amazonaws.com/backend-user:1");
         assertEquals("localhost:4566/123456789012/us-east-1/backend-user:1",
                 spec.image());
+    }
+
+    @Test
+    void enforcedEcrImagePassesItsCredentialToContainerCreation() {
+        when(config.services().iam().enforcementEnabled()).thenReturn(true);
+        LambdaImagePullService pulls = mock(LambdaImagePullService.class);
+        AuthConfig credentials = new AuthConfig().withRegistryAddress("localhost:4566")
+                .withUsername("AWS").withPassword("per-pull");
+        doAnswer(invocation -> {
+            Function<AuthConfig, String> create = invocation.getArgument(2);
+            return create.apply(credentials);
+        }).when(pulls).pull(any(), anyString(), any());
+        when(lifecycleManager.create(any(), any(), eq(credentials))).thenReturn("container-123");
+        ContainerReachableEndpoint endpoint =
+                new ContainerReachableEndpoint(config, dockerHostResolver, embeddedDnsServer, null, 4566);
+        ContainerLauncher authorized = new ContainerLauncher(
+                new ContainerBuilder(config, dockerHostResolver, embeddedDnsServer), lifecycleManager,
+                streamingDockerClient, logStreamer, imageResolver, runtimeApiServerFactory, dockerHostResolver,
+                config, regionResolver, ecrRegistryManager, layerService, new LaunchedContainerAwsEnv(endpoint),
+                executionRoleCredentials, ec2Service, pulls);
+        LambdaFunction function = new LambdaFunction();
+        function.setFunctionName("image");
+        function.setPackageType("Image");
+        function.setImageUri("localhost:4566/111111111111/us-east-1/image:latest");
+        try {
+            authorized.launch(function);
+            verify(pulls).pull(eq(function), eq(function.getImageUri()), any());
+            verify(lifecycleManager).create(any(), any(), eq(credentials));
+            verify(lifecycleManager, never()).create(any());
+            verify(lifecycleManager, never()).create(any(), anyString());
+        } finally {
+            authorized.shutdown();
+        }
+    }
+
+    @Test
+    void enforcedEcrDenialReleasesRuntimeApiAndCreatesNoUncredentialedContainer() {
+        when(config.services().iam().enforcementEnabled()).thenReturn(true);
+        LambdaImagePullService pulls = mock(LambdaImagePullService.class);
+        doThrow(new AwsException("DENIED", "Image pull denied", 403))
+                .when(pulls).pull(any(), anyString(), any());
+        ContainerReachableEndpoint endpoint =
+                new ContainerReachableEndpoint(config, dockerHostResolver, embeddedDnsServer, null, 4566);
+        ContainerLauncher authorized = new ContainerLauncher(
+                new ContainerBuilder(config, dockerHostResolver, embeddedDnsServer), lifecycleManager,
+                streamingDockerClient, logStreamer, imageResolver, runtimeApiServerFactory, dockerHostResolver,
+                config, regionResolver, ecrRegistryManager, layerService, new LaunchedContainerAwsEnv(endpoint),
+                executionRoleCredentials, ec2Service, pulls);
+        LambdaFunction function = new LambdaFunction();
+        function.setFunctionName("image");
+        function.setPackageType("Image");
+        function.setImageUri("localhost:4566/111111111111/us-east-1/image:latest");
+        try {
+            assertThrows(RuntimeException.class, () -> authorized.launch(function));
+            verify(runtimeApiServer).stop();
+            verify(lifecycleManager, never()).create(any());
+            verify(lifecycleManager, never()).create(any(), anyString());
+            verify(lifecycleManager, never()).create(any(), any(), any());
+        } finally {
+            authorized.shutdown();
+        }
     }
 
     @Test

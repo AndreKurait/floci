@@ -23,6 +23,7 @@ import io.floci.aws.services.cloudwatch.metrics.CloudWatchMetricsService;
 import io.floci.aws.services.cloudwatch.metrics.model.Dimension;
 import io.floci.aws.services.cloudwatch.metrics.model.MetricAlarm;
 import io.floci.aws.services.cloudwatch.metrics.model.MetricDatum;
+import io.floci.aws.services.ecr.registry.EcrRegistryManager;
 import io.floci.aws.services.ecs.container.EcsContainerManager;
 import io.floci.aws.services.ecs.container.EcsLinuxParameters;
 import io.floci.aws.services.ecs.container.EcsTaskHandle;
@@ -135,6 +136,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
 
     private final RegionResolver regionResolver;
     private final EcsContainerManager containerManager;
+    private final EmulatorConfig config;
     private final EcsLoadBalancerRegistrar lbRegistrar;
     private final StorageFactory storageFactory;
     private final EcsEventPublisher eventPublisher;
@@ -322,6 +324,7 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                ExecutorService taskLauncher, ExecutorService taskStopper) {
         this.regionResolver = regionResolver;
         this.containerManager = containerManager;
+        this.config = config;
         this.dockerMode = !config.services().ecs().mock();
         this.publishAwsvpcPortsToHost = config.services().ecs().publishAwsvpcPortsToHost();
         this.dynamicAwsvpcHostPorts = config.services().ecs().dynamicAwsvpcHostPorts();
@@ -1773,7 +1776,19 @@ public class EcsService implements ContainerTeardown, ResourceProvider, Resettab
                             "the containers a previous run of Floci left on the Docker daemon could not be removed yet");
                 }
                 task.setPullStartedAt(Instant.now());
-                EcsTaskHandle handle = containerManager.startTask(task, taskDef, containerOverrides, region);
+                EcsTaskHandle handle;
+                if (task.getLaunchType() == LaunchType.EC2 && task.getContainerInstanceArn() != null
+                        && taskDef.getContainerDefinitions().stream()
+                        .anyMatch(def -> EcrRegistryManager.ecrImage(def.getImage()).isPresent())
+                        && config.services().iam().enforcementEnabled()) {
+                    ContainerInstance instance = resolveContainerInstance(cluster.getClusterArn(), task.getContainerInstanceArn());
+                    if (instance == null || instance.getEc2InstanceId() == null) {
+                        throw new AwsException("ResourceInitializationError", "The container instance is unavailable.", 400);
+                    }
+                    handle = containerManager.startTask(task, taskDef, containerOverrides, region, instance.getEc2InstanceId());
+                } else {
+                    handle = containerManager.startTask(task, taskDef, containerOverrides, region);
+                }
                 task.setPullStoppedAt(Instant.now());
                 boolean stopRequested;
                 synchronized (task) {
