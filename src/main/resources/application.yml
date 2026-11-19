@@ -982,6 +982,8 @@ floci:
     elbv2:
       enabled: true
       mock: false
+      backend-keep-alive: true
+      backend-keep-alive-timeout-seconds: 60
       max-health-check-interval-millis: 0    # Local acceleration only; probe timeouts and success thresholds are unchanged
       dns-name-strategy: ${FLOCI_SERVICES_ELBV2_DNS_NAME_STRATEGY:floci}
       # single-zone-alb-accounts: 123456789012   # Opt-in: these accounts' ALBs may use one Availability Zone (local single-zone setups)
