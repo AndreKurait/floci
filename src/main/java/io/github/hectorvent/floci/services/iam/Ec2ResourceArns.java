@@ -17,7 +17,8 @@ import java.util.Optional;
  * <p>The network interface and VPC endpoint arms follow the resource types AWS's Service
  * Authorization Reference gives each action (servicereference {@code v1/ec2/ec2.json}), and only the
  * resources the request names: CreateNetworkInterface acts on network-interface, subnet and
- * security-group; DeleteNetworkInterface and CreateNetworkInterfacePermission on network-interface;
+ * security-group; DeleteNetworkInterface, CreateNetworkInterfacePermission, AssignIpv6Addresses and
+ * UnassignIpv6Addresses on network-interface;
  * AttachNetworkInterface and DetachNetworkInterface on instance and network-interface;
  * CreateVpcEndpoint on vpc-endpoint, vpc, subnet, security-group and route-table; ModifyVpcEndpoint
  * on vpc-endpoint, subnet, security-group and route-table; DeleteVpcEndpoints on vpc-endpoint. An
@@ -48,7 +49,8 @@ final class Ec2ResourceArns {
                     group(context, region, account, partition);
             case "ec2:CreateTags", "ec2:DeleteTags" -> tags(context, region, account, partition);
             case "ec2:CreateNetworkInterface" -> createNetworkInterface(context, region, account, partition);
-            case "ec2:DeleteNetworkInterface", "ec2:CreateNetworkInterfacePermission" -> List.of(networkInterfaceArn(
+            case "ec2:DeleteNetworkInterface", "ec2:CreateNetworkInterfacePermission", "ec2:AssignIpv6Addresses",
+                 "ec2:UnassignIpv6Addresses" -> List.of(networkInterfaceArn(
                     RequestBodyReader.formField(context, "NetworkInterfaceId"), region, account, partition));
             case "ec2:AttachNetworkInterface" -> attachNetworkInterface(context, region, account, partition);
             case "ec2:DetachNetworkInterface" -> detachNetworkInterface(context, region, account, partition, service);
