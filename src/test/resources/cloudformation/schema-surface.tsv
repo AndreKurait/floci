@@ -1,6 +1,6 @@
 AWS::ApiGateway::Account	Id	CloudWatchRoleArn
 AWS::ApiGateway::ApiKey	APIKeyId	CustomerId,Description,Enabled,GenerateDistinctId,Name,StageKeys,Tags,Value
-AWS::ApiGateway::Authorizer	AuthorizerId	AuthType,AuthorizerCredentials,AuthorizerResultTtlInSeconds,AuthorizerUri,IdentitySource,IdentityValidationExpression,Name,ProviderARNs,RestApiId,Type
+AWS::ApiGateway::Authorizer	AuthorizerId	AuthType,AuthorizerCredentials,AuthorizerResultTtlInSeconds,AuthorizerUri,IdentitySource,IdentityValidationExpression,JwtConfiguration,Name,ProviderARNs,RestApiId,Type
 AWS::ApiGateway::BasePathMapping		BasePath,DomainName,RestApiId,Stage
 AWS::ApiGateway::Deployment	DeploymentId	DeploymentCanarySettings,Description,RestApiId,StageDescription,StageName
 AWS::ApiGateway::DomainName	DistributionDomainName,DistributionHostedZoneId,DomainNameArn,RegionalDomainName,RegionalHostedZoneId	CertificateArn,DomainName,EndpointAccessMode,EndpointConfiguration,MutualTlsAuthentication,OwnershipVerificationCertificateArn,RegionalCertificateArn,RoutingMode,SecurityPolicy,Tags
