@@ -16,6 +16,7 @@ public final class KmsGrantConditions {
     private static final String TYPE = "floci:kms:ChildConstraintType";
     private static final String KEYS = "floci:kms:ChildConstraintKeys";
     private static final String PAIR = "floci:kms:ChildConstraint:";
+    private static final String EFFECTIVE_PAIR = "floci:kms:EffectiveChildConstraint:";
     private static final String SOURCE = "floci:kms:ChildSourceArn";
 
     private KmsGrantConditions() {
@@ -72,6 +73,7 @@ public final class KmsGrantConditions {
                         String key = encodedKey(entry.getKey());
                         keys.add(key);
                         result.put(PAIR + key, List.of(entry.getValue().textValue()));
+                        result.put(effectivePairKey(entry.getKey()), List.of(entry.getValue().textValue()));
                     }
                 });
                 result.put(KEYS, keys);
@@ -96,7 +98,10 @@ public final class KmsGrantConditions {
                 if (constraints.get(type) instanceof Map<?, ?> pairs) {
                     equalities.put(TYPE, "EncryptionContextEquals".equals(type) ? List.of(type)
                             : List.of("EncryptionContextEquals", "EncryptionContextSubset"));
-                    pairs.forEach((key, value) -> equalities.put(PAIR + encodedKey(key.toString()), value));
+                    pairs.forEach((key, value) -> {
+                        equalities.put(PAIR + encodedKey(key.toString()), value);
+                        equalities.put(effectivePairKey(key.toString()), value);
+                    });
                     if ("EncryptionContextEquals".equals(type)) {
                         if (pairs.isEmpty()) {
                             Map<String, Object> nulls = new LinkedHashMap<>();
@@ -122,6 +127,11 @@ public final class KmsGrantConditions {
 
     public static String encryptionContextKey(String key) {
         return "floci:kms:EncryptionContext:" + encodedKey(key.toLowerCase(Locale.ROOT));
+    }
+
+    private static String effectivePairKey(String key) {
+        // Preserve spelling checks while also bounding the value cryptographic matching will use.
+        return EFFECTIVE_PAIR + encodedKey(key.toLowerCase(Locale.ROOT));
     }
 
     private static String encodedKey(String key) {
