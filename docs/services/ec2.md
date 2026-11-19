@@ -41,6 +41,12 @@ interface's primary private IPv4 address and MAC; detach removes only that devic
 The network is selected using the interface owner's account. Device operations run outside the regional topology lock
 and retain attach/detach ordering for each instance.
 
+Successful physical attachments retain their Docker namespace owner in instance
+storage. With physical attachment enabled, start, reboot and metadata recovery
+restore the MAC only on an existing endpoint in the same owned account/VPC network.
+Recovery does not reconnect a missing endpoint. Older attachment records without
+physical ownership must be explicitly detached and reattached to acquire it.
+
 Physical attachment remains record-only when VPC networks are disabled, no container
 exists, security-group enforcement is enabled, the namespace already has an
 interface in that account's VPC, or the backend cannot assign the declared address.

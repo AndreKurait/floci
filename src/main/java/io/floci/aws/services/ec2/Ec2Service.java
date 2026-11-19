@@ -17260,6 +17260,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             }
             if (containerManager != null) {
                 containerManager.plugNetworkInterface(change.instance(), change.device());
+                if (change.device().getSharedNetworkContainerId() != null) {
+                    instances.persistIfCurrent(key(region, instanceId), change.instance());
+                }
             }
             return change.attachment();
         }

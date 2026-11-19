@@ -797,8 +797,8 @@ public class VpcNetworkManager {
         if (!enabled() || containerId == null || address == null || macAddress == null) {
             return;
         }
-        VpcBinding vpc = bindings.get(key(accountId, region, vpcId));
-        if (vpc == null) {
+        VpcBinding vpc = plannedVpc(accountId, region, vpcId);
+        if (vpc == null || !existingSharedNetworkBelongsTo(vpc)) {
             return;
         }
         ContainerNetwork endpoint = endpoints(containerId).get(vpc.networkName);
@@ -820,8 +820,8 @@ public class VpcNetworkManager {
         if (!enabled() || containerId == null || address == null || macAddress == null) {
             return;
         }
-        VpcBinding vpc = bindings.get(key(accountId, region, vpcId));
-        if (vpc == null || !vpc.created) {
+        VpcBinding vpc = plannedVpc(accountId, region, vpcId);
+        if (vpc == null || (!vpc.created && !existingSharedNetworkBelongsTo(vpc))) {
             return;
         }
         ContainerNetwork endpoint = endpoints(containerId).get(vpc.networkName);
@@ -832,6 +832,24 @@ public class VpcNetworkManager {
         // Read the device itself before allowing a detach to remove the shared network endpoint.
         deviceFor(links(containerId), macAddress);
         disconnect(vpc.networkName, containerId);
+    }
+
+    private boolean existingSharedNetworkBelongsTo(VpcBinding vpc) {
+        Network network;
+        try {
+            network = dockerClient.inspectNetworkCmd().withNetworkId(vpc.networkName).exec();
+        } catch (NotFoundException missing) {
+            return false;
+        }
+        Map<String, String> labels = network.getLabels() == null ? Map.of() : network.getLabels();
+        return ALIASES.consistent(network.getName(), labels)
+                && ownedByThisDeployment(labels)
+                && ALIASES.matches(labels, ContainerStorageHelper.SERVICE_LABEL, SERVICE_VALUE)
+                && ALIASES.matches(labels, ContainerStorageHelper.COMPONENT_LABEL, COMPONENT_VALUE)
+                && ALIASES.matches(labels, ContainerStorageHelper.RESOURCE_ID_LABEL, vpc.vpcId)
+                && ALIASES.matches(labels, ContainerStorageHelper.ACCOUNT_LABEL, vpc.accountId)
+                && ALIASES.matches(labels, ContainerStorageHelper.REGION_LABEL, vpc.region)
+                && ipamSubnets(network).contains(vpc.effective);
     }
 
     private Map<String, ContainerNetwork> endpoints(String containerId) {

@@ -21,6 +21,7 @@ import io.floci.aws.services.ec2.net.VpcNetworkManager;
 import io.floci.aws.services.ec2.portforward.Ec2PortForwardManager;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.ArrayList;
@@ -157,11 +158,63 @@ class Ec2HotAttachInterfaceTest {
     }
 
     @Test
+    void recordOnlyAttachmentCannotClaimAnExistingEndpointDuringRestoration() {
+        Ec2ContainerManager manager = manager();
+        InstanceNetworkInterface attached = customer();
+        Instance instance = instanceWith(primary(), attached);
+        when(vpcNetworks.attachInterface("000000000000", REGION, "vpc-customer", "subnet-customer",
+                "helper-1", "172.31.5.9", MAC)).thenReturn(Optional.empty());
+
+        assertTrue(manager.plugNetworkInterface(instance, attached).isPresent());
+        manager.restoreAttachedNetworkInterfaces(instance);
+
+        verify(vpcNetworks, never()).restoreInterface(anyString(), anyString(), anyString(),
+                anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void aSuccessfulAttachmentRecordsItsNamespaceOwner() {
+        Ec2ContainerManager manager = manager();
+        InstanceNetworkInterface attached = customer();
+        when(vpcNetworks.attachInterface("000000000000", REGION, "vpc-customer", "subnet-customer",
+                "helper-1", "172.31.5.9", MAC)).thenReturn(Optional.of("customer-network"));
+
+        assertEquals(Optional.empty(), manager.plugNetworkInterface(instanceWith(primary(), attached), attached));
+        assertEquals("helper-1", attached.getSharedNetworkContainerId());
+    }
+
+    @ParameterizedTest
+    @NullSource
+    @ValueSource(strings = {"helper-1", "different-helper"})
+    void restoredMetadataRepairsOnlyItsRecordedNamespace(String owner) throws Exception {
+        Ec2ContainerManager manager = manager();
+        InstanceNetworkInterface attached = customer();
+        attached.setSharedNetworkContainerId(owner);
+        ObjectMapper mapper = new ObjectMapper();
+        InstanceNetworkInterface restored = mapper.readValue(mapper.writeValueAsBytes(attached),
+                InstanceNetworkInterface.class);
+
+        manager.restoreAttachedNetworkInterfaces(instanceWith(primary(), restored));
+
+        if ("helper-1".equals(owner)) {
+            verify(vpcNetworks).restoreInterface("000000000000", REGION, "vpc-customer",
+                    "helper-1", "172.31.5.9", MAC);
+        } else {
+            verify(vpcNetworks, never()).restoreInterface(anyString(), anyString(), anyString(),
+                    anyString(), anyString(), anyString());
+        }
+    }
+
+    @Test
     void restorationUsesTheInterfaceOwnerAndNeverThePrimaryInterface() {
         Ec2ContainerManager manager = manager();
         InstanceNetworkInterface attached = customer();
         attached.setOwnerId("111122223333");
-        manager.restoreAttachedNetworkInterfaces(instanceWith(primary(), attached));
+        Instance instance = instanceWith(primary(), attached);
+        when(vpcNetworks.attachInterface("111122223333", REGION, "vpc-customer", "subnet-customer",
+                "helper-1", "172.31.5.9", MAC)).thenReturn(Optional.of("foreign-network"));
+        assertEquals(Optional.empty(), manager.plugNetworkInterface(instance, attached));
+        manager.restoreAttachedNetworkInterfaces(instance);
         verify(vpcNetworks).restoreInterface("111122223333", REGION, "vpc-customer", "helper-1", "172.31.5.9", MAC);
         verify(vpcNetworks, never()).restoreInterface(anyString(), anyString(), eq("vpc-home"),
                 anyString(), anyString(), anyString());

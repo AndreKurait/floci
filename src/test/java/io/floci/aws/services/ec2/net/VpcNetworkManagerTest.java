@@ -1477,6 +1477,69 @@ class VpcNetworkManagerTest {
         verify(docker.disconnectFromNetworkCmd(), times(1)).exec();
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"owned", "foreign deployment", "foreign account", "foreign region", "foreign VPC",
+            "different subnet", "missing network", "different address", "missing endpoint"})
+    void restoringAnAttachedMacUsesOnlyTheExistingOwnedNetwork(String scenario) {
+        manager.declareVpc(ACCOUNT, REGION, "vpc-2", "172.31.0.0/16");
+        manager.declareSubnet(ACCOUNT, REGION, "vpc-2", "subnet-c", "172.31.5.0/24");
+        String address = "172.31.5.10";
+        String networkName = manager.networkName(ACCOUNT, REGION, "vpc-2");
+        Map<String, String> labels = newLabels("vpc-2", "4650");
+        labels.put("io.floci.account", ACCOUNT);
+        switch (scenario) {
+            case "foreign deployment" -> labels.put("io.floci.owner", "9999");
+            case "foreign account" -> labels.put("io.floci.account", OTHER_ACCOUNT);
+            case "foreign region" -> labels.put("io.floci.region", "eu-west-1");
+            case "foreign VPC" -> labels.put("io.floci.resource-id", "vpc-other");
+            default -> { }
+        }
+        if (!scenario.equals("missing network")) {
+            existingNetwork(networkName, scenario.equals("different subnet") ? "10.20.0.0/16" : "172.31.0.0/16",
+                    labels);
+        }
+        Map<String, ContainerNetwork> endpoints = scenario.equals("missing endpoint") ? Map.of()
+                : Map.of(networkName, endpointWith(
+                        scenario.equals("different address") ? "172.31.5.99" : address, DOCKER_MAC));
+        endpointsAcrossConnect(endpoints, endpoints);
+        AtomicBoolean repaired = new AtomicBoolean();
+        manager.namespaceCommand = (container, command) -> {
+            if (command[0].equals("sh")) {
+                repaired.set(true);
+            }
+            return links(repaired.get() ? INTERFACE_MAC : DOCKER_MAC);
+        };
+
+        manager.restoreInterface(ACCOUNT, REGION, "vpc-2", "helper-1", address, INTERFACE_MAC);
+
+        assertEquals(scenario.equals("owned"), repaired.get());
+        verify(docker.createNetworkCmd(), never()).exec();
+        verify(docker.connectToNetworkCmd(), never()).exec();
+        verify(docker, never()).disconnectFromNetworkCmd();
+    }
+
+    @Test
+    void anOwnedEndpointCanBeDetachedAfterReconstructingTheNetworkManager() {
+        manager.declareVpc(ACCOUNT, REGION, "vpc-2", "172.31.0.0/16");
+        manager.declareSubnet(ACCOUNT, REGION, "vpc-2", "subnet-c", "172.31.5.0/24");
+        String address = "172.31.5.10";
+        String networkName = manager.networkName(ACCOUNT, REGION, "vpc-2");
+        Map<String, String> labels = newLabels("vpc-2", "4650");
+        labels.put("io.floci.account", ACCOUNT);
+        existingNetwork(networkName, "172.31.0.0/16", labels);
+        Map<String, ContainerNetwork> endpoints = Map.of(networkName, endpointWith(address, DOCKER_MAC));
+        endpointsAcrossConnect(endpoints, endpoints);
+        manager.namespaceCommand = (container, command) -> links(INTERFACE_MAC);
+
+        manager.detachInterface(ACCOUNT, REGION, "vpc-2", "helper-1", address, INTERFACE_MAC);
+
+        verify(docker.disconnectFromNetworkCmd()).withNetworkId(networkName);
+        verify(docker.disconnectFromNetworkCmd()).withContainerId("helper-1");
+        verify(docker.disconnectFromNetworkCmd()).exec();
+        verify(docker.createNetworkCmd(), never()).exec();
+        verify(docker.connectToNetworkCmd(), never()).exec();
+    }
+
     private ContainerNetwork observedEndpoint(String address) {
         ContainerNetwork endpoint = mock(ContainerNetwork.class);
         when(endpoint.getIpAddress()).thenReturn(address);

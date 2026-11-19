@@ -1131,6 +1131,8 @@ public class Ec2ContainerManager {
                 if (vpcNetworkManager.attachInterface(interfaceAccount(instance, eni), instance.getRegion(), eni.getVpcId(), eni.getSubnetId(),
                         helper, eni.getPrivateIpAddress(), eni.getMacAddress()).isEmpty()) {
                     reason = "its address is not on a VPC network Floci created";
+                } else {
+                    eni.setSharedNetworkContainerId(helper);
                 }
             } catch (RuntimeException failure) {
                 reason = failure.getMessage() == null ? failure.getClass().getSimpleName() : failure.getMessage();
@@ -1212,15 +1214,20 @@ public class Ec2ContainerManager {
     /** Docker can restore its original endpoint MAC when a standalone workload restarts. */
     void restoreAttachedNetworkInterfaces(Instance instance) {
         for (InstanceNetworkInterface eni : List.copyOf(instance.getNetworkInterfaces())) {
-            if (eni.getDeviceIndex() == 0 || hotAttachBlocker(instance, eni) != null) {
+            if (eni.getDeviceIndex() == 0 || eni.getSharedNetworkContainerId() == null
+                    || hotAttachBlocker(instance, eni) != null) {
                 continue;
             }
             try {
+                String helper = networkContainerOf(instance);
+                if (!helper.equals(eni.getSharedNetworkContainerId())) {
+                    continue;
+                }
                 vpcNetworkManager.restoreInterface(interfaceAccount(instance, eni), instance.getRegion(), eni.getVpcId(),
-                        networkContainerOf(instance), eni.getPrivateIpAddress(), eni.getMacAddress());
+                        helper, eni.getPrivateIpAddress(), eni.getMacAddress());
             } catch (RuntimeException failure) {
-                LOG.warnv("Could not restore interface {0} of EC2 instance {1}: {2}",
-                        eni.getNetworkInterfaceId(), instance.getInstanceId(), failure.getMessage());
+                LOG.warnv(failure, "Could not restore interface {0} of EC2 instance {1}",
+                        eni.getNetworkInterfaceId(), instance.getInstanceId());
             }
         }
     }
@@ -1535,6 +1542,7 @@ public class Ec2ContainerManager {
         metadataServer.registerContainer(containerIp, instance.getInstanceId(), instance);
         refreshImdsSourceRegistration(instance, containerId, containerIp);
         refreshMetadataAddresses(instance, containerId);
+        restoreAttachedNetworkInterfaces(instance);
         return true;
     }
 

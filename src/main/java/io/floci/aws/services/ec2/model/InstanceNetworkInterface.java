@@ -28,6 +28,7 @@ public class InstanceNetworkInterface {
     private int deviceIndex;
     private String attachTime;
     private boolean deleteOnTermination = true;
+    private String sharedNetworkContainerId;
 
     public InstanceNetworkInterface() {}
 
@@ -75,6 +76,11 @@ public class InstanceNetworkInterface {
 
     public boolean isDeleteOnTermination() { return deleteOnTermination; }
     public void setDeleteOnTermination(boolean deleteOnTermination) { this.deleteOnTermination = deleteOnTermination; }
+
+    public String getSharedNetworkContainerId() { return sharedNetworkContainerId; }
+    public void setSharedNetworkContainerId(String sharedNetworkContainerId) {
+        this.sharedNetworkContainerId = sharedNetworkContainerId;
+    }
 
     public List<String> getIpv6Addresses() { return ipv6Addresses; }
     public void setIpv6Addresses(List<String> ipv6Addresses) {
