@@ -180,6 +180,58 @@ class CloudFormationAcmPcaIntegrationTest {
         }
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void replacementRollbackPreservesPriorAuthorityAndCommitHonorsRetention(boolean retain) {
+        String account = Long.toString(840_000_000_000L + Integer.toUnsignedLong(UUID.randomUUID().hashCode()));
+        try (CloudFormationClient cfn = AwsTestClients.create(CloudFormationClient.builder(), account, Region.US_EAST_1);
+             AcmPcaClient pca = AwsTestClients.create(AcmPcaClient.builder(), account, Region.US_EAST_1)) {
+            String stack = "pca-replace-" + UUID.randomUUID().toString().substring(0, 8);
+            String initial = replacementTemplate("Prior CA", retain);
+            String stackId = cfn.createStack(request -> request.stackName(stack).templateBody(initial)).stackId();
+            String priorArn = null;
+            try {
+                Map<String, String> before = outputs(CfnStackWaits.awaitStatus(cfn, stack, "CREATE_COMPLETE"));
+                priorArn = before.get("Arn");
+                String changed = replacementTemplate("Replacement CA", retain);
+                String failing = changed.replace("\"Resources\": {", "\"Resources\": {\"Failure\": {"
+                        + "\"Type\":\"AWS::SecretsManager::Secret\",\"DependsOn\":\"Authority\","
+                        + "\"Properties\":{\"SecretString\":\"explicit\","
+                        + "\"GenerateSecretString\":{\"PasswordLength\":32}}},");
+                cfn.updateStack(request -> request.stackName(stack).templateBody(failing));
+                assertEquals(before, outputs(CfnStackWaits.awaitStatus(cfn, stack, "UPDATE_ROLLBACK_COMPLETE")));
+                assertEquals("PENDING_CERTIFICATE", describe(pca, priorArn).statusAsString());
+                assertEquals(1, pca.listCertificateAuthorities().certificateAuthorities().stream()
+                        .filter(authority -> !"DELETED".equals(authority.statusAsString())).count());
+                cfn.updateStack(request -> request.stackName(stack).templateBody(changed));
+                String replacement = outputs(CfnStackWaits.awaitStatus(cfn, stack, "UPDATE_COMPLETE")).get("Arn");
+                assertNotEquals(priorArn, replacement);
+                assertEquals(retain ? "PENDING_CERTIFICATE" : "DELETED", describe(pca, priorArn).statusAsString());
+                assertEquals("PENDING_CERTIFICATE", describe(pca, replacement).statusAsString());
+                cfn.deleteStack(request -> request.stackName(stack));
+                CfnStackWaits.awaitStatus(cfn, stackId, "DELETE_COMPLETE");
+                assertEquals("DELETED", describe(pca, replacement).statusAsString());
+                if (retain) {
+                    assertEquals("PENDING_CERTIFICATE", describe(pca, priorArn).statusAsString());
+                }
+            } finally {
+                cfn.deleteStack(request -> request.stackName(stack));
+                CfnStackWaits.awaitStatus(cfn, stackId, "DELETE_COMPLETE");
+                for (CertificateAuthority authority : pca.listCertificateAuthorities().certificateAuthorities()) {
+                    if (!"DELETED".equals(authority.statusAsString())) {
+                        pca.deleteCertificateAuthority(request -> request.certificateAuthorityArn(authority.arn()));
+                    }
+                }
+            }
+        }
+    }
+
+    private static String replacementTemplate(String name, boolean retain) {
+        return template(name, "{\"Key\":\"team\",\"Value\":\"original\"}")
+                .replace("\"Authority\": {", "\"Authority\": {\"UpdateReplacePolicy\":\""
+                        + (retain ? "Retain" : "Delete") + "\",");
+    }
+
     private static String revocationTemplate(String mechanism, boolean enabled) {
         return template("Pending CA", "{\"Key\": \"team\", \"Value\": \"updated\"}")
                 .replace("\"UsageMode\": \"GENERAL_PURPOSE\",", "\"UsageMode\": \"GENERAL_PURPOSE\","
