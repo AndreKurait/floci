@@ -131,18 +131,26 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
     private final IamService iamService;
     private final ResolvedServiceCatalog catalog;
     private final CurrentVertxRequest currentVertxRequest;
+    private final RequestContext requestContext;
 
     @Context
     ResourceInfo resourceInfo;
 
-    @Inject
     public SigV4HeaderSignatureFilter(jakarta.inject.Provider<EmulatorConfig> configProvider,
                                       IamService iamService, ResolvedServiceCatalog catalog,
                                       CurrentVertxRequest currentVertxRequest) {
+        this(configProvider, iamService, catalog, currentVertxRequest, null);
+    }
+
+    @Inject
+    public SigV4HeaderSignatureFilter(jakarta.inject.Provider<EmulatorConfig> configProvider,
+                                      IamService iamService, ResolvedServiceCatalog catalog,
+                                      CurrentVertxRequest currentVertxRequest, RequestContext requestContext) {
         this.config = new MemoizedSupplier<>(configProvider::get);
         this.iamService = iamService;
         this.catalog = catalog;
         this.currentVertxRequest = currentVertxRequest;
+        this.requestContext = requestContext;
     }
 
     private EmulatorConfig config() {
@@ -290,6 +298,8 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
             LOG.debugv("Refusing {0} request: signature mismatch for accessKey={1}",
                     scope.service(), SigV4RequestValidator.sanitizeForLog(scope.accessKeyId()));
             signatureDoesNotMatch(ctx, resource, MISMATCH_MESSAGE);
+        } else if (requestContext != null) {
+            requestContext.recordVerifiedSignature(scope.accessKeyId());
         }
     }
 
