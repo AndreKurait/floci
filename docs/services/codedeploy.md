@@ -120,7 +120,7 @@ For `computePlatform: ECS`, `CreateDeployment` performs a full blue/green traffi
 
 1. Parses the AppSpec (JSON, `revisionType: AppSpecContent`) to extract the target task definition, container name, and port
 2. Creates a **green task set** on the ECS service (via `CreateTaskSet`) pointing to the new task definition
-3. Runs lifecycle hook Lambdas in order: `BeforeInstall` → (install) → `AfterInstall` → `BeforeAllowTraffic` → (traffic shift) → `AfterAllowTraffic`
+3. Runs lifecycle hook Lambdas in order: `BeforeInstall` → (install) → `AfterInstall` → (test traffic) → `AfterAllowTestTraffic` → `BeforeAllowTraffic` → (production traffic shift) → `AfterAllowTraffic`. When `testTrafficRoute` is configured, its listeners forward to the green target group before `AfterAllowTestTraffic`. A failed test route or hook prevents the production traffic shift.
 4. **Traffic shift** — atomically updates the ELB v2 listener's default forward rule:
    - `ECSAllAtOnce`: immediately shifts 100% of traffic to the green target group
    - `ECSCanary*`: shifts the canary percentage first, waits a short interval (capped at 5 s in emulator), then shifts to 100%
@@ -150,13 +150,14 @@ For `computePlatform: ECS`, `CreateDeployment` performs a full blue/green traffi
   "Hooks": [
     { "BeforeInstall": "my-before-install-hook" },
     { "AfterInstall": "my-after-install-hook" },
+    { "AfterAllowTestTraffic": "my-test-traffic-hook" },
     { "BeforeAllowTraffic": "my-before-traffic-hook" },
     { "AfterAllowTraffic": "my-after-traffic-hook" }
   ]
 }
 ```
 
-All hook fields are optional.
+All hook fields are optional. A deployment without a test listener or test hook retains its existing production traffic flow.
 
 ### ECS Deployment Group Configuration
 
@@ -182,6 +183,9 @@ All hook fields are optional.
       ],
       "prodTrafficRoute": {
         "listenerArns": ["arn:aws:elasticloadbalancing:..."]
+      },
+      "testTrafficRoute": {
+        "listenerArns": ["arn:aws:elasticloadbalancing:...:listener/app/test"]
       }
     }]
   }
