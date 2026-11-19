@@ -42,6 +42,9 @@ final class BackendResponseCoordinator {
                 }
             } else {
                 pending.addLast(new PendingOperation(ticket, mutation, response));
+                if (operation == Operation.SYNC) {
+                    discardingUntilSync = false;
+                }
             }
             changed.signalAll();
             return ticket;
@@ -137,7 +140,6 @@ final class BackendResponseCoordinator {
                     pending.removeFirst();
                     reject(head);
                     resolveSkippedGate(head);
-                    discardingUntilSync = true;
                     discardQueuedOperationsBeforeSync();
                 }
                 changed.signalAll();
@@ -173,7 +175,6 @@ final class BackendResponseCoordinator {
             pending.remove(owned);
             confirm(owned);
             if (failed) {
-                discardingUntilSync = true;
                 discardQueuedOperationsBeforeSync();
             }
             changed.signalAll();
@@ -219,6 +220,8 @@ final class BackendResponseCoordinator {
             reject(skipped);
             resolveSkippedGate(skipped);
         }
+        // Sync starts the next frontend cycle; its queued response still prevents early backend ownership.
+        discardingUntilSync = pending.isEmpty();
     }
 
     private void resolveSkippedGate(PendingOperation operation) {
