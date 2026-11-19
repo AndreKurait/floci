@@ -76,7 +76,8 @@ public class CodeArtifactPypiController {
 
     @Inject
     public CodeArtifactPypiController(CodeArtifactService service, PypiserverSidecarClient pypiserver) {
-        this(service, pypiserver, HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build());
+        this(service, pypiserver, HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1)
+                .connectTimeout(Duration.ofSeconds(5)).build());
     }
 
     CodeArtifactPypiController(CodeArtifactService service, PypiserverSidecarClient pypiserver,

@@ -30,6 +30,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -92,6 +93,24 @@ class CodeArtifactPypiControllerTest {
     @AfterEach
     void tearDown() {
         backend.stop(0);
+    }
+
+    @Test
+    void defaultTransportDoesNotRequestAnH2cUpgrade() {
+        AtomicReference<String> upgrade = new AtomicReference<>("request not received");
+        backend.createContext("/simple/demo/", exchange -> {
+            upgrade.set(exchange.getRequestHeaders().getFirst("Upgrade"));
+            exchange.sendResponseHeaders(404, -1);
+            exchange.close();
+        });
+        CodeArtifactPypiController defaultController = new CodeArtifactPypiController(
+                service, pypiserver);
+
+        try (Response response = defaultController.packageIndex(
+                headers("Bearer token"), DOMAIN, REPOSITORY, "demo")) {
+            assertEquals(404, response.getStatus());
+        }
+        assertNull(upgrade.get(), "the pinned pypiserver accepts HTTP/1.1 without an h2c upgrade");
     }
 
     @Test
