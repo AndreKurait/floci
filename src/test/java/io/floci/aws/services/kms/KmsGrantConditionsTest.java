@@ -5,6 +5,8 @@ import io.floci.aws.services.iam.IamPolicyEvaluator;
 import io.floci.aws.services.iam.IamPolicyEvaluator.Decision;
 import io.floci.aws.services.iam.model.CallerContext;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.List;
 import java.util.Map;
@@ -70,6 +72,23 @@ class KmsGrantConditionsTest {
         assertEquals(Decision.DENY, decision(parent, Map.of("EncryptionContextEquals",
                 Map.of("Tenant", "A", "Purpose", "B"), "EncryptionContextSubset", Map.of("Tenant", "A")),
                 List.of("Decrypt")));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"B", "a"})
+    void childCannotReplaceTheParentsValueThroughACaseFoldedKey(String value) {
+        Map<String, Object> parent = Map.of("EncryptionContextSubset", Map.of("Tenant", "A"));
+        Map<String, Object> child = Map.of("EncryptionContextSubset", Map.of("Tenant", "A"),
+                "EncryptionContextEquals", Map.of("tenant", value));
+        assertEquals(Decision.DENY, decision(parent, child, List.of("Decrypt")));
+    }
+
+    @Test
+    void equivalentCaseFoldedPairsRetainTheParentsValue() {
+        Map<String, Object> parent = Map.of("EncryptionContextSubset", Map.of("Tenant", "A"));
+        Map<String, Object> child = Map.of("EncryptionContextSubset", Map.of("Tenant", "A"),
+                "EncryptionContextEquals", Map.of("tenant", "A"));
+        assertEquals(Decision.ALLOW, decision(parent, child, List.of("Decrypt")));
     }
 
     @Test

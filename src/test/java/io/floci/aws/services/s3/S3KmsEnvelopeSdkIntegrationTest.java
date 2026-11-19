@@ -630,6 +630,46 @@ class S3KmsEnvelopeSdkIntegrationTest {
     }
 
     @Test
+    void childGrantCannotReplaceTheParentValueThroughACaseFoldedKey() {
+        String principal = iam.getUser(user).getArn();
+        kms.createGrant(request -> request.keyId(keyArn).granteePrincipal(principal)
+                .operationsWithStrings("CreateGrant", "GenerateDataKey")
+                .constraints(child -> child.encryptionContextSubset(Map.of("Tenant", "A"))));
+        try (KmsClient direct = AwsTestClients.create(KmsClient.builder(), access.getAccessKeyId(),
+                access.getSecretAccessKey(), Region.US_EAST_1, endpoint)) {
+            int before = kms.listGrants(request -> request.keyId(keyArn)).grants().size();
+            assertEquals("AccessDeniedException", assertThrows(KmsException.class, () ->
+                    direct.createGrant(request -> request.keyId(keyArn).granteePrincipal(principal)
+                            .operationsWithStrings("GenerateDataKey").constraints(child -> child
+                                    .encryptionContextSubset(Map.of("Tenant", "A"))
+                                    .encryptionContextEquals(Map.of("tenant", "B")))))
+                    .awsErrorDetails().errorCode());
+            assertEquals(before, kms.listGrants(request -> request.keyId(keyArn)).grants().size());
+        }
+    }
+
+    @Test
+    void equivalentCaseFoldedChildGrantWorksAfterParentRevocation() {
+        String principal = iam.getUser(user).getArn();
+        String parent = kms.createGrant(request -> request.keyId(keyArn).granteePrincipal(principal)
+                .operationsWithStrings("CreateGrant", "GenerateDataKey")
+                .constraints(child -> child.encryptionContextSubset(Map.of("Tenant", "A")))).grantId();
+        try (KmsClient direct = AwsTestClients.create(KmsClient.builder(), access.getAccessKeyId(),
+                access.getSecretAccessKey(), Region.US_EAST_1, endpoint)) {
+            direct.createGrant(request -> request.keyId(keyArn).granteePrincipal(principal)
+                    .operationsWithStrings("GenerateDataKey").constraints(child -> child
+                            .encryptionContextSubset(Map.of("Tenant", "A"))
+                            .encryptionContextEquals(Map.of("tenant", "A"))));
+            kms.revokeGrant(request -> request.keyId(keyArn).grantId(parent));
+            assertEquals(32, direct.generateDataKey(request -> request.keyId(keyArn).keySpec("AES_256")
+                    .encryptionContext(Map.of("tenant", "A"))).plaintext().asByteArray().length);
+            assertEquals("AccessDeniedException", assertThrows(KmsException.class, () ->
+                    direct.generateDataKey(request -> request.keyId(keyArn).keySpec("AES_256")
+                            .encryptionContext(Map.of("tenant", "B")))).awsErrorDetails().errorCode());
+        }
+    }
+
+    @Test
     void independentPolicyCreateGrantIsNotLimitedByParentGrant() {
         String principal = iam.getUser(user).getArn();
         kms.createGrant(request -> request.keyId(keyArn).granteePrincipal(principal)
