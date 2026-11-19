@@ -89,6 +89,30 @@ def test_percentile_alarm_round_trip_and_evaluation(percentile_scope):
     _until(lambda: _read_alarm(scope), lambda row: row["StateValue"] == "ALARM")
 
 
+def test_percentile_alarm_accepts_ignore_for_low_sample_counts(percentile_scope):
+    scope = percentile_scope
+    client = scope["client"]
+    client.put_metric_alarm(**_alarm(scope, EvaluateLowSampleCountPercentile="ignore"))
+    scope["cleanup"].callback(client.delete_alarms, AlarmNames=[scope["name"]])
+    assert _read_alarm(scope)["EvaluateLowSampleCountPercentile"] == "ignore"
+
+    # p90 needs 10 / (1 - 0.9) = 100 samples per period before "ignore" lets it decide the state.
+    # 99 breaching samples must leave the alarm where it is across evaluator ticks (every 10 s);
+    # "evaluate" would alarm on them.
+    client.set_alarm_state(AlarmName=scope["name"], StateValue="OK", StateReason="Low sample baseline")
+    timestamp = _timestamp()
+    client.put_metric_data(Namespace=scope["namespace"], MetricData=[
+        {"MetricName": "Latency", "Timestamp": timestamp, "StatisticValues": {
+            "SampleCount": 99, "Sum": 99000, "Minimum": 1000, "Maximum": 1000}},
+    ])
+    time.sleep(25)
+    assert _read_alarm(scope)["StateValue"] == "OK"
+    client.put_metric_data(Namespace=scope["namespace"], MetricData=[
+        {"MetricName": "Latency", "Timestamp": timestamp, "Value": 1000},
+    ])
+    _until(lambda: _read_alarm(scope), lambda row: row["StateValue"] == "ALARM")
+
+
 def test_percentile_cloudformation_preserves_and_updates_statistic_selection(percentile_scope):
     scope = percentile_scope
     cfn = scope["cfn"]
@@ -173,7 +197,7 @@ def test_percentile_invalid_selection_preserves_existing_alarm(percentile_scope)
     client.put_metric_alarm(**_alarm(scope))
     scope["cleanup"].callback(client.delete_alarms, AlarmNames=[scope["name"]])
     for changes in ({"Statistic": "Average"}, {"ExtendedStatistic": "p101"},
-                    {"EvaluateLowSampleCountPercentile": "ignore"}):
+                    {"EvaluateLowSampleCountPercentile": "sometimes"}):
         with pytest.raises(ClientError):
             client.put_metric_alarm(**_alarm(scope, **changes))
         assert _read_alarm(scope)["ExtendedStatistic"] == "p90"
