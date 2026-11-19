@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.Network;
 import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.RegionResolver;
@@ -160,6 +161,7 @@ class Ec2HotAttachedRestartDockerIntegrationTest {
             assertEquals(originalDefaultRoute, run(guest, "ip", "-4", "route", "show", "default"));
             docker.stopContainerCmd(guest).withTimeout(1).exec();
             docker.startContainerCmd(guest).exec();
+            recreateAttachedEndpoint(guest, network, address);
             assertFalse(run(guest, "ip", "-j", "link").contains(MAC));
             ObjectMapper mapper = new ObjectMapper();
             InstanceNetworkInterface restored = mapper.readValue(mapper.writeValueAsBytes(eni),
@@ -179,6 +181,7 @@ class Ec2HotAttachedRestartDockerIntegrationTest {
                     .throwIfTimedOut(peer).exitCode());
             docker.stopContainerCmd(guest).withTimeout(1).exec();
             docker.startContainerCmd(guest).exec();
+            recreateAttachedEndpoint(guest, network, address);
             VpcNetworkManager recoveredNetworks = new VpcNetworkManager(config, docker, resolver);
             recoveredNetworks.declareVpc(REGION, "vpc-attached", cidr.toString());
             recoveredNetworks.declareSubnet(REGION, "vpc-attached", "subnet-attached", cidr.toString());
@@ -224,6 +227,16 @@ class Ec2HotAttachedRestartDockerIntegrationTest {
                 // The failed attach may not have created the owned network.
             }
         }
+    }
+
+    private void recreateAttachedEndpoint(String guest, String network, String address) {
+        docker.disconnectFromNetworkCmd().withContainerId(guest).withNetworkId(network).exec();
+        docker.connectToNetworkCmd().withContainerId(guest).withNetworkId(network)
+                .withContainerNetwork(new ContainerNetwork()
+                        .withIpamConfig(new ContainerNetwork.Ipam().withIpv4Address(address))
+                        .withMacAddress("02:66:77:88:99:aa"))
+                .exec();
+        assertFalse(run(guest, "ip", "-j", "link").contains(MAC));
     }
 
     private Ec2ContainerManager runtime(EmulatorConfig config, VpcNetworkManager manager) {
