@@ -44,6 +44,7 @@ import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
@@ -104,7 +105,7 @@ class Ec2HotAttachedRestartDockerIntegrationTest {
             lifecycle.createAndStart(builder.newContainer(helperImage)
                     .withName(guest).withNetworkMode("bridge").withCapAdd("NET_ADMIN")
                     .withLabels(Map.of(OWNER_LABEL, namespace)).withCmd(List.of("sleep", "120")).build());
-            String originalDefaultRoute = run(guest, "ip", "-4", "route", "show", "default");
+            assertDefaultRouteUsesBridge(guest);
             String originalMac = docker.inspectContainerCmd(guest).exec().getNetworkSettings()
                     .getNetworks().get("bridge").getMacAddress();
             Instance instance = new Instance();
@@ -125,7 +126,7 @@ class Ec2HotAttachedRestartDockerIntegrationTest {
             instance.setNetworkInterfaces(new ArrayList<>(List.of(eni)));
             assertEquals(Optional.empty(), runtime.plugNetworkInterface(instance, eni));
             assertTrue(run(guest, "ip", "-j", "link").contains(originalMac));
-            assertEquals(originalDefaultRoute, run(guest, "ip", "-4", "route", "show", "default"));
+            assertDefaultRouteUsesBridge(guest);
             JsonNode links = new ObjectMapper().readTree(run(guest, "ip", "-j", "address"));
             JsonNode device = null;
             for (JsonNode link : links) {
@@ -162,7 +163,7 @@ class Ec2HotAttachedRestartDockerIntegrationTest {
             });
             assertTrue(runtime.restoreMetadataRegistration(instance));
             assertTrue(run(guest, "ip", "-j", "link").contains(MAC));
-            assertEquals(originalDefaultRoute, run(guest, "ip", "-4", "route", "show", "default"));
+            assertDefaultRouteUsesBridge(guest);
             docker.stopContainerCmd(guest).withTimeout(1).exec();
             docker.startContainerCmd(guest).exec();
             recreateAttachedEndpoint(guest, network, address, peer);
@@ -233,6 +234,36 @@ class Ec2HotAttachedRestartDockerIntegrationTest {
                 // The failed attach may not have created the owned network.
             }
         }
+    }
+
+    private void assertDefaultRouteUsesBridge(String guest) throws Exception {
+        ContainerNetwork bridge = docker.inspectContainerCmd(guest).exec().getNetworkSettings()
+                .getNetworks().get("bridge");
+        ObjectMapper mapper = new ObjectMapper();
+        assertDefaultRouteUsesBridge(mapper.readTree(run(guest, "ip", "-j", "-4", "route", "show", "default")),
+                mapper.readTree(run(guest, "ip", "-j", "address")), bridge);
+    }
+
+    static void assertDefaultRouteUsesBridge(JsonNode routes, JsonNode addresses, ContainerNetwork bridge) {
+        assertNotNull(bridge, "The primary Docker bridge endpoint must remain attached");
+        assertEquals(1, routes.size(), routes.toString());
+        JsonNode route = routes.get(0);
+        assertEquals(bridge.getGateway(), route.path("gateway").asText(), routes.toString());
+        // Docker can rename interfaces on restart; identify the routed endpoint by its current MAC and IP.
+        JsonNode routedDevice = null;
+        for (JsonNode device : addresses) {
+            if (route.path("dev").asText().equals(device.path("ifname").asText())) {
+                routedDevice = device;
+            }
+        }
+        assertNotNull(routedDevice, addresses.toString());
+        assertTrue(bridge.getMacAddress().equalsIgnoreCase(routedDevice.path("address").asText()),
+                routedDevice.toString());
+        boolean bridgeAddressPresent = false;
+        for (JsonNode address : routedDevice.path("addr_info")) {
+            bridgeAddressPresent |= bridge.getIpAddress().equals(address.path("local").asText());
+        }
+        assertTrue(bridgeAddressPresent, routedDevice.toString());
     }
 
     private void recreateAttachedEndpoint(String guest, String network, String address, String peer) {
