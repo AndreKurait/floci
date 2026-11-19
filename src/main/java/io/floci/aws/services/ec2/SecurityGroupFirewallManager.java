@@ -129,6 +129,15 @@ public class SecurityGroupFirewallManager {
     public Namespace createNamespace(String service, String resourceId, String accountId, String region,
                                      Optional<String> dockerNetwork, Map<Integer, Integer> portBindings,
                                      Map<String, String> extraLabels, String hostIp, List<String> linkLocalIps) {
+        return createNamespace(service, resourceId, accountId, region, dockerNetwork, portBindings,
+                extraLabels, hostIp, linkLocalIps, null);
+    }
+
+    /** Explicit workload hosts; null retains the default host alias, and empty adds none. */
+    public Namespace createNamespace(String service, String resourceId, String accountId, String region,
+                                     Optional<String> dockerNetwork, Map<Integer, Integer> portBindings,
+                                     Map<String, String> extraLabels, String hostIp, List<String> linkLocalIps,
+                                     List<String> workloadHosts) {
         if (!enabled()) {
             throw new IllegalStateException("Security-group enforcement is disabled");
         }
@@ -141,7 +150,7 @@ public class SecurityGroupFirewallManager {
             throw new IllegalStateException("Security-group enforcement requires rootful Docker");
         }
         ContainerBuilder.Builder builder = helperBuilder(PROTECTED_HELPER_PREFIX, service, resourceId, accountId,
-                region, dockerNetwork, portBindings, hostIp)
+                region, dockerNetwork, portBindings, hostIp, workloadHosts)
                 .withLabels(Map.of(ContainerStorageHelper.SECURITY_GROUP_HELPER_LABEL, "true",
                         ContainerStorageHelper.OWNER_LABEL, ContainerStorageHelper.ownerIdentity(config)))
                 .withLabels(extraLabels);
@@ -159,8 +168,17 @@ public class SecurityGroupFirewallManager {
     public Namespace createSharedNamespace(String service, String resourceId, String accountId, String region,
                                            Optional<String> dockerNetwork, Map<Integer, Integer> portBindings,
                                            Map<String, String> extraLabels, String hostIp, List<String> linkLocalIps) {
+        return createSharedNamespace(service, resourceId, accountId, region, dockerNetwork, portBindings,
+                extraLabels, hostIp, linkLocalIps, null);
+    }
+
+    /** Explicit workload hosts; null retains the default host alias, and empty adds none. */
+    public Namespace createSharedNamespace(String service, String resourceId, String accountId, String region,
+                                           Optional<String> dockerNetwork, Map<Integer, Integer> portBindings,
+                                           Map<String, String> extraLabels, String hostIp, List<String> linkLocalIps,
+                                           List<String> workloadHosts) {
         ContainerBuilder.Builder builder = helperBuilder(SHARED_HELPER_PREFIX, service, resourceId, accountId,
-                region, dockerNetwork, portBindings, hostIp)
+                region, dockerNetwork, portBindings, hostIp, workloadHosts)
                 .withLabels(Map.of(ContainerStorageHelper.OWNER_LABEL, ContainerStorageHelper.ownerIdentity(config)))
                 .withLabels(extraLabels);
         linkLocalIps.forEach(builder::withLinkLocalIp);
@@ -197,17 +215,25 @@ public class SecurityGroupFirewallManager {
 
     private ContainerBuilder.Builder helperBuilder(String prefix, String service, String resourceId, String accountId,
                                                    String region, Optional<String> dockerNetwork,
-                                                   Map<Integer, Integer> portBindings, String hostIp) {
+                                                   Map<Integer, Integer> portBindings, String hostIp,
+                                                   List<String> workloadHosts) {
         ensureHelperImage();
         ContainerBuilder.Builder builder = containerBuilder.newContainer(config.network().securityGroupEnforcement().helperImage())
                 .withName(helperName(prefix, resourceId))
                 .withDockerNetwork(dockerNetwork)
                 // Workloads join this network namespace and use its resolver and hosts file.
                 .withEmbeddedDns()
-                .withHostDockerInternalOnLinux()
                 .withEntrypoint(List.of("sh", "-c"))
                 .withCmd(List.of("exec sleep 2147483647"))
                 .withLabels(ContainerStorageHelper.resourceIdentityLabels(service, resourceId, accountId, region));
+        if (workloadHosts == null) {
+            builder.withHostDockerInternalOnLinux();
+        } else {
+            for (String entry : workloadHosts) {
+                int separator = entry.indexOf(':');
+                builder.withExtraHost(entry.substring(0, separator), entry.substring(separator + 1));
+            }
+        }
         if (portBindings != null) {
             portBindings.forEach((containerPort, hostPort) -> {
                 if (hostIp == null) {
