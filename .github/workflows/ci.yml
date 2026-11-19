@@ -115,6 +115,25 @@ jobs:
           grep -v 'NightlyIntegrationTest$' shard.txt > prefetch.txt || true
           .github/ci/prefetch-images.sh prefetch.txt || true
 
+      - name: Test Maven bootstrap
+        if: matrix.shard == 1
+        run: python3 -m unittest discover -s .github/ci -p test_bootstrap_maven.py
+
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: maven_wrapper
+        with:
+          path: ~/.m2/wrapper/dists
+          key: maven-wrapper-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.mvn/wrapper/maven-wrapper.properties') }}
+
+      - name: Bootstrap Maven distribution
+        run: bash .github/ci/bootstrap-maven.sh
+
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: github.event_name == 'push' && matrix.shard == 1 && steps.maven_wrapper.outputs.cache-hit != 'true'
+        with:
+          path: ~/.m2/wrapper/dists
+          key: ${{ steps.maven_wrapper.outputs.cache-primary-key }}
+
       - name: Compile
         run: ./mvnw test-compile -B
 
