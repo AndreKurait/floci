@@ -12,10 +12,12 @@ import org.junit.jupiter.api.Test;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.retries.api.BackoffStrategy;
 import software.amazon.awssdk.services.cloudformation.CloudFormationClient;
 import software.amazon.awssdk.services.cloudformation.model.CloudFormationException;
 
 import java.net.URI;
+import java.time.Duration;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 
@@ -58,7 +60,9 @@ class CloudFormationExecutionIdentityIntegrationTest {
                     forged.createStack(r -> r.stackName(stack + "-forged").templateBody(template)));
             assertTrue(observed.isEmpty());
             client.createStack(r -> r.stackName(stack).templateBody(template));
-            client.waiter().waitUntilStackCreateComplete(r -> r.stackName(stack))
+            client.waiter().waitUntilStackCreateComplete(r -> r.stackName(stack),
+                            configuration -> configuration.waitTimeout(Duration.ofSeconds(60))
+                                    .backoffStrategyV2(BackoffStrategy.fixedDelayWithoutJitter(Duration.ofMillis(100))))
                     .matched().response().orElseThrow();
             assertEquals(1, observed.size());
             ExecutionIdentity identity = observed.getFirst();
@@ -67,7 +71,9 @@ class CloudFormationExecutionIdentityIntegrationTest {
             assertNotNull(identity.policies());
             assertTrue(CloudFormationExecutionScope.current().isEmpty());
             deleteClient.deleteStack(r -> r.stackName(stack));
-            deleteClient.waiter().waitUntilStackDeleteComplete(r -> r.stackName(stack));
+            deleteClient.waiter().waitUntilStackDeleteComplete(r -> r.stackName(stack),
+                    configuration -> configuration.waitTimeout(Duration.ofSeconds(60))
+                            .backoffStrategyV2(BackoffStrategy.fixedDelayWithoutJitter(Duration.ofMillis(100))));
             assertEquals(1, deleted.size());
             assertTrue(deleted.getFirst().signatureVerified());
             assertTrue(deleted.getFirst().caller().principalArn().endsWith(":user/" + deleter.name()));
