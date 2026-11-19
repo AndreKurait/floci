@@ -42,6 +42,7 @@ public class Certificate {
     private String certificateChain;
     private CertificateOptions certOptions;
     private String certAuthorityArn;
+    private boolean managedPrivateAuthority;
     private String failureReason;
     private List<DomainValidation> domainValidationOptions;
     private String idempotencyToken;
@@ -233,6 +234,14 @@ public class Certificate {
 
     public void setCertOptions(CertificateOptions certOptions) {
         this.certOptions = certOptions;
+    }
+
+    public boolean isManagedPrivateAuthority() {
+        return managedPrivateAuthority;
+    }
+
+    public void setManagedPrivateAuthority(boolean managedPrivateAuthority) {
+        this.managedPrivateAuthority = managedPrivateAuthority;
     }
 
     public String getCertAuthorityArn() {
