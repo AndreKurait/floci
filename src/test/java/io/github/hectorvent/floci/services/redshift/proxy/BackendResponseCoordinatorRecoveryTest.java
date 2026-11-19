@@ -4,11 +4,14 @@ import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 class BackendResponseCoordinatorRecoveryTest {
@@ -17,7 +20,7 @@ class BackendResponseCoordinatorRecoveryTest {
     @CsvSource({"false,false", "false,true", "true,false", "true,true"})
     @Timeout(5)
     void syncPreservesTheNextCycleWhileItsReadyForQueryIsPending(boolean owned, boolean syncBeforeError)
-            throws InterruptedException {
+            throws Exception {
         ExtendedQuerySession session = new ExtendedQuerySession();
         BackendResponseCoordinator coordinator = new BackendResponseCoordinator(session);
         BackendResponseCoordinator.Ticket failed = coordinator.register(
@@ -47,19 +50,26 @@ class BackendResponseCoordinatorRecoveryTest {
         assertSame(nextCopy, session.portal("p").orElseThrow(),
                 "A Sync already sent to the backend starts a new frontend query cycle");
         assertFalse(coordinator.isDiscardingUntilSync());
-        assertFalse(coordinator.canOwnExtendedExecute(next),
-                "The new Execute must still wait for the previous Sync response");
         assertFalse(coordinator.awaitIdle(1, TimeUnit.MILLISECONDS));
-
-        coordinator.onBackendFrame('Z', new byte[]{'I'});
-        assertSame(nextCopy, session.portal("p").orElseThrow());
-        coordinator.onBackendFrame('1', new byte[0]);
-        coordinator.onBackendFrame('2', new byte[0]);
-        assertEquals(BackendResponseCoordinator.GateResult.READY,
-                coordinator.awaitExtendedExecuteTurn(next));
-        coordinator.completeOwnedExecute(next, false);
-        coordinator.register(BackendResponseCoordinator.Operation.SYNC, null);
-        coordinator.onBackendFrame('Z', new byte[]{'I'});
-        assertTrue(coordinator.awaitIdle(1, TimeUnit.SECONDS));
+        FutureTask<BackendResponseCoordinator.GateResult> turn =
+                new FutureTask<>(() -> coordinator.awaitExtendedExecuteTurn(next));
+        Thread waiter = Thread.ofVirtual().start(turn);
+        try {
+            assertThrows(TimeoutException.class, () -> turn.get(25, TimeUnit.MILLISECONDS),
+                    "The new Execute must still wait for the previous Sync response");
+            coordinator.onBackendFrame('Z', new byte[]{'I'});
+            assertSame(nextCopy, session.portal("p").orElseThrow());
+            coordinator.onBackendFrame('1', new byte[0]);
+            coordinator.onBackendFrame('2', new byte[0]);
+            assertEquals(BackendResponseCoordinator.GateResult.READY, turn.get(1, TimeUnit.SECONDS));
+            coordinator.completeOwnedExecute(next, false);
+            coordinator.register(BackendResponseCoordinator.Operation.SYNC, null);
+            coordinator.onBackendFrame('Z', new byte[]{'I'});
+            assertTrue(coordinator.awaitIdle(1, TimeUnit.SECONDS));
+        } finally {
+            coordinator.close();
+            waiter.interrupt();
+            waiter.join(1000);
+        }
     }
 }
