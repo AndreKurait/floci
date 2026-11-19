@@ -10,6 +10,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.NullNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.databind.node.TextNode;
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.Digests;
@@ -91,6 +92,7 @@ public class CloudWatchMetricsService {
     private final AlarmSnsNotifier alarmSnsNotifier;
     private final ServiceQuotasService serviceQuotas;
     private final Clock clock;
+    private final boolean packWeightedValues;
     private long lastHistorySequence;
     private Instant nextHistoryPrune = Instant.MIN;
 
@@ -103,9 +105,22 @@ public class CloudWatchMetricsService {
         this(storageFactory, regionResolver, alarmSnsNotifier, null);
     }
 
-    @Inject
     public CloudWatchMetricsService(StorageFactory storageFactory, RegionResolver regionResolver,
                                     AlarmSnsNotifier alarmSnsNotifier, ServiceQuotasService serviceQuotas) {
+        this(storageFactory, regionResolver, alarmSnsNotifier, serviceQuotas, false);
+    }
+
+    @Inject
+    public CloudWatchMetricsService(StorageFactory storageFactory, RegionResolver regionResolver,
+                                    AlarmSnsNotifier alarmSnsNotifier, ServiceQuotasService serviceQuotas,
+                                    EmulatorConfig config) {
+        this(storageFactory, regionResolver, alarmSnsNotifier, serviceQuotas,
+                config.services().cloudwatchmetrics().packWeightedValues());
+    }
+
+    private CloudWatchMetricsService(StorageFactory storageFactory, RegionResolver regionResolver,
+                                     AlarmSnsNotifier alarmSnsNotifier, ServiceQuotasService serviceQuotas,
+                                     boolean packWeightedValues) {
         // Services publish into this store every minute, SQS for every active queue, so under
         // persistent mode it is journaled rather than rewritten in full on every datum.
         this.metricStore = storageFactory.create("cloudwatchmetrics", "cwmetrics.json",
@@ -118,12 +133,20 @@ public class CloudWatchMetricsService {
         this.alarmSnsNotifier = alarmSnsNotifier;
         this.serviceQuotas = serviceQuotas;
         this.clock = Clock.systemUTC();
+        this.packWeightedValues = packWeightedValues;
     }
 
     CloudWatchMetricsService(StorageBackend<String, MetricDatum> metricStore,
                              StorageBackend<String, Alarm> alarmStore,
                              RegionResolver regionResolver) {
         this(metricStore, alarmStore, regionResolver, null);
+    }
+
+    CloudWatchMetricsService(StorageBackend<String, MetricDatum> metricStore,
+                             StorageBackend<String, Alarm> alarmStore,
+                             RegionResolver regionResolver, boolean packWeightedValues) {
+        this(metricStore, alarmStore, new InMemoryStorage<>(), regionResolver, null, Clock.systemUTC(),
+                packWeightedValues);
     }
 
     CloudWatchMetricsService(StorageBackend<String, MetricDatum> metricStore,
@@ -144,6 +167,14 @@ public class CloudWatchMetricsService {
                              StorageBackend<String, Alarm> alarmStore,
                              StorageBackend<String, AlarmHistoryItem> historyStore,
                              RegionResolver regionResolver, AlarmSnsNotifier alarmSnsNotifier, Clock clock) {
+        this(metricStore, alarmStore, historyStore, regionResolver, alarmSnsNotifier, clock, false);
+    }
+
+    private CloudWatchMetricsService(StorageBackend<String, MetricDatum> metricStore,
+                                     StorageBackend<String, Alarm> alarmStore,
+                                     StorageBackend<String, AlarmHistoryItem> historyStore,
+                                     RegionResolver regionResolver, AlarmSnsNotifier alarmSnsNotifier, Clock clock,
+                                     boolean packWeightedValues) {
         this.clock = clock;
         this.metricStore = metricStore;
         this.alarmStore = alarmStore;
@@ -151,6 +182,7 @@ public class CloudWatchMetricsService {
         this.regionResolver = regionResolver;
         this.alarmSnsNotifier = alarmSnsNotifier;
         this.serviceQuotas = null;
+        this.packWeightedValues = packWeightedValues;
     }
 
     public void putMetricData(String namespace, List<MetricDatum> datums, String region) {
@@ -163,6 +195,9 @@ public class CloudWatchMetricsService {
      * streamed on another account's behalf. A null account is the caller's own.
      */
     public void putMetricDataForAccount(String accountId, String namespace, List<MetricDatum> datums, String region) {
+        if (!packWeightedValues && datums.stream().anyMatch(MetricDatum::hasPackedSamples)) {
+            datums = datums.stream().flatMap(MetricValues::expand).toList();
+        }
         long nowSeconds = clock.instant().getEpochSecond();
         for (MetricDatum datum : datums) {
             datum.setNamespace(namespace);
@@ -384,6 +419,8 @@ public class CloudWatchMetricsService {
                     .filter(d -> unit.equals(d.getUnit()))
                     .collect(Collectors.toList());
         }
+
+        matching = matching.stream().flatMap(MetricValues::expand).toList();
 
         // Group by period bucket
         Map<Long, List<MetricDatum>> buckets = new LinkedHashMap<>();

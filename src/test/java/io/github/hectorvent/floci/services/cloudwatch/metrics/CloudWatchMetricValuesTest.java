@@ -4,15 +4,20 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.RegionResolver;
+import io.github.hectorvent.floci.core.storage.AccountAwareStorageBackend;
 import io.github.hectorvent.floci.core.storage.InMemoryStorage;
+import io.github.hectorvent.floci.core.storage.StorageFactory;
+import io.github.hectorvent.floci.core.storage.WriteProfile;
 import io.github.hectorvent.floci.services.cloudwatch.dashboards.CloudWatchDashboardsService;
 import io.github.hectorvent.floci.services.cloudwatch.metrics.model.MetricDatum;
 import io.github.hectorvent.floci.services.cloudwatch.metricstreams.CloudWatchMetricStreamsService;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
+import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -21,17 +26,23 @@ import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 class CloudWatchMetricValuesTest {
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final String REGION = "eu-west-1";
     private static final String NAMESPACE = "Example/Weighted";
     private static final Instant START = Instant.now().minusSeconds(60);
+    private final InMemoryStorage<String, MetricDatum> metricStore = new InMemoryStorage<>();
     private final CloudWatchMetricsService service = new CloudWatchMetricsService(
-            new InMemoryStorage<>(), new InMemoryStorage<>(), new RegionResolver(REGION, "123456789012"));
+            metricStore, new InMemoryStorage<>(), new RegionResolver(REGION, "123456789012"), true);
     private final CloudWatchMetricsJsonHandler json = new CloudWatchMetricsJsonHandler(
             service, mock(CloudWatchDashboardsService.class), mock(CloudWatchMetricStreamsService.class), MAPPER);
     private final CloudWatchMetricsQueryHandler query = new CloudWatchMetricsQueryHandler(
@@ -78,6 +89,113 @@ class CloudWatchMetricValuesTest {
     private List<CloudWatchMetricsService.Datapoint> statistics(String... statistics) {
         return service.getMetricStatistics(NAMESPACE, "Latency", List.of(), START.minusSeconds(1),
                 START.plusSeconds(1), 60, List.of(statistics), "Milliseconds", REGION);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void weightedArrayUsesOneStoredRecordAndSurvivesSerialization(boolean useQuery) throws Exception {
+        ObjectNode datum = datum();
+        ArrayNode values = datum.putArray("Values");
+        ArrayNode counts = datum.putArray("Counts");
+        for (int index = 1; index <= 150; index++) {
+            values.add(index);
+            counts.add(2);
+        }
+        publish(useQuery, datum);
+        List<MetricDatum> stored = metricStore.scan(key -> true);
+        assertEquals(1, stored.size());
+        MetricDatum restored = MAPPER.readValue(MAPPER.writeValueAsString(stored.getFirst()), MetricDatum.class);
+        assertEquals(150, restored.getSampleValues().length);
+        assertEquals(150, restored.getSampleWeights().length);
+        CloudWatchMetricsService reloaded = new CloudWatchMetricsService(
+                new InMemoryStorage<>(), new InMemoryStorage<>(), new RegionResolver(REGION, "123456789012"));
+        reloaded.putMetricData(NAMESPACE, List.of(restored), REGION);
+        assertEquals(statistics("Sum", "p0", "p50", "p100"), reloaded.getMetricStatistics(
+                NAMESPACE, "Latency", List.of(), START.minusSeconds(1), START.plusSeconds(1),
+                60, List.of("Sum", "p0", "p50", "p100"), "Milliseconds", REGION));
+        assertEquals(300, statistics("Sum").getFirst().sampleCount());
+        assertEquals(22650, statistics("Sum").getFirst().sum());
+    }
+
+    @Test
+    void packedSampleArraysDoNotAliasCallers() {
+        MetricDatum datum = new MetricDatum();
+        double[] values = {7};
+        double[] weights = {3};
+        datum.setSampleValues(values);
+        datum.setSampleWeights(weights);
+        values[0] = 99;
+        weights[0] = 99;
+        datum.getSampleValues()[0] = 88;
+        datum.getSampleWeights()[0] = 88;
+        assertEquals(7, datum.getSampleValues()[0]);
+        assertEquals(3, datum.getSampleWeights()[0]);
+    }
+
+    @Test
+    void defaultStorageKeepsLegacyPerValueRecords() {
+        InMemoryStorage<String, MetricDatum> legacyStore = new InMemoryStorage<>();
+        CloudWatchMetricsService legacy = new CloudWatchMetricsService(
+                legacyStore, new InMemoryStorage<>(), new RegionResolver(REGION, "123456789012"));
+        MetricDatum template = MetricDatum.of("Latency", "Milliseconds", 0, List.of(), START.getEpochSecond());
+        legacy.putMetricData(NAMESPACE, MetricValues.fromJson(weighted(), template), REGION);
+        assertEquals(2, legacyStore.keys().size());
+        for (MetricDatum stored : legacyStore.scan(key -> true)) {
+            assertFalse(stored.hasPackedSamples());
+            JsonNode serialized = MAPPER.valueToTree(stored);
+            assertFalse(serialized.has("sampleValues"));
+            assertFalse(serialized.has("sampleWeights"));
+        }
+        publish(false, weighted());
+        assertEquals(statistics("Sum", "p50", "p90"), legacy.getMetricStatistics(
+                NAMESPACE, "Latency", List.of(), START.minusSeconds(1), START.plusSeconds(1),
+                60, List.of("Sum", "p50", "p90"), "Milliseconds", REGION));
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void configuredServiceUsesPackedWritesOnlyWhenEnabled(boolean enabled) {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().cloudwatchmetrics().packWeightedValues()).thenReturn(enabled);
+        StorageFactory factory = mock(StorageFactory.class);
+        when(factory.<MetricDatum>create(eq("cloudwatchmetrics"), eq("cwmetrics.json"),
+                any(), eq(WriteProfile.APPEND_HEAVY)))
+                .thenReturn(new AccountAwareStorageBackend<>(metricStore, null, "123456789012"));
+        CloudWatchMetricsService configured = new CloudWatchMetricsService(
+                factory, new RegionResolver(REGION, "123456789012"), null, null, config);
+        MetricDatum template = MetricDatum.of("Latency", "Milliseconds", 0, List.of(), START.getEpochSecond());
+        configured.putMetricData(NAMESPACE, MetricValues.fromJson(weighted(), template), REGION);
+        assertEquals(enabled ? 1 : 2, metricStore.keys().size());
+        assertEquals(enabled, metricStore.scan(key -> true).getFirst().hasPackedSamples());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void oneWeightedValueKeepsTheLegacyRecordWithoutArrays(boolean useQuery) {
+        ObjectNode datum = datum();
+        datum.putArray("Values").add(7);
+        datum.putArray("Counts").add(0.5);
+        publish(useQuery, datum);
+        assertEquals(1, metricStore.keys().size());
+        MetricDatum stored = metricStore.scan(key -> true).getFirst();
+        assertFalse(stored.hasPackedSamples());
+        assertEquals(0.5, stored.getSampleCount());
+        assertEquals(3.5, stored.getSum());
+        assertEquals(7, stored.getValue());
+    }
+
+    @Test
+    void packedValuesRetainGetMetricDataPercentilesAndMath() {
+        publish(false, weighted());
+        assertEquals(1, metricStore.keys().size());
+        CloudWatchMetricsService.MetricStat percentile = new CloudWatchMetricsService.MetricStat(
+                NAMESPACE, "Latency", List.of(), 60, "p90", "Milliseconds");
+        List<CloudWatchMetricsService.MetricDataResult> results = service.getMetricData(List.of(
+                new CloudWatchMetricsService.MetricDataQuery("p", percentile, null, null, true),
+                new CloudWatchMetricsService.MetricDataQuery("d", null, "p*2", null, true)),
+                START.minusSeconds(1), START.plusSeconds(1), REGION);
+        assertEquals(List.of(11.0), results.getFirst().values());
+        assertEquals(List.of(22.0), results.get(1).values());
     }
 
     @ParameterizedTest

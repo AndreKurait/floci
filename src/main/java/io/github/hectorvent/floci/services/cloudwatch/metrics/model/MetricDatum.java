@@ -2,6 +2,7 @@ package io.github.hectorvent.floci.services.cloudwatch.metrics.model;
 
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+import com.fasterxml.jackson.annotation.JsonInclude;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.util.ArrayList;
@@ -23,6 +24,8 @@ public class MetricDatum {
     private double minimum;
     private double maximum;
     private String unit;
+    private double[] sampleValues;
+    private double[] sampleWeights;
 
     public MetricDatum() {}
 
@@ -73,6 +76,17 @@ public class MetricDatum {
 
     public double getMaximum() { return maximum; }
     public void setMaximum(double maximum) { this.maximum = maximum; }
+
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public double[] getSampleValues() { return sampleValues == null ? null : sampleValues.clone(); }
+    public void setSampleValues(double[] values) { sampleValues = values == null ? null : values.clone(); }
+
+    @JsonInclude(JsonInclude.Include.NON_NULL)
+    public double[] getSampleWeights() { return sampleWeights == null ? null : sampleWeights.clone(); }
+    public void setSampleWeights(double[] weights) { sampleWeights = weights == null ? null : weights.clone(); }
+
+    @JsonIgnore
+    public boolean hasPackedSamples() { return sampleValues != null || sampleWeights != null; }
 
     public String getUnit() { return unit; }
     public void setUnit(String unit) { this.unit = unit; }
