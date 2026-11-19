@@ -5,6 +5,8 @@ import io.github.hectorvent.floci.testing.CfnStackWaits;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.acmpca.AcmPcaClient;
 import software.amazon.awssdk.services.acmpca.model.CertificateAuthority;
@@ -82,6 +84,75 @@ class CloudFormationAcmPcaIntegrationTest {
             CfnStackWaits.awaitStatus(cfn, stackId, "DELETE_COMPLETE");
             assertEquals("DELETED", describe(pca, replacement).statusAsString());
         }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"CrlConfiguration", "OcspConfiguration"})
+    void pendingAuthorityRejectsUnsupportedRevocationBeforeChangingTags(String mechanism) {
+        String account = Long.toString(840_000_000_000L + Integer.toUnsignedLong(UUID.randomUUID().hashCode()));
+        try (CloudFormationClient cfn = AwsTestClients.create(CloudFormationClient.builder(), account, Region.US_EAST_1);
+             AcmPcaClient pca = AwsTestClients.create(AcmPcaClient.builder(), account, Region.US_EAST_1)) {
+            String stack = "pca-revocation-" + UUID.randomUUID().toString().substring(0, 8);
+            String stackId = cfn.createStack(request -> request.stackName(stack).templateBody(template(
+                    "Pending CA", "{\"Key\": \"team\", \"Value\": \"original\"}"))).stackId();
+            try {
+                Map<String, String> before = outputs(CfnStackWaits.awaitStatus(cfn, stack, "CREATE_COMPLETE"));
+                String arn = before.get("Arn");
+                cfn.updateStack(request -> request.stackName(stack).templateBody(revocationTemplate(mechanism, true)));
+                Stack rejected = CfnStackWaits.awaitStatus(cfn, stack, "UPDATE_ROLLBACK_COMPLETE");
+                assertEquals(before, outputs(rejected));
+                assertEquals(Map.of("team", "original"), tags(pca, arn));
+                assertEquals("PENDING_CERTIFICATE", describe(pca, arn).statusAsString());
+                assertTrue(cfn.describeStackEvents(request -> request.stackName(stack)).stackEvents().stream()
+                        .anyMatch(event -> "Authority".equals(event.logicalResourceId())
+                                && event.resourceStatusReason() != null
+                                && event.resourceStatusReason().contains("revocation delivery is not supported")));
+
+                cfn.updateStack(request -> request.stackName(stack).templateBody(revocationTemplate(mechanism, false)));
+                assertEquals(before, outputs(CfnStackWaits.awaitStatus(cfn, stack, "UPDATE_COMPLETE")));
+                assertEquals(Map.of("team", "updated"), tags(pca, arn));
+                assertEquals("PENDING_CERTIFICATE", describe(pca, arn).statusAsString());
+            } finally {
+                cfn.deleteStack(request -> request.stackName(stack));
+                CfnStackWaits.awaitStatus(cfn, stackId, "DELETE_COMPLETE");
+            }
+        }
+    }
+
+    @Test
+    void csrExtensionUpdateRejectsUnsupportedReplacementWithoutChangingTheAuthority() {
+        String account = Long.toString(840_000_000_000L + Integer.toUnsignedLong(UUID.randomUUID().hashCode()));
+        try (CloudFormationClient cfn = AwsTestClients.create(CloudFormationClient.builder(), account, Region.US_EAST_1);
+             AcmPcaClient pca = AwsTestClients.create(AcmPcaClient.builder(), account, Region.US_EAST_1)) {
+            String stack = "pca-csr-" + UUID.randomUUID().toString().substring(0, 8);
+            String initial = template("Pending CA", "{\"Key\": \"team\", \"Value\": \"original\"}");
+            String stackId = cfn.createStack(request -> request.stackName(stack).templateBody(initial)).stackId();
+            try {
+                Map<String, String> before = outputs(CfnStackWaits.awaitStatus(cfn, stack, "CREATE_COMPLETE"));
+                String arn = before.get("Arn");
+                String changed = template("Pending CA", "{\"Key\": \"team\", \"Value\": \"updated\"}")
+                        .replace("\"UsageMode\": \"GENERAL_PURPOSE\",",
+                                "\"UsageMode\": \"GENERAL_PURPOSE\", \"CsrExtensions\": {},");
+                cfn.updateStack(request -> request.stackName(stack).templateBody(changed));
+                Stack rejected = CfnStackWaits.awaitStatus(cfn, stack, "UPDATE_ROLLBACK_COMPLETE");
+                assertEquals(before, outputs(rejected));
+                assertEquals(Map.of("team", "original"), tags(pca, arn));
+                assertEquals("PENDING_CERTIFICATE", describe(pca, arn).statusAsString());
+                assertTrue(cfn.describeStackEvents(request -> request.stackName(stack)).stackEvents().stream()
+                        .anyMatch(event -> "Authority".equals(event.logicalResourceId())
+                                && event.resourceStatusReason() != null
+                                && event.resourceStatusReason().contains("CsrExtensions")));
+            } finally {
+                cfn.deleteStack(request -> request.stackName(stack));
+                CfnStackWaits.awaitStatus(cfn, stackId, "DELETE_COMPLETE");
+            }
+        }
+    }
+
+    private static String revocationTemplate(String mechanism, boolean enabled) {
+        return template("Pending CA", "{\"Key\": \"team\", \"Value\": \"updated\"}")
+                .replace("\"UsageMode\": \"GENERAL_PURPOSE\",", "\"UsageMode\": \"GENERAL_PURPOSE\","
+                        + "\"RevocationConfiguration\": {\"" + mechanism + "\": {\"Enabled\": " + enabled + "}},");
     }
 
     private static String template(String commonName, String tags) {
