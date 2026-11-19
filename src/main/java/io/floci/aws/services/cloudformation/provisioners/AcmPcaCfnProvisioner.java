@@ -92,6 +92,7 @@ public class AcmPcaCfnProvisioner implements CfnResourceProvisioner {
                 && sameCreateOnlyProperties(existing, create)) {
             arn = existing.path("Arn").asText();
             acmPcaService.validateRevocationConfiguration(create);
+            snapshotTags(r, arn, ctx.region());
             reconcileTags(arn, tags, ctx.region());
             if (revocation != null && Set.of("ACTIVE", "DISABLED").contains(existing.path("Status").asText())) {
                 ObjectNode update = request(arn);
@@ -168,11 +169,51 @@ public class AcmPcaCfnProvisioner implements CfnResourceProvisioner {
                 && desired.path("UsageMode").asText("GENERAL_PURPOSE").equals(existing.path("UsageMode").asText());
     }
 
-    private void reconcileTags(String arn, Map<String, String> desired, String region) {
+    private void snapshotTags(StackResource resource, String arn, String region) {
+        ObjectNode snapshot = MAPPER.createObjectNode().put("arn", arn).put("region", region);
+        Map<String, String> current = currentTags(arn, region);
+        CfnRollback.putTagSnapshot(snapshot, current.keySet(), current);
+        resource.getAttributes().put(CfnRollback.ACM_PCA_TAGS_SNAPSHOT_ATTR, snapshot.toString());
+    }
+
+    @Override
+    public boolean retainsFailedUpdateState(StackResource resource) {
+        return resource.getAttributes().containsKey(CfnRollback.ACM_PCA_TAGS_SNAPSHOT_ATTR);
+    }
+
+    @Override
+    public boolean rollbackUpdate(StackResource resource) {
+        JsonNode snapshot = CfnRollback.updateSnapshot(resource, CfnRollback.ACM_PCA_TAGS_SNAPSHOT_ATTR);
+        if (snapshot == null) {
+            return false;
+        }
+        reconcileTags(snapshot.path("arn").asText(), CfnRollback.snapshotTags(snapshot),
+                snapshot.path("region").asText());
+        clearUpdate(resource);
+        return true;
+    }
+
+    @Override
+    public UpdateCleanupResult completeUpdate(StackResource resource) {
+        clearUpdate(resource);
+        return UpdateCleanupResult.notApplicable();
+    }
+
+    @Override
+    public void clearUpdate(StackResource resource) {
+        resource.getAttributes().remove(CfnRollback.ACM_PCA_TAGS_SNAPSHOT_ATTR);
+    }
+
+    private Map<String, String> currentTags(String arn, String region) {
         Map<String, String> current = new LinkedHashMap<>();
         for (JsonNode tag : acmPcaService.listTags(request(arn), region).path("Tags")) {
             current.put(tag.path("Key").asText(), tag.path("Value").asText());
         }
+        return current;
+    }
+
+    private void reconcileTags(String arn, Map<String, String> desired, String region) {
+        Map<String, String> current = currentTags(arn, region);
         List<String> stale = ProvisionContext.staleTagKeys(current, desired);
         if (!stale.isEmpty()) {
             ArrayNode keys = MAPPER.createArrayNode();
