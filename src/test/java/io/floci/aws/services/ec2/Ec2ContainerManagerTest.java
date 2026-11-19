@@ -32,6 +32,7 @@ import io.floci.aws.core.common.docker.ContainerBuilder;
 import io.floci.aws.core.common.docker.ContainerDetector;
 import io.floci.aws.core.common.docker.ContainerExecStubs;
 import io.floci.aws.core.common.docker.ContainerLifecycleManager;
+import io.floci.aws.core.common.docker.ContainerLiveness;
 import io.floci.aws.core.common.docker.ContainerLogStreamer;
 import io.floci.aws.core.common.docker.ContainerReachableEndpoint;
 import io.floci.aws.core.common.docker.ContainerSpec;
@@ -89,6 +90,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Answers.RETURNS_DEEP_STUBS;
 import static org.mockito.Answers.RETURNS_SELF;
@@ -114,6 +116,32 @@ import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.withSettings;
 
 class Ec2ContainerManagerTest {
+
+    @Test
+    void unknownContainerProbeDoesNotReportAnExitedEc2Guest() {
+        LaunchHarness harness = launchHarness();
+        Instance guest = instance("i-health-probe");
+        guest.setDockerContainerId(TEST_CONTAINER_ID);
+        guest.setState(InstanceState.running());
+        when(harness.lifecycleManager.isContainerRunning(TEST_CONTAINER_ID)).thenReturn(false);
+        doReturn(ContainerLiveness.UNKNOWN, ContainerLiveness.RUNNING, ContainerLiveness.NOT_RUNNING)
+                .when(harness.lifecycleManager).probeContainer(TEST_CONTAINER_ID);
+        try {
+            assertThrows(IllegalStateException.class, () -> harness.manager.isContainerRunning(guest));
+            assertTrue(harness.manager.isContainerRunning(guest));
+            assertFalse(harness.manager.isContainerRunning(guest));
+            assertEquals("running", guest.getState().getName());
+            doReturn(ContainerLiveness.UNKNOWN, ContainerLiveness.RUNNING, ContainerLiveness.NOT_RUNNING)
+                    .when(harness.lifecycleManager).probeContainer(TEST_CONTAINER_ID);
+            assertThrows(IllegalStateException.class, () -> harness.manager.isContainerRunning(TEST_CONTAINER_ID));
+            assertTrue(harness.manager.isContainerRunning(TEST_CONTAINER_ID));
+            assertFalse(harness.manager.isContainerRunning(TEST_CONTAINER_ID));
+            assertFalse(harness.manager.isContainerRunning((String) null));
+            assertFalse(harness.manager.isContainerRunning(" "));
+        } finally {
+            harness.manager.stop();
+        }
+    }
 
     @Test
     void terminationRetainsFirewallIdentityAfterInterfacesAreReleased() throws Exception {
