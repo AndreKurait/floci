@@ -169,7 +169,9 @@ in local storage whatever it says.
 Other signing algorithms, custom CA CSR configuration, other templates, short-lived
 usage, sharing and resource policies, revocation, CRL/OCSP delivery and audit
 reports are not supported. Unsupported options are rejected before issuing or
-activating a certificate. `END_DATE` validity is not supported.
+activating a certificate. Issued certificates cannot expire after any certificate
+in the issuer chain, including the root; matching the earliest expiration is
+allowed. `END_DATE` validity is not supported.
 
 This service does not provision certificate pools, renew certificates or integrate
 with an external certificate broker. ACM's `RequestCertificate` with the
