@@ -47,6 +47,12 @@ restore the MAC only on an existing endpoint in the same owned account/VPC netwo
 Recovery does not reconnect a missing endpoint. Older attachment records without
 physical ownership must be explicitly detached and reattached to acquire it.
 
+After changing a device's MAC, Floci attempts a one-second `arping` announcement
+from the namespace owner so peers replace the temporary Docker MAC in their
+neighbor caches. Existing guests without `arping` or permission to send ARP remain
+supported: Floci logs the announcement failure and leaves the repaired device
+attached, but peers may need to expire their old neighbor entries.
+
 Physical attachment remains record-only when VPC networks are disabled, no container
 exists, security-group enforcement is enabled, the namespace already has an
 interface in that account's VPC, or the backend cannot assign the declared address.
