@@ -124,6 +124,7 @@ class Ec2HotAttachedRestartDockerIntegrationTest {
             eni.setMacAddress(MAC);
             instance.setNetworkInterfaces(new ArrayList<>(List.of(eni)));
             assertEquals(Optional.empty(), runtime.plugNetworkInterface(instance, eni));
+            assertTrue(run(guest, "ip", "-j", "link").contains(originalMac));
             assertEquals(originalDefaultRoute, run(guest, "ip", "-4", "route", "show", "default"));
             JsonNode links = new ObjectMapper().readTree(run(guest, "ip", "-j", "address"));
             JsonNode device = null;
@@ -185,6 +186,8 @@ class Ec2HotAttachedRestartDockerIntegrationTest {
             docker.stopContainerCmd(guest).withTimeout(1).exec();
             docker.startContainerCmd(guest).exec();
             recreateAttachedEndpoint(guest, network, address, peer);
+            String primaryMacBeforeRecovery = docker.inspectContainerCmd(guest).exec().getNetworkSettings()
+                    .getNetworks().get("bridge").getMacAddress();
             VpcNetworkManager recoveredNetworks = new VpcNetworkManager(config, docker, resolver);
             recoveredNetworks.declareVpc(ACCOUNT, REGION, "vpc-attached", cidr.toString());
             recoveredNetworks.declareSubnet(ACCOUNT, REGION, "vpc-attached", "subnet-attached", cidr.toString());
@@ -204,7 +207,7 @@ class Ec2HotAttachedRestartDockerIntegrationTest {
             }
             String remainingLinks = run(guest, "ip", "-j", "link");
             assertFalse(remainingLinks.contains(MAC));
-            assertTrue(remainingLinks.contains(originalMac), remainingLinks);
+            assertTrue(remainingLinks.contains(primaryMacBeforeRecovery), remainingLinks);
             assertTrue(docker.inspectContainerCmd(guest).exec().getNetworkSettings().getNetworks().containsKey("bridge"));
             assertTrue(docker.inspectContainerCmd(peer).exec().getNetworkSettings().getNetworks().containsKey(network));
             assertNotEquals(0L, ContainerExec.run(docker, peer, new String[]{"ping", "-c", "1", "-W", "1", address}, 5)
