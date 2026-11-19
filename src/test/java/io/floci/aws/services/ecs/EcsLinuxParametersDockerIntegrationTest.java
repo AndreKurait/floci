@@ -7,6 +7,7 @@ import com.github.dockerjava.api.model.Capability;
 import com.github.dockerjava.api.model.Device;
 import com.github.dockerjava.api.model.HostConfig;
 import io.floci.aws.services.ecs.model.EcsTask;
+import io.floci.aws.services.ecs.model.LaunchType;
 import io.floci.aws.testing.DockerAvailability;
 import io.floci.aws.testing.RestAssuredJsonUtils;
 import io.floci.aws.testing.ScopedServiceSettingsProfile;
@@ -105,7 +106,7 @@ class EcsLinuxParametersDockerIntegrationTest {
         clusterName = family;
         ecsService.createCluster(clusterName, REGION);
         EcsTask task = ecsService.runTask(clusterName, taskDefinitionArn, 1,
-                null, null, null, null, null, REGION).getFirst();
+                LaunchType.FARGATE, null, null, null, null, REGION).getFirst();
         taskArn = task.getTaskArn();
         EcsTask described = awaitLastStatus(
                 () -> ecsService.describeTasks(clusterName, List.of(taskArn), REGION).getFirst(),
@@ -154,7 +155,7 @@ class EcsLinuxParametersDockerIntegrationTest {
         clusterName = family;
         ecsService.createCluster(clusterName, REGION);
         EcsTask task = ecsService.runTask(clusterName, taskDefinitionArn, 1,
-                null, null, null, null, null, REGION).getFirst();
+                LaunchType.FARGATE, null, null, null, null, REGION).getFirst();
         taskArn = task.getTaskArn();
         EcsTask described = awaitLastStatus(
                 () -> ecsService.describeTasks(clusterName, List.of(taskArn), REGION).getFirst(),

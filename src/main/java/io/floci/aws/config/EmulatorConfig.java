@@ -2824,6 +2824,39 @@ public interface EmulatorConfig {
 
         Optional<String> dockerNetwork();
 
+        /**
+         * Additional Docker create flags applied to every ECS task container, with the grammar of
+         * {@code floci.services.lambda.docker-flags} ({@code --dns}, {@code --add-host},
+         * {@code -v}, {@code --env}, {@code --label}, ...). A {@code --dns} server replaces Floci's
+         * embedded DNS. When set, task containers are not given Floci's SDK endpoint variables
+         * ({@code AWS_ENDPOINT_URL}, {@code FLOCI_ENDPOINT}, {@code FLOCI_HOSTNAME}): they reach
+         * AWS by its real names through the configured DNS, as on ECS.
+         *
+         * Env var: FLOCI_SERVICES_ECS_DOCKER_FLAGS
+         */
+        Optional<String> dockerFlags();
+
+        /**
+         * Additional existing Docker networks an ECS task container joins before it starts. The
+         * primary network remains selected by docker-network or docker-flags. Not applied to
+         * awsvpc tasks, whose containers share their task's network namespace.
+         *
+         * Env var: FLOCI_SERVICES_ECS_ADDITIONAL_DOCKER_NETWORKS (comma-separated)
+         */
+        Optional<List<String>> additionalDockerNetworks();
+
+        /**
+         * Extra /etc/hosts entries added to every ECS task container, as "hostname:ip" pairs; the
+         * ip may be the literal "host-gateway", as in {@code docker run --add-host}. Unset by
+         * default: like the ECS agent, Floci gives a task container only the {@code extraHosts}
+         * its container definition declares. {@code host.docker.internal:host-gateway} restores
+         * the entry Floci used to add to every task container on Linux. For an awsvpc task with
+         * security-group enforcement the entries go on the task's network namespace.
+         *
+         * Env var: FLOCI_SERVICES_ECS_EXTRA_HOSTS (comma-separated)
+         */
+        Optional<List<String>> extraHosts();
+
         @WithDefault("512")
         int defaultMemoryMb();
 
@@ -3585,6 +3618,14 @@ public interface EmulatorConfig {
 
         /** Docker network to attach Lambda containers to. Empty = default bridge. */
         Optional<String> dockerNetwork();
+
+        /**
+         * Additional existing Docker networks joined before a Lambda container starts.
+         * The primary network remains selected by docker-network or docker-flags.
+         *
+         * Env var: FLOCI_SERVICES_LAMBDA_ADDITIONAL_DOCKER_NETWORKS (comma-separated)
+         */
+        Optional<List<String>> additionalDockerNetworks();
 
         /** Additional Docker create flags applied to every Lambda execution container. */
         Optional<String> dockerFlags();

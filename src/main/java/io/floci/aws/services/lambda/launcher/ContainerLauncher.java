@@ -7,11 +7,13 @@ import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.Digests;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.docker.AdditionalDockerNetworks;
 import io.floci.aws.core.common.docker.ContainerBuilder;
 import io.floci.aws.core.common.docker.ContainerLifecycleManager;
 import io.floci.aws.core.common.docker.ContainerLogStreamer;
 import io.floci.aws.core.common.docker.ContainerSpec;
 import io.floci.aws.core.common.docker.ContainerStorageHelper;
+import io.floci.aws.core.common.docker.DockerFlags;
 import io.floci.aws.core.common.docker.DockerHostResolver;
 import io.floci.aws.core.common.docker.DockerPlatforms;
 import io.floci.aws.core.common.docker.LaunchedContainerAwsEnv;
@@ -121,6 +123,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
     private final DockerClient streamingDocker;
+    private final LambdaDnsResolver dnsResolver;
     private final ContainerLogStreamer logStreamer;
     private final ImageResolver imageResolver;
     private final RuntimeApiServerFactory runtimeApiServerFactory;
@@ -154,6 +157,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.streamingDocker = streamingDocker;
+        this.dnsResolver = new LambdaDnsResolver(containerBuilder, lifecycleManager, config);
         this.logStreamer = logStreamer;
         this.imageResolver = imageResolver;
         this.runtimeApiServerFactory = runtimeApiServerFactory;
@@ -241,10 +245,12 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // must be visible in the catch block below to release its in-flight reference on any
         // failure path, not just the one where useCodeVolume's block itself throws.
         String reservedCodeVolume = null;
+        String dnsResolverVolume = null;
         Optional<SessionCreds> roleCredentials = Optional.empty();
         try {
 
-        LambdaDockerFlags dockerFlags = configuredDockerFlags();
+        DockerFlags dockerFlags = configuredDockerFlags();
+        List<String> additionalNetworks = configuredAdditionalDockerNetworks();
         // Resolve the image for the same platform used by container creation.
         String image = "Image".equals(fn.getPackageType()) && fn.getImageUri() != null
                 ? fn.getImageUri()
@@ -408,6 +414,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             specBuilder.withReadOnlyBind(hostPath, "/opt/aws-config");
         });
 
+        dnsResolverVolume = dnsResolver.prepare(specBuilder,
+                requestedDockerPlatform(fn, dockerFlags).orElse(null));
         ContainerSpec spec = specBuilder.build();
 
         // Create container without starting — provided.* runtimes exec
@@ -423,6 +431,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         // Copy code into container via Docker API tar stream (works inside Docker too).
         // Hot-reload functions skip the tar-copy — the bind-mount already wires the host path.
         DockerClient dockerClient = lifecycleManager.getDockerClient();
+        AdditionalDockerNetworks.attach(dockerClient, containerId, additionalNetworks);
         if (!fn.isHotReload() && fn.getCodeLocalPath() != null) {
             Path codePath = Path.of(fn.getCodeLocalPath());
 
@@ -514,6 +523,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 containerId, fn.getFunctionName(), runtimeApiServer, ContainerState.WARM, fn.isHotReload(),
                 roleCredentials.map(SessionCreds::accessKeyId).orElse(null),
                 LambdaExecutionRoleCredentials.sessionAccountId(fn));
+        handle.setDnsResolverVolume(dnsResolverVolume);
 
         // Attach log streaming
         Closeable logHandle = logStreamer.attachForAccount(
@@ -538,6 +548,16 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                     releaseVpcLease(containerId);
                 } catch (Exception cleanupError) {
                     LOG.warnv(cleanupError, "Could not remove failed Lambda container {0}", containerId);
+                    e.addSuppressed(cleanupError);
+                }
+            }
+            if (dnsResolverVolume != null) {
+                try {
+                    dnsResolver.remove(dnsResolverVolume, containerId);
+                } catch (RuntimeException cleanupError) {
+                    if (cleanupError != e) {
+                        e.addSuppressed(cleanupError);
+                    }
                 }
             }
             if (roleCredentials.isPresent()) {
@@ -580,14 +600,14 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         return Optional.ofNullable(DockerPlatforms.forArchitecture(architectures.getFirst()));
     }
 
-    private Optional<String> requestedDockerPlatform(LambdaFunction fn, LambdaDockerFlags dockerFlags) {
+    private Optional<String> requestedDockerPlatform(LambdaFunction fn, DockerFlags dockerFlags) {
         if (dockerFlags.platform() != null) {
             return Optional.of(dockerFlags.platform());
         }
         return config.services().lambda().honourArchitectures() ? dockerPlatform(fn) : Optional.empty();
     }
 
-    private String createContainer(ContainerSpec spec, LambdaFunction fn, LambdaDockerFlags dockerFlags) {
+    private String createContainer(ContainerSpec spec, LambdaFunction fn, DockerFlags dockerFlags) {
         Optional<String> platform = requestedDockerPlatform(fn, dockerFlags);
         if (platform.isEmpty() && config.services().lambda().honourArchitectures()) {
             throw new IllegalStateException("Invalid persisted architectures "
@@ -597,72 +617,36 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 .orElseGet(() -> lifecycleManager.create(spec));
     }
 
-    private LambdaDockerFlags configuredDockerFlags() {
+    private List<String> configuredAdditionalDockerNetworks() {
+        return AdditionalDockerNetworks.validated(config.services().lambda().additionalDockerNetworks(), "Lambda");
+    }
+
+    private DockerFlags configuredDockerFlags() {
         Optional<String> configured = Optional.ofNullable(config.services().lambda().dockerFlags())
                 .orElse(Optional.empty());
         return configured.filter(value -> !value.isBlank())
-                .map(LambdaDockerFlags::parse)
-                .orElseGet(() -> LambdaDockerFlags.parse(null));
+                .map(DockerFlags::parse)
+                .orElseGet(() -> DockerFlags.none());
     }
 
-    private static void applyDockerFlags(ContainerBuilder.Builder builder, LambdaDockerFlags flags) {
-        builder.withEnv(flags.environment());
-        for (String volume : flags.volumes()) {
-            String[] parts = volume.split(":", -1);
-            if (parts.length < 2 || parts.length > 3 || parts[0].isBlank() || parts[1].isBlank()) {
-                throw new IllegalArgumentException("Invalid Lambda Docker volume: " + volume);
-            }
-            if (parts.length == 3 && "ro".equals(parts[2])) {
-                builder.withReadOnlyBind(parts[0], parts[1]);
-            } else if (parts.length == 2 || "rw".equals(parts[2])) {
-                builder.withBind(parts[0], parts[1]);
-            } else {
-                throw new IllegalArgumentException("Invalid Lambda Docker volume mode: " + volume);
-            }
-        }
-        for (String publishedPort : flags.publishedPorts()) {
-            String[] parts = publishedPort.split(":", -1);
-            String hostIp = parts.length == 3 ? parts[0] : null;
-            String hostPort = parts.length == 2 ? parts[0] : parts.length == 3 ? parts[1] : "";
-            String containerPort = parts.length == 2 ? parts[1] : parts.length == 3 ? parts[2] : "";
-            if (hostPort.isBlank() || containerPort.isBlank()) {
-                throw new IllegalArgumentException("Invalid Lambda Docker published port: " + publishedPort);
-            }
-            int parsedHostPort = Integer.parseInt(hostPort);
-            int parsedContainerPort = Integer.parseInt(containerPort);
-            if (hostIp == null) {
-                builder.withPortBinding(parsedContainerPort, parsedHostPort);
-            } else if ("127.0.0.1".equals(hostIp)) {
-                builder.withLoopbackPortBinding(parsedContainerPort, parsedHostPort);
-            } else {
-                throw new IllegalArgumentException("Lambda Docker published ports only support "
-                        + "127.0.0.1 as an explicit host address: " + publishedPort);
-            }
-        }
-        for (String extraHost : flags.extraHosts()) {
-            int separator = extraHost.indexOf(':');
-            if (separator <= 0 || separator == extraHost.length() - 1) {
-                throw new IllegalArgumentException("Invalid Lambda Docker extra host: " + extraHost);
-            }
-            builder.withExtraHost(extraHost.substring(0, separator), extraHost.substring(separator + 1));
-        }
-        for (String dnsServer : flags.dnsServers()) {
-            builder.withDnsServer(dnsServer);
-        }
-        builder.withLabels(flags.labels());
-        if (flags.network() != null) {
-            builder.withNetworkMode(flags.network());
-        }
-        if (flags.user() != null) {
-            builder.withUser(flags.user());
-        }
-        builder.withPrivileged(flags.privileged());
+    private static void applyDockerFlags(ContainerBuilder.Builder builder, DockerFlags flags) {
+        flags.applyTo(builder, "Lambda");
     }
 
     public void stop(ContainerHandle handle) {
+        synchronized (handle) {
+            stopOwnedContainer(handle);
+        }
+    }
+
+    private void stopOwnedContainer(ContainerHandle handle) {
         LOG.infov("Stopping container {0}", handle.getContainerId());
         handle.setState(ContainerState.STOPPED);
 
+        if (handle.isRuntimeApiReleased()) {
+            removeResolver(handle);
+            return;
+        }
         RuntimeApiServer server = handle.getRuntimeApiServer();
 
         // Quiesce first: stop accepting new work, notify extensions, complete pending
@@ -708,7 +692,19 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             LOG.warnv(e, "RuntimeApiServer did not close cleanly for container {0}",
                     handle.getContainerId());
         } finally {
-            runtimeApiServerFactory.release(server);
+            try {
+                runtimeApiServerFactory.release(server);
+                handle.markRuntimeApiReleased();
+            } finally {
+                removeResolver(handle);
+            }
+        }
+    }
+
+    private void removeResolver(ContainerHandle handle) {
+        if (handle.getDnsResolverVolume() != null) {
+            dnsResolver.remove(handle.getDnsResolverVolume(), null);
+            handle.setDnsResolverVolume(null);
         }
     }
 
@@ -996,6 +992,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
      * `docker volume prune --filter label=floci` same as before this existed).
      */
     void cleanupSupersededVolumes() {
+        dnsResolver.retryCleanup();
         long cutoff = System.currentTimeMillis() - VOLUME_CLEANUP_GRACE_MS;
         for (String volName : new ArrayList<>(volumesPendingCleanup.keySet())) {
             Long queuedAt = volumesPendingCleanup.get(volName);

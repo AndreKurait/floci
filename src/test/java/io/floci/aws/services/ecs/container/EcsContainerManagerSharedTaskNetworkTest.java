@@ -114,7 +114,7 @@ class EcsContainerManagerSharedTaskNetworkTest {
         firewallManager = mock(SecurityGroupFirewallManager.class);
         when(firewallManager.enabled()).thenReturn(false);
         when(firewallManager.createSharedNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(),
-                any(), any())).thenReturn(new SecurityGroupFirewallManager.Namespace("helper-id", "172.18.0.9"));
+                any(), any(), any())).thenReturn(new SecurityGroupFirewallManager.Namespace("helper-id", "172.18.0.9"));
         taskRoleCredentials = mock(EcsTaskRoleCredentials.class);
         when(taskRoleCredentials.issue(any(), any(), any(), any())).thenReturn(Optional.of(RELATIVE_URI));
         linkLocalAddresses = new EcsTaskLinkLocalAddresses();
@@ -142,14 +142,14 @@ class EcsContainerManagerSharedTaskNetworkTest {
         @SuppressWarnings("unchecked")
         ArgumentCaptor<Map<Integer, Integer>> ports = ArgumentCaptor.forClass(Map.class);
         verify(firewallManager).createSharedNamespace(eq("ecs"), eq("abc123"), eq("000000000000"),
-                eq("us-east-1"), any(), ports.capture(), any(), eq("127.0.0.1"), eq(List.of()));
+                eq("us-east-1"), any(), ports.capture(), any(), eq("127.0.0.1"), eq(List.of()), any());
         Map<Integer, Integer> expected = new LinkedHashMap<>();
         expected.put(8081, 0);
         expected.put(80, 0);
         assertEquals(expected, ports.getValue());
         // Each container's network bindings are read off the helper, which publishes them.
         verify(dockerClient, atLeastOnce()).inspectContainerCmd("helper-id");
-        verify(firewallManager, never()).createNamespace(any(), any(), any(), any(), any(), any(), any(), any(), any());
+        verify(firewallManager, never()).createNamespace(any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
         verify(firewallManager, never()).register(any(), any(), any());
         verify(ec2Service, never()).createNetworkInterface(any(), any(), any(), any(), any(), any(), any());
         assertEquals("eni-1", handle.getNetworkInterfaceId());
@@ -163,7 +163,7 @@ class EcsContainerManagerSharedTaskNetworkTest {
                 List.of(), "us-east-1");
 
         verify(firewallManager).createSharedNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(),
-                any(), eq(List.of("169.254.170.1")));
+                any(), eq(List.of("169.254.170.1")), any());
         // A container joined to the helper has no network endpoint of its own to give an address to.
         verify(builder, never()).withLinkLocalIp(anyString());
         @SuppressWarnings("unchecked")
@@ -274,7 +274,7 @@ class EcsContainerManagerSharedTaskNetworkTest {
     @Test
     void aHelperThatCannotStartFailsTheLaunchAndFreesItsAddressOnceItIsGone() {
         when(config.services().ecs().taskRoleCredentials().enabled()).thenReturn(true);
-        when(firewallManager.createSharedNamespace(any(), any(), any(), any(), any(), any(), any(), any(), any()))
+        when(firewallManager.createSharedNamespace(any(), any(), any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenThrow(new IllegalStateException("cannot start the helper"));
 
         assertThrows(IllegalStateException.class, () -> manager.startTask(awsvpcTask(),
@@ -290,7 +290,7 @@ class EcsContainerManagerSharedTaskNetworkTest {
     @Test
     void aHelperAFailedStartLeftBehindKeepsItsAddressAndItsCleanup() {
         when(config.services().ecs().taskRoleCredentials().enabled()).thenReturn(true);
-        when(firewallManager.createSharedNamespace(any(), any(), any(), any(), any(), any(), any(), any(), any()))
+        when(firewallManager.createSharedNamespace(any(), any(), any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenThrow(new IllegalStateException("inspect failed after the helper started"));
         doThrow(new IllegalStateException("helper busy")).when(firewallManager).removeSharedNamespaceStrict("abc123");
 
@@ -324,7 +324,7 @@ class EcsContainerManagerSharedTaskNetworkTest {
         manager.startTask(awsvpcTask(), taskDef(null, container("app", 80)), List.of(), "us-east-1");
 
         verify(firewallManager, never()).createSharedNamespace(any(), any(), any(), any(), any(), any(), any(), any(),
-                any());
+                any(), any());
         verify(builder, never()).withNetworkMode(anyString());
         verify(builder).withPortBinding(80, 0, "127.0.0.1");
     }
@@ -332,7 +332,7 @@ class EcsContainerManagerSharedTaskNetworkTest {
     @Test
     void enforcementGivesTheTaskItsProtectedNamespaceInstead() {
         when(firewallManager.enabled()).thenReturn(true);
-        when(firewallManager.createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(), any()))
+        when(firewallManager.createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(), any(), any()))
                 .thenThrow(new IllegalStateException("stop once the protected path is taken"));
         NetworkInterface eni = new NetworkInterface();
         eni.setNetworkInterfaceId("eni-1");
@@ -343,9 +343,9 @@ class EcsContainerManagerSharedTaskNetworkTest {
         assertThrows(IllegalStateException.class, () -> manager.startTask(awsvpcTask(),
                 taskDef(null, container("app", 80)), List.of(), "us-east-1"));
 
-        verify(firewallManager).createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(), any());
+        verify(firewallManager).createNamespace(eq("ecs"), eq("abc123"), any(), any(), any(), any(), any(), any(), any(), any());
         verify(firewallManager, never()).createSharedNamespace(any(), any(), any(), any(), any(), any(), any(), any(),
-                any());
+                any(), any());
     }
 
     @Test
@@ -356,7 +356,7 @@ class EcsContainerManagerSharedTaskNetworkTest {
         manager.startTask(awsvpcTask(), bridge, List.of(), "us-east-1");
 
         verify(firewallManager, never()).createSharedNamespace(any(), any(), any(), any(), any(), any(), any(), any(),
-                any());
+                any(), any());
         verify(builder, never()).withNetworkMode(anyString());
     }
 }
