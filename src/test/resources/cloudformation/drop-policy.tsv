@@ -157,7 +157,7 @@ AWS::ECS::Service	TaskDefinition	keep:required for the ECS controller
 AWS::KMS::Key	Description	clear	cleared to the empty description, KMS's own empty state; the CloudFormation page lists no default
 AWS::KMS::Key	EnableKeyRotation	default:false	the CloudFormation page: EnableKeyRotation defaults to false
 AWS::KMS::Key	Enabled	default:true	the CloudFormation page: Enabled defaults to true
-AWS::KMS::Key	KeyPolicy	keep:no AWS documentation says a dropped policy resets to the default, so the stored policy stays
+AWS::KMS::Key	KeyPolicy	default:account-root	a dropped declared policy restores the account default; an undeclared policy is kept
 AWS::KMS::Key	KeySpec	keep:a drop names the create default, so a key holding another value fails the update, as a change does
 AWS::KMS::Key	KeyUsage	keep:a drop names the create default, so a key holding another value fails the update, as a change does
 AWS::KMS::Key	MultiRegion	keep:a drop names the create default, so a key holding another value fails the update, as a change does
