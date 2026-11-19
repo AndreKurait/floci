@@ -13,6 +13,7 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.net.http.HttpResponse.BodyHandlers;
+import java.net.http.HttpTimeoutException;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.Map;
@@ -211,6 +212,8 @@ public class NpmExternalConnectionClient {
             throws IOException, InterruptedException {
         try {
             return httpClient.send(request, BodyHandlers.ofInputStream());
+        } catch (HttpTimeoutException e) {
+            throw e;
         } catch (IOException e) {
             // Retry the idempotent GET once before a response body has been handed to its consumer.
             // Body failures are handled separately, so partial files and buffers are never replayed.
