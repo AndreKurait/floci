@@ -32,6 +32,32 @@ import static org.mockito.Mockito.when;
 class AccountAwareStorageBackendTest {
 
     @Test
+    void explicitReadRetainsDefaultLegacyEntryAndPrefersScopedEntry() {
+        InMemoryStorage<String, String> delegate = new InMemoryStorage<>();
+        AccountAwareStorageBackend<String> storage =
+                new AccountAwareStorageBackend<>(delegate, null, "111111111111");
+        delegate.put("key", "legacy");
+
+        assertEquals(Optional.of("legacy"), AccountAwareStorageBackend.readInAccount(storage, "111111111111", "key"));
+        assertEquals(Set.of("key"), delegate.keys());
+        assertEquals(Optional.empty(), AccountAwareStorageBackend.readInAccount(storage, "222222222222", "key"));
+        delegate.put("111111111111/key", "scoped");
+        assertEquals(Optional.of("scoped"), AccountAwareStorageBackend.readInAccount(storage, "111111111111", "key"));
+        assertEquals(Optional.of("legacy"), delegate.get("key"));
+    }
+
+    @Test
+    void explicitReadFallsBackToOrdinaryStorageOrCurrentAccount() {
+        InMemoryStorage<String, String> delegate = new InMemoryStorage<>();
+        delegate.put("key", "plain");
+        assertEquals(Optional.of("plain"), AccountAwareStorageBackend.readInAccount(delegate, "111111111111", "key"));
+        AccountAwareStorageBackend<String> storage =
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, "111111111111");
+        storage.putForAccount("111111111111", "key", "scoped");
+        assertEquals(Optional.of("scoped"), AccountAwareStorageBackend.readInAccount(storage, null, "key"));
+    }
+
+    @Test
     void accountIdReturnsDefaultOutsideRequestScope() {
         AccountAwareStorageBackend<String> storage =
                 new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, "111111111111");

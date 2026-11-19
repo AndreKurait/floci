@@ -26,16 +26,19 @@ import java.time.Clock;
 import java.time.Instant;
 import java.util.Base64;
 import java.util.HexFormat;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 
 /** Native ECR passwords identify their issuing caller; registryIds never grant permissions. */
 @ApplicationScoped
 public class EcrRegistryAuthorization {
     @RegisterForReflection
     public record TokenRecord(String accessKeyId, String accountId, String principalArn, String userId,
-                              Instant expiresAt, boolean enforcementDisabled) {}
+                              Instant expiresAt, boolean enforcementDisabled, String region) {}
     public record IssuedToken(String authorizationToken, Instant expiresAt) {}
     public record Identity(TokenRecord token, IamService.CallerArns caller, CallerContext policies) {}
 
@@ -65,7 +68,7 @@ public class EcrRegistryAuthorization {
         this.clock = clock;
     }
 
-    public IssuedToken issue() {
+    public IssuedToken issue(String region) {
         boolean disabled = !config.services().iam().enforcementEnabled();
         String key = request.getAccessKeyId();
         IamService.CallerArns caller = key == null ? null : iam.resolveCallerArns(key).orElse(null);
@@ -95,7 +98,8 @@ public class EcrRegistryAuthorization {
         String password = Base64.getUrlEncoder().withoutPadding().encodeToString(bytes);
         pruneExpired();
         tokens.putForAccount(account, hash(password), new TokenRecord(key, account,
-                caller == null ? null : caller.principalArn(), caller == null ? null : caller.userId(), expiry, disabled));
+                caller == null ? null : caller.principalArn(), caller == null ? null : caller.userId(),
+                expiry, disabled, region));
         return new IssuedToken(Base64.getEncoder().encodeToString(
                 ("AWS:" + password).getBytes(StandardCharsets.UTF_8)), expiry);
     }
@@ -103,27 +107,45 @@ public class EcrRegistryAuthorization {
     /** Bounded sweep; expired records are never accepted even before their sweep turn. */
     private synchronized void pruneExpired() {
         Map<String, AccountAwareStorageBackend.AccountEntry<TokenRecord>> page = tokens.scanAllAccountEntriesAfter(pruneCursor, 128);
+        Map<String, Set<String>> expiredByAccount = new LinkedHashMap<>();
+        String nextCursor = pruneCursor;
         for (Map.Entry<String, AccountAwareStorageBackend.AccountEntry<TokenRecord>> entry : page.entrySet()) {
-            pruneCursor = entry.getKey();
+            nextCursor = entry.getKey();
             AccountAwareStorageBackend.AccountEntry<TokenRecord> item = entry.getValue();
             if (!item.value().expiresAt().isAfter(clock.instant())) {
-                tokens.deleteForAccount(item.accountId(), item.key());
+                expiredByAccount.computeIfAbsent(item.accountId(), account -> new LinkedHashSet<>()).add(item.key());
             }
         }
-        if (page.size() < 128) {
-            pruneCursor = null;
+        if (!expiredByAccount.isEmpty()) {
+            tokens.deleteAllAtomicallyForAccounts(expiredByAccount);
         }
+        pruneCursor = page.size() < 128 ? null : nextCursor;
     }
 
     @ActivateRequestContext
-    public Identity authenticate(String authorization) {
+    public Identity authenticate(String authorization, String region) {
+        if (region == null || region.isBlank()) {
+            throw unauthorized();
+        }
+        return authenticatedIdentity(authorization, region);
+    }
+
+    /** Path-style login has no repository Region; repository requests remain Region-bound. */
+    @ActivateRequestContext
+    public Identity authenticateLoginProbe(String authorization) {
+        return authenticatedIdentity(authorization, null);
+    }
+
+    private Identity authenticatedIdentity(String authorization, String region) {
         String password = password(authorization);
         if (password == null) {
             throw unauthorized();
         }
         AccountAwareStorageBackend.OwnedEntry<TokenRecord> stored = tokens.findAnyAccountEntry(hash(password)).orElseThrow(EcrRegistryAuthorization::unauthorized);
         TokenRecord token = stored.value();
-        if (!stored.account().equals(token.accountId()) || !token.expiresAt().isAfter(clock.instant())) {
+        if (!stored.account().equals(token.accountId()) || !token.expiresAt().isAfter(clock.instant())
+                || token.region() == null || token.region().isBlank()
+                || region != null && !token.region().equals(region)) {
             throw unauthorized();
         }
         if (token.enforcementDisabled()) {
