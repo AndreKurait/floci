@@ -43,6 +43,148 @@ class Route53ServiceTest {
 
     private final Map<String, AccountAwareStorageBackend<?>> stores = new HashMap<>();
 
+    @Test
+    void testDnsAnswerRejectsPrivateAndMissingZones() {
+        Route53Service service = newService();
+        String zoneId = service.createHostedZone("private.example", "answer-private", null,
+                new VpcAssociation("vpc-123", "us-east-1")).zone().getId();
+        AwsException privateError = assertThrows(AwsException.class, () ->
+                service.testDnsAnswer(zoneId, "private.example", "NS", null, null, null));
+        assertEquals("InvalidInput", privateError.getErrorCode());
+        AwsException missingError = assertThrows(AwsException.class, () ->
+                service.testDnsAnswer("ZMissing", "private.example", "NS", null, null, null));
+        assertEquals("NoSuchHostedZone", missingError.getErrorCode());
+    }
+
+    @Test
+    void testDnsAnswerUsesDelegationMetadataAndAcceptsZonePrefix() {
+        Route53Service service = newService();
+        String zoneId = service.createHostedZone("example.com", "answer-public", null, null).zone().getId();
+        Route53Service.TestDnsAnswerResult answer = service.testDnsAnswer("/hostedzone/" + zoneId,
+                "EXAMPLE.com", "NS", null, "2001:db8::1", null);
+        assertEquals("EXAMPLE.com", answer.recordName());
+        assertEquals(service.getAssignedNameServers(zoneId).getFirst(), answer.nameserver());
+        assertEquals(service.getAssignedNameServers(zoneId).stream().map(ns -> ns + ".").toList(), answer.recordData());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"", " ", "\t"})
+    void testDnsAnswerAcceptsStoredSimpleRecordsWithBlankIdentifiers(String identifier) {
+        Route53Service service = newService();
+        String zoneId = service.createHostedZone("example.com.", "answer-stored", null, null).zone().getId();
+        ResourceRecordSet legacy = aRecord("www.example.com.", 60, "192.0.2.81");
+        legacy.setSetIdentifier(identifier);
+        @SuppressWarnings("unchecked")
+        AccountAwareStorageBackend<List<ResourceRecordSet>> recordStore =
+                (AccountAwareStorageBackend<List<ResourceRecordSet>>) stores.get("route53-records.json");
+        List<ResourceRecordSet> seeded = new ArrayList<>(recordStore.get(zoneId).orElseThrow());
+        seeded.add(legacy);
+        recordStore.put(zoneId, seeded);
+
+        Route53Service.TestDnsAnswerResult answer =
+                service.testDnsAnswer(zoneId, legacy.getName(), "A", null, null, null);
+        assertEquals("NOERROR", answer.responseCode());
+        assertEquals(List.of("192.0.2.81"), answer.recordData());
+        assertEquals(identifier, typeARecords(service, zoneId).getFirst().getSetIdentifier());
+    }
+
+    @Test
+    void testDnsAnswerStillRefusesNonblankSimpleRoutingIdentifiers() {
+        Route53Service service = newService();
+        String zoneId = service.createHostedZone("example.com.", "answer-identifier", null, null).zone().getId();
+        ResourceRecordSet record = aRecord("www.example.com.", 60, "192.0.2.82");
+        record.setSetIdentifier("unsupported");
+        service.changeResourceRecordSets(zoneId, List.of(change("CREATE", record)), null);
+
+        Route53Service.TestDnsAnswerResult answer =
+                service.testDnsAnswer(zoneId, record.getName(), "A", null, null, null);
+        assertEquals("REFUSED", answer.responseCode());
+        assertEquals(List.of(), answer.recordData());
+    }
+
+    @ParameterizedTest
+    @CsvSource({"w.example.com.,w.example.com.", "\\127.Example.com.,w.example.com.",
+            "\\127.example.com.,\\127.example.com.", "*.example.com.,child.example.com.",
+            "\\052.example.com.,child.example.com.", "a\\056b.example.com.,a\\056b.example.com."})
+    void testDnsAnswerMatchesStoredNamesWithoutRewritingThem(String storedName, String queryName) {
+        Route53Service service = newService();
+        String zoneId = service.createHostedZone("example.com.", "answer-escaped", null, null).zone().getId();
+        ResourceRecordSet stored = aRecord(storedName, 60, "192.0.2.84");
+        seedStoredRecords(zoneId, List.of(stored));
+
+        Route53Service.TestDnsAnswerResult answer =
+                service.testDnsAnswer(zoneId, queryName, "A", null, null, null);
+        assertEquals("NOERROR", answer.responseCode());
+        assertEquals(List.of("192.0.2.84"), answer.recordData());
+        assertEquals(storedName, typeARecords(service, zoneId).getFirst().getName());
+    }
+
+    @Test
+    void testDnsAnswerKeepsEscapedDotsWithinTheirLabel() {
+        Route53Service service = newService();
+        String zoneId = service.createHostedZone("example.com.", "answer-escaped-dot", null, null).zone().getId();
+        seedStoredRecords(zoneId, List.of(aRecord("a\\056b.example.com.", 60, "192.0.2.85")));
+
+        Route53Service.TestDnsAnswerResult answer =
+                service.testDnsAnswer(zoneId, "a.b.example.com.", "A", null, null, null);
+        assertEquals("NXDOMAIN", answer.responseCode());
+        assertEquals(List.of(), answer.recordData());
+    }
+
+    @Test
+    void testDnsAnswerBlocksWildcardsBelowStoredEscapedAncestors() {
+        Route53Service service = newService();
+        String zoneId = service.createHostedZone("example.com.", "answer-escaped-parent", null, null).zone().getId();
+        seedStoredRecords(zoneId, List.of(aRecord("*.example.com.", 60, "192.0.2.86"),
+                aRecord("child.\\127.example.com.", 60, "192.0.2.87")));
+
+        Route53Service.TestDnsAnswerResult answer =
+                service.testDnsAnswer(zoneId, "w.example.com.", "A", null, null, null);
+        assertEquals("NOERROR", answer.responseCode());
+        assertEquals(List.of(), answer.recordData());
+    }
+
+    @SuppressWarnings("unchecked")
+    private void seedStoredRecords(String zoneId, List<ResourceRecordSet> records) {
+        AccountAwareStorageBackend<List<ResourceRecordSet>> recordStore =
+                (AccountAwareStorageBackend<List<ResourceRecordSet>>) stores.get("route53-records.json");
+        List<ResourceRecordSet> seeded = new ArrayList<>(recordStore.get(zoneId).orElseThrow());
+        seeded.addAll(records);
+        recordStore.put(zoneId, seeded);
+    }
+
+    @Test
+    void testDnsAnswerServesRecordsAndSameZoneAliasesBeneathAnExistingRootZone() {
+        Route53Service service = newService();
+        String zoneId = service.createHostedZone(".", "answer-root", null, null).zone().getId();
+        ResourceRecordSet record = aRecord("www.example.", 60, "192.0.2.83");
+        ResourceRecordSet alias = aliasRecord("alias.example.", record.getName(), false);
+        alias.getAliasTarget().setHostedZoneId(zoneId);
+        service.changeResourceRecordSets(zoneId,
+                List.of(change("CREATE", record), change("CREATE", alias)), null);
+
+        for (String name : List.of(record.getName(), alias.getName())) {
+            Route53Service.TestDnsAnswerResult answer =
+                    service.testDnsAnswer(zoneId, name, "A", null, null, null);
+            assertEquals("NOERROR", answer.responseCode());
+            assertEquals(List.of("192.0.2.83"), answer.recordData());
+        }
+    }
+
+    @Test
+    void testDnsAnswerStillRefusesAliasCyclesInARootZone() {
+        Route53Service service = newService();
+        String zoneId = service.createHostedZone(".", "answer-root-cycle", null, null).zone().getId();
+        ResourceRecordSet alias = aliasRecord("loop.example.", "loop.example.", false);
+        alias.getAliasTarget().setHostedZoneId(zoneId);
+        service.changeResourceRecordSets(zoneId, List.of(change("CREATE", alias)), null);
+
+        Route53Service.TestDnsAnswerResult answer =
+                service.testDnsAnswer(zoneId, alias.getName(), "A", null, null, null);
+        assertEquals("REFUSED", answer.responseCode());
+        assertEquals(List.of(), answer.recordData());
+    }
+
     private Route53Service newService() {
         return newService(".");
     }

@@ -52,6 +52,8 @@ public class Route53Service implements Resettable, RequestConditionSpelling {
     private static final int MAX_VPC_ASSOCIATION_AUTHORIZATIONS = 1000;
 
     public record CreateZoneResult(HostedZone zone, ChangeInfo change) {}
+    public record TestDnsAnswerResult(String nameserver, String protocol, String recordName, String recordType,
+                                      String responseCode, List<String> recordData) {}
     private record OwnedZone(String accountId, HostedZone zone) {}
 
     private final StorageBackend<String, HostedZone> zoneStore;
@@ -113,6 +115,17 @@ public class Route53Service implements Resettable, RequestConditionSpelling {
             zoneNameCounts(owned.zone().isPrivateZone()).merge(
                     normalizeName(owned.zone().getName()).toLowerCase(), 1, Integer::sum);
         }
+    }
+
+    public TestDnsAnswerResult testDnsAnswer(String hostedZoneId, String recordName, String recordType,
+                                             String resolverIp, String subnetIp, String subnetMask) {
+        String id = Route53TestDnsAnswer.validate(hostedZoneId, recordName, recordType, resolverIp, subnetIp, subnetMask);
+        HostedZone zone = getHostedZoneOwnedByCaller(id);
+        if (zone.isPrivateZone()) {
+            throw new AwsException("InvalidInput", "TestDNSAnswer supports public hosted zones only.", 400);
+        }
+        return Route53TestDnsAnswer.answer(zone, recordStore.get(id).orElse(List.of()),
+                assignedNameServers(zone), recordName, recordType);
     }
 
     public synchronized DelegationSet createReusableDelegationSet(String callerReference, String hostedZoneId) {
@@ -838,7 +851,7 @@ public class Route53Service implements Resettable, RequestConditionSpelling {
                         .toList());
     }
 
-    private static List<ResourceRecordSet> findRecordsForName(String normalizedQname,
+    static List<ResourceRecordSet> findRecordsForName(String normalizedQname,
                                                               List<List<ResourceRecordSet>> zoneRecords) {
         List<ResourceRecordSet> nameMatches = new ArrayList<>();
         List<ResourceRecordSet> wildcardMatches = new ArrayList<>();
@@ -846,7 +859,7 @@ public class Route53Service implements Resettable, RequestConditionSpelling {
         for (List<ResourceRecordSet> records : zoneRecords) {
             List<ResourceRecordSet> zoneWildcards = new ArrayList<>();
             for (ResourceRecordSet rrs : records) {
-                String rName = normalizeName(rrs.getName()).toLowerCase();
+                String rName = normalizeRecordName(rrs.getName());
                 if (rName.equals(normalizedQname)) {
                     nameMatches.add(rrs);
                 } else if (rName.startsWith("*.")) {
@@ -855,13 +868,13 @@ public class Route53Service implements Resettable, RequestConditionSpelling {
             }
             if (nameMatches.isEmpty()) {
                 for (ResourceRecordSet rrs : zoneWildcards) {
-                    String rName = normalizeName(rrs.getName()).toLowerCase();
+                    String rName = normalizeRecordName(rrs.getName());
                     String wildcardSuffix = rName.substring(2); // e.g. "corp.internal."
                     if (normalizedQname.endsWith("." + wildcardSuffix)) {
                         // A wildcard cannot match when the name or an ancestor closer than the wildcard's
                         // parent exists, and a name with records only beneath it exists too (RFC 4592 2.2)
                         boolean closerNameExists = records.stream()
-                                .map(r -> normalizeName(r.getName()).toLowerCase())
+                                .map(r -> normalizeRecordName(r.getName()))
                                 .anyMatch(n -> sharedSuffixLength(n, normalizedQname) > wildcardSuffix.length());
                         if (!closerNameExists) {
                             wildcardMatches.add(rrs);
