@@ -1616,8 +1616,9 @@ public class EventBridgeService implements ResourceProvider, StoredResourceArns 
             node.put("source", source);
             node.put("detail-type", detailType);
             node.put("account", envelopeAccount);
-            Instant time = entry.get("Time") instanceof Instant entryTime ? entryTime : Instant.now();
-            node.put("time", time.truncatedTo(ChronoUnit.SECONDS).toString());
+            Instant time = entry.get("Time") instanceof Instant entryTime
+                    ? entryTime : Instant.now().truncatedTo(ChronoUnit.SECONDS);
+            node.put("time", time.toString());
             node.put("region", envelopeRegion);
             node.putArray("resources").addAll(resources);
             node.set("detail", objectMapper.readTree(detail));
