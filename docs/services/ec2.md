@@ -2401,7 +2401,10 @@ interface of another VPC (its ranges may overlap the instance's) becomes one mor
 instance's protected namespace, carrying the interface's MAC address and primary private IPv4 with its
 subnet prefix. The device gets its own route table, selected by its address
 (`ip rule from <address> lookup <table>`), so a reply to a connection that arrived on it leaves through
-it. The main table gains that VPC's range only when no route the namespace holds overlaps it. The
+it. The table and the rule's priority are the lowest number from 10001 to 32765 that no rule of the
+namespace holds, so the rule comes before the kernel's main rule (32766), whatever the device's interface
+index. An address keeps its table when the device is restored after an emulator restart. The main
+table gains that VPC's range only when no route the namespace holds overlaps it. The
 interface's own security groups are enforced on the device alone: the namespace's base chains send its
 traffic into a chain pair of its own and drop it if that pair returns, while the primary interface's
 rules are unchanged. Peers in the interface's VPC see it as one more interface of that VPC, by its

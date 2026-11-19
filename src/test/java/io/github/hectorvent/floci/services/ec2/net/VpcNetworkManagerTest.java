@@ -53,11 +53,13 @@ import org.mockito.ArgumentCaptor;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -65,6 +67,8 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -278,7 +282,29 @@ class VpcNetworkManagerTest {
         nativeDeviceLifecycle(interfaceAccount, true, false);
     }
 
+    @Test
+    void aDeviceIndexedAbove65535AttachesRestoresAndDetachesOnOneTableThatDetachFrees() {
+        // A host whose containers have come and gone gives new devices interface indexes past 65535.
+        NativeNamespace namespace = nativeDeviceLifecycle("111111111111", true, true, 65_584);
+
+        List<String> scripts = namespace.scripts();
+        assertEquals(3, scripts.size(), "attach, restore and detach: " + scripts);
+        String rule = "ip -4 rule add priority 10001 from 10.0.1.10/32 lookup 10001\n";
+        assertTrue(scripts.get(0).contains(rule), scripts.get(0));
+        assertTrue(scripts.get(1).contains(rule), scripts.get(1));
+        assertTrue(scripts.get(2).contains("while ip -4 rule del priority 10001 2>/dev/null; do :; done\n"), scripts.get(2));
+        assertTrue(scripts.get(2).contains("ip -4 route flush table 10001\n"), scripts.get(2));
+        assertTrue(scripts.get(2).contains("nft delete table inet floci_vpc_attached_1 "), scripts.get(2));
+        assertTrue(scripts.stream().noneMatch(script -> script.contains("65584") || script.contains("75584")), scripts.toString());
+        assertTrue(namespace.rules().isEmpty(), "detach frees the table: " + namespace.rules());
+    }
+
     private void nativeDeviceLifecycle(String interfaceAccount, boolean recreateManager, boolean restoreDevice) {
+        nativeDeviceLifecycle(interfaceAccount, recreateManager, restoreDevice, 2);
+    }
+
+    private NativeNamespace nativeDeviceLifecycle(String interfaceAccount, boolean recreateManager,
+                                                  boolean restoreDevice, int ifindex) {
         enableAddressSpaceIsolation();
         RegionResolver resolver = mock(RegionResolver.class);
         when(resolver.getAccountId()).thenReturn(interfaceAccount);
@@ -325,7 +351,7 @@ class VpcNetworkManagerTest {
                     "NetworkID", network, "IPAddress", "172.20.0.2", "IPPrefixLen", 16), ContainerNetwork.class));
             return null;
         });
-        stubNativeDeviceCommands(mac, address);
+        NativeNamespace namespace = stubNativeDeviceCommands(mac, address, ifindex);
 
         assertEquals(Optional.of("eth2"), manager.attachInterfaceAcrossAddressSpaces(REGION, "vpc-default",
                 "subnet-default", "helper", "111111111111", address, mac, interfaceAccount));
@@ -347,10 +373,26 @@ class VpcNetworkManagerTest {
         verify(create).exec();
         verify(docker.disconnectFromNetworkCmd()).withNetworkId(network);
         assertEquals("111111111111", resolver.getAccountId());
+        return namespace;
     }
 
-    private void stubNativeDeviceCommands(String mac, String address) {
+    /** The scripts run in the protected namespace, and the source rules they leave there by priority. */
+    private record NativeNamespace(List<String> scripts, Map<Integer, String> rules) {}
+
+    private static final Pattern RULE_ADDED = Pattern.compile("ip -4 rule add priority (\\d+) from ([0-9.]+)/32 lookup \\1\n");
+    private static final Pattern RULE_DELETED = Pattern.compile("while ip -4 rule del priority (\\d+) ");
+
+    private NativeNamespace stubNativeDeviceCommands(String mac, String address, int ifindex) {
+        NativeNamespace namespace = new NativeNamespace(new ArrayList<>(), new TreeMap<>());
+        List<String> command = new ArrayList<>();
         ExecCreateCmd create = mock(ExecCreateCmd.class, RETURNS_SELF);
+        when(create.withCmd(any(String[].class))).thenAnswer(call -> {
+            Object[] args = call.getArguments();
+            command.clear();
+            command.addAll(Arrays.asList(args.length == 1 && args[0] instanceof String[] array
+                    ? array : Arrays.copyOf(args, args.length, String[].class)));
+            return create;
+        });
         ExecCreateCmdResponse created = mock(ExecCreateCmdResponse.class);
         when(created.getId()).thenReturn("native-device-exec");
         when(create.exec()).thenReturn(created);
@@ -364,14 +406,39 @@ class VpcNetworkManagerTest {
         when(docker.execStartCmd("native-device-exec")).thenReturn(start);
         when(start.exec(any())).thenAnswer(call -> {
             ResultCallback.Adapter<Frame> callback = call.getArgument(0);
-            String output = """
-                    [{"ifname":"eth2","ifindex":2,"address":"%s",
-                      "addr_info":[{"family":"inet","local":"%s","prefixlen":24}]}]
-                    """.formatted(mac, address);
-            callback.onNext(new Frame(StreamType.STDOUT, output.getBytes(StandardCharsets.UTF_8)));
+            String output;
+            if (command.size() == 3 && command.get(0).equals("sh")) {
+                String script = command.get(2);
+                namespace.scripts().add(script);
+                Matcher deleted = RULE_DELETED.matcher(script);
+                if (deleted.find()) {
+                    namespace.rules().remove(Integer.parseInt(deleted.group(1)));
+                }
+                Matcher added = RULE_ADDED.matcher(script);
+                if (added.find()) {
+                    namespace.rules().put(Integer.parseInt(added.group(1)), added.group(2));
+                }
+                output = "";
+            } else if (command.contains("rule")) {
+                // As iproute2 prints them: a /32 source carries no srclen.
+                StringBuilder rules = new StringBuilder("[{\"priority\":0,\"src\":\"all\",\"table\":\"local\"},");
+                namespace.rules().forEach((priority, source) -> rules.append(
+                        "{\"priority\":%d,\"src\":\"%s\",\"table\":\"%d\"},".formatted(priority, source, priority)));
+                output = rules.append("{\"priority\":32766,\"src\":\"all\",\"table\":\"main\"},"
+                        + "{\"priority\":32767,\"src\":\"all\",\"table\":\"default\"}]").toString();
+            } else {
+                output = """
+                        [{"ifname":"eth2","ifindex":%d,"address":"%s",
+                          "addr_info":[{"family":"inet","local":"%s","prefixlen":24}]}]
+                        """.formatted(ifindex, mac, address);
+            }
+            if (!output.isEmpty()) {
+                callback.onNext(new Frame(StreamType.STDOUT, output.getBytes(StandardCharsets.UTF_8)));
+            }
             callback.onComplete();
             return callback;
         });
+        return namespace;
     }
 
     @Test
