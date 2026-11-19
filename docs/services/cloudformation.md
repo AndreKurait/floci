@@ -214,7 +214,7 @@ cross-resource references.
 | IAM | `Role`, `User` (template `LoginProfile` and `PermissionsBoundary` are ignored; an API-created login profile is removed on delete), `AccessKey`, `Policy`, `ManagedPolicy`, `InstanceProfile` |
 | Organizations | `Organization`, `OrganizationalUnit`, `Account`, `Policy`, `ResourcePolicy` |
 | SSM | `Parameter` |
-| KMS | `Key` (created with `Description`, `KeyPolicy`, `KeySpec`, `KeyUsage`, `Origin`, `MultiRegion`, `Enabled`, `EnableKeyRotation` and `Tags`; updated in place for `Description`, `KeyPolicy`, `Enabled`, `EnableKeyRotation` and `Tags`, keeping tags added outside the stack; a template that drops `Description`, `Enabled` or `EnableKeyRotation` clears the description, enables the key and turns rotation off, a dropped `KeyPolicy` keeps the current policy, and one the stack never declared keeps the value set outside it; a rotation change on a key that stays disabled fails, as AWS raises `DisabledException`; a change to `KeySpec`, `KeyUsage`, `Origin` or `MultiRegion` fails the update, as on AWS, and the stack rolls back), `Alias` |
+| KMS | `Key` (created with `Description`, `KeyPolicy`, `KeySpec`, `KeyUsage`, `Origin`, `MultiRegion`, `Enabled`, `EnableKeyRotation` and `Tags`; updated in place for `Description`, `KeyPolicy`, `Enabled`, `EnableKeyRotation` and `Tags`, keeping tags added outside the stack; a template that drops `Description`, `Enabled` or `EnableKeyRotation` clears the description, enables the key and turns rotation off, a dropped `KeyPolicy` restores the account default, and one the stack never declared keeps the value set outside it; a rotation change on a key that stays disabled fails, as AWS raises `DisabledException`; a change to `KeySpec`, `KeyUsage`, `Origin` or `MultiRegion` fails the update, as on AWS, and the stack rolls back), `Alias` |
 | Secrets Manager | `Secret`, `SecretTargetAttachment` |
 | ECR | `Repository` |
 | ECS | `Cluster`, `TaskDefinition`, `Service`, `CapacityProvider`, `ClusterCapacityProviderAssociations` |
@@ -921,7 +921,7 @@ while the route's authorization type stays `JWT` or `CUSTOM`. An `Instance`'s dr
 cleared: a running instance is stopped for the rewrite and started again, and a stopped one stays stopped.
 An `Alias`'s, a `Secret`'s and a `UserPoolGroup`'s dropped `Description` and a `Trail`'s dropped
 `S3KeyPrefix` are cleared. A dropped `RoutingConfig` removes the alias weights. A key's dropped `Description` is cleared, its dropped `Enabled` enables it and its dropped
-`EnableKeyRotation` turns rotation off; a dropped `KeyPolicy` keeps the policy. The other members of
+`EnableKeyRotation` turns rotation off; a dropped `KeyPolicy` restores the account default. The other members of
 those five types are kept or create-only when dropped, as the drop policy table lists them, except a
 `Secret`'s `Tags`, which every update drives to the template.
 An update that drops a `PrefixList`'s `AddressFamily` or `PrefixListName`, or a `Route`'s or
