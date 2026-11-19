@@ -15,9 +15,12 @@ import io.floci.aws.services.s3.model.PutObjectOptions;
 import io.floci.aws.services.s3.model.S3Object;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -48,6 +51,48 @@ class S3DefaultEncryptionStorageTest {
 
     @TempDir
     Path directory;
+
+    @ParameterizedTest
+    @MethodSource("streamVariants")
+    void objectStreamsReturnPlaintextForEveryVersionForm(String mode, String versionForm, boolean encrypted)
+            throws IOException {
+        EmulatorConfig config = storageConfig(mode);
+        ServiceConfigAccess access = mock(ServiceConfigAccess.class);
+        when(access.storageMode(anyString())).thenReturn(mode);
+        when(access.storageFlushInterval(anyString())).thenReturn(3_600_000L);
+        StorageFactory factory = new StorageFactory(config, access);
+        try {
+            S3Service service = service(factory, config);
+            service.createBucket(BUCKET, "us-east-1");
+            if (encrypted) {
+                service.putBucketEncryption(BUCKET, kmsDefault());
+            }
+            if (!"null".equals(versionForm)) {
+                service.putBucketVersioning(BUCKET, "Enabled");
+            }
+            S3Object original = service.putObject(BUCKET, "stream", DATA, "text/plain", Map.of());
+            byte[] replacement = "replacement inventory".getBytes(StandardCharsets.UTF_8);
+            service.putObject(BUCKET, "stream", replacement, "text/plain", Map.of());
+            String versionId = switch (versionForm) {
+                case "version" -> original.getVersionId();
+                case "null" -> "null";
+                default -> null;
+            };
+            byte[] expected = "version".equals(versionForm) ? DATA : replacement;
+            try (InputStream stream = service.openObjectStream(BUCKET, "stream", versionId)) {
+                assertArrayEquals(expected, stream.readAllBytes());
+            }
+        } finally {
+            factory.shutdownAll();
+        }
+    }
+
+    private static Stream<Arguments> streamVariants() {
+        return Stream.of("memory", "persistent", "hybrid", "wal")
+                .flatMap(mode -> Stream.of("current", "null", "version")
+                        .flatMap(version -> Stream.of(false, true)
+                                .map(encrypted -> Arguments.of(mode, version, encrypted))));
+    }
 
     @ParameterizedTest
     @ValueSource(strings = {"memory", "persistent", "hybrid", "wal"})
