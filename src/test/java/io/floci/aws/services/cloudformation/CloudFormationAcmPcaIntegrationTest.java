@@ -149,6 +149,37 @@ class CloudFormationAcmPcaIntegrationTest {
         }
     }
 
+    @Test
+    void laterResourceFailureRestoresAuthorityTagsAndKeepsTheCommittedSnapshotFresh() {
+        String account = Long.toString(840_000_000_000L + Integer.toUnsignedLong(UUID.randomUUID().hashCode()));
+        try (CloudFormationClient cfn = AwsTestClients.create(CloudFormationClient.builder(), account, Region.US_EAST_1);
+             AcmPcaClient pca = AwsTestClients.create(AcmPcaClient.builder(), account, Region.US_EAST_1)) {
+            String stack = "pca-rollback-" + UUID.randomUUID().toString().substring(0, 8);
+            String initial = template("Pending CA", "{\"Key\":\"team\",\"Value\":\"original\"}");
+            String stackId = cfn.createStack(request -> request.stackName(stack).templateBody(initial)).stackId();
+            try {
+                Map<String, String> before = outputs(CfnStackWaits.awaitStatus(cfn, stack, "CREATE_COMPLETE"));
+                String arn = before.get("Arn");
+                String committed = template("Pending CA", "{\"Key\":\"team\",\"Value\":\"committed\"}");
+                cfn.updateStack(request -> request.stackName(stack).templateBody(committed));
+                CfnStackWaits.awaitStatus(cfn, stack, "UPDATE_COMPLETE");
+                String changed = template("Pending CA", "{\"Key\":\"added\",\"Value\":\"temporary\"}")
+                        .replace("\"Resources\": {", "\"Resources\": {\"Failure\": {"
+                                + "\"Type\":\"AWS::SecretsManager::Secret\",\"DependsOn\":\"Authority\","
+                                + "\"Properties\":{\"SecretString\":\"explicit\","
+                                + "\"GenerateSecretString\":{\"PasswordLength\":32}}},");
+                cfn.updateStack(request -> request.stackName(stack).templateBody(changed));
+                Stack rolledBack = CfnStackWaits.awaitStatus(cfn, stack, "UPDATE_ROLLBACK_COMPLETE");
+                assertEquals(before, outputs(rolledBack));
+                assertEquals(Map.of("team", "committed"), tags(pca, arn));
+                assertEquals("PENDING_CERTIFICATE", describe(pca, arn).statusAsString());
+            } finally {
+                cfn.deleteStack(request -> request.stackName(stack));
+                CfnStackWaits.awaitStatus(cfn, stackId, "DELETE_COMPLETE");
+            }
+        }
+    }
+
     private static String revocationTemplate(String mechanism, boolean enabled) {
         return template("Pending CA", "{\"Key\": \"team\", \"Value\": \"updated\"}")
                 .replace("\"UsageMode\": \"GENERAL_PURPOSE\",", "\"UsageMode\": \"GENERAL_PURPOSE\","
