@@ -2362,6 +2362,26 @@ class IamEnforcementFilterTest {
         assertTrue(sqs.contains("<Code>AccessDenied</Code>"), sqs);
     }
 
+    /**
+     * EC2 refuses with {@code UnauthorizedOperation}, a 403, in its own {@code <Response><Errors><Error>} envelope with a
+     * {@code <RequestID>} (the EC2 API Reference's error codes and error response format), the one its query protocol
+     * parses; the {@code <ErrorResponse>} of other Query services is not decoded by EC2 clients.
+     */
+    @Test
+    void ec2RefusesWithUnauthorizedOperationInItsOwnEnvelope() {
+        Response r = IamEnforcementFilter.accessDeniedResponse(
+                "ec2:AssignIpv6Addresses", "ec2", MediaType.APPLICATION_FORM_URLENCODED_TYPE);
+
+        assertEquals(403, r.getStatus());
+        assertEquals(MediaType.APPLICATION_XML_TYPE, r.getMediaType());
+        String body = entityString(r);
+        assertTrue(body.contains("<Response><Errors><Error><Code>UnauthorizedOperation</Code><Message>"), body);
+        assertTrue(body.contains("You are not authorized to perform this operation. "
+                + "User is not authorized to perform: ec2:AssignIpv6Addresses</Message></Error></Errors><RequestID>"), body);
+        assertTrue(!body.contains("<ErrorResponse>"), body);
+        assertTrue(!body.contains("AccessDenied"), body);
+    }
+
     @Test
     void s3GetsS3FlavoredXmlError() {
         // S3 — credential-scope is "s3"; S3 errors are <Error>... at the root, no <ErrorResponse> wrapper.

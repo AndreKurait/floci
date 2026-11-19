@@ -1811,7 +1811,9 @@ IAM authorization denials return HTTP 403 `AccessDeniedException` for KMS, SSM, 
 REST-JSON requests. Other AWS JSON 1.0/1.1 requests return HTTP 400 `AccessDeniedException`; AWS Query and S3
 requests retain HTTP 403 XML `AccessDenied` responses, except SNS's, which return HTTP 403
 `AuthorizationError`, the error every SNS operation lists for a caller denied access, whichever
-action is denied. The routed protocol determines the status, not just the request's content type.
+action is denied, and EC2's, which return HTTP 403 `UnauthorizedOperation` in EC2's own
+`<Response><Errors><Error>` envelope with a `<RequestID>`, the format EC2's query protocol parses.
+The routed protocol determines the status, not just the request's content type.
 
 A request is checked against the resources it names. Floci builds their ARNs itself for S3, Lambda,
 SQS, SNS, DynamoDB, Kinesis, SSM, KMS, IAM, Resource Groups, EventBridge Scheduler, EventBridge

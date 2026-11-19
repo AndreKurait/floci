@@ -10,7 +10,6 @@ import io.github.hectorvent.floci.testing.PartitionCleanup;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
-import io.restassured.path.xml.XmlPath;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.RegisterExtension;
 import software.amazon.awssdk.regions.Region;
@@ -172,14 +171,12 @@ class Ec2PlacementGroupIamIntegrationTest {
     private static void denied(String operation, Runnable action) {
         Ec2Exception exception = assertThrows(Ec2Exception.class, action::run);
         assertEquals(403, exception.statusCode());
-        // This branch retains the generic Query IAM envelope, which the EC2 SDK does not decode.
-        assertNotNull(exception.awsErrorDetails().rawResponse());
-        XmlPath error = XmlPath.from(exception.awsErrorDetails().rawResponse().asUtf8String());
-        assertEquals("Sender", error.getString("ErrorResponse.Error.Type"));
-        assertEquals("AccessDenied", error.getString("ErrorResponse.Error.Code"));
-        assertEquals("User is not authorized to perform: ec2:" + operation,
-                error.getString("ErrorResponse.Error.Message"));
-        assertFalse(error.getString("ErrorResponse.RequestId").isBlank());
+        // EC2's own envelope, which the EC2 SDK decodes: UnauthorizedOperation, with its message and request id.
+        assertEquals("UnauthorizedOperation", exception.awsErrorDetails().errorCode());
+        assertEquals("You are not authorized to perform this operation. User is not authorized to perform: ec2:"
+                + operation, exception.awsErrorDetails().errorMessage());
+        assertNotNull(exception.requestId());
+        assertFalse(exception.requestId().isBlank());
     }
 
     private static String arn(String name) {
