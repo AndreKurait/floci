@@ -13,6 +13,8 @@ on:
     paths:
       - 'src/**'
       - 'pom.xml'
+      - 'mvnw'
+      - '.mvn/wrapper/maven-wrapper.properties'
       - '.github/ci/**'
       - '.github/workflows/ci.yml'
   pull_request:
@@ -22,6 +24,8 @@ on:
     paths:
       - 'src/**'
       - 'pom.xml'
+      - 'mvnw'
+      - '.mvn/wrapper/maven-wrapper.properties'
       - '.github/ci/**'
       - '.github/workflows/ci.yml'
   # Runs each merge queue entry against main plus the PRs queued ahead of it. paths does not
