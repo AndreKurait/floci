@@ -43,6 +43,7 @@ import java.util.stream.IntStream;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
@@ -151,6 +152,7 @@ class Ec2HotAttachedRestartDockerIntegrationTest {
             CompletableFuture<Void> started = new CompletableFuture<>();
             runtime.start(instance, () -> started.complete(null));
             started.get(30, TimeUnit.SECONDS);
+            assertPrimaryDefaultRoute(guest);
             assertTrue(run(guest, "ip", "-j", "link").contains(MAC));
             assertEquals(0L, ContainerExec.run(docker, peer, new String[]{"ping", "-c", "1", "-W", "2", address}, 5)
                     .throwIfTimedOut(peer).exitCode());
@@ -159,7 +161,7 @@ class Ec2HotAttachedRestartDockerIntegrationTest {
             rebooted.get(30, TimeUnit.SECONDS);
             assertTrue(runtime.restoreMetadataRegistration(instance));
             assertTrue(run(guest, "ip", "-j", "link").contains(MAC));
-            assertEquals(originalDefaultRoute, run(guest, "ip", "-4", "route", "show", "default"));
+            assertPrimaryDefaultRoute(guest);
             docker.stopContainerCmd(guest).withTimeout(1).exec();
             docker.startContainerCmd(guest).exec();
             recreateAttachedEndpoint(guest, network, address, peer);
@@ -206,6 +208,7 @@ class Ec2HotAttachedRestartDockerIntegrationTest {
             assertFalse(remainingLinks.contains(MAC));
             assertTrue(remainingLinks.contains(primaryMacBeforeRecovery), remainingLinks);
             assertTrue(docker.inspectContainerCmd(guest).exec().getNetworkSettings().getNetworks().containsKey("bridge"));
+            assertPrimaryDefaultRoute(guest);
             assertTrue(docker.inspectContainerCmd(peer).exec().getNetworkSettings().getNetworks().containsKey(network));
             assertNotEquals(0L, ContainerExec.run(docker, peer, new String[]{"ping", "-c", "1", "-W", "1", address}, 5)
                     .throwIfTimedOut(peer).exitCode());
@@ -230,6 +233,27 @@ class Ec2HotAttachedRestartDockerIntegrationTest {
                 // The failed attach may not have created the owned network.
             }
         }
+    }
+
+    private void assertPrimaryDefaultRoute(String guest) throws Exception {
+        ContainerNetwork primary = docker.inspectContainerCmd(guest).exec().getNetworkSettings()
+                .getNetworks().get("bridge");
+        assertNotNull(primary, "The primary bridge endpoint must remain attached");
+        ObjectMapper mapper = new ObjectMapper();
+        JsonNode routes = mapper.readTree(run(guest, "ip", "-j", "-4", "route", "show", "default"));
+        assertTrue(routes.isArray(), routes.toString());
+        assertEquals(1, routes.size(), routes.toString());
+        JsonNode route = routes.get(0);
+        assertEquals(primary.getGateway(), route.path("gateway").asText(), route.toString());
+        String device = route.path("dev").asText();
+        assertFalse(device.isBlank(), route.toString());
+        JsonNode links = mapper.readTree(run(guest, "ip", "-j", "link", "show", "dev", device));
+        assertTrue(links.isArray(), links.toString());
+        assertEquals(1, links.size(), links.toString());
+        String primaryMac = primary.getMacAddress();
+        assertNotNull(primaryMac, "The primary bridge endpoint must report its MAC");
+        assertTrue(primaryMac.equalsIgnoreCase(links.get(0).path("address").asText()),
+                "The default route must use the primary bridge endpoint: " + route + ", " + links);
     }
 
     private void recreateAttachedEndpoint(String guest, String network, String address, String peer) {
