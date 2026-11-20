@@ -60,6 +60,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.LongSupplier;
+import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
 /**
@@ -250,6 +251,11 @@ public class ContainerLifecycleManager {
         return imageCacheService.resolveForLaunch(image, behavior, platform, credentials);
     }
 
+    public LaunchImage resolveImageForLaunchWithCredentials(String image, ImagePullBehavior behavior, String platform,
+                                                            Supplier<AuthConfig> credentials) {
+        return imageCacheService.resolveForLaunchWithCredentials(image, behavior, platform, credentials);
+    }
+
     /**
      * Creates a container without starting it. Use {@link #startCreated} to
      * start it after any pre-start setup (e.g. copying files into the
@@ -277,6 +283,11 @@ public class ContainerLifecycleManager {
 
     public String create(ContainerSpec spec, String platform, AuthConfig credentials) {
         String resolvedImage = imageCacheService.ensureImageExists(spec.image(), platform, credentials);
+        return create(spec, resolvedImage, platform);
+    }
+
+    public String createWithCredentials(ContainerSpec spec, String platform, Supplier<AuthConfig> credentials) {
+        String resolvedImage = imageCacheService.ensureImageExistsWithCredentials(spec.image(), platform, credentials);
         return create(spec, resolvedImage, platform);
     }
 

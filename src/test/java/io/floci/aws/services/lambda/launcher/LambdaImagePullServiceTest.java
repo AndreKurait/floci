@@ -30,6 +30,7 @@ import java.util.Base64;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -268,6 +269,10 @@ class LambdaImagePullServiceTest {
 
     private static String policy(String statements) {
         return "{\"Statement\":[" + statements + "]}";
+    }
+
+    private static String header(Supplier<AuthConfig> credentials) {
+        return header(credentials.get());
     }
 
     private static String header(AuthConfig credentials) {

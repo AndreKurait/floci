@@ -611,7 +611,7 @@ public class LambdaWebEnvironmentManager implements ContainerTeardown {
                     throw new AwsException("AccessDeniedException", "The runtime image-pull identity is unavailable", 403);
                 }
                 containerId = imagePulls.withRolePull(image, revision.serviceConfig.executionRoleArn, fn.functionArn,
-                        credential -> lifecycleManager.create(spec, null, credential));
+                        credential -> lifecycleManager.createWithCredentials(spec, null, credential));
             } else {
                 containerId = lifecycleManager.create(spec);
             }

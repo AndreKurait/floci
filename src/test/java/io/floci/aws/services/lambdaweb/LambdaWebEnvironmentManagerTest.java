@@ -27,6 +27,7 @@ import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -123,6 +124,7 @@ class LambdaWebEnvironmentManagerTest {
         EcrWorkloadImagePull pulls = mock(EcrWorkloadImagePull.class);
         AuthConfig credential = new AuthConfig().withRegistryAddress("localhost:4566")
                 .withUsername("AWS").withPassword("scoped");
+        Supplier<AuthConfig> credentialSource = () -> credential;
         SessionCreds session = new SessionCreds("ASIAWEB", "owned-test-secret", "owned-test-session");
         when(credentials.forRole(role, "000000000000", "fn")).thenReturn(Optional.of(session));
         when(metadata.register("us-east-1")).thenReturn("owned-token");
@@ -131,10 +133,10 @@ class LambdaWebEnvironmentManagerTest {
         when(registry.rewriteImageUri(image)).thenReturn(image);
         when(containerBuilder.newContainer(image)).thenReturn(mock(ContainerBuilder.Builder.class, RETURNS_SELF));
         when(pulls.withRolePull(eq(image), eq(role), eq(source), any())).thenAnswer(invocation -> {
-            Function<AuthConfig, String> operation = invocation.getArgument(3);
-            return operation.apply(credential);
+            Function<Supplier<AuthConfig>, String> operation = invocation.getArgument(3);
+            return operation.apply(credentialSource);
         });
-        when(lifecycle.create(null, null, credential)).thenThrow(new IllegalStateException("Owned pull failed"));
+        when(lifecycle.createWithCredentials(null, null, credentialSource)).thenThrow(new IllegalStateException("Owned pull failed"));
         LambdaWebEnvironmentManager manager = new LambdaWebEnvironmentManager(config, containerBuilder, lifecycle,
                 mock(DockerClient.class), images, registry, mock(LambdaWebCode.class), mock(ZipExtractor.class),
                 mock(LaunchedContainerAwsEnv.class), credentials, executionRole, metadata,
@@ -142,7 +144,7 @@ class LambdaWebEnvironmentManagerTest {
         try {
             assertEquals("Owned pull failed", assertThrows(IllegalStateException.class, () -> acquire(manager)).getMessage());
             verify(pulls).withRolePull(eq(image), eq(role), eq(source), any());
-            verify(lifecycle).create(null, null, credential);
+            verify(lifecycle).createWithCredentials(null, null, credentialSource);
             verify(lifecycle, never()).create(any());
             verify(credentials).unregister("000000000000", "ASIAWEB");
             verify(metadata).forget("owned-token");

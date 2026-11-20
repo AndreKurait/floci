@@ -17,12 +17,14 @@ import org.junit.jupiter.api.Test;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
+import java.time.Instant;
 import java.util.Base64;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -41,7 +43,9 @@ class EcrWorkloadImagePullTest {
     private EcrRegistryAuthorization authorization;
     private EcrWorkloadImagePull pulls;
     private Repository repository;
-    private Function<AuthConfig, String> cachedPull;
+    private Function<Supplier<AuthConfig>, String> cachedPull;
+    private Clock clock;
+    private Instant started;
 
     @BeforeEach
     @SuppressWarnings("unchecked")
@@ -59,8 +63,11 @@ class EcrWorkloadImagePullTest {
         repository = new Repository();
         repository.getTags().put("purpose", "workload");
         when(ecr.registryRepository("image", ACCOUNT, REGION)).thenReturn(Optional.of(repository));
+        clock = mock(Clock.class);
+        started = Instant.parse("2026-11-19T00:00:00Z");
+        when(clock.instant()).thenReturn(started);
         authorization = new EcrRegistryAuthorization(AccountAwareStorageBackend.inMemory(ACCOUNT),
-                iam, new IamPolicyEvaluator(new ObjectMapper()), mock(RequestContext.class), config, Clock.systemUTC());
+                iam, new IamPolicyEvaluator(new ObjectMapper()), mock(RequestContext.class), config, clock);
         pulls = new EcrWorkloadImagePull(ecr, authorization);
         cachedPull = mock(Function.class);
     }
@@ -133,8 +140,9 @@ class EcrWorkloadImagePullTest {
         AtomicReference<String> header = new AtomicReference<>();
         AtomicReference<AuthConfig> retained = new AtomicReference<>();
         assertThrows(IllegalStateException.class, () -> pulls.withRolePull(IMAGE, ROLE, SOURCE, credentials -> {
-            retained.set(credentials);
-            header.set(header(credentials));
+            AuthConfig attempt = credentials.get();
+            retained.set(attempt);
+            header.set(header(attempt));
             assertNotNull(authorization.authenticate(header.get(), REGION));
             throw new IllegalStateException("Docker pull failed");
         }));
@@ -186,6 +194,76 @@ class EcrWorkloadImagePullTest {
         when(config.services().iam().enforcementEnabled()).thenReturn(false);
         assertEquals("image-id", pulls.withEmrServerlessPull(IMAGE, null, cachedPull));
         verifyNoInteractions(ecr);
+    }
+
+    @Test
+    void roleCredentialRemainsUsableAfterWaitingBeyondLeaseExpiry() {
+        assertEquals("image-id", pulls.withRolePull(IMAGE, ROLE, SOURCE, credential -> {
+            when(clock.instant()).thenReturn(started.plusSeconds(301));
+            assertNotNull(authorization.authenticate(header(credential), REGION));
+            return "image-id";
+        }));
+    }
+
+    @Test
+    void emrCredentialRemainsUsableAfterWaitingBeyondLeaseExpiry() {
+        String source = "arn:aws:emr-serverless:us-east-1:111111111111:/applications/app";
+        repository.setRepositoryPolicyText("""
+                {"Statement":{"Effect":"Allow","Principal":{"Service":"emr-serverless.amazonaws.com"},
+                "Action":["ecr:BatchGetImage","ecr:GetDownloadUrlForLayer","ecr:DescribeImages"],"Resource":"*"}}
+                """);
+        assertEquals("image-id", pulls.withEmrServerlessPull(IMAGE, source, credential -> {
+            when(clock.instant()).thenReturn(started.plusSeconds(301));
+            assertNotNull(authorization.authenticate(header(credential), REGION));
+            return "image-id";
+        }));
+    }
+
+    @Test
+    void eachAttemptReplacesAndRevokesItsCredentialAndEscapedSupplierCannotIssueAfterCompletion() {
+        AtomicReference<Supplier<AuthConfig>> escaped = new AtomicReference<>();
+        AtomicReference<String> lastHeader = new AtomicReference<>();
+        assertEquals("image-id", pulls.withRolePull(IMAGE, ROLE, SOURCE, credentials -> {
+            escaped.set(credentials);
+            AuthConfig first = credentials.get();
+            String firstHeader = header(first);
+            assertNotNull(authorization.authenticate(firstHeader, REGION));
+            AuthConfig second = credentials.get();
+            assertNull(first.getPassword());
+            assertThrows(AwsException.class, () -> authorization.authenticate(firstHeader, REGION));
+            String secondHeader = header(second);
+            assertNotNull(authorization.authenticate(secondHeader, REGION));
+            when(clock.instant()).thenReturn(started.plusSeconds(301));
+            AuthConfig third = credentials.get();
+            assertNull(second.getPassword());
+            lastHeader.set(header(third));
+            assertNotNull(authorization.authenticate(lastHeader.get(), REGION));
+            return "image-id";
+        }));
+        assertThrows(AwsException.class, () -> authorization.authenticate(lastHeader.get(), REGION));
+        assertThrows(IllegalStateException.class, () -> escaped.get().get());
+    }
+
+    @Test
+    void refreshRechecksRepositoryPolicyAndRevokesThePriorCredentialWhenDenied() {
+        AtomicReference<String> header = new AtomicReference<>();
+        AtomicReference<AuthConfig> issued = new AtomicReference<>();
+        assertThrows(AwsException.class, () -> pulls.withRolePull(IMAGE, ROLE, SOURCE, credentials -> {
+            AuthConfig first = credentials.get();
+            issued.set(first);
+            header.set(header(first));
+            repository.setRepositoryPolicyText("""
+                    {"Statement":{"Effect":"Deny","Principal":"*","Action":"ecr:*","Resource":"*"}}
+                    """);
+            credentials.get();
+            return "must-not-launch";
+        }));
+        assertNull(issued.get().getPassword());
+        assertThrows(AwsException.class, () -> authorization.authenticate(header.get(), REGION));
+    }
+
+    private static String header(Supplier<AuthConfig> credentials) {
+        return header(credentials.get());
     }
 
     private static String header(AuthConfig credentials) {

@@ -58,6 +58,7 @@ import java.util.Properties;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.stream.Stream;
 import java.util.zip.GZIPInputStream;
 import java.util.zip.GZIPOutputStream;
@@ -730,16 +731,17 @@ class EmrServerlessSparkRunnerTest {
         String application = "arn:aws:emr-serverless:eu-west-1:123456789012:/applications/app";
         AuthConfig credential = new AuthConfig().withRegistryAddress("localhost:5100")
                 .withUsername("AWS").withPassword("scoped");
+        Supplier<AuthConfig> credentialSource = () -> credential;
         EcrWorkloadImagePull pulls = mock(EcrWorkloadImagePull.class);
         when(config.services().iam().enforcementEnabled()).thenReturn(true);
         when(builder.newContainer(anyString())).thenReturn(spec);
         when(builder.resolveImage(image)).thenReturn(image);
         when(ecr.rewriteImageUri(custom)).thenReturn(image);
         when(pulls.withEmrServerlessPull(eq(image), eq(application), any())).thenAnswer(invocation -> {
-            Function<AuthConfig, LaunchImage> operation = invocation.getArgument(2);
-            return operation.apply(credential);
+            Function<Supplier<AuthConfig>, LaunchImage> operation = invocation.getArgument(2);
+            return operation.apply(credentialSource);
         });
-        when(lifecycle.resolveImageForLaunch(image, ImagePullBehavior.DEFAULT, "linux/arm64", credential))
+        when(lifecycle.resolveImageForLaunchWithCredentials(image, ImagePullBehavior.DEFAULT, "linux/arm64", credentialSource))
                 .thenReturn(new LaunchImage("sha256:pulled", "sha256:manifest"));
         EmrServerlessSparkRunner runner = runner(builder, pulls);
         when(lifecycle.create(any(), eq("linux/arm64"))).thenReturn("driver");
@@ -750,7 +752,7 @@ class EmrServerlessSparkRunnerTest {
                 .withPlatform("linux/arm64"), progress);
 
         verify(pulls, times(2)).withEmrServerlessPull(eq(image), eq(application), any());
-        verify(lifecycle, times(2)).resolveImageForLaunch(image, ImagePullBehavior.DEFAULT, "linux/arm64", credential);
+        verify(lifecycle, times(2)).resolveImageForLaunchWithCredentials(image, ImagePullBehavior.DEFAULT, "linux/arm64", credentialSource);
         verify(lifecycle, never()).resolveImageForLaunch(image, ImagePullBehavior.DEFAULT, "linux/arm64");
         verify(builder).newContainer("sha256:pulled");
         verify(progress).imageResolved(SparkJobRunner.WorkerType.DRIVER, "sha256:manifest");

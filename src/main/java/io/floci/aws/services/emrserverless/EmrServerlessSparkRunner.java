@@ -1133,7 +1133,7 @@ public class EmrServerlessSparkRunner implements SparkJobRunner, ContainerTeardo
                 throw new AwsException("AccessDeniedException", "The application's image-pull identity is unavailable", 403);
             }
             launched = imagePulls.withEmrServerlessPull(image, job.imagePullSourceArn(),
-                    credentials -> lifecycleManager.resolveImageForLaunch(
+                    credentials -> lifecycleManager.resolveImageForLaunchWithCredentials(
                             image, ImagePullBehavior.DEFAULT, job.platform(), credentials));
         } else {
             launched = lifecycleManager.resolveImageForLaunch(image, ImagePullBehavior.DEFAULT, job.platform());
