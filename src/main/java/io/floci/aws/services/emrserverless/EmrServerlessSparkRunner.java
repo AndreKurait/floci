@@ -7,6 +7,7 @@ import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.StreamType;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.config.EmulatorConfig.EcsServiceConfig.ImagePullBehavior;
+import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.ContainerTeardown;
 import io.floci.aws.core.common.RequestScopes;
@@ -23,6 +24,7 @@ import io.floci.aws.core.common.docker.ContainerStorageHelper;
 import io.floci.aws.core.common.docker.LaunchedContainerAwsEnv;
 import io.floci.aws.core.common.docker.RetryingTarCopier;
 import io.floci.aws.services.ecr.registry.EcrRegistryManager;
+import io.floci.aws.services.ecr.registry.EcrWorkloadImagePull;
 import io.floci.aws.services.iam.model.SessionCreds;
 import io.floci.aws.services.lambda.launcher.ImageCacheService.LaunchImage;
 import io.floci.aws.services.lambda.launcher.LambdaExecutionRoleCredentials;
@@ -490,6 +492,7 @@ public class EmrServerlessSparkRunner implements SparkJobRunner, ContainerTeardo
     private final LambdaExecutionRoleCredentials roleCredentials;
     private final S3Service s3Service;
     private final EcrRegistryManager ecrRegistryManager;
+    private final EcrWorkloadImagePull imagePulls;
     private final EmulatorConfig config;
     private final Clock clock;
     private final Duration pollInterval;
@@ -498,9 +501,18 @@ public class EmrServerlessSparkRunner implements SparkJobRunner, ContainerTeardo
     public EmrServerlessSparkRunner(ContainerBuilder containerBuilder, ContainerLifecycleManager lifecycleManager,
                                     ContainerLogStreamer logStreamer, LaunchedContainerAwsEnv awsEnv,
                                     LambdaExecutionRoleCredentials roleCredentials, S3Service s3Service,
+                                    EcrRegistryManager ecrRegistryManager, EmulatorConfig config, Clock clock,
+                                    EcrWorkloadImagePull imagePulls) {
+        this(containerBuilder, lifecycleManager, logStreamer, awsEnv, roleCredentials, s3Service, ecrRegistryManager,
+                config, clock, POLL_INTERVAL, imagePulls);
+    }
+
+    public EmrServerlessSparkRunner(ContainerBuilder containerBuilder, ContainerLifecycleManager lifecycleManager,
+                                    ContainerLogStreamer logStreamer, LaunchedContainerAwsEnv awsEnv,
+                                    LambdaExecutionRoleCredentials roleCredentials, S3Service s3Service,
                                     EcrRegistryManager ecrRegistryManager, EmulatorConfig config, Clock clock) {
         this(containerBuilder, lifecycleManager, logStreamer, awsEnv, roleCredentials, s3Service, ecrRegistryManager,
-                config, clock, POLL_INTERVAL);
+                config, clock, POLL_INTERVAL, null);
     }
 
     EmrServerlessSparkRunner(ContainerBuilder containerBuilder, ContainerLifecycleManager lifecycleManager,
@@ -508,6 +520,15 @@ public class EmrServerlessSparkRunner implements SparkJobRunner, ContainerTeardo
                              LambdaExecutionRoleCredentials roleCredentials, S3Service s3Service,
                              EcrRegistryManager ecrRegistryManager, EmulatorConfig config, Clock clock,
                              Duration pollInterval) {
+        this(containerBuilder, lifecycleManager, logStreamer, awsEnv, roleCredentials, s3Service, ecrRegistryManager,
+                config, clock, pollInterval, null);
+    }
+
+    EmrServerlessSparkRunner(ContainerBuilder containerBuilder, ContainerLifecycleManager lifecycleManager,
+                             ContainerLogStreamer logStreamer, LaunchedContainerAwsEnv awsEnv,
+                             LambdaExecutionRoleCredentials roleCredentials, S3Service s3Service,
+                             EcrRegistryManager ecrRegistryManager, EmulatorConfig config, Clock clock,
+                             Duration pollInterval, EcrWorkloadImagePull imagePulls) {
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.logStreamer = logStreamer;
@@ -515,6 +536,7 @@ public class EmrServerlessSparkRunner implements SparkJobRunner, ContainerTeardo
         this.roleCredentials = roleCredentials;
         this.s3Service = s3Service;
         this.ecrRegistryManager = ecrRegistryManager;
+        this.imagePulls = imagePulls;
         this.config = config;
         this.clock = clock;
         this.pollInterval = pollInterval;
@@ -1100,7 +1122,22 @@ public class EmrServerlessSparkRunner implements SparkJobRunner, ContainerTeardo
      */
     private String customImageForLaunch(Job job, WorkerType workerType, String customImage, Progress progress) {
         String image = containerBuilder.resolveImage(ecrRegistryManager.rewriteImageUri(customImage));
-        LaunchImage launched = lifecycleManager.resolveImageForLaunch(image, ImagePullBehavior.DEFAULT, job.platform());
+        LaunchImage launched;
+        if (config.services().iam().enforcementEnabled() && "emr-serverless".equals(job.service())
+                && EcrRegistryManager.ecrImage(image).isPresent()) {
+            if (imagePulls == null || !AwsArnUtils.isArnFor(job.imagePullSourceArn(), "emr-serverless")) {
+                throw new AwsException("AccessDeniedException", "The application's image-pull identity is unavailable", 403);
+            }
+            AwsArnUtils.Arn source = AwsArnUtils.parse(job.imagePullSourceArn());
+            if (!source.accountId().equals(job.accountId()) || !source.region().equals(job.region())) {
+                throw new AwsException("AccessDeniedException", "The application's image-pull identity is unavailable", 403);
+            }
+            launched = imagePulls.withEmrServerlessPull(image, job.imagePullSourceArn(),
+                    credentials -> lifecycleManager.resolveImageForLaunchWithCredentials(
+                            image, ImagePullBehavior.DEFAULT, job.platform(), credentials));
+        } else {
+            launched = lifecycleManager.resolveImageForLaunch(image, ImagePullBehavior.DEFAULT, job.platform());
+        }
         if (launched.manifestDigest() != null) {
             progress.imageResolved(workerType, launched.manifestDigest());
         }

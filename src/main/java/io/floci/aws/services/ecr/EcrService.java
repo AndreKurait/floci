@@ -33,6 +33,7 @@ import io.floci.aws.services.ecr.model.PullThroughCacheRule;
 import io.floci.aws.services.ecr.model.RegistrySettings;
 import io.floci.aws.services.ecr.model.Repository;
 import io.floci.aws.services.ecr.model.RepositoryCreationTemplate;
+import io.floci.aws.services.ecr.registry.EcrRegistryAuthorization;
 import io.floci.aws.services.ecr.registry.EcrRegistryManager;
 import io.floci.aws.services.ecr.registry.RegistryHttpClient;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -43,7 +44,6 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -162,9 +162,9 @@ public class EcrService implements ResourceProvider, Resettable {
         return !config.services().ecr().enabled();
     }
 
-    // ============================================================
+    // =====================================================
     // Pull through cache rules
-    // ============================================================
+    // =====================================================
 
     public PullThroughCacheRule createPullThroughCacheRule(String ecrRepositoryPrefix,
                                                            String upstreamRegistryUrl,
@@ -349,9 +349,9 @@ public class EcrService implements ResourceProvider, Resettable {
         }
     }
 
-    // ============================================================
+    // =====================================================
     // Repository creation templates
-    // ============================================================
+    // =====================================================
 
     /**
      * Stores a template under its prefix. Fields left null take ECR's defaults: AES256 encryption
@@ -524,9 +524,9 @@ public class EcrService implements ResourceProvider, Resettable {
                         + "' does not exist in the registry with id '" + regionResolver.getAccountId() + "'", 400);
     }
 
-    // ============================================================
+    // =====================================================
     // CreateRepository
-    // ============================================================
+    // =====================================================
 
     public Repository createRepository(String repositoryName,
                                        String registryId,
@@ -576,9 +576,9 @@ public class EcrService implements ResourceProvider, Resettable {
         return repo;
     }
 
-    // ============================================================
+    // =====================================================
     // DescribeRepositories
-    // ============================================================
+    // =====================================================
 
     public List<Repository> describeRepositories(List<String> repositoryNames,
                                                  String registryId,
@@ -644,9 +644,9 @@ public class EcrService implements ResourceProvider, Resettable {
         return new BatchScanningConfigurationResult(repositories, failures);
     }
 
-    // ============================================================
+    // =====================================================
     // DeleteRepository
-    // ============================================================
+    // =====================================================
 
     public Repository deleteRepository(String repositoryName,
                                        String registryId,
@@ -719,24 +719,38 @@ public class EcrService implements ResourceProvider, Resettable {
         return repo;
     }
 
-    // ============================================================
+    // =====================================================
     // GetAuthorizationToken
-    // ============================================================
+    // =====================================================
+
+    @Inject
+    EcrRegistryAuthorization registryAuthorization;
+
+    public List<AuthorizationData> getAuthorizationToken(List<String> registryIds) {
+        if (registryIds == null) {
+            return List.of(getAuthorizationToken());
+        }
+        if (registryIds.isEmpty() || registryIds.size() > 10
+                || registryIds.stream().anyMatch(id -> id == null || !id.matches("[0-9]{12}"))) {
+            throw new AwsException("InvalidParameterException", "registryIds must contain 1 to 10 twelve-digit account IDs", 400);
+        }
+        EcrRegistryAuthorization.IssuedToken issued = registryAuthorization.issue(regionResolver.getRegion());
+        return registryIds.stream().map(account -> new AuthorizationData(issued.authorizationToken(), issued.expiresAt(),
+                registryManager.getProxyEndpoint(account, regionResolver.getRegion()))).toList();
+    }
 
     public AuthorizationData getAuthorizationToken() {
         // Deliberately not gated on the backing registry: AWS answers this call from the
         // control plane, and both values here are computed without Docker. Gating it made
         // every SDK client retry a 500 before its first repository call.
-        String token = Base64.getEncoder()
-                .encodeToString("AWS:floci".getBytes(StandardCharsets.UTF_8));
-        Instant expires = Instant.now().plusSeconds(12 * 60 * 60);
+        EcrRegistryAuthorization.IssuedToken issued = registryAuthorization.issue(regionResolver.getRegion());
         String proxy = registryManager.getProxyEndpoint();
-        return new AuthorizationData(token, expires, proxy);
+        return new AuthorizationData(issued.authorizationToken(), issued.expiresAt(), proxy);
     }
 
-    // ============================================================
+    // =====================================================
     // ListImages / DescribeImages / BatchGetImage / BatchDeleteImage
-    // ============================================================
+    // =====================================================
 
     public PaginatedResult<ImageIdentifier> listImages(String repositoryName, String registryId, String region,
                                                        Integer maxResults, String nextToken) {
@@ -1096,9 +1110,9 @@ public class EcrService implements ResourceProvider, Resettable {
         }
     }
 
-    // ============================================================
+    // =====================================================
     // Image push through the API (PutImage and the layer API)
-    // ============================================================
+    // =====================================================
 
     public record LayerAvailability(String layerDigest, String availability, Long layerSize) {}
     public record LayerFailure(String layerDigest, String failureCode, String failureReason) {}
@@ -1480,9 +1494,9 @@ public class EcrService implements ResourceProvider, Resettable {
         return new AwsException("ServerException", "The ECR backing registry failed: " + e.getMessage(), 500);
     }
 
-    // ============================================================
+    // =====================================================
     // Registry settings (policy, replication, scanning)
-    // ============================================================
+    // =====================================================
 
     /**
      * Stores the registry policy. Its length is checked against the model before this is reached;
@@ -1690,9 +1704,9 @@ public class EcrService implements ResourceProvider, Resettable {
                 "Registry policy does not exist in the registry with id '" + regionResolver.getAccountId() + "'", 400);
     }
 
-    // ============================================================
+    // =====================================================
     // Tag mutability + resource tags + policies (metadata round-trip)
-    // ============================================================
+    // =====================================================
 
     public Repository putImageScanningConfiguration(String repositoryName, String registryId,
                                                     boolean scanOnPush, String region) {
@@ -1725,6 +1739,11 @@ public class EcrService implements ResourceProvider, Resettable {
     }
 
     /** Returns the physical registry namespace selected for an ECR repository. */
+    public Optional<Repository> registryRepository(String name, String account, String region) {
+        String repositoryKey = key(region, account, name);
+        return AccountAwareStorageBackend.readInAccount(repoStore, account, repositoryKey);
+    }
+
     public String registryRepositoryName(String repositoryName, String registryId, String region) {
         String account = effectiveAccount(registryId);
         return repoStore.get(key(region, account, repositoryName))
@@ -1876,17 +1895,17 @@ public class EcrService implements ResourceProvider, Resettable {
         return Set.of(new SupportedResourceType("ecr:repository", "ecr", true));
     }
 
-    // ============================================================
+    // =====================================================
     // Result records
-    // ============================================================
+    // =====================================================
 
     public record DescribeImagesResult(List<ImageDetail> imageDetails, List<ImageFailure> failures) {}
     public record BatchGetImageResult(List<Image> images, List<ImageFailure> failures) {}
     public record BatchDeleteImageResult(List<ImageIdentifier> imageIds, List<ImageFailure> failures) {}
 
-    // ============================================================
+    // =====================================================
     // Helpers
-    // ============================================================
+    // =====================================================
 
     private Repository requireRepo(String name, String registryId, String region) {
         String account = effectiveAccount(registryId);

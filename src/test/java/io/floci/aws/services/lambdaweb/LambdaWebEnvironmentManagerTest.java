@@ -1,11 +1,15 @@
 package io.floci.aws.services.lambdaweb;
 
 import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.model.AuthConfig;
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.docker.ContainerBuilder;
 import io.floci.aws.core.common.docker.ContainerLifecycleManager;
 import io.floci.aws.core.common.docker.LaunchedContainerAwsEnv;
 import io.floci.aws.services.ecr.registry.EcrRegistryManager;
+import io.floci.aws.services.ecr.registry.EcrWorkloadImagePull;
+import io.floci.aws.services.iam.model.SessionCreds;
 import io.floci.aws.services.lambda.launcher.ImageResolver;
 import io.floci.aws.services.lambda.launcher.LambdaExecutionRoleCredentials;
 import io.floci.aws.services.lambda.zip.ZipExtractor;
@@ -22,13 +26,18 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Function;
+import java.util.function.Supplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.RETURNS_SELF;
+import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -103,14 +112,56 @@ class LambdaWebEnvironmentManagerTest {
         verify(metadata, never()).register(any());
     }
 
+    @Test
+    void privateRuntimeUsesWebFunctionsRoleAndCleansUpSessionsOnPullFailure() {
+        String image = "localhost:4566/000000000000/us-east-1/runtime:latest";
+        String source = "arn:aws:lambda:us-east-1:000000000000:web-function/fn";
+        String role = "arn:aws:iam::000000000000:role/web";
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        ContainerLifecycleManager lifecycle = mock(ContainerLifecycleManager.class);
+        ImageResolver images = mock(ImageResolver.class);
+        EcrRegistryManager registry = mock(EcrRegistryManager.class);
+        EcrWorkloadImagePull pulls = mock(EcrWorkloadImagePull.class);
+        AuthConfig credential = new AuthConfig().withRegistryAddress("localhost:4566")
+                .withUsername("AWS").withPassword("scoped");
+        Supplier<AuthConfig> credentialSource = () -> credential;
+        SessionCreds session = new SessionCreds("ASIAWEB", "owned-test-secret", "owned-test-session");
+        when(credentials.forRole(role, "000000000000", "fn")).thenReturn(Optional.of(session));
+        when(metadata.register("us-east-1")).thenReturn("owned-token");
+        when(config.services().iam().enforcementEnabled()).thenReturn(true);
+        when(images.resolve("nodejs24.x")).thenReturn(image);
+        when(registry.rewriteImageUri(image)).thenReturn(image);
+        when(containerBuilder.newContainer(image)).thenReturn(mock(ContainerBuilder.Builder.class, RETURNS_SELF));
+        when(pulls.withRolePull(eq(image), eq(role), eq(source), any())).thenAnswer(invocation -> {
+            Function<Supplier<AuthConfig>, String> operation = invocation.getArgument(3);
+            return operation.apply(credentialSource);
+        });
+        when(lifecycle.createWithCredentials(null, null, credentialSource)).thenThrow(new IllegalStateException("Owned pull failed"));
+        LambdaWebEnvironmentManager manager = new LambdaWebEnvironmentManager(config, containerBuilder, lifecycle,
+                mock(DockerClient.class), images, registry, mock(LambdaWebCode.class), mock(ZipExtractor.class),
+                mock(LaunchedContainerAwsEnv.class), credentials, executionRole, metadata,
+                mock(LambdaWebLogs.class), mock(LambdaWebMetrics.class), pulls);
+        try {
+            assertEquals("Owned pull failed", assertThrows(IllegalStateException.class, () -> acquire(manager)).getMessage());
+            verify(pulls).withRolePull(eq(image), eq(role), eq(source), any());
+            verify(lifecycle).createWithCredentials(null, null, credentialSource);
+            verify(lifecycle, never()).create(any());
+            verify(credentials).unregister("000000000000", "ASIAWEB");
+            verify(metadata).forget("owned-token");
+            clearInvocations(lifecycle, credentials, metadata);
+            when(pulls.withRolePull(eq(image), eq(role), eq(source), any()))
+                    .thenThrow(new AwsException("DENIED", "No image grant", 403));
+            assertEquals("No image grant", assertThrows(AwsException.class, () -> acquire(manager)).getMessage());
+            verify(lifecycle, never()).create(any());
+            verify(lifecycle, never()).create(any(), any(), any());
+            verify(credentials).unregister("000000000000", "ASIAWEB");
+            verify(metadata).forget("owned-token");
+        } finally {
+            manager.shutdown();
+        }
+    }
+
     private void acquire() {
-        WebFunction fn = new WebFunction();
-        fn.functionName = "fn";
-        fn.functionArn = "arn:aws:lambda:us-east-1:000000000000:web-function/fn";
-        WebFunctionRevision revision = new WebFunctionRevision();
-        revision.revisionId = "1";
-        revision.buildConfig.runtime = "nodejs24.x";
-        revision.serviceConfig.executionRoleArn = "arn:aws:iam::000000000000:role/web";
         LambdaWebEnvironmentManager manager = new LambdaWebEnvironmentManager(
                 mock(EmulatorConfig.class, RETURNS_DEEP_STUBS), containerBuilder,
                 mock(ContainerLifecycleManager.class), mock(DockerClient.class), mock(ImageResolver.class),
@@ -118,10 +169,21 @@ class LambdaWebEnvironmentManagerTest {
                 mock(LaunchedContainerAwsEnv.class), credentials, executionRole, metadata,
                 mock(LambdaWebLogs.class), mock(LambdaWebMetrics.class));
         try {
-            manager.acquire("000000000000", "us-east-1", fn, "endpoint", null, revision);
+            acquire(manager);
         } finally {
             manager.shutdown();
         }
+    }
+
+    private void acquire(LambdaWebEnvironmentManager manager) {
+        WebFunction fn = new WebFunction();
+        fn.functionName = "fn";
+        fn.functionArn = "arn:aws:lambda:us-east-1:000000000000:web-function/fn";
+        WebFunctionRevision revision = new WebFunctionRevision();
+        revision.revisionId = "1";
+        revision.buildConfig.runtime = "nodejs24.x";
+        revision.serviceConfig.executionRoleArn = "arn:aws:iam::000000000000:role/web";
+        manager.acquire("000000000000", "us-east-1", fn, "endpoint", null, revision);
     }
 
     private static List<String> flags(List<String> heap) {

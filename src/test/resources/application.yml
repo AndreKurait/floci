@@ -394,6 +394,7 @@ floci:
     ecr:
       enabled: true
       tls-uri: false
+      native-uri: false
     ui:
       enabled: true
     bedrock:

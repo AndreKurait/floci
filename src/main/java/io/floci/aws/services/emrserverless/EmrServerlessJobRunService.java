@@ -692,7 +692,8 @@ public class EmrServerlessJobRunService implements Resettable {
         // With honour-architectures on, its containers run for the application's architecture, "x86_64 is the default
         // option" on EMR Serverless; with it off, or where the application names none, for the Docker host's own.
         SparkJobRunner.Job onPlatform = job.withPlatform(
-                honourArchitectures ? DockerPlatforms.forArchitecture(app.getArchitecture()) : null);
+                honourArchitectures ? DockerPlatforms.forArchitecture(app.getArchitecture()) : null)
+                .withImagePullSourceArn(app.getArn());
         executing.add(run.getJobRunId());
         long launchedIn = generation;
         runExecutor.execute(() -> execute(onPlatform, launchedIn));
@@ -775,7 +776,8 @@ public class EmrServerlessJobRunService implements Resettable {
                 driverEnvironment(sparkDefaults), archives(sparkDefaults), null, Map.of(), Map.of(), Map.of(),
                 Map.of(), Map.of(), executors(app, executorContainers));
         SparkJobRunner.Job listening = job.withPlatform(
-                honourArchitectures ? DockerPlatforms.forArchitecture(app.getArchitecture()) : null).listeningOn(port);
+                honourArchitectures ? DockerPlatforms.forArchitecture(app.getArchitecture()) : null)
+                .withImagePullSourceArn(app.getArn()).listeningOn(port);
         return servesDriverUis() && writesEventLogs(sparkDefaults) ? listening.keepingEventLogs() : listening;
     }
 

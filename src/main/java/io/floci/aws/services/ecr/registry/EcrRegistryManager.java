@@ -10,6 +10,7 @@ import com.github.dockerjava.api.model.ContainerPort;
 import com.github.dockerjava.api.model.Frame;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsPartitions;
+import io.floci.aws.core.common.AwsRegions;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.docker.ContainerBuilder;
 import io.floci.aws.core.common.docker.ContainerDetector;
@@ -72,10 +73,11 @@ public class EcrRegistryManager {
      * {@code <account>.dkr.ecr.<region>.<dnsSuffix>/<repo>[:tag]}.
      */
     private static final Pattern AWS_ECR_URI = Pattern.compile(
-            "^([0-9]{12})\\.dkr\\.ecr\\.([a-z0-9-]+)\\." + AwsPartitions.dnsSuffixRegex() + "/(.+)$");
+            "^([0-9]{12})\\.dkr\\.ecr\\.([a-z0-9-]+)\\." + AwsPartitions.dnsSuffixRegex() + "(?::443)?/(.+)$");
 
     /** The host and port of a {@code repositoryUri} Floci's ECR hands out. */
     private static final String FLOCI_REGISTRY_HOST = "localhost(?:\\.floci\\.io)?:[0-9]+";
+    private static final String LOOPBACK_REGISTRY_HOST = "(?:localhost(?:\\.floci\\.io)?|127\\.0\\.0\\.1|\\[::1\\]):[0-9]+";
 
     /**
      * The Region of an image in an ECR repository: in {@code <account>.dkr.ecr.<region>.<dnsSuffix>/<repo>}, AWS's
@@ -84,13 +86,13 @@ public class EcrRegistryManager {
      * Floci's in the path style.
      */
     private static final Pattern ECR_IMAGE_REGION = Pattern.compile("^(?:[0-9]{12}\\.dkr\\.ecr\\.([a-z0-9-]+)\\.(?:"
-            + AwsPartitions.dnsSuffixRegex() + "|" + FLOCI_REGISTRY_HOST + ")"
-            + "|" + FLOCI_REGISTRY_HOST + "/[0-9]{12}/([a-z0-9-]+))/.+$");
+            + AwsPartitions.dnsSuffixRegex() + "(?::443)?|" + FLOCI_REGISTRY_HOST + ")"
+            + "|" + LOOPBACK_REGISTRY_HOST + "/[0-9]{12}/([a-z0-9-]+))/.+$");
 
     /** The account, Region and path of an image in an ECR repository, in {@link #ECR_IMAGE_REGION}'s forms. */
     private static final Pattern ECR_IMAGE_PARTS = Pattern.compile("^(?:([0-9]{12})\\.dkr\\.ecr\\.([a-z0-9-]+)\\.(?:"
-            + AwsPartitions.dnsSuffixRegex() + "|" + FLOCI_REGISTRY_HOST + ")"
-            + "|" + FLOCI_REGISTRY_HOST + "/([0-9]{12})/([a-z0-9-]+))/(.+)$");
+            + AwsPartitions.dnsSuffixRegex() + "(?::443)?|" + FLOCI_REGISTRY_HOST + ")"
+            + "|" + LOOPBACK_REGISTRY_HOST + "/([0-9]{12})/([a-z0-9-]+))/(.+)$");
 
     /**
      * The container name actually in use. Differs from {@link #registryContainerName()} only when
@@ -198,7 +200,7 @@ public class EcrRegistryManager {
         if (!m.matches()) {
             return image;
         }
-        if (config.services().ecr().preferLocalImages()) {
+        if (config.services().ecr().preferLocalImages() && !config.services().iam().enforcementEnabled()) {
             String resolved = containerBuilder.resolveImage(image);
             if (isPresentOnDaemon(resolved)) {
                 LOG.infov("Using locally present image {0} as-is (not rewriting to the emulated ECR registry)", resolved);
@@ -301,6 +303,9 @@ public class EcrRegistryManager {
 
     /** Returns the docker-pullable repository URI for the given account/region/name. */
     public String getRepositoryUri(String accountId, String region, String repoName) {
+        if (config.services().ecr().nativeUri()) {
+            return nativeRegistryHost(accountId, region) + "/" + repoName;
+        }
         return repositoryUri(accountId, region, repoName, tlsUriEnabled() ? "localhost.floci.io" : "localhost");
     }
 
@@ -311,6 +316,10 @@ public class EcrRegistryManager {
             return domain + ":" + port + "/" + accountId + "/" + region + "/" + repoName;
         }
         return accountId + ".dkr.ecr." + region + "." + domain + ":" + port + "/" + repoName;
+    }
+
+    private static String nativeRegistryHost(String accountId, String region) {
+        return accountId + ".dkr.ecr." + region + "." + AwsRegions.dnsSuffixFor(region);
     }
 
     private boolean tlsUriEnabled() {
@@ -338,16 +347,24 @@ public class EcrRegistryManager {
      * the two must name the same host.
      */
     public String getProxyEndpoint() {
+        return getProxyEndpoint(regionResolver.getAccountId(), regionResolver.getRegion());
+    }
+
+    public String getProxyEndpoint(String accountId, String region) {
+        if (config.services().ecr().nativeUri()) {
+            return "https://" + nativeRegistryHost(accountId, region);
+        }
         if (tlsUriEnabled()) {
             String host = "path".equalsIgnoreCase(config.services().ecr().uriStyle())
                     ? "localhost.floci.io"
-                    : regionResolver.getAccountId() + ".dkr.ecr."
-                            + regionResolver.getRegion() + ".localhost.floci.io";
+                    : accountId + ".dkr.ecr."
+                            + region + ".localhost.floci.io";
             return "https://" + host + ":" + advertisedPort();
         }
         String scheme = config.services().ecr().tlsEnabled() ? "https" : "http";
-        return scheme + "://" + regionResolver.getAccountId() + ".dkr.ecr."
-                + regionResolver.getRegion() + ".localhost:" + advertisedPort();
+        String host = "path".equalsIgnoreCase(config.services().ecr().uriStyle())
+                ? "localhost" : accountId + ".dkr.ecr." + region + ".localhost";
+        return scheme + "://" + host + ":" + advertisedPort();
     }
 
     /**
