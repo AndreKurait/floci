@@ -1,6 +1,7 @@
 package io.github.hectorvent.floci.core.common.dns;
 
 import io.github.hectorvent.floci.config.EmulatorConfig;
+import io.github.hectorvent.floci.config.TlsConfigSource;
 import io.github.hectorvent.floci.services.route53.Route53DnsRecordSource;
 import io.github.hectorvent.floci.services.route53.Route53Service;
 import io.github.hectorvent.floci.services.route53.model.ResourceRecord;
@@ -160,6 +161,68 @@ class Route53DnsPacketIntegrationTest {
     }
 
     @Test
+    void publicCnameAnswersWithItsTargetsAddressUnderTheZoneAuthority() throws Exception {
+        String name = uniqueName() + ".example";
+        String id = createZone(name);
+        change(id, "CREATE", record("endpoint." + name, "CNAME", 30, "ip-10-0-5-88.ec2.internal."));
+        byte[] request = request("endpoint." + name, 1);
+        byte[] response = query(request);
+        assertHeader(response, 0, true, 1, 0);
+        assertEquals(1, ByteBuffer.wrap(response).getShort(request.length + 2));
+        assertEquals(30, ByteBuffer.wrap(response).getInt(request.length + 6));
+        assertArrayEquals(new DnsRecord.Address(1, "10.0.5.88").data(),
+                Arrays.copyOfRange(response, request.length + 12, response.length));
+        assertNegative(query(request("endpoint." + name, 28)), name, 0, 900);
+    }
+
+    @Test
+    void publicCnameToAnOwnedLoadBalancerNameAnswersItsAddressRatherThanTheSpoofedRoute() {
+        String balancer = "internal-app-" + uniqueName() + ".us-east-1.elb.amazonaws.com";
+        DnsRecordSource frontend = new DnsRecordSource() {
+            @Override
+            public Optional<DnsAnswer> resolveIpv4(String name) {
+                return Optional.empty();
+            }
+
+            @Override
+            public Optional<DnsAnswer> resolveAuthoritative(String name, int type,
+                                                            DnsClientVpcSource.ClientVpc origin) {
+                return balancer.equals(name)
+                        ? Optional.of(DnsAnswer.records(List.of("198.51.100.7"), 60)) : Optional.empty();
+            }
+        };
+        List<DnsRecordSource> sources = new ArrayList<>();
+        DnsClientVpcSource.ClientVpc vpc = new DnsClientVpcSource.ClientVpc(
+                config.defaultAccountId(), "us-east-1", "vpc-cname-balancer");
+        EmbeddedDnsServer dns = new EmbeddedDnsServer(List.copyOf(TlsConfigSource.awsEndpointSuffixes()), sources,
+                List.of(), List.of(address -> "10.87.1.10".equals(address) ? Optional.of(vpc) : Optional.empty()),
+                true, List.of());
+        sources.add(new Route53DnsRecordSource(route53, config, new DnsLookupHelper(config), dns));
+        sources.add(frontend);
+        String name = uniqueName() + ".example";
+        String id = createZone(name);
+        change(id, "CREATE", record("endpoint." + name, "CNAME", 30, balancer + "."));
+
+        assertEquals(List.of(EmulatorConfig.VpcRoutingConfig.PUBLIC_AWS_API_ADDRESS),
+                dns.planQuery("ec2.us-east-1.amazonaws.com", "10.87.1.10", "127.0.0.1", 1)
+                        .answer().orElseThrow().addresses(), "spoofing routes a VPC client's AWS names");
+        DnsAnswer answer = dns.planQuery("endpoint." + name, "10.87.1.10", "127.0.0.1", 1).answer().orElseThrow();
+        assertEquals(List.of("198.51.100.7"), answer.addresses());
+        assertEquals(30, answer.ttlSeconds());
+    }
+
+    @Test
+    void publicCnameCycleAcrossZonesEndsWithoutAnswers() {
+        String first = uniqueName() + ".example";
+        String second = uniqueName() + ".example";
+        change(createZone(first), "CREATE", record("loop." + first, "CNAME", 30, "loop." + second + "."));
+        change(createZone(second), "CREATE", record("loop." + second, "CNAME", 30, "loop." + first + "."));
+        DnsAnswer answer = source.resolveAuthoritative("loop." + first, 1).orElseThrow();
+        assertEquals(0, answer.responseCode());
+        assertTrue(answer.isEmpty());
+    }
+
+    @Test
     void negativeAnswersDistinguishNamesEmptyNonterminalsAndWildcardMatches() throws Exception {
         String name = uniqueName() + ".example";
         String id = createZone(name);
@@ -206,9 +269,10 @@ class Route53DnsPacketIntegrationTest {
         String awsName = uniqueName() + ".amazonaws.com";
         createZone(awsName);
         assertNegative(query(request(awsName, 1)), awsName, 0, 900);
-        for (String label : List.of("weighted", "alias", "leaf.delegated")) {
+        for (String label : List.of("weighted", "leaf.delegated")) {
             assertHeader(query(request(label + "." + name, 16)), 5, false, 0, 0);
         }
+        assertNegative(query(request("alias." + name, 16)), name, 0, 900);
     }
 
     @Test

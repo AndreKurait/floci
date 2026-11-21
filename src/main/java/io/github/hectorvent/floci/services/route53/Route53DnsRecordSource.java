@@ -41,6 +41,7 @@ public class Route53DnsRecordSource implements DnsRecordSource {
     private static final Logger LOG = Logger.getLogger(Route53DnsRecordSource.class);
     private static final int MAX_CNAME_DEPTH = 8;
     private static final int MAX_DNS_ANSWERS = 8;
+    private static final ThreadLocal<Integer> OWNED_TARGET_HOPS = ThreadLocal.withInitial(() -> 0);
     private static final Pattern EC2_PRIVATE_DNS_NAME =
             Pattern.compile("^ip-(\\d{1,3})-(\\d{1,3})-(\\d{1,3})-(\\d{1,3})\\.ec2\\.internal$", Pattern.CASE_INSENSITIVE);
 
@@ -111,11 +112,11 @@ public class Route53DnsRecordSource implements DnsRecordSource {
         String normalized = Route53Service.normalizeName(name).toLowerCase(Locale.ROOT);
         String apex = Route53Service.normalizeName(zone.name()).toLowerCase(Locale.ROOT);
         // A delegation ends this zone's authority. Serving the parent's negative answer below
-        // that cut, or flattening an unsupported CNAME/routing policy, would hide real records.
+        // that cut, or flattening an unsupported routing policy, would hide real records.
         boolean delegated = zone.records().stream().anyMatch(record -> "NS".equals(record.getType())
                 && !Route53Service.normalizeName(record.getName()).equalsIgnoreCase(apex)
                 && DomainNames.isWithin(normalized, Route53Service.normalizeName(record.getName())));
-        if (delegated || zone.matchingRecords().stream().anyMatch(record -> "CNAME".equals(record.getType()))) {
+        if (delegated) {
             return Optional.of(DnsAnswer.refused());
         }
         ResourceRecordSet soaSet = zone.records().stream()
@@ -136,6 +137,19 @@ public class Route53DnsRecordSource implements DnsRecordSource {
                 case 6 -> "SOA";
                 default -> "TXT";
             };
+            // A CNAME owns its name for every query type. As in a private zone, the answer is
+            // flattened to the target's A records.
+            for (ResourceRecordSet record : selectPublicRecords(zone.matchingRecords(), "CNAME")) {
+                Optional<DnsAnswer> target = record.getAliasTarget() != null ? Optional.empty()
+                        : resolveCnameTarget(record, new HashSet<>(), 0, origin);
+                if (target.isEmpty()) {
+                    return Optional.of(DnsAnswer.refused());
+                }
+                if (type == 1) {
+                    answers.addAll(target.orElseThrow().records());
+                    ttl = Math.min(ttl, target.orElseThrow().ttlSeconds());
+                }
+            }
             for (ResourceRecordSet record : selectPublicRecords(zone.matchingRecords(), recordType)) {
                 AliasTarget alias = record.getAliasTarget();
                 if (alias != null) {
@@ -281,29 +295,60 @@ public class Route53DnsRecordSource implements DnsRecordSource {
         // 2. CNAME records
         for (ResourceRecordSet rrs : recordSets) {
             if ("CNAME".equalsIgnoreCase(rrs.getType())) {
-                if (rrs.getRecords() != null && !rrs.getRecords().isEmpty()) {
-                    String target = rrs.getRecords().get(0).getValue();
-                    if (target != null && !target.isBlank()) {
-                        String cleanTarget = DnsLookupHelper.normalizeTarget(target);
-                        // The answer is flattened to A records, so it can be cached only as long
-                        // as the shortest-lived record in the chain.
-                        int cnameTtl = ttlOf(rrs);
-                        if (route53Service.isCoveredByPrivateZone(cleanTarget, origin)) {
-                            DnsAnswer targetAnswer = resolveAddresses(cleanTarget, visited, depth + 1, origin);
-                            if (targetAnswer.isEmpty()) {
-                                return targetAnswer;
-                            }
-                            return DnsAnswer.records(targetAnswer.addresses(),
-                                    Math.min(cnameTtl, targetAnswer.ttlSeconds()));
-                        }
-                        return DnsAnswer.records(resolveOutsidePrivateZones(cleanTarget, origin),
-                                Math.min(cnameTtl, DnsAnswer.DEFAULT_TTL_SECONDS));
-                    }
+                Optional<DnsAnswer> target = resolveCnameTarget(rrs, visited, depth, origin);
+                if (target.isPresent()) {
+                    return target.orElseThrow();
                 }
             }
         }
 
         return DnsAnswer.noData();
+    }
+
+    /** The A records a CNAME's target resolves to, or empty when the record names no target. */
+    private Optional<DnsAnswer> resolveCnameTarget(ResourceRecordSet rrs, Set<String> visited, int depth,
+                                                   ClientVpc origin) {
+        if (rrs.getRecords() == null || rrs.getRecords().isEmpty()) {
+            return Optional.empty();
+        }
+        String target = rrs.getRecords().get(0).getValue();
+        if (target == null || target.isBlank()) {
+            return Optional.empty();
+        }
+        String cleanTarget = DnsLookupHelper.normalizeTarget(target);
+        // The answer is flattened to A records, so it can be cached only as long
+        // as the shortest-lived record in the chain.
+        int cnameTtl = ttlOf(rrs);
+        if (route53Service.isCoveredByPrivateZone(cleanTarget, origin)) {
+            DnsAnswer targetAnswer = resolveAddresses(cleanTarget, visited, depth + 1, origin);
+            if (targetAnswer.isEmpty()) {
+                return Optional.of(targetAnswer);
+            }
+            return Optional.of(DnsAnswer.records(targetAnswer.addresses(),
+                    Math.min(cnameTtl, targetAnswer.ttlSeconds())));
+        }
+        // A target a record source owns (a public zone, or a load balancer name) answers as a direct
+        // query for it would, ahead of spoofing. A public target can chase back into this source, so
+        // the hops through the server count against the same depth limit as a private chain.
+        int hops = OWNED_TARGET_HOPS.get();
+        if (dnsServer != null && hops >= MAX_CNAME_DEPTH) {
+            return Optional.of(DnsAnswer.noData());
+        }
+        Optional<DnsAnswer> owned = Optional.empty();
+        if (dnsServer != null) {
+            OWNED_TARGET_HOPS.set(hops + 1);
+            try {
+                owned = dnsServer.resolveOwnedName(cleanTarget, 1, origin);
+            } finally {
+                OWNED_TARGET_HOPS.set(hops);
+            }
+        }
+        if (owned != null && owned.isPresent()) {
+            DnsAnswer answer = owned.orElseThrow();
+            return Optional.of(DnsAnswer.records(answer.addresses(), Math.min(cnameTtl, answer.ttlSeconds())));
+        }
+        return Optional.of(DnsAnswer.records(resolveOutsidePrivateZones(cleanTarget, origin),
+                Math.min(cnameTtl, DnsAnswer.DEFAULT_TTL_SECONDS)));
     }
 
     private List<String> resolveOutsidePrivateZones(String name, ClientVpc origin) {
