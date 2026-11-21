@@ -160,6 +160,21 @@ class Route53DnsPacketIntegrationTest {
     }
 
     @Test
+    void publicCnameAnswersWithItsTargetsAddressUnderTheZoneAuthority() throws Exception {
+        String name = uniqueName() + ".example";
+        String id = createZone(name);
+        change(id, "CREATE", record("endpoint." + name, "CNAME", 30, "ip-10-0-5-88.ec2.internal."));
+        byte[] request = request("endpoint." + name, 1);
+        byte[] response = query(request);
+        assertHeader(response, 0, true, 1, 0);
+        assertEquals(1, ByteBuffer.wrap(response).getShort(request.length + 2));
+        assertEquals(30, ByteBuffer.wrap(response).getInt(request.length + 6));
+        assertArrayEquals(new DnsRecord.Address(1, "10.0.5.88").data(),
+                Arrays.copyOfRange(response, request.length + 12, response.length));
+        assertNegative(query(request("endpoint." + name, 28)), name, 0, 900);
+    }
+
+    @Test
     void negativeAnswersDistinguishNamesEmptyNonterminalsAndWildcardMatches() throws Exception {
         String name = uniqueName() + ".example";
         String id = createZone(name);
@@ -206,9 +221,10 @@ class Route53DnsPacketIntegrationTest {
         String awsName = uniqueName() + ".amazonaws.com";
         createZone(awsName);
         assertNegative(query(request(awsName, 1)), awsName, 0, 900);
-        for (String label : List.of("weighted", "alias", "leaf.delegated")) {
+        for (String label : List.of("weighted", "leaf.delegated")) {
             assertHeader(query(request(label + "." + name, 16)), 5, false, 0, 0);
         }
+        assertNegative(query(request("alias." + name, 16)), name, 0, 900);
     }
 
     @Test
