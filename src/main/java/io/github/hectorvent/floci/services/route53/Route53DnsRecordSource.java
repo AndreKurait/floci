@@ -41,6 +41,7 @@ public class Route53DnsRecordSource implements DnsRecordSource {
     private static final Logger LOG = Logger.getLogger(Route53DnsRecordSource.class);
     private static final int MAX_CNAME_DEPTH = 8;
     private static final int MAX_DNS_ANSWERS = 8;
+    private static final ThreadLocal<Integer> OWNED_TARGET_HOPS = ThreadLocal.withInitial(() -> 0);
     private static final Pattern EC2_PRIVATE_DNS_NAME =
             Pattern.compile("^ip-(\\d{1,3})-(\\d{1,3})-(\\d{1,3})-(\\d{1,3})\\.ec2\\.internal$", Pattern.CASE_INSENSITIVE);
 
@@ -325,6 +326,26 @@ public class Route53DnsRecordSource implements DnsRecordSource {
             }
             return Optional.of(DnsAnswer.records(targetAnswer.addresses(),
                     Math.min(cnameTtl, targetAnswer.ttlSeconds())));
+        }
+        // A target a record source owns (a public zone, or a load balancer name) answers as a direct
+        // query for it would, ahead of spoofing. A public target can chase back into this source, so
+        // the hops through the server count against the same depth limit as a private chain.
+        int hops = OWNED_TARGET_HOPS.get();
+        if (dnsServer != null && hops >= MAX_CNAME_DEPTH) {
+            return Optional.of(DnsAnswer.noData());
+        }
+        Optional<DnsAnswer> owned = Optional.empty();
+        if (dnsServer != null) {
+            OWNED_TARGET_HOPS.set(hops + 1);
+            try {
+                owned = dnsServer.resolveOwnedName(cleanTarget, 1, origin);
+            } finally {
+                OWNED_TARGET_HOPS.set(hops);
+            }
+        }
+        if (owned != null && owned.isPresent()) {
+            DnsAnswer answer = owned.orElseThrow();
+            return Optional.of(DnsAnswer.records(answer.addresses(), Math.min(cnameTtl, answer.ttlSeconds())));
         }
         return Optional.of(DnsAnswer.records(resolveOutsidePrivateZones(cleanTarget, origin),
                 Math.min(cnameTtl, DnsAnswer.DEFAULT_TTL_SECONDS)));
