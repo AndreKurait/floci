@@ -506,6 +506,20 @@ public class EmbeddedDnsServer {
         });
     }
 
+    /**
+     * What the record sources answer for a name, ahead of spoofing and upstream DNS, as a direct
+     * query from origin resolves it: stored records first, and the whole answer under an
+     * authoritative suffix. Empty when no source owns the name.
+     */
+    public Optional<DnsAnswer> resolveOwnedName(String name, int type, DnsClientVpcSource.ClientVpc origin) {
+        Optional<DnsAnswer> stored = resolveFromRecordSources(name, type, true, origin);
+        if (hasAuthoritativeSuffix(name)) {
+            return Optional.of(authoritativeAnswer(stored.or(() -> resolveFromRecordSources(name, type, false, origin))
+                    .or(() -> ec2PublicAnswer(name, type))));
+        }
+        return stored;
+    }
+
     /** The owned API listener remains subject to the caller's ordinary public routing. */
     public Optional<String> publicApiAddress(DnsClientVpcSource.ClientVpc origin) {
         return publicAwsApi && origin != null && isUsableOrigin(origin)

@@ -278,7 +278,11 @@ class PrivateHostedZoneVpcScopeIntegrationTest {
         stored.setName(("NS".equals(type) ? "child." : "api.child.") + name);
         stored.setType(type);
         stored.setTtl(60L);
-        stored.setRecords(List.of(new ResourceRecord("A".equals(type) ? "192.0.2.72" : "target.example.")));
+        stored.setRecords(List.of(new ResourceRecord(switch (type) {
+            case "A" -> "192.0.2.72";
+            case "CNAME" -> "ip-192-0-2-73.ec2.internal.";
+            default -> "target.example.";
+        })));
         route53.changeResourceRecordSets(
                 backingZone, List.of(Map.of("action", "CREATE", "rrs", stored)), null);
         try {
@@ -286,6 +290,8 @@ class PrivateHostedZoneVpcScopeIntegrationTest {
                 DnsAnswer resolved = answer("api.child." + name, null, sources).orElseThrow();
                 if ("A".equals(type)) {
                     assertEquals(List.of("192.0.2.72"), resolved.addresses());
+                } else if ("CNAME".equals(type)) {
+                    assertEquals(List.of("192.0.2.73"), resolved.addresses());
                 } else {
                     assertEquals(5, resolved.responseCode());
                 }
