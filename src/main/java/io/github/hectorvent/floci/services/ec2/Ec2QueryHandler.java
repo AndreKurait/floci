@@ -2827,6 +2827,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleCreateVpcEndpoint(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         VpcEndpoint endpoint = service.createVpcEndpoint(
                 region,
                 p.getFirst("VpcId"),
@@ -2848,6 +2849,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleModifyVpcEndpoint(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         service.modifyVpcEndpoint(
                 region,
                 p.getFirst("VpcEndpointId"),
@@ -2872,6 +2874,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDescribeVpcEndpoints(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         List<String> endpointIds = getList(p, "VpcEndpointId");
         List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
         List<VpcEndpoint> endpoints = service.describeVpcEndpoints(region, endpointIds, filters);
@@ -3657,6 +3660,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDeleteVpcEndpoints(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         List<String> endpointIds = getList(p, "VpcEndpointId");
         service.deleteVpcEndpoints(region, endpointIds);
         XmlBuilder xml = new XmlBuilder()
