@@ -97,7 +97,11 @@ class SsmControlChannelIntegrationTest {
         assertEquals("aws.ssm." + command.commandId() + "." + instance, job.path("JobId").asText());
         JsonNode content = mapper.readTree(job.path("Content").asText());
         assertEquals("printf native", content.at("/Parameters/commands/0").asText());
-        assertEquals("aws:runShellScript", content.at("/DocumentContent/mainSteps/0/action").asText());
+        // AWS-RunShellScript is a schema 1.2 document: its one plugin, aws:runShellScript, is its step name.
+        assertEquals("1.2", content.at("/DocumentContent/schemaVersion").asText());
+        assertEquals("0.aws:runShellScript",
+                content.at("/DocumentContent/runtimeConfig/aws:runShellScript/properties/0/id").asText());
+        assertTrue(content.at("/DocumentContent/mainSteps").isMissingNode());
         send(socket, "agent_job_ack", mapper.createObjectNode().put("jobId", job.path("JobId").asText())
                 .put("acknowledgedMessageId", delivery.id().toString()).put("statusCode", "200"));
         reply(socket, job.path("JobId").asText(), "{\"documentStatus\":\"InProgress\"}");
@@ -107,7 +111,7 @@ class SsmControlChannelIntegrationTest {
         assertEquals(-1, active.responseCode());
         reply(socket, job.path("JobId").asText(), """
                 {"documentStatus":"Success","runtimeStatus":{
-                  "runShellScript":{"status":"Success","code":0,"standardOutput":"native"}
+                  "aws:runShellScript":{"status":"Success","code":0,"standardOutput":"native"}
                 }}
                 """);
         receiver.next("agent_job_reply_ack");
@@ -115,6 +119,11 @@ class SsmControlChannelIntegrationTest {
         assertEquals("Success", complete.statusAsString());
         assertEquals(0, complete.responseCode());
         assertEquals("native", complete.standardOutputContent());
+        GetCommandInvocationResponse plugin = ssm.getCommandInvocation(request -> request
+                .commandId(command.commandId()).instanceId(instance).pluginName("aws:runShellScript"));
+        assertEquals("aws:runShellScript", plugin.pluginName());
+        assertEquals("Success", plugin.statusAsString());
+        assertEquals("native", plugin.standardOutputContent());
     }
 
     @Test

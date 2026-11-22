@@ -327,7 +327,7 @@ class SsmDirectCommandAccountIntegrationTest extends SsmCommandIntegrationFixtur
 
     private static String replyPayload() {
         return """
-                {"documentStatus":"Success","runtimeStatus":{"runShellScript":{
+                {"documentStatus":"Success","runtimeStatus":{"aws:runShellScript":{
                   "status":"Success","code":0,"standardOutput":"owned agent output"
                 }}}
                 """;

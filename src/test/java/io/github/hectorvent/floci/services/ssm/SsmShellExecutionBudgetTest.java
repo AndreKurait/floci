@@ -167,8 +167,12 @@ class SsmShellExecutionBudgetTest {
             assertEquals(30L + expected, Duration.between(command.getRequestedDateTime(), command.getExpiresAfter())
                     .toSeconds());
             assertEquals("3600", payload.at("/DocumentContent/parameters/executionTimeout/default").asText());
-            assertEquals(custom ? "customStep" : "runPowerShellScript",
-                    payload.at("/DocumentContent/mainSteps/0/name").asText());
+            if (custom) {
+                assertEquals("customStep", payload.at("/DocumentContent/mainSteps/0/name").asText());
+            } else {
+                assertEquals("0.aws:runPowerShellScript", payload
+                        .at("/DocumentContent/runtimeConfig/aws:runPowerShellScript/properties/0/id").asText());
+            }
             if (supplied != 0) {
                 assertEquals(Integer.toString(supplied), payload.at("/Parameters/executionTimeout").asText());
             }

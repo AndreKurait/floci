@@ -14,24 +14,30 @@ import java.util.Map;
 
 /** A command captures its selected version before the document can be updated or deleted. */
 record SsmCommandDocument(String version, JsonNode content) {
+    /**
+     * AWS-RunShellScript and AWS-RunPowerShellScript are schema 1.2 documents: their one plugin (for example
+     * aws:runShellScript) is configured under runtimeConfig, so that plugin name is also the step name that
+     * GetCommandInvocation's PluginName and the agent's runtimeStatus use.
+     */
     private static final String SHELL_DOCUMENT = """
             {
-              "schemaVersion": "2.2",
+              "schemaVersion": "1.2",
               "description": "Run a script",
               "parameters": {
                 "commands": {"type": "StringList"},
                 "workingDirectory": {"type": "String", "default": ""},
                 "executionTimeout": {"type": "String", "default": "3600"}
               },
-              "mainSteps": [{
-                "action": "%s",
-                "name": "%s",
-                "inputs": {
-                  "runCommand": "{{ commands }}",
-                  "workingDirectory": "{{ workingDirectory }}",
-                  "timeoutSeconds": "{{ executionTimeout }}"
+              "runtimeConfig": {
+                "%1$s": {
+                  "properties": [{
+                    "id": "0.%1$s",
+                    "runCommand": "{{ commands }}",
+                    "workingDirectory": "{{ workingDirectory }}",
+                    "timeoutSeconds": "{{ executionTimeout }}"
+                  }]
                 }
-              }]
+              }
             }
             """;
 
@@ -43,8 +49,8 @@ record SsmCommandDocument(String version, JsonNode content) {
                     && !"1".equals(requestedVersion)) {
                 throw new AwsException("InvalidDocumentVersion", "The document version does not exist.", 400);
             }
-            String plugin = "AWS-RunPowerShellScript".equals(name) ? "runPowerShellScript" : "runShellScript";
-            return new SsmCommandDocument("1", parse(mapper, SHELL_DOCUMENT.formatted("aws:" + plugin, plugin)));
+            String plugin = "AWS-RunPowerShellScript".equals(name) ? "aws:runPowerShellScript" : "aws:runShellScript";
+            return new SsmCommandDocument("1", parse(mapper, SHELL_DOCUMENT.formatted(plugin)));
         }
         if (documents == null) {
             throw new AwsException("InvalidDocument", "The command document does not exist.", 400);

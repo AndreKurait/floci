@@ -536,7 +536,7 @@ class SsmSendCommandIntegrationTest {
 
     private static String buildReplyPayload(String stdout, String status, int returnCode) {
         return new ObjectMapper().valueToTree(Map.of(
-                "documentStatus", status, "runtimeStatus", Map.of("runShellScript", Map.of(
+                "documentStatus", status, "runtimeStatus", Map.of("aws:runShellScript", Map.of(
                         "status", status, "code", returnCode, "standardOutput", stdout,
                         "standardError", "", "startDateTime", "2026-01-01T00:00:00Z",
                         "endDateTime", "2026-01-01T00:00:01Z")))).toString();
