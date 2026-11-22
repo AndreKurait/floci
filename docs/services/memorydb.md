@@ -1,6 +1,7 @@
 # MemoryDB
 
 **Protocol:** JSON 1.1 (`X-Amz-Target: AmazonMemoryDB.*`) for management API + Redis RESP protocol for data plane
+**Smithy RPC v2 CBOR:** `POST /service/AmazonMemoryDB/operation/<Action>` with `smithy-protocol: rpc-v2-cbor`, which the service model lists first
 **Management Endpoint:** `POST http://localhost:4566/`
 **Data Endpoint:** `localhost:<proxy-port>` (TCP)
 

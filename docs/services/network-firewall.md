@@ -1,6 +1,7 @@
 # AWS Network Firewall
 
 **Protocol:** AWS JSON 1.0  
+**Smithy RPC v2 CBOR:** `POST /service/NetworkFirewall_20201112/operation/<Action>` with `smithy-protocol: rpc-v2-cbor`, which the service model lists first  
 **Signing name:** `network-firewall`
 
 Floci persists Network Firewall rule groups, firewall policies, firewalls, and

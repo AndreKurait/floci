@@ -3,6 +3,7 @@
 Floci implements the CodeDeploy API — stored-state management for applications, deployment groups, and configs, plus real Lambda and ECS deployment execution with traffic shifting and lifecycle hooks.
 
 **Protocol:** JSON 1.1 — `POST /` with `X-Amz-Target: CodeDeploy_20141006.<Action>`
+**Smithy RPC v2 CBOR:** `POST /service/CodeDeploy_20141006/operation/<Action>` with `smithy-protocol: rpc-v2-cbor`, which the service model lists first
 
 **ARN formats:**
 

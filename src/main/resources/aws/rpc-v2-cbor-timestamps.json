@@ -1,0 +1,132 @@
+{
+  "_source": {
+    "generator": "tools/aws/regen_rpcv2_cbor_timestamps.py",
+    "botocore": "botocore 1.43.118 (local/aws/botocore)"
+  },
+  "services": {
+    "ACMPrivateCA": [
+      "CreatedAt",
+      "LastStateChangeAt",
+      "NotAfter",
+      "NotBefore",
+      "RestorableUntil"
+    ],
+    "AWS242ServiceCatalogService": [
+      "CreatedTime",
+      "LastSuccessfulSyncTime",
+      "LastSyncTime",
+      "UpdatedTime"
+    ],
+    "AWSShineFrontendService_20170701": [
+      "CreatedAt",
+      "EndTime",
+      "LastUpdatedAt",
+      "LatestUpdateAttemptAt",
+      "SubmittedAfterTime",
+      "SubmittedBeforeTime",
+      "SubmittedTime"
+    ],
+    "AmazonMemoryDB": [
+      "AutoUpdateStartDate",
+      "CreateTime",
+      "Date",
+      "EndTime",
+      "ReleaseDate",
+      "SnapshotCreationTime",
+      "StartTime"
+    ],
+    "BaldrApiService": [
+      "CopyTimestamp",
+      "CreateTimestamp",
+      "DeleteTimestamp",
+      "HsmTypeRollbackExpiration"
+    ],
+    "CodeBuild_20161006": [
+      "created",
+      "endTime",
+      "expired",
+      "lastModified",
+      "lastModifiedSecret",
+      "requestTime",
+      "requestedOn",
+      "startTime",
+      "submitTime"
+    ],
+    "CodeDeploy_20141006": [
+      "completeTime",
+      "createTime",
+      "deregisterTime",
+      "end",
+      "endTime",
+      "firstUsedTime",
+      "lastUpdatedAt",
+      "lastUsedTime",
+      "registerTime",
+      "start",
+      "startTime"
+    ],
+    "CodePipeline_20150709": [
+      "approvedAt",
+      "created",
+      "endTime",
+      "lastChangedAt",
+      "lastStatusChange",
+      "lastTriggered",
+      "lastUpdateTime",
+      "pollingDisabledAt",
+      "startTime",
+      "updated"
+    ],
+    "Comprehend_20171127": [
+      "CreationTime",
+      "CreationTimeAfter",
+      "CreationTimeBefore",
+      "EndTime",
+      "LastModifiedTime",
+      "LatestVersionCreatedAt",
+      "SubmitTime",
+      "SubmitTimeAfter",
+      "SubmitTimeBefore",
+      "TrainingEndTime",
+      "TrainingStartTime"
+    ],
+    "FmrsService": [
+      "CreationTime",
+      "EndTime",
+      "LastConnectionTime",
+      "LaunchTime",
+      "StartTime",
+      "StatusUpdateTime"
+    ],
+    "NetworkFirewall_20201112": [
+      "CreateTime",
+      "DeleteTime",
+      "EndTime",
+      "FirstAccessed",
+      "FlowRequestTimestamp",
+      "LastAccessed",
+      "LastModifiedTime",
+      "LastUpdatedTime",
+      "ReportTime",
+      "StartTime",
+      "UpdateTime"
+    ],
+    "Route53AutoNaming_v20170314": [
+      "CreateDate",
+      "UpdateDate"
+    ],
+    "Textract": [
+      "AfterCreationTime",
+      "BeforeCreationTime",
+      "CreationTime"
+    ],
+    "Transcribe": [
+      "CompletionTime",
+      "CreateTime",
+      "CreationTime",
+      "LastModifiedTime",
+      "LastUpdateTime",
+      "StartTime"
+    ]
+  }
+}
