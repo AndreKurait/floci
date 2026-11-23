@@ -154,7 +154,7 @@ class SsmAgentCommandServiceTest {
         assertEquals(-1, invocation(command).getResponseCode());
         reply(command, """
                 {"documentStatus":"Success","runtimeStatus":{
-                  "runShellScript":{"status":"Success","code":0,"standardOutput":"done"}
+                  "aws:runShellScript":{"status":"Success","code":0,"standardOutput":"done"}
                 }}
                 """);
         assertEquals("Success", invocation(command).getStatus());
@@ -198,7 +198,7 @@ class SsmAgentCommandServiceTest {
         assertThrows(AwsException.class, () -> service.sendReply(id, "not json"));
         service.sendReply(id, """
                 {"documentStatus":"Success","runtimeStatus":{
-                  "runShellScript":{"status":"Success","code":0,"standardOutput":"recovered"}
+                  "aws:runShellScript":{"status":"Success","code":0,"standardOutput":"recovered"}
                 }}
                 """);
         assertEquals("recovered", invocation(command).getStandardOutputContent());
@@ -291,11 +291,11 @@ class SsmAgentCommandServiceTest {
     void aMissingTerminalReplyExpiresEvenAfterAcknowledgement() throws Exception {
         Command command = send("AWS-RunShellScript");
         reply(command, """
-                {"documentStatus":"InProgress","runtimeStatus":{"runShellScript":{"status":"InProgress","code":0}}}
+                {"documentStatus":"InProgress","runtimeStatus":{"aws:runShellScript":{"status":"InProgress","code":0}}}
                 """);
         service.listCommands(command.getCommandId(), null, REGION).getFirst().setExpiresAfter(Instant.EPOCH);
         assertEquals("Delivery Timed Out", invocation(command).getStatusDetails());
-        assertEquals("TimedOut", invocation(command).getPluginResults().get("runShellScript").path("status").asText());
+        assertEquals("TimedOut", invocation(command).getPluginResults().get("aws:runShellScript").path("status").asText());
         reply(command, "{\"documentStatus\":\"Success\"}");
         Command summary = service.listCommands(command.getCommandId(), null, REGION).getFirst();
         assertEquals("TimedOut", summary.getStatus());

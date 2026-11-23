@@ -402,7 +402,8 @@ command metadata; delivery converts them to the document's declared `String` or
 values fail before command creation. The agent performs plugin-specific validation.
 
 Use a document step's name as `GetCommandInvocation.PluginName` when it has multiple
-steps. Results remain separate for each step. A document completion summary may arrive
+steps. The built-in shell documents are schema 1.2 documents, as in AWS: their one step is
+their plugin, `aws:runShellScript` or `aws:runPowerShellScript`. Results remain separate for each step. A document completion summary may arrive
 before its final plugin replies; those replies fill in missing results without
 reopening the finished command or overwriting completed steps with older progress.
 Inline output retains the first 24,000 characters of stdout and 8,000 of stderr.
