@@ -25,6 +25,7 @@ import jakarta.ws.rs.*;
 import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.core.UriInfo;
 import org.jboss.logging.Logger;
 
 import java.io.ByteArrayInputStream;
@@ -44,7 +45,9 @@ import java.util.zip.GZIPInputStream;
  * via either smithy-rpc-v2-cbor path routing or the legacy X-Amz-Target header.
  * <p>
  * Currently supported services: DynamoDB (incl. Streams), SQS, SNS, Kinesis,
- * Step Functions, CloudWatch Metrics, and EventBridge V2.
+ * Step Functions, CloudWatch Metrics, and EventBridge V2. An AWS JSON service whose descriptor also declares
+ * {@link ServiceProtocol#CBOR}, because its botocore model lists both protocols, is answered on the RPC v2 path by
+ * the handler {@link AwsJson11Controller} dispatches it to.
  * <p>
  * Requests run on virtual threads, as in {@link AwsJsonController}, so a ReceiveMessage or
  * GetActivityTask long poll does not hold one of the shared request workers while it waits.
@@ -70,6 +73,7 @@ public class AwsJsonCborController {
     private final SnsJsonHandler snsJsonHandler;
     private final KinesisJsonHandler kinesisJsonHandler;
     private final StepFunctionsJsonHandler sfnJsonHandler;
+    private final AwsJson11Controller awsJson11Controller;
     private final CloudWatchMetricsJsonHandler cloudWatchMetricsJsonHandler;
     private final MarketplaceEntitlementController marketplaceEntitlementController;
     private final EventBridgeV2Handler eventBridgeV2Handler;
@@ -83,6 +87,7 @@ public class AwsJsonCborController {
                                  SqsJsonHandler sqsJsonHandler, SnsJsonHandler snsJsonHandler,
                                  KinesisJsonHandler kinesisJsonHandler,
                                  StepFunctionsJsonHandler sfnJsonHandler,
+                                 AwsJson11Controller awsJson11Controller,
                                  CloudWatchMetricsJsonHandler cloudWatchMetricsJsonHandler,
                                  MarketplaceEntitlementController marketplaceEntitlementController,
                                  EventBridgeV2Handler eventBridgeV2Handler,
@@ -96,6 +101,7 @@ public class AwsJsonCborController {
         this.snsJsonHandler = snsJsonHandler;
         this.kinesisJsonHandler = kinesisJsonHandler;
         this.sfnJsonHandler = sfnJsonHandler;
+        this.awsJson11Controller = awsJson11Controller;
         this.cloudWatchMetricsJsonHandler = cloudWatchMetricsJsonHandler;
         this.marketplaceEntitlementController = marketplaceEntitlementController;
         this.eventBridgeV2Handler = eventBridgeV2Handler;
@@ -323,6 +329,7 @@ public class AwsJsonCborController {
             @PathParam(RPC_V2_SERVICE_PARAMETER) String serviceId,
             @PathParam(RPC_V2_OPERATION_PARAMETER) String operation,
             @Context HttpHeaders httpHeaders,
+            @Context UriInfo uriInfo,
             byte[] body) {
 
         LOG.debugv("Smithy RPC v2 CBOR: service={0}, operation={1}", serviceId, operation);
@@ -332,6 +339,9 @@ public class AwsJsonCborController {
             String region = regionResolver.resolveRegion(httpHeaders);
 
             Response delegated = dispatchCbor(serviceId, operation, request, region);
+            if (delegated == null) {
+                delegated = dispatchJson11(serviceId, operation, request, region, httpHeaders, uriInfo);
+            }
             if (delegated == null) {
                 return Response.status(404).build();
             }
@@ -526,12 +536,41 @@ public class AwsJsonCborController {
         };
     }
 
-    /** The timestamp members a service's responses carry under names {@link #isTimestampField} does not match. */
+    /**
+     * Answers an RPC v2 CBOR call with the AWS JSON handler of a service whose descriptor declares both protocols,
+     * as its botocore model lists both "smithy-rpc-v2-cbor" and "json"; an SDK that prefers CBOR sends it here. The
+     * RPC v2 service name is the service's X-Amz-Target prefix without its dot, so the target is rebuilt from the
+     * path. Null, and so the 404 as before, for a service that does not declare both.
+     */
+    private Response dispatchJson11(String serviceId, String operation, JsonNode request, String region,
+                                    HttpHeaders httpHeaders, UriInfo uriInfo) throws Exception {
+        ServiceDescriptor descriptor = catalog.byCborSdkServiceId(serviceId).orElse(null);
+        if (descriptor == null || !descriptor.supportsProtocol(ServiceProtocol.CBOR)
+                || !descriptor.supportsProtocol(ServiceProtocol.JSON)) {
+            return null;
+        }
+        ServiceCatalog.TargetMatch targetMatch = catalog.matchTarget(serviceId + "." + operation)
+                .filter(match -> match.descriptor() == descriptor)
+                .orElse(null);
+        if (targetMatch == null) {
+            return null;
+        }
+        String authorization = httpHeaders.getHeaderString("Authorization");
+        if (authorization == null || authorization.isBlank()) {
+            authorization = IamEnforcementFilter.requestAuthorization(null, uriInfo.getQueryParameters());
+        }
+        return awsJson11Controller.dispatch(targetMatch, request, region, authorization, uriInfo.getBaseUri());
+    }
+
+    /**
+     * The timestamp members a service's responses carry under names {@link #isTimestampField} does not match:
+     * EventBridge V2's own, or those botocore's model gives an AWS JSON service answered here.
+     */
     private Set<String> timestampMembers(String serviceId) {
-        return catalog.byCborSdkServiceId(serviceId)
+        boolean eventBridgeV2 = catalog.byCborSdkServiceId(serviceId)
                 .filter(descriptor -> "eventsv2".equals(descriptor.externalKey()))
-                .map(descriptor -> EventBridgeV2Handler.TIMESTAMP_MEMBERS)
-                .orElse(Set.of());
+                .isPresent();
+        return eventBridgeV2 ? EventBridgeV2Handler.TIMESTAMP_MEMBERS : RpcV2CborTimestamps.of(serviceId);
     }
 
     private Response cborUnknownOperationError(String message, HttpHeaders httpHeaders) {

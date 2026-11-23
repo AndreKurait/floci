@@ -1,11 +1,13 @@
 package io.github.hectorvent.floci.services.memorydb;
 
+import io.github.hectorvent.floci.testing.RestAssuredJsonUtils;
 import io.github.hectorvent.floci.testing.ValidateSignaturesProfile;
 import io.github.hectorvent.floci.testutil.AwsRequestSigner;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.Response;
+import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -24,6 +26,11 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 class MemoryDbParameterGroupValidationIntegrationTest {
     @TestHTTPResource
     URI endpoint;
+
+    @BeforeAll
+    static void configureContentTypes() {
+        RestAssuredJsonUtils.configureAwsContentTypes();
+    }
 
     @ParameterizedTest
     @ValueSource(strings = {

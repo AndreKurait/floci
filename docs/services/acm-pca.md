@@ -1,8 +1,10 @@
 # AWS Private CA
 
 Floci supports root and subordinate certificate authority lifecycles through the
-AWS Private CA JSON 1.1 API. Certificate authorities have actual RSA keys, signed PKCS#10
-certificate signing requests, and X.509 certificates. Issued certificates verify
+AWS Private CA JSON 1.1 API, and its Smithy RPC v2 CBOR form at
+`POST /service/ACMPrivateCA/operation/<Action>`, which the service model lists first.
+Certificate authorities have actual RSA keys, signed PKCS#10 certificate signing
+requests, and X.509 certificates. Issued certificates verify
 against their issuing authority; responses do not expose the authority's private
 key.
 

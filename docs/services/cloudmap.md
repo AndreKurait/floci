@@ -2,6 +2,7 @@
 
 **Protocol:** JSON 1.1
 **Header:** `X-Amz-Target: Route53AutoNaming_v20170314.<Action>`
+**Smithy RPC v2 CBOR:** `POST /service/Route53AutoNaming_v20170314/operation/<Action>` with `smithy-protocol: rpc-v2-cbor`, which the service model lists first
 **Endpoint prefix:** `servicediscovery`
 
 Floci emulates the AWS Cloud Map (service discovery) control plane in-process:

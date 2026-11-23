@@ -2,6 +2,7 @@
 
 **Protocol:** JSON 1.1
 **Header:** `X-Amz-Target: Transcribe.<Action>`
+**Smithy RPC v2 CBOR:** `POST /service/Transcribe/operation/<Action>` with `smithy-protocol: rpc-v2-cbor`, which the service model lists first
 **Endpoint prefix:** `transcribe`
 
 Floci emulates a small Amazon Transcribe control-plane stub for applications

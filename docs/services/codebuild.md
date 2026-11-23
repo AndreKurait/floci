@@ -3,6 +3,7 @@
 Floci implements the CodeBuild API — stored-state management plus real build execution inside Docker containers.
 
 **Protocol:** JSON 1.1 — `POST /` with `X-Amz-Target: CodeBuild_20161006.<Action>`
+**Smithy RPC v2 CBOR:** `POST /service/CodeBuild_20161006/operation/<Action>` with `smithy-protocol: rpc-v2-cbor`, which the service model lists first
 
 **ARN formats:**
 

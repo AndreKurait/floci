@@ -295,6 +295,7 @@ aws-data-sync-botocore: ## Regenerate only the AWS data derived from botocore, s
 	$(PYTHON) tools/aws/regen_emr_serverless_shapes.py
 	$(PYTHON) tools/aws/regen_stepfunctions_compute_shapes.py
 	$(PYTHON) tools/aws/regen_query_services.py
+	$(PYTHON) tools/aws/regen_rpcv2_cbor_timestamps.py
 	$(PYTHON) tools/aws/regen_rest_routes.py
 	$(PYTHON) tools/aws/regen_iam_paginators.py
 
@@ -438,6 +439,12 @@ aws-data-check-botocore: ## The AWS data derived from botocore must match a fres
 	@$(PYTHON) tools/aws/regen_query_services.py --check || { \
 		echo ""; \
 		echo "error: src/main/resources/aws/query-services.json is out of date."; \
+		echo "       Run 'make aws-data-sync' and commit the result."; \
+		exit 1; \
+	}
+	@$(PYTHON) tools/aws/regen_rpcv2_cbor_timestamps.py --check || { \
+		echo ""; \
+		echo "error: src/main/resources/aws/rpc-v2-cbor-timestamps.json is out of date."; \
 		echo "       Run 'make aws-data-sync' and commit the result."; \
 		exit 1; \
 	}
