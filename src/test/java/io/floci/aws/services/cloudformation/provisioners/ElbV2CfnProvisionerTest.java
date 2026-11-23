@@ -396,6 +396,46 @@ class ElbV2CfnProvisionerTest {
         assertEquals("v", conds.getValue().get(2).getQueryStringValues().get(0).getKey());
     }
 
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void invalidRuleRegexIsRejectedBeforeCreateOrUpdate(boolean update) {
+        when(elb.describeRules(REGION, null, List.of(RULE_ARN))).thenReturn(List.of(rule(LISTENER_ARN)));
+        for (String invalid : List.of("(", "", "a".repeat(129))) {
+            ObjectNode props = mapper.createObjectNode().put("ListenerArn", LISTENER_ARN).put("Priority", "75");
+            props.putArray("Conditions").addObject().put("Field", "path-pattern").putObject("PathPatternConfig")
+                    .putArray("RegexValues").add(invalid);
+            AwsException error = assertThrows(AwsException.class, () -> provisioner.provision(
+                    resource("AWS::ElasticLoadBalancingV2::ListenerRule", "Rule"), props,
+                    update ? ctx(RULE_ARN) : ctx()));
+            assertEquals("ValidationError", error.getErrorCode());
+            assertEquals(400, error.getHttpStatus());
+        }
+        verify(elb, never()).createRule(anyString(), anyString(), anyList(), anyInt(), anyList(), any());
+        verify(elb, never()).modifyRule(anyString(), anyString(), anyList(), anyList());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void mixedGlobAndRegexIsRejectedBeforeCreateOrUpdate(boolean update) {
+        when(elb.describeRules(REGION, null, List.of(RULE_ARN))).thenReturn(List.of(rule(LISTENER_ARN)));
+        for (boolean legacy : List.of(false, true)) {
+            ObjectNode props = mapper.createObjectNode().put("ListenerArn", LISTENER_ARN).put("Priority", "75");
+            ObjectNode condition = props.putArray("Conditions").addObject().put("Field", "path-pattern");
+            ObjectNode path = condition.putObject("PathPatternConfig");
+            path.putArray("RegexValues").add("^/api/.*$");
+            (legacy ? condition : path).putArray("Values").add("/api/*");
+            AwsException error = assertThrows(AwsException.class, () -> provisioner.provision(
+                    resource("AWS::ElasticLoadBalancingV2::ListenerRule", "Rule"), props,
+                    update ? ctx(RULE_ARN) : ctx()));
+            assertEquals("ValidationError", error.getErrorCode());
+            assertEquals(400, error.getHttpStatus());
+            assertEquals("A path-pattern condition can specify either Values or RegexValues, not both.",
+                    error.getMessage());
+        }
+        verify(elb, never()).createRule(anyString(), anyString(), anyList(), anyInt(), anyList(), any());
+        verify(elb, never()).modifyRule(anyString(), anyString(), anyList(), anyList());
+    }
+
     @Test
     void ruleParsesPathPatternRegexValues() {
         when(elb.createRule(eq(REGION), eq(LISTENER_ARN), anyList(), eq(75), anyList(), eq(Map.of())))
