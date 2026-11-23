@@ -15,8 +15,6 @@ import org.jboss.logging.Logger;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
-import java.util.regex.Pattern;
-import java.util.regex.PatternSyntaxException;
 
 @ApplicationScoped
 public class ElbV2QueryHandler {
@@ -1477,22 +1475,7 @@ public class ElbV2QueryHandler {
      * Each regular expression is at most 128 characters and must compile.
      */
     static void validatePathPatternRegexValues(List<String> regexValues, boolean hasGlobValues) {
-        if (hasGlobValues) {
-            throw new AwsException("ValidationError",
-                    "A path-pattern condition can specify either Values or RegexValues, not both.", 400);
-        }
-        for (String regex : regexValues) {
-            if (regex.isEmpty() || regex.length() > 128) {
-                throw new AwsException("ValidationError",
-                        "Each path-pattern regex value must be between 1 and 128 characters.", 400);
-            }
-            try {
-                Pattern.compile(regex);
-            } catch (PatternSyntaxException e) {
-                throw new AwsException("ValidationError",
-                        "Invalid path-pattern regex value '" + regex + "'.", 400);
-            }
-        }
+        PathPatternRegexValues.validate(regexValues, hasGlobValues);
     }
 
     private List<TargetDescription> parseTargets(MultivaluedMap<String, String> p) {
