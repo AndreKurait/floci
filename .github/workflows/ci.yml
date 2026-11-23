@@ -59,10 +59,28 @@ jobs:
         github.event.pull_request.state != 'closed' &&
         github.event.action != 'edited'
       )
+    # Share four test slots across PRs and main. Queue every shard; the default
+    # single pending job would cancel another PR's required tests.
+    concurrency:
+      group: floci-ci-slot-${{ matrix.slot }}
+      cancel-in-progress: false
+      queue: max
     strategy:
       fail-fast: false
+      max-parallel: 4
       matrix:
         shard: [1, 2, 3, 4, 5]
+        include:
+          - shard: 1
+            slot: 1
+          - shard: 2
+            slot: 2
+          - shard: 3
+            slot: 3
+          - shard: 4
+            slot: 4
+          - shard: 5
+            slot: 1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
