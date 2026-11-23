@@ -1,7 +1,8 @@
 # Resource Groups Tagging API
 
-**Protocol:** JSON 1.1
-**Header:** `X-Amz-Target: ResourceGroupsTaggingAPI_20170126.<Action>`
+**Protocol:** JSON 1.1, and Smithy RPC v2 CBOR, the first protocol the service model lists
+**Header:** `X-Amz-Target: ResourceGroupsTaggingAPI_20170126.<Action>` (JSON 1.1), or
+`POST /service/ResourceGroupsTaggingAPI_20170126/operation/<Action>` with `smithy-protocol: rpc-v2-cbor` (CBOR)
 **Endpoint prefix:** `tagging`
 
 Floci emulates the AWS Resource Groups Tagging API for local tests that need

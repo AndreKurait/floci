@@ -462,7 +462,7 @@ public class ResolvedServiceCatalog {
                 descriptor("tagging", "tagging", config.services().tagging().enabled(), true,
                         "tagging", storageMode(config.storage().services().tagging().mode(), config.storage().mode()),
                         config.storage().services().tagging().flushIntervalMs(), null, ServiceProtocol.JSON,
-                        protocols(ServiceProtocol.JSON),
+                        protocols(ServiceProtocol.JSON, ServiceProtocol.CBOR),
                         Set.of("ResourceGroupsTaggingAPI_20170126."), Set.of("tagging"), Set.of(), Set.of()),
                 descriptor("bedrock", "bedrock", config.services().bedrock().enabled(), true,
                         "bedrock", config.storage().mode(), 5000L, null, ServiceProtocol.REST_JSON,

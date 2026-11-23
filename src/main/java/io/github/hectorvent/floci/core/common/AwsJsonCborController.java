@@ -15,6 +15,7 @@ import io.github.hectorvent.floci.services.dynamodb.DynamoDbStreamsJsonHandler;
 import io.github.hectorvent.floci.services.eventbridgev2.EventBridgeV2Handler;
 import io.github.hectorvent.floci.services.kinesis.KinesisJsonHandler;
 import io.github.hectorvent.floci.services.marketplace.MarketplaceEntitlementController;
+import io.github.hectorvent.floci.services.resourcegroupstagging.ResourceGroupsTaggingJsonHandler;
 import io.github.hectorvent.floci.services.sns.SnsJsonHandler;
 import io.github.hectorvent.floci.services.sqs.SqsJsonHandler;
 import io.github.hectorvent.floci.services.stepfunctions.StepFunctionsJsonHandler;
@@ -72,6 +73,7 @@ public class AwsJsonCborController {
     private final CloudWatchMetricsJsonHandler cloudWatchMetricsJsonHandler;
     private final MarketplaceEntitlementController marketplaceEntitlementController;
     private final EventBridgeV2Handler eventBridgeV2Handler;
+    private final ResourceGroupsTaggingJsonHandler resourceGroupsTaggingJsonHandler;
 
     @Inject
     public AwsJsonCborController(ObjectMapper objectMapper, ResolvedServiceCatalog catalog,
@@ -83,7 +85,8 @@ public class AwsJsonCborController {
                                  StepFunctionsJsonHandler sfnJsonHandler,
                                  CloudWatchMetricsJsonHandler cloudWatchMetricsJsonHandler,
                                  MarketplaceEntitlementController marketplaceEntitlementController,
-                                 EventBridgeV2Handler eventBridgeV2Handler) {
+                                 EventBridgeV2Handler eventBridgeV2Handler,
+                                 ResourceGroupsTaggingJsonHandler resourceGroupsTaggingJsonHandler) {
         this.objectMapper = objectMapper;
         this.catalog = catalog;
         this.regionResolver = regionResolver;
@@ -96,6 +99,7 @@ public class AwsJsonCborController {
         this.cloudWatchMetricsJsonHandler = cloudWatchMetricsJsonHandler;
         this.marketplaceEntitlementController = marketplaceEntitlementController;
         this.eventBridgeV2Handler = eventBridgeV2Handler;
+        this.resourceGroupsTaggingJsonHandler = resourceGroupsTaggingJsonHandler;
     }
 
 
@@ -516,6 +520,8 @@ public class AwsJsonCborController {
             case "monitoring" -> cloudWatchMetricsJsonHandler.handle(operation, request, region);
             case "marketplace" -> marketplaceEntitlementController.handle(operation, request, region);
             case "eventsv2" -> eventBridgeV2Handler.handle(operation, request, region);
+            // The Resource Groups Tagging API's model lists smithy-rpc-v2-cbor first among its protocols.
+            case "tagging" -> resourceGroupsTaggingJsonHandler.handle(operation, request, region);
             default -> null;
         };
     }
