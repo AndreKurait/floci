@@ -95,6 +95,11 @@
     </dependencyManagement>
 
     <dependencies>
+        <dependency>
+            <groupId>com.google.re2j</groupId>
+            <artifactId>re2j</artifactId>
+            <version>1.8</version>
+        </dependency>
         <!-- Quarkus REST (RESTEasy Reactive) -->
         <dependency>
           <groupId>io.quarkus</groupId>

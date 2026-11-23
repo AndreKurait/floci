@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.LoadBalancerProxySources.Backend;
 import io.github.hectorvent.floci.config.TlsProxyServer;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.CertificateReferenceResolver;
 import io.github.hectorvent.floci.core.common.CertificateReferenceResolver.CertificateMaterial;
 import io.github.hectorvent.floci.core.common.Pem;
@@ -16,6 +17,7 @@ import io.github.hectorvent.floci.core.common.tls.ReloadingKeyManager;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
 import io.github.hectorvent.floci.services.elbv2.ElbV2VpcNetworkManager.BackendProxy;
+import io.github.hectorvent.floci.services.elbv2.PathPatternRegexValues.Compiled;
 import io.github.hectorvent.floci.services.elbv2.model.Action;
 import io.github.hectorvent.floci.services.elbv2.model.Listener;
 import io.github.hectorvent.floci.services.elbv2.model.LoadBalancer;
@@ -76,7 +78,9 @@ import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -2237,6 +2241,22 @@ public class ElbV2DataPlane {
         return last;
     }
 
+    static List<Compiled> compilePathRegexes(List<String> regexValues) {
+        List<Compiled> compiled = new ArrayList<>();
+        for (String regex : regexValues) {
+            try {
+                compiled.add(PathPatternRegexValues.compile(regex));
+            } catch (AwsException e) {
+                LOG.warnv("Ignoring path-pattern regex value that does not compile: {0}", regex);
+            }
+        }
+        return List.copyOf(compiled);
+    }
+
+    static boolean pathRegexMatches(List<Compiled> patterns, String path) {
+        return path != null && patterns.stream().anyMatch(p -> p.matches(path));
+    }
+
     private static boolean globMatches(String pattern, String text) {
         if (text == null) {
             return false;
@@ -2258,6 +2278,8 @@ public class ElbV2DataPlane {
         final Rule rule;
         final Action action;
         final List<String> hostHeaderPatterns;
+        private final Map<RuleCondition, List<Compiled>> pathRegexes =
+                Collections.synchronizedMap(new IdentityHashMap<>());
 
         CompiledRule(Rule rule) {
             this.rule = rule;
@@ -2291,6 +2313,17 @@ public class ElbV2DataPlane {
             return hostHeaderPatterns.stream().anyMatch(p -> globMatches(p, host));
         }
 
+        /**
+         * ALB regex path conditions: the condition holds when any expression matches the whole
+         * request path (not its query string). Expressions are compiled once per rule chain; one
+         * that does not compile never matches.
+         */
+        private boolean matchesPathRegex(RuleCondition condition, String path) {
+            List<Compiled> patterns = pathRegexes.computeIfAbsent(condition,
+                    c -> compilePathRegexes(c.getPathPatternRegexValues()));
+            return pathRegexMatches(patterns, path);
+        }
+
         boolean matches(HttpServerRequest req) {
             if (rule.isDefault()) {
                 return true;
@@ -2317,10 +2350,13 @@ public class ElbV2DataPlane {
                     yield patterns.stream().anyMatch(p -> globMatches(p, effectiveHost));
                 }
                 case "path-pattern" -> {
+                    String path = req.path();
+                    if (!condition.getPathPatternRegexValues().isEmpty()) {
+                        yield matchesPathRegex(condition, path);
+                    }
                     List<String> patterns = condition.getPathPatternValues().isEmpty()
                             ? condition.getValues()
                             : condition.getPathPatternValues();
-                    String path = req.path();
                     yield patterns.stream().anyMatch(p -> globMatches(p, path));
                 }
                 case "http-header" -> {

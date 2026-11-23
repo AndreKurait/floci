@@ -589,3 +589,8 @@ change the AWS API shape or require a separate Floci process for each region.
 `floci.services.elbv2.single-zone-alb-accounts` is independent of this policy: an
 account it lists may use one zone in every region, including a region set to
 `require-two-zones`.
+
+Path-pattern `RegexValues` use a linear-time regex engine for admission and full-path matching.
+Lookarounds, backreferences, atomic groups, possessive quantifiers, recursion, subroutines,
+and Unicode character classes are rejected. Escaped or quoted literal text remains valid.
+Existing `Values` glob matching is unchanged.

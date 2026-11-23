@@ -1055,10 +1055,19 @@ public class ElbV2QueryHandler {
             for (String v : c.getHostHeaderValues()) xml.elem("member", v);
             xml.end("Values").end("HostHeaderConfig");
         }
-        if (!c.getPathPatternValues().isEmpty()) {
-            xml.start("PathPatternConfig").start("Values");
-            for (String v : c.getPathPatternValues()) xml.elem("member", v);
-            xml.end("Values").end("PathPatternConfig");
+        if (!c.getPathPatternValues().isEmpty() || !c.getPathPatternRegexValues().isEmpty()) {
+            xml.start("PathPatternConfig");
+            if (!c.getPathPatternValues().isEmpty()) {
+                xml.start("Values");
+                for (String v : c.getPathPatternValues()) xml.elem("member", v);
+                xml.end("Values");
+            }
+            if (!c.getPathPatternRegexValues().isEmpty()) {
+                xml.start("RegexValues");
+                for (String v : c.getPathPatternRegexValues()) xml.elem("member", v);
+                xml.end("RegexValues");
+            }
+            xml.end("PathPatternConfig");
         }
         if (c.getHttpHeaderName() != null) {
             xml.start("HttpHeaderConfig")
@@ -1388,8 +1397,22 @@ public class ElbV2QueryHandler {
                         vals.add(val);
                         j++;
                     }
-                    if (!vals.isEmpty()) c.setPathPatternValues(vals);
-                    else c.setPathPatternValues(new ArrayList<>(legacyValues));
+                    List<String> regexVals = new ArrayList<>();
+                    j = 1;
+                    while (true) {
+                        String val = p.getFirst("Conditions.member." + i + ".PathPatternConfig.RegexValues.member." + j);
+                        if (val == null) break;
+                        regexVals.add(val);
+                        j++;
+                    }
+                    if (!regexVals.isEmpty()) {
+                        validatePathPatternRegexValues(regexVals, !vals.isEmpty() || !legacyValues.isEmpty());
+                        c.setPathPatternRegexValues(regexVals);
+                    } else if (!vals.isEmpty()) {
+                        c.setPathPatternValues(vals);
+                    } else {
+                        c.setPathPatternValues(new ArrayList<>(legacyValues));
+                    }
                 }
                 case "http-header" -> {
                     c.setHttpHeaderName(p.getFirst("Conditions.member." + i + ".HttpHeaderConfig.HttpHeaderName"));
@@ -1445,6 +1468,14 @@ public class ElbV2QueryHandler {
             i++;
         }
         return result;
+    }
+
+    /**
+     * A path-pattern condition carries either glob {@code Values} or {@code RegexValues}, never both.
+     * Each regular expression is at most 128 characters and must compile.
+     */
+    static void validatePathPatternRegexValues(List<String> regexValues, boolean hasGlobValues) {
+        PathPatternRegexValues.validate(regexValues, hasGlobValues);
     }
 
     private List<TargetDescription> parseTargets(MultivaluedMap<String, String> p) {

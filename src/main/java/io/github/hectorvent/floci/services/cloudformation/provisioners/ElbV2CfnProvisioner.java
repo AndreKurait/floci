@@ -7,6 +7,7 @@ import io.github.hectorvent.floci.core.common.AwsArnUtils;
 import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.services.cloudformation.model.StackResource;
 import io.github.hectorvent.floci.services.elbv2.ElbV2Service;
+import io.github.hectorvent.floci.services.elbv2.PathPatternRegexValues;
 import io.github.hectorvent.floci.services.elbv2.model.Action;
 import io.github.hectorvent.floci.services.elbv2.model.AvailabilityZone;
 import io.github.hectorvent.floci.services.elbv2.model.Listener;
@@ -642,6 +643,14 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
             JsonNode pathCfg = item.path("PathPatternConfig");
             if (pathCfg.path("Values").isArray()) {
                 condition.setPathPatternValues(toStringList(pathCfg.path("Values")));
+            }
+            if (pathCfg.path("RegexValues").isArray()) {
+                List<String> regexValues = toStringList(pathCfg.path("RegexValues"));
+                if ("path-pattern".equals(condition.getField()) && !regexValues.isEmpty()) {
+                    PathPatternRegexValues.validate(regexValues,
+                            !condition.getValues().isEmpty() || !condition.getPathPatternValues().isEmpty());
+                }
+                condition.setPathPatternRegexValues(regexValues);
             }
             JsonNode hostCfg = item.path("HostHeaderConfig");
             if (hostCfg.path("Values").isArray()) {
