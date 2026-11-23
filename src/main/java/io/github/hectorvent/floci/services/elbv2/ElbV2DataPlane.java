@@ -6,6 +6,7 @@ import io.github.hectorvent.floci.config.EmulatorConfig;
 import io.github.hectorvent.floci.config.LoadBalancerProxySources.Backend;
 import io.github.hectorvent.floci.config.TlsProxyServer;
 import io.github.hectorvent.floci.core.common.AwsArnUtils;
+import io.github.hectorvent.floci.core.common.AwsException;
 import io.github.hectorvent.floci.core.common.CertificateReferenceResolver;
 import io.github.hectorvent.floci.core.common.CertificateReferenceResolver.CertificateMaterial;
 import io.github.hectorvent.floci.core.common.Pem;
@@ -16,6 +17,7 @@ import io.github.hectorvent.floci.core.common.tls.ReloadingKeyManager;
 import io.github.hectorvent.floci.services.ec2.Ec2Service;
 import io.github.hectorvent.floci.services.ec2.SecurityGroupFirewallManager;
 import io.github.hectorvent.floci.services.elbv2.ElbV2VpcNetworkManager.BackendProxy;
+import io.github.hectorvent.floci.services.elbv2.PathPatternRegexValues.Compiled;
 import io.github.hectorvent.floci.services.elbv2.model.Action;
 import io.github.hectorvent.floci.services.elbv2.model.Listener;
 import io.github.hectorvent.floci.services.elbv2.model.LoadBalancer;
@@ -99,7 +101,6 @@ import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
-import java.util.regex.PatternSyntaxException;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -2240,20 +2241,20 @@ public class ElbV2DataPlane {
         return last;
     }
 
-    static List<Pattern> compilePathRegexes(List<String> regexValues) {
-        List<Pattern> compiled = new ArrayList<>();
+    static List<Compiled> compilePathRegexes(List<String> regexValues) {
+        List<Compiled> compiled = new ArrayList<>();
         for (String regex : regexValues) {
             try {
-                compiled.add(Pattern.compile(regex));
-            } catch (PatternSyntaxException e) {
+                compiled.add(PathPatternRegexValues.compile(regex));
+            } catch (AwsException e) {
                 LOG.warnv("Ignoring path-pattern regex value that does not compile: {0}", regex);
             }
         }
         return List.copyOf(compiled);
     }
 
-    static boolean pathRegexMatches(List<Pattern> patterns, String path) {
-        return path != null && patterns.stream().anyMatch(p -> p.matcher(path).matches());
+    static boolean pathRegexMatches(List<Compiled> patterns, String path) {
+        return path != null && patterns.stream().anyMatch(p -> p.matches(path));
     }
 
     private static boolean globMatches(String pattern, String text) {
@@ -2277,7 +2278,7 @@ public class ElbV2DataPlane {
         final Rule rule;
         final Action action;
         final List<String> hostHeaderPatterns;
-        private final Map<RuleCondition, List<Pattern>> pathRegexes =
+        private final Map<RuleCondition, List<Compiled>> pathRegexes =
                 Collections.synchronizedMap(new IdentityHashMap<>());
 
         CompiledRule(Rule rule) {
@@ -2318,7 +2319,7 @@ public class ElbV2DataPlane {
          * that does not compile never matches.
          */
         private boolean matchesPathRegex(RuleCondition condition, String path) {
-            List<Pattern> patterns = pathRegexes.computeIfAbsent(condition,
+            List<Compiled> patterns = pathRegexes.computeIfAbsent(condition,
                     c -> compilePathRegexes(c.getPathPatternRegexValues()));
             return pathRegexMatches(patterns, path);
         }

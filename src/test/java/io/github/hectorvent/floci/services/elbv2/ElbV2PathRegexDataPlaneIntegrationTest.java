@@ -15,6 +15,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.elasticloadbalancingv2.ElasticLoadBalancingV2Client;
+import software.amazon.awssdk.services.elasticloadbalancingv2.model.ElasticLoadBalancingV2Exception;
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.Rule;
 import software.amazon.awssdk.services.elasticloadbalancingv2.model.RuleCondition;
 
@@ -32,6 +33,8 @@ import static io.restassured.RestAssured.given;
 import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTimeout;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -151,6 +154,43 @@ class ElbV2PathRegexDataPlaneIntegrationTest {
                 .post("/")
                 .then().statusCode(400)
                 .body("ErrorResponse.Error.Code", equalTo("ValidationError"));
+    }
+
+    @Test
+    void unsupportedSyntaxCannotCreateOrModifySdkRules() {
+        String ruleArn = createSplitRule(0, 100);
+        try (ElasticLoadBalancingV2Client client = AwsTestClients.create(
+                ElasticLoadBalancingV2Client.builder(), "000000000000", Region.US_EAST_1)) {
+            int initialCount = client.describeRules(r -> r.listenerArn(listenerArn)).rules().size();
+            for (String regex : List.of("^/a(?=b)$", "^/(?>a)$", "^/\\p{L}+$")) {
+                ElasticLoadBalancingV2Exception createError = assertThrows(ElasticLoadBalancingV2Exception.class,
+                        () -> client.createRule(r -> r.listenerArn(listenerArn).priority(90)
+                                .conditions(c -> c.field("path-pattern").pathPatternConfig(p -> p.regexValues(regex)))
+                                .actions(a -> a.type("forward").targetGroupArn(cloneTg))));
+                assertEquals("ValidationError", createError.awsErrorDetails().errorCode());
+                ElasticLoadBalancingV2Exception updateError = assertThrows(ElasticLoadBalancingV2Exception.class,
+                        () -> client.modifyRule(r -> r.ruleArn(ruleArn)
+                                .conditions(c -> c.field("path-pattern").pathPatternConfig(p -> p.regexValues(regex)))));
+                assertEquals("ValidationError", updateError.awsErrorDetails().errorCode());
+            }
+            assertEquals(initialCount, client.describeRules(r -> r.listenerArn(listenerArn)).rules().size());
+            assertEquals(ElbV2PathRegexTest.READ_REGEXES, client.describeRules(r -> r.ruleArns(ruleArn))
+                    .rules().get(0).conditions().get(0).pathPatternConfig().regexValues());
+            assertEquals("clone", get("/idx/_search").asString());
+        }
+    }
+
+    @Test
+    void nestedRepetitionRoutesLongNonmatchingRequestsWithoutBacktracking() {
+        try (ElasticLoadBalancingV2Client client = AwsTestClients.create(
+                ElasticLoadBalancingV2Client.builder(), "000000000000", Region.US_EAST_1)) {
+            client.createRule(r -> r.listenerArn(listenerArn).priority(80)
+                    .conditions(c -> c.field("path-pattern").pathPatternConfig(p -> p.regexValues("^/(a+)+$")))
+                    .actions(a -> a.type("forward").targetGroupArn(cloneTg)));
+            assertEquals("clone", get("/aaaa").asString());
+            assertTimeout(Duration.ofSeconds(3), () ->
+                    assertEquals("primary", get("/" + "a".repeat(2000) + "!").asString()));
+        }
     }
 
     private String createSplitRule(int primaryWeight, int cloneWeight) {
