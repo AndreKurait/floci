@@ -961,6 +961,9 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
             if (pathCfg.path("Values").isArray()) {
                 condition.setPathPatternValues(toStringList(pathCfg.path("Values")));
             }
+            if (pathCfg.path("RegexValues").isArray()) {
+                condition.setPathPatternRegexValues(toStringList(pathCfg.path("RegexValues")));
+            }
             JsonNode hostCfg = item.path("HostHeaderConfig");
             if (hostCfg.path("Values").isArray()) {
                 condition.setHostHeaderValues(toStringList(hostCfg.path("Values")));

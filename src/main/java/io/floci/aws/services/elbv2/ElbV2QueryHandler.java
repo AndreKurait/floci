@@ -15,6 +15,8 @@ import org.jboss.logging.Logger;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.regex.Pattern;
+import java.util.regex.PatternSyntaxException;
 
 @ApplicationScoped
 public class ElbV2QueryHandler {
@@ -1055,10 +1057,19 @@ public class ElbV2QueryHandler {
             for (String v : c.getHostHeaderValues()) xml.start("member").raw(v).end("member");
             xml.end("Values").end("HostHeaderConfig");
         }
-        if (!c.getPathPatternValues().isEmpty()) {
-            xml.start("PathPatternConfig").start("Values");
-            for (String v : c.getPathPatternValues()) xml.start("member").raw(v).end("member");
-            xml.end("Values").end("PathPatternConfig");
+        if (!c.getPathPatternValues().isEmpty() || !c.getPathPatternRegexValues().isEmpty()) {
+            xml.start("PathPatternConfig");
+            if (!c.getPathPatternValues().isEmpty()) {
+                xml.start("Values");
+                for (String v : c.getPathPatternValues()) xml.start("member").raw(v).end("member");
+                xml.end("Values");
+            }
+            if (!c.getPathPatternRegexValues().isEmpty()) {
+                xml.start("RegexValues");
+                for (String v : c.getPathPatternRegexValues()) xml.elem("member", v);
+                xml.end("RegexValues");
+            }
+            xml.end("PathPatternConfig");
         }
         if (c.getHttpHeaderName() != null) {
             xml.start("HttpHeaderConfig")
@@ -1388,8 +1399,22 @@ public class ElbV2QueryHandler {
                         vals.add(val);
                         j++;
                     }
-                    if (!vals.isEmpty()) c.setPathPatternValues(vals);
-                    else c.setPathPatternValues(new ArrayList<>(legacyValues));
+                    List<String> regexVals = new ArrayList<>();
+                    j = 1;
+                    while (true) {
+                        String val = p.getFirst("Conditions.member." + i + ".PathPatternConfig.RegexValues.member." + j);
+                        if (val == null) break;
+                        regexVals.add(val);
+                        j++;
+                    }
+                    if (!regexVals.isEmpty()) {
+                        validatePathPatternRegexValues(regexVals, !vals.isEmpty() || !legacyValues.isEmpty());
+                        c.setPathPatternRegexValues(regexVals);
+                    } else if (!vals.isEmpty()) {
+                        c.setPathPatternValues(vals);
+                    } else {
+                        c.setPathPatternValues(new ArrayList<>(legacyValues));
+                    }
                 }
                 case "http-header" -> {
                     c.setHttpHeaderName(p.getFirst("Conditions.member." + i + ".HttpHeaderConfig.HttpHeaderName"));
@@ -1445,6 +1470,29 @@ public class ElbV2QueryHandler {
             i++;
         }
         return result;
+    }
+
+    /**
+     * A path-pattern condition carries either glob {@code Values} or {@code RegexValues}, never both.
+     * Each regular expression is at most 128 characters and must compile.
+     */
+    static void validatePathPatternRegexValues(List<String> regexValues, boolean hasGlobValues) {
+        if (hasGlobValues) {
+            throw new AwsException("ValidationError",
+                    "A path-pattern condition can specify either Values or RegexValues, not both.", 400);
+        }
+        for (String regex : regexValues) {
+            if (regex.isEmpty() || regex.length() > 128) {
+                throw new AwsException("ValidationError",
+                        "Each path-pattern regex value must be between 1 and 128 characters.", 400);
+            }
+            try {
+                Pattern.compile(regex);
+            } catch (PatternSyntaxException e) {
+                throw new AwsException("ValidationError",
+                        "Invalid path-pattern regex value '" + regex + "'.", 400);
+            }
+        }
     }
 
     private List<TargetDescription> parseTargets(MultivaluedMap<String, String> p) {

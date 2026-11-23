@@ -397,6 +397,24 @@ class ElbV2CfnProvisionerTest {
     }
 
     @Test
+    void ruleParsesPathPatternRegexValues() {
+        when(elb.createRule(eq(REGION), eq(LISTENER_ARN), anyList(), eq(75), anyList(), eq(Map.of())))
+                .thenReturn(rule(LISTENER_ARN));
+        ObjectNode props = mapper.createObjectNode().put("ListenerArn", LISTENER_ARN).put("Priority", "75");
+        props.putArray("Conditions").addObject().put("Field", "path-pattern").putObject("PathPatternConfig")
+                .putArray("RegexValues").add("^(.*/_search.*|.*/_count.*)$");
+        props.putArray("Actions").addObject().put("Type", "forward").put("TargetGroupArn", TG_ARN);
+
+        provisioner.provision(resource("AWS::ElasticLoadBalancingV2::ListenerRule", "Rule"), props, ctx());
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<RuleCondition>> conds = ArgumentCaptor.forClass(List.class);
+        verify(elb).createRule(eq(REGION), eq(LISTENER_ARN), conds.capture(), eq(75), anyList(), eq(Map.of()));
+        assertEquals(List.of("^(.*/_search.*|.*/_count.*)$"), conds.getValue().get(0).getPathPatternRegexValues());
+        assertEquals(List.of(), conds.getValue().get(0).getPathPatternValues());
+    }
+
+    @Test
     void anUnchangedRuleIsModifiedInPlaceAndAMovedRuleIsReplaced() {
         when(elb.describeRules(REGION, null, List.of(RULE_ARN))).thenReturn(List.of(rule(LISTENER_ARN)));
         when(elb.modifyRule(eq(REGION), eq(RULE_ARN), anyList(), anyList())).thenReturn(rule(LISTENER_ARN));
