@@ -15,6 +15,7 @@ import io.github.hectorvent.floci.services.dynamodb.DynamoDbStreamsJsonHandler;
 import io.github.hectorvent.floci.services.eventbridgev2.EventBridgeV2Handler;
 import io.github.hectorvent.floci.services.kinesis.KinesisJsonHandler;
 import io.github.hectorvent.floci.services.marketplace.MarketplaceEntitlementController;
+import io.github.hectorvent.floci.services.resourcegroupstagging.ResourceGroupsTaggingJsonHandler;
 import io.github.hectorvent.floci.services.sns.SnsJsonHandler;
 import io.github.hectorvent.floci.services.sqs.SqsJsonHandler;
 import io.github.hectorvent.floci.services.stepfunctions.StepFunctionsJsonHandler;
@@ -72,10 +73,11 @@ public class AwsJsonCborController {
     private final SnsJsonHandler snsJsonHandler;
     private final KinesisJsonHandler kinesisJsonHandler;
     private final StepFunctionsJsonHandler sfnJsonHandler;
+    private final AwsJson11Controller awsJson11Controller;
     private final CloudWatchMetricsJsonHandler cloudWatchMetricsJsonHandler;
     private final MarketplaceEntitlementController marketplaceEntitlementController;
     private final EventBridgeV2Handler eventBridgeV2Handler;
-    private final AwsJson11Controller awsJson11Controller;
+    private final ResourceGroupsTaggingJsonHandler resourceGroupsTaggingJsonHandler;
 
     @Inject
     public AwsJsonCborController(ObjectMapper objectMapper, ResolvedServiceCatalog catalog,
@@ -85,10 +87,11 @@ public class AwsJsonCborController {
                                  SqsJsonHandler sqsJsonHandler, SnsJsonHandler snsJsonHandler,
                                  KinesisJsonHandler kinesisJsonHandler,
                                  StepFunctionsJsonHandler sfnJsonHandler,
+                                 AwsJson11Controller awsJson11Controller,
                                  CloudWatchMetricsJsonHandler cloudWatchMetricsJsonHandler,
                                  MarketplaceEntitlementController marketplaceEntitlementController,
                                  EventBridgeV2Handler eventBridgeV2Handler,
-                                 AwsJson11Controller awsJson11Controller) {
+                                 ResourceGroupsTaggingJsonHandler resourceGroupsTaggingJsonHandler) {
         this.objectMapper = objectMapper;
         this.catalog = catalog;
         this.regionResolver = regionResolver;
@@ -98,10 +101,11 @@ public class AwsJsonCborController {
         this.snsJsonHandler = snsJsonHandler;
         this.kinesisJsonHandler = kinesisJsonHandler;
         this.sfnJsonHandler = sfnJsonHandler;
+        this.awsJson11Controller = awsJson11Controller;
         this.cloudWatchMetricsJsonHandler = cloudWatchMetricsJsonHandler;
         this.marketplaceEntitlementController = marketplaceEntitlementController;
         this.eventBridgeV2Handler = eventBridgeV2Handler;
-        this.awsJson11Controller = awsJson11Controller;
+        this.resourceGroupsTaggingJsonHandler = resourceGroupsTaggingJsonHandler;
     }
 
 
@@ -526,6 +530,8 @@ public class AwsJsonCborController {
             case "monitoring" -> cloudWatchMetricsJsonHandler.handle(operation, request, region);
             case "marketplace" -> marketplaceEntitlementController.handle(operation, request, region);
             case "eventsv2" -> eventBridgeV2Handler.handle(operation, request, region);
+            // The Resource Groups Tagging API's model lists smithy-rpc-v2-cbor first among its protocols.
+            case "tagging" -> resourceGroupsTaggingJsonHandler.handle(operation, request, region);
             default -> null;
         };
     }

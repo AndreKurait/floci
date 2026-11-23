@@ -1,7 +1,8 @@
 # AWS Service Catalog
 
 **Protocol:** AWS JSON 1.1  
-**Smithy RPC v2 CBOR:** `POST /service/AWS242ServiceCatalogService/operation/<Action>` with `smithy-protocol: rpc-v2-cbor`, which the service model lists first  
+**Smithy RPC v2 CBOR:** `POST /service/AWS242ServiceCatalogService/operation/<Action>` with `smithy-protocol: rpc-v2-cbor`, which the service model lists first
+
 **Signing name:** `servicecatalog`
 
 Floci persists portfolios, products and provisioning-artifact metadata, TagOptions,
