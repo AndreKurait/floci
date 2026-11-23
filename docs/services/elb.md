@@ -413,3 +413,8 @@ These explicit overrides intentionally change local compatibility; they do not
 change the AWS API shape or require a separate Floci process for each region.
 
 CloudFormation rollback can restore a saved legacy ALB subnet list with repeated Availability Zones. This internal snapshot path still checks subnet existence, the zone minimum, and VPC membership; new API and stack-update requests continue to reject repeated zones.
+
+Path-pattern `RegexValues` use a linear-time regex engine for admission and full-path matching.
+Lookarounds, backreferences, atomic groups, possessive quantifiers, recursion, subroutines,
+and Unicode character classes are rejected. Escaped or quoted literal text remains valid.
+Existing `Values` glob matching is unchanged.

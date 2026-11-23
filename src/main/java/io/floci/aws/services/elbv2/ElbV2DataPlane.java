@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.config.TlsProxyServer;
 import io.floci.aws.core.common.AwsArnUtils;
+import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.CertificateReferenceResolver;
 import io.floci.aws.core.common.CertificateReferenceResolver.CertificateMaterial;
 import io.floci.aws.core.common.Pem;
@@ -14,6 +15,7 @@ import io.floci.aws.core.common.WebSocketUpgrades;
 import io.floci.aws.core.common.tls.ReloadingKeyManager;
 import io.floci.aws.services.ec2.Ec2InstancePorts;
 import io.floci.aws.services.ec2.Ec2Service;
+import io.floci.aws.services.elbv2.PathPatternRegexValues.Compiled;
 import io.floci.aws.services.elbv2.model.Action;
 import io.floci.aws.services.elbv2.model.Listener;
 import io.floci.aws.services.elbv2.model.LoadBalancer;
@@ -88,7 +90,6 @@ import java.util.function.BooleanSupplier;
 import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.regex.Pattern;
-import java.util.regex.PatternSyntaxException;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
@@ -1782,20 +1783,20 @@ public class ElbV2DataPlane {
         return last;
     }
 
-    static List<Pattern> compilePathRegexes(List<String> regexValues) {
-        List<Pattern> compiled = new ArrayList<>();
+    static List<Compiled> compilePathRegexes(List<String> regexValues) {
+        List<Compiled> compiled = new ArrayList<>();
         for (String regex : regexValues) {
             try {
-                compiled.add(Pattern.compile(regex));
-            } catch (PatternSyntaxException e) {
+                compiled.add(PathPatternRegexValues.compile(regex));
+            } catch (AwsException e) {
                 LOG.warnv("Ignoring path-pattern regex value that does not compile: {0}", regex);
             }
         }
         return List.copyOf(compiled);
     }
 
-    static boolean pathRegexMatches(List<Pattern> patterns, String path) {
-        return path != null && patterns.stream().anyMatch(p -> p.matcher(path).matches());
+    static boolean pathRegexMatches(List<Compiled> patterns, String path) {
+        return path != null && patterns.stream().anyMatch(p -> p.matches(path));
     }
 
     private static boolean globMatches(String pattern, String text) {
@@ -1819,7 +1820,7 @@ public class ElbV2DataPlane {
         final Rule rule;
         final Action action;
         final List<String> hostHeaderPatterns;
-        private final Map<RuleCondition, List<Pattern>> pathRegexes =
+        private final Map<RuleCondition, List<Compiled>> pathRegexes =
                 Collections.synchronizedMap(new IdentityHashMap<>());
 
         CompiledRule(Rule rule) {
@@ -1860,7 +1861,7 @@ public class ElbV2DataPlane {
          * that does not compile never matches.
          */
         private boolean matchesPathRegex(RuleCondition condition, String path) {
-            List<Pattern> patterns = pathRegexes.computeIfAbsent(condition,
+            List<Compiled> patterns = pathRegexes.computeIfAbsent(condition,
                     c -> compilePathRegexes(c.getPathPatternRegexValues()));
             return pathRegexMatches(patterns, path);
         }
