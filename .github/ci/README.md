@@ -41,3 +41,8 @@ worker lock. A GitHub branch ruleset also blocks force pushes and deletion.
 Protected feature changes require an explicit policy update with fresh
 qualification; a failed preservation check is a reason to reconcile the
 candidate.
+
+When upstream changes a workflow, retain its complete shard and architecture
+matrices, triggers, test commands, and release gates. Assign added shards or
+suites to the existing capacity slots instead of restoring an older matrix.
+Dev reconciliation also retains any broader test coverage already on dev.
