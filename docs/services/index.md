@@ -36,8 +36,8 @@ Operation counts are exact. For dispatch-table services (Query and JSON 1.1) eac
 | [Lambda](lambda.md) | `/2015-03-31/functions/...` + `/2025-12-01/durable-executions/...` | REST JSON | 69 |
 | [Lambda MicroVMs](lambda-microvms.md) | `/2025-09-09/...` + `/2026-04-04/...` | REST JSON | 23 |
 | [Lambda Web Functions](lambda-web-functions.md) | `/2025-03-07/web-functions/...` | REST JSON | 20 |
-| [API Gateway v1](api-gateway.md) | `/restapis/...` | REST JSON | 101 |
-| [API Gateway v2](api-gateway.md#v2) | `/v2/apis/...` | REST JSON | 66 (+ the data plane) |
+| [API Gateway v1](api-gateway.md) | `/restapis/...` | REST JSON | 102 |
+| [API Gateway v2](api-gateway.md#v2) | `/v2/apis/...` | REST JSON | 67 (+ the data plane) |
 | [IAM](iam.md) | `POST /` with `Action=` param | Query | 180 |
 | [STS](sts.md) | `POST /` with `Action=` param | Query | 11 |
 | [AWS Sign-In](iam.md#aws-sign-in-login-credentials) | `/v1/authorize`, `/v1/token` | REST JSON | 2 |
@@ -83,7 +83,7 @@ Operation counts are exact. For dispatch-table services (Query and JSON 1.1) eac
 | [ElastiCache](elasticache.md) | `POST /` with `Action=` param + TCP proxy | Query + RESP | 38 |
 | [MemoryDB](memorydb.md) | `POST /` + `X-Amz-Target: AmazonMemoryDB.*` + TCP proxy | JSON 1.1 + RESP | 13 |
 | [Aurora DSQL](dsql.md) | `/cluster`, `/cluster/{identifier}`, `/cluster/{identifier}/policy` + TLS endpoint | REST JSON + wire | 9 |
-| [RDS](rds.md) | `POST /` with `Action=` param + TCP proxy | Query + wire | 121 |
+| [RDS](rds.md) | `POST /` with `Action=` param + TCP proxy | Query + wire | 125 |
 | [RDS Data API](rds-data.md) | `/Execute`, `/BatchExecute`, `/BeginTransaction`, `/CommitTransaction`, `/RollbackTransaction` | REST JSON | 5 |
 | [Timestream for InfluxDB](timestream-influxdb.md) | `POST /` + `X-Amz-Target: AmazonTimestreamInfluxDB.*` + InfluxDB container | JSON 1.0 + InfluxDB HTTP | 24 |
 | [MSK](msk.md) | `/v1/clusters/...`, `/api/v2/clusters/...` + Redpanda broker | REST JSON + Kafka | 21 |
@@ -148,7 +148,7 @@ Operation counts are exact. For dispatch-table services (Query and JSON 1.1) eac
 | [AWS FIS](fis.md) | `/experimentTemplates/*`, `/experiments/*`, `/actions/*`, `/targetResourceTypes/*`, `/safetyLevers/*`, `/tags/*` | REST JSON | 26 |
 | [CodeGuru Reviewer](codegurureviewer.md) | `/associations`, `/associations/{associationArn}`, `/tags/*` | REST JSON | 7 |
 | [CodeArtifact](codeartifact.md) | `/v1/domain*`, `/v1/repository*`, `/v1/package`, `/v1/package/version*`, `/v1/package-group*`, `/v1/list-associated-packages`, `/v1/get-associated-package-group`, `/v1/tag*`, `/v1/authorization-token`, `/codeartifact/maven/*`, `/codeartifact/npm/*`, `/codeartifact/pypi/*` | REST JSON | 48 |
-| [CloudFront](cloudfront.md) | `/2020-05-31/distribution/*`, `/2020-05-31/cache-policy/*`, `/2020-05-31/function/*`, `/2020-05-31/key-value-store/*` | REST XML | 97 |
+| [CloudFront](cloudfront.md) | `/2020-05-31/distribution/*`, `/2020-05-31/cache-policy/*`, `/2020-05-31/function/*`, `/2020-05-31/key-value-store/*` | REST XML | 104 |
 | [CloudFront KeyValueStore](cloudfront.md#key-value-stores) | `/key-value-stores/*` | REST JSON | 6 |
 | [Route53](route53.md) | `/2013-04-01/hostedzone/*`, `/2013-04-01/healthcheck/*`, `/2013-04-01/change/*`, `/2013-04-01/delegationset/*` | REST XML | 31 |
 | [Route 53 Resolver](route53resolver.md) | `POST /` + `X-Amz-Target: Route53Resolver.*` | JSON 1.1 | 25 |

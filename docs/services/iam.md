@@ -1838,7 +1838,7 @@ that has never set one.
 
 ### What a bad account property key answers
 
-A property key is read in three layers and two of them are settled by recordings.
+A property key is read in three layers.
 
 A key breaking the published shape, `accountPropertyKeyType` at 1 to 50 characters matching
 `^[A-Za-z][A-Za-z0-9/_-]*$`, is the declared constraint violation, a `ValidationError` naming the
@@ -1851,13 +1851,51 @@ sentence of its own describing the rule; the rule itself is unchanged, and the t
 it refuses, a trailing slash and several slashes, carry the same sentence without a recording of
 their own.
 
-The third layer is not implemented and is tracked rather than guessed. AWS also refuses a key whose
-namespace it does not recognise, `InvalidInput` 400 with `Unsupported namespace: <namespace>`,
-recorded 2026-10-25, where this emulator stores the property under whatever namespace the key
-names. Doing it needs the set of namespaces AWS recognises, and the recordings name exactly one
-real namespace and one invented one, so a check built from them would refuse namespaces AWS
-accepts. That is the wrong direction to be wrong in, so the set has to come from a source that
-publishes it.
+The third layer is the namespace itself. A key whose namespace AWS does not recognise is
+`InvalidInput` 400 with `Unsupported namespace: <namespace>`, recorded 2026-10-25, carrying the
+namespace half of the key rather than the whole key, and the refused write leaves every stored
+property as it was. Storing it instead was the worse of the two ways to be wrong here: one accepted
+bad write left this account answering every later read with a key AWS would never have stored, and
+the caller was never told.
+
+What that refusal is held to is the set of namespaces AWS recognises, and no page publishes the
+set. Only `RoleManager` is named anywhere: the API Reference's example for `PutAccountProperties`
+sets `RoleManager/Enabled`, the user guide has role manager "controlled by the account-level
+property RoleManager/Enabled", and the guide's policy example for `iam:AccountPropertyNamespaces`
+matches on `RoleManager`. All three introduce it as an example, and the operation's model carries no
+enum for the key, so what this package holds is those three pages read together rather than a list
+AWS published. The cost is the direction this refusal can be wrong in: a namespace AWS recognises
+and has not written down anywhere is refused here until the set in `IamService` names it, which is
+one set to extend when AWS publishes another.
+
+Two readings inside it are this package's own. The namespace is matched as AWS spells it, since
+nothing published says how AWS reads its case. And a request mixing two namespaces is answered for
+mixing them even when neither is recognised, because a request names one namespace before there is
+a namespace to look up; that order is also the one that leaves every request already being refused
+with the answer it already had.
+
+### What a bad account property value answers
+
+The value is the key's business: "the service validates each value based on the property key's
+expected type. For example, boolean properties expect `true` or `false`." So a value is held to
+what its key publishes, after the key itself has been read, and only one property publishes
+anything. Role manager is "controlled by the account-level property `RoleManager/Enabled`", where
+"a value of true enables role manager; false disables it"; the API Reference says to call the
+operation "with the `RoleManager/Enabled` property set to true or false", and its own example
+response carries `true`. Both spellings are lowercase on every page that writes them, the guide's
+two CLI examples included.
+
+That property takes those two values and nothing else, answering `InvalidInput` 400 with
+`Property <key> expects true or false: <value>`, the value as the request sent it. The sentence is
+this package's own: AWS publishes that a value is validated against its key's type and nothing of
+what it answers when one is not. A request is refused whole, so an entry beside the bad one is not
+stored either, which is how a request refused for its keys already behaves. Storing the value
+instead left a flag holding something nothing can read as one, under the key AWS gives the feature.
+
+What is held this way is the pair of values rather than a type, because a type is the thing this
+would be inventing: what AWS publishes for this property is `true` and `false`. Every other
+property takes any value the declared length admits, since no page says what any of them is for,
+which is the looser answer and the direction to be wrong in here.
 
 ### Organizations Root Access
 
@@ -2542,7 +2580,7 @@ AWS Data Exports, AWS Pricing Calculator, Cost Explorer, CloudTrail, Global Acce
 Timestream for InfluxDB, Amazon Redshift, the Amazon Redshift Data API, AWS Payment Cryptography, AWS DataSync, Amazon EMR,
 Amazon Rekognition, IAM Identity Center, Amazon Inspector, Amazon Macie, AWS Fault Injection Service, AWS Resource
 Access Manager, CloudWatch Observability Access Manager, AWS Resource Explorer, AWS Account Management, AWS Control
-Catalog, Amazon OpenSearch Service, IAM Access Analyzer, AWS Security Hub, Amazon GuardDuty, Lambda, AWS Glue, Amazon SQS, Amazon SNS, Amazon Kinesis Data Streams, Amazon EventBridge Pipes, Aurora DSQL, STS, Amazon EKS, AWS Resource Groups, Amazon CloudWatch Logs, Amazon CloudWatch, Amazon Comprehend, AWS Config and AWS DMS they come from a table generated from AWS's Service Reference and botocore, `src/main/resources/aws/iam-request-resources.json`, which gives each
+Catalog, Amazon OpenSearch Service, IAM Access Analyzer, AWS Security Hub, Amazon GuardDuty, Lambda, AWS Glue, Amazon SQS, Amazon SNS, Amazon Kinesis Data Streams, Amazon EventBridge Pipes, Aurora DSQL, STS, Amazon EKS, AWS Resource Groups, Amazon CloudWatch Logs, Amazon CloudWatch, Amazon Comprehend, AWS Config, AWS DMS, Amazon ElastiCache, AWS Identity Store, Amazon MemoryDB, Amazon Route 53 Resolver and Amazon SageMaker they come from a table generated from AWS's Service Reference and botocore, `src/main/resources/aws/iam-request-resources.json`, which gives each
 operation's action, the resource types that action acts on with their ARN formats, and the request
 members that name them: a member holding a resource's ARN, which counts when it matches the format
 of a type the action acts on, or members filling the variables of a type's format. Nothing in it is
@@ -3849,7 +3887,8 @@ floci populates:
   federated user carries the tags of the user whose key minted it. An account-root principal has
   no stored tags and no way to pass one. A session tag replaces the identity's tag of that key
   whatever its case; [STS](sts.md#session-tags) has where each operation takes its session tags
-  from, and the transitive inheritance that is not implemented.
+  from, and [Transitive tags](sts.md#transitive-tags) how a chained session inherits the ones the
+  calling session passes down, which are its own tags from then on.
 - `aws:PrincipalType` and `aws:userid`: resolved from the same lookup as `aws:PrincipalArn`, so
   they always describe the same credential. The values follow the user guide's principal key
   values list: `Account` with the account id for the account-root principal and for a session
@@ -3982,7 +4021,10 @@ floci populates:
   The actions and request members come from the same `request-condition-keys.json`.
   `AssumeRoleWithWebIdentity` and `AssumeRoleWithSAML` are not signed, so no identity-based policy is
   evaluated for them. `sts:SourceIdentity`, `sts:TransitiveTagKeys`, `aws:RequestTag/<key>` and `aws:TagKeys`
-  are not populated for `AssumeRole`: Floci does not model source identity or session tags.
+  are not populated for `AssumeRole`: source identity is not modelled, and the three tag keys are not in
+  this file for the action, which is what fills the context here. A session's own tags are modelled, and
+  reach a policy as `aws:PrincipalTag/<key>`; `sts:TransitiveTagKeys` reaches the role's trust policy,
+  which the STS handler reads with a context of its own (see [STS](sts.md#transitive-tags)).
 
 **Any other condition key is absent from the request context.** A positive scalar operator
 without `IfExists` on an absent key makes the whole statement *not apply*: it neither matches nor

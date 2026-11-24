@@ -6,7 +6,9 @@ import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.StoredResourceArns;
 import io.floci.aws.services.stepfunctions.LambdaTaskAuthorizer.Permission;
 import io.floci.aws.services.stepfunctions.model.StateMachine;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -27,6 +29,7 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
+@ResourceLock(ParallelLocks.PORTS)
 class TaskPermissionsTest {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -411,6 +414,8 @@ class TaskPermissionsTest {
     void aRedshiftDataCallOnAWorkgroupIsEvaluatedOnTheOneItsNameFinds() throws Exception {
         String workgroup = "arn:aws:redshift-serverless:eu-west-1:" + ACCOUNT + ":workgroup/1234";
         StoredResourceArns stored = mock(StoredResourceArns.class);
+        // The reader asks with the members' paths too, which a service finding by the values alone leaves to them.
+        when(stored.findByMembers(any(), any(), any(), any())).thenCallRealMethod();
         when(stored.findByMembers(eq("workgroup"), eq(List.of("analytics")), eq("eu-west-1"))).thenReturn(Optional.of(workgroup));
         assertEquals(List.of(new Permission("redshift-data:ExecuteStatement", workgroup),
                 new Permission("redshift-serverless:GetCredentials", workgroup)),

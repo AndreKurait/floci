@@ -60,12 +60,15 @@ import io.floci.aws.services.eks.model.CertificateAuthority;
 import io.floci.aws.services.eks.model.Cluster;
 import io.floci.aws.services.eks.model.ClusterIdentity;
 import io.floci.aws.services.eks.model.ClusterOidcKey;
+import io.floci.aws.services.eks.model.ElasticLoadBalancing;
+import io.floci.aws.services.eks.model.KubernetesNetworkConfig;
 import io.floci.aws.services.eks.model.LogSetup;
 import io.floci.aws.services.eks.model.Logging;
 import io.floci.aws.services.eks.model.Nodegroup;
 import io.floci.aws.services.eks.model.OidcIdentity;
 import io.floci.aws.services.eks.model.ResourcesVpcConfig;
 import io.floci.aws.services.eks.model.StorageConfig;
+import io.floci.aws.testing.ParallelLocks;
 import io.floci.aws.testing.ThreadStates;
 import io.floci.aws.testutil.LogCapture;
 import jakarta.ws.rs.core.Response;
@@ -75,7 +78,9 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.NullAndEmptySource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
@@ -136,6 +141,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
+@ResourceLock(ParallelLocks.PORTS)
 class EksClusterManagerTest {
 
     @Test
@@ -498,7 +504,8 @@ class EksClusterManagerTest {
                 "io.floci.eks.node-capacity", "m5.large:unbounded",
                 "io.floci.eks.default-storage-class", "false",
                 "io.floci.eks.shared-mounts", "true",
-                "io.floci.eks.pod-network", "flannel"));
+                "io.floci.eks.pod-network", "flannel",
+                "io.floci.eks.service-lb", "true"));
     }
 
     @ParameterizedTest
@@ -584,6 +591,39 @@ class EksClusterManagerTest {
         assertTrue(manifest.contains("- --provisioner-name\n        - ebs.csi.eks.amazonaws.com\n"), manifest);
         assertFalse(manifest.contains("%"), manifest);
         assertFalse(manifest.contains("kind: StorageClass"), manifest);
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void aNodeOfAClusterWithAutoModeLoadBalancingStartsWithoutServiceLb(boolean loadBalancing) {
+        EmulatorConfig config = Mockito.mock(EmulatorConfig.class, Mockito.RETURNS_DEEP_STUBS);
+        when(config.services().eks().defaultImage()).thenReturn("rancher/k3s:v1.30.0-k3s1");
+        ContainerLifecycleManager lifecycleManager = Mockito.mock(ContainerLifecycleManager.class, Mockito.RETURNS_DEEP_STUBS);
+        when(lifecycleManager.create(any())).thenReturn("container-id");
+        ContainerBuilder containerBuilder = Mockito.mock(ContainerBuilder.class);
+        ContainerBuilder.Builder builder = Mockito.mock(ContainerBuilder.Builder.class, Mockito.RETURNS_SELF);
+        when(containerBuilder.newContainer(anyString())).thenReturn(builder);
+        when(builder.build()).thenReturn(new ContainerSpec("test-image"));
+        EksClusterManager manager = EksClusterManagers.create(containerBuilder, lifecycleManager,
+                Mockito.mock(ContainerDetector.class), Mockito.mock(PortAllocator.class),
+                Mockito.mock(DockerHostResolver.class), Mockito.mock(EcrRegistryManager.class),
+                config, new RegionResolver("us-east-1", "000000000000"));
+        Cluster cluster = new Cluster();
+        cluster.setName("my-cluster");
+        KubernetesNetworkConfig network = new KubernetesNetworkConfig();
+        network.setElasticLoadBalancing(new ElasticLoadBalancing(loadBalancing));
+        cluster.setKubernetesNetworkConfig(network);
+
+        manager.startCluster(cluster);
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<String>> cmd = ArgumentCaptor.forClass(List.class);
+        verify(builder).withCmd(cmd.capture());
+        assertEquals(loadBalancing, cmd.getValue().contains("--disable=servicelb"));
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Map<String, String>> labels = ArgumentCaptor.forClass(Map.class);
+        verify(builder).withLabels(labels.capture());
+        assertEquals(String.valueOf(!loadBalancing), labels.getValue().get(EksClusterManager.SERVICE_LB_LABEL));
     }
 
     @ParameterizedTest
@@ -730,6 +770,63 @@ class EksClusterManagerTest {
             Cluster cluster = new Cluster();
             cluster.setName("demo");
             return cluster;
+        }
+
+        private Cluster loadBalancingCluster(boolean loadBalancing) {
+            Cluster cluster = cluster();
+            KubernetesNetworkConfig network = new KubernetesNetworkConfig();
+            network.setElasticLoadBalancing(new ElasticLoadBalancing(loadBalancing));
+            cluster.setKubernetesNetworkConfig(network);
+            return cluster;
+        }
+
+        private Container survivorWithServiceLb(String id, String serviceLb) {
+            return containerFromJson("{\"Id\":\"" + id + "\",\"Labels\":{"
+                    + "\"io.floci.eks.node-capacity\":\"m5.large:unbounded\",\"io.floci.eks.shared-mounts\":\"true\""
+                    + (serviceLb == null ? "" : ",\"io.floci.eks.service-lb\":\"" + serviceLb + "\"") + "}}");
+        }
+
+        /** A node runs ServiceLB unless load balancing is on: one started otherwise is replaced on its volume. */
+        @ParameterizedTest
+        @CsvSource(value = {"true,NULL", "true,true", "false,false"}, nullValues = "NULL")
+        void replacesASurvivorWhoseServiceLbDisagreesWithLoadBalancing(boolean loadBalancing, String serviceLb) {
+            when(lifecycleManager.findByName("floci-eks-demo"))
+                    .thenReturn(Optional.of(survivorWithServiceLb("cid-old", serviceLb)));
+            when(lifecycleManager.adopt(eq("cid-old"), eq(List.of(6443)), any()))
+                    .thenReturn(new ContainerInfo("cid-old", Map.of(), Map.of(6443, 6440)));
+            stubFreshStart("cid-new", 6440);
+
+            Cluster cluster = loadBalancingCluster(loadBalancing);
+            manager.restoreCluster(cluster);
+
+            assertEquals("cid-new", cluster.getContainerId());
+            verify(lifecycleManager, never()).removeVolume(anyString());
+        }
+
+        @ParameterizedTest
+        @CsvSource(value = {"true,false", "false,true", "false,NULL"}, nullValues = "NULL")
+        void keepsASurvivorWhoseServiceLbAgreesWithLoadBalancing(boolean loadBalancing, String serviceLb) {
+            when(lifecycleManager.findByName("floci-eks-demo"))
+                    .thenReturn(Optional.of(survivorWithServiceLb("cid-1", serviceLb)));
+            when(lifecycleManager.adopt(eq("cid-1"), eq(List.of(6443)), any()))
+                    .thenReturn(new ContainerInfo("cid-1", Map.of(), Map.of(6443, 6440)));
+
+            Cluster cluster = loadBalancingCluster(loadBalancing);
+            manager.restoreCluster(cluster);
+
+            assertEquals("cid-1", cluster.getContainerId());
+            verify(lifecycleManager, never()).create(any());
+        }
+
+        @ParameterizedTest
+        @CsvSource(value = {"false,true", "true,false", "NULL,false"}, nullValues = "NULL")
+        void aNodeRunsWithoutServiceLbOnlyWhenItsLabelSaysSo(String serviceLb, boolean without) {
+            when(lifecycleManager.findByName("floci-eks-demo"))
+                    .thenReturn(Optional.of(survivorWithServiceLb("cid-1", serviceLb)));
+            Cluster cluster = cluster();
+            cluster.setDockerName("floci-eks-demo");
+
+            assertEquals(without, manager.runsWithoutServiceLb(cluster));
         }
 
         private void stubFreshStart(String containerId, int allocatedPort) {
@@ -1150,6 +1247,43 @@ class EksClusterManagerTest {
             }
             verify(dockerClient).stopContainerCmd("cid-old");
             verify(portAllocator, never()).allocate(6440, 6499);
+        }
+
+        /** UpdateClusterConfig's load balancing change: a node whose ServiceLB disagrees is replaced in place. */
+        @ParameterizedTest
+        @CsvSource({"true,true", "false,false"})
+        void aNodeWhoseServiceLbDisagreesWithLoadBalancingIsReplacedKeepingItsEndpoint(boolean loadBalancing,
+                                                                                      String serviceLb) {
+            when(lifecycleManager.findByName("floci-eks-demo"))
+                    .thenReturn(Optional.of(survivorWithServiceLb("cid-old", serviceLb)));
+            when(lifecycleManager.create(any())).thenReturn("cid-new");
+            when(lifecycleManager.startCreated(any(), any())).thenReturn(new ContainerInfo("cid-new", Map.of()));
+            Cluster cluster = loadBalancingCluster(loadBalancing);
+            cluster.setDockerName("floci-eks-demo");
+            cluster.setContainerId("cid-old");
+            cluster.setHostPort(6441);
+
+            assertTrue(manager.replaceNodeForServiceLb(cluster));
+
+            assertEquals("cid-new", cluster.getContainerId());
+            assertEquals("https://localhost:6441", cluster.getEndpoint());
+            verify(dockerClient).stopContainerCmd("cid-old");
+            verify(lifecycleManager, never()).removeVolume(anyString());
+        }
+
+        @ParameterizedTest
+        @CsvSource({"true,false", "false,true"})
+        void aNodeWhoseServiceLbAgreesWithLoadBalancingIsKept(boolean loadBalancing, String serviceLb) {
+            when(lifecycleManager.findByName("floci-eks-demo"))
+                    .thenReturn(Optional.of(survivorWithServiceLb("cid-1", serviceLb)));
+            Cluster cluster = loadBalancingCluster(loadBalancing);
+            cluster.setDockerName("floci-eks-demo");
+            cluster.setContainerId("cid-1");
+
+            assertTrue(manager.replaceNodeForServiceLb(cluster));
+
+            assertEquals("cid-1", cluster.getContainerId());
+            verify(lifecycleManager, never()).create(any());
         }
 
         @Test
@@ -5169,6 +5303,82 @@ class EksClusterManagerTest {
         }
     }
 
+    /** The service account lookup the pod identity webhook makes, through kubectl in the server container. */
+    @Nested
+    class ServiceAccountLookupTest {
+
+        private EksClusterManager manager;
+        private final Cluster cluster = new Cluster();
+
+        @BeforeEach
+        void setUp() {
+            EmulatorConfig config = Mockito.mock(EmulatorConfig.class, Mockito.RETURNS_DEEP_STUBS);
+            manager = Mockito.spy(new EksClusterManager(Mockito.mock(ContainerBuilder.class),
+                    Mockito.mock(ContainerLifecycleManager.class), Mockito.mock(ContainerDetector.class),
+                    Mockito.mock(PortAllocator.class), Mockito.mock(DockerHostResolver.class),
+                    Mockito.mock(EcrRegistryManager.class), config, new RegionResolver("us-east-1", "000000000000"),
+                    Mockito.mock(Ec2MetadataServer.class), Mockito.mock(EksOidcService.class),
+                    inlineMock(FlociCertificateAuthority.class), Mockito.mock(ContainerLogStreamer.class),
+                    new InMemoryStorage<>(), 0, Mockito.mock(Ec2ImageCatalog.class),
+                    EksTestEndpoints.dockerHostEndpoint()));
+            cluster.setName("demo");
+            cluster.setContainerId("server-1");
+        }
+
+        @Test
+        void theServiceAccountIsReadAsKubectlPrintsIt() {
+            doReturn(new ContainerExec.Result(0L, "{\"kind\":\"ServiceAccount\"}", "a warning", false)).when(manager)
+                    .execInContainerSeparatingStderr(anyString(), any(), anyInt());
+
+            assertEquals(EksClusterManager.ServiceAccountRead.found("{\"kind\":\"ServiceAccount\"}"),
+                    manager.serviceAccount(cluster, "payments", "checkout", 2));
+            verify(manager).execInContainerSeparatingStderr("server-1", new String[]{"kubectl",
+                    "--request-timeout=2s", "get", "serviceaccount", "checkout", "--namespace", "payments",
+                    "--output", "json"}, 2);
+        }
+
+        @Test
+        void aServiceAccountThatDoesNotExistIsAbsent() {
+            doReturn(new ContainerExec.Result(1L, "",
+                    "Error from server (NotFound): serviceaccounts \"checkout\" not found", false)).when(manager)
+                    .execInContainerSeparatingStderr(anyString(), any(), anyInt());
+
+            assertEquals(EksClusterManager.ServiceAccountRead.absent(),
+                    manager.serviceAccount(cluster, "payments", "checkout", 2));
+        }
+
+        /** A failed read says nothing about the service account, so it is not taken for an absent one. */
+        @Test
+        void aReadThatFailsOrTimesOutFails() {
+            doReturn(new ContainerExec.Result(1L, "", "Unable to connect to the server", false),
+                    new ContainerExec.Result(-1L, "{", "", true)).when(manager)
+                    .execInContainerSeparatingStderr(anyString(), any(), anyInt());
+
+            assertEquals(EksClusterManager.ServiceAccountRead.failed(),
+                    manager.serviceAccount(cluster, "payments", "checkout", 2));
+            assertEquals(EksClusterManager.ServiceAccountRead.failed(),
+                    manager.serviceAccount(cluster, "payments", "checkout", 2));
+        }
+
+        @Test
+        void aFailedExecFails() {
+            doThrow(new IllegalStateException("container gone")).when(manager)
+                    .execInContainerSeparatingStderr(anyString(), any(), anyInt());
+
+            assertEquals(EksClusterManager.ServiceAccountRead.failed(),
+                    manager.serviceAccount(cluster, "payments", "checkout", 2));
+        }
+
+        @Test
+        void aClusterWithNoContainerIsNotAsked() {
+            cluster.setContainerId(null);
+
+            assertEquals(EksClusterManager.ServiceAccountRead.absent(),
+                    manager.serviceAccount(cluster, "payments", "checkout", 2));
+            verify(manager, never()).execInContainerSeparatingStderr(any(), any(), anyInt());
+        }
+    }
+
     @Nested
     class JoinedInstancesTest {
 
@@ -6124,6 +6334,7 @@ class EksClusterManagerTest {
         void clusterCopyPreservesNodePrivateIpAndEksControllerStripsItFromWireResponses() throws Exception {
             Cluster cluster = vpcCluster("wire-cluster", "vpc-1", List.of("subnet-1"));
             cluster.setNodePrivateIp("10.0.1.25");
+            cluster.setClientRequestToken("internal-retry-token");
 
             Cluster copy = cluster.copy();
             assertEquals("10.0.1.25", copy.getNodePrivateIp());
@@ -6135,7 +6346,7 @@ class EksClusterManagerTest {
             assertEquals("10.0.1.25", deserialized.getNodePrivateIp());
 
             EksService eksService = Mockito.mock(EksService.class);
-            when(eksService.createCluster(any())).thenReturn(cluster);
+            when(eksService.createCluster(any(), any())).thenReturn(cluster);
             when(eksService.requireClusterInRequestRegion("wire-cluster")).thenReturn(cluster);
             when(eksService.deleteClusterInRequestRegion("wire-cluster")).thenReturn(cluster);
 
@@ -6155,10 +6366,36 @@ class EksClusterManagerTest {
                 Map<String, Object> body = (Map<String, Object>) response.getEntity();
                 Cluster wireCluster = (Cluster) body.get("cluster");
                 assertNull(wireCluster.getNodePrivateIp());
+                assertNull(wireCluster.getClientRequestToken());
                 String wireJson = mapper.writeValueAsString(wireCluster);
                 assertFalse(wireJson.contains("nodePrivateIp"));
+                assertFalse(wireJson.contains("clientRequestToken"));
             }
             assertEquals("10.0.1.25", cluster.getNodePrivateIp());
+            assertEquals("internal-retry-token", cluster.getClientRequestToken());
+        }
+
+        @Test
+        void eksControllerStripsTokenFromAnOtherwiseBareCluster() throws Exception {
+            Cluster cluster = new Cluster();
+            cluster.setName("token-only");
+            cluster.setClientRequestToken("internal-retry-token");
+
+            EksService eksService = Mockito.mock(EksService.class);
+            when(eksService.requireClusterInRequestRegion("token-only")).thenReturn(cluster);
+            EksController controller = new EksController(
+                    eksService,
+                    Mockito.mock(EksAccessEntryService.class),
+                    Mockito.mock(EksPodIdentityAssociationService.class),
+                    Mockito.mock(EksAddonService.class),
+                    new ObjectMapper().findAndRegisterModules(),
+                    Mockito.mock(EksClusterManager.class));
+
+            @SuppressWarnings("unchecked")
+            Map<String, Object> body = (Map<String, Object>) controller.describeCluster("token-only").getEntity();
+            Cluster response = (Cluster) body.get("cluster");
+            assertNull(response.getClientRequestToken());
+            assertEquals("internal-retry-token", cluster.getClientRequestToken());
         }
 
         @Test
