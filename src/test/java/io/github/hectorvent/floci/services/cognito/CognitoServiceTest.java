@@ -6345,7 +6345,7 @@ class CognitoServiceTest {
     }
 
     @Test
-    void emailAliasPoolVerifiedDuplicateThrowsAliasExists() {
+    void emailAliasPoolVerifiedDuplicateWithVerifiedFlagThrowsUsernameExists() {
         UserPool pool = createEmailAliasPool();
         service.adminCreateUser(pool.getId(), "dupe@b.com",
                 new HashMap<>(Map.of("email", "dupe@b.com", "email_verified", "true")), null);
@@ -6353,33 +6353,46 @@ class CognitoServiceTest {
         AwsException ex = assertThrows(AwsException.class,
                 () -> service.adminCreateUser(pool.getId(), "dupe@b.com",
                         new HashMap<>(Map.of("email", "dupe@b.com", "email_verified", "true")), null));
-        assertEquals("AliasExistsException", ex.getErrorCode());
+        assertEquals("UsernameExistsException", ex.getErrorCode());
+        assertEquals("User account already exists", ex.getMessage());
     }
 
     @Test
-    void emailAliasPoolAliasExistsUsesExistingVerificationNotIncoming() {
+    void emailAliasPoolVerifiedDuplicateWithoutVerifiedFlagThrowsUsernameExists() {
         UserPool pool = createEmailAliasPool();
-        // Existing owner holds a *verified* alias.
         service.adminCreateUser(pool.getId(), "owner@b.com",
                 new HashMap<>(Map.of("email", "owner@b.com", "email_verified", "true")), null);
 
-        // The second create omits email_verified from its own payload. The exception
-        // type must be driven by the existing owner's verified alias -> AliasExistsException.
         AwsException ex = assertThrows(AwsException.class,
                 () -> service.adminCreateUser(pool.getId(), "owner@b.com",
                         new HashMap<>(Map.of("email", "owner@b.com")), null));
-        assertEquals("AliasExistsException", ex.getErrorCode());
+        assertEquals("UsernameExistsException", ex.getErrorCode());
     }
 
     @Test
-    void emailAliasPoolIncomingVerifiedFlagCannotForceAliasExists() {
+    void emailAliasPoolForceAliasCreationDoesNotTakeAVerifiedUsername() {
         UserPool pool = createEmailAliasPool();
-        // Existing owner's alias is *unverified*, so the alias is not reserved.
+        CognitoUser first = service.adminCreateUser(pool.getId(), "move@b.com",
+                new HashMap<>(Map.of("email", "move@b.com", "email_verified", "true")), null);
+
+        AwsException ex = assertThrows(AwsException.class,
+                () -> service.adminCreateUser(pool.getId(), "move@b.com",
+                        new HashMap<>(Map.of("email", "move@b.com", "email_verified", "true")), null, null, true));
+        assertEquals("UsernameExistsException", ex.getErrorCode());
+
+        List<CognitoUser> users = service.listUsers(pool.getId(), null);
+        assertEquals(1, users.size());
+        assertEquals(first.getUsername(), users.get(0).getUsername());
+        assertEquals("move@b.com", users.get(0).getAttributes().get("email"));
+        assertEquals("true", users.get(0).getAttributes().get("email_verified"));
+    }
+
+    @Test
+    void emailAliasPoolUnverifiedDuplicateWithVerifiedFlagThrowsUsernameExists() {
+        UserPool pool = createEmailAliasPool();
         service.adminCreateUser(pool.getId(), "unv@b.com",
                 new HashMap<>(Map.of("email", "unv@b.com")), null);
 
-        // A caller-supplied email_verified=true must not upgrade the decision:
-        // the existing owner is unverified -> UsernameExistsException, not AliasExistsException.
         AwsException ex = assertThrows(AwsException.class,
                 () -> service.adminCreateUser(pool.getId(), "unv@b.com",
                         new HashMap<>(Map.of("email", "unv@b.com", "email_verified", "true")), null));
@@ -6387,34 +6400,15 @@ class CognitoServiceTest {
     }
 
     @Test
-    void emailAliasPoolForceAliasCreationReclaimsWithoutIncomingVerifiedFlag() {
+    void emailAliasPoolUnverifiedDuplicateWithoutVerifiedFlagThrowsUsernameExists() {
         UserPool pool = createEmailAliasPool();
-        CognitoUser first = service.adminCreateUser(pool.getId(), "reclaim@b.com",
-                new HashMap<>(Map.of("email", "reclaim@b.com", "email_verified", "true")), null);
+        service.adminCreateUser(pool.getId(), "unv@b.com",
+                new HashMap<>(Map.of("email", "unv@b.com")), null);
 
-        // ForceAliasCreation reclaim keys off the existing owner's verified alias and
-        // must not require the caller to re-send email_verified in the new payload.
-        CognitoUser second = service.adminCreateUser(pool.getId(), "reclaim@b.com",
-                new HashMap<>(Map.of("email", "reclaim@b.com")), null, null, true);
-
-        assertNotEquals(first.getUsername(), second.getUsername());
-        assertEquals(second.getUsername(), service.adminGetUser(pool.getId(), "reclaim@b.com").getUsername());
-        assertNull(service.adminGetUser(pool.getId(), first.getUsername()).getAttributes().get("email"));
-    }
-
-    @Test
-    void emailAliasPoolForceAliasCreationMigratesVerifiedAlias() {
-        UserPool pool = createEmailAliasPool();
-        CognitoUser first = service.adminCreateUser(pool.getId(), "move@b.com",
-                new HashMap<>(Map.of("email", "move@b.com", "email_verified", "true")), null);
-
-        CognitoUser second = service.adminCreateUser(pool.getId(), "move@b.com",
-                new HashMap<>(Map.of("email", "move@b.com", "email_verified", "true")), null, null, true);
-
-        assertNotEquals(first.getUsername(), second.getUsername());
-        // The alias now resolves to the new user; the previous user lost it.
-        assertEquals(second.getUsername(), service.adminGetUser(pool.getId(), "move@b.com").getUsername());
-        assertNull(service.adminGetUser(pool.getId(), first.getUsername()).getAttributes().get("email"));
+        AwsException ex = assertThrows(AwsException.class,
+                () -> service.adminCreateUser(pool.getId(), "unv@b.com",
+                        new HashMap<>(Map.of("email", "unv@b.com")), null));
+        assertEquals("UsernameExistsException", ex.getErrorCode());
     }
 
     @Test
@@ -7177,25 +7171,25 @@ class CognitoServiceTest {
             AwsException lookup = assertThrows(AwsException.class, () -> svc.adminGetUser(pool.getId(), "alice"));
             assertEquals("UserNotFoundException", lookup.getErrorCode());
         }
-
         @Test
-        void failedInvitationDelivery_withForceAliasCreation_leavesTheAliasWithItsHolder() {
-            Map<String, Object> poolRequest = Map.of("PoolName", "AliasInvitePool",
-                    "UsernameAttributes", List.of("email"));
-            UserPool pool = svc.createUserPool(poolRequest, "us-east-1");
-            CognitoUser holder = create(pool, "alice@example.com", Map.of("email_verified", "true"), "Temp1234!",
-                    "SUPPRESS", List.of("EMAIL"));
+        void duplicateUsernameIsRefusedBeforeInvitationAndPreservesItsHolder() {
+            UserPool pool = svc.createUserPool(Map.of("PoolName", "AliasInvitePool",
+                    "UsernameAttributes", List.of("email")), "us-east-1");
+            CognitoUser holder = create(pool, "alice@example.com", Map.of("email_verified", "true"),
+                    "Temp1234!", "SUPPRESS", List.of("EMAIL"));
             failDelivery();
 
             AwsException failure = assertThrows(AwsException.class, () -> svc.adminCreateUser(pool.getId(),
                     "alice@example.com", Map.of("email_verified", "true"), null, null, true, List.of("EMAIL"),
                     Map.of(), Map.of()));
 
-            assertEquals("CodeDeliveryFailureException", failure.getErrorCode());
+            assertEquals("UsernameExistsException", failure.getErrorCode());
+            verify(messageDispatcher, never()).dispatchInvitation(any(), any(), any(), any(), any());
             CognitoUser after = svc.adminGetUser(pool.getId(), holder.getUsername());
             assertEquals("alice@example.com", after.getAttributes().get("email"));
             assertEquals("true", after.getAttributes().get("email_verified"));
             assertEquals(holder.getUsername(), svc.adminGetUser(pool.getId(), "alice@example.com").getUsername());
+            assertEquals(1, svc.listUsers(pool.getId(), null).size());
         }
     }
 }
