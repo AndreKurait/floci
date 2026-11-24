@@ -149,6 +149,7 @@ public class ElastiCacheContainerManager {
                 .withEnv("VALKEY_EXTRA_FLAGS", serverFlags.toString())
                 .withDockerNetwork(config.services().elasticache().dockerNetwork())
                 .withLogRotation()
+                .withPushedLogs()
                 .withLabels(ContainerStorageHelper.resourceIdentityLabels(
                         "elasticache", groupId, regionResolver.getAccountId(), region));
 
