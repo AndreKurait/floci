@@ -143,6 +143,7 @@ floci:
     reject-unknown-service-scope: true
 
   docker:
+    log-poll-interval-millis: 1000
     log-max-size: "10m"
     log-max-file: "3"
     resource-namespace: ""
