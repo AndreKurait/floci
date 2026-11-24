@@ -442,7 +442,7 @@ final class CognitoAuthFlowHandler {
             throw new AwsException("NotAuthorizedException", "Session does not match client", 400);
         }
         String username = responses.get("USERNAME");
-        if (username == null || !username.equals(state.username())) {
+        if (username == null || !service.signInKey(pool, username).equals(service.signInKey(pool, state.username()))) {
             throw new AwsException("NotAuthorizedException", "Session does not match user", 400);
         }
         validateSecretHash(client, responses, username);
@@ -542,13 +542,14 @@ final class CognitoAuthFlowHandler {
                 CognitoUser user = applyNewPasswordAttributes(pool, responses);
                 return continueCustomSrpAuth(pool, client, user, session, state, clientMetadata);
             }
+            String username = responses.get("USERNAME");
             PasswordChangeSession pending = session == null ? null : passwordChangeSessions.get(session);
             if (pending == null || sessionExpired(pending.expiresAt())
                     || !pool.getId().equals(pending.userPoolId()) || !client.getClientId().equals(pending.clientId())
-                    || !pending.username().equals(responses.get("USERNAME"))) {
+                    || !service.signInKey(pool, pending.username()).equals(service.signInKey(pool, username))) {
                 throw new AwsException("NotAuthorizedException", "Invalid session for the user.", 400);
             }
-            validateSecretHash(client, responses, pending.username());
+            validateSecretHash(client, responses, username);
             synchronized (pending) {
                 if (passwordChangeSessions.get(session) != pending || sessionExpired(pending.expiresAt())) {
                     throw new AwsException("NotAuthorizedException", "Session not found", 400);
@@ -1001,7 +1002,7 @@ final class CognitoAuthFlowHandler {
             throw new AwsException("InvalidParameterException",
                     "USERNAME, PASSWORD_CLAIM_SIGNATURE and TIMESTAMP are required", 400);
         }
-        if (!username.equals(srp.username())) {
+        if (!service.signInKey(pool, username).equals(service.signInKey(pool, srp.username()))) {
             throw new AwsException("NotAuthorizedException", "Session does not match user", 400);
         }
         validateSecretHash(client, responses, username);
@@ -2537,7 +2538,7 @@ final class CognitoAuthFlowHandler {
             throw new AwsException("NotAuthorizedException", "Session does not match client", 400);
         }
         String username = responses.get("USERNAME");
-        if (username == null || !username.equals(state.username())) {
+        if (username == null || !service.signInKey(pool, username).equals(service.signInKey(pool, state.username()))) {
             throw new AwsException("NotAuthorizedException", "Session does not match user", 400);
         }
         validateSecretHash(client, responses, username);
