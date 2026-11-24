@@ -99,6 +99,7 @@ public class ContainerLifecycleManager implements ContainerTeardown {
     private final LongSupplier nanoTime;
     private final CreateWait createWait;
     private final ContainerInternalDns internalDns;
+    private final GelfLogListener gelfLogListener;
 
     /** Volumes whose shared-ownership root has already been initialised this process (run-once guard). */
     private final ConcurrentHashMap<String, Boolean> initializedSharedVolumes = new ConcurrentHashMap<>();
@@ -107,6 +108,16 @@ public class ContainerLifecycleManager implements ContainerTeardown {
     private final AtomicReference<OptionalInt> hostCpuCount = new AtomicReference<>();
 
     @Inject
+    public ContainerLifecycleManager(DockerClient dockerClient,
+                                     ImageCacheService imageCacheService,
+                                     ContainerDetector containerDetector,
+                                     EmulatorConfig config,
+                                     GelfLogListener gelfLogListener) {
+        this(dockerClient, imageCacheService, containerDetector, config, RetryingTarCopier.DEFAULT_BACKOFF_MS,
+                WaitContainerResultCallback::awaitCompletion, System::nanoTime, TimeUnit.NANOSECONDS::sleep,
+                gelfLogListener);
+    }
+
     public ContainerLifecycleManager(DockerClient dockerClient,
                                      ImageCacheService imageCacheService,
                                      ContainerDetector containerDetector,
@@ -142,6 +153,20 @@ public class ContainerLifecycleManager implements ContainerTeardown {
                               RemovalWait removalWait,
                               LongSupplier nanoTime,
                               CreateWait createWait) {
+        this(dockerClient, imageCacheService, containerDetector, config, archiveRetryBackoffMillis,
+                removalWait, nanoTime, createWait, GelfLogListener.disabled());
+    }
+
+    private ContainerLifecycleManager(DockerClient dockerClient,
+                                      ImageCacheService imageCacheService,
+                                      ContainerDetector containerDetector,
+                                      EmulatorConfig config,
+                                      long archiveRetryBackoffMillis,
+                                      RemovalWait removalWait,
+                                      LongSupplier nanoTime,
+                                      CreateWait createWait,
+                                      GelfLogListener gelfLogListener) {
+        this.gelfLogListener = gelfLogListener;
         this.dockerClient = dockerClient;
         this.imageCacheService = imageCacheService;
         this.containerDetector = containerDetector;
@@ -152,6 +177,21 @@ public class ContainerLifecycleManager implements ContainerTeardown {
         this.createWait = createWait;
         this.internalDns = new ContainerInternalDns(dockerClient, config, archiveRetryBackoffMillis);
     }
+
+    // A container created in the log-driver mode dials the listener as it starts, a stopped one adopted
+    // after a restart of Floci included, and the start fails when nothing listens there.
+    private void startLogListener() {
+        if (!gelfLogListener.enabled()) {
+            return;
+        }
+        try {
+            gelfLogListener.ensureStarted();
+        } catch (IllegalStateException e) {
+            LOG.warnv("{0}: a container that sends its log there will not start: {1}", e.getMessage(),
+                    e.getCause() == null ? "" : e.getCause().getMessage());
+        }
+    }
+
 
     /** Pause between creation checks; tests advance the monotonic clock instead of sleeping. */
     @FunctionalInterface
@@ -676,6 +716,7 @@ public class ContainerLifecycleManager implements ContainerTeardown {
      * rather than a raw {@code dockerClient.startContainerCmd(...)} call.
      */
     void startContainer(String containerId) {
+        startLogListener();
         try {
             dockerClient.startContainerCmd(containerId).exec();
         } catch (NotModifiedException alreadyRunning) {

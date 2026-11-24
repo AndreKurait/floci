@@ -125,6 +125,7 @@ public class NeptuneContainerManager {
                 .withEnv(backendEnv(dbType))
                 .withDockerNetwork(config.services().neptune().dockerNetwork())
                 .withLogRotation()
+                .withPushedLogs()
                 .withLabels(ContainerStorageHelper.resourceIdentityLabels(
                         "neptune", clusterId, accountId, region));
 

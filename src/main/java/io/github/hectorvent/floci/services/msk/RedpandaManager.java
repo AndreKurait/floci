@@ -242,6 +242,7 @@ public class RedpandaManager {
                 .withName(containerName)
                 .withDockerNetwork(config.services().dockerNetwork())
                 .withLogRotation()
+                .withPushedLogs()
                 .withLabels(ContainerStorageHelper.resourceIdentityLabels(
                         "msk", cluster.getClusterName(),
                         AwsArnUtils.accountOrDefault(cluster.getClusterArn(), regionResolver.getAccountId()),

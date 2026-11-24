@@ -120,6 +120,7 @@ public class DocDbContainerManager {
                 .withName(containerName)
                 .withDockerNetwork(config.services().docdb().dockerNetwork())
                 .withLogRotation()
+                .withPushedLogs()
                 .withEnv(envVars)
                 .withLabels(ContainerStorageHelper.resourceIdentityLabels(
                         "docdb", clusterId, regionResolver.getAccountId(), region));

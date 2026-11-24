@@ -458,6 +458,7 @@ public class EcrRegistryManager {
                 .withLoopbackPortBinding(CONTAINER_INTERNAL_PORT, port)
                 .withDockerNetwork(resolveRegistryDockerNetwork())
                 .withLogRotation()
+                .withPushedLogs()
                 .withLabels(ContainerStorageHelper.resourceIdentityLabels(
                         "ecr", null, regionResolver.getAccountId(), regionResolver.getDefaultRegion()));
         addPersistenceMounts(specBuilder, env);

@@ -144,6 +144,8 @@ floci:
 
   docker:
     log-poll-interval-millis: 1000
+    log-driver-mode: false
+    log-driver-port: 12201
     log-max-size: "10m"
     log-max-file: "3"
     resource-namespace: ""

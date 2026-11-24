@@ -114,6 +114,9 @@ This foundation release provides opt-in security-group filtering for EC2 Docker 
 | `FLOCI_DOCKER_MAX_CONNECTIONS` | `1024` | Connection pool size for Floci's Docker client. Each live Lambda container holds one connection (its exit watcher) plus one per extension; log streams use the streaming pool. See [Docker Configuration](docker.md#connection-pool) |
 | `FLOCI_DOCKER_STREAMING_MAX_CONNECTIONS` | `512` | Connection pool size for container log-follow streams, kept apart from the main pool so they never starve create, start, stop and remove. See [Docker Configuration](docker.md#connection-pool) |
 | `FLOCI_DOCKER_LOG_POLL_INTERVAL_MILLIS` | `1000` | Milliseconds between the reads of a long-lived service container's log, read on a timer instead of followed; at least 100. See [Docker Configuration](docker.md#container-log-settings) |
+| `FLOCI_DOCKER_LOG_DRIVER_MODE` | `false` | Opt-in: long-lived service containers push their logs to Floci through Docker's `gelf` driver; needs a daemon that can reach Floci. See [Docker Configuration](docker.md#log-driver-mode-opt-in) |
+| `FLOCI_DOCKER_LOG_DRIVER_HOST` | _(unset)_ | Host the daemon dials in the log-driver mode; `host.docker.internal` on Docker Desktop, `127.0.0.1` otherwise |
+| `FLOCI_DOCKER_LOG_DRIVER_PORT` | `12201` | Fixed port of Floci's log listener in the log-driver mode; Docker dials it on every start of a container created in the mode |
 | `FLOCI_DOCKER_IMAGE_REGISTRY_BASE` | _(none)_ | Optional registry/repository base for every Docker image Floci launches. When set, `postgres:16-alpine` resolves as `<base>/postgres:16-alpine` and `public.ecr.aws/docker/library/ubuntu:24.04` resolves as `<base>/public.ecr.aws/docker/library/ubuntu:24.04` |
 | `FLOCI_DOCKER_LOG_MAX_SIZE` | `10m` | Log rotation max size for spawned containers (e.g. `10m`, `1g`) |
 | `FLOCI_DOCKER_LOG_MAX_FILE` | `3` | Number of rotated log files to keep for spawned containers |

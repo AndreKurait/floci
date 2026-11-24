@@ -127,6 +127,7 @@ public class ElastiCacheMemcachedContainerManager {
                 .withName(containerName)
                 .withDockerNetwork(config.services().elasticache().dockerNetwork())
                 .withLogRotation()
+                .withPushedLogs()
                 .withLabels(ContainerStorageHelper.resourceIdentityLabels(
                         "elasticache", clusterId, regionResolver.getAccountId(), effectiveRegion));
 

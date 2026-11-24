@@ -123,6 +123,8 @@ floci:
     max-connections: 1024                    # Docker client connection pool; each live Lambda container holds 1
     streaming-max-connections: 512           # Separate pool for container log-follow streams
     log-poll-interval-millis: 1000           # How often a long-lived service container's log is read (it is not followed)
+    log-driver-mode: false                   # Opt-in: service containers push their logs over GELF; needs a daemon that can reach Floci
+    log-driver-port: 12201                   # Fixed port of the log-driver listener; Docker dials it on every container start
     docker-config-path: ""                   # Path to dir containing Docker's config.json (e.g. /root/.docker)
     registry-credentials: []                 # Per-registry explicit credentials for private registries
 
