@@ -19,7 +19,7 @@ public final class StepFunctionsExecutions {
 
     private static final String SFN_CONTENT_TYPE = "application/x-amz-json-1.0";
     private static final Duration TERMINAL_STATE_TIMEOUT = Duration.ofSeconds(10);
-    private static final Duration POLL_INTERVAL = Duration.ofMillis(100);
+    private static final Duration POLL_INTERVAL = Duration.ofMillis(10);
     private static final String ROLE_ARN = "arn:aws:iam::000000000000:role/test-role";
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
@@ -46,12 +46,22 @@ public final class StepFunctionsExecutions {
      * the terminal status: asserting which one is the caller's business.
      */
     public static Response waitForTerminalState(String executionArn) {
-        return waitForTerminalState(executionArn, () -> describeExecution(executionArn));
+        return waitForTerminalState(executionArn, TERMINAL_STATE_TIMEOUT);
+    }
+
+    /** Waits up to the caller's limit, checking the execution immediately before polling. */
+    public static Response waitForTerminalState(String executionArn, Duration atMost) {
+        return waitForTerminalState(executionArn, atMost, () -> describeExecution(executionArn));
     }
 
     private static Response waitForTerminalState(String executionArn, Supplier<Response> describe) {
+        return waitForTerminalState(executionArn, TERMINAL_STATE_TIMEOUT, describe);
+    }
+
+    private static Response waitForTerminalState(String executionArn, Duration atMost, Supplier<Response> describe) {
         return await("execution " + executionArn + " to leave RUNNING")
-                .atMost(TERMINAL_STATE_TIMEOUT)
+                .atMost(atMost)
+                .pollDelay(Duration.ZERO)
                 .pollInterval(POLL_INTERVAL)
                 .until(describe::get,
                         response -> !"RUNNING".equals(response.jsonPath().getString("status")));
