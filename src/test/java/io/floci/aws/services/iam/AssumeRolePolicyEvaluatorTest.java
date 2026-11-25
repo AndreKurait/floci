@@ -98,6 +98,18 @@ class AssumeRolePolicyEvaluatorTest {
     }
 
     @Test
+    void permissionsOnlySessionActionsRetainTheirActionAndImmutableIdentity() {
+        IamService.CallerArns user = new IamService.CallerArns(CALLER_ARN, CALLER_ARN,
+                IamService.CallerArns.TYPE_USER, "AIDAORIGINAL", "alice");
+        String document = trust("{\"AWS\":\"AIDAORIGINAL\"}").replace("sts:AssumeRole", "sts:TagSession");
+        assertTrue(evaluator.allowsTagging(document, user, CALLER_ACCOUNT, Map.of()));
+        assertEquals(TrustDecision.NEUTRAL, evaluator.decide(document, user, CALLER_ACCOUNT, Map.of()));
+        IamService.CallerArns recreated = new IamService.CallerArns(CALLER_ARN, CALLER_ARN,
+                IamService.CallerArns.TYPE_USER, "AIDARECREATED", "alice");
+        assertFalse(evaluator.allowsTagging(document, recreated, CALLER_ACCOUNT, Map.of()));
+    }
+
+    @Test
     void allowsAServicePrincipalInTheUniversalForm() {
         assertTrue(evaluator.allowsService(
                 trust("{\"Service\":\"redshift.amazonaws.com\"}"), "redshift.amazonaws.com"));

@@ -148,12 +148,13 @@ class CloudFormationIamAttachmentProvisionerTest {
         // The restore goes through the seam that does not hold the document to being a policy:
         // putting back what the store already held is not a new write.
         ArgumentCaptor<String> docCaptor = ArgumentCaptor.forClass(String.class);
-        verify(iamService).updateAssumeRolePolicy(
+        InOrder trustWrites = inOrder(iamService);
+        trustWrites.verify(iamService).updateAssumeRolePolicy(
                 eq("existing-role"), docCaptor.capture(), eq(role.getRoleId()));
         assertEquals(mapper.readTree(newTrustPolicyJson), mapper.readTree(docCaptor.getValue()),
                 "the write applies the template's new trust policy");
         ArgumentCaptor<String> restoreCaptor = ArgumentCaptor.forClass(String.class);
-        verify(iamService).restoreAssumeRolePolicy(
+        trustWrites.verify(iamService).restoreAssumeRolePolicy(
                 eq("existing-role"), restoreCaptor.capture(), eq(role.getRoleId()));
         assertEquals(priorTrustPolicy, restoreCaptor.getValue(),
                 "the restore puts the role's pre-update trust policy back after the failure");
