@@ -167,14 +167,20 @@ class ElbClassicProxyPacketTest {
         return ContainerExec.run(docker, helper, new String[]{"sh", "-c", command}, 10).throwIfTimedOut(helper);
     }
 
-    private static void planned(String name) throws Exception {
-        Files.writeString(Path.of(System.getenv("FLOCI_AGENT_RUN_DIR"), "docker-ownership.txt"),
+    private Path ownershipJournal() {
+        String configured = System.getenv("FLOCI_AGENT_RUN_DIR");
+        Path directory = configured == null || configured.isBlank() ? certificates : Path.of(configured);
+        return directory.resolve("docker-ownership.txt");
+    }
+
+    private void planned(String name) throws Exception {
+        Files.writeString(ownershipJournal(),
                 "planned " + name + "\n", StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
     }
 
-    private static void record(List<String> created, String id) throws Exception {
+    private void record(List<String> created, String id) throws Exception {
         created.add(id);
-        Files.writeString(Path.of(System.getenv("FLOCI_AGENT_RUN_DIR"), "docker-ownership.txt"),
+        Files.writeString(ownershipJournal(),
                 "created " + id + "\n", StandardCharsets.UTF_8, StandardOpenOption.CREATE, StandardOpenOption.APPEND);
     }
 }

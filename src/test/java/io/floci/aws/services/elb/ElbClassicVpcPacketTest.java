@@ -107,7 +107,10 @@ class ElbClassicVpcPacketTest {
                 assertTrue(networks.attach("111111111111", "us-east-1", "vpc-owned", "subnet-owned", helper, backendAddress).isPresent());
                 RetryingTarCopier.copyBytes(docker, helper, "/tmp", "backend.sh",
                         (tcp ? "cat\n"
-                                : "printf 'HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\nowned-backend'\n").getBytes(StandardCharsets.UTF_8), 0600);
+                                : "while IFS= read -r line; do\n"
+                                        + "  [ \"$line\" = \"$(printf '\\r')\" ] && break\n"
+                                        + "done\n"
+                                        + "printf 'HTTP/1.1 200 OK\r\nContent-Length: 13\r\nConnection: close\r\n\r\nowned-backend'\n").getBytes(StandardCharsets.UTF_8), 0600);
                 RetryingTarCopier.copyBytes(docker, helper, "/tmp", "ca.pem",
                         ca.caPem().getBytes(StandardCharsets.UTF_8), 0600);
                 RetryingTarCopier.copyBytes(docker, helper, "/tmp", "backend.pem",
@@ -318,22 +321,28 @@ class ElbClassicVpcPacketTest {
         return permission;
     }
 
-    private static void planned(String name) throws IOException {
-        Files.writeString(Path.of(System.getenv("FLOCI_AGENT_RUN_DIR"), "docker-ownership.txt"),
+    private Path ownershipJournal() {
+        String configured = System.getenv("FLOCI_AGENT_RUN_DIR");
+        Path directory = configured == null || configured.isBlank() ? certificates : Path.of(configured);
+        return directory.resolve("docker-ownership.txt");
+    }
+
+    private void planned(String name) throws IOException {
+        Files.writeString(ownershipJournal(),
                 "planned " + name + "\n", StandardOpenOption.CREATE, StandardOpenOption.APPEND);
     }
 
-    private static void record(List<String> created, String id) throws IOException {
+    private void record(List<String> created, String id) throws IOException {
         created.add(id);
-        Files.writeString(Path.of(System.getenv("FLOCI_AGENT_RUN_DIR"), "docker-ownership.txt"),
+        Files.writeString(ownershipJournal(),
                 "created " + id + "\n", StandardOpenOption.CREATE, StandardOpenOption.APPEND);
     }
 
     private static final String PROXY = "haproxy:3.2-alpine@sha256:5893840576071e6217cd52ebdcc14f454c6f7a631056fa6f4e0f40d3cac4215b";
 
-    private static String create(DockerClient docker, List<String> created, String name,
+    private String create(DockerClient docker, List<String> created, String name,
                                  Map<String, String> labels, String network) throws IOException {
-        Path manifest = Path.of(System.getenv("FLOCI_AGENT_RUN_DIR"), "docker-ownership.txt");
+        Path manifest = ownershipJournal();
         Files.writeString(manifest, "planned " + name + "\n", StandardOpenOption.CREATE, StandardOpenOption.APPEND);
         String id = docker.createContainerCmd("floci/network-helper:local").withName(name).withLabels(labels)
                 .withHostConfig(HostConfig.newHostConfig().withNetworkMode(network))

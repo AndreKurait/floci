@@ -33,6 +33,7 @@ import io.floci.aws.services.elb.model.ClassicListener;
 import io.floci.aws.services.elb.model.ClassicLoadBalancer;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.lambda.launcher.ImageCacheService;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -53,6 +54,9 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class ElbClassicManagerPacketTest {
+    @TempDir
+    Path journalDirectory;
+
     @ParameterizedTest
     @ValueSource(strings = {"HTTP", "TCP"})
     void managerStartsProxyPublishesHealthAndRetiresNamespace(String protocol) throws Exception {
@@ -194,22 +198,28 @@ class ElbClassicManagerPacketTest {
                 "--noproxy", "*", "http://127.0.0.1:18080/"}, 5).throwIfTimedOut(helper);
     }
 
-    private static void planned(String name) throws IOException {
-        Files.writeString(Path.of(System.getenv("FLOCI_AGENT_RUN_DIR"), "docker-ownership.txt"),
+    private Path ownershipJournal() {
+        String configured = System.getenv("FLOCI_AGENT_RUN_DIR");
+        Path directory = configured == null || configured.isBlank() ? journalDirectory : Path.of(configured);
+        return directory.resolve("docker-ownership.txt");
+    }
+
+    private void planned(String name) throws IOException {
+        Files.writeString(ownershipJournal(),
                 "planned " + name + "\n", StandardOpenOption.CREATE, StandardOpenOption.APPEND);
     }
 
-    private static void record(List<String> created, String id) throws IOException {
+    private void record(List<String> created, String id) throws IOException {
         created.add(id);
-        Files.writeString(Path.of(System.getenv("FLOCI_AGENT_RUN_DIR"), "docker-ownership.txt"),
+        Files.writeString(ownershipJournal(),
                 "created " + id + "\n", StandardOpenOption.CREATE, StandardOpenOption.APPEND);
     }
 
     private static final String PROXY = "haproxy:3.2-alpine@sha256:5893840576071e6217cd52ebdcc14f454c6f7a631056fa6f4e0f40d3cac4215b";
 
-    private static String create(DockerClient docker, List<String> created, String name,
+    private String create(DockerClient docker, List<String> created, String name,
                                  Map<String, String> labels, String network) throws IOException {
-        Path manifest = Path.of(System.getenv("FLOCI_AGENT_RUN_DIR"), "docker-ownership.txt");
+        Path manifest = ownershipJournal();
         Files.writeString(manifest, "planned " + name + "\n", StandardOpenOption.CREATE, StandardOpenOption.APPEND);
         String id = docker.createContainerCmd("floci/network-helper:local").withName(name).withLabels(labels)
                 .withHostConfig(HostConfig.newHostConfig().withNetworkMode(network))
