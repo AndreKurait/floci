@@ -26,6 +26,7 @@ import io.floci.aws.services.iam.ResourcePolicyProviders;
 import io.floci.aws.services.iam.ScpProvider;
 import io.floci.aws.services.iam.model.CallerContext;
 import io.floci.aws.services.iam.model.IamRole;
+import io.floci.aws.services.kms.KmsService;
 import io.floci.aws.services.s3.S3ObjectActions;
 import io.floci.aws.services.s3.S3ScratchSpace;
 import io.floci.aws.services.s3.S3Service;
@@ -1278,6 +1279,10 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 if (decision != Decision.DENY) {
                     continue;
                 }
+                if (grantDecidesForeignKmsKey(credentialScope, action, resource, accountId)
+                        && !evaluator.deniesKmsGrant(caller, resourcePolicyDecision, action, resource, effectiveContext)) {
+                    continue;
+                }
                 LOG.infov("IAM enforcement DENY: akid={0} action={1} resource={2}", akid, action, resource);
                 // S3 answers the refusal with the caller, the resource and the policy that refused it, and
                 // CloudTrail records the message S3 answered; S3 Control keeps its own envelope and wording.
@@ -1298,6 +1303,25 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             }
         }
         return false;
+    }
+
+    /**
+     * A KMS operation a grant can admit, on another account's key. KMS authorizes such a request
+     * through the key's grants, which need no identity policy in the caller's account: "users and
+     * roles in the external account cannot use the KMS key until you attach IAM policies that
+     * delegate those permissions, or use grants to manage access to the KMS key" (KMS Developer
+     * Guide, key-policy-modifying-external-accounts). The KMS handler checks the grant where the key
+     * lives and refuses without one; explicit denies are checked here and still win.
+     */
+    private static boolean grantDecidesForeignKmsKey(String credentialScope, String action, String resource,
+                                                     String accountId) {
+        if (!"kms".equals(credentialScope) || action == null || !action.startsWith("kms:")
+                || !KmsService.GRANT_ACTIONS.contains(action.substring("kms:".length()))
+                || resource == null || !AwsArnUtils.isArnFor(resource, "kms")) {
+            return false;
+        }
+        AwsArnUtils.Arn arn = AwsArnUtils.parse(resource);
+        return arn.resource().startsWith("key/") && !arn.accountId().equals(accountId);
     }
 
     /** The same contexts with every object-tag key removed, keeping the principal and global keys. */

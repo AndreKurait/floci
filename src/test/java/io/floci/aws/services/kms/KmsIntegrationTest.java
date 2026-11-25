@@ -1227,7 +1227,7 @@ class KmsIntegrationTest {
     }
 
     @Test
-    void anotherAccountsKeyOrAliasArnIsNotFound() {
+    void anotherAccountsKeyNeedsAGrantAndAliasArnIsNotFound() {
         String owner = "AWS4-HMAC-SHA256 Credential=000000000103/20260215/us-east-1/kms/aws4_request, "
                 + "SignedHeaders=host, Signature=abc";
         String caller = "AWS4-HMAC-SHA256 Credential=000000000104/20260215/us-east-1/kms/aws4_request, "
@@ -1250,8 +1250,8 @@ class KmsIntegrationTest {
                 .body("message", equalTo("Alias " + ownerAliasArn + " is not found."));
         kmsAs(caller, "DescribeKey", "{\"KeyId\":\"%s\"}".formatted(ownerKeyArn)).then()
                 .statusCode(400)
-                .body("__type", equalTo("NotFoundException"))
-                .body("message", equalTo("Key '" + ownerKeyArn + "' does not exist"));
+                .body("__type", equalTo("AccessDeniedException"))
+                .body("message", containsString("kms:DescribeKey on resource: " + ownerKeyArn));
         kmsAs(caller, "DescribeKey", "{\"KeyId\":\"%s\"}".formatted(callerAliasArn)).then()
                 .statusCode(200)
                 .body("KeyMetadata.Arn", equalTo(callerKeyArn));
