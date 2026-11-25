@@ -25,6 +25,7 @@ import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertAll;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -105,14 +106,41 @@ class AppConfigDeploymentLifecycleTest {
         Scope scope = scope(service);
         Deployment first = deploy(service, scope, "1", scope.fast());
         Deployment second = deploy(service, scope, "2", scope.fast());
-        assertThrows(AwsException.class, () -> service.stopDeployment(
+        DeploymentStopException notLatest = assertThrows(DeploymentStopException.class, () -> service.stopDeployment(
                 scope.app(), scope.env(), first.getDeploymentNumber(), true));
+        assertEquals(DeploymentStopException.Reason.NOT_LATEST, notLatest.reason());
         assertEquals("2", service.getActiveVersion(scope.env(), scope.profile()));
         assertThrows(AwsException.class, () -> service.stopDeployment(
                 scope.app(), scope.env(), second.getDeploymentNumber(), false));
         assertEquals("REVERTED", service.stopDeployment(
                 scope.app(), scope.env(), second.getDeploymentNumber(), true).getState());
         assertEquals("1", service.getActiveVersion(scope.env(), scope.profile()));
+        DeploymentStopException repeated = assertThrows(DeploymentStopException.class, () -> service.stopDeployment(
+                scope.app(), scope.env(), second.getDeploymentNumber(), true));
+        assertEquals(DeploymentStopException.Reason.ALREADY_REVERTED, repeated.reason());
+        close(storage);
+    }
+
+    @Test
+    void anExpiredDeploymentHasASpecificStopRejectionAndRemainsActive() {
+        StorageFactory storage = factory();
+        Clock clock = mock(Clock.class);
+        when(clock.instant()).thenReturn(START);
+        AppConfigService service = new AppConfigService(storage,
+                new RegionResolver("us-east-1", "000000000000"), clock, mock(AppConfigAlarmMonitor.class));
+        Scope scope = scope(service);
+        Deployment deployment = deploy(service, scope, "1", scope.fast());
+        when(clock.instant()).thenReturn(START.plus(Duration.ofHours(72)).plusNanos(1));
+
+        DeploymentStopException expired = assertThrows(DeploymentStopException.class, () -> service.stopDeployment(
+                scope.app(), scope.env(), deployment.getDeploymentNumber(), true));
+
+        assertEquals(DeploymentStopException.Reason.TOO_OLD, expired.reason());
+        assertEquals("BadRequestException", expired.getErrorCode());
+        assertEquals(400, expired.getHttpStatus());
+        assertEquals("1", service.getActiveVersion(scope.env(), scope.profile()));
+        assertEquals("COMPLETE", service.getDeployment(
+                scope.app(), scope.env(), deployment.getDeploymentNumber()).getState());
         close(storage);
     }
 
@@ -128,6 +156,7 @@ class AppConfigDeploymentLifecycleTest {
         AwsException failure = assertThrows(AwsException.class, () -> service.stopDeployment(
                 scope.app(), scope.env(), current.getDeploymentNumber(), true));
         assertEquals("BadRequestException", failure.getErrorCode());
+        assertFalse(failure instanceof DeploymentStopException, "Missing content must not permit cleanup to pass.");
         assertEquals("2", service.getActiveVersion(scope.env(), scope.profile()));
         assertEquals("COMPLETE", service.getDeployment(scope.app(), scope.env(),
                 current.getDeploymentNumber()).getState());

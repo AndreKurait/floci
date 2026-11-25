@@ -65,6 +65,8 @@ MODELS: dict[str, str] = {
     "amp": "aps",
     "apigateway": "apigateway",
     "apigatewayv2": "apigateway",
+    "appconfig": "appconfig",
+    "appconfigdata": "appconfig",
     "bedrock": "bedrock",
     "bedrock-agent": "bedrock",
     "bedrock-runtime": "bedrock",
