@@ -1,34 +1,26 @@
-name: Fork dev image
+name: Publish qualified dev image candidate
+run-name: Publish and smoke dev candidate 008a32badc95
 
 on:
-  push:
-    branches: [dev]
   workflow_dispatch:
 
 permissions: {}
 
 concurrency:
-  group: fork-dev-image
+  group: qualified-dev-candidate-008a32badc95
   cancel-in-progress: false
 
 jobs:
-  test:
-    if: github.repository == 'AndreKurait/floci' && github.ref == 'refs/heads/dev'
-    permissions:
-      contents: read
-    uses: ./.github/workflows/ci.yml
-    with:
-      release-validation: true
-
   build:
-    if: github.repository == 'AndreKurait/floci' && github.ref == 'refs/heads/dev'
+    if: github.repository == 'AndreKurait/floci' && github.ref == 'refs/heads/agent/publish-qualified-dev-image-008a32badc95'
     permissions:
       contents: read
       packages: write
     uses: ./.github/workflows/build-images.yml
     with:
-      source-ref: ${{ github.sha }}
+      source-ref: 008a32badc95f1bc28b0cc2093dbae24fcca5776
       image: ghcr.io/andrekurait/floci
+      publish-native: false
 
   smoke:
     name: Smoke test (${{ matrix.arch }})
@@ -107,73 +99,3 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  promote:
-    name: Update dev tag
-    needs: [test, build, smoke, stock-agent]
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ github.token }}
-
-      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-
-      - name: Point dev at the tested image
-        env:
-          GH_TOKEN: ${{ github.token }}
-          IMAGE: ${{ needs.build.outputs.image-digest-ref }}
-          SOURCE_SHA: ${{ needs.build.outputs.source-sha }}
-        run: |
-          current="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/dev" --jq '.object.sha')"
-          if [[ "$current" != "$SOURCE_SHA" ]]; then
-            echo "Dev advanced during this build; leaving the moving tag unchanged."
-            exit 0
-          fi
-          docker buildx imagetools create --tag ghcr.io/andrekurait/floci:dev "$IMAGE"
-          {
-            echo "Pull: \`docker pull ghcr.io/andrekurait/floci:dev\`"
-            echo
-            echo "Tested immutable image: \`$IMAGE\`"
-            echo "Source: \`$SOURCE_SHA\`"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  cache-evidence:
-    name: Deliver cache publication evidence
-    needs: [build, smoke, stock-agent, promote]
-    if: >-
-      github.repository == 'AndreKurait/floci' && github.ref == 'refs/heads/dev' &&
-      vars.FLOCI_CACHE_ROLE_ARN != '' && vars.FLOCI_CACHE_BUCKET != '' &&
-      vars.FLOCI_CACHE_REGION != ''
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: read
-      actions: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-          ref: ${{ github.sha }}
-
-      - name: Validate cache delivery controls
-        run: python3 -m unittest discover -s .github/scripts -p test_deliver_floci_cache.py -v
-
-      - name: Configure ingress credentials
-        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
-        with:
-          role-to-assume: ${{ vars.FLOCI_CACHE_ROLE_ARN }}
-          aws-region: ${{ vars.FLOCI_CACHE_REGION }}
-
-      - name: Deliver the original provenance archive
-        env:
-          GH_TOKEN: ${{ github.token }}
-          FLOCI_CACHE_BUCKET: ${{ vars.FLOCI_CACHE_BUCKET }}
-          FLOCI_CACHE_REGION: ${{ vars.FLOCI_CACHE_REGION }}
-        run: python3 .github/scripts/deliver-floci-cache.py
