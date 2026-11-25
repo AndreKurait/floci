@@ -100,6 +100,10 @@ public record ContainerSpec(
             linuxOptions = LinuxOptions.NONE;
         }
         joinedNetworks = joinedNetworks == null ? List.of() : List.copyOf(joinedNetworks);
+        if (!linuxOptions.networkSysctls().isEmpty()
+                && ("host".equals(networkMode) || networkMode != null && networkMode.startsWith("container:"))) {
+            throw new IllegalArgumentException("Network sysctls require a container-owned network namespace");
+        }
         if (linkLocalIps != null && !linkLocalIps.isEmpty()) {
             requireUserDefinedNetwork(networkMode);
             linkLocalIps.forEach(ContainerSpec::requireLinkLocalIpv4);
