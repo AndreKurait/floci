@@ -489,7 +489,7 @@ class AppConfigIntegrationTest {
     void listTagsOnNewApplicationIsEmpty() {
         String arn = "arn:aws:appconfig:us-east-1:000000000000:application/" + appId;
         given()
-                .when().get("/tags/" + arn)
+                .when().get("/tags/{arn}", arn)
                 .then()
                 .statusCode(200)
                 .body("Tags", anEmptyMap());
@@ -501,7 +501,7 @@ class AppConfigIntegrationTest {
         given()
                 .contentType(ContentType.JSON)
                 .body("{\"Tags\": {\"env\": \"local\", \"team\": \"platform\"}}")
-                .when().post("/tags/" + arn)
+                .when().post("/tags/{arn}", arn)
                 .then()
                 .statusCode(204);
     }
@@ -510,7 +510,7 @@ class AppConfigIntegrationTest {
     void listTagsAfterTagging() {
         String arn = "arn:aws:appconfig:us-east-1:000000000000:application/" + appId;
         given()
-                .when().get("/tags/" + arn)
+                .when().get("/tags/{arn}", arn)
                 .then()
                 .statusCode(200)
                 .body("Tags.env", equalTo("local"))
@@ -521,7 +521,7 @@ class AppConfigIntegrationTest {
     void untagApplication() {
         String arn = "arn:aws:appconfig:us-east-1:000000000000:application/" + appId;
         given()
-                .when().delete("/tags/" + arn + "?tagKeys=env")
+                .when().delete("/tags/{arn}?tagKeys=env", arn)
                 .then()
                 .statusCode(204);
     }
@@ -530,7 +530,7 @@ class AppConfigIntegrationTest {
     void listTagsAfterUntagging() {
         String arn = "arn:aws:appconfig:us-east-1:000000000000:application/" + appId;
         given()
-                .when().get("/tags/" + arn)
+                .when().get("/tags/{arn}", arn)
                 .then()
                 .statusCode(200)
                 .body("Tags", not(hasKey("env")))
@@ -543,7 +543,7 @@ class AppConfigIntegrationTest {
     void listTagsForEnvironmentArnReturnsEmpty() {
         String arn = "arn:aws:appconfig:us-east-1:000000000000:application/" + appId + "/environment/" + envId;
         given()
-                .when().get("/tags/" + arn)
+                .when().get("/tags/{arn}", arn)
                 .then()
                 .statusCode(200)
                 .body("Tags", anEmptyMap());
@@ -553,7 +553,7 @@ class AppConfigIntegrationTest {
     void listTagsForDeploymentArnReturnsEmpty() {
         String arn = "arn:aws:appconfig:us-east-1:000000000000:application/" + appId + "/environment/" + envId + "/deployment/1";
         given()
-                .when().get("/tags/" + arn)
+                .when().get("/tags/{arn}", arn)
                 .then()
                 .statusCode(200)
                 .body("Tags", anEmptyMap());
@@ -566,7 +566,7 @@ class AppConfigIntegrationTest {
     void listTagsForDeploymentStrategyArnIsAcceptedNotRejected() {
         String arn = "arn:aws:appconfig:us-east-1:000000000000:deploymentstrategy/" + strategyId;
         given()
-                .when().get("/tags/" + arn)
+                .when().get("/tags/{arn}", arn)
                 .then()
                 .statusCode(200)
                 .body("Tags", anEmptyMap());
@@ -578,7 +578,7 @@ class AppConfigIntegrationTest {
         given()
                 .contentType(ContentType.JSON)
                 .body("{\"Tags\": {\"env\": \"local\"}}")
-                .when().post("/tags/" + arn)
+                .when().post("/tags/{arn}", arn)
                 .then()
                 .statusCode(204);
     }
@@ -588,12 +588,12 @@ class AppConfigIntegrationTest {
         String extensionArn = "arn:aws:appconfig:us-east-1:000000000000:extension/some-extension-id";
         String associationArn = "arn:aws:appconfig:us-east-1:000000000000:extensionassociation/some-association-id";
         given()
-                .when().get("/tags/" + extensionArn)
+                .when().get("/tags/{arn}", extensionArn)
                 .then()
                 .statusCode(200)
                 .body("Tags", anEmptyMap());
         given()
-                .when().get("/tags/" + associationArn)
+                .when().get("/tags/{arn}", associationArn)
                 .then()
                 .statusCode(200)
                 .body("Tags", anEmptyMap());
