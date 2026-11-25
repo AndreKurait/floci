@@ -9,6 +9,7 @@ import io.vertx.core.Future;
 import io.vertx.core.Promise;
 import io.vertx.core.Vertx;
 import io.vertx.core.datagram.DatagramSocket;
+import io.vertx.core.net.NetServer;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.parallel.ResourceAccessMode;
@@ -59,6 +60,7 @@ class EmbeddedDnsServerAddressTest {
 
     private final Vertx vertx = mock(Vertx.class);
     private final DatagramSocket socket = mock(DatagramSocket.class);
+    private final NetServer tcp = mock(NetServer.class);
     private final DockerBridgeAddress dockerBridge = mock(DockerBridgeAddress.class);
 
     private static EmulatorConfig config(OptionalInt hostPort, boolean bridgeListenerEnabled) {
@@ -78,6 +80,12 @@ class EmbeddedDnsServerAddressTest {
         when(containerDetector.isRunningInContainer()).thenReturn(inContainer);
         CurrentContainerNetworkResolver currentContainer = mock(CurrentContainerNetworkResolver.class);
         when(currentContainer.resolveContainerIp()).thenReturn(Optional.of("172.19.0.2"));
+        when(vertx.createNetServer(any())).thenReturn(tcp);
+        when(tcp.listen(anyInt(), anyString())).thenAnswer(invocation -> {
+            when(tcp.actualPort()).thenReturn(invocation.getArgument(0));
+            return Future.succeededFuture(tcp);
+        });
+        when(tcp.close()).thenReturn(Future.succeededFuture());
         when(vertx.createDatagramSocket(any())).thenReturn(socket);
         return new EmbeddedDnsServer(config, containerDetector, vertx, mock(Instance.class),
                 mock(Instance.class), mock(Instance.class), currentContainer, dockerBridge);
@@ -91,6 +99,7 @@ class EmbeddedDnsServerAddressTest {
         EmbeddedDnsServer server = server(config(OptionalInt.of(5354), true), true);
 
         assertEquals(Optional.of("172.19.0.2"), server.getServerIp());
+        verify(tcp).listen(53, "172.19.0.2");
         verify(socket).listen(53, "172.19.0.2");
         verify(socket, never()).listen(5354, "127.0.0.1");
         verify(dockerBridge, never()).resolve();
@@ -116,6 +125,7 @@ class EmbeddedDnsServerAddressTest {
         EmbeddedDnsServer server = server(config(OptionalInt.of(5354), false), false);
 
         verify(socket).listen(5354, "127.0.0.1");
+        verify(tcp).listen(5354, "127.0.0.1");
         assertEquals(Optional.empty(), server.getServerIp());
     }
 
