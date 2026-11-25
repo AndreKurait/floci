@@ -156,6 +156,23 @@ class SecurityGroupFirewallManagerTest {
     }
 
     @Test
+    void ipv6PolicyRefreshRetainsDnsRetirementIdentity() {
+        DockerClient dockerClient = mock(DockerClient.class);
+        ListContainersCmd listing = mock(ListContainersCmd.class, RETURNS_SELF);
+        when(dockerClient.listContainersCmd()).thenReturn(listing);
+        when(listing.exec()).thenReturn(List.of());
+        SecurityGroupFirewallManager manager = dnsManager(dockerClient);
+        registerOrigin(manager, "eni-a", "helper-a", "172.18.0.2", "vpc-a");
+        manager.updateIpv6Addresses("eni-a", List.of("2001:db8::10"));
+        clearInvocations(manager);
+
+        manager.retireDnsOrigins();
+
+        assertTrue(manager.vpcForClient("172.18.0.2").isEmpty());
+        verify(manager).reconcileAll();
+    }
+
+    @Test
     void retirementCannotRemoveAConcurrentRegistrationWithTheSameIdentity() {
         DockerClient dockerClient = mock(DockerClient.class);
         ListContainersCmd listing = mock(ListContainersCmd.class, RETURNS_SELF);
@@ -364,7 +381,7 @@ class SecurityGroupFirewallManagerTest {
             removing.countDown();
             assertTrue(release.await(5, TimeUnit.SECONDS));
             return null;
-        }).when(lifecycle).removeIfExists("helper-eni-0");
+        }).when(lifecycle).removeIfExistsStrict("helper-eni-0");
         try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
             Future<?> retirement = executor.submit(() -> manager.unregister("eni-0"));
             try {
