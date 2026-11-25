@@ -3,7 +3,7 @@
     "generator": "tools/aws/regen_cfn_property_types.py",
     "schemas": "https://schema.cloudformation.us-east-1.amazonaws.com/CloudformationSchema.zip",
     "retrieved": "2026-11-21",
-    "note": "make cfn-property-types-verify checks the file against AWS."
+    "note": "make cfn-property-types-verify checks the file against AWS. LoadBalancer schema added from the same AWS archive on 2026-11-25; other resource schemas retain the original retrieval date."
   },
   "operations": {
     "AWS::AutoScaling::LaunchConfiguration": "AWS::AutoScaling::LaunchConfiguration",
@@ -21,6 +21,7 @@
     "AWS::EMR::StudioSessionMapping": "AWS::EMR::StudioSessionMapping",
     "AWS::EMRContainers::VirtualCluster": "AWS::EMRContainers::VirtualCluster",
     "AWS::EMRServerless::Application": "AWS::EMRServerless::Application",
+    "AWS::ElasticLoadBalancingV2::LoadBalancer": "AWS::ElasticLoadBalancingV2::LoadBalancer",
     "AWS::Events::Connection": "AWS::Events::Connection",
     "AWS::Events::Rule": "AWS::Events::Rule",
     "AWS::Lambda::Function": "AWS::Lambda::Function",
@@ -3540,6 +3541,89 @@
       "minLength": 1,
       "maxLength": 50,
       "pattern": "^[a-zA-Z]+[-_]*[a-zA-Z]+$"
+    },
+    "AWS::ElasticLoadBalancingV2::LoadBalancer": {
+      "type": "structure",
+      "members": {
+        "IpAddressType": "String",
+        "EnablePrefixForIpv6SourceNat": "String",
+        "SecurityGroups": "AWS::ElasticLoadBalancingV2::LoadBalancer.SecurityGroups",
+        "LoadBalancerAttributes": "AWS::ElasticLoadBalancingV2::LoadBalancer.LoadBalancerAttributes",
+        "MinimumLoadBalancerCapacity": "AWS::ElasticLoadBalancingV2::LoadBalancer/MinimumLoadBalancerCapacity",
+        "EnableCapacityReservationProvisionStabilize": "Boolean",
+        "Scheme": "String",
+        "DNSName": "String",
+        "Name": "String",
+        "LoadBalancerName": "String",
+        "LoadBalancerFullName": "String",
+        "Subnets": "AWS::ElasticLoadBalancingV2::LoadBalancer.Subnets",
+        "Type": "String",
+        "CanonicalHostedZoneID": "String",
+        "Tags": "AWS::ElasticLoadBalancingV2::LoadBalancer.Tags",
+        "LoadBalancerArn": "String",
+        "SubnetMappings": "AWS::ElasticLoadBalancingV2::LoadBalancer.SubnetMappings",
+        "EnforceSecurityGroupInboundRulesOnPrivateLinkTraffic": "String",
+        "Ipv4IpamPoolId": "String"
+      }
+    },
+    "AWS::ElasticLoadBalancingV2::LoadBalancer.LoadBalancerAttributes": {
+      "type": "list",
+      "member": "AWS::ElasticLoadBalancingV2::LoadBalancer/LoadBalancerAttribute"
+    },
+    "AWS::ElasticLoadBalancingV2::LoadBalancer.SecurityGroups": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::ElasticLoadBalancingV2::LoadBalancer.SubnetMappings": {
+      "type": "list",
+      "member": "AWS::ElasticLoadBalancingV2::LoadBalancer/SubnetMapping"
+    },
+    "AWS::ElasticLoadBalancingV2::LoadBalancer.Subnets": {
+      "type": "list",
+      "member": "String"
+    },
+    "AWS::ElasticLoadBalancingV2::LoadBalancer.Tags": {
+      "type": "list",
+      "member": "AWS::ElasticLoadBalancingV2::LoadBalancer/Tag"
+    },
+    "AWS::ElasticLoadBalancingV2::LoadBalancer/LoadBalancerAttribute": {
+      "type": "structure",
+      "members": {
+        "Value": "String",
+        "Key": "String"
+      }
+    },
+    "AWS::ElasticLoadBalancingV2::LoadBalancer/MinimumLoadBalancerCapacity": {
+      "type": "structure",
+      "members": {
+        "CapacityUnits": "Integer"
+      },
+      "required": [
+        "CapacityUnits"
+      ]
+    },
+    "AWS::ElasticLoadBalancingV2::LoadBalancer/SubnetMapping": {
+      "type": "structure",
+      "members": {
+        "SubnetId": "String",
+        "AllocationId": "String",
+        "PrivateIPv4Address": "String",
+        "IPv6Address": "String",
+        "SourceNatIpv6Prefix": "String"
+      },
+      "required": [
+        "SubnetId"
+      ]
+    },
+    "AWS::ElasticLoadBalancingV2::LoadBalancer/Tag": {
+      "type": "structure",
+      "members": {
+        "Value": "String",
+        "Key": "String"
+      },
+      "required": [
+        "Key"
+      ]
     },
     "AWS::Events::Connection": {
       "type": "structure",

@@ -56,6 +56,7 @@ RESOURCE_TYPES = ["AWS::AutoScaling::LaunchConfiguration", "AWS::DSQL::Cluster",
                   "AWS::EMR::SecurityConfiguration", "AWS::EMR::Step", "AWS::EMR::Studio",
                   "AWS::EMR::StudioSessionMapping",
                   "AWS::EMRContainers::VirtualCluster", "AWS::EMRServerless::Application",
+                  "AWS::ElasticLoadBalancingV2::LoadBalancer",
                   "AWS::Events::Connection", "AWS::Events::Rule",
                   "AWS::Lambda::Function", "AWS::Lambda::LayerVersion",
                   "AWS::SES::ConfigurationSetEventDestination"]
@@ -68,6 +69,10 @@ SHAPE_TYPES = {"structure", "list", "map", *SCALAR_SHAPES}
 # Types the provisioners rely on, each measured on CloudFormation: (shape, member) -> member shape,
 # and for a list or a map the shape of its items or values.
 ANCHORS = {
+    ("AWS::ElasticLoadBalancingV2::LoadBalancer", "LoadBalancerAttributes"): [
+        "AWS::ElasticLoadBalancingV2::LoadBalancer/LoadBalancerAttribute"],
+    ("AWS::ElasticLoadBalancingV2::LoadBalancer/LoadBalancerAttribute", "Key"): "String",
+    ("AWS::ElasticLoadBalancingV2::LoadBalancer/LoadBalancerAttribute", "Value"): "String",
     ("AWS::Events::Rule/RetryPolicy", "MaximumRetryAttempts"): "Integer",
     ("AWS::Events::Rule/EcsParameters", "EnableECSManagedTags"): "Boolean",
     ("AWS::Events::Rule/AwsVpcConfiguration", "Subnets"): ["String"],
