@@ -149,6 +149,23 @@ class StsRegisteredOidcProviderIntegrationTest {
     }
 
     @Test
+    void mixedCognitoTrustKeepsRegisteredProviderVerificationAndRejectsForgery() throws Exception {
+        String host = issuer.substring("https://".length());
+        String trust = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
+                + "\"Principal\":{\"Federated\":[\"" + providerArn + "\",\"cognito-identity.amazonaws.com\"]},"
+                + "\"Action\":\"sts:AssumeRoleWithWebIdentity\",\"Condition\":{\"StringEquals\":{\""
+                + host + ":sub\":\"" + SUBJECT + "\"}}}]}";
+        iam.updateAssumeRolePolicy(b -> b.roleName(role.roleName()).policyDocument(trust));
+        AssumeRoleWithWebIdentityResponse issued = assume(token(issuer, "sts.amazonaws.com", privateKey));
+        assertEquals(issuer, issued.provider());
+        assertEquals(SUBJECT, issued.subjectFromWebIdentityToken());
+        RSAPrivateKey forged = (RSAPrivateKey) KeyPairGenerator.getInstance("RSA").generateKeyPair().getPrivate();
+        StsException failure = assertThrows(StsException.class,
+                () -> assume(token(issuer, "sts.amazonaws.com", forged)));
+        assertEquals("InvalidIdentityToken", failure.awsErrorDetails().errorCode());
+    }
+
+    @Test
     void tokenSignedWithAnotherKeyIsRefused() throws Exception {
         RSAPrivateKey forged = (RSAPrivateKey) KeyPairGenerator.getInstance("RSA").generateKeyPair().getPrivate();
 

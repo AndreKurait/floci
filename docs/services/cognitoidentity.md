@@ -113,3 +113,8 @@ aws cognito-identity describe-identity-pool --identity-pool-id us-east-1:...
 
 aws cognito-identity delete-identity-pool --identity-pool-id us-east-1:...
 ```
+
+Tokens without a known local OIDC signing key cannot bypass a role's Cognito token verification,
+even when general IAM enforcement is disabled. Mixed Cognito/OIDC trust still accepts local OIDC
+tokens through the existing signature, audience and role-trust checks. This is a local verifier routing
+guarantee; it does not change the unrelated STS fallback for roles without Cognito trust.

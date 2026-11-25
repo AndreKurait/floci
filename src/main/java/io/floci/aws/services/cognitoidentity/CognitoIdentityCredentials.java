@@ -65,10 +65,21 @@ public class CognitoIdentityCredentials {
                               String issuer, String audience) {}
 
     public boolean recognizes(String token, String roleArn) {
+        return recognizes(token, roleArn, false);
+    }
+
+    /** The caller must retain the resolved local issuer key for subsequent token verification. */
+    public boolean recognizes(String token, String roleArn, boolean hasLocalIssuerKey) {
+        return recognizes(token, roleArn, hasLocalIssuerKey, false);
+    }
+
+    /** Registered providers use the normal JWKS and trust checks after routing. */
+    public boolean recognizes(String token, String roleArn, boolean hasLocalIssuerKey,
+                              boolean hasRegisteredIssuer) {
         if (tokens.recognizes(token)) {
             return true;
         }
-        if (tokens.identifiesIssuer(token)) {
+        if (hasLocalIssuerKey || hasRegisteredIssuer) {
             return false;
         }
         try {

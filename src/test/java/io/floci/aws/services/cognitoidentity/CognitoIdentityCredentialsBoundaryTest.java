@@ -79,13 +79,14 @@ class CognitoIdentityCredentialsBoundaryTest {
         IamRole role = new IamRole("AROAEXAMPLE", "mixed", "/", roleArn, trust(true));
         String external = Base64Url.encode("{\"alg\":\"RS256\"}") + "."
                 + Base64Url.encode("{\"iss\":\"https://login.example.test\",\"sub\":\"app\"}") + ".signature";
-        assertFalse(credentials.recognizes(external, roleArn));
+        assertFalse(credentials.recognizes(external, roleArn, true));
         verifyNoInteractions(iam);
         when(iam.findRole(ACCOUNT, "mixed")).thenReturn(Optional.of(role));
+        assertTrue(credentials.recognizes(external, roleArn, false));
         assertTrue(credentials.recognizes("stripped-of-all-jwt-fields", roleArn));
         String damaged = Base64Url.encode("{\"kid\":\"cognito-missing\"}") + "."
                 + Base64Url.encode("{\"iss\":\"https://login.example.test\"}") + ".invalid";
-        assertTrue(credentials.recognizes(damaged, roleArn));
+        assertTrue(credentials.recognizes(damaged, roleArn, true));
         assertEquals("InvalidIdentityToken", assertThrows(AwsException.class,
                 () -> credentials.assumeRole(damaged, roleArn, "damaged", 3600, null, 0)).getErrorCode());
     }
