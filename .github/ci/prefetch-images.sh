@@ -200,9 +200,12 @@ REDSHIFT_PG_IMAGE="$(grep -oE 'image-version: *postgres:[^ ]+' src/main/resource
 grep -qE '/redshift/|/cloudformation/' "$SHARD_FILE" && [ -n "$REDSHIFT_PG_IMAGE" ] && pull "$REDSHIFT_PG_IMAGE"
 grep -qE '/rds/|/rdsdata/' "$SHARD_FILE" && pull postgres:16.3-alpine
 # The template-database restore fixture selects its own PostgreSQL image.
-# Read that override so its first CreateDBInstance does not also have to pull PostGIS.
+# Read its inline override or named test profile so the first CreateDBInstance need not pull PostGIS.
 POSTGIS_TEST="$(find src/test/java -name RdsTemplateDatabaseRestoreDockerNightlyIntegrationTest.java -print -quit)"
-POSTGIS_IMAGE="$(awk -F'"' '$2 == "floci.services.rds.default-postgres-image" { print $4 }' "${POSTGIS_TEST:-/dev/null}")"
+POSTGIS_PROFILE_NAME="$(sed -nE 's/^@TestProfile\(([[:alnum:]_]+)\.class\).*$/\1/p' "${POSTGIS_TEST:-/dev/null}")"
+POSTGIS_PROFILE="$(find src/test/java -name "${POSTGIS_PROFILE_NAME:-__none__}.java" -print -quit)"
+POSTGIS_IMAGE="$(awk -F'"' '$2 == "floci.services.rds.default-postgres-image" { print $4; exit }' \
+    "${POSTGIS_TEST:-/dev/null}" "${POSTGIS_PROFILE:-/dev/null}")"
 [ -n "$POSTGIS_IMAGE" ] \
     || echo "$(date -u +%H:%M:%S) prefetch skipped: RdsTemplateDatabaseRestoreDockerNightlyIntegrationTest default-postgres-image not readable" >> "$PREFETCH_LOG"
 starts RdsTemplateDatabaseRestoreDockerNightlyIntegrationTest \
