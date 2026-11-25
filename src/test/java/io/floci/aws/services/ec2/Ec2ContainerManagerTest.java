@@ -3035,23 +3035,83 @@ class Ec2ContainerManagerTest {
     }
 
     @Test
-    void theTeardownHookIsSkippedWhenTheContainerCouldNotBeRemoved() throws Exception {
-        // Running it anyway would start work that depends on the container being gone while it
-        // demonstrably is not, and nothing retries behind it. Skipping and logging is the
-        // honest outcome.
-        LaunchHarness harness = launchHarness();
+    void failedContainerRemovalKeepsOwnershipUntilRetrySucceeds() throws Exception {
+        ExecutorService executor = mock(ExecutorService.class);
+        List<Runnable> tasks = new ArrayList<>();
+        doAnswer(call -> {
+            tasks.add(call.getArgument(0));
+            return null;
+        }).when(executor).submit(any(Runnable.class));
+        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(5));
         stubDockerPing(harness.dockerClient(), false);
-        Instance instance = instance("i-teardown-hook-refused");
+        Instance instance = instance("i-teardown-retry");
         harness.manager().launch(instance, "ubuntu:24.04", null, "us-west-2");
         instance.setDockerContainerId("c-stuck");
+        instance.setContainerBridgeIp("172.18.0.12");
+        instance.setSshHostPort(2201);
+        RemoveContainerCmd removal = mock(RemoveContainerCmd.class, RETURNS_SELF);
         when(harness.dockerClient().removeContainerCmd("c-stuck"))
-                .thenThrow(new RuntimeException("daemon refused"));
+                .thenThrow(new RuntimeException("daemon refused")).thenReturn(removal);
         AtomicBoolean ran = new AtomicBoolean(false);
+        tasks.clear();
+        clearInvocations(harness.metadataServer(), harness.vpcNetworkManager(), harness.portAllocator());
 
         harness.manager().terminate(instance, () -> ran.set(true));
+        tasks.removeFirst().run();
 
-        awaitUntil(() -> "terminated".equals(instance.getState().getName()), Duration.ofSeconds(2));
-        assertFalse(ran.get(), "the hook must not run when the container is still present");
+        assertEquals("shutting-down", instance.getState().getName());
+        assertEquals(0, instance.getTerminatedAt());
+        assertFalse(ran.get());
+        verify(harness.metadataServer(), never()).unregisterInstance(instance);
+        verify(harness.vpcNetworkManager(), never()).releasePrivateIp(any(), any(), any(), any());
+        verify(harness.portAllocator(), never()).release(2201);
+
+        harness.manager().terminate(instance, () -> ran.set(true));
+        tasks.removeFirst().run();
+
+        assertEquals("terminated", instance.getState().getName());
+        assertTrue(instance.getTerminatedAt() > 0);
+        assertTrue(ran.get());
+        verify(harness.metadataServer()).unregisterInstance(instance);
+        verify(harness.portAllocator()).release(2201);
+        verify(removal).exec();
+        assertTrue(tasks.isEmpty());
+    }
+
+    @Test
+    void successfulRemovalStillReleasesOwnershipWhenMetadataCleanupFails() throws Exception {
+        ExecutorService executor = mock(ExecutorService.class);
+        List<Runnable> tasks = new ArrayList<>();
+        doAnswer(call -> {
+            tasks.add(call.getArgument(0));
+            return null;
+        }).when(executor).submit(any(Runnable.class));
+        LaunchHarness harness = launchHarness(executor, Duration.ofSeconds(5));
+        stubDockerPing(harness.dockerClient(), false);
+        Instance instance = instance("i-teardown-cleanup-failure");
+        harness.manager().launch(instance, "ubuntu:24.04", null, "us-west-2");
+        instance.setDockerContainerId("c-removed");
+        instance.setContainerBridgeIp("172.18.0.13");
+        instance.setSshHostPort(2202);
+        RemoveContainerCmd removal = mock(RemoveContainerCmd.class, RETURNS_SELF);
+        when(harness.dockerClient().removeContainerCmd("c-removed")).thenReturn(removal);
+        doThrow(new RuntimeException("metadata cleanup failed"))
+                .when(harness.metadataServer()).unregisterInstance(instance);
+        AtomicBoolean ran = new AtomicBoolean(false);
+        tasks.clear();
+        clearInvocations(harness.vpcNetworkManager(), harness.portAllocator());
+
+        harness.manager().terminate(instance, () -> ran.set(true));
+        tasks.removeFirst().run();
+
+        assertEquals("terminated", instance.getState().getName());
+        assertTrue(instance.getTerminatedAt() > 0);
+        assertTrue(ran.get());
+        verify(removal).exec();
+        verify(harness.portAllocator()).release(2202);
+        verify(harness.vpcNetworkManager()).releasePrivateIp(instance.getOwnerId(), instance.getRegion(),
+                instance.getSubnetId(), instance.getPrivateIpAddress());
+        assertTrue(tasks.isEmpty());
     }
 
     @Test

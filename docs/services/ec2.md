@@ -69,6 +69,13 @@ Every state change the container manager makes in the background is written to t
 
 A record is settled as `stopped` only once Docker confirms that its container stopped or is gone. When Docker cannot confirm it (it is unreachable, for one), the record keeps its state and the next start tries again, and an instance that cannot be settled is named in an error in the log. The releases of a termination (port forwards, firewall rules, addresses) are independent of the container removal, so one that fails neither skips it nor keeps the instance from terminating. The sweep that removes expired instances carries on past one that cannot be removed and reports the failure when it ends.
 
+
+Attached network interfaces stay `in-use` until the instance's physical teardown
+completes. Completion deletes launch-created primary interfaces and detaches
+caller-created interfaces in their owner's account. Both interface records protect
+their security groups while attached. A retained interface continues to protect its
+security groups until the interface is deleted.
+
 ## Instance Resource Limits
 
 By default, Docker containers launched for EC2 instances are bounded to the CPU and memory limits defined in the instance type catalog (`src/main/resources/ec2/instance-type-catalog.yaml`).

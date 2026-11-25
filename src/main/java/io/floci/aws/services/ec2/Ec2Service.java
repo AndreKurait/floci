@@ -4605,6 +4605,10 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                             // since the unlocked check above.
                             validateHostPlacement(getRequiredAvailableHost(region, hostId), az, effectiveInstanceType, tenancy);
                         }
+                        if (suppliedEni != null && suppliedEni.getAttachment() != null) {
+                            throw new AwsException("InvalidNetworkInterface.InUse",
+                                    "Interface: '" + suppliedEni.getNetworkInterfaceId() + "' is currently in use.", 400);
+                        }
                         List<String> launchIpv6 = allocateLaunchIpv6(region, finalSubnetId, suppliedEni, admitted);
                         List<String> privateIps = allocateLaunchAddresses(region, finalSubnetId, suppliedEni,
                                 privateIpAddress, admitted);
@@ -5695,13 +5699,20 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                     // Termination also disassociates an Elastic IP, so nothing public is left.
                     clearPublicAddress(inst);
                 }
+                releaseStandaloneInterfacesOnTermination(region, inst);
             } else {
                 // Also attempt the reclaim once this container is really gone. The synchronous
                 // attempt below runs while teardown is still scheduled, so for a batch whose
                 // containers all tear down slowly every in-loop attempt can be refused by the
                 // daemon and, without this, nothing would try again.
-                containerManager.terminate(inst, () ->
-                        RequestScopes.runAs(owner, () -> reclaimCapturesPinnedBy(region, inst, terminating)));
+                containerManager.terminate(inst, () -> RequestScopes.runAs(owner, () -> {
+                    try {
+                        releaseStandaloneInterfacesOnTermination(region, inst);
+                        instances.put(key(region, inst.getInstanceId()), inst);
+                    } finally {
+                        reclaimCapturesPinnedBy(region, inst, terminating);
+                    }
+                }));
                 // Termination releases the public address with a container too, under the lock a
                 // DescribeAddresses re-point holds, so one already under way cannot write it back.
                 synchronized (privateIpAllocationLock) {
@@ -5709,7 +5720,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 }
             }
             detachAttachedVolumesOnTermination(region, inst);
-            releaseStandaloneInterfacesOnTermination(region, inst);
             instances.put(key(region, id), inst);
             synchronized (capacityReservationLock) {
                 reconcileCapacityMembership(region);
@@ -8867,6 +8877,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 .filter(instance -> instance.getState() == null || !"terminated".equals(instance.getState().getName()))
                 .anyMatch(instance -> nullToEmpty(instance.getSecurityGroups()).stream()
                         .anyMatch(group -> groupId.equals(group.getGroupId())))) {
+            return true;
+        }
+        if (instances.scan(k -> k.startsWith(region + "::")).stream()
+                .filter(instance -> instance.getState() == null || !"terminated".equals(instance.getState().getName()))
+                .flatMap(instance -> nullToEmpty(instance.getNetworkInterfaces()).stream())
+                .flatMap(eni -> nullToEmpty(eni.getGroups()).stream())
+                .anyMatch(group -> group != null && groupId.equals(group.getGroupId()))) {
             return true;
         }
         if (listExternalInstances(callerAccountId(), region).stream()
@@ -17810,7 +17827,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // Under the topology lock, so the standalone record and the instance's copy change together for anything
         // that reads both, ModifyNetworkInterfaceAttribute among them.
         synchronized (attachmentTopologyLock(region)) {
-            return attachNetworkInterfaceLocked(region, networkInterfaceId, instanceId, deviceIndex);
+            synchronized (privateIpAllocationLock) {
+                return attachNetworkInterfaceLocked(region, networkInterfaceId, instanceId, deviceIndex);
+            }
         }
     }
 
@@ -17902,7 +17921,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         }
         // As attaching does: the standalone record and the instance's copy change together.
         synchronized (attachmentTopologyLock(region)) {
-            return detachNetworkInterfaceLocked(region, attachmentId);
+            synchronized (privateIpAllocationLock) {
+                return detachNetworkInterfaceLocked(region, attachmentId);
+            }
         }
     }
 
@@ -18119,29 +18140,30 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * dies with its instance.
      */
     private void releaseStandaloneInterfacesOnTermination(String region, Instance inst) {
-        for (InstanceNetworkInterface e : List.copyOf(inst.getNetworkInterfaces())) {
-            boolean deleted;
-            synchronized (attachmentTopologyLock(region)) {
-                NetworkInterface ni = networkInterfaces.get(key(region, e.getNetworkInterfaceId())).orElse(null);
-                NetworkInterfaceAttachment att = ni != null ? ni.getAttachment() : null;
-                deleted = ni == null || (att != null && att.isDeleteOnTermination());
-            }
-            releaseInterfaceAddresses(region, e.getNetworkInterfaceId(), deleted);
-            // Under the topology lock, as interface changes are, so one that resolved this interface before it
-            // was released cannot write it back afterwards.
-            synchronized (attachmentTopologyLock(region)) {
-                inst.getNetworkInterfaces().remove(e);
-                NetworkInterface ni = networkInterfaces.get(key(region, e.getNetworkInterfaceId())).orElse(null);
-                if (ni == null) {
-                    continue;
+        synchronized (attachmentTopologyLock(region)) {
+            synchronized (privateIpAllocationLock) {
+                for (InstanceNetworkInterface e : List.copyOf(inst.getNetworkInterfaces())) {
+                    NetworkInterface ni = networkInterfaces.get(key(region, e.getNetworkInterfaceId())).orElse(null);
+                    NetworkInterfaceAttachment att = ni != null ? ni.getAttachment() : null;
+                    if (ni != null && (att == null || !inst.getInstanceId().equals(att.getInstanceId())
+                            || !Objects.equals(e.getAttachmentId(), att.getAttachmentId()))) {
+                        inst.getNetworkInterfaces().remove(e);
+                        continue;
+                    }
+                    boolean deleted = ni == null || (att != null && att.isDeleteOnTermination());
+                    releaseInterfaceAddresses(region, e.getNetworkInterfaceId(), deleted);
+                    inst.getNetworkInterfaces().remove(e);
+                    if (ni == null) {
+                        continue;
+                    }
+                    if (deleted) {
+                        networkInterfaces.delete(key(region, ni.getNetworkInterfaceId()));
+                        continue;
+                    }
+                    ni.setAttachment(null);
+                    ni.setStatus("available");
+                    networkInterfaces.put(key(region, ni.getNetworkInterfaceId()), ni);
                 }
-                if (deleted) {
-                    networkInterfaces.delete(key(region, ni.getNetworkInterfaceId()));
-                    continue;
-                }
-                ni.setAttachment(null);
-                ni.setStatus("available");
-                networkInterfaces.put(key(region, ni.getNetworkInterfaceId()), ni);
             }
         }
     }
@@ -18277,32 +18299,35 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     private NetworkInterface releaseIfHostIsGone(String accountId, String region, NetworkInterface ni) {
-        NetworkInterfaceAttachment attachment = ni.getAttachment();
-        if (attachment == null || attachment.getInstanceId() == null) {
+        synchronized (privateIpAllocationLock) {
+            NetworkInterfaceAttachment attachment = ni.getAttachment();
+            if (attachment == null || attachment.getInstanceId() == null) {
+                return ni;
+            }
+            String safeAccount = accountId != null ? accountId : (ni.getOwnerId() != null ? ni.getOwnerId() : callerAccountId());
+            Instance host = instances instanceof AccountAwareStorageBackend<Instance> aware
+                    ? aware.getForAccount(safeAccount, key(region, attachment.getInstanceId())).orElse(null)
+                    : instances.get(key(region, attachment.getInstanceId())).orElse(null);
+            boolean hostIsGone = host == null || host.getState() == null
+                    || "terminated".equals(host.getState().getName());
+            if (!hostIsGone) {
+                return ni;
+            }
+            ni.setAttachment(null);
+            ni.setStatus("available");
+            if (networkInterfaces instanceof AccountAwareStorageBackend<NetworkInterface> aware) {
+                aware.putForAccount(safeAccount, key(region, ni.getNetworkInterfaceId()), ni);
+            } else {
+                networkInterfaces.put(key(region, ni.getNetworkInterfaceId()), ni);
+            }
+            // The dead instance has to let go of its copy as well. Releasing only the standalone
+            // record would leave the terminated instance still reporting the interface, so once it is
+            // reused two instance records would claim it, and a real one is not the winner by any
+            // rule DescribeInstances applies.
+            detachFromInstance(safeAccount, region, attachment.getInstanceId(), ni.getNetworkInterfaceId());
             return ni;
+
         }
-        String safeAccount = accountId != null ? accountId : (ni.getOwnerId() != null ? ni.getOwnerId() : callerAccountId());
-        Instance host = instances instanceof AccountAwareStorageBackend<Instance> aware
-                ? aware.getForAccount(safeAccount, key(region, attachment.getInstanceId())).orElse(null)
-                : instances.get(key(region, attachment.getInstanceId())).orElse(null);
-        boolean hostIsGone = host == null || host.getState() == null
-                || "terminated".equals(host.getState().getName());
-        if (!hostIsGone) {
-            return ni;
-        }
-        ni.setAttachment(null);
-        ni.setStatus("available");
-        if (networkInterfaces instanceof AccountAwareStorageBackend<NetworkInterface> aware) {
-            aware.putForAccount(safeAccount, key(region, ni.getNetworkInterfaceId()), ni);
-        } else {
-            networkInterfaces.put(key(region, ni.getNetworkInterfaceId()), ni);
-        }
-        // The dead instance has to let go of its copy as well. Releasing only the standalone
-        // record would leave the terminated instance still reporting the interface, so once it is
-        // reused two instance records would claim it, and a real one is not the winner by any
-        // rule DescribeInstances applies.
-        detachFromInstance(safeAccount, region, attachment.getInstanceId(), ni.getNetworkInterfaceId());
-        return ni;
     }
 
     /**
