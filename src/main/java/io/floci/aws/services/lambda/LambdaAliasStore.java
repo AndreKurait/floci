@@ -67,6 +67,9 @@ public class LambdaAliasStore {
 
     public void save(String region, LambdaAlias alias) {
         get(region, alias.getFunctionName(), alias.getName()).ifPresent(this::deindexAlias);
+        // The backend may hand out the stored instance itself, already changed by the caller, so the
+        // lookup above cannot tell which URL the alias used to have.
+        urlIdIndex.values().removeIf(indexed -> indexed == alias);
         backend.put(key(region, alias.getFunctionName(), alias.getName()), alias);
         indexAlias(alias);
     }

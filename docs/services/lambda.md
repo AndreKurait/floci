@@ -1641,3 +1641,5 @@ remain in effect.
 
 Environment variables use the quoted map-key form, for example
 `FLOCI_SERVICES_LAMBDA_RUNTIME_IMAGES__JAVA17_LINUX_ARM64__`.
+
+Function and alias URL lookups drop the previous URL ID when an existing URL configuration is deleted or replaced, including when an in-memory stored instance is changed before it is saved. Saving another function keeps its URL lookup intact.
