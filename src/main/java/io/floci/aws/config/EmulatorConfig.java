@@ -3960,6 +3960,10 @@ public interface EmulatorConfig {
     }
 
     interface Ec2ServiceConfig {
+        /** Trusted network helper that prepares IMDS before the guest image starts. */
+        @WithDefault("floci/network-helper:local")
+        String metadataHelperImage();
+
         /** Optional full EC2 catalog file for locally built guest images. */
         Optional<String> imageCatalogPath();
 
@@ -3979,6 +3983,35 @@ public interface EmulatorConfig {
          * Env: {@code FLOCI_SERVICES_EC2_ULIMITS}, comma-separated.
          */
         Optional<List<String>> ulimits();
+
+        /**
+         * Docker privileged mode for guest containers. Security-group enforcement always
+         * disables it. Network and volume helpers retain their own privilege settings.
+         * Env: {@code FLOCI_SERVICES_EC2_PRIVILEGED}.
+         */
+        @WithDefault("true")
+        boolean privileged();
+
+        /**
+         * Linux capabilities to drop from guest containers, in addition to mandatory
+         * security-group restrictions. Set privileged=false for capability restrictions.
+         * Env: {@code FLOCI_SERVICES_EC2_CAP_DROP}, comma-separated.
+         */
+        Optional<List<String>> capDrop();
+
+        /**
+         * Read-only bind mounts supplied by the deployment before the guest starts.
+         * Sources are absolute Linux paths on the Docker daemon host, not the Floci process host.
+         * Indexed environment entries use {@code FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__SOURCE}
+         * and {@code FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__TARGET}.
+         */
+        @WithDefault("")
+        List<GuestReadOnlyBind> readOnlyBinds();
+
+        interface GuestReadOnlyBind {
+            String source();
+            String target();
+        }
 
         @WithDefault("true")
         boolean enabled();
