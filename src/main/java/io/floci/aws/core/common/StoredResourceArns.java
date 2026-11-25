@@ -92,15 +92,6 @@ public interface StoredResourceArns {
     Optional<String> find(String type, List<String> names, String region);
 
     /**
-     * The ARN of a caller-owned resource stored under an untyped id in the Region, without inferring its type
-     * from the id's spelling. Empty when the service holds none. The request reader still checks that the
-     * generated table gives the operation that resource type before using the answer.
-     */
-    default Optional<String> findById(String id, String region) {
-        return Optional.empty();
-    }
-
-    /**
      * The resource resolved by an ARN in its own account and Region, without substituting the caller's
      * coordinates (a layer version), or as the service's handler reads the ARN where it reads it first as the
      * caller's (a secret a full or partial ARN names, in the ARN's Region, before one another account holds under

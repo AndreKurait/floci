@@ -11,6 +11,12 @@ its botocore shape each comes from, are generated from the Service Reference and
 every interface is checked against its own keys and tags before any tag changes; another
 interface's VPC or tags cannot authorize it. Authorization reads do not create default resources.
 
+With IAM enforcement enabled, `CreateTags` and `DeleteTags` check every VPC endpoint ID
+against its endpoint ARN before changing any batch member. The generated request resource
+table learns the `vpce-` prefix from the EC2 `CreateVpcEndpoint` API reference's response
+examples, copied by `tools/aws/fetch_ec2_id_examples.py` and matched to botocore's output
+shapes. This also covers endpoints retained under legacy unprefixed storage keys.
+
 ## Instance IAM authorization
 
 With IAM enforcement enabled, modeled instance-list operations, including `StartInstances`, `StopInstances`, `TerminateInstances`, and `RebootInstances`, authorize each requested instance ARN before changing any instance state.
@@ -1348,11 +1354,8 @@ With IAM enforcement enabled, the generated request-resource catalog checks inte
 endpoint operations on their resource ARNs. Creating an interface also names its subnet and security
 groups; creating an endpoint also names its VPC, subnets, security groups and route tables.
 `ModifyVpcEndpoint` includes both added and removed resources. Tag requests recognize the interface
-ID prefix supplied by the pinned botocore model. A VPC endpoint held in the caller's account and
-Region is checked on its stored identity even when the model supplies no ID prefix. The generated
-catalog still determines which resource types each action may authorize. Unknown endpoint IDs,
-attachment IDs and endpoint-service IDs without a model-backed prefix remain checked on `*`.
-Every target in a tag batch must be authorized before any target's tags change.
+ID prefix supplied by the pinned botocore model. Endpoint, attachment and endpoint-service IDs
+without a model-backed prefix remain checked on `*`.
 
 `DetachNetworkInterface` resolves the attachment's instance and interface in the caller's account
 and Region, then checks both resources. An attachment that cannot be resolved uses the caller's

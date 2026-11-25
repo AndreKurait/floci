@@ -5,7 +5,7 @@ Under IAM enforcement every request is checked against the resources it acts on.
 resources are not read is checked on `*`, so a grant scoped to a resource is refused and a deny scoped
 to one never applies. This file gives,
 for each operation of the namespaces it reads, the resources its request names, and `RequestResources`
-builds their ARNs from the request. It comes from two sources, each answering what the other cannot:
+builds their ARNs from the request. Its primary sources answer different questions:
 
 - AWS's Service Reference, which lists the resource types each action acts on and the ARN formats
   of each type, but not which request member names a resource:
@@ -15,6 +15,10 @@ builds their ARNs from the request. It comes from two sources, each answering wh
 
 - botocore's model of each SDK client the reference lists the operation for (Apache-2.0,
   https://github.com/boto/botocore, the pinned release), which gives the request's members.
+
+Where botocore gives no identifier example, tools/aws/fetch_ec2_id_examples.py copies examples
+from the EC2 API reference. Their XML paths are matched to modeled response members or shapes
+to derive prefixes, without a handwritten prefix-to-resource mapping.
 
 An operation is checked as its own action, or as the action of another name the reference gives it
 (`regen_iam_authorized_actions.py` vendors that mapping). For each resource type that action acts
@@ -328,6 +332,7 @@ from pathlib import Path
 import fetch_apigateway_arn_formats
 import fetch_athena_glue_ddl_permissions
 import fetch_dynamodb_permissions
+import fetch_ec2_id_examples
 import fetch_iam_identifiers
 import fetch_kms_api_permissions
 import fetch_required_resource_types
@@ -2693,6 +2698,64 @@ def id_prefixes(models: dict[str, dict], kinds: tuple[str, ...],
     return {kind: max(found, key=found.get) for kind, found in sorted(counts.items())}
 
 
+def reference_id_prefixes(models: dict[str, dict], kinds: tuple[str, ...], source: dict) -> dict[str, str]:
+    """Match copied response paths to modeled members or shapes, then read each ID's prefix.
+
+    EC2 response IDs often use the generic String shape: the model's VpcEndpointId
+    member still names the type, while its locationName matches the copied XML path.
+    """
+    found: dict[str, str] = {}
+    model = models.get("ec2")
+    if model is None:
+        return found
+    for operation, record in source["operations"].items():
+        output = model["operations"].get(operation, {}).get("output", {}).get("shape")
+        if output is None:
+            raise ValueError(f"{operation} has no modeled output for its reference examples")
+        for example in record["examples"]:
+            shape_name = output
+            member_name = None
+            for part in example["path"]:
+                shape = model["shapes"].get(shape_name, {})
+                if shape.get("type") == "structure":
+                    matches = [(name, member["shape"]) for name, member in shape.get("members", {}).items()
+                               if member.get("locationName", name) == part]
+                    member_name, shape_name = matches[0] if len(matches) == 1 else (None, None)
+                elif shape.get("type") == "list" and part == shape["member"].get("locationName", "item"):
+                    shape_name = shape["member"]["shape"]
+                else:
+                    shape_name = None
+                if shape_name is None:
+                    raise ValueError(f"{operation} reference path {example['path']} is not in botocore")
+            if model["shapes"].get(shape_name, {}).get("type") != "string":
+                raise ValueError(f"{operation} reference ID {example['path']} is not a string")
+            match = EXAMPLE_ID_RE.fullmatch(example["value"])
+            if not match:
+                raise ValueError(f"{operation} reference value is not an identifier: {example['value']}")
+            kind = next((kind for kind in kinds if stem(kind) in {
+                stem(shape_name), stem(member_name or "")}), None)
+            if kind:
+                prefix = match.group(1)
+                if kind in found and found[kind] != prefix:
+                    raise ValueError(f"conflicting reference prefixes for {kind}")
+                found[kind] = prefix
+    return found
+
+
+def documented_id_prefixes(namespace: str, models: dict[str, dict],
+                           examples: dict[str, dict] | None = None) -> dict[str, str] | None:
+    """Supplement botocore's examples with fetched EC2 API examples, rejecting conflicts."""
+    known = namespace_id_prefixes(namespace, models, examples)
+    if namespace != "ec2" or known is None:
+        return known
+    source = json.loads(fetch_ec2_id_examples.OUTPUT.read_text(encoding="utf-8"))
+    for kind, prefix in reference_id_prefixes(models, ID_TARGETS[namespace], source).items():
+        if kind in known and known[kind] != prefix:
+            raise ValueError(f"botocore and API reference prefixes disagree for {kind}")
+        known[kind] = prefix
+    return known
+
+
 def namespace_id_prefixes(namespace: str, models: dict[str, dict],
                           examples: dict[str, dict] | None = None) -> dict[str, str] | None:
     """`id_prefixes` of the types `ID_TARGETS` reads by id in the namespace; None for a namespace it reads none of."""
@@ -2702,11 +2765,13 @@ def namespace_id_prefixes(namespace: str, models: dict[str, dict],
 
 
 def id_targets(operation: str, types: list[str], formats: dict[str, str], models: dict[str, dict],
-               known: dict[str, str] | None = None) -> dict | None:
+               known: dict[str, str] | None = None,
+               generic_known: dict[str, str] | None = None) -> dict | None:
     """An id list, in model and EC2 Query spelling, with each type `ID_TARGETS` reads by id's discriminator, the prefix
     botocore gives its ids (`id_prefixes`): the list a type's ARN variable names, when the request names nothing else
     the action acts on, or else the request's list of whatever resources it acts on (`Resources`, of the tagging
-    calls). None when the request has neither, and the ordinary rules read it."""
+    calls). `generic_known` supplements only generic resource lists with reference examples:
+    already typed lists retain their existing readers. None when neither list is present."""
     configured = ID_TARGETS.get(namespace_of(operation))
     if configured is None:
         return None
@@ -2732,7 +2797,8 @@ def id_targets(operation: str, types: list[str], formats: dict[str, str], models
         member = members.get(member_name) if member_name else None
         if member is None or _strings(model, model["shapes"][member["shape"]]) != "[]":
             continue
-        prefixes = {kind: prefix for kind, prefix in known.items() if kind in types and kind in formats}
+        selected = generic_known if generic_known is not None and not candidates else known
+        prefixes = {kind: prefix for kind, prefix in selected.items() if kind in types and kind in formats}
         if candidates:
             # A list a type's ARN variable names holds that type's ids alone, and it is all the request acts on only
             # when the request names nothing else the action acts on: a launch's `SecurityGroupIds` sit beside its
@@ -2786,7 +2852,7 @@ def ec2_query_members(operation: str, models: dict[str, dict], named: set[str]) 
 
 def entry_for(operation: str, upstream: dict, formats: dict[str, str], models: dict[str, dict],
               known: dict[str, str] | None = None, forwarded: dict[str, dict] | None = None,
-              routed: list[dict] | None = None) -> dict:
+              routed: list[dict] | None = None, generic_known: dict[str, str] | None = None) -> dict:
     """What the file says for one operation, `forwarded` being what the file records of each action a `MEASURED` entry
     names, and `routed` the resources its routes name where AWS authorizes them as their method (`routed_resources`),
     which are then its resources. `upstream` gives, for a namespace with vendored permissions, the resource types of
@@ -2799,7 +2865,8 @@ def entry_for(operation: str, upstream: dict, formats: dict[str, str], models: d
     arn_members = {member for member, values in patterns.items()
                    if (kind_of(member) == "identifier" or stem(member) in ("", "resource"))
                    and values and all(only_arn(value) for value in values)}
-    targets = id_targets(operation, types, formats, models, known) if namespace_of(operation) in ID_TARGETS else None
+    targets = (id_targets(operation, types, formats, models, known, generic_known)
+               if namespace_of(operation) in ID_TARGETS else None)
     if targets is not None:
         return {"action": upstream["action"], "types": types, "resources": [], "targets": targets}
     actions = None
@@ -4592,13 +4659,17 @@ def build(documents: list[dict], provenance: str, data: Path, botocore: str) -> 
     prefixes = {namespace: namespace_id_prefixes(namespace, load_models(data, set(namespaces[namespace])),
                                                  load_examples(data, set(namespaces[namespace])))
                 for namespace in ID_TARGETS if namespace in namespaces}
+    generic_prefixes = {namespace: documented_id_prefixes(namespace, load_models(data, set(namespaces[namespace])),
+                                                          load_examples(data, set(namespaces[namespace])))
+                        for namespace in prefixes}
     for operation, value in sorted(covered.items()):
         models = load_models(data, set(namespaces[namespace_of(operation)]))
         if namespace_of(operation) in permission_actions:
             value = {**value, "actions": permission_actions[namespace_of(operation)]}
         operations[operation] = entry_for(operation, value, {**formats.get(namespace_of(operation), {}),
                                                              **path_formats.get(namespace_of(operation), {})}, models,
-                                          prefixes.get(namespace_of(operation)), forwarded, routed.get(operation))
+                                          prefixes.get(namespace_of(operation)), forwarded, routed.get(operation),
+                                          generic_prefixes.get(namespace_of(operation)))
     unqualified = unqualified_types(formats, operations, namespaces, data)
     return {
         "_source": {
@@ -5246,13 +5317,17 @@ def derive(document: dict, data: Path) -> list[str]:
     prefixes = {namespace: namespace_id_prefixes(namespace, load_models(data, set(document["namespaces"][namespace])),
                                                  load_examples(data, set(document["namespaces"][namespace])))
                 for namespace in ID_TARGETS if namespace in document["namespaces"]}
+    generic_prefixes = {namespace: documented_id_prefixes(
+        namespace, load_models(data, set(document["namespaces"][namespace])),
+        load_examples(data, set(document["namespaces"][namespace]))) for namespace in prefixes}
     for operation, entry in document["operations"].items():
         namespace = namespace_of(operation)
         models = load_models(data, set(document["namespaces"][namespace]))
         expected = entry_for(operation, {"action": entry["action"], "types": entry["types"],
                                          **({"actions": entry["actions"]} if "actions" in entry else {})},
                              {**document["arnFormats"].get(namespace, {}), **path_formats.get(namespace, {})}, models,
-                             prefixes.get(namespace), document["forwardedActions"], routed.get(operation))
+                             prefixes.get(namespace), document["forwardedActions"], routed.get(operation),
+                             generic_prefixes.get(namespace))
         if expected != entry:
             problems.append(f"{operation}: the file has {json.dumps(entry)}, botocore gives {json.dumps(expected)}")
     return problems
@@ -5297,6 +5372,17 @@ def verify_statements(vendored: dict, documents: list[dict]) -> list[str]:
             untrue.append(f"{source['_source']['page']} no longer gives what {STATEMENT_SOURCES[operation].name} "
                           f"holds for {operation}: run {source['_source']['fetcher']}")
     return untrue
+
+
+def verify_id_examples() -> list[str]:
+    """Check that the copied EC2 identifier examples still match their API reference pages."""
+    try:
+        source = json.loads(fetch_ec2_id_examples.OUTPUT.read_text(encoding="utf-8"))
+        changed = fetch_ec2_id_examples.stale(source, {
+            url: fetch_ec2_id_examples.fetch_url(url) for url in fetch_ec2_id_examples.PAGES.values()})
+    except (OSError, ValueError) as error:
+        raise OSError(f"could not verify EC2 identifier examples ({error})") from error
+    return ["EC2 API identifier examples changed: run tools/aws/fetch_ec2_id_examples.py"] if changed else []
 
 
 def verify_path_sources() -> list[str]:
@@ -5427,6 +5513,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             untrue += verify_statements(document, documents)
             untrue += verify_path_sources()
+            untrue += verify_id_examples()
             untrue += verify_permission_sources()
             untrue += verify_required_type_source()
         except OSError as e:

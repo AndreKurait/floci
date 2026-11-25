@@ -185,8 +185,8 @@ public final class RequestResources {
         RequestResourceMembers.Targets targets = operation == null ? null : table.targets().get(operation);
         if (targets != null) {
             Map<String, String> form = IamConditionContextResolver.formParameters(ctx);
-            return targetArns(targets, formats(table, operation), table.types().get(operation), form,
-                    form.isEmpty() ? PassedRoles.jsonBody(ctx) : null, partition, region, accountId, stored);
+            return targetArns(targets, formats(table, operation), form,
+                    form.isEmpty() ? PassedRoles.jsonBody(ctx) : null, partition, region, accountId);
         }
         // An operation the table does not read, an unread one among them, names nothing from it.
         List<RequestResourceMembers.Resource> resources = !readable(table, operation) ? null
@@ -335,8 +335,7 @@ public final class RequestResources {
         RequestResourceMembers.Table table = RequestResourceMembers.table();
         RequestResourceMembers.Targets targets = operation == null ? null : table.targets().get(operation);
         if (targets != null) {
-            return targetArns(targets, formats(table, operation), table.types().get(operation), Map.of(), body,
-                    partition, region, accountId, stored);
+            return targetArns(targets, formats(table, operation), Map.of(), body, partition, region, accountId);
         }
         List<RequestResourceMembers.Resource> resources = !readable(table, operation) ? null
                 : table.operations().get(operation);
@@ -455,8 +454,8 @@ public final class RequestResources {
 
     private static List<String> targetArns(RequestResourceMembers.Targets targets,
                                            Map<String, RequestResourceMembers.ArnFormat> formats,
-                                           List<String> types, Map<String, String> form, JsonNode body,
-                                           String partition, String region, String accountId, StoredResourceArns stored) {
+                                           Map<String, String> form, JsonNode body,
+                                           String partition, String region, String accountId) {
         List<String> ids = new ArrayList<>();
         if (!form.isEmpty()) {
             for (int i = 1; form.containsKey(targets.query() + "." + i); i++) {
@@ -473,17 +472,6 @@ public final class RequestResources {
                 if (id.startsWith(prefix.getValue()) && id.indexOf('-', prefix.getValue().length()) < 0) {
                     arn = idArn(formats.get(prefix.getKey()).format(), id, partition, region, accountId);
                     break;
-                }
-            }
-            if ("*".equals(arn) && stored != null) {
-                String held = stored.findById(id, region).orElse(null);
-                if (held != null && types.stream()
-                        .anyMatch(type -> formats.get(type).pattern().matcher(held).matches())) {
-                    AwsArnUtils.Arn resource = AwsArnUtils.parse(held);
-                    if (partition.equals(resource.partition()) && region.equals(resource.region())
-                            && accountId.equals(resource.accountId())) {
-                        arn = held;
-                    }
                 }
             }
             arns.add(arn);

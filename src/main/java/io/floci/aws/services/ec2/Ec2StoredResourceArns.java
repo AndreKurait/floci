@@ -12,7 +12,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
-/** Resolves EC2 names, attachments and held endpoint ids and reads the tags of the resource an ARN names. */
+/** Resolves EC2 names and attachments and reads the tags of the resource an ARN names. */
 @ApplicationScoped
 public class Ec2StoredResourceArns implements StoredResourceArns {
 
@@ -63,10 +63,5 @@ public class Ec2StoredResourceArns implements StoredResourceArns {
     public Optional<String> find(String type, List<String> names, String region) {
         return "launch-template".equals(type) && names.size() == 1
                 ? ec2.findLaunchTemplateArn(region, names.getFirst()) : Optional.empty();
-    }
-
-    @Override
-    public Optional<String> findById(String id, String region) {
-        return ec2.findVpcEndpointArn(region, id);
     }
 }

@@ -8300,18 +8300,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 "No unused fallback IPv4 address is available for endpoint " + endpoint.getVpcEndpointId(), 400);
     }
 
-    /** The caller's stored endpoint identity, without seeding resources or interpreting an id prefix. */
-    Optional<String> findVpcEndpointArn(String region, String endpointId) {
-        if (endpointId == null || endpointId.isBlank()) {
-            return Optional.empty();
-        }
-        String account = callerAccountId();
-        Optional<VpcEndpoint> endpoint = vpcEndpoints instanceof AccountAwareStorageBackend<VpcEndpoint> aware
-                ? aware.getForAccount(account, key(region, endpointId)) : vpcEndpoints.get(key(region, endpointId));
-        return endpoint.map(held -> AwsArnUtils.Arn.of("ec2", region, account,
-                "vpc-endpoint/" + held.getVpcEndpointId()).toString());
-    }
-
     private VpcEndpoint getRequiredVpcEndpoint(String region, String endpointId) {
         VpcEndpoint endpoint = vpcEndpoints.get(key(region, endpointId)).orElse(null);
         if (endpoint == null) {
