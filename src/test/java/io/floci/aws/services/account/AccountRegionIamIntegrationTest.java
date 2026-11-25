@@ -75,7 +75,7 @@ class AccountRegionIamIntegrationTest {
         store = factory.create("account", "account-region-transitions.json",
                 new TypeReference<Map<String, AccountRegionTransition>>() {});
         baseline = projection();
-        assertEquals(34, baseline.size());
+        assertEquals(36, baseline.size());
         assertEquals("DISABLED", baseline.get(TARGET));
         storedBaseline = snapshot();
         LOG.infov("ACCOUNT_REGION_IAM_RESERVED marker={0} baseline={1} stored={2}", marker, baseline, storedBaseline);
@@ -135,7 +135,7 @@ class AccountRegionIamIntegrationTest {
     @Test
     void theExactOwnAccountArnAllowsAllFourTypedSdkOperations() throws Exception {
         try (User user = user(allow("account:*", arn)); AccountClient caller = client(user)) {
-            assertEquals(34, caller.listRegions(ListRegionsRequest.builder().build()).regions().size());
+            assertEquals(36, caller.listRegions(ListRegionsRequest.builder().build()).regions().size());
             assertEquals(TARGET, caller.getRegionOptStatus(r -> r.regionName(TARGET)).regionName());
             assertEquals(200, caller.enableRegion(r -> r.regionName(TARGET)).sdkHttpResponse().statusCode());
             assertEquals("ENABLED", settle());
@@ -202,7 +202,7 @@ class AccountRegionIamIntegrationTest {
         try (User user = user(missingCondition)) {
             HttpResponse<String> response = signed(user.signer("account"), "/listRegions", BODY, Map.of());
             assertEquals(200, response.statusCode(), response.body());
-            assertEquals(34, JSON.readTree(response.body()).path("Regions").size());
+            assertEquals(36, JSON.readTree(response.body()).path("Regions").size());
             policy(user, condition("account:ListRegions", arn, TARGET));
             Map<String, AccountRegionTransition> before = snapshot();
             assertEquals(403, signed(user.signer("account"), "/listRegions", BODY, Map.of()).statusCode());
@@ -290,7 +290,7 @@ class AccountRegionIamIntegrationTest {
                     HttpResponse<String> accepted = scopedRequest(user.signer("account"), path, body, query);
                     assertEquals(200, accepted.statusCode(), accepted.body());
                     if (operation.equals("listRegions")) {
-                        assertEquals(34, JSON.readTree(accepted.body()).path("Regions").size());
+                        assertEquals(36, JSON.readTree(accepted.body()).path("Regions").size());
                         assertFalse(JSON.readTree(accepted.body()).has("NextToken"));
                         assertEquals(before, snapshot());
                     } else if (operation.equals("getRegionOptStatus")) {
