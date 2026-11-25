@@ -621,6 +621,24 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                     return;
                 }
             }
+        } else if ("athena:BatchGetQueryExecution".equals(action)) {
+            List<IamConditionContextResolver.AthenaQueryTarget> queryTargets =
+                    conditionContextResolver.athenaBatchQueryTargets(region, accountId, arnBuilder.readJsonBody(ctx));
+            if (queryTargets.isEmpty()) {
+                if (abortIfDenied(ctx, caller, principal, action, credentialScope, resources, targetContexts,
+                        region, accountId, akid)) {
+                    return;
+                }
+            } else {
+                for (IamConditionContextResolver.AthenaQueryTarget target : queryTargets) {
+                    Map<String, List<String>> targetContext = new HashMap<>(target.context());
+                    callerArns.ifPresent(arns -> arns.putPrincipalKeys(targetContext));
+                    if (abortIfDenied(ctx, caller, principal, action, credentialScope, List.of(target.resource()),
+                            List.of(targetContext), region, accountId, akid)) {
+                        return;
+                    }
+                }
+            }
         } else if (abortIfDenied(ctx, caller, principal, action, credentialScope, resources, targetContexts,
                 region, accountId, akid)) {
             return;
