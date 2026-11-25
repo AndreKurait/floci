@@ -45,6 +45,25 @@ class SdkComputeModelTest {
     }
 
     @Test
+    void monitoringCategoriesUseQueryRequestNamesAndSdkResponseNames() throws Exception {
+        byte[] encoded = new SdkComputeModel("ec2", "RunInstances").query("RunInstances", mapper.readTree("""
+                {"MinCount":1,"MaxCount":1,"Monitoring":{"Enabled":true,"MetricCategoryIds":["first","second"]}}
+                """));
+        String query = new String(encoded, StandardCharsets.UTF_8);
+        assertTrue(query.contains("Monitoring.MetricCategoryId.1=first"));
+        assertTrue(query.contains("Monitoring.MetricCategoryId.2=second"));
+
+        JsonNode result = new SdkComputeModel("ec2", "DescribeInstances").queryResponse("""
+                <DescribeInstancesResponse><reservationSet><item><instancesSet><item>
+                <monitoring><state>enabled</state><metricCategoryIdSet>
+                <item>first</item><item>second</item></metricCategoryIdSet></monitoring>
+                </item></instancesSet></item></reservationSet></DescribeInstancesResponse>
+                """);
+        assertEquals(mapper.readTree("[\"first\",\"second\"]"),
+                result.at("/Reservations/0/Instances/0/Monitoring/MetricCategoryIds"));
+    }
+
+    @Test
     void describeResponseUsesSdkCollectionsAndScalarTypes() throws Exception {
         JsonNode result = new SdkComputeModel("ec2", "DescribeInstances").queryResponse("""
                 <DescribeInstancesResponse xmlns="http://ec2.amazonaws.com/doc/2016-11-15/">
