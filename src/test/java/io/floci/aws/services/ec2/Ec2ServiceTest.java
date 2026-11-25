@@ -726,7 +726,8 @@ class Ec2ServiceTest {
     }
 
     @ParameterizedTest
-    @ValueSource(strings = {"grant-before-detach", "detach-before-grant", "grant-before-describe"})
+    @ValueSource(strings = {"grant-before-detach", "detach-before-grant", "grant-before-describe",
+            "delete-before-detach", "detach-before-delete", "delete-before-describe"})
     void interfacePermissionOperationsShareAttachmentSynchronization(String order) throws Exception {
         String region = "us-east-1";
         ParkingStore<NetworkInterface> interfaces = new ParkingStore<>();
@@ -747,7 +748,11 @@ class Ec2ServiceTest {
         Runnable grant = () -> service.createNetworkInterfacePermission(region, eni.getNetworkInterfaceId(),
                 "111111111111", null, Ec2Service.INSTANCE_ATTACH);
         Runnable detach = () -> service.detachNetworkInterface(region, attachment.getAttachmentId(), false);
-        Runnable describe = () -> assertEquals(1, service.describeNetworkInterfacePermissions(
+        boolean deleting = order.contains("delete");
+        String permissionId = deleting ? service.createNetworkInterfacePermission(region, eni.getNetworkInterfaceId(),
+                "111111111111", null, Ec2Service.INSTANCE_ATTACH).getNetworkInterfacePermissionId() : null;
+        Runnable delete = () -> service.deleteNetworkInterfacePermission(region, permissionId, false);
+        Runnable describe = () -> assertEquals(deleting ? 0 : 1, service.describeNetworkInterfacePermissions(
                 region, List.of(), List.of(), null, null).permissions().size());
         interfaces.parkNextWrite();
 
@@ -755,12 +760,15 @@ class Ec2ServiceTest {
             case "grant-before-detach" -> assertOperationWaitsForParkedStore(interfaces, grant, detach);
             case "detach-before-grant" -> assertOperationWaitsForParkedStore(interfaces, detach, grant);
             case "grant-before-describe" -> assertOperationWaitsForParkedStore(interfaces, grant, describe);
+            case "delete-before-detach" -> assertOperationWaitsForParkedStore(interfaces, delete, detach);
+            case "detach-before-delete" -> assertOperationWaitsForParkedStore(interfaces, detach, delete);
+            case "delete-before-describe" -> assertOperationWaitsForParkedStore(interfaces, delete, describe);
             default -> throw new IllegalArgumentException(order);
         }
 
-        assertEquals(1, service.describeNetworkInterfacePermissions(
+        assertEquals(deleting ? 0 : 1, service.describeNetworkInterfacePermissions(
                 region, List.of(), List.of(), null, null).permissions().size());
-        if (!"grant-before-describe".equals(order)) {
+        if (!order.endsWith("-before-describe")) {
             assertNull(eni.getAttachment());
             assertTrue(instance.getNetworkInterfaces().stream()
                     .noneMatch(value -> eni.getNetworkInterfaceId().equals(value.getNetworkInterfaceId())));

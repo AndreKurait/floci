@@ -15900,6 +15900,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                         .anyMatch(address -> matchesValue(values, address));
                 case "attachment.instance-id" -> ni.getAttachment() != null
                         && matchesValue(values, ni.getAttachment().getInstanceId());
+                case "attachment.instance-owner-id" -> ni.getAttachment() != null
+                        && matchesValue(values, ni.getAttachment().getInstanceOwnerId());
                 case "association.ip-owner-id" -> ni.getPrivateIpAddresses().stream()
                         .anyMatch(ip -> ip.isPrimary() && ip.getAssociation() != null
                                 && ip.getAssociation().getIpOwnerId() != null
@@ -16736,6 +16738,13 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             for (InstanceNetworkInterface eni : inst.getNetworkInterfaces()) {
                 if (!networkInterfaceIds.isEmpty()
                         && !networkInterfaceIds.contains(eni.getNetworkInterfaceId())) {
+                    continue;
+                }
+                // Another account's interface, attached here under its INSTANCE-ATTACH grant, is
+                // that account's to describe, not a copy of this one's.
+                if (eni.getOwnerId() != null && !safeAccount.equals(eni.getOwnerId())
+                        && networkInterfaces instanceof AccountAwareStorageBackend<NetworkInterface> owners
+                        && owners.getForAccount(eni.getOwnerId(), key(region, eni.getNetworkInterfaceId())).isPresent()) {
                     continue;
                 }
                 // A standalone ENI attached to this instance is reported from its own record
@@ -17804,11 +17813,16 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      * Attaches a standalone ENI to a running/stopped instance at the given device index,
      * the attach-eni example's runtime pattern (its user-data script calls this via the AWS CLI
      * after boot, rather than through the Terraform provider itself). floci-kt9.
+     *
+     * <p>The interface may be another account's when that account has granted the caller
+     * {@code INSTANCE-ATTACH} over it, which CreateNetworkInterfacePermission documents as
+     * permission "to attach the specified network interface to an instance in their account". The
+     * interface stays in its owner's account, and the attachment names the caller as
+     * {@code instanceOwnerId}.
      */
     public NetworkInterfaceAttachment attachNetworkInterface(String region, String networkInterfaceId,
                                                               String instanceId, int deviceIndex) {
-        // Under the topology lock, so the standalone record and the instance's copy change together for anything
-        // that reads both, ModifyNetworkInterfaceAttribute among them.
+        // Keep grant, attach and detach under the same region-wide topology lock.
         synchronized (attachmentTopologyLock(region)) {
             return attachNetworkInterfaceLocked(region, networkInterfaceId, instanceId, deviceIndex);
         }
@@ -17816,7 +17830,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     private NetworkInterfaceAttachment attachNetworkInterfaceLocked(String region, String networkInterfaceId,
                                                                     String instanceId, int deviceIndex) {
-        NetworkInterface ni = requireStandaloneNetworkInterface(region, networkInterfaceId);
+        AccountAwareStorageBackend.OwnedEntry<NetworkInterface> held =
+                requireAttachableNetworkInterface(region, networkInterfaceId);
+        NetworkInterface ni = held.value();
         if (ni.getAttachment() != null) {
             throw new AwsException("InvalidNetworkInterface.InUse",
                     "Interface: '" + networkInterfaceId + "' is currently in use.", 400);
@@ -17844,7 +17860,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
         ni.setAttachment(attachment);
         ni.setStatus("in-use");
-        networkInterfaces.put(key(region, networkInterfaceId), ni);
+        putNetworkInterface(held.account(), region, ni);
 
         // The instance must carry it as well, or DescribeInstances would deny an attachment
         // DescribeNetworkInterfaces reports, and the device-index check above, which reads this
@@ -17916,7 +17932,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         ni.setAttachment(null);
         ni.setStatus("available");
         networkInterfaces.put(key(region, ni.getNetworkInterfaceId()), ni);
-        detachFromInstance(region, detached.getInstanceId(), ni.getNetworkInterfaceId());
+        String hostAccount = detached.getInstanceOwnerId() != null ? detached.getInstanceOwnerId() : callerAccountId();
+        detachFromInstance(hostAccount, region, detached.getInstanceId(), ni.getNetworkInterfaceId());
         return detached;
     }
 
@@ -17941,7 +17958,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
 
     /**
      * CreateNetworkInterfacePermission: the interface's owner records an {@code INSTANCE-ATTACH}
-     * grant for another account. Attachment execution does not yet consume these grants.
+     * grant for another account. Attachment execution consumes these grants.
      * Only the owner can grant: the interface is looked up in the caller's account, and
      * one another account owns is {@code InvalidNetworkInterfaceID.NotFound}, as it is to every
      * other action of that account.
@@ -18052,6 +18069,54 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         return true;
     }
 
+    /**
+     * DeleteNetworkInterfacePermission: the interface's owner removes a permission it granted. As
+     * AWS documents, "By default, you cannot delete the permission if the account for which you're
+     * removing the permission has attached the network interface to an instance. However, you can
+     * force delete the permission, regardless of any attachment." Force removes the permission only:
+     * the attachment stays.
+     *
+     * <p>Only the owner can delete, as only the owner is shown its permissions: another account's
+     * permission is {@code InvalidNetworkInterfacePermissionID.NotFound}. AWS documents no error
+     * code for a permission in use; {@code OperationNotPermitted} is Floci's choice.
+     */
+    public void deleteNetworkInterfacePermission(String region, String permissionId, boolean force) {
+        if (!isSet(permissionId)) {
+            throw new AwsException("MissingParameter",
+                    "The request must contain the parameter NetworkInterfacePermissionId", 400);
+        }
+        if (!permissionId.startsWith(NETWORK_INTERFACE_PERMISSION_ID_PREFIX)) {
+            throw new AwsException("InvalidNetworkInterfacePermissionID.Malformed",
+                    "Invalid id: \"" + permissionId + "\" (expecting \"" + NETWORK_INTERFACE_PERMISSION_ID_PREFIX
+                            + "...\")", 400);
+        }
+        ensureDefaultResources(region);
+        synchronized (attachmentTopologyLock(region)) {
+            for (NetworkInterface stored : networkInterfaces.scan(k -> k.startsWith(region + "::"))) {
+                Optional<NetworkInterfacePermission> held = stored.getPermissions().stream()
+                        .filter(perm -> permissionId.equals(perm.getNetworkInterfacePermissionId()))
+                        .findFirst();
+                if (held.isEmpty()) {
+                    continue;
+                }
+                NetworkInterface ni = releaseIfHostIsGone(region, stored);
+                NetworkInterfaceAttachment attachment = ni.getAttachment();
+                String grantee = held.get().getAwsAccountId();
+                if (!force && attachment != null && grantee.equals(attachment.getInstanceOwnerId())) {
+                    throw new AwsException("OperationNotPermitted",
+                            "The network interface permission '" + permissionId + "' cannot be deleted while account "
+                                    + grantee + " has the network interface attached to an instance. "
+                                    + "Specify Force to delete it regardless.", 400);
+                }
+                ni.getPermissions().removeIf(perm -> permissionId.equals(perm.getNetworkInterfacePermissionId()));
+                networkInterfaces.put(key(region, ni.getNetworkInterfaceId()), ni);
+                return;
+            }
+        }
+        throw new AwsException("InvalidNetworkInterfacePermissionID.NotFound",
+                "The NetworkInterfacePermission ID '" + permissionId + "' does not exist", 400);
+    }
+
     /** The grant of {@code INSTANCE-ATTACH} to {@code grantee}, minted unless one is already in place. */
     private NetworkInterfacePermission grantInstanceAttach(String ownerAccountId, String region, NetworkInterface ni,
                                                            String grantee) {
@@ -18067,6 +18132,37 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         ni.getPermissions().add(granted);
         putNetworkInterface(ownerAccountId, region, ni);
         return granted;
+    }
+
+    /**
+     * The interface AttachNetworkInterface names, with the account that holds it: the caller's
+     * own, or another account's that has granted the caller {@code INSTANCE-ATTACH} over it. Any
+     * other account's interface is {@code InvalidNetworkInterfaceID.NotFound}, as it is to every
+     * other action of the caller.
+     */
+    private AccountAwareStorageBackend.OwnedEntry<NetworkInterface> requireAttachableNetworkInterface(
+            String region, String networkInterfaceId) {
+        String caller = callerAccountId();
+        String storeKey = key(region, networkInterfaceId);
+        Optional<NetworkInterface> own = networkInterfaces.get(storeKey);
+        if (own.isPresent()) {
+            return new AccountAwareStorageBackend.OwnedEntry<>(caller, releaseIfHostIsGone(region, own.get()));
+        }
+        if (networkInterfaces instanceof AccountAwareStorageBackend<NetworkInterface> aware) {
+            for (AccountAwareStorageBackend.AccountEntry<NetworkInterface> entry : aware.findAllAccountEntries(storeKey)) {
+                if (!caller.equals(entry.accountId()) && grantsInstanceAttach(entry.value(), caller)) {
+                    return new AccountAwareStorageBackend.OwnedEntry<>(entry.accountId(),
+                            releaseIfHostIsGone(entry.accountId(), region, entry.value()));
+                }
+            }
+        }
+        throw new AwsException("InvalidNetworkInterfaceID.NotFound",
+                "The network interface ID '" + networkInterfaceId + "' does not exist", 400);
+    }
+
+    private static boolean grantsInstanceAttach(NetworkInterface ni, String accountId) {
+        return ni.getPermissions().stream().anyMatch(perm ->
+                INSTANCE_ATTACH.equals(perm.getPermission()) && accountId.equals(perm.getAwsAccountId()));
     }
 
     private static void requireAccountId(String parameter, String value) {
@@ -18087,10 +18183,6 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     /** Removes an interface from an instance's own list, the mirror of attaching it. */
-    private void detachFromInstance(String region, String instanceId, String networkInterfaceId) {
-        detachFromInstance(callerAccountId(), region, instanceId, networkInterfaceId);
-    }
-
     private void detachFromInstance(String accountId, String region, String instanceId, String networkInterfaceId) {
         if (instanceId == null) {
             return;
@@ -18282,8 +18374,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             return ni;
         }
         String safeAccount = accountId != null ? accountId : (ni.getOwnerId() != null ? ni.getOwnerId() : callerAccountId());
+        String hostAccount = attachment.getInstanceOwnerId() != null ? attachment.getInstanceOwnerId() : safeAccount;
         Instance host = instances instanceof AccountAwareStorageBackend<Instance> aware
-                ? aware.getForAccount(safeAccount, key(region, attachment.getInstanceId())).orElse(null)
+                ? aware.getForAccount(hostAccount, key(region, attachment.getInstanceId())).orElse(null)
                 : instances.get(key(region, attachment.getInstanceId())).orElse(null);
         boolean hostIsGone = host == null || host.getState() == null
                 || "terminated".equals(host.getState().getName());
@@ -18301,7 +18394,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         // record would leave the terminated instance still reporting the interface, so once it is
         // reused two instance records would claim it, and a real one is not the winner by any
         // rule DescribeInstances applies.
-        detachFromInstance(safeAccount, region, attachment.getInstanceId(), ni.getNetworkInterfaceId());
+        detachFromInstance(hostAccount, region, attachment.getInstanceId(), ni.getNetworkInterfaceId());
         return ni;
     }
 

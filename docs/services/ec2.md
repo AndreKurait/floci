@@ -1307,7 +1307,7 @@ profile.
 |--------|-------------|
 | CreateNetworkInterface | Creates a standalone elastic network interface (ENI) in a subnet, unattached. `Ipv6Addresses` names IPv6 addresses inside one of the subnet's IPv6 blocks; `Ipv6AddressCount` draws that many from the subnet. Left out, the subnet's `AssignIpv6AddressOnCreation` gives the interface one address; an explicit `0` overrides it. Create and describe responses also expose the first assigned IPv6 address as `ipv6Address`, omitting it when the interface has none. |
 | DescribeNetworkInterfaces | Lists network interfaces known to the local EC2 service: an instance's implicit primary interface, an EKS cluster node's primary interface, and standalone ENIs created via `CreateNetworkInterface`. |
-| AttachNetworkInterface | Attaches an available standalone ENI to a running or stopped instance at a device index. |
+| AttachNetworkInterface | Attaches an available standalone ENI to a running or stopped instance at a device index. The interface can belong to another account that granted the caller `INSTANCE-ATTACH`. |
 | DetachNetworkInterface | Detaches a standalone ENI by attachment ID, returning it to `available`. |
 | AssignIpv6Addresses | Gives a standalone ENI or an instance's launch-created interface the named IPv6 addresses (`Ipv6Addresses.N`) or a count drawn from its subnet (`Ipv6AddressCount`); one of the two is required. `assignedIpv6Addresses` lists only the addresses the call added. An address outside the subnet's IPv6 blocks answers `InvalidParameterValue`, one another interface holds `InvalidIPAddress.InUse`. Prefix delegation (`Ipv6Prefix`, `Ipv6PrefixCount`) answers `UnsupportedOperation`. |
 | UnassignIpv6Addresses | Removes the named IPv6 addresses (`Ipv6Addresses.N`) from an interface; `unassignedIpv6Addresses` lists only the ones it held. `Ipv6Prefix` answers `UnsupportedOperation`. |
@@ -1315,6 +1315,7 @@ profile.
 | DeleteNetworkInterface | Deletes a standalone ENI. Fails while the ENI is still attached, matching AWS. |
 | CreateNetworkInterfacePermission | The interface's owner grants another account `INSTANCE-ATTACH` over it. `EIP-ASSOCIATE` and `AwsService` are `UnsupportedOperation`. |
 | DescribeNetworkInterfacePermissions | The permissions granted over the caller's interfaces, by `NetworkInterfacePermissionId.N` and the five `network-interface-permission.*` filters; `MaxResults` 5-255, default 50. |
+| DeleteNetworkInterfacePermission | The interface's owner deletes a permission. Refused while the account it names has the interface attached to an instance, unless `Force` is `true`. |
 
 A standalone ENI created via `CreateNetworkInterface` can also be handed to `RunInstances` as an instance's primary interface (`NetworkInterface.1.NetworkInterfaceId` / `NetworkInterface.1.DeviceIndex`) instead of letting the instance create its own implicit one, the pattern Terraform's `aws_instance` resource uses for `network_interface { network_interface_id = ... }`. AWS only allows this for a single instance per launch call; `RunInstances` rejects it otherwise with `InvalidParameterCombination`.
 
@@ -1333,7 +1334,27 @@ so an ordinary account accepted here can be rejected by AWS with `OperationNotPe
 
 A repeated grant of the same permission to the same account answers the grant already in place.
 AWS documents no duplicate error for it; this is Floci's choice. Grants are kept on the interface,
-so they go when it is deleted. `DeleteNetworkInterfacePermission` is not served.
+so they go when it is deleted.
+
+The account granted `INSTANCE-ATTACH` can then `AttachNetworkInterface` the interface to one of
+its own instances, as the [CreateNetworkInterfacePermission](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_CreateNetworkInterfacePermission.html)
+reference documents. The interface stays the owner's: the owner's `DescribeNetworkInterfaces`
+shows it `in-use`, with the attachment's `instanceOwnerId` naming the instance's account, and the
+`attachment.instance-owner-id` filter selects on it. The instance's `networkInterfaceSet` lists it
+with the owner's `ownerId`. An account without the grant is answered
+`InvalidNetworkInterfaceID.NotFound`, as before.
+
+`DeleteNetworkInterfacePermission` follows the
+[API reference](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DeleteNetworkInterfacePermission.html):
+while the account a permission names has the interface attached to an instance, the permission is
+deleted only with `Force`, and the attachment stays. AWS documents no error code for the refusal;
+Floci answers `OperationNotPermitted`.
+
+AWS documents nothing else about an interface attached across accounts (how the instance's account
+describes, detaches, tags or deletes it), so Floci keeps its account isolation there: to the
+instance's account it is still another account's interface, and `DescribeNetworkInterfaces` does
+not list it. The owner detaches it as any attachment of its interface, and terminating the
+instance returns it to `available`.
 
 #### Interface and VPC endpoint IAM resources
 
