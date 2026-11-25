@@ -3673,3 +3673,51 @@ def test_a_resource_named_after_its_path_or_signed_for_is_checked():
                 {"type": "group", "fill": {"GroupNameWithPath": "NewGroupName"}, "renames": "GroupName"},
                 dict(signer, signer="yes"), dict(signer, types=["user", "group"]), dict(signer, fill={})):
         assert r._resource_problems("iam:Op", bad, types, USERS_FORMATS), bad
+
+
+def test_derive_does_not_parse_the_same_models_for_every_operation(isolated, tmp_path):
+    operations = {f"GetThing{number}": {"ThingName": "String"} for number in range(20)}
+    write_models(tmp_path, {"svc": model(operations)})
+    documents = [reference("svc", {name: ["thing"] for name in operations}, {"thing": FORMATS["thing"]})]
+    document = r.build(documents, "test", tmp_path, "botocore test")
+    load_models = r.load_models
+    entry_for = r.entry_for
+    reads = []
+    consumed = []
+
+    def load(data, clients):
+        reads.append((data, clients))
+        return load_models(data, clients)
+
+    def entry(operation, action, formats, models, *args):
+        consumed.append((models, json.dumps(models, sort_keys=True)))
+        return entry_for(operation, action, formats, models, *args)
+
+    isolated.setattr(r, "load_models", load)
+    isolated.setattr(r, "entry_for", entry)
+    assert r.derive(document, tmp_path) == []
+    assert len(reads) < len(operations)
+    assert len(consumed) == len(operations)
+    assert len({id(models) for models, _ in consumed}) == 1
+    assert all(json.dumps(models, sort_keys=True) == before for models, before in consumed)
+
+
+@pytest.mark.parametrize("different_directory", [False, True])
+def test_a_later_derive_reads_current_models_without_reusing_a_previous_call(isolated, tmp_path, different_directory):
+    original = tmp_path / "original"
+    write_models(original, {"svc": model({"GetThing": {"ThingName": "String"}, "ListThings": {}})})
+    document = r.build(DOCUMENTS, "test", original, "botocore test")
+    assert r.derive(document, original) == []
+
+    changed = model({"GetThing": {}, "ListThings": {}})
+    if different_directory:
+        current = tmp_path / "current"
+        write_models(current, {"svc": changed})
+    else:
+        current = original
+        (current / "svc/2020-01-01/service-2.json").write_text(json.dumps(changed), encoding="utf-8")
+
+    problems = r.derive(document, current)
+    assert len(problems) == 1
+    assert "svc:GetThing: the file has" in problems[0]
+    assert '"resources": []' in problems[0].split("botocore gives", 1)[1]

@@ -5260,12 +5260,19 @@ def derive(document: dict, data: Path) -> list[str]:
     if document.get("pathFormats", {}) != path_formats:
         problems.append(f"the file gives {json.dumps(document.get('pathFormats', {}))} as route types, the path "
                         f"sources and botocore give {json.dumps(path_formats)}")
-    prefixes = {namespace: namespace_id_prefixes(namespace, load_models(data, set(document["namespaces"][namespace])),
+    models_by_namespace: dict[str, dict] = {}
+
+    def namespace_models(namespace: str) -> dict:
+        if namespace not in models_by_namespace:
+            models_by_namespace[namespace] = load_models(data, set(document["namespaces"][namespace]))
+        return models_by_namespace[namespace]
+
+    prefixes = {namespace: namespace_id_prefixes(namespace, namespace_models(namespace),
                                                  load_examples(data, set(document["namespaces"][namespace])))
                 for namespace in ID_TARGETS if namespace in document["namespaces"]}
     for operation, entry in document["operations"].items():
         namespace = namespace_of(operation)
-        models = load_models(data, set(document["namespaces"][namespace]))
+        models = namespace_models(namespace)
         expected = entry_for(operation, {"action": entry["action"], "types": entry["types"],
                                          **({"actions": entry["actions"]} if "actions" in entry else {})},
                              {**document["arnFormats"].get(namespace, {}), **path_formats.get(namespace, {})}, models,
