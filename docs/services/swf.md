@@ -15,6 +15,14 @@ and emitted by [Boto 2.49.0](https://github.com/boto/boto/blob/2.49.0/boto/swf/l
 Domains, workflow and activity type registration, and the workflow execution state
 machine: decision tasks, activity tasks, timers, signals, child workflows, and timeouts.
 
+## IAM domain permissions
+
+With IAM enforcement enabled, operations that name a domain are authorized against
+`arn:${Partition}:swf:${Region}:${Account}:/domain/${DomainName}`. A grant for one
+domain allows workflow starts and signals only in that domain; an explicit domain
+deny overrides a wildcard grant before state changes. Operations without a domain
+resource, such as `ListDomains`, still require an unscoped grant.
+
 ## Supported Actions
 
 <!-- floci:actions:start -->
