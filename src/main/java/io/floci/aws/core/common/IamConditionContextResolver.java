@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.services.amazonmq.AmazonMqConfigurationService;
 import io.floci.aws.services.dynamodb.DynamoDbConditionKeys;
 import io.floci.aws.services.dynamodb.DynamoDbFacade;
 import io.floci.aws.services.dynamodb.DynamoDbPartiQLParser;
@@ -115,6 +116,7 @@ public class IamConditionContextResolver {
     private final EmulatorConfig config;
     private final CurrentVertxRequest currentVertxRequest;
     private final Clock clock;
+    private final Instance<AmazonMqConfigurationService> mqConfigurations;
     private final ResolvedServiceCatalog serviceCatalog;
 
     /**
@@ -122,6 +124,23 @@ public class IamConditionContextResolver {
      * same now as S3Service, which checks retention against {@code Instant.now()}.
      */
     @Inject
+    public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                       Instance<Ec2Service> ec2Service,
+                                       Instance<S3Service> s3Service,
+                                       Instance<IamService> iamService,
+                                       Instance<LambdaWebService> lambdaWebService,
+                                       Instance<RequestConditionSpelling> requestConditionSpellings,
+                                       Instance<StoredResourceArns> storedResourceArns,
+                                       RequestContext requestContext,
+                                       RegionResolver regionResolver,
+                                       EmulatorConfig config,
+                                       CurrentVertxRequest currentVertxRequest,
+                                       ResolvedServiceCatalog serviceCatalog, Instance<AmazonMqConfigurationService> mqConfigurations) {
+        this(dynamoDbFacade, ec2Service, s3Service, iamService,
+                lambdaWebService, requestConditionSpellings, storedResourceArns, requestContext, regionResolver,
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), mqConfigurations);
+    }
+
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
                                        Instance<Ec2Service> ec2Service,
                                        Instance<S3Service> s3Service,
@@ -151,6 +170,25 @@ public class IamConditionContextResolver {
                                 EmulatorConfig config,
                                 CurrentVertxRequest currentVertxRequest,
                                 ResolvedServiceCatalog serviceCatalog, Clock clock) {
+        this(dynamoDbFacade, ec2Service, s3Service, iamService, lambdaWebService, requestConditionSpellings,
+                storedResourceArns, requestContext, regionResolver, config, currentVertxRequest, serviceCatalog,
+                clock, null);
+    }
+
+    IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                Instance<Ec2Service> ec2Service,
+                                Instance<S3Service> s3Service,
+                                Instance<IamService> iamService,
+                                Instance<LambdaWebService> lambdaWebService,
+                                Instance<RequestConditionSpelling> requestConditionSpellings,
+                                Instance<StoredResourceArns> storedResourceArns,
+                                RequestContext requestContext,
+                                RegionResolver regionResolver,
+                                EmulatorConfig config,
+                                CurrentVertxRequest currentVertxRequest,
+                                ResolvedServiceCatalog serviceCatalog, Clock clock,
+                                Instance<AmazonMqConfigurationService> mqConfigurations) {
+        this.mqConfigurations = mqConfigurations;
         this.dynamoDbFacade = dynamoDbFacade;
         this.ec2Service = ec2Service;
         this.s3Service = s3Service;
@@ -272,9 +310,38 @@ public class IamConditionContextResolver {
         return null;
     }
 
+            case "mq" -> mqConfigurationConditions(action, ctx);
+            case "lambda" -> lambdaConditionContext(action, ctx);
+            case "redshift" -> RequestConditionKeys.requestKeys(action).isEmpty() ? null
+                    : requestConditions(action, formParameters(ctx)::get);
+            default -> null;
+        };
+    }
+
+    private Map<String, List<String>> mqConfigurationConditions(String action, ContainerRequestContext ctx) {
+        if ("mq:CreateConfiguration".equals(action)) {
+            JsonNode body = PassedRoles.jsonBody(ctx);
+            return body == null ? null : AmazonMqConfigurationService.requestTagConditions(
+                    AmazonMqConfigurationService.requestTags(body.get("tags")));
+        }
+        if (mqConfigurations == null || !mqConfigurations.isResolvable() || action == null || !switch (action) {
+            case "mq:DescribeConfiguration", "mq:UpdateConfiguration", "mq:DeleteConfiguration",
+                    "mq:DescribeConfigurationRevision", "mq:ListConfigurationRevisions" -> true;
+            default -> false;
+        }) {
+            return null;
+        }
+        String id = ctx.getUriInfo().getPathParameters().getFirst("configurationId");
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        mqConfigurations.get().tagsForAuthorization(id).forEach((key, value) ->
+                conditions.put(RESOURCE_TAG_PREFIX + key, List.of(value)));
+        return conditions;
+    }
+
     public Map<String, List<String>> resolve(String credentialScope, String action,
                                              ContainerRequestContext ctx) {
         return switch (credentialScope) {
+            case "mq" -> withResourceTags(requestMemberConditions(action, ctx), mqConfigurationConditions(action, ctx));
             case "s3" -> s3ConditionContext(action, ctx);
             case "ec2" -> ec2ConditionContext(action, ctx);
             case "dynamodb" -> dynamoDbConditionContext(action, ctx);
