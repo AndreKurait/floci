@@ -51,18 +51,21 @@ public class SsmJsonHandler {
     private final SsmCommandService commandService;
     private final ObjectMapper objectMapper;
     private final IamEnforcementFilter iamEnforcementFilter;
+    private final SsmEc2RegistrationService ec2Registrations;
 
     @Inject
     public SsmJsonHandler(SsmService ssmService, SsmCommandService commandService, ObjectMapper objectMapper,
-                          IamEnforcementFilter iamEnforcementFilter) {
+                          IamEnforcementFilter iamEnforcementFilter, SsmEc2RegistrationService ec2Registrations) {
         this.ssmService = ssmService;
         this.commandService = commandService;
         this.objectMapper = objectMapper;
         this.iamEnforcementFilter = iamEnforcementFilter;
+        this.ec2Registrations = ec2Registrations;
     }
 
     public Response handle(String action, JsonNode request, String region, String authorization) {
         return switch (action) {
+            case "RegisterManagedInstance" -> Response.ok(ec2Registrations.register(request, region)).build();
             // Parameter Store
             case "PutParameter" -> handlePutParameter(request, region);
             case "GetParameter" -> handleGetParameter(request, region, authorization);

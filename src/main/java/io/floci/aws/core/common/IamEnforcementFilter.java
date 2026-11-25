@@ -464,6 +464,11 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             ctx.abortWith(accessDeniedForRequest(action, credentialScope, ctx));
             return;
         }
+        if ("ssm:RegisterManagedInstance".equals(action)
+                && iamService.ec2InstanceIdentitySession(akid).isPresent()) {
+            // Registration separately binds the signed request to this live EC2 instance.
+            return;
+        }
         if ("sts:GetCallerIdentity".equals(action)) {
             return; // AWS returns caller identity even when an identity policy explicitly denies it
         }
