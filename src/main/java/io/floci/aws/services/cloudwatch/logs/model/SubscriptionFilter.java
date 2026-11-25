@@ -12,9 +12,20 @@ public class SubscriptionFilter {
     private String filterPattern;
     private String destinationArn;
     private String distribution;
+    private Boolean applyOnTransformedLogs;
     private long creationTime;
 
     public SubscriptionFilter() {}
+
+    public SubscriptionFilter(SubscriptionFilter source) {
+        filterName = source.filterName;
+        logGroupName = source.logGroupName;
+        filterPattern = source.filterPattern;
+        destinationArn = source.destinationArn;
+        distribution = source.distribution;
+        applyOnTransformedLogs = source.applyOnTransformedLogs;
+        creationTime = source.creationTime;
+    }
 
     public String getFilterName() { return filterName; }
     public void setFilterName(String filterName) { this.filterName = filterName; }
@@ -30,6 +41,11 @@ public class SubscriptionFilter {
 
     public String getDistribution() { return distribution; }
     public void setDistribution(String distribution) { this.distribution = distribution; }
+
+    public Boolean getApplyOnTransformedLogs() { return applyOnTransformedLogs; }
+    public void setApplyOnTransformedLogs(Boolean applyOnTransformedLogs) {
+        this.applyOnTransformedLogs = applyOnTransformedLogs;
+    }
 
     public long getCreationTime() { return creationTime; }
     public void setCreationTime(long creationTime) { this.creationTime = creationTime; }

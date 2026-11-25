@@ -570,7 +570,11 @@ public class CloudWatchLogsMetricFilterService implements Resettable {
         Owner owner = new Owner(account, event.region(), event.logGroupName(), filter.getFilterName());
         List<Publication> publications = new ArrayList<>();
         for (LogEvent logEvent : event.events()) {
-            FilterMatch match = pattern.match(logEvent.getMessage());
+            String message = logEvent.messageForFilter(Boolean.TRUE.equals(filter.getApplyOnTransformedLogs()));
+            if (message == null) {
+                continue;
+            }
+            FilterMatch match = pattern.match(message);
             Double value = t.getDefaultValue();
             List<Dimension> dimensions = new ArrayList<>();
             if (match.matched()) {
