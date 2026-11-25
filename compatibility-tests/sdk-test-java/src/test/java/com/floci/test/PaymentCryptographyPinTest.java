@@ -122,7 +122,7 @@ class PaymentCryptographyPinTest {
 
     @Test
     void aPinThatDoesNotVerifyIsRefused() {
-        String block = client.generatePinData(r -> r
+        GeneratePinDataResponse generated = client.generatePinData(r -> r
                 .encryptionKeyIdentifier(pinEncryptionKeyArn)
                 .generationKeyIdentifier(visaVerificationKeyArn)
                 .pinBlockFormat(PinBlockFormatForPinData.ISO_FORMAT_0)
@@ -131,8 +131,10 @@ class PaymentCryptographyPinTest {
                         .visaPin(VisaPin.builder()
                                 .pinVerificationKeyIndex(VERIFICATION_KEY_INDEX)
                                 .build())
-                        .build()))
-                .encryptedPinBlock();
+                        .build()));
+        String block = generated.encryptedPinBlock();
+        String value = generated.pinData().verificationValue();
+        String invalidValue = PaymentCryptographyValues.withAnotherFirstDigit(value);
 
         // The verification value is not the one over the PIN, so the verification fails.
         assertThatThrownBy(() -> client.verifyPinData(r -> r
@@ -144,10 +146,45 @@ class PaymentCryptographyPinTest {
                 .verificationAttributes(PinVerificationAttributes.builder()
                         .visaPin(VisaPinVerification.builder()
                                 .pinVerificationKeyIndex(VERIFICATION_KEY_INDEX)
-                                .verificationValue("9999")
+                                .verificationValue(invalidValue)
                                 .build())
                         .build())))
                 .isInstanceOf(VerificationFailedException.class);
+    }
+
+    @Test
+    @DisplayName("a PIN block in a format the reference does not verify is refused")
+    void aBlockInAFormatTheReferenceDoesNotVerifyIsRefused() {
+        // The reference's page for the operation says it supports ISO_Format_0 and
+        // ISO_Format_3, so a verification that names the format 4 is refused.
+        String aesKeyArn = createKeyArn(KeyAlgorithm.AES_128,
+                KeyUsage.TR31_P0_PIN_ENCRYPTION_KEY, m -> m.encrypt(true).decrypt(true));
+
+        String block4 = client.generatePinData(r -> r
+                .encryptionKeyIdentifier(aesKeyArn)
+                .generationKeyIdentifier(visaVerificationKeyArn)
+                .pinBlockFormat(PinBlockFormatForPinData.ISO_FORMAT_4)
+                .primaryAccountNumber(PAN)
+                .generationAttributes(PinGenerationAttributes.builder()
+                        .visaPin(VisaPin.builder()
+                                .pinVerificationKeyIndex(VERIFICATION_KEY_INDEX)
+                                .build())
+                        .build()))
+                .encryptedPinBlock();
+
+        assertThatThrownBy(() -> client.verifyPinData(r -> r
+                .encryptionKeyIdentifier(aesKeyArn)
+                .verificationKeyIdentifier(visaVerificationKeyArn)
+                .pinBlockFormat(PinBlockFormatForPinData.ISO_FORMAT_4)
+                .primaryAccountNumber(PAN)
+                .encryptedPinBlock(block4)
+                .verificationAttributes(PinVerificationAttributes.builder()
+                        .visaPin(VisaPinVerification.builder()
+                                .pinVerificationKeyIndex(VERIFICATION_KEY_INDEX)
+                                .verificationValue("1234")
+                                .build())
+                        .build())))
+                .isInstanceOf(ValidationException.class);
     }
 
     @Test

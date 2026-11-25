@@ -1,6 +1,7 @@
 package io.floci.aws.services.emr;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.floci.aws.services.emr.model.EmrCluster;
 import io.floci.aws.services.emr.model.EmrStep;
 import io.floci.aws.services.lambda.launcher.BootstrapProcess;
 import org.junit.jupiter.api.Test;
@@ -10,6 +11,7 @@ import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -39,6 +41,52 @@ class EmrSparkStepsTest {
         // Options come before the application, so --master after it is the application's own argument.
         assertEquals(List.of("--verbose", "--conf", "spark.executor.cores=2", "--class", "com.example.Report",
                 "s3://bucket/jobs/report.jar", "--master", "kept"), EmrSparkSteps.application(step, false));
+    }
+
+    /** From 7.11 a step's own LogUri "take[s] precedence", but only on a cluster that logs. */
+    @Test
+    void aStepsLogsGoToItsOwnLogUriFromRelease711OnAClusterThatLogs() {
+        EmrStep step = step("command-runner.jar", null, "true");
+        step.setId("s-1");
+        step.setLogUri("s3://step-logs/");
+        EmrCluster cluster = new EmrCluster();
+        cluster.setId("j-1");
+        cluster.setLogUri("s3://cluster-logs/");
+
+        cluster.setReleaseLabel("emr-7.11.0");
+        assertEquals("s3://step-logs/j-1/steps/s-1/", EmrSparkSteps.logFolder(cluster, step));
+        assertEquals("s3://step-logs/j-1/containers/", EmrSparkSteps.containerLogFolder(cluster, step));
+        cluster.setReleaseLabel("emr-spark-8.0.0");
+        assertEquals("s3://step-logs/j-1/steps/s-1/", EmrSparkSteps.logFolder(cluster, step));
+        cluster.setReleaseLabel("emr-7.10.0");
+        assertEquals("s3://cluster-logs/j-1/steps/s-1/", EmrSparkSteps.logFolder(cluster, step));
+        cluster.setReleaseLabel("emr-7.11.0");
+        cluster.setLogUri(null);
+        assertNull(EmrSparkSteps.logFolder(cluster, step));
+    }
+
+    /** A node removed while steps run puts its containers' logs where those steps' container logs go. */
+    @Test
+    void aRemovedNodesLogsGoWhereTheRunningStepsContainerLogsGoWhenTheyShareOne() {
+        EmrCluster cluster = new EmrCluster();
+        cluster.setId("j-1");
+        cluster.setLogUri("s3://cluster-logs/");
+        cluster.setReleaseLabel("emr-7.11.0");
+        EmrStep own = step("command-runner.jar", null, "true");
+        own.setId("s-1");
+        own.setLogUri("s3://step-logs/");
+        own.setState("RUNNING");
+        EmrStep plain = step("command-runner.jar", null, "true");
+        plain.setId("s-2");
+        plain.setState("PENDING");
+        cluster.setSteps(new ArrayList<>(List.of(own, plain)));
+
+        assertEquals("s3://step-logs/j-1/containers/", EmrSparkSteps.nodeLogFolder(cluster));
+        plain.setState("RUNNING");
+        assertEquals("s3://cluster-logs/j-1/containers/", EmrSparkSteps.nodeLogFolder(cluster));
+        own.setState("COMPLETED");
+        plain.setState("COMPLETED");
+        assertEquals("s3://cluster-logs/j-1/containers/", EmrSparkSteps.nodeLogFolder(cluster));
     }
 
     @Test
@@ -182,6 +230,34 @@ class EmrSparkStepsTest {
         }
         // "Pig and Oozie are not included" in a release of the AWS runtime for Apache Spark.
         assertFalse(EmrSparkSteps.installsPig("emr-spark-8.1.0", "[{\"Name\": \"Pig\"}]", objectMapper));
+    }
+
+    @Test
+    void aClusterInstallsTrinoWhereItsApplicationsNameItOnANumberedRelease() {
+        assertTrue(EmrSparkSteps.installsTrino(RELEASE, "[{\"Name\": \"Trino\"}]", objectMapper));
+        assertTrue(EmrSparkSteps.installsTrino(RELEASE, "[{\"Name\": \"Spark\"}, {\"Name\": \"trino\"}]",
+                objectMapper));
+        for (String applications : new String[]{HIVE_AND_SPARK, "[]", null, "[{"}) {
+            assertFalse(EmrSparkSteps.installsTrino(RELEASE, applications, objectMapper));
+        }
+        // The AWS runtime for Apache Spark's applications are "AmazonCloudWatchAgent, Delta, Hudi, Iceberg,
+        // JupyterEnterpriseGateway, Livy, and Spark".
+        assertFalse(EmrSparkSteps.installsTrino("emr-spark-8.1.0", "[{\"Name\": \"Trino\"}]", objectMapper));
+    }
+
+    @Test
+    void trinosHiveCatalogGetsTheClustersTrinoConnectorHiveALaterConfigurationWinning() {
+        String configurations = """
+                [{"Classification": "trino-connector-hive", "Properties": {"hive.metastore": "glue",
+                  "hive.metastore.glue.catalogid": "111122223333"}},
+                 {"Classification": "hive-site", "Properties": {"hive.metastore.uris": "thrift://elsewhere:9083"}},
+                 {"Classification": "trino-connector-hive",
+                  "Properties": {"hive.metastore.glue.catalogid": "444455556666"}}]
+                """;
+
+        assertEquals(Map.of("hive.metastore", "glue", "hive.metastore.glue.catalogid", "444455556666"),
+                EmrSparkSteps.trinoHiveConnector(configurations, objectMapper));
+        assertEquals(Map.of(), EmrSparkSteps.trinoHiveConnector(null, objectMapper));
     }
 
     @Test

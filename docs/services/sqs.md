@@ -101,6 +101,8 @@ aws sqs set-queue-attributes \
 
 `GetQueueAttributes` with `--attribute-names All` returns the set AWS returns for a standard queue: `QueueArn`, `CreatedTimestamp`, `LastModifiedTimestamp`, `ApproximateNumberOfMessages`, `ApproximateNumberOfMessagesNotVisible`, `ApproximateNumberOfMessagesDelayed`, `VisibilityTimeout`, `MaximumMessageSize`, `MessageRetentionPeriod`, `DelaySeconds`, `ReceiveMessageWaitTimeSeconds` and `SqsManagedSseEnabled`. `Policy`, `RedrivePolicy` and `KmsMasterKeyId` appear only once set, and FIFO queues also report `FifoQueue` and `ContentBasedDeduplication`.
 
+A standard queue has no `FifoQueue` attribute: `CreateQueue` refuses one, even `FifoQueue=false`, with `InvalidAttributeName` (`Unknown Attribute FifoQueue.`), as AWS does. An `AWS::SQS::Queue` declaring `FifoQueue: false` fails its stack the same way; leave the property out for a standard queue.
+
 `MaximumMessageSize` defaults to `1048576` bytes, the AWS default and maximum since August 2025, when AWS raised both from `262144`. `CreateQueue` and `SetQueueAttributes` reject values outside 1024 to 1048576 with `InvalidAttributeValue`; raising `FLOCI_SERVICES_SQS_MAX_MESSAGE_SIZE` above the AWS maximum raises that accepted ceiling with it. Lowering the variable below 1048576 only changes the default a new queue receives: the accepted ceiling stays at the AWS maximum, so a queue can still be set to `1048576` explicitly.
 
 `DelaySeconds` must be 0 to 900, both on a message and as a queue attribute: `SendMessage` rejects other values with `InvalidParameterValue` (in `SendMessageBatch` only that entry fails), and `CreateQueue` and `SetQueueAttributes` reject them with `InvalidAttributeValue`.
@@ -135,7 +137,7 @@ Floci publishes the `AWS/SQS` metrics of every active queue to CloudWatch once a
 
 These match what AWS publishes. A deduplicated FIFO send still counts in `NumberOfMessagesSent`, and a message a redrive policy moves to a dead-letter queue does not. `ApproximateAgeOfOldestMessage` counts a message moved to a FIFO dead-letter queue or by `StartMessageMoveTask` from the move.
 
-Known differences: a `SendMessageBatch` or `DeleteMessageBatch` call adds one sample per entry where AWS adds one per call, so `Sum` matches while `SampleCount`, `Average`, `Minimum` and `Maximum` can differ. A message in a standard dead-letter queue keeps its original send time for its age, where AWS counts from the move, and a standard-queue message received three times or more still counts toward the age, where AWS leaves it out until it is deleted. Floci keeps these datapoints for the 15 days AWS keeps one-minute data and then drops them, where AWS goes on serving them at 5 minute and 1 hour resolution. The fair-queue metrics (`ApproximateNumberOfNoisyGroups` and the `InQuietGroups` variants) are not published, and the delay of up to 15 minutes AWS has before a newly active queue reports is not reproduced.
+Known differences: a `SendMessageBatch` or `DeleteMessageBatch` call adds one sample per entry where AWS adds one per call, so `Sum` matches while `SampleCount`, `Average`, `Minimum` and `Maximum` can differ. A message in a standard dead-letter queue keeps its original send time for its age, where AWS counts from the move, and a standard-queue message received three times or more still counts toward the age, where AWS leaves it out until it is deleted. Floci keeps these datapoints for the 15 days AWS keeps one-minute data and then drops them, where AWS goes on serving them at 5 minute and 1 hour resolution, and drops the oldest sooner once an account holds more `AWS/SQS` datapoints than the [metric store ceiling](cloudwatch.md#metric-storage). The fair-queue metrics (`ApproximateNumberOfNoisyGroups` and the `InQuietGroups` variants) are not published, and the delay of up to 15 minutes AWS has before a newly active queue reports is not reproduced.
 
 ## Configuration
 
@@ -241,3 +243,12 @@ does not begin a new delay or visibility period.
 Older stored messages without these fields still load as visible messages. Delivery state
 that an older version did not save cannot be reconstructed. Hybrid mode retains its
 configured flush window; this does not add synchronous durability to hybrid storage.
+
+### IAM resource tags
+
+With IAM enforcement enabled, queue operations use the exact queue's stored tags
+for `aws:ResourceTag` conditions. The lookup reads the ARN's account, Region and
+partition and observes tag changes immediately, including for cross-account
+requests. A matching tag does not replace the queue policy grant required for
+cross-account access; another queue's tags cannot satisfy the target queue's
+condition.

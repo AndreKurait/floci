@@ -3,14 +3,18 @@ package io.floci.aws.services.lambda.launcher;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.ExecCreateCmd;
 import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.transport.DockerHttpClient;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.Digests;
+import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.docker.ContainerBuilder;
 import io.floci.aws.core.common.docker.ContainerLifecycleManager;
 import io.floci.aws.core.common.docker.ContainerLogStreamer;
 import io.floci.aws.core.common.docker.ContainerSpec;
 import io.floci.aws.core.common.docker.ContainerStorageHelper;
+import io.floci.aws.core.common.docker.DockerCapacityExceededException;
+import io.floci.aws.core.common.docker.DockerExitEvents;
 import io.floci.aws.core.common.docker.DockerHostResolver;
 import io.floci.aws.core.common.docker.DockerPlatforms;
 import io.floci.aws.core.common.docker.LaunchedContainerAwsEnv;
@@ -120,16 +124,20 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
     private final DockerClient streamingDocker;
+    private final DockerHttpClient controlPlaneHttp;
     private final ContainerLogStreamer logStreamer;
     private final ImageResolver imageResolver;
     private final RuntimeApiServerFactory runtimeApiServerFactory;
     private final DockerHostResolver dockerHostResolver;
     private final EmulatorConfig config;
+    private final RegionResolver regionResolver;
     private final EcrRegistryManager ecrRegistryManager;
     private final LambdaLayerService layerService;
     private final LaunchedContainerAwsEnv awsEnv;
     private final LambdaExecutionRoleCredentials executionRoleCredentials;
     private final Ec2Service ec2Service;
+    /** When off, each container's exit is watched with its own wait stream (LambdaExitWatcher). */
+    private final DockerExitEvents exitEvents;
     private final LambdaContainerReconciler containerReconciler;
     /** The VPC address each VpcConfig function's container holds, returned once it is removed. */
     private final Map<String, VpcLease> vpcLeases = new ConcurrentHashMap<>();
@@ -138,24 +146,30 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     public ContainerLauncher(ContainerBuilder containerBuilder,
                              ContainerLifecycleManager lifecycleManager,
                              @StreamingDocker DockerClient streamingDocker,
+                             DockerHttpClient controlPlaneHttp,
                              ContainerLogStreamer logStreamer,
                              ImageResolver imageResolver,
                              RuntimeApiServerFactory runtimeApiServerFactory,
                              DockerHostResolver dockerHostResolver,
                              EmulatorConfig config,
+                             RegionResolver regionResolver,
                              EcrRegistryManager ecrRegistryManager,
                              LambdaLayerService layerService,
                              LaunchedContainerAwsEnv awsEnv,
                              LambdaExecutionRoleCredentials executionRoleCredentials,
-                             Ec2Service ec2Service) {
+                             Ec2Service ec2Service,
+                             DockerExitEvents exitEvents) {
+        this.exitEvents = exitEvents;
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.streamingDocker = streamingDocker;
+        this.controlPlaneHttp = controlPlaneHttp;
         this.logStreamer = logStreamer;
         this.imageResolver = imageResolver;
         this.runtimeApiServerFactory = runtimeApiServerFactory;
         this.dockerHostResolver = dockerHostResolver;
         this.config = config;
+        this.regionResolver = regionResolver;
         this.ecrRegistryManager = ecrRegistryManager;
         this.layerService = layerService;
         this.awsEnv = awsEnv;
@@ -262,7 +276,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         String cwLogGroup  = LambdaLogDestinations.logGroup(fn);
         String cwLogStream = LOG_STREAM_DATE_FMT.format(LocalDate.now()) + "/"
                 + LambdaLogDestinations.logStreamSuffix(fn, shortId);
-        String lambdaRegion = extractRegionFromArn(fn.getFunctionArn(), config.defaultRegion());
+        String lambdaRegion = regionResolver.regionOf(fn.getFunctionArn());
         String lambdaAccountId = AwsArnUtils.accountOrDefault(fn.getFunctionArn(), config.defaultAccountId());
 
         List<String> env = LambdaRuntimeEnv.of(fn, runtimeApiEndpoint, cwLogGroup, cwLogStream);
@@ -277,28 +291,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         env.addAll(awsEnv.sdkBaselineEnv(lambdaRegion,
                 awsConfigPath.isPresent() ? Optional.of("/opt/aws-config") : Optional.empty(),
                 awsEnv.flociEndpoint(dockerFlags.dnsServers().isEmpty()), roleCredentials, lambdaAccountId));
-        if (fn.getEnvironment() != null) {
-            boolean hasExecutionRoleCredentials = roleCredentials.isPresent();
-            boolean userDefinesFullCredentialTriad = definesFullCredentialTriad(fn.getEnvironment());
-            fn.getEnvironment().forEach((k, v) -> {
-                if (isAwsCredentialVariable(k)) {
-                    // Credential injection is all-or-nothing: a partial override (e.g. only
-                    // AWS_ACCESS_KEY_ID set) must never join the baseline's other two values —
-                    // that pairs a user-chosen key with the owner-account/execution-role secret
-                    // and session token, a tuple nothing can verify. Only let the user's triad
-                    // through when it is complete, and only when there is no execution role
-                    // (which is already the authoritative credential source).
-                    if (!hasExecutionRoleCredentials && userDefinesFullCredentialTriad) {
-                        env.add(k + "=" + v);
-                    }
-                } else {
-                    env.add(k + "=" + v);
-                }
-            });
-        }
-
-        env.removeIf(value -> value.startsWith("AWS_LAMBDA_FUNCTION_VERSION="));
-        env.add("AWS_LAMBDA_FUNCTION_VERSION=" + fn.getVersion());
+        LambdaRuntimeEnv.addFunctionEnvironment(env, fn, roleCredentials.isPresent());
         if (provisioned) {
             env.removeIf(value -> value.startsWith("AWS_LAMBDA_INITIALIZATION_TYPE="));
             env.add("AWS_LAMBDA_INITIALIZATION_TYPE=provisioned-concurrency");
@@ -470,14 +463,28 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         if ("Image".equals(fn.getPackageType())) {
             List<String> mountPaths = fn.getFileSystemConfigs() == null ? List.of()
                     : fn.getFileSystemConfigs().stream().map(LambdaFileSystemConfig::getLocalMountPath).toList();
-            WorkingDirectoryAccess.requireLambdaUserCanEnter(dockerClient, containerId, mountPaths);
+            WorkingDirectoryAccess.requireLambdaUserCanEnter(dockerClient, controlPlaneHttp, containerId, mountPaths);
         }
 
         // Now start the container with code in place
         joinVpcNetwork(fn, containerId, lambdaAccountId, lambdaRegion);
-        lifecycleManager.startCreated(containerId, spec);
+        boolean exitByEvents = exitEvents.enabled();
+        if (exitByEvents) {
+            // Events report only what happens after the subscription, so register before the start.
+            exitEvents.register(containerId, runtimeApiServer::handleRuntimeProcessExited);
+        }
+        try {
+            lifecycleManager.startCreated(containerId, spec);
+        } catch (RuntimeException e) {
+            if (exitByEvents) {
+                exitEvents.unregister(containerId);
+            }
+            throw e;
+        }
         runtimeApiServer.markContainerStarted();
-        watchForUnexpectedExit(dockerClient, containerId, runtimeApiServer);
+        if (!exitByEvents) {
+            watchForUnexpectedExit(dockerClient, containerId, runtimeApiServer);
+        }
 
         // Extensions can log as soon as they start, which is before the container's own log stream
         // is attached below. Create the group/stream up front so those early lines are not dropped
@@ -526,8 +533,13 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             // leaks one per attempt and exhausts the pool) and reap any half-built container (leaked
             // "Created" containers bog the daemon and starve reuse). containerId is null when we
             // failed before the container was created (e.g. an ensureCodeVolume populate failure).
-            LOG.errorv("Container launch failed for function {0}; cleaning up: {1}",
-                    fn.getFunctionName(), e.getMessage());
+            if (e instanceof DockerCapacityExceededException) {
+                // A full Docker budget is a throttle the caller sees, not a failed launch.
+                LOG.warnv("Not launching a container for function {0}: {1}", fn.getFunctionName(), e.getMessage());
+            } else {
+                LOG.errorv("Container launch failed for function {0}; cleaning up: {1}",
+                        fn.getFunctionName(), e.getMessage());
+            }
             if (containerId != null) {
                 try {
                     lifecycleManager.stopAndRemoveStrict(containerId, null);
@@ -545,16 +557,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
             // null by then); otherwise the failure happened before Docker ever saw the volume, so
             // its in-flight reference must be released here or cleanup would wait on it forever.
             releaseCodeVolumeReference(reservedCodeVolume);
-            // Stop the server before releasing its port, or the still-listening Vert.x server
-            // makes a later cold start that reuses the port serve this runtime too.
-            try {
-                runtimeApiServer.stop().get(5, TimeUnit.SECONDS);
-            } catch (InterruptedException ie) {
-                Thread.currentThread().interrupt();
-            } catch (Exception stopFailure) {
-                LOG.debugv("Runtime API server stop failed during launch cleanup: {0}",
-                        stopFailure.getMessage());
-            }
+            RuntimeApiServerFactory.stopBeforeRelease(runtimeApiServer);
             try {
                 runtimeApiServerFactory.release(runtimeApiServer);
             } catch (Exception cleanupError) {
@@ -1589,10 +1592,6 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                     EXTENSIONS_DIR, functionName, e.getMessage());
             return List.of();
         }
-    }
-
-    private static String extractRegionFromArn(String arn, String defaultRegion) {
-        return AwsArnUtils.regionOrDefault(arn, defaultRegion);
     }
 
     /**

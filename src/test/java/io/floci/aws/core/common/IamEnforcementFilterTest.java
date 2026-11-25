@@ -21,8 +21,6 @@ import io.floci.aws.services.s3.S3ScratchSpace;
 import io.floci.aws.services.s3.S3Service;
 import io.floci.aws.services.scheduler.SchedulerController;
 import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
-import io.vertx.core.http.HttpServerRequest;
-import io.vertx.ext.web.RoutingContext;
 import jakarta.enterprise.inject.Instance;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.container.ResourceInfo;
@@ -49,6 +47,7 @@ import java.util.Set;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -57,6 +56,7 @@ import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.atLeastOnce;
+import static org.mockito.Mockito.atMost;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
@@ -448,7 +448,8 @@ class IamEnforcementFilterTest {
 
         verify(actionRegistry).resolveRoute("apigateway", containerRequest);
         verify(actionRegistry, never()).resolveRoute("iam", containerRequest);
-        verify(arnBuilder).buildResources("apigateway", containerRequest, "us-east-1", "000000000000", "aws");
+        verify(arnBuilder).buildResources("apigateway", "apigateway:POST", containerRequest, "us-east-1",
+                "000000000000", "aws");
         verify(conditionContextResolver).resolve("apigateway", "apigateway:POST", containerRequest);
     }
 
@@ -481,7 +482,8 @@ class IamEnforcementFilterTest {
 
     @Test
     void apiGatewayResourcesAreBuiltInTheRequestsPartition() {
-        // A Region no partition publishes takes the deployment's partition, the one its path ARNs are in.
+        // A Region no partition publishes takes the deployment's partition, the one its path ARNs are in, on the
+        // operation the request is dispatched as, which the table of request resources reads.
         ContainerRequestContext containerRequest = mock(ContainerRequestContext.class);
         String auth = "AWS4-HMAC-SHA256 Credential=AKIAUSER/20260924/xx-local-1/apigateway/aws4_request, "
                 + "SignedHeaders=host, Signature=abc";
@@ -496,12 +498,13 @@ class IamEnforcementFilterTest {
                 .thenReturn(Optional.of(descriptor("apigateway", ServiceProtocol.REST_JSON,
                         Set.of("apigateway", "execute-api"), ApiGatewayController.class)));
         when(actionRegistry.resolveRoute("apigateway", containerRequest)).thenReturn("apigateway:GET");
-        when(arnBuilder.buildResources(any(), any(), any(), any(), any())).thenReturn(List.of("*"));
+        when(arnBuilder.buildResources(any(), any(), any(), any(), any(), any())).thenReturn(List.of("*"));
         when(iamService.resolveCallerContext(eq("AKIAUSER"), any())).thenReturn(CallerContext.of(List.of()));
 
         newFilter(resourceInfo(ApiGatewayController.class)).filter(containerRequest);
 
-        verify(arnBuilder).buildResources("apigateway", containerRequest, "xx-local-1", "000000000000", "aws-cn");
+        verify(arnBuilder).buildResources("apigateway", "apigateway:GET", containerRequest, "xx-local-1",
+                "000000000000", "aws-cn");
     }
 
     @Test
@@ -1094,22 +1097,35 @@ class IamEnforcementFilterTest {
         verify(containerRequest).abortWith(any());
     }
 
+    /** A scoped presigned request whose resources are not its URL's own object is refused. */
     @Test
-    void scopedPresignedRequestWithoutRoutingContextIsDenied() {
-        assertScopedPresignedRequestWithoutHttpRequestIsDenied(null);
-    }
-
-    @Test
-    void scopedPresignedRequestWithoutHttpRequestIsDenied() {
-        assertScopedPresignedRequestWithoutHttpRequestIsDenied(mock(RoutingContext.class));
-    }
-
-    @Test
-    void scopedPresignedRequestUsesWirePathForAbsoluteFormProxyTarget() {
+    void aScopedPresignedRequestOnAnotherResourceIsDenied() {
         ContainerRequestContext containerRequest = mock(ContainerRequestContext.class);
-        CurrentVertxRequest currentVertxRequest = mock(CurrentVertxRequest.class);
-        RoutingContext routingContext = mock(RoutingContext.class);
-        HttpServerRequest httpRequest = mock(HttpServerRequest.class);
+        String auth = "AWS4-HMAC-SHA256 Credential=ASIASCOPE/20260927/us-east-1/s3/aws4_request, "
+                + "SignedHeaders=host, Signature=abc";
+        when(containerRequest.getHeaderString("Authorization")).thenReturn(auth);
+        when(accountResolver.extractAccessKeyId(auth)).thenReturn("ASIASCOPE");
+        when(actionRegistry.resolve("s3", containerRequest)).thenReturn("s3:GetObject");
+        when(iamService.resolveCallerContext(eq("ASIASCOPE"), any()))
+                .thenReturn(CallerContext.of(List.of("{\"Version\":\"2012-10-17\",\"Statement\":[]}")));
+        when(iamService.presignedScope("ASIASCOPE"))
+                .thenReturn(Optional.of(new IamService.PresignedScope(
+                        "s3:GetObject", "arn:aws:s3:::bucket/key")));
+
+        newFilter().filter(containerRequest);
+
+        ArgumentCaptor<Response> response = ArgumentCaptor.forClass(Response.class);
+        verify(containerRequest).abortWith(response.capture());
+        assertEquals(403, response.getValue().getStatus());
+    }
+
+    /**
+     * A scoped presigned request is checked on the resources its request names, as its service reads them: an S3 key
+     * keeps the slashes it was sent with, so {@code /bucket//key} is the object {@code /key}.
+     */
+    @Test
+    void aScopedPresignedRequestIsCheckedOnTheResourcesItsRequestNames() {
+        ContainerRequestContext containerRequest = mock(ContainerRequestContext.class);
         String auth = "AWS4-HMAC-SHA256 Credential=ASIASCOPE/20260927/us-east-1/s3/aws4_request, "
                 + "SignedHeaders=host, Signature=abc";
         requestContext.setAccountId("000000000000");
@@ -1121,16 +1137,14 @@ class IamEnforcementFilterTest {
         when(iamService.presignedScope("ASIASCOPE"))
                 .thenReturn(Optional.of(new IamService.PresignedScope(
                         "s3:GetObject", "arn:aws:s3:::bucket//key")));
-        when(currentVertxRequest.getCurrent()).thenReturn(routingContext);
-        when(routingContext.request()).thenReturn(httpRequest);
-        when(httpRequest.uri()).thenReturn("https://proxy.example/bucket//key?X-Amz-Algorithm=AWS4-HMAC-SHA256");
-        when(httpRequest.path()).thenReturn("/bucket//key");
+        when(arnBuilder.buildResources(eq("s3"), any(), eq(containerRequest), any(), any(), any()))
+                .thenReturn(List.of("arn:aws:s3:::bucket//key"));
         when(conditionContextResolver.resolveRemainingTargets("s3", "s3:GetObject", containerRequest))
                 .thenReturn(List.of());
         when(evaluator.evaluateResolvedResourcePolicy(any(), any(), any(), any(), any(), any()))
                 .thenReturn(IamPolicyEvaluator.Decision.ALLOW);
 
-        newFilter(currentVertxRequest).filter(containerRequest);
+        newFilter().filter(containerRequest);
 
         verify(containerRequest, never()).abortWith(any());
         verify(evaluator).evaluateResolvedResourcePolicy(any(), any(), any(),
@@ -1143,9 +1157,6 @@ class IamEnforcementFilterTest {
         // the extra actions of an object creation on its own: the policies here allow everything,
         // so only the guard can deny the legal hold.
         ContainerRequestContext containerRequest = mock(ContainerRequestContext.class);
-        CurrentVertxRequest currentVertxRequest = mock(CurrentVertxRequest.class);
-        RoutingContext routingContext = mock(RoutingContext.class);
-        HttpServerRequest httpRequest = mock(HttpServerRequest.class);
         UriInfo uriInfo = mock(UriInfo.class);
         when(uriInfo.getQueryParameters()).thenReturn(new MultivaluedHashMap<>());
         when(containerRequest.getUriInfo()).thenReturn(uriInfo);
@@ -1162,42 +1173,17 @@ class IamEnforcementFilterTest {
         when(iamService.presignedScope("ASIASCOPE"))
                 .thenReturn(Optional.of(new IamService.PresignedScope(
                         "s3:PutObject", "arn:aws:s3:::bucket/key")));
-        when(currentVertxRequest.getCurrent()).thenReturn(routingContext);
-        when(routingContext.request()).thenReturn(httpRequest);
-        when(httpRequest.path()).thenReturn("/bucket/key");
+        when(arnBuilder.buildResources(eq("s3"), any(), eq(containerRequest), any(), any(), any()))
+                .thenReturn(List.of("arn:aws:s3:::bucket/key"));
         when(evaluator.evaluateResolvedResourcePolicy(any(), any(), any(), any(), any(), any()))
                 .thenReturn(IamPolicyEvaluator.Decision.ALLOW);
 
-        newFilter(currentVertxRequest).filter(containerRequest);
+        newFilter().filter(containerRequest);
 
         ArgumentCaptor<Response> denied = ArgumentCaptor.captor();
         verify(containerRequest).abortWith(denied.capture());
         assertEquals(403, denied.getValue().getStatus());
         assertTrue(entityString(denied.getValue()).contains("s3:PutObjectLegalHold"));
-    }
-
-    private void assertScopedPresignedRequestWithoutHttpRequestIsDenied(RoutingContext routingContext) {
-        ContainerRequestContext containerRequest = mock(ContainerRequestContext.class);
-        CurrentVertxRequest currentVertxRequest = mock(CurrentVertxRequest.class);
-        String auth = "AWS4-HMAC-SHA256 Credential=ASIASCOPE/20260927/us-east-1/s3/aws4_request, "
-                + "SignedHeaders=host, Signature=abc";
-        when(containerRequest.getHeaderString("Authorization")).thenReturn(auth);
-        when(accountResolver.extractAccessKeyId(auth)).thenReturn("ASIASCOPE");
-        when(actionRegistry.resolve("s3", containerRequest)).thenReturn("s3:GetObject");
-        when(iamService.resolveCallerContext(eq("ASIASCOPE"), any()))
-                .thenReturn(CallerContext.of(List.of("{\"Version\":\"2012-10-17\",\"Statement\":[]}")));
-        when(iamService.presignedScope("ASIASCOPE"))
-                .thenReturn(Optional.of(new IamService.PresignedScope(
-                        "s3:GetObject", "arn:aws:s3:::bucket/key")));
-        if (routingContext != null) {
-            when(currentVertxRequest.getCurrent()).thenReturn(routingContext);
-        }
-
-        newFilter(currentVertxRequest).filter(containerRequest);
-
-        ArgumentCaptor<Response> response = ArgumentCaptor.forClass(Response.class);
-        verify(containerRequest).abortWith(response.capture());
-        assertEquals(403, response.getValue().getStatus());
     }
 
     @Test
@@ -2483,35 +2469,55 @@ class IamEnforcementFilterTest {
     void aDeniedExtraActionNamesThePermissionAndRecordsTheOperation() {
         // A PutObject placing a legal hold also needs s3:PutObjectLegalHold. The denial names that
         // permission, while CloudTrail records PutObject, the operation that was refused.
-        assertEquals("PutObject", deniedExtraActionEvent("PUT", new MultivaluedHashMap<>(),
+        assertEquals("PutObject", deniedExtraActionEvent("s3:PutObject", "PUT", new MultivaluedHashMap<>(),
                 "x-amz-object-lock-legal-hold", "ON", "s3:PutObject", "s3:PutObjectLegalHold"));
-        // A retention change asking for the bypass is recorded as the retention change.
+        // A retention change asking for the bypass is recorded as the retention change, under the name the
+        // S3 user guide gives it, PutObjectLockRetention.
         MultivaluedHashMap<String, String> retention = new MultivaluedHashMap<>();
         retention.putSingle("retention", "");
-        assertEquals("PutObjectRetention", deniedExtraActionEvent("PUT", retention,
+        assertEquals("PutObjectLockRetention", deniedExtraActionEvent("s3:PutObjectRetention", "PUT", retention,
                 "x-amz-bypass-governance-retention", "true", "s3:PutObjectRetention",
                 "s3:BypassGovernanceRetention"));
         // GetObjectAttributes is checked as the read and as its own action; denied the second, it is
         // recorded as GetObjectAttributes, not as the read.
         MultivaluedHashMap<String, String> attributes = new MultivaluedHashMap<>();
         attributes.putSingle("attributes", "");
-        assertEquals("GetObjectAttributes", deniedExtraActionEvent("GET", attributes,
+        assertEquals("GetObjectAttributes", deniedExtraActionEvent("s3:GetObjectAttributes", "GET", attributes,
                 "x-amz-object-attributes", "ETag", "s3:GetObject", "s3:GetObjectAttributes"));
     }
 
     @Test
-    void aDeniedPostIsRecordedAsTheOperationItsSubResourceSelects() {
-        // CreateMultipartUpload and CompleteMultipartUpload are both checked as s3:PutObject, so the
-        // event is named from the request's sub-resource. An upload placing a legal hold also needs
+    void aDeniedRequestIsRecordedAsTheOperationItMatched() {
+        // CreateMultipartUpload and CompleteMultipartUpload are both checked as s3:PutObject, and are
+        // recorded as the operation each request matched. An upload placing a legal hold also needs
         // s3:PutObjectLegalHold, and a conditional complete needs s3:GetObject.
         MultivaluedHashMap<String, String> create = new MultivaluedHashMap<>();
         create.putSingle("uploads", "");
-        assertEquals("CreateMultipartUpload", deniedExtraActionEvent("POST", create,
+        assertEquals("CreateMultipartUpload", deniedExtraActionEvent("s3:CreateMultipartUpload", "POST", create,
                 "x-amz-object-lock-legal-hold", "ON", "s3:PutObject", "s3:PutObjectLegalHold"));
         MultivaluedHashMap<String, String> complete = new MultivaluedHashMap<>();
         complete.putSingle("uploadId", "u1");
-        assertEquals("CompleteMultipartUpload", deniedExtraActionEvent("POST", complete,
-                "If-Match", "\"etag\"", "s3:PutObject", "s3:GetObject"));
+        assertEquals("CompleteMultipartUpload", deniedExtraActionEvent("s3:CompleteMultipartUpload", "POST",
+                complete, "If-Match", "\"etag\"", "s3:PutObject", "s3:GetObject"));
+        // HeadBucket is checked as s3:ListBucket, as ListObjects is, and is recorded as itself; CopyObject is
+        // checked as s3:PutObject and is recorded as itself; ListObjectsV2 is recorded as ListObjects.
+        assertEquals("HeadBucket", deniedExtraActionEvent("s3:HeadBucket", "HEAD", new MultivaluedHashMap<>(),
+                "x-amz-expected-bucket-owner", "222233334444", "s3:ListBucket", "s3:ListBucket"));
+        assertEquals("CopyObject", deniedExtraActionEvent("s3:CopyObject", "PUT", new MultivaluedHashMap<>(),
+                "x-amz-copy-source", "/source/key", "s3:PutObject", "s3:PutObject"));
+        assertEquals("ListObjects", deniedExtraActionEvent("s3:ListObjectsV2", "GET", new MultivaluedHashMap<>(),
+                "x-amz-expected-bucket-owner", "222233334444", "s3:ListBucket", "s3:ListBucket"));
+    }
+
+    @Test
+    void aDeniedRequestWhoseOperationIsNoDataEventIsNotRecordedAsOne() {
+        // ListBuckets and GetBucketPolicy are management events, not data events.
+        assertNull(deniedExtraActionEvent("s3:ListBuckets", "GET", new MultivaluedHashMap<>(),
+                "x-amz-expected-bucket-owner", "222233334444", "s3:ListAllMyBuckets", "s3:ListAllMyBuckets"));
+        MultivaluedHashMap<String, String> policy = new MultivaluedHashMap<>();
+        policy.putSingle("policy", "");
+        assertNull(deniedExtraActionEvent("s3:GetBucketPolicy", "GET", policy,
+                "x-amz-expected-bucket-owner", "222233334444", "s3:GetBucketPolicy", "s3:GetBucketPolicy"));
     }
 
     @Test
@@ -2555,12 +2561,15 @@ class IamEnforcementFilterTest {
     }
 
     /**
-     * Runs an S3 request whose own action is allowed and whose extra action is denied, asserts the
-     * denial names the extra action, and returns the event name CloudTrail recorded for it.
+     * Runs an S3 request matched to {@code operation} whose own action is allowed and whose extra action is
+     * denied, asserts the denial names the extra action, and returns the event name CloudTrail recorded for
+     * it, or null when it recorded none. The same action given twice is the request's own action, denied.
      */
-    private String deniedExtraActionEvent(String method, MultivaluedHashMap<String, String> query, String header,
-                                          String headerValue, String allowedAction, String deniedAction) {
+    private String deniedExtraActionEvent(String operation, String method, MultivaluedHashMap<String, String> query,
+                                          String header, String headerValue, String allowedAction,
+                                          String deniedAction) {
         ContainerRequestContext containerRequest = mock(ContainerRequestContext.class);
+        when(containerRequest.getProperty(IamEnforcementFilter.RESOLVED_OPERATION_PROPERTY)).thenReturn(operation);
         UriInfo uriInfo = mock(UriInfo.class);
         when(uriInfo.getPath()).thenReturn("/bucket/object");
         when(uriInfo.getQueryParameters()).thenReturn(query);
@@ -2592,8 +2601,8 @@ class IamEnforcementFilterTest {
         assertEquals(403, denied.getValue().getStatus());
         assertTrue(entityString(denied.getValue()).contains(deniedAction));
         ArgumentCaptor<CloudTrailService.S3EventInput> event = ArgumentCaptor.captor();
-        verify(cloudTrail).emitS3DataEvent(event.capture());
-        return event.getValue().eventName();
+        verify(cloudTrail, atMost(1)).emitS3DataEvent(event.capture());
+        return event.getAllValues().isEmpty() ? null : event.getValue().eventName();
     }
 
     @Test

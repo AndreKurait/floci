@@ -106,13 +106,7 @@ public class ElastiCacheMemcachedContainerManager {
      * container that failed for its own reasons.
      */
     public boolean isDockerReachable() {
-        try {
-            lifecycleManager.getDockerClient().pingCmd().exec();
-            return true;
-        } catch (Exception e) {
-            LOG.debugv("Docker daemon is not reachable: {0}", e.getMessage());
-            return false;
-        }
+        return lifecycleManager.isDockerReachable();
     }
 
     /** {@code region} is null for a cluster recorded without one, which then counts as the default region's. */
@@ -127,6 +121,7 @@ public class ElastiCacheMemcachedContainerManager {
                 .withName(containerName)
                 .withDockerNetwork(config.services().elasticache().dockerNetwork())
                 .withLogRotation()
+                .withPushedLogs()
                 .withLabels(ContainerStorageHelper.resourceIdentityLabels(
                         "elasticache", clusterId, regionResolver.getAccountId(), effectiveRegion));
 
@@ -152,7 +147,7 @@ public class ElastiCacheMemcachedContainerManager {
         String logGroup = "/aws/elasticache/cluster/" + clusterId + "/engine-log";
         String logStream = logStreamer.generateLogStreamName(shortId);
 
-        Closeable logHandle = logStreamer.attach(
+        Closeable logHandle = logStreamer.attachPolled(
                 info.containerId(), logGroup, logStream, effectiveRegion, "elasticache-memcached:" + clusterId);
         handle.setLogStream(logHandle);
 

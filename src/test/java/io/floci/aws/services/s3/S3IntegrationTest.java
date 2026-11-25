@@ -1965,9 +1965,103 @@ class S3IntegrationTest {
 
     @Test
     @Order(76)
+    void anEncryptionRuleWithoutBlockedTypesKeepsSseCustomerBlocking() {
+        given()
+            .put("/sse-policy-bucket")
+        .then()
+            .statusCode(200);
+
+        given()
+            .body("<ServerSideEncryptionConfiguration><Rule>"
+                    + "<ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm>"
+                    + "</ApplyServerSideEncryptionByDefault></Rule></ServerSideEncryptionConfiguration>")
+        .when()
+            .put("/sse-policy-bucket?encryption")
+        .then()
+            .statusCode(200);
+
+        given()
+        .when()
+            .get("/sse-policy-bucket?encryption")
+        .then()
+            .statusCode(200)
+            .body(containsString("<BlockedEncryptionTypes><EncryptionType>SSE-C</EncryptionType>"));
+
+        given()
+            .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
+            .header("x-amz-server-side-encryption-customer-key", SSE_CUSTOMER_KEY)
+            .header("x-amz-server-side-encryption-customer-key-MD5", SSE_CUSTOMER_KEY_MD5)
+            .body("blocked")
+        .when()
+            .put("/sse-policy-bucket/blocked.txt")
+        .then()
+            .statusCode(403)
+            .body(containsString("AccessDenied"));
+
+        given()
+            .body("<ServerSideEncryptionConfiguration><Rule>"
+                    + "<ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm>"
+                    + "</ApplyServerSideEncryptionByDefault><BlockedEncryptionTypes>"
+                    + "<EncryptionType>NONE</EncryptionType></BlockedEncryptionTypes></Rule>"
+                    + "</ServerSideEncryptionConfiguration>")
+        .when()
+            .put("/sse-policy-bucket?encryption")
+        .then()
+            .statusCode(200);
+
+        given()
+        .when()
+            .get("/sse-policy-bucket?encryption")
+        .then()
+            .statusCode(200)
+            .body(containsString("<EncryptionType>NONE</EncryptionType>"));
+
+        given()
+            .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
+            .header("x-amz-server-side-encryption-customer-key", SSE_CUSTOMER_KEY)
+            .header("x-amz-server-side-encryption-customer-key-MD5", SSE_CUSTOMER_KEY_MD5)
+            .body("allowed")
+        .when()
+            .put("/sse-policy-bucket/allowed.txt")
+        .then()
+            .statusCode(200);
+
+        given().delete("/sse-policy-bucket/allowed.txt");
+        given().delete("/sse-policy-bucket");
+    }
+
+    @Test
+    @Order(76)
     void createSseBucketAndPutObject() {
         given()
             .put("/sse-bucket")
+        .then()
+            .statusCode(200);
+
+        given()
+        .when()
+            .get("/sse-bucket?encryption")
+        .then()
+            .statusCode(200)
+            .body(containsString("<BlockedEncryptionTypes><EncryptionType>SSE-C</EncryptionType>"));
+
+        given()
+            .header("x-amz-server-side-encryption-customer-algorithm", "AES256")
+            .header("x-amz-server-side-encryption-customer-key", SSE_CUSTOMER_KEY)
+            .header("x-amz-server-side-encryption-customer-key-MD5", SSE_CUSTOMER_KEY_MD5)
+            .body("blocked")
+        .when()
+            .put("/sse-bucket/default-blocked.txt")
+        .then()
+            .statusCode(403)
+            .body(containsString("AccessDenied"));
+
+        given()
+            .body("<ServerSideEncryptionConfiguration><Rule><BlockedEncryptionTypes>"
+                    + "<EncryptionType>NONE</EncryptionType></BlockedEncryptionTypes></Rule>"
+                    + "</ServerSideEncryptionConfiguration>")
+        .when()
+            .put("/sse-bucket?encryption")
         .then()
             .statusCode(200);
 
@@ -1997,15 +2091,49 @@ class S3IntegrationTest {
 
         given()
             .contentType("text/plain")
+            .header("x-amz-server-side-encryption", "aws:kms:dsse")
+            .header("x-amz-server-side-encryption-aws-kms-key-id", kmsKeyId)
+            .body("dsse-encrypted-content")
+        .when()
+            .put("/sse-bucket/dsse-encrypted.txt")
+        .then()
+            .statusCode(200)
+            .header("x-amz-server-side-encryption", equalTo("aws:kms:dsse"))
+            .header("x-amz-server-side-encryption-aws-kms-key-id", equalTo(kmsKeyId));
+
+        given()
+            .contentType("text/plain")
+            .header("x-amz-server-side-encryption-aws-kms-key-id", kmsKeyId)
+            .body("kms-id-without-algorithm")
+        .when()
+            .put("/sse-bucket/kms-id-without-algorithm.txt")
+        .then()
+            .statusCode(400)
+            .body(containsString("InvalidArgument"))
+            .body(containsString("Server Side Encryption with AWS KMS managed key requires HTTP header x-amz-server-side-encryption : aws:kms"));
+
+        given()
+            .contentType("text/plain")
             .header("x-amz-server-side-encryption", "AES256")
             .header("x-amz-server-side-encryption-aws-kms-key-id", kmsKeyId)
-            .body("aes-content")
+            .body("aes-with-kms-id")
         .when()
             .put("/sse-bucket/aes-with-kms-id.txt")
         .then()
-            .statusCode(200)
-            .header("x-amz-server-side-encryption", equalTo("AES256"))
-            .header("x-amz-server-side-encryption-aws-kms-key-id", nullValue());
+            .statusCode(400)
+            .body(containsString("InvalidArgument"))
+            .body(containsString("Server Side Encryption with AWS KMS managed key requires HTTP header x-amz-server-side-encryption : aws:kms"));
+
+        given()
+            .contentType("text/plain")
+            .header("x-amz-server-side-encryption-aws-kms-key-id", "")
+            .body("empty-kms-id")
+        .when()
+            .put("/sse-bucket/empty-kms-id.txt")
+        .then()
+            .statusCode(400)
+            .body(containsString("InvalidArgument"))
+            .body(containsString("Server Side Encryption with AWS KMS managed key requires HTTP header x-amz-server-side-encryption : aws:kms"));
     }
 
     @Test
@@ -2029,11 +2157,11 @@ class S3IntegrationTest {
 
         given()
         .when()
-            .get("/sse-bucket/aes-with-kms-id.txt")
+            .get("/sse-bucket/dsse-encrypted.txt")
         .then()
             .statusCode(200)
-            .header("x-amz-server-side-encryption", equalTo("AES256"))
-            .header("x-amz-server-side-encryption-aws-kms-key-id", nullValue());
+            .header("x-amz-server-side-encryption", equalTo("aws:kms:dsse"))
+            .header("x-amz-server-side-encryption-aws-kms-key-id", equalTo(kmsKeyId));
     }
 
     @Test
@@ -2058,7 +2186,7 @@ class S3IntegrationTest {
 
     @Test
     @Order(79)
-    void copyObjectPreservesServerSideEncryption() {
+    void copyObjectTakesTheDestinationBucketDefaultEncryptionUnlessTheRequestNamesOne() {
         given()
             .header("x-amz-copy-source", "/sse-bucket/encrypted.txt")
         .when()
@@ -2078,7 +2206,7 @@ class S3IntegrationTest {
             .statusCode(200)
             .header("x-amz-server-side-encryption", equalTo("AES256"));
 
-        String kmsKeyId = "arn:aws:kms:us-east-1:000000000000:key/test-key";
+        // The source is aws:kms, but sse-bucket has no default encryption configuration: the copy is SSE-S3.
         given()
             .header("x-amz-copy-source", "/sse-bucket/kms-encrypted.txt")
         .when()
@@ -2086,12 +2214,32 @@ class S3IntegrationTest {
         .then()
             .statusCode(200)
             .body(containsString("CopyObjectResult"))
+            .header("x-amz-server-side-encryption", equalTo("AES256"))
+            .header("x-amz-server-side-encryption-aws-kms-key-id", nullValue());
+
+        given()
+        .when()
+            .head("/sse-bucket/kms-encrypted-copy.txt")
+        .then()
+            .statusCode(200)
+            .header("x-amz-server-side-encryption", equalTo("AES256"))
+            .header("x-amz-server-side-encryption-aws-kms-key-id", nullValue());
+
+        String kmsKeyId = "arn:aws:kms:us-east-1:000000000000:key/test-key";
+        given()
+            .header("x-amz-copy-source", "/sse-bucket/encrypted.txt")
+            .header("x-amz-server-side-encryption", "aws:kms")
+            .header("x-amz-server-side-encryption-aws-kms-key-id", kmsKeyId)
+        .when()
+            .put("/sse-bucket/kms-requested-copy.txt")
+        .then()
+            .statusCode(200)
             .header("x-amz-server-side-encryption", equalTo("aws:kms"))
             .header("x-amz-server-side-encryption-aws-kms-key-id", equalTo(kmsKeyId));
 
         given()
         .when()
-            .head("/sse-bucket/kms-encrypted-copy.txt")
+            .head("/sse-bucket/kms-requested-copy.txt")
         .then()
             .statusCode(200)
             .header("x-amz-server-side-encryption", equalTo("aws:kms"))
@@ -2332,6 +2480,7 @@ class S3IntegrationTest {
         given().delete("/sse-bucket/aes-with-kms-id.txt");
         given().delete("/sse-bucket/kms-encrypted.txt");
         given().delete("/sse-bucket/kms-encrypted-copy.txt");
+        given().delete("/sse-bucket/kms-requested-copy.txt");
         given().delete("/sse-bucket/sse-c.txt");
         given().delete("/sse-bucket/sse-c-copy.txt");
         given().delete("/sse-bucket");

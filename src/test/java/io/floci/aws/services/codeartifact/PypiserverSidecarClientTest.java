@@ -6,9 +6,12 @@ import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.docker.ContainerBuilder;
 import io.floci.aws.core.common.docker.ContainerLifecycleManager;
 import io.floci.aws.core.common.docker.PerKeyContainerPool;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
@@ -29,6 +32,7 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
@@ -38,6 +42,7 @@ import static org.mockito.Mockito.mock;
  * in for a running pypiserver container. The container is registered in the manager's pool
  * directly, so readiness resolves to the fake server without any Docker daemon.
  */
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class PypiserverSidecarClientTest {
 
     private final ContainerBuilder containerBuilder = mock(ContainerBuilder.class);
@@ -61,6 +66,23 @@ class PypiserverSidecarClientTest {
     @AfterEach
     void tearDownBackend() {
         backend.stop(0);
+    }
+
+    @Test
+    void defaultTransportDoesNotRequestAnH2cUpgrade() throws Exception {
+        PypiserverSidecarManager manager = manager();
+        seedPooledContainer(manager, "pypi-repo-1", "tracked-pypiserver-1", backendUrl);
+        AtomicReference<String> upgrade = new AtomicReference<>("request not received");
+        backend.createContext("/simple/demo-pkg/", exchange -> {
+            upgrade.set(exchange.getRequestHeaders().getFirst("Upgrade"));
+            exchange.sendResponseHeaders(404, -1);
+            exchange.close();
+        });
+        PypiserverSidecarClient defaultClient = new PypiserverSidecarClient(manager, new ObjectMapper());
+
+        assertTrue(defaultClient.fetchPackageVersionAsset("pypi-repo-1", "dom", "repo", null,
+                "demo-pkg", "1.0.0", "demo_pkg-1.0.0.tar.gz").isEmpty());
+        assertNull(upgrade.get(), "the pinned pypiserver accepts HTTP/1.1 without an h2c upgrade");
     }
 
     @Test

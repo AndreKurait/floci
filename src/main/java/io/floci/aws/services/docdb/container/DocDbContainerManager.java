@@ -95,13 +95,7 @@ public class DocDbContainerManager {
      * container that failed for its own reasons.
      */
     public boolean isDockerReachable() {
-        try {
-            lifecycleManager.getDockerClient().pingCmd().exec();
-            return true;
-        } catch (Exception e) {
-            LOG.debugv("Docker daemon is not reachable: {0}", e.getMessage());
-            return false;
-        }
+        return lifecycleManager.isDockerReachable();
     }
 
     public DocDbContainerHandle start(String clusterId, String image, String masterUsername, String masterPassword,
@@ -122,6 +116,7 @@ public class DocDbContainerManager {
                 .withName(containerName)
                 .withDockerNetwork(config.services().docdb().dockerNetwork())
                 .withLogRotation()
+                .withPushedLogs()
                 .withEnv(envVars)
                 .withLabels(ContainerStorageHelper.resourceIdentityLabels(
                         "docdb", clusterId, accountId, region));
@@ -150,7 +145,7 @@ public class DocDbContainerManager {
         String logGroup = "/aws/docdb/cluster/" + clusterId + "/audit";
         String logStream = logStreamer.generateLogStreamName(shortId);
 
-        Closeable logHandle = logStreamer.attach(
+        Closeable logHandle = logStreamer.attachPolled(
                 info.containerId(), logGroup, logStream, region, "docdb:" + clusterId);
         handle.setLogStream(logHandle);
 

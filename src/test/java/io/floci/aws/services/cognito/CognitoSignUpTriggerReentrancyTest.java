@@ -19,10 +19,13 @@ import io.floci.aws.services.lambda.model.InvocationType;
 import io.floci.aws.services.lambda.model.InvokeResult;
 import io.floci.aws.services.sns.SnsService;
 import io.floci.aws.testing.InMemoryStorageFactory;
+import io.floci.aws.testing.ParallelLocks;
 import io.smallrye.config.SmallRyeConfigBuilder;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -56,6 +59,8 @@ import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
+@ResourceLock(ParallelLocks.CONFIG_MAPPING)
 class CognitoSignUpTriggerReentrancyTest {
     private static final ObjectMapper MAPPER = new ObjectMapper();
     private static final String FUNCTION = "signup-trigger";
@@ -87,7 +92,7 @@ class CognitoSignUpTriggerReentrancyTest {
                 new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
                 new InMemoryStorage<>(), new InMemoryStorage<>(), "http://localhost:4566",
                 regionResolver, lambdaService, null, codes,
-                new CognitoMessageDispatcher(null, smsService, "us-east-1"), null);
+                new CognitoMessageDispatcher(null, smsService, regionResolver), null);
     }
 
     @AfterEach
@@ -157,7 +162,7 @@ class CognitoSignUpTriggerReentrancyTest {
                 new InMemoryStorage<>(), new InMemoryStorage<>(), userStore,
                 new InMemoryStorage<>(), new InMemoryStorage<>(), "http://localhost:4566",
                 regionResolver, lambdaService, null, codes,
-                new CognitoMessageDispatcher(null, sns, "us-east-1"), null);
+                new CognitoMessageDispatcher(null, sns, regionResolver), null);
         UserPool pool = pool(Map.of("PostConfirmation", FUNCTION));
         UserPoolClient client = client(pool);
         service.signUp(client.getClientId(), "alice", "Perm1234!", Map.of("phone_number", PHONE), Map.of(), Map.of());

@@ -67,6 +67,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Function;
 
 /**
  * Unified AWS API Gateway management endpoints (v1 REST and v2 HTTP).
@@ -279,6 +280,16 @@ public class ApiGatewayController {
         return Pagination.parseMaxResults(limit, "limit", "BadRequestException");
     }
 
+    private <T> Response pageResponse(PaginatedResult<T> page, Function<T, JsonNode> toNode) {
+        ObjectNode root = objectMapper.createObjectNode();
+        ArrayNode items = root.putArray("item");
+        page.items().forEach(item -> items.add(toNode.apply(item)));
+        if (page.nextToken() != null) {
+            root.put("position", page.nextToken());
+        }
+        return Response.ok(root.toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
     @GET
     @Path("/restapis/{apiId}/authorizers")
     public Response getAuthorizers(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
@@ -286,13 +297,7 @@ public class ApiGatewayController {
         String region = regionResolver.resolveRegion(headers);
         // Authorizer clashes with the imported API Gateway v2 model
         PaginatedResult<io.floci.aws.services.apigateway.model.Authorizer> page = service.getAuthorizerPage(region, apiId, pageLimit(limit), position);
-        ObjectNode root = objectMapper.createObjectNode();
-        ArrayNode items = root.putArray("item");
-        page.items().forEach(a -> items.add(toAuthorizerNode(a)));
-        if (page.nextToken() != null) {
-            root.put("position", page.nextToken());
-        }
-        return Response.ok(root.toString()).type(MediaType.APPLICATION_JSON).build();
+        return pageResponse(page, this::toAuthorizerNode);
     }
 
     @GET
@@ -655,14 +660,10 @@ public class ApiGatewayController {
 
     @GET
     @Path("/restapis/{apiId}/deployments")
-    public Response getDeployments(@Context HttpHeaders headers,
-                                   @PathParam("apiId") String apiId) {
+    public Response getDeployments(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
+                                   @QueryParam("limit") String limit, @QueryParam("position") String position) {
         String region = regionResolver.resolveRegion(headers);
-        List<io.floci.aws.services.apigateway.model.Deployment> deployments = service.getDeployments(region, apiId);
-        ObjectNode root = objectMapper.createObjectNode();
-        ArrayNode items = root.putArray("item");
-        deployments.forEach(d -> items.add(toDeploymentNode(d)));
-        return Response.ok(root.toString()).type(MediaType.APPLICATION_JSON).build();
+        return pageResponse(service.getDeploymentsPage(region, apiId, limit, position), this::toDeploymentNode);
     }
 
     @GET
@@ -906,13 +907,11 @@ public class ApiGatewayController {
 
     @GET
     @Path("/usageplans")
-    public Response getUsagePlans(@Context HttpHeaders headers, @QueryParam("keyId") String keyId) {
+    public Response getUsagePlans(@Context HttpHeaders headers, @QueryParam("keyId") String keyId,
+                                  @QueryParam("limit") String limit, @QueryParam("position") String position) {
         String region = regionResolver.resolveRegion(headers);
-        List<UsagePlan> plans = service.getUsagePlans(region, keyId);
-        ObjectNode root = objectMapper.createObjectNode();
-        ArrayNode items = root.putArray("item");
-        plans.forEach(p -> items.add(toUsagePlanNode(p, false)));
-        return Response.ok(root.toString()).type(MediaType.APPLICATION_JSON).build();
+        PaginatedResult<UsagePlan> page = service.getUsagePlanPage(region, keyId, pageLimit(limit), position);
+        return pageResponse(page, p -> toUsagePlanNode(p, false));
     }
 
     @GET
@@ -1136,13 +1135,11 @@ public class ApiGatewayController {
 
     @GET
     @Path("/restapis/{apiId}/requestvalidators")
-    public Response getRequestValidators(@Context HttpHeaders headers, @PathParam("apiId") String apiId) {
+    public Response getRequestValidators(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
+                                         @QueryParam("limit") String limit, @QueryParam("position") String position) {
         String region = regionResolver.resolveRegion(headers);
-        List<RequestValidator> validators = service.getRequestValidators(region, apiId);
-        ObjectNode root = objectMapper.createObjectNode();
-        ArrayNode items = root.putArray("item");
-        validators.forEach(v -> items.add(toRequestValidatorNode(v)));
-        return Response.ok(root.toString()).type(MediaType.APPLICATION_JSON).build();
+        PaginatedResult<RequestValidator> page = service.getRequestValidatorPage(region, apiId, pageLimit(limit), position);
+        return pageResponse(page, this::toRequestValidatorNode);
     }
 
     @GET
@@ -1194,13 +1191,13 @@ public class ApiGatewayController {
 
     @GET
     @Path("/restapis/{apiId}/models")
-    public Response getModels(@Context HttpHeaders headers, @PathParam("apiId") String apiId) {
+    public Response getModels(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
+                              @QueryParam("limit") String limit, @QueryParam("position") String position) {
         String region = regionResolver.resolveRegion(headers);
-        List<io.floci.aws.services.apigateway.model.Model> models = service.getModels(region, apiId);
-        ObjectNode root = objectMapper.createObjectNode();
-        ArrayNode items = root.putArray("item");
-        models.forEach(m -> items.add(toModelNode(m)));
-        return Response.ok(root.toString()).type(MediaType.APPLICATION_JSON).build();
+        // Model clashes with the imported API Gateway v2 model
+        PaginatedResult<io.floci.aws.services.apigateway.model.Model> page =
+                service.getModelPage(region, apiId, pageLimit(limit), position);
+        return pageResponse(page, this::toModelNode);
     }
 
     @GET
@@ -1210,6 +1207,16 @@ public class ApiGatewayController {
                              @PathParam("modelName") String modelName) {
         String region = regionResolver.resolveRegion(headers);
         return Response.ok(toModelNode(service.getModel(region, apiId, modelName)).toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @GET
+    @Path("/restapis/{apiId}/models/{modelName}/default_template")
+    public Response getModelTemplate(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
+                                     @PathParam("modelName") String modelName) {
+        String region = regionResolver.resolveRegion(headers);
+        String value = service.getModelTemplate(region, apiId, modelName);
+        return Response.ok(objectMapper.createObjectNode().put("value", value).toString())
+                .type(MediaType.APPLICATION_JSON).build();
     }
 
     @PATCH
@@ -1259,13 +1266,7 @@ public class ApiGatewayController {
         String region = regionResolver.resolveRegion(headers);
         PaginatedResult<DocumentationPart> page = service.getDocumentationParts(region, apiId, type, name,
                 path, locationStatus, pageLimit(limit), position);
-        ObjectNode root = objectMapper.createObjectNode();
-        ArrayNode items = root.putArray("item");
-        page.items().forEach(part -> items.add(objectMapper.valueToTree(part)));
-        if (page.nextToken() != null) {
-            root.put("position", page.nextToken());
-        }
-        return Response.ok(root.toString()).type(MediaType.APPLICATION_JSON).build();
+        return pageResponse(page, part -> objectMapper.valueToTree(part));
     }
 
     @GET
@@ -1365,13 +1366,11 @@ public class ApiGatewayController {
 
     @GET
     @Path("/domainnames/{domainName}/basepathmappings")
-    public Response getBasePathMappings(@Context HttpHeaders headers, @PathParam("domainName") String domainName) {
+    public Response getBasePathMappings(@Context HttpHeaders headers, @PathParam("domainName") String domainName,
+                                        @QueryParam("limit") String limit, @QueryParam("position") String position) {
         String region = regionResolver.resolveRegion(headers);
-        List<BasePathMapping> mappings = service.getBasePathMappings(region, domainName);
-        ObjectNode root = objectMapper.createObjectNode();
-        ArrayNode items = root.putArray("item");
-        mappings.forEach(m -> items.add(toMappingNode(m)));
-        return Response.ok(root.toString()).type(MediaType.APPLICATION_JSON).build();
+        PaginatedResult<BasePathMapping> page = service.getBasePathMappingsPage(region, domainName, limit, position);
+        return pageResponse(page, this::toMappingNode);
     }
 
     @GET
@@ -1652,12 +1651,13 @@ public class ApiGatewayController {
 
     @GET
     @Path("/vpclinks")
-    public Response getV1VpcLinks(@Context HttpHeaders headers) {
+    public Response getV1VpcLinks(@Context HttpHeaders headers,
+                                  @QueryParam("limit") String limit, @QueryParam("position") String position) {
         String region = regionResolver.resolveRegion(headers);
-        ObjectNode result = objectMapper.createObjectNode();
-        ArrayNode items = result.putArray("item");
-        service.getVpcLinks(region).forEach(l -> items.add(toV1VpcLinkNode(l)));
-        return Response.ok(result.toString()).type(MediaType.APPLICATION_JSON).build();
+        // VpcLink clashes with the imported API Gateway v2 model
+        PaginatedResult<io.floci.aws.services.apigateway.model.VpcLink> page =
+                service.getVpcLinkPage(region, pageLimit(limit), position);
+        return pageResponse(page, this::toV1VpcLinkNode);
     }
 
     @GET
@@ -2241,6 +2241,16 @@ public class ApiGatewayController {
                                @PathParam("modelId") String modelId) {
         String region = regionResolver.resolveRegion(headers);
         return Response.ok(toV2ModelNode(v2Service.getModel(region, apiId, modelId)).toString()).type(MediaType.APPLICATION_JSON).build();
+    }
+
+    @GET
+    @Path("/v2/apis/{apiId}/models/{modelId}/template")
+    public Response getV2ModelTemplate(@Context HttpHeaders headers, @PathParam("apiId") String apiId,
+                                     @PathParam("modelId") String modelId) {
+        String region = regionResolver.resolveRegion(headers);
+        String value = v2Service.getModelTemplate(region, apiId, modelId);
+        return Response.ok(objectMapper.createObjectNode().put("value", value).toString())
+                .type(MediaType.APPLICATION_JSON).build();
     }
 
     @PATCH
@@ -2883,6 +2893,12 @@ public class ApiGatewayController {
         }
         if (i.getConnectionType() != null) node.put("connectionType", i.getConnectionType());
         if (i.getConnectionId() != null) node.put("connectionId", i.getConnectionId());
+        if (i.getTlsConfig() != null) {
+            ObjectNode tlsConfig = node.putObject("tlsConfig");
+            if (i.getTlsConfig().getServerNameToVerify() != null) {
+                tlsConfig.put("serverNameToVerify", i.getTlsConfig().getServerNameToVerify());
+            }
+        }
         node.put("payloadFormatVersion", i.getPayloadFormatVersion());
         if (i.getCredentialsArn() != null) {
             node.put("credentialsArn", i.getCredentialsArn());
@@ -2899,6 +2915,9 @@ public class ApiGatewayController {
         if (i.getRequestParameters() != null) {
             ObjectNode requestParameters = node.putObject("requestParameters");
             i.getRequestParameters().forEach(requestParameters::put);
+        }
+        if (i.getResponseParameters() != null) {
+            node.set("responseParameters", objectMapper.valueToTree(i.getResponseParameters()));
         }
         if (i.getTemplateSelectionExpression() != null) {
             node.put("templateSelectionExpression", i.getTemplateSelectionExpression());

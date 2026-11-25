@@ -99,10 +99,17 @@ returns the empty policy `{}`. A profile ARN of another account or partition ret
 `ResourceNotFoundException`; whether the profile's Region is a destination of the
 calling Region is not checked.
 
-With IAM enforcement on, `PutResourcePolicy`, `GetResourcePolicy` and
-`DeleteResourcePolicy` are authorized as `bedrock:PutResourcePolicy`,
-`bedrock:GetResourcePolicy` and `bedrock:DeleteResourcePolicy` on the ARN the request
-names.
+With IAM enforcement on, every Bedrock and Bedrock Runtime request is authorized as the action
+AWS's Service Reference gives its operation, on the resources its request names, read from the
+generated tables like other services' requests: `GetGuardrail` on the guardrail its path names,
+`PutResourcePolicy`, `GetResourcePolicy` and `DeleteResourcePolicy` on the ARN the request
+names, and `TagResource`, `UntagResource` and `ListTagsForResource` on the guardrail or
+application inference profile ARN they carry. A `CreateGuardrail` or `CreateInferenceProfile`
+carrying tags also needs `bedrock:TagResource`, with `aws:RequestTag` and `aws:TagKeys` taken
+from those tags. The tables do not read the model an `InvokeModel` or
+`InvokeModelWithResponseStream` request names, so those two are checked on the account's
+`marketplace/model-endpoint/all-access` resource, the one type of their actions that names no
+model.
 
 Guardrails are listed by the Resource Groups Tagging API (resource type `bedrock:guardrail`)
 and Resource Explorer with their own tags, and `TagResources` / `UntagResources` there change
@@ -113,11 +120,12 @@ those tags, as `TagResource` and `UntagResource` do.
 `ListFoundationModels` and `GetFoundationModel` read a fixed catalog,
 `bedrock/model-catalog.yaml`. System-defined inference profiles come from the same seed,
 while application inference profiles are created and stored by the Bedrock control plane.
-The catalog is a seed rather than a mirror of AWS: a few real models (Amazon Nova Micro
-and Nova Lite, Titan Text Embeddings V2, Llama 3.1 8B Instruct and Claude Sonnet 4.5)
+The catalog is a seed rather than a mirror of AWS: a few real models (Amazon Nova Micro,
+Nova Lite and Nova Pro, Titan Text Embeddings V2, Llama 3.1 8B Instruct and Claude Sonnet 4.5)
 with the modalities, streaming support, lifecycle status and Regional availability their
 [model cards](https://docs.aws.amazon.com/bedrock/latest/userguide/model-cards.html) publish,
-and their US and EU system-defined inference profiles.
+and selected US and EU system-defined inference profiles. Nova Pro is seeded for its
+direct In-Region availability; its system-defined inference profiles are not seeded.
 
 The answers depend on the calling Region, as on AWS:
 
@@ -134,9 +142,10 @@ The answers depend on the calling Region, as on AWS:
   the calling Region, so `us.amazon.nova-lite-v1:0` called from `us-west-1` routes to four Regions and from
   `us-east-1` to three. `GetInferenceProfile` on a profile the Region cannot use returns
   `ResourceNotFoundException`.
-- `inferenceTypesSupported` is `ON_DEMAND` only where the model is served in the Region
-  itself, and empty where it is reachable only through an inference profile, so
-  `byInferenceType=ON_DEMAND` leaves those out.
+- `inferenceTypesSupported` includes `ON_DEMAND` where the model is served in the Region
+  itself, and `INFERENCE_PROFILE` where a seeded system-defined profile can be called from
+  the Region. A model reachable only through a profile reports `INFERENCE_PROFILE` without
+  `ON_DEMAND`, so `byInferenceType=ON_DEMAND` leaves those out.
 - `modelArn` is `arn:<partition>:bedrock:<region>::foundation-model/<modelId>`, and
   the system-defined `inferenceProfileArn` carries the calling Region and account.
   `GetInferenceProfile` answers an ARN of another service or without an account with

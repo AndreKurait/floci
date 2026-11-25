@@ -21,6 +21,7 @@ import io.floci.aws.services.eks.model.Nodegroup;
 import io.floci.aws.services.eks.model.PodIdentityAssociation;
 import io.floci.aws.services.eks.model.Update;
 import io.floci.aws.services.eks.model.UpdateAddonRequest;
+import io.floci.aws.services.eks.model.UpdateClusterConfigRequest;
 import io.floci.aws.services.eks.model.UpdatePodIdentityAssociationRequest;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.Consumes;
@@ -37,6 +38,7 @@ import jakarta.ws.rs.core.Response;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * EKS REST-JSON controller.
@@ -58,6 +60,13 @@ public class EksController {
     public static final String ACCESS_POLICY_ARN = "arn(?::|%3[aA])[a-z-]+(?::|%3[aA])eks(?::|%3[aA])(?::|%3[aA])"
             + "aws(?::|%3[aA])cluster-access-policy(?:/|%2[fF])[^/]+";
 
+
+    private static final List<String> UPDATE_CONFIG_FAMILIES =
+            List.of("resourcesVpcConfig", "logging", "accessConfig", "upgradePolicy");
+    /** The members that together make one EKS Auto Mode update. */
+    private static final List<String> AUTO_MODE_MEMBERS = List.of("computeConfig", "storageConfig", "kubernetesNetworkConfig");
+    private static final Set<String> UPDATE_CONFIG_MEMBERS = Set.of("name", "clientRequestToken", "resourcesVpcConfig",
+            "logging", "accessConfig", "upgradePolicy", "computeConfig", "storageConfig", "kubernetesNetworkConfig");
 
     private final EksService eksService;
     private final EksAccessEntryService accessEntries;
@@ -95,7 +104,7 @@ public class EksController {
                 throw new AwsException("SerializationException", e.getOriginalMessage(), 400);
             }
         }
-        Cluster cluster = eksService.createCluster(request);
+        Cluster cluster = eksService.createCluster(request, body);
         return Response.ok(Map.of("cluster", toClusterResponse(cluster))).build();
     }
 
@@ -131,9 +140,10 @@ public class EksController {
      */
     private Cluster toClusterResponse(Cluster cluster) {
         if (cluster == null || (!cluster.isExplicitVersion() && cluster.getNodeInstanceType() == null
-                && cluster.getNodePrivateIp() == null
+                && cluster.getNodePrivateIp() == null && cluster.getNodePodPrefixes() == null
                 && cluster.getClusterArgs() == null && cluster.getDefaultStorageClass() == null
-                && cluster.getJoinedInstanceIds() == null && cluster.getDockerNameRegion() == null)) {
+                && cluster.getJoinedInstanceIds() == null && cluster.getDockerNameRegion() == null
+                && cluster.getCreateRequest() == null && cluster.getClientRequestToken() == null)) {
             return cluster;
         }
         Cluster response = cluster.copy();
@@ -141,9 +151,12 @@ public class EksController {
         response.setExplicitVersion(false);
         response.setNodeInstanceType(null);
         response.setNodePrivateIp(null);
+        response.setNodePodPrefixes(null);
         response.setClusterArgs(null);
         response.setDefaultStorageClass(null);
         response.setJoinedInstanceIds(null);
+        response.setCreateRequest(null);
+        response.setClientRequestToken(null);
         return response;
     }
 
@@ -341,6 +354,52 @@ public class EksController {
         Cluster cluster = eksService.requireClusterInRequestRegion(name);
         Update update = addons.update(cluster, addonName, request);
         return Response.ok(Map.of("update", update)).build();
+    }
+
+    /**
+     * The body is checked against its botocore shape as {@link #createCluster} checks its own. A member floci does
+     * not apply is refused rather than dropped. The service applies every family the request names; this endpoint
+     * refuses more than one, as EKS does.
+     */
+    @POST
+    @Path("/clusters/{name}/update-config")
+    public Response updateClusterConfig(@PathParam("name") String name, JsonNode body) {
+        UpdateClusterConfigRequest request = null;
+        if (body != null) {
+            EksRequestShapes.check("UpdateClusterConfig", body);
+            for (String member : (Iterable<String>) body::fieldNames) {
+                if (!UPDATE_CONFIG_MEMBERS.contains(member)) {
+                    throw new AwsException("InvalidParameterException",
+                            "Floci does not support updating " + member + " through UpdateClusterConfig yet", 400);
+                }
+            }
+            JsonNode network = body.path("kubernetesNetworkConfig");
+            for (String member : (Iterable<String>) network::fieldNames) {
+                if (!"elasticLoadBalancing".equals(member)) {
+                    throw new AwsException("InvalidParameterException",
+                            "Floci does not support updating kubernetesNetworkConfig." + member
+                                    + " through UpdateClusterConfig yet", 400);
+                }
+            }
+            for (String member : (Iterable<String>) network.path("elasticLoadBalancing")::fieldNames) {
+                if (!"enabled".equals(member)) {
+                    throw new AwsException("InvalidParameterException",
+                            "Floci does not support updating kubernetesNetworkConfig.elasticLoadBalancing." + member
+                                    + " through UpdateClusterConfig yet", 400);
+                }
+            }
+            long families = UPDATE_CONFIG_FAMILIES.stream().filter(body::has).count()
+                    + (AUTO_MODE_MEMBERS.stream().anyMatch(body::has) ? 1 : 0);
+            if (families > 1) {
+                throw new AwsException("InvalidParameterException", "Only one type of update can be allowed.", 400);
+            }
+            try {
+                request = objectMapper.treeToValue(body, UpdateClusterConfigRequest.class);
+            } catch (JsonProcessingException e) {
+                throw new AwsException("SerializationException", e.getOriginalMessage(), 400);
+            }
+        }
+        return Response.ok(Map.of("update", eksService.updateClusterConfig(name, request).get(0))).build();
     }
 
     @GET

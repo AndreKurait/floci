@@ -3,16 +3,22 @@ package io.floci.aws.core.common;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.config.EmulatorConfig;
-import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsCrossAccountService;
-import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsService;
+import io.floci.aws.core.storage.AccountAwareStorageBackend;
+import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.dynamodb.DynamoDbFacade;
 import io.floci.aws.services.dynamodb.DynamoDbService;
 import io.floci.aws.services.dynamodb.backend.NativeDynamoDbBackend;
 import io.floci.aws.services.dynamodb.model.KeySchemaElement;
 import io.floci.aws.services.dynamodb.model.TableDefinition;
+import io.floci.aws.services.ec2.AmiImageResolver;
+import io.floci.aws.services.ec2.Ec2ContainerManager;
+import io.floci.aws.services.ec2.Ec2ImageCatalog;
+import io.floci.aws.services.ec2.Ec2InstanceTypeCatalog;
 import io.floci.aws.services.ec2.Ec2Service;
+import io.floci.aws.services.ec2.Ec2StoredResourceArns;
 import io.floci.aws.services.ec2.model.NetworkInterface;
 import io.floci.aws.services.ec2.model.Tag;
+import io.floci.aws.services.ec2.portforward.Ec2PortForwardManager;
 import io.floci.aws.services.iam.IamPolicyEvaluator;
 import io.floci.aws.services.iam.IamPolicyEvaluator.Decision;
 import io.floci.aws.services.iam.IamService;
@@ -21,6 +27,7 @@ import io.floci.aws.services.iam.model.IamUser;
 import io.floci.aws.services.lambdaweb.LambdaWebService;
 import io.floci.aws.services.lambdaweb.model.WebFunctionEndpoint;
 import io.floci.aws.services.s3.S3Service;
+import io.floci.aws.testing.ParallelLocks;
 import jakarta.enterprise.inject.Instance;
 import jakarta.ws.rs.WebApplicationException;
 import jakarta.ws.rs.container.ContainerRequestContext;
@@ -30,6 +37,7 @@ import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.UriInfo;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
@@ -61,13 +69,13 @@ import static org.mockito.ArgumentMatchers.anyCollection;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
-import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+@ResourceLock(ParallelLocks.PORTS)
 class IamConditionContextResolverTest {
 
     private static final Instant LOCK_NOW = Instant.parse("2026-01-01T00:00:00Z");
@@ -77,8 +85,6 @@ class IamConditionContextResolverTest {
     private Instance<DynamoDbFacade> dynamoDbFacadeInstance;
     private Ec2Service ec2Service;
     private S3Service s3Service;
-    private CloudWatchLogsService logsService;
-    private CloudWatchLogsCrossAccountService crossAccountService;
     private IamService iamService;
     private LambdaWebService lambdaWebService;
     private RequestContext requestContext;
@@ -123,14 +129,6 @@ class IamConditionContextResolverTest {
         Instance<S3Service> s3ServiceInstance = mock(Instance.class);
         when(s3ServiceInstance.isResolvable()).thenReturn(true);
         when(s3ServiceInstance.get()).thenReturn(s3Service);
-        logsService = mock(CloudWatchLogsService.class);
-        Instance<CloudWatchLogsService> logsServiceInstance = mock(Instance.class);
-        when(logsServiceInstance.isResolvable()).thenReturn(true);
-        when(logsServiceInstance.get()).thenReturn(logsService);
-        crossAccountService = mock(CloudWatchLogsCrossAccountService.class);
-        Instance<CloudWatchLogsCrossAccountService> crossAccountServiceInstance = mock(Instance.class);
-        when(crossAccountServiceInstance.isResolvable()).thenReturn(true);
-        when(crossAccountServiceInstance.get()).thenReturn(crossAccountService);
         iamService = mock(IamService.class);
         Instance<IamService> iamServiceInstance = mock(Instance.class);
         when(iamServiceInstance.isResolvable()).thenReturn(true);
@@ -152,8 +150,7 @@ class IamConditionContextResolverTest {
         ServiceCatalog catalog = new ServiceCatalog(List.of(dynamo));
         when(serviceCatalog.matchTarget(any())).thenAnswer(call -> catalog.matchTarget(call.getArgument(0)));
         resolver = new IamConditionContextResolver(
-                dynamoDbFacadeInstance, ec2ServiceInstance, s3ServiceInstance, logsServiceInstance,
-                crossAccountServiceInstance, iamServiceInstance,
+                dynamoDbFacadeInstance, ec2ServiceInstance, s3ServiceInstance, iamServiceInstance,
                 lambdaWebServiceInstance, spellings(new ShapeNamingSpelling()), mock(Instance.class),
                 requestContext, new RegionResolver("us-east-1", "123456789012"), config,
                 null, serviceCatalog);
@@ -237,42 +234,36 @@ class IamConditionContextResolverTest {
     }
 
     @Test
-    void logStreamTagsUseRawParentNameAndRequestRegion() throws Exception {
+    void anAssumeRoleRequestCarriesItsSessionNameAndExternalId() {
+        assertEquals(Map.of("sts:RoleSessionName", List.of("alice"), "sts:ExternalId", List.of("partner-42")),
+                resolver.resolve("sts", "sts:AssumeRole", formRequest(
+                        "Action=AssumeRole&RoleArn=arn%3Aaws%3Aiam%3A%3A111111111111%3Arole%2Fr"
+                                + "&RoleSessionName=alice&ExternalId=partner-42")));
+        assertEquals(Map.of("sts:RoleSessionName", List.of("alice")), resolver.resolve("sts", "sts:AssumeRole",
+                formRequest("Action=AssumeRole&RoleSessionName=alice")), "no ExternalId, no sts:ExternalId");
+        assertNull(resolver.resolve("sts", "sts:GetCallerIdentity", formRequest("Action=GetCallerIdentity")));
+    }
+
+    /** A Logs create or tag call carries the tags it asks to attach or remove; what it names carries its own. */
+    @Test
+    void aLogsTagCallCarriesTheTagsItAsksToAttachOrRemove() throws Exception {
         ContainerRequestContext request = mock(ContainerRequestContext.class);
+        String group = "\"resourceArn\":\"arn:aws:logs:us-east-1:123456789012:log-group:app\"";
         when(request.getProperty("floci.bufferedJsonBody"))
-                .thenReturn(mapper.readTree("{\"logGroupName\":\" group \",\"logStreamName\":42}"));
-        when(logsService.listTagsLogGroup(" group ", "eu-west-1")).thenReturn(Map.of("team", "blue"));
-        requestContext.setRegion("eu-west-1");
-        for (String action : List.of("logs:CreateLogStream", "logs:DeleteLogStream")) {
-            assertEquals(Map.of("aws:ResourceTag/team", List.of("blue")), resolver.resolve("logs", action, request));
-        }
-        requestContext.setRegion(null);
-        when(logsService.listTagsLogGroup(" group ", "us-east-1")).thenReturn(Map.of("team", "red"));
-        assertEquals(Map.of("aws:ResourceTag/team", List.of("red")),
-                resolver.resolve("logs", "logs:CreateLogStream", request));
-    }
-
-    @Test
-    void missingLogGroupTagsDoNotReplaceTheHandlersMissingResourceError() throws Exception {
-        ContainerRequestContext request = mock(ContainerRequestContext.class);
-        when(request.getProperty("floci.bufferedJsonBody")).thenReturn(mapper.readTree("{\"logGroupName\":42}"));
-        when(logsService.listTagsLogGroup("42", "us-east-1"))
-                .thenThrow(new AwsException("ResourceNotFoundException", "missing", 400));
-        assertNull(resolver.resolve("logs", "logs:DeleteLogStream", request));
-    }
-
-    @Test
-    void unexpectedLogGroupLookupFailuresCannotEraseTagDenies() throws Exception {
-        ContainerRequestContext request = mock(ContainerRequestContext.class);
-        when(request.getProperty("floci.bufferedJsonBody")).thenReturn(mapper.readTree("{\"logGroupName\":\"group\"}"));
-        AwsException failure = new AwsException("InternalFailure", "storage unavailable", 500);
-        when(logsService.listTagsLogGroup("group", "us-east-1")).thenThrow(failure);
-        assertSame(failure, assertThrows(AwsException.class,
-                () -> resolver.resolve("logs", "logs:CreateLogStream", request)));
-        IllegalStateException unexpected = new IllegalStateException("unavailable");
-        doThrow(unexpected).when(logsService).listTagsLogGroup("group", "us-east-1");
-        assertSame(unexpected, assertThrows(IllegalStateException.class,
-                () -> resolver.resolve("logs", "logs:DeleteLogStream", request)));
+                .thenReturn(mapper.readTree("{" + group + ",\"tags\":{\"team\":\"blue\"}}"));
+        assertEquals(Map.of("aws:RequestTag/team", List.of("blue"), "aws:TagKeys", List.of("team")),
+                resolver.resolve("logs", "logs:TagResource", request));
+        when(request.getProperty("floci.bufferedJsonBody"))
+                .thenReturn(mapper.readTree("{" + group + ",\"tagKeys\":[\"team\"]}"));
+        assertEquals(Map.of("aws:TagKeys", List.of("team")), resolver.resolve("logs", "logs:UntagResource", request));
+        when(request.getProperty("floci.bufferedJsonBody"))
+                .thenReturn(mapper.readTree("{\"logGroupName\":\"app\",\"tags\":{\"team\":\"red\"}}"));
+        assertEquals(Map.of("aws:RequestTag/team", List.of("red"), "aws:TagKeys", List.of("team")),
+                resolver.resolve("logs", "logs:CreateLogGroup", request));
+        when(request.getProperty("floci.bufferedJsonBody"))
+                .thenReturn(mapper.readTree("{\"logGroupName\":\"app\",\"logStreamName\":\"s\"}"));
+        assertNull(resolver.resolve("logs", "logs:CreateLogGroup", request));
+        assertNull(resolver.resolve("logs", "logs:CreateLogStream", request));
     }
 
     /** A form request whose body can be read again, as a real request's restored stream can. */
@@ -855,7 +846,7 @@ class IamConditionContextResolverTest {
     @SuppressWarnings("unchecked")
     private IamConditionContextResolver resolverAt(Instant now) {
         return new IamConditionContextResolver(mock(Instance.class), mock(Instance.class), mock(Instance.class),
-                mock(Instance.class), mock(Instance.class), mock(Instance.class), mock(Instance.class),
+                mock(Instance.class), mock(Instance.class),
                 spellings(), mock(Instance.class), requestContext, new RegionResolver("us-east-1", "123456789012"),
                 config, null,
                 serviceCatalog, Clock.fixed(now, ZoneOffset.UTC));
@@ -867,9 +858,160 @@ class IamConditionContextResolverTest {
         Instance<StoredResourceArns> instance = mock(Instance.class);
         when(instance.iterator()).thenAnswer(invocation -> List.of(stored).iterator());
         return new IamConditionContextResolver(mock(Instance.class), mock(Instance.class), mock(Instance.class),
-                mock(Instance.class), mock(Instance.class), mock(Instance.class), mock(Instance.class),
+                mock(Instance.class), mock(Instance.class),
                 spellings(), instance, requestContext, new RegionResolver("us-east-1", "123456789012"), config,
                 null, serviceCatalog, Clock.systemUTC());
+    }
+
+    @Test
+    void ec2MainPortAccountlessImageReadsCallerTags() {
+        when(ec2Service.resourceTags("123456789012", "us-east-1", "ami-0123456789"))
+                .thenReturn(List.of(new Tag("Team", "payments")));
+        Map<String, List<String>> context = ec2ResourceContext(resolver, "ec2", "ec2:ModifyImageAttribute",
+                "arn:aws:ec2:us-east-1::image/ami-0123456789", "us-east-1", "123456789012", Map.of());
+        assertEquals(List.of("payments"), context.get("aws:ResourceTag/Team"));
+    }
+
+    @Test
+    void ec2MainPortAccountlessImageRetainsGeneratedResourceKeys() {
+        String image = "ami-0123456789";
+        when(ec2Service.resourceTags("123456789012", "us-east-1", image))
+                .thenReturn(List.of(new Tag("Team", "payments")));
+        when(ec2Service.heldResources("us-east-1", "image", List.of(image))).thenReturn(Map.of(image,
+                Map.of("ImageId", image, "OwnerId", "123456789012", "Public", false)));
+        Map<String, List<String>> context = ec2ResourceContext(resolver, "ec2", "ec2:ModifyImageAttribute",
+                "arn:aws:ec2:us-east-1::image/" + image, "us-east-1", "123456789012",
+                Map.of("ec2:Owner", List.of("stale"), "ec2:Public", List.of("true"),
+                        "aws:ResourceTag/Team", List.of("stale")));
+        assertEquals(List.of(image), context.get("ec2:ImageID"));
+        assertEquals(List.of("123456789012"), context.get("ec2:Owner"));
+        assertEquals(List.of("false"), context.get("ec2:Public"));
+        assertEquals(List.of("payments"), context.get("aws:ResourceTag/Team"));
+    }
+
+    @Test
+    void ec2MainPortForeignArnCannotRetainCallerResourceTags() {
+        Map<String, List<String>> context = ec2ResourceContext(resolver, "ec2", "ec2:ModifyVpcEndpoint",
+                "arn:aws:ec2:eu-west-1:111111111111:vpc-endpoint/vpce-0123456789", "us-east-1",
+                "123456789012", Map.of("aws:ResourceTag/OpenSearchManaged", List.of("true")));
+        assertFalse(context.containsKey("aws:ResourceTag/OpenSearchManaged"));
+    }
+
+    @Test
+    void ec2MainPortForeignArnReadsItsAccountAndRegion() {
+        when(ec2Service.resourceTags("111111111111", "eu-west-1", "vpce-0123456789"))
+                .thenReturn(List.of(new Tag("OpenSearchManaged", "true")));
+        Map<String, List<String>> context = ec2ResourceContext(resolver, "ec2", "ec2:ModifyVpcEndpoint",
+                "arn:aws:ec2:eu-west-1:111111111111:vpc-endpoint/vpce-0123456789", "us-east-1",
+                "123456789012", Map.of("aws:ResourceTag/OpenSearchManaged", List.of("false")));
+        assertEquals(List.of("true"), context.get("aws:ResourceTag/OpenSearchManaged"));
+        verify(ec2Service).resourceTags("111111111111", "eu-west-1", "vpce-0123456789");
+        verify(ec2Service, never()).resourceTags(anyString(), anyString());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"111111111111", "123456789012"})
+    void ec2ArnReadsRealStoredTagsAcrossAccountsAndRegions(String targetAccount) {
+        AccountAwareStorageBackend<List<Tag>> tags = AccountAwareStorageBackend.inMemory("123456789012");
+        tags.putForAccount("123456789012", "us-east-1::vpce-0123456789", List.of(new Tag("Team", "caller-east")));
+        tags.putForAccount("123456789012", "eu-west-1::vpce-0123456789", List.of(new Tag("Team", "caller-west")));
+        tags.putForAccount("111111111111", "us-east-1::vpce-0123456789", List.of(new Tag("Team", "foreign-east")));
+        tags.putForAccount("111111111111", "eu-west-1::vpce-0123456789", List.of(new Tag("Team", "foreign-west")));
+        IamConditionContextResolver stored = resolverWithStoredEc2Tags(tags);
+        String prefix = targetAccount.equals("123456789012") ? "caller" : "foreign";
+        for (String region : List.of("us-east-1", "eu-west-1")) {
+            Map<String, List<String>> context = ec2ResourceContext(stored, "ec2", "ec2:ModifyVpcEndpoint",
+                    "arn:aws:ec2:" + region + ":" + targetAccount + ":vpc-endpoint/vpce-0123456789",
+                    "us-east-1", "123456789012", Map.of("aws:ResourceTag/Team", List.of("stale")));
+            assertEquals(List.of(prefix + (region.equals("us-east-1") ? "-east" : "-west")),
+                    context.get("aws:ResourceTag/Team"));
+        }
+    }
+
+    @Test
+    void ec2UntaggedForeignArnDoesNotBorrowRealCallerTags() {
+        AccountAwareStorageBackend<List<Tag>> tags = AccountAwareStorageBackend.inMemory("123456789012");
+        tags.putForAccount("123456789012", "eu-west-1::vpce-0123456789", List.of(new Tag("Team", "caller-west")));
+        tags.putForAccount("111111111111", "us-east-1::vpce-0123456789", List.of(new Tag("Team", "foreign-east")));
+        Map<String, List<String>> context = ec2ResourceContext(resolverWithStoredEc2Tags(tags),
+                "ec2", "ec2:ModifyVpcEndpoint", "arn:aws:ec2:eu-west-1:111111111111:vpc-endpoint/vpce-0123456789",
+                "us-east-1", "123456789012", Map.of("aws:ResourceTag/Team", List.of("stale")));
+        assertFalse(context.containsKey("aws:ResourceTag/Team"));
+        assertEquals("caller-west", tags.getForAccount("123456789012",
+                "eu-west-1::vpce-0123456789").orElseThrow().getFirst().getValue());
+    }
+
+    @SuppressWarnings("unchecked")
+    private IamConditionContextResolver resolverWithStoredEc2Tags(AccountAwareStorageBackend<List<Tag>> tags) {
+        StorageFactory storage = mock(StorageFactory.class);
+        when(storage.create(anyString(), anyString(), any())).thenAnswer(call ->
+                call.getArgument(1).equals("ec2-tags.json") ? tags
+                        : AccountAwareStorageBackend.inMemory("123456789012"));
+        when(config.defaultAccountId()).thenReturn("123456789012");
+        EmulatorConfig.ServicesConfig serviceConfig = mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.Ec2ServiceConfig ec2Config = mock(EmulatorConfig.Ec2ServiceConfig.class);
+        when(config.services()).thenReturn(serviceConfig);
+        when(serviceConfig.ec2()).thenReturn(ec2Config);
+        when(ec2Config.mock()).thenReturn(true);
+        when(ec2Config.mockPublicAddresses()).thenReturn(EmulatorConfig.Ec2ServiceConfig.MockPublicAddresses.DOCUMENTATION);
+        when(ec2Config.mockPublicAddress()).thenReturn(Optional.empty());
+        Ec2Service service = new Ec2Service(config, mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(), storage);
+        Instance<Ec2Service> services = mock(Instance.class);
+        when(services.isResolvable()).thenReturn(true);
+        when(services.get()).thenReturn(service);
+        Instance<StoredResourceArns> readers = mock(Instance.class);
+        when(readers.iterator()).thenAnswer(call -> List.<StoredResourceArns>of(new Ec2StoredResourceArns(service,
+                new RegionResolver("us-east-1", "123456789012"))).iterator());
+        return new IamConditionContextResolver(dynamoDbFacadeInstance, services, mock(Instance.class),
+                mock(Instance.class), mock(Instance.class), spellings(new ShapeNamingSpelling()),
+                readers, requestContext, new RegionResolver("us-east-1", "123456789012"),
+                config, null, serviceCatalog);
+    }
+
+    @Test
+    void ec2MainPortOwnUntaggedArnClearsEarlierResourceTags() {
+        Map<String, List<String>> context = ec2ResourceContext(resolver, "ec2", "ec2:ModifyVpcEndpoint",
+                "arn:aws:ec2:us-east-1:123456789012:vpc-endpoint/vpce-0123456789", "us-east-1",
+                "123456789012", Map.of("aws:ResourceTag/OpenSearchManaged", List.of("true")));
+        assertFalse(context.containsKey("aws:ResourceTag/OpenSearchManaged"));
+    }
+
+    @Test
+    void ec2NameBasedForeignArnUsesSharedStoredTags() {
+        when(ec2Service.resourceTags("111111111111", "eu-west-1", "web"))
+                .thenReturn(List.of(new Tag("Team", "foreign")));
+        Map<String, List<String>> context = ec2ResourceContext(resolver, "ec2", "ec2:ModifyInstancePlacement",
+                "arn:aws:ec2:eu-west-1:111111111111:placement-group/web", "us-east-1", "123456789012", Map.of());
+        assertEquals(List.of("foreign"), context.get("aws:ResourceTag/Team"));
+    }
+
+    @Test
+    void ec2MainPortWildcardRetainsTheExistingContext() {
+        Map<String, List<String>> original = Map.of("aws:ResourceTag/Team", List.of("payments"));
+        assertSame(original, ec2ResourceContext(resolver, "ec2", "ec2:ModifyVpcEndpoint",
+                "arn:aws:ec2:us-east-1:123456789012:vpc-endpoint/*", "us-east-1", "123456789012", original));
+    }
+
+    private Map<String, List<String>> ec2ResourceContext(IamConditionContextResolver reading, String scope,
+            String action, String resource, String region, String account, Map<String, List<String>> context) {
+        Map<String, List<String>> record = reading.withEc2ResourceContext(scope, action, resource, region, account, context);
+        IamConditionContextResolver tags = reading == resolver
+                ? resolverReading(new Ec2StoredResourceArns(ec2Service, new RegionResolver(region, account))) : reading;
+        return IamConditionContextResolver.withResourceTags(record, tags.resourceTags(resource));
+    }
+
+    @Test
+    void otherServiceReadsEc2TagsThroughGeneratedSharedPath() {
+        AccountAwareStorageBackend<List<Tag>> tags = AccountAwareStorageBackend.inMemory("123456789012");
+        tags.putForAccount("111111111111", "eu-west-1::i-0123456789", List.of(new Tag("Team", "foreign")));
+        IamConditionContextResolver reading = resolverWithStoredEc2Tags(tags);
+        String arn = "arn:aws:ec2:eu-west-1:111111111111:instance/i-0123456789";
+        Map<String, List<String>> context = ec2ResourceContext(reading, "ec2-instance-connect", "ec2-instance-connect:SendSSHPublicKey",
+                arn, "us-east-1", "123456789012", Map.of("aws:RequestTag/Team", List.of("requested")));
+        assertEquals(List.of("foreign"), context.get("aws:ResourceTag/Team"));
+        assertEquals(List.of("requested"), context.get("aws:RequestTag/Team"));
     }
 
     @Test
@@ -972,8 +1114,8 @@ class IamConditionContextResolverTest {
                     + "\"Key\":{\"PK\":{\"S\":\"USER_alice\"}}," + extra + "}}]}");
             JsonNode original = body.deepCopy();
             when(request.getProperty("floci.bufferedJsonBody")).thenReturn(body);
-            Map<String, List<String>> context = resolver.dynamoDbTransactionItems("dynamodb:TransactGetItems",
-                    request, "us-east-1", "000000000000").getFirst().context();
+            Map<String, List<String>> context = resolver.resolvePart("dynamodb", "dynamodb:GetItem",
+                    "dynamodb:TransactGetItems", request, body.path("TransactItems").path(0).path("Get"), "us-east-1");
             assertEquals(List.of("ALL_ATTRIBUTES"), context.get("dynamodb:Select"));
             assertEquals(List.of("PK"), context.get("dynamodb:Attributes"));
             assertEquals(List.of("USER_alice"), context.get("dynamodb:LeadingKeys"));

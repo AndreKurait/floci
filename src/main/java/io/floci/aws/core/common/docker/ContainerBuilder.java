@@ -53,17 +53,28 @@ public class ContainerBuilder {
     private final EmbeddedDnsServer embeddedDnsServer;
     private final CurrentContainerNetworkResolver currentContainerNetworkResolver;
     private final ContainerEngineDetector containerEngineDetector;
+    private final GelfLogListener gelfLogListener;
 
     @Inject
     public ContainerBuilder(EmulatorConfig config, DockerHostResolver dockerHostResolver,
                             EmbeddedDnsServer embeddedDnsServer,
                             CurrentContainerNetworkResolver currentContainerNetworkResolver,
-                            ContainerEngineDetector containerEngineDetector) {
+                            ContainerEngineDetector containerEngineDetector,
+                            GelfLogListener gelfLogListener) {
         this.config = config;
         this.dockerHostResolver = dockerHostResolver;
         this.embeddedDnsServer = embeddedDnsServer;
         this.currentContainerNetworkResolver = currentContainerNetworkResolver;
         this.containerEngineDetector = containerEngineDetector;
+        this.gelfLogListener = gelfLogListener;
+    }
+
+    public ContainerBuilder(EmulatorConfig config, DockerHostResolver dockerHostResolver,
+                            EmbeddedDnsServer embeddedDnsServer,
+                            CurrentContainerNetworkResolver currentContainerNetworkResolver,
+                            ContainerEngineDetector containerEngineDetector) {
+        this(config, dockerHostResolver, embeddedDnsServer, currentContainerNetworkResolver,
+                containerEngineDetector, GelfLogListener.disabled());
     }
 
     public ContainerBuilder(EmulatorConfig config, DockerHostResolver dockerHostResolver,
@@ -84,8 +95,12 @@ public class ContainerBuilder {
      * @return a new Builder instance
      */
     public Builder newContainer(String image) {
-        return new Builder(resolveImage(image), config, dockerHostResolver, embeddedDnsServer,
+        Builder builder = new Builder(resolveImage(image), config, dockerHostResolver, embeddedDnsServer,
                 currentContainerNetworkResolver, containerEngineDetector);
+        if (gelfLogListener.enabled()) {
+            builder.logDriver = gelfLogListener;
+        }
+        return builder;
     }
 
     /**
@@ -96,6 +111,26 @@ public class ContainerBuilder {
      */
     public Optional<String> resolveDockerNetwork(Optional<String> serviceNetwork) {
         return resolveDockerNetwork(serviceNetwork, config, currentContainerNetworkResolver);
+    }
+
+    /**
+     * The address {@link Builder#withEmbeddedDns} hands a container as its first resolver, when a
+     * container on the network {@link Builder#withDockerNetwork} picks for {@code serviceNetwork} can
+     * reach it; empty when it cannot or the embedded DNS server is not running. Exposed for a container
+     * that must name that resolver alone in a file of its own, as a k3s node does for its pods, where an
+     * unreachable one leaves no resolver at all. Floci in a container listens on its own address on its
+     * own network, which Docker isolates from every other user-defined network. Floci running natively
+     * listens on the Docker bridge address, which every container already gets as its resolver.
+     */
+    public Optional<String> embeddedDnsServerIpReachableOn(Optional<String> serviceNetwork) {
+        Optional<String> dnsServerIp = embeddedDnsServer != null ? embeddedDnsServer.getServerIp() : Optional.empty();
+        Optional<String> flociNetwork = currentContainerNetworkResolver != null
+                ? currentContainerNetworkResolver.resolveNetworkName()
+                : Optional.empty();
+        if (dnsServerIp.isEmpty() || flociNetwork.isEmpty()) {
+            return dnsServerIp;
+        }
+        return resolveDockerNetwork(serviceNetwork).equals(flociNetwork) ? dnsServerIp : Optional.empty();
     }
 
     private static Optional<String> resolveDockerNetwork(Optional<String> serviceNetwork, EmulatorConfig config,
@@ -231,6 +266,8 @@ public class ContainerBuilder {
         private boolean javaTrustStore;
         private String dnsName;
         private final List<String> joinedNetworks = new ArrayList<>();
+        private GelfLogListener logDriver;
+        private boolean pushedLogs;
 
         Builder(String image, EmulatorConfig config, DockerHostResolver dockerHostResolver,
                 EmbeddedDnsServer embeddedDnsServer,
@@ -265,6 +302,15 @@ public class ContainerBuilder {
          */
         public Builder withEnv(List<String> env) {
             this.env.addAll(env);
+            return this;
+        }
+
+        /**
+         * Removes the environment variable {@code key}, however many times it was added.
+         */
+        public Builder withoutEnv(String key) {
+            String entry = key + "=";
+            this.env.removeIf(variable -> variable.startsWith(entry));
             return this;
         }
 
@@ -584,6 +630,16 @@ public class ContainerBuilder {
         }
 
         /**
+         * Marks a container whose owner attaches its log with one of the {@code attachPolled} methods of
+         * {@link ContainerLogStreamer}. In the opt-in log-driver mode the daemon then pushes that log to Floci
+         * instead of Floci reading it on a timer; a container nobody attaches keeps its json-file log.
+         */
+        public Builder withPushedLogs() {
+            this.pushedLogs = true;
+            return this;
+        }
+
+        /**
          * Sets a custom log configuration.
          */
         public Builder withLogConfig(LogConfig logConfig) {
@@ -840,6 +896,16 @@ public class ContainerBuilder {
          * Builds the immutable ContainerSpec.
          */
         public ContainerSpec build() {
+            LogConfig effectiveLogConfig = logConfig;
+            Map<String, String> effectiveLabels = labels;
+            if (pushedLogs && logDriver != null && logConfig != null
+                    && logConfig.getType() == LogConfig.LoggingType.JSON_FILE) {
+                // The opt-in log-driver mode: the daemon pushes this container's log to Floci.
+                String token = GelfLogListener.newToken();
+                effectiveLabels = new HashMap<>(labels);
+                effectiveLabels.put(GelfLogListener.LOG_TOKEN_LABEL, token);
+                effectiveLogConfig = logDriver.logConfigFor(token, logConfig.getConfig());
+            }
             return new ContainerSpec(
                     image,
                     name,
@@ -855,8 +921,8 @@ public class ContainerBuilder {
                     List.copyOf(binds),
                     List.copyOf(volumesFrom),
                     List.copyOf(extraHosts),
-                    Map.copyOf(labels),
-                    logConfig,
+                    Map.copyOf(effectiveLabels),
+                    effectiveLogConfig,
                     privileged,
                     cgroupnsMode,
                     List.copyOf(dnsServers),

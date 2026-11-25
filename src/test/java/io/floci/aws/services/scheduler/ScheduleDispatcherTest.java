@@ -2,14 +2,18 @@ package io.floci.aws.services.scheduler;
 
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.services.scheduler.model.DeadLetterConfig;
 import io.floci.aws.services.scheduler.model.RetryPolicy;
 import io.floci.aws.services.scheduler.model.Schedule;
 import io.floci.aws.services.scheduler.model.Target;
 import io.floci.aws.services.sqs.SqsService;
 import io.floci.aws.services.sqs.model.MessageAttributeValue;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.mockito.ArgumentCaptor;
 
 import java.time.Instant;
@@ -20,6 +24,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class ScheduleDispatcherTest {
 
     private static final String ARN_PREFIX = "arn:aws:scheduler:eu-central-1:000000000000:schedule/default/";
@@ -50,7 +55,8 @@ class ScheduleDispatcherTest {
         when(config.services()).thenReturn(servicesCfg);
         when(config.baseUrl()).thenReturn("http://localhost:4566");
 
-        dispatcher = new ScheduleDispatcher(schedulerService, invoker, sqsService, config);
+        dispatcher = new ScheduleDispatcher(schedulerService, invoker, sqsService, config,
+                new RegionResolver("us-east-1", "000000000000"));
     }
 
     private Schedule newSchedule(String name, String expression, String state) {
@@ -131,6 +137,70 @@ class ScheduleDispatcherTest {
         dispatcher.tick(Instant.parse("2026-04-21T09:20:00Z"));
 
         verify(invoker, times(1)).invoke(eq(s), any(), any(), anyInt());
+    }
+
+    // Catches: a restart firing a one-time schedule again, because whether it had fired lived only
+    // in the dispatcher's memory. A new dispatcher stands in for the restarted process.
+    @Test
+    void anAtScheduleStoredAsFiredDoesNotFireAgainAfterARestart() {
+        Schedule s = newSchedule("at1", "at(2026-04-21T09:17:54)", "ENABLED");
+        s.setLastFiredAt(Instant.parse("2026-04-21T09:18:00Z"));
+        when(schedulerService.listAllSchedules()).thenReturn(List.of(s));
+
+        dispatcher.tick(Instant.parse("2026-04-21T10:00:00Z"));
+
+        verify(invoker, never()).invoke(any(), any(), any(), anyInt());
+    }
+
+    @Test
+    void anAtScheduleUpdatedToALaterTimeFiresAgainAtThatTime() {
+        Schedule s = newSchedule("at1", "at(2026-04-21T11:00:00)", "ENABLED");
+        s.setLastFiredAt(Instant.parse("2026-04-21T09:18:00Z"));
+        when(schedulerService.listAllSchedules()).thenReturn(List.of(s));
+
+        dispatcher.tick(Instant.parse("2026-04-21T10:59:50Z"));
+        verify(invoker, never()).invoke(any(), any(), any(), anyInt());
+        dispatcher.tick(Instant.parse("2026-04-21T11:00:00Z"));
+
+        verify(invoker, times(1)).invoke(eq(s), eq(Instant.parse("2026-04-21T11:00:00Z")), any(), anyInt());
+    }
+
+    // Catches: every rate schedule firing an immediate catch-up after a restart, since its next fire
+    // fell back to its creation date when the last fire was forgotten.
+    @Test
+    void aRateScheduleResumesOneIntervalAfterItsStoredLastFire() {
+        Schedule s = newSchedule("r1", "rate(1 hour)", "ENABLED");
+        s.setLastFiredAt(Instant.parse("2026-04-21T12:00:00Z"));
+        when(schedulerService.listAllSchedules()).thenReturn(List.of(s));
+
+        dispatcher.tick(Instant.parse("2026-04-21T12:30:00Z"));
+        verify(invoker, never()).invoke(any(), any(), any(), anyInt());
+        dispatcher.tick(Instant.parse("2026-04-21T13:00:00Z"));
+
+        verify(invoker, times(1)).invoke(eq(s), eq(Instant.parse("2026-04-21T13:00:00Z")), any(), anyInt());
+    }
+
+    @Test
+    void aCronScheduleResumesAtTheNextOccurrenceAfterItsStoredLastFire() {
+        Schedule s = newSchedule("c1", "cron(0 * * * ? *)", "ENABLED");
+        s.setLastFiredAt(Instant.parse("2026-04-21T12:00:05Z"));
+        when(schedulerService.listAllSchedules()).thenReturn(List.of(s));
+
+        dispatcher.tick(Instant.parse("2026-04-21T12:30:00Z"));
+        verify(invoker, never()).invoke(any(), any(), any(), anyInt());
+        dispatcher.tick(Instant.parse("2026-04-21T13:00:00Z"));
+
+        verify(invoker, times(1)).invoke(eq(s), eq(Instant.parse("2026-04-21T13:00:00Z")), any(), anyInt());
+    }
+
+    @Test
+    void aFireIsRecordedInTheStoredSchedule() {
+        Schedule s = newSchedule("at1", "at(2026-04-21T09:17:54)", "ENABLED");
+        when(schedulerService.listAllSchedules()).thenReturn(List.of(s));
+
+        dispatcher.tick(Instant.parse("2026-04-21T09:18:00Z"));
+
+        verify(schedulerService).recordFire(eq(s), any(), eq(Instant.parse("2026-04-21T09:18:00Z")));
     }
 
     @Test

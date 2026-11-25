@@ -1,17 +1,22 @@
 package io.floci.aws.services.eks;
 
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.List;
 import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+@ResourceLock(ParallelLocks.PORTS)
 class EksClusterArgsTest {
 
     @Test
@@ -223,5 +228,26 @@ class EksClusterArgsTest {
         );
         List<String> args = EksClusterArgs.parseAndValidateClusterArgs(tags, "demo");
         assertEquals(List.of("--kubelet-arg=max-pods=250"), args);
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', value = {
+            "floci:kubelet-arg:resolv-conf|/etc/own-resolv.conf",
+            "floci:kubelet-arg|--resolv-conf=/etc/own-resolv.conf",
+            "floci:kubelet-args|[\"max-pods=250\", \"resolv-conf=/etc/own-resolv.conf\"]"})
+    void aKubeletResolvConfTagSetsThePodsResolverFile(String key, String value) {
+        List<String> args = EksClusterArgs.parseAndValidateClusterArgs(Map.of(key, value), "demo");
+
+        assertTrue(EksClusterArgs.setsKubeletResolvConf(args), args.toString());
+    }
+
+    @Test
+    void otherArgumentsLeaveThePodsResolverFileToFloci() {
+        assertFalse(EksClusterArgs.setsKubeletResolvConf(null));
+        assertFalse(EksClusterArgs.setsKubeletResolvConf(List.of()));
+        assertFalse(EksClusterArgs.setsKubeletResolvConf(List.of(
+                "--kubelet-arg=max-pods=250",
+                "--kubelet-arg=resolv-conf-extra=x",
+                "--kube-apiserver-arg=resolv-conf=/etc/own-resolv.conf")));
     }
 }

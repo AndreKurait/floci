@@ -198,6 +198,14 @@ public final class CfnRollback {
      */
     public static final String APIGW_AUTHORIZER_UPDATE_SNAPSHOT_ATTR = "__FlociApiGatewayAuthorizerUpdateSnapshot";
 
+    /**
+     * The deployment id and description an API Gateway stage carried before an in-place update, the
+     * stage an update created because the prior was gone, or the old API of a stage a RestApiId change
+     * moved, so a failed stack update can undo each. Written and spent by
+     * {@code ApiGatewayRestApiCfnProvisioner}.
+     */
+    public static final String APIGW_STAGE_UPDATE_SNAPSHOT_ATTR = "__FlociApiGatewayStageUpdateSnapshot";
+
     public static final String STACK_SET_UPDATE_SNAPSHOT_ATTR = "__FlociStackSetUpdateSnapshot";
 
     /**
@@ -235,6 +243,15 @@ public final class CfnRollback {
      * by {@code EventsCfnProvisioner} before its tag calls and spent by its {@code rollbackUpdate}.
      */
     public static final String EVENT_BUS_UPDATE_SNAPSHOT_ATTR = "__FlociEventBusUpdateSnapshot";
+
+    /**
+     * Holds the description, authorization type, auth and connectivity parameters, KMS key,
+     * authorization state and timestamps an EventBridge connection carried before an in-place
+     * update changed them, so a failed stack update can put them back. The auth parameters hold the
+     * connection's credentials, as the connection itself does. Written by
+     * {@code EventsCfnProvisioner} before its update call and spent by its {@code rollbackUpdate}.
+     */
+    public static final String CONNECTION_UPDATE_SNAPSHOT_ATTR = "__FlociConnectionUpdateSnapshot";
 
     /**
      * Holds the name, description and endpoint configuration a REST API had before an in-place
@@ -306,6 +323,16 @@ public final class CfnRollback {
      * {@code mergeFailedUpdateResourceTracking}.
      */
     public static final String APPCONFIG_UPDATE_SNAPSHOT_ATTR = "__FlociAppConfigUpdateSnapshot";
+
+    /**
+     * Holds what a Verified Permissions policy store, policy template or static policy was before an
+     * in-place update changed it: the store's validation mode, description, deletion protection,
+     * schema and the tags the stack owns, a template's or policy's statement, description and name. A
+     * later resource failing the update puts it back through {@code rollbackUpdate}, and the
+     * provisioner carries it onto the restored resource through
+     * {@code mergeFailedUpdateResourceTracking}.
+     */
+    public static final String VERIFIED_PERMISSIONS_UPDATE_SNAPSHOT_ATTR = "__FlociVerifiedPermissionsUpdateSnapshot";
 
     /**
      * Holds the members an AppSync GraphQL API, data source, function, resolver or API key carried
@@ -484,6 +511,26 @@ public final class CfnRollback {
             LOG.warnv("IAM rollback cleanup failed while attempting to {0}: {1}",
                     description, cleanupFailure.getMessage());
             return false;
+        }
+    }
+
+    /**
+     * Carries the snapshot of an in-place update whose own undo did not complete onto the previous
+     * resource the engine restores, for a provisioner's {@code mergeFailedUpdateResourceTracking}:
+     * with the state the update started from, a ContinueUpdateRollback tries the restore again
+     * instead of finding nothing to undo. An undo that completed spent its snapshot and left no
+     * {@link #UPDATE_ROLLBACK_FAILURE_ATTR}, so nothing is carried.
+     */
+    public static void carryFailedUndoSnapshot(StackResource previous, StackResource attempted,
+                                               String... snapshotAttrs) {
+        if (!attempted.getAttributes().containsKey(UPDATE_ROLLBACK_FAILURE_ATTR)) {
+            return;
+        }
+        for (String attr : snapshotAttrs) {
+            String snapshot = attempted.getAttributes().get(attr);
+            if (snapshot != null) {
+                previous.getAttributes().put(attr, snapshot);
+            }
         }
     }
 

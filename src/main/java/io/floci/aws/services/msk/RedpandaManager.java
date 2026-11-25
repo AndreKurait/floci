@@ -124,13 +124,7 @@ public class RedpandaManager {
      * container that failed for its own reasons.
      */
     public boolean isDockerReachable() {
-        try {
-            lifecycleManager.getDockerClient().pingCmd().exec();
-            return true;
-        } catch (Exception e) {
-            LOG.debugv("Docker daemon is not reachable: {0}", e.getMessage());
-            return false;
-        }
+        return lifecycleManager.isDockerReachable();
     }
 
     public void startContainer(MskCluster cluster) {
@@ -207,7 +201,7 @@ public class RedpandaManager {
         String region = regionResolver.regionOf(cluster.getClusterArn());
 
         String account = AwsArnUtils.accountOrDefault(cluster.getClusterArn(), regionResolver.getDefaultAccountId());
-        Closeable logHandle = logStreamer.attachForAccount(
+        Closeable logHandle = logStreamer.attachPolledForAccount(
                 account, info.containerId(), logGroup, logStream, region, "msk:" + cluster.getClusterName());
         if (logHandle != null) {
             logStreams.put(clusterIdentityKey(cluster), logHandle);
@@ -244,6 +238,7 @@ public class RedpandaManager {
                 .withName(containerName)
                 .withDockerNetwork(config.services().dockerNetwork())
                 .withLogRotation()
+                .withPushedLogs()
                 .withLabels(ContainerStorageHelper.resourceIdentityLabels(
                         "msk", cluster.getClusterName(),
                         AwsArnUtils.accountOrDefault(cluster.getClusterArn(), regionResolver.getAccountId()),
