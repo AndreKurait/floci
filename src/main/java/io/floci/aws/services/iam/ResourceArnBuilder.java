@@ -2,10 +2,13 @@ package io.floci.aws.services.iam;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.floci.aws.core.common.AwsArnUtils;
+import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.AwsRegions;
 import io.floci.aws.core.common.RequestPathLabels;
 import io.floci.aws.core.common.RequestResources;
 import io.floci.aws.core.common.StoredResourceArns;
+import io.floci.aws.services.lambda.LambdaRuntimeManagementReference;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
@@ -92,6 +95,10 @@ public class ResourceArnBuilder {
         if (credentialScope == null) {
             return List.of("*");
         }
+        if ("lambda:GetRuntimeManagementConfig".equals(operation)
+                || "lambda:PutRuntimeManagementConfig".equals(operation)) {
+            return List.of(runtimeManagementArn(ctx, region, accountId));
+        }
         return namedResources(credentialScope, operation, ctx, region, accountId, partition);
     }
 
@@ -102,6 +109,33 @@ public class ResourceArnBuilder {
      * namespace's {@link StoredResourceArns} finds under that name or the members naming it. A label of the
      * request's path is read as the namespace's {@link RequestPathLabels} reads it, where it reads one otherwise.
      */
+    private String runtimeManagementArn(ContainerRequestContext ctx, String region, String accountId) {
+        String reference = ctx.getUriInfo().getPathParameters().getFirst("functionName");
+        if (reference == null) {
+            reference = runtimeManagementPathReference(ctx);
+        }
+        try {
+            return LambdaRuntimeManagementReference.resolve(reference,
+                    ctx.getUriInfo().getQueryParameters().getFirst("Qualifier"), region, accountId)
+                    .authorizationArn();
+        } catch (AwsException expected) {
+            // Preserve a malformed or foreign identifier for policy matching; the service refuses it.
+            return AwsArnUtils.looksLikeArn(reference) ? reference
+                    : AwsArnUtils.Arn.of("lambda", region, accountId, "function:" + reference).toString();
+        }
+    }
+
+    private static String runtimeManagementPathReference(ContainerRequestContext ctx) {
+        String path = IamActionRegistry.decodedPath(ctx);
+        int start = path.indexOf("/functions/");
+        if (start < 0) {
+            return null;
+        }
+        String reference = path.substring(start + "/functions/".length());
+        int end = reference.indexOf('/');
+        return end < 0 ? reference : reference.substring(0, end);
+    }
+
     private List<String> namedResources(String credentialScope, String operation, ContainerRequestContext ctx,
                                         String region, String accountId, String partition) {
         if (operation == null || !operation.startsWith(credentialScope + ":")) {
