@@ -325,11 +325,11 @@ class SesTemplateServiceTest {
     void renderTestTemplate_datesTheMessageFromTheInjectedClock() {
         SesTemplateService fixed = new SesTemplateService(new InMemoryStorage<>(), new ObjectMapper(),
                 new SecureRandom(), new ManualClock(Instant.parse("2031-03-04T05:06:07Z")));
-        fixed.createTemplate(template("welcome"), REGION);
+        fixed.createTemplate(template("welcome"), REGION, ACCOUNT);
 
-        String mime = fixed.renderTestTemplate("welcome", "{}", REGION);
+        String mime = fixed.renderTestTemplate("welcome", "{}", REGION, ACCOUNT);
 
-        assertTrue(mime.startsWith("Date: Tue, 4 Mar 2031 05:06:07 GMT\r\n"), mime);
+        assertTrue(mime.startsWith("Date: 2031-03-04T05:06:07.000Z\r\n"), mime);
     }
 
     @Test

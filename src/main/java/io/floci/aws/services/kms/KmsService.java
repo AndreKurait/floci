@@ -1582,11 +1582,6 @@ public class KmsService implements ResourceProvider {
         requireNotPendingDeletion(key);
 
         String aliasArn = regionResolver.buildArn("kms", region, aliasName);
-        if (aliasStore.get(region + "::" + aliasName).isPresent()) {
-            // Pointing an existing alias at another key is UpdateAlias; CreateAlias never replaces one.
-            throw new AwsException("AlreadyExistsException",
-                    "An alias with the name " + aliasArn + " already exists", 400);
-        }
         KmsAlias alias = new KmsAlias(aliasName, aliasArn, key.getKeyId());
         String storageKey = region + "::" + aliasName;
         synchronized (aliasCreateLock) {

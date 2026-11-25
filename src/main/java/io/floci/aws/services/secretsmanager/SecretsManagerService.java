@@ -2084,13 +2084,6 @@ public class SecretsManagerService implements ResourceProvider, StoredResourceAr
         throwIfReplica(secret);
 
         synchronized (lockFor(secret.getArn())) {
-            // Checked before any label is moved: a refused request must leave the labels where they were.
-            if (moveToVersionId != null && !secret.getVersions().containsKey(moveToVersionId)) {
-                throw new AwsException("ResourceNotFoundException",
-                        "Secrets Manager can't find the specified secret value for VersionId: %s.".formatted(moveToVersionId),
-                        400);
-            }
-
             SecretVersion versionByStage = findVersionByStage(secret, versionStage);
             String currentVersionId = versionByStage != null
                     ? versionByStage.getVersionId() : null;
