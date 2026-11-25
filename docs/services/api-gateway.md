@@ -271,6 +271,13 @@ operational `x-amazon-apigateway-` fields are preserved. Wildcard inheritance an
 response parameter/body projection are not implemented. This is not full OpenAPI schema
 validation of documentation properties.
 
+### Deployment Pagination
+
+`GetDeployments` accepts `limit` and `position`, returns 25 deployments by default,
+and caps pages at 500. Use the returned `position` to continue a partial collection;
+the final page omits it. Positions belong to the caller's account, Region and REST
+API. A missing parent API returns `NotFoundException`.
+
 
 ### API Key Behaviour Notes
 
