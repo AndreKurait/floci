@@ -17018,6 +17018,32 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                                                     List<String> ipv6Addresses, Integer ipv6AddressCount,
                                                     List<String> securityGroupIds, List<Tag> tagList,
                                                     Integer secondaryCount) {
+        return createNetworkInterface(region, subnetId, description, privateIpAddress, privateIpAddresses,
+                ipv6Addresses, ipv6AddressCount, securityGroupIds, tagList, secondaryCount, null);
+    }
+
+    public NetworkInterface createServiceNetworkInterface(String region, String subnetId, String description,
+                                                           List<String> securityGroupIds, String allocationToken) {
+        if (allocationToken == null || allocationToken.isBlank()) {
+            throw new IllegalArgumentException("Service interface allocation token is required");
+        }
+        return createNetworkInterface(region, subnetId, description, null, List.of(), List.of(), null,
+                securityGroupIds, List.of(), null, allocationToken);
+    }
+
+    public List<NetworkInterface> findServiceNetworkInterfaces(String region, String allocationToken) {
+        if (allocationToken == null || allocationToken.isBlank()) {
+            throw new IllegalArgumentException("Service interface allocation token is required");
+        }
+        return networkInterfaces.scan(k -> k.startsWith(region + "::")).stream()
+                .filter(eni -> allocationToken.equals(eni.getServiceAllocationToken())).toList();
+    }
+
+    private NetworkInterface createNetworkInterface(String region, String subnetId, String description,
+                                                     String privateIpAddress, List<String> privateIpAddresses,
+                                                     List<String> ipv6Addresses, Integer ipv6AddressCount,
+                                                     List<String> securityGroupIds, List<Tag> tagList,
+                                                     Integer secondaryCount, String allocationToken) {
         if (secondaryCount != null && secondaryCount < 0) {
             throw new AwsException("InvalidParameterValue", "SecondaryPrivateIpAddressCount must not be negative", 400);
         }
@@ -17094,6 +17120,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 String primaryDns = AwsRegions.ec2PrivateIpDnsName(primaryIp, region);
 
                 NetworkInterface ni = new NetworkInterface();
+                ni.setServiceAllocationToken(allocationToken);
                 ni.setIpv6Addresses(new ArrayList<>(ipv6));
                 ni.setNetworkInterfaceId(eniId);
                 ni.setSubnetId(subnetId);

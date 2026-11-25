@@ -1,6 +1,7 @@
 package io.floci.aws.services.elb;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.exception.NotFoundException;
@@ -18,6 +19,8 @@ import io.floci.aws.core.common.docker.ContainerSpec;
 import io.floci.aws.core.common.docker.ContainerStorageHelper;
 import io.floci.aws.core.common.docker.NetworkNamespaceLease;
 import io.floci.aws.core.common.docker.RetryingTarCopier;
+import io.floci.aws.core.storage.AccountAwareStorageBackend;
+import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.acm.AcmService;
 import io.floci.aws.services.ec2.Ec2Service;
 import io.floci.aws.services.ec2.SecurityGroupFirewallManager;
@@ -30,6 +33,8 @@ import io.floci.aws.services.ec2.net.VpcNetworkManager;
 import io.floci.aws.services.ec2.net.VpcRoutingManager;
 import io.floci.aws.services.elb.model.ClassicLoadBalancer;
 import io.floci.aws.services.iam.IamService;
+import io.quarkus.runtime.annotations.RegisterForReflection;
+import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
 import jakarta.enterprise.context.ApplicationScoped;
 import org.jboss.logging.Logger;
@@ -65,13 +70,18 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
     private final ObjectMapper mapper;
     private final CertificateReferenceResolver certificates;
     private final Map<String, Frontend> frontends = new ConcurrentHashMap<>();
+    private final Map<String, PendingCleanup> pendingCleanups = new ConcurrentHashMap<>();
+    private final AccountAwareStorageBackend<Ownership> ownership;
+    private final Map<String, Ownership> pendingAllocations = new ConcurrentHashMap<>();
     private boolean recovered;
 
     public ElbClassicFrontendManager(EmulatorConfig config, Ec2Service ec2,
                                     SecurityGroupFirewallManager firewall, VpcNetworkManager vpcNetworks,
                                     ContainerBuilder containers, ContainerLifecycleManager lifecycle,
-                                    ObjectMapper mapper, IamService iam, AcmService acm, VpcRoutingManager routing) {
+                                    ObjectMapper mapper, IamService iam, AcmService acm, VpcRoutingManager routing,
+                                    StorageFactory storageFactory) {
         this.config = config;
+        this.ownership = storageFactory.create("elb", "elb-classic-frontends.json", new TypeReference<>() {});
         this.ec2 = ec2;
         this.firewall = firewall;
         this.vpcNetworks = vpcNetworks;
@@ -81,6 +91,13 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
         this.docker = lifecycle.getDockerClient();
         this.mapper = mapper;
         this.certificates = new CertificateReferenceResolver(iam, acm);
+    }
+
+    @PostConstruct
+    void initialize() {
+        if (enabled()) {
+            recoverOrphans();
+        }
     }
 
     boolean enabled() {
@@ -100,6 +117,8 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
         recoverOrphans();
         return RequestScopes.callAs(account(loadBalancer), loadBalancer.getRegion(), () -> {
             String key = key(loadBalancer);
+            retryPendingCleanups(key);
+            retryPendingAllocations(key);
             String state = state(loadBalancer);
             AtomicBoolean changed = new AtomicBoolean();
             frontends.compute(key, (ignored, previous) -> {
@@ -113,7 +132,7 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
                     }
                 } catch (RuntimeException failure) {
                     try {
-                        release(next);
+                        releaseOrRetain(key, next);
                     } catch (RuntimeException cleanupFailure) {
                         failure.addSuppressed(cleanupFailure);
                     }
@@ -163,12 +182,17 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
         String account = account(loadBalancer);
         String region = loadBalancer.getRegion();
         String resource = loadBalancer.getLoadBalancerName() + "-" + UUID.randomUUID();
-        NetworkInterface eni = ec2.createNetworkInterface(region, loadBalancer.getSubnets().getFirst(),
-                "Classic ELB " + loadBalancer.getLoadBalancerName(), null, List.of(),
-                loadBalancer.getSecurityGroups(), List.of());
-        Frontend pending = new Frontend(account, region, state, eni.getNetworkInterfaceId(),
-                eni.getPrivateIpAddress(), null, null, Map.of(), Map.of());
+        Ownership allocation = new Ownership(ContainerStorageHelper.ownerIdentity(config), account, region,
+                key(loadBalancer), resource, null);
+        saveOwnership(allocation);
+        Frontend pending = null;
         try {
+            NetworkInterface eni = ec2.createServiceNetworkInterface(region, loadBalancer.getSubnets().getFirst(),
+                    "Classic ELB " + loadBalancer.getLoadBalancerName(), loadBalancer.getSecurityGroups(), resource);
+            pending = new Frontend(account, region, state, eni.getNetworkInterfaceId(),
+                    eni.getPrivateIpAddress(), null, null, Map.of(), Map.of(), resource);
+            saveOwnership(new Ownership(allocation.owner(), account, region, allocation.key(), resource,
+                    eni.getNetworkInterfaceId()));
             ec2.holdNetworkInterfaceForService(region, eni.getNetworkInterfaceId());
             SecurityGroupFirewallManager.Namespace namespace = firewall.createNamespace(SERVICE, resource,
                     account, region, Optional.empty(), Map.of(), Map.of(ENI_LABEL, eni.getNetworkInterfaceId()));
@@ -236,7 +260,13 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
             return pending.withConfiguration(rendered.servers(), addresses);
         } catch (RuntimeException failure) {
             try {
-                release(pending);
+                if (pending == null) {
+                    pendingAllocations.put(resource, allocation);
+                    recoverAllocation(allocation);
+                    pendingAllocations.remove(resource);
+                } else {
+                    releaseOrRetain(key(loadBalancer), pending);
+                }
             } catch (RuntimeException cleanupFailure) {
                 failure.addSuppressed(cleanupFailure);
             }
@@ -325,12 +355,40 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
     }
 
     private void remove(String key) {
+        retryPendingCleanups(key);
+        retryPendingAllocations(key);
         frontends.computeIfPresent(key, (ignored, frontend) ->
             RequestScopes.callAs(frontend.account(), frontend.region(), () -> {
                 release(frontend);
                 return null;
             }));
     }
+
+    private void releaseOrRetain(String key, Frontend frontend) {
+        try {
+            release(frontend);
+        } catch (RuntimeException failure) {
+            pendingCleanups.put(frontend.eni(), new PendingCleanup(key, frontend));
+            throw failure;
+        }
+    }
+
+    private void retryPendingCleanups(String key) {
+        for (String eni : pendingCleanups.keySet()) {
+            pendingCleanups.computeIfPresent(eni, (ignored, pending) -> {
+                if (!pending.key().equals(key)) {
+                    return pending;
+                }
+                Frontend frontend = pending.frontend();
+                return RequestScopes.callAs(frontend.account(), frontend.region(), () -> {
+                    release(frontend);
+                    return null;
+                });
+            });
+        }
+    }
+
+    private record PendingCleanup(String key, Frontend frontend) {}
 
     private void release(Frontend frontend) {
         if (frontend.proxy() != null) {
@@ -350,7 +408,47 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
                 throw failure;
             }
         }
+        if (frontend.ownershipId() != null) {
+            forgetOwnership(frontend.account(), frontend.ownershipId());
+        }
     }
+
+    private void saveOwnership(Ownership allocation) {
+        ownership.putAllAtomicallyForAccount(allocation.account(), Map.of(allocation.id(), allocation));
+    }
+
+    private void forgetOwnership(String account, String id) {
+        ownership.deleteAllAtomicallyForAccounts(Map.of(account, Set.of(id)));
+    }
+
+    private void recoverAllocation(Ownership allocation) {
+        RequestScopes.callAs(allocation.account(), allocation.region(), () -> {
+            List<String> interfaces = allocation.eni() == null
+                    ? ec2.findServiceNetworkInterfaces(allocation.region(), allocation.id()).stream()
+                            .map(NetworkInterface::getNetworkInterfaceId).toList()
+                    : List.of(allocation.eni());
+            for (String eni : interfaces) {
+                firewall.unregister(eni);
+                routing.unregister(allocation.account(), allocation.region(), eni);
+                release(new Frontend(allocation.account(), allocation.region(), "", eni, null,
+                        null, null, Map.of(), Map.of()));
+            }
+            forgetOwnership(allocation.account(), allocation.id());
+            return null;
+        });
+    }
+
+    private void retryPendingAllocations(String key) {
+        for (Ownership allocation : pendingAllocations.values()) {
+            if (allocation.key().equals(key)) {
+                recoverAllocation(allocation);
+                pendingAllocations.remove(allocation.id(), allocation);
+            }
+        }
+    }
+
+    @RegisterForReflection
+    public record Ownership(String owner, String account, String region, String key, String id, String eni) {}
 
     private boolean running(Frontend frontend) {
         try {
@@ -423,6 +521,11 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
                 return null;
             });
         }
+        for (Ownership allocation : ownership.scanAllAccounts()) {
+            if (ContainerStorageHelper.ownerIdentity(config).equals(allocation.owner())) {
+                recoverAllocation(allocation);
+            }
+        }
         recovered = true;
     }
 
@@ -433,7 +536,10 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
 
     @Override
     public void stopManagedContainers() {
-        for (String key : frontends.keySet()) {
+        Set<String> keys = Stream.concat(frontends.keySet().stream(),
+                pendingCleanups.values().stream().map(PendingCleanup::key)).collect(Collectors.toSet());
+        keys.addAll(pendingAllocations.values().stream().map(Ownership::key).toList());
+        for (String key : keys) {
             try {
                 remove(key);
             } catch (RuntimeException failure) {
@@ -452,21 +558,27 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
 
     record Frontend(String account, String region, String state, String eni, String address,
                     NetworkNamespaceLease namespace, String proxy,
-                    Map<String, List<String>> servers, Map<String, String> backends) {
+                    Map<String, List<String>> servers, Map<String, String> backends, String ownershipId) {
+        Frontend(String account, String region, String state, String eni, String address,
+                 NetworkNamespaceLease namespace, String proxy,
+                 Map<String, List<String>> servers, Map<String, String> backends) {
+            this(account, region, state, eni, address, namespace, proxy, servers, backends, null);
+        }
+
         String helper() {
             return namespace == null ? null : namespace.id();
         }
 
         Frontend withNamespace(NetworkNamespaceLease value) {
-            return new Frontend(account, region, state, eni, address, value, proxy, servers, backends);
+            return new Frontend(account, region, state, eni, address, value, proxy, servers, backends, ownershipId);
         }
 
         Frontend withProxy(String proxyId) {
-            return new Frontend(account, region, state, eni, address, namespace, proxyId, servers, backends);
+            return new Frontend(account, region, state, eni, address, namespace, proxyId, servers, backends, ownershipId);
         }
 
         Frontend withConfiguration(Map<String, List<String>> servers, Map<String, String> backends) {
-            return new Frontend(account, region, state, eni, address, namespace, proxy, servers, backends);
+            return new Frontend(account, region, state, eni, address, namespace, proxy, servers, backends, ownershipId);
         }
     }
 }

@@ -1,6 +1,7 @@
 package io.floci.aws.services.ec2;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.ListNetworksCmd;
 import io.floci.aws.config.EmulatorConfig;
@@ -172,6 +173,41 @@ import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.withSettings;
 
 class Ec2ServiceTest {
+
+    @Test
+    void serviceInterfaceOwnershipSurvivesSerializationAndCannotBeForgedByTags() throws Exception {
+        Ec2Service service = mockModeService();
+        String region = "us-east-1";
+        String vpcId = service.createVpc(region, "10.94.0.0/16", false).getVpcId();
+        Subnet subnet = service.createSubnet(region, vpcId, "10.94.1.0/24", region + "a");
+        NetworkInterface owned = service.createServiceNetworkInterface(region, subnet.getSubnetId(),
+                "Classic frontend", List.of(), "allocation-token");
+        NetworkInterface unrelated = service.createNetworkInterface(region, subnet.getSubnetId(),
+                "Classic frontend", null, List.of(), List.of(),
+                List.of(new Tag("floci:elb-classic:allocation", "allocation-token")));
+
+        assertEquals(List.of(owned.getNetworkInterfaceId()), service.findServiceNetworkInterfaces(region,
+                "allocation-token").stream().map(NetworkInterface::getNetworkInterfaceId).toList());
+        assertNull(unrelated.getServiceAllocationToken());
+        assertTrue(service.findServiceNetworkInterfaces("us-west-2", "allocation-token").isEmpty());
+        assertTrue(service.findServiceNetworkInterfaces(region, "other-token").isEmpty());
+        ObjectMapper mapper = new ObjectMapper();
+        NetworkInterface restored = mapper.readValue(mapper.writeValueAsBytes(owned), NetworkInterface.class);
+        assertEquals("allocation-token", restored.getServiceAllocationToken());
+        service.deleteNetworkInterface(region, owned.getNetworkInterfaceId());
+        assertTrue(service.findServiceNetworkInterfaces(region, "allocation-token").isEmpty());
+        assertEquals(List.of(unrelated.getNetworkInterfaceId()), service.describeNetworkInterfaces(region,
+                List.of(), Map.of()).networkInterfaces().stream().map(NetworkInterface::getNetworkInterfaceId).toList());
+    }
+
+    @Test
+    void serviceInterfaceOwnershipRejectsMissingTokenBeforeAllocation() {
+        Ec2Service service = mockModeService();
+        assertThrows(IllegalArgumentException.class,
+                () -> service.createServiceNetworkInterface("us-east-1", "subnet", null, List.of(), null));
+        assertThrows(IllegalArgumentException.class,
+                () -> service.findServiceNetworkInterfaces("us-east-1", " "));
+    }
 
     @ParameterizedTest
     @CsvSource({"false, us-east-1", "true, us-east-1", "false, eu-west-1", "true, eu-west-1"})

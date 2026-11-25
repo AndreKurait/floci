@@ -418,3 +418,12 @@ These explicit overrides intentionally change local compatibility; they do not
 change the AWS API shape or require a separate Floci process for each region.
 
 CloudFormation rollback can restore a saved legacy ALB subnet list with repeated Availability Zones. This internal snapshot path still checks subnet existence, the zone minimum, and VPC membership; new API and stack-update requests continue to reject repeated zones.
+
+Classic VPC frontend ownership is stored in `elb-classic-frontends.json` through the
+ELB storage backend. An allocation intent precedes interface creation; internal
+interface metadata allows recovery if the interface identity was not yet recorded.
+Cleanup retains ownership until dependent resources and the interface are removed.
+Memory mode does not retain this journal across process exit, and hybrid mode keeps
+its configured asynchronous flush semantics. Keep the ELB and EC2 persistent data
+together when restoring a deployment. Process-crash and packet recovery require
+separate runtime qualification.

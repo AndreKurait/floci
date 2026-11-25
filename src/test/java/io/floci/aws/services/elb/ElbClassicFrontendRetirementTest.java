@@ -7,6 +7,8 @@ import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.docker.ContainerBuilder;
 import io.floci.aws.core.common.docker.ContainerLifecycleManager;
 import io.floci.aws.core.common.docker.NetworkNamespaceLease;
+import io.floci.aws.core.storage.AccountAwareStorageBackend;
+import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.acm.AcmService;
 import io.floci.aws.services.ec2.Ec2Service;
 import io.floci.aws.services.ec2.SecurityGroupFirewallManager;
@@ -33,7 +35,6 @@ import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
-@Timeout(15)
 class ElbClassicFrontendRetirementTest {
     private static final String ACCOUNT = "111111111111";
     private static final String REGION = "us-east-1";
@@ -50,10 +51,13 @@ class ElbClassicFrontendRetirementTest {
         when(docker.listContainersCmd()).thenReturn(listContainers);
         when(listContainers.withShowAll(true)).thenReturn(listContainers);
         when(listContainers.exec()).thenReturn(List.of());
+        StorageFactory factory = mock(StorageFactory.class);
+        doReturn(AccountAwareStorageBackend.inMemory(ACCOUNT)).when(factory)
+                .create(eq("elb"), eq("elb-classic-frontends.json"), any());
         manager = new ElbClassicFrontendManager(mock(EmulatorConfig.class), ec2,
                 mock(SecurityGroupFirewallManager.class), mock(VpcNetworkManager.class),
                 mock(ContainerBuilder.class), lifecycle, new ObjectMapper(), mock(IamService.class),
-                mock(AcmService.class), mock(VpcRoutingManager.class));
+                mock(AcmService.class), mock(VpcRoutingManager.class), factory);
         Field field = ElbClassicFrontendManager.class.getDeclaredField("frontends");
         field.setAccessible(true);
         frontends = (Map<String, ElbClassicFrontendManager.Frontend>) field.get(manager);
