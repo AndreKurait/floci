@@ -6,6 +6,8 @@ import io.floci.aws.core.common.AwsRegions;
 import io.floci.aws.core.common.RequestPathLabels;
 import io.floci.aws.core.common.RequestResources;
 import io.floci.aws.core.common.StoredResourceArns;
+import io.floci.aws.services.cloudformation.CloudFormationDriftService;
+import io.floci.aws.services.cloudformation.CloudFormationDriftSnapshot;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
@@ -27,6 +29,9 @@ import java.util.Map;
  */
 @ApplicationScoped
 public class ResourceArnBuilder {
+
+    @Inject
+    Instance<CloudFormationDriftService> driftService;
 
     private final ObjectMapper objectMapper;
     /**
@@ -91,6 +96,17 @@ public class ResourceArnBuilder {
                                        String region, String accountId, String partition) {
         if (credentialScope == null) {
             return List.of("*");
+        }
+        if ("cloudformation".equals(credentialScope) && CloudFormationDriftService.handles(operation)) {
+            if ("cloudformation:DescribeStackDriftDetectionStatus".equals(operation)) {
+                return List.of("*");
+            }
+            if (driftService == null || !driftService.isResolvable()) {
+                return List.of("*");
+            }
+            CloudFormationDriftSnapshot stack = driftService.get().authorizationTarget(
+                    firstFormParam(ctx, "StackName"), region, accountId);
+            return List.of(stack.stackId() == null ? "*" : stack.stackId());
         }
         return namedResources(credentialScope, operation, ctx, region, accountId, partition);
     }
