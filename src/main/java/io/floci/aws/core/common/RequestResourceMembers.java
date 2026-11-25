@@ -160,7 +160,7 @@ final class RequestResourceMembers {
             return arn.substring(0, at);
         }
 
-        private String normalizeIntegers(String arn) {
+        String normalizeIntegers(String arn) {
             if (integers == null) {
                 return arn;
             }

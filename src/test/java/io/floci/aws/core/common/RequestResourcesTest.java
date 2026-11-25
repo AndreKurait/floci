@@ -54,6 +54,37 @@ class RequestResourcesTest {
         }
     };
 
+    @ParameterizedTest
+    @CsvSource({"GetDeployment,GET,01", "GetDeployment,GET,+1", "GetDeployment,GET,1",
+            "StopDeployment,DELETE,01", "StopDeployment,DELETE,+1", "StopDeployment,DELETE,1"})
+    void appConfigDeploymentNumbersUseCanonicalAuthorizationResources(String operation, String method, String number) {
+        String prefix = "arn:aws:appconfig:us-east-1:000000000000:application/app";
+        Map<String, String> labels = Map.of("ApplicationId", "app", "EnvironmentId", "env", "DeploymentNumber", number);
+        List<String> expected = List.of(prefix, prefix + "/environment/env/deployment/1", prefix + "/environment/env");
+        assertEquals(expected, RequestResources.of("appconfig:" + operation, rest(method, null, Map.of()),
+                "aws", "us-east-1", "000000000000", null, labels));
+        StoredResourceArns stored = new StoredResourceArns() {
+            @Override
+            public String namespace() {
+                return "appconfig";
+            }
+
+            @Override
+            public Optional<String> find(String type, List<String> names, String region) {
+                return Optional.empty();
+            }
+
+            @Override
+            public Optional<String> findByVariables(String type, Map<String, String> variables, String region) {
+                return "deployment".equals(type)
+                        ? Optional.of(prefix + "/environment/env/deployment/" + variables.get("DeploymentNumber"))
+                        : Optional.empty();
+            }
+        };
+        assertEquals(expected, RequestResources.of("appconfig:" + operation, rest(method, null, Map.of()),
+                "aws", "us-east-1", "000000000000", stored, labels));
+    }
+
     @Test
     void detachFindsBothAttachmentEndpointsAndKeepsTypedMissingFallbacks() {
         String prefix = "arn:aws:ec2:us-east-1:000000000000:";

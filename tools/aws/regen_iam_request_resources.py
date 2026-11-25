@@ -170,8 +170,9 @@ Beyond the members' names, botocore's shapes and documentation say what a member
   variable of that type's format, rather than naming nothing.
 A URI or query member can carry the same name-or-ARN alternative as a body member. An integer shape
 whose name matches an otherwise unfilled ARN variable (optionally ending in `Number`) supplies that variable.
-`integerVariables` records these numeric identifiers so the reader canonicalizes leading zeroes even when the
-request gives the whole ARN; string identifiers retain their spelling.
+`integerVariables` records every explicitly mapped integer member, including shapes named only `Integer`, so the
+reader canonicalizes leading zeroes even when the request gives the whole ARN or storage resolves its IDs;
+string identifiers retain their spelling.
 What a request names, this file alone says. A service only looks up what it holds where an entry asks it to
 (`StoredResourceArns`): the resource the members a `find` gives name, the ones a `through` member reaches, the
 resource its handler uses for a member left out (Athena's `primary` workgroup, EventBridge's `default` bus, ECS's
@@ -4689,10 +4690,18 @@ def integer_variables(operations: dict[str, dict], namespaces: dict[str, list[st
         namespace, name = operation.split(":", 1)
         if namespace not in loaded:
             loaded[namespace] = load_models(data, set(namespaces[namespace]))
-        members = integer_members(loaded[namespace], name)
+        members = set()
+        for model in loaded[namespace].values():
+            spec = model["operations"].get(name, {})
+            if "input" not in spec or _reading(model) is None:
+                continue
+            for member, traits in model["shapes"][spec["input"]["shape"]].get("members", {}).items():
+                if model["shapes"][traits["shape"]]["type"] in ("integer", "long"):
+                    if traits.get("location") in BODY_LOCATIONS or _located(traits) is not None:
+                        members.add(member)
         for resource in entry["resources"]:
             for variable, member in resource.get("fill", {}).items():
-                if members.get(variable) == member:
+                if member in members:
                     types = found.setdefault(namespace, {})
                     types.setdefault(resource["type"], set()).add(variable)
     result = {}

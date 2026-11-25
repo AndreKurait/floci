@@ -1246,7 +1246,7 @@ public final class RequestResources {
         if (stored != null) {
             Optional<String> found = stored.findByVariables(type, filling, region);
             if (found.isPresent()) {
-                return found.get();
+                return format.normalizeIntegers(found.get());
             }
         }
         if (format.minted()) {

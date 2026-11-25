@@ -569,6 +569,19 @@ def test_rest_arn_alternatives_and_integer_shapes_fill_versioned_resources(isola
     assert r.validate(document) == ["integerVariables names no ARN variables for svc:productVersion"]
 
 
+@pytest.mark.parametrize("shape_type", ["integer", "long", "string", "double"])
+def test_integer_variables_follow_explicit_member_mapping_not_shape_names(isolated, tmp_path, shape_type):
+    api = model({"GetDeployment": {"DeploymentNumber": "Integer", "OtherNumber": "Integer"}}, "rest-json")
+    api["shapes"]["Integer"] = {"type": shape_type}
+    api["shapes"]["GetDeploymentIn"]["members"]["DeploymentNumber"].update(
+        location="uri", locationName="DeploymentNumber")
+    write_models(tmp_path, {"svc": api})
+    operations = {"svc:GetDeployment": {"resources": [
+        {"type": "deployment", "fill": {"DeploymentNumber": "DeploymentNumber"}}]}}
+    expected = {"svc": {"deployment": ["DeploymentNumber"]}} if shape_type in ("integer", "long") else {}
+    assert r.integer_variables(operations, {"svc": ["svc"]}, tmp_path) == expected
+
+
 def test_numeric_shapes_do_not_guess_between_members_or_accept_floats():
     api = model({"UpdateThing": {"MinCapacity": "Capacity", "MaxCapacity": "Capacity",
                                  "Weight": "WeightNumber"}})
@@ -1453,7 +1466,8 @@ def test_the_vendored_file_is_well_formed():
                    and "endpoint" in json.dumps(entry) for resource in entry["resources"])
     # A state machine's version or alias is checked on the state machine; a Lambda function's is checked qualified.
     assert document["unqualified"] == {"ssm": ["parameter"], "states": ["statemachine"]}
-    assert document["integerVariables"] == {"lambda": {"layerVersion": ["LayerVersion"]}}
+    assert document["integerVariables"] == {
+        "appconfig": {"deployment": ["DeploymentNumber"]}, "lambda": {"layerVersion": ["LayerVersion"]}}
     # Lambda is read whole: a partial ARN names a function, a provisioned concurrency config acts on the version or
     # alias its Qualifier names, the action the reference gives it, and AddPermission's SourceAccount is its source's.
     assert "lambda" in document["namespaces"]
