@@ -26,6 +26,7 @@ import io.floci.aws.services.ec2.net.Cidr4;
 import io.floci.aws.services.ec2.net.VpcNetworkManager;
 import io.floci.aws.services.ec2.portforward.Ec2PortForwardManager;
 import io.floci.aws.testing.DockerAvailability;
+import io.floci.aws.testing.DockerDefaultRouteAssertions;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
@@ -44,7 +45,6 @@ import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
-import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
@@ -246,25 +246,7 @@ class Ec2HotAttachedRestartDockerIntegrationTest {
     }
 
     static void assertDefaultRouteUsesBridge(JsonNode routes, JsonNode addresses, ContainerNetwork bridge) {
-        assertNotNull(bridge, "The primary Docker bridge endpoint must remain attached");
-        assertEquals(1, routes.size(), routes.toString());
-        JsonNode route = routes.get(0);
-        assertEquals(bridge.getGateway(), route.path("gateway").asText(), routes.toString());
-        // Docker can rename interfaces on restart; identify the routed endpoint by its current MAC and IP.
-        JsonNode routedDevice = null;
-        for (JsonNode device : addresses) {
-            if (route.path("dev").asText().equals(device.path("ifname").asText())) {
-                routedDevice = device;
-            }
-        }
-        assertNotNull(routedDevice, addresses.toString());
-        assertTrue(bridge.getMacAddress().equalsIgnoreCase(routedDevice.path("address").asText()),
-                routedDevice.toString());
-        boolean bridgeAddressPresent = false;
-        for (JsonNode address : routedDevice.path("addr_info")) {
-            bridgeAddressPresent |= bridge.getIpAddress().equals(address.path("local").asText());
-        }
-        assertTrue(bridgeAddressPresent, routedDevice.toString());
+        DockerDefaultRouteAssertions.assertDefaultRouteUsesBridge(routes, addresses, bridge);
     }
 
     private void recreateAttachedEndpoint(String guest, String network, String address, String peer) {
