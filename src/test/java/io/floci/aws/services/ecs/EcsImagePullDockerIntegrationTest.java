@@ -78,10 +78,11 @@ class EcsImagePullDockerIntegrationTest {
     }
 
     @AfterEach
-    void cleanUp() {
+    void cleanUp() throws Exception {
         for (String taskArn : taskArns) {
             ecsService.stopTask(clusterName, taskArn, "test teardown", REGION);
         }
+        ecsService.awaitPendingStops();
         for (String image : images) {
             try {
                 dockerClient.removeImageCmd(image).withForce(true).exec();
@@ -90,7 +91,7 @@ class EcsImagePullDockerIntegrationTest {
             }
         }
         if (registryContainerId != null) {
-            dockerClient.removeContainerCmd(registryContainerId).withForce(true).exec();
+            dockerClient.removeContainerCmd(registryContainerId).withForce(true).withRemoveVolumes(true).exec();
         }
     }
 
