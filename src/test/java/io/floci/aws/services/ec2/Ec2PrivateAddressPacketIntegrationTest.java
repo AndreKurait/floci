@@ -5,6 +5,8 @@ import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.BuildImageResultCallback;
 import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.model.Frame;
+import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.core.common.docker.ContainerStorageHelper;
 import io.floci.aws.services.ec2.model.Instance;
 import io.floci.aws.testing.DockerAvailability;
 import io.floci.aws.testing.TestImages;
@@ -70,6 +72,7 @@ class Ec2PrivateAddressPacketIntegrationTest {
     @Inject Ec2Service service;
     @Inject SecurityGroupFirewallManager firewall;
     @Inject DockerClient docker;
+    @Inject EmulatorConfig config;
     @InjectMock AmiImageResolver images;
     @TestHTTPResource URI endpoint;
     @TempDir Path imageContext;
@@ -80,7 +83,8 @@ class Ec2PrivateAddressPacketIntegrationTest {
     void requireDocker() throws Exception {
         assumeTrue(DockerAvailability.isAvailable(), "Docker is required for private-address packets");
         Files.writeString(imageContext.resolve("Dockerfile"),
-                "FROM " + TestImages.BUSYBOX + "\nRUN mkdir -p /var/lib\n");
+                "FROM " + TestImages.BUSYBOX + "\nRUN mkdir -p /var/lib\n"
+                        + "LABEL floci.test.fixture=" + UUID.randomUUID() + "\n");
         try (BuildImageResultCallback build = docker.buildImageCmd(imageContext.toFile()).withPull(false).start()) {
             String image = build.awaitImageId(60, TimeUnit.SECONDS);
             cleanup.addFirst(() -> docker.removeImageCmd(image).exec());
@@ -102,7 +106,13 @@ class Ec2PrivateAddressPacketIntegrationTest {
         cleanup.addFirst(sdk::close);
         String suffix = UUID.randomUUID().toString().substring(0, 8);
         String vpc = sdk.createVpc(request -> request.cidrBlock("10.87.0.0/16")).vpc().vpcId();
-        cleanup.addFirst(() -> sdk.deleteVpc(request -> request.vpcId(vpc)));
+        cleanup.addFirst(() -> {
+            sdk.deleteVpc(request -> request.vpcId(vpc));
+            await("Private-address VPC network removal").atMost(Duration.ofSeconds(30)).until(() ->
+                    docker.listNetworksCmd().withFilter("label", List.of(
+                            ContainerStorageHelper.OWNER_LABEL + "=" + ContainerStorageHelper.ownerIdentity(config),
+                            ContainerStorageHelper.RESOURCE_ID_LABEL + "=" + vpc)).exec().isEmpty());
+        });
         String subnet = sdk.createSubnet(request -> request.vpcId(vpc).cidrBlock("10.87.1.0/24"))
                 .subnet().subnetId();
         cleanup.addFirst(() -> sdk.deleteSubnet(request -> request.subnetId(subnet)));
@@ -130,8 +140,7 @@ class Ec2PrivateAddressPacketIntegrationTest {
         String callerGuest = localInstance(caller).getDockerContainerId();
         String privateAddress = sdk.describeInstances(request -> request.instanceIds(target)).reservations()
                 .getFirst().instances().getFirst().privateIpAddress();
-        String transportAddress = networkNamespace(targetGuest).getNetworkSettings()
-                .getNetworks().get("bridge").getIpAddress();
+        String transportAddress = transportAddress(networkNamespace(targetGuest));
         assertEquals("10.87.1.10", privateAddress);
         assertNotEquals(privateAddress, transportAddress);
         await().atMost(Duration.ofSeconds(30)).until(() -> fetch(targetGuest, "127.0.0.1").code() == 0);
@@ -166,7 +175,7 @@ class Ec2PrivateAddressPacketIntegrationTest {
         assertEquals(marker, fetch(callerGuest, transportAddress).output().trim());
 
         InspectContainerResponse callerNetwork = networkNamespace(callerGuest);
-        String callerTransport = callerNetwork.getNetworkSettings().getNetworks().get("bridge").getIpAddress();
+        String callerTransport = transportAddress(callerNetwork);
         String vpcNetwork = callerNetwork.getNetworkSettings().getNetworks().values().stream()
                 .filter(network -> "10.87.1.11".equals(network.getIpAddress()))
                 .findFirst().orElseThrow().getNetworkID();
@@ -193,6 +202,12 @@ class Ec2PrivateAddressPacketIntegrationTest {
 
     private Instance localInstance(String id) {
         return service.describeInstances("us-east-1", List.of(id), Map.of()).getFirst().getInstances().getFirst();
+    }
+
+    private String transportAddress(InspectContainerResponse namespace) {
+        String network = docker.inspectNetworkCmd().withNetworkId(namespace.getHostConfig().getNetworkMode())
+                .exec().getName();
+        return namespace.getNetworkSettings().getNetworks().get(network).getIpAddress();
     }
 
     private InspectContainerResponse networkNamespace(String guest) {
