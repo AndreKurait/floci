@@ -4163,6 +4163,10 @@ public interface EmulatorConfig {
     interface AppConfigServiceConfig {
         @WithDefault("true")
         boolean enabled();
+
+        /** Local rollout and bake duration multiplier, greater than zero and at most one. */
+        @WithDefault("1.0")
+        double deploymentTimeScale();
     }
 
     interface AppConfigDataServiceConfig {
