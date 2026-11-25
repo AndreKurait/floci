@@ -207,4 +207,18 @@ class CloudWatchPackedValuesTest {
         assertEquals(List.of(11.0), results.getFirst().values());
     }
 
+    @Test
+    void packedValuesRetainGetMetricDataPercentilesAndMath() {
+        publish(false, weighted());
+        assertEquals(1, metricStore.keys().size());
+        CloudWatchMetricsService.MetricStat percentile = new CloudWatchMetricsService.MetricStat(
+                NAMESPACE, "Latency", List.of(), 60, "p90", "Milliseconds");
+        List<CloudWatchMetricsService.MetricDataResult> results = service.getMetricData(List.of(
+                new CloudWatchMetricsService.MetricDataQuery("p", percentile, null, null, true),
+                new CloudWatchMetricsService.MetricDataQuery("d", null, "p*2", null, true)),
+                START.minusSeconds(1), START.plusSeconds(1), REGION);
+        assertEquals(List.of(11.0), results.getFirst().values());
+        assertEquals(List.of(22.0), results.get(1).values());
+    }
+
 }
