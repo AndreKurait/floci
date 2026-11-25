@@ -92,6 +92,7 @@ import java.util.concurrent.Executor;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.LongUnaryOperator;
 import java.util.function.Predicate;
 import java.util.function.Supplier;
 import java.util.function.ToIntFunction;
@@ -188,6 +189,7 @@ public class DynamoDbService {
     private DynamoDbTransactionConflicts transactionConflicts = DynamoDbTransactionConflicts.OFF;
     private final int vectorIndexAllocationSeconds;
     private final int vectorIndexBackfillSeconds;
+    private final boolean nativeBackend;
     private static final long MAX_DYNAMODB_LIST_INDEX = 4_294_967_294L;
 
     @Inject
@@ -211,7 +213,9 @@ public class DynamoDbService {
              regionResolver, streamService, kinesisForwarder, s3Service, objectMapper,
              config.services().dynamodb().vectorIndexAllocationSeconds(),
              config.services().dynamodb().vectorIndexBackfillSeconds(),
-             config.services().dynamodb().latestRestorableLagSeconds(), Clock.systemUTC());
+             config.services().dynamodb().latestRestorableLagSeconds(), Clock.systemUTC(),
+             command -> Thread.ofVirtual().start(command),
+             "native".equals(config.services().dynamodb().backend().trim().toLowerCase(Locale.ROOT)));
         this.transactionConflicts = DynamoDbTransactionConflicts.of(
                 config.services().dynamodb().transactionConflictsEnabled());
     }
@@ -340,6 +344,29 @@ public class DynamoDbService {
                     int latestRestorableLagSeconds,
                     Clock clock,
                     Executor exportExecutor) {
+        this(tableStore, itemStore, exportStore, importStore, backupStore, pointInTimeStore, regionResolver,
+             streamService, kinesisForwarder, s3Service, objectMapper, vectorIndexAllocationSeconds,
+             vectorIndexBackfillSeconds, latestRestorableLagSeconds, clock, exportExecutor, true);
+    }
+
+    private DynamoDbService(StorageBackend<String, TableDefinition> tableStore,
+                    StorageBackend<String, Map<String, JsonNode>> itemStore,
+                    StorageBackend<String, ExportDescription> exportStore,
+                    StorageBackend<String, ImportTableDescription> importStore,
+                    StorageBackend<String, TableBackup> backupStore,
+                    StorageBackend<String, PointInTimeChange> pointInTimeStore,
+                    RegionResolver regionResolver,
+                    DynamoDbStreamService streamService,
+                    KinesisStreamingForwarder kinesisForwarder,
+                    S3Service s3Service,
+                    ObjectMapper objectMapper,
+                    int vectorIndexAllocationSeconds,
+                    int vectorIndexBackfillSeconds,
+                    int latestRestorableLagSeconds,
+                    Clock clock,
+                    Executor exportExecutor,
+                    boolean nativeBackend) {
+        this.nativeBackend = nativeBackend;
         this.tableStore = tableStore;
         this.itemStore = itemStore;
         this.exportStore = exportStore;
@@ -2887,9 +2914,99 @@ public class DynamoDbService {
     // --- UpdateTable ---
 
 
+    private void requireNativeAutoScaling() {
+        if (!nativeBackend) {
+            throw new AwsException("ValidationException",
+                    "DynamoDB auto scaling requires the native backend.", 400);
+        }
+    }
+
+    /** Detached result of one decision made while the selected native capacity is locked. */
+    public record ScalableCapacityDecision(boolean active, long previousCapacity, long capacity) {}
+
+    /** The decision is pure; the caller retains its scalable-target lock through this method. */
+    public ScalableCapacityDecision decideScalableCapacity(String resourceId, String dimension,
+                                                           String region, LongUnaryOperator decision) {
+        requireNativeAutoScaling();
+        if (!Set.of("dynamodb:table:ReadCapacityUnits", "dynamodb:table:WriteCapacityUnits",
+                "dynamodb:index:ReadCapacityUnits", "dynamodb:index:WriteCapacityUnits").contains(dimension)) {
+            throw new AwsException("ValidationException", "Unsupported DynamoDB scalable dimension.", 400);
+        }
+        boolean index = dimension.startsWith("dynamodb:index:");
+        String[] parts = resourceId == null ? new String[0] : resourceId.split("/", -1);
+        if (parts.length != (index ? 4 : 2) || !"table".equals(parts[0]) || parts[1].isBlank()
+                || index && (!"index".equals(parts[2]) || parts[3].isBlank())) {
+            throw new AwsException("ValidationException", "ResourceId does not match the scalable dimension.", 400);
+        }
+        Objects.requireNonNull(decision);
+        synchronized (capacityLock) {
+            synchronized (tableControlLock(parts[1], region)) {
+                return decideScalableCapacityLocked(resourceId, parts[1], index ? parts[3] : null,
+                        dimension.endsWith("ReadCapacityUnits"), region, decision);
+            }
+        }
+    }
+
+    private ScalableCapacityDecision decideScalableCapacityLocked(String resourceId, String tableName,
+                                                                  String indexName, boolean read, String region,
+                                                                  LongUnaryOperator decision) {
+        String storageKey = regionKey(region, canonicalTableName(region, tableName));
+        String missing = "DynamoDB " + (indexName == null ? "table" : "index") + " does not exist: " + resourceId;
+        TableDefinition table = tableStore.get(storageKey)
+                .orElseThrow(() -> new AwsException("ValidationException", missing, 400));
+        GlobalSecondaryIndex index = indexName == null ? null : table.findGsi(indexName)
+                .orElseThrow(() -> new AwsException("ValidationException", missing, 400));
+        if ("PAY_PER_REQUEST".equals(table.getBillingMode()) || !"ACTIVE".equals(table.getTableStatus())) {
+            // An inactive result has no applicable provisioned capacity; the caller must check active first.
+            return new ScalableCapacityDecision(false, 0, 0);
+        }
+        ProvisionedThroughput throughput = index == null
+                ? table.getProvisionedThroughput() : index.getProvisionedThroughput();
+        long current = read ? throughput.getReadCapacityUnits() : throughput.getWriteCapacityUnits();
+        long desired = decision.applyAsLong(current);
+        if (desired == current) {
+            return new ScalableCapacityDecision(true, current, current);
+        }
+        if (desired <= 0) {
+            throw new AwsException("ValidationException", "DynamoDB provisioned capacity must be positive.", 400);
+        }
+        Long requestedRead = read ? desired : null;
+        Long requestedWrite = read ? null : desired;
+        List<GsiThroughputUpdate> updates = List.of();
+        if (index != null) {
+            DynamoDbCapacityQuotas.requireWithinIndexQuota(index.getIndexName(),
+                    requestedRead, requestedWrite, region);
+            updates = List.of(new GsiThroughputUpdate(index.getIndexName(),
+                    new NativeDynamoDbTableService.Throughput(requestedRead, requestedWrite), null, null));
+        } else {
+            DynamoDbCapacityQuotas.requireWithinTableQuota(requestedRead, requestedWrite, region);
+        }
+        DynamoDbCapacityQuotas.requireUpdateWithinQuotas(table,
+                index == null ? requestedRead : null, index == null ? requestedWrite : null,
+                List.of(), List.of(), updates, reservedCapacity(region), region);
+        long oldWarm = registrationWarm(table, index, read, true);
+        long desiredWarm = Math.max(desired, registrationWarm(table, index, read, false));
+        try {
+            setRegistrationCapacity(throughput, read, desired);
+            setRegistrationWarm(table, index, read, desiredWarm);
+            tableStore.put(storageKey, table);
+        } catch (RuntimeException failure) {
+            setRegistrationCapacity(throughput, read, current);
+            setRegistrationWarm(table, index, read, oldWarm);
+            try {
+                tableStore.put(storageKey, table);
+            } catch (RuntimeException restorationFailure) {
+                failure.addSuppressed(restorationFailure);
+            }
+            throw failure;
+        }
+        return new ScalableCapacityDecision(true, current, desired);
+    }
+
     /** Reconcile this registration only; this is not a policy-executor capacity adapter. */
     public void reconcileScalableTarget(String resourceId, String dimension, int min, int max,
                                        String region, DynamoDbRegistrationTarget publication) {
+        requireNativeAutoScaling();
         if (!Set.of("dynamodb:table:ReadCapacityUnits", "dynamodb:table:WriteCapacityUnits",
                 "dynamodb:index:ReadCapacityUnits", "dynamodb:index:WriteCapacityUnits").contains(dimension)) {
             throw new AwsException("ValidationException", "Unsupported DynamoDB scalable dimension.", 400);
