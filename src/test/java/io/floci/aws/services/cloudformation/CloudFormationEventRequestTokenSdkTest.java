@@ -233,7 +233,11 @@ class CloudFormationEventRequestTokenSdkTest {
                             && "AWS::CloudFormation::Stack".equals(event.resourceType())
                             && TERMINAL.contains(event.resourceStatusAsString())) {
                         assertEquals(expected, event.resourceStatusAsString(), latest.toString());
-                        return latest;
+                        if ("DELETE_COMPLETE".equals(expected)
+                                || expected.equals(cfn.describeStacks(request -> request.stackName(stackId))
+                                        .stacks().getFirst().stackStatusAsString())) {
+                            return latest;
+                        }
                     }
                 }
                 pause();
