@@ -352,14 +352,6 @@ public final class TestTime {
             while ((due = takeDue(target)) != null) {
                 due.fire();
             }
-            lock.lock();
-            try {
-                if (target.isAfter(now)) {
-                    now = target;
-                }
-            } finally {
-                lock.unlock();
-            }
         } finally {
             advancing.unlock();
         }
@@ -381,8 +373,8 @@ public final class TestTime {
     }
 
     /**
-     * Moves the timeline on one due instant at a time, running what is due there, until
-     * {@code condition} holds or {@code limit} has passed, whichever comes first. Returns whether the
+     * Moves the timeline on one due entry at a time, running it before checking whether
+     * {@code condition} holds or {@code limit} has passed. Returns whether the
      * condition holds, with the clock at the instant it first did, or at the limit.
      *
      * <pre>{@code
@@ -400,11 +392,11 @@ public final class TestTime {
         try {
             Instant deadline = now.plus(limit);
             while (!condition.getAsBoolean()) {
-                Instant next = nextDue().filter(due -> !due.isAfter(deadline)).orElse(deadline);
-                advanceTo(next.isAfter(now) ? next : now);
-                if (next.equals(deadline)) {
+                Entry due = takeDue(deadline);
+                if (due == null) {
                     return condition.getAsBoolean();
                 }
+                due.fire();
             }
             return true;
         } finally {
@@ -525,12 +517,15 @@ public final class TestTime {
                 .filter(entry -> entry instanceof Parked parked && parked.interrupts == timedWaits).count();
     }
 
-    /** Removes the earliest entry due by {@code target} and moves the clock up to it. */
+    /** Moves to the earliest entry due by {@code target}, or atomically finishes at the target. */
     private Entry takeDue(Instant target) {
         lock.lock();
         try {
             Entry head = queue.peek();
             if (head == null || head.due.isAfter(target)) {
+                if (target.isAfter(now)) {
+                    now = target;
+                }
                 return null;
             }
             queue.remove();

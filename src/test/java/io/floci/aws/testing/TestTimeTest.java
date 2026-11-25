@@ -573,6 +573,8 @@ class TestTimeTest {
 
         assertEquals("late answer", time.getAdvancing(response, Duration.ofSeconds(10)));
         assertEquals(START.plusSeconds(3), time.now());
+        assertEquals(2, ticks.get());
+        time.runDue();
         assertEquals(3, ticks.get());
 
         assertThrows(TimeoutException.class,
@@ -636,6 +638,38 @@ class TestTimeTest {
         assertThrows(IllegalArgumentException.class, () -> time.advanceUntil(() -> true, Duration.ofNanos(-1)));
         poller.interrupt();
         poller.join();
+    }
+
+    @Test
+    void finishingAnEmptyAdvanceCommitsTheClockBeforeAnotherTaskIsEnqueued() throws Exception {
+        Method takeDue = TestTime.class.getDeclaredMethod("takeDue", Instant.class);
+        takeDue.setAccessible(true);
+
+        assertNull(takeDue.invoke(time, START.plusSeconds(10)));
+        time.scheduler().schedule(() -> { }, 1, TimeUnit.SECONDS);
+
+        assertEquals(START.plusSeconds(10), time.now());
+        assertEquals(START.plusSeconds(11), time.nextTaskDue().orElseThrow());
+    }
+
+    @Test
+    void advancingGetStopsBeforeAnotherEntryAtTheSameInstant() throws Exception {
+        CompletableFuture<String> result = new CompletableFuture<>();
+        time.scheduler().schedule(() -> result.complete("ready"), 2, TimeUnit.SECONDS);
+        AtomicBoolean secondRan = new AtomicBoolean();
+        time.scheduler().schedule(() -> {
+            secondRan.set(true);
+            time.sleepAdvancing(Duration.ofSeconds(3));
+        }, 2, TimeUnit.SECONDS);
+
+        assertEquals("ready", time.getAdvancing(result, Duration.ofSeconds(10)));
+        assertEquals(START.plusSeconds(2), time.now());
+        assertFalse(secondRan.get());
+        assertEquals(1, time.pendingTasks());
+
+        time.runDue();
+        assertTrue(secondRan.get());
+        assertEquals(START.plusSeconds(5), time.now());
     }
 
     /** What a five-minute timed get of {@code future} ends with: its value, or what it threw. */
