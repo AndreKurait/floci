@@ -205,8 +205,9 @@ class Ec2PrivateAddressPacketIntegrationTest {
     }
 
     private String transportAddress(InspectContainerResponse namespace) {
-        String network = docker.inspectNetworkCmd().withNetworkId(namespace.getHostConfig().getNetworkMode())
-                .exec().getName();
+        String mode = namespace.getHostConfig().getNetworkMode();
+        String network = docker.inspectNetworkCmd().withNetworkId(mode == null || "default".equals(mode)
+                ? "bridge" : mode).exec().getName();
         return namespace.getNetworkSettings().getNetworks().get(network).getIpAddress();
     }
 
