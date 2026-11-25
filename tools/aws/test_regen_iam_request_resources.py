@@ -3426,12 +3426,14 @@ def test_an_operation_checked_as_several_actions_checks_each_resource_as_one_of_
 
 
 def test_every_permission_source_is_written_by_its_own_fetcher():
-    assert set(r.PERMISSION_FETCHERS) == set(r.PERMISSION_SOURCES)
-    for namespace, path in r.PERMISSION_SOURCES.items():
-        assert r.PERMISSION_FETCHERS[namespace].OUTPUT == path, namespace
+    for sources, fetchers in ((r.PERMISSION_SOURCES, r.PERMISSION_FETCHERS),
+                              (r.ID_EXAMPLE_SOURCES, r.ID_EXAMPLE_FETCHERS)):
+        assert set(fetchers) == set(sources)
+        for namespace, path in sources.items():
+            assert fetchers[namespace].OUTPUT == path, namespace
 
 
-def test_each_permission_source_is_verified_against_the_pages_its_own_fetcher_reads(isolated, tmp_path):
+def test_each_permission_source_is_verified_against_the_pages_its_own_fetcher_reads(tmp_path):
     class Fetcher:
         def __init__(self, page: str):
             self.page = page
@@ -3447,12 +3449,10 @@ def test_each_permission_source_is_verified_against_the_pages_its_own_fetcher_re
         sources[namespace] = tmp_path / f"{namespace}.json"
         sources[namespace].write_text(json.dumps({"_source": {"pages": [f"https://{namespace}"],
                                                               "fetcher": f"fetch_{namespace}.py"}, "says": says}))
-    isolated.setattr(r, "PERMISSION_SOURCES", sources)
-    isolated.setattr(r, "PERMISSION_FETCHERS", {"first": Fetcher("kept"), "second": Fetcher("kept")})
-    assert r.verify_permission_sources() == []
-    isolated.setattr(r, "PERMISSION_FETCHERS", {"first": Fetcher("kept"), "second": Fetcher("changed")})
-    assert r.verify_permission_sources() == ["https://second and the pages they link to no longer give what "
-                                             "second.json holds for second: run fetch_second.py"]
+    assert r.verify_sources(sources, {"first": Fetcher("kept"), "second": Fetcher("kept")}) == []
+    assert r.verify_sources(sources, {"first": Fetcher("kept"), "second": Fetcher("changed")}) == [
+        "https://second and the pages they link to no longer give what second.json holds for second: run "
+        "fetch_second.py"]
 
 
 # --------------------------------------------------------------------------- #
@@ -3675,6 +3675,7 @@ def test_a_resource_named_after_its_path_or_signed_for_is_checked():
         assert r._resource_problems("iam:Op", bad, types, USERS_FORMATS), bad
 
 
+
 def reference_endpoint_model():
     return {"ec2": {"operations": {"CreateVpcEndpoint": {"output": {"shape": "Result"}}}, "shapes": {
         "Result": {"type": "structure", "members": {"VpcEndpoint": {
@@ -3686,7 +3687,7 @@ def reference_endpoint_model():
 
 
 def reference_endpoint_source(value="vpce-abc12345"):
-    return {"operations": {"CreateVpcEndpoint": {"examples": [
+    return {"namespace": "ec2", "operations": {"CreateVpcEndpoint": {"examples": [
         {"path": ["vpcEndpoint", "vpcEndpointId"], "value": value}]}}}
 
 
@@ -3696,6 +3697,7 @@ def test_reference_prefix_comes_from_the_response_value_and_modeled_shape():
         "vpc-endpoint": "vpce-"}
     assert r.reference_id_prefixes(models, ("vpc-endpoint",), reference_endpoint_source("changed-12345678")) == {
         "vpc-endpoint": "changed-"}
+    # EC2 often gives an id the generic String shape: the member's name still names the type.
     models["ec2"]["shapes"]["VpcEndpoint"]["members"]["VpcEndpointId"]["shape"] = "String"
     models["ec2"]["shapes"]["String"] = {"type": "string"}
     assert r.reference_id_prefixes(models, ("vpc-endpoint",), reference_endpoint_source()) == {
@@ -3721,9 +3723,9 @@ def test_reference_example_path_drift_and_conflicting_prefixes_fail_closed():
 def test_documented_prefix_refuses_to_override_conflicting_botocore_evidence(monkeypatch, tmp_path):
     source = tmp_path / "examples.json"
     source.write_text(json.dumps(reference_endpoint_source()))
-    monkeypatch.setattr(r.fetch_ec2_id_examples, "OUTPUT", source)
+    monkeypatch.setattr(r, "ID_EXAMPLE_SOURCES", {"ec2": source})
     models = reference_endpoint_model()
-    assert r.documented_id_prefixes("ec2", models) == {"vpc-endpoint": "vpce-"}
+    assert r.documented_id_prefixes("ec2", models).prefixes == {"vpc-endpoint": "vpce-"}
     monkeypatch.setattr(r, "namespace_id_prefixes", lambda *args: {"vpc-endpoint": "other-"})
     with pytest.raises(ValueError, match="disagree"):
         r.documented_id_prefixes("ec2", models)
@@ -3734,7 +3736,7 @@ def test_vendored_ec2_examples_resolve_through_the_actual_pinned_response_member
     models = r.load_models(data, {"ec2"})
     source = json.loads(r.fetch_ec2_id_examples.OUTPUT.read_text())
     assert r.reference_id_prefixes(models, r.ID_TARGETS["ec2"], source)["vpc-endpoint"] == "vpce-"
-    assert r.documented_id_prefixes("ec2", models, r.load_examples(data, {"ec2"}))["vpc-endpoint"] == "vpce-"
+    assert r.documented_id_prefixes("ec2", models, r.load_examples(data, {"ec2"})).prefixes["vpc-endpoint"] == "vpce-"
 
 
 def test_identifier_reference_verification_reports_unavailable_pages(monkeypatch):
@@ -3752,7 +3754,36 @@ def test_reference_prefix_supplements_generic_lists_without_changing_typed_endpo
     generic = r.documented_id_prefixes("ec2", models, r.load_examples(data, {"ec2"}))
     formats = {"vpc-endpoint": "arn:${Partition}:ec2:${Region}:${Account}:vpc-endpoint/${VpcEndpointId}"}
     for operation in ("ec2:CreateTags", "ec2:DeleteTags"):
-        assert r.id_targets(operation, ["vpc-endpoint"], formats, models, known, generic)["prefixes"] == {
+        assert r.id_targets(operation, ["vpc-endpoint"], formats, models, generic)["prefixes"] == {
             "vpc-endpoint": "vpce-"}
-    assert r.id_targets("ec2:DeleteVpcEndpoints", ["vpc-endpoint"], formats, models, known, generic) == \
+    assert r.id_targets("ec2:DeleteVpcEndpoints", ["vpc-endpoint"], formats, models, generic) == \
+        r.id_targets("ec2:DeleteVpcEndpoints", ["vpc-endpoint"], formats, models, known)
+
+
+def test_a_reference_prefix_joins_botocores_without_making_a_typed_list(monkeypatch, tmp_path):
+    source = tmp_path / "examples.json"
+    source.write_text(json.dumps(reference_endpoint_source()))
+    monkeypatch.setattr(r, "ID_EXAMPLE_SOURCES", {"ec2": source})
+    monkeypatch.setattr(r, "namespace_id_prefixes", lambda *args: {"instance": "i-"})
+    found = r.documented_id_prefixes("ec2", reference_endpoint_model())
+    assert found.prefixes == {"instance": "i-", "vpc-endpoint": "vpce-"}
+    assert found.typed == frozenset({"instance"})
+    monkeypatch.setattr(r, "namespace_id_prefixes", lambda *args: {"vpc-endpoint": "other-"})
+    with pytest.raises(ValueError, match="disagree"):
+        r.documented_id_prefixes("ec2", reference_endpoint_model())
+
+
+def test_the_vendored_ec2_examples_give_tag_calls_the_endpoint_prefix_and_leave_endpoint_deletion_typed():
+    data, _ = r.resolve_botocore_data(None)
+    models = r.load_models(data, {"ec2"})
+    examples = r.load_examples(data, {"ec2"})
+    known = r.namespace_id_prefixes("ec2", models, examples)
+    merged = r.documented_id_prefixes("ec2", models, examples)
+    assert "vpc-endpoint" not in known
+    assert merged.prefixes["vpc-endpoint"] == "vpce-"
+    formats = {"vpc-endpoint": "arn:${Partition}:ec2:${Region}:${Account}:vpc-endpoint/${VpcEndpointId}"}
+    for operation in ("ec2:CreateTags", "ec2:DeleteTags"):
+        assert r.id_targets(operation, ["vpc-endpoint"], formats, models, merged)["prefixes"] == {
+            "vpc-endpoint": "vpce-"}
+    assert r.id_targets("ec2:DeleteVpcEndpoints", ["vpc-endpoint"], formats, models, merged) == \
         r.id_targets("ec2:DeleteVpcEndpoints", ["vpc-endpoint"], formats, models, known)
