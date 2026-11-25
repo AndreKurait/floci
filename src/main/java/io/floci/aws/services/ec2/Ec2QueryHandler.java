@@ -4695,7 +4695,6 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDeleteTags(MultivaluedMap<String, String> p, String region) {
-        checkDryRun(p);
         List<String> resourceIds = getList(p, "ResourceId");
         List<Tag> tagList = new ArrayList<>();
         for (int i = 1; ; i++) {
@@ -7599,7 +7598,6 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDetachVolume(MultivaluedMap<String, String> p, String region) {
-        checkDryRun(p);
         String volumeId = p.getFirst("VolumeId");
         String instanceId = p.getFirst("InstanceId");
         String device = p.getFirst("Device");
