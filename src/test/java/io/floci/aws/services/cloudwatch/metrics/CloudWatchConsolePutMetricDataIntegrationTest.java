@@ -73,6 +73,21 @@ class CloudWatchConsolePutMetricDataIntegrationTest {
         }
     }
 
+    private static void assertStatistics(String namespace, String metric, long timestamp,
+                                         double sum, double sampleCount, double average) {
+        try (CloudWatchClient client = AwsTestClients.create(CloudWatchClient.builder(), "test", Region.US_EAST_1)) {
+            List<Datapoint> datapoints = client.getMetricStatistics(request -> request.namespace(namespace)
+                    .metricName(metric).startTime(Instant.ofEpochSecond(timestamp - 120))
+                    .endTime(Instant.ofEpochSecond(timestamp + 120)).period(60)
+                    .statistics(Statistic.SUM, Statistic.SAMPLE_COUNT, Statistic.AVERAGE)).datapoints();
+            assertEquals(1, datapoints.size());
+            Datapoint datapoint = datapoints.getFirst();
+            assertEquals(sum, datapoint.sum());
+            assertEquals(sampleCount, datapoint.sampleCount());
+            assertEquals(average, datapoint.average(), 0.000001);
+        }
+    }
+
     @Test
     void sharedDatumShapesAreStoredAndReadableThroughTheStandardProtocol() {
         String namespace = namespace();
@@ -112,8 +127,8 @@ class CloudWatchConsolePutMetricDataIntegrationTest {
                 .when().post("/")
                 .then().statusCode(200);
 
-        assertSum(namespace, "Weighted", timestamp, 16);
-        assertSum(namespace, "Unweighted", timestamp, 7);
+        assertStatistics(namespace, "Weighted", timestamp, 16, 5, 3.2);
+        assertStatistics(namespace, "Unweighted", timestamp, 7, 2, 3.5);
     }
 
     @Test
