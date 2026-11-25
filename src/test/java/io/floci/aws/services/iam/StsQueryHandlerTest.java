@@ -40,6 +40,7 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyMap;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -663,8 +664,8 @@ class StsQueryHandlerTest {
         Response response = handler.handle("AssumeRole", params);
 
         assertEquals(200, response.getStatus(), (String) response.getEntity());
-        verify(iamService).registerSession(anyString(), anyString(), anyString(), eq(storedArn), any(),
-                any(), eq("000000000000"), eq("test-session"), eq("AROA-test:test-session"));
+        verify(iamService).registerAssumeRoleSession(anyString(), anyString(), anyString(), eq(storedArn), any(),
+                any(), eq("000000000000"), eq("test-session"), eq("AROA-test:test-session"), eq(false), isNull());
     }
 
     @Test
@@ -751,13 +752,13 @@ class StsQueryHandlerTest {
         if (status == 400) {
             assertTrue(body.contains("<Code>ValidationError</Code>"), body);
             assertTrue(body.contains("The requested DurationSeconds exceeds the MaxSessionDuration set for this role."), body);
-            verify(service, never()).registerSession(anyString(), anyString(), anyString(), anyString(),
-                    any(), any(), anyString(), anyString(), anyString());
+            verify(service, never()).registerAssumeRoleSession(anyString(), anyString(), anyString(), anyString(),
+                    any(), any(), anyString(), anyString(), anyString(), anyBoolean(), any());
         } else {
             Instant expiry = now.plusSeconds(requested == 0 ? 3600 : requested);
             assertEquals(expiry.toString(), extract(EXPIRATION, body));
-            verify(service).registerSession(anyString(), anyString(), anyString(), eq(role.getArn()),
-                    eq(expiry), isNull(), eq("000000000000"), eq("duration"), anyString());
+            verify(service).registerAssumeRoleSession(anyString(), anyString(), anyString(), eq(role.getArn()),
+                    eq(expiry), isNull(), eq("000000000000"), eq("duration"), anyString(), eq(false), isNull());
         }
     }
 
@@ -772,8 +773,8 @@ class StsQueryHandlerTest {
                 .handle("AssumeRole", params);
         assertEquals(403, response.getStatus());
         assertTrue(response.getEntity().toString().contains("<Code>AccessDenied</Code>"));
-        verify(service, never()).registerSession(anyString(), anyString(), anyString(), anyString(),
-                any(), any(), anyString(), anyString(), anyString());
+        verify(service, never()).registerAssumeRoleSession(anyString(), anyString(), anyString(), anyString(),
+                any(), any(), anyString(), anyString(), anyString(), anyBoolean(), any());
     }
 
     @Test
@@ -1237,8 +1238,8 @@ class StsQueryHandlerTest {
         assertEquals(200, response.getStatus(), (String) response.getEntity());
         assertEquals(expected, extract(EXPIRATION, (String) response.getEntity()));
         ArgumentCaptor<Instant> sessionExpiration = ArgumentCaptor.forClass(Instant.class);
-        verify(iamService).registerSession(anyString(), anyString(), anyString(), eq(role.getArn()),
-                sessionExpiration.capture(), isNull(), eq("000000000000"), eq("sx"), anyString());
+        verify(iamService).registerAssumeRoleSession(anyString(), anyString(), anyString(), eq(role.getArn()),
+                sessionExpiration.capture(), isNull(), eq("000000000000"), eq("sx"), anyString(), eq(false), isNull());
         assertEquals(expiration, sessionExpiration.getValue());
     }
 
@@ -1282,11 +1283,11 @@ class StsQueryHandlerTest {
         assertEquals(status, response.getStatus(), response.getEntity().toString());
         if (status == 400) {
             assertTrue(response.getEntity().toString().contains("role chaining"));
-            verify(service, never()).registerSession(anyString(), anyString(), anyString(), anyString(), any(),
-                    any(), anyString(), anyString(), anyString());
+            verify(service, never()).registerAssumeRoleSession(anyString(), anyString(), anyString(), anyString(), any(),
+                    any(), anyString(), anyString(), anyString(), anyBoolean(), any());
         } else {
-            verify(service).registerSession(anyString(), anyString(), anyString(), eq(role.getArn()), any(),
-                    isNull(), eq("000000000000"), eq("chained"), anyString());
+            verify(service).registerAssumeRoleSession(anyString(), anyString(), anyString(), eq(role.getArn()), any(),
+                    isNull(), eq("000000000000"), eq("chained"), anyString(), eq(false), isNull());
         }
     }
 

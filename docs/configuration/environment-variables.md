@@ -366,6 +366,8 @@ See [Initialization Hooks](./initialization-hooks.md) for lifecycle phases and s
 | Variable | Default | Description |
 |---|---|---|
 | `FLOCI_SERVICES_IAM_ENABLED` | `true` | Enable the IAM service |
+| `FLOCI_SERVICES_IAM_ISSUED_SESSION_VERIFICATION_ENABLED` | `false` | Enable bounded local metadata lookup and SigV4 proof verification for current normal AssumeRole sessions; does not grant permissions |
+| `FLOCI_SERVICES_IAM_LAMBDA_IDENTITY_VERIFICATION_ENABLED` | `false` | Enable local observation and proof verification of current Lambda execution-role identities; does not grant permissions |
 | `FLOCI_SERVICES_IAM_ENFORCEMENT_ENABLED` | `false` | When `true`, enforce IAM policies on API calls. Leave `false` for most local development scenarios |
 | `FLOCI_SERVICES_IAM_SEED_DEPLOYER_PRINCIPAL` | `false` | Create a local `floci-deployer` IAM user with `AdministratorAccess` and static `floci`/`floci` credentials |
 | `FLOCI_SERVICES_IAM_SEED_DEPLOYER_ACCESS_KEY_ID` | `floci` | Access key ID of the seeded deployer's key: `floci`, or 16 to 128 word characters (for example `AKIA` plus 16 uppercase letters and digits) to be able to deactivate or delete it. Floci refuses to start with any other value |

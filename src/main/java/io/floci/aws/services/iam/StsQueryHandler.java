@@ -93,6 +93,9 @@ public class StsQueryHandler {
     /** CSPRNG for session secret keys and session tokens; ordinary IDs keep using {@link ThreadLocalRandom}. */
     private final SecureRandom secureRandom = new SecureRandom();
 
+    @Inject
+    RequestContext verifiedRequest;
+
     @Context
     HttpHeaders headers;
 
@@ -246,9 +249,11 @@ public class StsQueryHandler {
         // role's own ARN, path included: it is the session's aws:PrincipalArn, and it keeps naming
         // the role that issued the session even if a role of the same name replaces it later.
         String sessionPolicy = getParam(params, "Policy");
-        iamService.registerSession(
+        iamService.registerAssumeRoleSession(
                 accessKeyId, secretKey, sessionToken, sessionRoleArn, expiration, sessionPolicy, callerAccountId,
-                sessionName, assumedRoleId);
+                sessionName, assumedRoleId,
+                params.keySet().stream().anyMatch(key -> key.startsWith("PolicyArns.member.")),
+                verifiedRequest == null ? null : verifiedRequest.getVerifiedSession());
         // The tags inherited from the calling session are this session's own from here on, under
         // the ones the request passes, and the keys they came in under stay transitive so the next
         // session in the chain inherits them too: in the guide's chain the second session's
