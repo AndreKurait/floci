@@ -6,6 +6,7 @@ import io.floci.aws.core.common.AwsRegions;
 import io.floci.aws.core.common.RequestPathLabels;
 import io.floci.aws.core.common.RequestResources;
 import io.floci.aws.core.common.StoredResourceArns;
+import io.floci.aws.services.ssm.SsmSessionResources;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
@@ -91,6 +92,13 @@ public class ResourceArnBuilder {
                                        String region, String accountId, String partition) {
         if (credentialScope == null) {
             return List.of("*");
+        }
+        if ("ssm".equals(credentialScope) && operation != null && operation.startsWith("ssm:")) {
+            List<String> sessions = SsmSessionResources.of(operation.substring(4), readJsonBody(ctx),
+                    region, accountId, partition);
+            if (sessions != null) {
+                return sessions;
+            }
         }
         return namedResources(credentialScope, operation, ctx, region, accountId, partition);
     }
