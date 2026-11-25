@@ -19,6 +19,7 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicReference;
 
 import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
@@ -145,14 +146,20 @@ final class Ec2MetadataTestFixture implements AutoCloseable {
     static <T> HttpResponse<T> sendResponse(HttpClient client, HttpRequest request,
                                            HttpResponse.BodyHandler<T> bodyHandler) throws Exception {
         Duration timeout = request.timeout().orElseThrow();
-        CompletableFuture<HttpResponse<T>> response = client.sendAsync(request, bodyHandler);
+        AtomicReference<String> stage = new AtomicReference<>("awaiting response headers");
+        CompletableFuture<HttpResponse<T>> response = client.sendAsync(request, info -> {
+            stage.set("reading response body (status=" + info.statusCode() + ", content-length="
+                    + info.headers().firstValue("Content-Length").orElse("unknown") + ")");
+            return bodyHandler.apply(info);
+        });
         try {
             return response.get(timeout.toNanos(), TimeUnit.NANOSECONDS);
         } catch (TimeoutException expired) {
-            HttpTimeoutException failure = new HttpTimeoutException("IMDS response body did not complete within " + timeout);
-            failure.initCause(expired);
-            throw failure;
+            throw responseTimeout(timeout, stage.get(), expired);
         } catch (ExecutionException failure) {
+            if (failure.getCause() instanceof HttpTimeoutException expired) {
+                throw responseTimeout(timeout, stage.get(), expired);
+            }
             if (failure.getCause() instanceof Exception cause) {
                 throw cause;
             }
@@ -160,6 +167,13 @@ final class Ec2MetadataTestFixture implements AutoCloseable {
         } finally {
             response.cancel(true);
         }
+    }
+
+    private static HttpTimeoutException responseTimeout(Duration timeout, String stage, Exception cause) {
+        HttpTimeoutException failure = new HttpTimeoutException("IMDS response did not complete within "
+                + timeout + ": " + stage);
+        failure.initCause(cause);
+        return failure;
     }
 
 }

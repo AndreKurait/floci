@@ -47,10 +47,23 @@ class Ec2MetadataResponseTest {
     @Test
     void stalledBodyTimesOutAndCancelsTheExchange() throws Exception {
         try (BodyServer server = new BodyServer(true, false); HttpClient client = HttpClient.newHttpClient()) {
-            assertTimeoutPreemptively(Duration.ofSeconds(8), () ->
+            HttpTimeoutException failure = assertTimeoutPreemptively(Duration.ofSeconds(8), () ->
                     assertThrows(HttpTimeoutException.class, () -> Ec2MetadataTestFixture.sendResponse(
                             client, server.request(), HttpResponse.BodyHandlers.ofString())));
+            assertEquals("IMDS response did not complete within PT2S: reading response body "
+                    + "(status=200, content-length=16384)", failure.getMessage());
             server.headersSent.get(3, TimeUnit.SECONDS);
+            server.completed.get(3, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void stalledHeadersReportTheirStageAndCancelTheExchange() throws Exception {
+        try (BodyServer server = new BodyServer(true, false, true); HttpClient client = HttpClient.newHttpClient()) {
+            HttpTimeoutException failure = assertTimeoutPreemptively(Duration.ofSeconds(8), () ->
+                    assertThrows(HttpTimeoutException.class, () -> Ec2MetadataTestFixture.sendResponse(
+                            client, server.request(), HttpResponse.BodyHandlers.ofString())));
+            assertEquals("IMDS response did not complete within PT2S: awaiting response headers", failure.getMessage());
             server.completed.get(3, TimeUnit.SECONDS);
         }
     }
@@ -99,9 +112,13 @@ class Ec2MetadataResponseTest {
         private final Thread thread;
 
         BodyServer(boolean partial, boolean closeEarly) throws IOException {
+            this(partial, closeEarly, false);
+        }
+
+        BodyServer(boolean partial, boolean closeEarly, boolean stallHeaders) throws IOException {
             listener = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"));
             listener.setSoTimeout(5000);
-            thread = Thread.ofPlatform().start(() -> serve(partial, closeEarly));
+            thread = Thread.ofPlatform().start(() -> serve(partial, closeEarly, stallHeaders));
         }
 
         HttpRequest request() {
@@ -113,7 +130,7 @@ class Ec2MetadataResponseTest {
                     .timeout(timeout).GET().build();
         }
 
-        private void serve(boolean partial, boolean closeEarly) {
+        private void serve(boolean partial, boolean closeEarly, boolean stallHeaders) {
             try (Socket socket = listener.accept()) {
                 accepted.set(socket);
                 socket.setSoTimeout(10000);
@@ -122,6 +139,11 @@ class Ec2MetadataResponseTest {
                 do {
                     line = input.readLine();
                 } while (line != null && !line.isEmpty());
+                if (stallHeaders) {
+                    assertEquals(-1, input.read(), "Cancellation must close the client exchange before headers");
+                    completed.complete(null);
+                    return;
+                }
                 OutputStream output = socket.getOutputStream();
                 output.write("HTTP/1.1 200 OK\r\nContent-Length: 16384\r\nConnection: close\r\n\r\n"
                         .getBytes(StandardCharsets.US_ASCII));
