@@ -8,6 +8,7 @@ import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.services.ses.model.EmailContent;
 import io.floci.aws.services.ses.model.EmailTemplate;
 import io.floci.aws.services.ses.model.Tag;
+import io.floci.aws.testing.ManualClock;
 import io.floci.aws.testing.MutableClock;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -318,6 +319,17 @@ class SesTemplateServiceTest {
         service.deleteTemplate("welcome", REGION);
         assertThrows(AwsException.class, () -> service.getTemplate("welcome", REGION));
         assertThrows(AwsException.class, () -> service.deleteTemplate("welcome", REGION));
+    }
+
+    @Test
+    void renderTestTemplate_datesTheMessageFromTheInjectedClock() {
+        SesTemplateService fixed = new SesTemplateService(new InMemoryStorage<>(), new ObjectMapper(),
+                new SecureRandom(), new ManualClock(Instant.parse("2031-03-04T05:06:07Z")));
+        fixed.createTemplate(template("welcome"), REGION);
+
+        String mime = fixed.renderTestTemplate("welcome", "{}", REGION);
+
+        assertTrue(mime.startsWith("Date: Tue, 4 Mar 2031 05:06:07 GMT\r\n"), mime);
     }
 
     @Test
