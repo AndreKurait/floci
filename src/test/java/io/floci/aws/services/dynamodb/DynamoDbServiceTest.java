@@ -5308,7 +5308,7 @@ class DynamoDbServiceTest {
         pitr.updateTimeToLive("Users", "expiresAt", true, region);
         pitr.updateContinuousBackups("Users", true, null, region);
         ObjectNode expired = item("userId", "u1");
-        expired.set("expiresAt", attributeValue("N", "1"));
+        expired.set("expiresAt", attributeValue("N", String.valueOf(Instant.now().getEpochSecond() - 3600)));
         pitr.putItem("Users", expired, null, null, null, region, null);
         Instant beforeSweep = clock.instant();
         pitr.deleteExpiredItems();

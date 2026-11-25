@@ -135,7 +135,7 @@ class DynamoDbPartitionedItemStoreTest {
     void expiredItemsTheSweeperRemovesStayRemovedAfterARestart() {
         service.updateTimeToLive("Nodes", "expires", true, REGION);
         ObjectNode expired = item("node-1", "beat-1");
-        expired.set("expires", mapper.createObjectNode().put("N", "1"));
+        expired.set("expires", mapper.createObjectNode().put("N", String.valueOf(Instant.now().getEpochSecond() - 3600)));
         service.putItem("Nodes", expired, REGION);
         service.putItem("Nodes", item("node-2", "beat-1"), REGION);
 
@@ -147,12 +147,30 @@ class DynamoDbPartitionedItemStoreTest {
     }
 
     @Test
+    void zeroAndAncientTtlItemsSurviveTheSweepAndRestart() {
+        service.updateTimeToLive("Nodes", "expires", true, REGION);
+        ObjectNode unset = item("unset", "beat-1");
+        unset.set("expires", mapper.createObjectNode().put("N", "0"));
+        ObjectNode ancient = item("ancient", "beat-1");
+        ancient.set("expires", mapper.createObjectNode().put("N",
+                String.valueOf(Instant.now().minusSeconds(366L * 6 * 86400).getEpochSecond())));
+        service.putItem("Nodes", unset, REGION);
+        service.putItem("Nodes", ancient, REGION);
+
+        service.deleteExpiredItems();
+
+        DynamoDbService restarted = restart();
+        assertNotNull(restarted.getItem("Nodes", key("unset"), REGION));
+        assertNotNull(restarted.getItem("Nodes", key("ancient"), REGION));
+    }
+
+    @Test
     void aWriteRightAfterTheSweeperRemovesAnItemSurvivesARestart() {
         DynamoDbStreamService streams = mock(DynamoDbStreamService.class);
         DynamoDbService swept = new DynamoDbService(tableStore, openItemStore(), resolver, streams, null);
         swept.updateTimeToLive("Nodes", "expires", true, REGION);
         ObjectNode expired = item("node-1", "beat-1");
-        expired.set("expires", mapper.createObjectNode().put("N", "1"));
+        expired.set("expires", mapper.createObjectNode().put("N", String.valueOf(Instant.now().getEpochSecond() - 3600)));
         swept.putItem("Nodes", expired, REGION);
         // The REMOVE event fires after the sweeper drops the item and releases its lock: the
         // moment a new write of the same key can land before the removal reaches disk.
