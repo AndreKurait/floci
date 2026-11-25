@@ -11,7 +11,8 @@ import java.util.Optional;
 /**
  * What IAM asks CloudFormation of the resources a request names: the ARN of the stack or the stack set a name names,
  * whose id CloudFormation minted, so a request naming one by its name is checked on the ARN AWS checks; and the tags
- * of a stack, a stack set or a change set, which a resource-tag condition reads.
+ * of a stack, a stack set or a change set, which a resource-tag condition reads. A change-set ARN also identifies
+ * the stack that holds it, for requests that reach the stack through that ARN.
  */
 @ApplicationScoped
 public class CloudFormationStoredResourceArns implements StoredResourceArns {
@@ -40,6 +41,11 @@ public class CloudFormationStoredResourceArns implements StoredResourceArns {
             case "stackset" -> stackSets.stackSetArn(names.getFirst(), region);
             default -> Optional.empty();
         };
+    }
+
+    @Override
+    public List<String> through(String member, String value, String region) {
+        return "ChangeSetName".equals(member) ? stacks.changeSetStackArn(value, region).stream().toList() : List.of();
     }
 
     /** The tags of the stack, stack set or change set {@code arn} names, which a resource-tag condition reads. */
