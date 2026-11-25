@@ -168,7 +168,22 @@ public interface SparkJobRunner {
                List<String> archives, Storage storage, Map<String, String> coreSite,
                Map<String, String> sparkLog4j2, Map<String, String> mapredSite, Map<String, String> hadoopLog4j,
                Map<String, String> hadoopEnvironment, Executors executors, String platform, int listenPort,
-               boolean keepsEventLogs, boolean interruptible) {
+               boolean keepsEventLogs, boolean interruptible, String imagePullSourceArn) {
+
+
+        public Job(String service, String runId, String accountId, String region, String releaseLabel, Engine engine,
+                   String imageTemplate, String customImage, String dockerNetwork, String executionRole,
+                   Map<String, String> sparkDefaults, List<String> application, List<String> command, Duration timeout,
+                   String logFolder, CloudWatchLogs cloudWatchLogs, Map<String, String> environment,
+                   List<String> archives, Storage storage, Map<String, String> coreSite,
+                   Map<String, String> sparkLog4j2, Map<String, String> mapredSite, Map<String, String> hadoopLog4j,
+                   Map<String, String> hadoopEnvironment, Executors executors, String platform, int listenPort,
+                   boolean keepsEventLogs, boolean interruptible) {
+            this(service, runId, accountId, region, releaseLabel, engine, imageTemplate, customImage, dockerNetwork,
+                    executionRole, sparkDefaults, application, command, timeout, logFolder, cloudWatchLogs,
+                    environment, archives, storage, coreSite, sparkLog4j2, mapredSite, hadoopLog4j,
+                    hadoopEnvironment, executors, platform, listenPort, keepsEventLogs, interruptible, null);
+        }
 
         /** A job whose driver listens on no port for Floci. */
         public Job(String service, String runId, String accountId, String region, String releaseLabel, Engine engine,
@@ -204,7 +219,7 @@ public interface SparkJobRunner {
             return new Job(service, runId, accountId, region, releaseLabel, engine, imageTemplate, customImage,
                     dockerNetwork, executionRole, sparkDefaults, application, command, timeout, logFolder,
                     cloudWatchLogs, environment, archives, storage, coreSite, sparkLog4j2, mapredSite, hadoopLog4j,
-                    hadoopEnvironment, executors, platform, listenPort, keepsEventLogs, interruptible);
+                    hadoopEnvironment, executors, platform, listenPort, keepsEventLogs, interruptible, imagePullSourceArn);
         }
 
         /** This job, run in {@code image}. */
@@ -212,7 +227,7 @@ public interface SparkJobRunner {
             return new Job(service, runId, accountId, region, releaseLabel, engine, image, customImage, dockerNetwork,
                     executionRole, sparkDefaults, application, command, timeout, logFolder, cloudWatchLogs, environment,
                     archives, storage, coreSite, sparkLog4j2, mapredSite, hadoopLog4j, hadoopEnvironment, executors,
-                    platform, listenPort, keepsEventLogs, interruptible);
+                    platform, listenPort, keepsEventLogs, interruptible, imagePullSourceArn);
         }
 
         /** This job, its executors where {@code executors} has them. */
@@ -220,7 +235,7 @@ public interface SparkJobRunner {
             return new Job(service, runId, accountId, region, releaseLabel, engine, imageTemplate, customImage,
                     dockerNetwork, executionRole, sparkDefaults, application, command, timeout, logFolder,
                     cloudWatchLogs, environment, archives, storage, coreSite, sparkLog4j2, mapredSite, hadoopLog4j,
-                    hadoopEnvironment, executors, platform, listenPort, keepsEventLogs, interruptible);
+                    hadoopEnvironment, executors, platform, listenPort, keepsEventLogs, interruptible, imagePullSourceArn);
         }
 
         /** This job, its driver listening on {@code port} for Floci (0 for none). */
@@ -228,7 +243,7 @@ public interface SparkJobRunner {
             return new Job(service, runId, accountId, region, releaseLabel, engine, imageTemplate, customImage,
                     dockerNetwork, executionRole, sparkDefaults, application, command, timeout, logFolder,
                     cloudWatchLogs, environment, archives, storage, coreSite, sparkLog4j2, mapredSite, hadoopLog4j,
-                    hadoopEnvironment, executors, platform, port, keepsEventLogs, interruptible);
+                    hadoopEnvironment, executors, platform, port, keepsEventLogs, interruptible, imagePullSourceArn);
         }
 
         /** This job, its containers on {@code network} (null for the global default). */
@@ -236,7 +251,7 @@ public interface SparkJobRunner {
             return new Job(service, runId, accountId, region, releaseLabel, engine, imageTemplate, customImage,
                     network, executionRole, sparkDefaults, application, command, timeout, logFolder, cloudWatchLogs,
                     environment, archives, storage, coreSite, sparkLog4j2, mapredSite, hadoopLog4j, hadoopEnvironment,
-                    executors, platform, listenPort, keepsEventLogs, interruptible);
+                    executors, platform, listenPort, keepsEventLogs, interruptible, imagePullSourceArn);
         }
 
         /** This job, its Spark event logs kept for its Spark History Server once it ends. */
@@ -244,7 +259,7 @@ public interface SparkJobRunner {
             return new Job(service, runId, accountId, region, releaseLabel, engine, imageTemplate, customImage,
                     dockerNetwork, executionRole, sparkDefaults, application, command, timeout, logFolder,
                     cloudWatchLogs, environment, archives, storage, coreSite, sparkLog4j2, mapredSite, hadoopLog4j,
-                    hadoopEnvironment, executors, platform, listenPort, true, interruptible);
+                    hadoopEnvironment, executors, platform, listenPort, true, interruptible, imagePullSourceArn);
         }
 
         /**
@@ -256,7 +271,15 @@ public interface SparkJobRunner {
             return new Job(service, runId, accountId, region, releaseLabel, engine, imageTemplate, customImage,
                     dockerNetwork, executionRole, sparkDefaults, application, command, timeout, logFolder,
                     cloudWatchLogs, environment, archives, storage, coreSite, sparkLog4j2, mapredSite, hadoopLog4j,
-                    hadoopEnvironment, executors, platform, listenPort, keepsEventLogs, true);
+                    hadoopEnvironment, executors, platform, listenPort, keepsEventLogs, true, imagePullSourceArn);
+        }
+
+        /** The owning application's identity for pulling its custom images. */
+        public Job withImagePullSourceArn(String sourceArn) {
+            return new Job(service, runId, accountId, region, releaseLabel, engine, imageTemplate, customImage,
+                    dockerNetwork, executionRole, sparkDefaults, application, command, timeout, logFolder,
+                    cloudWatchLogs, environment, archives, storage, coreSite, sparkLog4j2, mapredSite, hadoopLog4j,
+                    hadoopEnvironment, executors, platform, listenPort, keepsEventLogs, interruptible, sourceArn);
         }
 
         /** This job, its containers run for {@code platform} (null for the Docker host's own). */
@@ -264,7 +287,7 @@ public interface SparkJobRunner {
             return new Job(service, runId, accountId, region, releaseLabel, engine, imageTemplate, customImage,
                     dockerNetwork, executionRole, sparkDefaults, application, command, timeout, logFolder,
                     cloudWatchLogs, environment, archives, storage, coreSite, sparkLog4j2, mapredSite, hadoopLog4j,
-                    hadoopEnvironment, executors, platform, listenPort, keepsEventLogs, interruptible);
+                    hadoopEnvironment, executors, platform, listenPort, keepsEventLogs, interruptible, imagePullSourceArn);
         }
     }
 

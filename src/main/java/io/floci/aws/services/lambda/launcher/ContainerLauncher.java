@@ -138,6 +138,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
     private final Ec2Service ec2Service;
     /** When off, each container's exit is watched with its own wait stream (LambdaExitWatcher). */
     private final DockerExitEvents exitEvents;
+    private final LambdaImagePullService imagePulls;
     private final LambdaContainerReconciler containerReconciler;
     /** The VPC address each VpcConfig function's container holds, returned once it is removed. */
     private final Map<String, VpcLease> vpcLeases = new ConcurrentHashMap<>();
@@ -158,7 +159,8 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                              LaunchedContainerAwsEnv awsEnv,
                              LambdaExecutionRoleCredentials executionRoleCredentials,
                              Ec2Service ec2Service,
-                             DockerExitEvents exitEvents) {
+                             DockerExitEvents exitEvents,
+                             LambdaImagePullService imagePulls) {
         this.exitEvents = exitEvents;
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
@@ -175,8 +177,30 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         this.awsEnv = awsEnv;
         this.executionRoleCredentials = executionRoleCredentials;
         this.ec2Service = ec2Service;
+        this.imagePulls = imagePulls;
         this.containerReconciler = new LambdaContainerReconciler(config, lifecycleManager);
         this.populateSemaphore = new Semaphore(resolvePopulateConcurrency(config));
+    }
+
+    public ContainerLauncher(ContainerBuilder containerBuilder,
+                             ContainerLifecycleManager lifecycleManager,
+                             DockerClient streamingDocker,
+                             DockerHttpClient controlPlaneHttp,
+                             ContainerLogStreamer logStreamer,
+                             ImageResolver imageResolver,
+                             RuntimeApiServerFactory runtimeApiServerFactory,
+                             DockerHostResolver dockerHostResolver,
+                             EmulatorConfig config,
+                             RegionResolver regionResolver,
+                             EcrRegistryManager ecrRegistryManager,
+                             LambdaLayerService layerService,
+                             LaunchedContainerAwsEnv awsEnv,
+                             LambdaExecutionRoleCredentials executionRoleCredentials,
+                             Ec2Service ec2Service,
+                             DockerExitEvents exitEvents) {
+        this(containerBuilder, lifecycleManager, streamingDocker, controlPlaneHttp, logStreamer, imageResolver,
+                runtimeApiServerFactory, dockerHostResolver, config, regionResolver, ecrRegistryManager,
+                layerService, awsEnv, executionRoleCredentials, ec2Service, exitEvents, null);
     }
 
     @PostConstruct
@@ -591,6 +615,14 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         if (platform.isEmpty() && config.services().lambda().honourArchitectures()) {
             throw new IllegalStateException("Invalid persisted architectures "
                     + fn.getArchitectures() + " for function '" + fn.getFunctionName() + "'");
+        }
+        if ("Image".equals(fn.getPackageType()) && config.services().iam().enforcementEnabled()
+                && EcrRegistryManager.ecrImage(spec.image()).isPresent()) {
+            if (imagePulls == null) {
+                throw new IllegalStateException("The image-pull authorizer is unavailable");
+            }
+            return imagePulls.pull(fn, spec.image(),
+                    credentials -> lifecycleManager.create(spec, platform.orElse(null), credentials));
         }
         return platform.map(value -> lifecycleManager.create(spec, value))
                 .orElseGet(() -> lifecycleManager.create(spec));

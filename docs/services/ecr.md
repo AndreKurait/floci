@@ -392,6 +392,10 @@ With IAM enforcement enabled, every Distribution request requires a native ECR p
 
 Explicitly disabling IAM enforcement retains the existing unauthenticated emulator mode. Tokens issued in that mode are not accepted after enforcement is enabled. Internal image consumers in enforced mode must supply native issued credentials too; loopback addressing is not an authentication exemption.
 
+Internal Lambda, ECS, EMR Serverless and Lambda Web image retrieval uses short-lived, repository-scoped credentials that are revoked when retrieval finishes. Role-backed retrieval uses the workload's validated retrieval role; EMR Serverless uses its service repository grant and application source ARN. These credentials are not stored as Docker registry configuration or issued to management clients.
+
+Scoped internal retrieval contacts the registry even when Docker already has the image layers. The registry checks the complete retrieval permissions before serving the manifest, so a cached layer cannot skip a permission denial. Transport and source-IP conditions use the observed registry request, rather than an invented network context at credential issuance. A denied scoped pull cannot fall back to a cached image. With enforcement enabled, AWS-shaped references are rewritten to the emulator registry even when `prefer-local-images` is on; this prevents an authorization refresh from reaching the real AWS registry. IAM-off operation and pulls using the ordinary configured registry credentials retain their existing cache behavior.
+
 Upload-status queries and cancellation (`GET`, `HEAD`, or `DELETE` on `/blobs/uploads/`) are explicitly unsupported in enforced mode; ordinary layer upload `POST`, `PATCH`, and `PUT` are supported.
 
 The underlying-session expiry cap is a conservative emulator constraint; it has not been validated against AWS in a differential test.

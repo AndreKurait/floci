@@ -205,7 +205,7 @@ public class EcrRegistryManager {
         if (!m.matches()) {
             return image;
         }
-        if (config.services().ecr().preferLocalImages()) {
+        if (config.services().ecr().preferLocalImages() && !config.services().iam().enforcementEnabled()) {
             String resolved = containerBuilder.resolveImage(image);
             if (isPresentOnDaemon(resolved)) {
                 LOG.infov("Using locally present image {0} as-is (not rewriting to the emulated ECR registry)", resolved);

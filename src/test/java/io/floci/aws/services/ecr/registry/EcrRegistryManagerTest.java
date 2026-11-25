@@ -138,6 +138,7 @@ class EcrRegistryManagerTest {
         storage = Mockito.mock(EmulatorConfig.StorageConfig.class);
         when(config.services()).thenReturn(Mockito.mock(EmulatorConfig.ServicesConfig.class));
         when(config.services().ecr()).thenReturn(ecr);
+        when(config.services().iam()).thenReturn(Mockito.mock(EmulatorConfig.IamServiceConfig.class));
         when(config.port()).thenReturn(4566);
         when(config.docker()).thenReturn(docker);
         when(config.storage()).thenReturn(storage);
@@ -986,6 +987,19 @@ class EcrRegistryManagerTest {
         assertEquals(AWS_ECR_IMAGE, rewritten);
         verify(dockerClient).inspectImageCmd(AWS_ECR_IMAGE);
         verify(lifecycleManager, Mockito.never()).createAndStart(any());
+    }
+
+    @Test
+    void rewriteImageUri_enforcedPullOfLocallyPresentAwsReferenceStillUsesEmulatorRegistry() {
+        when(config.services().iam().enforcementEnabled()).thenReturn(true);
+        Mockito.doReturn(new InspectImageResponse()).when(inspectImage).exec();
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+
+        assertEquals("localhost:4566/123456789012/us-east-1/backend-user:1",
+                manager.rewriteImageUri(AWS_ECR_IMAGE));
+        verify(dockerClient, never()).inspectImageCmd(AWS_ECR_IMAGE);
+        verify(lifecycleManager).createAndStart(any());
     }
 
     @Test

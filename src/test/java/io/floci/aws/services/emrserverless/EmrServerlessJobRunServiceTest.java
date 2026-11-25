@@ -370,6 +370,7 @@ class EmrServerlessJobRunServiceTest {
         assertEquals(batch, job.runId());
         assertEquals(ACCOUNT_ID, job.accountId());
         assertEquals(REGION, job.region());
+        assertEquals(applications.getApplication(applicationId).getArn(), job.imagePullSourceArn());
         assertEquals("emr-7.5.0", job.releaseLabel());
         assertNull(job.imageTemplate());
         assertNull(job.customImage());

@@ -14,6 +14,7 @@ import com.github.dockerjava.api.exception.ConflictException;
 import com.github.dockerjava.api.exception.DockerException;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.exception.NotModifiedException;
+import com.github.dockerjava.api.model.AuthConfig;
 import com.github.dockerjava.api.model.Bind;
 import com.github.dockerjava.api.model.Capability;
 import com.github.dockerjava.api.model.Container;
@@ -296,6 +297,11 @@ public class ContainerLifecycleManager {
         return imageCacheService.resolveForLaunch(image, behavior, platform);
     }
 
+    public LaunchImage resolveImageForLaunch(String image, ImagePullBehavior behavior, String platform,
+                                             AuthConfig credentials) {
+        return imageCacheService.resolveForLaunch(image, behavior, platform, credentials);
+    }
+
     /**
      * Creates a container without starting it. Use {@link #startCreated} to
      * start it after any pre-start setup (e.g. copying files into the
@@ -306,7 +312,7 @@ public class ContainerLifecycleManager {
      */
     public String create(ContainerSpec spec) {
         String resolvedImage = imageCacheService.ensureImageExists(spec.image());
-        return create(spec, resolvedImage, null);
+        return create(spec, resolvedImage, null, false);
     }
 
     /** Creates a container Docker removes as soon as its process exits. */
@@ -324,6 +330,11 @@ public class ContainerLifecycleManager {
      */
     public String create(ContainerSpec spec, String platform) {
         String resolvedImage = imageCacheService.ensureImageExists(spec.image(), platform);
+        return create(spec, resolvedImage, platform);
+    }
+
+    public String create(ContainerSpec spec, String platform, AuthConfig credentials) {
+        String resolvedImage = imageCacheService.ensureImageExists(spec.image(), platform, credentials);
         return create(spec, resolvedImage, platform);
     }
 
