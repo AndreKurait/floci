@@ -3,11 +3,14 @@ package io.floci.aws.services.codeartifact;
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
 import io.floci.aws.testing.ParallelLocks;
+import io.floci.aws.testutil.LogCapture;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.parallel.ResourceAccessMode;
 import org.junit.jupiter.api.parallel.ResourceLock;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -16,8 +19,10 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.logging.LogRecord;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -181,6 +186,53 @@ class MavenExternalConnectionClientTest {
         server.createContext("/moved/widget-1.0.jar", exchange -> respondEmpty(exchange, 200));
 
         assertTrue(client.exists("fake", "com/example/widget/1.0/widget-1.0.jar"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {404, 429, 503})
+    void failedFetchReportsStatusWithoutResponseContent(int status) throws IOException {
+        server.createContext("/artifact.jar", exchange -> {
+            byte[] content = "private upstream error detail".getBytes(StandardCharsets.UTF_8);
+            exchange.sendResponseHeaders(status, content.length);
+            exchange.getResponseBody().write(content);
+            exchange.close();
+        });
+
+        List<LogRecord> records = LogCapture.capture(MavenExternalConnectionClient.class,
+                () -> assertTrue(client.fetchAsset("fake", "artifact.jar").isEmpty()));
+
+        assertEquals(List.of("External connection fake GET returned HTTP " + status),
+                records.stream().map(LogCapture::formatted).toList());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {404, 429, 503})
+    void failedHeadReportsStatus(int status) {
+        server.createContext("/artifact.jar", exchange -> respondEmpty(exchange, status));
+
+        List<LogRecord> records = LogCapture.capture(MavenExternalConnectionClient.class,
+                () -> assertFalse(client.exists("fake", "artifact.jar")));
+
+        assertEquals(List.of("External connection fake HEAD returned HTTP " + status),
+                records.stream().map(LogCapture::formatted).toList());
+    }
+
+    @ParameterizedTest
+    @ValueSource(ints = {404, 429, 503})
+    void failedStreamedFetchPreservesDestinationAndReportsStatus(int status) throws IOException {
+        server.createContext("/artifact.jar", exchange -> respondEmpty(exchange, status));
+        Path destination = Files.createTempFile("maven-external-status-", ".jar");
+        try {
+            Files.writeString(destination, "retained content");
+            List<LogRecord> records = LogCapture.capture(MavenExternalConnectionClient.class,
+                    () -> assertTrue(client.fetchAsset("fake", "artifact.jar", destination).isEmpty()));
+
+            assertEquals("retained content", Files.readString(destination));
+            assertEquals(List.of("External connection fake GET returned HTTP " + status),
+                    records.stream().map(LogCapture::formatted).toList());
+        } finally {
+            Files.deleteIfExists(destination);
+        }
     }
 
     private static void respondEmpty(HttpExchange exchange, int status) throws IOException {

@@ -144,6 +144,8 @@ public class MavenExternalConnectionClient {
             return false;
         }
         if (response.statusCode() != 200) {
+            LOG.debugv("External connection {0} GET returned HTTP {1}", externalConnectionName,
+                    response.statusCode());
             StreamingResponses.closeQuietly(response.body());
             return false;
         }
@@ -168,7 +170,11 @@ public class MavenExternalConnectionClient {
                     .timeout(Duration.ofSeconds(20))
                     .method("HEAD", HttpRequest.BodyPublishers.noBody())
                     .build();
-            return httpClient.send(request, BodyHandlers.discarding()).statusCode() == 200;
+            int status = httpClient.send(request, BodyHandlers.discarding()).statusCode();
+            if (status != 200) {
+                LOG.debugv("External connection {0} HEAD returned HTTP {1}", externalConnectionName, status);
+            }
+            return status == 200;
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             return false;
