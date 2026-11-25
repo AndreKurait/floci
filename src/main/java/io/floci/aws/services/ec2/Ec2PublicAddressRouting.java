@@ -106,7 +106,8 @@ final class Ec2PublicAddressRouting {
             throw new IllegalArgumentException("EC2 routing requires literal IPv4 interface addresses");
         }
         int first = Integer.parseInt(address.substring(0, address.indexOf('.')));
-        if (first == 0 || first == 127 || first >= 224 || address.startsWith("169.254.")) {
+        if (first == 0 || first == 127 || first >= 224 && first <= 239
+                || address.equals("255.255.255.255") || address.startsWith("169.254.")) {
             throw new IllegalArgumentException("EC2 routing requires non-loopback unicast interface addresses");
         }
     }

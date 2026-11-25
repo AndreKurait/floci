@@ -42,6 +42,7 @@ import java.util.concurrent.ConcurrentMap;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.stream.Stream;
 
 /**
  * Owns the network-namespace helpers that EC2 instances and ECS tasks run in: the protected namespace and the
@@ -116,7 +117,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                     && container.getNetworkSettings().getNetworks() != null) {
                 Set<String> addresses = new HashSet<>();
                 container.getNetworkSettings().getNetworks().values().stream()
-                        .flatMap(network -> java.util.stream.Stream.of(
+                        .flatMap(network -> Stream.of(
                                 network.getIpAddress(), network.getGlobalIPv6Address()))
                         .filter(address -> address != null && !address.isBlank()).forEach(addresses::add);
                 liveAddresses.put(container.getId(), addresses);

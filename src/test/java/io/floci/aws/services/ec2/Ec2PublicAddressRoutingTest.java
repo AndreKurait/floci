@@ -37,7 +37,7 @@ class Ec2PublicAddressRoutingTest {
 
     @ParameterizedTest
     @ValueSource(strings = {"", "localhost", "127.0.0.1", "0.0.0.0", "169.254.169.254",
-            "224.0.0.1", "256.1.1.1", "172.18.0.3;true", "::1"})
+            "224.0.0.1", "239.255.255.255", "255.255.255.255", "256.1.1.1", "172.18.0.3;true", "::1"})
     void nonInterfaceAddressesCannotEnterTheNamespaceCommand(String address) {
         assertThrows(IllegalArgumentException.class, () -> Ec2PublicAddressRouting.command("10.0.1.10", address));
         assertThrows(IllegalArgumentException.class, () -> Ec2PublicAddressRouting.command(address, "172.18.0.3"));
@@ -62,10 +62,15 @@ class Ec2PublicAddressRoutingTest {
         }
     }
 
-    @Test
-    void retainedSingleNetworkDoesNotNeedARecordedAddress() {
-        assertEquals("172.18.0.3", Ec2PublicAddressRouting.privateAddress(namespace("control-plane",
-                Map.of("control-plane", new ContainerNetwork().withIpv4Address("172.18.0.3"))), null));
+    @ParameterizedTest
+    @ValueSource(strings = {"172.18.0.3", "240.10.0.3", "255.255.255.254"})
+    void retainedSingleNetworkUsesItsDockerAddressWithoutARecordedAddress(String address) {
+        InspectContainerResponse network = namespace("control-plane",
+                Map.of("control-plane", new ContainerNetwork().withIpv4Address(address)));
+        assertEquals(address, Ec2PublicAddressRouting.privateAddress(network, null));
+        assertEquals(address, Ec2PublicAddressRouting.primaryAddress(network));
+        assertDoesNotThrow(() -> Ec2PublicAddressRouting.command("10.0.1.10", address));
+        assertDoesNotThrow(() -> Ec2PublicAddressRouting.command(address, "172.18.0.4"));
     }
 
     @Test

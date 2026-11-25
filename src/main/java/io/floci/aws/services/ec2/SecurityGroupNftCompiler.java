@@ -1,8 +1,8 @@
 package io.floci.aws.services.ec2;
 
-import io.netty.util.NetUtil;
 import io.floci.aws.services.ec2.model.IpPermission;
 import io.floci.aws.services.ec2.model.SecurityGroup;
+import io.netty.util.NetUtil;
 
 import java.net.InetAddress;
 import java.net.UnknownHostException;
