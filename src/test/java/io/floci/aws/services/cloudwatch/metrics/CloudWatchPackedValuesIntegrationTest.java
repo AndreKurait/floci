@@ -60,4 +60,31 @@ class CloudWatchPackedValuesIntegrationTest {
             assertEquals(Map.of("p0", 1.0, "p50", 75.0, "p100", 150.0), percentiles);
         }
     }
+
+    @Test
+    void sdkPackedZeroWeightsRetainOnlyObservedPercentileEndpoints() {
+        Instant timestamp = Instant.now().minusSeconds(60);
+        try (CloudWatchClient client = AwsTestClients.create(CloudWatchClient.builder(), "test", Region.US_EAST_1)) {
+            for (double firstCount : List.of(0.0, 1.0)) {
+                String namespace = "PackedZeroWeighted/" + UUID.randomUUID();
+                client.putMetricData(request -> request.namespace(namespace).metricData(MetricDatum.builder()
+                        .metricName("Latency").timestamp(timestamp).values(7.0, 11.0)
+                        .counts(firstCount, 0.0).build()));
+                Map<String, Double> endpoints = client.getMetricStatistics(request -> request.namespace(namespace)
+                        .metricName("Latency").startTime(timestamp.minusSeconds(1)).endTime(timestamp.plusSeconds(1))
+                        .period(60).extendedStatistics("p0", "p100"))
+                        .datapoints().getFirst().extendedStatistics();
+                assertEquals(Map.of("p0", 7.0, "p100", 11.0), endpoints);
+                List<Datapoint> interior = client.getMetricStatistics(request -> request.namespace(namespace)
+                        .metricName("Latency").startTime(timestamp.minusSeconds(1)).endTime(timestamp.plusSeconds(1))
+                        .period(60).extendedStatistics("p90")).datapoints();
+                if (firstCount == 0) {
+                    assertTrue(interior.isEmpty());
+                } else {
+                    assertEquals(Map.of("p90", 7.0), interior.getFirst().extendedStatistics());
+                }
+            }
+        }
+    }
+
 }
