@@ -471,11 +471,18 @@ public class AppConfigService implements Resettable {
         if (!"hosted".equals(profile.getLocationUri())) {
             throw new AwsException("BadRequestException", "Only hosted configuration validation is supported.", 400);
         }
+        String prefix = profile.getApplicationId() + "::" + profile.getId() + "::";
+        HostedConfigurationVersion labeled = versionStore.scan(key -> key.startsWith(prefix)).stream()
+                .filter(candidate -> configurationVersion.equals(candidate.getVersionLabel()))
+                .findFirst().orElse(null);
+        if (labeled != null) {
+            return labeled;
+        }
         int version;
         try {
             version = Integer.parseInt(configurationVersion);
         } catch (NumberFormatException e) {
-            throw new AwsException("BadRequestException", "Hosted ConfigurationVersion must be an integer.", 400);
+            throw new AwsException("ResourceNotFoundException", "Hosted configuration version not found.", 404);
         }
         return getHostedConfigurationVersion(profile.getApplicationId(), profile.getId(), version);
     }
@@ -822,7 +829,12 @@ public class AppConfigService implements Resettable {
         }
 
         // Refuse invalid content before assigning a deployment number or changing the active version.
-        if (profile.getValidators() != null && !profile.getValidators().isEmpty()) {
+        HostedConfigurationVersion selected = null;
+        if ("hosted".equals(profile.getLocationUri())) {
+            selected = validationVersion(profile, version);
+            validateProfile(profile, selected);
+            version = Integer.toString(selected.getVersionNumber());
+        } else if (profile.getValidators() != null && !profile.getValidators().isEmpty()) {
             validateProfile(profile, validationVersion(profile, version));
         }
 
@@ -833,6 +845,7 @@ public class AppConfigService implements Resettable {
         deployment.setConfigurationName(profile.getName());
         deployment.setConfigurationLocationUri(profile.getLocationUri());
         deployment.setConfigurationVersion(version);
+        deployment.setVersionLabel(selected == null ? null : selected.getVersionLabel());
         deployment.setDeploymentStrategyId(strategyId);
         deployment.setDeploymentDurationInMinutes(strategy.getDeploymentDurationInMinutes());
         deployment.setFinalBakeTimeInMinutes(strategy.getFinalBakeTimeInMinutes());
@@ -1115,6 +1128,7 @@ public class AppConfigService implements Resettable {
         DeploymentSummary summary = new DeploymentSummary();
         summary.setConfigurationProfileId(deployment.getConfigurationProfileId());
         summary.setConfigurationVersion(deployment.getConfigurationVersion());
+        summary.setVersionLabel(deployment.getVersionLabel());
         summary.setDeploymentNumber(deployment.getDeploymentNumber());
         summary.setState(deployment.getState());
         summary.setConfigurationName(deployment.getConfigurationName());
