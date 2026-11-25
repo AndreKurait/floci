@@ -1,0 +1,3303 @@
+{
+  "_source": {
+    "generator": "tools/aws/regen_stepfunctions_compute_shapes.py",
+    "botocore": "botocore 1.43.118 (installed package)"
+  },
+  "services": {
+    "ec2": {
+      "apiVersion": "2016-11-15",
+      "targetPrefix": null,
+      "operations": {
+        "RunInstances": {
+          "input": "RunInstancesRequest",
+          "output": "Reservation"
+        },
+        "DescribeInstances": {
+          "input": "DescribeInstancesRequest",
+          "output": "DescribeInstancesResult"
+        },
+        "TerminateInstances": {
+          "input": "TerminateInstancesRequest",
+          "output": "TerminateInstancesResult"
+        }
+      },
+      "shapes": {
+        "AmdSevSnpSpecification": {
+          "type": "string"
+        },
+        "ArchitectureValues": {
+          "type": "string"
+        },
+        "AttachmentStatus": {
+          "type": "string"
+        },
+        "AvailabilityZoneId": {
+          "type": "string"
+        },
+        "BlockDeviceMapping": {
+          "type": "structure",
+          "members": {
+            "Ebs": {
+              "shape": "EbsBlockDevice",
+              "locationName": "ebs"
+            },
+            "NoDevice": {
+              "shape": "String",
+              "locationName": "noDevice"
+            },
+            "DeviceName": {
+              "shape": "String",
+              "locationName": "deviceName"
+            },
+            "VirtualName": {
+              "shape": "String",
+              "locationName": "virtualName"
+            }
+          }
+        },
+        "BlockDeviceMappingRequestList": {
+          "type": "list",
+          "member": {
+            "shape": "BlockDeviceMapping",
+            "locationName": "BlockDeviceMapping"
+          }
+        },
+        "Boolean": {
+          "type": "boolean"
+        },
+        "BootModeValues": {
+          "type": "string"
+        },
+        "CapacityReservationId": {
+          "type": "string"
+        },
+        "CapacityReservationPreference": {
+          "type": "string"
+        },
+        "CapacityReservationSpecification": {
+          "type": "structure",
+          "members": {
+            "CapacityReservationPreference": {
+              "shape": "CapacityReservationPreference"
+            },
+            "CapacityReservationTarget": {
+              "shape": "CapacityReservationTarget"
+            }
+          }
+        },
+        "CapacityReservationSpecificationResponse": {
+          "type": "structure",
+          "members": {
+            "CapacityReservationPreference": {
+              "shape": "CapacityReservationPreference",
+              "locationName": "capacityReservationPreference"
+            },
+            "CapacityReservationTarget": {
+              "shape": "CapacityReservationTargetResponse",
+              "locationName": "capacityReservationTarget"
+            }
+          }
+        },
+        "CapacityReservationTarget": {
+          "type": "structure",
+          "members": {
+            "CapacityReservationId": {
+              "shape": "CapacityReservationId"
+            },
+            "CapacityReservationResourceGroupArn": {
+              "shape": "String"
+            }
+          }
+        },
+        "CapacityReservationTargetResponse": {
+          "type": "structure",
+          "members": {
+            "CapacityReservationId": {
+              "shape": "String",
+              "locationName": "capacityReservationId"
+            },
+            "CapacityReservationResourceGroupArn": {
+              "shape": "String",
+              "locationName": "capacityReservationResourceGroupArn"
+            }
+          }
+        },
+        "ConnectionTrackingSpecificationRequest": {
+          "type": "structure",
+          "members": {
+            "TcpEstablishedTimeout": {
+              "shape": "Integer"
+            },
+            "UdpStreamTimeout": {
+              "shape": "Integer"
+            },
+            "UdpTimeout": {
+              "shape": "Integer"
+            }
+          }
+        },
+        "ConnectionTrackingSpecificationResponse": {
+          "type": "structure",
+          "members": {
+            "TcpEstablishedTimeout": {
+              "shape": "Integer",
+              "locationName": "tcpEstablishedTimeout"
+            },
+            "UdpStreamTimeout": {
+              "shape": "Integer",
+              "locationName": "udpStreamTimeout"
+            },
+            "UdpTimeout": {
+              "shape": "Integer",
+              "locationName": "udpTimeout"
+            }
+          }
+        },
+        "CpuOptions": {
+          "type": "structure",
+          "members": {
+            "CoreCount": {
+              "shape": "Integer",
+              "locationName": "coreCount"
+            },
+            "ThreadsPerCore": {
+              "shape": "Integer",
+              "locationName": "threadsPerCore"
+            },
+            "AmdSevSnp": {
+              "shape": "AmdSevSnpSpecification",
+              "locationName": "amdSevSnp"
+            },
+            "NestedVirtualization": {
+              "shape": "NestedVirtualizationSpecification",
+              "locationName": "nestedVirtualization"
+            }
+          }
+        },
+        "CpuOptionsRequest": {
+          "type": "structure",
+          "members": {
+            "CoreCount": {
+              "shape": "Integer"
+            },
+            "ThreadsPerCore": {
+              "shape": "Integer"
+            },
+            "AmdSevSnp": {
+              "shape": "AmdSevSnpSpecification"
+            },
+            "NestedVirtualization": {
+              "shape": "NestedVirtualizationSpecification"
+            }
+          }
+        },
+        "CreditSpecificationRequest": {
+          "type": "structure",
+          "required": [
+            "CpuCredits"
+          ],
+          "members": {
+            "CpuCredits": {
+              "shape": "String"
+            }
+          }
+        },
+        "DateTime": {
+          "type": "timestamp"
+        },
+        "DescribeInstancesRequest": {
+          "type": "structure",
+          "members": {
+            "InstanceIds": {
+              "shape": "InstanceIdStringList",
+              "locationName": "InstanceId"
+            },
+            "IncludeManagedResources": {
+              "shape": "Boolean"
+            },
+            "DryRun": {
+              "shape": "Boolean",
+              "locationName": "dryRun"
+            },
+            "Filters": {
+              "shape": "FilterList",
+              "locationName": "Filter"
+            },
+            "NextToken": {
+              "shape": "String",
+              "locationName": "nextToken"
+            },
+            "MaxResults": {
+              "shape": "Integer",
+              "locationName": "maxResults"
+            }
+          }
+        },
+        "DescribeInstancesResult": {
+          "type": "structure",
+          "members": {
+            "NextToken": {
+              "shape": "String",
+              "locationName": "nextToken"
+            },
+            "Reservations": {
+              "shape": "ReservationList",
+              "locationName": "reservationSet"
+            }
+          }
+        },
+        "DeviceType": {
+          "type": "string"
+        },
+        "EbsBlockDevice": {
+          "type": "structure",
+          "members": {
+            "DeleteOnTermination": {
+              "shape": "Boolean",
+              "locationName": "deleteOnTermination"
+            },
+            "Iops": {
+              "shape": "Integer",
+              "locationName": "iops"
+            },
+            "SnapshotId": {
+              "shape": "SnapshotId",
+              "locationName": "snapshotId"
+            },
+            "VolumeSize": {
+              "shape": "Integer",
+              "locationName": "volumeSize"
+            },
+            "VolumeType": {
+              "shape": "VolumeType",
+              "locationName": "volumeType"
+            },
+            "KmsKeyId": {
+              "shape": "String",
+              "locationName": "kmsKeyId"
+            },
+            "Throughput": {
+              "shape": "Integer",
+              "locationName": "throughput"
+            },
+            "OutpostArn": {
+              "shape": "String",
+              "locationName": "outpostArn"
+            },
+            "AvailabilityZone": {
+              "shape": "String",
+              "locationName": "availabilityZone"
+            },
+            "Encrypted": {
+              "shape": "Boolean",
+              "locationName": "encrypted"
+            },
+            "VolumeInitializationRate": {
+              "shape": "Integer"
+            },
+            "AvailabilityZoneId": {
+              "shape": "String"
+            },
+            "EbsCardIndex": {
+              "shape": "Integer"
+            }
+          }
+        },
+        "EbsInstanceBlockDevice": {
+          "type": "structure",
+          "members": {
+            "AttachTime": {
+              "shape": "DateTime",
+              "locationName": "attachTime"
+            },
+            "DeleteOnTermination": {
+              "shape": "Boolean",
+              "locationName": "deleteOnTermination"
+            },
+            "Status": {
+              "shape": "AttachmentStatus",
+              "locationName": "status"
+            },
+            "VolumeId": {
+              "shape": "String",
+              "locationName": "volumeId"
+            },
+            "AssociatedResource": {
+              "shape": "String",
+              "locationName": "associatedResource"
+            },
+            "VolumeOwnerId": {
+              "shape": "String",
+              "locationName": "volumeOwnerId"
+            },
+            "Operator": {
+              "shape": "OperatorResponse",
+              "locationName": "operator"
+            },
+            "EbsCardIndex": {
+              "shape": "Integer",
+              "locationName": "ebsCardIndex"
+            }
+          }
+        },
+        "ElasticGpuAssociation": {
+          "type": "structure",
+          "members": {
+            "ElasticGpuId": {
+              "shape": "ElasticGpuId",
+              "locationName": "elasticGpuId"
+            },
+            "ElasticGpuAssociationId": {
+              "shape": "String",
+              "locationName": "elasticGpuAssociationId"
+            },
+            "ElasticGpuAssociationState": {
+              "shape": "String",
+              "locationName": "elasticGpuAssociationState"
+            },
+            "ElasticGpuAssociationTime": {
+              "shape": "String",
+              "locationName": "elasticGpuAssociationTime"
+            }
+          }
+        },
+        "ElasticGpuAssociationList": {
+          "type": "list",
+          "member": {
+            "shape": "ElasticGpuAssociation",
+            "locationName": "item"
+          }
+        },
+        "ElasticGpuId": {
+          "type": "string"
+        },
+        "ElasticGpuSpecification": {
+          "type": "structure",
+          "required": [
+            "Type"
+          ],
+          "members": {
+            "Type": {
+              "shape": "String"
+            }
+          }
+        },
+        "ElasticGpuSpecifications": {
+          "type": "list",
+          "member": {
+            "shape": "ElasticGpuSpecification",
+            "locationName": "item"
+          }
+        },
+        "ElasticInferenceAccelerator": {
+          "type": "structure",
+          "required": [
+            "Type"
+          ],
+          "members": {
+            "Type": {
+              "shape": "String"
+            },
+            "Count": {
+              "shape": "ElasticInferenceAcceleratorCount"
+            }
+          }
+        },
+        "ElasticInferenceAcceleratorAssociation": {
+          "type": "structure",
+          "members": {
+            "ElasticInferenceAcceleratorArn": {
+              "shape": "String",
+              "locationName": "elasticInferenceAcceleratorArn"
+            },
+            "ElasticInferenceAcceleratorAssociationId": {
+              "shape": "String",
+              "locationName": "elasticInferenceAcceleratorAssociationId"
+            },
+            "ElasticInferenceAcceleratorAssociationState": {
+              "shape": "String",
+              "locationName": "elasticInferenceAcceleratorAssociationState"
+            },
+            "ElasticInferenceAcceleratorAssociationTime": {
+              "shape": "DateTime",
+              "locationName": "elasticInferenceAcceleratorAssociationTime"
+            }
+          }
+        },
+        "ElasticInferenceAcceleratorAssociationList": {
+          "type": "list",
+          "member": {
+            "shape": "ElasticInferenceAcceleratorAssociation",
+            "locationName": "item"
+          }
+        },
+        "ElasticInferenceAcceleratorCount": {
+          "type": "integer"
+        },
+        "ElasticInferenceAccelerators": {
+          "type": "list",
+          "member": {
+            "shape": "ElasticInferenceAccelerator",
+            "locationName": "item"
+          }
+        },
+        "EnaSrdSpecificationRequest": {
+          "type": "structure",
+          "members": {
+            "EnaSrdEnabled": {
+              "shape": "Boolean"
+            },
+            "EnaSrdUdpSpecification": {
+              "shape": "EnaSrdUdpSpecificationRequest"
+            }
+          }
+        },
+        "EnaSrdUdpSpecificationRequest": {
+          "type": "structure",
+          "members": {
+            "EnaSrdUdpEnabled": {
+              "shape": "Boolean"
+            }
+          }
+        },
+        "EnclaveOptions": {
+          "type": "structure",
+          "members": {
+            "Enabled": {
+              "shape": "Boolean",
+              "locationName": "enabled"
+            }
+          }
+        },
+        "EnclaveOptionsRequest": {
+          "type": "structure",
+          "members": {
+            "Enabled": {
+              "shape": "Boolean"
+            }
+          }
+        },
+        "Filter": {
+          "type": "structure",
+          "members": {
+            "Name": {
+              "shape": "String"
+            },
+            "Values": {
+              "shape": "ValueStringList",
+              "locationName": "Value"
+            }
+          }
+        },
+        "FilterList": {
+          "type": "list",
+          "member": {
+            "shape": "Filter",
+            "locationName": "Filter"
+          }
+        },
+        "GroupIdentifier": {
+          "type": "structure",
+          "members": {
+            "GroupId": {
+              "shape": "String",
+              "locationName": "groupId"
+            },
+            "GroupName": {
+              "shape": "String",
+              "locationName": "groupName"
+            }
+          }
+        },
+        "GroupIdentifierList": {
+          "type": "list",
+          "member": {
+            "shape": "GroupIdentifier",
+            "locationName": "item"
+          }
+        },
+        "HibernationOptions": {
+          "type": "structure",
+          "members": {
+            "Configured": {
+              "shape": "Boolean",
+              "locationName": "configured"
+            }
+          }
+        },
+        "HibernationOptionsRequest": {
+          "type": "structure",
+          "members": {
+            "Configured": {
+              "shape": "Boolean"
+            }
+          }
+        },
+        "HostnameType": {
+          "type": "string"
+        },
+        "HttpTokensState": {
+          "type": "string"
+        },
+        "HypervisorType": {
+          "type": "string"
+        },
+        "IamInstanceProfile": {
+          "type": "structure",
+          "members": {
+            "Arn": {
+              "shape": "String",
+              "locationName": "arn"
+            },
+            "Id": {
+              "shape": "String",
+              "locationName": "id"
+            }
+          }
+        },
+        "IamInstanceProfileSpecification": {
+          "type": "structure",
+          "members": {
+            "Arn": {
+              "shape": "String",
+              "locationName": "arn"
+            },
+            "Name": {
+              "shape": "String",
+              "locationName": "name"
+            }
+          }
+        },
+        "ImageId": {
+          "type": "string"
+        },
+        "Instance": {
+          "type": "structure",
+          "members": {
+            "Architecture": {
+              "shape": "ArchitectureValues",
+              "locationName": "architecture"
+            },
+            "BlockDeviceMappings": {
+              "shape": "InstanceBlockDeviceMappingList",
+              "locationName": "blockDeviceMapping"
+            },
+            "ClientToken": {
+              "shape": "String",
+              "locationName": "clientToken"
+            },
+            "EbsOptimized": {
+              "shape": "Boolean",
+              "locationName": "ebsOptimized"
+            },
+            "EnaSupport": {
+              "shape": "Boolean",
+              "locationName": "enaSupport"
+            },
+            "Hypervisor": {
+              "shape": "HypervisorType",
+              "locationName": "hypervisor"
+            },
+            "IamInstanceProfile": {
+              "shape": "IamInstanceProfile",
+              "locationName": "iamInstanceProfile"
+            },
+            "InstanceLifecycle": {
+              "shape": "InstanceLifecycleType",
+              "locationName": "instanceLifecycle"
+            },
+            "ElasticGpuAssociations": {
+              "shape": "ElasticGpuAssociationList",
+              "locationName": "elasticGpuAssociationSet"
+            },
+            "ElasticInferenceAcceleratorAssociations": {
+              "shape": "ElasticInferenceAcceleratorAssociationList",
+              "locationName": "elasticInferenceAcceleratorAssociationSet"
+            },
+            "NetworkInterfaces": {
+              "shape": "InstanceNetworkInterfaceList",
+              "locationName": "networkInterfaceSet"
+            },
+            "OutpostArn": {
+              "shape": "String",
+              "locationName": "outpostArn"
+            },
+            "RootDeviceName": {
+              "shape": "String",
+              "locationName": "rootDeviceName"
+            },
+            "RootDeviceType": {
+              "shape": "DeviceType",
+              "locationName": "rootDeviceType"
+            },
+            "SecurityGroups": {
+              "shape": "GroupIdentifierList",
+              "locationName": "groupSet"
+            },
+            "SourceDestCheck": {
+              "shape": "Boolean",
+              "locationName": "sourceDestCheck"
+            },
+            "SpotInstanceRequestId": {
+              "shape": "String",
+              "locationName": "spotInstanceRequestId"
+            },
+            "SriovNetSupport": {
+              "shape": "String",
+              "locationName": "sriovNetSupport"
+            },
+            "StateReason": {
+              "shape": "StateReason",
+              "locationName": "stateReason"
+            },
+            "Tags": {
+              "shape": "TagList",
+              "locationName": "tagSet"
+            },
+            "VirtualizationType": {
+              "shape": "VirtualizationType",
+              "locationName": "virtualizationType"
+            },
+            "CpuOptions": {
+              "shape": "CpuOptions",
+              "locationName": "cpuOptions"
+            },
+            "CapacityBlockId": {
+              "shape": "String",
+              "locationName": "capacityBlockId"
+            },
+            "CapacityReservationId": {
+              "shape": "String",
+              "locationName": "capacityReservationId"
+            },
+            "CapacityReservationSpecification": {
+              "shape": "CapacityReservationSpecificationResponse",
+              "locationName": "capacityReservationSpecification"
+            },
+            "HibernationOptions": {
+              "shape": "HibernationOptions",
+              "locationName": "hibernationOptions"
+            },
+            "Licenses": {
+              "shape": "LicenseList",
+              "locationName": "licenseSet"
+            },
+            "MetadataOptions": {
+              "shape": "InstanceMetadataOptionsResponse",
+              "locationName": "metadataOptions"
+            },
+            "EnclaveOptions": {
+              "shape": "EnclaveOptions",
+              "locationName": "enclaveOptions"
+            },
+            "BootMode": {
+              "shape": "BootModeValues",
+              "locationName": "bootMode"
+            },
+            "PlatformDetails": {
+              "shape": "String",
+              "locationName": "platformDetails"
+            },
+            "UsageOperation": {
+              "shape": "String",
+              "locationName": "usageOperation"
+            },
+            "UsageOperationUpdateTime": {
+              "shape": "MillisecondDateTime",
+              "locationName": "usageOperationUpdateTime"
+            },
+            "PrivateDnsNameOptions": {
+              "shape": "PrivateDnsNameOptionsResponse",
+              "locationName": "privateDnsNameOptions"
+            },
+            "Ipv6Address": {
+              "shape": "String",
+              "locationName": "ipv6Address"
+            },
+            "TpmSupport": {
+              "shape": "String",
+              "locationName": "tpmSupport"
+            },
+            "MaintenanceOptions": {
+              "shape": "InstanceMaintenanceOptions",
+              "locationName": "maintenanceOptions"
+            },
+            "CurrentInstanceBootMode": {
+              "shape": "InstanceBootModeValues",
+              "locationName": "currentInstanceBootMode"
+            },
+            "NetworkPerformanceOptions": {
+              "shape": "InstanceNetworkPerformanceOptions",
+              "locationName": "networkPerformanceOptions"
+            },
+            "Operator": {
+              "shape": "OperatorResponse",
+              "locationName": "operator"
+            },
+            "SecondaryInterfaces": {
+              "shape": "InstanceSecondaryInterfaceList",
+              "locationName": "secondaryInterfaceSet"
+            },
+            "InstanceId": {
+              "shape": "String",
+              "locationName": "instanceId"
+            },
+            "ImageId": {
+              "shape": "String",
+              "locationName": "imageId"
+            },
+            "State": {
+              "shape": "InstanceState",
+              "locationName": "instanceState"
+            },
+            "PrivateDnsName": {
+              "shape": "String",
+              "locationName": "privateDnsName"
+            },
+            "PublicDnsName": {
+              "shape": "String",
+              "locationName": "dnsName"
+            },
+            "StateTransitionReason": {
+              "shape": "String",
+              "locationName": "reason"
+            },
+            "KeyName": {
+              "shape": "String",
+              "locationName": "keyName"
+            },
+            "AmiLaunchIndex": {
+              "shape": "Integer",
+              "locationName": "amiLaunchIndex"
+            },
+            "ProductCodes": {
+              "shape": "ProductCodeList",
+              "locationName": "productCodes"
+            },
+            "InstanceType": {
+              "shape": "InstanceType",
+              "locationName": "instanceType"
+            },
+            "LaunchTime": {
+              "shape": "DateTime",
+              "locationName": "launchTime"
+            },
+            "Placement": {
+              "shape": "Placement",
+              "locationName": "placement"
+            },
+            "KernelId": {
+              "shape": "String",
+              "locationName": "kernelId"
+            },
+            "RamdiskId": {
+              "shape": "String",
+              "locationName": "ramdiskId"
+            },
+            "Platform": {
+              "shape": "PlatformValues",
+              "locationName": "platform"
+            },
+            "Monitoring": {
+              "shape": "Monitoring",
+              "locationName": "monitoring"
+            },
+            "SubnetId": {
+              "shape": "String",
+              "locationName": "subnetId"
+            },
+            "VpcId": {
+              "shape": "String",
+              "locationName": "vpcId"
+            },
+            "PrivateIpAddress": {
+              "shape": "String",
+              "locationName": "privateIpAddress"
+            },
+            "PublicIpAddress": {
+              "shape": "String",
+              "locationName": "ipAddress"
+            }
+          }
+        },
+        "InstanceAttachmentEnaSrdSpecification": {
+          "type": "structure",
+          "members": {
+            "EnaSrdEnabled": {
+              "shape": "Boolean",
+              "locationName": "enaSrdEnabled"
+            },
+            "EnaSrdUdpSpecification": {
+              "shape": "InstanceAttachmentEnaSrdUdpSpecification",
+              "locationName": "enaSrdUdpSpecification"
+            }
+          }
+        },
+        "InstanceAttachmentEnaSrdUdpSpecification": {
+          "type": "structure",
+          "members": {
+            "EnaSrdUdpEnabled": {
+              "shape": "Boolean",
+              "locationName": "enaSrdUdpEnabled"
+            }
+          }
+        },
+        "InstanceAutoRecoveryState": {
+          "type": "string"
+        },
+        "InstanceBandwidthWeighting": {
+          "type": "string"
+        },
+        "InstanceBlockDeviceMapping": {
+          "type": "structure",
+          "members": {
+            "DeviceName": {
+              "shape": "String",
+              "locationName": "deviceName"
+            },
+            "Ebs": {
+              "shape": "EbsInstanceBlockDevice",
+              "locationName": "ebs"
+            }
+          }
+        },
+        "InstanceBlockDeviceMappingList": {
+          "type": "list",
+          "member": {
+            "shape": "InstanceBlockDeviceMapping",
+            "locationName": "item"
+          }
+        },
+        "InstanceBootModeValues": {
+          "type": "string"
+        },
+        "InstanceId": {
+          "type": "string"
+        },
+        "InstanceIdStringList": {
+          "type": "list",
+          "member": {
+            "shape": "InstanceId",
+            "locationName": "InstanceId"
+          }
+        },
+        "InstanceInterruptionBehavior": {
+          "type": "string"
+        },
+        "InstanceIpv4Prefix": {
+          "type": "structure",
+          "members": {
+            "Ipv4Prefix": {
+              "shape": "String",
+              "locationName": "ipv4Prefix"
+            }
+          }
+        },
+        "InstanceIpv4PrefixList": {
+          "type": "list",
+          "member": {
+            "shape": "InstanceIpv4Prefix",
+            "locationName": "item"
+          }
+        },
+        "InstanceIpv6Address": {
+          "type": "structure",
+          "members": {
+            "Ipv6Address": {
+              "shape": "String",
+              "locationName": "ipv6Address"
+            },
+            "IsPrimaryIpv6": {
+              "shape": "Boolean",
+              "locationName": "isPrimaryIpv6"
+            }
+          }
+        },
+        "InstanceIpv6AddressList": {
+          "type": "list",
+          "member": {
+            "shape": "InstanceIpv6Address",
+            "locationName": "item"
+          }
+        },
+        "InstanceIpv6Prefix": {
+          "type": "structure",
+          "members": {
+            "Ipv6Prefix": {
+              "shape": "String",
+              "locationName": "ipv6Prefix"
+            }
+          }
+        },
+        "InstanceIpv6PrefixList": {
+          "type": "list",
+          "member": {
+            "shape": "InstanceIpv6Prefix",
+            "locationName": "item"
+          }
+        },
+        "InstanceLifecycleType": {
+          "type": "string"
+        },
+        "InstanceList": {
+          "type": "list",
+          "member": {
+            "shape": "Instance",
+            "locationName": "item"
+          }
+        },
+        "InstanceMaintenanceOptions": {
+          "type": "structure",
+          "members": {
+            "AutoRecovery": {
+              "shape": "InstanceAutoRecoveryState",
+              "locationName": "autoRecovery"
+            },
+            "RebootMigration": {
+              "shape": "InstanceRebootMigrationState",
+              "locationName": "rebootMigration"
+            }
+          }
+        },
+        "InstanceMaintenanceOptionsRequest": {
+          "type": "structure",
+          "members": {
+            "AutoRecovery": {
+              "shape": "InstanceAutoRecoveryState"
+            }
+          }
+        },
+        "InstanceMarketOptionsRequest": {
+          "type": "structure",
+          "members": {
+            "MarketType": {
+              "shape": "MarketType"
+            },
+            "SpotOptions": {
+              "shape": "SpotMarketOptions"
+            }
+          }
+        },
+        "InstanceMetadataEndpointState": {
+          "type": "string"
+        },
+        "InstanceMetadataOptionsRequest": {
+          "type": "structure",
+          "members": {
+            "HttpTokens": {
+              "shape": "HttpTokensState"
+            },
+            "HttpPutResponseHopLimit": {
+              "shape": "Integer"
+            },
+            "HttpEndpoint": {
+              "shape": "InstanceMetadataEndpointState"
+            },
+            "HttpProtocolIpv6": {
+              "shape": "InstanceMetadataProtocolState"
+            },
+            "InstanceMetadataTags": {
+              "shape": "InstanceMetadataTagsState"
+            }
+          }
+        },
+        "InstanceMetadataOptionsResponse": {
+          "type": "structure",
+          "members": {
+            "State": {
+              "shape": "InstanceMetadataOptionsState",
+              "locationName": "state"
+            },
+            "HttpTokens": {
+              "shape": "HttpTokensState",
+              "locationName": "httpTokens"
+            },
+            "HttpPutResponseHopLimit": {
+              "shape": "Integer",
+              "locationName": "httpPutResponseHopLimit"
+            },
+            "HttpEndpoint": {
+              "shape": "InstanceMetadataEndpointState",
+              "locationName": "httpEndpoint"
+            },
+            "HttpProtocolIpv6": {
+              "shape": "InstanceMetadataProtocolState",
+              "locationName": "httpProtocolIpv6"
+            },
+            "InstanceMetadataTags": {
+              "shape": "InstanceMetadataTagsState",
+              "locationName": "instanceMetadataTags"
+            }
+          }
+        },
+        "InstanceMetadataOptionsState": {
+          "type": "string"
+        },
+        "InstanceMetadataProtocolState": {
+          "type": "string"
+        },
+        "InstanceMetadataTagsState": {
+          "type": "string"
+        },
+        "InstanceNetworkInterface": {
+          "type": "structure",
+          "members": {
+            "Association": {
+              "shape": "InstanceNetworkInterfaceAssociation",
+              "locationName": "association"
+            },
+            "Attachment": {
+              "shape": "InstanceNetworkInterfaceAttachment",
+              "locationName": "attachment"
+            },
+            "Description": {
+              "shape": "String",
+              "locationName": "description"
+            },
+            "Groups": {
+              "shape": "GroupIdentifierList",
+              "locationName": "groupSet"
+            },
+            "Ipv6Addresses": {
+              "shape": "InstanceIpv6AddressList",
+              "locationName": "ipv6AddressesSet"
+            },
+            "MacAddress": {
+              "shape": "String",
+              "locationName": "macAddress"
+            },
+            "NetworkInterfaceId": {
+              "shape": "String",
+              "locationName": "networkInterfaceId"
+            },
+            "OwnerId": {
+              "shape": "String",
+              "locationName": "ownerId"
+            },
+            "PrivateDnsName": {
+              "shape": "String",
+              "locationName": "privateDnsName"
+            },
+            "PrivateIpAddress": {
+              "shape": "String",
+              "locationName": "privateIpAddress"
+            },
+            "PrivateIpAddresses": {
+              "shape": "InstancePrivateIpAddressList",
+              "locationName": "privateIpAddressesSet"
+            },
+            "SourceDestCheck": {
+              "shape": "Boolean",
+              "locationName": "sourceDestCheck"
+            },
+            "Status": {
+              "shape": "NetworkInterfaceStatus",
+              "locationName": "status"
+            },
+            "SubnetId": {
+              "shape": "String",
+              "locationName": "subnetId"
+            },
+            "VpcId": {
+              "shape": "String",
+              "locationName": "vpcId"
+            },
+            "InterfaceType": {
+              "shape": "String",
+              "locationName": "interfaceType"
+            },
+            "Ipv4Prefixes": {
+              "shape": "InstanceIpv4PrefixList",
+              "locationName": "ipv4PrefixSet"
+            },
+            "Ipv6Prefixes": {
+              "shape": "InstanceIpv6PrefixList",
+              "locationName": "ipv6PrefixSet"
+            },
+            "ConnectionTrackingConfiguration": {
+              "shape": "ConnectionTrackingSpecificationResponse",
+              "locationName": "connectionTrackingConfiguration"
+            },
+            "Operator": {
+              "shape": "OperatorResponse",
+              "locationName": "operator"
+            }
+          }
+        },
+        "InstanceNetworkInterfaceAssociation": {
+          "type": "structure",
+          "members": {
+            "CarrierIp": {
+              "shape": "String",
+              "locationName": "carrierIp"
+            },
+            "CustomerOwnedIp": {
+              "shape": "String",
+              "locationName": "customerOwnedIp"
+            },
+            "IpOwnerId": {
+              "shape": "String",
+              "locationName": "ipOwnerId"
+            },
+            "PublicDnsName": {
+              "shape": "String",
+              "locationName": "publicDnsName"
+            },
+            "PublicIp": {
+              "shape": "String",
+              "locationName": "publicIp"
+            }
+          }
+        },
+        "InstanceNetworkInterfaceAttachment": {
+          "type": "structure",
+          "members": {
+            "AttachTime": {
+              "shape": "DateTime",
+              "locationName": "attachTime"
+            },
+            "AttachmentId": {
+              "shape": "String",
+              "locationName": "attachmentId"
+            },
+            "DeleteOnTermination": {
+              "shape": "Boolean",
+              "locationName": "deleteOnTermination"
+            },
+            "DeviceIndex": {
+              "shape": "Integer",
+              "locationName": "deviceIndex"
+            },
+            "Status": {
+              "shape": "AttachmentStatus",
+              "locationName": "status"
+            },
+            "NetworkCardIndex": {
+              "shape": "Integer",
+              "locationName": "networkCardIndex"
+            },
+            "EnaSrdSpecification": {
+              "shape": "InstanceAttachmentEnaSrdSpecification",
+              "locationName": "enaSrdSpecification"
+            },
+            "EnaQueueCount": {
+              "shape": "Integer",
+              "locationName": "enaQueueCount"
+            }
+          }
+        },
+        "InstanceNetworkInterfaceList": {
+          "type": "list",
+          "member": {
+            "shape": "InstanceNetworkInterface",
+            "locationName": "item"
+          }
+        },
+        "InstanceNetworkInterfaceSpecification": {
+          "type": "structure",
+          "members": {
+            "AssociatePublicIpAddress": {
+              "shape": "Boolean",
+              "locationName": "associatePublicIpAddress"
+            },
+            "DeleteOnTermination": {
+              "shape": "Boolean",
+              "locationName": "deleteOnTermination"
+            },
+            "Description": {
+              "shape": "String",
+              "locationName": "description"
+            },
+            "DeviceIndex": {
+              "shape": "Integer",
+              "locationName": "deviceIndex"
+            },
+            "Groups": {
+              "shape": "SecurityGroupIdStringList",
+              "locationName": "SecurityGroupId"
+            },
+            "Ipv6AddressCount": {
+              "shape": "Integer",
+              "locationName": "ipv6AddressCount"
+            },
+            "Ipv6Addresses": {
+              "shape": "InstanceIpv6AddressList",
+              "locationName": "ipv6AddressesSet",
+              "queryName": "Ipv6Addresses"
+            },
+            "NetworkInterfaceId": {
+              "shape": "NetworkInterfaceId",
+              "locationName": "networkInterfaceId"
+            },
+            "PrivateIpAddress": {
+              "shape": "String",
+              "locationName": "privateIpAddress"
+            },
+            "PrivateIpAddresses": {
+              "shape": "PrivateIpAddressSpecificationList",
+              "locationName": "privateIpAddressesSet",
+              "queryName": "PrivateIpAddresses"
+            },
+            "SecondaryPrivateIpAddressCount": {
+              "shape": "Integer",
+              "locationName": "secondaryPrivateIpAddressCount"
+            },
+            "SubnetId": {
+              "shape": "String",
+              "locationName": "subnetId"
+            },
+            "AssociateCarrierIpAddress": {
+              "shape": "Boolean"
+            },
+            "InterfaceType": {
+              "shape": "String"
+            },
+            "NetworkCardIndex": {
+              "shape": "Integer"
+            },
+            "Ipv4Prefixes": {
+              "shape": "Ipv4PrefixList",
+              "locationName": "Ipv4Prefix"
+            },
+            "Ipv4PrefixCount": {
+              "shape": "Integer"
+            },
+            "Ipv6Prefixes": {
+              "shape": "Ipv6PrefixList",
+              "locationName": "Ipv6Prefix"
+            },
+            "Ipv6PrefixCount": {
+              "shape": "Integer"
+            },
+            "PrimaryIpv6": {
+              "shape": "Boolean"
+            },
+            "EnaSrdSpecification": {
+              "shape": "EnaSrdSpecificationRequest"
+            },
+            "ConnectionTrackingSpecification": {
+              "shape": "ConnectionTrackingSpecificationRequest"
+            },
+            "EnaQueueCount": {
+              "shape": "Integer"
+            }
+          }
+        },
+        "InstanceNetworkInterfaceSpecificationList": {
+          "type": "list",
+          "member": {
+            "shape": "InstanceNetworkInterfaceSpecification",
+            "locationName": "item"
+          }
+        },
+        "InstanceNetworkPerformanceOptions": {
+          "type": "structure",
+          "members": {
+            "BandwidthWeighting": {
+              "shape": "InstanceBandwidthWeighting",
+              "locationName": "bandwidthWeighting"
+            }
+          }
+        },
+        "InstanceNetworkPerformanceOptionsRequest": {
+          "type": "structure",
+          "members": {
+            "BandwidthWeighting": {
+              "shape": "InstanceBandwidthWeighting"
+            }
+          }
+        },
+        "InstancePrivateIpAddress": {
+          "type": "structure",
+          "members": {
+            "Association": {
+              "shape": "InstanceNetworkInterfaceAssociation",
+              "locationName": "association"
+            },
+            "Primary": {
+              "shape": "Boolean",
+              "locationName": "primary"
+            },
+            "PrivateDnsName": {
+              "shape": "String",
+              "locationName": "privateDnsName"
+            },
+            "PrivateIpAddress": {
+              "shape": "String",
+              "locationName": "privateIpAddress"
+            }
+          }
+        },
+        "InstancePrivateIpAddressList": {
+          "type": "list",
+          "member": {
+            "shape": "InstancePrivateIpAddress",
+            "locationName": "item"
+          }
+        },
+        "InstanceRebootMigrationState": {
+          "type": "string"
+        },
+        "InstanceSecondaryInterface": {
+          "type": "structure",
+          "members": {
+            "Attachment": {
+              "shape": "InstanceSecondaryInterfaceAttachment",
+              "locationName": "attachment"
+            },
+            "MacAddress": {
+              "shape": "String",
+              "locationName": "macAddress"
+            },
+            "SecondaryInterfaceId": {
+              "shape": "SecondaryInterfaceId",
+              "locationName": "secondaryInterfaceId"
+            },
+            "OwnerId": {
+              "shape": "String",
+              "locationName": "ownerId"
+            },
+            "PrivateIpAddresses": {
+              "shape": "InstanceSecondaryInterfacePrivateIpAddressList",
+              "locationName": "privateIpAddressSet"
+            },
+            "SourceDestCheck": {
+              "shape": "Boolean",
+              "locationName": "sourceDestCheck"
+            },
+            "Status": {
+              "shape": "SecondaryInterfaceStatus",
+              "locationName": "status"
+            },
+            "SecondarySubnetId": {
+              "shape": "SecondarySubnetId",
+              "locationName": "secondarySubnetId"
+            },
+            "SecondaryNetworkId": {
+              "shape": "SecondaryNetworkId",
+              "locationName": "secondaryNetworkId"
+            },
+            "InterfaceType": {
+              "shape": "SecondaryInterfaceType",
+              "locationName": "interfaceType"
+            }
+          }
+        },
+        "InstanceSecondaryInterfaceAttachment": {
+          "type": "structure",
+          "members": {
+            "AttachTime": {
+              "shape": "MillisecondDateTime",
+              "locationName": "attachTime"
+            },
+            "AttachmentId": {
+              "shape": "String",
+              "locationName": "attachmentId"
+            },
+            "DeleteOnTermination": {
+              "shape": "Boolean",
+              "locationName": "deleteOnTermination"
+            },
+            "DeviceIndex": {
+              "shape": "Integer",
+              "locationName": "deviceIndex"
+            },
+            "Status": {
+              "shape": "AttachmentStatus",
+              "locationName": "status"
+            },
+            "NetworkCardIndex": {
+              "shape": "Integer",
+              "locationName": "networkCardIndex"
+            }
+          }
+        },
+        "InstanceSecondaryInterfaceList": {
+          "type": "list",
+          "member": {
+            "shape": "InstanceSecondaryInterface",
+            "locationName": "item"
+          }
+        },
+        "InstanceSecondaryInterfacePrivateIpAddress": {
+          "type": "structure",
+          "members": {
+            "PrivateIpAddress": {
+              "shape": "String",
+              "locationName": "privateIpAddress"
+            }
+          }
+        },
+        "InstanceSecondaryInterfacePrivateIpAddressList": {
+          "type": "list",
+          "member": {
+            "shape": "InstanceSecondaryInterfacePrivateIpAddress",
+            "locationName": "item"
+          }
+        },
+        "InstanceSecondaryInterfacePrivateIpAddressListRequest": {
+          "type": "list",
+          "member": {
+            "shape": "InstanceSecondaryInterfacePrivateIpAddressRequest",
+            "locationName": "item"
+          }
+        },
+        "InstanceSecondaryInterfacePrivateIpAddressRequest": {
+          "type": "structure",
+          "required": [
+            "PrivateIpAddress"
+          ],
+          "members": {
+            "PrivateIpAddress": {
+              "shape": "String"
+            }
+          }
+        },
+        "InstanceSecondaryInterfaceSpecificationListRequest": {
+          "type": "list",
+          "member": {
+            "shape": "InstanceSecondaryInterfaceSpecificationRequest",
+            "locationName": "item"
+          }
+        },
+        "InstanceSecondaryInterfaceSpecificationRequest": {
+          "type": "structure",
+          "members": {
+            "DeleteOnTermination": {
+              "shape": "Boolean"
+            },
+            "DeviceIndex": {
+              "shape": "Integer"
+            },
+            "PrivateIpAddresses": {
+              "shape": "InstanceSecondaryInterfacePrivateIpAddressListRequest",
+              "locationName": "PrivateIpAddress"
+            },
+            "PrivateIpAddressCount": {
+              "shape": "Integer"
+            },
+            "SecondarySubnetId": {
+              "shape": "SecondarySubnetId"
+            },
+            "InterfaceType": {
+              "shape": "SecondaryInterfaceType"
+            },
+            "NetworkCardIndex": {
+              "shape": "Integer"
+            }
+          }
+        },
+        "InstanceState": {
+          "type": "structure",
+          "members": {
+            "Code": {
+              "shape": "Integer",
+              "locationName": "code"
+            },
+            "Name": {
+              "shape": "InstanceStateName",
+              "locationName": "name"
+            }
+          }
+        },
+        "InstanceStateChange": {
+          "type": "structure",
+          "members": {
+            "InstanceId": {
+              "shape": "String",
+              "locationName": "instanceId"
+            },
+            "CurrentState": {
+              "shape": "InstanceState",
+              "locationName": "currentState"
+            },
+            "PreviousState": {
+              "shape": "InstanceState",
+              "locationName": "previousState"
+            }
+          }
+        },
+        "InstanceStateChangeList": {
+          "type": "list",
+          "member": {
+            "shape": "InstanceStateChange",
+            "locationName": "item"
+          }
+        },
+        "InstanceStateName": {
+          "type": "string"
+        },
+        "InstanceType": {
+          "type": "string"
+        },
+        "Integer": {
+          "type": "integer"
+        },
+        "Ipv4PrefixList": {
+          "type": "list",
+          "member": {
+            "shape": "Ipv4PrefixSpecificationRequest",
+            "locationName": "item"
+          }
+        },
+        "Ipv4PrefixSpecificationRequest": {
+          "type": "structure",
+          "members": {
+            "Ipv4Prefix": {
+              "shape": "String"
+            }
+          }
+        },
+        "Ipv6PrefixList": {
+          "type": "list",
+          "member": {
+            "shape": "Ipv6PrefixSpecificationRequest",
+            "locationName": "item"
+          }
+        },
+        "Ipv6PrefixSpecificationRequest": {
+          "type": "structure",
+          "members": {
+            "Ipv6Prefix": {
+              "shape": "String"
+            }
+          }
+        },
+        "KernelId": {
+          "type": "string"
+        },
+        "KeyPairName": {
+          "type": "string"
+        },
+        "LaunchTemplateId": {
+          "type": "string"
+        },
+        "LaunchTemplateSpecification": {
+          "type": "structure",
+          "members": {
+            "LaunchTemplateId": {
+              "shape": "LaunchTemplateId"
+            },
+            "LaunchTemplateName": {
+              "shape": "String"
+            },
+            "Version": {
+              "shape": "String"
+            }
+          }
+        },
+        "LicenseConfiguration": {
+          "type": "structure",
+          "members": {
+            "LicenseConfigurationArn": {
+              "shape": "String",
+              "locationName": "licenseConfigurationArn"
+            }
+          }
+        },
+        "LicenseConfigurationRequest": {
+          "type": "structure",
+          "members": {
+            "LicenseConfigurationArn": {
+              "shape": "String"
+            }
+          }
+        },
+        "LicenseList": {
+          "type": "list",
+          "member": {
+            "shape": "LicenseConfiguration",
+            "locationName": "item"
+          }
+        },
+        "LicenseSpecificationListRequest": {
+          "type": "list",
+          "member": {
+            "shape": "LicenseConfigurationRequest",
+            "locationName": "item"
+          }
+        },
+        "MarketType": {
+          "type": "string"
+        },
+        "MillisecondDateTime": {
+          "type": "timestamp"
+        },
+        "Monitoring": {
+          "type": "structure",
+          "members": {
+            "State": {
+              "shape": "MonitoringState",
+              "locationName": "state"
+            }
+          }
+        },
+        "MonitoringState": {
+          "type": "string"
+        },
+        "NestedVirtualizationSpecification": {
+          "type": "string"
+        },
+        "NetworkInterfaceId": {
+          "type": "string"
+        },
+        "NetworkInterfaceStatus": {
+          "type": "string"
+        },
+        "OperatorRequest": {
+          "type": "structure",
+          "members": {
+            "Principal": {
+              "shape": "String"
+            }
+          }
+        },
+        "OperatorResponse": {
+          "type": "structure",
+          "members": {
+            "Managed": {
+              "shape": "Boolean",
+              "locationName": "managed"
+            },
+            "Principal": {
+              "shape": "String",
+              "locationName": "principal"
+            },
+            "HiddenByDefault": {
+              "shape": "Boolean",
+              "locationName": "hiddenByDefault"
+            }
+          }
+        },
+        "Placement": {
+          "type": "structure",
+          "members": {
+            "AvailabilityZoneId": {
+              "shape": "AvailabilityZoneId",
+              "locationName": "availabilityZoneId"
+            },
+            "Affinity": {
+              "shape": "String",
+              "locationName": "affinity"
+            },
+            "GroupName": {
+              "shape": "PlacementGroupName",
+              "locationName": "groupName"
+            },
+            "PartitionNumber": {
+              "shape": "Integer",
+              "locationName": "partitionNumber"
+            },
+            "HostId": {
+              "shape": "String",
+              "locationName": "hostId"
+            },
+            "Tenancy": {
+              "shape": "Tenancy",
+              "locationName": "tenancy"
+            },
+            "SpreadDomain": {
+              "shape": "String",
+              "locationName": "spreadDomain"
+            },
+            "HostResourceGroupArn": {
+              "shape": "String",
+              "locationName": "hostResourceGroupArn"
+            },
+            "GroupId": {
+              "shape": "PlacementGroupId",
+              "locationName": "groupId"
+            },
+            "AvailabilityZone": {
+              "shape": "String",
+              "locationName": "availabilityZone"
+            }
+          }
+        },
+        "PlacementGroupId": {
+          "type": "string"
+        },
+        "PlacementGroupName": {
+          "type": "string"
+        },
+        "PlatformValues": {
+          "type": "string"
+        },
+        "PrivateDnsNameOptionsRequest": {
+          "type": "structure",
+          "members": {
+            "HostnameType": {
+              "shape": "HostnameType"
+            },
+            "EnableResourceNameDnsARecord": {
+              "shape": "Boolean"
+            },
+            "EnableResourceNameDnsAAAARecord": {
+              "shape": "Boolean"
+            }
+          }
+        },
+        "PrivateDnsNameOptionsResponse": {
+          "type": "structure",
+          "members": {
+            "HostnameType": {
+              "shape": "HostnameType",
+              "locationName": "hostnameType"
+            },
+            "EnableResourceNameDnsARecord": {
+              "shape": "Boolean",
+              "locationName": "enableResourceNameDnsARecord"
+            },
+            "EnableResourceNameDnsAAAARecord": {
+              "shape": "Boolean",
+              "locationName": "enableResourceNameDnsAAAARecord"
+            }
+          }
+        },
+        "PrivateIpAddressSpecification": {
+          "type": "structure",
+          "members": {
+            "Primary": {
+              "shape": "Boolean",
+              "locationName": "primary"
+            },
+            "PrivateIpAddress": {
+              "shape": "String",
+              "locationName": "privateIpAddress"
+            }
+          }
+        },
+        "PrivateIpAddressSpecificationList": {
+          "type": "list",
+          "member": {
+            "shape": "PrivateIpAddressSpecification",
+            "locationName": "item"
+          }
+        },
+        "ProductCode": {
+          "type": "structure",
+          "members": {
+            "ProductCodeId": {
+              "shape": "String",
+              "locationName": "productCode"
+            },
+            "ProductCodeType": {
+              "shape": "ProductCodeValues",
+              "locationName": "type"
+            }
+          }
+        },
+        "ProductCodeList": {
+          "type": "list",
+          "member": {
+            "shape": "ProductCode",
+            "locationName": "item"
+          }
+        },
+        "ProductCodeValues": {
+          "type": "string"
+        },
+        "RamdiskId": {
+          "type": "string"
+        },
+        "Reservation": {
+          "type": "structure",
+          "members": {
+            "ReservationId": {
+              "shape": "String",
+              "locationName": "reservationId"
+            },
+            "OwnerId": {
+              "shape": "String",
+              "locationName": "ownerId"
+            },
+            "RequesterId": {
+              "shape": "String",
+              "locationName": "requesterId"
+            },
+            "Groups": {
+              "shape": "GroupIdentifierList",
+              "locationName": "groupSet"
+            },
+            "Instances": {
+              "shape": "InstanceList",
+              "locationName": "instancesSet"
+            }
+          }
+        },
+        "ReservationList": {
+          "type": "list",
+          "member": {
+            "shape": "Reservation",
+            "locationName": "item"
+          }
+        },
+        "ResourceType": {
+          "type": "string"
+        },
+        "RunInstancesMonitoringEnabled": {
+          "type": "structure",
+          "required": [
+            "Enabled"
+          ],
+          "members": {
+            "Enabled": {
+              "shape": "Boolean",
+              "locationName": "enabled"
+            }
+          }
+        },
+        "RunInstancesRequest": {
+          "type": "structure",
+          "required": [
+            "MaxCount",
+            "MinCount"
+          ],
+          "members": {
+            "BlockDeviceMappings": {
+              "shape": "BlockDeviceMappingRequestList",
+              "locationName": "BlockDeviceMapping"
+            },
+            "ImageId": {
+              "shape": "ImageId"
+            },
+            "InstanceType": {
+              "shape": "InstanceType"
+            },
+            "Ipv6AddressCount": {
+              "shape": "Integer"
+            },
+            "Ipv6Addresses": {
+              "shape": "InstanceIpv6AddressList",
+              "locationName": "Ipv6Address"
+            },
+            "KernelId": {
+              "shape": "KernelId"
+            },
+            "KeyName": {
+              "shape": "KeyPairName"
+            },
+            "MaxCount": {
+              "shape": "Integer"
+            },
+            "MinCount": {
+              "shape": "Integer"
+            },
+            "Monitoring": {
+              "shape": "RunInstancesMonitoringEnabled"
+            },
+            "Placement": {
+              "shape": "Placement"
+            },
+            "RamdiskId": {
+              "shape": "RamdiskId"
+            },
+            "SecurityGroupIds": {
+              "shape": "SecurityGroupIdStringList",
+              "locationName": "SecurityGroupId"
+            },
+            "SecurityGroups": {
+              "shape": "SecurityGroupStringList",
+              "locationName": "SecurityGroup"
+            },
+            "SubnetId": {
+              "shape": "SubnetId"
+            },
+            "UserData": {
+              "shape": "RunInstancesUserData"
+            },
+            "ElasticGpuSpecification": {
+              "shape": "ElasticGpuSpecifications"
+            },
+            "ElasticInferenceAccelerators": {
+              "shape": "ElasticInferenceAccelerators",
+              "locationName": "ElasticInferenceAccelerator"
+            },
+            "TagSpecifications": {
+              "shape": "TagSpecificationList",
+              "locationName": "TagSpecification"
+            },
+            "LaunchTemplate": {
+              "shape": "LaunchTemplateSpecification"
+            },
+            "InstanceMarketOptions": {
+              "shape": "InstanceMarketOptionsRequest"
+            },
+            "CreditSpecification": {
+              "shape": "CreditSpecificationRequest"
+            },
+            "CpuOptions": {
+              "shape": "CpuOptionsRequest"
+            },
+            "CapacityReservationSpecification": {
+              "shape": "CapacityReservationSpecification"
+            },
+            "HibernationOptions": {
+              "shape": "HibernationOptionsRequest"
+            },
+            "LicenseSpecifications": {
+              "shape": "LicenseSpecificationListRequest",
+              "locationName": "LicenseSpecification"
+            },
+            "MetadataOptions": {
+              "shape": "InstanceMetadataOptionsRequest"
+            },
+            "EnclaveOptions": {
+              "shape": "EnclaveOptionsRequest"
+            },
+            "PrivateDnsNameOptions": {
+              "shape": "PrivateDnsNameOptionsRequest"
+            },
+            "MaintenanceOptions": {
+              "shape": "InstanceMaintenanceOptionsRequest"
+            },
+            "DisableApiStop": {
+              "shape": "Boolean"
+            },
+            "EnablePrimaryIpv6": {
+              "shape": "Boolean"
+            },
+            "NetworkPerformanceOptions": {
+              "shape": "InstanceNetworkPerformanceOptionsRequest"
+            },
+            "Operator": {
+              "shape": "OperatorRequest"
+            },
+            "SecondaryInterfaces": {
+              "shape": "InstanceSecondaryInterfaceSpecificationListRequest",
+              "locationName": "SecondaryInterface"
+            },
+            "DryRun": {
+              "shape": "Boolean",
+              "locationName": "dryRun"
+            },
+            "DisableApiTermination": {
+              "shape": "Boolean",
+              "locationName": "disableApiTermination"
+            },
+            "InstanceInitiatedShutdownBehavior": {
+              "shape": "ShutdownBehavior",
+              "locationName": "instanceInitiatedShutdownBehavior"
+            },
+            "PrivateIpAddress": {
+              "shape": "String",
+              "locationName": "privateIpAddress"
+            },
+            "ClientToken": {
+              "shape": "String",
+              "locationName": "clientToken"
+            },
+            "AdditionalInfo": {
+              "shape": "String",
+              "locationName": "additionalInfo"
+            },
+            "NetworkInterfaces": {
+              "shape": "InstanceNetworkInterfaceSpecificationList",
+              "locationName": "networkInterface"
+            },
+            "IamInstanceProfile": {
+              "shape": "IamInstanceProfileSpecification",
+              "locationName": "iamInstanceProfile"
+            },
+            "EbsOptimized": {
+              "shape": "Boolean",
+              "locationName": "ebsOptimized"
+            }
+          }
+        },
+        "RunInstancesUserData": {
+          "type": "string"
+        },
+        "SecondaryInterfaceId": {
+          "type": "string"
+        },
+        "SecondaryInterfaceStatus": {
+          "type": "string"
+        },
+        "SecondaryInterfaceType": {
+          "type": "string"
+        },
+        "SecondaryNetworkId": {
+          "type": "string"
+        },
+        "SecondarySubnetId": {
+          "type": "string"
+        },
+        "SecurityGroupId": {
+          "type": "string"
+        },
+        "SecurityGroupIdStringList": {
+          "type": "list",
+          "member": {
+            "shape": "SecurityGroupId",
+            "locationName": "SecurityGroupId"
+          }
+        },
+        "SecurityGroupName": {
+          "type": "string"
+        },
+        "SecurityGroupStringList": {
+          "type": "list",
+          "member": {
+            "shape": "SecurityGroupName",
+            "locationName": "SecurityGroup"
+          }
+        },
+        "ShutdownBehavior": {
+          "type": "string"
+        },
+        "SnapshotId": {
+          "type": "string"
+        },
+        "SpotInstanceType": {
+          "type": "string"
+        },
+        "SpotMarketOptions": {
+          "type": "structure",
+          "members": {
+            "MaxPrice": {
+              "shape": "String"
+            },
+            "SpotInstanceType": {
+              "shape": "SpotInstanceType"
+            },
+            "BlockDurationMinutes": {
+              "shape": "Integer"
+            },
+            "ValidUntil": {
+              "shape": "DateTime"
+            },
+            "InstanceInterruptionBehavior": {
+              "shape": "InstanceInterruptionBehavior"
+            }
+          }
+        },
+        "StateReason": {
+          "type": "structure",
+          "members": {
+            "Code": {
+              "shape": "String",
+              "locationName": "code"
+            },
+            "Message": {
+              "shape": "String",
+              "locationName": "message"
+            }
+          }
+        },
+        "String": {
+          "type": "string"
+        },
+        "SubnetId": {
+          "type": "string"
+        },
+        "Tag": {
+          "type": "structure",
+          "members": {
+            "Key": {
+              "shape": "String",
+              "locationName": "key"
+            },
+            "Value": {
+              "shape": "String",
+              "locationName": "value"
+            }
+          }
+        },
+        "TagList": {
+          "type": "list",
+          "member": {
+            "shape": "Tag",
+            "locationName": "item"
+          }
+        },
+        "TagSpecification": {
+          "type": "structure",
+          "members": {
+            "ResourceType": {
+              "shape": "ResourceType",
+              "locationName": "resourceType"
+            },
+            "Tags": {
+              "shape": "TagList",
+              "locationName": "Tag"
+            }
+          }
+        },
+        "TagSpecificationList": {
+          "type": "list",
+          "member": {
+            "shape": "TagSpecification",
+            "locationName": "item"
+          }
+        },
+        "Tenancy": {
+          "type": "string"
+        },
+        "TerminateInstancesRequest": {
+          "type": "structure",
+          "required": [
+            "InstanceIds"
+          ],
+          "members": {
+            "InstanceIds": {
+              "shape": "InstanceIdStringList",
+              "locationName": "InstanceId"
+            },
+            "Force": {
+              "shape": "Boolean"
+            },
+            "SkipOsShutdown": {
+              "shape": "Boolean"
+            },
+            "DryRun": {
+              "shape": "Boolean",
+              "locationName": "dryRun"
+            }
+          }
+        },
+        "TerminateInstancesResult": {
+          "type": "structure",
+          "members": {
+            "TerminatingInstances": {
+              "shape": "InstanceStateChangeList",
+              "locationName": "instancesSet"
+            }
+          }
+        },
+        "ValueStringList": {
+          "type": "list",
+          "member": {
+            "shape": "String",
+            "locationName": "item"
+          }
+        },
+        "VirtualizationType": {
+          "type": "string"
+        },
+        "VolumeType": {
+          "type": "string"
+        }
+      },
+      "exceptions": {}
+    },
+    "ssm": {
+      "apiVersion": "2014-11-06",
+      "targetPrefix": "AmazonSSM",
+      "operations": {
+        "DescribeInstanceInformation": {
+          "input": "DescribeInstanceInformationRequest",
+          "output": "DescribeInstanceInformationResult"
+        },
+        "SendCommand": {
+          "input": "SendCommandRequest",
+          "output": "SendCommandResult"
+        },
+        "GetCommandInvocation": {
+          "input": "GetCommandInvocationRequest",
+          "output": "GetCommandInvocationResult"
+        },
+        "ListCommands": {
+          "input": "ListCommandsRequest",
+          "output": "ListCommandsResult"
+        },
+        "ListCommandInvocations": {
+          "input": "ListCommandInvocationsRequest",
+          "output": "ListCommandInvocationsResult"
+        },
+        "CancelCommand": {
+          "input": "CancelCommandRequest",
+          "output": "CancelCommandResult"
+        }
+      },
+      "shapes": {
+        "ActivationId": {
+          "type": "string"
+        },
+        "Alarm": {
+          "type": "structure",
+          "required": [
+            "Name"
+          ],
+          "members": {
+            "Name": {
+              "shape": "AlarmName"
+            }
+          }
+        },
+        "AlarmConfiguration": {
+          "type": "structure",
+          "required": [
+            "Alarms"
+          ],
+          "members": {
+            "IgnorePollAlarmFailure": {
+              "shape": "Boolean"
+            },
+            "Alarms": {
+              "shape": "AlarmList"
+            }
+          }
+        },
+        "AlarmList": {
+          "type": "list",
+          "member": {
+            "shape": "Alarm"
+          }
+        },
+        "AlarmName": {
+          "type": "string"
+        },
+        "AlarmStateInformation": {
+          "type": "structure",
+          "required": [
+            "Name",
+            "State"
+          ],
+          "members": {
+            "Name": {
+              "shape": "AlarmName"
+            },
+            "State": {
+              "shape": "ExternalAlarmState"
+            }
+          }
+        },
+        "AlarmStateInformationList": {
+          "type": "list",
+          "member": {
+            "shape": "AlarmStateInformation"
+          }
+        },
+        "Boolean": {
+          "type": "boolean"
+        },
+        "CancelCommandRequest": {
+          "type": "structure",
+          "required": [
+            "CommandId"
+          ],
+          "members": {
+            "CommandId": {
+              "shape": "CommandId"
+            },
+            "InstanceIds": {
+              "shape": "InstanceIdList"
+            }
+          }
+        },
+        "CancelCommandResult": {
+          "type": "structure",
+          "members": {}
+        },
+        "CloudWatchLogGroupName": {
+          "type": "string"
+        },
+        "CloudWatchOutputConfig": {
+          "type": "structure",
+          "members": {
+            "CloudWatchLogGroupName": {
+              "shape": "CloudWatchLogGroupName"
+            },
+            "CloudWatchOutputEnabled": {
+              "shape": "CloudWatchOutputEnabled"
+            }
+          }
+        },
+        "CloudWatchOutputEnabled": {
+          "type": "boolean"
+        },
+        "Command": {
+          "type": "structure",
+          "members": {
+            "CommandId": {
+              "shape": "CommandId"
+            },
+            "DocumentName": {
+              "shape": "DocumentName"
+            },
+            "DocumentVersion": {
+              "shape": "DocumentVersion"
+            },
+            "Comment": {
+              "shape": "Comment"
+            },
+            "ExpiresAfter": {
+              "shape": "DateTime"
+            },
+            "Parameters": {
+              "shape": "Parameters"
+            },
+            "InstanceIds": {
+              "shape": "InstanceIdList"
+            },
+            "Targets": {
+              "shape": "Targets"
+            },
+            "RequestedDateTime": {
+              "shape": "DateTime"
+            },
+            "Status": {
+              "shape": "CommandStatus"
+            },
+            "StatusDetails": {
+              "shape": "StatusDetails"
+            },
+            "OutputS3Region": {
+              "shape": "S3Region"
+            },
+            "OutputS3BucketName": {
+              "shape": "S3BucketName"
+            },
+            "OutputS3KeyPrefix": {
+              "shape": "S3KeyPrefix"
+            },
+            "MaxConcurrency": {
+              "shape": "MaxConcurrency"
+            },
+            "MaxErrors": {
+              "shape": "MaxErrors"
+            },
+            "TargetCount": {
+              "shape": "TargetCount"
+            },
+            "CompletedCount": {
+              "shape": "CompletedCount"
+            },
+            "ErrorCount": {
+              "shape": "ErrorCount"
+            },
+            "DeliveryTimedOutCount": {
+              "shape": "DeliveryTimedOutCount"
+            },
+            "ServiceRole": {
+              "shape": "ServiceRole"
+            },
+            "NotificationConfig": {
+              "shape": "NotificationConfig"
+            },
+            "CloudWatchOutputConfig": {
+              "shape": "CloudWatchOutputConfig"
+            },
+            "TimeoutSeconds": {
+              "shape": "TimeoutSeconds"
+            },
+            "AlarmConfiguration": {
+              "shape": "AlarmConfiguration"
+            },
+            "TriggeredAlarms": {
+              "shape": "AlarmStateInformationList"
+            }
+          }
+        },
+        "CommandFilter": {
+          "type": "structure",
+          "required": [
+            "key",
+            "value"
+          ],
+          "members": {
+            "key": {
+              "shape": "CommandFilterKey"
+            },
+            "value": {
+              "shape": "CommandFilterValue"
+            }
+          }
+        },
+        "CommandFilterKey": {
+          "type": "string"
+        },
+        "CommandFilterList": {
+          "type": "list",
+          "member": {
+            "shape": "CommandFilter"
+          }
+        },
+        "CommandFilterValue": {
+          "type": "string"
+        },
+        "CommandId": {
+          "type": "string"
+        },
+        "CommandInvocation": {
+          "type": "structure",
+          "members": {
+            "CommandId": {
+              "shape": "CommandId"
+            },
+            "InstanceId": {
+              "shape": "InstanceId"
+            },
+            "InstanceName": {
+              "shape": "InstanceTagName"
+            },
+            "Comment": {
+              "shape": "Comment"
+            },
+            "DocumentName": {
+              "shape": "DocumentName"
+            },
+            "DocumentVersion": {
+              "shape": "DocumentVersion"
+            },
+            "RequestedDateTime": {
+              "shape": "DateTime"
+            },
+            "Status": {
+              "shape": "CommandInvocationStatus"
+            },
+            "StatusDetails": {
+              "shape": "StatusDetails"
+            },
+            "TraceOutput": {
+              "shape": "InvocationTraceOutput"
+            },
+            "StandardOutputUrl": {
+              "shape": "Url"
+            },
+            "StandardErrorUrl": {
+              "shape": "Url"
+            },
+            "CommandPlugins": {
+              "shape": "CommandPluginList"
+            },
+            "ServiceRole": {
+              "shape": "ServiceRole"
+            },
+            "NotificationConfig": {
+              "shape": "NotificationConfig"
+            },
+            "CloudWatchOutputConfig": {
+              "shape": "CloudWatchOutputConfig"
+            }
+          }
+        },
+        "CommandInvocationList": {
+          "type": "list",
+          "member": {
+            "shape": "CommandInvocation"
+          }
+        },
+        "CommandInvocationStatus": {
+          "type": "string"
+        },
+        "CommandList": {
+          "type": "list",
+          "member": {
+            "shape": "Command"
+          }
+        },
+        "CommandMaxResults": {
+          "type": "integer"
+        },
+        "CommandPlugin": {
+          "type": "structure",
+          "members": {
+            "Name": {
+              "shape": "CommandPluginName"
+            },
+            "Status": {
+              "shape": "CommandPluginStatus"
+            },
+            "StatusDetails": {
+              "shape": "StatusDetails"
+            },
+            "ResponseCode": {
+              "shape": "ResponseCode"
+            },
+            "ResponseStartDateTime": {
+              "shape": "DateTime"
+            },
+            "ResponseFinishDateTime": {
+              "shape": "DateTime"
+            },
+            "Output": {
+              "shape": "CommandPluginOutput"
+            },
+            "StandardOutputUrl": {
+              "shape": "Url"
+            },
+            "StandardErrorUrl": {
+              "shape": "Url"
+            },
+            "OutputS3Region": {
+              "shape": "S3Region"
+            },
+            "OutputS3BucketName": {
+              "shape": "S3BucketName"
+            },
+            "OutputS3KeyPrefix": {
+              "shape": "S3KeyPrefix"
+            }
+          }
+        },
+        "CommandPluginList": {
+          "type": "list",
+          "member": {
+            "shape": "CommandPlugin"
+          }
+        },
+        "CommandPluginName": {
+          "type": "string"
+        },
+        "CommandPluginOutput": {
+          "type": "string"
+        },
+        "CommandPluginStatus": {
+          "type": "string"
+        },
+        "CommandStatus": {
+          "type": "string"
+        },
+        "Comment": {
+          "type": "string"
+        },
+        "CompletedCount": {
+          "type": "integer"
+        },
+        "ComputerName": {
+          "type": "string"
+        },
+        "DateTime": {
+          "type": "timestamp"
+        },
+        "DeliveryTimedOutCount": {
+          "type": "integer"
+        },
+        "DescribeInstanceInformationRequest": {
+          "type": "structure",
+          "members": {
+            "InstanceInformationFilterList": {
+              "shape": "InstanceInformationFilterList"
+            },
+            "Filters": {
+              "shape": "InstanceInformationStringFilterList"
+            },
+            "MaxResults": {
+              "shape": "MaxResultsEC2Compatible"
+            },
+            "NextToken": {
+              "shape": "NextToken"
+            }
+          }
+        },
+        "DescribeInstanceInformationResult": {
+          "type": "structure",
+          "members": {
+            "InstanceInformationList": {
+              "shape": "InstanceInformationList"
+            },
+            "NextToken": {
+              "shape": "NextToken"
+            }
+          }
+        },
+        "DocumentARN": {
+          "type": "string"
+        },
+        "DocumentHash": {
+          "type": "string"
+        },
+        "DocumentHashType": {
+          "type": "string"
+        },
+        "DocumentName": {
+          "type": "string"
+        },
+        "DocumentVersion": {
+          "type": "string"
+        },
+        "ErrorCount": {
+          "type": "integer"
+        },
+        "ExternalAlarmState": {
+          "type": "string"
+        },
+        "GetCommandInvocationRequest": {
+          "type": "structure",
+          "required": [
+            "CommandId",
+            "InstanceId"
+          ],
+          "members": {
+            "CommandId": {
+              "shape": "CommandId"
+            },
+            "InstanceId": {
+              "shape": "InstanceId"
+            },
+            "PluginName": {
+              "shape": "CommandPluginName"
+            }
+          }
+        },
+        "GetCommandInvocationResult": {
+          "type": "structure",
+          "members": {
+            "CommandId": {
+              "shape": "CommandId"
+            },
+            "InstanceId": {
+              "shape": "InstanceId"
+            },
+            "Comment": {
+              "shape": "Comment"
+            },
+            "DocumentName": {
+              "shape": "DocumentName"
+            },
+            "DocumentVersion": {
+              "shape": "DocumentVersion"
+            },
+            "PluginName": {
+              "shape": "CommandPluginName"
+            },
+            "ResponseCode": {
+              "shape": "ResponseCode"
+            },
+            "ExecutionStartDateTime": {
+              "shape": "StringDateTime"
+            },
+            "ExecutionElapsedTime": {
+              "shape": "StringDateTime"
+            },
+            "ExecutionEndDateTime": {
+              "shape": "StringDateTime"
+            },
+            "Status": {
+              "shape": "CommandInvocationStatus"
+            },
+            "StatusDetails": {
+              "shape": "StatusDetails"
+            },
+            "StandardOutputContent": {
+              "shape": "StandardOutputContent"
+            },
+            "StandardOutputUrl": {
+              "shape": "Url"
+            },
+            "StandardErrorContent": {
+              "shape": "StandardErrorContent"
+            },
+            "StandardErrorUrl": {
+              "shape": "Url"
+            },
+            "CloudWatchOutputConfig": {
+              "shape": "CloudWatchOutputConfig"
+            }
+          }
+        },
+        "IPAddress": {
+          "type": "string"
+        },
+        "IamRole": {
+          "type": "string"
+        },
+        "InstanceAggregatedAssociationOverview": {
+          "type": "structure",
+          "members": {
+            "DetailedStatus": {
+              "shape": "StatusName"
+            },
+            "InstanceAssociationStatusAggregatedCount": {
+              "shape": "InstanceAssociationStatusAggregatedCount"
+            }
+          }
+        },
+        "InstanceAssociationStatusAggregatedCount": {
+          "type": "map",
+          "key": {
+            "shape": "StatusName"
+          },
+          "value": {
+            "shape": "InstanceCount"
+          }
+        },
+        "InstanceCount": {
+          "type": "integer"
+        },
+        "InstanceId": {
+          "type": "string"
+        },
+        "InstanceIdList": {
+          "type": "list",
+          "member": {
+            "shape": "InstanceId"
+          }
+        },
+        "InstanceInformation": {
+          "type": "structure",
+          "members": {
+            "InstanceId": {
+              "shape": "InstanceId"
+            },
+            "PingStatus": {
+              "shape": "PingStatus"
+            },
+            "LastPingDateTime": {
+              "shape": "DateTime"
+            },
+            "AgentVersion": {
+              "shape": "Version"
+            },
+            "IsLatestVersion": {
+              "shape": "Boolean"
+            },
+            "PlatformType": {
+              "shape": "PlatformType"
+            },
+            "PlatformName": {
+              "shape": "String"
+            },
+            "PlatformVersion": {
+              "shape": "String"
+            },
+            "ActivationId": {
+              "shape": "ActivationId"
+            },
+            "IamRole": {
+              "shape": "IamRole"
+            },
+            "RegistrationDate": {
+              "shape": "DateTime"
+            },
+            "ResourceType": {
+              "shape": "ResourceType"
+            },
+            "Name": {
+              "shape": "String"
+            },
+            "IPAddress": {
+              "shape": "IPAddress"
+            },
+            "ComputerName": {
+              "shape": "ComputerName"
+            },
+            "AssociationStatus": {
+              "shape": "StatusName"
+            },
+            "LastAssociationExecutionDate": {
+              "shape": "DateTime"
+            },
+            "LastSuccessfulAssociationExecutionDate": {
+              "shape": "DateTime"
+            },
+            "AssociationOverview": {
+              "shape": "InstanceAggregatedAssociationOverview"
+            },
+            "SourceId": {
+              "shape": "SourceId"
+            },
+            "SourceType": {
+              "shape": "SourceType"
+            },
+            "SourceLocation": {
+              "shape": "SourceLocation"
+            }
+          }
+        },
+        "InstanceInformationFilter": {
+          "type": "structure",
+          "required": [
+            "key",
+            "valueSet"
+          ],
+          "members": {
+            "key": {
+              "shape": "InstanceInformationFilterKey"
+            },
+            "valueSet": {
+              "shape": "InstanceInformationFilterValueSet"
+            }
+          }
+        },
+        "InstanceInformationFilterKey": {
+          "type": "string"
+        },
+        "InstanceInformationFilterList": {
+          "type": "list",
+          "member": {
+            "shape": "InstanceInformationFilter"
+          }
+        },
+        "InstanceInformationFilterValue": {
+          "type": "string"
+        },
+        "InstanceInformationFilterValueSet": {
+          "type": "list",
+          "member": {
+            "shape": "InstanceInformationFilterValue"
+          }
+        },
+        "InstanceInformationList": {
+          "type": "list",
+          "member": {
+            "shape": "InstanceInformation"
+          }
+        },
+        "InstanceInformationStringFilter": {
+          "type": "structure",
+          "required": [
+            "Key",
+            "Values"
+          ],
+          "members": {
+            "Key": {
+              "shape": "InstanceInformationStringFilterKey"
+            },
+            "Values": {
+              "shape": "InstanceInformationFilterValueSet"
+            }
+          }
+        },
+        "InstanceInformationStringFilterKey": {
+          "type": "string"
+        },
+        "InstanceInformationStringFilterList": {
+          "type": "list",
+          "member": {
+            "shape": "InstanceInformationStringFilter"
+          }
+        },
+        "InstanceTagName": {
+          "type": "string"
+        },
+        "InvocationTraceOutput": {
+          "type": "string"
+        },
+        "ListCommandInvocationsRequest": {
+          "type": "structure",
+          "members": {
+            "CommandId": {
+              "shape": "CommandId"
+            },
+            "InstanceId": {
+              "shape": "InstanceId"
+            },
+            "MaxResults": {
+              "shape": "CommandMaxResults"
+            },
+            "NextToken": {
+              "shape": "NextToken"
+            },
+            "Filters": {
+              "shape": "CommandFilterList"
+            },
+            "Details": {
+              "shape": "Boolean"
+            }
+          }
+        },
+        "ListCommandInvocationsResult": {
+          "type": "structure",
+          "members": {
+            "CommandInvocations": {
+              "shape": "CommandInvocationList"
+            },
+            "NextToken": {
+              "shape": "NextToken"
+            }
+          }
+        },
+        "ListCommandsRequest": {
+          "type": "structure",
+          "members": {
+            "CommandId": {
+              "shape": "CommandId"
+            },
+            "InstanceId": {
+              "shape": "InstanceId"
+            },
+            "MaxResults": {
+              "shape": "CommandMaxResults"
+            },
+            "NextToken": {
+              "shape": "NextToken"
+            },
+            "Filters": {
+              "shape": "CommandFilterList"
+            }
+          }
+        },
+        "ListCommandsResult": {
+          "type": "structure",
+          "members": {
+            "Commands": {
+              "shape": "CommandList"
+            },
+            "NextToken": {
+              "shape": "NextToken"
+            }
+          }
+        },
+        "MaxConcurrency": {
+          "type": "string"
+        },
+        "MaxErrors": {
+          "type": "string"
+        },
+        "MaxResultsEC2Compatible": {
+          "type": "integer"
+        },
+        "NextToken": {
+          "type": "string"
+        },
+        "NotificationArn": {
+          "type": "string"
+        },
+        "NotificationConfig": {
+          "type": "structure",
+          "members": {
+            "NotificationArn": {
+              "shape": "NotificationArn"
+            },
+            "NotificationEvents": {
+              "shape": "NotificationEventList"
+            },
+            "NotificationType": {
+              "shape": "NotificationType"
+            }
+          }
+        },
+        "NotificationEvent": {
+          "type": "string"
+        },
+        "NotificationEventList": {
+          "type": "list",
+          "member": {
+            "shape": "NotificationEvent"
+          }
+        },
+        "NotificationType": {
+          "type": "string"
+        },
+        "ParameterName": {
+          "type": "string"
+        },
+        "ParameterValue": {
+          "type": "string"
+        },
+        "ParameterValueList": {
+          "type": "list",
+          "member": {
+            "shape": "ParameterValue"
+          }
+        },
+        "Parameters": {
+          "type": "map",
+          "key": {
+            "shape": "ParameterName"
+          },
+          "value": {
+            "shape": "ParameterValueList"
+          }
+        },
+        "PingStatus": {
+          "type": "string"
+        },
+        "PlatformType": {
+          "type": "string"
+        },
+        "ResourceType": {
+          "type": "string"
+        },
+        "ResponseCode": {
+          "type": "integer"
+        },
+        "S3BucketName": {
+          "type": "string"
+        },
+        "S3KeyPrefix": {
+          "type": "string"
+        },
+        "S3Region": {
+          "type": "string"
+        },
+        "SendCommandRequest": {
+          "type": "structure",
+          "required": [
+            "DocumentName"
+          ],
+          "members": {
+            "InstanceIds": {
+              "shape": "InstanceIdList"
+            },
+            "Targets": {
+              "shape": "Targets"
+            },
+            "DocumentName": {
+              "shape": "DocumentARN"
+            },
+            "DocumentVersion": {
+              "shape": "DocumentVersion"
+            },
+            "DocumentHash": {
+              "shape": "DocumentHash"
+            },
+            "DocumentHashType": {
+              "shape": "DocumentHashType"
+            },
+            "TimeoutSeconds": {
+              "shape": "TimeoutSeconds"
+            },
+            "Comment": {
+              "shape": "Comment"
+            },
+            "Parameters": {
+              "shape": "Parameters"
+            },
+            "OutputS3Region": {
+              "shape": "S3Region"
+            },
+            "OutputS3BucketName": {
+              "shape": "S3BucketName"
+            },
+            "OutputS3KeyPrefix": {
+              "shape": "S3KeyPrefix"
+            },
+            "MaxConcurrency": {
+              "shape": "MaxConcurrency"
+            },
+            "MaxErrors": {
+              "shape": "MaxErrors"
+            },
+            "ServiceRoleArn": {
+              "shape": "ServiceRole"
+            },
+            "NotificationConfig": {
+              "shape": "NotificationConfig"
+            },
+            "CloudWatchOutputConfig": {
+              "shape": "CloudWatchOutputConfig"
+            },
+            "AlarmConfiguration": {
+              "shape": "AlarmConfiguration"
+            }
+          }
+        },
+        "SendCommandResult": {
+          "type": "structure",
+          "members": {
+            "Command": {
+              "shape": "Command"
+            }
+          }
+        },
+        "ServiceRole": {
+          "type": "string"
+        },
+        "SourceId": {
+          "type": "string"
+        },
+        "SourceLocation": {
+          "type": "string"
+        },
+        "SourceType": {
+          "type": "string"
+        },
+        "StandardErrorContent": {
+          "type": "string"
+        },
+        "StandardOutputContent": {
+          "type": "string"
+        },
+        "StatusDetails": {
+          "type": "string"
+        },
+        "StatusName": {
+          "type": "string"
+        },
+        "String": {
+          "type": "string"
+        },
+        "StringDateTime": {
+          "type": "string"
+        },
+        "Target": {
+          "type": "structure",
+          "members": {
+            "Key": {
+              "shape": "TargetKey"
+            },
+            "Values": {
+              "shape": "TargetValues"
+            }
+          }
+        },
+        "TargetCount": {
+          "type": "integer"
+        },
+        "TargetKey": {
+          "type": "string"
+        },
+        "TargetValue": {
+          "type": "string"
+        },
+        "TargetValues": {
+          "type": "list",
+          "member": {
+            "shape": "TargetValue"
+          }
+        },
+        "Targets": {
+          "type": "list",
+          "member": {
+            "shape": "Target"
+          }
+        },
+        "TimeoutSeconds": {
+          "type": "integer"
+        },
+        "Url": {
+          "type": "string"
+        },
+        "Version": {
+          "type": "string"
+        }
+      },
+      "exceptions": {
+        "AccessDeniedException": "AccessDeniedException",
+        "AlreadyExistsException": "AlreadyExistsException",
+        "AssociatedInstances": "AssociatedInstancesException",
+        "AssociationAlreadyExists": "AssociationAlreadyExistsException",
+        "AssociationDoesNotExist": "AssociationDoesNotExistException",
+        "AssociationExecutionDoesNotExist": "AssociationExecutionDoesNotExistException",
+        "AssociationLimitExceeded": "AssociationLimitExceededException",
+        "AssociationVersionLimitExceeded": "AssociationVersionLimitExceededException",
+        "AutomationDefinitionNotApprovedException": "AutomationDefinitionNotApprovedException",
+        "AutomationDefinitionNotFoundException": "AutomationDefinitionNotFoundException",
+        "AutomationDefinitionVersionNotFoundException": "AutomationDefinitionVersionNotFoundException",
+        "AutomationExecutionLimitExceededException": "AutomationExecutionLimitExceededException",
+        "AutomationExecutionNotFoundException": "AutomationExecutionNotFoundException",
+        "AutomationStepNotFoundException": "AutomationStepNotFoundException",
+        "ComplianceTypeCountLimitExceededException": "ComplianceTypeCountLimitExceededException",
+        "ConflictException": "ConflictException",
+        "CustomSchemaCountLimitExceededException": "CustomSchemaCountLimitExceededException",
+        "DocumentAlreadyExists": "DocumentAlreadyExistsException",
+        "DocumentLimitExceeded": "DocumentLimitExceededException",
+        "DocumentPermissionLimit": "DocumentPermissionLimitException",
+        "DocumentVersionLimitExceeded": "DocumentVersionLimitExceededException",
+        "DoesNotExistException": "DoesNotExistException",
+        "DuplicateDocumentContent": "DuplicateDocumentContentException",
+        "DuplicateDocumentVersionName": "DuplicateDocumentVersionNameException",
+        "DuplicateInstanceId": "DuplicateInstanceIdException",
+        "FeatureNotAvailableException": "FeatureNotAvailableException",
+        "HierarchyLevelLimitExceededException": "HierarchyLevelLimitExceededException",
+        "HierarchyTypeMismatchException": "HierarchyTypeMismatchException",
+        "IdempotentParameterMismatch": "IdempotentParameterMismatchException",
+        "IncompatiblePolicyException": "IncompatiblePolicyException",
+        "InternalServerError": "InternalServerErrorException",
+        "InvalidActivation": "InvalidActivationException",
+        "InvalidActivationId": "InvalidActivationIdException",
+        "InvalidAggregatorException": "InvalidAggregatorException",
+        "InvalidAllowedPatternException": "InvalidAllowedPatternException",
+        "InvalidAssociation": "InvalidAssociationException",
+        "InvalidAssociationVersion": "InvalidAssociationVersionException",
+        "InvalidAutomationExecutionParametersException": "InvalidAutomationExecutionParametersException",
+        "InvalidAutomationSignalException": "InvalidAutomationSignalException",
+        "InvalidAutomationStatusUpdateException": "InvalidAutomationStatusUpdateException",
+        "InvalidCommandId": "InvalidCommandIdException",
+        "InvalidDeleteInventoryParametersException": "InvalidDeleteInventoryParametersException",
+        "InvalidDeletionIdException": "InvalidDeletionIdException",
+        "InvalidDocument": "InvalidDocumentException",
+        "InvalidDocumentContent": "InvalidDocumentContentException",
+        "InvalidDocumentOperation": "InvalidDocumentOperationException",
+        "InvalidDocumentSchemaVersion": "InvalidDocumentSchemaVersionException",
+        "InvalidDocumentType": "InvalidDocumentTypeException",
+        "InvalidDocumentVersion": "InvalidDocumentVersionException",
+        "InvalidFilter": "InvalidFilterException",
+        "InvalidFilterKey": "InvalidFilterKeyException",
+        "InvalidFilterOption": "InvalidFilterOptionException",
+        "InvalidFilterValue": "InvalidFilterValueException",
+        "InvalidInstanceId": "InvalidInstanceIdException",
+        "InvalidInstanceInformationFilterValue": "InvalidInstanceInformationFilterValueException",
+        "InvalidInstancePropertyFilterValue": "InvalidInstancePropertyFilterValueException",
+        "InvalidInventoryGroupException": "InvalidInventoryGroupException",
+        "InvalidInventoryItemContextException": "InvalidInventoryItemContextException",
+        "InvalidInventoryRequestException": "InvalidInventoryRequestException",
+        "InvalidItemContentException": "InvalidItemContentException",
+        "InvalidKeyId": "InvalidKeyIdException",
+        "InvalidNextToken": "InvalidNextTokenException",
+        "InvalidNotificationConfig": "InvalidNotificationConfigException",
+        "InvalidOptionException": "InvalidOptionException",
+        "InvalidOutputFolder": "InvalidOutputFolderException",
+        "InvalidOutputLocation": "InvalidOutputLocationException",
+        "InvalidParameters": "InvalidParametersException",
+        "InvalidPermissionType": "InvalidPermissionTypeException",
+        "InvalidPluginName": "InvalidPluginNameException",
+        "InvalidPolicyAttributeException": "InvalidPolicyAttributeException",
+        "InvalidPolicyTypeException": "InvalidPolicyTypeException",
+        "InvalidResourceId": "InvalidResourceIdException",
+        "InvalidResourceType": "InvalidResourceTypeException",
+        "InvalidResultAttributeException": "InvalidResultAttributeException",
+        "InvalidRole": "InvalidRoleException",
+        "InvalidSchedule": "InvalidScheduleException",
+        "InvalidTag": "InvalidTagException",
+        "InvalidTarget": "InvalidTargetException",
+        "InvalidTargetMaps": "InvalidTargetMapsException",
+        "InvalidTypeNameException": "InvalidTypeNameException",
+        "InvalidUpdate": "InvalidUpdateException",
+        "InvocationDoesNotExist": "InvocationDoesNotExistException",
+        "ItemContentMismatchException": "ItemContentMismatchException",
+        "ItemSizeLimitExceededException": "ItemSizeLimitExceededException",
+        "MalformedResourcePolicyDocumentException": "MalformedResourcePolicyDocumentException",
+        "MaxDocumentSizeExceeded": "MaxDocumentSizeExceededException",
+        "NoLongerSupportedException": "NoLongerSupportedException",
+        "OpsItemAccessDeniedException": "OpsItemAccessDeniedException",
+        "OpsItemAlreadyExistsException": "OpsItemAlreadyExistsException",
+        "OpsItemConflictException": "OpsItemConflictException",
+        "OpsItemInvalidParameterException": "OpsItemInvalidParameterException",
+        "OpsItemLimitExceededException": "OpsItemLimitExceededException",
+        "OpsItemNotFoundException": "OpsItemNotFoundException",
+        "OpsItemRelatedItemAlreadyExistsException": "OpsItemRelatedItemAlreadyExistsException",
+        "OpsItemRelatedItemAssociationNotFoundException": "OpsItemRelatedItemAssociationNotFoundException",
+        "OpsMetadataAlreadyExistsException": "OpsMetadataAlreadyExistsException",
+        "OpsMetadataInvalidArgumentException": "OpsMetadataInvalidArgumentException",
+        "OpsMetadataKeyLimitExceededException": "OpsMetadataKeyLimitExceededException",
+        "OpsMetadataLimitExceededException": "OpsMetadataLimitExceededException",
+        "OpsMetadataNotFoundException": "OpsMetadataNotFoundException",
+        "OpsMetadataTooManyUpdatesException": "OpsMetadataTooManyUpdatesException",
+        "ParameterAlreadyExists": "ParameterAlreadyExistsException",
+        "ParameterLimitExceeded": "ParameterLimitExceededException",
+        "ParameterMaxVersionLimitExceeded": "ParameterMaxVersionLimitExceededException",
+        "ParameterNotFound": "ParameterNotFoundException",
+        "ParameterPatternMismatchException": "ParameterPatternMismatchException",
+        "ParameterVersionLabelLimitExceeded": "ParameterVersionLabelLimitExceededException",
+        "ParameterVersionNotFound": "ParameterVersionNotFoundException",
+        "PoliciesLimitExceededException": "PoliciesLimitExceededException",
+        "ResourceDataSyncAlreadyExistsException": "ResourceDataSyncAlreadyExistsException",
+        "ResourceDataSyncConflictException": "ResourceDataSyncConflictException",
+        "ResourceDataSyncCountExceededException": "ResourceDataSyncCountExceededException",
+        "ResourceDataSyncInvalidConfigurationException": "ResourceDataSyncInvalidConfigurationException",
+        "ResourceDataSyncNotFoundException": "ResourceDataSyncNotFoundException",
+        "ResourceInUseException": "ResourceInUseException",
+        "ResourceLimitExceededException": "ResourceLimitExceededException",
+        "ResourceNotFoundException": "ResourceNotFoundException",
+        "ResourcePolicyConflictException": "ResourcePolicyConflictException",
+        "ResourcePolicyInvalidParameterException": "ResourcePolicyInvalidParameterException",
+        "ResourcePolicyLimitExceededException": "ResourcePolicyLimitExceededException",
+        "ResourcePolicyNotFoundException": "ResourcePolicyNotFoundException",
+        "ServiceQuotaExceededException": "ServiceQuotaExceededException",
+        "ServiceSettingNotFound": "ServiceSettingNotFoundException",
+        "StatusUnchanged": "StatusUnchangedException",
+        "SubTypeCountLimitExceededException": "SubTypeCountLimitExceededException",
+        "TargetInUseException": "TargetInUseException",
+        "TargetNotConnected": "TargetNotConnectedException",
+        "ThrottlingException": "ThrottlingException",
+        "TooManyTagsError": "TooManyTagsErrorException",
+        "TooManyUpdates": "TooManyUpdatesException",
+        "TotalSizeLimitExceededException": "TotalSizeLimitExceededException",
+        "UnsupportedCalendarException": "UnsupportedCalendarException",
+        "UnsupportedFeatureRequiredException": "UnsupportedFeatureRequiredException",
+        "UnsupportedInventoryItemContextException": "UnsupportedInventoryItemContextException",
+        "UnsupportedInventorySchemaVersionException": "UnsupportedInventorySchemaVersionException",
+        "UnsupportedOperatingSystem": "UnsupportedOperatingSystemException",
+        "UnsupportedOperationException": "UnsupportedOperationException",
+        "UnsupportedParameterType": "UnsupportedParameterTypeException",
+        "UnsupportedPlatformType": "UnsupportedPlatformTypeException",
+        "ValidationException": "ValidationException"
+      }
+    }
+  }
+}

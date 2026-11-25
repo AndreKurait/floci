@@ -76,6 +76,32 @@ class LocalAwsSigningSessionTest {
     }
 
     @Test
+    void explicitTaskRoleRegistrationRetainsForeignAccountIdentityAndCleanup() {
+        String account = "222222222222";
+        String role = "arn:aws:iam::" + account + ":role/foreign";
+        ArgumentCaptor<String> key = ArgumentCaptor.forClass(String.class);
+        try (LocalAwsSigningSession session = LocalAwsSigningSession.assumedRoleForAccount(iam, account, role,
+                "task-session", "AROAFOREIGN:task-session")) {
+            verify(iam).registerSessionForAccount(eq(account), key.capture(), anyString(), anyString(), eq(role),
+                    any(Instant.class), isNull(), eq("task-session"), eq("AROAFOREIGN:task-session"));
+        }
+        verify(iam).unregisterSession(account, key.getValue());
+    }
+
+    @Test
+    void explicitTaskRoleRegistrationFailureRevokesOnlyItsOwnedKey() {
+        RuntimeException registration = new IllegalStateException("registration failed");
+        doThrow(registration).when(iam).registerSessionForAccount(eq(ACCOUNT), anyString(), anyString(), anyString(),
+                eq(ROLE), any(Instant.class), isNull(), eq("task"), eq("AROAID:task"));
+        assertSame(registration, assertThrows(IllegalStateException.class,
+                () -> LocalAwsSigningSession.assumedRoleForAccount(iam, ACCOUNT, ROLE, "task", "AROAID:task")));
+        ArgumentCaptor<String> key = ArgumentCaptor.forClass(String.class);
+        verify(iam).registerSessionForAccount(eq(ACCOUNT), key.capture(), anyString(), anyString(), eq(ROLE),
+                any(Instant.class), isNull(), eq("task"), eq("AROAID:task"));
+        verify(iam).unregisterSession(ACCOUNT, key.getValue());
+    }
+
+    @Test
     void registrationFailureRevokesTheKeyAndPreservesTheOriginalFailure() {
         RuntimeException registration = new IllegalStateException("registration failed");
         RuntimeException cleanup = new IllegalStateException("cleanup failed");
