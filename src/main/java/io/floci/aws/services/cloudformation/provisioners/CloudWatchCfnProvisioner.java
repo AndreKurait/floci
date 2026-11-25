@@ -54,8 +54,8 @@ public class CloudWatchCfnProvisioner implements CfnResourceProvisioner {
         }
         if (props.hasNonNull("Metrics")) {
             JsonNode queries = ctx.engine().resolveNode(props.get("Metrics"));
-            if (!queries.isArray() || queries.isEmpty()) {
-                throw new AwsException("InvalidParameterValue", "Metrics must be a nonempty list.", 400);
+            if (!queries.isArray()) {
+                throw new AwsException("InvalidParameterValue", "Metrics must be a list.", 400);
             }
             for (JsonNode query : queries) {
                 alarm.getMetrics().add(MAPPER.convertValue(query, AlarmMetricDataQuery.class));

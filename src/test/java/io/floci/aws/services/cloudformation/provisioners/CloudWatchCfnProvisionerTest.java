@@ -161,6 +161,17 @@ class CloudWatchCfnProvisionerTest {
     }
 
     @Test
+    void metricsMustBeAnArrayBeforeCallingTheService() {
+        for (String metricsJson : List.of("{}", "1", "\"invalid\"")) {
+            AwsException refused = assertThrows(AwsException.class, () -> provisionAndCapture(
+                    "{\"AlarmName\": \"latency\", \"Metrics\": " + metricsJson + "}"));
+            assertEquals("InvalidParameterValue", refused.getErrorCode());
+            assertEquals("Metrics must be a list.", refused.getMessage());
+        }
+        verifyNoInteractions(metrics);
+    }
+
+    @Test
     void extendedStatisticAndMetricQueriesAreRejectedBeforeCallingTheService() {
         assertThrows(AwsException.class, () -> provisionAndCapture("""
                 {"AlarmName": "latency", "ExtendedStatistic": "p90",
