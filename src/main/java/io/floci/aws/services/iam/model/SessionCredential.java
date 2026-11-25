@@ -1,5 +1,6 @@
 package io.floci.aws.services.iam.model;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
@@ -38,6 +39,9 @@ public class SessionCredential {
     private boolean lambdaExecutionRole;
     private String ec2InstanceId;
     private String ec2RoleId;
+    /** Live IMDS issuance provenance; never restored from persistent credentials. */
+    @JsonIgnore
+    private String ec2InstanceArn;
     /**
      * Exact ARN of the workload this session was minted for and is served to at the container
      * credentials endpoint: an ECS task's, for a task-role session, or a CodeBuild build's, for a
@@ -177,6 +181,9 @@ public class SessionCredential {
 
     public String getEc2RoleId() { return ec2RoleId; }
     public void setEc2RoleId(String ec2RoleId) { this.ec2RoleId = ec2RoleId; }
+
+    public String getEc2InstanceArn() { return ec2InstanceArn; }
+    public void setEc2InstanceArn(String ec2InstanceArn) { this.ec2InstanceArn = ec2InstanceArn; }
 
     public String getEc2InstanceId() { return ec2InstanceId; }
     public void setEc2InstanceId(String ec2InstanceId) { this.ec2InstanceId = ec2InstanceId; }
