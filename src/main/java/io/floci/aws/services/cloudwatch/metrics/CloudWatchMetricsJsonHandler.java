@@ -46,22 +46,6 @@ public class CloudWatchMetricsJsonHandler {
 
     private static final Logger LOG = Logger.getLogger(CloudWatchMetricsJsonHandler.class);
 
-    /**
-     * The operations served through the console's {@code CloudWatchVersion20130116.} target, each
-     * with the request members accepted there: some of the ones this handler honours. ListMetrics
-     * honours {@code NextToken}; DescribeAlarms' {@code MaxRecords} and {@code NextToken} still
-     * change nothing because every alarm comes back at once. DescribeAlarms' {@code StateValue},
-     * {@code ActionPrefix}, {@code ChildrenOfAlarmName} and {@code ParentsOfAlarmName}
-     * stay refused here until the console's API is known to give them the same shapes.
-     */
-    private static final Map<String, Set<String>> CONSOLE_TARGET_OPERATIONS = Map.of(
-            "PutMetricData", Set.of("Namespace", "MetricData"),
-            "ListMetrics", Set.of("Namespace", "MetricName", "Dimensions", "NextToken"),
-            "DescribeAlarms", Set.of("AlarmNames", "AlarmNamePrefix", "MaxRecords", "NextToken"),
-            "GetMetricStatistics", Set.of("Namespace", "MetricName", "Dimensions", "StartTime", "EndTime",
-                    "Period", "Statistics", "Unit"),
-            "DeleteAlarms", Set.of("AlarmNames"));
-
     private static final Set<String> CONSOLE_METRIC_DATUM_MEMBERS = Set.of(
             "MetricName", "Dimensions", "Timestamp", "Unit", "Value", "StatisticValues");
     private static final Set<String> CONSOLE_STATISTIC_MEMBERS = Set.of(
@@ -124,7 +108,7 @@ public class CloudWatchMetricsJsonHandler {
      * their own, which this handler would silently misread or ignore, such as {@code GetMetricData}
      * with {@code Defaults} and {@code Metrics}, or {@code PutMetricAlarm} metric items with
      * {@code Alias} and {@code MetricName}. So only the operations and top-level members in
-     * {@code CONSOLE_TARGET_OPERATIONS} are served: any other operation, and any other member set
+     * {@code CloudWatchLegacyProtocol} are served: any other operation, and any other member set
      * to a value other than {@code null} or {@code false}, is refused rather than answered as if it
      * were unset, and a top-level {@code null} member is dropped. {@code PutMetricData} also checks
      * the complete batch for supported scalar or statistic-set shapes before storing any metrics;
@@ -136,7 +120,7 @@ public class CloudWatchMetricsJsonHandler {
      * target.
      */
     public Response handleLegacy(String action, JsonNode request, String region) {
-        Set<String> servedMembers = CONSOLE_TARGET_OPERATIONS.get(action);
+        Set<String> servedMembers = CloudWatchLegacyProtocol.members(action);
         if (servedMembers == null) {
             return unsupportedWithConsoleTarget("Operation " + action);
         }
