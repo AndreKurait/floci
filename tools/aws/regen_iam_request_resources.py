@@ -684,7 +684,8 @@ KNOWN_VARIABLES = {"Partition", "Region", "Account"}
 # prefix of each type (`id_prefixes`), supplemented by cited API examples when botocore has none. Other ids keep
 # a wildcard entry until their coverage grows; every request
 # without those lists is read by the ordinary rules.
-ID_TARGETS = {"ec2": ("instance", "network-acl", "network-interface", "route-table", "security-group", "vpc-endpoint")}
+ID_TARGETS = {"ec2": ("image", "instance", "network-acl", "network-interface", "route-table", "security-group",
+                      "snapshot", "vpc-endpoint")}
 # These ID lists supplement named resources rather than replacing them.
 MIXED_ID_TARGETS = {"ssm": ("instance", "managed-instance")}
 # An ARN format's account given as `${AccountId}`, the account `${Account}` gives in every other format.

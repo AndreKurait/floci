@@ -3836,7 +3836,10 @@ def test_vendored_ec2_examples_resolve_through_the_actual_pinned_response_member
     models = r.load_models(data, {"ec2"})
     source = json.loads(r.fetch_ec2_id_examples.OUTPUT.read_text())
     assert r.reference_id_prefixes(models, r.ID_TARGETS["ec2"], source)["vpc-endpoint"] == "vpce-"
-    assert r.documented_id_prefixes("ec2", models, r.load_examples(data, {"ec2"}))["vpc-endpoint"] == "vpce-"
+    prefixes = r.documented_id_prefixes("ec2", models, r.load_examples(data, {"ec2"}))
+    assert prefixes["vpc-endpoint"] == "vpce-"
+    assert prefixes["image"] == "ami-"
+    assert prefixes["snapshot"] == "snap-"
 
 
 def test_identifier_reference_verification_reports_unavailable_pages(monkeypatch):
