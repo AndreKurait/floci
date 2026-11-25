@@ -7,6 +7,9 @@ import java.util.zip.GZIPInputStream;
 /** Bounded inflation for the AWS JSON operations that accept compressed requests. */
 final class AwsJsonGzipBody {
 
+    /** Set only after a request filter has replaced wire bytes with the bounded decoded body. */
+    static final String DECODED_PROPERTY = AwsJsonGzipBody.class.getName() + ".decoded";
+
     private AwsJsonGzipBody() {
     }
 

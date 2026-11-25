@@ -633,7 +633,9 @@ public class IamActionRegistry {
      * PartiQL statement by its verb) is checked as the actions the request-resources table gives those parts.
      */
     public String resolveOperation(String credentialScope, String operationName, ContainerRequestContext ctx) {
-        return IamAuthorizedActions.actionFor(credentialScope, operationName);
+        // Resource Groups Tagging signs as tagging, but its permission namespace is tag.
+        String namespace = "tagging".equals(credentialScope) ? "tag" : credentialScope;
+        return IamAuthorizedActions.actionFor(namespace, operationName);
     }
 
     /** The serving method identifies these actions even when path encoding or matrix parameters vary. */

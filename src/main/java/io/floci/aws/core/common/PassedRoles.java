@@ -1044,7 +1044,8 @@ final class PassedRoles {
         }
         try {
             String encoding = ctx.getHeaderString(HttpHeaders.CONTENT_ENCODING);
-            if (encoding != null && AwsJsonCborController.isGZipped(List.of(encoding))) {
+            if (!Boolean.TRUE.equals(ctx.getProperty(AwsJsonGzipBody.DECODED_PROPERTY))
+                    && encoding != null && AwsJsonCborController.isGZipped(List.of(encoding))) {
                 body = AwsJsonCborController.decodeBody(body);
             }
             JsonNode node = (isCbor(ctx.getMediaType()) ? CBOR_MAPPER : MAPPER).readTree(body);

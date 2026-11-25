@@ -339,6 +339,13 @@ public class ResourceArnBuilder {
             return List.of(eksService.get().findAccessEntryUpdateTarget(pathSegment(updatePath[1]), pathSegment(updatePath[3]))
                     .map(entry -> entry.accessEntryArn()).orElse("*"));
         }
+        if (operation != null && operation.startsWith("ssm:")) {
+            List<String> session = ssmSessionResources(operation.substring("ssm:".length()),
+                    readJsonBody(ctx), region, accountId, partition);
+            if (session != null) {
+                return session;
+            }
+        }
         if (operation != null && operation.startsWith(credentialScope + ":") && RequestResources.reads(operation)) {
             return namedResources(credentialScope, operation, ctx, region, accountId, partition);
         }
