@@ -14,13 +14,20 @@ import io.floci.aws.services.iam.model.VerifiedIdentityContext;
  *                         session ARN; null for the other kinds
  * @param roleArn          for a role session, the ARN of the role that was assumed, path included,
  *                         which a {@code Principal} naming the role identifies; null otherwise
+ * @param identityId       immutable user or role ID verified from the caller credentials; null when unknown
  * @param servicePrincipal a service caller's principal name, such as {@code sns.amazonaws.com};
  *                         null for the other kinds
  * @param permissionsBoundary whether an IAM caller has a permissions boundary attached, which a
  *                         Deny's {@code NotPrincipal} never spares
  */
 public record RequestPrincipal(Type type, String arn, String roleArn, String servicePrincipal,
-                               boolean permissionsBoundary, VerifiedIdentityContext verifiedIdentityContext) {
+                               boolean permissionsBoundary, VerifiedIdentityContext verifiedIdentityContext,
+                               String identityId) {
+
+    public RequestPrincipal(Type type, String arn, String roleArn, String servicePrincipal,
+                            boolean permissionsBoundary, VerifiedIdentityContext verifiedIdentityContext) {
+        this(type, arn, roleArn, servicePrincipal, permissionsBoundary, verifiedIdentityContext, null);
+    }
 
     public RequestPrincipal(Type type, String arn, String roleArn, String servicePrincipal,
                             boolean permissionsBoundary) {
@@ -51,7 +58,21 @@ public record RequestPrincipal(Type type, String arn, String roleArn, String ser
         }
         return new RequestPrincipal(Type.IAM, callerArns.callerArn(),
                 callerArns.callerArn().equals(callerArns.principalArn()) ? null : callerArns.principalArn(),
-                null, callerArns.permissionsBoundary(), callerArns.verifiedIdentityContext());
+                null, callerArns.permissionsBoundary(), callerArns.verifiedIdentityContext(), identityId(callerArns));
+    }
+
+    private static String identityId(IamService.CallerArns caller) {
+        String id = caller.userId();
+        if (id == null) {
+            return null;
+        }
+        if (IamService.CallerArns.TYPE_ASSUMED_ROLE.equals(caller.principalType())) {
+            int separator = id.indexOf(':');
+            id = separator < 0 ? id : id.substring(0, separator);
+            return id.startsWith("AROA") && TrustPolicyPrincipalIds.isIdentityId(id) ? id : null;
+        }
+        return IamService.CallerArns.TYPE_USER.equals(caller.principalType())
+                && id.startsWith("AIDA") && TrustPolicyPrincipalIds.isIdentityId(id) ? id : null;
     }
 
     /** An AWS service acting on its own behalf, such as SNS delivering to a queue. */
