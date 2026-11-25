@@ -98,8 +98,12 @@ class EcsServiceTeardownTest {
         definition.setImage("busybox:stable");
         service.registerTaskDefinition("parallel-shutdown", List.of(definition), null, null, null,
                 null, null, List.of(), REGION);
-        service.runTask(null, "parallel-shutdown", 9, LaunchType.FARGATE, null, null,
+        List<EcsTask> launched = service.runTask(null, "parallel-shutdown", 9, LaunchType.FARGATE, null, null,
                 List.of(), null, REGION);
+        for (EcsTask task : launched) {
+            awaitLastStatus(() -> service.describeTasks(null, List.of(task.getTaskArn()), REGION).getFirst(),
+                    EcsTask::getLastStatus, Duration.ofSeconds(5), "RUNNING");
+        }
         AtomicReference<Throwable> failure = new AtomicReference<>();
         AtomicBoolean interruptionPreserved = new AtomicBoolean();
         Thread shutdown = new Thread(() -> {
