@@ -149,11 +149,27 @@ class ApiGatewayLambdaPermissionIntegrationTest {
     @Test
     void integrationWithCredentialsIsNotDecidedByTheFunctionPolicy() {
         String functionArn = createFunction("role-invoked-" + suffix());
-        String apiId = createApi("AWS_PROXY", functionArn, "arn:aws:iam::" + ACCOUNT + ":role/apigateway-invoke");
+        String roleName = "apigateway-invoke-" + suffix();
+        String trust = """
+                {"Version":"2012-10-17","Statement":{"Effect":"Allow",
+                "Principal":{"Service":"apigateway.amazonaws.com"},"Action":"sts:AssumeRole"}}""";
+        iam("CreateRole", Map.of("RoleName", roleName, "AssumeRolePolicyDocument", trust));
+        cleanup.push(() -> iam("DeleteRole", Map.of("RoleName", roleName)));
+        String policy = """
+                {"Statement":{"Effect":"Allow","Action":"lambda:InvokeFunction","Resource":"%s"}}"""
+                .formatted(functionArn);
+        iam("PutRolePolicy", Map.of("RoleName", roleName, "PolicyName", "invoke", "PolicyDocument", policy));
+        cleanup.push(() -> iam("DeleteRolePolicy", Map.of("RoleName", roleName, "PolicyName", "invoke")));
+        String apiId = createApi("AWS_PROXY", functionArn, "arn:aws:iam::" + ACCOUNT + ":role/" + roleName);
 
         execute(apiId).statusCode(200);
 
         verify(lambdaService).invokeTarget(any(), eq(functionArn), any(), eq(InvocationType.RequestResponse));
+    }
+
+    private static void iam(String action, Map<String, String> parameters) {
+        signed("iam").contentType("application/x-www-form-urlencoded").formParam("Action", action)
+                .formParams(parameters).post("/").then().statusCode(200);
     }
 
     @Test

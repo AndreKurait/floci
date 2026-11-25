@@ -225,7 +225,7 @@ class HttpRouteIamIntegrationTest {
     void rejectedRolePolicyDoesNotDeleteExistingPolicy() throws Exception {
         String name = "http-existing-route-policy-" + UUID.randomUUID();
         createPolicyRole(name);
-        putRolePolicy(name, "{}", cleanup);
+        putRolePolicy(name, policy("*"), cleanup);
         String path = "GetRolePolicyResponse.GetRolePolicyResult.PolicyDocument";
         String before = SignedIamUsers.iam(endpoint, "GetRolePolicy", Map.of("RoleName", name, "PolicyName", "invoke"))
                 .then().statusCode(200).extract().xmlPath().getString(path);
@@ -251,7 +251,7 @@ class HttpRouteIamIntegrationTest {
         createPolicyRole(name);
         PartitionCleanup owned = new PartitionCleanup();
         try {
-            putRolePolicy(name, "{}", owned);
+            putRolePolicy(name, policy("*"), owned);
         } finally {
             owned.afterEach(mock(ExtensionContext.class));
         }
