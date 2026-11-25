@@ -7,6 +7,8 @@ it. `SERVICES` names, for each namespace, the keys read and where:
 - `eks`: a CreateCluster or UpdateClusterConfig request is checked with the access configuration and endpoint
   flags it names in its JSON body, as `eks:authenticationMode`, `eks:bootstrapClusterCreatorAdminPermissions`,
   `eks:endpointPrivateAccess` and `eks:endpointPublicAccess`; a member it leaves out names nothing.
+- `account`: EnableRegion, DisableRegion and GetRegionOptStatus carry account:TargetRegion in RegionName.
+  ListRegions has no such condition key.
 - `lambda`: a Lambda Web Functions request is checked with the endpoint's authType as
   `lambda:Request/WebFunctionAuthType`, the one the request names, and `lambda:Resource/WebFunctionAuthType`,
   the one the endpoint has before the request, read from the stored endpoint.
@@ -92,6 +94,8 @@ SERVICES = {
         "stored": (),
         "not_in_request": {},
     },
+    "account": {"model": "account", "request": {"account:TargetRegion": "RegionName"},
+                "stored": (), "not_in_request": {}},
     "lambda": {
         "model": "lambda-web",
         "request": {"lambda:Request/WebFunctionAuthType": "authType"},
