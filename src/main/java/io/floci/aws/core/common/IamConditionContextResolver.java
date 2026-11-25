@@ -2024,6 +2024,10 @@ public class IamConditionContextResolver {
         List<String> prefixes = RequestResourceMembers.table().resourceTagKeys()
                 .getOrDefault("ec2", Map.of()).getOrDefault(parts[0], List.of());
         boolean callerResource = region.equals(resourceRegion) && accountId.equals(resourceAccount);
+        if (callerResource && "ec2:DeletePlacementGroup".equals(action) && "placement-group".equals(parts[0])) {
+            // Native placement groups keep their name-scoped tags and strategy in their own store.
+            return context;
+        }
         Map<String, RequestResourceMembers.ResourceKey> keys = callerResource ? ec2ResourceKeys(parts[0]) : Map.of();
         if (prefixes.isEmpty() && keys.isEmpty()) {
             return context;

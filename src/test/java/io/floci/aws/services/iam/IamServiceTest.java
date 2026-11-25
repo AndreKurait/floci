@@ -592,12 +592,10 @@ class IamServiceTest {
         // The principal keys ride along from the same lookup: a role session is typed as an
         // assumed role, its aws:userid is the stored role-id:session-name, and it has no
         // aws:username, which the guide lists as not present for a role.
-        // It carries what its credentials say about MFA as well, which for a session minted
-        // without a device is the key present and false.
+        // AssumeRole authenticates MFA on the request; its credentials carry neither MFA context key.
         assertSessionCaller(new IamService.CallerArns("arn:aws:sts::123456789012:assumed-role/TestRole/s",
                         "arn:aws:iam::123456789012:role/team/TestRole",
-                        IamService.CallerArns.TYPE_ASSUMED_ROLE, "AROATESTROLEID:s", null)
-                        .withSessionMfa(new IamService.CallerArns.SessionMfa(false, 0)),
+                        IamService.CallerArns.TYPE_ASSUMED_ROLE, "AROATESTROLEID:s", null),
                 service.resolveCallerArns("ASIALIVESESSION").orElseThrow());
         // An expired session answers for neither, never for one and not the other.
         assertTrue(service.resolveCallerArns("ASIAEXPIREDSESSION").isEmpty());

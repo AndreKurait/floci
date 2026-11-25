@@ -332,6 +332,21 @@ public class ResourceArnBuilder {
             String tagged = labels(credentialScope, ctx).get("resourceArn");
             return List.of(S3ControlArnUtils.parse(tagged).map(AwsArnUtils.Arn::toString).orElse("*"));
         }
+        if ("ec2:RunInstances".equals(operation)) {
+            return Ec2ResourceArns.of(operation, ctx, region, accountId, partition,
+                    ec2Service != null && ec2Service.isResolvable() ? ec2Service.get() : null);
+        }
+        if ("ec2".equals(credentialScope)) {
+            if ("ec2:DescribePlacementGroups".equals(operation)) {
+                return List.of("*");
+            }
+            if ("ec2:CreatePlacementGroup".equals(operation) || "ec2:DeletePlacementGroup".equals(operation)) {
+                String name = firstFormParam(ctx, "GroupName");
+                return name == null || name.isBlank() ? List.of("*")
+                        : List.of(new AwsArnUtils.Arn(partition, "ec2", region, accountId,
+                                "placement-group/" + name).toString());
+            }
+        }
         // Access-entry updates resolve the held target without migrating legacy records before authorization.
         if ("eks".equals(credentialScope) && "eks:UpdateAccessEntry".equals(operation)) {
             String[] updatePath = IamActionRegistry.routedPath(ctx).substring(1).split("/", 4);
@@ -471,17 +486,6 @@ public class ResourceArnBuilder {
         }
         if ("mq:CreateConfiguration".equals(operation) || "mq:ListConfigurations".equals(operation)) {
             return List.of("*");
-        }
-        if ("ec2".equals(credentialScope)) {
-            if ("ec2:DescribePlacementGroups".equals(operation)) {
-                return List.of("*");
-            }
-            if ("ec2:CreatePlacementGroup".equals(operation) || "ec2:DeletePlacementGroup".equals(operation)) {
-                String name = firstFormParam(ctx, "GroupName");
-                return name == null || name.isBlank() ? List.of("*")
-                        : List.of(new AwsArnUtils.Arn(partition, "ec2", region, accountId,
-                                "placement-group/" + name).toString());
-            }
         }
         if ("lambda:GetRuntimeManagementConfig".equals(operation)
                 || "lambda:PutRuntimeManagementConfig".equals(operation)) {
