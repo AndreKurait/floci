@@ -8,6 +8,8 @@ import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.UriInfo;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
@@ -51,6 +53,37 @@ class RequestResourcesTest {
                     : Optional.empty();
         }
     };
+
+    @ParameterizedTest
+    @CsvSource({"GetDeployment,GET,01", "GetDeployment,GET,+1", "GetDeployment,GET,1",
+            "StopDeployment,DELETE,01", "StopDeployment,DELETE,+1", "StopDeployment,DELETE,1"})
+    void appConfigDeploymentNumbersUseCanonicalAuthorizationResources(String operation, String method, String number) {
+        String prefix = "arn:aws:appconfig:us-east-1:000000000000:application/app";
+        Map<String, String> labels = Map.of("ApplicationId", "app", "EnvironmentId", "env", "DeploymentNumber", number);
+        List<String> expected = List.of(prefix, prefix + "/environment/env/deployment/1", prefix + "/environment/env");
+        assertEquals(expected, RequestResources.of("appconfig:" + operation, rest(method, null, Map.of()),
+                "aws", "us-east-1", "000000000000", null, labels));
+        StoredResourceArns stored = new StoredResourceArns() {
+            @Override
+            public String namespace() {
+                return "appconfig";
+            }
+
+            @Override
+            public Optional<String> find(String type, List<String> names, String region) {
+                return Optional.empty();
+            }
+
+            @Override
+            public Optional<String> findByVariables(String type, Map<String, String> variables, String region) {
+                return "deployment".equals(type)
+                        ? Optional.of(prefix + "/environment/env/deployment/" + variables.get("DeploymentNumber"))
+                        : Optional.empty();
+            }
+        };
+        assertEquals(expected, RequestResources.of("appconfig:" + operation, rest(method, null, Map.of()),
+                "aws", "us-east-1", "000000000000", stored, labels));
+    }
 
     @Test
     void detachFindsBothAttachmentEndpointsAndKeepsTypedMissingFallbacks() {
@@ -129,6 +162,28 @@ class RequestResourcesTest {
                         """)));
         assertEquals(List.of(prefix + "vpc/*", "arn:aws:ec2::000000000000:ipam-pool/ipam-pool-v6"),
                 of("ec2:CreateVpc", json("{\"Ipv6IpamPoolId\":\"ipam-pool-v6\"}")));
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+        "CreateApplication,application",
+        "CreateDeploymentStrategy,deploymentstrategy",
+        "CreateExtension,extension",
+        "CreateExtensionAssociation,extensionassociation"
+    })
+    void appConfigCreatesKeepWildcardActionScopeAndTagOnlyTheirMintedResource(String operation, String type) {
+        String action = "appconfig:" + operation;
+        for (Map.Entry<String, String> location : Map.of(
+                "aws", "us-east-1", "aws-cn", "cn-north-1", "aws-us-gov", "us-gov-west-1").entrySet()) {
+            ContainerRequestContext request = json("{\"Name\":\"schema-owned\",\"Tags\":{\"audit\":\"owned\"}}");
+            assertEquals(List.of(), RequestResources.of(action, request,
+                    location.getKey(), location.getValue(), "111122223333"));
+            // Extension ARNs include both the extension ID and version number.
+            assertEquals(List.of("arn:" + location.getKey() + ":appconfig:" + location.getValue()
+                    + ":111122223333:" + type + ("extension".equals(type) ? "/*/*" : "/*")),
+                    RequestResources.created(action, "appconfig:TagResource",
+                    request, location.getKey(), location.getValue(), "111122223333", Map.of()));
+        }
     }
 
     @Test
@@ -264,6 +319,38 @@ class RequestResourcesTest {
                 new ObjectMapper().readTree("{\"InstanceIds\":[\"i-one\"]}"), "aws", "us-east-1",
                 "000000000000", null));
     }
+
+    @Test
+    void aConfigurationNamesTheCanonicalApplicationEnvironmentAndProfileTogether() {
+        StoredResourceArns stored = new StoredResourceArns() {
+            @Override
+            public String namespace() {
+                return "appconfig";
+            }
+
+            @Override
+            public Optional<String> find(String type, List<String> names, String region) {
+                throw new AssertionError("A compound identity must retain its variable names");
+            }
+
+            @Override
+            public Optional<String> findByVariables(String type, Map<String, String> variables, String region) {
+                assertEquals("configuration", type);
+                assertEquals("cn-north-1", region);
+                assertEquals(Map.of("ApplicationId", "orders", "EnvironmentId", "production",
+                        "ConfigurationProfileId", "settings"), variables);
+                return Optional.of("arn:aws-cn:appconfig:cn-north-1:111122223333:"
+                        + "application/app1234/environment/env1234/configuration/cfg1234");
+            }
+        };
+        assertEquals(List.of("arn:aws-cn:appconfig:cn-north-1:111122223333:"
+                        + "application/app1234/environment/env1234/configuration/cfg1234"),
+                RequestResources.of("appconfig:StartConfigurationSession", json("""
+                        {"ApplicationIdentifier":"orders","EnvironmentIdentifier":"production",
+                         "ConfigurationProfileIdentifier":"settings"}
+                        """), "aws-cn", "cn-north-1", "111122223333", stored));
+    }
+
 
     @Test
     void anAssociationOnASharedDocumentGivenByItsArnIsCheckedOnThatArn() throws Exception {

@@ -10,6 +10,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 
@@ -160,6 +161,40 @@ class RegionScopedStorageTest {
                     new RegionScopedStorage.RegionEntry<>("eu-west-1", "app", "eu"),
                     new RegionScopedStorage.RegionEntry<>("eu-west-1", "my-cd-1/plan", "eu-plan")),
                     Set.copyOf(store(factory, "us-west-2").scanEveryRegion()));
+        } finally {
+            factory.shutdownAll();
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"memory", "persistent", "hybrid", "wal"})
+    void everyRegionScanOmitsOnlyShadowedLegacyValues(String mode) {
+        StorageFactory factory = StorageFactories.open(directory, mode, "000000000000");
+        try {
+            AccountAwareStorageBackend<String> legacy = factory.create(
+                    "appconfig", "records.json", new TypeReference<>() {});
+            legacy.put("app/environment", "old");
+            legacy.put("other", "legacy-other");
+            legacy.putForAccount("111111111111", "us-east-1/other", "foreign");
+            RegionScopedStorage<String> east = store(factory, "us-east-1");
+            RegionScopedStorage<String> west = store(factory, "us-west-2");
+            west.putAllAtomically(Map.of("app/environment", "west", "other", "west-other"));
+            east.putAllAtomically(Map.of("app/environment", "replacement"));
+
+            assertEquals(Optional.of("old"), legacy.get("app/environment"));
+            assertEquals(Optional.of("replacement"), east.get("app/environment"));
+            List<RegionScopedStorage.RegionEntry<String>> entries = west.scanEveryRegion();
+            assertEquals(4, entries.size());
+            assertEquals(Set.of(
+                    new RegionScopedStorage.RegionEntry<>("us-east-1", "app/environment", "replacement"),
+                    new RegionScopedStorage.RegionEntry<>("us-east-1", "other", "legacy-other"),
+                    new RegionScopedStorage.RegionEntry<>("us-west-2", "app/environment", "west"),
+                    new RegionScopedStorage.RegionEntry<>("us-west-2", "other", "west-other")),
+                    Set.copyOf(entries));
+            east.delete("app/environment");
+            assertEquals(Optional.empty(), legacy.get("app/environment"));
+            assertEquals(Optional.empty(), east.get("app/environment"));
+            assertEquals(Optional.of("west"), west.get("app/environment"));
         } finally {
             factory.shutdownAll();
         }

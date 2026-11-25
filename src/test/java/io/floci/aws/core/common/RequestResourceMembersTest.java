@@ -598,7 +598,7 @@ class RequestResourceMembersTest {
                     });
                     List<String> named = operation.getValue().stream()
                             .filter(other -> (other == resource || named(other) && !other.signer()
-                                    || signedFor(other, given) || sharesAMember(other, given)
+                                    || signedFor(other, given) || sharesAMember(other, given, table.formats().get(namespace))
                                     || fillsFromTheArn(other, resource, type)
                                     || !other.find().isEmpty() && other.find().equals(resource.find())
                                     && other.when().equals(resource.when()) && other.unless().equals(resource.unless()))
@@ -771,7 +771,16 @@ class RequestResourceMembersTest {
      * values fail leaves it out (each member given is {@code x}, any other absent, which a value list holds as
      * {@code ""}).
      */
-    private static boolean sharesAMember(Resource resource, Map<Member, String> given) {
+    private static boolean sharesAMember(Resource resource, Map<Member, String> given,
+                                         Map<String, ArnFormat> formats) {
+        if (resource.fill().size() == 1) {
+            String value = given.get(resource.fill().values().iterator().next());
+            // A complete own ARN is already expected; the reader does not also infer an ID-based wildcard.
+            if (value != null && resource.types().stream()
+                    .anyMatch(type -> formats.get(type).pattern().matcher(value).matches())) {
+                return false;
+            }
+        }
         // A resource its service finds by several members is found only from a request giving every one of them.
         if (!resource.find().isEmpty() && !given.keySet().containsAll(resource.find())) {
             return false;

@@ -170,8 +170,9 @@ Beyond the members' names, botocore's shapes and documentation say what a member
   variable of that type's format, rather than naming nothing.
 A URI or query member can carry the same name-or-ARN alternative as a body member. An integer shape
 whose name matches an otherwise unfilled ARN variable (optionally ending in `Number`) supplies that variable.
-`integerVariables` records these numeric identifiers so the reader canonicalizes leading zeroes even when the
-request gives the whole ARN; string identifiers retain their spelling.
+`integerVariables` records every explicitly mapped integer member, including shapes named only `Integer`, so the
+reader canonicalizes leading zeroes even when the request gives the whole ARN or storage resolves its IDs;
+string identifiers retain their spelling.
 What a request names, this file alone says. A service only looks up what it holds where an entry asks it to
 (`StoredResourceArns`): the resource the members a `find` gives name, the ones a `through` member reaches, the
 resource its handler uses for a member left out (Athena's `primary` workgroup, EventBridge's `default` bus, ECS's
@@ -351,7 +352,7 @@ OUTPUT = REPO_ROOT / "src/main/resources/aws/iam-request-resources.json"
 
 # The namespaces read, in batches: each moves here from NOT_COVERED with the tests that show its ARNs
 # are the ones its handlers mint.
-NAMESPACES = ("access-analyzer", "account", "acm", "application-autoscaling", "aps", "athena", "bcm-data-exports",
+NAMESPACES = ("access-analyzer", "account", "acm", "appconfig", "application-autoscaling", "aps", "athena", "bcm-data-exports",
               "bcm-pricing-calculator", "budgets", "ce", "cloudfront", "cloudfront-keyvaluestore", "cloudtrail",
               "codebuild", "codepipeline", "cognito-identity", "cognito-idp", "controlcatalog", "controltower", "cur",
               "datasync", "ec2", "ecr", "ecs", "elasticloadbalancing", "elasticmapreduce", "emr-containers",
@@ -600,7 +601,6 @@ _REST = ("REST: its requests name their resources in the path, which RequestReso
 NOT_COVERED: dict[str, str] = {
     "airflow": _REST,
     "app-integrations": _REST,
-    "appconfig": _REST,
     "appsync": _REST,
     "autoscaling": "not read yet: AWS's group and launch configuration ARNs carry an id the service mints, "
                    "`autoScalingGroup:<id>:autoScalingGroupName/<name>`, while Floci mints `autoScalingGroup:<name>`, "
@@ -1464,6 +1464,9 @@ def request_members(models: dict[str, dict], operation: str) -> dict[str, str]:
             shape = model["shapes"][member["shape"]]
             if _strings(model, shape) is not None:
                 found.setdefault(name, name + _strings(model, shape))
+            elif member.get("location") == "uri" and shape["type"] in ("integer", "long"):
+                # Numeric path labels are still strings on the wire, such as DeploymentNumber.
+                found.setdefault(name, name)
             for path in _nested_arns(model, name, shape):
                 found.setdefault(path.removesuffix("[]"), path)
     return found
@@ -2333,7 +2336,10 @@ def resources_for(operation: str, types: list[str], formats: dict[str, str], mem
     for kinds in by_members.values():
         if len(kinds) == 1 or not by_members_key_is_empty(kinds, filled):
             full = [kind for kind in kinds if complete[kind]]
-            kept += kinds if len(kinds) == 1 else (full if len(full) == 1 else [])
+            # Two reference types can name exactly the same ARN, as AppConfig's configuration profile and hosted
+            # configuration version do. They are aliases, not alternatives: retain one reading of that ARN.
+            readings = {(formats[kind], tuple(sorted(filled[kind].items()))) for kind in full}
+            kept += kinds if len(kinds) == 1 else (full[:1] if len(readings) == 1 else [])
         else:
             # A type of no variables of its own is the account's one, which every request names, never an
             # alternative to a create's own type: Glue's `catalog` beside the database `CreateDatabase` makes.
@@ -2861,6 +2867,7 @@ def entry_for(operation: str, upstream: dict, formats: dict[str, str], models: d
             resources = with_signing_user(resources, operation, types, of_operation("signingUser"), models)
             resources = with_same_as_arn(resources, operation, types, of_operation("sameAsArn"), formats, models)
             resources = with_formats(resources, operation, types, of_operation("formats"), models)
+    resources = with_appconfig_resource_reads(resources, operation, types, formats, members)
     uses = MEASURED.get(operation, (None, ""))[0]
     # An entry naming only another action AWS checks gives the operation no resources of its own.
     if uses is not None and not (uses and all("action" in use for use in uses)):
@@ -2893,6 +2900,33 @@ def entry_for(operation: str, upstream: dict, formats: dict[str, str], models: d
     if operation in measured_actions():
         entry["forwarded"] = forwarded_for(operation, types, models, forwarded or {})
     return entry
+
+
+def with_appconfig_resource_reads(resources: list[dict], operation: str, types: list[str],
+                                 formats: dict[str, str], members: dict[str, str]) -> list[dict]:
+    """Preserve the AppConfig reader's name and token resolution where model member names do not identify a type.
+
+    GetConfiguration's Configuration path member names its configuration profile. GetLatestConfiguration's token
+    names the configuration of the StartConfigurationSession session. AppConfigResourceArns resolves both to stored
+    IDs before authorization; neither the legacy spelling nor the opaque token can fill an ARN by a naming rule.
+    See the AppConfig API reference's API_GetConfiguration and API_appconfigdata_GetLatestConfiguration.
+    """
+    if operation == "appconfig:GetConfiguration":
+        extra = {"type": "configurationprofile",
+                 "fill": {"ApplicationId": "Application", "ConfigurationProfileId": "Configuration"}}
+        expected_format = ("arn:${Partition}:appconfig:${Region}:${Account}:"
+                           "application/${ApplicationId}/configurationprofile/${ConfigurationProfileId}")
+        if formats.get("configurationprofile") != expected_format:
+            raise ValueError("AppConfig's configuration profile ARN changed; review the legacy Configuration reader")
+    elif operation == "appconfig:GetLatestConfiguration":
+        extra = {"types": ["configuration"], "through": "ConfigurationToken"}
+    else:
+        return resources
+    paths = set(extra["fill"].values()) if "fill" in extra else {extra["through"]}
+    if not set(_kinds(extra)) <= set(types) or not paths <= set(members.values()):
+        raise ValueError(f"{operation}'s types or request members changed; review its AppConfig resource reader")
+    return resources if extra in resources else resources + [extra]
+
 
 
 def body_only_identifiers(types: list[str], formats: dict[str, str], resources: list[dict], models: dict[str, dict],
@@ -4656,10 +4690,18 @@ def integer_variables(operations: dict[str, dict], namespaces: dict[str, list[st
         namespace, name = operation.split(":", 1)
         if namespace not in loaded:
             loaded[namespace] = load_models(data, set(namespaces[namespace]))
-        members = integer_members(loaded[namespace], name)
+        members = set()
+        for model in loaded[namespace].values():
+            spec = model["operations"].get(name, {})
+            if "input" not in spec or _reading(model) is None:
+                continue
+            for member, traits in model["shapes"][spec["input"]["shape"]].get("members", {}).items():
+                if model["shapes"][traits["shape"]]["type"] in ("integer", "long"):
+                    if traits.get("location") in BODY_LOCATIONS or _located(traits) is not None:
+                        members.add(member)
         for resource in entry["resources"]:
             for variable, member in resource.get("fill", {}).items():
-                if members.get(variable) == member:
+                if member in members:
                     types = found.setdefault(namespace, {})
                     types.setdefault(resource["type"], set()).add(variable)
     result = {}

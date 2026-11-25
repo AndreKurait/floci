@@ -113,14 +113,6 @@
             <scope>test</scope>
         </dependency>
         <dependency>
-            <groupId>com.google.protobuf</groupId>
-            <artifactId>protobuf-java-util</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>com.google.api.grpc</groupId>
-            <artifactId>proto-google-common-protos</artifactId>
-        </dependency>
-        <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>quicksight</artifactId>
             <version>${aws.sdk.version}</version>
@@ -366,6 +358,12 @@
         <!-- Testing -->
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
+            <artifactId>appconfig</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
             <artifactId>rekognition</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
@@ -379,6 +377,18 @@
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>acm</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>cloudwatch</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>apache-client</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
         </dependency>
@@ -481,12 +491,6 @@
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>bedrock</artifactId>
-            <version>${aws.sdk.version}</version>
-            <scope>test</scope>
-        </dependency>
-        <dependency>
-            <groupId>software.amazon.awssdk</groupId>
-            <artifactId>cloudwatch</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
         </dependency>
