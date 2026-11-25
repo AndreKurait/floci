@@ -2,6 +2,7 @@ package io.floci.aws.services.iam;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.floci.aws.core.common.AwsQueryServiceResolver;
 import io.floci.aws.core.common.AwsRegions;
 import io.floci.aws.core.common.RequestPathLabels;
 import io.floci.aws.core.common.RequestResources;
@@ -92,7 +93,25 @@ public class ResourceArnBuilder {
         if (credentialScope == null) {
             return List.of("*");
         }
+        if ("elasticloadbalancing".equals(credentialScope)) {
+            return buildElbResources(operation, ctx, region, accountId, partition);
+        }
         return namedResources(credentialScope, operation, ctx, region, accountId, partition);
+    }
+
+    private List<String> buildElbResources(String operation, ContainerRequestContext ctx,
+                                         String region, String accountId, String partition) {
+        boolean provisionedCapacity = "elasticloadbalancing:DescribeProvisionedCapacity".equals(operation);
+        if (operation == null) {
+            String action = AwsQueryServiceResolver.action(RequestBodyReader.formField(ctx, "Action"),
+                    RequestBodyReader.formField(ctx, "Operation"));
+            provisionedCapacity = "DescribeProvisionedCapacity".equals(action);
+        }
+        if (!provisionedCapacity) {
+            return namedResources("elasticloadbalancing", operation, ctx, region, accountId, partition);
+        }
+        String arn = RequestBodyReader.formField(ctx, "LoadBalancerArn");
+        return List.of(arn == null || arn.isBlank() ? "*" : arn);
     }
 
     /**
@@ -118,7 +137,7 @@ public class ResourceArnBuilder {
      * others: KMS's ReEncrypt, a DynamoDB transaction's items or PartiQL statements. Empty for every other operation.
      */
     public List<RequestResources.Target> targets(String credentialScope, String operation, ContainerRequestContext ctx,
-                                                 String region, String accountId, String partition) {
+                                               String region, String accountId, String partition) {
         if (credentialScope == null || operation == null || !operation.startsWith(credentialScope + ":")
                 || !RequestResources.reads(operation)) {
             return List.of();
