@@ -15,6 +15,7 @@ import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 
@@ -125,6 +126,21 @@ class ContainerLifecycleManagerLinuxOptionsTest {
         }
         assertThrows(IllegalArgumentException.class,
                 () -> builder().withNetworkSysctl("kernel.hostname", "changed").build());
+        assertThrows(IllegalArgumentException.class,
+                () -> builder().withNetworkSysctl("net.ipv4.ip_forward", " ").build());
+    }
+
+    @Test
+    void networkSysctlsAreAnImmutableSnapshotAndNoneKeepsItsOwnNamespace() {
+        ContainerBuilder.Builder mutable = builder().withNetworkMode("none")
+                .withNetworkSysctl("net.ipv6.conf.default.disable_ipv6", "0");
+        ContainerSpec spec = mutable.build();
+        mutable.withNetworkSysctl("net.ipv4.ip_forward", "1");
+        assertEquals(Map.of("net.ipv6.conf.default.disable_ipv6", "0"), spec.linuxOptions().networkSysctls());
+        assertThrows(UnsupportedOperationException.class,
+                () -> spec.linuxOptions().networkSysctls().put("net.ipv4.ip_forward", "1"));
+        assertTrue(new LinuxOptions(List.of(), List.of(), List.of(), null, Map.of(), null, null)
+                .networkSysctls().isEmpty());
     }
 
     @Test
