@@ -126,7 +126,7 @@ class MemoryDbParameterGroupDenialScopeIntegrationTest {
 
     @ParameterizedTest
     @ValueSource(strings = {"DescribeClusters", "DescribeUsers", "DescribeACLs"})
-    void legacyDescribeDenialsKeepTheirInherited400Response(String operation) throws Exception {
+    void describeDenialsKeepLegacyJson400AndCurrentSdkCbor403(String operation) throws Exception {
         try (SignedUser user = user(policy("memorydb:" + operation, "*"));
              MemoryDbClient caller = client(user.credentials())) {
             Call response = capture(() -> switch (operation) {
@@ -136,7 +136,9 @@ class MemoryDbParameterGroupDenialScopeIntegrationTest {
                 default -> throw new IllegalArgumentException(operation);
             });
             observeLegacy(operation, response);
-            assertDenied(response, 400, operation);
+            String action = operation.equals("DescribeACLs") ? "DescribeAcls" : operation;
+            assertAll(() -> assertDenied(response, 403, action),
+                    () -> assertDenied(jsonCall(user, operation, Map.of()), 400, action));
         }
     }
 
@@ -144,14 +146,31 @@ class MemoryDbParameterGroupDenialScopeIntegrationTest {
     @CsvSource({"cluster,ListTags", "cluster,TagResource", "cluster,UntagResource",
             "user,ListTags", "user,TagResource", "user,UntagResource",
             "acl,ListTags", "acl,TagResource", "acl,UntagResource"})
-    void legacyTagTargetDenialsKeepTheirInherited400Response(String kind, String operation) throws Exception {
+    void tagTargetDenialsKeepLegacyJson400AndCurrentSdkCbor403(String kind, String operation) throws Exception {
         String target = "arn:aws:memorydb:us-east-1:000000000000:" + kind + "/denial-scope-existing-shape";
         try (SignedUser user = user(policy("memorydb:" + operation, "*"));
              MemoryDbClient caller = client(user.credentials())) {
             Call response = capture(() -> invoke(caller, operation, "", target));
             observeLegacy(kind + " " + operation, response);
-            assertDenied(response, 400, operation);
+            Map<String, Object> body = switch (operation) {
+                case "TagResource" -> Map.of("ResourceArn", target,
+                        "Tags", List.of(Map.of("Key", "mode", "Value", "red")));
+                case "UntagResource" -> Map.of("ResourceArn", target, "TagKeys", List.of("mode"));
+                default -> Map.of("ResourceArn", target);
+            };
+            assertAll(() -> assertDenied(response, 403, operation),
+                    () -> assertDenied(jsonCall(user, operation, body), 400, operation));
         }
+    }
+
+    /** The SDK now uses RPC v2 CBOR; these signed requests retain the original JSON 1.1 controls. */
+    private Call jsonCall(SignedUser user, String operation, Map<String, Object> body) throws Exception {
+        Response response = given().filter(AwsRequestSigner.signedAs(user.accessKey, user.secretKey, "memorydb")
+                        .inRegion("us-east-1"))
+                .contentType("application/x-amz-json-1.1").header("X-Amz-Target", "AmazonMemoryDB." + operation)
+                .body(MAPPER.writeValueAsBytes(body)).post(endpoint);
+        return new Call(response.statusCode(), response.jsonPath().getString("__type"),
+                response.jsonPath().getString("message"));
     }
 
     private static SdkResponse invoke(MemoryDbClient client, String operation, String name, String arn) {
