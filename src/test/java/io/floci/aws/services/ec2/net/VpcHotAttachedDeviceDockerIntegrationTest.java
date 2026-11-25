@@ -13,6 +13,7 @@ import io.floci.aws.core.common.docker.ContainerStorageHelper;
 import io.floci.aws.core.common.docker.CurrentContainerNetworkResolver;
 import io.floci.aws.core.common.docker.LocallyBuiltHelperImage;
 import io.floci.aws.testing.DockerAvailability;
+import io.floci.aws.testing.DockerDefaultRouteAssertions;
 import io.floci.aws.testing.TestImages;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
@@ -85,12 +86,12 @@ class VpcHotAttachedDeviceDockerIntegrationTest {
             lifecycle.createAndStart(builder.newContainer(helperImage)
                     .withName(guest).withNetworkMode("bridge").withCapAdd("NET_ADMIN")
                     .withLabels(Map.of(OWNER_LABEL, namespace)).withCmd(List.of("sleep", "120")).build());
-            String originalDefaultRoute = run(guest, "ip", "-4", "route", "show", "default");
+            assertDefaultRouteUsesBridge(guest);
             String originalMac = docker.inspectContainerCmd(guest).exec().getNetworkSettings()
                     .getNetworks().get("bridge").getMacAddress();
             assertEquals(Optional.of(network), manager.attachInterface(ACCOUNT, REGION, "vpc-attached",
                     "subnet-attached", guest, address, MAC));
-            assertEquals(originalDefaultRoute, run(guest, "ip", "-4", "route", "show", "default"));
+            assertDefaultRouteUsesBridge(guest);
             JsonNode links = new ObjectMapper().readTree(run(guest, "ip", "-j", "address"));
             JsonNode device = null;
             for (JsonNode link : links) {
@@ -120,7 +121,7 @@ class VpcHotAttachedDeviceDockerIntegrationTest {
             manager.restoreInterface(ACCOUNT, REGION, "vpc-attached", guest, address, MAC);
             manager.restoreInterface(ACCOUNT, REGION, "vpc-attached", guest, address, MAC);
             assertTrue(run(guest, "ip", "-j", "link").contains(MAC));
-            assertEquals(originalDefaultRoute, run(guest, "ip", "-4", "route", "show", "default"));
+            assertDefaultRouteUsesBridge(guest);
             manager.detachInterface(ACCOUNT, REGION, "vpc-attached", guest, address, MAC);
             manager.restoreInterface(ACCOUNT, REGION, "vpc-attached", guest, address, MAC);
             assertFalse(docker.inspectContainerCmd(guest).exec().getNetworkSettings().getNetworks().containsKey(network));
@@ -151,6 +152,14 @@ class VpcHotAttachedDeviceDockerIntegrationTest {
                 // The failed attach may not have created the owned network.
             }
         }
+    }
+
+    private void assertDefaultRouteUsesBridge(String guest) throws Exception {
+        ObjectMapper mapper = new ObjectMapper();
+        DockerDefaultRouteAssertions.assertDefaultRouteUsesBridge(
+                mapper.readTree(run(guest, "ip", "-j", "-4", "route", "show", "default")),
+                mapper.readTree(run(guest, "ip", "-j", "address")),
+                docker.inspectContainerCmd(guest).exec().getNetworkSettings().getNetworks().get("bridge"));
     }
 
     private String run(String container, String... command) {
