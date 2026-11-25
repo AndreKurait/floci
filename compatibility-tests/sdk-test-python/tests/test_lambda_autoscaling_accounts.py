@@ -7,7 +7,7 @@ import time
 import boto3
 from botocore.exceptions import ClientError
 
-from test_cloudformation_provisioned_concurrency import remove_stack, settled, template
+from lambda_capacity_fixtures import remove_stack, settled, template
 from test_lambda_application_autoscaling import capacity, deregister, target
 
 

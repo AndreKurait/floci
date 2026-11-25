@@ -9,7 +9,7 @@ import boto3
 import pytest
 from botocore.exceptions import ClientError
 
-from test_cloudformation_provisioned_concurrency import remove_stack, settled, template
+from lambda_capacity_fixtures import remove_stack, settled, template
 
 
 @pytest.fixture
