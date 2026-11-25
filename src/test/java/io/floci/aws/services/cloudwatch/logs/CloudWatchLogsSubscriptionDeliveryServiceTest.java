@@ -52,6 +52,7 @@ class CloudWatchLogsSubscriptionDeliveryServiceTest {
     private static final String STREAM = "backend-stream";
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
+    private Event<LogEventsIngested> ingestedEvent;
     private CloudWatchLogsService logsService;
     private CloudWatchLogsSubscriptionDeliveryService deliveryService;
     private LambdaService lambdaService;
@@ -62,7 +63,7 @@ class CloudWatchLogsSubscriptionDeliveryServiceTest {
     @SuppressWarnings("unchecked")
     void setUp() {
         RegionResolver regionResolver = new RegionResolver(REGION, ACCOUNT);
-        Event<LogEventsIngested> ingestedEvent = mock(Event.class);
+        ingestedEvent = mock(Event.class);
 
         logsService = new CloudWatchLogsService(
                 new InMemoryStorage<>(),
@@ -85,7 +86,6 @@ class CloudWatchLogsSubscriptionDeliveryServiceTest {
         firehoseService = mock(FirehoseService.class);
 
         deliveryService = new CloudWatchLogsSubscriptionDeliveryService(
-                logsService,
                 lambdaService,
                 kinesisService,
                 firehoseService,
@@ -101,6 +101,66 @@ class CloudWatchLogsSubscriptionDeliveryServiceTest {
 
         logsService.createLogGroup(GROUP, null, null, REGION);
         logsService.createLogStream(GROUP, STREAM, REGION);
+    }
+
+    @Test
+    void recreationCannotRouteAnEarlierBatchToTheReplacementFilter() {
+        String oldTarget = "arn:aws:lambda:us-east-1:123456789012:function:original";
+        String newTarget = "arn:aws:lambda:us-east-1:123456789012:function:replacement";
+        logsService.putSubscriptionFilter(GROUP, "filter", "", oldTarget, null, REGION);
+        doAnswer(invocation -> {
+            LogEventsIngested event = invocation.getArgument(0);
+            assertFalse(Thread.holdsLock(logsService.metricFilterStore()));
+            logsService.deleteLogGroup(GROUP, REGION);
+            logsService.createLogGroup(GROUP, null, null, REGION);
+            logsService.createLogStream(GROUP, STREAM, REGION);
+            logsService.putSubscriptionFilter(GROUP, "filter", "", newTarget, null, REGION);
+            deliveryService.onLogEventsIngested(event);
+            return null;
+        }).when(ingestedEvent).fire(any());
+
+        logsService.putLogEvents(GROUP, STREAM,
+                List.of(Map.of("timestamp", 1759406400000L, "message", "original batch")), REGION);
+
+        verify(lambdaService, never()).invokeArn(eq(newTarget), any(), any());
+        verify(lambdaService).invokeArn(eq(oldTarget), any(), eq(InvocationType.Event));
+    }
+
+    @Test
+    void aFilterInstalledAfterIngestionCannotReceiveTheEarlierBatch() {
+        doAnswer(invocation -> {
+            LogEventsIngested event = invocation.getArgument(0);
+            logsService.deleteLogGroup(GROUP, REGION);
+            logsService.createLogGroup(GROUP, null, null, REGION);
+            logsService.putSubscriptionFilter(GROUP, "new-filter", "",
+                    "arn:aws:lambda:us-east-1:123456789012:function:replacement", null, REGION);
+            deliveryService.onLogEventsIngested(event);
+            return null;
+        }).when(ingestedEvent).fire(any());
+
+        logsService.putLogEvents(GROUP, STREAM,
+                List.of(Map.of("timestamp", 1759406400000L, "message", "unsubscribed batch")), REGION);
+
+        verifyNoInteractions(lambdaService, kinesisService, firehoseService);
+    }
+
+    @Test
+    void capturedFiltersAreDetachedFromLaterMetadataChanges() {
+        String oldTarget = "arn:aws:lambda:us-east-1:123456789012:function:original";
+        logsService.putSubscriptionFilter(GROUP, "filter", "", oldTarget, null, REGION);
+        doAnswer(invocation -> {
+            LogEventsIngested event = invocation.getArgument(0);
+            logsService.describeSubscriptionFilters(GROUP, null, null, 50, REGION)
+                    .subscriptionFilters().getFirst().setDestinationArn(
+                            "arn:aws:lambda:us-east-1:123456789012:function:replacement");
+            deliveryService.onLogEventsIngested(event);
+            return null;
+        }).when(ingestedEvent).fire(any());
+
+        logsService.putLogEvents(GROUP, STREAM,
+                List.of(Map.of("timestamp", 1759406400000L, "message", "original batch")), REGION);
+
+        verify(lambdaService).invokeArn(eq(oldTarget), any(), eq(InvocationType.Event));
     }
 
     private static byte[] decompress(byte[] compressed) throws IOException {
