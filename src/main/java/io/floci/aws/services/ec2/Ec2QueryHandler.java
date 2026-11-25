@@ -323,6 +323,7 @@ public class Ec2QueryHandler {
                 case "DescribeCapacityReservations" -> handleDescribeCapacityReservations(params, region);
                 case "ModifyCapacityReservation" -> handleModifyCapacityReservation(params, region);
                 case "CancelCapacityReservation" -> handleCancelCapacityReservation(params, region);
+            case "MoveCapacityReservationInstances" -> handleMoveCapacityReservationInstances(params, region);
                 // Dedicated Hosts
                 case "AllocateHosts" -> handleAllocateHosts(params, region);
                 case "DescribeHosts" -> handleDescribeHosts(params, region);
@@ -797,6 +798,74 @@ public class Ec2QueryHandler {
     // ─── Instance handlers ────────────────────────────────────────────────────
 
     private Response handleRunInstances(MultivaluedMap<String, String> p, String region) {
+        Reservation res;
+        String token = p.getFirst("ClientToken");
+        boolean dryRun = Boolean.parseBoolean(p.getFirst("DryRun"));
+        if (token == null || dryRun) {
+            res = launchRunInstances(p, region, null);
+        } else {
+            Map<String, List<String>> identity = new LinkedHashMap<>();
+            p.forEach((name, values) -> {
+                if (!Set.of("Action", "Version", "ClientToken", "DryRun", "AWSAccessKeyId", "Signature",
+                        "SignatureMethod", "SignatureVersion", "Timestamp", "Expires", "SecurityToken").contains(name)
+                        && !name.startsWith("X-Amz-")) {
+                    identity.put(name, List.copyOf(values));
+                }
+            });
+            if (!anyParamStartsWith(p, "LaunchTemplate.")) {
+                LaunchTemplateData.MetadataOptions defaults = LaunchTemplateData.MetadataOptions.launchDefaults();
+                identity.putIfAbsent("MetadataOptions.HttpTokens", List.of(defaults.getHttpTokens()));
+                identity.putIfAbsent("MetadataOptions.HttpEndpoint", List.of(defaults.getHttpEndpoint()));
+                identity.putIfAbsent("MetadataOptions.HttpPutResponseHopLimit",
+                        List.of(String.valueOf(defaults.getHttpPutResponseHopLimit())));
+                identity.putIfAbsent("MetadataOptions.HttpProtocolIpv6", List.of(defaults.getHttpProtocolIpv6()));
+                identity.putIfAbsent("MetadataOptions.InstanceMetadataTags", List.of(defaults.getInstanceMetadataTags()));
+            }
+            res = service.replayRunInstances(region, token, false, identity,
+                    p.getFirst("NetworkInterface.1.NetworkInterfaceId"),
+                    () -> runInstancesScope(p, region), attempt -> launchRunInstances(p, region, attempt));
+        }
+        XmlBuilder xml = new XmlBuilder()
+                .start("RunInstancesResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .elem("reservationId", res.getReservationId())
+                .elem("ownerId", res.getOwnerId())
+                .start("groupSet").end("groupSet")
+                .start("instancesSet");
+        Map<String, String> capacityAssociations = service.capacityReservationAssociations(region);
+        Map<String, List<VolumeAttachment>> volumeAttachments = service.instanceVolumeAttachments(res.getInstances());
+        Ec2Service.ElasticAddresses elasticAddresses = service.elasticAddresses(region);
+        for (Instance inst : res.getInstances()) {
+            xml.start("item").raw(instanceXml(inst, capacityAssociations, volumeAttachments, elasticAddresses))
+                    .end("item");
+        }
+        xml.end("instancesSet")
+                .end("RunInstancesResponse");
+        return xmlResponse(xml.build());
+    }
+
+    private Ec2RunInstancesReplay.Scope runInstancesScope(MultivaluedMap<String, String> p, String region) {
+        String zone = p.getFirst("Placement.AvailabilityZone");
+        String subnet = firstNonBlank(p.getFirst("SubnetId"), p.getFirst("NetworkInterface.1.SubnetId"));
+        String eni = p.getFirst("NetworkInterface.1.NetworkInterfaceId");
+        LaunchTemplateData template = resolveRunInstancesLaunchTemplateData(p, region, false);
+        if (template != null) {
+            if (template.getPlacement() != null) {
+                zone = firstNonBlank(zone, template.getPlacement().getAvailabilityZone());
+            }
+            if (!anyParamStartsWith(p, "NetworkInterface.")) {
+                LaunchTemplateData.NetworkInterface primary = template.primaryNetworkInterface();
+                if (primary != null) {
+                    subnet = firstNonBlank(subnet, primary.getSubnetId());
+                    eni = firstNonBlank(eni, primary.getNetworkInterfaceId());
+                }
+            }
+        }
+        return service.runInstancesScope(region, subnet, eni, zone, p.getFirst("Placement.HostId"));
+    }
+
+    private Reservation launchRunInstances(MultivaluedMap<String, String> p, String region,
+                                          Ec2RunInstancesReplay.Attempt attempt) {
         String imageId = p.getFirst("ImageId");
         String instanceType = p.getFirst("InstanceType");
         int minCount = parseRunInstancesCount(p, "MinCount");
@@ -806,6 +875,7 @@ public class Ec2QueryHandler {
         }
         String keyName = p.getFirst("KeyName");
         String subnetId = p.getFirst("SubnetId");
+        String availabilityZone = p.getFirst("Placement.AvailabilityZone");
         // The launch-time public-IP override arrives either on the primary
         // network interface spec (the shape Terraform's
         // associate_public_ip_address sends) or as the legacy top-level
@@ -890,6 +960,10 @@ public class Ec2QueryHandler {
                     "Network interfaces and an instance-level private IP address may not be specified on the same request", 400);
         }
         if (launchTemplateData != null) {
+            if (launchTemplateData.getPlacement() != null) {
+                availabilityZone = firstNonBlank(availabilityZone,
+                        launchTemplateData.getPlacement().getAvailabilityZone());
+            }
             if (marketType == null && launchTemplateData.getInstanceMarketOptions() != null) {
                 marketType = launchTemplateData.getInstanceMarketOptions().getMarketType();
             }
@@ -969,12 +1043,18 @@ public class Ec2QueryHandler {
                     "You can specify true for DeleteOnTermination only when creating a new network interface.", 400);
         }
 
-        Reservation res = service.runInstances(region, imageId, instanceType, minCount, maxCount,
+        Reservation res = attempt == null ? service.runInstances(region, imageId, instanceType, minCount, maxCount,
                 keyName, sgIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn,
-                associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, null, metadataOptions,
+                associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, availabilityZone, metadataOptions,
                 creditSpecificationCpuCredits, userDataEncoded, dryRun(p),
                 p.getFirst("Placement.HostId"), p.getFirst("Placement.Tenancy"), blockDeviceMappings,
-                "spot".equals(marketType), privateIpAddress, capacitySpecification);
+                "spot".equals(marketType), privateIpAddress, capacitySpecification)
+                : service.launchInstances(region, imageId, instanceType, minCount, maxCount,
+                keyName, sgIds, subnetId, clientToken, instanceTags, userData, iamInstanceProfileArn,
+                associatePublicIp, networkInterfaceId, networkInterfaceDeviceIndex, availabilityZone, metadataOptions,
+                creditSpecificationCpuCredits, userDataEncoded, false,
+                p.getFirst("Placement.HostId"), p.getFirst("Placement.Tenancy"), blockDeviceMappings,
+                "spot".equals(marketType), privateIpAddress, capacitySpecification, attempt);
 
         // Apply an explicit NetworkInterface.1.DeleteOnTermination to the launched instance.
         if (explicitDeleteOnTermination != null) {
@@ -1004,27 +1084,15 @@ public class Ec2QueryHandler {
                 inst.getNetworkInterfaces().forEach(eni -> eniIds.add(eni.getNetworkInterfaceId()));
             }
             if (!eniIds.isEmpty()) {
-                service.createTags(region, eniIds, networkInterfaceTags);
+                if (attempt == null) {
+                    service.createTags(region, eniIds, networkInterfaceTags);
+                } else {
+                    service.tagRunInstancesInterfaces(region, eniIds, networkInterfaceTags, attempt);
+                }
             }
         }
 
-        XmlBuilder xml = new XmlBuilder()
-                .start("RunInstancesResponse", AwsNamespaces.EC2)
-                .elem("requestId", UUID.randomUUID().toString())
-                .elem("reservationId", res.getReservationId())
-                .elem("ownerId", res.getOwnerId())
-                .start("groupSet").end("groupSet")
-                .start("instancesSet");
-        Map<String, String> capacityAssociations = service.capacityReservationAssociations(region);
-        Map<String, List<VolumeAttachment>> volumeAttachments = service.instanceVolumeAttachments(res.getInstances());
-        Ec2Service.ElasticAddresses elasticAddresses = service.elasticAddresses(region);
-        for (Instance inst : res.getInstances()) {
-            xml.start("item").raw(instanceXml(inst, capacityAssociations, volumeAttachments, elasticAddresses))
-                    .end("item");
-        }
-        xml.end("instancesSet")
-                .end("RunInstancesResponse");
-        return xmlResponse(xml.build());
+        return res;
     }
 
     private int parseRunInstancesCount(MultivaluedMap<String, String> p, String name) {
@@ -1137,7 +1205,7 @@ public class Ec2QueryHandler {
                         launch.keyName(),
                         launch.securityGroupIds(),
                         launch.subnetId(),
-                        p.getFirst("ClientToken"),
+                        null, // A fleet token identifies the fleet request, not each member launch.
                         launch.instanceTags(),
                         launch.userData(),
                         launch.iamInstanceProfileArn(),
@@ -4965,12 +5033,34 @@ public class Ec2QueryHandler {
         return booleanResponse("CancelCapacityReservation");
     }
 
+    private Response handleMoveCapacityReservationInstances(MultivaluedMap<String, String> p, String region) {
+        Integer instanceCount = intOrNull(p, "InstanceCount");
+        checkDryRun(p);
+        Ec2Service.CapacityReservationMoveResult moved = service.moveCapacityReservationInstances(region,
+                p.getFirst("SourceCapacityReservationId"), p.getFirst("DestinationCapacityReservationId"),
+                instanceCount, p.getFirst("ClientToken"));
+        XmlBuilder xml = new XmlBuilder()
+                .start("MoveCapacityReservationInstancesResponse", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .start("sourceCapacityReservation").raw(capacityReservationXml(moved.source(), false))
+                .end("sourceCapacityReservation")
+                .start("destinationCapacityReservation").raw(capacityReservationXml(moved.destination(), false))
+                .end("destinationCapacityReservation")
+                .elem("instanceCount", moved.instanceCount())
+                .end("MoveCapacityReservationInstancesResponse");
+        return xmlResponse(xml.build());
+    }
+
     private String capacityReservationXml(CapacityReservation reservation) {
+        return capacityReservationXml(reservation, true);
+    }
+
+    private String capacityReservationXml(CapacityReservation reservation, boolean includeMetadata) {
         XmlBuilder xml = new XmlBuilder()
                 .elem("capacityReservationId", reservation.getCapacityReservationId())
                 .elem("ownerId", reservation.getOwnerId())
-                .elem("capacityReservationArn", reservation.getCapacityReservationArn())
-                .elem("availabilityZoneId", reservation.getAvailabilityZoneId())
+                .elem("capacityReservationArn", includeMetadata ? reservation.getCapacityReservationArn() : null)
+                .elem("availabilityZoneId", includeMetadata ? reservation.getAvailabilityZoneId() : null)
                 .elem("availabilityZone", reservation.getAvailabilityZone())
                 .elem("instanceType", reservation.getInstanceType())
                 .elem("instancePlatform", reservation.getInstancePlatform())
@@ -4988,7 +5078,7 @@ public class Ec2QueryHandler {
                 .elem("createDate", reservation.getCreateDate() != null ? ISO_FMT.format(reservation.getCreateDate()) : null)
                 .elem("outpostArn", reservation.getOutpostArn())
                 .elem("placementGroupArn", reservation.getPlacementGroupArn())
-                .raw(tagSetXml(reservation.getTags()));
+                .raw(includeMetadata ? tagSetXml(reservation.getTags()) : null);
         if (reservation.getCommitmentDuration() != null) {
             xml.start("commitmentInfo")
                     .elem("commitmentDuration", reservation.getCommitmentDuration())

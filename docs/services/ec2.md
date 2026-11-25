@@ -69,6 +69,36 @@ Every state change the container manager makes in the background is written to t
 
 A record is settled as `stopped` only once Docker confirms that its container stopped or is gone. When Docker cannot confirm it (it is unreachable, for one), the record keeps its state and the next start tries again, and an instance that cannot be settled is named in an error in the log. The releases of a termination (port forwards, firewall rules, addresses) are independent of the container removal, so one that fails neither skips it nor keeps the instance from terminating. The sweep that removes expired instances carries on past one that cannot be removed and reports the failure when it ends.
 
+Instances retained by a successful `RunInstances` client token remain available for replay until storage is reset.
+
+## RunInstances request replay
+
+`ClientToken` identifies a launch request within its account and region. Repeating a successful
+request returns its original reservation and instance IDs with the instances' current state.
+The replay does not launch containers again, consume another Capacity Reservation slot, reapply
+interface tags, or resolve the launch template again. Requests without a token launch independently.
+An explicitly supplied network interface must still exist: a deleted interface returns
+`InvalidNetworkInterfaceID.NotFound` before exact replay or parameter mismatch.
+`DryRun` retains its validation behavior and does not consume a token.
+
+A subnet or explicit availability zone scopes the token to that zone. A request without either
+binds to its selected zone; an explicit request for that zone uses the same outcome and must
+match the original parameters. Other zones are independent. Request matching retains original
+parameter presence, including omitted versus explicit `Monitoring.Enabled=false` and
+`DisableApiTermination=false`. Metadata options without a launch template use their effective
+launch defaults. Transport signatures and timestamps do not form part of request identity.
+Changed parameters return `IdempotentParameterMismatch`.
+
+The journal and generated resource ownership use the EC2 storage backend. Persistent, hybrid,
+and WAL modes persist allocation intent before resource publication and flush launch resources
+before acknowledging a completed outcome. Interrupted attempts reclaim their owned resources
+before retry; cleanup failures retain that ownership for retry or service startup recovery.
+Startup logs failed recovery attempts and continues recovering other pending requests and zones.
+Memory mode remains volatile. This is request replay, separate from Capacity Reservation
+membership recovery. Tokens and protected instance tombstones currently have no automatic
+expiry. CreateFleet does not pass its token to independent member launches.
+CreateFleet request replay remains unsupported.
+
 ## Instance Resource Limits
 
 By default, Docker containers launched for EC2 instances are bounded to the CPU and memory limits defined in the instance type catalog (`src/main/resources/ec2/instance-type-catalog.yaml`).
@@ -934,6 +964,7 @@ A repeated `ClientToken` returns the endpoint the first call created (`Idempoten
 | DescribeCapacityReservations | Lists or returns stored Capacity Reservations. |
 | ModifyCapacityReservation | Updates `InstanceCount`, `EndDate`, `EndDateType` or `InstanceMatchCriteria` in place. |
 | CancelCapacityReservation | Marks a Capacity Reservation `cancelled` and its available count `0`, matching real AWS's retain-but-cancel behaviour rather than deleting the record. |
+| MoveCapacityReservationInstances | Transfers capacity between compatible reservations and returns both updated reservations. |
 
 `InstanceType`, `InstancePlatform` and `InstanceCount` are required, matching the AWS API, and
 one of `AvailabilityZone` or `AvailabilityZoneId` must be given; a request missing any of
@@ -962,6 +993,39 @@ the reservation. Immediate reservations retain their existing open-matching beha
 Assessment and incremental delivery are modeled synchronously, without AWS capacity
 assessment or billing. Cancellation retains Floci's immediate cancellation behavior;
 cancellation quotes and charges are not modeled.
+
+Capacity moves require different, active reservations in the caller's account and region
+with matching instance type, platform, Availability Zone, tenancy, placement group and
+end time. Eligibility (`open` or `targeted`) and tags can differ. Both total and available
+counts are updated, and moving all capacity cancels the empty source reservation.
+`DryRun` checks permissions without moving capacity. Case-sensitive `ClientToken` retries
+do not move capacity twice, including after a storage restart. A matching retry requires
+both reservations to remain active; a cancelled reservation returns `Unsupported`.
+Changed parameters return `IdempotentParameterMismatch`, including after cancellation.
+Malformed move IDs return `InvalidCapacityReservationId.Malformed`; source existence precedes
+count bounds, identical-ID checks and destination validation. An existing foreign source
+still permits those input checks before returning `InvalidCapacityReservationId.NotFound`;
+it never permits a transfer. Invalid IDs and counts are
+rejected before checking a completed client token. ID validation checks the prefix, hex
+length and all-zero ID; AWS's additional validation of synthetic IDs is not reproduced.
+Whitespace-only ID error precedence is not qualified.
+Moves accept 1 to 1,000 instances. Identical source and destination IDs return
+`InvalidParameterCombination`; differing instance types, platforms, Availability Zones, tenancy,
+placement groups or end dates return `Unsupported`. Completed tokens apply across source
+reservations in the same account and region; the same token can be used independently in
+another account or region. With a completed token, an inaccessible source returns
+`InvalidCapacityReservationId.NotFound`, while a changed destination returns
+`IdempotentParameterMismatch` before destination lookup.
+Rejected attribute checks do not consume the token.
+Available capacity is checked before matching reservation attributes. Move responses omit the
+ARN, Availability Zone ID and tags that remain available through DescribeCapacityReservations.
+Successful retries return the reservations' current capacity state. Moves, modifications, cancellations
+and describes share a lock.
+
+Capacity reservation moves publish the source, destination and retry token as one storage
+batch. Persistent and WAL write failures return `InternalError` without publishing the
+candidate values in memory. Hybrid mode retains asynchronous persistence, but a flush
+cannot split a move between its source and destination.
 
 On-demand launches consume matching open reservation capacity unless their preference is
 `none`. RunInstances also honors an explicit reservation target, including one supplied by
@@ -992,6 +1056,28 @@ Running group-targeted instances can acquire newly added matching members or mov
 another matching member after cancellation or expiration. Existing membership survives
 group deletion until the instance releases its reservation.
 
+Moves between open reservations can transfer consumed capacity and reassign the associated
+running instances with an `open` preference. An explicitly targeted instance remains in its
+reservation; moving capacity that requires it returns `Unsupported`. Unused capacity moves first. Reservation membership, counts and the move
+retry token share one atomic storage batch, including WAL replay. Targeted reservations
+continue to transfer only unused capacity. Older snapshots without membership remain readable.
+Live AWS checks confirm that an owner can move unused capacity between two RAM-shared
+reservations, while a recipient cannot move it even when Describe exposes the reservations.
+A move to a foreign-owned destination returns `InvalidCapacityReservationId.NotFound`
+when it only needs unused capacity, but `InvalidParameterValue` when it needs consumed
+capacity. Rejected moves preserve membership, counts and retry tokens.
+Shared reservations admit recipients only through an active RAM share with an accepted
+account invitation or an authorized organization principal. Pending invitations provide
+RAM discovery metadata, not EC2 admission. Reservation mutation remains owner-only.
+Accepted open shares also adopt matching, unassociated running recipient instances with
+an `open` preference when capacity membership is reconciled.
+Membership records retain the instance account across storage recovery. Removing a share
+prevents new admissions; existing membership remains until the instance stops or terminates,
+or the reservation is cancelled or expires. Restart checks current sharing authorization.
+Consumed capacity moves retain member ownership and require the recipient to be authorized
+to use the destination. Capacity updates across owners publish in one atomic storage batch.
+Moves require active reservations; scheduled reservations and Capacity Blocks cannot be moved.
+The consumed-sharing and inflight compatibility matrix remains incomplete.
 
 Capacity reservation zone IDs must be among those returned by `DescribeAvailabilityZones`.
 

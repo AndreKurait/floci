@@ -129,6 +129,18 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
     }
 
     @Override
+    public void putAllDurably(Map<String, V> entries) {
+        putAllDurablyForAccount(prefix(), entries);
+    }
+
+    public void putAllDurablyForAccount(String accountId, Map<String, V> entries) {
+        Map<String, V> prefixedEntries = new LinkedHashMap<>();
+        entries.forEach((key, value) -> prefixedEntries.put(accountId + "/" + key, value));
+        delegate.putAllDurably(prefixedEntries);
+        trackOwner(accountId);
+    }
+
+    @Override
     public void putAllAtomically(Map<String, V> entries) {
         putAllAtomicallyForAccount(prefix(), entries);
     }
@@ -138,6 +150,16 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
         entries.forEach((key, value) -> prefixedEntries.put(accountId + "/" + key, value));
         delegate.putAllAtomically(prefixedEntries);
         trackOwner(accountId);
+    }
+
+    /** Publishes one batch across account partitions, without changing request identity. */
+    public void putAllAccountsAtomically(List<AccountEntry<V>> entries) {
+        Map<String, V> prefixedEntries = new LinkedHashMap<>();
+        for (AccountEntry<V> entry : entries) {
+            prefixedEntries.put(entry.accountId() + "/" + entry.key(), entry.value());
+        }
+        delegate.putAllAtomically(prefixedEntries);
+        entries.forEach(entry -> trackOwner(entry.accountId()));
     }
 
     @Override
@@ -195,6 +217,11 @@ public class AccountAwareStorageBackend<V> implements StorageBackend<String, V> 
         }
         String prefix = prefix() + "/";
         return delegate.keys().stream().noneMatch(k -> k.startsWith(prefix));
+    }
+
+    @Override
+    public void flushOrThrow() {
+        delegate.flushOrThrow();
     }
 
     @Override
