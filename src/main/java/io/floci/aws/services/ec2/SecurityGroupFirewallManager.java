@@ -302,6 +302,7 @@ public class SecurityGroupFirewallManager {
             throw new IllegalArgumentException("Protected endpoint needs valid security groups");
         }
         SecurityGroupNftCompiler.Endpoint updated = identity.withPolicy(Set.copyOf(groupIds), attached);
+
         endpoints.put(eniId, new ProtectedEndpoint(updated, current.helperId(), Map.copyOf(prefixLists)));
         reconcileAll();
     }
@@ -370,6 +371,7 @@ public class SecurityGroupFirewallManager {
                 throw new IllegalStateException("A protected endpoint's security group disappeared");
             }
             SecurityGroupNftCompiler.Endpoint updated = identity.withPolicy(identity.groupIds(), attached);
+
             endpoints.put(entry.getKey(), new ProtectedEndpoint(updated, current.helperId(),
                     Map.copyOf(prefixLists)));
         }
