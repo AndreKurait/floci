@@ -40,7 +40,8 @@ class EksAccessEntryUpdateOwnershipTest {
         String key = rawEntries.keys().iterator().next();
         EksAccessEntryService.StoredEntry stored = rawEntries.get(key).orElseThrow();
         InMemoryStorage<String, Cluster> rawClusters = new InMemoryStorage<>();
-        rawClusters.put(fixture.cluster().getName(), fixture.cluster());
+        String clusterKey = EksService.clusterKey("us-east-1", fixture.cluster().getName());
+        rawClusters.put(clusterKey, fixture.cluster());
         rawClusters.put("999999999999/foreign", fixture.cluster());
         Set<String> clusterKeys = rawClusters.keys();
         for (String[] scope : new String[][] {{"999999999999", "us-east-1"}, {ACCOUNT, "us-west-2"}}) {
@@ -71,8 +72,8 @@ class EksAccessEntryUpdateOwnershipTest {
                     new UpdateAccessEntryRequest("legacy-owner", null, null));
             assertEquals("legacy-owner", updated.username());
             assertEquals(Set.of(ACCOUNT + "/" + key), rawEntries.keys());
-            assertFalse(rawClusters.keys().contains(fixture.cluster().getName()));
-            assertTrue(rawClusters.keys().contains(ACCOUNT + "/" + fixture.cluster().getName()));
+            assertFalse(rawClusters.keys().contains(clusterKey));
+            assertTrue(rawClusters.keys().contains(ACCOUNT + "/" + clusterKey));
             assertIdentity(original, updated);
             assertEquals("stable-principal", rawEntries.get(ACCOUNT + "/" + key).orElseThrow().principalId());
         } finally {
@@ -102,7 +103,7 @@ class EksAccessEntryUpdateOwnershipTest {
         Fixture fixture = fixture(rawEntries, "aws", "us-east-1");
         create(fixture, "STANDARD");
         InMemoryStorage<String, Cluster> rawClusters = new InMemoryStorage<>();
-        rawClusters.put(fixture.cluster().getName(), fixture.cluster());
+        rawClusters.put(EksService.clusterKey("us-east-1", fixture.cluster().getName()), fixture.cluster());
         EksService owner = service(ACCOUNT, "us-east-1", rawClusters, rawEntries, fixture);
         try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
             Future<AccessEntry> update = executor.submit(() -> owner.updateAccessEntryInRequestRegion(
@@ -136,6 +137,7 @@ class EksAccessEntryUpdateOwnershipTest {
         UriInfo uriInfo = mock(UriInfo.class);
         String path = "/clusters/" + entry.clusterName() + "/access-entries/" + entry.principalArn();
         when(context.getUriInfo()).thenReturn(uriInfo);
+        when(context.getMethod()).thenReturn("POST");
         when(uriInfo.getPath()).thenReturn(path);
         when(uriInfo.getRequestUri()).thenReturn(URI.create("http://localhost" + path));
         when(uriInfo.getBaseUri()).thenReturn(URI.create("http://localhost/"));
