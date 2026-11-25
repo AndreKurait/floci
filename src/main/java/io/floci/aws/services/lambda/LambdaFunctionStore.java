@@ -97,13 +97,13 @@ public class LambdaFunctionStore implements Resettable {
      * otherwise write every account's function into the default account's partition.
      */
     public void saveForAccount(String accountId, String region, LambdaFunction fn) {
-        getForAccount(accountId, region, fn.getFunctionName(), fn.getVersion()).ifPresent(this::deindexFunction);
-
+        Optional<LambdaFunction> previous = getForAccount(accountId, region, fn.getFunctionName(), fn.getVersion());
         if (backend instanceof AccountAwareStorageBackend<LambdaFunction> aware) {
             aware.putForAccount(accountId, regionKey(region, fn.getFunctionName(), fn.getVersion()), fn);
         } else {
             backend.put(regionKey(region, fn.getFunctionName(), fn.getVersion()), fn);
         }
+        previous.ifPresent(this::deindexFunction);
         indexFunction(fn);
     }
 
