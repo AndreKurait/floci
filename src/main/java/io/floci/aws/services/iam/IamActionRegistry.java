@@ -9,6 +9,7 @@ import io.floci.aws.core.common.ResteasyRequests;
 import io.floci.aws.core.common.SignedServiceRoute;
 import io.floci.aws.core.common.WireProtocol;
 import io.floci.aws.services.eks.EksController;
+import io.floci.aws.services.iot.IotController;
 import io.floci.aws.services.s3.S3BucketSubresources;
 import io.floci.aws.services.s3.S3ObjectActions;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -70,6 +71,8 @@ public class IamActionRegistry {
 
     /** The routes the registry checks as an action of its own, each a rule of the scope it serves. */
     private static final List<ActionRule> RULES = List.of(
+        rule("iot", "DELETE", "^/jobs/[^/]+/?$", "iot:DeleteJob"),
+
         // ── Lambda ──────────────────────────────────────────────────────────────
         // Code signing configs first: a config's function list ends in /functions, as ListFunctions does.
         rule("lambda", "GET",    "^/2020-04-22/code-signing-configs/[^/]+/functions$",
@@ -583,6 +586,12 @@ public class IamActionRegistry {
 
     /** The serving method identifies these actions even when path encoding or matrix parameters vary. */
     public String resolveMatchedRoute(String credentialScope, ResourceInfo resourceInfo) {
+        if ("iot".equals(credentialScope) && resourceInfo != null
+                && IotController.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null
+                && "deleteJob".equals(resourceInfo.getResourceMethod().getName())) {
+            return "iot:DeleteJob";
+        }
         if (resourceInfo == null || resourceInfo.getResourceClass() == null) {
             return null;
         }
