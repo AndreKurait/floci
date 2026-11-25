@@ -23,12 +23,14 @@ import io.floci.aws.services.lambda.launcher.ImageCacheService.LaunchImage;
 import io.floci.aws.services.s3.S3Service;
 import io.floci.aws.services.secretsmanager.SecretsManagerService;
 import io.floci.aws.services.ssm.SsmService;
+import io.floci.aws.testing.ParallelLocks;
 import io.floci.aws.testutil.FreePorts;
 import io.vertx.core.Vertx;
 import io.vertx.core.json.JsonObject;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.mockito.ArgumentCaptor;
 import org.mockito.stubbing.Answer;
 
@@ -65,6 +67,7 @@ import static org.mockito.Mockito.when;
  * placement copies onto the task. The IMDS here is Floci's real one, reached over HTTP from the
  * address the task container is registered under, IMDSv2 token first as the Go SDK does.
  */
+@ResourceLock(ParallelLocks.PORTS)
 class EcsContainerManagerInstanceRoleTest {
 
     private static final String ACCOUNT = "123456789012";

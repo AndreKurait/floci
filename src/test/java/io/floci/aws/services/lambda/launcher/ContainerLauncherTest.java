@@ -152,6 +152,7 @@ import static org.mockito.Mockito.*;
 
 @ExtendWith(MockitoExtension.class)
 @ResourceLock(ParallelLocks.PORTS)
+@ResourceLock(ParallelLocks.CONFIG_MAPPING)
 class ContainerLauncherTest {
 
     @Mock ContainerLifecycleManager lifecycleManager;

@@ -14,7 +14,10 @@ import io.floci.aws.services.acm.CertificateGenerator.GeneratedCertificate;
 import io.floci.aws.services.acm.model.KeyAlgorithm;
 import io.floci.aws.services.elb.model.ClassicListener;
 import io.floci.aws.services.elb.model.ClassicLoadBalancer;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
@@ -31,6 +34,7 @@ import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class ElbClassicProxyPacketTest {
     private static final String PROXY = "haproxy:3.2-alpine@sha256:5893840576071e6217cd52ebdcc14f454c6f7a631056fa6f4e0f40d3cac4215b";
 

@@ -5,9 +5,12 @@ import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.services.sqs.SqsService;
 import io.floci.aws.services.sqs.SqsServiceFactory;
 import io.floci.aws.services.sqs.model.Message;
+import io.floci.aws.testing.ParallelLocks;
 import io.floci.aws.testing.TestTime;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -23,6 +26,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
  * are read from the clock the service is built with. The subscriber is a standard queue, so only
  * the topic deduplicates.
  */
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class SnsFifoDeduplicationWindowTest {
 
     private static final String REGION = "us-east-1";

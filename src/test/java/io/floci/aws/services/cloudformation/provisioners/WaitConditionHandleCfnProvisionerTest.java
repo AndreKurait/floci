@@ -7,7 +7,10 @@ import io.floci.aws.services.cloudformation.model.StackResource;
 import io.floci.aws.services.s3.PreSignedUrlGenerator;
 import io.floci.aws.services.s3.S3Service;
 import io.floci.aws.services.s3.model.S3Object;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.util.HashMap;
 import java.util.List;
@@ -26,6 +29,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class WaitConditionHandleCfnProvisionerTest {
     private final S3Service s3 = mock(S3Service.class);
     private final PreSignedUrlGenerator presigner = mock(PreSignedUrlGenerator.class);

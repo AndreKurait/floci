@@ -4,7 +4,10 @@ import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.services.scheduler.model.Schedule;
 import io.floci.aws.services.scheduler.model.Target;
 import io.floci.aws.services.sqs.SqsService;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.time.Instant;
 import java.time.ZoneOffset;
@@ -28,6 +31,7 @@ import static org.mockito.Mockito.when;
  * The dispatcher in real time: its own thread and the system clock fire a schedule that is due.
  * {@code ScheduleDispatcherTest} covers when it ticks and what a tick does, on a controlled timeline.
  */
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class ScheduleDispatcherWiringTest {
 
     @Test

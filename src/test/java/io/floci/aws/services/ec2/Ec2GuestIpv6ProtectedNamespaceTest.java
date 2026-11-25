@@ -31,10 +31,12 @@ import io.floci.aws.services.ec2.model.Instance;
 import io.floci.aws.services.ec2.model.InstanceNetworkInterface;
 import io.floci.aws.services.ec2.net.VpcNetworkManager;
 import io.floci.aws.services.ec2.portforward.Ec2PortForwardManager;
+import io.floci.aws.testing.ParallelLocks;
 import io.floci.aws.testing.TestTime;
 import io.smallrye.config.EnvConfigSource;
 import io.smallrye.config.SmallRyeConfigBuilder;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.mockito.Answers;
 import org.mockito.invocation.Invocation;
 
@@ -69,6 +71,7 @@ import static org.mockito.Mockito.withSettings;
  * instance's address is put on its VPC interface and the IPv6 VPC router joins its VPC. In an isolated address space
  * the native interface keeps that address, and the router joins at the transport address Docker gives it there.
  */
+@ResourceLock(ParallelLocks.CONFIG_MAPPING)
 class Ec2GuestIpv6ProtectedNamespaceTest {
 
     private static final String HELPER = "firewall-helper";

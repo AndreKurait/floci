@@ -15,8 +15,11 @@ import io.floci.aws.services.ecs.model.TaskDefinition;
 import io.floci.aws.services.ecs.model.TaskStatus;
 import io.floci.aws.testing.InMemoryStorageFactory;
 import io.floci.aws.testing.ManualClock;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -41,6 +44,7 @@ import static org.mockito.Mockito.when;
  * Every instant ECS stamps or compares is read from the one injected clock, so a test that owns the
  * clock owns the whole timeline: nothing here is compared with the wall clock.
  */
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class EcsServiceTimelineTest {
 
     private static final String REGION = "us-east-1";

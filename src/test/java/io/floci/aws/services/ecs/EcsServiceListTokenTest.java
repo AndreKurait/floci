@@ -6,9 +6,12 @@ import io.floci.aws.core.common.Base64Url;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.services.ecs.container.EcsContainerManager;
 import io.floci.aws.testing.InMemoryStorageFactory;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.util.List;
 
@@ -20,6 +23,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /** A list token is an offset into the listing: one that decodes to no position in it is the caller's error. */
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class EcsServiceListTokenTest {
 
     private static final String REGION = "us-east-1";

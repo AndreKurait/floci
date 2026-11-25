@@ -1,8 +1,11 @@
 package io.floci.aws.services.elb;
 
+import io.floci.aws.testing.ParallelLocks;
 import io.floci.aws.testing.TestTime;
 import io.floci.aws.testing.TimelineDeadlineWaits;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.io.BufferedReader;
 import java.io.InputStreamReader;
@@ -22,6 +25,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class ElbClassicProbeDeadlineTest {
 
     private static final Duration PROBE_TIMEOUT = Duration.ofSeconds(1);

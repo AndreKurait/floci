@@ -1,7 +1,9 @@
 package io.floci.aws.services.ec2;
 
 import io.floci.aws.services.ec2.model.Instance;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
@@ -9,6 +11,7 @@ import java.net.http.HttpResponse;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
+@ResourceLock(ParallelLocks.PORTS)
 class Ec2MetadataServiceIdentityTest {
 
     @ParameterizedTest

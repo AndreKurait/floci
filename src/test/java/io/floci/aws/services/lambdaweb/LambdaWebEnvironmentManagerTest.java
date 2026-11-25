@@ -17,8 +17,11 @@ import io.floci.aws.services.lambdaweb.LambdaWebEnvironmentManager.Environment;
 import io.floci.aws.services.lambdaweb.LambdaWebEnvironmentManager.StartFailure;
 import io.floci.aws.services.lambdaweb.model.WebFunction;
 import io.floci.aws.services.lambdaweb.model.WebFunctionRevision;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.time.Duration;
 import java.util.ArrayList;
@@ -43,6 +46,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class LambdaWebEnvironmentManagerTest {
 
     private static final List<String> BASE = List.of("--expose-gc", "--max-http-header-size", "135168",

@@ -7,8 +7,11 @@ import io.floci.aws.services.kinesis.KinesisService;
 import io.floci.aws.services.pipes.model.DesiredState;
 import io.floci.aws.services.pipes.model.Pipe;
 import io.floci.aws.services.sqs.SqsService;
+import io.floci.aws.testing.ParallelLocks;
 import io.floci.aws.testing.TestTime;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.time.Duration;
 import java.util.List;
@@ -29,6 +32,7 @@ import static org.mockito.Mockito.when;
  * When a pipe's source is polled: once per second from the moment polling starts, checked on both
  * sides of each tick with the timers and the poll executor on a controlled timeline.
  */
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class PipesPollerScheduleTest {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();

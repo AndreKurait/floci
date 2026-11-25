@@ -3,10 +3,13 @@ package io.floci.aws.core.common.dns;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.docker.ContainerDetector;
 import io.floci.aws.core.common.docker.CurrentContainerNetworkResolver;
+import io.floci.aws.testing.ParallelLocks;
 import io.smallrye.config.EnvConfigSource;
 import io.smallrye.config.SmallRyeConfigBuilder;
 import io.vertx.core.Vertx;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.io.DataInputStream;
 import java.io.DataOutputStream;
@@ -33,6 +36,7 @@ import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class EmbeddedDnsAuthoritativeSuffixesTest {
     private static final String CONTROL = "127.0.0.1";
     private static final String CLIENT = "192.0.2.9";

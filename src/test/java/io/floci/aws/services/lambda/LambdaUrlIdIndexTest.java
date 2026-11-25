@@ -4,7 +4,10 @@ import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.services.lambda.model.LambdaAlias;
 import io.floci.aws.services.lambda.model.LambdaFunction;
 import io.floci.aws.services.lambda.model.LambdaUrlConfig;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertSame;
@@ -15,6 +18,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * backend hands out the stored instance itself, so a caller changes that instance first and saves it
  * afterwards: the store cannot learn the previous URL by reading the stored copy.
  */
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class LambdaUrlIdIndexTest {
 
     private static final String REGION = "us-east-1";

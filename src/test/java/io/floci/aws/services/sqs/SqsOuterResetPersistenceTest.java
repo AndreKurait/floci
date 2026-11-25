@@ -14,6 +14,7 @@ import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.lifecycle.EmulatorInfoController;
 import io.floci.aws.services.sqs.model.Message;
 import io.floci.aws.services.sqs.model.Queue;
+import io.floci.aws.testing.ParallelLocks;
 import io.floci.aws.testing.ParkingStore;
 import io.floci.aws.testing.TestTime;
 import io.floci.aws.testing.ThreadStates;
@@ -21,6 +22,8 @@ import jakarta.enterprise.inject.Instance;
 import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -42,6 +45,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class SqsOuterResetPersistenceTest {
     private static final String ACCOUNT = "000000000000";
     private static final String REGION = "us-east-1";
