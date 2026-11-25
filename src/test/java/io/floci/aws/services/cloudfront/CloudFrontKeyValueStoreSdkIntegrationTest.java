@@ -25,6 +25,7 @@ import software.amazon.awssdk.services.cloudfront.model.KeyValueStoreAssociation
 import software.amazon.awssdk.services.cloudfront.model.ListKeyValueStoresResponse;
 import software.amazon.awssdk.services.cloudfront.model.UpdateKeyValueStoreResponse;
 import software.amazon.awssdk.services.cloudfrontkeyvaluestore.CloudFrontKeyValueStoreClient;
+import software.amazon.awssdk.services.cloudfrontkeyvaluestore.endpoints.CloudFrontKeyValueStoreEndpointProvider;
 import software.amazon.awssdk.services.cloudfrontkeyvaluestore.model.CloudFrontKeyValueStoreException;
 import software.amazon.awssdk.services.cloudfrontkeyvaluestore.model.DeleteKeyRequestListItem;
 import software.amazon.awssdk.services.cloudfrontkeyvaluestore.model.DeleteKeyResponse;
@@ -222,16 +223,16 @@ class CloudFrontKeyValueStoreSdkIntegrationTest {
     private CloudFrontKeyValueStoreClient data(String accessKey, String secret, boolean spoof,
                                                AtomicInteger signedRequests) {
         return CloudFrontKeyValueStoreClient.builder().endpointOverride(endpoint).region(Region.US_EAST_1)
+                .endpointProvider(parameters -> CloudFrontKeyValueStoreEndpointProvider.defaultProvider()
+                        .resolveEndpoint(parameters).thenApply(resolved -> resolved.toBuilder().url(endpoint).build()))
                 .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(accessKey, secret)))
                 .httpClientBuilder(UrlConnectionHttpClient.builder())
                 .overrideConfiguration(c -> c.addExecutionInterceptor(new ExecutionInterceptor() {
                     @Override
                     public SdkHttpRequest modifyHttpRequest(Context.ModifyHttpRequest context,
                                                             ExecutionAttributes attributes) {
-                        // SDK endpoint rules add an account host prefix. Route to loopback before signing,
-                        // retaining the SDK's SigV4A auth scheme, path, modeled payload and region set.
-                        SdkHttpRequest.Builder request = context.httpRequest().toBuilder()
-                                .protocol(endpoint.getScheme()).host(endpoint.getHost()).port(endpoint.getPort());
+                        // The endpoint provider keeps the SDK auth scheme and routes its resolved host locally.
+                        SdkHttpRequest.Builder request = context.httpRequest().toBuilder();
                         if (spoof) {
                             request.putHeader("X-Amz-Target", "CloudFrontKeyValueStore.ListKeys")
                                     .putRawQueryParameter("Action", "ListKeys");
