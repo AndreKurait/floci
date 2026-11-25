@@ -11,6 +11,7 @@ import io.floci.aws.lifecycle.inithook.InitializationHooksRunner;
 import io.floci.aws.services.amazonmq.AmazonMqService;
 import io.floci.aws.services.amazonmq.container.RabbitMqManager;
 import io.floci.aws.services.appsync.graphql.SchemaCreationWorker;
+import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsExportService;
 import io.floci.aws.services.cloudwatch.metrics.CloudWatchMetricsService;
 import io.floci.aws.services.codeartifact.CodeArtifactService;
 import io.floci.aws.services.docdb.container.DocDbContainerManager;
@@ -69,6 +70,9 @@ import java.util.concurrent.CompletableFuture;
 
 @ApplicationScoped
 public class EmulatorLifecycle {
+
+    @Inject
+    CloudWatchLogsExportService logsExportService;
 
     private static final Logger LOG = Logger.getLogger(EmulatorLifecycle.class);
 
@@ -264,6 +268,9 @@ public class EmulatorLifecycle {
         serviceRegistry.logEnabledServices();
         storageFactory.loadAll();
         cloudWatchMetricsService.buildMetricKeyIndex();
+        if (logsExportService != null) {
+            logsExportService.recoverAfterRestart();
+        }
         int sweptSessions = iamService.sweepOrphanedLambdaExecutionRoleSessions();
         if (sweptSessions > 0) {
             LOG.infov("Removed {0} orphaned Lambda execution-role session(s)", sweptSessions);
@@ -470,6 +477,9 @@ public class EmulatorLifecycle {
         runCleanup("DynamoDB Streams poller", dynamodbStreamsPoller::shutdown);
         runCleanup("Kinesis poller", kinesisPoller::shutdown);
         runCleanup("Redshift zero-ETL consumer", redshiftZeroEtlConsumer::shutdown);
+        if (logsExportService != null) {
+            runCleanup("Logs export worker", logsExportService::shutdown);
+        }
         runCleanup("storage flush", storageFactory::flushAll);
         List<ContainerTeardown> prepared = ContainerTeardowns.prepareAll(containerTeardowns, LOG);
         runCleanup("EC2 metadata server", () -> {
