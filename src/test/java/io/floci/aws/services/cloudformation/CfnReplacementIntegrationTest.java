@@ -537,7 +537,7 @@ class CfnReplacementIntegrationTest {
                 new Row("reference to the literal it resolves to", previewProfile(reference, "d"),
                         previewProfile("'hosted'", "d"), "Subject", "False", false, null),
                 new Row("reference to another literal", previewProfile(reference, "d"),
-                        previewProfile("'s3://b/k'", "d"), "Subject", "True", true, null));
+                        previewProfile("'ssm-parameter://preview-location'", "d"), "Subject", "True", true, null));
         try (SsmClient ssm = AwsTestClients.create(SsmClient.builder(), "test", Region.US_EAST_1)) {
             ssm.putParameter(request -> request.name(parameter).value("hosted")
                     .type(ParameterType.STRING).overwrite(true));
