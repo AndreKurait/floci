@@ -12,6 +12,7 @@ import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.AdditionalAnswers.returnsFirstArg;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -33,6 +34,7 @@ class RoleTrustPolicyProviderTest {
     @BeforeEach
     void setUp() {
         iamService = mock(IamService.class);
+        when(iamService.renderAssumeRolePolicy(anyString())).thenAnswer(returnsFirstArg());
         when(iamService.findRole(anyString(), anyString())).thenReturn(Optional.empty());
         provider = new RoleTrustPolicyProvider(iamService, mapper);
     }
@@ -63,6 +65,36 @@ class RoleTrustPolicyProviderTest {
         assertEquals(IamPolicyEvaluator.ResourcePolicyDecision.NEUTRAL,
                 evaluator.evaluateResourcePolicyFor(documents, RequestPrincipal.iam(USER_ARN),
                         "sts:AssumeRole", "arn:aws:iam::" + OWNER + ":role/team/other", null));
+    }
+
+    @Test
+    void liveBoundPrincipalIsProjectedForTheGenericMatcherWithoutChangingStoredTrust() throws Exception {
+        String stored = TRUST.replace(USER_ARN, "AIDALIVE");
+        storeRole(stored);
+        when(iamService.renderAssumeRolePolicy(stored)).thenReturn(TRUST);
+
+        List<ResourcePolicy> policies = provider.getResourcePolicies("sts", "sts:AssumeRole", ROLE_ARN);
+
+        assertEquals(IamPolicyEvaluator.ResourcePolicyDecision.ALLOW_DIRECT_IAM_USER,
+                evaluator.evaluateResourcePolicyFor(documents(policies), RequestPrincipal.iam(USER_ARN),
+                        "sts:AssumeRole", ROLE_ARN, null));
+        assertEquals(USER_ARN, mapper.readTree(policies.getFirst().policyDocument())
+                .path("Statement").get(0).path("Principal").path("AWS").asText());
+        assertEquals(stored, iamService.findRole(OWNER, "deployer").orElseThrow().getAssumeRolePolicyDocument());
+    }
+
+    @Test
+    void unresolvedDeletedPrincipalCannotGrantToTheSameArn() throws Exception {
+        String stored = TRUST.replace(USER_ARN, "AIDADELETED");
+        storeRole(stored);
+
+        List<ResourcePolicy> policies = provider.getResourcePolicies("sts", "sts:AssumeRole", ROLE_ARN);
+
+        assertEquals("AIDADELETED", mapper.readTree(policies.getFirst().policyDocument())
+                .path("Statement").get(0).path("Principal").path("AWS").asText());
+        assertEquals(IamPolicyEvaluator.ResourcePolicyDecision.NEUTRAL,
+                evaluator.evaluateResourcePolicyFor(documents(policies), RequestPrincipal.iam(USER_ARN),
+                        "sts:AssumeRole", ROLE_ARN, null));
     }
 
     @Test
