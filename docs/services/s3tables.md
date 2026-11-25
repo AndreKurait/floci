@@ -36,6 +36,7 @@ was stored with, which ends in its name.
 |---|---|
 | Table buckets | CreateTableBucket, GetTableBucket, ListTableBuckets, DeleteTableBucket |
 | Bucket encryption | GetTableBucketEncryption |
+| Storage classes | GetTableBucketStorageClass, PutTableBucketStorageClass, GetTableStorageClass |
 | Bucket policy | PutTableBucketPolicy, GetTableBucketPolicy, DeleteTableBucketPolicy |
 | Bucket storage class | GetTableBucketStorageClass |
 | Bucket maintenance | PutTableBucketMaintenanceConfiguration, GetTableBucketMaintenanceConfiguration |
@@ -55,6 +56,13 @@ without an explicit configuration, including those loaded from older
 snapshots, report `AES256`. This is configuration readback; Floci does not
 encrypt table data or perform KMS cryptographic operations. Updating or
 deleting a bucket's encryption configuration is not implemented.
+
+Storage classes support `STANDARD` (the default) and `INTELLIGENT_TIERING`.
+`PutTableBucketStorageClass` changes the default for new tables. Each table
+retains the class selected at creation, either its explicit configuration or
+the bucket's default at that time. Bucket settings and table classes survive
+restarts in persistent storage modes. These settings are metadata; Floci does
+not move table data between storage tiers.
 
 ## Example
 
