@@ -5,6 +5,8 @@ import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.Response;
 import io.restassured.specification.RequestSpecification;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
@@ -88,6 +90,114 @@ class CloudFrontKeyValueStoreIntegrationTest {
                 </CreateFunctionRequest>
                 """.formatted(NS, name, runtime, associations,
                 Base64.getEncoder().encodeToString(FUNCTION_CODE.getBytes(StandardCharsets.UTF_8)));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"truncated", "trailing", "wrong-root"})
+    void invalidCreateXmlDoesNotCreateStore(String invalidity) {
+        String name = uniqueName();
+        String body = "<CreateKeyValueStoreRequest><Name>" + name + "</Name>";
+        body += switch (invalidity) {
+            case "truncated" -> "<ImportSource>";
+            case "trailing" -> "</CreateKeyValueStoreRequest><";
+            default -> "</CreateKeyValueStoreRequest>";
+        };
+        if ("wrong-root".equals(invalidity)) {
+            body = body.replace("CreateKeyValueStoreRequest", "OtherRequest");
+        }
+        try {
+            given().contentType(XML).body(body).when().post(CLOUDFRONT + "key-value-store")
+                    .then().statusCode(400).body(hasXPath("//*[local-name()='Code']", equalTo("InvalidArgument")));
+            given().get(CLOUDFRONT + "key-value-store/" + name).then().statusCode(404);
+        } finally {
+            deleteStoreIfPresent(name);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"truncated", "trailing", "wrong-root"})
+    void invalidUpdateXmlPreservesCommentAndEtag(String invalidity) {
+        Store store = createStore(uniqueName(), "original");
+        String body = "<UpdateKeyValueStoreRequest><Comment>changed</Comment>";
+        body += switch (invalidity) {
+            case "truncated" -> "<";
+            case "trailing" -> "</UpdateKeyValueStoreRequest><";
+            default -> "</UpdateKeyValueStoreRequest>";
+        };
+        if ("wrong-root".equals(invalidity)) {
+            body = body.replace("UpdateKeyValueStoreRequest", "OtherRequest");
+        }
+        try {
+            given().contentType(XML).header("If-Match", store.etag()).body(body)
+                    .put(CLOUDFRONT + "key-value-store/" + store.name()).then().statusCode(400);
+            given().get(CLOUDFRONT + "key-value-store/" + store.name()).then()
+                    .statusCode(200).header("ETag", equalTo(store.etag()))
+                    .body(hasXPath("//*[local-name()='Comment']", equalTo("original")));
+        } finally {
+            deleteStoreIfPresent(store.name());
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"0", "2", "-1", "invalid", "missing"})
+    void invalidAssociationQuantityDoesNotCreateFunction(String quantity) {
+        Store store = createStore(uniqueName(), "association");
+        String name = uniqueName();
+        String body = withAssociationQuantity(createFunction(name, "cloudfront-js-2.0", store.arn()), quantity);
+        try {
+            given().contentType(XML).body(body).post(CLOUDFRONT + "function").then().statusCode(400);
+            given().get(CLOUDFRONT + "function/" + name + "/describe").then().statusCode(404);
+        } finally {
+            deleteFunctionIfPresent(name);
+            deleteStoreIfPresent(store.name());
+        }
+    }
+
+    @Test
+    void invalidAssociationQuantityPreservesFunctionAndEtag() {
+        Store store = createStore(uniqueName(), "association");
+        String name = uniqueName();
+        try {
+            Response created = given().contentType(XML).body(createFunction(name, "cloudfront-js-2.0", null))
+                    .post(CLOUDFRONT + "function");
+            created.then().statusCode(201);
+            String body = withAssociationQuantity(createFunction(name, "cloudfront-js-2.0", store.arn()), "0")
+                    .replace("CreateFunctionRequest", "UpdateFunctionRequest").replace("<Comment>kvs", "<Comment>changed");
+            given().contentType(XML).header("If-Match", created.header("ETag")).body(body)
+                    .put(CLOUDFRONT + "function/" + name).then().statusCode(400);
+            Response described = given().get(CLOUDFRONT + "function/" + name + "/describe");
+            described.then().statusCode(200).header("ETag", equalTo(created.header("ETag")));
+            assertEquals("kvs", XmlParser.extractFirst(described.asString(), "Comment", null));
+            assertEquals(0, XmlParser.extractAll(described.asString(), "KeyValueStoreARN").size());
+        } finally {
+            deleteFunctionIfPresent(name);
+            deleteStoreIfPresent(store.name());
+        }
+    }
+
+    private static String withAssociationQuantity(String body, String quantity) {
+        return body.replace("<Quantity>1</Quantity>", "missing".equals(quantity)
+                ? "" : "<Quantity>" + quantity + "</Quantity>");
+    }
+
+    private static void deleteFunctionIfPresent(String name) {
+        Response current = given().get(CLOUDFRONT + "function/" + name + "/describe");
+        if (current.statusCode() == 200) {
+            given().header("If-Match", current.header("ETag")).delete(CLOUDFRONT + "function/" + name)
+                    .then().statusCode(204);
+        } else {
+            current.then().statusCode(404);
+        }
+    }
+
+    private static void deleteStoreIfPresent(String name) {
+        Response current = given().get(CLOUDFRONT + "key-value-store/" + name);
+        if (current.statusCode() == 200) {
+            given().header("If-Match", current.header("ETag")).delete(CLOUDFRONT + "key-value-store/" + name)
+                    .then().statusCode(204);
+        } else {
+            current.then().statusCode(404);
+        }
     }
 
     // ── Control plane ─────────────────────────────────────────────────────────
