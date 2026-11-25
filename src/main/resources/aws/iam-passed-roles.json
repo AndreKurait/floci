@@ -714,7 +714,7 @@
     "rds:ModifyOptionGroup": {"passedTo": ["rds"], "byHand": "the role each option takes in its IAM_ROLE_ARN setting"},
     "rds:RemoveRoleFromDBCluster": {"passedTo": ["rds"], "byHand": "the role it removes"},
     "rds:RemoveRoleFromDBInstance": {"passedTo": ["rds"], "byHand": "the role it removes"},
-    "rds:RestoreDBClusterFromS3": {"passedTo": ["rds", "rds-preview"], "roles": [
+    "rds:RestoreDBClusterFromS3": {"passedTo": ["rds"], "roles": [
       {"member": "AssociatedRoles[DBClusterAssociatedRole].RoleArn", "passedTo": "rds"},
       {"member": "DomainIAMRoleName", "passedTo": "rds", "byName": true},
       {"member": "S3IngestionRoleArn", "passedTo": "rds"}
