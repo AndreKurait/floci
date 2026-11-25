@@ -10,6 +10,8 @@ public class LogEvent {
     private String eventId;
     private long timestamp;
     private String message;
+    private String transformedMessage;
+    private String transformationError;
     private long ingestionTime;
     /**
      * Monotonically increasing ingestion sequence number, used to preserve ingestion
@@ -28,6 +30,22 @@ public class LogEvent {
 
     public String getMessage() { return message; }
     public void setMessage(String message) { this.message = message; }
+
+    public String getTransformedMessage() { return transformedMessage; }
+    public void setTransformedMessage(String transformedMessage) { this.transformedMessage = transformedMessage; }
+
+    public String getTransformationError() { return transformationError; }
+    public void setTransformationError(String transformationError) { this.transformationError = transformationError; }
+
+    public String messageForFilter(boolean transformed) {
+        if (!transformed) {
+            return message;
+        }
+        if (transformationError != null) {
+            return null;
+        }
+        return transformedMessage == null ? message : transformedMessage;
+    }
 
     public long getIngestionTime() { return ingestionTime; }
     public void setIngestionTime(long ingestionTime) { this.ingestionTime = ingestionTime; }
