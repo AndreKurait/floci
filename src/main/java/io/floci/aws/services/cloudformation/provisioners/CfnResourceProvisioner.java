@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.LongNode;
 import com.fasterxml.jackson.databind.node.TextNode;
+import io.floci.aws.core.common.AwsException;
+import io.floci.aws.services.cloudformation.CloudFormationDriftSnapshot;
 import io.floci.aws.services.cloudformation.model.StackEvent;
 import io.floci.aws.services.cloudformation.model.StackResource;
 
@@ -25,6 +27,12 @@ import java.util.function.Consumer;
 public interface CfnResourceProvisioner {
 
     Set<String> resourceTypes();
+
+    /** Only a real provider read can qualify drift; unimplemented readers must not report IN_SYNC. */
+    default CfnDriftProjection readDrift(CloudFormationDriftSnapshot.Resource resource, JsonNode properties,
+                                        String account, String region) {
+        throw new AwsException("ValidationError", "Drift detection is not implemented for " + resource.type(), 400);
+    }
 
     /** GetAtt attributes the registry schema types as integers, by resource type. */
     default Map<String, Set<String>> integerAttributes() {

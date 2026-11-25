@@ -14,6 +14,7 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.ArgumentCaptor;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -531,6 +532,9 @@ class SnsCfnProvisionerTest {
     @Test
     void anUpdateThatDropsDisplayNameClearsItButContinuedOmissionDoesNot() {
         when(sns.createTopic(eq("events"), anyMap(), anyMap(), eq(REGION))).thenReturn(topic(TOPIC_ARN));
+        when(sns.readTopicForDrift(TOPIC_ARN, REGION, "000000000000"))
+                .thenReturn(new SnsService.DriftTopic(TOPIC_ARN, "events", Instant.EPOCH,
+                        Map.of("DisplayName", "Expected Name"), Map.of(), false));
 
         provisionUpdate("""
                 {"TopicName": "events", "DisplayName": "Expected Name"}
@@ -541,6 +545,9 @@ class SnsCfnProvisionerTest {
 
         setUp();
         when(sns.createTopic(eq("events"), anyMap(), anyMap(), eq(REGION))).thenReturn(topic(TOPIC_ARN));
+        when(sns.readTopicForDrift(TOPIC_ARN, REGION, "000000000000"))
+                .thenReturn(new SnsService.DriftTopic(TOPIC_ARN, "events", Instant.EPOCH,
+                        Map.of("DisplayName", ""), Map.of(), false));
         provisionUpdate("""
                 {"TopicName": "events"}
                 """, """
