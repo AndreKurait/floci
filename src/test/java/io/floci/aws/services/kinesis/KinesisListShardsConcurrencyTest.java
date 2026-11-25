@@ -61,6 +61,7 @@ class KinesisListShardsConcurrencyTest {
         service.splitShard("reshard-stream", firstShardId,
                 splitPoint, REGION);
 
+
         // Pre-fix: iterating/sizing the live sub-list here throws ConcurrentModificationException.
         assertDoesNotThrow(() -> {
             int seen = 0;
