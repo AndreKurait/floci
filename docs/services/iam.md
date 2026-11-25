@@ -3676,6 +3676,11 @@ trust policy and the value it sits in matches nothing.
 A `Condition` operator can only match a key floci actually places in the request context.
 floci populates:
 
+- `aws:SecureTransport`: whether the incoming connection uses TLS, for both the
+  primary operation and its additional resource checks. Client-supplied forwarding
+  headers do not set this key. Signed S3 bucket-policy checks receive the same TLS
+  state, including copy sources and browser POST uploads. Internal service calls
+  retain their own condition context rather than inheriting the outer connection's TLS state.
 - The `iam:` keys an IAM request carries in its own parameters, from
   `src/main/resources/aws/iam-condition-keys.json`. `tools/aws/regen_iam_condition_keys.py`
   generates it: for each action and `iam:` key the AWS Service Reference lists, the key is read
