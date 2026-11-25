@@ -6,6 +6,8 @@ import io.floci.aws.core.common.AwsRegions;
 import io.floci.aws.core.common.RequestPathLabels;
 import io.floci.aws.core.common.RequestResources;
 import io.floci.aws.core.common.StoredResourceArns;
+import io.floci.aws.services.amazonmq.AmazonMqConfigurationService;
+import io.floci.aws.services.amazonmq.model.ConfigurationState.Scope;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
@@ -90,6 +92,17 @@ public class ResourceArnBuilder {
     public List<String> buildResources(String credentialScope, String operation, ContainerRequestContext ctx,
                                        String region, String accountId, String partition) {
         if (credentialScope == null) {
+            return List.of("*");
+        }
+        if ("mq".equals(credentialScope) && operation != null && switch (operation) {
+            case "mq:DescribeConfiguration", "mq:UpdateConfiguration", "mq:DeleteConfiguration",
+                    "mq:DescribeConfigurationRevision", "mq:ListConfigurationRevisions" -> true;
+            default -> false;
+        }) {
+            String id = ctx.getUriInfo().getPathParameters().getFirst("configurationId");
+            return List.of(AmazonMqConfigurationService.configurationArn(new Scope(partition, accountId, region), id));
+        }
+        if ("mq:CreateConfiguration".equals(operation) || "mq:ListConfigurations".equals(operation)) {
             return List.of("*");
         }
         return namedResources(credentialScope, operation, ctx, region, accountId, partition);
