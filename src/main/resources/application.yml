@@ -875,6 +875,8 @@ floci:
       # FLOCI_SERVICES_EC2_INSTANCE_RESOURCE_LIMITS
       instance-resource-limits: true
       aws-faithful-private-ip: false
+      # Give instance containers Floci's https endpoint. FLOCI_SERVICES_EC2_GUEST_TLS_ENDPOINT
+      guest-tls-endpoint: false
       # Floci in a container: report an instance's address on Floci's own Docker network as its
       # public IP. FLOCI_SERVICES_EC2_PUBLIC_IP_FROM_SERVICE_NETWORK
       public-ip-from-service-network: false
