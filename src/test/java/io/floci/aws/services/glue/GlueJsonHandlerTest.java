@@ -56,7 +56,8 @@ class GlueJsonHandlerTest {
                 new GlueTriggerService(new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(), glueService,
                         jobRunService, crawlerRunService),
                 schemaRegistryService, new GlueCatalogService(new InMemoryStorage<>(), null, null,
-                        new RegionResolver("us-east-1", "000000000000"), null, mapper), mapper);
+                        new RegionResolver("us-east-1", "000000000000"), null, mapper), mapper,
+                new GlueCustomEntityService(storageFactory, regionResolver, mapper));
     }
 
     @Test
