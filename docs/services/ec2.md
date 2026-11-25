@@ -260,6 +260,35 @@ With `FLOCI_NETWORK_SECURITY_GROUP_ENFORCEMENT_ENABLED=true`, Floci prepares a s
 
 An ENI's IPv6 addresses are part of its identity too. A rule naming an IPv6 range matches a managed peer on any IPv6 address its ENI holds, and admits that peer's traffic only on its helper's Docker IPv6 address, never on its IPv4 one. On a Docker network without IPv6 the helper has no IPv6 address, so such a rule has nothing to match. `AssignIpv6Addresses` and `UnassignIpv6Addresses` update the ENI's firewall identity at once.
 
+With VPC Docker networks enabled, the protected EC2 namespace also joins its VPC
+at the instance's allocated private IP. Guests can bind and reach that address;
+the private and primary Docker addresses share the same ENI permissions.
+A failed VPC attachment stops the launch. Stop/start retains the private interface.
+
+When embedded DNS is available, the protected namespace supplies its address as
+the sole nameserver before starting workloads. Workloads inherit that resolver
+file, so ordinary DNS works on an internal Docker network without an external
+gateway. Floci handles recursive lookups and the workload VPC's Resolver rules.
+The existing DNS packet exception still permits only port 53 at that resolver.
+
+Rule and prefix-list updates refresh protected workloads in the caller's account and region.
+Workloads in other accounts keep their own groups and prefix-list entries.
+
+An observer detects externally stopped, removed, or disconnected namespace helpers.
+It retires their DNS identity and removes their addresses from peer security-group rules,
+so an unrelated container reusing an address does not inherit the former ENI's membership.
+Losing either registered interface withdraws both addresses, including a surviving primary interface.
+Detection is asynchronous; failed policy updates quarantine peers and are retried.
+The owning workload retains responsibility for removing its retired helper; failed
+Docker removal is reported and remains retryable.
+
+VPC-connected Docker Lambda environments use the same policy engine. Their Runtime API
+has an exact IP and TCP-port exception, while their application traffic remains filtered.
+See [Lambda VPC configuration](lambda.md#vpcconfig-snapstart-loggingconfig-and-durableconfig)
+for execution and lifecycle limits.
+
+
+
 Security-group permissions on a host-published port use the source visible inside Docker, and Docker can replace the original client address (Docker Desktop shows every host client as its gateway). So while enforcement is enabled, host-published access counts as traffic from outside the VPC: Floci publishes an application port only when an ingress rule opens it to every address, `0.0.0.0/0` or `::/0`, since such a rule admits a client whatever address it arrives with. A client's family is still seen on the host, so a port only `0.0.0.0/0` opens is published on the host's IPv4 addresses, one only `::/0` opens on its IPv6 addresses, and one both open on every address. The socat sidecar described below dials the instance through its protected namespace, on the instance's IPv4 address, or on its Docker IPv6 address when only `::/0` opens the port; on a Docker network without IPv6 such a port is not published. A port that only a narrower CIDR, a prefix list or a referenced group opens stays reachable on the direct container path, where the firewall sees the peer's own ENI identity. Authorizing a world-open rule after launch publishes the port. Revoking the last world-open rule closes the host listener. If egress permits TCP to every address and port in the address family the relay uses to reach the guest, revocation also closes existing connections immediately. With narrower egress, established connections can finish until the instance stops or terminates. SSH is published directly by the protected namespace.
 
 When enforcement is disabled, an instance's security groups can open a TCP port to any CIDR source and Floci publishes that port on the host so you can reach the app from `localhost`. For each opened port Floci starts a small `alpine/socat` sidecar container that binds an allocated host port (default range 30000–30999) and forwards it to the instance container's IP, with `TCP_NODELAY` on both sockets so a request the client sends as two small writes is not held for the first write's delayed ACK (about 40 ms per round trip otherwise). The listen socket also takes a `backlog` of 4096 (socat's default is 5), so a burst of connections is queued rather than silently dropped from a full accept queue; the kernel caps the backlog at `net.core.somaxconn`. This works both for rules present at launch and for rules added later with `authorize-security-group-ingress`; revoking the rule removes the forward. The mapping (`app port -> host port`) is written to the logs:
@@ -1632,9 +1661,9 @@ true or it is in the log.
 
 Limits worth knowing before reading a passing test as evidence:
 
-- **Security groups and NACLs are not enforced by this.** Within one Docker network every
-  container reaches every other on every port.
-- **Between-VPC isolation is the daemon's, not Floci's.** It comes from Docker's own
+- **VPC networks alone do not enforce security groups or NACLs.** Enable security-group
+  enforcement to protect EC2 namespaces on these networks. NACLs remain unemulated.
+- **Without packet enforcement, between-VPC isolation depends on the daemon.** It comes from Docker's own
   `DOCKER-ISOLATION-STAGE` rules. OrbStack does not apply them: measured on OrbStack 29.4.0,
   two containers on separate networks reach each other in both directions, `--internal` included.
   On such a host the VPC boundary is an addressing boundary only.
