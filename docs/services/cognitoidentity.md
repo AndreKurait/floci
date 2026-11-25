@@ -74,7 +74,8 @@ sessions with expiration, session-token authentication, role policies, and Cogni
 context. Enhanced guest permissions are restricted to the combined documented inline and
 managed guest policy allow sets, intersected with role permissions. Enhanced sessions cannot
 call identity-pool or Cognito Sync APIs. Classic sessions retain role grants and any requested
-inline session-policy restriction.
+inline session-policy restriction. Each classic exchange requires an active identity and a
+pool with `AllowClassicFlow` enabled, including exchanges using a previously issued token.
 
 Identity records, developer links, and signing keys persist through storage reloads. Removing
 the last developer link disables new public token and credential access; it never turns an
