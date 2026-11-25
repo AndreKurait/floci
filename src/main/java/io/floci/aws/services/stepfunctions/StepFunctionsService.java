@@ -938,6 +938,10 @@ public class StepFunctionsService implements Resettable, ResourceProvider, Store
 
     private record ResolvedStateMachine(
             StateMachine stateMachine, String baseArn, String versionArn, String aliasArn) {
+        private ResolvedStateMachine {
+            // Descriptions are detached copies; execution identity remains the base machine.
+            stateMachine.setStateMachineArn(baseArn);
+        }
     }
 
     private ResolvedStateMachine resolveStateMachineForExecution(String arn) {
