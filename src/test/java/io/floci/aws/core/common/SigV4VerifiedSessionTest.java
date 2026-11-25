@@ -3,6 +3,7 @@ package io.floci.aws.core.common;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.iam.model.SessionCredential;
+import io.floci.aws.testing.ParallelLocks;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.container.ResourceInfo;
 import jakarta.ws.rs.core.MultivaluedHashMap;
@@ -11,6 +12,8 @@ import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.UriInfo;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
 import software.amazon.awssdk.auth.signer.Aws4Signer;
 import software.amazon.awssdk.auth.signer.params.Aws4SignerParams;
@@ -31,6 +34,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class SigV4VerifiedSessionTest {
     private static final String KEY = "ASIAEXAMPLEPROFILE";
     private static final String SECRET = "example-profile-secret";
@@ -144,7 +148,8 @@ class SigV4VerifiedSessionTest {
         filter.filter(next);
         assertFalse(context.isSignatureVerifiedFor(KEY));
         assertNull(context.getVerifiedSession());
-        verifyNoInteractions(next);
+        verify(next).getHeaderString("X-Amz-Target");
+        verifyNoMoreInteractions(next);
     }
 
     @Test
