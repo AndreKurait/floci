@@ -1,8 +1,12 @@
 package io.floci.aws.services.iam;
 
+import io.floci.aws.services.iam.model.AccessKey;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.specification.RequestSpecification;
+import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
+
+import java.util.UUID;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.containsString;
@@ -32,6 +36,9 @@ import static org.hamcrest.Matchers.not;
  */
 @QuarkusTest
 class StsRequestConstraintsIntegrationTest {
+
+    @Inject
+    IamService iam;
 
     private static final String STS_AUTH =
             "AWS4-HMAC-SHA256 Credential=test/20261027/us-east-1/sts/aws4_request";
@@ -89,8 +96,27 @@ class StsRequestConstraintsIntegrationTest {
         sts("GetSessionToken")
             .formParam("SerialNumber", "arn:aws:iam::000000000000:mfa/user")
             .formParam("TokenCode", "123456")
-        .when().post("/").then().statusCode(403)
-            .body(CODE, equalTo("AccessDenied"));
+        .when().post("/").then().statusCode(200)
+            .body(SESSION_KEY, containsString("ASIA"));
+
+        String userName = "mfa-constraints-" + UUID.randomUUID();
+        iam.createUser(userName, "/");
+        AccessKey accessKey = null;
+        try {
+            accessKey = iam.createAccessKey(userName);
+            given().header("Authorization", STS_AUTH.replace("Credential=test/",
+                            "Credential=" + accessKey.getAccessKeyId() + "/"))
+                .formParam("Action", "GetSessionToken")
+                .formParam("SerialNumber", "arn:aws:iam::000000000000:mfa/user")
+                .formParam("TokenCode", "123456")
+            .when().post("/").then().statusCode(403)
+                .body(CODE, equalTo("AccessDenied"));
+        } finally {
+            if (accessKey != null) {
+                iam.deleteAccessKey(userName, accessKey.getAccessKeyId());
+            }
+            iam.deleteUser(userName);
+        }
     }
 
     /**
