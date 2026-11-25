@@ -22,6 +22,7 @@ AWS::ApiGatewayV2::Stage		AccessLogSettings,ApiId,AutoDeploy,ClientCertificateId
 AWS::ApiGatewayV2::VpcLink	VpcLinkId	Name,SecurityGroupIds,SubnetIds,Tags
 AWS::AppConfig::Application	ApplicationId	Description,Name,Tags
 AWS::AppConfig::ConfigurationProfile	ConfigurationProfileId,KmsKeyArn	ApplicationId,DeletionProtectionCheck,Description,KmsKeyIdentifier,LocationUri,Name,RetrievalRoleArn,Tags,Type,Validators
+AWS::AppConfig::Deployment	DeploymentNumber,State	ApplicationId,ConfigurationProfileId,ConfigurationVersion,DeploymentStrategyId,Description,DynamicExtensionParameters,EnvironmentId,KmsKeyIdentifier,Tags
 AWS::AppConfig::DeploymentStrategy	Id	DeploymentDurationInMinutes,Description,FinalBakeTimeInMinutes,GrowthFactor,GrowthType,Name,ReplicateTo,Tags
 AWS::AppConfig::Environment	EnvironmentId	ApplicationId,DeletionProtectionCheck,Description,Monitors,Name,Tags
 AWS::AppConfig::HostedConfigurationVersion	VersionNumber	ApplicationId,ConfigurationProfileId,Content,ContentType,Description,LatestVersionNumber,VersionLabel

@@ -116,7 +116,7 @@ Operation counts are exact. For dispatch-table services (Query and JSON 1.1) eac
 | [SES](ses.md) | `POST /` with `Action=` param | Query | 70 |
 | [SES v2](ses.md#v2) | `/v2/email/*` | REST JSON | 102 |
 | [OpenSearch](opensearch.md) | `/2021-01-01/opensearch/...`, legacy `/2015-01-01/es/...` | REST JSON | 36 |
-| [AppConfig](appconfig.md) | `/applications/...`, `/deploymentstrategies/...` | REST JSON | 29 |
+| [AppConfig](appconfig.md) | `/applications/...`, `/deploymentstrategies/...` | REST JSON | 30 |
 | [AppConfigData](appconfig.md#data-plane) | `/configurationsessions`, `/configuration` | REST JSON | 2 |
 | [AppSync](appsync.md) | `/v1/apis/...` | REST JSON | 58 |
 | [Amazon Bedrock](bedrock.md) | `/guardrails`, `/guardrails/{guardrailIdentifier}`, `/foundation-models`, `/foundation-models/{modelIdentifier}`, `/inference-profiles`, `/inference-profiles/{inferenceProfileIdentifier}`, `/resource-policy`, `/resource-policy/{resourceArn}`, `/tagResource`, `/untagResource`, `/listTagsForResource` | REST JSON | 18 |
