@@ -44,7 +44,7 @@ jobs:
           fetch-depth: 0
 
       - name: Test signature verification guard
-        run: python3 -m unittest discover -s .github/scripts -p test_pr_hygiene.py -v
+        run: python3 -m unittest discover -s .github/scripts -p 'test_pr_hygiene*.py' -v
 
       - name: Commits are signed and verified
         if: ${{ !cancelled() }}
@@ -72,6 +72,11 @@ jobs:
           # verdict that branch protection enforces at the merge button
           # anyway, so failing closed costs a re-run, not a blocked person.
 
+          SCOPE_FILE="$RUNNER_TEMP/pr-hygiene-scope.json"
+          python3 "$GITHUB_WORKSPACE/.github/scripts/pr_hygiene_scope.py" resolve --scope-file "$SCOPE_FILE"
+          COMMITS_FILE=$(mktemp)
+          python3 "$GITHUB_WORKSPACE/.github/scripts/pr_hygiene_scope.py" commits --scope-file "$SCOPE_FILE" > "$COMMITS_FILE"
+
           FAILED=0
           UNSIGNED=0
 
@@ -83,7 +88,7 @@ jobs:
           # still requires the per-commit API call and fails closed on errors.
           range_commits=$(gh api "repos/$REPO/compare/$BASE_SHA...$HEAD_SHA?per_page=100" --paginate --jq '.commits[] | {sha: .sha, verification: (.commit.verification | {verified, reason})}') || range_commits=''
 
-          for sha in $(git log --no-merges --format=%H "$BASE_SHA".."$HEAD_SHA"); do
+          for sha in $(cat "$COMMITS_FILE"); do
             subject=$(git show -s --format=%s "$sha")
 
             verification=$(echo "$range_commits" | jq -c --arg sha "$sha" 'select(.sha == $sha) | .verification')
@@ -94,10 +99,10 @@ jobs:
               continue
             fi
 
-            verified=$(echo "$verification" | jq -r '.verified')
+            verified=$(echo "$verification" | jq -r '.verified == true')
             reason=$(echo "$verification" | jq -r '.reason')
 
-            if [ "$verified" = "true" ]; then
+            if [ "$verified" = "true" ] && [ "$reason" = "valid" ]; then
               echo "ok: $sha $subject"
             else
               echo "::error::Commit is not signed/verified: $sha $subject ($reason)"
@@ -350,45 +355,14 @@ jobs:
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPO: ${{ github.repository }}
         run: |
-          # AGENTS.md: "No em-dashes anywhere, in any content. Use colons,
-          # commas, or periods."
-          #
-          # Scoped to files this PR adds, not lines changed in existing ones:
-          # plenty of existing content already has em-dashes, and flagging
-          # every PR that happens to touch one of those files would make this
-          # check noise rather than signal. New files start clean.
-
-          # Written as an escape, not the literal glyph: this workflow file is
-          # itself a new file the first time it is added, and the check below
-          # would otherwise flag itself for containing the character it is
-          # searching for.
-          EM_DASH=$'\u2014'
-          FAILED=0
-
-          # -z / -d '' throughout: plain --name-only C-quotes paths with
-          # non-ASCII or special characters (e.g. "caf\303\251.md"), which then
-          # fail to match the real file on disk and get silently skipped.
-          # NUL-delimited output/reads sidestep that.
-          while IFS= read -r -d '' file; do
-            [ -z "$file" ] && continue
-
-            MATCHES=$(grep -InH "$EM_DASH" -- "$file" || true)
-            [ -z "$MATCHES" ] && continue
-
-            FAILED=1
-            while IFS=: read -r path lineno content; do
-              echo "::error file=$path,line=$lineno::Em-dash found in new file (AGENTS.md: no em-dashes anywhere, in any content)"
-              echo "  $path:$lineno: $content"
-            done <<< "$MATCHES"
-          done < <(git diff -z --diff-filter=A --name-only "$BASE_SHA" "$HEAD_SHA")
-
-          if [ "$FAILED" -eq 1 ]; then
-            echo ""
-            echo "Use colons, commas, or periods instead of em-dashes (U+2014). See AGENTS.md, Documentation Style."
-          fi
-
-          exit $FAILED
+          # Ordinary PRs retain the added-file check. The exact same-repository
+          # dev_target -> dev sync additionally checks every new ordinary
+          # contribution and final merge text against accepted dev/main content.
+          # Reuse the immutable scope resolved by the signature step; missing or
+          # mismatched scope fails closed even if an earlier step failed.
+          python3 "$GITHUB_WORKSPACE/.github/scripts/pr_hygiene_scope.py" emdashes --scope-file "$RUNNER_TEMP/pr-hygiene-scope.json"
 
       - name: PR body keeps the required template sections
         # Bot PRs (dependabot) do not use the template.
