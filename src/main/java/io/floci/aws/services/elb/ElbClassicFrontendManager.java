@@ -169,7 +169,7 @@ public class ElbClassicFrontendManager implements ContainerTeardown {
             pending = pending.withNamespace(new NetworkNamespace(namespace.helperId(), null));
             pending = pending.withNamespace(new NetworkNamespace(namespace.helperId(),
                     docker.inspectContainerCmd(namespace.helperId()).exec().getName()));
-            if (vpcNetworks.attach(region, eni.getVpcId(), eni.getSubnetId(),
+            if (vpcNetworks.attach(account, region, eni.getVpcId(), eni.getSubnetId(),
                     namespace.helperId(), eni.getPrivateIpAddress()).isEmpty()) {
                 throw new IllegalStateException("Classic frontend could not attach to its VPC");
             }
