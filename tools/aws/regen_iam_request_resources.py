@@ -607,7 +607,8 @@ NOT_COVERED: dict[str, str] = {
                    "which other services (ECS capacity providers) read back; the mint is fixed first",
     "aws-marketplace": _LATER,
     "backup": _REST,
-    "batch": _REST,
+    "batch": ("Five scheduling-policy operations and their matched tag routes use narrow ResourceArnBuilder hooks; "
+              "remaining Batch operations are not covered"),
     "bedrock-agentcore": _REST,
     "cloudhsm": "not read yet: its ARN formats end in ${CloudHsmClusterInstanceName} and "
                 "${CloudHsmBackupInstanceName}, names, while its requests give ClusterId and BackupId, ids, which the "
