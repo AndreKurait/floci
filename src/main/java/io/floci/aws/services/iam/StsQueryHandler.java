@@ -739,7 +739,8 @@ public class StsQueryHandler {
         String tokenIssuer = tokenVerifier.peekIssuer(webIdentityToken).orElse(null);
         RSAPublicKey issuerKey = tokenIssuer == null ? null : oidcIssuerKeys.findVerificationKey(tokenIssuer).orElse(null);
         if (cognitoIdentities != null && cognitoIdentities.isResolvable()
-                && cognitoIdentities.get().recognizes(webIdentityToken, roleArn, issuerKey != null)) {
+                && cognitoIdentities.get().recognizes(webIdentityToken, roleArn, issuerKey != null,
+                        hasRegisteredWebIdentityIssuer(tokenIssuer, roleArn, accountId))) {
             if (params.keySet().stream().anyMatch(key -> key.startsWith("PolicyArns."))) {
                 return AwsQueryResponse.error("ValidationError",
                         "Managed session-policy ARNs are not supported for Cognito token exchange.", AwsNamespaces.STS, 400);
@@ -761,7 +762,7 @@ public class StsQueryHandler {
         }
 
         WebIdentityOutcome outcome = verifyWebIdentityToken(webIdentityToken, roleName, accountId, roleArn,
-                sessionName);
+                sessionName, tokenIssuer, issuerKey);
         if (outcome.denial() != null) {
             return outcome.denial();
         }
@@ -869,13 +870,25 @@ public class StsQueryHandler {
         }
     }
 
+    /** Chooses the registered-provider verification path without treating the token as verified. */
+    private boolean hasRegisteredWebIdentityIssuer(String issuer, String roleArn, String accountId) {
+        if (issuer == null || !issuer.startsWith("https://") || !config.services().iam().enforcementEnabled()) {
+            return false;
+        }
+        String providerArn = AwsArnUtils.Arn.global(
+                AwsArnUtils.partitionOrDefault(roleArn, regionResolver.getPartition()),
+                "iam", accountId, "oidc-provider/" + stripScheme(issuer)).toString();
+        return iamService.findOpenIDConnectProvider(accountId, providerArn).isPresent();
+    }
+
     /**
      * Inspects {@code token} and decides whether it may assume {@code roleArn} as the session
      * {@code sessionName}, which the trust policy reads as {@code sts:RoleSessionName}.
      */
     private WebIdentityOutcome verifyWebIdentityToken(String token, String roleName, String roleAccountId,
-                                                      String roleArn, String sessionName) {
-        String issuer = tokenVerifier.peekIssuer(token).orElse(null);
+                                                      String roleArn, String sessionName,
+                                                      String tokenIssuer, RSAPublicKey localIssuerKey) {
+        String issuer = tokenIssuer;
         if (issuer == null) {
             return config.services().iam().enforcementEnabled()
                     ? WebIdentityOutcome.deny(AwsQueryResponse.error("InvalidIdentityToken",
@@ -889,7 +902,7 @@ public class StsQueryHandler {
                 AwsArnUtils.partitionOrDefault(role.map(IamRole::getArn).orElse(roleArn),
                         regionResolver.getPartition()),
                 "iam", roleAccountId, "oidc-provider/" + issuerKeyPrefix).toString();
-        Optional<RSAPublicKey> key = oidcIssuerKeys.findVerificationKey(issuer);
+        Optional<RSAPublicKey> key = Optional.ofNullable(localIssuerKey);
         List<String> acceptedAudiences = List.of(STS_AUDIENCE);
         // IAM stores a provider's URL without its scheme and accepts only https, so only an https
         // issuer names one.
