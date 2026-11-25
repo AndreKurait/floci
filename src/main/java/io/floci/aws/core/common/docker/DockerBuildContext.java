@@ -6,21 +6,28 @@ import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.util.Map;
 
-/** The tar build context Docker's build API takes, for an image built from a Dockerfile alone. */
+/** The tar build context Docker's build API takes. */
 public final class DockerBuildContext {
 
     private DockerBuildContext() {
     }
 
     public static byte[] ofDockerfile(byte[] dockerfile) {
-        ByteArrayOutputStream archive = new ByteArrayOutputStream(dockerfile.length + 1024);
+        return ofFiles(Map.of("Dockerfile", dockerfile));
+    }
+
+    public static byte[] ofFiles(Map<String, byte[]> files) {
+        ByteArrayOutputStream archive = new ByteArrayOutputStream();
         try (TarArchiveOutputStream tar = new TarArchiveOutputStream(archive)) {
-            TarArchiveEntry entry = new TarArchiveEntry("Dockerfile");
-            entry.setSize(dockerfile.length);
-            tar.putArchiveEntry(entry);
-            tar.write(dockerfile);
-            tar.closeArchiveEntry();
+            for (Map.Entry<String, byte[]> file : files.entrySet()) {
+                TarArchiveEntry entry = new TarArchiveEntry(file.getKey());
+                entry.setSize(file.getValue().length);
+                tar.putArchiveEntry(entry);
+                tar.write(file.getValue());
+                tar.closeArchiveEntry();
+            }
         } catch (IOException e) {
             throw new UncheckedIOException("Cannot write the Docker build context", e);
         }
