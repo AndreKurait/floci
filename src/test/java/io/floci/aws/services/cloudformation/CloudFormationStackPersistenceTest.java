@@ -16,6 +16,7 @@ import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -67,6 +68,16 @@ class CloudFormationStackPersistenceTest {
         changeSet.setChangeSetName("initial-create");
         changeSet.setStackName("my-stack");
         changeSet.setStatus("CREATE_COMPLETE");
+        String original = """
+                {"Resources":{"Resource":{"Fn::Transform":{"Name":"AWS::Include",
+                  "Parameters":{"Location":"s3://template-snippets/resource.json"}}}}}
+                """;
+        String processed = """
+                {"Resources":{"Resource":{"Type":"AWS::SSM::Parameter",
+                  "Properties":{"Type":"String","Value":"approved"}}}}
+                """;
+        changeSet.setTemplateBody(original);
+        changeSet.setProcessedTemplateBody(processed);
         changeSet.setStackPolicyBody(PENDING_POLICY);
         stack.getChangeSets().put("initial-create", changeSet);
 
@@ -106,6 +117,8 @@ class CloudFormationStackPersistenceTest {
         assertTrue(loaded.getChangeSets().containsKey("initial-create"));
         assertEquals("CREATE_COMPLETE", loaded.getChangeSets().get("initial-create").getStatus());
         assertEquals(PENDING_POLICY, loaded.getChangeSets().get("initial-create").getStackPolicyBody());
+        assertEquals(original, loaded.getChangeSets().get("initial-create").getTemplateBody());
+        assertEquals(processed, loaded.getChangeSets().get("initial-create").getProcessedTemplateBody());
     }
 
     @Test
@@ -119,6 +132,12 @@ class CloudFormationStackPersistenceTest {
                     "stackName" : "legacy-stack",
                     "region" : "us-east-1",
                     "status" : "CREATE_COMPLETE",
+                    "changeSets" : {
+                      "preview" : {
+                        "changeSetName" : "preview",
+                        "templateBody" : "{\\\"Resources\\\":{}}"
+                      }
+                    },
                     "fieldFromFutureVersion" : "whatever"
                   }
                 }
@@ -133,5 +152,9 @@ class CloudFormationStackPersistenceTest {
         assertTrue(loaded.isPresent(), "Stacks with unknown extra fields should still load");
         assertEquals("legacy-stack", loaded.get().getStackName());
         assertEquals("CREATE_COMPLETE", loaded.get().getStatus());
+        ChangeSet legacyChangeSet = loaded.get().getChangeSets().get("preview");
+        assertEquals("{\"Resources\":{}}", legacyChangeSet.getTemplateBody());
+        assertNull(legacyChangeSet.getProcessedTemplateBody(),
+                "An older change set must not invent a historical processed template");
     }
 }
