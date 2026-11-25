@@ -810,15 +810,17 @@ public class AppConfigService {
             }
             summary.setType(profile.getType());
         }
+        summary.setFinalBakeTimeInMinutes(deployment.getFinalBakeTimeInMinutes());
         if (deployment.getDeploymentDurationInMinutes() != null) {
             summary.setDeploymentDurationInMinutes(deployment.getDeploymentDurationInMinutes());
-            summary.setFinalBakeTimeInMinutes(deployment.getFinalBakeTimeInMinutes());
             summary.setGrowthFactor(deployment.getGrowthFactor());
             summary.setGrowthType(deployment.getGrowthType());
         } else {
             findDeploymentStrategy(deployment.getDeploymentStrategyId()).ifPresent(strategy -> {
                 summary.setDeploymentDurationInMinutes(strategy.getDeploymentDurationInMinutes());
-                summary.setFinalBakeTimeInMinutes(strategy.getFinalBakeTimeInMinutes());
+                if (summary.getFinalBakeTimeInMinutes() == null) {
+                    summary.setFinalBakeTimeInMinutes(strategy.getFinalBakeTimeInMinutes());
+                }
                 summary.setGrowthFactor(strategy.getGrowthFactor());
                 summary.setGrowthType(strategy.getGrowthType());
             });

@@ -1,16 +1,20 @@
 package io.floci.aws.services.appconfig;
 
+import com.fasterxml.jackson.core.type.TypeReference;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.ServiceConfigAccess;
+import io.floci.aws.core.storage.RegionScopedStorage;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.appconfig.model.Deployment;
+import io.floci.aws.services.appconfig.model.DeploymentSummary;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.charset.StandardCharsets;
@@ -218,6 +222,29 @@ class AppConfigDeploymentLifecycleTest {
         assertEquals("COMPLETE", service.getDeployment(scope.app(), scope.env(),
                 current.getDeploymentNumber()).getState());
         assertEquals("COMPLETE", current.getState());
+    }
+
+    @ParameterizedTest
+    @CsvSource(value = {"7, 7", "0, 0", "null, 1"}, nullValues = "null")
+    void legacySummaryKeepsStoredBakeTimeAfterRestart(Integer storedBake, int expectedBake) {
+        StorageFactory first = factory();
+        AppConfigService service = service(first, START);
+        Scope scope = scope(service);
+        Deployment deployment = deploy(service, scope, "1", scope.bake());
+        deployment.setDeploymentDurationInMinutes(null);
+        deployment.setFinalBakeTimeInMinutes(storedBake);
+        new RegionScopedStorage<>(first, new RegionResolver("us-east-1", "000000000000"),
+                "appconfig", "appconfig-deployments.json", new TypeReference<Map<String, Deployment>>() {})
+                .put(scope.app() + "::" + scope.env() + "::" + deployment.getDeploymentNumber(), deployment);
+        close(first);
+
+        StorageFactory second = factory();
+        AppConfigService restarted = service(second, START);
+        DeploymentSummary summary = restarted.listDeployments(scope.app(), scope.env(), 50, null).items().getFirst();
+        assertEquals(expectedBake, summary.getFinalBakeTimeInMinutes());
+        assertEquals(deployment.getDeploymentNumber(), summary.getDeploymentNumber());
+        assertEquals(0, summary.getDeploymentDurationInMinutes());
+        close(second);
     }
 
     private Scope scope(AppConfigService service) {
