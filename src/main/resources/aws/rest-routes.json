@@ -1,5 +1,5 @@
 {
-  "_source": {"generator": "tools/aws/regen_rest_routes.py", "botocore": "botocore 1.44.11 (installed package)"},
+  "_source": {"generator": "tools/aws/regen_rest_routes.py", "botocore": "botocore 1.44.9 (installed package)"},
   "models": {
     "accessanalyzer": {
       "credentialScope": "access-analyzer",

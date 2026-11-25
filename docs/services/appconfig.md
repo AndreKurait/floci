@@ -20,6 +20,9 @@ partition, account and Region. Both the create action and tagging action evaluat
 `aws:RequestTag` and `aws:TagKeys` conditions. An untagged create needs only its create
 permission. This tag-on-create admission currently covers these two operations;
 child-resource and deployment creation tags remain outside this admission scope.
+Stored application tags also supply `aws:ResourceTag` conditions for application
+requests. Tag changes take effect on the next request. Tags on other AppConfig
+resource types remain outside the persisted-tag scope.
 
 ## Management Plane (AppConfig)
 

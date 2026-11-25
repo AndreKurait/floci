@@ -103,6 +103,38 @@ class AppConfigTagOnCreateIntegrationTest {
         }
     }
 
+    @ParameterizedTest
+    @CsvSource({"us-east-1,aws", "cn-north-1,aws-cn", "us-gov-west-1,aws-us-gov"})
+    void storedApplicationTagsEnforceSignedReadDenialsAndRevocation(String regionName, String partition) throws Exception {
+        Region region = Region.of(regionName);
+        try (AppConfigClient admin = client("test", "test", region);
+             StsClient identity = AwsTestClients.create(StsClient.builder(), "test", "test", region, endpoint)) {
+            String id = admin.createApplication(request -> request.name("stored-tags-" + UUID.randomUUID())).id();
+            try {
+                String arn = "arn:" + partition + ":appconfig:" + region.id() + ":"
+                        + identity.getCallerIdentity(request -> {}).account() + ":application/" + id;
+                admin.tagResource(request -> request.resourceArn(arn).tags(Map.of("protected", "true")));
+                assertEquals("true", admin.listTagsForResource(request -> request.resourceArn(arn)).tags().get("protected"));
+                List<Map<String, Object>> statements = List.of(
+                        Map.of("Effect", "Allow", "Action", "appconfig:GetApplication", "Resource", arn),
+                        Map.of("Effect", "Deny", "Action", "appconfig:GetApplication", "Resource", arn,
+                                "Condition", Map.of("StringEquals", Map.of("aws:ResourceTag/protected", "true"))));
+                try (SignedIamUsers.User user = user(statements);
+                     AppConfigClient caller = client(user.accessKeyId(), user.secretAccessKey(), region)) {
+                    assertCaller(user, region);
+                    assertEquals(DENIED, verdict(() -> caller.getApplication(request -> request.applicationId(id))));
+                    admin.untagResource(request -> request.resourceArn(arn).tagKeys("protected"));
+                    assertEquals(id, caller.getApplication(request -> request.applicationId(id)).id());
+                    admin.tagResource(request -> request.resourceArn(arn).tags(Map.of("protected", "true")));
+                    assertEquals(DENIED, verdict(() -> caller.getApplication(request -> request.applicationId(id))));
+                }
+            } finally {
+                admin.deleteApplication(request -> request.applicationId(id));
+                absent(() -> admin.getApplication(request -> request.applicationId(id)));
+            }
+        }
+    }
+
     private static Verdict createTagged(AppConfigClient caller, String operation, String name, List<String> created) {
         return verdict(() -> {
             if ("CreateApplication".equals(operation)) {

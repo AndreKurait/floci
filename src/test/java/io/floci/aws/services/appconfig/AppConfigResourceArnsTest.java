@@ -7,6 +7,7 @@ import io.floci.aws.testing.InMemoryStorageFactory;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -67,6 +68,30 @@ class AppConfigResourceArnsTest {
         fixture.service().createConfigurationProfile(fixture.application(),
                 Map.of("Name", fixture.profile(), "LocationUri", "hosted"));
         assertEquals(List.of(arn), fixture.arns().through("ConfigurationToken", next, region));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"us-east-1,aws", "cn-north-1,aws-cn", "us-gov-west-1,aws-us-gov"})
+    void storedTagsUseOnlyExactApplicationIdsInTheCurrentAccountAndRegion(String region, String partition) {
+        Fixture fixture = fixture(region);
+        Map<String, String> tags = new HashMap<>();
+        tags.put("protected", "true");
+        tags.put("empty", null);
+        fixture.service().setApplicationTags(fixture.application(), tags);
+        String prefix = "arn:" + partition + ":appconfig:" + region + ":" + ACCOUNT + ":";
+        String arn = prefix + "application/" + fixture.application();
+        assertEquals(Map.of("protected", "true", "empty", ""), fixture.arns().storedTags(arn));
+        assertTrue(fixture.arns().storedTags(arn.replace(ACCOUNT, "999900001111")).isEmpty());
+        assertTrue(fixture.arns().storedTags(arn.replace(region, "eu-west-1")).isEmpty());
+        assertTrue(fixture.arns().storedTags(prefix + "application/orders").isEmpty());
+        assertTrue(fixture.arns().storedTags(arn + "/environment/" + fixture.environment()).isEmpty());
+        assertTrue(fixture.arns().storedTags(arn.replace(":appconfig:", ":ec2:")).isEmpty());
+        assertTrue(fixture.arns().storedTags("invalid").isEmpty());
+        assertTrue(fixture.arns().storedTags(arn.replace("arn:" + partition + ":", "arn:aws-iso:")).isEmpty());
+        fixture.service().deleteApplicationById(fixture.application());
+        String replacement = fixture.service().createApplication(Map.of("Name", fixture.application())).getId();
+        fixture.service().setApplicationTags(replacement, Map.of("protected", "false"));
+        assertTrue(fixture.arns().storedTags(arn).isEmpty());
     }
 
     private static Fixture fixture(String region) {

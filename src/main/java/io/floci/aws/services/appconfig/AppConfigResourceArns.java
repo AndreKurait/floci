@@ -1,5 +1,6 @@
 package io.floci.aws.services.appconfig;
 
+import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.StoredResourceArns;
@@ -82,6 +83,22 @@ public class AppConfigResourceArns implements StoredResourceArns {
         return List.of(regions.buildArn("appconfig", region,
                 "application/" + ids.get("ApplicationId") + "/environment/" + ids.get("EnvironmentId")
                         + "/configuration/" + ids.get("ConfigurationProfileId")));
+    }
+
+    @Override
+    public Map<String, String> storedTags(String arn) {
+        Optional<AwsArnUtils.Arn> candidate = AwsArnUtils.parseIfArnIn(arn, namespace(), regions.getRegion());
+        if (candidate.isEmpty() || !candidate.get().accountId().equals(regions.getAccountId())) {
+            return Map.of();
+        }
+        AwsArnUtils.Arn parsed = candidate.get();
+        String[] resource = parsed.resource().split("/", -1);
+        if (resource.length != 2 || !"application".equals(resource[0])) {
+            return Map.of();
+        }
+        return appConfig.findApplication(resource[1])
+                .map(application -> StoredResourceArns.withEmptyValues(application.getTags()))
+                .orElseGet(Map::of);
     }
 
     private String environment(String application, Map<String, String> variables) {
