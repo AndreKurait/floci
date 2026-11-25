@@ -10,6 +10,8 @@ import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.List;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static io.floci.aws.testing.Ec2QueryHandlerFixtures.queryHandler;
 import static io.floci.aws.testing.Ec2ServiceFixtures.mockModeService;
@@ -17,7 +19,6 @@ import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsString;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.verifyNoInteractions;
 
 /** A dry run of an operation that stops, detaches or deletes something answers DryRunOperation and does nothing. */
 class Ec2DestructiveDryRunTest {
@@ -29,8 +30,20 @@ class Ec2DestructiveDryRunTest {
             "DeleteTags", "DeleteRoute",
             "ReleaseAddress", "DeleteNetworkInterface", "DetachVolume", "DeregisterImage",
             "DeleteLaunchTemplate", "CancelSpotInstanceRequests"})
-    void aDryRunAnswersDryRunOperationWithoutReachingTheService(String action) {
-        Ec2Service service = mock(Ec2Service.class);
+    void aDryRunAnswersDryRunOperationThroughTheCorrectValidationBoundary(String action) {
+        boolean validatesInService = Set.of("TerminateInstances", "StartInstances", "StopInstances", "RebootInstances",
+                "DeleteTags", "DeleteRoute", "DetachVolume", "CancelSpotInstanceRequests").contains(action);
+        AtomicInteger validationCalls = new AtomicInteger();
+        Ec2Service service = mock(Ec2Service.class, invocation -> {
+            assertEquals(true, validatesInService, "This operation must stop before reaching its service");
+            assertEquals(Character.toLowerCase(action.charAt(0)) + action.substring(1),
+                    invocation.getMethod().getName());
+            assertEquals(REGION, invocation.getArgument(0));
+            assertEquals(Boolean.TRUE, invocation.getArgument(invocation.getArguments().length - 1),
+                    "Validation must receive DryRun=true, so it cannot perform the real operation");
+            validationCalls.incrementAndGet();
+            throw Ec2Service.dryRunOperation();
+        });
         Ec2QueryHandler handler = new Ec2QueryHandler(service, mock(EmulatorConfig.class),
                 mock(FlowLogService.class), mock(Ec2EbsEncryptionService.class),
                 mock(Ec2BlockPublicAccessService.class), mock(Ec2IpamService.class),
@@ -56,7 +69,7 @@ class Ec2DestructiveDryRunTest {
 
         assertEquals(412, response.getStatus());
         assertThat(response.getEntity().toString(), containsString("<Code>DryRunOperation</Code>"));
-        verifyNoInteractions(service);
+        assertEquals(validatesInService ? 1 : 0, validationCalls.get());
     }
 
     @ParameterizedTest
