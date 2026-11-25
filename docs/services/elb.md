@@ -20,6 +20,7 @@ Floci supports Application Load Balancers (ALB) and Network Load Balancers (NLB)
 | ModifyLoadBalancerAttributes | Updates persisted load balancer attributes. |
 | DescribeLoadBalancerAttributes | Returns attributes stored for a load balancer. |
 | DescribeCapacityReservation | Returns the stored capacity reservation fields for a load balancer. |
+| DescribeProvisionedCapacity | Legacy Floci capacity view for an application load balancer without a reservation. |
 | SetSecurityGroups | Replaces the security groups associated with a load balancer. |
 | SetSubnets | Replaces the subnets associated with a load balancer. |
 | SetIpAddressType | Updates the IP address type stored for a load balancer. |
@@ -418,3 +419,5 @@ These explicit overrides intentionally change local compatibility; they do not
 change the AWS API shape or require a separate Floci process for each region.
 
 CloudFormation rollback can restore a saved legacy ALB subnet list with repeated Availability Zones. This internal snapshot path still checks subnet existence, the zone minimum, and VPC membership; new API and stack-update requests continue to reject repeated zones.
+
+`DescribeProvisionedCapacity` is a legacy Floci Query extension using version `2015-12-01` and exactly one `LoadBalancerArn`. Its `ProvisionedCapacity` contains `MinimumLBCapacityUnits=0`, `Status=disabled` and `DecreasesRemaining=4`; `LastModifiedTime` is absent. Floci reserves no capacity, so startup and health states do not imply a pending reservation. Invalid scope and non-application types are rejected; deleted and inaccessible load balancers are hidden. IAM checks `elasticloadbalancing:DescribeProvisionedCapacity` against the named load balancer. This extension is not a public AWS SDK operation. The separate public `DescribeCapacityReservation` action is unchanged. Quota overrides and reservation mutations are not implemented.
