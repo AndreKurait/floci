@@ -1,7 +1,7 @@
 {
   "_source": {
     "generator": "tools/aws/regen_stepfunctions_compute_shapes.py",
-    "botocore": "botocore 1.43.118 (installed package)"
+    "botocore": "--botocore-data /srv/floci-agent/runs/root-allocator-reconcile-20261125T031857Z/complete-dev-composition/botocore-1.44.9-complete-observation/botocore/data"
   },
   "services": {
     "ec2": {
@@ -1620,12 +1620,26 @@
         "MarketType": {
           "type": "string"
         },
+        "MetricCategoryId": {
+          "type": "string"
+        },
+        "MetricCategoryIdList": {
+          "type": "list",
+          "member": {
+            "shape": "MetricCategoryId",
+            "locationName": "item"
+          }
+        },
         "MillisecondDateTime": {
           "type": "timestamp"
         },
         "Monitoring": {
           "type": "structure",
           "members": {
+            "MetricCategoryIds": {
+              "shape": "MetricCategoryIdList",
+              "locationName": "metricCategoryIdSet"
+            },
             "State": {
               "shape": "MonitoringState",
               "locationName": "state"
@@ -1841,6 +1855,10 @@
             "Enabled"
           ],
           "members": {
+            "MetricCategoryIds": {
+              "shape": "MetricCategoryIdList",
+              "locationName": "MetricCategoryId"
+            },
             "Enabled": {
               "shape": "Boolean",
               "locationName": "enabled"

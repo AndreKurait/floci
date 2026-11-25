@@ -139,7 +139,7 @@ class StepFunctionsComputeIntegrationTest {
             cloud.iam.deleteRolePolicy(request -> request.roleName(cloud.name).policyName("tasks"));
             JsonNode denied = cloud.task("ec2", "describeInstances", Map.of());
             assertEquals("Ec2.Ec2Exception", denied.path("Error").asText());
-            assertTrue(denied.path("Cause").asText().contains("AccessDenied"));
+            assertTrue(denied.path("Cause").asText().contains("UnauthorizedOperation"));
             cloud.iam.putRolePolicy(request -> request.roleName(cloud.name).policyName("tasks").policyDocument(ACTIONS));
             assertTrue(cloud.task("ec2", "describeInstances", Map.of()).path("Reservations").isArray());
             cloud.iam.updateAssumeRolePolicy(request -> request.roleName(cloud.name).policyDocument("""
