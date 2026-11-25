@@ -70,6 +70,7 @@ class VpcNetworkTeardownDockerIntegrationTest {
         String namespace = "vpc-attach-loss-" + UUID.randomUUID();
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.port()).thenReturn(4650);
+        when(config.defaultAccountId()).thenReturn("000000000000");
         when(config.services().ec2().mock()).thenReturn(false);
         when(config.services().ec2().vpcNetworks().enabled()).thenReturn(true);
         when(config.services().ec2().vpcNetworks().driver()).thenReturn("bridge");
@@ -154,6 +155,7 @@ class VpcNetworkTeardownDockerIntegrationTest {
         String namespace = "vpc-delete-" + UUID.randomUUID();
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.port()).thenReturn(4650);
+        when(config.defaultAccountId()).thenReturn("000000000000");
         when(config.services().ec2().mock()).thenReturn(false);
         when(config.services().ec2().vpcNetworks().enabled()).thenReturn(true);
         when(config.services().ec2().vpcNetworks().driver()).thenReturn("bridge");

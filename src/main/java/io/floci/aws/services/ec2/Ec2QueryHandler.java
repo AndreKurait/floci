@@ -4899,7 +4899,6 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDeleteRoute(MultivaluedMap<String, String> p, String region) {
-        checkDryRun(p);
         String rtId = p.getFirst("RouteTableId");
         String dest = p.getFirst("DestinationCidrBlock");
         String destIpv6 = p.getFirst("DestinationIpv6CidrBlock");
