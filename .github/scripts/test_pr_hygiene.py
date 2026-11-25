@@ -86,6 +86,21 @@ else:
         gh.chmod(0o755)
         self.env.update(PATH=f"{tools}:{self.env['PATH']}", BASE_SHA=self.base, HEAD_SHA=self.head,
                         REPO="example/floci", GH_TOKEN="fixture-token")
+        self.env.update(GITHUB_EVENT_NAME="pull_request", GITHUB_REPOSITORY_ID="123",
+                        GITHUB_WORKSPACE=str(WORKFLOW.parents[2]), RUNNER_TEMP=str(self.root),
+                        GITHUB_EVENT_PATH=str(self.root / "event.json"))
+        self.write_event()
+
+    def write_event(self, base_ref="main", head_ref="feature", head_repository="example/floci"):
+        repository = {"id": 123, "full_name": "example/floci"}
+        event = {"repository": repository, "pull_request": {
+            "base": {"sha": self.base, "ref": base_ref, "repo": repository},
+            "head": {"sha": self.head, "ref": head_ref, "repo": {
+                "id": 123 if head_repository == "example/floci" else 456,
+                "full_name": head_repository}},
+        }}
+        Path(self.env["GITHUB_EVENT_PATH"]).write_text(json.dumps(event))
+
 
     def git(self, *args, input=None):
         return subprocess.check_output(["git", *args], cwd=self.root, env=self.env,
