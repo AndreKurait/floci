@@ -17,6 +17,8 @@ import io.floci.aws.services.eks.model.OidcIdentity;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.testing.DockerAvailability;
 import io.floci.aws.testing.EksPodIdentityProfile;
+import io.floci.aws.testing.ParallelLocks;
+import io.quarkus.test.common.QuarkusTestResourceLifecycleManager;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import jakarta.inject.Inject;
@@ -25,9 +27,14 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
+import java.nio.file.Path;
 import java.time.Instant;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -36,8 +43,54 @@ import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @QuarkusTest
-@TestProfile(EksPodIdentityProfile.class)
+@TestProfile(EksPodIdentityDockerIntegrationTest.Profile.class)
+@ResourceLock(ParallelLocks.TLS_CONFIG)
 class EksPodIdentityDockerIntegrationTest {
+
+    /** The public proxy is reachable from Docker; the real TLS bootstrap keeps its backends private. */
+    public static class Profile extends EksPodIdentityProfile {
+        @Override
+        public Map<String, String> getConfigOverrides() {
+            Map<String, String> overrides = new HashMap<>(super.getConfigOverrides());
+            // The public host comes from the bootstrap below; the TLS config source pins the backends.
+            overrides.remove("quarkus.http.host");
+            return overrides;
+        }
+
+        @Override
+        public List<TestResourceEntry> testResources() {
+            return List.of(new TestResourceEntry(TlsBootstrap.class));
+        }
+    }
+
+    /** Profile overrides alone are not visible to TlsConfigSource's early bootstrap. */
+    public static class TlsBootstrap implements QuarkusTestResourceLifecycleManager {
+        private final Map<String, String> original = new HashMap<>();
+
+        @Override
+        public Map<String, String> start() {
+            String directory = Path.of("target", "eks-pod-identity-tls").toAbsolutePath().toString();
+            Map<String, String> properties = Map.of("floci.tls.enabled", "true",
+                    "floci.storage.persistent-path", directory, "quarkus.http.host", "0.0.0.0");
+            properties.forEach((name, value) -> {
+                original.put(name, System.getProperty(name));
+                System.setProperty(name, value);
+            });
+            return Map.of("floci.storage.persistent-path", directory);
+        }
+
+        @Override
+        public void stop() {
+            original.forEach((name, value) -> {
+                if (value == null) {
+                    System.clearProperty(name);
+                } else {
+                    System.setProperty(name, value);
+                }
+            });
+            original.clear();
+        }
+    }
 
     private static final Logger LOG = Logger.getLogger(EksPodIdentityDockerIntegrationTest.class);
     private static final String TEST_IMAGE = "alpine:3.21";
@@ -143,6 +196,7 @@ class EksPodIdentityDockerIntegrationTest {
         ContainerSpec spec = containerBuilder.newContainer(TEST_IMAGE)
                 .withName("floci-eks-pi-test-" + clusterName)
                 .withPrivileged(true)
+                .withDockerNetwork(Optional.empty())
                 .withHostDockerInternalOnLinux()
                 // PID 1 gets no default SIGTERM handler, so a bare "sleep 300" sits out the
                 // whole stopAndRemove grace period when @AfterEach tears the container down.
@@ -171,6 +225,14 @@ class EksPodIdentityDockerIntegrationTest {
                 "pods.eks.amazonaws.com", 3600);
         String missingCode = execInContainer(containerId, "curl -s -o /dev/null -w '%{http_code}' -H 'Authorization: " + unassociatedToken + "' http://169.254.170.23/v1/credentials");
         assertEquals("404", missingCode.trim());
+
+        for (int privatePort : List.of(4510, 4511)) {
+            ContainerExec.Result direct = ContainerExec.runMerged(dockerClient, containerId,
+                    new String[]{"sh", "-c", "curl -sS --connect-timeout 2 --max-time 3 -o /dev/null http://"
+                            + dockerHostResolver.resolve() + ":" + privatePort + "/"}, 5);
+            assertFalse(direct.timedOut(), direct.summary());
+            assertEquals(7, direct.exitCode(), "Private API port " + privatePort + ": " + direct.summary());
+        }
     }
 
     private String execInContainer(String containerId, String cmd) {
