@@ -8,11 +8,14 @@ import io.floci.aws.services.lambda.LambdaService;
 import io.floci.aws.services.lambda.model.InvokeResult;
 import io.floci.aws.services.lambda.model.LambdaFunction;
 import io.floci.aws.services.secretsmanager.model.Secret;
+import io.floci.aws.testing.ThreadStates;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.time.Duration;
+import java.util.EnumSet;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -449,18 +452,9 @@ class SecretsManagerWriteLockTest {
         }
 
         /** Waits for the thread to sit on a monitor rather than for a fixed interval to pass. */
-        boolean awaitBlocked() throws InterruptedException {
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-            while (System.nanoTime() < deadline) {
-                if (thread.getState() == Thread.State.BLOCKED) {
-                    return true;
-                }
-                if (!thread.isAlive()) {
-                    return false;
-                }
-                Thread.sleep(5);
-            }
-            return false;
+        boolean awaitBlocked() {
+            return ThreadStates.awaitState(thread, EnumSet.of(Thread.State.BLOCKED, Thread.State.TERMINATED),
+                    Duration.ofSeconds(5), thread.getName()) == Thread.State.BLOCKED;
         }
 
         void awaitSuccess() throws InterruptedException {
