@@ -14,6 +14,8 @@ import java.util.function.LongSupplier;
 final class PostgresIamReadiness {
     private static final long BUDGET_NANOS = TimeUnit.SECONDS.toNanos(60);
     private static final long EXEC_NANOS = TimeUnit.SECONDS.toNanos(5);
+    // An exec given less than this cannot finish; it would only replace the last psql error with a timeout.
+    private static final long MIN_EXEC_NANOS = TimeUnit.MILLISECONDS.toNanos(500);
     private static final long POLL_NANOS = TimeUnit.SECONDS.toNanos(1);
 
     private PostgresIamReadiness() {
@@ -29,8 +31,9 @@ final class PostgresIamReadiness {
         void await(long nanos) throws InterruptedException;
     }
 
-    static void await(DockerClient docker, String containerId, String[] command, Semaphore startupSignal) {
-        await(containerId, timeout -> {
+    static void await(DockerClient docker, String containerName, String containerId, String[] command,
+                      Semaphore startupSignal) {
+        await(containerName, timeout -> {
             ByteArrayOutputStream stdout = new ByteArrayOutputStream();
             ByteArrayOutputStream stderr = new ByteArrayOutputStream();
             ContainerExec.Result result = ContainerExec.run(docker, containerId, command, timeout, stdout, stderr);
@@ -39,57 +42,62 @@ final class PostgresIamReadiness {
         }, System::nanoTime, nanos -> startupSignal.tryAcquire(nanos, TimeUnit.NANOSECONDS));
     }
 
-    static void await(String containerId, Probe probe, LongSupplier clock, Waiter waiter) {
+    static void await(String containerName, Probe probe, LongSupplier clock, Waiter waiter) {
         long deadline = clock.getAsLong() + BUDGET_NANOS;
         String lastOutput = "(no output)";
+        int execTimeouts = 0;
         while (true) {
-            checkInterrupted(containerId);
+            checkInterrupted(containerName);
             long remaining = deadline - clock.getAsLong();
-            if (remaining <= 0) {
-                throw failure(containerId, lastOutput);
+            if (remaining < MIN_EXEC_NANOS) {
+                throw failure(containerName, lastOutput, execTimeouts);
             }
             ContainerExec.Result result;
             try {
                 result = probe.run(Duration.ofNanos(Math.min(EXEC_NANOS, remaining)));
-                lastOutput = result.summary();
             } catch (RuntimeException error) {
-                checkInterrupted(containerId);
-                // A broken exec connection may leave SQL running. Retrying could
-                // overlap role creation, so let launch cleanup stop the container.
-                throw new IllegalStateException("Could not initialize PostgreSQL IAM role in " + containerId, error);
+                checkInterrupted(containerName);
+                // An exec that cannot be started or read usually means the container or Docker is
+                // gone, which waiting does not fix. Fail now so launch cleanup removes the container.
+                throw new IllegalStateException("Could not initialize PostgreSQL IAM role in " + containerName, error);
             }
-            checkInterrupted(containerId);
+            checkInterrupted(containerName);
             if (result.timedOut()) {
-                // The exec may still be running; launch cleanup must stop it rather than overlap another SQL command.
-                throw failure(containerId, lastOutput);
-            }
-            if (result.exitCode() < 0) {
-                throw new IllegalStateException("Unknown PostgreSQL IAM initialization outcome in "
-                        + containerId + ": " + lastOutput);
+                // Usually a slow host, not hung SQL. Retrying is safe because the SQL is idempotent:
+                // if the abandoned exec still creates the role, the retry finds it and exits 0.
+                execTimeouts++;
+            } else if (result.exitCode() == 0) {
+                // A completed success stands even when exec overhead ran past the deadline.
+                return;
+            } else {
+                // Covers a missing exit status (-1) too: the exec has ended, so it is retried like any failure.
+                lastOutput = result.summary();
             }
             remaining = deadline - clock.getAsLong();
-            if (remaining <= 0) {
-                throw failure(containerId, lastOutput);
-            }
-            if (result.exitCode() == 0) {
-                return;
+            if (remaining < MIN_EXEC_NANOS) {
+                throw failure(containerName, lastOutput, execTimeouts);
             }
             try {
                 waiter.await(Math.min(POLL_NANOS, remaining));
             } catch (InterruptedException error) {
                 Thread.currentThread().interrupt();
-                throw new IllegalStateException("Interrupted initializing PostgreSQL IAM role in " + containerId, error);
+                throw new IllegalStateException("Interrupted initializing PostgreSQL IAM role in " + containerName,
+                        error);
             }
         }
     }
 
-    private static void checkInterrupted(String containerId) {
+    private static void checkInterrupted(String containerName) {
         if (Thread.currentThread().isInterrupted()) {
-            throw new IllegalStateException("Interrupted initializing PostgreSQL IAM role in " + containerId);
+            throw new IllegalStateException("Interrupted initializing PostgreSQL IAM role in " + containerName);
         }
     }
 
-    private static IllegalStateException failure(String containerId, String output) {
-        return new IllegalStateException("Timed out initializing PostgreSQL IAM role in " + containerId + ": " + output);
+    private static IllegalStateException failure(String containerName, String lastOutput, int execTimeouts) {
+        // Exec timeouts point at a slow host rather than at PostgreSQL never becoming ready.
+        String detail = execTimeouts == 0 ? lastOutput
+                : execTimeouts + " exec(s) did not finish in time; last output: " + lastOutput;
+        return new IllegalStateException("Timed out initializing PostgreSQL IAM role in " + containerName + ": "
+                + detail);
     }
 }
