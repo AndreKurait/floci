@@ -104,6 +104,29 @@ class EcrRegistryAuthorizationTest {
     }
 
     @Test
+    void loginProbeValidatesExpiryAndPreservesRegionalRepositoryChecks() {
+        String header = "Basic " + auth.issue(REGION).authorizationToken();
+        assertEquals(REGION, auth.authenticateLoginProbe(header).token().region());
+        assertEquals(401, assertThrows(AwsException.class,
+                () -> auth.authenticate(header, "us-east-1")).getHttpStatus());
+        EcrRegistryAuthorization expired = new EcrRegistryAuthorization(store, iam,
+                new IamPolicyEvaluator(new ObjectMapper()), request, config, Clock.offset(clock, Duration.ofHours(13)));
+        assertEquals(401, assertThrows(AwsException.class,
+                () -> expired.authenticateLoginProbe(header)).getHttpStatus());
+    }
+
+    @ParameterizedTest
+    @NullAndEmptySource
+    @ValueSource(strings = {" "})
+    void loginProbeRejectsRecordsWithoutAnIssuingRegion(String storedRegion) {
+        String header = "Basic " + auth.issue(storedRegion).authorizationToken();
+        clearInvocations(iam);
+        assertEquals(401, assertThrows(AwsException.class,
+                () -> auth.authenticateLoginProbe(header)).getHttpStatus());
+        verifyNoInteractions(iam);
+    }
+
+    @Test
     void issuanceRequiresVerifiedCallerWithoutRootFallback() {
         when(request.isSignatureVerifiedFor("AKIAISSUED")).thenReturn(false);
         assertEquals(403, assertThrows(AwsException.class, () -> auth.issue(REGION)).getHttpStatus());

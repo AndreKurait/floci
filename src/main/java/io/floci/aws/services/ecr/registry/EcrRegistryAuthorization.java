@@ -119,6 +119,19 @@ public class EcrRegistryAuthorization {
 
     @ActivateRequestContext
     public Identity authenticate(String authorization, String region) {
+        if (region == null || region.isBlank()) {
+            throw unauthorized();
+        }
+        return authenticatedIdentity(authorization, region);
+    }
+
+    /** Path-style login has no repository Region; repository requests remain Region-bound. */
+    @ActivateRequestContext
+    public Identity authenticateLoginProbe(String authorization) {
+        return authenticatedIdentity(authorization, null);
+    }
+
+    private Identity authenticatedIdentity(String authorization, String region) {
         String password = password(authorization);
         if (password == null) {
             throw unauthorized();
@@ -126,7 +139,8 @@ public class EcrRegistryAuthorization {
         AccountAwareStorageBackend.OwnedEntry<TokenRecord> stored = tokens.findAnyAccountEntry(hash(password)).orElseThrow(EcrRegistryAuthorization::unauthorized);
         TokenRecord token = stored.value();
         if (!stored.account().equals(token.accountId()) || !token.expiresAt().isAfter(clock.instant())
-                || token.region() == null || !token.region().equals(region)) {
+                || token.region() == null || token.region().isBlank()
+                || region != null && !token.region().equals(region)) {
             throw unauthorized();
         }
         if (token.enforcementDisabled()) {
