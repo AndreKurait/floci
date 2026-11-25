@@ -20,6 +20,7 @@ import io.floci.aws.services.eks.model.FargateProfile;
 import io.floci.aws.services.eks.model.Nodegroup;
 import io.floci.aws.services.eks.model.PodIdentityAssociation;
 import io.floci.aws.services.eks.model.Update;
+import io.floci.aws.services.eks.model.UpdateAccessEntryRequest;
 import io.floci.aws.services.eks.model.UpdateAddonRequest;
 import io.floci.aws.services.eks.model.UpdateClusterConfigRequest;
 import io.floci.aws.services.eks.model.UpdatePodIdentityAssociationRequest;
@@ -267,6 +268,14 @@ public class EksController {
     @Path("/clusters/{name}/access-entries/{principalArn: .+}")
     public Response describeAccessEntry(@PathParam("name") String name, @PathParam("principalArn") String principalArn) {
         return Response.ok(Map.of("accessEntry", accessEntries.describe(eksService.requireClusterInRequestRegion(name), principalArn))).build();
+    }
+
+    @POST
+    @Path("/clusters/{name}/access-entries/{principalArn: .+}")
+    public Response updateAccessEntry(@PathParam("name") String name, @PathParam("principalArn") String principalArn,
+                                      JsonNode request) {
+        return Response.ok(Map.of("accessEntry", eksService.updateAccessEntryInRequestRegion(
+                name, principalArn, UpdateAccessEntryRequest.fromJson(request)))).build();
     }
 
     @DELETE
