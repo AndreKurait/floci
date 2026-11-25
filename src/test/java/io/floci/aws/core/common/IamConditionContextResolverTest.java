@@ -2103,13 +2103,12 @@ class IamConditionContextResolverTest {
                 .thenReturn(mapper.readTree("{\"logGroupName\":\" group \",\"logStreamName\":42}"));
         when(logsService.listTagsLogGroup(" group ", "eu-west-1")).thenReturn(Map.of("team", "blue"));
         requestContext.setRegion("eu-west-1");
-        for (String action : List.of("logs:CreateLogStream", "logs:DeleteLogStream", "logs:PutLogEvents")) {
-            assertEquals(Map.of("aws:ResourceTag/team", List.of("blue")), resolver.resolve("logs", action, request));
-        }
+        assertEquals(Map.of("aws:ResourceTag/team", List.of("blue")),
+                resolver.resolve("logs", "logs:PutLogEvents", request));
         requestContext.setRegion(null);
         when(logsService.listTagsLogGroup(" group ", "us-east-1")).thenReturn(Map.of("team", "red"));
         assertEquals(Map.of("aws:ResourceTag/team", List.of("red")),
-                resolver.resolve("logs", "logs:CreateLogStream", request));
+                resolver.resolve("logs", "logs:PutLogEvents", request));
     }
 
     @Test
@@ -2118,7 +2117,7 @@ class IamConditionContextResolverTest {
         when(request.getProperty("floci.bufferedJsonBody")).thenReturn(mapper.readTree("{\"logGroupName\":42}"));
         when(logsService.listTagsLogGroup("42", "us-east-1"))
                 .thenThrow(new AwsException("ResourceNotFoundException", "missing", 400));
-        assertNull(resolver.resolve("logs", "logs:DeleteLogStream", request));
+        assertNull(resolver.resolve("logs", "logs:PutLogEvents", request));
     }
 
     @Test
@@ -2128,11 +2127,22 @@ class IamConditionContextResolverTest {
         AwsException failure = new AwsException("InternalFailure", "storage unavailable", 500);
         when(logsService.listTagsLogGroup("group", "us-east-1")).thenThrow(failure);
         assertSame(failure, assertThrows(AwsException.class,
-                () -> resolver.resolve("logs", "logs:CreateLogStream", request)));
+                () -> resolver.resolve("logs", "logs:PutLogEvents", request)));
         IllegalStateException unexpected = new IllegalStateException("unavailable");
         doThrow(unexpected).when(logsService).listTagsLogGroup("group", "us-east-1");
         assertSame(unexpected, assertThrows(IllegalStateException.class,
-                () -> resolver.resolve("logs", "logs:DeleteLogStream", request)));
+                () -> resolver.resolve("logs", "logs:PutLogEvents", request)));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"logs:CreateLogStream", "logs:DeleteLogStream"})
+    void streamCreationAndDeletionDoNotInheritParentGroupTags(String action) throws Exception {
+        ContainerRequestContext request = mock(ContainerRequestContext.class);
+        when(request.getProperty("floci.bufferedJsonBody"))
+                .thenReturn(mapper.readTree("{\"logGroupName\":\"group\",\"logStreamName\":\"stream\"}"));
+        when(logsService.listTagsLogGroup("group", "us-east-1")).thenReturn(Map.of("team", "blue"));
+        assertNull(resolver.resolve("logs", action, request));
+        verify(logsService, never()).listTagsLogGroup(anyString(), anyString());
     }
 
     private ContainerRequestContext webRequest(String path, String body) throws Exception {
