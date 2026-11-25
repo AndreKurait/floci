@@ -789,6 +789,7 @@ class IamActionRegistryTest {
         assertEquals("s3:PutObject", s3Action("POST", "/bucket/key", "uploadId=u1"));
         assertEquals("s3:RestoreObject", s3Action("POST", "/bucket/key", "restore"));
         assertEquals("s3:GetObject", s3Action("POST", "/bucket/key", "select", "select-type=2"));
+        assertEquals("s3:GetObject", s3Action("POST", "/bucket/key", "select", "select-type=2", "versionId=old"));
         // No bucket-level multipart POST is checked: S3VirtualHostFilter moves a virtual-hosted
         // upload's bucket into the path before IAM sees it, so the upload reaches the object rules.
         assertNull(s3Action("POST", "/key", "uploads"));

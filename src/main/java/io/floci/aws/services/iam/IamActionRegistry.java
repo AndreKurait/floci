@@ -1242,8 +1242,8 @@ public class IamActionRegistry {
                     yield "s3:RestoreObject";
                 }
                 if (params.containsKey("select")) {
-                    // S3Controller selects from the version a versionId names.
-                    yield S3ObjectActions.forVersion("s3:GetObject", versionId);
+                    // SelectObjectContent reads the current object; its modeled input names no version.
+                    yield "s3:GetObject";
                 }
                 yield params.containsKey("uploadId") ? "s3:PutObject" : null;
             }
