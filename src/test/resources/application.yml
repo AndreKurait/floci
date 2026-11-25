@@ -38,6 +38,7 @@ floci:
       sns:
         flush-interval-ms: 60000
       lambda:
+        # Includes per-version runtime-management settings.
         flush-interval-ms: 60000
       cloudwatchlogs:
         # Includes saved Logs Insights query definitions.
