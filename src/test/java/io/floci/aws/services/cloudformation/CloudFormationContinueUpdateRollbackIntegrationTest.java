@@ -156,6 +156,7 @@ class CloudFormationContinueUpdateRollbackIntegrationTest {
             List<Map<String, String>> events = events(stack.id());
             boolean skipped = false;
             for (Map<String, String> event : events) {
+                assertEquals("cur-skip-token", event.get("ClientRequestToken"), event.toString());
                 if (stack.name().equals(event.get("LogicalResourceId"))
                         && "UPDATE_ROLLBACK_IN_PROGRESS".equals(event.get("ResourceStatus"))) {
                     assertEquals(USER_INITIATED, event.get("ResourceStatusReason"), event.toString());
