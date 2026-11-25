@@ -667,9 +667,6 @@ NOT_COVERED: dict[str, str] = {
                    "CreateControlChannel, OpenControlChannel and CreateDataChannel unscoped and "
                    "OpenDataChannel on its session",
     "sso-oauth": _REST,
-    "swf": "not read yet: the Service Reference gives a domain's ARN no Region, `swf::<account>:/domain/<name>`, "
-           "while the SWF Developer Guide gives it as arn:aws:swf:Region:AccountID:/domain/DomainName, as Floci mints "
-           "it; reading it needs that format corrected",
     "verifiedpermissions": "not read yet: a policyStoreId may name its store by an alias, `policy-store-alias/<name>`, "
                            "which AWS authorizes as the action on the store the alias points to and "
                            "GetPolicyStoreAlias on the alias, and an aliasName carries the `policy-store-alias/` its "
