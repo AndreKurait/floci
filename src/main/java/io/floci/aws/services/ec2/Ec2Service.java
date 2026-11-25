@@ -7289,17 +7289,21 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             egressOnlyInternetGateways.delete(key(region, eigwId));
             removeTags(region, eigwId);
         }
+        blackholeRoutes(region, route -> eigwId.equals(route.getEgressOnlyInternetGatewayId()));
+    }
+
+    private void blackholeRoutes(String region, Predicate<Route> targetsGateway) {
         for (RouteTable table : routeTables.scan(k -> k.startsWith(region + "::"))) {
-            if (table.getRoutes().stream().noneMatch(r -> eigwId.equals(r.getEgressOnlyInternetGatewayId()))) {
+            if (table.getRoutes().stream().noneMatch(targetsGateway)) {
                 continue;
             }
             synchronized (lockFor(key(region, table.getRouteTableId()))) {
                 RouteTable current = routeTables.get(key(region, table.getRouteTableId())).orElse(null);
-                if (current == null) {
+                if (current == null || current.getRoutes().stream().noneMatch(targetsGateway)) {
                     continue;
                 }
                 current.getRoutes().stream()
-                        .filter(r -> eigwId.equals(r.getEgressOnlyInternetGatewayId()))
+                        .filter(targetsGateway)
                         .forEach(r -> r.setState("blackhole"));
                 routeTables.put(key(region, current.getRouteTableId()), current);
                 notifyRouteTableUpdated(region, current);
@@ -13158,11 +13162,14 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      */
     public void deleteRouteTable(String region, String routeTableId, boolean dryRun) {
         ensureDefaultResources(region);
-        RouteTable rt = getRequiredRouteTable(region, routeTableId);
-        if (dryRun) {
-            throw dryRunOperation();
+        RouteTable rt;
+        synchronized (lockFor(key(region, routeTableId))) {
+            rt = getRequiredRouteTable(region, routeTableId);
+            if (dryRun) {
+                throw dryRunOperation();
+            }
+            routeTables.delete(key(region, routeTableId));
         }
-        routeTables.delete(key(region, routeTableId));
         notifyRouteTableUpdated(region, rt);
     }
 
@@ -14611,6 +14618,7 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
             natGateways.delete(key(region, natGatewayId));
             removeTags(region, natGatewayId);
             natGateway.getNatGatewayAddresses().forEach(a -> removeTags(region, a.getNetworkInterfaceId()));
+            blackholeRoutes(region, route -> natGatewayId.equals(route.getNatGatewayId()));
             return natGateway;
         }
     }
