@@ -1,5 +1,6 @@
 package io.floci.aws.services.s3;
 
+import io.floci.aws.testing.AwsTestClients;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.ValidatableResponse;
 import org.junit.jupiter.api.Assertions;
@@ -9,13 +10,17 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
+import software.amazon.awssdk.regions.Region;
+import software.amazon.awssdk.services.kms.KmsClient;
 
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
+import java.util.ArrayList;
 import java.util.Base64;
+import java.util.List;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.MatcherAssert.assertThat;
@@ -836,60 +841,68 @@ class S3PresignedPostIntegrationTest {
     void presignedPostPreservesKmsEncryptionOnEachVersion(String encryption) {
         String bucket = "presigned-post-kms-bucket-" + encryption.replace(':', '-');
         String key = "uploads/encrypted.txt";
-        String[] kmsKeys = {
-                "arn:aws:kms:us-east-1:000000000000:key/11111111-1111-1111-1111-111111111111",
-                "arn:aws:kms:us-east-1:000000000000:key/22222222-2222-2222-2222-222222222222"
-        };
-        String[] versionIds = new String[kmsKeys.length];
+        List<String> ownedKeys = new ArrayList<>();
+        try (KmsClient kms = AwsTestClients.create(KmsClient.builder(), "test", Region.US_EAST_1)) {
+            try {
+                for (int index = 0; index < 2; index++) {
+                    ownedKeys.add(kms.createKey().keyMetadata().arn());
+                }
+                String[] kmsKeys = ownedKeys.toArray(String[]::new);
+                String[] versionIds = new String[kmsKeys.length];
 
-        given().put("/" + bucket).then().statusCode(200);
-        given()
-            .body("<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>")
-        .when()
-            .put("/" + bucket + "?versioning")
-        .then()
-            .statusCode(200);
+                given().put("/" + bucket).then().statusCode(200);
+                given()
+                    .body("<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>")
+                .when()
+                    .put("/" + bucket + "?versioning")
+                .then()
+                    .statusCode(200);
 
-        for (int index = 0; index < kmsKeys.length; index++) {
-            versionIds[index] = given()
-                .multiPart("key", key)
-                .multiPart("x-amz-server-side-encryption", encryption)
-                .multiPart("x-amz-server-side-encryption-aws-kms-key-id", kmsKeys[index])
-                .multiPart("file", "encrypted.txt",
-                        ("version-" + index).getBytes(StandardCharsets.UTF_8), "text/plain")
-            .when()
-                .post("/" + bucket)
-            .then()
-                .statusCode(204)
-                .header("x-amz-server-side-encryption", equalTo(encryption))
-                .header("x-amz-server-side-encryption-aws-kms-key-id", equalTo(kmsKeys[index]))
-                .extract().header("x-amz-version-id");
-            assertThat(versionIds[index], notNullValue());
-        }
-        assertThat(versionIds[0], not(equalTo(versionIds[1])));
+                for (int index = 0; index < kmsKeys.length; index++) {
+                    versionIds[index] = given()
+                        .multiPart("key", key)
+                        .multiPart("x-amz-server-side-encryption", encryption)
+                        .multiPart("x-amz-server-side-encryption-aws-kms-key-id", kmsKeys[index])
+                        .multiPart("file", "encrypted.txt",
+                                ("version-" + index).getBytes(StandardCharsets.UTF_8), "text/plain")
+                    .when()
+                        .post("/" + bucket)
+                    .then()
+                        .statusCode(204)
+                        .header("x-amz-server-side-encryption", equalTo(encryption))
+                        .header("x-amz-server-side-encryption-aws-kms-key-id", equalTo(kmsKeys[index]))
+                        .extract().header("x-amz-version-id");
+                    assertThat(versionIds[index], notNullValue());
+                }
+                assertThat(versionIds[0], not(equalTo(versionIds[1])));
 
-        for (int index = 0; index < kmsKeys.length; index++) {
-            given()
-                .queryParam("versionId", versionIds[index])
-                .header("x-amz-checksum-mode", "ENABLED")
-            .when()
-                .head("/" + bucket + "/" + key)
-            .then()
-                .statusCode(200)
-                .header("x-amz-version-id", equalTo(versionIds[index]))
-                .header("x-amz-server-side-encryption", equalTo(encryption))
-                .header("x-amz-server-side-encryption-aws-kms-key-id", equalTo(kmsKeys[index]))
-                .header("x-amz-checksum-crc64nvme", notNullValue());
+                for (int index = 0; index < kmsKeys.length; index++) {
+                    given()
+                        .queryParam("versionId", versionIds[index])
+                        .header("x-amz-checksum-mode", "ENABLED")
+                    .when()
+                        .head("/" + bucket + "/" + key)
+                    .then()
+                        .statusCode(200)
+                        .header("x-amz-version-id", equalTo(versionIds[index]))
+                        .header("x-amz-server-side-encryption", equalTo(encryption))
+                        .header("x-amz-server-side-encryption-aws-kms-key-id", equalTo(kmsKeys[index]))
+                        .header("x-amz-checksum-crc64nvme", notNullValue());
 
-            given()
-                .queryParam("versionId", versionIds[index])
-            .when()
-                .get("/" + bucket + "/" + key)
-            .then()
-                .statusCode(200)
-                .header("x-amz-server-side-encryption", equalTo(encryption))
-                .header("x-amz-server-side-encryption-aws-kms-key-id", equalTo(kmsKeys[index]))
-                .body(equalTo("version-" + index));
+                    given()
+                        .queryParam("versionId", versionIds[index])
+                    .when()
+                        .get("/" + bucket + "/" + key)
+                    .then()
+                        .statusCode(200)
+                        .header("x-amz-server-side-encryption", equalTo(encryption))
+                        .header("x-amz-server-side-encryption-aws-kms-key-id", equalTo(kmsKeys[index]))
+                        .body(equalTo("version-" + index));
+                }
+            } finally {
+                ownedKeys.forEach(keyArn -> kms.scheduleKeyDeletion(request -> request.keyId(keyArn)
+                        .pendingWindowInDays(7)));
+            }
         }
     }
 

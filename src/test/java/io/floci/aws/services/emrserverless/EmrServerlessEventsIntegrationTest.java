@@ -19,6 +19,7 @@ import static org.awaitility.Awaitility.await;
 import static org.hamcrest.MatcherAssert.assertThat;
 import static org.hamcrest.Matchers.containsInAnyOrder;
 import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.greaterThanOrEqualTo;
 import static org.hamcrest.Matchers.nullValue;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 
@@ -75,7 +76,7 @@ class EmrServerlessEventsIntegrationTest {
     }
 
     @Test
-    void aFinishedRunReportsZeroBilledAndTotalResourceUtilization() {
+    void aFinishedRunReportsUsedResourcesAndMinimumWorkerBilling() {
         // A Region of its own, whose events no rule of the other test can see.
         String region = "eu-central-2";
         String applicationId = EmrServerlessRequests.createSparkApplication(region, "emr-7.5.0");
@@ -88,10 +89,21 @@ class EmrServerlessEventsIntegrationTest {
 
         for (String jobRunId : List.of(succeeded, cancelled)) {
             ValidatableResponse finished = jobRun(region, applicationId, jobRunId);
-            for (String utilization : List.of("billedResourceUtilization", "totalResourceUtilization")) {
-                finished.body("jobRun." + utilization + ".vCPUHour", equalTo(0.0f))
-                        .body("jobRun." + utilization + ".memoryGBHour", equalTo(0.0f))
-                        .body("jobRun." + utilization + ".storageGBHour", equalTo(0.0f));
+            // Four default Spark workers each have 4 vCPUs, 16 GB memory and 20 GB included disk.
+            finished.body("jobRun.billedResourceUtilization.vCPUHour", greaterThanOrEqualTo(16.0f / 60))
+                    .body("jobRun.billedResourceUtilization.memoryGBHour", greaterThanOrEqualTo(64.0f / 60))
+                    .body("jobRun.billedResourceUtilization.storageGBHour", equalTo(0.0f));
+            for (String resource : List.of("vCPUHour", "memoryGBHour", "storageGBHour")) {
+                float used = finished.extract().path("jobRun.totalResourceUtilization." + resource);
+                assertThat(used, greaterThanOrEqualTo(0.0f));
+                if (!"storageGBHour".equals(resource)) {
+                    finished.body("jobRun.billedResourceUtilization." + resource, greaterThanOrEqualTo(used));
+                }
+            }
+            if (jobRunId.equals(succeeded)) {
+                finished.body("jobRun.totalResourceUtilization.vCPUHour", equalTo(0.0f))
+                        .body("jobRun.totalResourceUtilization.memoryGBHour", equalTo(0.0f))
+                        .body("jobRun.totalResourceUtilization.storageGBHour", equalTo(0.0f));
             }
         }
     }
