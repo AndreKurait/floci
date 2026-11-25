@@ -377,6 +377,22 @@ public class ResourceArnBuilder {
                 }
             }
         }
+        if ("rds".equals(credentialScope) && NeptuneSnapshotResources.supports(operation) && neptuneSnapshotResources != null
+                && !neptuneSnapshotResources.isUnsatisfied()) {
+            Map<String, String> parameters = new LinkedHashMap<>();
+            for (String member : List.of("Engine", "DBClusterIdentifier", "DBClusterSnapshotIdentifier",
+                    "SnapshotIdentifier", "DBClusterParameterGroupName", "DBSubnetGroupName")) {
+                String value = firstFormParam(ctx, member);
+                if (value != null) {
+                    parameters.put(member, value);
+                }
+            }
+            Optional<List<String>> resources = neptuneSnapshotResources.get().resolve(operation,
+                    parameters, partition, region, accountId);
+            if (resources.isPresent()) {
+                return resources.get();
+            }
+        }
         if (operation != null && operation.startsWith(credentialScope + ":") && RequestResources.reads(operation)) {
             return namedResources(credentialScope, operation, ctx, region, accountId, partition);
         }
@@ -406,22 +422,6 @@ public class ResourceArnBuilder {
             String arn = BatchSchedulingPolicyTarget.taggedArn(ctx);
             if (BatchSchedulingPolicyTarget.isPolicySelector(arn)) {
                 return List.of(arn);
-            }
-        }
-        if ("rds".equals(credentialScope) && NeptuneSnapshotResources.supports(operation) && neptuneSnapshotResources != null
-                && !neptuneSnapshotResources.isUnsatisfied()) {
-            Map<String, String> parameters = new LinkedHashMap<>();
-            for (String member : List.of("Engine", "DBClusterIdentifier", "DBClusterSnapshotIdentifier",
-                    "SnapshotIdentifier", "DBClusterParameterGroupName", "DBSubnetGroupName")) {
-                String value = firstFormParam(ctx, member);
-                if (value != null) {
-                    parameters.put(member, value);
-                }
-            }
-            Optional<List<String>> resources = neptuneSnapshotResources.get().resolve(operation,
-                    parameters, partition, region, accountId);
-            if (resources.isPresent()) {
-                return resources.get();
             }
         }
         if ("iot".equals(credentialScope) && "iot:DeleteJob".equals(operation)) {
