@@ -11,10 +11,11 @@ import io.floci.aws.services.acm.AcmService;
 import io.floci.aws.services.cognito.model.UserPool;
 import io.floci.aws.services.cognito.model.UserPoolClient;
 import io.floci.aws.services.cognito.verification.CognitoMessageDispatcher;
-import io.floci.aws.services.cognito.verification.VerificationCode;
 import io.floci.aws.services.cognito.verification.VerificationCodeService;
 import io.floci.aws.services.lambda.LambdaService;
 import io.floci.aws.services.lambda.model.InvokeResult;
+import io.floci.aws.services.ses.SesService;
+import io.floci.aws.services.sns.SnsService;
 import io.floci.aws.testing.MutableClock;
 import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.BeforeEach;
@@ -43,6 +44,7 @@ class CognitoChallengeCompositionTest {
     private MutableClock clock;
     private CognitoService service;
     private CognitoMessageDispatcher dispatcher;
+    private SnsService sns;
     private LambdaService lambda;
     private UserPool pool;
     private UserPoolClient client;
@@ -51,7 +53,9 @@ class CognitoChallengeCompositionTest {
     void setUp() {
         clock = new MutableClock();
         lambda = mock(LambdaService.class);
-        dispatcher = mock(CognitoMessageDispatcher.class);
+        sns = mock(SnsService.class);
+        dispatcher = new CognitoMessageDispatcher(mock(SesService.class), sns,
+                new RegionResolver("us-east-1", "000000000000"));
         StorageFactory storageFactory = mock(StorageFactory.class);
         when(storageFactory.create(eq("cognito"), eq("cognito-verification-codes.json"), any()))
                 .thenAnswer(invocation -> AccountAwareStorageBackend.inMemory("000000000000"));
@@ -111,15 +115,19 @@ class CognitoChallengeCompositionTest {
     @Test
     void smsChallengeResolvesOnlyTheSessionUsersAliasBeforeConsumingItsCode() {
         service.setUserPoolMfaConfig(pool.getId(), "ON", false, true);
+        pool.setSmsAuthenticationMessage("MFA: {####}");
+        clearInvocations(sns);
         Map<String, Object> challenge = login();
         assertEquals("SMS_MFA", challenge.get("ChallengeName"));
-        ArgumentCaptor<String> code = ArgumentCaptor.forClass(String.class);
-        verify(dispatcher).dispatch(eq(pool), any(), eq(VerificationCode.Purpose.SMS_MFA),
-                code.capture(), eq(List.of("SMS")), any());
+        ArgumentCaptor<String> message = ArgumentCaptor.forClass(String.class);
+        verify(sns).publish(isNull(), isNull(), eq("+15555550123"), message.capture(),
+                isNull(), isNull(), eq("us-east-1"));
+        assertTrue(message.getValue().matches("MFA: \\d{6}"));
+        String code = message.getValue().substring("MFA: ".length());
         String session = (String) challenge.get("Session");
-        assertDenied("SMS_MFA", session, Map.of("USERNAME", OTHER_EMAIL, "SMS_MFA_CODE", code.getValue()));
+        assertDenied("SMS_MFA", session, Map.of("USERNAME", OTHER_EMAIL, "SMS_MFA_CODE", code));
         assertTokens(service.respondToAuthChallenge(client.getClientId(), "SMS_MFA", session,
-                Map.of("USERNAME", EMAIL, "SMS_MFA_CODE", code.getValue())));
+                Map.of("USERNAME", EMAIL, "SMS_MFA_CODE", code)));
     }
 
     @Test
