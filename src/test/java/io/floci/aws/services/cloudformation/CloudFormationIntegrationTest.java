@@ -2604,7 +2604,27 @@ class CloudFormationIntegrationTest {
             Thread.sleep(200);
         }
 
+        for (String action : List.of("ListStackResources", "DescribeStackResources", "DescribeStackResource")) {
+            RequestSpecification request = given().contentType("application/x-www-form-urlencoded")
+                    .formParam("Action", action).formParam("StackName", stackArn);
+            if ("DescribeStackResource".equals(action)) {
+                request.formParam("LogicalResourceId", "MyBucket");
+            }
+            request.when().post("/")
+            .then().statusCode(200).body(containsString("DELETE_COMPLETE"));
+        }
+
         clock.advance(Duration.ofSeconds(31));
+
+        for (String action : List.of("ListStackResources", "DescribeStackResources", "DescribeStackResource")) {
+            RequestSpecification request = given().contentType("application/x-www-form-urlencoded")
+                    .formParam("Action", action).formParam("StackName", stackArn);
+            if ("DescribeStackResource".equals(action)) {
+                request.formParam("LogicalResourceId", "MyBucket");
+            }
+            request.when().post("/")
+            .then().statusCode(400).body(containsString("does not exist"));
+        }
 
         given()
             .contentType("application/x-www-form-urlencoded")
