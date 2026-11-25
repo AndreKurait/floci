@@ -425,3 +425,14 @@ Set `FLOCI_SERVICES_ATHENA_MOCK=true` to skip DuckDB entirely for Athena. In thi
 `CREATE DATABASE`, the [Hive DDL](#hive-ddl) statements and an Iceberg `CREATE TABLE` still change the Glue catalog in mock mode, and `SHOW PARTITIONS` still returns its rows, since none of them needs the sidecar. Writes to an Iceberg table and `VACUUM` need it, so they succeed without effect.
 
 When mock mode is enabled the sidecar does **not** start. S3 Select will use the Java evaluator for CSV and JSON. Parquet queries will fail unless `FLOCI_SERVICES_DUCK_URL` points to an already-running floci-duck instance.
+
+Query executions with a recorded region are answered and listed only in that region.
+A direct read, result fetch, or stop elsewhere returns `InvalidRequestException` with
+`QueryExecution <id> was not found`. Account-scoped executions whose region was never
+recorded remain readable in every region. Raw unscoped legacy rows remain restricted
+to the configured default account and region. An authorized migration persists that
+legacy admission region in the query-region sidecar before adopting the row, so repeated
+reads keep the same workgroup IAM target and migration cannot broaden its visibility;
+a denied request neither migrates them nor changes their stored state. IAM resource
+discovery never invents a workgroup region for an account-scoped execution with no
+recorded region.

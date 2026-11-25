@@ -55,6 +55,9 @@ class AthenaDirectQueryServiceTest {
                 .getMetadata().getColumnInfo().getFirst().getType());
         assertTrue(fixture.queries.get("legacy").isEmpty());
         assertSame(query, fixture.queries.get(ACCOUNT + "/legacy").orElseThrow());
+        assertSame(query, fixture.service.getQueryExecution(REGION, "legacy"));
+        assertThrows(AwsException.class, () -> fixture.service.getQueryExecution("us-west-2", "legacy"));
+        assertTrue(fixture.service.listQueryExecutionsPage("us-west-2", null, 50, null).items().isEmpty());
     }
 
     @Test
