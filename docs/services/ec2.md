@@ -69,6 +69,36 @@ Every state change the container manager makes in the background is written to t
 
 A record is settled as `stopped` only once Docker confirms that its container stopped or is gone. When Docker cannot confirm it (it is unreachable, for one), the record keeps its state and the next start tries again, and an instance that cannot be settled is named in an error in the log. The releases of a termination (port forwards, firewall rules, addresses) are independent of the container removal, so one that fails neither skips it nor keeps the instance from terminating. The sweep that removes expired instances carries on past one that cannot be removed and reports the failure when it ends.
 
+Instances retained by a successful `RunInstances` client token remain available for replay until storage is reset.
+
+## RunInstances request replay
+
+`ClientToken` identifies a launch request within its account and region. Repeating a successful
+request returns its original reservation and instance IDs with the instances' current state.
+The replay does not launch containers again, consume another Capacity Reservation slot, reapply
+interface tags, or resolve the launch template again. Requests without a token launch independently.
+An explicitly supplied network interface must still exist: a deleted interface returns
+`InvalidNetworkInterfaceID.NotFound` before exact replay or parameter mismatch.
+`DryRun` retains its validation behavior and does not consume a token.
+
+A subnet or explicit availability zone scopes the token to that zone. A request without either
+binds to its selected zone; an explicit request for that zone uses the same outcome and must
+match the original parameters. Other zones are independent. Request matching retains original
+parameter presence, including omitted versus explicit `Monitoring.Enabled=false` and
+`DisableApiTermination=false`. Metadata options without a launch template use their effective
+launch defaults. Transport signatures and timestamps do not form part of request identity.
+Changed parameters return `IdempotentParameterMismatch`.
+
+The journal and generated resource ownership use the EC2 storage backend. Persistent, hybrid,
+and WAL modes persist allocation intent before resource publication and flush launch resources
+before acknowledging a completed outcome. Interrupted attempts reclaim their owned resources
+before retry; cleanup failures retain that ownership for retry or service startup recovery.
+Startup logs failed recovery attempts and continues recovering other pending requests and zones.
+Memory mode remains volatile. This is request replay, separate from Capacity Reservation
+membership recovery. Tokens and protected instance tombstones currently have no automatic
+expiry. CreateFleet does not pass its token to independent member launches.
+CreateFleet request replay remains unsupported.
+
 ## Instance Resource Limits
 
 By default, Docker containers launched for EC2 instances are bounded to the CPU and memory limits defined in the instance type catalog (`src/main/resources/ec2/instance-type-catalog.yaml`).
