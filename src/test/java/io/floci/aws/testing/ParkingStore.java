@@ -2,6 +2,7 @@ package io.floci.aws.testing;
 
 import io.floci.aws.core.storage.InMemoryStorage;
 
+import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -17,6 +18,7 @@ public final class ParkingStore<V> extends InMemoryStorage<String, V> {
 
     private final AtomicBoolean parkNextRead = new AtomicBoolean();
     private final AtomicBoolean parkNextWrite = new AtomicBoolean();
+    private final AtomicBoolean parkNextAtomicWrite = new AtomicBoolean();
     private final CountDownLatch parked = new CountDownLatch(1);
     private final CountDownLatch released = new CountDownLatch(1);
 
@@ -28,6 +30,11 @@ public final class ParkingStore<V> extends InMemoryStorage<String, V> {
     /** Parks the next {@code put}, before it writes the value. */
     public void parkNextWrite() {
         parkNextWrite.set(true);
+    }
+
+    /** Parks the next {@code putAllAtomically}, before writing its entries. */
+    public void parkNextAtomicWrite() {
+        parkNextAtomicWrite.set(true);
     }
 
     /** Waits up to two seconds for the armed call to park; false if it never did. */
@@ -54,6 +61,14 @@ public final class ParkingStore<V> extends InMemoryStorage<String, V> {
             park();
         }
         super.put(key, value);
+    }
+
+    @Override
+    public void putAllAtomically(Map<String, V> entries) {
+        if (parkNextAtomicWrite.getAndSet(false)) {
+            park();
+        }
+        super.putAllAtomically(entries);
     }
 
     private void park() {
