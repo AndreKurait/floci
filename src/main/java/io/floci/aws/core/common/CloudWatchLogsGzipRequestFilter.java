@@ -47,5 +47,6 @@ public class CloudWatchLogsGzipRequestFilter implements ContainerRequestFilter {
         }
         context.setEntityStream(new ByteArrayInputStream(
                 AwsJsonGzipBody.decode(context.getEntityStream(), MAX_BODY_BYTES)));
+        context.setProperty(AwsJsonGzipBody.DECODED_PROPERTY, Boolean.TRUE);
     }
 }
