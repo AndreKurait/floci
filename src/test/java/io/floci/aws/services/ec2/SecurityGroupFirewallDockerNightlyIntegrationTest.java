@@ -2,7 +2,9 @@ package io.floci.aws.services.ec2;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
+import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.Frame;
+import com.github.dockerjava.api.model.Network;
 import io.floci.aws.core.common.docker.ContainerBuilder;
 import io.floci.aws.core.common.docker.ContainerExec;
 import io.floci.aws.core.common.docker.ContainerLifecycleManager;
@@ -90,6 +92,63 @@ class SecurityGroupFirewallDockerNightlyIntegrationTest {
     @Inject ContainerLifecycleManager lifecycle;
     @Inject ContainerBuilder builder;
     @Inject DockerClient docker;
+
+    @Test
+    void metadataDnatBypassesDeniedEgressWithoutOpeningTheBackendDirectly() throws Exception {
+        Assumptions.assumeTrue(firewall.enabled());
+        try {
+            Assumptions.assumeTrue("linux".equalsIgnoreCase(docker.infoCmd().exec().getOsType()));
+        } catch (Exception e) {
+            Assumptions.abort("Docker daemon is unavailable");
+        }
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String eni = "eni-imds-" + suffix;
+        String networkName = "floci-sg-imds-" + suffix;
+        String backendName = "floci-sg-imds-backend-" + suffix;
+        String network = null;
+        String backend = null;
+        SecurityGroupFirewallManager.Namespace source = null;
+        try {
+            int subnetOctet = Integer.parseInt(suffix.substring(0, 2), 16);
+            Network.Ipam ipam = new Network.Ipam().withConfig(
+                    new Network.Ipam.Config().withSubnet("172.29." + subnetOctet + ".0/24"));
+            network = docker.createNetworkCmd().withName(networkName).withIpam(ipam).exec().getId();
+            backend = lifecycle.createAndStart(builder.newContainer("alpine:3.21")
+                    .withName(backendName)
+                    .withDockerNetwork(Optional.of(networkName))
+                    .withEntrypoint(List.of("sh", "-c"))
+                    .withCmd(List.of("exec nc -lk -p 8080 -e /bin/cat"))
+                    .build()).containerId();
+            String backendAddress = docker.inspectContainerCmd(backend).exec().getNetworkSettings()
+                    .getNetworks().values().stream().map(ContainerNetwork::getIpAddress)
+                    .filter(address -> address != null && !address.isBlank()).findFirst().orElseThrow();
+            for (int attempt = 0; attempt < 20 && connect(backend, "127.0.0.1") != 0; attempt++) {
+                Thread.sleep(100);
+            }
+            assertEquals(0, connect(backend, "127.0.0.1"));
+            source = firewall.createNamespace("ec2", "sg-imds-" + suffix, "000000000000",
+                    "us-east-1", Optional.of(networkName), Map.of());
+            SecurityGroup denyEgress = group("sg-imds", false, "192.0.2.0/24");
+            firewall.register(endpoint(eni, "10.0.0.2", source, denyEgress), source.helperId(), Map.of());
+
+            assertNotEquals(0, connect(source.helperId(), backendAddress, DENIED_TIMEOUT_SECONDS));
+            assertEquals(0, execute(source.helperId(),
+                    Ec2MetadataProxy.ec2RoutingCommand(backendName, 8080, false)));
+            assertEquals(0, execute(source.helperId(), "nc", "-z", "-w", "2", "169.254.169.254", "80"));
+            assertNotEquals(0, connect(source.helperId(), backendAddress, DENIED_TIMEOUT_SECONDS));
+        } finally {
+            firewall.unregister(eni);
+            if (source != null) {
+                lifecycle.removeIfExists(source.helperId());
+            }
+            if (backend != null) {
+                lifecycle.removeIfExists(backend);
+            }
+            if (network != null) {
+                docker.removeNetworkCmd(network).exec();
+            }
+        }
+    }
 
     @Test
     void legacyImdsRelayMigratesOfflineAndLeavesWildcardHttpPortAvailable() throws Exception {
@@ -315,11 +374,15 @@ class SecurityGroupFirewallDockerNightlyIntegrationTest {
     }
 
     private int connect(String worker, String address, int timeoutSeconds) throws Exception {
+        return execute(worker, "nc", "-z", "-w", String.valueOf(timeoutSeconds), address, "8080");
+    }
+
+    private int execute(String worker, String... command) throws Exception {
         String id = docker.execCreateCmd(worker).withAttachStdout(true).withAttachStderr(true)
-                .withCmd("nc", "-z", "-w", String.valueOf(timeoutSeconds), address, "8080")
+                .withCmd(command)
                 .exec().getId();
         try (ResultCallback.Adapter<Frame> callback = new ResultCallback.Adapter<>()) {
-            docker.execStartCmd(id).exec(callback).awaitCompletion(5, TimeUnit.SECONDS);
+            assertTrue(docker.execStartCmd(id).exec(callback).awaitCompletion(5, TimeUnit.SECONDS));
         }
         return docker.inspectExecCmd(id).exec().getExitCodeLong().intValue();
     }

@@ -3960,11 +3960,67 @@ public interface EmulatorConfig {
     }
 
     interface Ec2ServiceConfig {
+        /** Trusted network helper that prepares IMDS before the guest image starts. */
+        @WithDefault("floci/network-helper:local")
+        String metadataHelperImage();
+
         /** Optional full EC2 catalog file for locally built guest images. */
         Optional<String> imageCatalogPath();
 
         /** Optional JSON file of additional regional AWS-managed prefix lists. */
         Optional<String> managedPrefixListCatalogPath();
+
+        /**
+         * Explicit guest environment entries, each {@code KEY=VALUE}. Duplicate keys and
+         * Floci-owned identity, credential, region, endpoint and IMDS settings are rejected.
+         * Env: {@code FLOCI_SERVICES_EC2_EXTRA_ENV}, comma-separated; escape a comma as {@code \,}.
+         */
+        Optional<List<String>> extraEnv();
+
+        /**
+         * Guest process limits, each {@code name=soft[:hard]}; omitted hard equals soft and
+         * {@code -1} means unlimited. Unset keeps Docker's defaults.
+         * Env: {@code FLOCI_SERVICES_EC2_ULIMITS}, comma-separated.
+         */
+        Optional<List<String>> ulimits();
+
+        /**
+         * Docker privileged mode for guest containers. Security-group enforcement always
+         * disables it. Network and volume helpers retain their own privilege settings.
+         * Env: {@code FLOCI_SERVICES_EC2_PRIVILEGED}.
+         */
+        @WithDefault("true")
+        boolean privileged();
+
+        /**
+         * Linux capabilities to drop from guest containers, in addition to mandatory
+         * security-group restrictions. Set privileged=false for capability restrictions.
+         * Env: {@code FLOCI_SERVICES_EC2_CAP_DROP}, comma-separated.
+         */
+        Optional<List<String>> capDrop();
+
+        /**
+         * Linux capabilities to add to guest containers, for images whose own startup grants
+         * file capabilities (for example {@code setcap cap_syslog+ep}) outside Docker's default
+         * set. Security-group enforcement still removes NET_ADMIN and NET_RAW from these. A
+         * capability may not be both added and dropped. Set privileged=false for this to matter.
+         * Env: {@code FLOCI_SERVICES_EC2_CAP_ADD}, comma-separated.
+         */
+        Optional<List<String>> capAdd();
+
+        /**
+         * Read-only bind mounts supplied by the deployment before the guest starts.
+         * Sources are absolute Linux paths on the Docker daemon host, not the Floci process host.
+         * Indexed environment entries use {@code FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__SOURCE}
+         * and {@code FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__TARGET}.
+         */
+        @WithDefault("")
+        List<GuestReadOnlyBind> readOnlyBinds();
+
+        interface GuestReadOnlyBind {
+            String source();
+            String target();
+        }
 
         @WithDefault("true")
         boolean enabled();
