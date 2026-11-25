@@ -26,6 +26,7 @@ import jakarta.ws.rs.PathParam;
 import jakarta.ws.rs.Produces;
 import jakarta.ws.rs.QueryParam;
 import jakarta.ws.rs.core.Context;
+import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import jakarta.ws.rs.core.UriInfo;
@@ -141,7 +142,23 @@ public class AppConfigController {
     @GET
     @Path("/applications/{appId}/configurationprofiles/{profileId}")
     public Response getConfigurationProfile(@PathParam("appId") String appId, @PathParam("profileId") String profileId) {
-        return Response.ok(service.getConfigurationProfile(appId, profileId)).build();
+        ConfigurationProfile profile = service.getConfigurationProfile(appId, profileId);
+        if ("".equals(profile.getDescription())) {
+            ObjectNode response = objectMapper.valueToTree(profile);
+            response.remove("Description");
+            return Response.ok(response).build();
+        }
+        return Response.ok(profile).build();
+    }
+
+    @PATCH
+    @Path("/applications/{appId}/configurationprofiles/{profileId}")
+    public Response updateConfigurationProfile(@PathParam("appId") String appId,
+                                                @PathParam("profileId") String profileId,
+                                                String body) throws IOException {
+        @SuppressWarnings("unchecked")
+        Map<String, Object> request = objectMapper.readValue(body, Map.class);
+        return Response.ok(service.updateConfigurationProfile(appId, profileId, request)).build();
     }
 
     @GET
@@ -162,6 +179,15 @@ public class AppConfigController {
         return Response.noContent().build();
     }
 
+    @POST
+    @Path("/applications/{appId}/configurationprofiles/{profileId}/validators")
+    public Response validateConfiguration(@PathParam("appId") String appId,
+                                           @PathParam("profileId") String profileId,
+                                           @QueryParam("configuration_version") String configurationVersion) {
+        service.validateConfiguration(appId, profileId, configurationVersion);
+        return Response.noContent().build();
+    }
+
     // ──────────────────────────── Hosted Configuration Version ────────────────────────────
 
     @GET
@@ -173,7 +199,7 @@ public class AppConfigController {
                                                     @Context UriInfo uriInfo) {
         PaginatedResult<HostedConfigurationVersionSummary> page = service.listHostedConfigurationVersionsPage(
                 appId, profileId, parseListMaxResults(maxResults, uriInfo),
-                rawNextToken(nextToken, uriInfo));
+                rawNextToken(nextToken, uriInfo), uriInfo.getQueryParameters().getFirst("version_label"));
         return listResponse(page.items(), page.nextToken());
     }
 
@@ -184,8 +210,12 @@ public class AppConfigController {
                                                      @PathParam("profileId") String profileId,
                                                      @HeaderParam("Content-Type") String contentType,
                                                      @HeaderParam("Description") String description,
+                                                     @Context HttpHeaders headers,
                                                      byte[] content) {
-        HostedConfigurationVersion version = service.createHostedConfigurationVersion(appId, profileId, content, contentType, description);
+        HostedConfigurationVersion version = service.createHostedConfigurationVersion(
+                appId, profileId, content, contentType, description,
+                headers.getHeaderString("VersionLabel"),
+                parseLatestVersionNumber(headers.getHeaderString("Latest-Version-Number")));
         return versionResponse(version, 201);
     }
 
@@ -214,6 +244,9 @@ public class AppConfigController {
         rb.header("Version-Number", v.getVersionNumber());
         rb.header("Content-Type", v.getContentType());
         if (v.getDescription() != null) rb.header("Description", v.getDescription());
+        if (v.getVersionLabel() != null) {
+            rb.header("VersionLabel", v.getVersionLabel());
+        }
         return rb.build();
     }
 
@@ -320,7 +353,7 @@ public class AppConfigController {
         String clientVersion = uriInfo.getQueryParameters().getFirst("client_configuration_version");
         LegacyConfiguration data = dataService.getConfiguration(
                 appId, envId, configuration, clientId, clientVersion, accept);
-        if (data.configurationVersion().equals(clientVersion)) {
+        if (data.configurationVersion().equals(clientVersion) && !data.s3Source()) {
             return Response.noContent()
                     .header("Configuration-Version", data.configurationVersion())
                     .build();
@@ -344,5 +377,16 @@ public class AppConfigController {
             throw new AwsException("BadRequestException", "max_results must be an integer.", 400);
         }
         return Pagination.parseMaxResults(maxResults, "BadRequestException");
+    }
+
+    private static Integer parseLatestVersionNumber(String value) {
+        if (value == null) {
+            return null;
+        }
+        try {
+            return Integer.valueOf(value);
+        } catch (NumberFormatException e) {
+            throw new AwsException("BadRequestException", "LatestVersionNumber must be an integer.", 400);
+        }
     }
 }
