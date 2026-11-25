@@ -142,7 +142,23 @@ public class AppConfigController {
     @GET
     @Path("/applications/{appId}/configurationprofiles/{profileId}")
     public Response getConfigurationProfile(@PathParam("appId") String appId, @PathParam("profileId") String profileId) {
-        return Response.ok(service.getConfigurationProfile(appId, profileId)).build();
+        ConfigurationProfile profile = service.getConfigurationProfile(appId, profileId);
+        if ("".equals(profile.getDescription())) {
+            ObjectNode response = objectMapper.valueToTree(profile);
+            response.remove("Description");
+            return Response.ok(response).build();
+        }
+        return Response.ok(profile).build();
+    }
+
+    @PATCH
+    @Path("/applications/{appId}/configurationprofiles/{profileId}")
+    public Response updateConfigurationProfile(@PathParam("appId") String appId,
+                                                @PathParam("profileId") String profileId,
+                                                String body) throws IOException {
+        @SuppressWarnings("unchecked")
+        Map<String, Object> request = objectMapper.readValue(body, Map.class);
+        return Response.ok(service.updateConfigurationProfile(appId, profileId, request)).build();
     }
 
     @GET

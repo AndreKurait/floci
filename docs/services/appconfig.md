@@ -52,6 +52,7 @@ Older stored deployments without a captured label continue to omit it.
 - `DeleteEnvironment`
 - `CreateConfigurationProfile`
 - `GetConfigurationProfile`
+- `UpdateConfigurationProfile`
 - `ListConfigurationProfiles`
 - `DeleteConfigurationProfile`
 - `ValidateConfiguration`
@@ -82,6 +83,17 @@ A missing or undeployed environment returns `BadRequestException`; an unknown ap
 returns `ResourceNotFoundException`.
 Only hosted configurations are served: a deployed version with no hosted configuration version behind it,
 such as one from an S3 or SSM source, returns `ResourceNotFoundException`.
+
+`UpdateConfigurationProfile` accepts application/profile IDs or names and updates supplied
+`Name`, `Description` and `Validators` fields. Omitted fields retain their values; an empty
+description or validator list clears that field. The update returns the complete profile and
+preserves its ID, parent application, type and location. Validator declaration checks run before
+the stored profile is replaced; schema compilation and Lambda invocation remain in configuration
+validation and deployment. Updating validators does not replace hosted versions or active content.
+Retrieval-role and KMS-key updates are not implemented.
+
+Clearing `Description` with an empty string returns `Description: ""` in the update response.
+The following `GetConfigurationProfile` response omits `Description`; other fields retain their values.
 
 `CreateConfigurationProfile` stores up to two `Validators`, each with a `Type` and `Content`
 of at most 32,768 characters. Hosted freeform profiles support inline `JSON_SCHEMA` validators
