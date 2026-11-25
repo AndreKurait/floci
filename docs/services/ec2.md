@@ -256,7 +256,7 @@ When the image lacks `sshd` or `scp`, Floci first installs OpenSSH with the imag
 
 ## Security Group Port Publishing
 
-With `FLOCI_NETWORK_SECURITY_GROUP_ENFORCEMENT_ENABLED=true`, Floci prepares a separate Linux network namespace and an nftables default-deny policy before starting each Docker-backed instance. It checks new managed connections against both the sender's egress rules and the receiver's ingress rules, using emulated ENI addresses and security-group membership before translating to Docker addresses. Established replies use connection tracking. This filters packets but does not emulate VPC routing, NACLs, NAT gateways, or peering. Rootless Docker and Windows containers are unsupported.
+With `FLOCI_NETWORK_SECURITY_GROUP_ENFORCEMENT_ENABLED=true`, Floci prepares a separate Linux network namespace and an nftables default-deny policy before starting each Docker-backed instance. It checks new managed connections against both the sender's egress rules and the receiver's ingress rules, using emulated ENI addresses and security-group membership before translating to Docker addresses. Established replies use connection tracking. Security-group enforcement alone does not implement VPC routes or NAT; see [NAT Gateways](#nat-gateways) for the optional public routing path. NACLs, peering, rootless Docker and Windows containers are unsupported.
 
 An ENI's IPv6 addresses are part of its identity too. A rule naming an IPv6 range matches a managed peer on any IPv6 address its ENI holds, and admits that peer's traffic only on its helper's Docker IPv6 address, never on its IPv4 one. On a Docker network without IPv6 the helper has no IPv6 address, so such a rule has nothing to match. `AssignIpv6Addresses` and `UnassignIpv6Addresses` update the ENI's firewall identity at once.
 
@@ -955,6 +955,23 @@ back, and a new address that is already held fails the update and leaves the gat
 
 A repeated `ClientToken` returns the endpoint the first call created (`IdempotentParameterMismatch` when reused with another subnet, security group set, `IpAddressType`, `PreserveClientIp` or tag set; tags added later with `CreateTags` do not count). While an endpoint exists, `DeleteSubnet` on its subnet and `DeleteVpc` on its VPC fail with `DependencyViolation`, as on AWS. The interface ID in an endpoint's `networkInterfaceIdSet` resolves in `DescribeNetworkInterfaces` while the endpoint exists: a requester-managed `ec2_instance_connect_endpoint` interface carrying the endpoint's private address, subnet, VPC and security groups. An unknown filter name is `InvalidParameterValue` even when no endpoint exists. `DescribeInstanceConnectEndpoints` pages by `MaxResults`/`NextToken` in endpoint ID order (`MaxResults` outside 1-50 is `InvalidMaxResults`), and `publicDnsNames` carries only the `ipv4` names. The endpoint's tunnel is real: see [EC2 Instance Connect](ec2-instance-connect.md#instance-connect-endpoint-tunnels).
 
+`FLOCI_NETWORK_VPC_ROUTING_ENABLED=true` additionally enables an experimental IPv4
+packet path from protected workloads through public NAT gateways to managed
+internet-facing [Classic frontends](elb-classic.md#protected-frontends).
+It requires EC2 VPC networks, native private addresses and security-group enforcement.
+The frontend observes the allocated NAT Elastic IP. The workload's NAT route and
+both the NAT and frontend subnets' internet-gateway routes must exist; missing or
+unsupported routes drop traffic. Frontend security-group ingress remains a
+separate requirement.
+
+In this mode, public NAT creation without an attached internet gateway returns a
+failed gateway with failure code `Gateway.NotAttached`. Runtime programming errors fail route API calls.
+Deleting a NAT removes forwarding before releasing its addresses; a remaining
+namespace consumer prevents retirement and keeps the reservation for a retry.
+This is limited to managed public destinations, with no general internet,
+private NAT, multi-address NAT, IPv6/NAT64, peering or NACL forwarding.
+See the [routing design and qualification limits](../design/vpc-public-routing.md).
+
 ### Capacity Reservations
 
 | Action | Description |
@@ -1616,6 +1633,7 @@ State is reported settled rather than transitional, as elsewhere in this service
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_RECONCILE_ON_STARTUP` | `true` | Remove VPC networks left behind by a previous run of this same emulator. Whatever its value, the network a previous run created for a VPC that still exists is kept, and goes when that VPC is deleted |
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_DRIVER` | `bridge` | Docker network driver used for VPC networks |
 | `FLOCI_SERVICES_EC2_VPC_NETWORKS_INTERNAL` | `false` | Create internal Docker VPC networks without external connectivity through that network |
+| `FLOCI_NETWORK_VPC_ROUTING_ENABLED` | `false` | Enforce native IPv4 routes and public NAT for protected workloads reaching managed Classic frontends |
 
 ## VPC Docker networks
 

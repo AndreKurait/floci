@@ -144,6 +144,12 @@ public interface EmulatorConfig {
 
     interface NetworkConfig {
         SecurityGroupEnforcementConfig securityGroupEnforcement();
+        VpcRoutingConfig vpcRouting();
+    }
+
+    interface VpcRoutingConfig {
+        @WithDefault("false")
+        boolean enabled();
     }
 
     interface SecurityGroupEnforcementConfig {

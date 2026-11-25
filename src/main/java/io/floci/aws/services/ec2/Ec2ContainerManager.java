@@ -260,6 +260,11 @@ public class Ec2ContainerManager {
         return mode != null && mode.startsWith("container:") ? mode.substring("container:".length()) : null;
     }
 
+    private String instanceAccount(Instance instance) {
+        // Launch workers need the resource owner even when no request scope is active.
+        return instance.getOwnerId() != null ? instance.getOwnerId() : regionResolver.getAccountId();
+    }
+
     public void restoreSecurityGroups(Instance instance, String region, List<SecurityGroup> groups,
                                       Map<String, List<String>> prefixLists) {
         if (firewallManager == null || !firewallManager.enabled()) {
@@ -274,7 +279,7 @@ public class Ec2ContainerManager {
         InstanceNetworkInterface eni = instance.getNetworkInterfaces().getFirst();
         String logical = instance.getLogicalPrivateIpAddress() != null
                 ? instance.getLogicalPrivateIpAddress() : eni.getPrivateIpAddress();
-        firewallManager.register(new SecurityGroupNftCompiler.Endpoint(regionResolver.getAccountId(), region,
+        firewallManager.register(new SecurityGroupNftCompiler.Endpoint(instanceAccount(instance), region,
                 instance.getVpcId(), eni.getNetworkInterfaceId(), logical, eni.getIpv6Addresses(), address,
                 namespace.transportIpv6Address(), instance.getSecurityGroups().stream()
                         .map(GroupIdentifier::getGroupId).collect(Collectors.toSet()), groups, List.of(), true,
@@ -702,14 +707,14 @@ public class Ec2ContainerManager {
                     eniId = eni.getNetworkInterfaceId();
                     instance.setLogicalPrivateIpAddress(eni.getPrivateIpAddress());
                     namespace = firewallManager.createNamespace("ec2", instanceId,
-                            regionResolver.getAccountId(), region, Optional.empty(), Map.of(22, sshHostPort));
+                            instanceAccount(instance), region, Optional.empty(), Map.of(22, sshHostPort));
                     protectedVpcAddress = vpcNetworkManager.attach(instance.getOwnerId(), region,
                             instance.getVpcId(), instance.getSubnetId(), namespace.helperId(), leasedPrivateIp)
                             .map(network -> leasedPrivateIp).orElse(null);
                     if (vpcNetworkManager.enabled() && protectedVpcAddress == null) {
                         throw new IllegalStateException("Protected EC2 namespace could not attach to its VPC");
                     }
-                    firewallManager.register(new SecurityGroupNftCompiler.Endpoint(regionResolver.getAccountId(),
+                    firewallManager.register(new SecurityGroupNftCompiler.Endpoint(instanceAccount(instance),
                             region, instance.getVpcId(), eniId, eni.getPrivateIpAddress(), eni.getIpv6Addresses(),
                             namespace.transportAddress(), namespace.transportIpv6Address(),
                             instance.getSecurityGroups().stream().map(g -> g.getGroupId())

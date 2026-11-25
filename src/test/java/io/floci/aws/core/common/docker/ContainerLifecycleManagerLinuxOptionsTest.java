@@ -81,6 +81,7 @@ class ContainerLifecycleManagerLinuxOptionsTest {
                 .withTmpfs("/scratch", "noexec,size=64m")
                 .withMemorySwapBytes(1536 * MIB)
                 .withMemorySwappiness(10)
+                .withNetworkSysctl("net.ipv4.ip_forward", "1")
                 .build();
 
         manager().create(spec);
@@ -95,6 +96,7 @@ class ContainerLifecycleManagerLinuxOptionsTest {
         assertEquals(512 * MIB, hostConfig.getMemory());
         assertEquals(1536 * MIB, hostConfig.getMemorySwap());
         assertEquals(10L, hostConfig.getMemorySwappiness());
+        assertEquals(Map.of("net.ipv4.ip_forward", "1"), hostConfig.getSysctls());
     }
 
     @Test
@@ -112,6 +114,17 @@ class ContainerLifecycleManagerLinuxOptionsTest {
         assertNull(hostConfig.getTmpFs());
         assertNull(hostConfig.getMemorySwap());
         assertNull(hostConfig.getMemorySwappiness());
+        assertNull(hostConfig.getSysctls());
+    }
+
+    @Test
+    void networkSysctlsCannotChangeAnotherNamespacesSettings() {
+        for (String network : new String[]{"host", "container:another"}) {
+            assertThrows(IllegalArgumentException.class, () -> builder().withNetworkMode(network)
+                    .withNetworkSysctl("net.ipv4.ip_forward", "1").build());
+        }
+        assertThrows(IllegalArgumentException.class,
+                () -> builder().withNetworkSysctl("kernel.hostname", "changed").build());
     }
 
     @Test
