@@ -1,6 +1,7 @@
 package io.floci.aws.services.acmpca;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.aws.core.common.AwsException;
@@ -212,6 +213,31 @@ class AcmPcaServiceTest {
                 () -> service.importCertificate(importRequest(ca, PrivateCaCertificates.pem(certificate)), REGION));
         assertEquals(before, store.get(ca).orElseThrow());
         assertEquals(Set.of(ca), store.keys());
+    }
+
+    @Test
+    void authoritiesStoredBeforeSubordinateSupportLoadAsUntaggedRoots() throws Exception {
+        AdjustableClock clock = new AdjustableClock();
+        StorageBackend<String, CertificateAuthority> first = backend("persistent");
+        first.load();
+        String ca = create(service(first, clock), null);
+        first.flush();
+        Path path = directory.resolve("authorities.json");
+        JsonNode stored = MAPPER.readTree(path.toFile());
+        for (JsonNode record : stored.findParents("csrPem")) {
+            ((ObjectNode) record).remove(List.of("type", "certificateChainPem", "keyStorageSecurityStandard", "tags"));
+        }
+        MAPPER.writeValue(path.toFile(), stored);
+        StorageBackend<String, CertificateAuthority> reopened = backend("persistent");
+        reopened.load();
+        AcmPcaService service = service(reopened, clock);
+        ObjectNode description = (ObjectNode) service.describe(arn(ca), REGION).path("CertificateAuthority");
+        assertEquals("ROOT", description.path("Type").asText());
+        assertFalse(description.has("KeyStorageSecurityStandard"));
+        String issued = root(service, reopened.get(ca).orElseThrow());
+        service.importCertificate(importRequest(ca, service.certificate(
+                arn(ca).put("CertificateArn", issued), REGION).path("Certificate").asText()), REGION);
+        assertEquals("ACTIVE", service.describe(arn(ca), REGION).path("CertificateAuthority").path("Status").asText());
     }
 
     @Test

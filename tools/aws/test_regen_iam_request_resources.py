@@ -68,7 +68,6 @@ def test_documented_child_arn_is_not_a_second_parent_id(
         {"first": parent_only, "second": child_only}, "GetChild") == resources
 
 
-
 def test_a_member_fills_a_variable_its_stem_relates_to_and_of_its_kind():
     assert r.resources_for("svc:GetThing", ["thing"], FORMATS, members("ThingName")) == [
         {"type": "thing", "fill": {"ThingName": "ThingName"}}]

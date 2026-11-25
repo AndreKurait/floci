@@ -5,6 +5,7 @@ import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.docker.ContainerReachableEndpoint;
 import io.floci.aws.services.acm.AcmService;
+import io.floci.aws.services.acmpca.AcmPcaService;
 import io.floci.aws.services.apigateway.ApiGatewayService;
 import io.floci.aws.services.apigatewayv2.ApiGatewayV2Service;
 import io.floci.aws.services.appconfig.AppConfigService;
@@ -17,6 +18,7 @@ import io.floci.aws.services.bedrock.BedrockService;
 import io.floci.aws.services.bedrockagentcorecontrol.BedrockAgentCoreControlService;
 import io.floci.aws.services.bedrockagentcorecontrol.BedrockAgentCoreMemoryService;
 import io.floci.aws.services.cloudformation.provisioners.AcmCfnProvisioner;
+import io.floci.aws.services.cloudformation.provisioners.AcmPcaCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.ApiGatewayAccountCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.ApiGatewayApiKeyCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.ApiGatewayDomainCfnProvisioner;
@@ -283,6 +285,7 @@ final class CfnProvisionerFixture {
         private CloudWatchMetricsService cloudWatchMetricsService;
         private AutoScalingService autoScalingService;
         private AcmService acmService;
+        private AcmPcaService acmPcaService;
         private FirehoseService firehoseService;
         private DocDbService docDbService;
         private CloudFrontService cloudFrontService;
@@ -490,6 +493,9 @@ final class CfnProvisionerFixture {
             }
             if (acmService != null) {
                 discovered.add(new AcmCfnProvisioner(acmService));
+            }
+            if (acmPcaService != null) {
+                discovered.add(new AcmPcaCfnProvisioner(acmPcaService));
             }
             if (appSyncService != null) {
                 discovered.add(new AppSyncCfnProvisioner(appSyncService));
@@ -894,6 +900,11 @@ final class CfnProvisionerFixture {
 
         public Builder acm(AcmService v) {
             this.acmService = v;
+            return this;
+        }
+
+        public Builder acmPca(AcmPcaService v) {
+            this.acmPcaService = v;
             return this;
         }
 
