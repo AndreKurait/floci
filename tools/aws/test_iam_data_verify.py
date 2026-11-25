@@ -50,12 +50,17 @@ class IamDataVerifyTest(unittest.TestCase):
     def test_empty_diff_keeps_full_verification(self):
         result, calls = self.run_gate(self.changed_file(""))
         self.assertEqual(0, result.returncode, result.stderr)
-        self.assertEqual(12, len(calls))
+        self.assertEqual(13, len(calls))
 
     def test_weekly_run_checks_every_file(self):
         result, calls = self.run_gate()
         self.assertEqual(0, result.returncode, result.stderr)
-        self.assertEqual(12, len(calls))
+        self.assertEqual(13, len(calls))
+
+    def test_the_cloudtrail_s3_data_events_check_covers_its_fetcher(self):
+        result, calls = self.run_gate(self.changed_file("tools/aws/fetch_cloudtrail_s3_data_events.py\n"))
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(["cloudtrail-s3-data-events-verify"], calls)
 
     def test_legacy_changed_argument_still_selects(self):
         result, calls = self.run_gate("CHANGED=  tools/aws/regen_service_namespaces.py  ")
@@ -120,7 +125,8 @@ class IamDataVerifyManifestTest(unittest.TestCase):
         self.assertEqual(expected, blank_calls)
         self.assertEqual(0, default.returncode, default.stdout)
         self.assertEqual(0, empty.returncode, empty.stdout)
-        self.assertEqual(12, len(expected))
+        self.assertEqual(13, len(expected))
+        self.assertIn("cloudtrail-s3-data-events-verify", expected)
         self.assertIn("documented-routes-verify", expected)
         self.assertEqual(expected, actual)
 
@@ -148,7 +154,8 @@ class IamDataVerifyManifestTest(unittest.TestCase):
     def test_failure_does_not_hide_later_verifier_results(self):
         result, calls = self.run_gate("", fail_target="iam-namespaces-verify")
         self.assertNotEqual(0, result.returncode)
-        self.assertEqual(12, len(calls))
+        self.assertEqual(13, len(calls))
+        self.assertIn("cloudtrail-s3-data-events-verify", calls)
         self.assertIn("documented-routes-verify", calls)
         self.assertIn("the service namespace list, see its message above", result.stdout)
 
