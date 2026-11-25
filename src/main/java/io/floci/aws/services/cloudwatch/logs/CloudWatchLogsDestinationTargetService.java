@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.Gzip;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.ServicePrincipals;
 import io.floci.aws.services.cloudwatch.logs.model.LogDestination;
@@ -46,7 +47,7 @@ public class CloudWatchLogsDestinationTargetService {
         String sourceArn = new AwsArnUtils.Arn(logical.partition(), "logs", logical.region(),
                 logical.accountId(), "*").toString();
         try {
-            byte[] control = CloudWatchLogsSubscriptionDeliveryService.gzip(mapper.writeValueAsBytes(
+            byte[] control = Gzip.compress(mapper.writeValueAsBytes(
                     Map.of("messageType", "CONTROL_MESSAGE", "owner", logical.accountId())));
             deliver(destination, logical.accountId(), sourceArn, control, UUID.randomUUID().toString());
         } catch (JsonProcessingException failure) {
