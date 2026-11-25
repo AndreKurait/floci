@@ -1,6 +1,5 @@
 package io.floci.aws.services.neptune.container;
 
-import com.github.dockerjava.api.DockerClient;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.docker.ContainerBuilder;
@@ -9,8 +8,11 @@ import io.floci.aws.core.common.docker.ContainerLifecycleManager;
 import io.floci.aws.core.common.docker.ContainerLogStreamer;
 import io.floci.aws.core.common.docker.ContainerSpec;
 import io.floci.aws.services.neptune.model.NeptuneDbType;
+import io.floci.aws.testing.ParallelLocks;
 import org.jboss.logging.Logger;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.mockito.Mockito;
 
 import java.io.IOException;
@@ -32,6 +34,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class NeptuneContainerManagerTest {
 
     private static final Logger LOG = Logger.getLogger(NeptuneContainerManagerTest.class);
@@ -57,8 +60,7 @@ class NeptuneContainerManagerTest {
         ContainerLifecycleManager lifecycleManager = mock(ContainerLifecycleManager.class);
         when(lifecycleManager.createAndStart(any()))
                 .thenThrow(new RuntimeException("java.net.SocketException: No such file or directory"));
-        when(lifecycleManager.getDockerClient()).thenThrow(
-                new RuntimeException("java.net.SocketException: No such file or directory"));
+        when(lifecycleManager.isDockerReachable()).thenReturn(false);
 
         NeptuneContainerManager manager = newManager(lifecycleManager);
 
@@ -77,8 +79,7 @@ class NeptuneContainerManagerTest {
         ContainerLifecycleManager lifecycleManager = mock(ContainerLifecycleManager.class);
         when(lifecycleManager.createAndStart(any()))
                 .thenThrow(new RuntimeException("no such image: tinkerpop/gremlin-server:3.7.3"));
-        DockerClient dockerClient = mock(DockerClient.class, Mockito.RETURNS_DEEP_STUBS);
-        when(lifecycleManager.getDockerClient()).thenReturn(dockerClient);
+        when(lifecycleManager.isDockerReachable()).thenReturn(true);
 
         NeptuneContainerManager manager = newManager(lifecycleManager);
 

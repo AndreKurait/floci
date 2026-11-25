@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.config.TlsProxyServer;
 import io.floci.aws.core.common.AwsArnUtils;
+import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.CertificateReferenceResolver;
 import io.floci.aws.core.common.CertificateReferenceResolver.CertificateMaterial;
 import io.floci.aws.core.common.Pem;
@@ -12,7 +13,9 @@ import io.floci.aws.core.common.RequestHost;
 import io.floci.aws.core.common.RequestScopes;
 import io.floci.aws.core.common.WebSocketUpgrades;
 import io.floci.aws.core.common.tls.ReloadingKeyManager;
+import io.floci.aws.services.ec2.Ec2InstancePorts;
 import io.floci.aws.services.ec2.Ec2Service;
+import io.floci.aws.services.elbv2.PathPatternRegexValues.Compiled;
 import io.floci.aws.services.elbv2.model.Action;
 import io.floci.aws.services.elbv2.model.Listener;
 import io.floci.aws.services.elbv2.model.LoadBalancer;
@@ -65,7 +68,9 @@ import java.security.cert.X509Certificate;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -135,6 +140,9 @@ public class ElbV2DataPlane {
 
     @Inject
     Ec2Service ec2Service;
+
+    @Inject
+    Ec2InstancePorts instancePorts;
 
     @Inject
     CertificateReferenceResolver certificateResolver;
@@ -718,8 +726,10 @@ public class ElbV2DataPlane {
             return;
         }
         TargetDescription target = pickRoundRobin(tgArn, candidates);
-        int port = ElbV2HealthChecker.effectivePort(target, tg);
-        String host = ElbV2TargetResolver.resolveHost(ec2Service, tg, target);
+        Ec2InstancePorts.Endpoint endpoint = ElbV2TargetResolver.resolve(ec2Service, instancePorts, tg,
+                target.getId(), ElbV2HealthChecker.effectivePort(target, tg));
+        int port = endpoint.port();
+        String host = endpoint.host();
         AtomicBoolean disconnected = new AtomicBoolean();
         socket.closeHandler(ignored -> disconnected.set(true));
         vertx.executeBlocking(() -> ElbV2TargetResolver.resolveCheckedAddress(host))
@@ -1161,8 +1171,10 @@ public class ElbV2DataPlane {
             target = pickRoundRobin(tgArn, candidates);
         }
         List<String> cookies = duration > 0 ? stickyCookie.headers(scope, tg, target) : List.of();
-        int targetPort = ElbV2HealthChecker.effectivePort(target, tg);
-        String host = ElbV2TargetResolver.resolveHost(ec2Service, tg, target);
+        Ec2InstancePorts.Endpoint endpoint = ElbV2TargetResolver.resolve(ec2Service, instancePorts, tg,
+                target.getId(), ElbV2HealthChecker.effectivePort(target, tg));
+        int targetPort = endpoint.port();
+        String host = endpoint.host();
         boolean secure = "HTTPS".equals(tg.getProtocol());
         if (isWebSocketUpgrade(req)) {
             proxyUpgrade(req, host, targetPort, secure, hostHeader, forwarded,
@@ -1771,6 +1783,22 @@ public class ElbV2DataPlane {
         return last;
     }
 
+    static List<Compiled> compilePathRegexes(List<String> regexValues) {
+        List<Compiled> compiled = new ArrayList<>();
+        for (String regex : regexValues) {
+            try {
+                compiled.add(PathPatternRegexValues.compile(regex));
+            } catch (AwsException e) {
+                LOG.warnv("Ignoring path-pattern regex value that does not compile: {0}", regex);
+            }
+        }
+        return List.copyOf(compiled);
+    }
+
+    static boolean pathRegexMatches(List<Compiled> patterns, String path) {
+        return path != null && patterns.stream().anyMatch(p -> p.matches(path));
+    }
+
     private static boolean globMatches(String pattern, String text) {
         if (text == null) {
             return false;
@@ -1792,6 +1820,8 @@ public class ElbV2DataPlane {
         final Rule rule;
         final Action action;
         final List<String> hostHeaderPatterns;
+        private final Map<RuleCondition, List<Compiled>> pathRegexes =
+                Collections.synchronizedMap(new IdentityHashMap<>());
 
         CompiledRule(Rule rule) {
             this.rule = rule;
@@ -1825,6 +1855,17 @@ public class ElbV2DataPlane {
             return hostHeaderPatterns.stream().anyMatch(p -> globMatches(p, host));
         }
 
+        /**
+         * ALB regex path conditions: the condition holds when any expression matches the whole
+         * request path (not its query string). Expressions are compiled once per rule chain; one
+         * that does not compile never matches.
+         */
+        private boolean matchesPathRegex(RuleCondition condition, String path) {
+            List<Compiled> patterns = pathRegexes.computeIfAbsent(condition,
+                    c -> compilePathRegexes(c.getPathPatternRegexValues()));
+            return pathRegexMatches(patterns, path);
+        }
+
         boolean matches(HttpServerRequest req) {
             if (rule.isDefault()) {
                 return true;
@@ -1855,10 +1896,13 @@ public class ElbV2DataPlane {
                     yield patterns.stream().anyMatch(p -> globMatches(p, effectiveHost));
                 }
                 case "path-pattern" -> {
+                    String path = req.path();
+                    if (!condition.getPathPatternRegexValues().isEmpty()) {
+                        yield matchesPathRegex(condition, path);
+                    }
                     List<String> patterns = condition.getPathPatternValues().isEmpty()
                             ? condition.getValues()
                             : condition.getPathPatternValues();
-                    String path = req.path();
                     yield patterns.stream().anyMatch(p -> globMatches(p, path));
                 }
                 case "http-header" -> {

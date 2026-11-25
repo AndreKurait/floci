@@ -6,6 +6,7 @@ import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.ContainerTeardown;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.SparkConnectProxy;
 import io.floci.aws.services.ec2.model.Instance;
 import io.floci.aws.services.emr.model.EmrCluster;
 import io.floci.aws.services.emr.model.EmrErrorDetail;
@@ -67,6 +68,8 @@ class EmrServiceContainerStepsTest {
     private static final String REPORT = "s3://bucket/jobs/report.py";
     private static final String DRIVER_FAILED = "The Spark driver exited with code 1.";
     private static final String INSTALL = "s3://bucket/bootstrap/install.sh";
+    private static final String PIG = "[{\"Name\": \"Hadoop\"}, {\"Name\": \"Pig\"}]";
+    private static final String TRINO = "[{\"Name\": \"Trino\"}]";
     private static final String ERROR_CODE_PAGES = "https://docs.aws.amazon.com/emr/latest/ManagementGuide/";
     // The id of the image a bootstrap kept, which the cluster's steps run in.
     private static final String IMAGE = "sha256:" + "2".repeat(64);
@@ -599,7 +602,7 @@ class EmrServiceContainerStepsTest {
         // Its release's image with Hadoop's services, as it has no Hive, made on the step's thread: its steps and its
         // primary node's HDFS and YARN run in it, the NodeManager offering what Floci gives it.
         assertEquals(List.of(List.of("emr-7.5.0", "public.ecr.aws/emr-serverless/spark/emr-7.5.0:latest",
-                "public.ecr.aws/emr-serverless/hive/emr-7.5.0:latest", "false")), fixture.releaseImages.asked);
+                "public.ecr.aws/emr-serverless/hive/emr-7.5.0:latest", "false", "false")), fixture.releaseImages.asked);
         SparkJobRunner.Job job = runner.jobs.get(0);
         assertEquals(EmrServiceFixture.RecordingReleaseImages.IMAGE, job.imageTemplate());
         assertEquals(EmrServiceFixture.RecordingReleaseImages.IMAGE, fixture.clusterStorage.hdfs.get(0).get(2));
@@ -754,6 +757,31 @@ class EmrServiceContainerStepsTest {
     }
 
     @Test
+    void aNodeOfAGroupWithItsOwnAmiRunsThatAmiAndHasThePublicAddressItsNameNames() {
+        EmrCluster requested = cluster("own-ami", true);
+        requested.setCustomAmiId("ami-0000000000000c1a5");
+        EmrInstanceGroup master = new EmrInstanceGroup();
+        master.setInstanceGroupType("MASTER");
+        master.setInstanceType("m5.xlarge");
+        master.setRequestedInstanceCount(1);
+        EmrInstanceGroup core = new EmrInstanceGroup();
+        core.setInstanceGroupType("CORE");
+        core.setInstanceType("m5.xlarge");
+        core.setRequestedInstanceCount(1);
+        core.setCustomAmiId("ami-00000000000000c0e");
+        requested.setInstanceGroups(new ArrayList<>(List.of(master, core)));
+        EmrCluster cluster = service.runJobFlow(requested, REGION);
+
+        Instance primary = service.nodeInstance(cluster, "111111111111", 0, 1);
+        Instance coreNode = service.nodeInstance(cluster, "111111111111", 1, 1);
+
+        assertEquals("ami-0000000000000c1a5", primary.getImageId());
+        assertEquals("ami-00000000000000c0e", coreNode.getImageId());
+        assertEquals("203.0.113.2", coreNode.getPublicIpAddress());
+        assertEquals("ec2-203-0-113-2.compute-1.amazonaws.com", coreNode.getPublicDnsName());
+    }
+
+    @Test
     void aRelayThatCannotStartFailsTheStepThatWouldReadIt() {
         fixture.clusterStorage.metadata = true;
         fixture.clusterStorage.metadataFailure = new IllegalStateException("The relay did not listen");
@@ -779,7 +807,7 @@ class EmrServiceContainerStepsTest {
 
         // Its release has no Hive image, so emr-7.5.0's gives the Hadoop its image holds for the node's daemons.
         assertEquals(List.of(List.of("emr-spark-8.1.0", "public.ecr.aws/emr-serverless/spark4/emr-spark-8.1.0:latest",
-                "public.ecr.aws/emr-serverless/hive/emr-7.5.0:latest", "false")), fixture.releaseImages.asked);
+                "public.ecr.aws/emr-serverless/hive/emr-7.5.0:latest", "false", "false")), fixture.releaseImages.asked);
         SparkJobRunner.Job job = runner.jobs.get(0);
         assertEquals(EmrServiceFixture.RecordingReleaseImages.IMAGE, job.imageTemplate());
         assertEquals(EmrServiceFixture.RecordingReleaseImages.IMAGE, fixture.clusterStorage.hdfs.get(0).get(2));
@@ -815,7 +843,7 @@ class EmrServiceContainerStepsTest {
         SparkJobRunner.Job job = runner.jobs.get(0);
         assertEquals(SparkJobRunner.Engine.HIVE, job.engine());
         assertEquals(List.of(List.of("emr-7.5.0", "public.ecr.aws/emr-serverless/spark/emr-7.5.0:latest",
-                "public.ecr.aws/emr-serverless/hive/emr-7.5.0:latest", "true")), fixture.releaseImages.asked);
+                "public.ecr.aws/emr-serverless/hive/emr-7.5.0:latest", "true", "false")), fixture.releaseImages.asked);
         assertEquals(EmrServiceFixture.RecordingReleaseImages.IMAGE, job.imageTemplate());
         assertEquals(hdfsStorage(cluster).withHiveMetastore("thrift://ip-10-0-0-1.ec2.internal:9083"), job.storage());
     }
@@ -984,7 +1012,9 @@ class EmrServiceContainerStepsTest {
     void aStepFlociDoesNotRunHandedOffBeforeATeardownEndsAsAStoppedDriverAndStartsNoOther() {
         EmrStep pig = sparkStep("query", "CONTINUE");
         pig.setArgs(List.of("pig-script", "--run-pig-script", "--args", "-f", "s3://bucket/query.pig"));
-        EmrCluster cluster = service.runJobFlow(cluster("pig", true, pig, sparkStep("next", "CONTINUE")), REGION);
+        EmrCluster requested = cluster("pig", true, pig, sparkStep("next", "CONTINUE"));
+        requested.setApplications(PIG);
+        EmrCluster cluster = service.runJobFlow(requested, REGION);
         service.stopManagedContainers();
 
         fixture.runStepThread();
@@ -1015,9 +1045,12 @@ class EmrServiceContainerStepsTest {
 
     @Test
     void aStepFlociDoesNotRunFailsWithoutRunning() {
+        // A cluster that installs Pig, which Floci adds only with floci.services.emr.pig.enabled.
         EmrStep pig = sparkStep("query", "CONTINUE");
         pig.setArgs(List.of("pig-script", "--run-pig-script", "--args", "-f", "s3://bucket/query.pig"));
-        EmrCluster cluster = service.runJobFlow(cluster("pig", true, pig), REGION);
+        EmrCluster requested = cluster("pig", true, pig);
+        requested.setApplications(PIG);
+        EmrCluster cluster = service.runJobFlow(requested, REGION);
 
         fixture.runStepThread();
 
@@ -1025,6 +1058,88 @@ class EmrServiceContainerStepsTest {
         assertEquals("FAILED", failed.getState());
         assertEquals(EmrSparkSteps.NOT_RUN, failed.getFailureMessage());
         assertEquals(List.of(), runner.jobs);
+        assertEquals(List.of(), fixture.releaseImages.asked);
+    }
+
+    @Test
+    void aPigStepOnAClusterWithoutPigRunsEmrsPigScriptWhichFindsNoPig() {
+        EmrStep pig = sparkStep("query", "CONTINUE");
+        List<String> args = List.of("pig-script", "--run-pig-script", "--args", "-f", "s3://bucket/query.pig");
+        pig.setArgs(args);
+        service.runJobFlow(cluster("no-pig", true, pig), REGION);
+
+        fixture.runStepThread();
+
+        // EMR's pig-script says "Pig isn't installed." there, and the step fails with its exit code.
+        assertEquals(args, runner.jobs.get(0).command());
+        assertFalse(runner.jobs.get(0).environment().containsKey("FLOCI_PIG_PROPERTIES"));
+    }
+
+    @Test
+    void aPigStepWithFlocisPigRunsEmrsPigScriptOnTezInTheReleasesImageWithPig() {
+        EmrService withPig = fixture.withPig();
+        EmrStep pig = sparkStep("query", "CONTINUE");
+        List<String> args = List.of("pig-script", "--run-pig-script", "--args", "-f", "s3://bucket/query.pig");
+        pig.setArgs(args);
+        EmrCluster requested = cluster("pig", true, pig);
+        requested.setApplications(PIG);
+        requested.setConfigurations("[{\"Classification\": \"pig-properties\", \"Properties\": "
+                + "{\"pig.exec.reducers.max\": \"8\"}}]");
+        withPig.runJobFlow(requested, REGION);
+
+        fixture.runStepThread();
+
+        assertEquals(List.of(List.of("emr-7.5.0", "public.ecr.aws/emr-serverless/spark/emr-7.5.0:latest",
+                "public.ecr.aws/emr-serverless/hive/emr-7.5.0:latest", "false", "true")),
+                fixture.releaseImages.asked);
+        SparkJobRunner.Job job = runner.jobs.get(0);
+        assertEquals(args, job.command());
+        assertEquals(EmrServiceFixture.RecordingReleaseImages.IMAGE, job.imageTemplate());
+        assertEquals("exectype = tez\nmapreduce.job.working.dir = /user/${user.name}\npig.exec.reducers.max = 8",
+                job.environment().get("FLOCI_PIG_PROPERTIES"));
+    }
+
+    @Test
+    void aClusterWithFlocisTrinoRunsItBesideTheMetastoreWhereItsStepsTrinoCliReachesIt() {
+        EmrService withTrino = fixture.withTrino();
+        EmrStep query = sparkStep("query", "CONTINUE");
+        List<String> args = List.of("trino-cli", "--execute", "SHOW CATALOGS");
+        query.setArgs(args);
+        EmrCluster requested = cluster("trino", true, query);
+        requested.setApplications(TRINO);
+        requested.setConfigurations("[{\"Classification\": \"trino-connector-hive\", \"Properties\": "
+                + "{\"hive.metastore\": \"glue\"}}]");
+        withTrino.runJobFlow(requested, REGION);
+
+        fixture.runStepThread();
+
+        // The image has Hive, as EMR installs hive-client and hcatalog-server with Trino, and the CLI of the Trino the
+        // release ships, 446 for emr-7.5.0.
+        assertEquals(List.of(List.of("emr-7.5.0", "public.ecr.aws/emr-serverless/spark/emr-7.5.0:latest",
+                "public.ecr.aws/emr-serverless/hive/emr-7.5.0:latest", "true", "false")),
+                fixture.releaseImages.asked);
+        assertEquals(List.of("trinodb/trino:446"), fixture.releaseImages.trinoImages);
+        assertEquals(new ClusterStorage.Trino("trinodb/trino:446", 2048, Map.of("hive.metastore", "glue")),
+                fixture.clusterStorage.metastores.get(0).trino());
+        SparkJobRunner.Job job = runner.jobs.get(0);
+        assertEquals(args, job.command());
+        String host = fixture.clusterStorage.hdfs.get(0).get(1);
+        assertEquals("http://" + host + ":8889", job.environment().get("FLOCI_TRINO_SERVER"));
+    }
+
+    @Test
+    void aClusterWithTrinoRunsNoneWhileFlocisTrinoIsOff() {
+        EmrStep query = sparkStep("query", "CONTINUE");
+        query.setArgs(List.of("trino-cli", "--execute", "SHOW CATALOGS"));
+        EmrCluster requested = cluster("trino", true, query);
+        requested.setApplications(TRINO);
+        service.runJobFlow(requested, REGION);
+
+        fixture.runStepThread();
+
+        assertEquals(List.of(), fixture.releaseImages.asked);
+        assertEquals(List.of(), fixture.clusterStorage.metastores);
+        assertFalse(runner.jobs.get(0).environment().containsKey("FLOCI_TRINO_SERVER"));
     }
 
     @Test
@@ -1067,8 +1182,9 @@ class EmrServiceContainerStepsTest {
         fixture.runStepThread();
         ObjectMapper objectMapper = new ObjectMapper();
 
-        JsonNode answer = (JsonNode) new EmrHandler(service, objectMapper).handle("DescribeStep",
-                objectMapper.createObjectNode().put("ClusterId", cluster.getId())
+        JsonNode answer = (JsonNode) new EmrHandler(service, mock(EmrStudioService.class),
+                mock(EmrNotebookExecutionService.class), mock(EmrAppUiService.class), objectMapper)
+                .handle("DescribeStep", objectMapper.createObjectNode().put("ClusterId", cluster.getId())
                         .put("StepId", cluster.getSteps().get(0).getId()), REGION).getEntity();
 
         JsonNode status = answer.path("Step").path("Status");
@@ -1099,7 +1215,8 @@ class EmrServiceContainerStepsTest {
 
         // The next step starts once the driver is gone, before anything reads the cluster.
         assertEquals(1, fixture.stepThreadsWaiting());
-        assertEquals(Set.of(stoppedId), runner.stopped);
+        // SEND_INTERRUPT, the default, sends it SIGTERM, which ends it.
+        assertEquals(Set.of(stoppedId), runner.interrupted);
         // "Canceling a running step does not allow a pending step to start running" while its driver stops.
         assertEquals(List.of("RUNNING", "CANCEL_PENDING", "PENDING", "PENDING"), whileStopping);
         // "CancelSteps is idempotent".
@@ -1110,6 +1227,69 @@ class EmrServiceContainerStepsTest {
         assertEquals(List.of("CANCELLED", "RUNNING", "PENDING"), stepStates(running.getSteps()));
         assertEquals(List.of("STARTING", "PENDING stopped", "PENDING next", "RUNNING stopped", "CANCEL_PENDING stopped",
                 "PENDING added", "CANCELLED stopped", "RUNNING next"), fixture.states());
+    }
+
+    /**
+     * SEND_INTERRUPT, the default: "EMR sends a SIGTERM signal to the step", which may "terminate descendant step
+     * processes or wait for them to complete". The step is CANCEL_PENDING while its driver goes on, and CANCELLED,
+     * without its ActionOnFailure, once the driver has ended on its own.
+     */
+    @Test
+    void aSendInterruptCancelSignalsTheStepAndLetsItsDriverEndOnItsOwn() {
+        EmrCluster cluster = service.runJobFlow(cluster("interrupted", true,
+                sparkStep("interrupted", "TERMINATE_CLUSTER"), sparkStep("next", "CONTINUE")), REGION);
+        String interruptedId = cluster.getSteps().get(0).getId();
+        List<String> whileInterrupted = new ArrayList<>();
+        // A driver ended by SIGTERM: 128 + 15.
+        runner.outcome = SparkJobRunner.Outcome.exitedWith(143);
+        runner.whileRunning = () -> {
+            service.cancelSteps(cluster.getId(), List.of(interruptedId));
+            whileInterrupted.add(service.describeCluster(cluster.getId()).getSteps().get(0).getState());
+        };
+
+        fixture.runStepThread();
+
+        assertEquals(Set.of(interruptedId), runner.interrupted);
+        assertEquals(Set.of(), runner.stopped);
+        assertEquals(List.of(false, false), runner.cancelledAsRunning, "the driver may go on until it ends");
+        assertEquals(List.of("CANCEL_PENDING"), whileInterrupted);
+        EmrCluster running = service.describeCluster(cluster.getId());
+        assertEquals("RUNNING", running.getState());
+        assertEquals(List.of("CANCELLED", "RUNNING"), stepStates(running.getSteps()));
+        assertNull(running.getSteps().get(0).getFailureMessage());
+    }
+
+    /** TERMINATE_PROCESS: "EMR sends a SIGKILL signal to the step and all its descendant processes". */
+    @Test
+    void aTerminateProcessCancelKillsTheStepAtOnce() {
+        EmrCluster cluster = service.runJobFlow(cluster("killed", true, sparkStep("killed", "CONTINUE")), REGION);
+        String killedId = cluster.getSteps().get(0).getId();
+        runner.whileRunning = () -> service.cancelSteps(cluster.getId(), List.of(killedId), "TERMINATE_PROCESS");
+
+        fixture.runStepThread();
+
+        assertEquals(Set.of(killedId), runner.stopped);
+        assertEquals(Set.of(), runner.interrupted);
+        assertEquals(List.of(false, true), runner.cancelledAsRunning);
+        assertEquals("CANCELLED", service.describeCluster(cluster.getId()).getSteps().get(0).getState());
+    }
+
+    @Test
+    void aTerminateProcessCancelKillsAStepAnInterruptLeftRunning() {
+        EmrCluster cluster = service.runJobFlow(cluster("escalated", true, sparkStep("escalated", "CONTINUE")),
+                REGION);
+        String escalatedId = cluster.getSteps().get(0).getId();
+        runner.whileRunning = () -> {
+            service.cancelSteps(cluster.getId(), List.of(escalatedId), "SEND_INTERRUPT");
+            service.cancelSteps(cluster.getId(), List.of(escalatedId), "TERMINATE_PROCESS");
+        };
+
+        fixture.runStepThread();
+
+        assertEquals(Set.of(escalatedId), runner.interrupted);
+        assertEquals(Set.of(escalatedId), runner.stopped);
+        assertEquals(List.of(false, true), runner.cancelledAsRunning);
+        assertEquals("CANCELLED", service.describeCluster(cluster.getId()).getSteps().get(0).getState());
     }
 
     @Test
@@ -1409,7 +1589,8 @@ class EmrServiceContainerStepsTest {
 
             new EmrService(new InMemoryStorageFactory(ACCOUNT), config, regionResolver,
                     new EmrEventPublisher(mock(EventBridgeService.class), new ObjectMapper(), regionResolver),
-                    sparkRunner, bootstrapRunner, clusterStorage, mock(EmrReleaseImages.class), mock(IamService.class))
+                    sparkRunner, bootstrapRunner, clusterStorage, mock(EmrReleaseImages.class), mock(IamService.class),
+                    mock(SparkConnectProxy.class))
                     .shutdown();
 
             verify(sparkRunner, times(reconcile ? 1 : 0)).removeLeftoverDrivers("emr");
@@ -1495,7 +1676,7 @@ class EmrServiceContainerStepsTest {
         assertEquals(stepId, job.runId());
         // The release's EMR Serverless image with its EMR Serverless Hive image's Hive, made on the step's thread.
         assertEquals(List.of(List.of("emr-7.5.0", "public.ecr.aws/emr-serverless/spark/emr-7.5.0:latest",
-                "public.ecr.aws/emr-serverless/hive/emr-7.5.0:latest", "true")), fixture.releaseImages.asked);
+                "public.ecr.aws/emr-serverless/hive/emr-7.5.0:latest", "true", "false")), fixture.releaseImages.asked);
         assertEquals(EmrServiceFixture.RecordingReleaseImages.IMAGE, job.imageTemplate());
         assertNull(job.customImage());
         assertEquals(List.of("hive-script", "--run-hive-script", "--args"), job.command());
@@ -1539,7 +1720,8 @@ class EmrServiceContainerStepsTest {
         fixture.runStepThread();
 
         assertEquals(List.of(List.of("emr-7.5.0", "public.ecr.aws/emr-serverless/spark/emr-7.5.0:latest",
-                "registry.internal/emr-serverless/hive/emr-7.5.0:20250425", "true")), fixture.releaseImages.asked);
+                "registry.internal/emr-serverless/hive/emr-7.5.0:20250425", "true", "false")),
+                fixture.releaseImages.asked);
         assertEquals(SparkJobRunner.Engine.SPARK, runner.jobs.get(0).engine());
         assertEquals(EmrServiceFixture.RecordingReleaseImages.IMAGE, runner.jobs.get(0).imageTemplate());
     }
@@ -1994,7 +2176,8 @@ class EmrServiceContainerStepsTest {
         bootstrapping.runStepThread();
         String waitingId = bootstrapping.service.runJobFlow(cluster("waiting", true), REGION).getId();
         ObjectMapper objectMapper = new ObjectMapper();
-        EmrHandler handler = new EmrHandler(bootstrapping.service, objectMapper);
+        EmrHandler handler = new EmrHandler(bootstrapping.service, mock(EmrStudioService.class),
+                mock(EmrNotebookExecutionService.class), mock(EmrAppUiService.class), objectMapper);
         String page = ERROR_CODE_PAGES + "BOOTSTRAP_FAILURE_PRIMARY_WITH_NON_ZERO_CODE.html";
         JsonNode expected = objectMapper.readTree("""
                 [{"ErrorCode": "BOOTSTRAP_FAILURE_PRIMARY_WITH_NON_ZERO_CODE",
@@ -2216,7 +2399,9 @@ class EmrServiceContainerStepsTest {
     void aClusterWhoseStepsNoContainerRanHasNoStorage() {
         EmrStep query = sparkStep("query", "CONTINUE");
         query.setArgs(new ArrayList<>(List.of("pig-script", "--run-pig-script", "--args", "-f", "s3://bucket/q.pig")));
-        EmrCluster cluster = service.runJobFlow(cluster("unrun", true, query), REGION);
+        EmrCluster requested = cluster("unrun", true, query);
+        requested.setApplications(PIG);
+        EmrCluster cluster = service.runJobFlow(requested, REGION);
         fixture.runStepThread();
 
         service.terminateJobFlows(List.of(cluster.getId()));
@@ -2393,6 +2578,8 @@ class EmrServiceContainerStepsTest {
     private static final class FakeRunner implements SparkJobRunner {
         final List<Job> jobs = new ArrayList<>();
         final Set<String> stopped = new HashSet<>();
+        // Runs sent SIGTERM: a driver that ignores it runs on.
+        final Set<String> interrupted = new HashSet<>();
         final List<String> driversStarted = new ArrayList<>();
         // What progress.cancelled() said once the driver ran, and again after whileRunning.
         final List<Boolean> cancelledAsRunning = new ArrayList<>();
@@ -2403,7 +2590,7 @@ class EmrServiceContainerStepsTest {
         public Outcome run(Job job, Progress progress) {
             jobs.add(job);
             // As the Docker runner, a stop counts only for a run in progress, so a cancel before then is read here.
-            if (progress.cancelled()) {
+            if (progress.cancelled() || stopped.contains(job.runId())) {
                 return Outcome.halted();
             }
             driversStarted.add(job.runId());
@@ -2417,6 +2604,14 @@ class EmrServiceContainerStepsTest {
         @Override
         public void stop(String runId) {
             stopped.add(runId);
+        }
+
+        // As the Docker runner, only a run whose driver runs is interrupted; one before then reads as cancelled.
+        @Override
+        public void interrupt(String runId) {
+            if (driversStarted.contains(runId)) {
+                interrupted.add(runId);
+            }
         }
 
         @Override

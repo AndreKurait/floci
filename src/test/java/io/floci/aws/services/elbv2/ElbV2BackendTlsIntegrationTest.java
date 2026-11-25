@@ -3,7 +3,7 @@ package io.floci.aws.services.elbv2;
 import io.floci.aws.services.acm.CertificateGenerator;
 import io.floci.aws.services.acm.model.KeyAlgorithm;
 import io.floci.aws.testing.AwsTestClients;
-import io.floci.aws.testing.RealElbV2DataPlaneProfile;
+import io.floci.aws.testing.RdsMockProfile;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
@@ -62,7 +62,7 @@ import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.*;
 
 @QuarkusTest
-@TestProfile(RealElbV2DataPlaneProfile.class)
+@TestProfile(RdsMockProfile.class)
 class ElbV2BackendTlsIntegrationTest {
 
     private final String name = "alb-tls-" + UUID.randomUUID().toString().substring(0, 8);
@@ -198,32 +198,40 @@ class ElbV2BackendTlsIntegrationTest {
         assertNull(received.get(), "The plaintext application must not receive the request");
     }
 
-    @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void unansweredBackendTlsHandshakeReturnsGatewayTimeout(boolean websocket) throws Exception {
-        CompletableFuture<Duration> disconnected = new CompletableFuture<>();
-        AtomicBoolean clientHello = new AtomicBoolean();
+    @Test
+    void unansweredBackendTlsHandshakeReturnsGatewayTimeoutToHttpAndWebSocketClients() throws Exception {
+        List<Duration> disconnected = new CopyOnWriteArrayList<>();
+        AtomicInteger clientHellos = new AtomicInteger();
         NetServer stalled = vertx.createNetServer().connectHandler(socket -> {
             long accepted = System.nanoTime();
+            // A ClientHello can arrive over several reads, so only a connection's first bytes decide it.
+            AtomicBoolean firstRead = new AtomicBoolean(true);
             socket.handler(buffer -> {
-                if (buffer.length() > 0 && buffer.getUnsignedByte(0) == 22) {
-                    clientHello.set(true);
+                if (buffer.length() > 0 && firstRead.getAndSet(false) && buffer.getUnsignedByte(0) == 22) {
+                    clientHellos.incrementAndGet();
                 }
             });
-            socket.closeHandler(ignored ->
-                    disconnected.complete(Duration.ofNanos(System.nanoTime() - accepted)));
+            socket.closeHandler(ignored -> disconnected.add(Duration.ofNanos(System.nanoTime() - accepted)));
         }).listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
         cleanup.add(() -> stalled.close().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS));
         HttpServer health = backend(false);
         createTarget("HTTPS", stalled.actualPort(), "HTTP", health.actualPort(), "200");
         awaitHealth("healthy", null);
 
-        assertForwardingFailure(websocket, 504);
-        assertTrue(clientHello.get(), "The backend must receive the real TLS ClientHello");
-        Duration elapsed = disconnected.get(5, TimeUnit.SECONDS);
-        assertTrue(elapsed.compareTo(Duration.ofSeconds(9)) >= 0
-                        && elapsed.compareTo(Duration.ofSeconds(15)) < 0,
-                "An ALB backend TLS handshake has a ten-second deadline: " + elapsed);
+        // Both clients wait out the same ten-second handshake deadline, so they share it.
+        CompletableFuture<Void> http = CompletableFuture.runAsync(() -> assertForwardingFailureUnchecked(false, 504));
+        CompletableFuture<Void> websocket = CompletableFuture.runAsync(
+                () -> assertForwardingFailureUnchecked(true, 504));
+        CompletableFuture.allOf(http, websocket).get(30, TimeUnit.SECONDS);
+
+        await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> assertEquals(2, disconnected.size(),
+                "Each client's backend connection must be closed: " + disconnected));
+        assertEquals(2, clientHellos.get(), "The backend must receive a real TLS ClientHello per client");
+        for (Duration elapsed : disconnected) {
+            assertTrue(elapsed.compareTo(Duration.ofSeconds(9)) >= 0
+                            && elapsed.compareTo(Duration.ofSeconds(15)) < 0,
+                    "An ALB backend TLS handshake has a ten-second deadline: " + elapsed);
+        }
         assertNull(received.get(), "The native wait must end before an application request is sent");
     }
 
@@ -380,6 +388,14 @@ class ElbV2BackendTlsIntegrationTest {
                                 .setPort(listenerPort).setURI("/socket.io/").addHeader("Host", dns))
                         .toCompletionStage().toCompletableFuture().get(15, TimeUnit.SECONDS));
         assertEquals(status, assertInstanceOf(UpgradeRejectedException.class, failure.getCause()).getStatus());
+    }
+
+    private void assertForwardingFailureUnchecked(boolean websocket, int status) {
+        try {
+            assertForwardingFailure(websocket, status);
+        } catch (Exception failure) {
+            throw new AssertionError(failure);
+        }
     }
 
     private HttpServer backend(boolean tls) throws Exception {

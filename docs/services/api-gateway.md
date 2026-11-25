@@ -24,6 +24,33 @@ bundle Floci gives the containers it launches (see [TLS](../configuration/tls.md
 authorizer on a Floci user pool verifies its tokens, as one on a Cognito user pool does on AWS. Its
 address is still a private one, so it also needs `FLOCI_SECURITY_ALLOW_PRIVATE_JWT_TARGETS=true`.
 
+## Integration target addresses
+
+REST API `HTTP` and `HTTP_PROXY` integrations, HTTP API `HTTP_PROXY` integrations and WebSocket API
+HTTP integrations send the request from Floci itself, so Floci screens where it may go. When an
+integration is invoked, Floci resolves the integration URI's host and refuses link-local and cloud
+instance-metadata addresses (`169.254.0.0/16`, `fe80::/10`, `fd00:ec2::254`).
+
+How a refusal reaches the caller depends on the integration:
+
+- `HTTP_PROXY`, on a REST or an HTTP API, answers `502`.
+- A REST `HTTP` integration treats the refusal like a backend `502` and runs it through the
+  integration responses, so with only a default `200` response the client gets `200`. A
+  `5\d{2}` selection pattern surfaces it.
+- A WebSocket integration fails with `500`: `$connect` rejects the upgrade, and a message route
+  sends no reply.
+
+For an `http://` URI, Floci connects to the address it checked, so a name that resolves differently
+on a second lookup cannot reach a refused address. For an `https://` URI, it checks the address and
+then hands the URL to the JDK HTTP client, which resolves the name again when it connects, so a name
+that changes between the two lookups is not screened. Treat the check as the boundary for `http://`
+targets only.
+
+Loopback and private addresses stay reachable, since an integration in front of a service on the
+same host or in a neighbouring container is the normal case in local development. Unlike the JWT
+policy above, no setting refuses them, so keep Floci off networks where untrusted callers can
+create integrations.
+
 ## Custom API IDs
 
 API IDs are generated randomly, which means endpoint URLs change every time you recreate an API. To pin
@@ -96,6 +123,42 @@ Unknown integration type strings produce warnings and leave the method without a
 integration. With `failOnWarnings=true`, the import or update is rejected before
 changing the API. Leading/trailing whitespace and non-ASCII lookalikes are not accepted.
 
+### Model templates
+
+`GetModelTemplate` returns the same sample VTL format for REST and WebSocket API models.
+Object properties use two-space indentation and sample values, including `"foo"` for
+strings and `3.1415` for numbers. Arrays contain a `##TODO:` comment and a
+`#foreach($elem in $inputRoot.TODO)` placeholder to customize for the source payload.
+This is a starting point for a mapping template, not a projection of the input JSON.
+Top-level array directives are unindented, with one space surrounding each sample element.
+
+Nested objects, typed arrays and finite local JSON Pointer references
+(`#/definitions/...`) are supported. Updating a model changes its next template;
+no generated-template cache or additional persistent state is used. The existing
+`AmazonApiGatewayV2` JSON compatibility target also accepts `GetModelTemplate`, with
+`ApiId` and `ModelId` inputs and a `Value` response.
+
+Template generation supports a bounded JSON-schema subset for `application/json` models.
+Composition (`allOf`, `anyOf`, `oneOf`, `not`), enums, const values, union types,
+tuple/untyped arrays, external or cyclic references, and property names containing
+VTL delimiters (`'`, `"`, `\`, `$`, `#`) or control characters return
+`UnsupportedOperation` (HTTP 501). Constraints such as ranges and formats do not
+choose the sample values. A schema must state a supported type or provide
+`properties`/`items` from which a type can be inferred.
+
+Malformed JSON, including extra tokens after the schema, returns
+`BadRequestException` (HTTP 400). Top-level scalar models also return HTTP 400,
+with `Unsupported data type for mapping template: <type>`. Schema admission at
+model creation and update is unchanged; valid schemas outside the generator's
+subset remain storable. HTTP APIs reject model creation because models are only
+supported for WebSocket APIs in API Gateway v2.
+Template reads for a missing WebSocket model return `NotFoundException` (HTTP 404)
+with `Invalid model identifier specified: <id>`.
+
+Local generation limits are 1,048,576 schema characters, 4,096 visited schema nodes,
+32 levels of nesting and 262,144 output characters. These are Floci limits, not
+AWS service quotas.
+
 ### Supported Operations
 
 | Category | Operations |
@@ -114,7 +177,7 @@ changing the API. Leading/trailing whitespace and non-ASCII lookalikes are not a
 | **Usage Plan Keys** | CreateUsagePlanKey, GetUsagePlanKey, GetUsagePlanKeys, DeleteUsagePlanKey |
 | **Request Validators** | CreateRequestValidator, GetRequestValidator, GetRequestValidators, UpdateRequestValidator, DeleteRequestValidator |
 | **Gateway Responses** | PutGatewayResponse, GetGatewayResponse, GetGatewayResponses, UpdateGatewayResponse, DeleteGatewayResponse |
-| **Models** | CreateModel, GetModel, GetModels, UpdateModel, DeleteModel |
+| **Models** | CreateModel, GetModel, GetModels, GetModelTemplate, UpdateModel, DeleteModel |
 | **Documentation Parts** | CreateDocumentationPart, GetDocumentationPart, GetDocumentationParts, UpdateDocumentationPart, DeleteDocumentationPart |
 | **Domain Names** | CreateDomainName, GetDomainName, GetDomainNames, UpdateDomainName, DeleteDomainName |
 | **Base Path Mappings** | CreateBasePathMapping, GetBasePathMapping, GetBasePathMappings, UpdateBasePathMapping, DeleteBasePathMapping |
@@ -131,6 +194,23 @@ An ARN with an account segment is rejected with `BadRequestException` and an ARN
 Tagged REST APIs, stages, API keys, usage plans and custom domain names are discoverable through the
 [Resource Groups Tagging API](resource-groups-tagging.md), whose `TagResources` and `UntagResources`
 write REST API, stage, API key, usage plan and custom domain name tags through to API Gateway.
+
+### Base Path Mapping Pagination
+
+`GetBasePathMappings` accepts `limit` and `position`, returns 25 mappings by default,
+and caps pages at 500. A nonterminal page includes an opaque `position`; the final
+page omits it. Positions belong to the caller's account, Region and domain. Paging
+uses each record's stored base path, so legacy root records that report the same
+`basePath` remain distinct. Looking up a missing domain still returns `NotFoundException`.
+
+
+### Deployment Pagination
+
+`GetDeployments` accepts `limit` and `position`, returns 25 deployments by default,
+and caps pages at 500. Use the returned `position` to continue a partial collection;
+the final page omits it. Positions belong to the caller's account, Region and REST
+API. A missing parent API returns `NotFoundException`.
+
 
 ### API Key Behaviour Notes
 
@@ -405,7 +485,6 @@ treated as a gateway response.
 These management-plane operations have no handler in v1. Calls will return `404` or an error:
 
 - Authorizer testing: `TestInvokeAuthorizer`
-- Model templates: `GetModelTemplate`
 - Documentation versions (5 operations)
 - Client Certificates (5 operations)
 - `ImportDocumentationParts`
@@ -546,9 +625,11 @@ in that map, return `BadRequestException` rather than silently discarding or cha
 | `contentHandling` | `CONVERT_TO_TEXT` base64-encodes a binary request for mapping templates; `CONVERT_TO_BINARY` base64-decodes a text request before sending it |
 | `connectionType` / `connectionId` | `VPC_LINK` requires `connectionId` to name an existing, available VPC link; an unknown link yields `502` |
 | `cacheNamespace` / `cacheKeyParameters` | Form the response cache key (see below) |
-| `credentials` | Persisted and returned. Floci does not enforce IAM, so the role is not actually assumed |
+| `credentials` | Persisted and returned. The role is not assumed, and even with IAM enforcement on neither its trust policy nor its identity policies are checked |
 
 Integration responses additionally accept `contentHandling`, applied as an output conversion after response templates.
+
+With IAM enforcement on, an `AWS_PROXY` or `AWS` Lambda integration with no `credentials` invokes the function only when its function policy allows `apigateway.amazonaws.com` to, for the request's execute-api ARN when the statement names a `SourceArn` (`arn:aws:execute-api:<region>:<account>:<api-id>/<stage>/<METHOD>/<path>`). `<path>` is the concrete request path such as `items/42`, not the resource path template `items/{id}`, so a grant for `.../GET/items/42` covers that call, and a greedy `{proxy+}` resource is checked against the full path it matched. `<region>` is the function's Region, taken from the function ARN in the integration URI, and the API's Region when that ARN names none; it differs from the API's for a cross-Region integration, as [Lambda's guide for API Gateway](https://docs.aws.amazon.com/lambda/latest/dg/services-apigateway.html) specifies. The Lambda authorizer `methodArn` keeps the API's Region. For an `ANY` method, `<METHOD>` is the request's verb, as in a Lambda authorizer's `methodArn`; this was not measured on AWS. A refused call is answered with `500` and `{"message": "Internal server error"}`, shaped by an `API_CONFIGURATION_ERROR` or `DEFAULT_5XX` gateway response when one is set, and the function is not invoked. A call to a function that does not exist is refused the same way; with enforcement off it is still answered with `404`. See [Function policies under IAM enforcement](lambda.md#function-policies-under-iam-enforcement). An integration with `credentials` skips the function-policy check, since AWS authorizes it through that role instead, but Floci does not check the role either: its trust policy for `apigateway.amazonaws.com` and its identity policies for `lambda:InvokeFunction` are not evaluated, so such an integration always invokes the function. REST Lambda authorizers and HTTP and WebSocket API integrations are not checked yet.
 
 ### Binary Payloads
 
@@ -738,6 +819,24 @@ setups, and `floci:override-id` wins when both are present. Every other tag is p
 
 ---
 
+## IAM enforcement of management calls
+
+With IAM enforcement on, a v1 or v2 management call is authorized as AWS authorizes it, read from
+the generated tables like other services' requests. A route AWS authorizes by its HTTP method is
+checked as `apigateway:GET`, `POST`, `PUT`, `DELETE` or `PATCH` on the resource its own path names,
+`arn:aws:apigateway:<region>::<path>`, without the `/v2` of an HTTP or WebSocket API path:
+`GET /restapis/abc123/stages` acts on `arn:aws:apigateway:<region>::/restapis/abc123/stages`. The
+[ARN reference](https://docs.aws.amazon.com/apigateway/latest/developerguide/arn-format-reference.html)
+of the developer guide gives the ARN of each such path; where it gives one with an account
+(`/domainnameaccessassociations`), the account is the caller's. A path it gives no ARN for
+(`/sdktypes`, `/usageplans/<id>/usage`) acts on the guide's ARN format with that path as its
+resource path. A tagging route acts on `/tags/<arn>` with the ARN it tags URL-encoded, however the
+request sends it. A label's own `/` stays escaped in its segment, and
+`DeleteDomainNameAccessAssociation` acts on the association ARN its path carries. A route AWS
+authorizes as an action of its own, a portal's, a routing rule's or
+`RejectDomainNameAccessAssociation`'s, is checked as that action on the resources the Service
+Reference gives it.
+
 ## Partitions
 
 Edge-optimized APIs and custom domains (`EDGE`) exist only in the commercial partition: China
@@ -840,6 +939,10 @@ query names are case-sensitive. No configured sources produces an empty array
 or string. A missing or empty configured value returns `401` without invoking
 Lambda in either format. Repeated request values use each event's delivered
 representation: last value in format `1.0`, comma-joined values in format `2.0`.
+The authorizer event's source IP (`requestContext.http.sourceIp` in format `2.0`,
+`requestContext.identity.sourceIp` in format `1.0`) and the Lambda proxy event's
+`requestContext.http.sourceIp` are the address of the TCP connection to Floci, as in
+`$context.identity.sourceIp`; a client's `X-Forwarded-For` header does not change them.
 
 HTTP API `HTTP_PROXY` integrations can map values from a successful Lambda
 authorizer's context into request headers, query strings, and paths. For a returned
@@ -865,6 +968,31 @@ source, including the whole `$request.body`, is rejected when it contains CR, LF
 control character besides tab, as is a mapped `Host`: the request never reaches the backend and the
 caller receives `502` with
 `{"message":"Bad Gateway: invalid request header value for <name>"}`.
+
+HTTP API integrations store and return `responseParameters`, and an `HTTP_PROXY` integration
+applies the mappings keyed by the backend's status code to its response. `overwrite:statuscode`
+replaces the status, and `append:header.<name>`, `overwrite:header.<name>` and
+`remove:header.<name>` edit the response headers, matching the name case-insensitively. A value is a
+static string, `$response.header.<name>` (repeated values joined with commas), `$response.body`,
+`$response.body.<JSONPath>`, `$stageVariables.<name>` or one of the `$context` variables above, and
+every value reads the backend response as it arrived. A value that resolves to nothing skips its
+mapping. So does an `overwrite:statuscode` source that resolves to anything but a status from 100 to
+599, and a header value holding CR, LF, NUL or any other control character besides tab, such as a
+pretty-printed `$response.body`, while the other mappings still apply. Floci
+evaluates the whole body, where AWS reads only its first 100 KB, and does not resolve the braced
+`${response.header.<name>}` form. The `502` Floci answers for an unreachable backend goes through
+the same mappings as a backend's own `502`. Lambda (`AWS_PROXY`) integrations store
+`responseParameters` without applying them.
+
+Create, update and OpenAPI import reject `responseParameters` that is not an object, a status code
+key outside 200 to 599, a mapping key other than `overwrite:statuscode` or an `append`, `overwrite`
+or `remove` of `header.<name>`, a header name that is not an HTTP token, and a static
+`overwrite:statuscode` value that is not a status from 100 to 599, with `400 BadRequestException`.
+The headers AWS reserves from mapping, such as `Content-Length`, are not checked. `UpdateIntegration` merges by status code: a status code with mappings replaces that status
+code's mappings, an empty map such as `{"500": {}}` removes it, and a status code the update leaves
+out is kept. CloudFormation carries `ResponseParameters` from an `AWS::ApiGatewayV2::Integration`,
+each status code's `Destination` and `Source` pairs becoming its mappings, and from the
+`x-amazon-apigateway-integration` extension of an `AWS::ApiGatewayV2::Api` `Body`.
 
 HTTP API `AWS_PROXY` integrations accept every `integrationSubtype` AWS defines:
 `EventBridge-PutEvents`, `SQS-SendMessage`, `SQS-ReceiveMessage`, `SQS-DeleteMessage`,
@@ -903,8 +1031,10 @@ expressions are `$request.body`, `$request.body.<JSONPath>`, `$request.header.<n
 `$context` variables: `accountId`, `apiId`, `domainName`, `domainPrefix`, `extendedRequestId`,
 `httpMethod`, `path`, `protocol`, `requestTime`, `requestTimeEpoch`, `routeKey`, `stage`,
 `requestId`, `identity.sourceIp`, `authorizer.<key>` and `authorizer.claims.<claim>`. `requestId`
-and `domainName` are the values the rest of the gateway reports for the request, and `path`
-starts with the stage name, as in `/test/send`, except on the `$default` stage. An expression
+and `domainName` are the values the rest of the gateway reports for the request,
+`extendedRequestId` is the same value as `requestId`, as AWS documents for HTTP APIs and as
+`HTTP_PROXY` mappings also resolve it (an `HTTP_PROXY` response returns that id as `x-amzn-RequestId`,
+in place of any the backend sent, and a valid UUID sent in `x-amzn-RequestId` replaces it), and `path` starts with the stage name, as in `/test/send`, except on the `$default` stage. An expression
 with any other source is rejected with `400 BadRequestException` on create, update and import,
 including one embedded as `${...}` or inside a JSON parameter's string values. A `$` inside static
 text without braces, as in `price $5`, stays literal. A `$context` variable outside the list
@@ -1026,7 +1156,7 @@ listener relays the request unchanged and does not add a hop.
 | **Authorizers** | CreateAuthorizer, GetAuthorizer, GetAuthorizers, UpdateAuthorizer, DeleteAuthorizer |
 | **Stages** | CreateStage, GetStage, GetStages, UpdateStage, DeleteStage |
 | **Deployments** | CreateDeployment, GetDeployment, GetDeployments, UpdateDeployment, DeleteDeployment |
-| **Models** | CreateModel, GetModel, GetModels, UpdateModel, DeleteModel |
+| **Models** | CreateModel, GetModel, GetModels, GetModelTemplate, UpdateModel, DeleteModel |
 | **Domain Names** | CreateDomainName, GetDomainName, GetDomainNames, UpdateDomainName, DeleteDomainName |
 | **API Mappings** | CreateApiMapping, GetApiMapping, GetApiMappings, UpdateApiMapping, DeleteApiMapping |
 | **VPC Links** | CreateVpcLink, GetVpcLink, GetVpcLinks, UpdateVpcLink, DeleteVpcLink |

@@ -5,11 +5,14 @@ import com.sun.net.httpserver.HttpsServer;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.config.FlociCertificateAuthority;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.testing.ExtraCaConfigs;
 import io.floci.aws.testing.LocalHttpsServer;
+import io.floci.aws.testing.ParallelLocks;
 import io.floci.aws.testing.StorageFactories;
 import io.floci.aws.testutil.LogCapture;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.nio.file.Path;
 import java.time.Duration;
@@ -30,6 +33,7 @@ import static org.mockito.Mockito.when;
  * An HTTPS subscription's endpoint is reached through Floci's outbound trust, so a certificate from a CA in
  * floci.tls.extra-ca-path is accepted, with TLS off.
  */
+@ResourceLock(ParallelLocks.PORTS)
 class SnsHttpsSubscriptionTrustTest {
 
     private static final String REGION = "us-east-1";
@@ -99,10 +103,9 @@ class SnsHttpsSubscriptionTrustTest {
 
     // A service built the way CDI builds it, with TLS off.
     private SnsService service(Optional<String> extraCaPath) {
-        EmulatorConfig config = StorageFactories.config(dir.resolve("data"), ACCOUNT);
+        EmulatorConfig config = ExtraCaConfigs.stub(StorageFactories.config(dir.resolve("data"), ACCOUNT), false,
+                extraCaPath);
         when(config.effectiveBaseUrl()).thenReturn(BASE_URL);
-        when(config.tls().enabled()).thenReturn(false);
-        when(config.tls().extraCaPath()).thenReturn(extraCaPath);
         return new SnsService(StorageFactories.open(config, "memory"), config, new RegionResolver(REGION, ACCOUNT),
                 null, null, null, new ObjectMapper(), SnsMessageSigner.inMemory(BASE_URL));
     }

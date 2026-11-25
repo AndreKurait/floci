@@ -34,6 +34,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
@@ -207,6 +208,36 @@ class S3ServiceTest {
     }
 
     @Test
+    void serviceOwnedBucketsStayHiddenWithoutHidingCustomerNames() throws Exception {
+        s3Service.createBucket("awslambda-eu-west-1-tasks", "eu-west-1");
+        Bucket internal = s3Service.createServiceOwnedBucket("awslambda-us-east-1-tasks", "us-east-1");
+        assertTrue(internal.isServiceOwned());
+        assertEquals(List.of("awslambda-eu-west-1-tasks"),
+                s3Service.listBuckets().stream().map(Bucket::getName).toList());
+
+        ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
+        Bucket restored = mapper.readValue(mapper.writeValueAsBytes(internal), Bucket.class);
+        assertTrue(restored.isServiceOwned());
+        assertFalse(mapper.readValue("{\"name\":\"legacy-customer\"}", Bucket.class).isServiceOwned());
+    }
+
+    @ParameterizedTest
+    @NullAndEmptySource
+    @ValueSource(strings = {"us-east-1", "eu-west-1"})
+    void customerCreateCannotClaimServiceOwnedBucket(String region) {
+        String name = "service-owned-bucket";
+        Bucket bucket = s3Service.createServiceOwnedBucket(name, region);
+
+        AwsException conflict = assertThrows(AwsException.class,
+                () -> s3Service.createBucket(name, region));
+
+        assertEquals("BucketAlreadyExists", conflict.getErrorCode());
+        assertEquals(409, conflict.getHttpStatus());
+        assertTrue(bucket.isServiceOwned());
+        assertTrue(s3Service.listBuckets().isEmpty());
+    }
+
+    @Test
     void listBucketsHidesScratchBucketsButKeepsOtherInternalPrefixBuckets() {
         s3Service.createBucket("bucket-a", "us-east-1");
         s3Service.createBucket(S3Service.REDSHIFT_SPECTRUM_SCRATCH_BUCKET, "us-east-1");
@@ -265,7 +296,7 @@ class S3ServiceTest {
     }
 
     @Test
-    void putObjectTrimsBlankServerSideEncryptionToAbsent() {
+    void putObjectTreatsBlankServerSideEncryptionAsAbsentAndAppliesTheBucketDefault() {
         s3Service.createBucket("test-bucket", "us-east-1");
 
         S3Object put = s3Service.putObject(
@@ -277,7 +308,7 @@ class S3ServiceTest {
                 new PutObjectOptions().withServerSideEncryption("   ")
         );
 
-        assertNull(put.getServerSideEncryption());
+        assertEquals("AES256", put.getServerSideEncryption());
     }
 
     @Test
@@ -297,6 +328,132 @@ class S3ServiceTest {
 
         assertEquals("InvalidArgument", exception.getErrorCode());
         assertTrue(exception.getMessage().contains("Unsupported x-amz-server-side-encryption value"));
+    }
+
+    @Test
+    void putObjectRefusesKmsKeyIdWithoutServerSideEncryption() {
+        s3Service.createBucket("test-bucket", "us-east-1");
+
+        AwsException exception = assertThrows(AwsException.class, () ->
+                s3Service.putObject(
+                        "test-bucket",
+                        "kms-id-without-algorithm.txt",
+                        "data".getBytes(StandardCharsets.UTF_8),
+                        "text/plain",
+                        null,
+                        new PutObjectOptions()
+                                .withSseKmsKeyId("arn:aws:kms:us-east-1:000000000000:key/test-key")
+                )
+        );
+
+        assertEquals("InvalidArgument", exception.getErrorCode());
+        assertEquals("Server Side Encryption with AWS KMS managed key requires HTTP header x-amz-server-side-encryption : aws:kms",
+                exception.getMessage());
+        assertThrows(AwsException.class, () -> s3Service.getObject("test-bucket", "kms-id-without-algorithm.txt"));
+    }
+
+    @Test
+    void putObjectRefusesKmsKeyIdWithAes256() {
+        s3Service.createBucket("test-bucket", "us-east-1");
+
+        AwsException exception = assertThrows(AwsException.class, () ->
+                s3Service.putObject(
+                        "test-bucket",
+                        "kms-id-with-aes256.txt",
+                        "data".getBytes(StandardCharsets.UTF_8),
+                        "text/plain",
+                        null,
+                        new PutObjectOptions()
+                                .withServerSideEncryption("AES256")
+                                .withSseKmsKeyId("arn:aws:kms:us-east-1:000000000000:key/test-key")
+                )
+        );
+
+        assertEquals("InvalidArgument", exception.getErrorCode());
+        assertEquals("Server Side Encryption with AWS KMS managed key requires HTTP header x-amz-server-side-encryption : aws:kms",
+                exception.getMessage());
+    }
+
+    @Test
+    void putObjectRefusesAnEmptyKmsKeyIdWithoutServerSideEncryption() {
+        s3Service.createBucket("test-bucket", "us-east-1");
+
+        AwsException exception = assertThrows(AwsException.class, () ->
+                s3Service.putObject(
+                        "test-bucket",
+                        "empty-kms-id.txt",
+                        "data".getBytes(StandardCharsets.UTF_8),
+                        "text/plain",
+                        null,
+                        new PutObjectOptions().withSseKmsKeyId("")
+                )
+        );
+
+        assertEquals("InvalidArgument", exception.getErrorCode());
+        assertEquals("Server Side Encryption with AWS KMS managed key requires HTTP header x-amz-server-side-encryption : aws:kms",
+                exception.getMessage());
+    }
+
+    @Test
+    void putObjectWithKmsKeepsTheKeyId() {
+        s3Service.createBucket("test-bucket", "us-east-1");
+        String kmsKeyId = "arn:aws:kms:us-east-1:000000000000:key/test-key";
+
+        S3Object put = s3Service.putObject(
+                "test-bucket",
+                "kms-with-key-id.txt",
+                "data".getBytes(StandardCharsets.UTF_8),
+                "text/plain",
+                null,
+                new PutObjectOptions()
+                        .withServerSideEncryption("aws:kms")
+                        .withSseKmsKeyId(kmsKeyId)
+        );
+
+        assertEquals("aws:kms", put.getServerSideEncryption());
+        assertEquals(kmsKeyId, put.getSseKmsKeyId());
+    }
+
+    @Test
+    void putObjectWithDsseKeepsTheKeyId() {
+        s3Service.createBucket("test-bucket", "us-east-1");
+        String kmsKeyId = "arn:aws:kms:us-east-1:000000000000:key/test-key";
+
+        S3Object put = s3Service.putObject(
+                "test-bucket",
+                "dsse-with-key-id.txt",
+                "data".getBytes(StandardCharsets.UTF_8),
+                "text/plain",
+                null,
+                new PutObjectOptions()
+                        .withServerSideEncryption("aws:kms:dsse")
+                        .withSseKmsKeyId(kmsKeyId)
+        );
+
+        assertEquals("aws:kms:dsse", put.getServerSideEncryption());
+        assertEquals(kmsKeyId, put.getSseKmsKeyId());
+    }
+
+    @Test
+    void streamedPutObjectRefusesKmsKeyIdWithoutReadingTheBody() {
+        s3Service.createBucket("test-bucket", "us-east-1");
+        InputStream body = new InputStream() {
+            @Override
+            public int read() throws IOException {
+                throw new IOException("the body must not be read");
+            }
+        };
+
+        AwsException exception = assertThrows(AwsException.class, () ->
+                s3Service.putObject("test-bucket", "streamed-kms-id.txt", body, UploadChecksums.NONE,
+                        "text/plain", null,
+                        new PutObjectOptions()
+                                .withSseKmsKeyId("arn:aws:kms:us-east-1:000000000000:key/test-key"))
+        );
+
+        assertEquals("InvalidArgument", exception.getErrorCode());
+        assertEquals("Server Side Encryption with AWS KMS managed key requires HTTP header x-amz-server-side-encryption : aws:kms",
+                exception.getMessage());
     }
 
     @Test
@@ -1186,14 +1343,14 @@ class S3ServiceTest {
     @Test
     void resolvePathWithTraversalThrows() {
         s3Service.createBucket("test-bucket", "us-east-1");
-        
+
         // Blocked: going above the bucket root
-        AwsException ex = assertThrows(AwsException.class, () -> 
+        AwsException ex = assertThrows(AwsException.class, () ->
                 s3Service.putObject("test-bucket", "../outside.txt", "data".getBytes(), null, null));
         assertEquals("InvalidKey", ex.getErrorCode());
-        
+
         // Blocked: deeper traversal
-        assertThrows(AwsException.class, () -> 
+        assertThrows(AwsException.class, () ->
                 s3Service.getObject("test-bucket", "dir/../../../etc/passwd"));
     }
 

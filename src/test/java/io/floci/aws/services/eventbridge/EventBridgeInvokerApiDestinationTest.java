@@ -11,9 +11,13 @@ import io.floci.aws.services.eventbridge.model.Target;
 import io.floci.aws.services.lambda.LambdaService;
 import io.floci.aws.services.sns.SnsService;
 import io.floci.aws.services.sqs.SqsService;
+import io.floci.aws.testing.ExtraCaConfigs;
 import io.floci.aws.testing.LocalHttpsServer;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -33,10 +37,10 @@ import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class EventBridgeInvokerApiDestinationTest {
 
     private static final String REGION = "us-east-1";
@@ -189,9 +193,7 @@ class EventBridgeInvokerApiDestinationTest {
 
     // An invoker built the way CDI builds it, its API destination pointing at endpoint, with TLS off.
     private static EventBridgeInvoker invoker(String endpoint, Optional<String> extraCaPath) {
-        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
-        when(config.tls().enabled()).thenReturn(false);
-        when(config.tls().extraCaPath()).thenReturn(extraCaPath);
+        EmulatorConfig config = ExtraCaConfigs.config(false, extraCaPath);
         EventBridgeService eventBridgeService = mock(EventBridgeService.class);
         when(eventBridgeService.findApiDestinationByArn(DESTINATION_ARN, REGION)).thenReturn(
                 new ApiDestination("tls", DESTINATION_ARN, CONNECTION_ARN, endpoint, "POST", null, null));

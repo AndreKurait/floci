@@ -548,7 +548,10 @@ public class RedshiftDataService implements Resettable, StoredResourceArns {
                 }
                 boolean autoCommit = AUTO_COMMIT_SQL.matcher(sql).find() || CopyJobSql.requiresAutoCommit(sql)
                         || preparation != null && target.spectrum() != null
-                        && preparation.handlesDdl(sql, target.spectrum());
+                        && (preparation.needsBackendForDdl(sql, target.spectrum())
+                                ? preparation.handlesDdl(sql, target.spectrum(),
+                                        new RedshiftDataBackendSql(connection, execution))
+                                : preparation.handlesDdl(sql, target.spectrum()));
                 if (autoCommit) {
                     if (session != null && session.inTransaction()) {
                         throw new SQLException("Statement cannot run inside a transaction block", "25001");
@@ -694,14 +697,44 @@ public class RedshiftDataService implements Resettable, StoredResourceArns {
                                  Connection connection, String sql, Map<String, String> parameters, SpectrumSession context,
                                  RedshiftDataExecution execution, boolean autoCommit)
             throws SQLException {
+        String rewritten = CopyJobSql.rewrite(sql, !autoCommit || !connection.getAutoCommit());
+        ParsedSql parsed = RedshiftDataSqlParameters.parse(RedshiftSqlInterceptor.rewrite(rewritten));
+        boolean udfPrepared = false;
         if (preparation != null && context != null) {
             SpectrumSession session = new SpectrumSession(context.accountId(), context.clusterKey(), context.databaseName(),
                     context.iamRoleArns(), !connection.getAutoCommit());
             try {
-                if (preparation.prepare(sql, session, new RedshiftDataBackendSql(connection, execution))) {
+                RedshiftDataBackendSql backend = new RedshiftDataBackendSql(connection, execution);
+                boolean ddl = preparation.needsBackendForDdl(sql, session)
+                        ? preparation.handlesDdl(sql, session, backend)
+                        : preparation.handlesDdl(sql, session);
+                boolean usesUdf = !ddl && preparation.referencesExternalFunction(parsed.sql(), session);
+                List<String> positional = positionalParameters(parsed.parameterOrder(), parameters);
+                boolean handled;
+                if (ddl) {
+                    handled = preparation.prepare(sql, session, backend);
+                } else if (usesUdf) {
+                    handled = preparation.prepareTables(parsed.sql(), session, backend, positional);
+                    if (!handled) {
+                        // The collect passes and the statement share one transaction, so now() and the other
+                        // transaction-time arguments the cached results are keyed on cannot change between them.
+                        if (!autoCommit) {
+                            connection.setAutoCommit(false);
+                        }
+                        preparation.prepareExternalFunctions(parsed.sql(), new SpectrumSession(context.accountId(),
+                                context.clusterKey(), context.databaseName(), context.iamRoleArns(),
+                                !connection.getAutoCommit()), backend, positional, null);
+                    }
+                } else if (parsed.parameterOrder().isEmpty()) {
+                    handled = preparation.prepare(parsed.sql(), session, backend);
+                } else {
+                    handled = preparation.prepare(parsed.sql(), session, backend, positional);
+                }
+                if (handled) {
                     stored.status = RedshiftDataStatementStore.Status.FINISHED;
                     return;
                 }
+                udfPrepared = usesUdf;
             } catch (SpectrumSqlException exception) {
                 throw new SQLException(exception.getMessage(), exception.sqlState(), exception);
             } catch (SpectrumReadException exception) {
@@ -711,13 +744,12 @@ public class RedshiftDataService implements Resettable, StoredResourceArns {
                 throw new SQLException("External query preparation failed: " + exception.getMessage(), "58030", exception);
             }
         }
-        String rewritten = CopyJobSql.rewrite(sql, !autoCommit || !connection.getAutoCommit());
-        ParsedSql parsed = RedshiftDataSqlParameters.parse(RedshiftSqlInterceptor.rewrite(rewritten));
         execution.checkCancellation();
         if (!autoCommit) {
             connection.setAutoCommit(false);
         }
         long t0 = System.nanoTime();
+        boolean statementSucceeded = false;
         try (PreparedStatement statement = connection.prepareStatement(parsed.sql())) {
             execution.track(statement);
             try {
@@ -737,12 +769,35 @@ public class RedshiftDataService implements Resettable, StoredResourceArns {
                     stored.hasResultSet = false;
                     stored.resultRows = Math.max(statement.getUpdateCount(), 0);
                 }
+                statementSucceeded = true;
             } finally {
                 execution.untrack(statement);
+            }
+        } finally {
+            if (udfPrepared && (statementSucceeded || connection.getAutoCommit()) && !connection.isClosed()) {
+                try {
+                    preparation.resetUdfState(new RedshiftDataBackendSql(connection, execution));
+                } catch (RuntimeException ignored) {
+                    // Best-effort cleanup so a subsequent statement on a retained session cannot see stale UDF state.
+                }
             }
         }
         stored.durationNanos = System.nanoTime() - t0;
         stored.status = RedshiftDataStatementStore.Status.FINISHED;
+    }
+
+    private static List<String> positionalParameters(List<String> order, Map<String, String> valuesByName) {
+        if (order.isEmpty()) {
+            return List.of();
+        }
+        List<String> values = new ArrayList<>(order.size());
+        for (String name : order) {
+            if (!valuesByName.containsKey(name)) {
+                return null;
+            }
+            values.add(valuesByName.get(name));
+        }
+        return values;
     }
 
     private ObjectNode executeResponse(RedshiftDataStatementStore.StoredStatement stored) {

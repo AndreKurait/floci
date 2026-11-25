@@ -70,7 +70,7 @@ public class SesCvetService implements SesTaggable {
     }
 
     public CustomVerificationEmailTemplate getCustomVerificationEmailTemplate(String templateName, String region) {
-        return cvetStore.get(cvetKey(region, templateName)).orElseThrow(() -> cvetNotFound(templateName));
+        return cvetStore.get(cvetKey(region, templateName)).orElseThrow(SesCvetService::cvetNotFound);
     }
 
     public PaginatedResult<CustomVerificationEmailTemplate> listCustomVerificationEmailTemplates(
@@ -88,13 +88,17 @@ public class SesCvetService implements SesTaggable {
                 .toList();
     }
 
-    public void updateCustomVerificationEmailTemplate(CustomVerificationEmailTemplate template, String region) {
+    /**
+     * The v2 update: the template given replaces the stored one, which keeps only its tags. The v1
+     * update is {@link #patchCustomVerificationEmailTemplate}.
+     */
+    public void replaceCustomVerificationEmailTemplate(CustomVerificationEmailTemplate template, String region) {
         String key = cvetKey(region, template.getTemplateName());
         // Guard the existence check and the put together so a concurrent delete can't slip between
         // them and have the update resurrect the just-deleted template.
         synchronized (cvetMutationLock) {
             CustomVerificationEmailTemplate existing = cvetStore.get(key)
-                    .orElseThrow(() -> cvetNotFound(template.getTemplateName()));
+                    .orElseThrow(SesCvetService::cvetNotFound);
             // The update request has no Tags member — preserve the stored ones (copied, so the
             // two objects never share a list instance).
             template.setTags(new ArrayList<>(existing.getTags()));
@@ -104,17 +108,60 @@ public class SesCvetService implements SesTaggable {
                 template.getTemplateName(), region);
     }
 
-    public void deleteCustomVerificationEmailTemplate(String templateName, String region) {
+    /**
+     * The v1 update (probed): a member left out keeps its stored value, and an empty subject clears
+     * the stored one, so the template then reads back without it. The content follows the subject.
+     * An empty sender or redirection URL was not probed and is treated as left out, which keeps the
+     * template sendable.
+     */
+    public void patchCustomVerificationEmailTemplate(CustomVerificationEmailTemplate changes, String region) {
+        String key = cvetKey(region, changes.getTemplateName());
+        synchronized (cvetMutationLock) {
+            CustomVerificationEmailTemplate existing = cvetStore.get(key)
+                    .orElseThrow(SesCvetService::cvetNotFound);
+            CustomVerificationEmailTemplate patched = new CustomVerificationEmailTemplate();
+            patched.setTemplateName(existing.getTemplateName());
+            patched.setFromEmailAddress(kept(changes.getFromEmailAddress(), existing.getFromEmailAddress()));
+            patched.setTemplateSubject(cleared(changes.getTemplateSubject(), existing.getTemplateSubject()));
+            patched.setTemplateContent(cleared(changes.getTemplateContent(), existing.getTemplateContent()));
+            patched.setSuccessRedirectionURL(
+                    kept(changes.getSuccessRedirectionURL(), existing.getSuccessRedirectionURL()));
+            patched.setFailureRedirectionURL(
+                    kept(changes.getFailureRedirectionURL(), existing.getFailureRedirectionURL()));
+            patched.setTags(new ArrayList<>(existing.getTags()));
+            cvetStore.put(key, patched);
+        }
+        LOG.infov("Updated custom verification email template {0} in region {1}",
+                changes.getTemplateName(), region);
+    }
+
+    private static String kept(String change, String stored) {
+        return change == null || change.isEmpty() ? stored : change;
+    }
+
+    private static String cleared(String change, String stored) {
+        if (change == null) {
+            return stored;
+        }
+        return change.isEmpty() ? null : change;
+    }
+
+    /**
+     * Reports whether the template existed instead of throwing, because the two protocols disagree
+     * (probed): v1 answers 200 for an unknown name, v2 answers 404.
+     */
+    public boolean deleteCustomVerificationEmailTemplate(String templateName, String region) {
         String key = cvetKey(region, templateName);
         // Guard the check-then-delete on the same lock as create/update so the three mutations
         // serialize against each other.
         synchronized (cvetMutationLock) {
             if (cvetStore.get(key).isEmpty()) {
-                throw cvetNotFound(templateName);
+                return false;
             }
             cvetStore.delete(key);
         }
         LOG.infov("Deleted custom verification email template {0} in region {1}", templateName, region);
+        return true;
     }
 
     /**
@@ -174,11 +221,11 @@ public class SesCvetService implements SesTaggable {
                 "No CustomVerificationEmailTemplate present with name: " + templateName, 404);
     }
 
-    private static AwsException cvetNotFound(String templateName) {
-        // v1-native code (verified: CustomVerificationEmailTemplateDoesNotExist / 400).
-        // SesV2Json.remapV1Exception translates it to NotFoundException / 404 for the v2 boundary.
+    private static AwsException cvetNotFound() {
+        // v1-native code and message (probed: a fixed sentence that does not name the template).
+        // The v2 controller restates it as NotFoundException / 404 in the v2 wording.
         return new AwsException("CustomVerificationEmailTemplateDoesNotExist",
-                "Custom verification email template <" + templateName + "> does not exist", 400);
+                "Provided custom verification email template name does not exist.", 400);
     }
 
     private static String cvetKey(String region, String templateName) {

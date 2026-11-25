@@ -6,7 +6,9 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -30,6 +32,14 @@ public final class PostgresWire {
      */
     public static String quoteLiteral(String value) {
         return "E'" + value.replace("\\", "\\\\").replace("'", "''") + "'";
+    }
+
+    /**
+     * An identifier, always quoted, with any double quote doubled, so no name needs checking
+     * against PostgreSQL's reserved words and its case is kept.
+     */
+    public static String quoteIdentifier(String identifier) {
+        return '"' + identifier.replace("\"", "\"\"") + '"';
     }
 
     /** A message after the startup: its type byte and its body, without the length. */
@@ -170,6 +180,39 @@ public final class PostgresWire {
         byte[] bytes = new byte[text.length + 1];
         System.arraycopy(text, 0, bytes, 0, text.length);
         return bytes;
+    }
+
+    // ── Rows ──────────────────────────────────────────────────────────────────
+
+    /**
+     * The text-format values of a DataRow body in column order, with {@code null} for SQL NULL.
+     *
+     * @throws IllegalArgumentException when a value runs past the end of the body
+     */
+    public static List<String> dataRowValues(byte[] body) {
+        if (body == null || body.length < 2) {
+            return List.of();
+        }
+        int count = ((body[0] & 0xFF) << 8) | (body[1] & 0xFF);
+        List<String> values = new ArrayList<>(count);
+        int offset = 2;
+        for (int i = 0; i < count; i++) {
+            if (offset + 4 > body.length) {
+                throw new IllegalArgumentException("DataRow ends before column " + (i + 1) + " of " + count);
+            }
+            int length = int32(body, offset);
+            offset += 4;
+            if (length < 0) {
+                values.add(null);
+                continue;
+            }
+            if (offset + length > body.length) {
+                throw new IllegalArgumentException("DataRow ends inside column " + (i + 1) + " of " + count);
+            }
+            values.add(new String(body, offset, length, StandardCharsets.UTF_8));
+            offset += length;
+        }
+        return values;
     }
 
     // ── Startup ───────────────────────────────────────────────────────────────

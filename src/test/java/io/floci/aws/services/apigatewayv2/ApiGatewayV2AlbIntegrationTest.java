@@ -2,7 +2,7 @@ package io.floci.aws.services.apigatewayv2;
 
 import com.sun.net.httpserver.HttpServer;
 import io.floci.aws.services.ec2.Ec2Service;
-import io.floci.aws.testing.RealElbV2DataPlaneProfile;
+import io.floci.aws.testing.RdsMockProfile;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.http.ContentType;
@@ -28,7 +28,7 @@ import static org.hamcrest.Matchers.*;
 
 /** End-to-end: HTTP API → ALB listener ARN → ELBv2 data plane → registered stub target. */
 @QuarkusTest
-@TestProfile(RealElbV2DataPlaneProfile.class)
+@TestProfile(RdsMockProfile.class)
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class ApiGatewayV2AlbIntegrationTest {
 
@@ -83,8 +83,8 @@ class ApiGatewayV2AlbIntegrationTest {
                 .formParam("Name", "apigw-alb-test")
                 .formParam("Type", "application")
                 .formParam("Scheme", "internet-facing")
-                .formParam("Subnets.member.1", Ec2Service.defaultSubnetId("us-east-1", "a"))
-                .formParam("Subnets.member.2", Ec2Service.defaultSubnetId("us-east-1", "b"))
+                .formParam("Subnets.member.1", Ec2Service.defaultSubnetId("us-east-1", "a", "000000000000"))
+                .formParam("Subnets.member.2", Ec2Service.defaultSubnetId("us-east-1", "b", "000000000000"))
                 .header("Authorization", AUTH)
             .when()
                 .post("/")

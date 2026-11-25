@@ -94,17 +94,18 @@ public class AthenaJsonHandler {
                     resultConfiguration = mapper.treeToValue(request.get("ResultConfiguration"), ResultConfiguration.class);
                 }
 
-                String id = athenaService.startQueryExecution(query, workGroup, context, resultConfiguration);
+                String id = athenaService.startQueryExecution(query, workGroup, context, resultConfiguration,
+                        strings(request, "ExecutionParameters"));
                 yield Response.ok(Map.of("QueryExecutionId", id)).build();
             }
             case "GetQueryExecution" -> {
                 String id = request.get("QueryExecutionId").asText();
-                QueryExecution execution = athenaService.getQueryExecution(id);
+                QueryExecution execution = athenaService.getQueryExecution(region, id);
                 yield Response.ok(Map.of("QueryExecution", execution)).build();
             }
             case "GetQueryResults" -> {
                 String id = request.get("QueryExecutionId").asText();
-                ResultSet results = athenaService.getQueryResults(id);
+                ResultSet results = athenaService.getQueryResults(region, id);
                 yield Response.ok(Map.of("ResultSet", results)).build();
             }
             case "ListQueryExecutions" -> {
@@ -124,7 +125,7 @@ public class AthenaJsonHandler {
                 yield Response.ok(response).build();
             }
             case "StopQueryExecution" -> {
-                athenaService.stopQueryExecution(request.get("QueryExecutionId").asText());
+                athenaService.stopQueryExecution(region, request.get("QueryExecutionId").asText());
                 yield Response.ok(Map.of()).build();
             }
             case "GetWorkGroup" -> {
@@ -194,7 +195,7 @@ public class AthenaJsonHandler {
                 yield Response.ok(Map.of()).build();
             }
             case "UntagResource" -> {
-                athenaService.untagResource(text(request, "ResourceARN"), tagKeys(request));
+                athenaService.untagResource(text(request, "ResourceARN"), strings(request, "TagKeys"));
                 yield Response.ok(Map.of()).build();
             }
             case "ListDatabases" -> {
@@ -260,15 +261,16 @@ public class AthenaJsonHandler {
         return tags;
     }
 
-    private static List<String> tagKeys(JsonNode request) {
-        JsonNode node = request.get("TagKeys");
+    /** The strings of the list member {@code field}, such as {@code TagKeys}; none when it is absent. */
+    private static List<String> strings(JsonNode request, String field) {
+        JsonNode node = request.get(field);
         if (node == null || !node.isArray()) {
             return List.of();
         }
-        List<String> keys = new ArrayList<>();
-        for (JsonNode key : node) {
-            keys.add(key.asText());
+        List<String> strings = new ArrayList<>();
+        for (JsonNode string : node) {
+            strings.add(string.asText());
         }
-        return keys;
+        return strings;
     }
 }

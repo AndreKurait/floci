@@ -49,9 +49,13 @@ public class RestAssuredJsonUtils {
     }
 
     public static Response awsAction(String target, String action, String body) {
+        return awsAction(target, action, body, CONTENT_TYPE_AWS_JSON_1_1);
+    }
+
+    public static Response awsAction(String target, String action, String body, String contentType) {
         return given()
                 .header("X-Amz-Target", target + "." + action)
-                .contentType(CONTENT_TYPE_AWS_JSON_1_1)
+                .contentType(contentType)
                 .body(body)
                 .when()
                 .post("/");
@@ -64,6 +68,14 @@ public class RestAssuredJsonUtils {
                 .extract()
                 .asString();
         return OBJECT_MAPPER.readTree(response);
+    }
+
+    /**
+     * {@code jsonObject}, a request body written as one JSON object, with {@code member} added holding
+     * {@code rawValue}, written as it goes into the body.
+     */
+    public static String withMember(String jsonObject, String member, String rawValue) {
+        return jsonObject.substring(0, jsonObject.lastIndexOf('}')) + ", \"" + member + "\": " + rawValue + "}";
     }
 
 }

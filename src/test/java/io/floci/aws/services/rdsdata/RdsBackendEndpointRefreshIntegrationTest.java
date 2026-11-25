@@ -10,9 +10,6 @@ import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.ExposedPort;
 import com.github.dockerjava.api.model.HostConfig;
 import com.github.dockerjava.api.model.Network;
-import com.github.dockerjava.core.DefaultDockerClientConfig;
-import com.github.dockerjava.core.DockerClientImpl;
-import com.github.dockerjava.httpclient5.ApacheDockerHttpClient;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.docker.ContainerDetector;
 import io.floci.aws.core.common.docker.ContainerExec;
@@ -26,6 +23,8 @@ import io.floci.aws.services.rds.proxy.RdsProxyTlsCertificates;
 import io.floci.aws.services.rds.proxy.RdsSigV4Validator;
 import io.floci.aws.services.secretsmanager.SecretsManagerService;
 import io.floci.aws.services.secretsmanager.model.SecretVersion;
+import io.floci.aws.testing.ParallelLocks;
+import io.floci.aws.testing.TestDockerClients;
 import io.floci.aws.testutil.FreePorts;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
@@ -34,6 +33,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Tag;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
@@ -61,6 +61,7 @@ import static org.mockito.Mockito.when;
 
 @Tag("docker")
 @TestInstance(TestInstance.Lifecycle.PER_CLASS)
+@ResourceLock(ParallelLocks.PORTS)
 class RdsBackendEndpointRefreshIntegrationTest {
 
     private static final String IMAGE = "postgres:16.3-alpine";
@@ -91,16 +92,7 @@ class RdsBackendEndpointRefreshIntegrationTest {
     @BeforeAll
     void connectToDocker() {
         try {
-            DefaultDockerClientConfig clientConfig = DefaultDockerClientConfig
-                    .createDefaultConfigBuilder()
-                    .build();
-            ApacheDockerHttpClient httpClient = new ApacheDockerHttpClient.Builder()
-                    .dockerHost(clientConfig.getDockerHost())
-                    .maxConnections(10)
-                    .connectionTimeout(Duration.ofSeconds(10))
-                    .responseTimeout(Duration.ofMinutes(5))
-                    .build();
-            dockerClient = DockerClientImpl.getInstance(clientConfig, httpClient);
+            dockerClient = TestDockerClients.local();
             dockerClient.pingCmd().exec();
             dockerClient.pullImageCmd(IMAGE).start().awaitCompletion(120, TimeUnit.SECONDS);
         } catch (Exception e) {
@@ -110,7 +102,7 @@ class RdsBackendEndpointRefreshIntegrationTest {
         ContainerDetector detector = mock(ContainerDetector.class);
         when(detector.isRunningInContainer()).thenReturn(true);
         lifecycleManager = new ContainerLifecycleManager(
-                dockerClient, mock(ImageCacheService.class), detector, mock(EmulatorConfig.class));
+                dockerClient, dockerClient, mock(ImageCacheService.class), detector, mock(EmulatorConfig.class));
     }
 
     @AfterAll

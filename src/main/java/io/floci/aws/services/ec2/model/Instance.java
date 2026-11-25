@@ -67,6 +67,8 @@ public class Instance {
     // without model backing, a modify → plan cycle would show drift. Tracked as a known limitation.
     private boolean disableApiStop = false;
     private boolean disableApiTermination = false;
+    // EC2's copy of an instance a cluster serves, its node, which a change through EC2 stores.
+    private boolean clusterNodeCopy;
 
     // Null for an instance persisted before metadata options were stored; reads fall back to
     // AWS's launch defaults through effectiveMetadataOptions(). Volatile because IMDS reads it on
@@ -106,6 +108,9 @@ public class Instance {
     // Security-group ingress ports published on the host via socat sidecars:
     // container app port -> allocated host port. Not part of the AWS wire format.
     private Map<Integer, Integer> publishedPorts = new LinkedHashMap<>();
+    // The family each published port admits, when it is not ANY: with security-group enforcement on,
+    // a port only one family's world-open rule opens. Not part of the AWS wire format.
+    private Map<Integer, PublishedPortFamily> publishedPortFamilies = new LinkedHashMap<>();
 
     public Instance() {}
 
@@ -124,6 +129,17 @@ public class Instance {
         }
         state = updated;
         return true;
+    }
+
+    /**
+     * Moves the instance to {@code terminated} and starts its retention clock. The clock starts
+     * once: terminating an already terminated record never extends how long it stays listed.
+     */
+    public synchronized void markTerminated(long nowMillis) {
+        state = InstanceState.terminated();
+        if (terminatedAt <= 0) {
+            terminatedAt = nowMillis;
+        }
     }
 
     public String getStateTransitionReason() { return stateTransitionReason; }
@@ -272,6 +288,16 @@ public class Instance {
     }
     public void setPublishedPorts(Map<Integer, Integer> publishedPorts) { this.publishedPorts = publishedPorts; }
 
+    public Map<Integer, PublishedPortFamily> getPublishedPortFamilies() {
+        if (publishedPortFamilies == null) {
+            publishedPortFamilies = new LinkedHashMap<>();
+        }
+        return publishedPortFamilies;
+    }
+    public void setPublishedPortFamilies(Map<Integer, PublishedPortFamily> publishedPortFamilies) {
+        this.publishedPortFamilies = publishedPortFamilies;
+    }
+
     public String getRootVolumeId() { return rootVolumeId; }
     public void setRootVolumeId(String rootVolumeId) { this.rootVolumeId = rootVolumeId; }
 
@@ -280,6 +306,9 @@ public class Instance {
 
     public boolean isDisableApiTermination() { return disableApiTermination; }
     public void setDisableApiTermination(boolean disableApiTermination) { this.disableApiTermination = disableApiTermination; }
+
+    public boolean isClusterNodeCopy() { return clusterNodeCopy; }
+    public void setClusterNodeCopy(boolean clusterNodeCopy) { this.clusterNodeCopy = clusterNodeCopy; }
 
     public LaunchTemplateData.MetadataOptions getMetadataOptions() { return metadataOptions; }
     public void setMetadataOptions(LaunchTemplateData.MetadataOptions metadataOptions) { this.metadataOptions = metadataOptions; }

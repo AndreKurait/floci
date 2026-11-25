@@ -29,6 +29,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyBoolean;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
@@ -100,8 +101,8 @@ class LeafCfnProvisionerTest {
 
             assertEquals("k-123", r.getPhysicalId(), "Ref is the key id (schema primaryIdentifier)");
             // aws-kms-key.json readOnlyProperties
-            assertEquals(Map.of("Arn", "arn:aws:kms:us-east-1:000000000000:key/k-123", "KeyId", "k-123"),
-                    r.getAttributes());
+            assertEquals(Map.of("Arn", "arn:aws:kms:us-east-1:000000000000:key/k-123", "KeyId", "k-123",
+                    KmsCfnProvisioner.TAG_KEYS_ATTR, "[\"env\"]"), r.getAttributes());
         }
 
         @Test
@@ -138,7 +139,8 @@ class LeafCfnProvisionerTest {
 
             verify(kms, never()).describeKey(anyString(), anyString());
             assertEquals("k-real", r.getPhysicalId());
-            assertEquals(Map.of("Arn", key.getArn(), "KeyId", "k-real"), r.getAttributes());
+            assertEquals(Map.of("Arn", key.getArn(), "KeyId", "k-real", KmsCfnProvisioner.TAG_KEYS_ATTR, "[]"),
+                    r.getAttributes());
         }
 
         @Test
@@ -400,6 +402,77 @@ class LeafCfnProvisionerTest {
             verify(ecr, never()).putImageTagMutability(anyString(), any(), any(), anyString());
             verify(ecr, never()).putLifecyclePolicy(anyString(), any(), any(), anyString());
             verify(ecr, never()).deleteLifecyclePolicy(anyString(), any(), anyString());
+        }
+
+        @Test
+        void imageScanningConfigurationReachesCreateRepository() {
+            when(ecr.createRepository(eq("app"), eq(null), eq(null), eq(Boolean.TRUE),
+                    eq(null), eq(null), any(), eq(REGION)))
+                    .thenReturn(repo("arn:app", "uri:app"));
+
+            provisioner.provision(resource("Repo", "AWS::ECR::Repository"), props("""
+                    {"RepositoryName": "app", "ImageScanningConfiguration": {"ScanOnPush": true}}
+                    """), ctx);
+
+            verify(ecr).createRepository(eq("app"), eq(null), eq(null), eq(Boolean.TRUE),
+                    eq(null), eq(null), any(), eq(REGION));
+        }
+
+        @Test
+        void imageScanningConfigurationStringTrueFromRefReachesCreateRepository() {
+            when(ecr.createRepository(eq("app"), eq(null), eq(null), eq(Boolean.TRUE),
+                    eq(null), eq(null), any(), eq(REGION)))
+                    .thenReturn(repo("arn:app", "uri:app"));
+
+            provisioner.provision(resource("Repo", "AWS::ECR::Repository"), props("""
+                    {"RepositoryName": "app", "ImageScanningConfiguration": {"ScanOnPush": "true"}}
+                    """), ctx);
+
+            verify(ecr).createRepository(eq("app"), eq(null), eq(null), eq(Boolean.TRUE),
+                    eq(null), eq(null), any(), eq(REGION));
+        }
+
+        @Test
+        void omittedImageScanningConfigurationPassesNullToCreateRepository() {
+            when(ecr.createRepository(eq("app"), eq(null), eq(null), eq(null),
+                    eq(null), eq(null), any(), eq(REGION)))
+                    .thenReturn(repo("arn:app", "uri:app"));
+
+            provisioner.provision(resource("Repo", "AWS::ECR::Repository"), props("""
+                    {"RepositoryName": "app"}
+                    """), ctx);
+
+            verify(ecr).createRepository(eq("app"), eq(null), eq(null), eq(null),
+                    eq(null), eq(null), any(), eq(REGION));
+        }
+
+        @Test
+        void updatingImageScanningConfigurationCallsPutImageScanningConfiguration() {
+            Repository updated = repo("arn:updated", "uri:updated");
+            when(ecr.putImageTagMutability("app", null, "MUTABLE", REGION))
+                    .thenReturn(repo("arn:existing", "uri:existing"));
+            when(ecr.putImageScanningConfiguration("app", null, true, REGION))
+                    .thenReturn(updated);
+
+            StackResource r = resource("Repo", "AWS::ECR::Repository");
+            provisioner.provision(r, props("""
+                    {"RepositoryName": "app", "ImageScanningConfiguration": {"ScanOnPush": true}}
+                    """), new ProvisionContext(engine, REGION, "000000000000", "my-stack", "app"));
+
+            verify(ecr).putImageScanningConfiguration("app", null, true, REGION);
+            assertEquals("arn:updated", r.getAttributes().get("Arn"));
+        }
+
+        @Test
+        void droppingImageScanningConfigurationOnUpdateLeavesItUnchanged() {
+            when(ecr.putImageTagMutability("app", null, "MUTABLE", REGION))
+                    .thenReturn(repo("arn:existing", "uri:existing"));
+
+            provisioner.provision(resource("Repo", "AWS::ECR::Repository"), props("""
+                    {"RepositoryName": "app"}
+                    """), new ProvisionContext(engine, REGION, "000000000000", "my-stack", "app"));
+
+            verify(ecr, never()).putImageScanningConfiguration(anyString(), any(), anyBoolean(), anyString());
         }
 
         @Test

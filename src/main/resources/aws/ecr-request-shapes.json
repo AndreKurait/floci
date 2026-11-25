@@ -1,7 +1,7 @@
 {
   "_source": {
     "generator": "tools/aws/regen_ecr_shapes.py",
-    "botocore": "botocore 1.43.118 (local/aws/botocore)"
+    "botocore": "botocore 1.44.9 (local/aws/botocore)"
   },
   "operations": {
     "GetAccountSetting": "GetAccountSettingRequest",
@@ -20,7 +20,9 @@
     "CreateRepositoryCreationTemplate": "CreateRepositoryCreationTemplateRequest",
     "UpdateRepositoryCreationTemplate": "UpdateRepositoryCreationTemplateRequest",
     "DescribeRepositoryCreationTemplates": "DescribeRepositoryCreationTemplatesRequest",
-    "DeleteRepositoryCreationTemplate": "DeleteRepositoryCreationTemplateRequest"
+    "DeleteRepositoryCreationTemplate": "DeleteRepositoryCreationTemplateRequest",
+    "ListImages": "ListImagesRequest",
+    "DescribeImages": "DescribeImagesRequest"
   },
   "shapes": {
     "AccountSettingName": {
@@ -67,6 +69,18 @@
       "type": "structure",
       "members": {}
     },
+    "DeleteReplication": {
+      "type": "structure",
+      "required": [
+        "enabled"
+      ],
+      "members": {
+        "enabled": "DeleteReplicationFlag"
+      }
+    },
+    "DeleteReplicationFlag": {
+      "type": "boolean"
+    },
     "DeleteRepositoryCreationTemplateRequest": {
       "type": "structure",
       "required": [
@@ -83,6 +97,27 @@
       ],
       "members": {
         "principalArn": "PrincipalArn"
+      }
+    },
+    "DescribeImagesFilter": {
+      "type": "structure",
+      "members": {
+        "tagStatus": "TagStatus",
+        "imageStatus": "ImageStatusFilter"
+      }
+    },
+    "DescribeImagesRequest": {
+      "type": "structure",
+      "required": [
+        "repositoryName"
+      ],
+      "members": {
+        "registryId": "RegistryId",
+        "repositoryName": "RepositoryName",
+        "imageIds": "ImageIdentifierList",
+        "nextToken": "NextToken",
+        "maxResults": "MaxResults",
+        "filter": "DescribeImagesFilter"
       }
     },
     "DescribeRegistryRequest": {
@@ -132,6 +167,36 @@
       "type": "structure",
       "members": {}
     },
+    "ImageDigest": {
+      "type": "string"
+    },
+    "ImageIdentifier": {
+      "type": "structure",
+      "members": {
+        "imageDigest": "ImageDigest",
+        "imageTag": "ImageTag"
+      }
+    },
+    "ImageIdentifierList": {
+      "type": "list",
+      "min": 1,
+      "max": 100,
+      "member": "ImageIdentifier"
+    },
+    "ImageStatusFilter": {
+      "type": "string",
+      "enum": [
+        "ACTIVE",
+        "ARCHIVED",
+        "ACTIVATING",
+        "ANY"
+      ]
+    },
+    "ImageTag": {
+      "type": "string",
+      "min": 1,
+      "max": 300
+    },
     "ImageTagMutability": {
       "type": "string",
       "enum": [
@@ -180,6 +245,26 @@
       "type": "string",
       "min": 0,
       "max": 30720
+    },
+    "ListImagesFilter": {
+      "type": "structure",
+      "members": {
+        "tagStatus": "TagStatus",
+        "imageStatus": "ImageStatusFilter"
+      }
+    },
+    "ListImagesRequest": {
+      "type": "structure",
+      "required": [
+        "repositoryName"
+      ],
+      "members": {
+        "registryId": "RegistryId",
+        "repositoryName": "RepositoryName",
+        "nextToken": "NextToken",
+        "maxResults": "MaxResults",
+        "filter": "ListImagesFilter"
+      }
     },
     "ListPullTimeUpdateExclusionsRequest": {
       "type": "structure",
@@ -333,7 +418,8 @@
       ],
       "members": {
         "destinations": "ReplicationDestinationList",
-        "repositoryFilters": "RepositoryFilterList"
+        "repositoryFilters": "RepositoryFilterList",
+        "deleteReplication": "DeleteReplication"
       }
     },
     "ReplicationRuleList": {
@@ -453,6 +539,14 @@
     "TagList": {
       "type": "list",
       "member": "Tag"
+    },
+    "TagStatus": {
+      "type": "string",
+      "enum": [
+        "TAGGED",
+        "UNTAGGED",
+        "ANY"
+      ]
     },
     "TagValue": {
       "type": "string"

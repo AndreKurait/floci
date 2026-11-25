@@ -159,6 +159,7 @@ public class IamRoleCfnProvisioner implements CfnResourceProvisioner {
         Set<String> previousManagedArns = CfnTrackedSets.read(r, MANAGED_ARNS_ATTR);
 
         Set<String> originalPolicyArns = new HashSet<>(role.getAttachedPolicyArns());
+        List<String> canonicalPolicyArns = new ArrayList<>();
         LinkedHashSet<String> attachedByThisAttempt = new LinkedHashSet<>();
         LinkedHashSet<String> detachedByThisAttempt = new LinkedHashSet<>();
         LinkedHashSet<String> inlineRemovedByThisAttempt = new LinkedHashSet<>();
@@ -191,9 +192,11 @@ public class IamRoleCfnProvisioner implements CfnResourceProvisioner {
             }
 
             for (String policyArn : managedPolicyArns) {
-                iamService.attachRolePolicy(resolvedRoleName, policyArn);
-                if (!originalPolicyArns.contains(policyArn)) {
-                    attachedByThisAttempt.add(policyArn);
+                String canonicalArn = iamService.canonicalPolicyArn(policyArn);
+                iamService.attachRolePolicy(resolvedRoleName, canonicalArn);
+                canonicalPolicyArns.add(canonicalArn);
+                if (!originalPolicyArns.contains(canonicalArn)) {
+                    attachedByThisAttempt.add(canonicalArn);
                 }
             }
 
@@ -243,7 +246,7 @@ public class IamRoleCfnProvisioner implements CfnResourceProvisioner {
                 inlineWrittenByThisAttempt.add(policy.getKey());
             }
             for (String stale : previousManagedArns) {
-                if (!managedPolicyArns.contains(stale) && originalPolicyArns.contains(stale)) {
+                if (!canonicalPolicyArns.contains(stale) && originalPolicyArns.contains(stale)) {
                     iamService.detachRolePolicy(resolvedRoleName, stale);
                     detachedByThisAttempt.add(stale);
                 }
@@ -333,7 +336,7 @@ public class IamRoleCfnProvisioner implements CfnResourceProvisioner {
 
         // What the next execution compares its template against.
         CfnTrackedSets.write(r, INLINE_NAMES_ATTR, inlineWrittenByThisAttempt);
-        CfnTrackedSets.write(r, MANAGED_ARNS_ATTR, managedPolicyArns);
+        CfnTrackedSets.write(r, MANAGED_ARNS_ATTR, canonicalPolicyArns);
     }
 
     private void snapshotDuration(StackResource resource, IamRole role) {
@@ -415,6 +418,10 @@ public class IamRoleCfnProvisioner implements CfnResourceProvisioner {
             LOG.debugv("IAM role already gone, treating as deleted: {0}", physicalId);
             return;
         }
+        // Asked before anything is cleared: the delete can be refused for an instance profile
+        // this stack does not own, and nothing takes a role out of one on the caller's behalf, so
+        // detaching first would leave a role that is still there and no longer has its policies.
+        iamService.requireNotHeldByAnInstanceProfile(physicalId);
         for (String policyArn : new ArrayList<>(role.getAttachedPolicyArns())) {
             iamService.detachRolePolicy(physicalId, policyArn);
         }

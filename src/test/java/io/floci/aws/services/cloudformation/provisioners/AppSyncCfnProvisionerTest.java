@@ -19,7 +19,9 @@ import io.floci.aws.services.appsync.model.SchemaCreationStatusType;
 import io.floci.aws.services.cloudformation.CfnDropPolicyTable;
 import io.floci.aws.services.cloudformation.CloudFormationTemplateEngine;
 import io.floci.aws.services.cloudformation.model.StackResource;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 
@@ -49,6 +51,7 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /** The AppSync CFN provisioner in isolation, with only AppSyncService mocked. */
+@ResourceLock(ParallelLocks.PORTS)
 class AppSyncCfnProvisionerTest {
 
     private static final String API_ID = "abcd1234";
@@ -1240,7 +1243,8 @@ class AppSyncCfnProvisionerTest {
     void aRollbackThatTheServiceRefusesLeavesTheApiKeyAsTheUpdateLeftItAndKeepsTheSnapshot() throws Exception {
         Instant start = Instant.parse("2026-01-01T00:00:00Z");
         AppSyncServiceFixture.MutableClock clock = new AppSyncServiceFixture.MutableClock(start);
-        AppSyncService real = AppSyncServiceFixture.create(clock);
+        // CloudFormation provisions in its stack's Region, eu-west-1 here, and the service answers for it.
+        AppSyncService real = AppSyncServiceFixture.create(clock, "eu-west-1");
         AppSyncCfnProvisioner onRealService = new AppSyncCfnProvisioner(real);
         GraphqlApi created = real.createGraphqlApi(Map.of("name", "keys", "authenticationType", "API_KEY"), "eu-west-1");
         long soonExpiry = start.getEpochSecond() + Duration.ofHours(25).getSeconds();
@@ -1267,7 +1271,8 @@ class AppSyncCfnProvisionerTest {
 
     @Test
     void aSnapshotThatIsNotJsonFailsTheRollbackNamingTheResourceAndChangesNothing() {
-        AppSyncService real = AppSyncServiceFixture.create(Clock.fixed(Instant.parse("2026-01-01T00:00:00Z"), ZoneOffset.UTC));
+        AppSyncService real = AppSyncServiceFixture.create(
+                Clock.fixed(Instant.parse("2026-01-01T00:00:00Z"), ZoneOffset.UTC), "eu-west-1");
         AppSyncCfnProvisioner onRealService = new AppSyncCfnProvisioner(real);
         GraphqlApi created = real.createGraphqlApi(Map.of("name", "corrupt", "authenticationType", "API_KEY"), "eu-west-1");
         real.createDataSource(created.getApiId(), Map.of("name", "ds", "type", "NONE", "description", "kept"), "eu-west-1");

@@ -10,6 +10,28 @@ Floci manages real Valkey/Redis Docker containers and proxies TCP connections to
 
 Set `FLOCI_SERVICES_MEMORYDB_MOCK=true` to manage clusters as control-plane-only resources — no Redis container is started. The management API (`CreateCluster`, `DescribeClusters`, tagging, etc.) behaves normally and returns a `ClusterEndpoint` of `<hostname>:6379` (defaults to `localhost:6379`, controlled by `FLOCI_HOSTNAME`), but there is no live data plane to connect to. This is intended for Infrastructure-as-Code tools like Terraform and OpenTofu running in environments without a Docker socket, where you only need the AWS resources to exist and return consistent attributes.
 
+## User access strings
+
+A cluster bound to an ACL of its own runs each connection under the `AccessString` of the user it
+signs in as. The proxy installs that access string on a private backend ACL user, and the backend
+answers a command, key or channel outside it with `NOPERM`, as on AWS. A connection that does not
+authenticate runs as the ACL's `default` user, but signing in as `default` is refused: AWS lets the
+built-in `default` user belong only to the `open-access` ACL. Once the first connection is set up, the backend's
+own `default` account is disabled, so an `AUTH` sent after the proxy has bridged the connection
+cannot reach unrestricted permissions.
+
+The backend user is the same kind ElastiCache uses, so the same commands are denied to every
+session, and an access string with an ACL selector is refused. See
+[User access strings](elasticache.md#user-access-strings) on the ElastiCache page.
+Clusters on the `open-access` ACL are relayed without a backend ACL user, as before.
+
+A connection that sends `AUTH` or `HELLO` with `AUTH` again after it has signed in is checked by the
+proxy as at sign-in, and switches to the new user's access string, as described in
+[Signing in again](elasticache.md#signing-in-again). As on AWS, a connection signed in with an IAM
+token is closed 12 hours after it signed in unless it sends a new token, and IAM authentication is
+refused inside `MULTI`/`EXEC`, with the same reply as ElastiCache (see
+[IAM connection lifetime and transactions](elasticache.md#iam-connection-lifetime-and-transactions)).
+
 ## Supported Management Actions
 
 <!-- floci:actions:start -->
@@ -29,6 +51,17 @@ Set `FLOCI_SERVICES_MEMORYDB_MOCK=true` to manage clusters as control-plane-only
 | `TagResource` | Add tags to a cluster, user or ACL |
 | `UntagResource` | Remove tags from a cluster, user or ACL |
 <!-- floci:actions:end -->
+
+With IAM enforcement on, each action is checked on the resources the AWS Service Authorization
+Reference lists for it, read from the request: a cluster by its `ClusterName`, an ACL by its
+`ACLName` and a user by its `UserName`, as `arn:aws:memorydb:<region>:<account>:<type>/<name>`, the
+ARN MemoryDB mints, and a tag call on its `ResourceArn`. The reference lists no `cluster` for
+`CreateCluster`, but the multi-Region cluster it may join, which its `MultiRegionClusterName` names,
+`arn:aws:memorydb::<account>:multiregioncluster/<name>`, beside its ACL, parameter group, subnet group
+and snapshot. `DeleteCluster` is checked on the cluster its `ClusterName` names, and on its final
+snapshot and multi-Region cluster when it names them. The reference lists no ACL or user type for `CreateACL` and
+`CreateUser`, so a new ACL is checked on the users its `UserNames` lists, and a new user, or an ACL
+listing none, on `*`.
 
 ## Configuration
 

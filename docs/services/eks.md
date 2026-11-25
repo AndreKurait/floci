@@ -11,8 +11,7 @@ With IAM enforcement enabled, `CreateCluster` evaluates `eks:authenticationMode`
 `eks:bootstrapClusterCreatorAdminPermissions`, `eks:endpointPrivateAccess`, and
 `eks:endpointPublicAccess` from the request's `accessConfig` and `resourcesVpcConfig`.
 The generated metadata also maps those keys for `UpdateClusterConfig`, except the
-create-only bootstrap flag; this does not implement the currently unsupported
-update API. Its extraction is covered by resolver tests, not an SDK update lifecycle.
+create-only bootstrap flag. Its extraction is covered by resolver tests, not an SDK update lifecycle.
 The action-to-key mappings come from AWS's Service Reference and the request paths from
 botocore. Omitted attributes remain absent from the IAM context; stored cluster settings
 and service defaults do not supply missing request conditions. Generic request-tag
@@ -25,19 +24,29 @@ boolean or the text `true` or `false`, such as `"endpointPublicAccess": 1`, is r
 no value. A structure, list or map of the wrong kind is refused the same way. EKS's own wording
 for this error has not been measured; Floci answers as the REST JSON services it was measured on do.
 
+## Deletion waiters and IAM
+
+After deleting an add-on or Fargate profile, a principal with resource-scoped describe
+permission receives `ResourceNotFoundException` from its deletion waiter. Floci retains
+only the deleted ARN for authorization, so unrelated resource grants and explicit denies
+still return `AccessDeniedException`. This metadata follows the configured EKS storage mode;
+it is cleared on resource recreation or cluster deletion and is not returned by describe
+or list operations. Resource tags are not retained for post-deletion policy conditions.
+
 ## Supported Operations
 
 | Operation | Description |
 |---|---|
 | `CreateCluster` | Create a new EKS cluster |
 | `DescribeCluster` | Describe a cluster by name |
+| `UpdateClusterConfig` | Update a cluster's endpoint access, logging, authentication mode or upgrade policy |
 | `ListClusters` | List cluster names with pagination (`maxResults` 1-100 and `nextToken`) |
 | `DeleteCluster` | Delete a cluster |
-| `CreateAccessEntry` | Create STANDARD or EC2_LINUX access-entry metadata |
+| `CreateAccessEntry` | Create STANDARD, EC2_LINUX or EC2 (EKS Auto Mode) access-entry metadata |
 | `DescribeAccessEntry` | Describe an access entry by IAM principal ARN |
 | `ListAccessEntries` | List principal ARNs with pagination |
 | `DeleteAccessEntry` | Delete access-entry metadata |
-| `AssociateAccessPolicy` | Associate an EKS access policy and its cluster or namespace scope with a STANDARD access entry |
+| `AssociateAccessPolicy` | Associate an EKS access policy and its cluster or namespace scope with a STANDARD or EC2 access entry |
 | `ListAssociatedAccessPolicies` | List the access policies associated with an access entry, with pagination |
 | `DisassociateAccessPolicy` | Remove an access policy from an access entry |
 | `CreatePodIdentityAssociation` | Create a pod identity association between a service account and IAM role |
@@ -49,7 +58,7 @@ for this error has not been measured; Floci answers as the REST JSON services it
 | `DescribeAddon` | Describe an addon by cluster and addon name |
 | `ListAddons` | List addon names installed in a cluster with pagination |
 | `UpdateAddon` | Update addon configuration, version, or service account role |
-| `DescribeUpdate` | Describe an update for an addon |
+| `DescribeUpdate` | Describe an update for an addon or a cluster's configuration |
 | `DeleteAddon` | Delete an addon from a cluster |
 | `DescribeAddonVersions` | Describe supported addon versions by Kubernetes version or addon name |
 | `CreateNodegroup` | Create node group metadata for a cluster |
@@ -60,6 +69,7 @@ for this error has not been measured; Floci answers as the REST JSON services it
 | `DescribeFargateProfile` | Describe a Fargate profile by cluster and name |
 | `ListFargateProfiles` | List Fargate profile names for a cluster |
 | `DeleteFargateProfile` | Delete a Fargate profile |
+| `ListIdentityProviderConfigs` | List a cluster's identity provider configs, always empty since none can be associated |
 | `TagResource` | Add tags to a cluster |
 | `UntagResource` | Remove tags from a cluster |
 | `ListTagsForResource` | List tags on a cluster |
@@ -68,9 +78,9 @@ for this error has not been measured; Floci answers as the REST JSON services it
 
 `CreateCluster` accepts `accessConfig.authenticationMode` (`CONFIG_MAP`, `API_AND_CONFIG_MAP`, or `API`) and `bootstrapClusterCreatorAdminPermissions`. The API default is `CONFIG_MAP`; access-entry operations require an ACTIVE cluster created with `API` or `API_AND_CONFIG_MAP`.
 
-The access-entry management operations support `STANDARD` (the default) and `EC2_LINUX`. STANDARD accepts existing IAM users or roles, including principals in another account. EC2_LINUX requires a role in the cluster account and generates `system:node:{{EC2PrivateDNSName}}`; custom usernames and Kubernetes groups are not accepted for node entries. Tags supplied at creation are preserved. Repeating a create with the same client token and normalized parameters returns the existing entry. Listing accepts `maxResults` from 1 to 100 and cluster-specific `nextToken` values.
+The access-entry management operations support `STANDARD` (the default), `EC2_LINUX` and `EC2`. STANDARD accepts existing IAM users or roles, including principals in another account. EC2_LINUX requires a role in the cluster account and generates `system:node:{{EC2PrivateDNSName}}`; custom usernames and Kubernetes groups are not accepted for node entries. `EC2`, the type of EKS Auto Mode's node role, accepts roles only and generates `system:node:{{SessionName}}` in the `system:nodes` group; like AWS, it refuses Kubernetes groups, a username or an IAM user with AWS's messages, and access policies can be associated with it. When a cluster's EKS Auto Mode compute capability is turned on, by `CreateCluster` or `UpdateClusterConfig`, Floci makes the node role's `EC2` entry with `AmazonEKSAutoNodePolicy` on the cluster scope, as EKS does, unless the role already has an entry, IAM doesn't have the role, or the cluster's authentication mode is `CONFIG_MAP`. Tags supplied at creation are preserved. Repeating a create with the same client token and normalized parameters returns the existing entry. Listing accepts `maxResults` from 1 to 100 and cluster-specific `nextToken` values.
 
-Access policies are management metadata, like the entries they belong to: Floci stores and returns them but does not enforce their Kubernetes permissions. `policyArn` must be an `arn:<partition>:eks::aws:cluster-access-policy/<name>` ARN in the cluster's partition. The policy name itself is not checked against AWS's list of access policies. The scope `type` is `cluster` (no namespaces) or `namespace` (one or more names; wildcards such as `dev-*` are kept as given, and a repeated name is stored once). Associating a policy that is already associated replaces its scope and keeps its `associatedAt`. Only STANDARD entries accept access policies, and deleting an entry removes its policies. Disassociating a policy the entry does not hold succeeds. `ListAccessEntries` accepts `associatedPolicyArn`.
+Access policies are management metadata, like the entries they belong to: Floci stores and returns them but does not enforce their Kubernetes permissions. `policyArn` must be an `arn:<partition>:eks::aws:cluster-access-policy/<name>` ARN in the cluster's partition. The policy name itself is not checked against AWS's list of access policies. The scope `type` is `cluster` (no namespaces) or `namespace` (one or more names; wildcards such as `dev-*` are kept as given, and a repeated name is stored once). Associating a policy that is already associated replaces its scope and keeps its `associatedAt`. Only STANDARD and EC2 entries accept access policies, and deleting an entry removes its policies. Disassociating a policy the entry does not hold succeeds. `ListAccessEntries` accepts `associatedPolicyArn`.
 
 The principal ARN in an access-entry path should be URL-encoded, as the SDKs and the CLI send it. Sent unencoded, a principal whose ARN ends in `/access-policies` (a role named `access-policies`) is read as the access-policies route of the shorter principal before it. A DELETE is a disassociate only when a cluster access policy ARN follows `access-policies`, so an entry with `access-policies` inside its IAM path can always be deleted.
 
@@ -79,7 +89,8 @@ Access entries use EKS storage and retain the IAM principal's stable ID internal
 ### EC2 Linux worker authentication
 
 IMDS instance-profile credentials authenticate through a matching `EC2_LINUX` entry as
-`system:node:<private-DNS-name>` with `system:bootstrappers` and `system:nodes` groups.
+`system:node:<private-DNS-name>`, or through an EKS Auto Mode node role's `EC2` entry as
+`system:node:<instance-ID>` (its `{{SessionName}}`), with `system:bootstrappers` and `system:nodes` groups.
 The webhook verifies the signed token, cluster account/region/incarnation, stored role ID,
 running EC2 instance, and attached instance profile. Missing/deleted entries, recreated roles,
 revoked sessions and terminated instances are rejected without falling back to administrator access.
@@ -136,11 +147,38 @@ A matching pod is patched exactly the way real EKS patches it. Every init contai
 
 The volume is a projected service account token with audience `pods.eks.amazonaws.com`, `expirationSeconds: 86400` and path `eks-pod-identity-token`. A name the pod already carries (a volume, a mount, or any of the environment variables) is left as the workload set it.
 
-Real EKS sets neither endpoint variable. Floci adds them so the credentials it hands out are used against Floci, as every container Floci launches already is, instead of being sent to AWS, which rejects them. `AWS_ENDPOINT_URL_STS` is set beside the global variable because the AWS SDK for Go v2 builds the STS client of its web identity provider before it reads `AWS_ENDPOINT_URL`. A pod cannot resolve the Docker host name (`host.docker.internal` lives only in the cluster container's `/etc/hosts`) or Floci's hostname (on a custom Docker network k3s replaces the loopback resolver `127.0.0.11` with a public one, so `localhost.floci.io` answers `127.0.0.1`), so the endpoint is the Docker host address and is injected only when that is an IP address, as it is when Floci runs in a container. A container that sets `AWS_ENDPOINT_URL` itself gets no `AWS_ENDPOINT_URL_STS`, which would override its choice for STS. A container with any `envFrom` source gets no endpoint variable, because its values are unknown at admission and an injected `env` entry would take precedence over them; it still gets the credentials variables.
+Real EKS sets neither endpoint variable. Floci adds them so the credentials it hands out are used against Floci, as every container Floci launches already is, instead of being sent to AWS, which rejects them. `AWS_ENDPOINT_URL_STS` is set beside the global variable because the AWS SDK for Go v2 builds the STS client of its web identity provider before it reads `AWS_ENDPOINT_URL`. A pod cannot resolve the Docker host name (`host.docker.internal` lives only in the cluster container's `/etc/hosts`) or, unless the cluster's pods resolve through Floci's embedded DNS (see [DNS resolution](#dns-resolution-and-route-53-private-hosted-zones)), Floci's hostname (k3s replaces a custom Docker network's loopback resolver `127.0.0.11` with a public one, so `localhost.floci.io` answers `127.0.0.1`), so the endpoint is the Docker host address and is injected only when that is an IP address, as it is when Floci runs in a container. A container that sets `AWS_ENDPOINT_URL` itself gets no `AWS_ENDPOINT_URL_STS`, which would override its choice for STS. A container with any `envFrom` source gets no endpoint variable, because its values are unknown at admission and an injected `env` entry would take precedence over them; it still gets the credentials variables.
+
+#### IAM roles for service accounts
+
+The same webhook also makes the IAM roles for service accounts (IRSA) mutation, as the Amazon EKS pod identity webhook does. A pod that gets no Pod Identity mutation, because no association matches it or the agent addon is not installed, is checked for a service account annotated with `eks.amazonaws.com/role-arn`. The webhook is handed only the pod, so Floci reads the service account with `kubectl` in the cluster container, within two seconds of the webhook's three, even when Docker is slow. A read is reused for 10 seconds, so a burst of pods, and the cluster's own pods of service accounts with no role, cost one read each. So a change to a service account reaches pods created up to 10 seconds later. A failed read is not reused. A service account that is missing, unannotated or unreadable leaves the pod unchanged, and a failed read is logged as a warning. Pod Identity takes precedence, as the upstream webhook's container credentials do, and the two mutations are never made together.
+
+Every init container and container gets:
+
+| What | Value |
+|---|---|
+| `AWS_ROLE_ARN` | The service account's `eks.amazonaws.com/role-arn` |
+| `AWS_WEB_IDENTITY_TOKEN_FILE` | `/var/run/secrets/eks.amazonaws.com/serviceaccount/token` |
+| `AWS_STS_REGIONAL_ENDPOINTS` | `regional`, unless the service account sets `eks.amazonaws.com/sts-regional-endpoints: "false"` |
+| `AWS_DEFAULT_REGION`, `AWS_REGION` | The cluster's Region |
+| Volume mount | `/var/run/secrets/eks.amazonaws.com/serviceaccount`, read-only, from volume `aws-iam-token` |
+| `AWS_ENDPOINT_URL`, `AWS_ENDPOINT_URL_STS` | Floci's endpoint, under the rules above (Floci only) |
+
+The volume is a projected service account token with path `token`, audience `sts.amazonaws.com`, and `expirationSeconds` 86400. Floci's STS exchanges a cluster's tokens for `sts.amazonaws.com` alone, so a service account whose `eks.amazonaws.com/audience` names another gets no mutation, with a warning, rather than a token it could not exchange. The service account's `eks.amazonaws.com/token-expiration` overrides the expiry and the pod's overrides that. A value that is not a whole number is ignored, and a shorter one than 600 seconds is raised to 600, the shortest the API server issues. Containers the pod names in its `eks.amazonaws.com/skip-containers` annotation, comma-separated, are left as they are. As upstream, a container that sets either `AWS_ROLE_ARN` or `AWS_WEB_IDENTITY_TOKEN_FILE` gets neither, one that sets either Region variable gets neither, and a volume or mount the pod already has under the name is kept. When that volume is not a projected service account token at path `token`, or a container mounts it elsewhere, the container gets no `AWS_ROLE_ARN` or `AWS_WEB_IDENTITY_TOKEN_FILE`, which would name a token it does not have. Like upstream, the webhook reads only `env` for values the container sets, so its entries take precedence over the same names an `envFrom` source holds. The region variables are what the SDK needs to call STS; the token is exchanged at Floci's STS as described under [IRSA](#irsa-iam-roles-for-service-accounts).
 
 ### Credential endpoint
 
-Floci serves pod identity credentials through a link-local relay bound to `169.254.170.23:80` inside the cluster container, forwarding requests to Floci's credentials endpoint (`GET /v1/credentials`). Workloads reach this endpoint using the injected `AWS_CONTAINER_CREDENTIALS_FULL_URI` environment variable, passing their projected token in the `Authorization` header (`Authorization: <token>` or `Authorization: Bearer <token>`).
+On EKS the Pod Identity Agent answers on `169.254.170.23:80` on every node while the `eks-pod-identity-agent` add-on is installed. Floci makes that address answer in the cluster container while the add-on is stored, with NAT rules that send requests for it straight to Floci's credentials endpoint (`GET /v1/credentials`), so nothing is installed or run in the node. A `PREROUTING` rule takes the pod network's requests (the cluster's pod CIDR) and an `OUTPUT` rule the node's own, which is where `hostNetwork` pods' come from. The node's masquerade rule (flannel's) carries the answers back. Workloads reach this endpoint using the injected `AWS_CONTAINER_CREDENTIALS_FULL_URI` environment variable, passing their projected token in the `Authorization` header (`Authorization: <token>` or `Authorization: Bearer <token>`).
+
+The rules follow the add-on:
+
+- `CreateAddon` for `eks-pod-identity-agent` adds them, replacing any an earlier Floci left for the address.
+- `DeleteAddon` removes them. With `preserve=true` they stay, since EKS leaves the agent running on the cluster then.
+- When the cluster container starts or a Floci restart adopts it, Floci adds them while the add-on is stored and otherwise removes any it finds. So after a `DeleteAddon` with `preserve=true`, the address answers only until the next restart.
+
+Each of these also retires the `socat` relay an older Floci ran for the address in the node, with its loopback address and its rule in the `FLOCI-LINK-LOCAL` chain, so the relay can't answer once the rules are removed.
+
+The rules need `iptables` in the node, which the stock `rancher/k3s` image has, and they are only set up with `floci.services.eks.pod-identity-webhook` and TLS on (see below), since pods get the credentials URL only from the webhook. Floci's host name is resolved inside the node, from its `/etc/hosts` (where `host.docker.internal` lives on Linux) or else through DNS.
 
 The credentials endpoint performs the following validations:
 1. Validates token format and extracts the issuer URL without verifying signatures yet.
@@ -152,13 +190,13 @@ The credentials endpoint performs the following validations:
 
 #### TLS is required
 
-Kubernetes only accepts an `https` `clientConfig.url` on a `MutatingWebhookConfiguration`, together with a `caBundle` the API server trusts. Floci serves HTTP with the default `floci.tls.enabled=false`, so the webhook is skipped with a warning in that case and pods start unmutated. Set `FLOCI_TLS_ENABLED=true` to get injection; the `caBundle` is then Floci's local CA, the same one served at `GET /_floci/ca.pem`.
+Kubernetes only accepts an `https` `clientConfig.url` on a `MutatingWebhookConfiguration`, together with a `caBundle` the API server trusts. Floci serves HTTP with the default `floci.tls.enabled=false`, so the webhook is skipped with a warning in that case and pods start unmutated. Set `FLOCI_TLS_ENABLED=true` to get injection; the `caBundle` is then what `GET /_floci/ca.pem` serves: Floci's local CA, after the certificates in the `floci.tls.cert-path` file when Floci serves a certificate of your own.
 
-The webhook URL uses the hostname containers reach Floci on. When Floci runs natively that is `host.docker.internal`, which the self-signed certificate covers. When Floci itself runs in a container the hostname is its container IP, and the self-signed certificate carries no SAN for it, so the API server rejects the handshake. Pods still start, unmutated. Point `FLOCI_SERVICES_LAMBDA_DOCKER_HOST_OVERRIDE` at a name the certificate covers (add it with `FLOCI_HOSTNAME`) to make the webhook reachable from that setup.
+The API server also checks that the certificate names the webhook URL's host, so the URL uses a host the certificate Floci serves names. When the cluster resolves through Floci's embedded DNS (`FLOCI_SERVICES_EKS_EMBEDDED_DNS`, with the cluster on a Docker network that reaches Floci's DNS server, as it does by default with Floci in a container), that is Floci's hostname: `FLOCI_HOSTNAME`, or `localhost.floci.io`, both of which the self-signed certificate covers. Otherwise it is the host other containers reach Floci on: `host.docker.internal` when Floci runs natively, which the self-signed certificate also covers, or Floci's container IP, which it does not. When the certificate does not name that host, as with a certificate of your own issued for other names, pod identity injection is not available: the webhook is skipped with a warning naming the host, and pods start unmutated. To get it, have the API server call Floci by a name the certificate covers: with embedded DNS, set `FLOCI_HOSTNAME` to that name; without it, point `FLOCI_SERVICES_LAMBDA_DOCKER_HOST_OVERRIDE` at it. The self-signed certificate covers `FLOCI_HOSTNAME` too.
 
 The webhook carries `failurePolicy: Ignore`, and Floci admits the pod unchanged on any internal error, so a webhook that cannot be registered or cannot be reached never prevents a pod from being created. Registration failures log a warning and leave the cluster running.
 
-The manifest is written into the cluster's k3s server manifests directory (`/var/lib/rancher/k3s/server/manifests`) before the container starts, so k3s applies it as the API server comes up.
+The manifest is written into the cluster's k3s server manifests directory (`/var/lib/rancher/k3s/server/manifests`) before the container starts, so k3s applies it as the API server comes up. Floci writes it again when it adopts the cluster's surviving container after a restart, so the URL and `caBundle` follow Floci's current address and certificate. An adopted node keeps the resolvers it was created with, so its URL names Floci's hostname only when the node was created with Floci's DNS server, at the address that server has now. The cluster's data volume keeps the manifest, and the webhook k3s registered from it, across restarts and replaced containers, so when the webhook is skipped Floci writes a manifest that holds no objects, and k3s deletes the webhook an earlier start registered.
 
 ## Addon management
 
@@ -172,11 +210,12 @@ Floci supports the EKS cluster addon management plane for AWS SDKs and Terraform
 - **Updating**: `UpdateAddon` updates the addon version, configuration values, service account role ARN, or resolve-conflicts strategy. It returns an `Update` tracking object and updates the addon metadata.
 - **Update tracking**: `DescribeUpdate` describes the status of an addon update (such as an in-place addon version update queried by Terraform).
 - **Deletion**: `DeleteAddon` marks the addon as `DELETING` and removes it from the cluster. Deleting a cluster automatically cleans up all associated addons.
+- **Pod Identity Agent**: while `eks-pod-identity-agent` is installed, `169.254.170.23:80` answers in the cluster container, as described under [Credential endpoint](#credential-endpoint).
 - **Supported versions**: `DescribeAddonVersions` queries the addon version catalog with optional filtering by `addonName` and `kubernetesVersion`, supporting pagination. As in AWS, a `kubernetesVersion` filter also limits each version's `compatibilities` to that Kubernetes version. The catalog in `src/main/resources/eks/addon-versions.json` holds the parts of AWS's `DescribeAddonVersions` answer that Floci serves, for every Kubernetes version Floci can run; `make eks-addons-sync` regenerates it from `DescribeAddonVersions` with any AWS account's credentials.
 
 ### Metadata recording only
 
-Addons in Floci are recorded metadata only. Creating or updating an addon does not install or reconcile Kubernetes DaemonSets, Deployments, or custom resources inside the cluster container.
+Addons in Floci are recorded metadata only. Creating or updating an addon does not install or reconcile Kubernetes DaemonSets, Deployments, or custom resources inside the cluster container. The one effect inside it is the Pod Identity address of `eks-pod-identity-agent`, which Floci forwards itself rather than by running the agent.
 
 ## Cluster security group
 
@@ -209,6 +248,7 @@ Floci tags the cluster security group with the standard AWS system tags:
 - **Creation**: The security group is created in the resolved cluster VPC when the cluster is created. Both real and mock clusters receive a security group. If a cluster is created without any VPC or subnets, `clusterSecurityGroupId` is omitted from the response. If a caller explicitly provides a `resourcesVpcConfig.vpcId` that does not exist in EC2, the request is rejected with `InvalidParameterException` (HTTP 400).
 - **Deletion**: When the cluster is deleted via `DeleteCluster`, Floci deletes the associated cluster security group from EC2. If the security group was already removed out-of-band, the deletion succeeds idempotently without error.
 - **Backfill**: Existing persisted clusters that were created before this feature receive an auto-generated cluster security group during startup backfill if their VPC is present.
+- **Node network interface**: A node holding an address in the cluster's first subnet has a primary network interface there, at that address, and the node instance and its interface hold the cluster security group, as an EKS node's interface does. The AWS Load Balancer Controller reads the group there to open a target's ports. `DescribeInstances` and `DescribeNetworkInterfaces` report the interface (see [EC2 cluster node instances](ec2.md#cluster-node-instances)), and the group cannot be deleted while the node holds it. Deleting the cluster ends the node in EC2 as terminating it would, so the group goes with the cluster.
 - **Rules**: In accordance with AWS EKS behavior, the cluster security group includes a self-referencing inbound rule allowing all traffic from members of the same security group to enable control plane and node communication, a self-referencing outbound rule for Elastic Fabric Adapter (EFA) traffic, and the standard EC2 outbound rule.
 
 ## Custom control-plane and node arguments (emulator affordance)
@@ -320,6 +360,8 @@ EKS clusters support configuring KMS envelope encryption for secrets and control
 
 - **Supported log types**: The valid EKS log types are `api`, `audit`, `authenticator`, `controllerManager`, and `scheduler`. Specifying an unrecognized type causes `InvalidParameterException` (HTTP 400).
 - **Response normalization**: AWS EKS always returns the status of all five log types. Enabled types are returned first (`enabled: true`), followed by disabled types (`enabled: false`).
+- **Changing logging later**: A logging change made through `UpdateClusterConfig` is stored and returned by `DescribeCluster`; it is read when a cluster's container is started or adopted, when the control plane log stream and audit follower are attached and the audit flags are given to the API server, so it does not change what a running cluster exports.
+- **Refused updates**: `UpdateClusterConfig` moves the authentication mode one step forward only (`CONFIG_MAP`, `API_AND_CONFIG_MAP`, `API`), and refuses an endpoint or logging update that changes nothing, as EKS does.
 - **Default logging**: When omitted or empty at creation time, Floci returns all five log types disabled in a single entry (`enabled: false`).
 - **Backfill**: Existing persisted clusters created before this feature was introduced are automatically backfilled on startup with default disabled logging.
 - **CloudWatch Logs delivery**:
@@ -329,13 +371,205 @@ EKS clusters support configuring KMS envelope encryption for secrets and control
 - **Component streams deviation**: AWS EKS provisions separate log streams for each component (`kube-apiserver-*`, `kube-apiserver-audit-*`, `kube-controller-manager-*`, `kube-scheduler-*`, `authenticator-*`). Because Floci runs clusters on k3s, which embeds the Kubernetes API server, controller manager, and scheduler within a single process, control plane container logs are delivered to the single `kube-apiserver-<hash>` stream when `api` is enabled, and API server audit logs are delivered to `kube-apiserver-audit-<hash>` when `audit` is enabled. Other control plane log types (`authenticator`, `controllerManager`, `scheduler`) do not provision separate streams.
 - **Authenticator logs**: Authenticator webhook authentication events are logged directly by Floci.
 
+## Upgrade policy
+
+`CreateCluster` accepts `upgradePolicy.supportType`, `STANDARD` or `EXTENDED`, and `CreateCluster` and
+`DescribeCluster` return it. A cluster created without one reports `EXTENDED`, the policy AWS gives new clusters, and
+so does a cluster Floci stored before it kept the policy, as AWS gave existing clusters extended support as well.
+`UpdateClusterConfig` changes it, alone in its request as EKS requires, and answers with a `Successful`
+`UpgradePolicyUpdate` whose `UpgradePolicy` parameter holds the policy as JSON, `{"supportType":"STANDARD"}`, as AWS
+records it. Any other support type is refused with `InvalidParameterException`.
+
+`STANDARD` is refused for a version past its end of standard support, as on AWS. Floci keeps the Amazon EKS
+Kubernetes release calendar's end of standard support for each version it serves, and treats a newer version as in
+standard support. Both refusals are `InvalidParameterException`:
+
+- `CreateCluster`: "The requested Kubernetes version "1.30" is only supported under extended support. Please change
+  the supportType to extended support to create the cluster."
+- `UpdateClusterConfig`: "The Kubernetes version "1.30" is not in standard support. Please update the cluster to a
+  version in standard support to change the supportType"
+
+`EXTENDED` is accepted on any version. A cluster created without a version is treated as in standard support, since
+the version AWS gives such a cluster is, although Floci reports 1.29 for it. Floci does not upgrade a `STANDARD`
+cluster when its version reaches the end of standard support, and it records an update that names the policy the
+cluster already has.
+
+In CloudFormation, `AWS::EKS::Cluster` creates the cluster with its `UpgradePolicy` and updates it in place. A
+template that drops `UpgradePolicy` returns the cluster to `EXTENDED`, and a stack rollback restores the policy. A
+cluster a stack created before Floci kept the policy gets the one its template declares on the stack's next update.
+
+## EKS Auto Mode configuration
+
+`CreateCluster` accepts EKS Auto Mode's configuration, and `CreateCluster` and `DescribeCluster` return it as it
+was given: `computeConfig` (`enabled`, `nodePools` and `nodeRoleArn`), `storageConfig.blockStorage.enabled` and
+`kubernetesNetworkConfig.elasticLoadBalancing.enabled`.
+
+```json
+{
+  "computeConfig": {
+    "enabled": true,
+    "nodePools": ["general-purpose", "system"],
+    "nodeRoleArn": "arn:aws:iam::000000000000:role/AmazonEKSAutoNodeRole"
+  },
+  "storageConfig": {"blockStorage": {"enabled": true}},
+  "kubernetesNetworkConfig": {"elasticLoadBalancing": {"enabled": true}}
+}
+```
+
+As on AWS, the compute, block storage and load balancing capabilities are enabled together or not at all. A
+request that enables some of them and not the others is refused with `InvalidParameterException` ("For EKS Auto
+Mode, please ensure that all required configs, including computeConfig, kubernetesNetworkConfig, and
+blockStorage are all either fully enabled or fully disabled."), and a capability the request leaves out counts
+as not enabled. A `computeConfig` that names node pools without a `nodeRoleArn` is refused with
+`InvalidParameterException` ("When Compute Config nodeRoleArn is null or empty, nodePool list cannot be
+populated"), and one that names a `nodeRoleArn` without node pools with `InvalidParameterException` ("When
+Compute Config nodeRoleArn is not null or empty, nodePool value(s) must be provided."). A `computeConfig` with
+neither is accepted, as AWS accepts it for Auto Mode without its built-in node pools.
+
+`UpdateClusterConfig` turns Auto Mode on or off for an existing cluster and changes its node pools, taking
+`computeConfig`, `storageConfig` and `kubernetesNetworkConfig.elasticLoadBalancing` together as one update, which
+it records as an `AutoModeUpdate`. A member the request leaves out keeps its stored value, and while compute stays
+on, a `computeConfig` without `nodeRoleArn` keeps the cluster's role, which can't change while it is on. A request
+that changes nothing is refused with `InvalidRequestException` ("No changes needed for EKS Auto Mode
+configuration provided").
+
+In CloudFormation, `AWS::EKS::Cluster` creates its cluster with `ComputeConfig`, `StorageConfig` and
+`KubernetesNetworkConfig.ElasticLoadBalancing`, and an update changes them in place through `UpdateClusterConfig`:
+a property the template drops is read as disabled, and a stack rollback puts the configuration before back.
+
+With IAM enforcement on, `CreateCluster` checks `iam:PassRole` on the cluster role, passed to
+`eks.amazonaws.com`, and not yet on the node role. AWS's Service Reference lists both `ec2.amazonaws.com` and
+`eks.amazonaws.com` for the roles `CreateCluster` passes, and does not say which one the node role goes to.
+
+Floci acts on the configuration as EKS does:
+
+- **Compute.** Turning it on gives the node role its `EC2` access entry with `AmazonEKSAutoNodePolicy` (see
+  [Access-entry management](#access-entry-management)). While it is on, the cluster has the `NodePool`
+  (`karpenter.sh/v1`) and `NodeClass` (`eks.amazonaws.com/v1`) kinds, the `default` NodeClass (the node role's name,
+  the cluster's subnets and security group) and the built-in `general-purpose` and `system` NodePools
+  `computeConfig.nodePools` names, as Auto Mode makes them: on-demand c, m and r instances of generation 5 and later,
+  `amd64` (`system` also `arm64`, with a `CriticalAddonsOnly` `NoSchedule` taint), expiring after 336 hours. A pool
+  `UpdateClusterConfig` drops is removed. The cluster's node carries Auto Mode's `eks.amazonaws.com/compute-type: auto`
+  label, so workloads that select Auto Mode nodes run on it.
+- **Block storage.** While it is on, claims of a StorageClass naming `ebs.csi.eks.amazonaws.com` are provisioned
+  (see [Storage classes](#storage-classes)).
+- **Load balancing.** While it is on, Services get Network Load Balancers (see
+  [Auto Mode load balancing for Services](#auto-mode-load-balancing-for-services)) and Ingresses Application Load
+  Balancers (see [Auto Mode load balancing for Ingresses](#auto-mode-load-balancing-for-ingresses)).
+
+Floci launches no nodes for the pools: workloads run on the cluster's k3s node.
+[#8914](https://github.com/floci-io/floci/issues/8914) plans the rest.
+
+### Auto Mode load balancing for Services
+
+While a cluster has the load balancing capability on (`kubernetesNetworkConfig.elasticLoadBalancing.enabled`), a
+Service of type `LoadBalancer` whose `loadBalancerClass` is `eks.amazonaws.com/nlb` gets a Network Load Balancer in
+the cluster's subnets, as [on AWS](https://docs.aws.amazon.com/eks/latest/userguide/auto-configure-nlb.html):
+
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing   # internal when left out
+spec:
+  type: LoadBalancer
+  loadBalancerClass: eks.amazonaws.com/nlb
+  selector:
+    app: web
+  ports:
+  - port: 80
+    targetPort: 8080
+```
+
+Each TCP port gets a target group on the Service's NodePort, with the cluster's node registered by instance ID and a
+TCP health check, and a listener on the Service port. Once the node is registered, the load balancer's DNS name is
+written to the Service's `status.loadBalancer.ingress[0].hostname`. The load balancer, its listeners and target
+groups are deleted with the Service, with the cluster, and when the cluster's load balancing is turned off. Floci
+checks the cluster's Services every 10 seconds, and each check makes whatever a Service's ports are missing, so a
+port added later gets its listener and a changed NodePort its target group. The load balancers and target groups carry
+the tags Auto Mode sets, `eks:eks-cluster-name` and `service.eks.amazonaws.com/stack` (the only keys
+`AmazonEKSLoadBalancingPolicy` lets it set), and Floci takes as its own only those it named for the Service.
+
+UDP and SCTP ports get no listener, as Floci's load balancers serve TCP and HTTP only, and a Service with no TCP
+NodePort, such as one with `allocateLoadBalancerNodePorts: false`, gets no load balancer.
+
+On AWS, `eks.amazonaws.com/nlb` is the cluster's default class, so a Service that names no class gets one too. In
+Floci it does once the cluster's node runs without k3s's own ServiceLB, which would otherwise answer it with the
+node's address: a node started while load balancing is on, as one of a cluster created with it, runs without
+ServiceLB. ServiceLB is a k3s server flag, so when `UpdateClusterConfig` turns load balancing on or off, Floci
+replaces the cluster's node on the same data volume, to start without or with ServiceLB, and the cluster's pods
+restart, as they do on AWS, where [turning it off](https://docs.aws.amazon.com/eks/latest/userguide/auto-disable.html)
+terminates Auto Mode's instances. A restored node whose ServiceLB disagrees with the cluster is replaced the same way.
+On a node without ServiceLB, a Service of no class with only UDP ports gets no load balancer, as Floci's load
+balancers don't forward UDP. A Service of another class, such as the AWS Load Balancer Controller's
+`service.k8s.aws/nlb`, is left to its controller.
+
+### Auto Mode load balancing for Ingresses
+
+While a cluster has the load balancing capability on, Floci installs the `IngressClassParams` kind
+(`eks.amazonaws.com/v1`), as Auto Mode does, and an Ingress whose IngressClass names the `eks.amazonaws.com/alb`
+controller, or that names no class while such a class is the default, gets an Application Load Balancer, as
+[on AWS](https://docs.aws.amazon.com/eks/latest/userguide/auto-configure-alb.html). Auto Mode creates no
+IngressClass; create one:
+
+```yaml
+apiVersion: eks.amazonaws.com/v1
+kind: IngressClassParams
+metadata:
+  name: alb
+spec:
+  scheme: internet-facing        # internal when left out
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: alb
+spec:
+  controller: eks.amazonaws.com/alb
+  parameters:
+    apiGroup: eks.amazonaws.com
+    kind: IngressClassParams
+    name: alb
+```
+
+- **Load balancer.** Named `k8s-<namespace>-<name>-<hash>`, with the scheme and subnets (`subnets.ids`) of the class's
+  `IngressClassParams`, else the `alb.ingress.kubernetes.io/scheme` annotation and the cluster's subnets. As in
+  ELBv2, it needs two subnets in two Availability Zones; an Ingress that can't have one is logged and the others are
+  served. An Ingress whose class names `IngressClassParams` that aren't there is logged and its load balancer left as
+  it is, as the Load Balancer Controller fails it: the annotations don't stand in for the class's settings.
+- **Listener and rules.** An HTTP listener on port 80, whose default answers a fixed 404 (`text/plain`), or forwards
+  to the Ingress's `defaultBackend`. Each path of each rule becomes a listener rule, in order: a `Prefix` path `/` is
+  the path pattern `/*`, as AWS makes it, another `Prefix` path `/p` is `/p` and `/p/*`, and an `Exact` path is itself;
+  a rule's `host` adds a host header condition. The rules are ordered as the AWS Load Balancer Controller orders them:
+  the Ingress's rules as listed, and within each, `Exact` paths first, then `Prefix` paths longest first, then
+  `ImplementationSpecific` ones as listed.
+- **Target groups.** One per backend Service port, on the Service's NodePort, with the cluster's node registered by
+  instance ID, and an HTTP health check on the traffic port at the `alb.ingress.kubernetes.io/healthcheck-path`
+  annotation's path (`/` by default), every 15 seconds with a 5 second timeout.
+- **Tags and status.** The tags Auto Mode sets: `eks:eks-cluster-name`, `ingress.eks.amazonaws.com/stack`
+  (`<namespace>/<name>`) and `ingress.eks.amazonaws.com/resource`. Once the node is registered, the load balancer's DNS
+  name is written to the Ingress's `status.loadBalancer.ingress[0].hostname`. Floci checks every 10 seconds, sets the
+  rules again when the Ingress changes, and deletes the load balancer with the Ingress, with the cluster, and when load
+  balancing is turned off.
+
+Floci's load balancers reach the cluster's node, not the pods inside it, so a backend is served through its Service's
+NodePort: a backend Service without one (a `ClusterIP` Service) is left out, and an Ingress whose target type is
+`ip` (`IngressClassParams.targetType` or the `alb.ingress.kubernetes.io/target-type` annotation) gets no load
+balancer. Only HTTP on port 80 is served: HTTPS listeners, certificates and the other `IngressClassParams` fields
+are kept but not applied.
+Floci's load balancers share one address, so a TCP listener needs its local port to itself
+([Elastic Load Balancing](elb.md)): while a `LoadBalancer` Service of the cluster serves TCP port 80, an Ingress's
+ALB is made and its address written, but its listener serves no traffic until that Service's listener is gone.
+
 ## Node group inputs
 
 `CreateNodegroup` accepts the full documented input set and stores every member, so `CreateNodegroup` and `DescribeNodegroup` both return exactly what was supplied.
 
 ### Scalar and collection inputs
 
-`nodegroupName`, `nodeRole`, `subnets`, `version`, `releaseVersion`, `amiType`, `capacityType`, `diskSize`, `instanceTypes`, `scalingConfig`, `labels`, `tags`, and `clientRequestToken`. Several of these receive an AWS-shaped default when omitted: `capacityType` becomes `ON_DEMAND`, `amiType` becomes `AL2_x86_64`, `diskSize` becomes `20`, `instanceTypes` becomes `["t3.medium"]`, `version` is inherited from the cluster, and `releaseVersion` becomes `<version>-eks-1`.
+`nodegroupName`, `nodeRole`, `subnets`, `version`, `releaseVersion`, `amiType`, `capacityType`, `diskSize`, `instanceTypes`, `scalingConfig`, `labels`, `tags`, and `clientRequestToken`. Several of these receive an AWS-shaped default when omitted: `capacityType` becomes `ON_DEMAND`, `amiType` becomes `AL2_x86_64`, `diskSize` becomes `20`, `instanceTypes` becomes `["t3.medium"]`, `version` is inherited from the cluster, and `releaseVersion` becomes the release of the recommended EKS optimized AMI for that version and AMI type, the `<patch version>-<build date>` value SSM publishes under its `recommended/release_version` (see [SSM](ssm.md#public-ami-parameters)). A node group whose launch template names a custom AMI reports that AMI id instead, as AWS does, and an AMI type the image catalog has no recommended AMI for, such as Bottlerocket or Windows, keeps `<version>-eks-1`.
 
 ### Structured inputs
 
@@ -390,7 +624,7 @@ Floci configures `--kubelet-arg=node-labels=...` with the following entries:
 - EKS system labels:
   - `eks.amazonaws.com/nodegroup=<nodegroupName>`
   - `eks.amazonaws.com/capacityType=<ON_DEMAND|SPOT|CAPACITY_BLOCK>` (defaults to `ON_DEMAND` when omitted)
-  - `eks.amazonaws.com/nodegroup-image=<imageId>` (sourced from `releaseVersion`, launch template AMI, or defaulting to `ami-eks-k3s`)
+  - `eks.amazonaws.com/nodegroup-image=<imageId>` (the launch template's AMI, else the recommended EKS optimized AMI for the node group's version and AMI type, as AWS labels a node with its AMI rather than its `releaseVersion`, else `ami-eks-k3s`)
 - User-defined labels: all key-value pairs specified in the nodegroup's `labels` map, excluding reserved system keys (`topology.kubernetes.io/*`, `eks.amazonaws.com/*`, and `node.kubernetes.io/instance-type`).
 
 #### Applied taints
@@ -451,9 +685,9 @@ aws eks update-kubeconfig --name my-cluster
 kubectl get nodes
 ```
 
-`aws eks update-kubeconfig` wires `aws eks get-token` into the kubeconfig as an exec credential. The bearer token contains a SigV4-presigned STS `GetCallerIdentity` request. Floci validates its signature and 15-minute token lifetime matching `aws-iam-authenticator` rather than the presigned expiry, then verifies the signed `x-k8s-aws-id` header against the cluster-specific `/_floci/eks/clusters/<cluster-name>/token-webhook` endpoint before resolving the caller identity. Instance-profile sessions require an EC2_LINUX access entry as described above; non-worker callers retain the `system:masters` mapping (bound to `cluster-admin`). A long-term access key gets it only on clusters of its own account, so a default-account key is refused on another account's cluster; on the older unscoped webhook path only the default account's keys get it. No `aws-iam-authenticator` is required.
+`aws eks update-kubeconfig` wires `aws eks get-token` into the kubeconfig as an exec credential. The bearer token contains a SigV4-presigned STS `GetCallerIdentity` request. Floci validates its signature and 15-minute token lifetime matching `aws-iam-authenticator` rather than the presigned expiry, then verifies the signed `x-k8s-aws-id` header against the cluster-specific `/_floci/eks/clusters/<cluster-name>/token-webhook` endpoint before resolving the caller identity. Instance-profile sessions require an EC2_LINUX or EC2 access entry as described above; non-worker callers retain the `system:masters` mapping (bound to `cluster-admin`). A long-term access key gets it only on clusters of its own account, so a default-account key is refused on another account's cluster; on the older unscoped webhook path only the default account's keys get it. No `aws-iam-authenticator` is required.
 
-Create an IAM access key before using EKS authentication. The public local-development pairs `test`/`test` and `floci`/`floci` are deliberately rejected because the webhook grants cluster-admin access.
+Create an IAM access key before using EKS authentication. The public local-development pair `test`/`test` and the seeded deployer's key, whose secret `floci` is public whatever access key ID it was seeded under, are deliberately rejected because the webhook grants cluster-admin access.
 
 Temporary IAM credentials must include their `AWS_SESSION_TOKEN` when signing the token.
 
@@ -611,6 +845,17 @@ Stock Amazon EKS clusters historically define a default `gp2` StorageClass point
 
 Callers requiring dynamic volume provisioning can install a driver (such as the `aws-ebs-csi-driver` addon) and define their desired StorageClass. As on an EKS node, the cluster node's mounts are shared, so a driver's node plugin can mount volumes under `/var/lib/kubelet` with `Bidirectional` propagation.
 
+An [EKS Auto Mode](https://docs.aws.amazon.com/eks/latest/userguide/automode.html) cluster with block storage enabled (`storageConfig.blockStorage.enabled`) provisions the claims of a StorageClass whose provisioner is `ebs.csi.eks.amazonaws.com`, as Auto Mode's EBS capability does. Floci serves them from the node's disk with a local-path provisioner registered under that name (`FLOCI_SERVICES_EKS_BLOCK_STORAGE_PROVISIONER_IMAGE`), installed while block storage is enabled. As on AWS, the cluster gets no StorageClass; create one naming the provisioner:
+
+```yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: auto-ebs-sc
+provisioner: ebs.csi.eks.amazonaws.com
+volumeBindingMode: WaitForFirstConsumer
+```
+
 For local testing workflows that rely on automatic volume binding without a CSI driver, set `floci.services.eks.default-storage-class: true` (or `FLOCI_SERVICES_EKS_DEFAULT_STORAGE_CLASS=true`) to retain k3s's bundled `local-path` provisioner and default StorageClass.
 
 ## Joining EC2 instances as cluster nodes
@@ -672,11 +917,58 @@ does not enable it; omitted or false values keep the simulated behavior.
 | `FLOCI_SERVICES_EKS_ECR_REGISTRY_MIRROR` | `true` | Inject a containerd `registries.yaml` so pods can pull images pushed to [Floci ECR](ecr.md) |
 | `FLOCI_SERVICES_EKS_DISABLE_CNI` | `false` | Start k3s without bundled flannel, network policy, and kube-proxy so an external CNI can take over |
 | `FLOCI_SERVICES_EKS_DEFAULT_STORAGE_CLASS` | `false` | Retain k3s bundled local-path provisioner and default StorageClass (default false matches EKS with no default class) |
+| `FLOCI_SERVICES_EKS_BLOCK_STORAGE_PROVISIONER_IMAGE` | `rancher/local-path-provisioner:v0.0.35` | Provisioner that serves EKS Auto Mode block storage (`ebs.csi.eks.amazonaws.com`) |
+| `FLOCI_SERVICES_EKS_BLOCK_STORAGE_HELPER_IMAGE` | `rancher/mirrored-library-busybox:1.37.0` | Helper pod image of that provisioner |
 | `FLOCI_SERVICES_EKS_IRSA_SIGNING_KEY` | `true` | Pass the cluster OIDC signing key to k3s so in-cluster projected service account tokens can assume IAM roles via Floci STS |
 | `FLOCI_SERVICES_EKS_POD_IDENTITY_WEBHOOK` | `true` | Register a mutating admission webhook that injects pod identity credentials. Needs `FLOCI_TLS_ENABLED=true` |
 | `FLOCI_SERVICES_EKS_IMDS` | `false` | Enable link-local IMDS (`169.254.169.254`) proxy in cluster containers |
 | `FLOCI_SERVICES_EKS_EMBEDDED_DNS` | `true` | Inject Floci's embedded DNS server into cluster containers for Route 53 private hosted zones and internal name resolution |
 | `FLOCI_SERVICES_EKS_VPC_ROUTE_PROGRAMMING` | `true` | Program emulated VPC route table entries into k3s cluster containers |
+| `FLOCI_SERVICES_EKS_VPC_POD_NETWORK` | `false` | Give pods addresses from IPv4 `/28` prefixes of the node's subnet, listed on its network interface, as the VPC CNI's prefix delegation does (see [VPC pod network](#vpc-pod-network)) |
+| `FLOCI_SERVICES_EKS_VPC_POD_PREFIXES` | `2` | How many `/28` prefixes a node holds with `FLOCI_SERVICES_EKS_VPC_POD_NETWORK` |
+
+### VPC pod network
+
+With `FLOCI_SERVICES_EKS_VPC_POD_NETWORK=true`, pods get addresses from the cluster's VPC, as the Amazon VPC CNI plugin
+gives them with prefix delegation, instead of k3s's own pod network. A node holding an address in a Docker-backed subnet
+leases IPv4 `/28` prefixes of that subnet, and its pods take their addresses from them. The node's interface lists the
+prefixes in `ipv4PrefixSet`, on `DescribeInstances` and `DescribeNetworkInterfaces`, where the AWS Load Balancer
+Controller finds the interface behind a pod address, so a target group with `TargetType ip` reaches the pods: Floci's
+health checks and load balancers dial the pod addresses on the VPC's Docker network, as other instances in the VPC do.
+
+- **Count**: `FLOCI_SERVICES_EKS_VPC_POD_PREFIXES`, two by default: under the VPC CNI's default `WARM_PREFIX_TARGET` of
+  one, which keeps one prefix wholly free, a node running pods holds two. With the setting on, Floci refuses to start
+  unless the count is between 1 and 16. A subnet without enough free `/28` blocks leaves the node the ones it could
+  lease, with a warning.
+- **Placement**: prefixes are taken from the top of the subnet down, clear of the subnet's last address, which AWS
+  reserves, and of every address an instance, interface, gateway, endpoint or container already holds. A container Floci
+  joins to the VPC's network without an address of its own, Floci itself or a node holding no subnet address, takes the
+  lowest address of the VPC's range that nothing leases or holds, so it never lands in a prefix. When Docker cannot say
+  which addresses its containers hold, no prefix is leased or re-reserved, with a warning.
+- **Held addresses**: a prefix's sixteen addresses count as held, so no instance or interface gets one, and
+  `DescribeSubnets` leaves them out of `AvailableIpAddressCount`.
+- **Lifecycle**: the node keeps its prefixes across a restart, re-reserving them as it re-reserves its address, and
+  leases new ones only for those another holder took meanwhile. An adopted node keeps the prefixes it was started with
+  and leases no others; a container that replaces it later leases the ones it lacks. Deleting the cluster, or a first
+  start that falls back to the bridge network, gives them back.
+- **On the node**: k3s starts without flannel and its network policy controller (the VPC CNI enforces no network
+  policy unless it is enabled), with the VPC's range as its cluster CIDR. A bridge, `cni0`, hands out the prefixes'
+  addresses, keeping the first host address of each for itself as the pods' gateway, so a prefix gives thirteen pods
+  their addresses. The node answers ARP for them on the VPC network, as the VPC delivers a prefix's traffic to the
+  interface it is delegated to, and traffic from a prefix leaving the VPC takes the node's address, as the VPC CNI's
+  SNAT gives it. Inside the VPC, pods keep their own addresses both ways.
+- **Out of addresses**: pods beyond what the prefixes hold stay in `ContainerCreating`, as on EKS when a node runs out
+  of addresses. `FLOCI_SERVICES_EKS_VPC_POD_PREFIXES` gives the node more.
+- **Link-local endpoints**: the rules that send pods' requests for IMDS (with `FLOCI_SERVICES_EKS_IMDS_POD_NETWORK`) and
+  for the Pod Identity address to Floci match the prefixes instead of `10.42.0.0/16`.
+- **Changing the setting**: a node started with another pod network, or with prefixes it no longer holds all of, is
+  replaced on its data volume when Floci starts, as one with another capacity is. A node on k3s's network is replaced
+  only when its replacement would run the VPC's, so one that fell back stays as it is until its subnet has a free `/28`.
+  A replacement that fails leaves the node running as it was, with the prefixes it was started with.
+- **Falls back to k3s's network** when `FLOCI_SERVICES_EKS_DISABLE_CNI` leaves the pod network to an external CNI, or
+  when the node holds no address or prefix in a Docker-backed subnet; a warning says which. On Docker Desktop for macOS
+  and Windows, as with any container address, the host cannot dial pod addresses; containers and Floci in a container
+  can.
 
 ### Kubernetes versions and network configuration
 
@@ -756,31 +1048,43 @@ helm install my-app ./chart \
   --set image.tag=v1
 ```
 
+The same two accounts' registry hosts as AWS names them,
+`<account>.dkr.ecr.<region>.amazonaws.com` (`amazonaws.com.cn` in the China regions), are
+mirrored too, so a chart written for EKS that names its own account's images that way pulls
+them from Floci unchanged:
+
+```bash
+helm install my-app ./chart \
+  --set image.repository=000000000000.dkr.ecr.us-east-1.amazonaws.com/my-repo \
+  --set image.tag=v1
+```
+
+containerd still tries AWS itself last, so an image Floci does not hold is looked for there,
+as it would be without the mirror.
+
 Requirements and limits:
 
 - The k3s container must reach Floci's Docker-network address. Set the global
   `FLOCI_SERVICES_DOCKER_NETWORK` as in the standard `docker-compose.yml` or the
   EKS service network variable.
-- Only Floci-mintable hostnames are mirrored; public registries (docker.io, ghcr.io, …)
-  are never touched.
+- Only Floci-mintable hostnames and the two accounts' AWS registry hosts are mirrored;
+  public registries (docker.io, ghcr.io, …) and other accounts' AWS registries, such as the
+  ones EKS add-on images come from, are never touched.
 - Mirrored hostnames carry the port the repository URIs advertise, which is the host port
   when Floci's container publishes `4566` on another one (see [ECR](ecr.md#docker-compose-port-mapping)).
 - Repository URIs using a non-default `registryId` (account) are not covered.
-- The mirror set is snapshotted when the cluster is created. Clusters created before this
-  feature can be fixed manually because the k3s container filesystem survives a restart. A surviving
-  container keeps the name it was created with, so those clusters are still `floci-eks-<cluster>`
-  while newer ones are `floci-aws-eks-<cluster>`, and a non-default account adds `<account>.` before
-  the cluster name. Look the name up first:
-
-  ```bash
-  docker ps --filter name=<cluster> --format '{{.Names}}'
-  docker cp registries.yaml <container>:/etc/rancher/k3s/registries.yaml
-  docker restart <container>
-  ```
+- A node keeps the mirror set it was started with. When Floci starts, a surviving node whose
+  `registries.yaml` differs from the one Floci gives it now, such as one created before a mirror
+  entry was added, is replaced on its data volume, as one with another capacity is, and the
+  replacement gets the current set. It is not replaced while the registry is unavailable, since the
+  replacement would get no mirror either, nor to take its mirror away when
+  `FLOCI_SERVICES_EKS_ECR_REGISTRY_MIRROR` is off.
 
 ### DNS resolution and Route 53 private hosted zones
 
 By default, Floci injects its embedded DNS server into each cluster container (`FLOCI_SERVICES_EKS_EMBEDDED_DNS=true`). Cluster containers and CoreDNS forward to Floci's embedded resolver on port 53, enabling resolution of Route 53 private hosted zone records, internal hostnames, and records managed by `external-dns`. Set `FLOCI_SERVICES_EKS_EMBEDDED_DNS=false` to use standard Docker network DNS instead.
+
+Pods resolve through CoreDNS, which forwards to the resolver file k3s hands its pods. Floci writes that file to `/etc/rancher/k3s/floci-resolv.conf` in the cluster container, naming only its embedded DNS server, and starts k3s with `--resolv-conf` pointing at it. With Floci in a container, it does so only when the cluster joins Floci's own Docker network, the default when neither `FLOCI_SERVICES_EKS_DOCKER_NETWORK` nor `FLOCI_SERVICES_DOCKER_NETWORK` names another: Docker isolates user-defined networks from each other, so on another network the pods keep k3s's resolver rather than one they cannot reach. Otherwise k3s reads the container's `/etc/resolv.conf`, which on a user-defined Docker network names only Docker's `127.0.0.11`; k3s refuses that loopback address and writes a file naming a public resolver, which never sees Floci's names. The public fallback resolvers (`FLOCI_DNS_CONTAINER_FALLBACK_SERVERS`) stay out of the file, because CoreDNS picks among its upstreams at random and a public one would answer some lookups of Floci's names; Floci forwards every name it does not hold itself. A cluster that sets the kubelet's resolver file itself, with the `floci:kubelet-arg:resolv-conf` tag, keeps its own file.
 
 ### Registry host configuration (pull-through caches and custom mirrors)
 
@@ -835,7 +1139,7 @@ services:
 ## Instance Metadata Service (IMDS)
 The cluster container is registered as a synthesized EC2 instance node (image `ami-eks-k3s`) regardless of whether IMDS is enabled, making it visible to the EC2 service (`DescribeInstances`, `DescribeInstanceStatus`, volume attachments, tagging). Its instance type is the node group's type, which also sizes the container unless `floci.services.eks.node-instance-type` is set.
 
-When IMDS is enabled (`FLOCI_SERVICES_EKS_IMDS=true`), each k3s cluster container exposes the AWS Instance Metadata Service on the link-local address `169.254.169.254:80`. Inside the container, Floci adds `169.254.169.254/32` to the loopback interface (`lo`) and runs a lightweight `socat` TCP relay forwarding metadata requests to Floci's IMDS server.
+When IMDS is enabled (`FLOCI_SERVICES_EKS_IMDS=true`), each k3s cluster container exposes the AWS Instance Metadata Service on the link-local address `169.254.169.254:80`. Inside the container, NAT rules send metadata requests to Floci's IMDS server (see below).
 
 Both IMDSv1 and IMDSv2 (`PUT /latest/api/token`) are supported. The cluster container is registered as a synthesized EC2 instance node associated with the cluster's IAM role:
 
@@ -851,23 +1155,24 @@ curl -s -H "x-aws-ec2-metadata-token: $TOKEN" \
 
 ### Reachability and network namespaces
 
-The link-local proxy attaches to the loopback interface of the k3s container network namespace (the node network namespace).
+NAT rules in the k3s container's network namespace (the node network namespace) send `169.254.169.254:80` straight to Floci's metadata service, as they send the EKS Pod Identity address to its credentials endpoint. No relay process runs in the node, so nothing is installed there: a stock `rancher/k3s` image, which has `iptables` but no package manager, answers IMDS too.
 
-- **Reachable from node network namespace:** Workloads configured with `hostNetwork: true` share the node network namespace and can reach `169.254.169.254:80`. This allows local testing of host-network security policies, intrusion-detection rules, and credential exfiltration defenses.
-- **Default isolation for ordinary pods:** By default, pods running in separate pod network namespaces cannot reach `169.254.169.254`. CNI portmap rules on the node intercept local traffic, preserving node credential isolation for multi-tenant or untrusted workloads.
-- **Opt-in pod network routing:** When `floci.services.eks.imds-pod-network=true` is set alongside `floci.services.eks.imds=true`, iptables DNAT rules are programmed in a custom `FLOCI-LINK-LOCAL` chain at the head of `PREROUTING`. Traffic originating from the pod CIDR (`10.42.0.0/16`) targeting `169.254.169.254:80` matches first and is routed directly to the local node listener, preempting CNI portmap rules. This enables standard AWS SDK credential resolution inside ordinary pods without requiring `hostNetwork: true`.
+- **Reachable from node network namespace:** An `OUTPUT` rule takes the node's own requests. Workloads configured with `hostNetwork: true` share the node network namespace and can reach `169.254.169.254:80`. This allows local testing of host-network security policies, intrusion-detection rules, and credential exfiltration defenses.
+- **Default isolation for ordinary pods:** By default, pods running in separate pod network namespaces cannot reach `169.254.169.254`: a `FORWARD` rule refuses their requests, so that they don't leave the node for the network the Docker host is on, where a Docker host on EC2 can answer them with its own metadata. This preserves node credential isolation for multi-tenant or untrusted workloads.
+- **Opt-in pod network routing:** When `floci.services.eks.imds-pod-network=true` is set alongside `floci.services.eks.imds=true`, a `PREROUTING` rule at the head of the chain takes requests from the pod CIDR (`10.42.0.0/16`) for `169.254.169.254:80` too, and the node's masquerade rule (flannel's) carries the answers back. This enables standard AWS SDK credential resolution inside ordinary pods without requiring `hostNetwork: true`.
+- **Nodes an older Floci set up:** the rules and the `socat` relay an older Floci left for the address, on the node's loopback, are removed when the node starts or is adopted.
 
 ### Configuration
 
-IMDS proxy initialization is disabled by default (`floci.services.eks.imds=false`). Set `FLOCI_SERVICES_EKS_IMDS=true` to enable the proxy setup inside the k3s container.
+IMDS is disabled by default (`floci.services.eks.imds=false`). Set `FLOCI_SERVICES_EKS_IMDS=true` to add the forward inside the k3s container.
 
-Pod network reachability is also disabled by default (`floci.services.eks.imds-pod-network=false`) to maintain pod isolation. Set `FLOCI_SERVICES_EKS_IMDS_POD_NETWORK=true` together with `FLOCI_SERVICES_EKS_IMDS=true` to route pod traffic to the link-local proxy.
+Pod network reachability is also disabled by default (`floci.services.eks.imds-pod-network=false`) to maintain pod isolation. Set `FLOCI_SERVICES_EKS_IMDS_POD_NETWORK=true` together with `FLOCI_SERVICES_EKS_IMDS=true` to forward pod traffic too.
 
-A failure to configure the proxy (for example on custom minimal images lacking network utilities) logs a warning and allows cluster startup to continue.
+A failure to configure the forward (for example on a custom image without `iptables`) logs a warning and allows cluster startup to continue.
 
 ### Hop limits
 
-EC2 metadata options store `HttpPutResponseHopLimit`, but the userspace TCP proxy relay terminates the incoming connection and opens a new connection to Floci, regenerating the IP packet TTL. Hop limits are recorded on the instance metadata options model but are not enforced by the userspace proxy.
+EC2 metadata options store `HttpPutResponseHopLimit`, but Floci's metadata service sets no TTL on the packets of its answers, so a hop limit is recorded on the instance metadata options model but not enforced.
 
 ## IRSA (IAM Roles for Service Accounts)
 
@@ -901,7 +1206,7 @@ The k3s API server is configured with:
 - `--kube-apiserver-arg=service-account-issuer=https://kubernetes.default.svc.cluster.local`
 - `--kube-apiserver-arg=api-audiences=https://kubernetes.default.svc.cluster.local,sts.amazonaws.com`
 
-This enables in-cluster pods to project service account tokens directly using Kubernetes standard projected volumes:
+With `floci.services.eks.pod-identity-webhook` and TLS on, annotating the service account with `eks.amazonaws.com/role-arn` is enough: the admission webhook injects the token and the variables, as described under [IAM roles for service accounts](#iam-roles-for-service-accounts). A pod can also project the token itself, using Kubernetes standard projected volumes:
 
 ```yaml
 apiVersion: v1
@@ -989,11 +1294,11 @@ When `sts:AssumeRoleWithWebIdentity` receives a token whose `iss` names an issue
 - `iss` matches the cluster's issuer exactly
 - `aud` contains `sts.amazonaws.com`
 - `exp` / `nbf`, with 60s of clock-skew tolerance
-- the role's trust policy: `Principal.Federated` and the `Condition` block, comparing `oidc:sub` / `oidc:aud` with exact, case-sensitive equality
+- the role's trust policy: `Principal.Federated` and the `Condition` block, comparing `oidc:sub` / `oidc:aud` / `sts:RoleSessionName` with exact, case-sensitive equality
 
 The response then carries the token's real claims in `SubjectFromWebIdentityToken`, `Provider`, and `Audience`. Failures return `InvalidIdentityToken` (400) for a bad token, `ExpiredTokenException` (400) for an expired one, or `AccessDenied` (403) when the trust policy does not permit the subject.
 
-A token whose issuer Floci does not host is treated as opaque and accepted, since Floci cannot adjudicate a third-party provider. Validation is therefore automatic for Floci-issued tokens and requires no configuration flag.
+With IAM enforcement off, a token whose issuer Floci does not host is treated as opaque and accepted. With it on, such a token is verified against the issuer's published keys when the role's account registered the issuer as an OIDC provider, and refused otherwise (see [STS](sts.md#issuers-registered-in-iam)). Validation is automatic for Floci-issued tokens and requires no configuration flag.
 
 ### OIDC discovery endpoints
 
@@ -1153,7 +1458,8 @@ eks.deleteCluster(r -> r.name("my-cluster"));
 
 The following EKS features are not yet supported:
 
-- `UpdateClusterConfig` / `UpdateClusterVersion`
+- `UpdateClusterVersion`
+- `UpdateClusterConfig` members other than `resourcesVpcConfig` endpoint access and `publicAccessCidrs`, `logging`, `accessConfig.authenticationMode` and `upgradePolicy`; a different `subnetIds` or `securityGroupIds` list is refused
 - `UpdateNodegroupConfig` / `UpdateNodegroupVersion`
 - Add-ons (`CreateAddon`, `DescribeAddon`, `ListAddons`)
 - Identity provider configs

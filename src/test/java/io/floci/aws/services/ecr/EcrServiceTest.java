@@ -20,10 +20,12 @@ import io.floci.aws.services.ecr.model.Repository;
 import io.floci.aws.services.ecr.model.RepositoryCreationTemplate;
 import io.floci.aws.services.ecr.registry.EcrRegistryManager;
 import io.floci.aws.services.ecr.registry.RegistryHttpClient;
+import io.floci.aws.testing.ParallelLocks;
 import io.floci.aws.testing.ParkingStore;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.mockito.Mockito;
 
 import java.io.IOException;
@@ -62,11 +64,13 @@ import static org.mockito.Mockito.when;
  * Unit tests for {@link EcrService}. Uses an in-memory storage backend and a
  * mocked {@link EcrRegistryManager} so the test never touches Docker.
  */
+@ResourceLock(ParallelLocks.PORTS)
 class EcrServiceTest {
 
     private static final String REGION = "us-east-1";
     private static final String ACCOUNT = "000000000000";
     private static final String REPO = "floci-it/svc-test";
+    private static final String OTHER_ACCOUNT = "111111111111";
 
     private EcrService service;
     private EcrRegistryManager registryManager;
@@ -339,6 +343,25 @@ class EcrServiceTest {
     }
 
     @Test
+    void storedTagsAreTheTagsOfTheRepositoryTheArnNamesAndTaggingPutsANewMapInPlaceOfTheHeldOne() {
+        String arn = service.createRepository(REPO, null, null, null, null, null, Map.of("team", "data"), REGION)
+                .getRepositoryArn();
+        Map<String, String> held = service.listTagsForResource(REPO, null, REGION);
+
+        assertEquals(Map.of("team", "data"), service.storedTags(arn));
+        assertEquals(Map.of(), service.storedTags(arn + "-other"));
+        assertEquals(Map.of(), service.storedTags(arn.replace(ACCOUNT, "111111111111")));
+        assertEquals(Map.of(), service.storedTags(arn.replace(REGION, "us-west-2")));
+        assertEquals(Map.of(), service.storedTags(arn.replace("arn:aws:", "arn:aws-cn:")));
+
+        service.tagResource(REPO, null, Map.of("stage", "prod"), REGION);
+        service.untagResource(REPO, null, List.of("team"), REGION);
+
+        assertEquals(Map.of("stage", "prod"), service.storedTags(arn));
+        assertEquals(Map.of("team", "data"), held);
+    }
+
+    @Test
     void immutableRepositoryIsMarkedForDataPlaneTagProtection() {
         service.createRepository(REPO, null, "IMMUTABLE", null, null, null, null, REGION);
 
@@ -374,6 +397,54 @@ class EcrServiceTest {
                 service.describeRepositories(List.of(repositoryName), null, REGION).getFirst().getRepositoryName());
         assertEquals(repositoryName, service.registryRepositoryName(repositoryName, ACCOUNT, REGION));
         assertThrows(AwsException.class, () -> service.describeRepositories(List.of("legacy"), null, REGION));
+    }
+
+    @Test
+    void theDataPlaneReadsARepositoryInTheAccountItsRegistryHostNames() {
+        AccountAwareStorageBackend<Repository> repositories = AccountAwareStorageBackend.inMemory(ACCOUNT);
+        EcrService accountAware = accountAwareService(repositories, new RegionResolver(REGION, ACCOUNT));
+        // Where account 111111111111's own CreateRepository keeps it: in that account's partition.
+        repositories.putForAccount(OTHER_ACCOUNT, REGION + "::" + OTHER_ACCOUNT + "::app",
+                repository("app", OTHER_ACCOUNT, "IMMUTABLE"));
+
+        assertTrue(accountAware.isImageTagImmutable("app", OTHER_ACCOUNT, REGION));
+        assertEquals(OTHER_ACCOUNT + "/" + REGION + "/app",
+                accountAware.registryRepositoryName("app", OTHER_ACCOUNT, REGION));
+        assertFalse(accountAware.isImageTagImmutable("app", ACCOUNT, REGION));
+    }
+
+    @Test
+    void aNameNobodyCreatedIsUnknownOnceTheCatalogIsReadAndUnavailableBefore() {
+        when(registryManager.isCatalogReconciled()).thenReturn(false);
+        assertThrows(IllegalStateException.class,
+                () -> service.registryRepositoryName("never-created", ACCOUNT, REGION));
+
+        when(registryManager.isCatalogReconciled()).thenReturn(true);
+        AwsException missing = assertThrows(AwsException.class,
+                () -> service.registryRepositoryName("never-created", ACCOUNT, REGION));
+
+        assertEquals("RepositoryNotFoundException", missing.getErrorCode());
+        assertEquals("The repository with name 'never-created' does not exist in the registry with id '"
+                + ACCOUNT + "'", missing.getMessage());
+        verify(registryManager, never()).internalRepoName(anyString(), anyString(), anyString());
+    }
+
+    @Test
+    void theCatalogReconcileKeepsANamespacedRepositoryInItsOwnAccount() {
+        AccountAwareStorageBackend<Repository> repositories = AccountAwareStorageBackend.inMemory(ACCOUNT);
+        EcrService accountAware = accountAwareService(repositories, new RegionResolver(REGION, ACCOUNT));
+        String keptKey = REGION + "::" + OTHER_ACCOUNT + "::kept";
+        repositories.putForAccount(OTHER_ACCOUNT, keptKey, repository("kept", OTHER_ACCOUNT, "IMMUTABLE"));
+
+        accountAware.reconcileFromCatalog(List.of(
+                OTHER_ACCOUNT + "/" + REGION + "/kept", OTHER_ACCOUNT + "/" + REGION + "/recovered"));
+
+        assertEquals("IMMUTABLE", repositories.getForAccount(OTHER_ACCOUNT, keptKey).orElseThrow()
+                .getImageTagMutability());
+        assertEquals(OTHER_ACCOUNT, repositories.getForAccount(OTHER_ACCOUNT, REGION + "::" + OTHER_ACCOUNT
+                + "::recovered").orElseThrow().getRegistryId());
+        assertTrue(repositories.scanAllAccountEntries(key -> true).stream()
+                .allMatch(entry -> OTHER_ACCOUNT.equals(entry.accountId())));
     }
 
     // ------------------------------------------------------------
@@ -552,6 +623,59 @@ class EcrServiceTest {
     }
 
     @Test
+    void deleteRepository_withoutForceRefusesWhileAnUntaggedImageRemains() throws Exception {
+        InMemoryStorage<String, ImageMetadata> metaStore = new InMemoryStorage<>();
+        EcrService withMeta = new EcrService(new InMemoryStorage<>(), metaStore, pullThroughCacheRuleStore,
+                registryManager, Mockito.mock(EmulatorConfig.class), new RegionResolver(REGION, ACCOUNT));
+        RegistryHttpClient http = Mockito.mock(RegistryHttpClient.class);
+        when(registryManager.httpClient()).thenReturn(http);
+        when(http.listTagsStrict(anyString())).thenReturn(List.of());
+        when(http.headManifestDigestStrict(anyString(), anyString(), any())).thenReturn(DELETE_DIGEST);
+        withMeta.createRepository(REPO, null, null, null, null, null, null, REGION);
+        withMeta.recordImagePush(ACCOUNT, REGION, REPO, DELETE_DIGEST, Instant.now());
+
+        AwsException ex = assertThrows(AwsException.class, () -> withMeta.deleteRepository(REPO, null, false, REGION));
+        assertEquals("RepositoryNotEmptyException", ex.getErrorCode());
+
+        when(http.headManifestDigestStrict(anyString(), anyString(), any())).thenReturn(null);
+        assertEquals(REPO, withMeta.deleteRepository(REPO, null, false, REGION).getRepositoryName());
+
+        // A push whose record write failed, and a record kept under the bare key of the
+        // pre-account store, still count as an image while the registry holds its manifest.
+        for (boolean legacy : new boolean[] {false, true}) {
+            InMemoryStorage<String, ImageMetadata> delegate = new InMemoryStorage<>() {
+                @Override
+                public void put(String key, ImageMetadata value) {
+                    if (!legacy) {
+                        throw new IllegalStateException("store down");
+                    }
+                    super.put(key, value);
+                }
+            };
+            EcrService other = new EcrService(new InMemoryStorage<>(),
+                    new AccountAwareStorageBackend<>(delegate, null, ACCOUNT), pullThroughCacheRuleStore,
+                    registryManager, Mockito.mock(EmulatorConfig.class), new RegionResolver(REGION, ACCOUNT));
+            when(http.headManifestDigestStrict(anyString(), anyString(), any())).thenReturn(DELETE_DIGEST);
+            other.createRepository(REPO, null, null, null, null, null, null, REGION);
+            if (legacy) {
+                delegate.put(REGION + "::" + ACCOUNT + "::" + REPO + "::" + DELETE_DIGEST,
+                        new ImageMetadata(DELETE_DIGEST, Instant.now()));
+            } else {
+                assertThrows(IllegalStateException.class,
+                        () -> other.recordImagePush(ACCOUNT, REGION, REPO, DELETE_DIGEST, Instant.now()));
+            }
+
+            ex = assertThrows(AwsException.class, () -> other.deleteRepository(REPO, null, false, REGION),
+                    "legacy=" + legacy);
+            assertEquals("RepositoryNotEmptyException", ex.getErrorCode(), "legacy=" + legacy);
+
+            when(http.headManifestDigestStrict(anyString(), anyString(), any())).thenReturn(null);
+            assertEquals(REPO, other.deleteRepository(REPO, null, false, REGION).getRepositoryName());
+            assertTrue(delegate.keys().stream().noneMatch(k -> k.contains("::" + REPO + "::")), "legacy=" + legacy);
+        }
+    }
+
+    @Test
     void deleteRepository_keepsSharedRegistryStorageForRemainingRepositories() {
         service.createRepository(REPO, null, null, null, null, null, null, REGION);
         service.createRepository("other", null, null, null, null, null, null, REGION);
@@ -591,13 +715,7 @@ class EcrServiceTest {
     @Test
     void deleteRepository_keepsSharedStorageForRepositoriesOwnedByAnotherAccount() {
         AccountAwareStorageBackend<Repository> repositories = AccountAwareStorageBackend.inMemory(ACCOUNT);
-        EcrService accountAwareService = new EcrService(
-                repositories,
-                new InMemoryStorage<>(),
-                new InMemoryStorage<>(),
-                registryManager,
-                Mockito.mock(EmulatorConfig.class),
-                new RegionResolver(REGION, ACCOUNT));
+        EcrService accountAwareService = accountAwareService(repositories, new RegionResolver(REGION, ACCOUNT));
         accountAwareService.createRepository(REPO, null, null, null, null, null, null, REGION);
         repositories.putForAccount("111111111111", REGION + "::111111111111::other", new Repository());
 
@@ -1011,6 +1129,35 @@ class EcrServiceTest {
             assertEquals("nope", result.failures().get(0).getImageId().getImageTag());
             assertEquals("ImageNotFound", result.failures().get(0).getFailureCode());
             assertEquals(List.of("stable"), registry.tags());
+        }
+    }
+
+    @Test
+    void aRegistryErrorFailsListAndDescribeImagesInsteadOfListingTaggedImagesAsUntagged() throws Exception {
+        RegistryHttpClient http = Mockito.mock(RegistryHttpClient.class);
+        when(registryManager.httpClient()).thenReturn(http);
+        service.createRepository(REPO, null, null, null, null, null, null, REGION);
+        service.recordImagePush(ACCOUNT, REGION, REPO, DELETE_DIGEST, Instant.now());
+
+        // The tag listing fails while a recorded digest is present: the tagged image must not
+        // surface as untagged, so both operations fail instead of answering.
+        when(http.listTagsStrict(anyString())).thenThrow(new ConnectException("Connection refused"));
+        when(http.headManifestDigestStrict(anyString(), anyString(), any())).thenReturn(DELETE_DIGEST);
+        // A manifest HEAD that fails for a tag fails the walk the same way.
+        Executable headFails = () -> {
+            Mockito.doReturn(List.of("release")).when(http).listTagsStrict(anyString());
+            doThrow(new ConnectException("Connection refused"))
+                    .when(http).headManifestDigestStrict(anyString(), anyString(), any());
+            service.listImages(REPO, null, REGION, null, null, "ANY");
+        };
+        List<Executable> calls = List.of(
+                () -> service.listImages(REPO, null, REGION, null, null, "UNTAGGED"),
+                () -> service.describeImages(REPO, null, null, REGION, "ANY"),
+                headFails);
+        for (int i = 0; i < calls.size(); i++) {
+            AwsException ex = assertThrows(AwsException.class, calls.get(i), "call " + i);
+            assertEquals("ServerException", ex.getErrorCode(), "call " + i);
+            assertEquals(500, ex.getHttpStatus(), "call " + i);
         }
     }
 
@@ -1458,6 +1605,8 @@ class EcrServiceTest {
         AwsException ex = assertThrows(AwsException.class,
                 () -> service.getLifecyclePolicy(REPO, null, REGION));
         assertEquals("LifecyclePolicyNotFoundException", ex.getErrorCode());
+        assertEquals("Lifecycle policy does not exist for the repository with name '" + REPO
+                + "' in the registry with id '" + ACCOUNT + "'", ex.getMessage());
     }
 
     // ------------------------------------------------------------
@@ -1503,6 +1652,20 @@ class EcrServiceTest {
         Repository existing = service.describeRepositories(List.of(REPO), null, REGION).get(0);
         // Tag is still present → existing entry was NOT overwritten by reconcile
         assertEquals("yes", existing.getTags().get("preserved"));
+    }
+
+    private EcrService accountAwareService(AccountAwareStorageBackend<Repository> repositories,
+                                           RegionResolver regionResolver) {
+        return new EcrService(repositories, new InMemoryStorage<>(), new InMemoryStorage<>(), registryManager,
+                Mockito.mock(EmulatorConfig.class), regionResolver);
+    }
+
+    private static Repository repository(String name, String account, String imageTagMutability) {
+        Repository repository = new Repository();
+        repository.setRepositoryName(name);
+        repository.setRegistryId(account);
+        repository.setImageTagMutability(imageTagMutability);
+        return repository;
     }
 
     private static final class FakeRegistryServer implements AutoCloseable {
@@ -2098,7 +2261,7 @@ class EcrServiceTest {
     private static RegistrySettings.ReplicationRule replicateTo(String region, String registryId, String prefix) {
         return new RegistrySettings.ReplicationRule(
                 List.of(new RegistrySettings.ReplicationDestination(region, registryId)),
-                prefix == null ? null : List.of(new RegistrySettings.RepositoryFilter(prefix, "PREFIX_MATCH")));
+                prefix == null ? null : List.of(new RegistrySettings.RepositoryFilter(prefix, "PREFIX_MATCH")), null);
     }
 
     private static RegistrySettings.ScanningRule scan(String frequency, String filter) {

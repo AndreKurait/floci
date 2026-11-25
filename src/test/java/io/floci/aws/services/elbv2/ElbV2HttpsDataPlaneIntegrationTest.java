@@ -14,7 +14,7 @@ import io.floci.aws.services.acm.model.ValidationMethod;
 import io.floci.aws.services.ec2.Ec2Service;
 import io.floci.aws.testing.AlbFixtures;
 import io.floci.aws.testing.InlineMocks;
-import io.floci.aws.testing.RealElbV2DataPlaneProfile;
+import io.floci.aws.testing.RdsMockProfile;
 import io.floci.aws.testing.RestAssuredJsonUtils;
 import io.quarkus.arc.ClientProxy;
 import io.quarkus.test.junit.QuarkusTest;
@@ -89,7 +89,7 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 
 @QuarkusTest
-@TestProfile(RealElbV2DataPlaneProfile.class)
+@TestProfile(RdsMockProfile.class)
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class ElbV2HttpsDataPlaneIntegrationTest {
 
@@ -1239,8 +1239,8 @@ class ElbV2HttpsDataPlaneIntegrationTest {
             Response created = given().header("Authorization", accountAuthorization(owner, "elasticloadbalancing"))
                     .formParam("Action", "CreateLoadBalancer").formParam("Name", "https-scoped-iam")
                     .formParam("Type", "application")
-                    .formParam("Subnets.member.1", Ec2Service.defaultSubnetId(REGION, "a"))
-                    .formParam("Subnets.member.2", Ec2Service.defaultSubnetId(REGION, "b"))
+                    .formParam("Subnets.member.1", Ec2Service.defaultSubnetId(REGION, "a", owner))
+                    .formParam("Subnets.member.2", Ec2Service.defaultSubnetId(REGION, "b", owner))
                     .when().post("/").then().statusCode(200).extract().response();
             loadBalancer = new LoadBalancerRef(
                     created.xmlPath().getString("CreateLoadBalancerResponse.CreateLoadBalancerResult.LoadBalancers.member.LoadBalancerArn"),

@@ -33,6 +33,7 @@ import java.net.InetAddress;
 import java.time.Instant;
 import java.util.*;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -94,6 +95,7 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
     private AccountAwareStorageBackend<Map<String, TargetGroup>> targetGroupStore;
     private AccountAwareStorageBackend<Map<String, Listener>> listenerStore;
     private AccountAwareStorageBackend<Map<String, Rule>> ruleStore;
+    private AccountAwareStorageBackend<Map<String, String>> tagStore;
 
     // indexes
     private final Map<String, List<String>> lbToListeners   = new ConcurrentHashMap<>(); // LB-ARN → listener ARNs
@@ -102,6 +104,22 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
 
     // tags: resource-ARN → {key → value}
     private Map<String, Map<String, String>> tags = new ConcurrentHashMap<>();
+
+    /** DNS selects the resource owner independently of a management request's account. */
+    List<LoadBalancer> findByDnsName(String name) {
+        if (name == null || name.isBlank()) {
+            return List.of();
+        }
+        String normalized = name.endsWith(".") ? name.substring(0, name.length() - 1) : name;
+        if (normalized.regionMatches(true, 0, "dualstack.", 0, "dualstack.".length())) {
+            normalized = normalized.substring("dualstack.".length());
+        }
+        String target = normalized;
+        Collection<Map<String, LoadBalancer>> regions = allAccounts(loadBalancers, loadBalancerStore);
+        return regions.stream().flatMap(region -> region.values().stream())
+                .filter(lb -> target.equalsIgnoreCase(lb.getDnsName()))
+                .toList();
+    }
 
     @PostConstruct
     void initializeStorage()
@@ -121,19 +139,15 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         this.targetGroups = new StorageBackedMap<>(targetGroupStore);
         this.listeners = new StorageBackedMap<>(listenerStore);
         this.rules = new StorageBackedMap<>(ruleStore);
-        this.tags = storageBacked("elbv2-tags.json",
+        this.tagStore = storageFactory.create("elbv2", "elbv2-tags.json",
                 new TypeReference<Map<String, Map<String, String>>>() {});
+        this.tags = new StorageBackedMap<>(tagStore);
         normalizeRegionMaps(loadBalancers);
         normalizeRegionMaps(targetGroups);
         normalizeRegionMaps(listeners);
         normalizeRegionMaps(rules);
         normalizeRegionMaps(tags);
         rebuildIndexes();
-    }
-
-    private <V> Map<String, V> storageBacked(String fileName, TypeReference<Map<String, V>> typeReference)
-    {
-        return new StorageBackedMap<>(storageFactory.create("elbv2", fileName, typeReference));
     }
 
     private <V> void normalizeRegionMaps(Map<String, Map<String, V>> resources) {
@@ -569,6 +583,14 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
             throw new AwsException("ValidationError", "A port must be specified", 400);
         }
         validateHealthCheckPort(healthCheckPort);
+        String groupProtocol = protocol != null ? protocol : "HTTP";
+        String groupTargetType = targetType != null ? targetType : "instance";
+        validateHealthCheckProtocol(healthCheckProtocol, groupProtocol, groupTargetType);
+        String checkProtocol = healthCheckProtocol != null ? healthCheckProtocol
+                : defaultHealthCheckProtocol(groupProtocol, groupTargetType);
+        validateLayer7Members(checkProtocol, healthCheckPath, matcher);
+        boolean layer7Check = isHttpProtocol(checkProtocol);
+        validateHealthCheckEnabled(groupTargetType, healthCheckEnabled);
         Map<String, TargetGroup> regionTgs = targetGroups.computeIfAbsent(region, k -> new ConcurrentHashMap<>());
         boolean duplicate = regionTgs.values().stream()
                 .anyMatch(tg -> tg.getTargetGroupName().equals(name));
@@ -583,24 +605,24 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         TargetGroup tg = new TargetGroup();
         tg.setTargetGroupArn(arn);
         tg.setTargetGroupName(name);
-        tg.setProtocol(protocol != null ? protocol : "HTTP");
+        tg.setProtocol(groupProtocol);
         tg.setProtocolVersion(protocolVersion != null ? protocolVersion : "HTTP1");
         tg.setPort(port);
         tg.setVpcId(vpcId);
-        tg.setTargetType(targetType != null ? targetType : "instance");
+        tg.setTargetType(groupTargetType);
         tg.setIpAddressType(ipAddressType != null ? ipAddressType : "ipv4");
         tg.setRegion(region);
 
         // health check defaults
-        tg.setHealthCheckEnabled(healthCheckEnabled != null ? healthCheckEnabled : true);
-        tg.setHealthCheckProtocol(healthCheckProtocol != null ? healthCheckProtocol : "HTTP");
+        tg.setHealthCheckEnabled(healthCheckEnabled != null ? healthCheckEnabled : !"lambda".equals(groupTargetType));
+        tg.setHealthCheckProtocol(checkProtocol);
         tg.setHealthCheckPort(healthCheckPort != null ? healthCheckPort : "traffic-port");
-        tg.setHealthCheckPath(healthCheckPath != null ? healthCheckPath : "/");
+        tg.setHealthCheckPath(layer7Check ? (healthCheckPath != null ? healthCheckPath : "/") : null);
         tg.setHealthCheckIntervalSeconds(healthCheckInterval != null ? healthCheckInterval : 30);
         tg.setHealthCheckTimeoutSeconds(healthCheckTimeout != null ? healthCheckTimeout : 5);
         tg.setHealthyThresholdCount(healthyThreshold != null ? healthyThreshold : 5);
         tg.setUnhealthyThresholdCount(unhealthyThreshold != null ? unhealthyThreshold : 2);
-        tg.setMatcher(matcher != null ? matcher : "200");
+        tg.setMatcher(layer7Check ? (matcher != null ? matcher : "200") : null);
 
         regionTgs.put(arn, tg);
         targetGroups.put(region, regionTgs);
@@ -664,7 +686,21 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         validateHealthCheckTimeout(healthCheckTimeout);
         TargetGroup tg = requireTargetGroup(region, arn);
         validateHealthCheckPort(healthCheckPort);
+        validateHealthCheckEnabled(tg.getTargetType(), healthCheckEnabled);
+        validateHealthCheckProtocol(healthCheckProtocol, tg.getProtocol(), tg.getTargetType());
+        String checkProtocol = healthCheckProtocol != null ? healthCheckProtocol : tg.getHealthCheckProtocol();
+        validateLayer7Members(checkProtocol, healthCheckPath, matcher);
+        if (isHttpProtocol(healthCheckProtocol) && !isHttpProtocol(tg.getHealthCheckProtocol())
+                && (healthCheckPath == null || matcher == null)) {
+            throw new AwsException("ValidationError", "Path and return code are required for layer 7 health checks.",
+                    400);
+        }
+        Integer previousInterval = tg.getHealthCheckIntervalSeconds();
         if (healthCheckProtocol != null) tg.setHealthCheckProtocol(healthCheckProtocol);
+        if (!isHttpProtocol(checkProtocol)) {
+            tg.setHealthCheckPath(null);
+            tg.setMatcher(null);
+        }
         if (healthCheckPort != null)     tg.setHealthCheckPort(healthCheckPort);
         if (healthCheckEnabled != null)  tg.setHealthCheckEnabled(healthCheckEnabled);
         if (healthCheckPath != null)     tg.setHealthCheckPath(healthCheckPath);
@@ -674,6 +710,81 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
         if (unhealthyThreshold != null)  tg.setUnhealthyThresholdCount(unhealthyThreshold);
         if (matcher != null)             tg.setMatcher(matcher);
         persistRegion(targetGroups, region);
+        if (!Objects.equals(previousInterval, tg.getHealthCheckIntervalSeconds())) {
+            healthChecker.startMonitoring(tg);
+        }
+    }
+
+    /**
+     * Puts back the health check {@code prior} holds, as a CloudFormation rollback does. A TCP check has no path or
+     * matcher, so the ones a target group saved before TCP checks dropped them still holds are not put back.
+     */
+    public void restoreHealthCheck(String region, String arn, TargetGroup prior) {
+        boolean layer7Check = isHttpProtocol(prior.getHealthCheckProtocol());
+        modifyTargetGroup(region, arn, prior.getHealthCheckProtocol(), prior.getHealthCheckPort(),
+                prior.getHealthCheckEnabled(), layer7Check ? prior.getHealthCheckPath() : null,
+                prior.getHealthCheckIntervalSeconds(), prior.getHealthCheckTimeoutSeconds(),
+                prior.getHealthyThresholdCount(), prior.getUnhealthyThresholdCount(),
+                layer7Check ? prior.getMatcher() : null);
+    }
+
+    /**
+     * The health check protocol a target group gets when the request names none: "For Application Load Balancers,
+     * the default is HTTP. For Network Load Balancers and Gateway Load Balancers, the default is TCP." An HTTP or
+     * HTTPS target group is an Application Load Balancer's, and one whose target is an Application Load Balancer
+     * supports only HTTP and HTTPS checks.
+     */
+    static String defaultHealthCheckProtocol(String protocol, String targetType) {
+        return isHttpProtocol(protocol) || "alb".equals(targetType) ? "HTTP" : "TCP";
+    }
+
+    /**
+     * A health check uses HTTP, HTTPS or TCP: "The GENEVE, TLS, UDP, TCP_UDP, QUIC, and TCP_QUIC protocols are not
+     * supported for health checks", "the TCP protocol is not supported for health checks if the protocol of the
+     * target group is HTTP or HTTPS", and for a target type of {@code alb} "the supported health check protocols are
+     * HTTP and HTTPS". A protocol outside them is refused naming the ones the target group takes, as AWS refuses a
+     * TCP check of an HTTP target group: "Health check protocol 'TCP' must be one of 'HTTP, HTTPS'".
+     */
+    private static void validateHealthCheckProtocol(String healthCheckProtocol, String protocol, String targetType) {
+        if (healthCheckProtocol == null) {
+            return;
+        }
+        List<String> supported = isHttpProtocol(protocol) || "alb".equals(targetType)
+                ? List.of("HTTP", "HTTPS") : List.of("HTTP", "HTTPS", "TCP");
+        if (!supported.contains(healthCheckProtocol)) {
+            throw new AwsException("ValidationError", "Health check protocol '" + healthCheckProtocol
+                    + "' must be one of '" + String.join(", ", supported) + "'", 400);
+        }
+    }
+
+    /**
+     * {@code HealthCheckPath} and {@code Matcher} are "[HTTP/HTTPS health checks]" members, so a TCP check, which
+     * only opens a connection, carries neither. {@code protocol} is the protocol of the check the request leaves.
+     */
+    private static void validateLayer7Members(String protocol, String healthCheckPath, String matcher) {
+        if (isHttpProtocol(protocol)) {
+            return;
+        }
+        if (healthCheckPath != null) {
+            throw new AwsException("InvalidConfigurationRequest",
+                    "Health check paths are not supported for " + protocol + " health checks", 400);
+        }
+        if (matcher != null) {
+            throw new AwsException("InvalidConfigurationRequest",
+                    "Health check matchers are not supported for " + protocol + " health checks", 400);
+        }
+    }
+
+    /** Whether {@code protocol} is HTTP or HTTPS, the protocols whose health checks have a path and a matcher. */
+    static boolean isHttpProtocol(String protocol) {
+        return "HTTP".equals(protocol) || "HTTPS".equals(protocol);
+    }
+
+    private static void validateHealthCheckEnabled(String targetType, Boolean enabled) {
+        if (Boolean.FALSE.equals(enabled) && !"lambda".equals(targetType)) {
+            throw new AwsException("InvalidConfigurationRequest",
+                    "Health check enabled must be true for target groups with target type '" + targetType + "'", 400);
+        }
     }
 
     private static void validateHealthCheckTimeout(Integer timeout) {
@@ -1228,7 +1339,13 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
             th.setTarget(t);
             if (isLambdaTg) {
                 th.setHealthCheckPort("N/A");
-                th.setState("healthy");
+                if (Boolean.FALSE.equals(tg.getHealthCheckEnabled())) {
+                    th.setState("unavailable");
+                    th.setReason("Target.HealthCheckDisabled");
+                    th.setDescription("Health checks are disabled for the target group");
+                } else {
+                    th.setState("healthy");
+                }
                 return th;
             }
             int port = ElbV2HealthChecker.effectivePort(t, tg);
@@ -1254,21 +1371,40 @@ public class ElbV2Service implements ResourceProvider, ServerCertificateReferenc
 
     // ── Tags ──────────────────────────────────────────────────────────────────
 
-    public void addTags(List<String> resourceArns, Map<String, String> newTags) {
+    /**
+     * Gives each resource a new map holding its tags and {@code newTags}. Tag calls run one at a time, so two of them
+     * never lose one's tags, and a lookup reads one whole set.
+     */
+    public synchronized void addTags(List<String> resourceArns, Map<String, String> newTags) {
         for (String arn : resourceArns) {
-            tags.computeIfAbsent(arn, k -> new LinkedHashMap<>()).putAll(newTags);
-            tags.put(arn, tags.get(arn));
+            Map<String, String> merged = new LinkedHashMap<>(tags.getOrDefault(arn, Map.of()));
+            merged.putAll(newTags);
+            tags.put(arn, merged);
         }
     }
 
-    public void removeTags(List<String> resourceArns, List<String> tagKeys) {
+    /** Gives each resource holding tags a new map without {@code tagKeys}, one tag call at a time. */
+    public synchronized void removeTags(List<String> resourceArns, List<String> tagKeys) {
         for (String arn : resourceArns) {
             Map<String, String> resourceTags = tags.get(arn);
             if (resourceTags != null) {
-                tagKeys.forEach(resourceTags::remove);
-                tags.put(arn, resourceTags);
+                Map<String, String> remaining = new LinkedHashMap<>(resourceTags);
+                tagKeys.forEach(remaining::remove);
+                tags.put(arn, remaining);
             }
         }
+    }
+
+    /**
+     * The tags of the load balancer, target group, listener or rule whose ARN is {@code arn}, in {@code account}, read
+     * in place under the ARN they are kept under, for IAM's lookup of stored tags. A resource's tags go with it when it
+     * is deleted, so a deleted resource's ARN reads none.
+     */
+    public Map<String, String> tagsInAccount(String account, String arn) {
+        if (tagStore == null) {
+            return tags.getOrDefault(arn, Map.of());
+        }
+        return AccountAwareStorageBackend.readInAccount(tagStore, account, arn).orElse(Map.of());
     }
 
     public Map<String, Map<String, String>> describeTags(List<String> resourceArns) {

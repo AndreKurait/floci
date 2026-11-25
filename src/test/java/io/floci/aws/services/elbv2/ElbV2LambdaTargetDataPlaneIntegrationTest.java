@@ -1,7 +1,7 @@
 package io.floci.aws.services.elbv2;
 
 import io.floci.aws.services.ec2.Ec2Service;
-import io.floci.aws.testing.RealElbV2DataPlaneProfile;
+import io.floci.aws.testing.RdsMockProfile;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.response.Response;
@@ -36,7 +36,7 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
  * disables that override to exercise the real listener.
  */
 @QuarkusTest
-@TestProfile(RealElbV2DataPlaneProfile.class)
+@TestProfile(RdsMockProfile.class)
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class ElbV2LambdaTargetDataPlaneIntegrationTest {
 
@@ -118,8 +118,8 @@ class ElbV2LambdaTargetDataPlaneIntegrationTest {
                 .formParam("Action", "CreateLoadBalancer")
                 .formParam("Name", "alb-dataplane-lb")
                 .formParam("Type", "application")
-                .formParam("Subnets.member.1", Ec2Service.defaultSubnetId("us-east-1", "a"))
-                .formParam("Subnets.member.2", Ec2Service.defaultSubnetId("us-east-1", "b"))
+                .formParam("Subnets.member.1", Ec2Service.defaultSubnetId("us-east-1", "a", "000000000000"))
+                .formParam("Subnets.member.2", Ec2Service.defaultSubnetId("us-east-1", "b", "000000000000"))
                 .header("Authorization", AUTH)
             .when()
                 .post("/")

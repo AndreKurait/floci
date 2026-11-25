@@ -1,11 +1,14 @@
 package io.floci.aws.core.common;
 
+import io.floci.aws.testing.ParallelLocks;
 import jakarta.ws.rs.core.Cookie;
 import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.MultivaluedMap;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.util.Date;
 import java.util.List;
@@ -15,6 +18,7 @@ import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class RegionResolverTest {
 
     private final RegionResolver resolver = new RegionResolver("us-east-1", "000000000000");
@@ -392,6 +396,22 @@ class RegionResolverTest {
     void regionFromAuthWithATrailingControlCharacter() {
         String header = "AWS4-HMAC-SHA256 Credential=AKID/20260215/eu-west-1/s3/aws4_request\u0001";
         assertEquals("eu-west-1", resolver.resolveRegionFromAuth(header));
+    }
+
+    @Test
+    void aStoredResourcesRegionIsTheOneItsArnNamesOrTheDefault() {
+        assertEquals("eu-west-1", resolver.regionOf("arn:aws:appsync:eu-west-1:000000000000:apis/abc"));
+        // Records stored without an ARN, or with one that names no Region, count as the default Region's.
+        assertEquals("us-east-1", resolver.regionOf(null));
+        assertEquals("us-east-1", resolver.regionOf("arn:aws:iam::000000000000:role/r"));
+        assertEquals("us-east-1", resolver.regionOf("not-an-arn"));
+    }
+
+    @Test
+    void outsideARequestOnlyTheDefaultRegionsResourcesAreInTheRequestsRegion() {
+        assertTrue(resolver.inRequestRegion("arn:aws:appsync:us-east-1:000000000000:apis/abc"));
+        assertTrue(resolver.inRequestRegion(null));
+        assertFalse(resolver.inRequestRegion("arn:aws:appsync:eu-west-1:000000000000:apis/abc"));
     }
 
     @Test

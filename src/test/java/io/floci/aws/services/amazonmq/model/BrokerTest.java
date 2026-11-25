@@ -12,7 +12,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 class BrokerTest {
 
     /**
-     * containerId / accountId / volumeId are internal bookkeeping but must survive a
+     * containerId / accountId / volumeId / nodeName / host ports are internal bookkeeping but must survive a
      * serialize -> deserialize round-trip so the broker stays manageable after an
      * emulator restart (volume cleanup, container teardown, account-aware routing).
      * They are kept out of the API by the controller's explicit DescribeBroker
@@ -26,12 +26,18 @@ class BrokerTest {
         broker.setContainerId("container-xyz");
         broker.setAccountId("000000000000");
         broker.setVolumeId("a1b2c3");
+        broker.setNodeName("rabbit@localhost");
+        broker.setAmqpHostPort(5680);
+        broker.setConsoleHostPort(15680);
 
         Broker roundTripped = mapper.readValue(mapper.writeValueAsString(broker), Broker.class);
 
         assertEquals("container-xyz", roundTripped.getContainerId());
         assertEquals("000000000000", roundTripped.getAccountId());
         assertEquals("a1b2c3", roundTripped.getVolumeId());
+        assertEquals("rabbit@localhost", roundTripped.getNodeName());
+        assertEquals(5680, roundTripped.getAmqpHostPort());
+        assertEquals(15680, roundTripped.getConsoleHostPort());
     }
 
     @Test
@@ -49,17 +55,6 @@ class BrokerTest {
         assertEquals(Map.of("dayOfWeek", "MONDAY"), roundTripped.getMaintenanceWindowStartTime());
         assertEquals(Map.of("id", "c-1", "revision", 2), roundTripped.getConfiguration());
         assertEquals("EBS", roundTripped.getStorageType());
-    }
-
-    /** A broker's Region is the one its ARN names, and the default Region's for a broker recorded without one. */
-    @Test
-    void aBrokersRegionIsTheOneItsArnNames() {
-        Broker inIreland = new Broker("b-1", "arn:aws:mq:eu-west-1:000000000000:broker:n:b-1",
-                "n", "RABBITMQ", "3.13", "SINGLE_INSTANCE", "mq.t3.micro");
-        Broker withoutArn = new Broker("b-2", null, "m", "RABBITMQ", "3.13", "SINGLE_INSTANCE", "mq.t3.micro");
-
-        assertEquals("eu-west-1", inIreland.region("us-east-1"));
-        assertEquals("us-east-1", withoutArn.region("us-east-1"));
     }
 
     /** A broker persisted before these members existed must still load, with them absent. */

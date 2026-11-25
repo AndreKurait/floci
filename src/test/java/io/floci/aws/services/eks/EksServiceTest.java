@@ -2,6 +2,7 @@ package io.floci.aws.services.eks;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsArnUtils;
@@ -26,13 +27,17 @@ import io.floci.aws.services.ec2.model.SecurityGroup;
 import io.floci.aws.services.ec2.model.Tag;
 import io.floci.aws.services.ec2.model.Vpc;
 import io.floci.aws.services.ec2.portforward.Ec2PortForwardManager;
+import io.floci.aws.services.eks.model.AccessConfig;
+import io.floci.aws.services.eks.model.BlockStorage;
 import io.floci.aws.services.eks.model.Cluster;
 import io.floci.aws.services.eks.model.ClusterIdentity;
 import io.floci.aws.services.eks.model.ClusterOidcKey;
 import io.floci.aws.services.eks.model.ClusterStatus;
+import io.floci.aws.services.eks.model.ComputeConfig;
 import io.floci.aws.services.eks.model.CreateClusterRequest;
 import io.floci.aws.services.eks.model.CreateFargateProfileRequest;
 import io.floci.aws.services.eks.model.CreateNodeGroupRequest;
+import io.floci.aws.services.eks.model.ElasticLoadBalancing;
 import io.floci.aws.services.eks.model.EncryptionConfig;
 import io.floci.aws.services.eks.model.FargateProfile;
 import io.floci.aws.services.eks.model.FargateProfileStatus;
@@ -45,10 +50,17 @@ import io.floci.aws.services.eks.model.NodegroupStatus;
 import io.floci.aws.services.eks.model.OidcIdentity;
 import io.floci.aws.services.eks.model.Provider;
 import io.floci.aws.services.eks.model.ResourcesVpcConfig;
+import io.floci.aws.services.eks.model.StorageConfig;
+import io.floci.aws.services.eks.model.Update;
+import io.floci.aws.services.eks.model.UpdateClusterConfigRequest;
+import io.floci.aws.services.eks.model.UpdateParam;
+import io.floci.aws.services.eks.model.UpgradePolicy;
+import io.floci.aws.testing.ParallelLocks;
 import io.floci.aws.testing.ThreadStates;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 
@@ -60,12 +72,14 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.EnumSet;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
@@ -77,6 +91,8 @@ import java.util.stream.Collectors;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.argThat;
+import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.inOrder;
@@ -89,6 +105,7 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.verifyNoMoreInteractions;
 import static org.mockito.Mockito.when;
 
+@ResourceLock(ParallelLocks.PORTS)
 class EksServiceTest {
 
     private EksService eksService;
@@ -393,6 +410,216 @@ class EksServiceTest {
     }
 
     @Test
+    void turningAutoModeOnGivesTheRunningNodeBlockStorageAndReplacesItForLoadBalancingAndAPoolChangeDoesNeither() {
+        StorageBackend<String, Cluster> rawClusters = new InMemoryStorage<>();
+        AccountAwareStorageBackend<Cluster> clusterStore = new AccountAwareStorageBackend<>(rawClusters, null, "000000000000");
+        Cluster running = new Cluster();
+        running.setName("auto-running");
+        running.setArn("arn:aws:eks:us-east-1:000000000000:cluster/auto-running");
+        running.setStatus(ClusterStatus.ACTIVE);
+        running.setContainerId("k3s-auto-running");
+        running.setKubernetesNetworkConfig(new KubernetesNetworkConfig());
+        clusterStore.putForAccount("000000000000", EksService.clusterKey("us-east-1", "auto-running"), running);
+        EksClusterManager clusterManager = mock(EksClusterManager.class);
+        when(clusterManager.replaceNodeForServiceLb(any())).thenReturn(true);
+        EksAddonService addons = mock(EksAddonService.class);
+        when(addons.recordUpdate(any(), anyString(), any(), any(), any()))
+                .thenReturn(new Update("u", "Successful", "AutoModeUpdate", List.of(), 0, List.of()));
+        EksService service = new EksService(fixedStorageFactory(clusterStore), testConfig(false),
+                new RegionResolver("us-east-1", "000000000000"), clusterManager, null,
+                new EksOidcService(fixedStorageFactory(new InMemoryStorage<String, ClusterOidcKey>()),
+                        new ObjectMapper()), mock(EksAccessEntryService.class),
+                mock(EksPodIdentityAssociationService.class), addons);
+        KubernetesNetworkConfig loadBalancing = new KubernetesNetworkConfig();
+        loadBalancing.setElasticLoadBalancing(new ElasticLoadBalancing(true));
+        String nodeRole = "arn:aws:iam::000000000000:role/eks-auto-node";
+
+        service.updateClusterConfig("auto-running", new UpdateClusterConfigRequest(null, null, null, null, null,
+                new ComputeConfig(true, List.of("general-purpose", "system"), nodeRole),
+                new StorageConfig(new BlockStorage(true)), loadBalancing));
+
+        ArgumentCaptor<Cluster> applied = ArgumentCaptor.forClass(Cluster.class);
+        verify(clusterManager).applyBlockStorage(eq("k3s-auto-running"), applied.capture());
+        assertEquals(Boolean.TRUE, applied.getValue().getStorageConfig().blockStorage().enabled());
+        // ServiceLB is a k3s server flag, so turning load balancing on replaces the node, which the poller verifies.
+        verify(clusterManager).replaceNodeForServiceLb(running);
+        assertTrue(running.isFinalizePending());
+
+        service.updateClusterConfig("auto-running", new UpdateClusterConfigRequest(null, null, null, null, null,
+                new ComputeConfig(true, List.of("general-purpose"), nodeRole),
+                new StorageConfig(new BlockStorage(true)), loadBalancing));
+
+        verify(clusterManager, times(1)).applyBlockStorage(anyString(), any());
+        verify(clusterManager, times(1)).replaceNodeForServiceLb(any());
+
+        KubernetesNetworkConfig off = new KubernetesNetworkConfig();
+        off.setElasticLoadBalancing(new ElasticLoadBalancing(false));
+        service.updateClusterConfig("auto-running", new UpdateClusterConfigRequest(null, null, null, null, null,
+                new ComputeConfig(false, List.of(), null), new StorageConfig(new BlockStorage(false)), off));
+
+        verify(clusterManager, times(2)).replaceNodeForServiceLb(running);
+        // Each Auto Mode update gives the running node the pools it names, or none once compute is off.
+        verify(clusterManager, times(3)).applyCompute(eq("k3s-auto-running"), eq(running));
+    }
+
+    /** An authentication change whose node entry failed makes it on the retry the client token returns. */
+    @Test
+    void aRetriedAuthenticationChangeMakesTheNodeEntryTheFirstAttemptMissed() {
+        Cluster cluster = activeCluster();
+        cluster.setAccessConfig(new AccessConfig("CONFIG_MAP", false));
+        cluster.setComputeConfig(new ComputeConfig(true, List.of("general-purpose"), "arn:aws:iam::000000000000:role/node"));
+        EksAccessEntryService accessEntries = mock(EksAccessEntryService.class);
+        doThrow(new IllegalStateException("entry write failed")).doNothing()
+                .when(accessEntries).ensureAutoModeNodeEntry(any(), any());
+        UpdateClusterConfigRequest request = new UpdateClusterConfigRequest(null, null,
+                new AccessConfig("API_AND_CONFIG_MAP", null), null, "retry-token");
+        Update recorded = new Update("u", "Successful", "AccessConfigUpdate", List.of(), 0, List.of());
+        EksAddonService addons = mock(EksAddonService.class);
+        when(addons.recordUpdate(any(), anyString(), any(), any(), any())).thenReturn(recorded);
+        when(addons.findConfigUpdateByToken(any(), eq("retry-token"))).thenReturn(Optional.empty())
+                .thenReturn(Optional.of(new EksAddonService.StoredUpdate(recorded, null, request)));
+        EksService service = new EksService(fixedStorageFactory(clusterStoreWith(cluster)), testConfig(true),
+                new RegionResolver("us-east-1", "000000000000"), mock(EksClusterManager.class), null,
+                new EksOidcService(fixedStorageFactory(new InMemoryStorage<String, ClusterOidcKey>()),
+                        new ObjectMapper()), accessEntries, mock(EksPodIdentityAssociationService.class), addons);
+
+        assertThrows(IllegalStateException.class, () -> service.updateClusterConfig("running-cluster", request));
+        assertEquals(List.of(recorded), service.updateClusterConfig("running-cluster", request));
+
+        verify(accessEntries, times(2)).ensureAutoModeNodeEntry(cluster, "arn:aws:iam::000000000000:role/node");
+    }
+
+    /** A retry of an update that makes no node entry, such as a logging change, doesn't make one. */
+    @Test
+    void aRetriedLoggingUpdateLeavesTheNodeEntriesAlone() {
+        Cluster cluster = activeCluster();
+        cluster.setAccessConfig(new AccessConfig("API", false));
+        cluster.setComputeConfig(new ComputeConfig(true, List.of("general-purpose"), "arn:aws:iam::000000000000:role/node"));
+        EksAccessEntryService accessEntries = mock(EksAccessEntryService.class);
+        UpdateClusterConfigRequest request = new UpdateClusterConfigRequest(null, new Logging(List.of()), null, null,
+                "logging-token");
+        Update recorded = new Update("u", "Successful", "LoggingUpdate", List.of(), 0, List.of());
+        EksAddonService addons = mock(EksAddonService.class);
+        when(addons.findConfigUpdateByToken(any(), eq("logging-token")))
+                .thenReturn(Optional.of(new EksAddonService.StoredUpdate(recorded, null, request)));
+        EksService service = new EksService(fixedStorageFactory(clusterStoreWith(cluster)), testConfig(true),
+                new RegionResolver("us-east-1", "000000000000"), mock(EksClusterManager.class), null,
+                new EksOidcService(fixedStorageFactory(new InMemoryStorage<String, ClusterOidcKey>()),
+                        new ObjectMapper()), accessEntries, mock(EksPodIdentityAssociationService.class), addons);
+
+        assertEquals(List.of(recorded), service.updateClusterConfig("running-cluster", request));
+
+        verify(accessEntries, never()).ensureAutoModeNodeEntry(any(), any());
+    }
+
+    @Test
+    void aCreateWhoseNodeEntryFailsStoresNoClusterAndLeavesNoEntry() {
+        EksAccessEntryService accessEntries = mock(EksAccessEntryService.class);
+        doThrow(new IllegalStateException("entry write failed")).when(accessEntries).ensureAutoModeNodeEntry(any(), any());
+        EksService service = new EksService(storageFactory, testConfig(), regionResolver, null, ec2Service,
+                new EksOidcService(storageFactory, new ObjectMapper()), accessEntries,
+                mock(EksPodIdentityAssociationService.class));
+        CreateClusterRequest request = new CreateClusterRequest();
+        request.setName("auto-failing");
+        request.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
+        request.setAccessConfig(new AccessConfig("API", false));
+        request.setComputeConfig(new ComputeConfig(true, List.of("general-purpose"), "arn:aws:iam::000000000000:role/node"));
+        request.setStorageConfig(new StorageConfig(new BlockStorage(true)));
+        KubernetesNetworkConfig loadBalancing = new KubernetesNetworkConfig();
+        loadBalancing.setElasticLoadBalancing(new ElasticLoadBalancing(true));
+        request.setKubernetesNetworkConfig(loadBalancing);
+
+        assertThrows(IllegalStateException.class, () -> service.createCluster(request));
+
+        assertThrows(AwsException.class, () -> service.describeCluster("auto-failing"));
+        verify(accessEntries).deleteClusterEntries(argThat(cluster -> "auto-failing".equals(cluster.getName())));
+    }
+
+    @Test
+    void aCreateWhoseEntryCleanupFailsTooKeepsTheCreatesError() {
+        EksAccessEntryService accessEntries = mock(EksAccessEntryService.class);
+        doThrow(new IllegalStateException("entry write failed")).when(accessEntries).ensureAutoModeNodeEntry(any(), any());
+        doThrow(new IllegalStateException("entry cleanup failed")).when(accessEntries).deleteClusterEntries(any());
+        EksService service = new EksService(storageFactory, testConfig(), regionResolver, null, ec2Service,
+                new EksOidcService(storageFactory, new ObjectMapper()), accessEntries,
+                mock(EksPodIdentityAssociationService.class));
+        CreateClusterRequest request = new CreateClusterRequest();
+        request.setName("auto-failing-twice");
+        request.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
+        request.setAccessConfig(new AccessConfig("API", false));
+        request.setComputeConfig(new ComputeConfig(true, List.of("general-purpose"), "arn:aws:iam::000000000000:role/node"));
+        request.setStorageConfig(new StorageConfig(new BlockStorage(true)));
+        KubernetesNetworkConfig loadBalancing = new KubernetesNetworkConfig();
+        loadBalancing.setElasticLoadBalancing(new ElasticLoadBalancing(true));
+        request.setKubernetesNetworkConfig(loadBalancing);
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class, () -> service.createCluster(request));
+
+        assertEquals("entry write failed", failure.getMessage());
+        assertThrows(AwsException.class, () -> service.describeCluster("auto-failing-twice"));
+    }
+
+    @Test
+    void aDeleteWhoseEntryCleanupFailsKeepsTheClusterForARetry() {
+        Cluster cluster = activeCluster();
+        EksAccessEntryService accessEntries = mock(EksAccessEntryService.class);
+        doThrow(new IllegalStateException("entry delete failed")).doNothing()
+                .when(accessEntries).deleteClusterEntries(cluster);
+        EksService service = new EksService(fixedStorageFactory(clusterStoreWith(cluster)), testConfig(true),
+                new RegionResolver("us-east-1", "000000000000"), mock(EksClusterManager.class), null,
+                new EksOidcService(fixedStorageFactory(new InMemoryStorage<String, ClusterOidcKey>()),
+                        new ObjectMapper()), accessEntries);
+
+        assertThrows(IllegalStateException.class, () -> service.deleteCluster("running-cluster"));
+        assertEquals("running-cluster", service.describeCluster("running-cluster").getName());
+
+        service.deleteCluster("running-cluster");
+        assertThrows(AwsException.class, () -> service.describeCluster("running-cluster"));
+    }
+
+    /**
+     * A delete that starts while an update is past its status check, and has removed the cluster's entries before
+     * the update makes the node's, leaves no entry to outlive the cluster.
+     */
+    @Test
+    void anUpdateTurningComputeOnDuringADeleteMakesNoNodeEntry() {
+        StorageBackend<String, Cluster> rawClusters = new InMemoryStorage<>();
+        AccountAwareStorageBackend<Cluster> clusterStore = new AccountAwareStorageBackend<>(rawClusters, null, "000000000000");
+        Cluster cluster = new Cluster();
+        cluster.setName("deleting");
+        cluster.setArn("arn:aws:eks:us-east-1:000000000000:cluster/deleting");
+        cluster.setStatus(ClusterStatus.ACTIVE);
+        cluster.setAccessConfig(new AccessConfig("API", false));
+        cluster.setKubernetesNetworkConfig(new KubernetesNetworkConfig());
+        cluster.setContainerId("k3s-deleting");
+        clusterStore.putForAccount("000000000000", EksService.clusterKey("us-east-1", "deleting"), cluster);
+        EksAccessEntryService accessEntries = mock(EksAccessEntryService.class);
+        EksPodIdentityAssociationService podIdentity = mock(EksPodIdentityAssociationService.class);
+        EksAddonService addons = mock(EksAddonService.class);
+        when(addons.recordUpdate(any(), anyString(), any(), any(), any()))
+                .thenReturn(new Update("u", "Successful", "AutoModeUpdate", List.of(), 0, List.of()));
+        EksClusterManager clusterManager = mock(EksClusterManager.class);
+        // A delete begins (its first step marks the cluster DELETING) after the update stored the configuration and
+        // before it makes the node entry: the block storage the update turns on is applied to the node in between.
+        doAnswer(inv -> {
+            cluster.setStatus(ClusterStatus.DELETING);
+            return null;
+        }).when(clusterManager).applyBlockStorage(anyString(), any());
+        EksService service = new EksService(fixedStorageFactory(clusterStore), testConfig(false),
+                new RegionResolver("us-east-1", "000000000000"), clusterManager, null,
+                new EksOidcService(fixedStorageFactory(new InMemoryStorage<String, ClusterOidcKey>()),
+                        new ObjectMapper()), accessEntries, podIdentity, addons);
+        KubernetesNetworkConfig loadBalancing = new KubernetesNetworkConfig();
+        loadBalancing.setElasticLoadBalancing(new ElasticLoadBalancing(true));
+
+        service.updateClusterConfig("deleting", new UpdateClusterConfigRequest(null, null, null, null, null,
+                new ComputeConfig(true, List.of("general-purpose"), "arn:aws:iam::000000000000:role/node"),
+                new StorageConfig(new BlockStorage(true)), loadBalancing));
+
+        verify(accessEntries, never()).ensureAutoModeNodeEntry(any(), any());
+    }
+
+    @Test
     void initRestoresPersistedClustersAfterARestart() {
         // A cluster restored from eks-clusters.json after a Floci/Docker restart (#2609) has no
         // container attached — init must re-latch it and hand it back to the readiness poller.
@@ -580,6 +807,22 @@ class EksServiceTest {
     }
 
     @Test
+    void aDeletedClustersAutoModeLoadBalancersGoWithIt() {
+        Cluster cluster = activeCluster();
+        EksAutoModeLoadBalancers loadBalancers = mock(EksAutoModeLoadBalancers.class);
+        @SuppressWarnings("unchecked")
+        jakarta.enterprise.inject.Instance<EksAutoModeLoadBalancers> lookup =
+                mock(jakarta.enterprise.inject.Instance.class);
+        when(lookup.isResolvable()).thenReturn(true);
+        when(lookup.get()).thenReturn(loadBalancers);
+        EksService service = serviceWithCluster(cluster, mock(EksClusterManager.class), false, lookup);
+
+        service.deleteCluster("running-cluster");
+
+        verify(loadBalancers).deleteLoadBalancers(cluster, service.clusterRegion(cluster));
+    }
+
+    @Test
     void aDeleteOverlappingOneStillInProgressIsRejectedAndCannotReviveTheCluster() {
         Cluster cluster = activeCluster();
         EksClusterManager clusterManager = mock(EksClusterManager.class);
@@ -626,6 +869,33 @@ class EksServiceTest {
         assertEquals(ClusterStatus.ACTIVE, service.describeCluster("running-cluster").getStatus());
     }
 
+    @Test
+    void deletingAClusterEndsItsNodeInEc2BeforeDeletingItsSecurityGroup() {
+        Cluster cluster = activeCluster();
+        cluster.setArn("arn:aws:eks:us-east-1:000000000000:cluster/running-cluster");
+        ResourcesVpcConfig vpc = new ResourcesVpcConfig();
+        vpc.setVpcId("vpc-1");
+        vpc.setClusterSecurityGroupId("sg-cluster");
+        cluster.setResourcesVpcConfig(vpc);
+        EksClusterManager clusterManager = mock(EksClusterManager.class);
+        when(clusterManager.deriveClusterNodeInstanceId(cluster, "us-east-1", "000000000000")).thenReturn("i-0de00node");
+        Ec2Service ec2 = mock(Ec2Service.class);
+        AccountAwareStorageBackend<Cluster> clusterStore =
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, "000000000000");
+        clusterStore.putForAccount("000000000000", EksService.clusterKey("us-east-1", cluster.getName()), cluster);
+        EksService service = new EksService(fixedStorageFactory(clusterStore), testConfig(false, false),
+                new RegionResolver("us-east-1", "000000000000"), clusterManager, ec2,
+                new EksOidcService(fixedStorageFactory(new InMemoryStorage<String, ClusterOidcKey>()),
+                        new ObjectMapper()), mock(EksAccessEntryService.class));
+
+        service.deleteCluster(cluster.getName());
+
+        InOrder order = inOrder(clusterManager, ec2);
+        order.verify(clusterManager).stopCluster(cluster);
+        order.verify(ec2).endClusterNodeInstance("000000000000", "us-east-1", "i-0de00node");
+        order.verify(ec2).deleteSecurityGroup("us-east-1", "sg-cluster");
+    }
+
     private static Cluster activeCluster() {
         Cluster cluster = new Cluster();
         cluster.setName("running-cluster");
@@ -633,8 +903,22 @@ class EksServiceTest {
         return cluster;
     }
 
+    private AccountAwareStorageBackend<Cluster> clusterStoreWith(Cluster cluster) {
+        AccountAwareStorageBackend<Cluster> clusterStore =
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, "000000000000");
+        clusterStore.putForAccount("000000000000", EksService.clusterKey(
+                AwsArnUtils.regionOrDefault(cluster.getArn(), "us-east-1"), cluster.getName()), cluster);
+        return clusterStore;
+    }
+
     private EksService serviceWithCluster(Cluster cluster, EksClusterManager clusterManager,
             boolean keepRunningOnShutdown) {
+        return serviceWithCluster(cluster, clusterManager, keepRunningOnShutdown, null);
+    }
+
+    private EksService serviceWithCluster(Cluster cluster, EksClusterManager clusterManager,
+            boolean keepRunningOnShutdown,
+            jakarta.enterprise.inject.Instance<EksAutoModeLoadBalancers> autoModeLoadBalancers) {
         AccountAwareStorageBackend<Cluster> clusterStore =
                 new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, "000000000000");
         clusterStore.putForAccount("000000000000", EksService.clusterKey(
@@ -642,7 +926,8 @@ class EksServiceTest {
         return new EksService(fixedStorageFactory(clusterStore), testConfig(false, keepRunningOnShutdown),
                 new RegionResolver("us-east-1", "000000000000"), clusterManager, null,
                 new EksOidcService(fixedStorageFactory(new InMemoryStorage<String, ClusterOidcKey>()),
-                        new ObjectMapper()), mock(EksAccessEntryService.class));
+                        new ObjectMapper()), mock(EksAccessEntryService.class), null, null, null,
+                autoModeLoadBalancers);
     }
 
     private StorageFactory fixedStorageFactory(StorageBackend<String, ?> backend) {
@@ -668,6 +953,111 @@ class EksServiceTest {
         eksService.createCluster(req);
 
         assertThrows(AwsException.class, () -> eksService.createCluster(req));
+    }
+
+    @Test
+    void createClusterRetryWithSameClientRequestTokenReturnsExistingCluster() {
+        CreateClusterRequest req = new CreateClusterRequest();
+        req.setName("retry-cluster");
+        req.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
+        req.setClientRequestToken("retry-token");
+
+        Cluster created = eksService.createCluster(req);
+        Cluster retried = eksService.createCluster(req);
+
+        assertEquals(created.getArn(), retried.getArn());
+        assertEquals(created.getCreatedAt(), retried.getCreatedAt());
+        assertEquals(List.of("retry-cluster"), eksService.listClusters());
+    }
+
+    @Test
+    void createClusterRejectsReusedTokenWithDifferentParameters() {
+        CreateClusterRequest original = clusterRequest("token-conflict");
+        original.setClientRequestToken("shared-token");
+        eksService.createCluster(original);
+
+        CreateClusterRequest changedRole = clusterRequest("token-conflict");
+        changedRole.setRoleArn("arn:aws:iam::000000000000:role/another-role");
+        changedRole.setClientRequestToken("shared-token");
+        AwsException changed = assertThrows(AwsException.class, () -> eksService.createCluster(changedRole));
+        assertEquals("InvalidParameterException", changed.getErrorCode());
+        assertEquals(400, changed.getHttpStatus());
+
+        CreateClusterRequest changedName = clusterRequest("another-cluster");
+        changedName.setClientRequestToken("shared-token");
+        AwsException renamed = assertThrows(AwsException.class, () -> eksService.createCluster(changedName));
+        assertEquals("InvalidParameterException", renamed.getErrorCode());
+        assertEquals(List.of("token-conflict"), eksService.listClusters());
+    }
+
+    @Test
+    void createClusterRetryUsesTheOriginalRequestAfterTagsChange() {
+        CreateClusterRequest original = clusterRequest("retagged-cluster");
+        original.setClientRequestToken("retag-token");
+        original.setTags(Map.of("env", "initial"));
+        Cluster created = eksService.createCluster(original);
+        eksService.tagResource(created.getArn(), Map.of("env", "updated"));
+
+        CreateClusterRequest retry = clusterRequest("retagged-cluster");
+        retry.setClientRequestToken("retag-token");
+        retry.setTags(Map.of("env", "initial"));
+        Cluster retried = eksService.createCluster(retry);
+
+        assertEquals(created.getArn(), retried.getArn());
+        assertEquals(created.getCreatedAt(), retried.getCreatedAt());
+        assertEquals(Map.of("env", "updated"), retried.getTags());
+    }
+
+    @Test
+    void createClusterRetrySurvivesPersistentStorageRestart(@TempDir Path directory) {
+        EksService before = persistentEksService(directory, null);
+        CreateClusterRequest original = clusterRequest("persisted-token-cluster");
+        original.setClientRequestToken("persisted-token");
+        ObjectNode rawRequest = new ObjectMapper().createObjectNode().put("deletionProtection", true);
+        Cluster created = before.createCluster(original, rawRequest);
+
+        EksService after = persistentEksService(directory, null);
+        CreateClusterRequest retry = clusterRequest("persisted-token-cluster");
+        retry.setClientRequestToken("persisted-token");
+        ObjectNode rawRetry = new ObjectMapper().createObjectNode().put("deletionProtection", true);
+        Cluster retried = after.createCluster(retry, rawRetry);
+
+        assertEquals(created.getArn(), retried.getArn());
+        assertEquals(created.getCreatedAt(), retried.getCreatedAt());
+        assertEquals(List.of("persisted-token-cluster"), after.listClusters());
+
+        rawRetry.put("deletionProtection", false);
+        AwsException changed = assertThrows(AwsException.class, () -> after.createCluster(retry, rawRetry));
+        assertEquals("InvalidParameterException", changed.getErrorCode());
+    }
+
+    @Test
+    void createClusterFailedRequestReleasesItsToken() {
+        CreateClusterRequest invalid = clusterRequest("retry-after-failure");
+        invalid.setVersion("1.0");
+        invalid.setClientRequestToken("failure-token");
+        AwsException failure = assertThrows(AwsException.class, () -> eksService.createCluster(invalid));
+        assertEquals("InvalidParameterException", failure.getErrorCode());
+
+        CreateClusterRequest corrected = clusterRequest("retry-after-failure");
+        corrected.setClientRequestToken("failure-token");
+        Cluster created = eksService.createCluster(corrected);
+        assertEquals("retry-after-failure", created.getName());
+        assertEquals(List.of("retry-after-failure"), eksService.listClusters());
+    }
+
+    @Test
+    void createClusterRetryWithWhitespaceTokenStillReplays() {
+        CreateClusterRequest original = clusterRequest("blank-token-cluster");
+        original.setClientRequestToken(" ");
+        Cluster created = eksService.createCluster(original);
+
+        CreateClusterRequest retry = clusterRequest("blank-token-cluster");
+        retry.setClientRequestToken(" ");
+        Cluster retried = eksService.createCluster(retry);
+
+        assertEquals(created.getArn(), retried.getArn());
+        assertEquals(created.getCreatedAt(), retried.getCreatedAt());
     }
 
     @Test
@@ -737,8 +1127,8 @@ class EksServiceTest {
                 new EksOidcService(storageFactory, new ObjectMapper()), mock(EksAccessEntryService.class));
 
         ResourcesVpcConfig vpcConfig = new ResourcesVpcConfig();
-        vpcConfig.setSubnetIds(List.of(Ec2Service.defaultSubnetId("us-east-1", "a"),
-                Ec2Service.defaultSubnetId("us-east-1", "b")));
+        vpcConfig.setSubnetIds(List.of(Ec2Service.defaultSubnetId("us-east-1", "a", "000000000000"),
+                Ec2Service.defaultSubnetId("us-east-1", "b", "000000000000")));
 
         CreateClusterRequest req = new CreateClusterRequest();
         req.setName("real-subnet-cluster");
@@ -748,8 +1138,8 @@ class EksServiceTest {
         Cluster cluster = service.createCluster(req);
 
         assertEquals("real-subnet-cluster", cluster.getName());
-        assertEquals(List.of(Ec2Service.defaultSubnetId("us-east-1", "a"),
-                Ec2Service.defaultSubnetId("us-east-1", "b")),
+        assertEquals(List.of(Ec2Service.defaultSubnetId("us-east-1", "a", "000000000000"),
+                Ec2Service.defaultSubnetId("us-east-1", "b", "000000000000")),
                 cluster.getResourcesVpcConfig().getSubnetIds());
     }
 
@@ -772,8 +1162,8 @@ class EksServiceTest {
                 realEc2Service(), new EksOidcService(storageFactory, new ObjectMapper()), mock(EksAccessEntryService.class));
 
         ResourcesVpcConfig vpcConfig = new ResourcesVpcConfig();
-        vpcConfig.setSubnetIds(List.of(Ec2Service.defaultSubnetId("us-east-1", "a"),
-                Ec2Service.defaultSubnetId("us-east-1", "b")));
+        vpcConfig.setSubnetIds(List.of(Ec2Service.defaultSubnetId("us-east-1", "a", "000000000000"),
+                Ec2Service.defaultSubnetId("us-east-1", "b", "000000000000")));
 
         CreateClusterRequest req = new CreateClusterRequest();
         req.setName("vpc-id-cluster");
@@ -782,7 +1172,7 @@ class EksServiceTest {
 
         Cluster cluster = service.createCluster(req);
 
-        assertEquals(Ec2Service.defaultVpcId("us-east-1"), cluster.getResourcesVpcConfig().getVpcId());
+        assertEquals(Ec2Service.defaultVpcId("us-east-1", "000000000000"), cluster.getResourcesVpcConfig().getVpcId());
     }
 
     @Test
@@ -802,7 +1192,7 @@ class EksServiceTest {
                 realEc2Service(), new EksOidcService(storageFactory, new ObjectMapper()), mock(EksAccessEntryService.class));
 
         ResourcesVpcConfig vpcConfig = new ResourcesVpcConfig();
-        vpcConfig.setSubnetIds(List.of(Ec2Service.defaultSubnetId("eu-west-2", "a")));
+        vpcConfig.setSubnetIds(List.of(Ec2Service.defaultSubnetId("eu-west-2", "a", "000000000000")));
 
         CreateClusterRequest req = new CreateClusterRequest();
         req.setName("cross-region-cluster");
@@ -840,7 +1230,7 @@ class EksServiceTest {
         Ec2Service ec2Service = realEc2Service();
         ec2Service.ensureDefaultResources("us-east-1");
         String usEastOnlySubnet = ec2Service
-                .createSubnet("us-east-1", Ec2Service.defaultVpcId("us-east-1"), "172.31.200.0/24", "us-east-1a")
+                .createSubnet("us-east-1", Ec2Service.defaultVpcId("us-east-1", "000000000000"), "172.31.200.0/24", "us-east-1a")
                 .getSubnetId();
 
         // The request is for eu-west-2, where that subnet does not exist.
@@ -911,6 +1301,165 @@ class EksServiceTest {
         Cluster deleted = eksService.deleteCluster("to-delete");
         assertEquals(ClusterStatus.DELETING, deleted.getStatus());
         assertTrue(eksService.listClusters().isEmpty());
+    }
+
+    @Test
+    void updateClusterConfigRefusesBadPublicAccessCidrsOnAnIpv4ClusterAndChangesNothing() {
+        EksAddonService addons = mock(EksAddonService.class);
+        Update recorded = new Update("u", "Successful", "EndpointAccessUpdate", List.of(), 0, List.of());
+        when(addons.recordUpdate(any(), anyString(), any(), any(), any())).thenReturn(recorded);
+        EksService service = new EksService(storageFactory, testConfig(), regionResolver, null, ec2Service,
+                new EksOidcService(storageFactory, new ObjectMapper()), mock(EksAccessEntryService.class),
+                mock(EksPodIdentityAssociationService.class), addons);
+        CreateClusterRequest create = new CreateClusterRequest();
+        create.setName("cidr-cluster");
+        create.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
+        service.createCluster(create);
+        for (String cidr : List.of("10.0.0.0/33", "::/0")) {
+            ResourcesVpcConfig vpc = new ResourcesVpcConfig();
+            vpc.setEndpointPublicAccess(false);
+            vpc.setPublicAccessCidrs(List.of(cidr));
+            AwsException e = assertThrows(AwsException.class, () -> service.updateClusterConfig(
+                    "cidr-cluster", new UpdateClusterConfigRequest(vpc, null, null, null, null)), cidr);
+            assertEquals("InvalidParameterException", e.getErrorCode(), cidr);
+            ResourcesVpcConfig stored = service.describeCluster("cidr-cluster").getResourcesVpcConfig();
+            assertEquals(Boolean.TRUE, stored.getEndpointPublicAccess(), cidr);
+            assertEquals(List.of("0.0.0.0/0"), stored.getPublicAccessCidrs(), cidr);
+        }
+        verify(addons, never()).recordUpdate(any(), anyString(), any(), any(), any());
+    }
+
+    @Test
+    void createClusterGivesExtendedSupportUnlessTheRequestAsksForStandard() {
+        CreateClusterRequest noSupportType = new CreateClusterRequest();
+        noSupportType.setName("policy-default");
+        noSupportType.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
+        noSupportType.setUpgradePolicy(new UpgradePolicy(null));
+        assertEquals(new UpgradePolicy("EXTENDED"), eksService.createCluster(noSupportType).getUpgradePolicy());
+
+        CreateClusterRequest standard = new CreateClusterRequest();
+        standard.setName("policy-standard");
+        standard.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
+        standard.setUpgradePolicy(new UpgradePolicy("STANDARD"));
+        eksService.createCluster(standard);
+        assertEquals(new UpgradePolicy("STANDARD"), eksService.describeCluster("policy-standard").getUpgradePolicy());
+
+        CreateClusterRequest bogus = new CreateClusterRequest();
+        bogus.setName("policy-bogus");
+        bogus.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
+        bogus.setUpgradePolicy(new UpgradePolicy("standard"));
+        AwsException e = assertThrows(AwsException.class, () -> eksService.createCluster(bogus));
+        assertEquals("InvalidParameterException", e.getErrorCode());
+        assertEquals("Invalid supportType 'standard'. Valid values: STANDARD | EXTENDED", e.getMessage());
+        assertFalse(eksService.listClusters().contains("policy-bogus"));
+    }
+
+    @Test
+    void standardSupportIsRefusedForAVersionPastItsEndOfStandardSupport() {
+        CreateClusterRequest create = new CreateClusterRequest();
+        create.setName("policy-retired");
+        create.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
+        create.setVersion("1.30");
+        create.setUpgradePolicy(new UpgradePolicy("STANDARD"));
+        AwsException refused = assertThrows(AwsException.class, () -> eksService.createCluster(create));
+        assertEquals("InvalidParameterException", refused.getErrorCode());
+        assertEquals("The requested Kubernetes version \"1.30\" is only supported under extended support. "
+                + "Please change the supportType to extended support to create the cluster.", refused.getMessage());
+        assertFalse(eksService.listClusters().contains("policy-retired"));
+
+        create.setUpgradePolicy(null);
+        eksService.createCluster(create);
+        AwsException update = assertThrows(AwsException.class, () -> eksService.updateClusterConfig("policy-retired",
+                new UpdateClusterConfigRequest(null, null, null, new UpgradePolicy("STANDARD"), null)));
+        assertEquals("InvalidParameterException", update.getErrorCode());
+        assertEquals("The Kubernetes version \"1.30\" is not in standard support. Please update the cluster to a "
+                + "version in standard support to change the supportType", update.getMessage());
+        assertEquals(new UpgradePolicy("EXTENDED"), eksService.describeCluster("policy-retired").getUpgradePolicy());
+    }
+
+    @Test
+    void standardSupportIsAcceptedForAVersionTheCalendarDoesNotListYet() {
+        CreateClusterRequest create = new CreateClusterRequest();
+        create.setName("policy-newest");
+        create.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
+        create.setVersion("1.38");
+        create.setUpgradePolicy(new UpgradePolicy("STANDARD"));
+
+        assertEquals(new UpgradePolicy("STANDARD"), eksService.createCluster(create).getUpgradePolicy());
+    }
+
+    @Test
+    void aClusterStoredBeforeFlociKeptTheUpgradePolicyReportsExtendedSupport() throws Exception {
+        // AWS gave existing clusters extended support too.
+        ObjectMapper mapper = new ObjectMapper();
+        Cluster stored = mapper.readValue("{\"name\":\"old\"}", Cluster.class);
+
+        assertEquals("EXTENDED", mapper.valueToTree(stored).path("upgradePolicy").path("supportType").asText());
+    }
+
+    @Test
+    void updateClusterConfigRecordsTheUpgradePolicyAsJsonAndRefusesAnUnknownSupportType() {
+        EksAddonService addons = mock(EksAddonService.class);
+        Update recorded = new Update("u", "Successful", "UpgradePolicyUpdate", List.of(), 0, List.of());
+        when(addons.recordUpdate(any(), anyString(), any(), any(), any())).thenReturn(recorded);
+        EksService service = new EksService(storageFactory, testConfig(), regionResolver, null, ec2Service,
+                new EksOidcService(storageFactory, new ObjectMapper()), mock(EksAccessEntryService.class),
+                mock(EksPodIdentityAssociationService.class), addons);
+        CreateClusterRequest create = new CreateClusterRequest();
+        create.setName("policy-update");
+        create.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
+        service.createCluster(create);
+
+        AwsException e = assertThrows(AwsException.class, () -> service.updateClusterConfig("policy-update",
+                new UpdateClusterConfigRequest(null, null, null, new UpgradePolicy("LONG"), null)));
+        assertEquals("InvalidParameterException", e.getErrorCode());
+        assertEquals(new UpgradePolicy("EXTENDED"), service.describeCluster("policy-update").getUpgradePolicy());
+        verify(addons, never()).recordUpdate(any(), anyString(), any(), any(), any());
+
+        UpdateClusterConfigRequest request =
+                new UpdateClusterConfigRequest(null, null, null, new UpgradePolicy("STANDARD"), null);
+        service.updateClusterConfig("policy-update", request);
+
+        verify(addons).recordUpdate(any(), eq("UpgradePolicyUpdate"),
+                eq(List.of(new UpdateParam("UpgradePolicy", "{\"supportType\":\"STANDARD\"}"))), any(), eq(request));
+        assertEquals(new UpgradePolicy("STANDARD"), service.describeCluster("policy-update").getUpgradePolicy());
+    }
+
+    @Test
+    void updateClusterConfigMovesTheAuthenticationModeOneStepForwardOnly() {
+        EksAddonService addons = mock(EksAddonService.class);
+        Update recorded = new Update("u", "Successful", "AuthenticationModeUpdate", List.of(), 0, List.of());
+        when(addons.recordUpdate(any(), anyString(), any(), any(), any())).thenReturn(recorded);
+        EksService service = new EksService(storageFactory, testConfig(), regionResolver, null, ec2Service,
+                new EksOidcService(storageFactory, new ObjectMapper()), mock(EksAccessEntryService.class),
+                mock(EksPodIdentityAssociationService.class), addons);
+        List<String> modes = List.of("CONFIG_MAP", "API_AND_CONFIG_MAP", "API");
+        for (int from = 0; from < modes.size(); from++) {
+            for (int to = 0; to < modes.size(); to++) {
+                String pair = modes.get(from) + " to " + modes.get(to);
+                String name = "mode-" + from + "-" + to;
+                CreateClusterRequest create = new CreateClusterRequest();
+                create.setName(name);
+                create.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
+                create.setAccessConfig(new AccessConfig(modes.get(from), null));
+                service.createCluster(create);
+                UpdateClusterConfigRequest request = new UpdateClusterConfigRequest(
+                        null, null, new AccessConfig(modes.get(to), null), null, null);
+                if (to == from + 1) {
+                    service.updateClusterConfig(name, request);
+                    assertEquals(modes.get(to), service.describeCluster(name).getAccessConfig()
+                            .authenticationMode(), pair);
+                } else {
+                    AwsException e = assertThrows(AwsException.class,
+                            () -> service.updateClusterConfig(name, request), pair);
+                    assertEquals("InvalidParameterException", e.getErrorCode(), pair);
+                    assertEquals("Unsupported authentication mode update from " + pair,
+                            e.getMessage(), pair);
+                    assertEquals(modes.get(from), service.describeCluster(name).getAccessConfig()
+                            .authenticationMode(), pair);
+                }
+            }
+        }
     }
 
     @Test
@@ -1578,6 +2127,17 @@ class EksServiceTest {
         assertEquals(FargateProfileStatus.DELETING, deleted.getStatus());
         assertThrows(AwsException.class, () -> eksService.describeFargateProfile("my-eks-cluster", "profile-a"));
         assertEquals(List.of("profile-b"), eksService.listFargateProfiles("my-eks-cluster"));
+        assertEquals(Optional.of(deleted.getFargateProfileArn()),
+                eksService.findResourceArn("my-eks-cluster", "fargate-profiles", "profile-a"));
+        FargateProfile replacement = eksService.createFargateProfile("my-eks-cluster", fargateProfileRequest("profile-a"));
+        assertNotEquals(deleted.getFargateProfileArn(), replacement.getFargateProfileArn());
+        assertEquals(Optional.of(replacement.getFargateProfileArn()),
+                eksService.findResourceArn("my-eks-cluster", "fargate-profiles", "profile-a"));
+        eksService.deleteFargateProfile("my-eks-cluster", "profile-a");
+        eksService.deleteFargateProfile("my-eks-cluster", "profile-b");
+        eksService.deleteCluster("my-eks-cluster");
+        createTestCluster("my-eks-cluster");
+        assertTrue(eksService.findResourceArn("my-eks-cluster", "fargate-profiles", "profile-a").isEmpty());
     }
 
     @Test
@@ -1732,7 +2292,7 @@ class EksServiceTest {
     void createClusterCreatesClusterSecurityGroupInResolvedVpc() {
         Ec2Service ec2Service = realEc2Service();
         ec2Service.ensureDefaultResources("us-east-1");
-        String defaultVpc = Ec2Service.defaultVpcId("us-east-1");
+        String defaultVpc = Ec2Service.defaultVpcId("us-east-1", "000000000000");
         String subnetId = ec2Service
                 .createSubnet("us-east-1", defaultVpc, "172.31.100.0/24", "us-east-1a")
                 .getSubnetId();
@@ -1783,6 +2343,58 @@ class EksServiceTest {
                 .anyMatch(p -> "-1".equals(p.getIpProtocol())
                         && p.getUserIdGroupPairs().stream().anyMatch(u -> sgId.equals(u.getGroupId())));
         assertTrue(hasSelfEgress, "Security group should have self-referencing outbound egress rule for EFA");
+
+        String otherVpc = ec2Service.createVpc("us-east-1", "10.50.0.0/16", false).getVpcId();
+        String otherSubnet = ec2Service.createSubnet("us-east-1", otherVpc, "10.50.1.0/24", "us-east-1b").getSubnetId();
+        Map<String, Consumer<CreateClusterRequest>> rejected = new LinkedHashMap<>();
+        rejected.put("ipFamily ipv5", r -> r.setKubernetesNetworkConfig(network("ipv5", null)));
+        rejected.put("service CIDR 8.8.8.0/24", r -> r.setKubernetesNetworkConfig(network("ipv4", "8.8.8.0/24")));
+        rejected.put("unknown log type", r -> r.setLogging(new Logging(List.of(new LogSetup(List.of("bogus"), true)))));
+        rejected.put("subnets in two VPCs", r -> vpcConfig.setSubnetIds(List.of(subnetId, otherSubnet)));
+        rejected.put("public CIDR /33", r -> vpcConfig.setPublicAccessCidrs(List.of("10.0.0.0/33")));
+        rejected.put("IPv6 public CIDR on ipv4", r -> vpcConfig.setPublicAccessCidrs(List.of("::/0")));
+        int row = 0;
+        List<String> failed = new ArrayList<>();
+        for (Map.Entry<String, Consumer<CreateClusterRequest>> entry : rejected.entrySet()) {
+            vpcConfig.setSubnetIds(List.of(subnetId));
+            vpcConfig.setPublicAccessCidrs(null);
+            CreateClusterRequest bad = new CreateClusterRequest();
+            bad.setName("cluster-sg-bad-" + row++);
+            bad.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
+            bad.setResourcesVpcConfig(vpcConfig);
+            entry.getValue().accept(bad);
+            int groupsBefore = ec2Service.describeSecurityGroups("us-east-1", List.of(), List.of(), Map.of()).size();
+            try {
+                service.createCluster(bad);
+                failed.add(entry.getKey() + ": accepted");
+            } catch (AwsException e) {
+                boolean clean = groupsBefore
+                        == ec2Service.describeSecurityGroups("us-east-1", List.of(), List.of(), Map.of()).size();
+                if (!"InvalidParameterException".equals(e.getErrorCode()) || !clean) {
+                    failed.add(entry.getKey() + ": " + e.getErrorCode() + (clean ? "" : ", security group left"));
+                }
+            }
+        }
+        vpcConfig.setSubnetIds(List.of(subnetId));
+        vpcConfig.setPublicAccessCidrs(List.of("::/0"));
+        CreateClusterRequest v6 = new CreateClusterRequest();
+        v6.setName("cluster-sg-ipv6");
+        v6.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
+        v6.setResourcesVpcConfig(vpcConfig);
+        v6.setKubernetesNetworkConfig(network("ipv6", null));
+        try {
+            service.createCluster(v6);
+        } catch (AwsException e) {
+            failed.add("ipv6 with ::/0: " + e.getErrorCode());
+        }
+        assertEquals(List.of(), failed);
+    }
+
+    private static KubernetesNetworkConfig network(String family, String serviceCidr) {
+        KubernetesNetworkConfig network = new KubernetesNetworkConfig();
+        network.setIpFamily(family);
+        network.setServiceIpv4Cidr(serviceCidr);
+        return network;
     }
 
     @Test
@@ -1807,7 +2419,7 @@ class EksServiceTest {
     void deleteClusterDeletesClusterSecurityGroup() {
         Ec2Service ec2Service = realEc2Service();
         ec2Service.ensureDefaultResources("us-east-1");
-        String defaultVpc = Ec2Service.defaultVpcId("us-east-1");
+        String defaultVpc = Ec2Service.defaultVpcId("us-east-1", "000000000000");
         String subnetId = ec2Service
                 .createSubnet("us-east-1", defaultVpc, "172.31.101.0/24", "us-east-1a")
                 .getSubnetId();
@@ -1837,7 +2449,7 @@ class EksServiceTest {
     void deleteClusterSucceedsWhenClusterSecurityGroupAlreadyDeleted() {
         Ec2Service ec2Service = realEc2Service();
         ec2Service.ensureDefaultResources("us-east-1");
-        String defaultVpc = Ec2Service.defaultVpcId("us-east-1");
+        String defaultVpc = Ec2Service.defaultVpcId("us-east-1", "000000000000");
         String subnetId = ec2Service
                 .createSubnet("us-east-1", defaultVpc, "172.31.102.0/24", "us-east-1a")
                 .getSubnetId();
@@ -1898,7 +2510,7 @@ class EksServiceTest {
     void backfillClusterSecurityGroupOnStartup() {
         Ec2Service ec2Service = realEc2Service();
         ec2Service.ensureDefaultResources("us-east-1");
-        String defaultVpc = Ec2Service.defaultVpcId("us-east-1");
+        String defaultVpc = Ec2Service.defaultVpcId("us-east-1", "000000000000");
 
         StorageBackend<String, Cluster> rawClusters = new InMemoryStorage<>();
         AccountAwareStorageBackend<Cluster> clusterStore =
@@ -1937,7 +2549,7 @@ class EksServiceTest {
     void backfillClusterSecurityGroupLeavesExistingSecurityGroupUnchanged() {
         Ec2Service ec2Service = realEc2Service();
         ec2Service.ensureDefaultResources("us-east-1");
-        String defaultVpc = Ec2Service.defaultVpcId("us-east-1");
+        String defaultVpc = Ec2Service.defaultVpcId("us-east-1", "000000000000");
 
         StorageBackend<String, Cluster> rawClusters = new InMemoryStorage<>();
         AccountAwareStorageBackend<Cluster> clusterStore =
@@ -1968,7 +2580,7 @@ class EksServiceTest {
     void restartRoundTripPersistsClusterSecurityGroupId() {
         Ec2Service ec2Service = realEc2Service();
         ec2Service.ensureDefaultResources("us-east-1");
-        String defaultVpc = Ec2Service.defaultVpcId("us-east-1");
+        String defaultVpc = Ec2Service.defaultVpcId("us-east-1", "000000000000");
         String subnetId = ec2Service
                 .createSubnet("us-east-1", defaultVpc, "172.31.103.0/24", "us-east-1a")
                 .getSubnetId();
@@ -2036,7 +2648,7 @@ class EksServiceTest {
     void createClusterCleansUpSecurityGroupWhenClusterCreationFails() {
         Ec2Service ec2Service = realEc2Service();
         ec2Service.ensureDefaultResources("us-east-1");
-        String defaultVpc = Ec2Service.defaultVpcId("us-east-1");
+        String defaultVpc = Ec2Service.defaultVpcId("us-east-1", "000000000000");
         String subnetId = ec2Service
                 .createSubnet("us-east-1", defaultVpc, "172.31.104.0/24", "us-east-1a")
                 .getSubnetId();
@@ -2071,7 +2683,7 @@ class EksServiceTest {
     void backfillClusterSecurityGroupsSkipsMissingVpcWithoutFailingStartup() {
         Ec2Service ec2Service = realEc2Service();
         ec2Service.ensureDefaultResources("us-east-1");
-        String defaultVpc = Ec2Service.defaultVpcId("us-east-1");
+        String defaultVpc = Ec2Service.defaultVpcId("us-east-1", "000000000000");
 
         StorageBackend<String, Cluster> rawClusters = new InMemoryStorage<>();
         AccountAwareStorageBackend<Cluster> clusterStore =
@@ -2116,7 +2728,7 @@ class EksServiceTest {
         String nonDefaultAccount = "123456789012";
         Ec2Service ec2Service = realEc2Service();
         ec2Service.ensureDefaultResources("us-east-1");
-        String defaultVpc = Ec2Service.defaultVpcId("us-east-1");
+        String defaultVpc = Ec2Service.defaultVpcId("us-east-1", "000000000000");
 
         StorageBackend<String, Cluster> rawClusters = new InMemoryStorage<>();
         AccountAwareStorageBackend<Cluster> clusterStore =
@@ -2151,7 +2763,7 @@ class EksServiceTest {
     void createClusterSecurityGroupCleansUpWhenTaggingFails() {
         Ec2Service spyEc2 = spy(realEc2Service());
         spyEc2.ensureDefaultResources("us-east-1");
-        String defaultVpc = Ec2Service.defaultVpcId("us-east-1");
+        String defaultVpc = Ec2Service.defaultVpcId("us-east-1", "000000000000");
 
         doThrow(new RuntimeException("Simulated tagging failure"))
                 .when(spyEc2).createSystemTags(any(), any(), any());
@@ -2181,6 +2793,84 @@ class EksServiceTest {
         req.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
         req.setVersion("1.29");
         return req;
+    }
+
+    private static final String AUTO_MODE_NODE_ROLE = "arn:aws:iam::000000000000:role/eks-auto-node";
+    private static final String AUTO_MODE_PARTIAL = "For EKS Auto Mode, please ensure that all required configs, "
+            + "including computeConfig, kubernetesNetworkConfig, and blockStorage are all either fully enabled or "
+            + "fully disabled.";
+
+    /** A cluster request with EKS Auto Mode's three capabilities; a null one is left out of the request. */
+    private CreateClusterRequest autoModeRequest(String name, ComputeConfig compute, Boolean blockStorage,
+                                                 Boolean loadBalancing) {
+        CreateClusterRequest req = createTestClusterRequest(name);
+        req.setComputeConfig(compute);
+        if (blockStorage != null) {
+            req.setStorageConfig(new StorageConfig(new BlockStorage(blockStorage)));
+        }
+        if (loadBalancing != null) {
+            KubernetesNetworkConfig network = new KubernetesNetworkConfig();
+            network.setElasticLoadBalancing(new ElasticLoadBalancing(loadBalancing));
+            req.setKubernetesNetworkConfig(network);
+        }
+        return req;
+    }
+
+    private void assertCreateClusterRefused(CreateClusterRequest req, String message) {
+        AwsException refused = assertThrows(AwsException.class, () -> eksService.createCluster(req));
+        assertEquals("InvalidParameterException", refused.getErrorCode());
+        assertEquals(message, refused.getMessage());
+        assertEquals("ResourceNotFoundException",
+                assertThrows(AwsException.class, () -> eksService.describeCluster(req.getName())).getErrorCode());
+    }
+
+    @Test
+    void aClusterCreatedWithAutoModeDescribesItsComputeStorageAndLoadBalancing() {
+        ComputeConfig compute = new ComputeConfig(true, List.of("general-purpose", "system"), AUTO_MODE_NODE_ROLE);
+
+        eksService.createCluster(autoModeRequest("auto-mode-cluster", compute, true, true));
+        Cluster described = eksService.describeCluster("auto-mode-cluster");
+
+        assertEquals(compute, described.getComputeConfig());
+        assertEquals(new StorageConfig(new BlockStorage(true)), described.getStorageConfig());
+        assertEquals(new ElasticLoadBalancing(true), described.getKubernetesNetworkConfig().getElasticLoadBalancing());
+    }
+
+    @Test
+    void autoModeIsRefusedUnlessComputeBlockStorageAndLoadBalancingAreEnabledTogether() {
+        ComputeConfig on = new ComputeConfig(true, List.of("general-purpose"), AUTO_MODE_NODE_ROLE);
+        ComputeConfig off = new ComputeConfig(false, null, null);
+        assertCreateClusterRefused(autoModeRequest("auto-compute", on, false, false), AUTO_MODE_PARTIAL);
+        assertCreateClusterRefused(autoModeRequest("auto-storage", off, true, false), AUTO_MODE_PARTIAL);
+        assertCreateClusterRefused(autoModeRequest("auto-load-balancing", off, false, true), AUTO_MODE_PARTIAL);
+        assertCreateClusterRefused(autoModeRequest("auto-no-load-balancing", on, true, false), AUTO_MODE_PARTIAL);
+        // A capability the request leaves out is not enabled.
+        assertCreateClusterRefused(autoModeRequest("auto-compute-alone", on, null, null), AUTO_MODE_PARTIAL);
+        assertCreateClusterRefused(autoModeRequest("auto-storage-alone", null, true, null), AUTO_MODE_PARTIAL);
+    }
+
+    @Test
+    void autoModeNodePoolsAreRefusedWithoutANodeRole() {
+        String message = "When Compute Config nodeRoleArn is null or empty, nodePool list cannot be populated";
+        assertCreateClusterRefused(autoModeRequest("auto-null-node-role",
+                new ComputeConfig(true, List.of("general-purpose", "system"), null), true, true), message);
+        assertCreateClusterRefused(autoModeRequest("auto-empty-node-role",
+                new ComputeConfig(true, List.of("general-purpose", "system"), ""), true, true), message);
+    }
+
+    @Test
+    void autoModeNodeRoleIsRefusedWithoutNodePools() {
+        String message = "When Compute Config nodeRoleArn is not null or empty, nodePool value(s) must be provided.";
+        assertCreateClusterRefused(autoModeRequest("auto-null-node-pools",
+                new ComputeConfig(true, null, AUTO_MODE_NODE_ROLE), true, true), message);
+        assertCreateClusterRefused(autoModeRequest("auto-empty-node-pools",
+                new ComputeConfig(true, List.of(), AUTO_MODE_NODE_ROLE), true, true), message);
+
+        // Without built-in node pools, Auto Mode takes no node role either.
+        eksService.createCluster(autoModeRequest("auto-without-node-pools", new ComputeConfig(true, List.of(), null),
+                true, true));
+        assertEquals(new ComputeConfig(true, List.of(), null),
+                eksService.describeCluster("auto-without-node-pools").getComputeConfig());
     }
 
     @Test
@@ -3305,5 +3995,78 @@ class EksServiceTest {
         assertEquals("racing", first.get(5, TimeUnit.SECONDS).getName());
         AwsException after = assertThrows(AwsException.class, () -> service.createCluster(clusterRequest("racing")));
         assertEquals("ResourceInUseException", after.getErrorCode());
+    }
+
+    @Test
+    void aConcurrentRetryWithTheSameTokenWaitsForTheFirstCreate() throws Exception {
+        EksOidcService oidc = mock(EksOidcService.class);
+        CountDownLatch building = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        when(oidc.newIssuerUrl(anyString())).thenAnswer(invocation -> {
+            building.countDown();
+            release.await();
+            return "https://oidc.eks.us-east-1.amazonaws.com/id/0123456789ABCDEF0123456789ABCDEF";
+        });
+        EksService service = new EksService(storageFactory, testConfig(), regionResolver, null, null, oidc,
+                mock(EksAccessEntryService.class), mock(EksPodIdentityAssociationService.class));
+
+        CreateClusterRequest firstRequest = clusterRequest("retry-while-creating");
+        firstRequest.setClientRequestToken("in-flight-token");
+        CreateClusterRequest retryRequest = clusterRequest("retry-while-creating");
+        retryRequest.setClientRequestToken("in-flight-token");
+        CompletableFuture<Cluster> first = CompletableFuture.supplyAsync(() -> service.createCluster(firstRequest));
+        assertTrue(building.await(5, TimeUnit.SECONDS));
+        AtomicReference<Thread> retryThread = new AtomicReference<>();
+        CompletableFuture<Cluster> retry = CompletableFuture.supplyAsync(() -> {
+            retryThread.set(Thread.currentThread());
+            return service.createCluster(retryRequest);
+        });
+        try {
+            ThreadStates.awaitBlockedOrDone(retryThread, retry);
+        } finally {
+            release.countDown();
+        }
+
+        Cluster created = first.get(5, TimeUnit.SECONDS);
+        Cluster retried = retry.get(5, TimeUnit.SECONDS);
+        assertEquals(created.getArn(), retried.getArn());
+        assertEquals(created.getCreatedAt(), retried.getCreatedAt());
+        verify(oidc, times(1)).newIssuerUrl("us-east-1");
+        assertEquals(List.of("retry-while-creating"), service.listClusters());
+    }
+
+    @Test
+    void aConcurrentRetryEndsWhenTheFirstCreateThrowsAnError() throws Exception {
+        EksOidcService oidc = mock(EksOidcService.class);
+        CountDownLatch building = new CountDownLatch(1);
+        CountDownLatch release = new CountDownLatch(1);
+        when(oidc.newIssuerUrl(anyString())).thenAnswer(invocation -> {
+            building.countDown();
+            release.await();
+            throw new AssertionError("failed during cluster creation");
+        });
+        EksService service = new EksService(storageFactory, testConfig(), regionResolver, null, null, oidc,
+                mock(EksAccessEntryService.class), mock(EksPodIdentityAssociationService.class));
+
+        CreateClusterRequest request = clusterRequest("failed-in-flight-create");
+        request.setClientRequestToken("failed-in-flight-token");
+        CompletableFuture<Cluster> first = CompletableFuture.supplyAsync(() -> service.createCluster(request));
+        assertTrue(building.await(5, TimeUnit.SECONDS));
+        AtomicReference<Thread> retryThread = new AtomicReference<>();
+        CompletableFuture<Cluster> retry = CompletableFuture.supplyAsync(() -> {
+            retryThread.set(Thread.currentThread());
+            return service.createCluster(request);
+        });
+        try {
+            ThreadStates.awaitBlockedOrDone(retryThread, retry);
+        } finally {
+            release.countDown();
+        }
+
+        ExecutionException firstFailure = assertThrows(ExecutionException.class, () -> first.get(5, TimeUnit.SECONDS));
+        assertEquals(AssertionError.class, firstFailure.getCause().getClass());
+        ExecutionException retryFailure = assertThrows(ExecutionException.class,
+                () -> retry.get(2, TimeUnit.SECONDS));
+        assertEquals(AssertionError.class, retryFailure.getCause().getClass());
     }
 }

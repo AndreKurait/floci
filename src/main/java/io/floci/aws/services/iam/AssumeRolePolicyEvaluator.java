@@ -6,6 +6,7 @@ import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.IamConditionContextResolver;
 import io.floci.aws.core.common.ServicePrincipals;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
@@ -46,11 +47,26 @@ public class AssumeRolePolicyEvaluator {
 
     private static final Logger LOG = Logger.getLogger(AssumeRolePolicyEvaluator.class);
     private static final String ASSUME_ROLE_ACTION = "sts:AssumeRole";
+    /**
+     * What a trust policy has to allow beside the assume for the request's session tags to be
+     * taken: "when using session tags, trust policies for all roles connected to the identity
+     * provider passing tags must have the sts:TagSession permission. For roles without this
+     * permission in the trust policy, the AssumeRole operation fails."
+     */
+    public static final String TAG_SESSION_ACTION = "sts:TagSession";
     private static final Pattern ACCOUNT_ROOT_ARN =
             Pattern.compile("^arn:" + AwsArnUtils.PARTITION_REGEX + ":iam::(\\d{12}):root$");
 
     private final ObjectMapper objectMapper;
     private final IamPolicyEvaluator policyEvaluator;
+
+    /**
+     * The organization an account belongs to, when Organizations is deployed. A field rather than
+     * a constructor parameter so a caller that builds this evaluator itself needs nothing of it,
+     * and narrow for the same reason the rest of IAM reads organizations through a port.
+     */
+    @Inject
+    Instance<PrincipalOrganization> principalOrganizations;
 
     @Inject
     public AssumeRolePolicyEvaluator(ObjectMapper objectMapper, IamPolicyEvaluator policyEvaluator) {
@@ -87,6 +103,18 @@ public class AssumeRolePolicyEvaluator {
     }
 
     /**
+     * Whether the trust policy lets this caller tag the session it is assuming, which is the
+     * {@link #TAG_SESSION_ACTION} permission read on the same document, with the same principals
+     * and the same conditions as the assume itself.
+     */
+    public boolean allowsTagging(String trustPolicyDocument, IamService.CallerArns caller,
+                                 String callerAccount, Map<String, List<String>> requestContext) {
+        TrustDecision decision = decide(TAG_SESSION_ACTION, trustPolicyDocument, caller, callerAccount,
+                requestContext);
+        return decision == TrustDecision.ALLOW || decision == TrustDecision.ALLOW_ACCOUNT;
+    }
+
+    /**
      * Returns true if {@code trustPolicyDocument} lets some principal of {@code account} assume the
      * role: the account itself, through its root, or a principal of it that an Allow names, each
      * decided by {@link #decide} with its conditions and Deny statements. It answers for a service
@@ -95,16 +123,32 @@ public class AssumeRolePolicyEvaluator {
      */
     public boolean allowsAnyPrincipalOf(String trustPolicyDocument, String account, String partition) {
         String root = AwsArnUtils.Arn.global(partition, "iam", account, "root").toString();
-        if (allows(trustPolicyDocument, IamService.CallerArns.accountRoot(root, account), account, Map.of())) {
+        if (allows(trustPolicyDocument, inOrganizationOf(IamService.CallerArns.accountRoot(root, account), account),
+                account, Map.of())) {
             return true;
         }
         for (String principal : allowedAwsPrincipals(trustPolicyDocument)) {
             if (AwsArnUtils.isArn(principal) && account.equals(AwsArnUtils.parse(principal).accountId())
-                    && allows(trustPolicyDocument, callerNamed(principal), account, Map.of())) {
+                    && allows(trustPolicyDocument, inOrganizationOf(callerNamed(principal), account),
+                            account, Map.of())) {
                 return true;
             }
         }
         return false;
+    }
+
+    /**
+     * The principal in the organization its account belongs to, so a trust policy written on
+     * {@code aws:PrincipalOrgID} and its two companions reads the same keys here as it does for a
+     * caller resolved from a credential. Left as it is when Organizations answers nothing.
+     */
+    private IamService.CallerArns inOrganizationOf(IamService.CallerArns caller, String account) {
+        if (principalOrganizations == null || !principalOrganizations.isResolvable()) {
+            return caller;
+        }
+        return principalOrganizations.get().organizationContextOf(account)
+                .map(caller::withOrganization)
+                .orElse(caller);
     }
 
     /** The {@code Principal.AWS} entries of the Allow statements that apply to {@code sts:AssumeRole}. */
@@ -125,7 +169,7 @@ public class AssumeRolePolicyEvaluator {
         }
         Iterable<JsonNode> statementList = statements.isArray() ? statements : List.of(statements);
         for (JsonNode stmt : statementList) {
-            if (effectOf(stmt) != Match.ALLOW || !actionApplies(stmt)) {
+            if (effectOf(stmt) != Match.ALLOW || !actionApplies(stmt, ASSUME_ROLE_ACTION)) {
                 continue;
             }
             JsonNode aws = stmt.path("Principal").path("AWS");
@@ -170,6 +214,12 @@ public class AssumeRolePolicyEvaluator {
      */
     public TrustDecision decide(String trustPolicyDocument, IamService.CallerArns caller,
                                 String callerAccount, Map<String, List<String>> requestContext) {
+        return decide(ASSUME_ROLE_ACTION, trustPolicyDocument, caller, callerAccount, requestContext);
+    }
+
+    /** The same, for one of the two actions a trust policy is read for. */
+    private TrustDecision decide(String action, String trustPolicyDocument, IamService.CallerArns caller,
+                                 String callerAccount, Map<String, List<String>> requestContext) {
         if (trustPolicyDocument == null || trustPolicyDocument.isBlank()) {
             return TrustDecision.NEUTRAL;
         }
@@ -194,8 +244,8 @@ public class AssumeRolePolicyEvaluator {
         Iterable<JsonNode> statementList = statements.isArray() ? statements : List.of(statements);
         TrustDecision decision = TrustDecision.NEUTRAL;
         for (JsonNode stmt : statementList) {
-            TrustDecision match =
-                    evaluateStatement(stmt, callerArn, principalArn, callerAccount, context, version);
+            TrustDecision match = evaluateStatement(action, stmt, callerArn, principalArn, callerAccount,
+                    context, version);
             if (match == TrustDecision.EXPLICIT_DENY) {
                 return TrustDecision.EXPLICIT_DENY;
             }
@@ -280,10 +330,10 @@ public class AssumeRolePolicyEvaluator {
 
     private enum Match { ALLOW, DENY, NO_MATCH }
 
-    private TrustDecision evaluateStatement(JsonNode stmt, String callerArn, String principalArn,
-                                            String callerAccount, Map<String, List<String>> context,
-                                            String policyVersion) {
-        if (!actionApplies(stmt)) {
+    private TrustDecision evaluateStatement(String action, JsonNode stmt, String callerArn,
+                                            String principalArn, String callerAccount,
+                                            Map<String, List<String>> context, String policyVersion) {
+        if (!actionApplies(stmt, action)) {
             return TrustDecision.NEUTRAL;
         }
         PrincipalMatch principal = matchPrincipal(stmt.get("Principal"), callerArn, principalArn, callerAccount);
@@ -301,7 +351,8 @@ public class AssumeRolePolicyEvaluator {
     }
 
     private Match evaluateServiceStatement(JsonNode stmt, String servicePrincipal) {
-        if (!actionApplies(stmt) || !matchesServicePrincipal(stmt.get("Principal"), servicePrincipal)) {
+        if (!actionApplies(stmt, ASSUME_ROLE_ACTION)
+                || !matchesServicePrincipal(stmt.get("Principal"), servicePrincipal)) {
             return Match.NO_MATCH;
         }
         return effectOf(stmt);
@@ -309,7 +360,8 @@ public class AssumeRolePolicyEvaluator {
 
     private Match evaluateServiceStatement(JsonNode stmt, String servicePrincipal,
                                            Map<String, List<String>> context, String policyVersion) {
-        if (!actionApplies(stmt) || !matchesServicePrincipal(stmt.get("Principal"), servicePrincipal)) {
+        if (!actionApplies(stmt, ASSUME_ROLE_ACTION)
+                || !matchesServicePrincipal(stmt.get("Principal"), servicePrincipal)) {
             return Match.NO_MATCH;
         }
         if (!policyEvaluator.conditionMatches(stmt.get("Condition"), context, policyVersion)) {
@@ -364,33 +416,34 @@ public class AssumeRolePolicyEvaluator {
     }
 
     /**
-     * True if the statement's action element applies to {@code sts:AssumeRole}. An {@code Action}
-     * element applies when any of its patterns match; a {@code NotAction} element applies when none
+     * True if the statement's action element applies to {@code action}, which is the assume itself
+     * or the {@link #TAG_SESSION_ACTION} a tagged assume also needs. An {@code Action} element
+     * applies when any of its patterns match; a {@code NotAction} element applies when none
      * of its patterns match (AWS semantics, mirroring {@link IamPolicyEvaluator}'s action handling).
      * A statement with neither key expresses no action constraint and does not apply.
      */
-    private boolean actionApplies(JsonNode stmt) {
-        JsonNode action = stmt.get("Action");
-        if (action != null) {
-            return matchesAssumeRoleAction(action);
+    private boolean actionApplies(JsonNode stmt, String action) {
+        JsonNode element = stmt.get("Action");
+        if (element != null) {
+            return matchesAction(element, action);
         }
         JsonNode notAction = stmt.get("NotAction");
         if (notAction != null) {
-            return !matchesAssumeRoleAction(notAction);
+            return !matchesAction(notAction, action);
         }
         return false;
     }
 
-    private boolean matchesAssumeRoleAction(JsonNode actionNode) {
+    private boolean matchesAction(JsonNode actionNode, String action) {
         if (actionNode == null) {
             return false;
         }
         if (actionNode.isTextual()) {
-            return IamPolicyEvaluator.globMatches(actionNode.asText(), ASSUME_ROLE_ACTION);
+            return IamPolicyEvaluator.globMatches(actionNode.asText(), action);
         }
         if (actionNode.isArray()) {
             for (JsonNode a : actionNode) {
-                if (a.isTextual() && IamPolicyEvaluator.globMatches(a.asText(), ASSUME_ROLE_ACTION)) {
+                if (a.isTextual() && IamPolicyEvaluator.globMatches(a.asText(), action)) {
                     return true;
                 }
             }

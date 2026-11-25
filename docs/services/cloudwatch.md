@@ -432,6 +432,10 @@ aws logs put-retention-policy \
 
 **Protocol:** Query (XML), JSON 1.0, and OTLP/HTTP.
 
+`GetMetricStatistics` and `GetMetricData` exclude samples exactly at `EndTime`, so
+adjacent query windows do not count their shared boundary twice. A whole-second sample
+before a fractional-second `EndTime` remains included.
+
 The OTLP HTTP metrics endpoint accepts `POST /v1/metrics` with `application/json` or
 `application/x-protobuf`, optionally gzip-compressed. Requests are stored separately from classic
 CloudWatch metrics, retaining their OTLP resource, scope and metric data. The uncompressed request
@@ -463,6 +467,15 @@ legacy `2009-05-15` API, which supports only `ListMetrics` and `GetMetricStatist
 An invalid version or action returns HTTP 404 `InvalidAction`; an absent action returns
 HTTP 404 `UnknownOperationException`. IAM policies use the `cloudwatch` action prefix.
 
+With IAM enforcement on, each action is checked on the resources the AWS Service Authorization
+Reference lists for it, read from the request: an alarm by its `AlarmName` or each of its
+`AlarmNames`, as `arn:aws:cloudwatch:<region>:<account>:alarm:<name>`; a dashboard by its
+`DashboardName` or each of its `DashboardNames`, as `arn:aws:cloudwatch::<account>:dashboard/<name>`,
+with no Region; a metric stream by its `Name` or each of its `Names`, as
+`arn:aws:cloudwatch:<region>:<account>:metric-stream/<name>`; and a tag call on its `ResourceARN`.
+`PutMetricData`, `GetMetricData`, `GetMetricStatistics`, `ListMetrics`, `ListDashboards` and
+`ListMetricStreams` name no resource and are checked on `*`, as is a `DescribeAlarms` naming no alarm.
+
 JSON `PutMetricData` accepts a gzip-compressed body (`Content-Encoding: gzip`), which the AWS
 CLI, boto3 and the other SDKs that call CloudWatch over JSON send by default for any body of
 10 KiB or more. With signature validation and IAM enforcement on, the signature is checked over
@@ -477,7 +490,10 @@ through 2^360. They reject incomplete `StatisticValues` sets and datums combinin
 `StatisticValues` before storing any part of the batch. Missing statistics return `MissingParameter`;
 invalid values and non-object statistics return `InvalidParameterValue`; combining scalar and
 statistics returns `InvalidParameterCombination`. JSON bodies use the corresponding SDK exception
-shape names. The console's supported numeric values use the same bounds.
+shape names. `Values` accepts 1 to 150 numeric samples with optional matching, nonnegative
+`Counts`; omitted counts default to one. The public JSON and Query APIs normalize these weighted
+samples without expanding their counts and reject combinations with `Value` or `StatisticValues`.
+The console's supported numeric values use the same bounds.
 
 **Endpoint:** `http://localhost:4566/`. Query: GET or POST; JSON: POST.
 
@@ -550,12 +566,39 @@ Composite alarms support boolean rules over alarm states. Request `AlarmTypes` c
 action lists are stored but not executed. Action suppression is not implemented and is
 rejected with `ValidationError`.
 
+### Metric storage {#metric-storage}
+
+Every datapoint is one entry in the metric store, which is held in memory and written out as a
+whole: about 500 bytes of JSON each in `cwmetrics.json`. Services that publish their own metrics
+fill it without a `PutMetricData` call: an active SQS queue adds 8 to 11 datapoints a minute.
+
+Floci therefore keeps at most 100,000 datapoints per account in each namespace it publishes
+itself, `AWS/SQS` and `AWS/Redshift` (`FLOCI_SERVICES_CLOUDWATCHMETRICS_MAX_STORED_DATAPOINTS`).
+Once a minute, an account holding more than that in one of those namespaces loses its oldest
+datapoints there, by datapoint timestamp and whichever metrics they belong to, until nine tenths
+of the ceiling are left. A store loaded from disk above the ceiling is cut back the same way a
+minute after startup. With the default, 50 active queues keep about four hours of history; raise
+the ceiling to keep more, up to the 15 days those datapoints are kept for, or set it to `0` to
+keep them all.
+
+Datapoints in any other namespace are never dropped for the ceiling, so what a client writes with
+`PutMetricData` under its own namespace stays.
+
 ### Metric alarm updates
 
 Updating a metric alarm preserves its current state, state reason, state timestamps and tags.
 Tags supplied to `PutMetricAlarm` apply only when creating an alarm; use `TagResource` and
 `UntagResource` to change existing tags. `SetAlarmState` requires `StateReason` and rejects
 missing or unknown state values before changing the alarm.
+
+`PutMetricAlarm` refuses an `EvaluationInterval` on an alarm configured with `MetricName` or `Metrics`
+with `InvalidParameterCombination`: the API reference allows it only with `EvaluationCriteria`, which
+Floci does not model and accepts without keeping the interval. Over Query and through CloudFormation an
+integer outside 10 to 3600, of any size, is a `ValidationError`; a value that is not an integer is an
+`InvalidParameterValue` over Query, a `SerializationException` over JSON and CBOR (as is a number beyond
+32 bits) and a failed resource through CloudFormation. AWS documents none of these answers. An
+`AWS::CloudWatch::Alarm` fails the same way on create and on update, so a stack that sets the property
+cannot change that alarm until its template drops it.
 
 `StateTransitionedTimestamp` records when an alarm's `StateValue` last changed, while
 `StateUpdatedTimestamp` moves on every state update, including one that keeps the value.

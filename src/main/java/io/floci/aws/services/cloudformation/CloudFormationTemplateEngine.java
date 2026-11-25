@@ -9,6 +9,7 @@ import com.fasterxml.jackson.databind.node.TextNode;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.AwsRegions;
+import io.floci.aws.services.cloudformation.provisioners.CfnDynamicReferences;
 import org.jboss.logging.Logger;
 
 import java.util.ArrayList;
@@ -441,7 +442,7 @@ public class CloudFormationTemplateEngine {
      */
     private TextNode resolveDynamicReferences(String value) {
         if (dynamicReferenceResolver == null || dynamicReferencesSuspended > 0 || value == null
-                || !value.contains("{{resolve:")) {
+                || !CfnDynamicReferences.holdsDynamicReference(value)) {
             return TextNode.valueOf(value);
         }
         return TextNode.valueOf(dynamicReferenceResolver.apply(value));
@@ -478,6 +479,10 @@ public class CloudFormationTemplateEngine {
                             + ". Storing them would silently void the statements that use them.", 400);
         }
         return resolved;
+    }
+
+    boolean hasUnresolvedIntrinsics() {
+        return !unresolvedIntrinsics.isEmpty();
     }
 
     private String resolveRef(String name) {

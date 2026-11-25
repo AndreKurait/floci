@@ -10,10 +10,13 @@ import io.floci.aws.core.common.docker.ContainerLifecycleManager;
 import io.floci.aws.core.common.docker.ContainerSpec;
 import io.floci.aws.core.common.docker.DockerHostResolver;
 import io.floci.aws.testing.DockerArchiveUploadFixture;
+import io.floci.aws.testing.ParallelLocks;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -35,6 +38,7 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class VerdaccioConfigRetryTest {
 
     private final DockerClient docker = mock(DockerClient.class);
@@ -44,7 +48,8 @@ class VerdaccioConfigRetryTest {
 
     @BeforeEach
     void setUp() {
-        manager = new VerdaccioSidecarManager(mock(ContainerBuilder.class), lifecycle, mock(EmulatorConfig.class));
+        manager = new VerdaccioSidecarManager(mock(ContainerBuilder.class), lifecycle, mock(EmulatorConfig.class),
+                new CodeArtifactContainerRuns(lifecycle, mock(EmulatorConfig.class)).containers());
         when(lifecycle.getDockerClient()).thenReturn(docker);
     }
 
@@ -102,7 +107,8 @@ class VerdaccioConfigRetryTest {
         when(config.docker().logMaxFile()).thenReturn("3");
         ContainerBuilder builder = new ContainerBuilder(config,
                 mock(DockerHostResolver.class), mock(EmbeddedDnsServer.class));
-        manager = new VerdaccioSidecarManager(builder, lifecycle, config);
+        manager = new VerdaccioSidecarManager(builder, lifecycle, config,
+                new CodeArtifactContainerRuns(lifecycle, config).containers());
         when(lifecycle.create(any(ContainerSpec.class))).thenReturn("container");
         uploads.failures = 1;
         uploads.failure = new NotFoundException("container missing");

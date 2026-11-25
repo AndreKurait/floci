@@ -11,9 +11,11 @@ import io.floci.aws.services.appsync.model.DomainName;
 import io.floci.aws.services.appsync.model.FunctionConfiguration;
 import io.floci.aws.services.appsync.model.GraphqlApi;
 import io.floci.aws.services.appsync.model.SchemaCreationStatusType;
+import io.floci.aws.testing.ParallelLocks;
 import io.floci.aws.testing.ParkingStore;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -42,6 +44,7 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+@ResourceLock(ParallelLocks.PORTS)
 class AppSyncServiceTest {
 
     private static final Instant NOW = Instant.parse("2026-01-01T00:00:00Z");
@@ -527,6 +530,9 @@ class AppSyncServiceTest {
             "cn-north-1,     aws-cn",
             "us-isob-east-1, aws-iso-b"})
     void tagResourceAcceptsAnApiArnFromAnyPartition(String region, String partition) {
+        // The service answers for the Region of the API, as a request tagging it there does.
+        this.region = region;
+        service = newService(Clock.fixed(NOW, ZoneOffset.UTC));
         GraphqlApi api = service.createGraphqlApi(
                 Map.of("name", "p-" + region, "authenticationType", "API_KEY"), region);
         String apiArn = "arn:" + partition + ":appsync:" + region + ":000000000000:apis/" + api.getApiId();

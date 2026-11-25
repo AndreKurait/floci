@@ -285,6 +285,7 @@ public class DocDbService {
      * the family's default parameter group, the VPC's default security group, one day of backups
      * and windows clear of each other; on modify it keeps the cluster's.
      */
+
     private DocDbClusterSettings resolveClusterSettings(DocDbClusterSettings settings, DocDbCluster current,
                                                         String engineVersion, String region) {
         boolean create = current == null;
@@ -338,49 +339,23 @@ public class DocDbService {
             }
             RdsSecurityGroups.requireInVpc(ec2Service, region, securityGroups, null);
         } else if (create) {
-            securityGroups = List.of(Ec2Service.defaultSecurityGroupId(region));
+            securityGroups = List.of(resolveDefaultSecurityGroupId(ec2Service, region, regionResolver.getAccountId()));
         }
         String kmsKeyArn = resolveKmsKeyArn(settings.kmsKeyId(), region);
-        String backup = settings.preferredBackupWindow();
-        String maintenance = settings.preferredMaintenanceWindow();
-        boolean backupGiven = backup != null;
-        boolean maintenanceGiven = maintenance != null;
-        if (create) {
-            if (!backupGiven) {
-                backup = maintenanceGiven && BackupWindows.overlap(BackupWindows.DEFAULT_BACKUP_WINDOW, maintenance)
-                        ? BackupWindows.backupWindowAfter(maintenance) : BackupWindows.DEFAULT_BACKUP_WINDOW;
-                if (maintenanceGiven && BackupWindows.overlap(backup, maintenance)) {
-                    // the given window leaves no daily half hour free
-                    throw new AwsException("InvalidParameterValue", "The specified maintenance window overlaps "
-                            + "all available default backup windows. Shrink the maintenance window or specify "
-                            + "a non-overlapping backup window.", 400);
-                }
-            }
-            if (!maintenanceGiven) {
-                maintenance = backupGiven && BackupWindows.overlap(backup, BackupWindows.DEFAULT_MAINTENANCE_WINDOW)
-                        ? BackupWindows.maintenanceWindowAfter(backup) : BackupWindows.DEFAULT_MAINTENANCE_WINDOW;
-                if (BackupWindows.overlap(backup, maintenance)) {
-                    throw new AwsException("InvalidParameterValue", "The specified backup window overlaps "
-                            + "all available default maintenance windows. Shrink the backup window or specify "
-                            + "a non-overlapping maintenance window.", 400);
-                }
-            }
-        } else {
-            if (!backupGiven) {
-                backup = current.getPreferredBackupWindow() != null
-                        ? current.getPreferredBackupWindow() : BackupWindows.DEFAULT_BACKUP_WINDOW;
-            }
-            if (!maintenanceGiven) {
-                maintenance = current.getPreferredMaintenanceWindow() != null
-                        ? current.getPreferredMaintenanceWindow() : BackupWindows.DEFAULT_MAINTENANCE_WINDOW;
-            }
-        }
-        if (BackupWindows.overlap(backup, maintenance)) {
-            throw BackupWindows.overlapping();
-        }
+        String[] windows = BackupWindows.effectiveWindows(create, settings.preferredBackupWindow(),
+                settings.preferredMaintenanceWindow(),
+                create ? null : current.getPreferredBackupWindow(),
+                create ? null : current.getPreferredMaintenanceWindow());
         return new DocDbClusterSettings(subnetGroup, parameterGroup, securityGroups,
                 settings.storageEncrypted(), kmsKeyArn, settings.backupRetentionPeriod(),
-                backup, maintenance, settings.deletionProtection());
+                windows[0], windows[1], settings.deletionProtection());
+    }
+
+    /** The security group a cluster's VPC security group ids fall back to: the service's
+     *  resolved default when it is up, the account and region's computed default otherwise (#7307). */
+    private static String resolveDefaultSecurityGroupId(Ec2Service ec2Service, String region, String accountId) {
+        String resolved = ec2Service != null ? ec2Service.resolveDefaultSecurityGroupId(region) : null;
+        return resolved != null ? resolved : Ec2Service.defaultSecurityGroupId(region, accountId);
     }
 
     /** The family of the group a cluster is on; a group deleted since is judged by nothing. */
@@ -493,7 +468,8 @@ public class DocDbService {
             changed = true;
         }
         if (cluster.getVpcSecurityGroupIds() == null || cluster.getVpcSecurityGroupIds().isEmpty()) {
-            cluster.setVpcSecurityGroupIds(List.of(Ec2Service.defaultSecurityGroupId(region)));
+            cluster.setVpcSecurityGroupIds(List.of(
+                    resolveDefaultSecurityGroupId(ec2Service, region, regionResolver.getAccountId())));
             changed = true;
         }
         if (cluster.getPreferredBackupWindow() == null) {
@@ -546,11 +522,6 @@ public class DocDbService {
         if (!requested.equalsIgnoreCase(stored)) {
             throw new AwsException(errorCode, message, 404);
         }
-    }
-
-    /** The region a record was created in, taken from its ARN; older records carry the default. */
-    private String regionOf(String arn) {
-        return AwsArnUtils.regionOrDefault(arn, regionResolver.getDefaultRegion());
     }
 
     /**

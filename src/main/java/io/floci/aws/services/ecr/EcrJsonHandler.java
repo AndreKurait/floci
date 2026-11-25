@@ -22,6 +22,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Response;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.HashMap;
@@ -55,7 +56,8 @@ public class EcrJsonHandler {
             "PutRegistryScanningConfiguration", "GetRegistryScanningConfiguration",
             "BatchGetRepositoryScanningConfiguration",
             "CreateRepositoryCreationTemplate", "UpdateRepositoryCreationTemplate",
-            "DescribeRepositoryCreationTemplates", "DeleteRepositoryCreationTemplate");
+            "DescribeRepositoryCreationTemplates", "DeleteRepositoryCreationTemplate",
+            "ListImages", "DescribeImages");
 
     public Response handle(String action, JsonNode request, String region) {
         if (MODEL_CHECKED.contains(action)) {
@@ -356,7 +358,7 @@ public class EcrJsonHandler {
         }
         Integer maxResults = request.hasNonNull("maxResults") ? limit.asInt() : null;
         PaginatedResult<ImageIdentifier> page = service.listImages(repo, registryId, region,
-                maxResults, request.path("nextToken").asText(null));
+                maxResults, request.path("nextToken").asText(null), tagStatus(request));
 
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode arr = objectMapper.createArrayNode();
@@ -370,12 +372,17 @@ public class EcrJsonHandler {
         return Response.ok(response).build();
     }
 
+    private static String tagStatus(JsonNode request) {
+        return request.path("filter").path("tagStatus").asText(null);
+    }
+
     private Response handleDescribeImages(JsonNode request, String region) {
         String repo = request.path("repositoryName").asText(null);
         String registryId = request.path("registryId").asText(null);
         List<ImageIdentifier> requested = parseImageIds(request.path("imageIds"));
 
-        EcrService.DescribeImagesResult result = service.describeImages(repo, requested, registryId, region);
+        EcrService.DescribeImagesResult result = service.describeImages(repo, requested, registryId, region,
+                tagStatus(request));
 
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode details = objectMapper.createArrayNode();
@@ -611,27 +618,39 @@ public class EcrJsonHandler {
         String repo = request.path("repositoryName").asText(null);
         String registryId = request.path("registryId").asText(null);
         Repository r = service.getLifecyclePolicy(repo, registryId, region);
-        return lifecycleResponse(r);
+        ObjectNode response = lifecycleBody(r.getRegistryId(), r.getRepositoryName(), r.getLifecyclePolicyText());
+        putLastEvaluatedAt(response, service.lifecyclePolicyEvaluatedAt(r, region));
+        return Response.ok(response).build();
     }
 
     private Response handleDeleteLifecyclePolicy(JsonNode request, String region) {
         String repo = request.path("repositoryName").asText(null);
         String registryId = request.path("registryId").asText(null);
-        Repository r = service.deleteLifecyclePolicy(repo, registryId, region);
-        ObjectNode response = objectMapper.createObjectNode();
-        response.put("registryId", r.getRegistryId());
-        response.put("repositoryName", r.getRepositoryName());
+        EcrService.DeletedLifecyclePolicy deleted = service.deleteLifecyclePolicy(repo, registryId, region);
+        ObjectNode response = lifecycleBody(deleted.registryId(), deleted.repositoryName(),
+                deleted.lifecyclePolicyText());
+        putLastEvaluatedAt(response, deleted.lastEvaluatedAt());
         return Response.ok(response).build();
     }
 
     private Response lifecycleResponse(Repository r) {
+        return Response.ok(lifecycleBody(r.getRegistryId(), r.getRepositoryName(), r.getLifecyclePolicyText()))
+                .build();
+    }
+
+    private ObjectNode lifecycleBody(String registryId, String repositoryName, String lifecyclePolicyText) {
         ObjectNode response = objectMapper.createObjectNode();
-        response.put("registryId", r.getRegistryId());
-        response.put("repositoryName", r.getRepositoryName());
-        if (r.getLifecyclePolicyText() != null) {
-            response.put("lifecyclePolicyText", r.getLifecyclePolicyText());
+        response.put("registryId", registryId);
+        response.put("repositoryName", repositoryName);
+        if (lifecyclePolicyText != null) {
+            response.put("lifecyclePolicyText", lifecyclePolicyText);
         }
-        return Response.ok(response).build();
+        return response;
+    }
+
+    /** ECR answers with a time stamp before the policy is first applied, as Floci does with the epoch. */
+    private static void putLastEvaluatedAt(ObjectNode response, Instant lastEvaluatedAt) {
+        response.put("lastEvaluatedAt", lastEvaluatedAt != null ? lastEvaluatedAt.getEpochSecond() : 0L);
     }
 
     private Response handleSetRepositoryPolicy(JsonNode request, String region) {
@@ -692,8 +711,12 @@ public class EcrJsonHandler {
                             d.path("region").asText(null), d.path("registryId").asText(null)));
                 }
             }
+            RegistrySettings.DeleteReplication deletion = rule.has("deleteReplication")
+                    ? new RegistrySettings.DeleteReplication(rule.path("deleteReplication").path("enabled").asBoolean())
+                    : null;
             rules.add(new RegistrySettings.ReplicationRule(destinations,
-                    rule.has("repositoryFilters") ? parseRepositoryFilters(rule.path("repositoryFilters")) : null));
+                    rule.has("repositoryFilters") ? parseRepositoryFilters(rule.path("repositoryFilters")) : null,
+                    deletion));
         }
         ObjectNode response = objectMapper.createObjectNode();
         response.set("replicationConfiguration",
@@ -768,6 +791,9 @@ public class EcrJsonHandler {
             }
             if (rule.repositoryFilters() != null) {
                 n.set("repositoryFilters", buildRepositoryFilters(rule.repositoryFilters()));
+            }
+            if (rule.deleteReplication() != null) {
+                n.putObject("deleteReplication").put("enabled", rule.deleteReplication().enabled());
             }
         }
         return config;

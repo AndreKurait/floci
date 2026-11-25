@@ -1,5 +1,6 @@
 package io.floci.aws.services.iam;
 
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.aws.core.common.*;
 import io.floci.aws.core.common.AwsQueryLists;
 import io.floci.aws.core.common.RegionResolver;
@@ -20,6 +21,7 @@ import io.floci.aws.services.iam.model.OpenIDConnectProvider;
 import io.floci.aws.services.iam.model.OrganizationsAccessReportJob;
 import io.floci.aws.services.iam.model.OutboundWebIdentityFederation;
 import io.floci.aws.services.iam.model.PolicyParameter;
+import io.floci.aws.services.iam.model.PolicySource;
 import io.floci.aws.services.iam.model.PolicyVersion;
 import io.floci.aws.services.iam.model.SAMLProvider;
 import io.floci.aws.services.iam.model.ServerCertificate;
@@ -48,6 +50,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
@@ -86,8 +89,6 @@ public class IamQueryHandler {
     private static final Set<String> SORT_KEYS = Set.of("SERVICE_NAMESPACE_ASCENDING",
             "SERVICE_NAMESPACE_DESCENDING", "LAST_AUTHENTICATED_TIME_ASCENDING",
             "LAST_AUTHENTICATED_TIME_DESCENDING");
-    /** {@code serviceNamespaceListType}: minimum 1 item, maximum 200. */
-    private static final int MAX_SERVICE_NAMESPACES = 200;
     private static final int MAX_TAG_LIST_MEMBERS = 50;
     private static final int MAX_TAG_KEY_LENGTH = 128;
     private static final int MAX_TAG_VALUE_LENGTH = 256;
@@ -106,6 +107,7 @@ public class IamQueryHandler {
     /** The caller this request signed as, which says whether a delegation bounds what it creates. */
     private final RequestContext requestContext;
     private final Instance<ServerCertificateReferenceProvider> serverCertificateReferenceProviders;
+    private final IamCloudTrailEvents cloudTrailEvents;
     /** Signs each page's Marker, so only a marker this handler issued names an item. */
     private final SignedMarkers markers = new SignedMarkers(MARKER_MAX_LENGTH);
 
@@ -118,7 +120,8 @@ public class IamQueryHandler {
                            CentralRootAccess centralRootAccess,
                            RegionResolver regionResolver,
                            RequestContext requestContext,
-                           Instance<ServerCertificateReferenceProvider> serverCertificateReferenceProviders) {
+                           Instance<ServerCertificateReferenceProvider> serverCertificateReferenceProviders,
+                           IamCloudTrailEvents cloudTrailEvents) {
         this.iamService = iamService;
         this.policyEvaluator = policyEvaluator;
         this.accountResolver = accountResolver;
@@ -130,13 +133,23 @@ public class IamQueryHandler {
         this.centralRootAccess = centralRootAccess;
         this.regionResolver = regionResolver;
         this.serverCertificateReferenceProviders = serverCertificateReferenceProviders;
+        this.cloudTrailEvents = cloudTrailEvents;
     }
 
     public Response handle(String action, MultivaluedMap<String, String> params, String authorization) {
         LOG.debugv("IAM action: {0}", action);
+        // The caller is read before the call runs, which may delete the key it was signed with.
+        ObjectNode caller = cloudTrailEvents.caller(authorization);
+        Response response = dispatch(action, params, authorization);
+        cloudTrailEvents.record(action, params, authorization, caller, response);
+        return response;
+    }
 
+    private Response dispatch(String action, MultivaluedMap<String, String> params, String authorization) {
         try {
+            IamArnShapes.checkPolicySourceArn(action, params);
             IamRequestShapes.check(action, params);
+            IamArnShapes.checkPolicyArn(action, params);
             return switch (action) {
             // Users
             case "CreateUser" -> handleCreateUser(params);
@@ -406,8 +419,7 @@ public class IamQueryHandler {
                     "No access key could be determined from the request.", 404);
         }
         return iamService.findUserNameByAccessKeyId(accessKeyId)
-                .orElseThrow(() -> new AwsException("NoSuchEntity",
-                        "The Access Key with id " + accessKeyId + " cannot be found.", 404));
+                .orElseThrow(() -> accessKeyNotFound(accessKeyId));
     }
 
     /**
@@ -638,7 +650,8 @@ public class IamQueryHandler {
      * the CLI reference adds that it "can be called by IAM users only. If this command is called
      * using AWS account (root) credentials, the command returns an InvalidUserType error". A
      * signing key that belongs to no stored user is Floci's stand-in for exactly that caller, so
-     * it answers the same way rather than reporting the key as missing.
+     * it answers the same way rather than reporting the key as missing; an assumed-role session
+     * answers {@code NoSuchEntity}, which {@link #callingIamUser} sets out.
      */
     private Response handleChangePassword(MultivaluedMap<String, String> params,
                                           String authorization) {
@@ -654,16 +667,52 @@ public class IamQueryHandler {
 
     /**
      * The IAM user whose access key signed the request, for the one operation that acts on the
-     * caller and gives no way to name anyone else. Unlike {@link #resolveUserName}, a key with no
-     * user behind it is not a missing entity here: the caller is not an IAM user, which is the
-     * case {@code InvalidUserType} is published for.
+     * caller and gives no way to name anyone else. A key with no user behind it is not one caller
+     * but several, and AWS does not answer them all the same way.
+     *
+     * <p>Credentials that belong to no stored user are Floci's stand-in for account root, and the
+     * CLI reference publishes that case: the operation "can be called by IAM users only. If this
+     * command is called using AWS account (root) credentials, the command returns an
+     * InvalidUserType error". That stays the answer for every caller but the one recorded below,
+     * a session minted for the account root included: the error is published for root, however
+     * root signs, and {@code AssumeRoot} mints a session that acts as the account root.
+     *
+     * <p>An assumed-role session is the recorded exception. Taken against a real account on
+     * 2026-10-29, {@code ChangePassword} under one answers {@code NoSuchEntity} 404, a code this
+     * operation's model declares alongside {@code InvalidUserType}, so the two are not one case
+     * and that session must not be given root's error. The recording names the code and not the
+     * sentence, so the sentence is {@link #accessKeyNotFound}'s, the one this package already
+     * answers wherever a signing key resolves to no user, which keeps one situation to one
+     * wording. What AWS answers the other session kinds is not recorded, so they keep the error
+     * they had.
      */
     private String callingIamUser(String authorization) {
         String accessKeyId = accountResolver.extractAccessKeyId(authorization);
         return iamService.findUserNameByAccessKeyId(accessKeyId)
-                .orElseThrow(() -> new AwsException("InvalidUserType",
-                        "The request was rejected because the type of user for the transaction "
-                                + "was incorrect.", 400));
+                .orElseThrow(() -> signedByAnAssumedRole(accessKeyId)
+                        ? accessKeyNotFound(accessKeyId)
+                        : new AwsException("InvalidUserType",
+                                "The request was rejected because the type of user for the "
+                                        + "transaction was incorrect.", 400));
+    }
+
+    /**
+     * Whether an assumed-role session signed the request, the one caller with no stored user
+     * behind it that is answered a missing key rather than root's error. The principal type is
+     * what separates them rather than the key's own prefix, which every session shares: a
+     * privileged session and a session the root credential minted each report the account,
+     * being the root they act as.
+     */
+    private boolean signedByAnAssumedRole(String accessKeyId) {
+        return iamService.resolveCallerArns(accessKeyId)
+                .filter(caller -> IamService.CallerArns.TYPE_ASSUMED_ROLE.equals(caller.principalType()))
+                .isPresent();
+    }
+
+    /** The error a signing key that resolves to no stored user answers, wherever one is read. */
+    private static AwsException accessKeyNotFound(String accessKeyId) {
+        return new AwsException("NoSuchEntity",
+                "The Access Key with id " + accessKeyId + " cannot be found.", 404);
     }
 
     private String loginProfileXml(LoginProfile profile) {
@@ -751,6 +800,14 @@ public class IamQueryHandler {
     }
 
     private Response handleCreateOpenIDConnectProvider(MultivaluedMap<String, String> params) {
+        // The reference gives IdentityCenterInstanceArn as "The Amazon Resource Name (ARN) of the IAM Identity Center
+        // instance to associate with the OpenID Connect (OIDC) provider": any other ARN is a value IAM does not take,
+        // so no provider is made on it, as none is under the name of a provider it might otherwise name.
+        String identityCenterInstance = getParam(params, "IdentityCenterInstanceArn");
+        if (identityCenterInstance != null && !isIdentityCenterInstance(identityCenterInstance)) {
+            throw new AwsException("InvalidInput",
+                    "IdentityCenterInstanceArn must be the ARN of an IAM Identity Center instance.", 400);
+        }
         OpenIDConnectProvider provider = iamService.createOpenIDConnectProvider(
                 getParam(params, "Url"),
                 getMemberList(params, "ClientIDList"),
@@ -761,6 +818,16 @@ public class IamQueryHandler {
             xml.start("Tags").raw(tagsXml(provider.getTags())).end("Tags");
         }
         return Response.ok(AwsQueryResponse.envelope("CreateOpenIDConnectProvider", AwsNamespaces.IAM, xml.build())).build();
+    }
+
+    /** Whether {@code arn} is an IAM Identity Center instance's ARN, {@code arn:<partition>:sso:::instance/<id>}. */
+    private static boolean isIdentityCenterInstance(String arn) {
+        if (!AwsArnUtils.isArn(arn)) {
+            return false;
+        }
+        AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+        return "sso".equals(parsed.service()) && parsed.resource().startsWith("instance/")
+                && parsed.resource().length() > "instance/".length();
     }
 
     // The response carries no ARN: AWS echoes back the scheme-less Url, and the caller already
@@ -2188,40 +2255,104 @@ public class IamQueryHandler {
     private Response handleSimulatePrincipalPolicy(MultivaluedMap<String, String> params) {
         String policySourceArn = validatedPolicySourceArn(params);
         PolicyExclusions exclusions = PolicyExclusions.from(params);
-        List<String> inputDocuments = readablePolicyInputList(params);
+        SuppliedPolicies inputDocuments = readablePolicyInputList(params);
         String inputBoundary = inputBoundaryDocument(params);
-        CallerContext caller = withInputDocuments(
-                iamService.resolvePrincipalContext(policySourceArn, exclusions), inputDocuments, inputBoundary);
-        List<String> actionNames = requireActionNames(params);
+        // SCPs enter a simulation only when the call asks for them, the way the console includes
+        // them only when "AWS Organizations SCPs" is ticked, so the levels the call handed in are
+        // the whole of the organization the simulation runs against. They are read where the other
+        // handed-in documents are, ahead of the lookup, so a principal that does not exist cannot
+        // answer for an input this operation refuses: that is the rule above, and these two inputs
+        // live under it as well.
+        List<List<String>> scpLevels = organizationPolicyLevels(params);
         List<String> resourceArns = extractResourceArnsOrWildcard(params);
+        SimulationScenarios.requireScenarioResources(params.getFirst("ResourceHandlingOption"),
+                resourceArns);
+        CallerContext caller = withInputDocuments(
+                iamService.resolvePrincipalContext(policySourceArn, exclusions), inputDocuments, inputBoundary)
+                .withScpLevels(scpLevels);
+        List<String> actionNames = requireActionNames(params);
         // Keyed without regard to case, as the evaluator compares condition key names: a value
         // the call supplied has to shadow a populated one however the call spelled the key.
         Map<String, List<String>> context = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
         context.putAll(extractContextEntries(params));
         // The simulator fills the principal keys in itself rather than asking for them, so a
         // policy scoped to ${aws:username} or keyed on who is calling simulates as it evaluates.
-        // A value the call supplied stays, being the one the caller asked to simulate with. The
-        // account comes from the identity that was resolved, not from the ARN the call wrote,
-        // which need not be one this evaluator can parse.
-        iamService.simulationPrincipalKeys(policySourceArn).ifPresent(principal -> {
-            Map<String, List<String>> populated = new HashMap<>();
-            principal.putPrincipalKeys(populated);
-            String account = AwsArnUtils.accountOrDefault(principal.principalArn(), null);
-            if (account != null) {
-                populated.put("aws:PrincipalAccount", List.of(account));
-            }
-            populated.forEach(context::putIfAbsent);
-        });
+        // A value the call supplied stays, being the one the caller asked to simulate with.
+        Map<String, List<String>> populated = new HashMap<>();
+        Optional<IamService.CallerArns> principal = iamService.simulationPrincipalKeys(policySourceArn);
+        principal.ifPresent(arns -> arns.putPrincipalKeys(populated));
+        // The account comes from the identity that was resolved where there is one, and otherwise
+        // from the ARN the call wrote, which by here has been resolved to a user or a role. The
+        // keys that say which account and which organization a principal is in are answered for
+        // either source: they are properties of the account the source names rather than of a
+        // credential, which is what the keys above it describe.
+        String sourceAccount = AwsArnUtils.accountOrDefault(
+                principal.map(IamService.CallerArns::principalArn).orElse(policySourceArn), null);
+        if (sourceAccount != null) {
+            populated.put("aws:PrincipalAccount", List.of(sourceAccount));
+            // The same lookup an enforced request takes, so a simulation reads the keys an
+            // evaluation would: an account in no organization carries none of them, and a policy
+            // matching on one then matches nothing, as an absent key always means.
+            iamService.organizationContextOf(sourceAccount)
+                    .ifPresent(organization -> organization.putOrganizationKeys(populated));
+        }
+        populated.forEach(context::putIfAbsent);
         return simulationResults("SimulatePrincipalPolicy", params, caller, actionNames, resourceArns, context);
     }
 
     private Response handleSimulateCustomPolicy(MultivaluedMap<String, String> params) {
-        List<String> policyInputList = requirePolicyInputList(params);
+        SuppliedPolicies policyInputList = requirePolicyInputList(params);
         List<String> actionNames = requireActionNames(params);
+        // Read before the scenario, as the principal simulation reads them, so a bad level and a
+        // bad scenario are answered in the same order whichever operation was called.
+        List<List<String>> scpLevels = organizationPolicyLevels(params);
         List<String> resourceArns = extractResourceArnsOrWildcard(params);
+        SimulationScenarios.requireScenarioResources(params.getFirst("ResourceHandlingOption"),
+                resourceArns);
         Map<String, List<String>> context = extractContextEntries(params);
-        CallerContext caller = new CallerContext(policyInputList, null, inputBoundaryDocument(params));
+        CallerContext caller = CallerContext.named(policyInputList.documents(), policyInputList.sources(),
+                        inputBoundaryDocument(params))
+                .withScpLevels(scpLevels);
         return simulationResults("SimulateCustomPolicy", params, caller, actionNames, resourceArns, context);
+    }
+
+    /**
+     * The service control policies a simulation was handed, one list per level of an
+     * organization. The member's reference describes both the shape and the order: "An ordered
+     * list of service control policies (SCPs) to include in the simulation. Each element
+     * represents one level of an Organizations hierarchy, from the organization root to the
+     * account. The simulator evaluates SCPs in the order that you provide, consistent with how
+     * Organizations enforces SCPs." So the levels go to the evaluator as the caller's effective
+     * SCPs, which is the walk a live request already takes through them, in the order the request
+     * wrote. How many levels there may be is the model's to say, seven on this list, and the
+     * declared constraints are read ahead of this.
+     *
+     * <p>Each document is held to being a policy document, as the documents of the other input
+     * lists are, and a level naming none is no level: a request that carries the member and
+     * nothing in it simulates with no organization above it rather than with an empty root.
+     */
+    private List<List<String>> organizationPolicyLevels(MultivaluedMap<String, String> params) {
+        List<List<String>> levels = new ArrayList<>();
+        for (AwsQueryLists.IndexedMember level
+                : AwsQueryLists.members(params, "OrderedOrganizationPolicyInputList", null)) {
+            List<String> documents = new ArrayList<>();
+            for (AwsQueryLists.IndexedMember document : AwsQueryLists.members(params,
+                    level.prefix() + ".ServiceControlPolicyInputList", null)) {
+                String policy = params.getFirst(document.prefix());
+                if (policy == null) {
+                    continue;
+                }
+                if (!policyEvaluator.readsAsPolicyDocument(policy)) {
+                    throw new AwsException("InvalidInput", "Ordered organization policy input list"
+                            + " item " + level.index() + " has invalid content", 400);
+                }
+                documents.add(policy);
+            }
+            if (!documents.isEmpty()) {
+                levels.add(List.copyOf(documents));
+            }
+        }
+        return levels.isEmpty() ? null : List.copyOf(levels);
     }
 
     /**
@@ -2239,9 +2370,9 @@ public class IamQueryHandler {
      * this package answers an input, so a document the operation cannot read is refused whether or
      * not the ARN names anybody.
      */
-    private CallerContext withInputDocuments(CallerContext caller, List<String> documents,
+    private CallerContext withInputDocuments(CallerContext caller, SuppliedPolicies documents,
                                              String boundaryDocument) {
-        CallerContext simulated = caller.withIdentityPolicies(documents);
+        CallerContext simulated = caller.withIdentityPolicies(documents.documents(), documents.sources());
         return boundaryDocument == null ? simulated : simulated.withBoundaryPolicy(boundaryDocument);
     }
 
@@ -2283,8 +2414,9 @@ public class IamQueryHandler {
      * naming the offending entry by the index it arrived under, the member carrying several
      * documents and the caller needing to know which of them was refused.
      */
-    private List<String> readablePolicyInputList(MultivaluedMap<String, String> params) {
+    private SuppliedPolicies readablePolicyInputList(MultivaluedMap<String, String> params) {
         List<String> documents = new ArrayList<>();
+        List<PolicySource> sources = new ArrayList<>();
         for (AwsQueryLists.IndexedMember member : AwsQueryLists.members(params, "PolicyInputList", null)) {
             String document = params.getFirst(member.prefix());
             if (document == null) {
@@ -2295,8 +2427,16 @@ public class IamQueryHandler {
                         "Policy input list item " + member.index() + " has invalid content", 400);
             }
             documents.add(document);
+            // The identifier AWS reports for a supplied document is the position it arrived under,
+            // "PolicyInputList.1" in its own example response, which is the member's own index and
+            // not its place among the documents that were readable.
+            sources.add(PolicySource.input(member.index()));
         }
-        return documents;
+        return new SuppliedPolicies(documents, sources);
+    }
+
+    /** The documents a request supplied, each beside the identifier a result reports for it. */
+    private record SuppliedPolicies(List<String> documents, List<PolicySource> sources) {
     }
 
     private List<String> requireActionNames(MultivaluedMap<String, String> params) {
@@ -2307,12 +2447,12 @@ public class IamQueryHandler {
         return actionNames;
     }
 
-    private List<String> requirePolicyInputList(MultivaluedMap<String, String> params) {
-        List<String> policyInputList = readablePolicyInputList(params);
-        if (policyInputList.isEmpty()) {
+    private SuppliedPolicies requirePolicyInputList(MultivaluedMap<String, String> params) {
+        SuppliedPolicies supplied = readablePolicyInputList(params);
+        if (supplied.documents().isEmpty()) {
             throw new AwsException("ValidationError", "At least one PolicyInputList member is required.", 400);
         }
-        return policyInputList;
+        return supplied;
     }
 
     private List<String> extractResourceArnsOrWildcard(MultivaluedMap<String, String> params) {
@@ -2320,35 +2460,216 @@ public class IamQueryHandler {
         return resourceArns.isEmpty() ? List.of("*") : resourceArns;
     }
 
+    /** One action a simulation was asked about, keyed by its position so a page resumes in request order. */
+    private record SimulatedAction(String key, String name) {
+    }
+
     /**
-     * One evaluation result per action and resource, in request order. A page is evaluated only
-     * for the pairs it carries, and keyed by position, since a simulation's inputs do not change
-     * between the calls that page it.
+     * One evaluation result per action, in request order, whatever the call named for resources:
+     * "The simulator now returns a single {@code EvaluationResult} per action, regardless of how
+     * many resource ARNs are provided. Previously, simulating one action against N resources
+     * returned N evaluation results, each containing the same aggregate decision." A page is
+     * evaluated only for the actions it carries, and keyed by position, since a simulation's
+     * inputs do not change between the calls that page it.
      */
     private Response simulationResults(String action, MultivaluedMap<String, String> params, CallerContext caller,
                                        List<String> actionNames, List<String> resourceArns,
                                        Map<String, List<String>> context) {
-        List<String[]> pairs = new ArrayList<>();
+        List<SimulatedAction> actions = new ArrayList<>();
         for (String actionName : actionNames) {
-            for (String resourceArn : resourceArns) {
-                pairs.add(new String[] {positionKey(pairs.size()), actionName, resourceArn});
+            actions.add(new SimulatedAction(positionKey(actions.size()), actionName));
+        }
+        return pagedList(action, actions, SimulatedAction::key, params, (xml, simulated) ->
+                evaluationResult(xml, caller, simulated.name(), resourceArns, context));
+    }
+
+    /**
+     * The one result an action answers with: the aggregate across every resource the call named at
+     * the top, and each resource's own answer beside it.
+     *
+     * <p>The top-level decision is the aggregate, "the most restrictive decision across all
+     * resources (for example, if any resource produces {@code explicitDeny}, the top-level
+     * decision is {@code explicitDeny})", so a call naming resources that answer differently is
+     * told the worst of them and reads the rest below. {@code EvalResourceName} names the action's
+     * own ARN template rather than a resource, which {@link SimulatedResourceTemplates} reads, and
+     * the resources the call named carry their ARNs under {@code ResourceSpecificResults}, where
+     * the reference sends a client that parsed them off the top-level result before.
+     *
+     * <p>A simulation that named no resource, or named {@code *}, carries no per-resource section:
+     * the resource "is '*', either explicitly, or when the {@code ResourceArns} parameter blank" is
+     * the case the reference answers at the top level alone, with the per-resource section the one
+     * it describes for "a list of resources".
+     *
+     * <p>{@code MatchedStatements} names the statements that decided the scenario and
+     * {@code MissingContextValues} the keys it wanted and had no value for, both as the evaluation
+     * reports them, with the two policy types that report their own effect beside them. The
+     * top-level statements are "the union of matched statements across all requested resources"
+     * held to "only statements that contributed to the reported decision", and the top-level keys
+     * "the deduplicated set of missing context values across all requested resources".
+     *
+     * <p>{@code EvalDecisionDetails} carries nothing, these simulations being within one
+     * account, and the reference distinguishes the two ways of carrying nothing: "if the simulation
+     * evaluates policies within the same account and includes a resource ARN, then the parameter is
+     * present but the response is empty. If the simulation evaluates policies within the same
+     * account and specifies all resources (*), then the parameter is not returned." So a call that
+     * named resources gets the member empty and a call that named none gets no member.
+     */
+    private void evaluationResult(XmlBuilder xml, CallerContext caller, String actionName,
+                                  List<String> resourceArns, Map<String, List<String>> context) {
+        List<IamPolicyEvaluator.SimulationReport> reports = resourceArns.stream()
+                .map(resourceArn -> policyEvaluator.simulate(caller, actionName, resourceArn, context))
+                .toList();
+        IamPolicyEvaluator.SimulationDecision decision = mostRestrictive(
+                reports.stream().map(IamPolicyEvaluator.SimulationReport::decision).toList());
+        xml.start("member")
+                .elem("EvalActionName", actionName)
+                .elem("EvalResourceName", SimulatedResourceTemplates.of(actionName))
+                .elem("EvalDecision", decision.awsValue());
+        matchedStatements(xml, reportedStatements(reports, decision));
+        missingContextValues(xml, reportedMissingValues(reports));
+        decisionDetail(xml, "OrganizationsDecisionDetail", "AllowedByOrganizations",
+                aggregateFlag(reports, IamPolicyEvaluator.SimulationReport::allowedByOrganizations));
+        decisionDetail(xml, "PermissionsBoundaryDecisionDetail", "AllowedByPermissionsBoundary",
+                aggregateFlag(reports, IamPolicyEvaluator.SimulationReport::allowedByPermissionsBoundary));
+        if (!List.of("*").equals(resourceArns)) {
+            xml.start("EvalDecisionDetails").end("EvalDecisionDetails");
+            xml.start("ResourceSpecificResults");
+            for (int resource = 0; resource < resourceArns.size(); resource++) {
+                IamPolicyEvaluator.SimulationReport report = reports.get(resource);
+                xml.start("member")
+                        .elem("EvalResourceName", resourceArns.get(resource))
+                        .elem("EvalResourceDecision", report.decision().awsValue());
+                matchedStatements(xml, report.matchedStatements());
+                missingContextValues(xml, report.missingContextValues());
+                decisionDetail(xml, "PermissionsBoundaryDecisionDetail", "AllowedByPermissionsBoundary",
+                        report.allowedByPermissionsBoundary());
+                xml.end("member");
+            }
+            xml.end("ResourceSpecificResults");
+        }
+        xml.end("member");
+    }
+
+    /**
+     * The statements the top-level result reports: "the union of matched statements across all
+     * requested resources", held to the sentence beside it, "only statements that contributed to
+     * the reported decision are included". A resource that answered something other than the
+     * aggregate contributed nothing to it, so an action allowed on one resource and denied on
+     * another reports the deny alone, which is also what the member's own rule says of a deny.
+     */
+    private static List<IamPolicyEvaluator.MatchedStatement> reportedStatements(
+            List<IamPolicyEvaluator.SimulationReport> reports, IamPolicyEvaluator.SimulationDecision decision) {
+        List<IamPolicyEvaluator.MatchedStatement> reported = new ArrayList<>();
+        for (IamPolicyEvaluator.SimulationReport report : reports) {
+            if (report.decision() != decision) {
+                continue;
+            }
+            for (IamPolicyEvaluator.MatchedStatement statement : report.matchedStatements()) {
+                if (!reported.contains(statement)) {
+                    reported.add(statement);
+                }
             }
         }
-        return pagedList(action, pairs, pair -> pair[0], params, (xml, pair) -> {
-            IamPolicyEvaluator.SimulationDecision decision =
-                    policyEvaluator.simulatePrincipalPolicy(caller, pair[1], pair[2], context);
-            xml.start("member")
-                    .elem("EvalActionName", pair[1])
-                    .elem("EvalResourceName", pair[2])
-                    .elem("EvalDecision", decision.awsValue())
-                    .start("MatchedStatements").end("MatchedStatements")
-                    .start("MissingContextValues").end("MissingContextValues")
-                    .end("member");
-        });
+        return reported;
+    }
+
+    /**
+     * "The deduplicated set of missing context values across all requested resources", in the order
+     * the resources were named and each key in the spelling the first policy to want it used.
+     *
+     * <p>One key, however two statements spell it: a context key "is not case sensitive", so two
+     * resources whose statements write the same key differently want the one key between them,
+     * which is how the evaluation that answered them read it too.
+     */
+    private static List<String> reportedMissingValues(List<IamPolicyEvaluator.SimulationReport> reports) {
+        Map<String, String> reported = new LinkedHashMap<>();
+        for (IamPolicyEvaluator.SimulationReport report : reports) {
+            for (String key : report.missingContextValues()) {
+                reported.putIfAbsent(key.toLowerCase(Locale.ROOT), key);
+            }
+        }
+        return List.copyOf(reported.values());
+    }
+
+    /**
+     * The flag the top-level result reports for a policy type, which is the most restrictive of the
+     * resources' answers: a type that allowed the action on every resource the call named allowed
+     * it, and one that stopped it anywhere did not. Null when no resource answered for the type at
+     * all, which is a simulation that was handed no organization levels, or none that carries a
+     * permissions boundary.
+     */
+    private static Boolean aggregateFlag(List<IamPolicyEvaluator.SimulationReport> reports,
+                                         Function<IamPolicyEvaluator.SimulationReport, Boolean> flag) {
+        Boolean aggregate = null;
+        for (IamPolicyEvaluator.SimulationReport report : reports) {
+            Boolean answered = flag.apply(report);
+            if (answered != null) {
+                aggregate = aggregate == null ? answered : aggregate && answered;
+            }
+        }
+        return aggregate;
+    }
+
+    /**
+     * One statement per entry, each naming the policy it came from and where in that policy it
+     * sits. Both identifiers are optional, and a document nothing names carries neither: AWS's own
+     * example reports a supplied document as {@code PolicyInputList.1} with no type beside it.
+     */
+    private static void matchedStatements(XmlBuilder xml,
+                                          List<IamPolicyEvaluator.MatchedStatement> matched) {
+        xml.start("MatchedStatements");
+        for (IamPolicyEvaluator.MatchedStatement statement : matched) {
+            xml.start("member");
+            if (statement.source().policyId() != null) {
+                xml.elem("SourcePolicyId", statement.source().policyId());
+            }
+            if (statement.source().policyType() != null) {
+                xml.elem("SourcePolicyType", statement.source().policyType());
+            }
+            if (statement.span() != null) {
+                position(xml, "StartPosition", statement.span().startLine(), statement.span().startColumn());
+                position(xml, "EndPosition", statement.span().endLine(), statement.span().endColumn());
+            }
+            xml.end("member");
+        }
+        xml.end("MatchedStatements");
+    }
+
+    private static void position(XmlBuilder xml, String element, int line, int column) {
+        xml.start(element).elem("Line", line).elem("Column", column).end(element);
+    }
+
+    private static void missingContextValues(XmlBuilder xml, List<String> keys) {
+        xml.start("MissingContextValues");
+        keys.forEach(key -> xml.elem("member", key));
+        xml.end("MissingContextValues");
+    }
+
+    /** A decision detail, which is one flag under its own element, written only when it was answered. */
+    private static void decisionDetail(XmlBuilder xml, String element, String flag, Boolean answered) {
+        if (answered != null) {
+            xml.start(element).elem(flag, answered.booleanValue()).end(element);
+        }
+    }
+
+    /**
+     * The worst of the resources' decisions, which is the aggregate the top-level result reports:
+     * an explicit deny on any resource is the published example, and an implicit deny on one
+     * refuses the request as surely as it would alone, so only an action allowed on every resource
+     * the call named is allowed here.
+     */
+    private static IamPolicyEvaluator.SimulationDecision mostRestrictive(
+            List<IamPolicyEvaluator.SimulationDecision> decisions) {
+        if (decisions.contains(IamPolicyEvaluator.SimulationDecision.EXPLICIT_DENY)) {
+            return IamPolicyEvaluator.SimulationDecision.EXPLICIT_DENY;
+        }
+        return decisions.contains(IamPolicyEvaluator.SimulationDecision.IMPLICIT_DENY)
+                ? IamPolicyEvaluator.SimulationDecision.IMPLICIT_DENY
+                : IamPolicyEvaluator.SimulationDecision.ALLOWED;
     }
 
     private Response handleGetContextKeysForCustomPolicy(MultivaluedMap<String, String> params) {
-        List<String> policyInputList = requirePolicyInputList(params);
+        List<String> policyInputList = requirePolicyInputList(params).documents();
         List<String> keys = policyEvaluator.contextKeysReferencedIn(policyInputList);
         return Response.ok(AwsQueryResponse.envelope("GetContextKeysForCustomPolicy", AwsNamespaces.IAM,
                 contextKeyNamesXml(keys))).build();
@@ -2360,7 +2681,7 @@ public class IamQueryHandler {
         // entity, and any additional policies that you provide, are included": a grant the account
         // applies without attaching it is therefore not read here, though a simulation evaluates
         // with it.
-        List<String> inputDocuments = readablePolicyInputList(params);
+        List<String> inputDocuments = readablePolicyInputList(params).documents();
         CallerContext caller = iamService.resolveAttachedPrincipalContext(policySourceArn);
         List<String> allDocuments = new ArrayList<>(caller.identityPolicies());
         allDocuments.addAll(inputDocuments);
@@ -2578,6 +2899,47 @@ public class IamQueryHandler {
     }
 
     /**
+     * The namespaces a request names, held to the ones AWS publishes. The member's pattern admits
+     * anything word-shaped, so a value like {@code amazon-s3} satisfies the model and still names
+     * no service, and AWS refuses it rather than reporting that the identity reaches nothing.
+     *
+     * <p>Recorded on {@code ListPoliciesGrantingServiceAccess} on 2026-11-03: {@code InvalidInput}
+     * 400 with a sender fault and {@code Invalid service namespace: [<namespace>]}, the brackets
+     * being AWS's own. The recording covers one bad value; several are rendered inside the one
+     * pair of brackets, which is this emulator's reading of a sentence AWS writes for the plural.
+     */
+    private static void requirePublishedNamespaces(List<String> namespaces) {
+        List<String> unknown = namespaces.stream()
+                .filter(namespace -> !AwsServiceNamespaces.isPublished(namespace))
+                .toList();
+        if (!unknown.isEmpty()) {
+            throw new AwsException("InvalidInput",
+                    "Invalid service namespace: [" + String.join(", ", unknown) + "]", 400);
+        }
+    }
+
+    /**
+     * The same rule for the member that takes one namespace, which AWS words differently and
+     * spells {@code namepace}, recorded on {@code GetServiceLastAccessedDetailsWithEntities} on
+     * 2026-11-03. The misspelling is AWS's and is kept, a client matching the message having to
+     * match what the service sends.
+     *
+     * <p>A namespace the job itself reports is readable whether the catalog publishes it or not.
+     * The catalog is vendored, so it is as new as the last regeneration, where a policy may grant
+     * a service published after it: the report would list that namespace and a request for its
+     * entities would then be refused, which is this emulator disagreeing with itself. The job is
+     * what decides, which is why it is read first. Nothing else is exempt: a namespace the job
+     * does not report and the catalog does not publish is still refused.
+     */
+    private static void requireReadableNamespace(String namespace, ServiceLastAccessedJob job) {
+        if (AwsServiceNamespaces.isPublished(namespace) || job.getServiceNamespaces().contains(namespace)) {
+            return;
+        }
+        throw new AwsException("InvalidInput",
+                "Service namepace " + namespace + " is either invalid or unsupported.", 400);
+    }
+
+    /**
      * {@code SortKey} if the request carries one the enum permits, null if it carries none. A
      * request that carries the member is held to the enum whatever it carries: an empty value is
      * not one of the four, and reading it as an absent member would answer a default-ordered
@@ -2625,6 +2987,7 @@ public class IamQueryHandler {
         validatePagingInputs("GetServiceLastAccessedDetailsWithEntities", params);
         ServiceLastAccessedJob job = serviceLastAccessedService.get(
                 accountResolver.resolve(authorization), jobId);
+        requireReadableNamespace(namespace, job);
         // The report named the services it covers, so an entity is only reported for one of those.
         List<ServiceLastAccessedEntity> reported = job.getServiceNamespaces().contains(namespace)
                 ? job.getEntities() : List.of();
@@ -2659,12 +3022,12 @@ public class IamQueryHandler {
                                                              String authorization) {
         String accountId = accountResolver.resolve(authorization);
         String arn = requireParam(params, "Arn");
+        // The vendored request shape carries the member now, so the declared constraints are read
+        // ahead of this method: an absent list is the required member it declares, a list over 200
+        // is its own bound, and a value breaking the published pattern is that pattern. What is
+        // left here is the one rule the model cannot state, which services AWS publishes.
         List<String> namespaces = getMemberList(params, "ServiceNamespaces");
-        if (namespaces.isEmpty()) {
-            throw new AwsException("InvalidInput",
-                    "The request must include at least one service namespace.", 400);
-        }
-        checkListLength(namespaces.size(), "serviceNamespaces", MAX_SERVICE_NAMESPACES);
+        requirePublishedNamespaces(namespaces);
         List<GrantingPolicy> candidates = policiesForIdentity(accountId, arn);
         // The response list carries one entry per requested namespace, so that is what a Marker
         // walks through. The request models no MaxItems, so the table gives it no limit and the

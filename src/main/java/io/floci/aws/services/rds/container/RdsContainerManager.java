@@ -34,9 +34,11 @@ import java.io.IOException;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.security.SecureRandom;
 import java.time.Clock;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -80,6 +82,15 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
     private static final Map<String, String> MYSQL_OPTION_NAMES = Map.of("time_zone", "default-time-zone");
     /** How long a server started with a parameter group's options gets to start listening. */
     private static final int PARAMETER_GROUP_START_SECONDS = 120;
+    /**
+     * The role RDS for PostgreSQL runs its own management tasks as ("rdsadmin – A role that's created to handle
+     * many of the management tasks that the administrator with superuser privileges would perform on a
+     * standalone PostgreSQL database", RDS User Guide, "Understanding the rds_superuser role"). A PostgreSQL
+     * backend is initialized as this role, and the master user is created as an ordinary role beside it.
+     */
+    static final String POSTGRES_ADMIN_ROLE = "rdsadmin";
+    /** The bootstrap superuser of a PostgreSQL cluster, whatever initdb named it. */
+    private static final String POSTGRES_SUPERUSER_SQL = "SELECT rolname FROM pg_catalog.pg_roles WHERE oid = 10";
 
     private final ContainerBuilder containerBuilder;
     private final ContainerLifecycleManager lifecycleManager;
@@ -219,7 +230,7 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
             if (!dockerUnavailableLogged) {
                 dockerUnavailableLogged = true;
                 LOG.warnv("No Docker daemon is reachable from Floci ({0}). RDS metadata operations "
-                        + "keep working and DB instances still reach 'available', but they have no "
+                        + "keep working and DB instances still reach ''available'', but they have no "
                         + "backing database container until a daemon becomes reachable.",
                         e.getMessage());
             }
@@ -240,13 +251,7 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
      * container that failed for its own reasons.
      */
     public boolean isDockerReachable() {
-        try {
-            lifecycleManager.getDockerClient().pingCmd().exec();
-            return true;
-        } catch (Exception e) {
-            LOG.debugv("Docker daemon is not reachable: {0}", e.getMessage());
-            return false;
-        }
+        return lifecycleManager.isDockerReachable();
     }
 
     /**
@@ -384,6 +389,10 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
                     .withLogRotation()
                     .withLabels(ContainerStorageHelper.resourceIdentityLabels(
                             "rds", instanceId, runtimeIdentity.accountId(), runtimeIdentity.region()));
+            if (!ephemeral) {
+                // Only a container whose log is attached below gets it pushed; an ephemeral one is never read.
+                specBuilder.withPushedLogs();
+            }
 
             if (!containerDetector.isRunningInContainer()) {
                 specBuilder.withDynamicPort(enginePort);
@@ -418,6 +427,9 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
             if (needsMasterGrant(engine, masterUsername)) {
                 installMasterGrantInitScript(createdContainerId, masterUsername);
             }
+            if (engine == DatabaseEngine.POSTGRES && bootstrapsAsAdminRole(masterUsername)) {
+                installPostgresMasterInitScript(createdContainerId, masterUsername, masterPassword, dbName);
+            }
             ContainerInfo info = lifecycleManager.startCreated(createdContainerId, spec);
             EndpointInfo endpoint = info.getEndpoint(enginePort);
 
@@ -425,11 +437,13 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
             if (!engineParameterOptions(engine, engineParameters).isEmpty()) {
                 awaitServerWithParameterGroup(containerName, info.containerId(), enginePort);
             }
-            initializeEngine(containerName, info.containerId(), engine, masterUsername, masterPassword, dbName);
+            RdsContainerHandle.PostgresSuperuser postgresSuperuser = initializeEngine(
+                    containerName, info.containerId(), engine, masterUsername, masterPassword, dbName);
 
             handle = new RdsContainerHandle(
                     info.containerId(), effectiveRuntimeId, instanceId,
                     endpoint.host(), endpoint.port(), storageKey, containerKey);
+            handle.setPostgresSuperuser(postgresSuperuser);
 
         // Attach log streaming
             if (!ephemeral) {
@@ -440,10 +454,10 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
                 String logStream = logStreamer.generateLogStreamName(shortId);
 
                 Closeable logHandle = runtimeIdentity.arnAccountId() != null
-                        ? logStreamer.attachForAccount(
+                        ? logStreamer.attachPolledForAccount(
                                 runtimeIdentity.arnAccountId(), info.containerId(), logGroup,
                                 logStream, runtimeIdentity.region(), "rds:" + effectiveRuntimeId)
-                        : logStreamer.attach(
+                        : logStreamer.attachPolled(
                                 info.containerId(), logGroup, logStream, runtimeIdentity.region(),
                                 "rds:" + effectiveRuntimeId);
                 handle.setLogStream(logHandle);
@@ -640,6 +654,7 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
                     newInstanceId, handle.getHost(), handle.getPort(),
                     handle.getStorageKey(), handle.getContainerKey());
             moved.setLogStream(handle.getLogStream());
+            moved.setPostgresSuperuser(handle.getPostgresSuperuser());
             activeContainers.put(newRuntimeId, moved);
         }
         activeStorageOwners.replaceAll((key, owner) -> owner.equals(oldRuntimeId) ? newRuntimeId : owner);
@@ -885,15 +900,127 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
         return Integer.parseInt(tag.substring(0, end));
     }
 
-    private void initializeEngine(String containerName, String containerId, DatabaseEngine engine,
-                                  String masterUsername, String masterPassword, String dbName) {
+    /** Returns a PostgreSQL backend's superuser, and null for the other engines. */
+    private RdsContainerHandle.PostgresSuperuser initializeEngine(String containerName, String containerId,
+                                                                 DatabaseEngine engine, String masterUsername,
+                                                                 String masterPassword, String dbName) {
         switch (engine) {
-            case POSTGRES -> initializePostgresIamRole(containerName, containerId, masterUsername);
+            case POSTGRES -> {
+                return initializePostgres(containerName, containerId, masterUsername);
+            }
             case SQLSERVER -> initializeSqlServerMaster(containerName, containerId,
                     masterUsername, masterPassword);
             case MYSQL, MARIADB -> {
             }
         }
+        return null;
+    }
+
+    /** The master user a PostgreSQL backend is created with: the requested one, else {@code postgres}. */
+    static String effectivePostgresMaster(String masterUsername) {
+        return (masterUsername != null && !masterUsername.isBlank()) ? masterUsername : "postgres";
+    }
+
+    /**
+     * Whether a new PostgreSQL backend is initialized as {@link #POSTGRES_ADMIN_ROLE} with the master user created
+     * beside it, as on RDS. A master user that is itself named after that role stays the bootstrap superuser.
+     */
+    static boolean bootstrapsAsAdminRole(String masterUsername) {
+        return !POSTGRES_ADMIN_ROLE.equals(effectivePostgresMaster(masterUsername));
+    }
+
+    /**
+     * What a new PostgreSQL backend runs once, as {@link #POSTGRES_ADMIN_ROLE}, while its data directory is
+     * initialized: the master user, created as RDS creates it, then {@link #postgresRdsRolesSql}, then the
+     * requested database handed to the master. The image creates that database, so an image's own init scripts
+     * (PostGIS installs its extension) still run in it. One requested under the name {@code rdsadmin} is the
+     * master's too, so the master can open it although the role setup closes it to everyone else.
+     */
+    static String postgresMasterInitSql(String masterUsername, String masterPassword, String dbName) {
+        String master = effectivePostgresMaster(masterUsername);
+        String database = (dbName != null && !dbName.isBlank()) ? dbName : master;
+        StringBuilder sql = new StringBuilder()
+                .append("CREATE ROLE ").append(quotePostgresIdentifier(master)).append(" WITH LOGIN PASSWORD ")
+                .append(postgresLiteral(masterPassword == null ? "" : masterPassword)).append(";\n")
+                .append(postgresRdsRolesSql(master));
+        if (!Set.of("postgres", "template0", "template1").contains(database)) {
+            sql.append("ALTER DATABASE ").append(quotePostgresIdentifier(database))
+                    .append(" OWNER TO ").append(quotePostgresIdentifier(master)).append(";\n");
+        }
+        return sql.toString();
+    }
+
+    /**
+     * The roles and ownership RDS gives an instance, applied as {@link #POSTGRES_ADMIN_ROLE} when a backend is
+     * initialized and again after a snapshot is restored into one; it may run any number of times. A psql
+     * script, not one statement: it creates the {@code rdsadmin} database with {@code \gexec} when it is missing.
+     *
+     * <ul>
+     *   <li>The master user is {@code LOGIN NOSUPERUSER INHERIT CREATEDB CREATEROLE NOREPLICATION VALID UNTIL
+     *       'infinity'} and a member of {@code rds_superuser} (RDS User Guide, "Understanding the rds_superuser
+     *       role"), and owns the {@code postgres} and {@code template1} databases.</li>
+     *   <li>{@code rds_superuser} holds, with ADMIN OPTION, the predefined roles an RDS instance grants it, where
+     *       the server has them, and {@code rds_password} and {@code rds_replication}, which the master can
+     *       therefore grant to other users. {@code rds_iam} is granted to it with ADMIN OPTION alone on
+     *       PostgreSQL 16 and later, so the master can grant it without becoming a member, which would make the
+     *       master an IAM-only role; before 16 {@code CREATEROLE} already lets it.</li>
+     *   <li>The {@code rdsadmin} database is closed to everyone but its owner.</li>
+     * </ul>
+     */
+    static String postgresRdsRolesSql(String masterUsername) {
+        String master = quotePostgresIdentifier(effectivePostgresMaster(masterUsername));
+        return """
+                DO $floci$
+                DECLARE
+                    predefined text;
+                BEGIN
+                    FOREACH predefined IN ARRAY ARRAY['rds_superuser', 'rds_password', 'rds_replication', 'rds_iam']
+                    LOOP
+                        IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = predefined) THEN
+                            EXECUTE pg_catalog.format('CREATE ROLE %I', predefined);
+                        END IF;
+                    END LOOP;
+                    FOREACH predefined IN ARRAY ARRAY['pg_checkpoint', 'pg_create_subscription', 'pg_maintain',
+                            'pg_monitor', 'pg_read_all_data', 'pg_signal_backend', 'pg_use_reserved_connections',
+                            'pg_write_all_data', 'rds_password', 'rds_replication']
+                    LOOP
+                        IF EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = predefined) THEN
+                            EXECUTE pg_catalog.format('GRANT %I TO rds_superuser WITH ADMIN OPTION', predefined);
+                        END IF;
+                    END LOOP;
+                    IF pg_catalog.current_setting('server_version_num')::int >= 160000 THEN
+                        EXECUTE 'GRANT rds_iam TO rds_superuser WITH ADMIN OPTION, INHERIT FALSE, SET FALSE';
+                    END IF;
+                END
+                $floci$;
+                """
+                + "ALTER ROLE " + master + " WITH LOGIN NOSUPERUSER INHERIT CREATEDB CREATEROLE NOREPLICATION"
+                + " NOBYPASSRLS VALID UNTIL 'infinity';\n"
+                + "GRANT rds_superuser TO " + master + ";\n"
+                + "ALTER DATABASE postgres OWNER TO " + master + ";\n"
+                + "ALTER DATABASE template1 OWNER TO " + master + ";\n"
+                + "SELECT 'CREATE DATABASE " + POSTGRES_ADMIN_ROLE + "' WHERE NOT EXISTS "
+                + "(SELECT 1 FROM pg_catalog.pg_database WHERE datname = '" + POSTGRES_ADMIN_ROLE + "')\n"
+                + "\\gexec\n"
+                + "REVOKE ALL ON DATABASE " + POSTGRES_ADMIN_ROLE + " FROM PUBLIC;\n";
+    }
+
+    /** A PostgreSQL string literal: wrapped in single quotes, with each embedded one doubled. */
+    static String postgresLiteral(String value) {
+        return "'" + value.replace("'", "''") + "'";
+    }
+
+    /**
+     * Delivered as a {@code /docker-entrypoint-initdb.d} script, as {@link #installMasterGrantInitScript} is, so
+     * it runs only against an empty data directory: a volume the backend has used before keeps the roles it
+     * has, including one whose master user is still the bootstrap superuser.
+     */
+    private void installPostgresMasterInitScript(String containerId, String masterUsername, String masterPassword,
+                                                 String dbName) {
+        byte[] sql = postgresMasterInitSql(masterUsername, masterPassword, dbName).getBytes(StandardCharsets.UTF_8);
+        RetryingTarCopier.copyBytes(lifecycleManager.getDockerClient(), containerId,
+                "/docker-entrypoint-initdb.d", "floci-rds-master.sql", sql, 0644,
+                RetryingTarCopier.DEFAULT_MAX_ATTEMPTS, uploadBackoffMillis);
     }
 
     private void initializeSqlServerMaster(String containerName, String containerId,
@@ -935,6 +1062,9 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
                     IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rds_iam') THEN
                         CREATE ROLE rds_iam;
                     END IF;
+                    IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'rds_replication') THEN
+                        CREATE ROLE rds_replication;
+                    END IF;
                 END
                 $$;
                 """;
@@ -963,23 +1093,85 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
      * temporary server that listens only on the Unix socket, so a socket connection can succeed
      * before the final server is up. Loopback is trusted by the generated pg_hba.conf.
      */
-    private void initializePostgresIamRole(String containerName, String containerId, String masterUsername) {
-        String effectiveUser = (masterUsername != null && !masterUsername.isBlank()) ? masterUsername : "postgres";
+    private RdsContainerHandle.PostgresSuperuser initializePostgres(String containerName, String containerId,
+                                                                    String masterUsername) {
+        String master = effectivePostgresMaster(masterUsername);
+        String[] lookup = {
+                "psql",
+                "-h", "127.0.0.1",
+                "-X", "-q", "-A", "-t",
+                "-v", "ON_ERROR_STOP=1",
+                "-U", master,
+                "-d", "postgres",
+                "-c", POSTGRES_SUPERUSER_SQL
+        };
+        PostgresStartupSignal startup = new PostgresStartupSignal();
+        String superuser = master;
+        // This path receives a newly created container, so replay cannot include a prior start.
+        try (Closeable observation = logStreamer.observe(containerId, startup)) {
+            String found = execUntilSuccess(containerName, containerId, lookup, "PostgreSQL superuser lookup",
+                    startup.signal).trim();
+            if (!found.isEmpty()) {
+                superuser = found;
+            }
+        } catch (IOException e) {
+            LOG.warnv(e, "Could not close PostgreSQL startup observation for {0}", containerName);
+        }
+        // A backend Floci initialized as rdsadmin gets a password for this start only, which the proxy alone
+        // knows; one whose master user is the bootstrap superuser keeps logging in with the master's password.
+        String password = superuser.equals(master) ? null : randomPostgresPassword();
+        String sql = postgresIamRoleInitSql() + (password == null ? ""
+                : "ALTER ROLE " + quotePostgresIdentifier(superuser) + " WITH PASSWORD " + postgresLiteral(password)
+                + ";\n");
         String[] cmd = {
                 "psql",
                 "-h", "127.0.0.1",
                 "-v", "ON_ERROR_STOP=1",
-                "-U", effectiveUser,
+                "-U", superuser,
                 "-d", "postgres",
-                "-c", postgresIamRoleInitSql()
+                "-c", sql
         };
-        PostgresStartupSignal startup = new PostgresStartupSignal();
-        // This path receives a newly created container, so replay cannot include a prior start.
-        try (Closeable observation = logStreamer.observe(containerId, startup)) {
-            execUntilSuccess(containerName, containerId, cmd, "PostgreSQL IAM role", startup.signal);
-        } catch (IOException e) {
-            LOG.warnv(e, "Could not close PostgreSQL startup observation for {0}", containerName);
+        execUntilSuccess(containerName, containerId, cmd, "PostgreSQL IAM role");
+        return new RdsContainerHandle.PostgresSuperuser(superuser, password);
+    }
+
+    private static String randomPostgresPassword() {
+        byte[] bytes = new byte[24];
+        new SecureRandom().nextBytes(bytes);
+        return HexFormat.of().formatHex(bytes);
+    }
+
+    /**
+     * The superuser Floci runs its own SQL in a PostgreSQL backend as: {@link #POSTGRES_ADMIN_ROLE} for a backend
+     * initialized as it, the master user for one whose master is the bootstrap superuser, as found when the
+     * container started, and the master user for a container this manager did not start.
+     */
+    String postgresSuperuser(String containerId, String masterUsername) {
+        RdsContainerHandle handle = activeHandleOfContainer(containerId);
+        RdsContainerHandle.PostgresSuperuser superuser = handle == null ? null : handle.getPostgresSuperuser();
+        return superuser != null ? superuser.user() : effectivePostgresMaster(masterUsername);
+    }
+
+    /**
+     * The login the auth proxy hands an IAM session over through: the {@link #POSTGRES_ADMIN_ROLE} superuser
+     * with this start's password, or null when the runtime has none, so the master user's login serves.
+     */
+    public RdsContainerHandle.PostgresSuperuser postgresHandoverLogin(String runtimeId) {
+        RdsContainerHandle handle = runtimeId == null ? null : activeContainers.get(runtimeId);
+        RdsContainerHandle.PostgresSuperuser superuser = handle == null ? null : handle.getPostgresSuperuser();
+        return superuser == null || superuser.password() == null ? null : superuser;
+    }
+
+    private RdsContainerHandle activeHandleOfContainer(String containerId) {
+        if (containerId == null) {
+            return null;
         }
+        for (RdsContainerHandle handle : activeContainers.values()) {
+            if (containerId.equals(handle.getContainerId())) {
+                return handle;
+            }
+        }
+        return null;
     }
 
     /**
@@ -1077,12 +1269,13 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
                 RetryingTarCopier.DEFAULT_MAX_ATTEMPTS, uploadBackoffMillis);
     }
 
-    private void execUntilSuccess(String containerName, String containerId, String[] cmd, String description) {
-        execUntilSuccess(containerName, containerId, cmd, description, new Semaphore(0));
+    private String execUntilSuccess(String containerName, String containerId, String[] cmd, String description) {
+        return execUntilSuccess(containerName, containerId, cmd, description, new Semaphore(0));
     }
 
-    private void execUntilSuccess(String containerName, String containerId, String[] cmd, String description,
-                                  Semaphore startupSignal) {
+    /** Runs {@code cmd} until it exits 0, for up to a minute, and returns what it wrote to stdout. */
+    private String execUntilSuccess(String containerName, String containerId, String[] cmd, String description,
+                                    Semaphore startupSignal) {
         String lastOutput = "";
         for (int attempt = 1; attempt <= 60; attempt++) {
             try {
@@ -1090,7 +1283,7 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
                 lastOutput = result.stdout() + (result.stderr().isEmpty() ? "" : "\n" + result.stderr());
                 if (result.exitCode() == 0) {
                     LOG.infov("Initialized {0} in RDS container {1}", description, containerName);
-                    return;
+                    return result.stdout();
                 }
             } catch (Exception e) {
                 lastOutput = e.getMessage();
@@ -1106,9 +1299,9 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
     }
 
     /**
-     * Waits for a MySQL or MariaDB server started with a parameter group's options to accept TCP
-     * connections. The image checks the options before it starts anything, and the server reads
-     * them again as it starts, so a container that stops here refused one of them. A server still
+     * Waits for a server started with a parameter group's options to accept TCP connections. The
+     * MySQL and MariaDB images check the options before they start anything, and every server reads
+     * them as it starts, so a container that stops here refused one of them. A server still
      * starting when the wait ends is left to finish, as one started without a group is.
      */
     private void awaitServerWithParameterGroup(String containerName, String containerId, int enginePort) {
@@ -1222,7 +1415,7 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
     }
 
     public String createPostgresSnapshot(String containerId, String masterUsername) {
-        String effectiveUser = (masterUsername != null && !masterUsername.isBlank()) ? masterUsername : "postgres";
+        String effectiveUser = postgresSuperuser(containerId, masterUsername);
         String[] cmd = {
                 "pg_dumpall",
                 "-U", effectiveUser
@@ -1239,8 +1432,8 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
     }
 
     /**
-     * Runs one query as the master user and returns its rows, one per line, unaligned and without
-     * headers. The session uses ISO dates in UTC, so a value's text output does not depend on the
+     * Runs one query as the backend's superuser ({@link #postgresSuperuser}) and returns its rows, one per
+     * line, unaligned and without headers. The session uses ISO dates in UTC, so a value's text output does not depend on the
      * image's defaults.
      */
     public String queryPostgres(String containerId, String masterUsername, String database, String sql) {
@@ -1255,7 +1448,7 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
      */
     public void queryPostgres(String containerId, String masterUsername, String database, String sql,
                               OutputStream rows, int timeoutSeconds) {
-        String effectiveUser = (masterUsername != null && !masterUsername.isBlank()) ? masterUsername : "postgres";
+        String effectiveUser = postgresSuperuser(containerId, masterUsername);
         String[] cmd = {
                 "env", "PGOPTIONS=-c DateStyle=ISO -c TimeZone=UTC -c IntervalStyle=postgres",
                 "psql", "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1",
@@ -1272,13 +1465,32 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
         }
     }
 
+    /**
+     * Replays a {@link #createPostgresSnapshot} dump as the backend's superuser. In a backend initialized as
+     * {@link #POSTGRES_ADMIN_ROLE}, the roles and ownership RDS gives an instance are applied again afterwards,
+     * so a dump of an older backend, whose master user was the bootstrap superuser, restores with the master
+     * as RDS has it, and that role gets back the password of this start, which the dump replaced.
+     */
     public void restorePostgresSnapshot(String containerId, String masterUsername, String sqlDump) {
-        String effectiveUser = (masterUsername != null && !masterUsername.isBlank()) ? masterUsername : "postgres";
+        String master = effectivePostgresMaster(masterUsername);
+        String superuser = postgresSuperuser(containerId, master);
+        boolean adminBackend = !superuser.equals(master);
         Map<String, String> files = new LinkedHashMap<>();
         files.put("dump.sql", sqlDump);
-        files.put("restore.sh", postgresRestoreScript());
+        files.put("restore.sh", postgresRestoreScript(
+                adminBackend ? postgresRdsRolesSql(master) : postgresIamRoleInitSql()));
         runSnapshotScript(containerId, "postgres-restore", files,
-                new String[]{"sh", "/tmp/restore.sh", effectiveUser}, 60, 120, "psql restore");
+                new String[]{"sh", "/tmp/restore.sh", superuser}, List.of(), 60, 120, "psql restore");
+        RdsContainerHandle handle = activeHandleOfContainer(containerId);
+        RdsContainerHandle.PostgresSuperuser login = handle == null ? null : handle.getPostgresSuperuser();
+        if (adminBackend && login != null && login.password() != null) {
+            String[] cmd = {"psql", "-v", "ON_ERROR_STOP=1", "-U", superuser, "-d", "postgres", "-c",
+                    "ALTER ROLE " + quotePostgresIdentifier(superuser) + " WITH PASSWORD "
+                            + postgresLiteral(login.password()) + ";"};
+            try (Lease _ = holdContainer(containerId)) {
+                execUntilSuccess(containerId, containerId, cmd, "PostgreSQL superuser password");
+            }
+        }
     }
 
     /**
@@ -1290,7 +1502,8 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
      * tries, throws with {@code operation} and the command's error output.
      */
     private String runSnapshotScript(String containerId, String uploadName, Map<String, String> files,
-                                     String[] cmd, int attempts, int timeoutSeconds, String operation) {
+                                     String[] cmd, List<String> env, int attempts, int timeoutSeconds,
+                                     String operation) {
         try (Lease _ = holdContainer(containerId)) {
             ByteArrayOutputStream bos = new ByteArrayOutputStream();
             try (TarArchiveOutputStream tar = new TarArchiveOutputStream(bos)) {
@@ -1304,30 +1517,53 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
                     "/tmp", uploadName, out -> out.write(archive),
                     RetryingTarCopier.DEFAULT_MAX_ATTEMPTS, uploadBackoffMillis);
 
-            ContainerExec.Result result = null;
-            for (int i = 0; i < attempts; i++) {
-                result = execInContainer(containerId, cmd, timeoutSeconds);
-                if (result.exitCode() != 2) {
-                    break;
+            boolean succeeded = false;
+            try {
+                ContainerExec.Result result = null;
+                for (int i = 0; i < attempts; i++) {
+                    result = ContainerExec.run(lifecycleManager.getDockerClient(), containerId, cmd, env,
+                            timeoutSeconds);
+                    if (result.exitCode() != 2) {
+                        break;
+                    }
+                    try {
+                        Thread.sleep(1000);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new RuntimeException("Interrupted while waiting to run " + operation, ie);
+                    }
                 }
-                try {
-                    Thread.sleep(1000);
-                } catch (InterruptedException ie) {
-                    Thread.currentThread().interrupt();
-                    throw new RuntimeException("Interrupted while waiting to run " + operation, ie);
-                }
-            }
 
-            if (result == null || result.exitCode() != 0) {
-                String errMsg = result != null ? (result.stderr().isEmpty() ? result.stdout() : result.stderr()) : "";
-                throw new RuntimeException(operation + " failed with exit code "
-                        + (result != null ? result.exitCode() : -1) + ": " + errMsg);
+                if (result == null || result.exitCode() != 0) {
+                    String errMsg = result != null ? (result.stderr().isEmpty() ? result.stdout() : result.stderr()) : "";
+                    throw new RuntimeException(operation + " failed with exit code "
+                            + (result != null ? result.exitCode() : -1) + ": " + errMsg);
+                }
+                succeeded = true;
+                return result.stdout();
+            } finally {
+                // On success the script's own EXIT trap has removed it.
+                if (!succeeded && files.containsKey("dump.sql")) {
+                    removeDump(containerId);
+                }
             }
-            return result.stdout();
         } catch (RuntimeException e) {
             throw e;
         } catch (Exception e) {
             throw new RuntimeException("Failed to run " + operation, e);
+        }
+    }
+
+    /**
+     * Removes the uploaded dump when the script could not: it gave up on a server that never answered,
+     * or its exec timed out or was killed. Best effort, since the container may be gone.
+     */
+    private void removeDump(String containerId) {
+        try {
+            ContainerExec.run(lifecycleManager.getDockerClient(), containerId,
+                    new String[]{"rm", "-f", "/tmp/dump.sql"}, 30);
+        } catch (RuntimeException e) {
+            LOG.debugv("Could not remove /tmp/dump.sql from {0}: {1}", containerId, e.getMessage());
         }
     }
 
@@ -1343,11 +1579,10 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
     public String createMysqlSnapshot(DatabaseEngine engine, String containerId,
                                       String masterUsername, String masterPassword) {
         MysqlTools tools = MysqlTools.of(engine);
-        String[] cmd = {"env", "MYSQL_PWD=" + (masterPassword == null ? "" : masterPassword),
-                "sh", "/tmp/floci-mysql-dump.sh", tools.client(), tools.dump(), mysqlUser(masterUsername),
+        String[] cmd = {"sh", "/tmp/floci-mysql-dump.sh", tools.client(), tools.dump(), mysqlUser(masterUsername),
                 tools.dumpFlags(), tools.accountClause(), tools.roleFilter()};
         return runSnapshotScript(containerId, "mysql-dump", Map.of("floci-mysql-dump.sh", mysqlDumpScript()),
-                cmd, 120, 300, tools.dump());
+                cmd, mysqlPasswordEnv(masterPassword), 120, 300, tools.dump());
     }
 
     /**
@@ -1361,9 +1596,9 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
         Map<String, String> files = new LinkedHashMap<>();
         files.put("dump.sql", sqlDump);
         files.put("restore.sh", mysqlRestoreScript());
-        String[] cmd = {"env", "MYSQL_PWD=" + (masterPassword == null ? "" : masterPassword),
-                "sh", "/tmp/restore.sh", tools.client(), mysqlUser(masterUsername)};
-        runSnapshotScript(containerId, "mysql-restore", files, cmd, 120, 300, tools.client() + " restore");
+        String[] cmd = {"sh", "/tmp/restore.sh", tools.client(), mysqlUser(masterUsername)};
+        runSnapshotScript(containerId, "mysql-restore", files, cmd, mysqlPasswordEnv(masterPassword), 120, 300,
+                tools.client() + " restore");
     }
 
     /**
@@ -1385,6 +1620,11 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
         }
     }
 
+    /** The password goes in the exec's own environment, so it is not part of the command Docker records. */
+    private static List<String> mysqlPasswordEnv(String masterPassword) {
+        return List.of("MYSQL_PWD=" + (masterPassword == null ? "" : masterPassword));
+    }
+
     private static String mysqlUser(String masterUsername) {
         return masterUsername != null && !masterUsername.isBlank() ? masterUsername : "root";
     }
@@ -1393,20 +1633,23 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
         return """
                 #!/bin/sh
                 # usage: floci-mysql-dump.sh <client> <dump> <user> <dump flags> <account clause> <role filter>
-                # The password arrives in MYSQL_PWD. Names are read one per line, so a schema or
-                # account name with spaces stays one argument.
+                # The password arrives in MYSQL_PWD. Names are read one per line, so the client
+                # escapes a newline in one as \\n (batch mode without -r) and unesc restores it.
                 set -ef
                 C="$1"; D="$2"; U="$3"; FLAGS="$4"; ACCOUNT_CLAUSE="$5"; ROLE_FILTER="$6"
                 SQL() { "$C" -h127.0.0.1 --protocol=TCP -u"$U" -N -B -r -e "$1"; }
+                NAMES() { "$C" -h127.0.0.1 --protocol=TCP -u"$U" -N -B -e "$1"; }
+                # Sets R to the name in $1 with its escapes undone; the dot keeps a trailing newline.
+                unesc() { R=$(printf '%b.' "$1"); R=${R%.}; }
                 # Exit 2: the server does not accept the master user over TCP yet. Past this point a
                 # failure exits 1, even mysqldump's own exit 2, so it is not retried as one.
                 SQL "SELECT 1" >/dev/null 2>&1 || exit 2
                 trap 'rc=$?; if [ "$rc" = 2 ]; then exit 1; fi' EXIT
-                DBS=$(SQL "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN \\
+                DBS=$(NAMES "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN \\
                   ('mysql','sys','performance_schema','information_schema')")
                 set --
                 while IFS= read -r db; do
-                  if [ -n "$db" ]; then set -- "$@" "$db"; fi
+                  if [ -n "$db" ]; then unesc "$db"; set -- "$@" "$R"; fi
                 done <<EOF
                 $DBS
                 EOF
@@ -1415,17 +1658,18 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
                   "$D" -h127.0.0.1 --protocol=TCP -u"$U" --routines --events --triggers \\
                     --single-transaction --hex-blob --no-tablespaces $FLAGS --databases "$@"
                 fi
-                ROLES=$(SQL "SELECT QUOTE(user) FROM mysql.user WHERE $ROLE_FILTER")
-                ACCOUNTS=$(SQL "SELECT CONCAT(QUOTE(user),'@',QUOTE(host)) FROM mysql.user WHERE user NOT IN \\
+                ROLES=$(NAMES "SELECT QUOTE(user) FROM mysql.user WHERE $ROLE_FILTER")
+                ACCOUNTS=$(NAMES "SELECT CONCAT(QUOTE(user),'@',QUOTE(host)) FROM mysql.user WHERE user NOT IN \\
                   ('','root','mysql.sys','mysql.session','mysql.infoschema','mariadb.sys','healthcheck','PUBLIC') $ACCOUNT_CLAUSE")
                 # Every role and account is created before any grant, which can name a role.
                 while IFS= read -r role; do
-                  if [ -n "$role" ]; then echo "CREATE ROLE IF NOT EXISTS $role;"; fi
+                  if [ -n "$role" ]; then unesc "$role"; echo "CREATE ROLE IF NOT EXISTS $R;"; fi
                 done <<EOF
                 $ROLES
                 EOF
                 while IFS= read -r acct; do
                   if [ -n "$acct" ]; then
+                    unesc "$acct"; acct=$R
                     # MySQL prints a binary password hash as hex only when asked; MariaDB has no such setting.
                     stmt=$(SQL "SET SESSION print_identified_with_as_hex = ON; SHOW CREATE USER $acct" 2>/dev/null \\
                            || SQL "SHOW CREATE USER $acct")
@@ -1435,7 +1679,9 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
                 $ACCOUNTS
                 EOF
                 while IFS= read -r grantee; do
-                  if [ -n "$grantee" ]; then SQL "SHOW GRANTS FOR $grantee" | sed 's/$/;/'; fi
+                  # Batch mode without -r prints each statement on one line (a newline in a name is \\n), so one row is
+                  # one statement whatever a name contains; %b undoes the escapes.
+                  if [ -n "$grantee" ]; then unesc "$grantee"; NAMES "SHOW GRANTS FOR $R" | while IFS= read -r g; do printf '%b;\\n' "$g"; done; fi
                 done <<EOF
                 $ROLES
                 $ACCOUNTS
@@ -1449,6 +1695,9 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
                 #!/bin/sh
                 # usage: restore.sh <client> <user>; the password arrives in MYSQL_PWD.
                 C="$1"; U="$2"
+                # The dump holds every schema and account; leave none behind for FILE-privileged readers.
+                # Exit 2 means the server is not up: the caller retries, and needs the dump.
+                trap 'rc=$?; [ "$rc" = 2 ] || rm -f /tmp/dump.sql' EXIT
                 "$C" -h127.0.0.1 --protocol=TCP -u"$U" -e "SELECT 1" >/dev/null 2>&1 || exit 2
                 "$C" -h127.0.0.1 --protocol=TCP -u"$U" < /tmp/dump.sql || exit 1
                 """;
@@ -1461,7 +1710,7 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
      * template1, so it also works when {@code from} is {@code postgres}.
      */
     public void renamePostgresDatabase(String containerId, String masterUsername, String from, String to) {
-        String effectiveUser = (masterUsername != null && !masterUsername.isBlank()) ? masterUsername : "postgres";
+        String effectiveUser = postgresSuperuser(containerId, masterUsername);
         String sql = "ALTER DATABASE " + quotePostgresIdentifier(from) + " RENAME TO " + quotePostgresIdentifier(to);
         String[] cmd = {"psql", "-v", "ON_ERROR_STOP=1", "-U", effectiveUser, "-d", "template1", "-c", sql};
         try (Lease _ = holdContainer(containerId)) {
@@ -1483,10 +1732,21 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
     }
 
     static String postgresRestoreScript() {
+        return postgresRestoreScript(postgresIamRoleInitSql());
+    }
+
+    /**
+     * The restore script, run as the backend's superuser, ending with {@code closingSql}, a psql script run once
+     * the dump is replayed.
+     */
+    static String postgresRestoreScript(String closingSql) {
         return """
                 #!/bin/sh
                 set -e
                 USER="$1"
+                # The dump holds every database; leave none behind. Exit 2 means the server is not up:
+                # the caller retries, and needs it.
+                trap 'rc=$?; [ "$rc" = 2 ] || rm -f /tmp/dump.sql /tmp/dump_filtered.sql' EXIT
 
                 # Drop every database but postgres, template0 and template1, including template
                 # databases an image creates at startup (PostGIS's template_postgis), which the dump
@@ -1502,6 +1762,12 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
                 # Exclude the master user CREATE ROLE statement to avoid conflicts during restore
                 sed -e "s/^CREATE ROLE \\\"\\?$USER\\\"\\?.*;/-- &/" /tmp/dump.sql > /tmp/dump_filtered.sql
                 mv /tmp/dump_filtered.sql /tmp/dump.sql
+                chmod 600 /tmp/dump.sql
+
+                # The databases kept above may belong to a role dropped below, as postgres and template1
+                # belong to the master user of an instance initialized as rdsadmin
+                psql -v ON_ERROR_STOP=1 -U "$USER" -d postgres -c "ALTER DATABASE postgres OWNER TO CURRENT_USER"
+                psql -v ON_ERROR_STOP=1 -U "$USER" -d postgres -c "ALTER DATABASE template1 OWNER TO CURRENT_USER"
 
                 # Drop all non-current-user, non-system roles
                 psql -v ON_ERROR_STOP=1 -U "$USER" -d postgres -tAc \\
@@ -1513,7 +1779,11 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
 
                 # Replay the dump connected to postgres
                 psql -v ON_ERROR_STOP=1 -U "$USER" -d postgres -f /tmp/dump.sql
-                """;
+
+                # What a dump does not bring back: the predefined roles of a dump taken before Floci created
+                # them, and in an instance initialized as rdsadmin the roles and ownership RDS gives it
+                psql -v ON_ERROR_STOP=1 -U "$USER" -d postgres <<'SQL'
+                """ + closingSql + "SQL\n";
     }
 
     private static void addTarEntry(
@@ -1523,7 +1793,8 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
         TarArchiveEntry entry =
                 new TarArchiveEntry(name);
         entry.setSize(bytes.length);
-        entry.setMode(0755);
+        // The dump holds every schema; only root, who restores it, may read it.
+        entry.setMode(name.endsWith(".sql") ? 0600 : 0755);
         tar.putArchiveEntry(entry);
         tar.write(bytes);
         tar.closeArchiveEntry();
@@ -1596,16 +1867,19 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
         return value;
     }
 
-    private List<String> buildEnvVars(DatabaseEngine engine, String masterUsername,
-                                      String masterPassword, String dbName) {
+    static List<String> buildEnvVars(DatabaseEngine engine, String masterUsername,
+                                     String masterPassword, String dbName) {
         String effectiveUser = (masterUsername != null && !masterUsername.isBlank()) ? masterUsername : "postgres";
         String effectiveDb = (dbName != null && !dbName.isBlank()) ? dbName : effectiveUser;
 
         List<String> envs = new ArrayList<>();
         switch (engine) {
             case POSTGRES -> {
-                envs.add("POSTGRES_USER=" + effectiveUser);
-                envs.add("POSTGRES_PASSWORD=" + masterPassword);
+                // Initialized as rdsadmin, whose password Floci sets again on every start; the master user is
+                // created by the init script installPostgresMasterInitScript adds.
+                boolean adminBootstrap = bootstrapsAsAdminRole(masterUsername);
+                envs.add("POSTGRES_USER=" + (adminBootstrap ? POSTGRES_ADMIN_ROLE : effectiveUser));
+                envs.add("POSTGRES_PASSWORD=" + (adminBootstrap ? randomPostgresPassword() : masterPassword));
                 envs.add("POSTGRES_DB=" + effectiveDb);
                 envs.add("POSTGRES_HOST_AUTH_METHOD=md5");
             }
@@ -1649,18 +1923,24 @@ public class RdsContainerManager implements RdsBackendGate, RdsBackendEndpointRe
     }
 
     /**
-     * A parameter group's overrides as MySQL or MariaDB server options. Each takes the
-     * {@code --loose-} prefix, so a parameter only Aurora or RDS knows (or one an older server
-     * does not have) is skipped with a warning instead of stopping the server. A value that is a
-     * formula, such as {@code {DBInstanceClassMemory*3/4}}, is worked out by AWS from the
-     * instance class and is left to the server's default, as are the parameters that decide
-     * where the server listens and keeps its data, which Floci controls, and the ones that would
-     * lock Floci's proxy out. {@code time_zone} is set through {@code --default-time-zone}, and
+     * A parameter group's overrides as server options. PostgreSQL takes only
+     * {@code rds.logical_replication}, whose value of 1 becomes {@code wal_level=logical}; its
+     * other values, and SQL Server's, give no options. For MySQL or MariaDB each
+     * override takes the {@code --loose-} prefix, so a parameter only Aurora or RDS knows (or one
+     * an older server does not have) is skipped with a warning instead of stopping the server. A
+     * value that is a formula, such as {@code {DBInstanceClassMemory*3/4}}, is worked out by AWS
+     * from the instance class and is left to the server's default, as are the parameters that
+     * decide where the server listens and keeps its data, which Floci controls, and the ones that
+     * would lock Floci's proxy out. {@code time_zone} is set through {@code --default-time-zone}, and
      * Aurora's {@code binlog_format=OFF}, which turns binary logging off, through
      * {@code --skip-log-bin}.
      */
     public static List<String> engineParameterOptions(
             DatabaseEngine engine, Map<String, String> engineParameters) {
+        if (engine == DatabaseEngine.POSTGRES && engineParameters != null
+                && "1".equals(engineParameters.get("rds.logical_replication"))) {
+            return List.of("-c", "wal_level=logical");
+        }
         if (engineParameters == null || engineParameters.isEmpty()
                 || (engine != DatabaseEngine.MYSQL && engine != DatabaseEngine.MARIADB)) {
             return List.of();

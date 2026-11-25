@@ -25,7 +25,8 @@ import java.util.Map;
  * each one chosen where no operation answers a declared constraint in a wording of its own.
  * {@code GetAccessKeyInfo} is the parity case, its own check having answered {@code accessKeyId}
  * from the same bounds and the same pattern; {@code GetSessionToken} brings {@code SerialNumber},
- * {@code TokenCode} and {@code MinimumSessionTokenSize}, which nothing read at all; and
+ * {@code TokenCode} and {@code MinimumSessionTokenSize}, the first two of which the operation
+ * reads now, as a device and its code, while nothing reads the third; and
  * {@code GetWebIdentityToken} is where the audience and tag checks come off hand-written code.
  */
 final class StsRequestShapes {
@@ -35,6 +36,14 @@ final class StsRequestShapes {
             SmithyValidationErrors.Violations.QUOTED);
 
     private StsRequestShapes() {
+    }
+
+    /**
+     * Whether the operation's generated input shape declares the member, which is how a read of a
+     * request asks what that request is allowed to carry rather than naming the operations itself.
+     */
+    static boolean hasMember(String action, String member) {
+        return CHECK.hasMember(action, member);
     }
 
     /** Every constraint the model declares for {@code action} that {@code params} breaks. */

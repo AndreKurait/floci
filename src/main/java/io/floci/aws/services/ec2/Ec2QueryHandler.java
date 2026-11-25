@@ -29,9 +29,11 @@ import java.util.function.Consumer;
 
 import static io.floci.aws.services.ec2.Ec2QueryProtocol.boolParam;
 import static io.floci.aws.services.ec2.Ec2QueryProtocol.booleanResponse;
+import static io.floci.aws.services.ec2.Ec2QueryProtocol.endResponse;
 import static io.floci.aws.services.ec2.Ec2QueryProtocol.getFiltersList;
 import static io.floci.aws.services.ec2.Ec2QueryProtocol.getList;
 import static io.floci.aws.services.ec2.Ec2QueryProtocol.intParam;
+import static io.floci.aws.services.ec2.Ec2QueryProtocol.startResponse;
 import static io.floci.aws.services.ec2.Ec2QueryProtocol.tagSetXml;
 import static io.floci.aws.services.ec2.Ec2QueryProtocol.xmlResponse;
 
@@ -43,6 +45,10 @@ public class Ec2QueryHandler {
             .withZone(ZoneOffset.UTC);
 
     /** ReplaceRoute targets AWS accepts that a stored {@code Route} cannot represent here. */
+    /** ModifyNetworkInterfaceAttribute members Floci does not apply, as their query names prefix them. */
+    private static final List<String> UNAPPLIED_INTERFACE_ATTRIBUTES = List.of("EnablePrimaryIpv6",
+            "EnaSrdSpecification", "ConnectionTrackingSpecification", "AssociatePublicIpAddress", "AssociatedSubnetId",
+            "Attachment.DefaultEnaQueueCount", "Attachment.EnaQueueCount");
     private static final List<String> UNSUPPORTED_ROUTE_TARGETS = List.of(
             "CarrierGatewayId", "CoreNetworkArn", "EgressOnlyInternetGatewayId",
             "LocalGatewayId", "OdbNetworkArn",
@@ -350,6 +356,12 @@ public class Ec2QueryHandler {
                 case "DeleteNetworkInterface" -> handleDeleteNetworkInterface(params, region);
                 case "AttachNetworkInterface" -> handleAttachNetworkInterface(params, region);
                 case "DetachNetworkInterface" -> handleDetachNetworkInterface(params, region);
+                case "ModifyNetworkInterfaceAttribute" -> handleModifyNetworkInterfaceAttribute(params, region);
+                case "AssignIpv6Addresses" -> handleAssignIpv6Addresses(params, region);
+                case "UnassignIpv6Addresses" -> handleUnassignIpv6Addresses(params, region);
+                case "CreateNetworkInterfacePermission" -> handleCreateNetworkInterfacePermission(params, region);
+                case "DescribeNetworkInterfacePermissions" ->
+                        handleDescribeNetworkInterfacePermissions(params, region);
                 // Volumes
                 case "CreateVolume" -> handleCreateVolume(params, region);
                 case "DescribeVolumes" -> handleDescribeVolumes(params, region);
@@ -1688,6 +1700,9 @@ public class Ec2QueryHandler {
                         .end("item");
             }
             xml.end("groupSet");
+        } else if ("blockDeviceMapping".equals(attribute)) {
+            instanceBlockDeviceMappingXml(xml, service.instanceVolumeAttachments(List.of(inst))
+                    .getOrDefault(instanceId, List.of()));
         }
         xml.end("DescribeInstanceAttributeResponse");
         return xmlResponse(xml.build());
@@ -1720,10 +1735,57 @@ public class Ec2QueryHandler {
             }
             groupIds.add(groupId);
         }
-        if (dryRun(p)) {
-            service.checkInstanceAttributeChange(region, instanceId, userDataEncoded != null, attrName != null,
-                    groupIds);
-            throw Ec2Service.dryRunOperation();
+        List<Ec2Service.InstanceBlockDeviceMappingChange> blockDeviceMappings = new ArrayList<>();
+        SortedSet<Integer> mappingIndices = new TreeSet<>();
+        for (String key : p.keySet()) {
+            if (!key.startsWith("BlockDeviceMapping.")) {
+                continue;
+            }
+            String[] parts = key.split("\\.", 3);
+            if (parts.length != 3) {
+                throw new AwsException("InvalidParameterValue", "Invalid block device mapping parameter: " + key,
+                        400);
+            }
+            int index;
+            try {
+                index = Integer.parseInt(parts[1]);
+            } catch (NumberFormatException exception) {
+                throw new AwsException("InvalidParameterValue", "Invalid block device mapping index.", 400);
+            }
+            if (index < 1 || !Set.of("DeviceName", "Ebs.VolumeId",
+                    "Ebs.DeleteOnTermination").contains(parts[2])) {
+                throw new AwsException("InvalidParameterValue", "Unsupported block device mapping parameter: " + key,
+                        400);
+            }
+            mappingIndices.add(index);
+        }
+        for (int i : mappingIndices) {
+            String prefix = "BlockDeviceMapping." + i;
+            String deviceName = p.getFirst(prefix + ".DeviceName");
+            String volumeId = p.getFirst(prefix + ".Ebs.VolumeId");
+            String deleteOnTermination = p.getFirst(prefix + ".Ebs.DeleteOnTermination");
+            if ((deviceName != null && deviceName.isBlank()) || (volumeId != null && volumeId.isBlank())
+                    || (deviceName == null && volumeId == null)) {
+                throw new AwsException("InvalidParameterValue",
+                        prefix + " must identify an attached device or volume.", 400);
+            }
+            Boolean value = parseOptionalBoolean(deleteOnTermination, prefix + ".Ebs.DeleteOnTermination");
+            blockDeviceMappings.add(new Ec2Service.InstanceBlockDeviceMappingChange(
+                    deviceName, volumeId, value == null || value));
+        }
+        if (!blockDeviceMappings.isEmpty() && (userDataEncoded != null || attrName != null || !groupIds.isEmpty())) {
+            throw new AwsException("InvalidParameterCombination", "You can specify only one attribute at a time.",
+                    400);
+        }
+        boolean dryRun = dryRun(p);
+        if (dryRun || !blockDeviceMappings.isEmpty()) {
+            service.checkInstanceAttributeChange(region, instanceId, userDataEncoded != null, attrName, groupIds);
+            if (!blockDeviceMappings.isEmpty()) {
+                service.checkInstanceBlockDeviceMappings(region, instanceId, blockDeviceMappings);
+            }
+            if (dryRun) {
+                throw Ec2Service.dryRunOperation();
+            }
         }
         if (userDataEncoded != null) {
             service.modifyInstanceUserData(region, instanceId, userData, userDataEncoded);
@@ -1733,6 +1795,9 @@ public class Ec2QueryHandler {
         }
         if (!groupIds.isEmpty()) {
             service.modifyInstanceGroups(region, instanceId, groupIds);
+        }
+        if (!blockDeviceMappings.isEmpty()) {
+            service.modifyInstanceBlockDeviceMappings(region, instanceId, blockDeviceMappings);
         }
         return booleanResponse("ModifyInstanceAttribute");
     }
@@ -1814,7 +1879,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDeleteVpc(MultivaluedMap<String, String> p, String region) {
-        service.deleteVpc(region, p.getFirst("VpcId"));
+        service.deleteVpc(region, p.getFirst("VpcId"), dryRun(p));
         return booleanResponse("DeleteVpc");
     }
 
@@ -1966,6 +2031,9 @@ public class Ec2QueryHandler {
             "elasticloadbalancing", "sns", "sqs", "kinesis-streams", "kinesis-firehose",
             "states", "events", "lambda", "glue", "athena", "iot.data", "execute-api");
 
+    // The services AWS also offers as a Gateway endpoint, each named com.amazonaws.<region>.<name>.
+    private static final List<String> GATEWAY_ENDPOINT_SERVICES = List.of("s3", "dynamodb");
+
     private Response handleDescribeVpcEndpointServices(MultivaluedMap<String, String> p, String region) {
         List<String> requested = getList(p, "ServiceName");
         List<Map.Entry<String, List<String>>> filters = getFiltersList(p);
@@ -2026,10 +2094,13 @@ public class Ec2QueryHandler {
     private List<ServiceDetail> buildServiceDetails(String region, List<String> requested, List<String> azNames) {
         List<ServiceDetail> services = new ArrayList<>();
 
-        // S3 is the one service with both offerings. The gateway keeps com.amazonaws in every
-        // partition; the interface takes the region's prefix, so in China the two are named apart.
-        String s3Gateway = "com.amazonaws." + region + ".s3";
-        String s3Interface = AwsRegionFacts.vpcEndpointServiceName(region, "s3");
+        // S3 and DynamoDB are the services with both offerings. The gateway keeps com.amazonaws in
+        // every partition; the interface takes the region's prefix, so in China S3's two are named apart.
+        Map<String, String> gatewayInterfaces = new LinkedHashMap<>();
+        for (String name : GATEWAY_ENDPOINT_SERVICES) {
+            gatewayInterfaces.put("com.amazonaws." + region + "." + name,
+                    AwsRegionFacts.vpcEndpointServiceName(region, name));
+        }
 
         // Requested service names are echoed verbatim, exactly as AWS does. The emulator
         // supports any interface service in every AZ, so a requested (often custom) name
@@ -2042,22 +2113,23 @@ public class Ec2QueryHandler {
             for (String name : INTERFACE_ENDPOINT_SERVICES) {
                 fullNames.add(AwsRegionFacts.vpcEndpointServiceName(region, name));
             }
-            fullNames.add(s3Gateway);
-            if (!s3Interface.equals(s3Gateway)) {
-                fullNames.add(s3Interface);
+            for (Map.Entry<String, String> gateway : gatewayInterfaces.entrySet()) {
+                fullNames.add(gateway.getKey());
+                if (!gateway.getValue().equals(gateway.getKey())) {
+                    fullNames.add(gateway.getValue());
+                }
             }
         }
 
         for (String full : fullNames) {
             List<String> serviceTypes;
-            if (full.equals(s3Interface) && !s3Interface.equals(s3Gateway)) {
+            String gatewayInterface = gatewayInterfaces.get(full);
+            if (gatewayInterface == null) {
                 serviceTypes = List.of("Interface");
-            } else if (full.endsWith(".s3")) {
-                serviceTypes = s3Interface.equals(s3Gateway)
-                        ? List.of("Gateway", "Interface")
-                        : List.of("Gateway");
+            } else if (gatewayInterface.equals(full)) {
+                serviceTypes = List.of("Gateway", "Interface");
             } else {
-                serviceTypes = List.of("Interface");
+                serviceTypes = List.of("Gateway");
             }
             services.add(new ServiceDetail(
                     full,
@@ -3490,6 +3562,7 @@ public class Ec2QueryHandler {
 
 
     private Response handleCreateDefaultVpc(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         Vpc vpc = service.createDefaultVpc(region);
         XmlBuilder xml = new XmlBuilder()
                 .start("CreateDefaultVpcResponse", AwsNamespaces.EC2)
@@ -3607,17 +3680,24 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDeleteSubnet(MultivaluedMap<String, String> p, String region) {
-        service.deleteSubnet(region, p.getFirst("SubnetId"));
+        service.deleteSubnet(region, p.getFirst("SubnetId"), dryRun(p));
         return booleanResponse("DeleteSubnet");
     }
 
     private Response handleModifySubnetAttribute(MultivaluedMap<String, String> p, String region) {
         String subnetId = p.getFirst("SubnetId");
+        String hostnameType = p.getFirst("PrivateDnsHostnameTypeOnLaunch");
+        if (hostnameType != null) {
+            service.modifySubnetAttribute(region, subnetId, "privateDnsHostnameTypeOnLaunch", hostnameType);
+            return booleanResponse("ModifySubnetAttribute");
+        }
         for (String attr : List.of(
                 "MapPublicIpOnLaunch",
                 "AssignIpv6AddressOnCreation",
                 "EnableDns64",
-                "MapCustomerOwnedIpOnLaunch")) {
+                "MapCustomerOwnedIpOnLaunch",
+                "EnableResourceNameDnsARecordOnLaunch",
+                "EnableResourceNameDnsAAAARecordOnLaunch")) {
             String val = p.getFirst(attr + ".Value");
             if (val != null) {
                 String camel = Character.toLowerCase(attr.charAt(0)) + attr.substring(1);
@@ -3710,7 +3790,7 @@ public class Ec2QueryHandler {
         List<Tag> ruleTags = parseTagsForResource(p, "security-group-rule");
         String groupId = p.getFirst("GroupId");
         List<IpPermission> perms = parseIpPermissions(p, "IpPermissions");
-        List<SecurityGroupRule> rules = service.authorizeSecurityGroupIngress(region, groupId, perms);
+        List<SecurityGroupRule> rules = service.authorizeSecurityGroupIngress(region, groupId, perms, dryRun(p));
         applySecurityGroupRuleTags(ruleTags, region, rules);
         XmlBuilder xml = new XmlBuilder()
                 .start("AuthorizeSecurityGroupIngressResponse", AwsNamespaces.EC2)
@@ -3728,7 +3808,7 @@ public class Ec2QueryHandler {
         List<Tag> ruleTags = parseTagsForResource(p, "security-group-rule");
         String groupId = p.getFirst("GroupId");
         List<IpPermission> perms = parseIpPermissions(p, "IpPermissions");
-        List<SecurityGroupRule> rules = service.authorizeSecurityGroupEgress(region, groupId, perms);
+        List<SecurityGroupRule> rules = service.authorizeSecurityGroupEgress(region, groupId, perms, dryRun(p));
         applySecurityGroupRuleTags(ruleTags, region, rules);
         XmlBuilder xml = new XmlBuilder()
                 .start("AuthorizeSecurityGroupEgressResponse", AwsNamespaces.EC2)
@@ -3746,11 +3826,14 @@ public class Ec2QueryHandler {
         String groupId = p.getFirst("GroupId");
         List<IpPermission> perms = parseIpPermissions(p, "IpPermissions");
         List<String> ruleIds = getList(p, "SecurityGroupRuleId");
+        boolean dryRun = dryRun(p);
+        // A dry run naming rule ids is answered once they are checked: the permissions' revoke refuses only a
+        // group that doesn't exist, which the ids' check refuses first.
         if (!ruleIds.isEmpty()) {
-            service.revokeSecurityGroupRulesByIds(region, groupId, ruleIds, false);
+            service.revokeSecurityGroupRulesByIds(region, groupId, ruleIds, false, dryRun);
         }
         if (!perms.isEmpty() || ruleIds.isEmpty()) {
-            service.revokeSecurityGroupIngress(region, groupId, perms);
+            service.revokeSecurityGroupIngress(region, groupId, perms, dryRun);
         }
         return booleanResponse("RevokeSecurityGroupIngress");
     }
@@ -3759,11 +3842,13 @@ public class Ec2QueryHandler {
         String groupId = p.getFirst("GroupId");
         List<IpPermission> perms = parseIpPermissions(p, "IpPermissions");
         List<String> ruleIds = getList(p, "SecurityGroupRuleId");
+        boolean dryRun = dryRun(p);
+        // As for RevokeSecurityGroupIngress, a dry run naming rule ids is answered once they are checked.
         if (!ruleIds.isEmpty()) {
-            service.revokeSecurityGroupRulesByIds(region, groupId, ruleIds, true);
+            service.revokeSecurityGroupRulesByIds(region, groupId, ruleIds, true, dryRun);
         }
         if (!perms.isEmpty() || ruleIds.isEmpty()) {
-            service.revokeSecurityGroupEgress(region, groupId, perms);
+            service.revokeSecurityGroupEgress(region, groupId, perms, dryRun);
         }
         return booleanResponse("RevokeSecurityGroupEgress");
     }
@@ -3805,17 +3890,19 @@ public class Ec2QueryHandler {
             if (desc != null) update.put("Description", desc);
             updates.add(update);
         }
-        service.modifySecurityGroupRules(region, groupId, updates);
+        service.modifySecurityGroupRules(region, groupId, updates, dryRun(p));
         return booleanResponse("ModifySecurityGroupRules");
     }
 
     private Response handleUpdateSgRuleDescriptionsIngress(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         String groupId = p.getFirst("GroupId");
         service.updateSecurityGroupRuleDescriptionsIngress(region, groupId, Collections.emptyList());
         return booleanResponse("UpdateSecurityGroupRuleDescriptionsIngress");
     }
 
     private Response handleUpdateSgRuleDescriptionsEgress(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         String groupId = p.getFirst("GroupId");
         service.updateSecurityGroupRuleDescriptionsEgress(region, groupId, Collections.emptyList());
         return booleanResponse("UpdateSecurityGroupRuleDescriptionsEgress");
@@ -4333,6 +4420,7 @@ public class Ec2QueryHandler {
 
     private Response handleCreateInternetGateway(MultivaluedMap<String, String> p, String region) {
         List<Tag> resourceTags = parseTagsForResource(p, "internet-gateway");
+        checkDryRun(p);
         InternetGateway igw = service.createInternetGateway(region);
         applyResourceTags(resourceTags, region, igw.getInternetGatewayId());
         XmlBuilder xml = new XmlBuilder()
@@ -4359,17 +4447,17 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDeleteInternetGateway(MultivaluedMap<String, String> p, String region) {
-        service.deleteInternetGateway(region, p.getFirst("InternetGatewayId"));
+        service.deleteInternetGateway(region, p.getFirst("InternetGatewayId"), dryRun(p));
         return booleanResponse("DeleteInternetGateway");
     }
 
     private Response handleAttachInternetGateway(MultivaluedMap<String, String> p, String region) {
-        service.attachInternetGateway(region, p.getFirst("InternetGatewayId"), p.getFirst("VpcId"));
+        service.attachInternetGateway(region, p.getFirst("InternetGatewayId"), p.getFirst("VpcId"), dryRun(p));
         return booleanResponse("AttachInternetGateway");
     }
 
     private Response handleDetachInternetGateway(MultivaluedMap<String, String> p, String region) {
-        service.detachInternetGateway(region, p.getFirst("InternetGatewayId"), p.getFirst("VpcId"));
+        service.detachInternetGateway(region, p.getFirst("InternetGatewayId"), p.getFirst("VpcId"), dryRun(p));
         return booleanResponse("DetachInternetGateway");
     }
 
@@ -4378,7 +4466,7 @@ public class Ec2QueryHandler {
     private Response handleCreateRouteTable(MultivaluedMap<String, String> p, String region) {
         List<Tag> resourceTags = parseTagsForResource(p, "route-table");
         String vpcId = p.getFirst("VpcId");
-        RouteTable rt = service.createRouteTable(region, vpcId);
+        RouteTable rt = service.createRouteTable(region, vpcId, dryRun(p));
         applyResourceTags(resourceTags, region, rt.getRouteTableId());
         XmlBuilder xml = new XmlBuilder()
                 .start("CreateRouteTableResponse", AwsNamespaces.EC2)
@@ -4409,14 +4497,14 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDeleteRouteTable(MultivaluedMap<String, String> p, String region) {
-        service.deleteRouteTable(region, p.getFirst("RouteTableId"));
+        service.deleteRouteTable(region, p.getFirst("RouteTableId"), dryRun(p));
         return booleanResponse("DeleteRouteTable");
     }
 
     private Response handleAssociateRouteTable(MultivaluedMap<String, String> p, String region) {
         String rtId = p.getFirst("RouteTableId");
         String subnetId = p.getFirst("SubnetId");
-        RouteTableAssociation assoc = service.associateRouteTable(region, rtId, subnetId);
+        RouteTableAssociation assoc = service.associateRouteTable(region, rtId, subnetId, dryRun(p));
         XmlBuilder xml = new XmlBuilder()
                 .start("AssociateRouteTableResponse", AwsNamespaces.EC2)
                 .elem("requestId", UUID.randomUUID().toString())
@@ -4429,6 +4517,7 @@ public class Ec2QueryHandler {
     }
 
     private Response handleDisassociateRouteTable(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
         service.disassociateRouteTable(region, p.getFirst("AssociationId"));
         return booleanResponse("DisassociateRouteTable");
     }
@@ -4494,7 +4583,7 @@ public class Ec2QueryHandler {
         String dest = p.getFirst("DestinationCidrBlock");
         String destIpv6 = p.getFirst("DestinationIpv6CidrBlock");
         String destPrefixList = p.getFirst("DestinationPrefixListId");
-        service.deleteRoute(region, rtId, dest, destIpv6, destPrefixList);
+        service.deleteRoute(region, rtId, dest, destIpv6, destPrefixList, dryRun(p));
         return booleanResponse("DeleteRoute");
     }
 
@@ -5487,7 +5576,36 @@ public class Ec2QueryHandler {
             }
             xml.end("privateIpAddressesSet");
         }
+        if (ni.getIpv6Addresses() != null && !ni.getIpv6Addresses().isEmpty()) {
+            xml.elem("ipv6Address", ni.getIpv6Addresses().getFirst());
+        }
+        xml.raw(ipv6AddressesSetXml(ni.getIpv6Addresses()));
+        xml.raw(ipv4PrefixSetXml(ni.getIpv4Prefixes()));
         return xml.build();
+    }
+
+    /** An interface's {@code ipv6AddressesSet}, left out when it holds no IPv6 address. */
+    private static String ipv6AddressesSetXml(List<String> addresses) {
+        if (addresses == null || addresses.isEmpty()) {
+            return "";
+        }
+        XmlBuilder xml = new XmlBuilder().start("ipv6AddressesSet");
+        for (String address : addresses) {
+            xml.start("item").elem("ipv6Address", address).elem("isPrimaryIpv6", "false").end("item");
+        }
+        return xml.end("ipv6AddressesSet").build();
+    }
+
+    /** The IPv4 prefixes delegated to an interface, as {@code ipv4PrefixSet}; nothing for an interface with none. */
+    private static String ipv4PrefixSetXml(List<String> prefixes) {
+        if (prefixes == null || prefixes.isEmpty()) {
+            return "";
+        }
+        XmlBuilder xml = new XmlBuilder().start("ipv4PrefixSet");
+        for (String prefix : prefixes) {
+            xml.start("item").elem("ipv4Prefix", prefix).end("item");
+        }
+        return xml.end("ipv4PrefixSet").build();
     }
 
     private static String networkInterfaceAssociationXml(NetworkInterfaceAssociation association) {
@@ -5535,9 +5653,19 @@ public class Ec2QueryHandler {
             securityGroupIds = getList(p, "Groups.SecurityGroupId");
         }
         List<Tag> tagList = parseTagsForResource(p, "network-interface");
+        List<String> ipv6Addresses = new ArrayList<>();
+        for (int i = 1; p.getFirst("Ipv6Addresses." + i + ".Ipv6Address") != null; i++) {
+            ipv6Addresses.add(p.getFirst("Ipv6Addresses." + i + ".Ipv6Address"));
+        }
+        Integer ipv6AddressCount = parseOptionalInt(p.getFirst("Ipv6AddressCount"), "Ipv6AddressCount");
+        String ipv6Source = !ipv6Addresses.isEmpty() ? "Ipv6Addresses"
+                : p.getFirst("Ipv6Prefix.1.Ipv6Prefix") != null ? "Ipv6Prefix"
+                : p.getFirst("Ipv6PrefixCount") != null ? "Ipv6PrefixCount" : null;
+        Ec2Service.requireIpv6Source(ipv6Source, ipv6AddressCount);
 
         NetworkInterface ni = service.createNetworkInterface(region, subnetId, description,
-                privateIpAddress, privateIpAddresses, securityGroupIds, tagList);
+                privateIpAddress, privateIpAddresses, ipv6Addresses, ipv6AddressCount, securityGroupIds, tagList,
+                intParam(p, "SecondaryPrivateIpAddressCount"));
 
         XmlBuilder xml = new XmlBuilder()
                 .start("CreateNetworkInterfaceResponse", AwsNamespaces.EC2)
@@ -5571,6 +5699,112 @@ public class Ec2QueryHandler {
         boolean force = "true".equalsIgnoreCase(p.getFirst("Force"));
         service.detachNetworkInterface(region, attachmentId, force);
         return booleanResponse("DetachNetworkInterface");
+    }
+
+    private Response handleAssignIpv6Addresses(MultivaluedMap<String, String> p, String region) {
+        String networkInterfaceId = requireNetworkInterfaceId(p);
+        refuseUnappliedMembers(p, "AssignIpv6Addresses", List.of("Ipv6Prefix", "Ipv6PrefixCount"));
+        // botocore's Ipv6Addresses member carries the locationName ipv6Addresses, which the EC2 protocol
+        // capitalizes into the query name the SDKs and the CLI send: Ipv6Addresses.N.
+        List<String> assigned = service.assignIpv6Addresses(region, networkInterfaceId,
+                getList(p, "Ipv6Addresses"), parseOptionalInt(p.getFirst("Ipv6AddressCount"), "Ipv6AddressCount"));
+        return ipv6AddressesResponse("AssignIpv6Addresses", "assignedIpv6Addresses", networkInterfaceId, assigned);
+    }
+
+    private Response handleUnassignIpv6Addresses(MultivaluedMap<String, String> p, String region) {
+        String networkInterfaceId = requireNetworkInterfaceId(p);
+        refuseUnappliedMembers(p, "UnassignIpv6Addresses", List.of("Ipv6Prefix"));
+        List<String> unassigned = service.unassignIpv6Addresses(region, networkInterfaceId,
+                getList(p, "Ipv6Addresses"));
+        return ipv6AddressesResponse("UnassignIpv6Addresses", "unassignedIpv6Addresses", networkInterfaceId,
+                unassigned);
+    }
+
+    private static String requireNetworkInterfaceId(MultivaluedMap<String, String> p) {
+        String networkInterfaceId = p.getFirst("NetworkInterfaceId");
+        if (networkInterfaceId == null || networkInterfaceId.isBlank()) {
+            throw new AwsException("MissingParameter", "The request must contain the parameter NetworkInterfaceId",
+                    400);
+        }
+        return networkInterfaceId;
+    }
+
+    /**
+     * Refuses a call naming a member Floci does not apply (prefix delegation among them), as ReplaceRoute refuses a
+     * target it cannot store, rather than answering as though it had been applied. {@code members} are query-name
+     * prefixes.
+     */
+    private static void refuseUnappliedMembers(MultivaluedMap<String, String> p, String action, List<String> members) {
+        for (String member : members) {
+            if (p.keySet().stream().anyMatch(name -> name.equals(member) || name.startsWith(member + "."))) {
+                throw new AwsException("UnsupportedOperation", action + " with " + member + " is not supported.",
+                        400);
+            }
+        }
+    }
+
+    private Response ipv6AddressesResponse(String action, String listName, String networkInterfaceId,
+                                           List<String> addresses) {
+        XmlBuilder xml = new XmlBuilder()
+                .start(action + "Response", AwsNamespaces.EC2)
+                .elem("requestId", UUID.randomUUID().toString())
+                .elem("networkInterfaceId", networkInterfaceId)
+                .start(listName);
+        for (String address : addresses) {
+            xml.elem("item", address);
+        }
+        xml.end(listName).end(action + "Response");
+        return xmlResponse(xml.build());
+    }
+
+    private Response handleModifyNetworkInterfaceAttribute(MultivaluedMap<String, String> p, String region) {
+        String networkInterfaceId = requireNetworkInterfaceId(p);
+        refuseUnappliedMembers(p, "ModifyNetworkInterfaceAttribute", UNAPPLIED_INTERFACE_ATTRIBUTES);
+        // The SDKs and the CLI send the group list as SecurityGroupId.N: botocore's Groups member carries that
+        // locationName, and the EC2 protocol serializes a list by it.
+        Ec2Service.NetworkInterfaceAttributeChange change = new Ec2Service.NetworkInterfaceAttributeChange(
+                getList(p, "SecurityGroupId"),
+                p.getFirst("Description.Value"),
+                parseOptionalBoolean(p.getFirst("SourceDestCheck.Value"), "SourceDestCheck"),
+                p.getFirst("Attachment.AttachmentId"),
+                parseOptionalBoolean(p.getFirst("Attachment.DeleteOnTermination"), "Attachment.DeleteOnTermination"));
+        service.modifyNetworkInterfaceAttribute(region, networkInterfaceId, change, dryRun(p));
+        return booleanResponse("ModifyNetworkInterfaceAttribute");
+    }
+
+    private Response handleCreateNetworkInterfacePermission(MultivaluedMap<String, String> p, String region) {
+        checkDryRun(p);
+        NetworkInterfacePermission permission = service.createNetworkInterfacePermission(region,
+                p.getFirst("NetworkInterfaceId"), p.getFirst("AwsAccountId"), p.getFirst("AwsService"),
+                p.getFirst("Permission"));
+        XmlBuilder xml = startResponse("CreateNetworkInterfacePermission")
+                .start("interfacePermission").raw(networkInterfacePermissionXml(permission)).end("interfacePermission");
+        return endResponse(xml, "CreateNetworkInterfacePermission");
+    }
+
+    private Response handleDescribeNetworkInterfacePermissions(MultivaluedMap<String, String> p, String region) {
+        Ec2Service.NetworkInterfacePermissionPage page = service.describeNetworkInterfacePermissions(region,
+                getList(p, "NetworkInterfacePermissionId"), getFiltersList(p),
+                parseOptionalInt(p.getFirst("MaxResults"), "MaxResults"), p.getFirst("NextToken"));
+        XmlBuilder xml = startResponse("DescribeNetworkInterfacePermissions").start("networkInterfacePermissions");
+        for (NetworkInterfacePermission permission : page.permissions()) {
+            xml.start("item").raw(networkInterfacePermissionXml(permission)).end("item");
+        }
+        xml.end("networkInterfacePermissions");
+        if (page.nextToken() != null) {
+            xml.elem("nextToken", page.nextToken());
+        }
+        return endResponse(xml, "DescribeNetworkInterfacePermissions");
+    }
+
+    private static String networkInterfacePermissionXml(NetworkInterfacePermission permission) {
+        return new XmlBuilder()
+                .elem("networkInterfacePermissionId", permission.getNetworkInterfacePermissionId())
+                .elem("networkInterfaceId", permission.getNetworkInterfaceId())
+                .elem("awsAccountId", permission.getAwsAccountId())
+                .elem("permission", permission.getPermission())
+                .start("permissionState").elem("state", permission.getState()).end("permissionState")
+                .build();
     }
 
     // ─── XML fragment builders ────────────────────────────────────────────────
@@ -5679,9 +5913,17 @@ public class Ec2QueryHandler {
                     .raw(associationXml)
                     .end("item")
                     .end("privateIpAddressesSet")
+                    .raw(ipv6AddressesSetXml(eni.getIpv6Addresses()))
+                    .raw(ipv4PrefixSetXml(eni.getIpv4Prefixes()))
                     .end("item");
         }
         xml.end("networkInterfaceSet");
+        for (InstanceNetworkInterface eni : inst.getNetworkInterfaces()) {
+            if (eni.getDeviceIndex() == 0 && !eni.getIpv6Addresses().isEmpty()) {
+                xml.elem("ipv6Address", eni.getIpv6Addresses().get(0));
+                break;
+            }
+        }
         xml.elem("clientToken", inst.getClientToken());
         if (inst.getStateReasonCode() != null || inst.getStateReasonMessage() != null) {
             xml.start("stateReason")
@@ -5806,6 +6048,13 @@ public class Ec2QueryHandler {
             xml.start("item").raw(subnetIpv6AssociationXml(assoc)).end("item");
         }
         xml.end("ipv6CidrBlockAssociationSet")
+                .start("privateDnsNameOptionsOnLaunch")
+                    .elem("hostnameType", s.getPrivateDnsHostnameTypeOnLaunch())
+                    .elem("enableResourceNameDnsARecord",
+                            String.valueOf(s.isEnableResourceNameDnsARecordOnLaunch()))
+                    .elem("enableResourceNameDnsAAAARecord",
+                            String.valueOf(s.isEnableResourceNameDnsAAAARecordOnLaunch()))
+                .end("privateDnsNameOptionsOnLaunch")
                 .elem("ownerId", s.getOwnerId())
                 .raw(tagSetXml(s.getTags()));
         return xml.build();

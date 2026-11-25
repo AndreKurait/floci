@@ -1,8 +1,11 @@
 package io.floci.aws.config;
 
+import io.floci.aws.testing.ExtraCaConfigs;
+import io.floci.aws.testing.ParallelLocks;
 import io.quarkus.runtime.StartupEvent;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -13,13 +16,11 @@ import java.util.Optional;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
-import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
-import static org.mockito.Mockito.mock;
-import static org.mockito.Mockito.when;
 
 /**
  * The floci.tls.extra-ca-path file is checked at startup, from whichever source sets it, with TLS on or off.
  */
+@ResourceLock(ParallelLocks.TLS_CONFIG)
 class TlsExtraCaStartupValidatorTest {
 
     @TempDir
@@ -85,9 +86,6 @@ class TlsExtraCaStartupValidatorTest {
     }
 
     private static TlsExtraCaStartupValidator validator(boolean tlsEnabled, Optional<String> extraCaPath) {
-        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
-        when(config.tls().enabled()).thenReturn(tlsEnabled);
-        when(config.tls().extraCaPath()).thenReturn(extraCaPath);
-        return new TlsExtraCaStartupValidator(config);
+        return new TlsExtraCaStartupValidator(ExtraCaConfigs.config(tlsEnabled, extraCaPath));
     }
 }

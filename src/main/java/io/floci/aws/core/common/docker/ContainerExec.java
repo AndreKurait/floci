@@ -55,9 +55,15 @@ public final class ContainerExec {
 
     /** Runs {@code cmd}, keeping its stdout and stderr apart. */
     public static Result run(DockerClient dockerClient, String containerId, String[] cmd, int timeoutSeconds) {
+        return run(dockerClient, containerId, cmd, List.of(), timeoutSeconds);
+    }
+
+    /** As {@link #run(DockerClient, String, String[], int)}, with {@code env} for this command alone. */
+    public static Result run(DockerClient dockerClient, String containerId, String[] cmd, List<String> env,
+                             int timeoutSeconds) {
         ByteArrayOutputStream stdout = new ByteArrayOutputStream();
         ByteArrayOutputStream stderr = new ByteArrayOutputStream();
-        Result result = run(dockerClient, containerId, cmd, timeoutSeconds, stdout, stderr);
+        Result result = run(dockerClient, containerId, cmd, env, timeoutSeconds, stdout, stderr);
         return new Result(result.exitCode(), stdout.toString(StandardCharsets.UTF_8),
                 joinLines(stderr.toString(StandardCharsets.UTF_8), result.stderr()), result.timedOut());
     }
@@ -98,6 +104,25 @@ public final class ContainerExec {
     /** Runs a command with an additional environment and a subsecond budget. */
     public static Result run(DockerClient dockerClient, String containerId, String[] cmd, List<String> env,
                              Duration timeout, OutputStream stdout, OutputStream stderr) {
+        return run(dockerClient, dockerClient, containerId, cmd, env, timeout, stdout, stderr);
+    }
+
+    /**
+     * As {@link #run(DockerClient, String, String[], List, int, OutputStream, OutputStream)}, the command's
+     * output read over {@code streamingDockerClient}: for a command that may run for a long time, such as a
+     * user's script, so its output stream holds a streaming lease rather than a control-plane one. The exec
+     * is still created and inspected on {@code dockerClient}.
+     */
+    public static Result run(DockerClient dockerClient, DockerClient streamingDockerClient, String containerId,
+                             String[] cmd, List<String> env, int timeoutSeconds, OutputStream stdout,
+                             OutputStream stderr) {
+        return run(dockerClient, streamingDockerClient, containerId, cmd, env,
+                Duration.ofSeconds(timeoutSeconds), stdout, stderr);
+    }
+
+    private static Result run(DockerClient dockerClient, DockerClient streamingDockerClient, String containerId,
+                              String[] cmd, List<String> env, Duration timeout, OutputStream stdout,
+                              OutputStream stderr) {
         ExecCreateCmd create = dockerClient.execCreateCmd(containerId)
                 .withCmd(cmd)
                 .withAttachStdout(true)
@@ -125,7 +150,7 @@ public final class ContainerExec {
                 }
             }
         };
-        dockerClient.execStartCmd(execId).exec(callback);
+        streamingDockerClient.execStartCmd(execId).exec(callback);
 
         try {
             // docker-java closes the attach stream on completion, timeout, or interruption.

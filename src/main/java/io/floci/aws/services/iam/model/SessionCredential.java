@@ -5,7 +5,9 @@ import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 @RegisterForReflection
 @JsonIgnoreProperties(ignoreUnknown = true)
@@ -18,6 +20,11 @@ public class SessionCredential {
     private String roleSessionName;
     private String assumedRoleId;
     private Instant expiration;
+    /**
+     * When the credentials were issued, the request's {@code aws:TokenIssueTime}. Null for a
+     * session stored before Floci recorded it.
+     */
+    private Instant issuedAt;
     /** Inline session policy passed to AssumeRole/GetFederationToken — further restricts role policies. */
     private String sessionPolicyDocument;
     /**
@@ -31,7 +38,11 @@ public class SessionCredential {
     private boolean lambdaExecutionRole;
     private String ec2InstanceId;
     private String ec2RoleId;
-    /** Exact ECS task ARN this session was minted for, when this is a task-role session. */
+    /**
+     * Exact ARN of the workload this session was minted for and is served to at the container
+     * credentials endpoint: an ECS task's, for a task-role session, or a CodeBuild build's, for a
+     * build's service-role session.
+     */
     private String ecsTaskArn;
     /** Exact object action and ARN for an internally generated S3 presigned URL. */
     private String presignedAction;
@@ -59,6 +70,34 @@ public class SessionCredential {
      * long-term half of temporary delegation: a role created with this session carries one.
      */
     private List<String> delegatedRoleBoundaryArns = new ArrayList<>();
+    /**
+     * When the identity behind these credentials last authenticated with an MFA device, which is
+     * what {@code aws:MultiFactorAuthAge} counts from and what makes
+     * {@code aws:MultiFactorAuthPresent} true. Null for a session minted without MFA, which is a
+     * different thing from a long-term key: that session publishes the key as false, where a
+     * long-term key publishes no key at all. A session assumed from an MFA session keeps the
+     * instant the device was used rather than the instant of the assume, so the age keeps
+     * counting from the authentication itself.
+     */
+    private Instant mfaAuthenticatedAt;
+    /**
+     * The session tags this session was minted with, which its requests publish as
+     * {@code aws:PrincipalTag/<key>} beside the tags of the user or role it acts as. They are the
+     * session's own: "session tags are valid only for the current session", and a session carries
+     * them whether they came as a request member, as a SAML assertion's attributes or as a web
+     * identity token's claims. Empty for a session minted with none and for one stored before
+     * Floci recorded them.
+     */
+    private Map<String, String> sessionTags = new LinkedHashMap<>();
+    /**
+     * The keys among those session tags the session was asked to set as transitive, in the order
+     * the request named them: "if you set a tag key as transitive, the corresponding key and value
+     * passes to subsequent sessions in a role chain". A session assumed from this one inherits
+     * those tags and keeps their keys transitive, so a chain carries them all the way down. Empty
+     * for a session that named none, which is AWS's default: "if you choose not to specify a
+     * transitive tag key, then no tags are passed from this session to any subsequent sessions".
+     */
+    private List<String> transitiveTagKeys = new ArrayList<>();
 
     public SessionCredential() {}
 
@@ -127,6 +166,9 @@ public class SessionCredential {
     public Instant getExpiration() { return expiration; }
     public void setExpiration(Instant expiration) { this.expiration = expiration; }
 
+    public Instant getIssuedAt() { return issuedAt; }
+    public void setIssuedAt(Instant issuedAt) { this.issuedAt = issuedAt; }
+
     public String getSessionPolicyDocument() { return sessionPolicyDocument; }
     public void setSessionPolicyDocument(String sessionPolicyDocument) { this.sessionPolicyDocument = sessionPolicyDocument; }
 
@@ -171,4 +213,29 @@ public class SessionCredential {
                 ? new ArrayList<>() : new ArrayList<>(delegatedRoleBoundaryArns);
     }
     public void setDelegatedApproverArn(String arn) { this.delegatedApproverArn = arn; }
+
+    public Instant getMfaAuthenticatedAt() {
+        return mfaAuthenticatedAt;
+    }
+
+    public void setMfaAuthenticatedAt(Instant mfaAuthenticatedAt) {
+        this.mfaAuthenticatedAt = mfaAuthenticatedAt;
+    }
+
+    public Map<String, String> getSessionTags() {
+        return sessionTags;
+    }
+
+    public void setSessionTags(Map<String, String> sessionTags) {
+        this.sessionTags = sessionTags == null ? new LinkedHashMap<>() : new LinkedHashMap<>(sessionTags);
+    }
+
+    public List<String> getTransitiveTagKeys() {
+        return transitiveTagKeys;
+    }
+
+    public void setTransitiveTagKeys(List<String> transitiveTagKeys) {
+        this.transitiveTagKeys = transitiveTagKeys == null
+                ? new ArrayList<>() : new ArrayList<>(transitiveTagKeys);
+    }
 }

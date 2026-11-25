@@ -10,6 +10,9 @@ import io.floci.aws.core.common.PaginatedResult;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.services.ses.address.SesAddressLength;
 import io.floci.aws.services.ses.address.SesAddressSyntax;
+import io.floci.aws.services.ses.mime.SesContentScan;
+import io.floci.aws.services.ses.mime.SesMimeParser;
+import io.floci.aws.services.ses.mime.SesRawMessage;
 import io.floci.aws.services.ses.model.BulkEmailEntry;
 import io.floci.aws.services.ses.model.BulkEmailEntryResult;
 import io.floci.aws.services.ses.model.ConfigurationSet;
@@ -133,6 +136,7 @@ public class SesService {
     // S/MIME certificate associations live in SesIdentityCertificateService, which the v2 controller
     // calls directly; the facade only reaches it for the identity delete-guard.
     private final SesIdentityCertificateService certificateService;
+    private final SesAccountService accountService;
     private final SmtpRelay smtpRelay;
     private final SesEventPublisher eventPublisher;
     private final String defaultAccountId;
@@ -151,8 +155,8 @@ public class SesService {
                        SesSuppressionService suppressionService, SesDedicatedIpService dedicatedIpService,
                        SesTemplateService templateService, SesSentEmailService sentEmailService,
                        SesTenantService tenantService, SesConfigurationSetService configSetService,
-                       SesIdentityCertificateService certificateService, SmtpRelay smtpRelay,
-                       SesEventPublisher eventPublisher, EmulatorConfig config,
+                       SesIdentityCertificateService certificateService, SesAccountService accountService,
+                       SmtpRelay smtpRelay, SesEventPublisher eventPublisher, EmulatorConfig config,
                        RegionResolver regionResolver) {
         this.identityService = identityService;
         this.sentEmailService = sentEmailService;
@@ -165,6 +169,7 @@ public class SesService {
         this.cvetService = cvetService;
         this.tenantService = tenantService;
         this.certificateService = certificateService;
+        this.accountService = accountService;
         this.smtpRelay = smtpRelay;
         this.eventPublisher = eventPublisher;
         this.defaultAccountId = config.defaultAccountId();
@@ -184,6 +189,7 @@ public class SesService {
                SesCvetService cvetService,
                SesTenantService tenantService,
                SesIdentityCertificateService certificateService,
+               SesAccountService accountService,
                SmtpRelay smtpRelay) {
         this.identityService = identityService;
         this.sentEmailService = sentEmailService;
@@ -196,6 +202,7 @@ public class SesService {
         this.cvetService = cvetService;
         this.tenantService = tenantService;
         this.certificateService = certificateService;
+        this.accountService = accountService;
         this.smtpRelay = smtpRelay;
         this.eventPublisher = null;
         this.defaultAccountId = "000000000000";
@@ -277,11 +284,11 @@ public class SesService {
         if (request.content() instanceof EmailContent.Raw raw) {
             return sendRawEmail(request, raw, requireVerifiedSender);
         }
-        Tenant tenant = requireSendingTenant(request.tenantName(), request.region(), request,
-                request::configurationSetName);
         if (request.content() instanceof EmailContent.InlineTemplate inline) {
             requireInlineTemplateContent(inline.subject(), inline.textPart(), inline.htmlPart());
         }
+        Tenant tenant = requireSendingTenant(request.tenantName(), request.region(), request,
+                request::configurationSetName);
         // After a missing sender, AWS reports a malformed address ahead of the destination and
         // configuration-set checks, then an over-long address, then an unverified sender, and only
         // then a missing stored template (probe-confirmed), so the content is resolved last.
@@ -289,6 +296,9 @@ public class SesService {
         SesAddressSyntax.requireEnvelope(request);
         String effectiveConfigSet = validateEnvelope(request);
         SesAddressLength.requireEnvelope(request);
+        if (request.content() instanceof EmailContent.Template template) {
+            SesTemplateService.requireSendTemplateName(template.templateName());
+        }
         if (requireVerifiedSender) {
             requireVerifiedSenders(List.of(
                     new SendingAddress(request.source(), request.sourceArn()),
@@ -297,7 +307,7 @@ public class SesService {
         EmailContent.Simple content = switch (request.content()) {
             case EmailContent.Simple simple -> simple;
             case EmailContent.Template template ->
-                    renderInlineTemplate(templateService.inline(template, request.region()));
+                    SesTemplateService.render(templateService.inline(template, request.region()));
             case EmailContent.InlineTemplate inline -> SesTemplateService.render(inline);
             case EmailContent.Raw raw -> throw new IllegalStateException("Raw content is sent above");
         };
@@ -358,7 +368,7 @@ public class SesService {
     // Whether AWS still checks a Return-Path header that the request's return path overrides has
     // not been probed; every address present is checked.
     private static List<SendingAddress> rawSendingAddresses(SendEmailRequest request, EmailContent.Raw raw,
-                                                            SmtpRelay.RawMessageHeaders headers) {
+                                                            SesRawMessage.Headers headers) {
         String sourceArn = firstNonBlank(request.sourceArn(), headers.sourceArn());
         String fromArn = firstNonBlank(request.fromArn(), headers.fromArn(), sourceArn);
         String returnPathArn = firstNonBlank(request.returnPathArn(), headers.returnPathArn(), sourceArn);
@@ -373,11 +383,6 @@ public class SesService {
         senders.add(new SendingAddress(request.returnPath(), returnPathArn));
         senders.add(new SendingAddress(headers.returnPath(), returnPathArn));
         return senders;
-    }
-
-    private static EmailContent.Simple renderInlineTemplate(EmailContent.InlineTemplate template) {
-        requireInlineTemplateContent(template.subject(), template.textPart(), template.htmlPart());
-        return SesTemplateService.render(template);
     }
 
     private static void requireSource(SendEmailRequest request) {
@@ -450,7 +455,7 @@ public class SesService {
         if (content.hasAttachments()) {
             mime = SmtpRelay.encodeMime(simpleRelayMessage(request, content, effectiveReturnPath, messageId,
                     request.toAddresses(), request.ccAddresses(), null));
-            Message parsedMime = SmtpRelay.parseMime(mime);
+            Message parsedMime = SesMimeParser.parse(mime);
             rejectBlockedAttachments(parsedMime);
             SesContentScan.Result scan = SesContentScan.scan(mime, parsedMime);
             if (scan == SesContentScan.Result.UNREADABLE) {
@@ -540,15 +545,15 @@ public class SesService {
         // X-SES-CONFIGURATION-SET header alone, so the message is read for it only on that path.
         Tenant tenant = requireSendingTenant(request.tenantName(), region, null,
                 () -> firstNonBlank(request.configurationSetName(),
-                        SmtpRelay.parseRawHeaders(raw.data()).configurationSet()));
+                        SesRawMessage.parseRawHeaders(raw.data()).configurationSet()));
         if (raw.data() == null || raw.data().isBlank()) {
             throw new AwsException("InvalidParameterValue", "RawMessage.Data is required.", 400);
         }
         // The MIME headers are always parsed: X-SES-CONFIGURATION-SET can name the configuration
         // set that decides whether events are published at all, so the configuration set cannot be
         // resolved before the message has been read.
-        SmtpRelay.ParsedRawMessage parsed = SmtpRelay.parseRawMessage(raw.data());
-        SmtpRelay.RawMessageHeaders headers = parsed.headers();
+        SesRawMessage.Parsed parsed = SesRawMessage.parseRawMessage(raw.data());
+        SesRawMessage.Headers headers = parsed.headers();
         SesAddressSyntax.requireRaw(request, raw, parsed.message());
         // AWS accepts the configuration set either as a request field or as the
         // X-SES-CONFIGURATION-SET header on the message itself; the request field wins.
@@ -589,6 +594,9 @@ public class SesService {
         SesAddressLength.requireRaw(request, raw, parsed.message());
         if (requireVerifiedSender) {
             requireVerifiedSenders(rawSendingAddresses(request, raw, headers), region);
+            // v2 refuses a paused account only here, after the sender check; v1 SendRawEmail has
+            // already refused it ahead of every check (probe-confirmed).
+            accountService.requireAccountSendingEnabled(region);
         }
         requireTenantAssociations(tenant, effectiveSource, effectiveConfigSet, null, region);
         // Resolve suppression before recording the message so a bad ListManagementOptions (e.g. an
@@ -639,7 +647,7 @@ public class SesService {
         List<String> relayedDestinations = filterUnsuppressed(effectiveDestinations, suppressedReasons);
         if (!rejected && !relayedDestinations.isEmpty()) {
             smtpRelay.relayRaw(new SmtpRelay.RawRelayMessage(effectiveSource, effectiveReturnPath,
-                    relayedDestinations, raw.data(), messageId));
+                    relayedDestinations, parsed.message(), messageId));
         } else {
             LOG.infov("SES raw email accepted but not relayed ({0}): messageId={1}",
                     rejected ? "content rejected" : "all recipients suppressed", messageId);
@@ -889,11 +897,40 @@ public class SesService {
         cvetService.createCustomVerificationEmailTemplate(template, region);
     }
 
-    public void updateCustomVerificationEmailTemplate(CustomVerificationEmailTemplate template, String region) {
+    /**
+     * The v2 update, which takes every member and replaces the stored template with them. The v1
+     * update is {@link #patchCustomVerificationEmailTemplate}.
+     */
+    public void replaceCustomVerificationEmailTemplate(CustomVerificationEmailTemplate template, String region) {
         // Validate (including the From-verified identity check and the required-field checks) before
         // delegating the storage update, matching createCustomVerificationEmailTemplate.
         validateCustomVerificationTemplate(template, region);
-        cvetService.updateCustomVerificationEmailTemplate(template, region);
+        cvetService.replaceCustomVerificationEmailTemplate(template, region);
+    }
+
+    /**
+     * The v1 update, which unlike the v2 one takes any subset of the members (probed). Only the
+     * members given are checked, redirection URLs before the sender, and all of it before the
+     * template's existence. An empty member is checked as if it were absent.
+     */
+    public void patchCustomVerificationEmailTemplate(CustomVerificationEmailTemplate changes, String region) {
+        requireCvetField(changes.getTemplateName(), "TemplateName");
+        if (isGiven(changes.getSuccessRedirectionURL()) && !isValidRedirectUrl(changes.getSuccessRedirectionURL())) {
+            throw new AwsException("InvalidParameterValue", "The success redirection URL is invalid.", 400);
+        }
+        if (isGiven(changes.getFailureRedirectionURL()) && !isValidRedirectUrl(changes.getFailureRedirectionURL())) {
+            throw new AwsException("InvalidParameterValue", "The failure redirection URL is invalid.", 400);
+        }
+        if (isGiven(changes.getFromEmailAddress())
+                && !identityService.isVerifiedSender(changes.getFromEmailAddress(), region)) {
+            throw new AwsException("FromEmailAddressNotVerified",
+                    "The from email address " + changes.getFromEmailAddress() + " is not verified.", 400);
+        }
+        cvetService.patchCustomVerificationEmailTemplate(changes, region);
+    }
+
+    private static boolean isGiven(String member) {
+        return member != null && !member.isEmpty();
     }
 
     // AWS appends this exact disclaimer to the end of every custom verification email and it cannot
@@ -1161,7 +1198,7 @@ public class SesService {
      * The first half of the tenant send gate, run where each send starts: resolves the
      * tenant with the send-flavored not-found wording and refuses a tenant whose sending is DISABLED,
      * or returns null for a send with no tenant. Placement is probe-confirmed: request-shape
-     * validation (a missing Content, an empty inline template, a missing FromEmailAddress on Simple,
+     * validation (a missing Content, an incomplete inline template, a missing FromEmailAddress on Simple,
      * the bulk template-content checks) runs before the tenant lookup, while the recipient checks,
      * the raw MIME-From derivation, and identity verification all lose to the tenant 404. The
      * DISABLED refusal also beats identity verification, the association check and a raw message's
@@ -1572,7 +1609,7 @@ public class SesService {
         return result;
     }
 
-    private static final String UNSUBSCRIBE_PLACEHOLDER = "{{amazonSESUnsubscribeUrl}}";
+    private static final String UNSUBSCRIBE_PLACEHOLDER = SesTemplateService.UNSUBSCRIBE_PLACEHOLDER;
 
     private static boolean hasListManagement(ListManagementOptions listManagement) {
         return listManagement != null && listManagement.contactListName() != null
@@ -1661,18 +1698,19 @@ public class SesService {
     }
 
     /**
-     * Also called by the controller ahead of the tenant send gate: AWS reports an empty inline
-     * template before it looks the tenant up (probe-confirmed), so the check must not stay behind
-     * the gate for tenant sends.
+     * An inline template needs a subject and a text or html part, each with a non-whitespace
+     * character, and AWS answers every incomplete shape with the one message (probe-confirmed on
+     * v2 SendEmail and SendBulkEmail). It is the first check of a send, and the controller runs
+     * it as well, ahead of its own sender and template data checks.
      */
     static void requireInlineTemplateContent(String subject, String textPart, String htmlPart) {
-        boolean hasSubject = subject != null && !subject.isBlank();
-        boolean hasText = textPart != null && !textPart.isBlank();
-        boolean hasHtml = htmlPart != null && !htmlPart.isBlank();
-        if (!hasSubject && !hasText && !hasHtml) {
-            throw new AwsException("InvalidTemplate",
-                    "Template must have at least a subject, text, or html part.", 400);
+        if (isBlank(subject) || (isBlank(textPart) && isBlank(htmlPart))) {
+            throw new AwsException("InvalidTemplate", "Template is missing required fields.", 400);
         }
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.isBlank();
     }
 
     // Probe-confirmed: both bulk sends count the destinations before the stored template lookup,
@@ -1695,11 +1733,11 @@ public class SesService {
     }
 
     public List<BulkEmailEntryResult> sendBulkEmail(SendBulkEmailRequest request) {
-        if (request.source() == null || request.source().isBlank()) {
-            throw new AwsException("InvalidParameterValue", "Source email is required.", 400);
-        }
         if (request.defaultContent() instanceof EmailContent.InlineTemplate inline) {
             requireInlineTemplateContent(inline.subject(), inline.textPart(), inline.htmlPart());
+        }
+        if (request.source() == null || request.source().isBlank()) {
+            throw new AwsException("InvalidParameterValue", "Source email is required.", 400);
         }
         requireBulkDestinationCount(sizeOf(request.entries()));
         // SendBulkEmail refuses a DISABLED tenant before it looks up the configuration set, unlike
@@ -1721,18 +1759,26 @@ public class SesService {
         }
 
         // When no entry names a recipient, SES answers every entry the same, whatever its lists hold
-        // (probe-confirmed for null elements, empty lists and an empty Destination).
+        // (probe-confirmed for null elements, empty lists and an empty Destination). No sender is
+        // checked then, so a paused account is still refused (unprobed).
         if (!anyBulkRecipient(request.entries())) {
+            accountService.requireAccountSendingEnabled(request.region());
             return request.entries().stream()
                     .map(entry -> BulkEmailEntryResult.failure(BulkEmailEntryResult.Status.INVALID_PARAMETER,
                             "Destination cannot be empty"))
                     .toList();
         }
+        if (request.templateName() != null) {
+            SesTemplateService.requireSendTemplateName(request.templateName());
+        }
         // The sender and return path are checked once for the whole call, then a stored template is
-        // looked up, then the tenant associations, as on a single send (probe-confirmed).
+        // looked up, then the tenant associations, as on a single send (probe-confirmed). A paused
+        // account is refused after the sender check (probe-confirmed); placing it ahead of the
+        // template lookup is a choice.
         requireVerifiedSenders(List.of(
                 new SendingAddress(request.source(), request.sourceArn()),
                 new SendingAddress(request.returnPath(), request.returnPathArn())), request.region());
+        accountService.requireAccountSendingEnabled(request.region());
         EmailContent.InlineTemplate template = switch (request.defaultContent()) {
             case EmailContent.Template stored -> templateService.inline(stored, request.region());
             case EmailContent.InlineTemplate inline -> inline;

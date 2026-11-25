@@ -12,9 +12,12 @@ import io.floci.aws.services.ecs.model.EcsServiceModel;
 import io.floci.aws.services.ecs.model.EcsTask;
 import io.floci.aws.services.ecs.model.LaunchType;
 import io.floci.aws.testing.InMemoryStorageFactory;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -44,6 +47,7 @@ import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class EcsEssentialContainerExitServiceTest {
 
     private static final String REGION = "us-east-1";
@@ -277,6 +281,34 @@ class EcsEssentialContainerExitServiceTest {
         verify(manager, times(1)).cleanupStoppedTask(handle);
         verify(manager, never()).stopTaskAndCollectExitCodes(any());
         verify(manager, times(1)).releaseTaskNetwork(task, REGION);
+    }
+
+    @Test
+    void aNamespaceHelperDockerKeptAfterTheContainersExitedIsRetried() {
+        EcsTask task = runningTask(false);
+        when(manager.getExitCodeIfStopped("app-id")).thenReturn(9);
+        when(manager.getExitCodeIfStopped("sidecar-id")).thenReturn(0);
+        doAnswer(invocation -> {
+            EcsTaskHandle stopped = invocation.getArgument(0);
+            stopped.getContainerIds().keySet().forEach(stopped::recordContainerRemoved);
+            stopped.recordNamespaceHelperPending(true);
+            return null;
+        }).when(manager).cleanupStoppedTask(any());
+        when(manager.stopTaskAndCollectExitCodes(any())).thenAnswer(invocation -> {
+            handle.recordNamespaceHelperPending(false);
+            return completeDockerStop();
+        });
+
+        service.reconcile();
+        service.reconcile();
+        assertEquals("STOPPED", task.getLastStatus());
+        verify(manager, times(1)).cleanupStoppedTask(handle);
+
+        // The helper still holds the task's host ports and link-local address, so its removal is retried
+        // until Docker lets it go, and not after.
+        service.reconcile();
+        service.reconcile();
+        verify(manager, times(1)).stopTaskAndCollectExitCodes(handle);
     }
 
     private EcsTask runningTask(boolean explicitEssential) {

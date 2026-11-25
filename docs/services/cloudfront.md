@@ -25,7 +25,95 @@ OPTIONS, POST, PUT, PATCH and DELETE).
 | `UpdateDistribution` | PUT | `/2020-05-31/distribution/{Id}/config` |
 | `DeleteDistribution` | DELETE | `/2020-05-31/distribution/{Id}` |
 | `ListDistributions` | GET | `/2020-05-31/distribution` |
+| `ListDistributionsByConnectionMode` | GET | `/2020-05-31/distributionsByConnectionMode/{ConnectionMode}` |
 | `AssociateAlias` | PUT | `/2020-05-31/distribution/{TargetDistributionId}/associate-alias` |
+
+### Connection Groups
+
+Multi-tenant distributions (`ConnectionMode: tenant-only`) are served through a connection group.
+The account's default group is created automatically with the first `tenant-only` distribution, as
+the [Developer Guide](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/custom-connection-group.html)
+documents, and it can never be deleted. A group is addressable by its id, name or ARN wherever the
+API takes an `Identifier`.
+
+| Operation | Method | Path |
+|---|---|---|
+| `CreateConnectionGroup` | POST | `/2020-05-31/connection-group` |
+| `GetConnectionGroup` | GET | `/2020-05-31/connection-group/{Identifier}` |
+| `GetConnectionGroupByRoutingEndpoint` | GET | `/2020-05-31/connection-group?RoutingEndpoint` |
+| `UpdateConnectionGroup` | PUT | `/2020-05-31/connection-group/{Id}` |
+| `DeleteConnectionGroup` | DELETE | `/2020-05-31/connection-group/{Id}` |
+| `ListConnectionGroups` | POST | `/2020-05-31/connection-groups` |
+
+`CreateConnectionGroup` requires a unique `Name` and answers `EntityAlreadyExists` otherwise. A
+connection group's `RoutingEndpoint` reads like a distribution's domain name and is derived from
+the partition's DNS suffix. `UpdateConnectionGroup` and `DeleteConnectionGroup` require `If-Match`
+and answer `InvalidIfMatchVersion` without it, `PreconditionFailed` on a stale value, and
+`ResourceNotDisabled` on a delete of a group that is still enabled. `ListConnectionGroups` takes
+`Marker`, `MaxItems` and an optional `AssociationFilter.AnycastIpListId`, and returns
+`ConnectionGroupSummary` items carrying the group's `ETag`.
+
+### Distribution Tenants
+
+A distribution tenant is a customer of a multi-tenant distribution: it carries its own domains, a
+connection group, and optional parameters and customizations. The tenants' data plane (serving by
+tenant domain), tenant invalidations, WAF association operations and managed certificate details are
+not implemented.
+
+| Operation | Method | Path |
+|---|---|---|
+| `CreateDistributionTenant` | POST | `/2020-05-31/distribution-tenant` |
+| `GetDistributionTenant` | GET | `/2020-05-31/distribution-tenant/{Identifier}` |
+| `GetDistributionTenantByDomain` | GET | `/2020-05-31/distribution-tenant?domain` |
+| `UpdateDistributionTenant` | PUT | `/2020-05-31/distribution-tenant/{Id}` |
+| `DeleteDistributionTenant` | DELETE | `/2020-05-31/distribution-tenant/{Id}` |
+| `ListDistributionTenants` | POST | `/2020-05-31/distribution-tenants` |
+| `ListDistributionTenantsByCustomization` | POST | `/2020-05-31/distribution-tenants-by-customization` |
+
+The service model does not spell every outcome out, so these are Floci's readings of it:
+
+- `DistributionId` must name an existing distribution (`EntityNotFound` otherwise) whose
+  configuration has `ConnectionMode: tenant-only`. The model declares no code for a standard
+  distribution, so it is answered with `InvalidArgument`. A `ConnectionGroupId` that names no group
+  is `EntityNotFound`; an omitted one is the account's default connection group, and the id comes
+  back on the tenant.
+- `Name` is unique per account (`EntityAlreadyExists`), fixed after creation, and held to the
+  pattern the request shape declares. A tenant is addressable by its id, name or ARN in
+  `GetDistributionTenant`; `UpdateDistributionTenant` and `DeleteDistributionTenant` take the id.
+  Ids are `dt_` followed by 24 characters, like connection group ids. The ARN names the account of
+  the request, as a connection group's does.
+- At least one domain is required, and a tenant has up to 5 (the limit `UpdateDistributionTenant`
+  documents), answered with `EntityLimitExceeded` beyond that. A domain is unique, ignoring case,
+  across all tenants and all distribution `Aliases` (`CNAMEAlreadyExists`), in both directions: a
+  distribution cannot claim an alias a tenant holds, whether in its configuration or through
+  `AssociateAlias`, which also answers `CNAMEAlreadyExists` for a tenant's domain. Floci performs no DNS or certificate checks, so
+  every domain reads back with `Status: active`, and the tenant itself reads `Status: Deployed`.
+- `Enabled` defaults to true. `DeleteDistributionTenant` requires the tenant to be disabled
+  (`ResourceNotDisabled`) and, like `UpdateDistributionTenant`, requires `If-Match`: it answers
+  `InvalidIfMatchVersion` without it and `PreconditionFailed` on a stale value. Every write rotates
+  the `ETag`. An update leaves alone what it omits and replaces `Domains`, `Parameters` and
+  `Customizations` wholesale when it carries them; it may also move the tenant to another
+  `tenant-only` distribution or connection group.
+- `Parameters` and `Customizations` are validated for shape only (`Name` and `Value` are required,
+  parameter name pattern and value length, `WebAcl.Action` is required with a `WebAcl` and
+  `GeoRestrictions.RestrictionType` is held to its enumeration); each failure is `InvalidArgument`. A distribution's
+  `TenantConfig.ParameterDefinitions` is not modeled, so the parameters are stored as given and not
+  checked against the distribution. `ManagedCertificateRequest` is accepted and ignored.
+- `AWS::CloudFront::DistributionTenant` updates are declarative: a template that drops
+  `ConnectionGroupId` moves the tenant back to the account's default connection group, which is what
+  a create without it picks.
+- `ListDistributionTenants` takes `Marker`, `MaxItems` and an optional `AssociationFilter` by
+  `DistributionId` or `ConnectionGroupId`. `ListDistributionTenantsByCustomization` takes exactly one
+  of `WebACLArn` and `CertificateArn` and answers `InvalidArgument` for none or both. Both list
+  tenants by name and return `DistributionTenantSummary` items carrying the tenant's `ETag`.
+- Tags use the CloudFront tag operations on the tenant's ARN, and are removed with the tenant. The
+  `Domains` and `Parameters` lists declare no member name, so the SDKs read their items as `member`
+  elements, which is how Floci writes them; a request is read by position.
+- `DeleteConnectionGroup` answers `CannotDeleteEntityWhileInUse` for a group that a tenant still
+  references, after the `If-Match` checks and the default-group refusal and before the
+  `ResourceNotDisabled` check.
+- Deleting a distribution that still has tenants is not refused: AWS documents no such error, so
+  the tenants keep their stored `DistributionId`.
 
 ### Invalidations
 
@@ -147,6 +235,64 @@ the path:
 | `DeleteKeyGroup` | DELETE | `/2020-05-31/key-group/{Id}` |
 | `ListKeyGroups` | GET | `/2020-05-31/key-group` |
 
+### Stored configurations
+
+These operations store what they are given and return it, so code that manages these resources works, but Floci does not act on them: a continuous deployment policy never diverts a primary distribution's requests to its staging distribution, no real-time log or monitoring-subscription metric is delivered, no field is encrypted, and a streaming distribution serves no RTMP. A staging distribution made by `CopyDistribution` still answers on its own domain name, as any enabled distribution does.
+
+#### Staging distributions and continuous deployment
+
+| Operation | Method | Path |
+|---|---|---|
+| `CopyDistribution` | POST | `/2020-05-31/distribution/{PrimaryDistributionId}/copy` |
+| `CreateContinuousDeploymentPolicy` | POST | `/2020-05-31/continuous-deployment-policy` |
+| `GetContinuousDeploymentPolicy` | GET | `/2020-05-31/continuous-deployment-policy/{Id}` |
+| `UpdateContinuousDeploymentPolicy` | PUT | `/2020-05-31/continuous-deployment-policy/{Id}` |
+| `DeleteContinuousDeploymentPolicy` | DELETE | `/2020-05-31/continuous-deployment-policy/{Id}` |
+| `ListContinuousDeploymentPolicies` | GET | `/2020-05-31/continuous-deployment-policy` |
+
+#### Real-time log configs
+
+| Operation | Method | Path |
+|---|---|---|
+| `CreateRealtimeLogConfig` | POST | `/2020-05-31/realtime-log-config` |
+| `GetRealtimeLogConfig` | POST | `/2020-05-31/get-realtime-log-config` |
+| `UpdateRealtimeLogConfig` | PUT | `/2020-05-31/realtime-log-config` |
+| `DeleteRealtimeLogConfig` | POST | `/2020-05-31/delete-realtime-log-config` |
+| `ListRealtimeLogConfigs` | GET | `/2020-05-31/realtime-log-config` |
+
+#### Field-level encryption
+
+| Operation | Method | Path |
+|---|---|---|
+| `CreateFieldLevelEncryptionConfig` | POST | `/2020-05-31/field-level-encryption` |
+| `GetFieldLevelEncryptionConfig` | GET | `/2020-05-31/field-level-encryption/{Id}/config` |
+| `UpdateFieldLevelEncryptionConfig` | PUT | `/2020-05-31/field-level-encryption/{Id}/config` |
+| `DeleteFieldLevelEncryptionConfig` | DELETE | `/2020-05-31/field-level-encryption/{Id}` |
+| `ListFieldLevelEncryptionConfigs` | GET | `/2020-05-31/field-level-encryption` |
+| `CreateFieldLevelEncryptionProfile` | POST | `/2020-05-31/field-level-encryption-profile` |
+| `GetFieldLevelEncryptionProfile` | GET | `/2020-05-31/field-level-encryption-profile/{Id}` |
+| `UpdateFieldLevelEncryptionProfile` | PUT | `/2020-05-31/field-level-encryption-profile/{Id}/config` |
+| `DeleteFieldLevelEncryptionProfile` | DELETE | `/2020-05-31/field-level-encryption-profile/{Id}` |
+| `ListFieldLevelEncryptionProfiles` | GET | `/2020-05-31/field-level-encryption-profile` |
+
+#### Monitoring subscriptions
+
+| Operation | Method | Path |
+|---|---|---|
+| `CreateMonitoringSubscription` | POST | `/2020-05-31/distributions/{DistributionId}/monitoring-subscription` |
+| `GetMonitoringSubscription` | GET | `/2020-05-31/distributions/{DistributionId}/monitoring-subscription` |
+| `DeleteMonitoringSubscription` | DELETE | `/2020-05-31/distributions/{DistributionId}/monitoring-subscription` |
+
+#### Streaming distributions
+
+| Operation | Method | Path |
+|---|---|---|
+| `CreateStreamingDistribution` | POST | `/2020-05-31/streaming-distribution` |
+| `GetStreamingDistribution` | GET | `/2020-05-31/streaming-distribution/{Id}` |
+| `GetStreamingDistributionConfig` | GET | `/2020-05-31/streaming-distribution/{Id}/config` |
+| `UpdateStreamingDistribution` | PUT | `/2020-05-31/streaming-distribution/{Id}/config` |
+| `DeleteStreamingDistribution` | DELETE | `/2020-05-31/streaming-distribution/{Id}` |
+
 ### Tagging
 
 | Operation | Method | Path |
@@ -179,7 +325,8 @@ the path:
   `<Quantity>N</Quantity><Items>...</Items>`.
 - OAI `CallerReference` uniqueness is enforced — duplicate `CallerReference` values return `CloudFrontOriginAccessIdentityAlreadyExists` (409).
 - CNAME aliases are globally unique. `AssociateAlias` atomically transfers an alias from its current
-  owner to the target distribution. Exact aliases take precedence over the most-specific matching
+  owner to the target distribution, except a domain a distribution tenant holds, which is refused
+  with `CNAMEAlreadyExists`. Exact aliases take precedence over the most-specific matching
   wildcard alias.
 - Viewer requests addressed to an enabled distribution's generated domain or alias are routed to the
   matching S3 or custom origin when the matched cache behavior's `AllowedMethods` includes the
@@ -399,6 +546,18 @@ the path:
   created with no `ViewerCertificate` at all reads the same way, the default certificate on `TLSv1`.
   The `us-east-1` restriction AWS states for ACM certificates is not enforced: a certificate is
   resolved from whatever region its ARN names, as long as it exists.
+- `AWS::CloudFront::Distribution` passes `ViewerCertificate` through, on create and on update, so the
+  certificate and protocol rules above apply to a stack the same way they do to the API.
+- `ConnectionMode` is stored and returned by `GetDistribution`, `GetDistributionConfig`,
+  `ListDistributions` and the create and update responses, and `AWS::CloudFront::Distribution`
+  passes it through. It is held to `direct` and `tenant-only`; anything else is `InvalidArgument`
+  400, the code this service answers a member outside its shape with. An omitted mode is reported
+  as omitted: no published sentence says which mode such a distribution reads back as. A
+  `tenant-only` distribution is otherwise treated like a standard one. The restrictions the
+  Developer Guide lists for multi-tenant distributions (only `sni-only`, no `SSLv3`, no IAM
+  certificate, no `Aliases` or `PriceClass`) are not enforced, because no error code is published
+  for them, and an omitted `ViewerCertificate` on a `tenant-only` distribution reads as the default
+  certificate, the same as on a standard one. AWS documents no default for that case.
 - Up to 20 custom response headers policies can be created, and one policy can be associated with
   up to 100 distributions.
 - The five AWS managed response headers policy IDs are available and can be selected with
@@ -624,20 +783,22 @@ signatures must still return 403. Verify those cases through the proxy after con
 
 ## Not Supported (Phase 2)
 
-- Continuous deployment policies (`CreateContinuousDeploymentPolicy`, etc.)
-- `CopyDistribution` (staging distributions)
-- Real-time log configs (`CreateRealtimeLogConfig`, etc.)
-- Field-level encryption (`CreateFieldLevelEncryptionConfig`, etc.)
+- Continuous deployment: a policy never diverts a primary distribution's requests to its staging
+  distribution (see [Stored configurations](#stored-configurations))
+- Delivering real-time logs, and encrypting fields with field-level encryption
 - `TestFunction` execution (function is stored, not executed)
-- Streaming distributions (RTMP — deprecated by AWS)
+- Serving RTMP for a streaming distribution (deprecated by AWS)
 - VPC origins, Anycast IP lists
+- Serving a `tenant-only` distribution by a tenant's domain, tenant invalidations, web ACL
+  association and managed certificate details (`CreateInvalidationForDistributionTenant`,
+  `AssociateDistributionTenantWebACL`, `GetManagedCertificateDetails`, etc.)
 - Importing keys into a key value store from S3: `CreateKeyValueStore` with an `ImportSource` is rejected with
   `InvalidArgument`
 - Running CloudFront Functions, so the key value store can only be read and written through its API, not
   from a function with `cf.kvs()`
 - CloudFormation provisioning of `AWS::CloudFront::KeyValueStore`, and `KeyValueStoreAssociations` on
   `AWS::CloudFront::Function`
-- Monitoring subscriptions
+- Publishing the additional metrics a monitoring subscription turns on
 - CloudFormation provisioning of custom `AWS::CloudFront::ResponseHeadersPolicy` resources
   (literal custom or managed policy IDs are supported on distributions)
 - Persistent edge caching and global CDN propagation

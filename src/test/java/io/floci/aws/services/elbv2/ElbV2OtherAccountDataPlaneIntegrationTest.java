@@ -1,6 +1,6 @@
 package io.floci.aws.services.elbv2;
 
-import io.floci.aws.testing.RealElbV2DataPlaneProfile;
+import io.floci.aws.testing.RdsMockProfile;
 import io.floci.aws.testutil.FreePorts;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
@@ -19,6 +19,7 @@ import static io.floci.aws.testing.AlbFixtures.deleteListener;
 import static io.floci.aws.testing.AlbFixtures.deleteLoadBalancer;
 import static io.floci.aws.testing.AlbFixtures.deleteTargetGroup;
 import static io.floci.aws.testing.AlbFixtures.registerTarget;
+import static io.floci.aws.testing.AlbFixtures.withHealthCheck;
 import static io.restassured.RestAssured.given;
 import static org.awaitility.Awaitility.await;
 import static org.hamcrest.Matchers.equalTo;
@@ -26,7 +27,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** A listener port carries no credentials, so a load balancer outside the default account must still serve. */
 @QuarkusTest
-@TestProfile(RealElbV2DataPlaneProfile.class)
+@TestProfile(RdsMockProfile.class)
 class ElbV2OtherAccountDataPlaneIntegrationTest {
 
     private static final String ACCOUNT = "111122223333";
@@ -43,7 +44,7 @@ class ElbV2OtherAccountDataPlaneIntegrationTest {
     @Test
     void listenerForwardsAndIsRestoredForItsOwnAccount() throws Exception {
         HttpServer backend = vertx.createHttpServer()
-                .requestHandler(request -> request.response().end("other-account"))
+                .requestHandler(withHealthCheck(request -> request.response().end("other-account")))
                 .listen(0, "127.0.0.1")
                 .toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
         int listenerPort = FreePorts.anyInterfacePort();

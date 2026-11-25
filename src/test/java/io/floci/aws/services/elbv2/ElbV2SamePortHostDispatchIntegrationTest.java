@@ -1,7 +1,7 @@
 package io.floci.aws.services.elbv2;
 
 import io.floci.aws.services.ec2.Ec2Service;
-import io.floci.aws.testing.RealElbV2DataPlaneProfile;
+import io.floci.aws.testing.RdsMockProfile;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
 import io.restassured.specification.RequestSpecification;
@@ -17,7 +17,7 @@ import static org.hamcrest.Matchers.anyOf;
 import static org.hamcrest.Matchers.equalTo;
 
 @QuarkusTest
-@TestProfile(RealElbV2DataPlaneProfile.class)
+@TestProfile(RdsMockProfile.class)
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class ElbV2SamePortHostDispatchIntegrationTest {
 
@@ -41,8 +41,8 @@ class ElbV2SamePortHostDispatchIntegrationTest {
                 .formParam("Action", "CreateLoadBalancer")
                 .formParam("Name", "same-port-first")
                 .formParam("Type", "application")
-                .formParam("Subnets.member.1", Ec2Service.defaultSubnetId("us-east-1", "a"))
-                .formParam("Subnets.member.2", Ec2Service.defaultSubnetId("us-east-1", "b"))
+                .formParam("Subnets.member.1", Ec2Service.defaultSubnetId("us-east-1", "a", "000000000000"))
+                .formParam("Subnets.member.2", Ec2Service.defaultSubnetId("us-east-1", "b", "000000000000"))
                 .formParam("Scheme", "internet-facing")
                 .header("Authorization", AUTH)
             .when()
@@ -79,8 +79,8 @@ class ElbV2SamePortHostDispatchIntegrationTest {
                 .formParam("Action", "CreateLoadBalancer")
                 .formParam("Name", "same-port-second")
                 .formParam("Type", "application")
-                .formParam("Subnets.member.1", Ec2Service.defaultSubnetId("us-east-1", "a"))
-                .formParam("Subnets.member.2", Ec2Service.defaultSubnetId("us-east-1", "b"))
+                .formParam("Subnets.member.1", Ec2Service.defaultSubnetId("us-east-1", "a", "000000000000"))
+                .formParam("Subnets.member.2", Ec2Service.defaultSubnetId("us-east-1", "b", "000000000000"))
                 .formParam("Scheme", "internet-facing")
                 .header("Authorization", AUTH)
             .when()

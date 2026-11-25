@@ -14,8 +14,9 @@ import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
 import java.time.Clock;
-import java.time.ZoneOffset;
+import java.time.Instant;
 import java.time.ZonedDateTime;
+import java.time.temporal.ChronoUnit;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -43,8 +44,8 @@ public class RuleScheduler implements Resettable {
     }
 
     /**
-     * Test seam: lets cron next-fire computation be exercised deterministically instead
-     * of depending on wall-clock time. Production code always goes through the
+     * Test seam: lets cron next-fire computation and event time be exercised deterministically
+     * instead of depending on wall-clock time. Production code always goes through the
      * public/{@code @Inject} constructor, which pins the system clock.
      */
     RuleScheduler(Vertx vertx,
@@ -102,7 +103,7 @@ public class RuleScheduler implements Resettable {
 
         long timerId = vertx.setPeriodic(intervalMs, id -> tick(ruleArn, id, dataSupplier));
         scheduleContexts.put(ruleArn, new ScheduleContext(timerId, scheduleExpr));
-        tick(ruleArn, timerId, dataSupplier);
+        currentScheduleData(ruleArn, timerId, dataSupplier);
         LOG.debugv("Started rate scheduler for rule {0} with interval {1}ms", ruleArn, intervalMs);
     }
 
@@ -150,7 +151,7 @@ public class RuleScheduler implements Resettable {
         }
     }
 
-    private void tick(String ruleArn, long timerId, Supplier<ScheduleData> dataSupplier) {
+    private ScheduleData currentScheduleData(String ruleArn, long timerId, Supplier<ScheduleData> dataSupplier) {
         ScheduleData data = dataSupplier.get();
         
         if (data == null || data.rule == null) {
@@ -158,6 +159,15 @@ public class RuleScheduler implements Resettable {
             vertx.cancelTimer(timerId);
             // A rule recreated under the same ARN may already have its own timer; leave that one.
             scheduleContexts.computeIfPresent(ruleArn, (arn, ctx) -> ctx.timerId() == timerId ? null : ctx);
+            return null;
+        }
+
+        return data;
+    }
+
+    private void tick(String ruleArn, long timerId, Supplier<ScheduleData> dataSupplier) {
+        ScheduleData data = currentScheduleData(ruleArn, timerId, dataSupplier);
+        if (data == null) {
             return;
         }
 
@@ -187,14 +197,13 @@ public class RuleScheduler implements Resettable {
 
     private String buildScheduledEvent(Rule rule, String region) {
         try {
-            ZonedDateTime now = ZonedDateTime.now(ZoneOffset.UTC);
             ObjectNode node = objectMapper.createObjectNode();
             node.put("version", "0");
             node.put("id", UUID.randomUUID().toString());
             node.put("source", "aws.events");
             node.put("detail-type", "Scheduled Event");
             node.put("account", rule.getAccountId() != null ? rule.getAccountId() : defaultAccountId);
-            node.put("time", now.toInstant().toString());
+            node.put("time", Instant.now(clock).truncatedTo(ChronoUnit.SECONDS).toString());
             node.put("region", region);
             node.putArray("resources").add(rule.getArn());
             node.putObject("detail");

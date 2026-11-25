@@ -6,6 +6,7 @@ import org.junit.jupiter.api.*;
 
 import java.util.Map;
 
+import static io.floci.aws.testing.EnforcementFixtures.auth;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.*;
 
@@ -102,7 +103,8 @@ class AthenaIntegrationTest {
             .post("/")
         .then()
             .statusCode(400)
-            .body("__type", equalTo("InvalidRequestException"));
+            .body("__type", equalTo("InvalidRequestException"))
+            .body("message", equalTo("QueryExecution nonexistent-id was not found"));
     }
 
     @Test
@@ -515,6 +517,17 @@ class AthenaIntegrationTest {
             .body("QueryExecution.Status.StateChangeReason", equalTo("Invalid database properties"))
             .body("QueryExecution.StatementType", equalTo("DDL"))
             .body("QueryExecution.ResultConfiguration", nullValue());
+
+        given()
+            .header("X-Amz-Target", "AmazonAthena.GetQueryResults")
+            .contentType(CONTENT_TYPE)
+            .body("{ \"QueryExecutionId\": \"" + id + "\" }")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("InvalidRequestException"))
+            .body("message", equalTo("Query did not finish successfully. Final query state: FAILED"));
     }
 
     @Test
@@ -577,5 +590,93 @@ class AthenaIntegrationTest {
         .then()
             .statusCode(200)
             .body("QueryExecution.WorkGroup", equalTo("primary"));
+    }
+
+    @Test
+    @Order(18)
+    void startQueryExecutionRecordsTheQueryWithoutItsTrailingSemicolons() {
+        String id = given()
+            .header("X-Amz-Target", "AmazonAthena.StartQueryExecution")
+            .contentType(CONTENT_TYPE)
+            .body("{ \"QueryString\": \"\\nSELECT 1 ;;\\n\" }")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("QueryExecutionId");
+
+        given()
+            .header("X-Amz-Target", "AmazonAthena.GetQueryExecution")
+            .contentType(CONTENT_TYPE)
+            .body("{ \"QueryExecutionId\": \"" + id + "\" }")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("QueryExecution.Query", equalTo("SELECT 1"));
+    }
+
+    @Test
+    @Order(19)
+    void startQueryExecutionRejectsASecondStatementAsMalformed() {
+        given()
+            .header("X-Amz-Target", "AmazonAthena.StartQueryExecution")
+            .contentType(CONTENT_TYPE)
+            .body("{ \"QueryString\": \"SELECT 1; -- done\" }")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("InvalidRequestException"))
+            .body("message", equalTo("Only one sql statement is allowed. Got: SELECT 1; -- done"))
+            .body("AthenaErrorCode", equalTo("MALFORMED_QUERY"));
+    }
+
+    @Test
+    @Order(20)
+    void aQueryExecutionIsAnsweredOnlyInTheRegionItWasStartedIn() {
+        String id = given()
+            .header("X-Amz-Target", "AmazonAthena.StartQueryExecution")
+            .contentType(CONTENT_TYPE)
+            .body("{ \"QueryString\": \"SELECT 1\" }")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .extract().path("QueryExecutionId");
+        String elsewhere = auth("test", "eu-west-1", "athena");
+
+        given()
+            .header("Authorization", elsewhere)
+            .header("X-Amz-Target", "AmazonAthena.GetQueryExecution")
+            .contentType(CONTENT_TYPE)
+            .body("{ \"QueryExecutionId\": \"" + id + "\" }")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(400)
+            .body("__type", equalTo("InvalidRequestException"))
+            .body("message", equalTo("QueryExecution " + id + " was not found"));
+
+        given()
+            .header("Authorization", elsewhere)
+            .header("X-Amz-Target", "AmazonAthena.ListQueryExecutions")
+            .contentType(CONTENT_TYPE)
+            .body("{}")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("QueryExecutionIds", not(hasItem(id)));
+
+        given()
+            .header("X-Amz-Target", "AmazonAthena.GetQueryExecution")
+            .contentType(CONTENT_TYPE)
+            .body("{ \"QueryExecutionId\": \"" + id + "\" }")
+        .when()
+            .post("/")
+        .then()
+            .statusCode(200)
+            .body("QueryExecution.QueryExecutionId", equalTo(id));
     }
 }

@@ -9,7 +9,10 @@ import io.floci.aws.core.common.docker.ContainerLifecycleManager;
 import io.floci.aws.core.common.docker.ContainerSpec;
 import io.floci.aws.core.common.docker.DockerHostResolver;
 import io.floci.aws.core.common.docker.PerKeyContainerPool;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.mockito.ArgumentCaptor;
 
 import java.lang.reflect.Field;
@@ -31,6 +34,7 @@ import static org.mockito.Mockito.when;
  * reset, nuke, and shutdown after their in-flight requests complete. Containers are seeded into
  * the pool by reflection, so these tests need no Docker daemon.
  */
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class PypiserverSidecarManagerTest {
 
     private final ContainerBuilder containerBuilder = mock(ContainerBuilder.class);
@@ -88,7 +92,8 @@ class PypiserverSidecarManagerTest {
         ContainerBuilder realBuilder = new ContainerBuilder(
                 deepConfig, mock(DockerHostResolver.class), mock(EmbeddedDnsServer.class));
         when(lifecycleManager.startCreated(any(), any())).thenThrow(new IllegalStateException("no Docker here"));
-        PypiserverSidecarManager manager = new PypiserverSidecarManager(realBuilder, lifecycleManager, deepConfig);
+        PypiserverSidecarManager manager = new PypiserverSidecarManager(realBuilder, lifecycleManager, deepConfig,
+                new CodeArtifactContainerRuns(lifecycleManager, deepConfig).containers());
 
         assertThrows(IllegalStateException.class, () -> manager.ensureReady("pypi-repo-1", "http://localhost:4566"));
 
@@ -107,7 +112,8 @@ class PypiserverSidecarManagerTest {
     }
 
     private PypiserverSidecarManager manager() {
-        return new PypiserverSidecarManager(containerBuilder, lifecycleManager, config);
+        return new PypiserverSidecarManager(containerBuilder, lifecycleManager, config,
+                new CodeArtifactContainerRuns(lifecycleManager, config).containers());
     }
 
     @SuppressWarnings("unchecked")

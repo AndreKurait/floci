@@ -2,7 +2,6 @@ package io.floci.aws.services.amazonmq.model;
 
 import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonProperty;
-import io.floci.aws.core.common.AwsArnUtils;
 import io.quarkus.runtime.annotations.RegisterForReflection;
 
 import java.time.Instant;
@@ -111,6 +110,17 @@ public class Broker {
      */
     private String dockerVolumeName;
 
+    /**
+     * The RabbitMQ node name the broker's container runs as, which names its data directory in the volume, so a
+     * later container finds the same users, vhosts and messages. Null on a broker whose container ran under
+     * Docker's own hostname, whose data no later container can find.
+     */
+    private String nodeName;
+
+    /** The host ports the broker's AMQP and console ports were published on, which a restart publishes again. */
+    private Integer amqpHostPort;
+    private Integer consoleHostPort;
+
     public Broker() {}
 
     public Broker(String brokerId, String brokerArn, String brokerName,
@@ -138,12 +148,6 @@ public class Broker {
 
     public String getBrokerArn() { return brokerArn; }
     public void setBrokerArn(String brokerArn) { this.brokerArn = brokerArn; }
-
-    /**
-     * The Region the broker's ARN names; a broker recorded without one counts as {@code defaultRegion}'s.
-     * Not a getter, so Jackson neither persists nor returns it.
-     */
-    public String region(String defaultRegion) { return AwsArnUtils.regionOrDefault(brokerArn, defaultRegion); }
 
     public String getBrokerName() { return brokerName; }
     public void setBrokerName(String brokerName) { this.brokerName = brokerName; }
@@ -217,4 +221,13 @@ public class Broker {
     public String getDockerVolumeName() { return dockerVolumeName; }
 
     public void setDockerVolumeName(String dockerVolumeName) { this.dockerVolumeName = dockerVolumeName; }
+
+    public String getNodeName() { return nodeName; }
+    public void setNodeName(String nodeName) { this.nodeName = nodeName; }
+
+    public Integer getAmqpHostPort() { return amqpHostPort; }
+    public void setAmqpHostPort(Integer amqpHostPort) { this.amqpHostPort = amqpHostPort; }
+
+    public Integer getConsoleHostPort() { return consoleHostPort; }
+    public void setConsoleHostPort(Integer consoleHostPort) { this.consoleHostPort = consoleHostPort; }
 }

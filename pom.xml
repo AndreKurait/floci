@@ -20,7 +20,16 @@
         <apicurio.version>2.6.13.Final</apicurio.version>
         <everit.json.schema.version>1.14.6</everit.json.schema.version>
         <wire.version>7.1.2</wire.version>
-        <aws.sdk.version>2.57.7</aws.sdk.version>
+        <aws.sdk.version>2.59.7</aws.sdk.version>
+        <!-- Nightly checks skip unless -Dnightly.checks.enabled=true, but a skipped @QuarkusTest still
+             costs its profile's application: Quarkus builds every profile's application while JUnit
+             discovers the tests, before any class is skipped, and keeps it for the rest of the JVM.
+             Leaving them out of discovery saves that heap in every routine run; the nightly-checks
+             profile below brings them back. -->
+        <nightly.checks.excludes>**/*NightlyIntegrationTest.java</nightly.checks.excludes>
+        <!-- How JUnit runs test classes against each other. Quarkus test classes share one emulator and
+             run one at a time; ci.yml runs the plain classes in a pass of their own with concurrent. -->
+        <test.classes.mode>same_thread</test.classes.mode>
     </properties>
 
     <dependencyManagement>
@@ -92,6 +101,11 @@
     </dependencyManagement>
 
     <dependencies>
+        <dependency>
+            <groupId>com.google.re2j</groupId>
+            <artifactId>re2j</artifactId>
+            <version>1.8</version>
+        </dependency>
         <dependency>
             <groupId>io.opentelemetry.proto</groupId>
             <artifactId>opentelemetry-proto</artifactId>
@@ -388,6 +402,12 @@
         </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
+            <artifactId>translate</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
             <artifactId>dynamodb</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
@@ -407,6 +427,12 @@
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>eventbridge</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>kinesis</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
         </dependency>
@@ -556,6 +582,12 @@
         </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
+            <artifactId>cloudtrail</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
             <artifactId>appsync</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
@@ -641,6 +673,18 @@
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
             <artifactId>ecs</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>kinesisanalyticsv2</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>opensearch</artifactId>
             <version>${aws.sdk.version}</version>
             <scope>test</scope>
         </dependency>
@@ -838,13 +882,18 @@
                     <!-- The suite's end-of-run live set exceeds the 4g default heap of
                          16g CI runners; a full GC near the end reclaims almost nothing. -->
                     <argLine>@{argLine} -Xmx6g</argLine>
+                    <excludes>
+                        <!-- Surefire's default exclude, kept since a configured list replaces it. -->
+                        <exclude>**/*$*</exclude>
+                        <exclude>${nightly.checks.excludes}</exclude>
+                    </excludes>
                     <systemPropertyVariables>
                         <java.util.logging.manager>org.jboss.logmanager.LogManager</java.util.logging.manager>
                         <!-- Parallel execution is opt-in per class; CPU-heavy service
                              tests with independent fixtures can share four workers. -->
                         <junit.jupiter.execution.parallel.enabled>true</junit.jupiter.execution.parallel.enabled>
                         <junit.jupiter.execution.parallel.mode.default>same_thread</junit.jupiter.execution.parallel.mode.default>
-                        <junit.jupiter.execution.parallel.mode.classes.default>same_thread</junit.jupiter.execution.parallel.mode.classes.default>
+                        <junit.jupiter.execution.parallel.mode.classes.default>${test.classes.mode}</junit.jupiter.execution.parallel.mode.classes.default>
                         <junit.jupiter.execution.parallel.config.strategy>fixed</junit.jupiter.execution.parallel.config.strategy>
                         <junit.jupiter.execution.parallel.config.fixed.parallelism>4</junit.jupiter.execution.parallel.config.fixed.parallelism>
                         <junit.jupiter.execution.parallel.config.fixed.max-pool-size>4</junit.jupiter.execution.parallel.config.fixed.max-pool-size>
@@ -912,6 +961,19 @@
     </build>
 
     <profiles>
+        <profile>
+            <!-- The flag a nightly check reads to run at all also lets Surefire select it. -->
+            <id>nightly-checks</id>
+            <activation>
+                <property>
+                    <name>nightly.checks.enabled</name>
+                    <value>true</value>
+                </property>
+            </activation>
+            <properties>
+                <nightly.checks.excludes>**/*$*</nightly.checks.excludes>
+            </properties>
+        </profile>
         <profile>
             <id>native</id>
             <activation>

@@ -9,6 +9,7 @@ import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.services.cloudwatch.metrics.model.Alarm;
 import io.floci.aws.services.cloudwatch.metrics.model.AlarmHistoryItem;
+import io.floci.aws.services.cloudwatch.metrics.model.AlarmMetricDataQuery;
 import io.floci.aws.services.cloudwatch.metrics.model.CompositeAlarm;
 import io.floci.aws.services.cloudwatch.metrics.model.Dimension;
 import io.floci.aws.services.cloudwatch.metrics.model.MetricAlarm;
@@ -16,9 +17,11 @@ import io.floci.aws.services.cloudwatch.metrics.model.MetricDatum;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.NullSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.math.BigInteger;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -406,6 +409,147 @@ class CloudWatchMetricsServiceTest {
         assertFalse(points.isEmpty());
         assertEquals(5.0, points.getFirst().sum());
         assertEquals(1.0, points.getFirst().sampleCount());
+    }
+
+    @Test
+    void getMetricStatistics_readsDatapointsTheStoreHeldBeforeTheIndexWasBuilt() {
+        InMemoryStorage<String, MetricDatum> store = new InMemoryStorage<>();
+        CloudWatchMetricsService loaded = new CloudWatchMetricsService(
+                store, new InMemoryStorage<>(), new RegionResolver(REGION, "000000000000"));
+        long minute = (Instant.now().getEpochSecond() / 60) * 60 - 120;
+        MetricDatum persisted = datum("Requests", 7);
+        persisted.setNamespace(NAMESPACE);
+        persisted.setTimestamp(minute);
+        persisted.setSampleCount(1.0);
+        persisted.setSum(7.0);
+        persisted.setMinimum(7.0);
+        persisted.setMaximum(7.0);
+        store.put(REGION + "::" + NAMESPACE + "::Requests::::"
+                + MetricKeyIndex.timestampSegment(minute) + "::persisted", persisted);
+
+        loaded.buildMetricKeyIndex();
+
+        List<CloudWatchMetricsService.Datapoint> points = loaded.getMetricStatistics(
+                NAMESPACE, "Requests", null, Instant.ofEpochSecond(minute), Instant.ofEpochSecond(minute + 60),
+                60, List.of("Sum"), null, REGION);
+        assertEquals(1, points.size());
+        assertEquals(7.0, points.getFirst().sum());
+    }
+
+    @Test
+    void deleteMetricDataBefore_dropsOnlyTheNamespacesOlderDatapoints() {
+        long minute = (Instant.now().getEpochSecond() / 60) * 60 - 600;
+        MetricDatum old = datum("Requests", 1);
+        old.setTimestamp(minute);
+        MetricDatum recent = datum("Requests", 2);
+        recent.setTimestamp(minute + 120);
+        MetricDatum otherNamespace = datum("Requests", 4);
+        otherNamespace.setTimestamp(minute);
+        service.putMetricData(NAMESPACE, List.of(old, recent), REGION);
+        service.putMetricData("Other/Metrics", List.of(otherNamespace), REGION);
+
+        service.deleteMetricDataBefore(NAMESPACE, Instant.ofEpochSecond(minute + 60));
+
+        Instant start = Instant.ofEpochSecond(minute);
+        Instant end = Instant.ofEpochSecond(minute + 180);
+        assertEquals(List.of(2.0), service.getMetricStatistics(NAMESPACE, "Requests", null, start, end,
+                60, List.of("Sum"), null, REGION).stream().map(CloudWatchMetricsService.Datapoint::sum).toList());
+        assertEquals(List.of(4.0), service.getMetricStatistics("Other/Metrics", "Requests", null, start, end,
+                60, List.of("Sum"), null, REGION).stream().map(CloudWatchMetricsService.Datapoint::sum).toList());
+    }
+
+    @Test
+    void deleteOldestMetricData_cutsOnlyThatNamespaceBackToNineTenthsOfTheCeiling() {
+        long minute = (Instant.now().getEpochSecond() / 60) * 60 - 6000;
+        putOnePerMinute(service, null, "AWS/SQS", minute, 12);
+        putOnePerMinute(service, null, NAMESPACE, minute, 12);
+
+        service.deleteOldestMetricData("AWS/SQS", 10);
+
+        assertEquals(minutesFrom(minute, 3, 12), storedMinutes("AWS/SQS", minute));
+        assertEquals(minutesFrom(minute, 0, 12), storedMinutes(NAMESPACE, minute));
+    }
+
+    @Test
+    void deleteOldestMetricData_leavesANamespaceThatHoldsExactlyTheCeiling() {
+        long minute = (Instant.now().getEpochSecond() / 60) * 60 - 6000;
+        putOnePerMinute(service, null, "AWS/SQS", minute, 10);
+
+        service.deleteOldestMetricData("AWS/SQS", 10);
+
+        assertEquals(minutesFrom(minute, 0, 10), storedMinutes("AWS/SQS", minute));
+    }
+
+    @Test
+    void deleteOldestMetricData_countsEachAccountOnItsOwn() {
+        AccountAwareStorageBackend<MetricDatum> store = AccountAwareStorageBackend.inMemory("000000000000");
+        CloudWatchMetricsService accountAware = new CloudWatchMetricsService(store, new InMemoryStorage<>(),
+                new RegionResolver("us-east-1", "000000000000"));
+        long minute = (Instant.now().getEpochSecond() / 60) * 60 - 6000;
+        putOnePerMinute(accountAware, "111111111111", "AWS/SQS", minute, 12);
+        putOnePerMinute(accountAware, null, "AWS/SQS", minute, 8);
+
+        accountAware.deleteOldestMetricData("AWS/SQS", 10);
+
+        assertEquals(9, store.scanForAccount("111111111111", k -> true).size());
+        assertEquals(8, store.scan(k -> true).size());
+    }
+
+    @Test
+    void deleteOldestMetricData_cutsBackAStoreThatWasLoadedPastTheCeiling() {
+        AccountAwareStorageBackend<MetricDatum> store = AccountAwareStorageBackend.inMemory("000000000000");
+        RegionResolver resolver = new RegionResolver("us-east-1", "000000000000");
+        long minute = (Instant.now().getEpochSecond() / 60) * 60 - 6000;
+        putOnePerMinute(new CloudWatchMetricsService(store, new InMemoryStorage<>(), resolver), null, "AWS/SQS",
+                minute, 30);
+        CloudWatchMetricsService restarted = new CloudWatchMetricsService(store, new InMemoryStorage<>(), resolver);
+
+        restarted.deleteOldestMetricData("AWS/SQS", 10);
+
+        assertEquals(9, store.scan(k -> true).size());
+    }
+
+    @Test
+    void deleteOldestMetricData_waitsForTheKeyIndex() {
+        long minute = (Instant.now().getEpochSecond() / 60) * 60 - 6000;
+        putOnePerMinute(service, null, "AWS/SQS", minute, 12);
+        service.beforeReset();
+
+        service.deleteOldestMetricData("AWS/SQS", 10);
+        assertEquals(minutesFrom(minute, 0, 12), storedMinutes("AWS/SQS", minute));
+
+        service.afterReset();
+        service.deleteOldestMetricData("AWS/SQS", 10);
+        assertEquals(minutesFrom(minute, 3, 12), storedMinutes("AWS/SQS", minute));
+    }
+
+    private void putOnePerMinute(CloudWatchMetricsService target, String accountId, String namespace,
+                                 long firstMinute, int count) {
+        for (int i = 0; i < count; i++) {
+            MetricDatum datum = datum(i % 2 == 0 ? "Sent" : "Received", 1);
+            datum.setTimestamp(firstMinute + 60L * i);
+            target.putMetricDataForAccount(accountId, namespace, List.of(datum), REGION);
+        }
+    }
+
+    /** The minutes for which {@code namespace} still holds a datapoint of either metric, oldest first. */
+    private List<Instant> storedMinutes(String namespace, long firstMinute) {
+        List<Instant> minutes = new ArrayList<>();
+        for (String metric : List.of("Sent", "Received")) {
+            service.getMetricStatistics(namespace, metric, null, Instant.ofEpochSecond(firstMinute),
+                            Instant.ofEpochSecond(firstMinute + 6000), 60, List.of("Sum"), null, REGION)
+                    .forEach(point -> minutes.add(point.timestamp()));
+        }
+        minutes.sort(null);
+        return minutes;
+    }
+
+    private static List<Instant> minutesFrom(long firstMinute, int from, int to) {
+        List<Instant> minutes = new ArrayList<>();
+        for (int i = from; i < to; i++) {
+            minutes.add(Instant.ofEpochSecond(firstMinute + 60L * i));
+        }
+        return minutes;
     }
 
     // ──────────────────────────── GetMetricStatistics ────────────────────────────
@@ -913,5 +1057,51 @@ class CloudWatchMetricsServiceTest {
         assertEquals(1.0, store.scanForAccount("111111111111", k -> true).getFirst().getValue());
         assertEquals(1, store.scan(k -> true).size(), "the default partition holds only the ambient put");
         assertEquals(2.0, store.scan(k -> true).getFirst().getValue());
+    }
+
+    // M: MetricName, X: Metrics, C: neither (an EvaluationCriteria alarm); "-" is no interval
+    @ParameterizedTest
+    @CsvSource(nullValues = "-", value = {
+            "5, M, true, LOW", "9, M, true, LOW", "9, C, true, LOW", "-99999999999999999999, C, true, LOW",
+            "10, M, true, COMBINATION", "45, M, true, COMBINATION", "60, X, true, COMBINATION",
+            "3600, M, true, COMBINATION", "3601, M, true, HIGH", "99999999999999999999, M, true, HIGH",
+            "60, C, true, STORED", "3600, C, true, STORED", "-, M, true, STORED",
+            "60, M, false, NAME", "60, C, false, NAME", "-, M, false, NAME",
+            "5, M, false, NAME_LOW", "99999999999999999999, M, false, NAME_HIGH"})
+    void evaluationIntervalIsCheckedAfterTheNameThenItsRangeThenTheAlarmKind(String interval, String kind,
+            boolean named, String expected) {
+        MetricAlarm alarm = new MetricAlarm();
+        alarm.setAlarmName(named ? "a" : null);
+        if ("M".equals(kind)) {
+            alarm.setMetricName("Errors");
+        } else if ("X".equals(kind)) {
+            alarm.getMetrics().add(new AlarmMetricDataQuery("m1", "1 + 1", null, true, null, null, null));
+        }
+        BigInteger value = interval == null ? null : new BigInteger(interval);
+        if ("STORED".equals(expected)) {
+            service.putMetricAlarm(alarm, REGION, value);
+            assertEquals(1, service.describeAlarms(List.of("a"), null, REGION).size());
+            return;
+        }
+
+        AwsException refused = assertThrows(AwsException.class, () -> service.putMetricAlarm(alarm, REGION, value));
+
+        String nameOnly = named ? null
+                : assertThrows(AwsException.class, () -> service.putMetricAlarm(alarm, REGION)).getMessage();
+        String bound = expected.endsWith("LOW") ? "greater than or equal to 10" : "less than or equal to 3600";
+        String range = "Value '" + interval + "' at 'evaluationInterval' failed to satisfy constraint: Member must "
+                + "have value " + bound;
+        switch (expected) {
+            case "COMBINATION" -> {
+                assertEquals("InvalidParameterCombination", refused.getErrorCode());
+                assertEquals("EvaluationInterval cannot be specified for alarms configured with MetricName or "
+                        + "Metrics.", refused.getMessage());
+            }
+            case "NAME" -> assertEquals(nameOnly, refused.getMessage());
+            case "LOW", "HIGH" -> assertEquals("1 validation error detected: " + range, refused.getMessage());
+            default -> assertEquals("2 validation errors detected: " + nameOnly.substring(nameOnly.indexOf(": ") + 2)
+                    + "; " + range, refused.getMessage());
+        }
+        assertTrue(service.describeAlarms(List.of("a"), null, REGION).isEmpty());
     }
 }

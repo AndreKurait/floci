@@ -417,6 +417,17 @@ that matches, so an undefined condition in a later rule is never evaluated.
 The cause of a real execution carries the state prefix described under
 [The cause of a failure](#the-cause-of-a-failure).
 
+## JSONata constructed-array paths
+
+An indexed constructed array followed by a property path follows JSONata 2.0.6's
+sequence reduction rules. For example,
+`$exists([$states.input.Items.{'ok':true}][0].ok)` returns `false`, including when
+`Items` has one element. The unwrapped path returns no value, so using it directly
+as a state's `Output` fails with `States.QueryEvaluationError`.
+Group the array before indexing, `([$states.input.Items.{'ok':true}])[0].ok`,
+to read the first object's property. A standalone `[...][0]` still returns the
+first object.
+
 ## JSONata functions
 
 State machines with `"QueryLanguage": "JSONata"` reach the six functions Step Functions adds on
@@ -789,7 +800,7 @@ type comes from the Service Authorization Reference:
 
 | Resource | Action | Resource evaluated | Refused with |
 |---|---|---|---|
-| `arn:aws:states:::aws-sdk:scheduler:createSchedule`, `updateSchedule`, `deleteSchedule` | `scheduler:CreateSchedule` and so on | `schedule/<GroupName>/<Name>`, `default` for a group left out | `Scheduler.AccessDeniedException` |
+| `arn:aws:states:::aws-sdk:scheduler:createSchedule`, `updateSchedule`, `deleteSchedule` | `scheduler:CreateSchedule` and so on | As a direct request: `schedule/<GroupName>/<Name>`, Scheduler's `default` for a group left out | `Scheduler.AccessDeniedException` |
 | `arn:aws:states:::aws-sdk:cloudformation:<api>` | `cloudformation:<Action>` | See below | `CloudFormation.AccessDeniedException` |
 | `arn:aws:states:::http:invoke` | `states:InvokeHTTPEndpoint` | The state machine | `States.Http.AccessDeniedException` |
 | `arn:aws:states:::aws-sdk:ec2:describeRegions` | `ec2:DescribeRegions` | `*` | `Ec2.AccessDeniedException` |

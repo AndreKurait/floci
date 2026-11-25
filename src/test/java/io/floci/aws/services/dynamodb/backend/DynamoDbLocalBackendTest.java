@@ -17,8 +17,10 @@ import io.floci.aws.services.dynamodb.model.KeySchemaElement;
 import io.floci.aws.services.dynamodb.model.LocalSecondaryIndex;
 import io.floci.aws.services.dynamodb.model.TableDefinition;
 import io.floci.aws.services.kinesis.KinesisService;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 
@@ -50,6 +52,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /** The DynamoDB Local engine: identity translation, Floci-held tags, typed operations and lifecycle. */
+@ResourceLock(ParallelLocks.PORTS)
 class DynamoDbLocalBackendTest {
 
     private static final String ACCOUNT = "123456789012";
@@ -424,6 +427,31 @@ class DynamoDbLocalBackendTest {
         execute("CreateTable", "{\"TableName\":\"orders\",\"Tags\":[{\"Key\":\"env\",\"Value\":\"dev\"}]}");
 
         assertEquals(Map.of("env", "dev"), backend.listTagsOfResource(SCOPE, ORDERS_ARN));
+    }
+
+    @Test
+    void storedTagsAreTheTagsHeldForTheTableTheArnNamesAndForAnIndexItHolds() throws Exception {
+        answer("DescribeTable", 200, "{\"Table\":{\"TableName\":\"orders\",\"TableArn\":\"" + LOCAL
+                + "table/orders\",\"TableStatus\":\"ACTIVE\","
+                + "\"GlobalSecondaryIndexes\":[{\"IndexName\":\"byCustomer\"}]}}");
+        backend.tagResource(SCOPE, ORDERS_ARN, Map.of("team", "data"));
+
+        assertEquals(Map.of("team", "data"), backend.storedTags(ORDERS_ARN));
+        assertEquals(Map.of("team", "data"), backend.storedTags(ORDERS_ARN + "/index/byCustomer"));
+        assertEquals(Map.of(), backend.storedTags(ORDERS_ARN + "/index/byStatus"));
+        assertEquals(Map.of(), backend.storedTags(PUBLIC + STREAM_RESOURCE));
+        assertEquals(Map.of(), backend.storedTags(ORDERS_ARN.replace(ACCOUNT, "111122223333")));
+        assertEquals(Map.of(), backend.storedTags(ORDERS_ARN.replace(REGION, "us-east-1")));
+        assertEquals(Map.of(), backend.storedTags("arn:aws-cn:dynamodb:" + REGION + ":" + ACCOUNT + ":table/orders"));
+    }
+
+    @Test
+    void storedTagsAreNoneForATableDynamoDbLocalNoLongerHas() throws Exception {
+        tags.putForAccount(ACCOUNT, REGION + "/orders", Map.of("team", "data"));
+        answer("DescribeTable", 400, "{\"__type\":\"com.amazonaws.dynamodb.v20120810#ResourceNotFoundException\","
+                + "\"message\":\"Requested resource not found\"}");
+
+        assertEquals(Map.of(), backend.storedTags(ORDERS_ARN));
     }
 
     @Test

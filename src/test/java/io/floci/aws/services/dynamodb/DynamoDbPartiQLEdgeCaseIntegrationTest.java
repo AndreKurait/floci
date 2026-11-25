@@ -11,6 +11,7 @@ import org.junit.jupiter.api.TestMethodOrder;
 
 import java.util.Arrays;
 import java.util.List;
+import java.util.Map;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
@@ -18,6 +19,8 @@ import static io.floci.aws.testing.DynamoDbRequests.nestedMap;
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.contains;
 import static org.hamcrest.Matchers.containsInAnyOrder;
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.empty;
 import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.notNullValue;
 import static org.hamcrest.Matchers.nullValue;
@@ -856,6 +859,322 @@ class DynamoDbPartiQLEdgeCaseIntegrationTest {
                 {"TableName":"%s","Key":{"pk":{"S":"%s"},"sk":{"S":"1"}},"ConsistentRead":true}
                 """.formatted(TABLE, pk))
             .statusCode(200);
+    }
+
+    @Test
+    @Order(34)
+    void refusesAKeyReadWhoseFilterNamesAKey() {
+        String select = "SELECT sk FROM " + QUOTED_TABLE + " WHERE ";
+        String refused = "Filter Expression can only contain non-primary key attributes: Primary key attribute: ";
+
+        for (String where : List.of("pk='ranges' AND (NOT sk='1' OR flag='one')",
+                "pk='ranges' AND NOT (sk='1' AND flag='one')",
+                "pk='ranges' AND NOT NOT sk='1'",
+                "pk='ranges' AND NOT size(sk) = 1",
+                "pk='ranges' AND (size(sk) = 1 OR flag='one')",
+                "pk IN ['ranges','ranges-other'] AND (NOT sk='1' OR flag='one')",
+                "pk='ranges' AND (NOT pk='ranges-other' OR NOT sk='1')",
+                "pk='ranges' AND ((sk='1' AND NOT size(sk) = 1) OR (sk='2' AND NOT size(sk) = 1))",
+                "(pk='ranges' AND NOT size(pk) = 1) OR (pk='ranges-other' AND NOT size(sk) = 1)")) {
+            statement(select + where).statusCode(400).body("message", equalTo(refused + "sk"));
+        }
+        for (String where : List.of("pk='ranges' AND (NOT pk='ranges-other' OR flag='one')",
+                "pk='ranges' AND ((sk='1' AND NOT size(sk) = 1) OR (sk='2' AND NOT size(pk) = 1))",
+                "pk='ranges' AND ((sk='2' AND NOT size(pk) = 1) OR (sk='1' AND NOT size(sk) = 1))")) {
+            statement(select + where).statusCode(400).body("message", equalTo(refused + "pk"));
+        }
+        for (String where : List.of("pk='ranges' AND NOT sk='1'",
+                "pk='ranges' AND size(sk) = 1",
+                "pk='ranges' AND (sk<>'1' OR flag='one')",
+                "(pk='ranges' AND (NOT sk='1' OR flag='one')) OR (pk='ranges-other' AND flag='two')",
+                "pk='ranges' AND ((sk='1' AND NOT size(sk) = 1) OR sk='2')",
+                "pk='ranges' AND ((sk='1' AND flag='one') OR (sk='2' AND NOT size(sk) = 1))",
+                "NOT sk='1' OR flag='one'")) {
+            statement(select + where).statusCode(200);
+        }
+    }
+
+    @Test
+    @Order(35)
+    void readsTheWholeTableForABranchThatNamesTheSortKeyTwice() {
+        String select = "SELECT sk FROM " + QUOTED_TABLE + " WHERE ";
+
+        statement(select + "pk='ranges' AND sk >= '1' AND sk <= '2'")
+            .statusCode(200)
+            .body("Items.sk.S", containsInAnyOrder("1", "2"));
+        statement(select + "pk='ranges' AND ((sk >= '1' AND sk <= '2') OR sk = '1')")
+            .statusCode(200)
+            .body("Items.sk.S", containsInAnyOrder("1", "2"));
+        statement(select + "pk='ranges' AND (sk = '1' OR flag = 'x') AND (sk = '2' OR flag = 'one')")
+            .statusCode(200)
+            .body("Items.sk.S", contains("1"));
+        for (int count : List.of(9, 16)) {
+            String pairs = IntStream.range(0, count)
+                    .mapToObj(n -> "(sk = 's" + n + "' OR flag = '" + n + "')")
+                    .collect(Collectors.joining(" AND "));
+            statement(select + "pk='ranges' AND " + pairs).statusCode(200).body("Items", empty());
+        }
+        for (String where : List.of("pk='ranges' AND sk = '1' AND sk = '2'",
+                "pk=true AND sk >= '1' AND sk <= '2'", "pk=1 AND sk >= '1' AND sk <= '2'",
+                "pk='ranges' AND sk >= 1 AND sk <= '2'",
+                "pk=true AND ((sk >= 'b' AND sk <= 'c') OR sk = 'a')",
+                "pk=true AND (sk = 's0' OR flag = '0') AND (sk = 's1' OR flag = '1')",
+                "pk='ranges' AND ((sk >= 'b' AND sk <= 'c') OR sk = 1)")) {
+            statement(select + where).statusCode(200).body("Items", empty());
+        }
+
+        statement(select + "pk='ranges' AND (sk = '1' OR flag = 'x') AND (sk = '1' OR flag = 'one')")
+            .statusCode(400)
+            .body("message", equalTo("Overlapping conditions with range keys are not supported in where clause"));
+        for (String where : List.of("pk=true AND (sk = 'a' OR (sk >= 'b' AND sk <= 'c'))",
+                "pk=true AND (flag = '0' OR sk = 's0') AND (sk = 's1' OR flag = '1')")) {
+            statement(select + where)
+                .statusCode(400)
+                .body("message", equalTo("Key value must be of type S, N, or B. Key name: pk, Key type: BOOL"));
+        }
+        statement(select + "pk='ranges' AND sk >= '1' AND sk <= '2' ORDER BY sk DESC")
+            .statusCode(400)
+            .body("message", equalTo(
+                    "Must have at least one non-optional hash key condition in WHERE clause when using ORDER BY clause."));
+    }
+
+    @Test
+    @Order(36)
+    void readsTheWholeIndexForABranchThatNamesItsSortKeyTwice() {
+        request("DynamoDB_20120810.CreateTable", """
+                {
+                  "TableName": "partiql-edge-cases-index-sort",
+                  "AttributeDefinitions": [
+                    {"AttributeName":"pk","AttributeType":"S"},
+                    {"AttributeName":"sk","AttributeType":"S"},
+                    {"AttributeName":"g","AttributeType":"S"},
+                    {"AttributeName":"gs","AttributeType":"S"},
+                    {"AttributeName":"l","AttributeType":"S"}
+                  ],
+                  "KeySchema": [
+                    {"AttributeName":"pk","KeyType":"HASH"},
+                    {"AttributeName":"sk","KeyType":"RANGE"}
+                  ],
+                  "GlobalSecondaryIndexes": [{
+                    "IndexName": "gix",
+                    "KeySchema": [{"AttributeName":"g","KeyType":"HASH"},{"AttributeName":"gs","KeyType":"RANGE"}],
+                    "Projection": {"ProjectionType":"ALL"}
+                  }],
+                  "LocalSecondaryIndexes": [{
+                    "IndexName": "lix",
+                    "KeySchema": [{"AttributeName":"pk","KeyType":"HASH"},{"AttributeName":"l","KeyType":"RANGE"}],
+                    "Projection": {"ProjectionType":"ALL"}
+                  }],
+                  "BillingMode": "PAY_PER_REQUEST"
+                }
+                """)
+            .statusCode(200);
+        for (List<String> item : List.of(List.of("r1", "a", "0"), List.of("r2", "b", "1"), List.of("r3", "c", "2"))) {
+            request("DynamoDB_20120810.PutItem", """
+                    {"TableName":"partiql-edge-cases-index-sort","Item":{"pk":{"S":"p"},"sk":{"S":"%1$s"},
+                     "g":{"S":"ga"},"gs":{"S":"%2$s"},"l":{"S":"%2$s"},"x":{"S":"%3$s"}}}
+                    """.formatted(item.get(0), item.get(1), item.get(2)))
+                .statusCode(200);
+        }
+        String gsi = "SELECT sk FROM \"partiql-edge-cases-index-sort\".\"gix\" WHERE ";
+        String lsi = "SELECT sk FROM \"partiql-edge-cases-index-sort\".\"lix\" WHERE ";
+
+        statement(gsi + "g = 'ga' AND gs >= 'a' AND gs <= 'b'")
+            .statusCode(200)
+            .body("Items.sk.S", containsInAnyOrder("r1", "r2"));
+        statement(lsi + "pk = 'p' AND l >= 'a' AND l <= 'b'")
+            .statusCode(200)
+            .body("Items.sk.S", containsInAnyOrder("r1", "r2"));
+        for (String select : List.of(gsi + "g = 1 AND gs >= 'a' AND gs <= 'b'",
+                gsi + "g = 'ga' AND (gs = 'a' OR x = '0') AND (gs = 'b' OR x = '1')",
+                lsi + "pk = 1 AND l >= 'a' AND l <= 'b'",
+                lsi + "pk = 'p' AND (l = 'a' OR x = '0') AND (l = 'b' OR x = '1')")) {
+            statement(select).statusCode(200).body("Items", empty());
+        }
+
+        for (String select : List.of(gsi + "g = 1 AND gs >= 'a'", gsi + "g = 1 AND sk >= 'r1' AND sk <= 'r2'")) {
+            statement(select)
+                .statusCode(400)
+                .body("message", equalTo("Key attribute's data type should match its data type in table's schema: Key g"));
+        }
+        for (String select : List.of(lsi + "pk = 1 AND l >= 'a'", lsi + "pk = 1 AND sk >= 'r1' AND sk <= 'r2'")) {
+            statement(select)
+                .statusCode(400)
+                .body("message", equalTo("Key attribute's data type should match its data type in table's schema: Key pk"));
+        }
+        statement(gsi + "g = 'ga' AND (gs = 'a' OR x = '0') AND (gs = 'a' OR x = '1')")
+            .statusCode(400)
+            .body("message", equalTo("Overlapping conditions with range keys are not supported in where clause"));
+        for (String select : List.of(gsi + "g = 'ga' AND gs >= 'a' AND gs <= 'b' ORDER BY gs DESC",
+                lsi + "pk = 'p' AND l >= 'a' AND l <= 'b' ORDER BY l DESC")) {
+            statement(select)
+                .statusCode(400)
+                .body("message", equalTo(
+                        "Must have at least one non-optional hash key condition in WHERE clause when using ORDER BY clause."));
+        }
+    }
+
+    @Test
+    @Order(37)
+    void listsUnprojectedColumnsInTheSameOrderWhateverTheStatementOrder() {
+        String refused = "One or more parameter values were invalid: Global secondary index gsi-inc does not project ";
+        Map<List<String>, String> lists = Map.of(
+                List.of("nonproj", "lsiSk"), "[nonproj, lsiSk]",
+                List.of("lsiSk", "nonproj"), "[nonproj, lsiSk]",
+                List.of("alpha", "beta", "gamma", "delta"), "[delta, alpha, gamma, beta]",
+                List.of("x1", "x2", "x3", "x10", "x20"), "[x10, x20, x1, x2, x3]");
+
+        lists.forEach((columns, list) -> statement("SELECT " + String.join(", ", columns)
+                + " FROM \"partiql-edge-cases-index\".\"gsi-inc\" WHERE gsiPk = 'y'")
+            .statusCode(400)
+            .body("message", equalTo(refused + list)));
+    }
+
+    @Test
+    @Order(38)
+    void writesWithAGroupedOrOrNotInTheWhereClause() {
+        String attributes = "\"y\":{\"N\":\"1\"},\"z\":{\"N\":\"1\"}";
+        String where = " WHERE pk='grouped-or' AND sk='1' AND ";
+        putItem("grouped-or", attributes);
+
+        statement("UPDATE " + QUOTED_TABLE + " SET a=1" + where + "(y=1 OR y=2)").statusCode(200);
+        statement("UPDATE " + QUOTED_TABLE + " SET b=1" + where + "NOT (y=3 OR y=2)").statusCode(200);
+        transaction("UPDATE " + QUOTED_TABLE + " SET c=1" + where + "NOT (y=3 AND z=1)").statusCode(200);
+        getItem("grouped-or")
+            .body("Item.a.N", equalTo("1"))
+            .body("Item.b.N", equalTo("1"))
+            .body("Item.c.N", equalTo("1"));
+
+        statement("DELETE FROM " + QUOTED_TABLE + where + "(y=1 OR y=2)").statusCode(200);
+        getItem("grouped-or").body("Item", nullValue());
+
+        putItem("grouped-or", attributes);
+        transaction("DELETE FROM " + QUOTED_TABLE + where + "NOT (y=3 OR y=2)").statusCode(200);
+        getItem("grouped-or").body("Item", nullValue());
+    }
+
+    private static final String NUMERIC_TABLE = "partiql-between-numeric-sk";
+    private static final String MIXED_BOUNDS = "The BETWEEN operator requires same data type for lower and upper "
+            + "bounds; lower bound operand: ";
+    private static final String REVERSED_BOUNDS = "The BETWEEN operator requires upper bound to be greater than "
+            + "or equal to lower bound; lower bound operand: ";
+    private static final String BETWEEN_WHERE = " WHERE pk='between' AND sk='1' AND ";
+
+    @Test
+    @Order(39)
+    void refusesUpdateWithBetweenBoundsOfDifferentTypesOrReversed() {
+        putItem("between", "\"y\":{\"N\":\"2\"}");
+        String update = "UPDATE " + QUOTED_TABLE + " SET a=1" + BETWEEN_WHERE;
+
+        statement(update + "y BETWEEN 1 AND 'b'")
+            .statusCode(400)
+            .body("message", equalTo(MIXED_BOUNDS + "AttributeValue: {N:1}, upper bound operand: AttributeValue: {S:b}"));
+        statement(update + "y BETWEEN 3 AND 1")
+            .statusCode(400)
+            .body("message", equalTo(REVERSED_BOUNDS + "AttributeValue: {N:3}, upper bound operand: AttributeValue: {N:1}"));
+        statement(update + "NOT (y BETWEEN 3 AND 1)").statusCode(400);
+        statement(update + "(y = 2 OR y BETWEEN 1 AND 'b')").statusCode(400);
+        getItem("between").body("Item.a", nullValue());
+
+        statement(update + "y BETWEEN 2 AND 10").statusCode(200);
+        statement(update + "y BETWEEN 2.0 AND 2").statusCode(200);
+        getItem("between").body("Item.a.N", equalTo("1"));
+    }
+
+    @Test
+    @Order(40)
+    void refusesSelectDeleteAndTheOtherPartiQLApisWithBetweenBounds() {
+        String mixed = MIXED_BOUNDS + "AttributeValue: {N:1}, upper bound operand: AttributeValue: {S:b}";
+        String select = "SELECT * FROM " + QUOTED_TABLE + " WHERE y BETWEEN 1 AND 'b'";
+        String delete = "DELETE FROM " + QUOTED_TABLE + BETWEEN_WHERE + "y BETWEEN 1 AND 'b'";
+
+        statement(select).statusCode(400).body("message", equalTo(mixed));
+        statement(delete).statusCode(400).body("message", equalTo(mixed));
+        transaction(delete)
+            .statusCode(400)
+            .body("__type", equalTo("ValidationException"))
+            .body("message", equalTo("Validation failed in TransactStatements[0]: " + mixed));
+        request("DynamoDB_20120810.BatchExecuteStatement", "{\"Statements\":[{\"Statement\":" + json(delete) + "}]}")
+            .statusCode(200)
+            .body("Responses[0].Error.Code", equalTo("ValidationError"))
+            .body("Responses[0].Error.Message", equalTo(mixed));
+        getItem("between").body("Item.y.N", equalTo("2"));
+    }
+
+    @Test
+    @Order(41)
+    void showsBetweenBoundsTheWayDynamoDbDoes() {
+        String update = "UPDATE " + QUOTED_TABLE + " SET a=2" + BETWEEN_WHERE;
+
+        statement(update + "y BETWEEN 1e2 AND 1")
+            .statusCode(400)
+            .body("message", equalTo(REVERSED_BOUNDS + "AttributeValue: {N:1E+2}, upper bound operand: AttributeValue: {N:1}"));
+        statement(update + "y BETWEEN ? AND ?", "[{\"N\":\"3.50\"},{\"N\":\"1\"}]")
+            .statusCode(400)
+            .body("message", equalTo(REVERSED_BOUNDS + "AttributeValue: {N:3.50}, upper bound operand: AttributeValue: {N:1}"));
+        statement(update + "y BETWEEN ? AND ?", "[{\"B\":\"AQI=\"},{\"S\":\"3\"}]")
+            .statusCode(400)
+            .body("message", equalTo(MIXED_BOUNDS + "AttributeValue: {B:[AQI=]}, upper bound operand: AttributeValue: {S:3}"));
+        statement(update + "y BETWEEN ? AND ?", "[{\"B\":\"AQI=\"},{\"B\":\"AQ==\"}]")
+            .statusCode(400)
+            .body("message", equalTo(REVERSED_BOUNDS + "AttributeValue: {B:[AQI=]}, upper bound operand: AttributeValue: {B:[AQ==]}"));
+        statement(update + "y BETWEEN 1 AND true")
+            .statusCode(400)
+            .body("message", equalTo("Incorrect operand type for operator or function; "
+                    + "operator or function: BETWEEN, operand type: BOOL"));
+        getItem("between").body("Item.a.N", equalTo("1"));
+    }
+
+    @Test
+    @Order(42)
+    void reportsTheFirstFailingConditionInWrittenOrder() {
+        String update = "UPDATE " + QUOTED_TABLE + " SET a=3" + BETWEEN_WHERE;
+        String mixed = MIXED_BOUNDS + "AttributeValue: {N:1}, upper bound operand: AttributeValue: {S:b}";
+        String reversed = REVERSED_BOUNDS + "AttributeValue: {N:3}, upper bound operand: AttributeValue: {N:1}";
+        String beginsWith = "Incorrect operand type for operator or function; "
+                + "operator or function: begins_with, operand type: N";
+
+        statement(update + "y BETWEEN 1 AND 'b' AND y BETWEEN 3 AND 1").body("message", equalTo(mixed));
+        statement(update + "y BETWEEN 3 AND 1 AND y BETWEEN 1 AND 'b'").body("message", equalTo(reversed));
+        statement(update + "begins_with(z, 1) AND y BETWEEN 1 AND 'b'").body("message", equalTo(beginsWith));
+        statement(update + "y BETWEEN 1 AND 'b' AND begins_with(z, 1)").body("message", equalTo(mixed));
+        statement(update + "y BETWEEN 1 AND 'b' AND y = 1e999")
+            .body("message", containsString("Number overflow"));
+        statement(update + "y BETWEEN 1 AND 'b' AND nope(z)")
+            .body("message", containsString("Unrecognized function: nope"));
+        statement("UPDATE " + QUOTED_TABLE + " SET x = set_add(z, 1)" + BETWEEN_WHERE + "y BETWEEN 1 AND 'b'")
+            .statusCode(400)
+            .body("message", equalTo(mixed));
+        getItem("between").body("Item.a.N", equalTo("1"));
+    }
+
+    @Test
+    @Order(43)
+    void refusesBetweenBoundsOfASortKeyCondition() {
+        request("DynamoDB_20120810.CreateTable", """
+                {
+                  "TableName": "%s",
+                  "AttributeDefinitions": [
+                    {"AttributeName":"pk","AttributeType":"S"},
+                    {"AttributeName":"sk","AttributeType":"N"}
+                  ],
+                  "KeySchema": [
+                    {"AttributeName":"pk","KeyType":"HASH"},
+                    {"AttributeName":"sk","KeyType":"RANGE"}
+                  ],
+                  "BillingMode": "PAY_PER_REQUEST"
+                }
+                """.formatted(NUMERIC_TABLE))
+            .statusCode(200);
+        String select = "SELECT * FROM \"" + NUMERIC_TABLE + "\" WHERE pk = 'a' AND sk BETWEEN ";
+
+        statement(select + "1 AND 'b'")
+            .statusCode(400)
+            .body("message", equalTo(MIXED_BOUNDS + "AttributeValue: {N:1}, upper bound operand: AttributeValue: {S:b}"));
+        statement(select + "3 AND 1")
+            .statusCode(400)
+            .body("message", equalTo(REVERSED_BOUNDS + "AttributeValue: {N:3}, upper bound operand: AttributeValue: {N:1}"));
+        statement(select + "1 AND 3").statusCode(200);
     }
 
     private static void putItem(String pk, String attributes) {

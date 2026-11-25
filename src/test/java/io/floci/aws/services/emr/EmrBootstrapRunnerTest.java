@@ -16,9 +16,11 @@ import io.floci.aws.services.lambda.launcher.BootstrapProcess;
 import io.floci.aws.services.lambda.launcher.LambdaExecutionRoleCredentials;
 import io.floci.aws.services.s3.S3Service;
 import io.floci.aws.services.s3.model.S3Object;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -56,6 +58,7 @@ import static org.mockito.Mockito.when;
  * A cluster's bootstrap actions run one after the other through {@code docker exec}, as root, in one
  * container of the release's image, which is then kept as the image the cluster's steps run in.
  */
+@ResourceLock(ParallelLocks.TLS_CONFIG)
 class EmrBootstrapRunnerTest {
 
     private static final String ACCOUNT = "123456789012";
@@ -83,6 +86,7 @@ class EmrBootstrapRunnerTest {
     void setUp() {
         when(builder.newContainer(anyString())).thenReturn(spec);
         when(lifecycle.getDockerClient()).thenReturn(docker);
+        when(lifecycle.getStreamingDockerClient()).thenReturn(docker);
         when(lifecycle.createAndStart(any()))
                 .thenReturn(new ContainerLifecycleManager.ContainerInfo(CONTAINER, Map.of()));
         when(roleCredentials.forRole(any(), any(), any())).thenReturn(Optional.empty());
@@ -102,6 +106,20 @@ class EmrBootstrapRunnerTest {
                     }
                     return null;
                 });
+    }
+
+    // Catches: a bootstrap action, a user's script with no timeout, holding a control-plane connection for
+    // as long as it runs instead of a streaming one.
+    @Test
+    void eachActionsOutputStreamsOnTheStreamingClient() {
+        DockerClient streaming = mock(DockerClient.class);
+        when(lifecycle.getStreamingDockerClient()).thenReturn(streaming);
+        ContainerExecStubs.completeEveryExec(docker, streaming, CONTAINER, 0, "installed\n", "");
+
+        runner.run(bootstrap(null, action("s3://bucket/bootstrap/install.sh"),
+                action("s3n://bucket/bootstrap/jars.sh")), () -> false);
+
+        verify(streaming, times(2)).execStartCmd(anyString());
     }
 
     @Test

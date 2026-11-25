@@ -185,8 +185,29 @@ public class SesQueryHandler {
                         "Operation " + action + " is not supported by SES.", AwsNamespaces.SES, 400);
             };
         } catch (AwsException e) {
-            return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.SES, e.getHttpStatus());
+            return AwsQueryResponse.error(e.getErrorCode(), spellOutControlCharacters(e.getMessage()),
+                    AwsNamespaces.SES, e.getHttpStatus());
         }
+    }
+
+    /**
+     * SES writes a control character a message quotes as {@code 0x0009}, which also keeps the
+     * characters XML 1.0 forbids out of the error document.
+     */
+    static String spellOutControlCharacters(String message) {
+        if (message == null || message.chars().noneMatch(c -> c < ' ')) {
+            return message;
+        }
+        StringBuilder out = new StringBuilder(message.length() + 8);
+        for (int i = 0; i < message.length(); i++) {
+            char c = message.charAt(i);
+            if (c < ' ') {
+                out.append(String.format(Locale.ROOT, "0x%04x", (int) c));
+            } else {
+                out.append(c);
+            }
+        }
+        return out.toString();
     }
 
     private Response handleVerifyEmailIdentity(MultivaluedMap<String, String> params, String region) {
@@ -256,10 +277,7 @@ public class SesQueryHandler {
     }
 
     private Response handleSendEmail(MultivaluedMap<String, String> params, String region) {
-        if (!accountService.isAccountSendingEnabled(region)) {
-            throw new AwsException("AccountSendingPausedException",
-                    "Account sending is disabled.", 400);
-        }
+        accountService.requireAccountSendingEnabled(region);
         String source = getParam(params, "Source");
         List<String> toAddresses = extractMembers(params, "Destination.ToAddresses");
         List<String> ccAddresses = extractMembers(params, "Destination.CcAddresses");
@@ -293,10 +311,7 @@ public class SesQueryHandler {
     }
 
     private Response handleSendRawEmail(MultivaluedMap<String, String> params, String region) {
-        if (!accountService.isAccountSendingEnabled(region)) {
-            throw new AwsException("AccountSendingPausedException",
-                    "Account sending is disabled.", 400);
-        }
+        accountService.requireAccountSendingEnabled(region);
         String source = getParam(params, "Source");
         List<String> destinations = extractMembers(params, "Destinations");
         String rawMessage = getParam(params, "RawMessage.Data");
@@ -475,10 +490,6 @@ public class SesQueryHandler {
     private Response handleSetIdentityMailFromDomain(MultivaluedMap<String, String> params, String region) {
         String identityValue = getParam(params, "Identity");
         String mailFromDomain = getParam(params, "MailFromDomain");
-        if (mailFromDomain == null) {
-            throw new AwsException("InvalidParameterValue",
-                    "MailFromDomain is required (use an empty string to clear the existing setting).", 400);
-        }
         String behaviorOnMxFailure = getParam(params, "BehaviorOnMXFailure");
         identityService.setMailFromDomain(identityValue, mailFromDomain, behaviorOnMxFailure,
                 region);
@@ -496,20 +507,26 @@ public class SesQueryHandler {
         return raw != null && AwsQueryBooleans.parse(raw);
     }
 
+    /**
+     * Probed: an identity the account does not hold gets no entry, and one without a MAIL FROM
+     * domain reports {@code BehaviorOnMXFailure} alone, although the model requires all three.
+     */
     private Response handleGetIdentityMailFromDomainAttributes(MultivaluedMap<String, String> params, String region) {
         List<String> identities = extractMembers(params, "Identities");
         XmlBuilder xml = new XmlBuilder().start("MailFromDomainAttributes");
         for (String identityValue : identities) {
             Identity identity = identityService.getMailFromAttributes(identityValue, region);
+            if (identity == null) {
+                continue;
+            }
             xml.start("entry");
             xml.elem("key", identityValue);
             xml.start("value");
-            xml.elem("MailFromDomain", identity != null && identity.getMailFromDomain() != null
-                    ? identity.getMailFromDomain() : "");
-            xml.elem("MailFromDomainStatus", identity != null
-                    ? identity.getMailFromDomainStatus() : "Pending");
-            xml.elem("BehaviorOnMXFailure", identity != null
-                    ? identity.getBehaviorOnMxFailure() : "UseDefaultValue");
+            xml.elem("BehaviorOnMXFailure", identity.getBehaviorOnMxFailure());
+            if (identity.getMailFromDomain() != null) {
+                xml.elem("MailFromDomain", identity.getMailFromDomain());
+                xml.elem("MailFromDomainStatus", identity.getMailFromDomainStatus());
+            }
             xml.end("value");
             xml.end("entry");
         }
@@ -558,7 +575,7 @@ public class SesQueryHandler {
 
     private Response handleCreateTemplate(MultivaluedMap<String, String> params, String region) {
         EmailTemplate template = readTemplateParams(params);
-        templateService.createTemplate(template, region);
+        templateService.createTemplate(template, region, regionResolver.getAccountId());
         return Response.ok(AwsQueryResponse.envelopeEmptyResult("CreateTemplate", AwsNamespaces.SES)).build();
     }
 
@@ -612,10 +629,7 @@ public class SesQueryHandler {
     }
 
     private Response handleSendTemplatedEmail(MultivaluedMap<String, String> params, String region) {
-        if (!accountService.isAccountSendingEnabled(region)) {
-            throw new AwsException("AccountSendingPausedException",
-                    "Account sending is disabled.", 400);
-        }
+        accountService.requireAccountSendingEnabled(region);
         String source = getParam(params, "Source");
         List<String> toAddresses = extractMembers(params, "Destination.ToAddresses");
         List<String> ccAddresses = extractMembers(params, "Destination.CcAddresses");
@@ -625,13 +639,10 @@ public class SesQueryHandler {
         String templateArn = getParam(params, "TemplateArn");
         String templateDataRaw = getParam(params, "TemplateData");
 
-        boolean hasName = templateName != null && !templateName.isBlank();
-        boolean hasArn = templateArn != null && !templateArn.isBlank();
-        if (!hasName && !hasArn) {
-            throw new AwsException("InvalidParameterValue",
-                    "Template or TemplateArn is required.", 400);
+        if (templateName == null) {
+            throw SmithyValidationErrors.validationError(SmithyValidationErrors.notNullWithoutValue("template"));
         }
-        String resolvedName = hasName ? templateName : SesTemplateService.templateNameFromArn(templateArn);
+        String resolvedName = sendTemplateName(templateName.isEmpty(), templateName, templateArn, region);
 
         JsonNode templateData = parseTemplateData(templateDataRaw);
         String configurationSetName = getParam(params, "ConfigurationSetName");
@@ -658,15 +669,12 @@ public class SesQueryHandler {
 
     private Response handleTestRenderTemplate(MultivaluedMap<String, String> params, String region) {
         String templateName = getParam(params, "TemplateName");
-        if (templateName == null || templateName.isBlank()) {
-            throw new AwsException("InvalidParameterValue", "TemplateName is required.", 400);
-        }
         String templateDataRaw = getParam(params, "TemplateData");
-        String rendered = templateService.renderTestTemplate(templateName, templateDataRaw, region);
-        // XML 1.0 character data forbids C0 controls except \t \n \r; strip them
-        // so SDK clients can parse the response when template data injects \x01 etc.
-        String xmlSafe = stripXml10InvalidChars(rendered);
-        String result = new XmlBuilder().elem("RenderedTemplate", xmlSafe).build();
+        String rendered = templateService.renderTestTemplate(templateName, templateDataRaw, region,
+                regionResolver.getAccountId());
+        // The rendered message is printable ASCII, CR, LF and TAB by construction: a part holding
+        // anything else is quoted-printable or base64, so it is always valid XML character data.
+        String result = new XmlBuilder().elem("RenderedTemplate", rendered).build();
         return Response.ok(AwsQueryResponse.envelope("TestRenderTemplate", AwsNamespaces.SES, result)).build();
     }
 
@@ -679,7 +687,7 @@ public class SesQueryHandler {
     }
 
     private Response handleUpdateCustomVerificationEmailTemplate(MultivaluedMap<String, String> params, String region) {
-        sesService.updateCustomVerificationEmailTemplate(readCvetParams(params), region);
+        sesService.patchCustomVerificationEmailTemplate(readCvetParams(params), region);
         return Response.ok(AwsQueryResponse.envelopeEmptyResult(
                 "UpdateCustomVerificationEmailTemplate", AwsNamespaces.SES)).build();
     }
@@ -729,10 +737,7 @@ public class SesQueryHandler {
     }
 
     private Response handleSendCustomVerificationEmail(MultivaluedMap<String, String> params, String region) {
-        if (!accountService.isAccountSendingEnabled(region)) {
-            throw new AwsException("AccountSendingPausedException",
-                    "Account sending is disabled.", 400);
-        }
+        accountService.requireAccountSendingEnabled(region);
         // getParam (not requireParam) so the service is the single validation authority and returns
         // the AWS-faithful "Email address not specified." / "Invalid email address<...>." shapes.
         String messageId = sesService.sendCustomVerificationEmail(
@@ -755,10 +760,6 @@ public class SesQueryHandler {
     }
 
     private Response handleSendBulkTemplatedEmail(MultivaluedMap<String, String> params, String region) {
-        if (!accountService.isAccountSendingEnabled(region)) {
-            throw new AwsException("AccountSendingPausedException",
-                    "Account sending is disabled.", 400);
-        }
         String templateName = getParam(params, "Template");
         String templateArn = getParam(params, "TemplateArn");
         BulkDestinationIndexes destinations = bulkDestinationIndexes(params);
@@ -766,7 +767,7 @@ public class SesQueryHandler {
         // top-level members before the nested ones ('template' ahead of 'defaultTags.1.member.name'),
         // each group in the model's member order (probe-confirmed).
         List<String> violations = new ArrayList<>();
-        if (templateName == null && templateArn == null) {
+        if (templateName == null) {
             violations.add(SmithyValidationErrors.notNullWithoutValue("template"));
         }
         if (!params.containsKey("Destinations") && !hasParamWithPrefix(params, "Destinations.")) {
@@ -792,13 +793,7 @@ public class SesQueryHandler {
         List<String> replyToAddresses = extractMembers(params, "ReplyToAddresses");
         String defaultDataRaw = getParam(params, "DefaultTemplateData");
 
-        boolean hasName = templateName != null && !templateName.isBlank();
-        boolean hasArn = templateArn != null && !templateArn.isBlank();
-        if (!hasName && !hasArn) {
-            throw new AwsException("InvalidParameterValue",
-                    "Template or TemplateArn is required.", 400);
-        }
-        String resolvedName = hasName ? templateName : SesTemplateService.templateNameFromArn(templateArn);
+        String resolvedName = sendTemplateName(templateName.isBlank(), templateName, templateArn, region);
 
         int lastIndex = destinations.last();
         if (lastIndex == 0) {
@@ -1718,34 +1713,20 @@ public class SesQueryHandler {
         }
     }
 
+    // The templated sends require Template whatever TemplateArn holds, word an empty one ahead of
+    // the ARN checks, and take a TemplateArn only beside the Template it names (probe-confirmed).
+    // SendBulkTemplatedEmail counts a whitespace-only Template as empty; SendTemplatedEmail does not.
+    private static String sendTemplateName(boolean empty, String templateName, String templateArn, String region) {
+        if (empty) {
+            throw new AwsException("InvalidParameterValue", "Template cannot be empty", 400);
+        }
+        if (templateArn != null && !templateArn.isBlank()) {
+            SesTemplateService.requireNameAlignsWithArn(templateName, templateArn, region);
+        }
+        return templateName;
+    }
+
     private String getParam(MultivaluedMap<String, String> params, String name) {
         return params.getFirst(name);
-    }
-
-    /** Package-private for the unit test; the sole caller is the TestRenderTemplate XML response above. */
-    static String stripXml10InvalidChars(String s) {
-        if (s == null || s.isEmpty()) {
-            return s;
-        }
-        // XML 1.0 char production: \t \n \r, U+0020-U+D7FF, U+E000-U+FFFD,
-        // U+10000-U+10FFFF. Anything else (C0 controls, U+FFFE/U+FFFF, lone
-        // surrogates) makes the response unparseable by SDK XML parsers.
-        StringBuilder out = new StringBuilder(s.length());
-        int i = 0;
-        while (i < s.length()) {
-            int cp = s.codePointAt(i);
-            if (isXml10Char(cp)) {
-                out.appendCodePoint(cp);
-            }
-            i += Character.charCount(cp);
-        }
-        return out.toString();
-    }
-
-    private static boolean isXml10Char(int cp) {
-        return cp == 0x09 || cp == 0x0A || cp == 0x0D
-                || (cp >= 0x20 && cp <= 0xD7FF)
-                || (cp >= 0xE000 && cp <= 0xFFFD)
-                || (cp >= 0x10000 && cp <= 0x10FFFF);
     }
 }
