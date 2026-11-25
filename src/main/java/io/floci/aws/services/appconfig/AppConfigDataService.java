@@ -103,6 +103,19 @@ public class AppConfigDataService {
         return getLatestConfiguration(token, null);
     }
 
+    /** The resource a valid token names, without consuming the token or changing its session. */
+    Map<String, String> configurationForToken(String token) {
+        ConfigurationSession session = sessionStore.get(token)
+                .orElseThrow(() -> new AwsException("BadRequestException", "Invalid configuration token", 400));
+        synchronized (session) {
+            if (!token.equals(session.getCurrentToken())) {
+                throw new AwsException("BadRequestException", "Invalid configuration token", 400);
+            }
+            return Map.of("ApplicationId", session.getApplicationId(), "EnvironmentId", session.getEnvironmentId(),
+                    "ConfigurationProfileId", session.getConfigurationProfileId());
+        }
+    }
+
     /** {@code accept} is the caller's Accept header: the AppConfig Agent asks for Ion to evaluate variant flags itself. */
     public ConfigurationData getLatestConfiguration(String token, String accept) {
         ConfigurationSession session = sessionStore.get(token)
