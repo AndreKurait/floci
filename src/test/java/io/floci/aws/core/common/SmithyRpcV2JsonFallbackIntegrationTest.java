@@ -120,16 +120,24 @@ class SmithyRpcV2JsonFallbackIntegrationTest {
     }
 
     @Test
-    void jsonOnlyServiceKeepsItsNotFound() throws Exception {
-        given()
+    void kmsAnswersThroughItsJsonFallback() throws Exception {
+        assertTrue(call("TrentService", "ListKeys", "{}").path("Keys").isArray());
+    }
+
+    @Test
+    void unregisteredServiceKeepsItsNotFound() throws Exception {
+        byte[] response = given()
             .contentType("application/cbor")
             .accept("application/cbor")
             .header("smithy-protocol", "rpc-v2-cbor")
             .body(CBOR_MAPPER.writeValueAsBytes(JSON_MAPPER.readTree("{}")))
         .when()
-            .post("/service/TrentService/operation/ListKeys")
+            .post("/service/UnregisteredJsonFallbackService/operation/ListKeys")
         .then()
-            .statusCode(404);
+            .statusCode(404)
+            .contentType("application/cbor")
+            .extract().asByteArray();
+        assertEquals("UnknownOperationException", CBOR_MAPPER.readTree(response).path("__type").asText());
     }
 
     private static JsonNode call(String service, String operation, String json) throws Exception {
