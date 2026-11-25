@@ -9,6 +9,7 @@ import io.floci.aws.core.common.ResteasyRequests;
 import io.floci.aws.core.common.SignedServiceRoute;
 import io.floci.aws.core.common.WireProtocol;
 import io.floci.aws.services.eks.EksController;
+import io.floci.aws.services.route53.Route53Controller;
 import io.floci.aws.services.s3.S3BucketSubresources;
 import io.floci.aws.services.s3.S3ObjectActions;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -40,6 +41,13 @@ import java.util.regex.Pattern;
  */
 @ApplicationScoped
 public class IamActionRegistry {
+
+    private static final Map<String, String> ROUTE53_ACTIONS = Map.of(
+            "testDnsAnswer", "route53:TestDNSAnswer",
+            "createReusableDelegationSet", "route53:CreateReusableDelegationSet",
+            "getReusableDelegationSet", "route53:GetReusableDelegationSet",
+            "listReusableDelegationSets", "route53:ListReusableDelegationSets",
+            "deleteReusableDelegationSet", "route53:DeleteReusableDelegationSet");
 
     private static final Logger LOG = Logger.getLogger(IamActionRegistry.class);
 
@@ -583,6 +591,11 @@ public class IamActionRegistry {
 
     /** The serving method identifies these actions even when path encoding or matrix parameters vary. */
     public String resolveMatchedRoute(String credentialScope, ResourceInfo resourceInfo) {
+        if ("route53".equals(credentialScope) && resourceInfo != null
+                && Route53Controller.class.equals(resourceInfo.getResourceClass())
+                && resourceInfo.getResourceMethod() != null) {
+            return ROUTE53_ACTIONS.get(resourceInfo.getResourceMethod().getName());
+        }
         if (resourceInfo == null || resourceInfo.getResourceClass() == null) {
             return null;
         }
