@@ -12,7 +12,7 @@ import jakarta.inject.Inject;
 
 import java.time.Instant;
 
-/** Executes one-off actions after persisted storage and ECS runtime have been restored. */
+/** Executes one-off actions after persisted storage and service runtimes have been restored. */
 @ApplicationScoped
 public class ApplicationAutoScalingScheduledActionScheduler extends SweepScheduler {
     private final ApplicationAutoScalingService service;
