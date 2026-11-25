@@ -8,7 +8,7 @@ import jakarta.inject.Inject;
 import java.util.List;
 import java.util.Optional;
 
-/** Resolves the caller's launch-template names and network-interface attachments to resource ARNs. */
+/** Resolves the caller's launch-template names, network-interface attachments and held endpoint ids to ARNs. */
 @ApplicationScoped
 public class Ec2StoredResourceArns implements StoredResourceArns {
 
@@ -38,5 +38,10 @@ public class Ec2StoredResourceArns implements StoredResourceArns {
     public Optional<String> find(String type, List<String> names, String region) {
         return "launch-template".equals(type) && names.size() == 1
                 ? ec2.findLaunchTemplateArn(region, names.getFirst()) : Optional.empty();
+    }
+
+    @Override
+    public Optional<String> findById(String id, String region) {
+        return ec2.findVpcEndpointArn(region, id);
     }
 }
