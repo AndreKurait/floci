@@ -51,6 +51,7 @@ class ContainerReachableEndpointTest {
         when(embeddedDnsServer.getServerIp()).thenReturn(Optional.of("172.18.0.2"));
 
         assertEquals("http://" + EmbeddedDnsServer.DEFAULT_SUFFIX + ":4566", endpoint.baseUrl());
+        assertEquals("http://" + EmbeddedDnsServer.DEFAULT_SUFFIX + ":4566", endpoint.baseUrlWithTls(true));
     }
 
     @Test
@@ -147,7 +148,7 @@ class ContainerReachableEndpointTest {
     }
 
     @Test
-    void tlsUsesPublicProxyPortNotInternalHttpPort() {
+    void tlsKeepsHttpForClientsWithoutCaTrustAndOffersHttpsOnTheSamePublicPort() {
         // TLS pins quarkus.http.port to a loopback-only backend (4510); the TlsProxyServer serves
         // floci.port, the only one a container can reach.
         when(tls.enabled()).thenReturn(true);
@@ -157,6 +158,8 @@ class ContainerReachableEndpointTest {
 
         assertEquals("http://172.18.0.2:4566", endpoint(4510).baseUrl());
         assertEquals("http://172.18.0.2:4566", endpoint(4510).baseUrl(false));
+        assertEquals("https://172.18.0.2:4566", endpoint(4510).baseUrlWithTls(true));
+        assertEquals("https://172.18.0.2:4566", endpoint(4510).baseUrlWithTls(false));
     }
 
     @Test
@@ -220,5 +223,25 @@ class ContainerReachableEndpointTest {
         when(dockerHostResolver.resolve()).thenReturn("172.18.0.2");
 
         assertEquals("http://172.18.0.2:4566", endpoint(4566).customResourceResponseBaseUrl());
+    }
+
+    @Test
+    void tlsUsesTheEmbeddedDnsNameCoveredByTheContainerTrustBundle() {
+        hostMappedTo4811();
+        when(tls.enabled()).thenReturn(true);
+        when(embeddedDnsServer.getServerIp()).thenReturn(Optional.of("172.18.0.2"));
+
+        assertEquals("https://" + EmbeddedDnsServer.DEFAULT_SUFFIX + ":4566", endpoint(4510).baseUrlWithTls(true));
+        when(config.hostname()).thenReturn(Optional.of("floci"));
+        assertEquals("https://floci:4566", endpoint(4510).baseUrlWithTls(true));
+    }
+
+    @Test
+    void tlsPreservesTheDockerHostsGatewayAliasWithoutEmbeddedDns() {
+        when(tls.enabled()).thenReturn(true);
+        when(config.port()).thenReturn(4566);
+        when(dockerHostResolver.resolve()).thenReturn("host.docker.internal");
+
+        assertEquals("https://host.docker.internal:4566", endpoint(4510).baseUrlWithTls(false));
     }
 }

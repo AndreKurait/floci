@@ -77,6 +77,12 @@ public class ContainerReachableEndpoint {
         return "http://" + host(useEmbeddedDns) + ":" + port();
     }
 
+    /** Uses HTTPS when configured, for a client that receives the Floci CA trust bundle. */
+    public String baseUrlWithTls(boolean useEmbeddedDns) {
+        String scheme = config.tls().enabled() ? "https" : "http";
+        return scheme + "://" + host(useEmbeddedDns) + ":" + port();
+    }
+
     private String host(boolean useEmbeddedDns) {
         String flociHostname;
         if (useEmbeddedDns && embeddedDnsServer.getServerIp().isPresent()) {
