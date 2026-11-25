@@ -190,6 +190,10 @@ class PassedRolesTest {
                 PassedRoles.of("states:UpdateStateMachine", cbor(role), LOOKUPS));
         assertEquals(List.of(passed("sm", "states.amazonaws.com")),
                 PassedRoles.of("states:CreateStateMachine", gzippedCbor(role), LOOKUPS));
+        assertEquals(List.of(passed("sm", "states.amazonaws.com")),
+                PassedRoles.of("states:TestState", json(role), LOOKUPS));
+        assertEquals(List.of(passed("sm", "states.amazonaws.com")),
+                PassedRoles.of("states:TestState", cbor(role), LOOKUPS));
         assertEquals(List.of(passed("rule", "events.amazonaws.com")),
                 PassedRoles.of("events:PutRule", json("{\"RoleArn\":\"" + ROLES + "rule\"}"), LOOKUPS));
         assertEquals(List.of(passed("one", "events.amazonaws.com"), passed("two", "events.amazonaws.com")),
