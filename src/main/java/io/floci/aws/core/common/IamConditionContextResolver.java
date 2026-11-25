@@ -975,8 +975,8 @@ public class IamConditionContextResolver {
      * request names come from Logs' {@link StoredResourceArns}, as for every namespace the table reads.
      */
     private Map<String, List<String>> logsConditionContext(String action, ContainerRequestContext ctx) {
-        if (!("logs:CreateLogStream".equals(action) || "logs:DeleteLogStream".equals(action)
-                || "logs:PutLogEvents".equals(action)
+        // Stream creation/deletion has no resource tags; the generated table owns those checks.
+        if (!("logs:PutLogEvents".equals(action)
                 || LogGroupTagTarget.supports(action) || LogTransformerTarget.supports(action)
                 || "logs:CreateLogGroup".equals(action) || "logs:DeleteLogGroup".equals(action)
                 || "logs:PutRetentionPolicy".equals(action) || "logs:DeleteRetentionPolicy".equals(action)
@@ -1023,8 +1023,11 @@ public class IamConditionContextResolver {
         if (logsService == null || !logsService.isResolvable()) {
             return conditions.isEmpty() ? null : conditions;
         }
-        if (direct && CloudWatchLogsDeliveryService.isDeliveryResourceArn(body.path("resourceArn").asText())) {
-            // A delivery source, destination or delivery: its request tags apply, its own tags are not read.
+        String taggedArn = body.path("resourceArn").asText();
+        if (direct && (CloudWatchLogsDeliveryService.isDeliveryResourceArn(taggedArn)
+                || AwsArnUtils.isArnFor(taggedArn, "logs")
+                && AwsArnUtils.parse(taggedArn).resource().startsWith("destination:"))) {
+            // A destination or delivery resource is not a log group; its own table-backed tags apply.
             return conditions.isEmpty() ? null : conditions;
         }
         String group = direct ? logsService.get().resolveTagTarget(body.path("resourceArn").asText(), region).name()
