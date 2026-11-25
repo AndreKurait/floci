@@ -26,6 +26,7 @@ import io.floci.aws.core.resource.ExplorerResource;
 import io.floci.aws.core.resource.ResourceProvider;
 import io.floci.aws.core.resource.SupportedResourceType;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
+import io.floci.aws.core.storage.AccountAwareStorageBackend.AccountEntry;
 import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
@@ -162,6 +163,8 @@ public class SnsService implements Resettable, ResourceProvider {
             "aws-controltower-AggregateSecurityNotifications";
     private static final List<String> PENDING_CONFIRMATION_PROTOCOLS =
             List.of("http", "https", "email", "email-json", "sms");
+    private static final Set<String> CONFIRMATION_STATE_ATTRIBUTES =
+            Set.of("PendingConfirmation", "ConfirmationToken", "ConfirmationWasAuthenticated");
     /** Mobile-push platforms Floci mocks. iOS and Android only — anything else is rejected. */
     private static final Set<String> SUPPORTED_PUSH_PLATFORMS = Set.of(
             "APNS", "APNS_SANDBOX", "GCM", "FCM");
@@ -687,8 +690,12 @@ public class SnsService implements Resettable, ResourceProvider {
         if (topicStore.get(key).isEmpty()) {
             throw new AwsException("NotFound", "Topic does not exist.", 404);
         }
-        for (Subscription sub : subscriptionsByTopic(topicArn, region)) {
-            subscriptionStore.delete(subKey(region, sub.getSubscriptionArn()));
+        if (subscriptionStore instanceof AccountAwareStorageBackend<Subscription> aware) {
+            aware.deleteAllAccountsMatching(sub -> topicArn.equals(sub.getTopicArn()));
+        } else {
+            for (AccountEntry<Subscription> entry : subscriptionEntriesByTopic(topicArn, region)) {
+                subscriptionStore.delete(entry.key());
+            }
         }
         topicStore.delete(key);
         LOG.infov("Deleted SNS topic: {0}", topicArn);
@@ -1012,7 +1019,7 @@ public class SnsService implements Resettable, ResourceProvider {
 
     /** The topic's configured {@code MaximumMessageSize}, or the AWS default when unset. */
     private int topicMaxMessageSize(String topicArn, String region) {
-        return topicStore.get(topicKey(region, topicArn))
+        return findTopic(topicArn, region)
                 .map(SnsService::maxMessageSize)
                 .orElse(DEFAULT_MAX_MESSAGE_SIZE);
     }
@@ -1059,8 +1066,7 @@ public class SnsService implements Resettable, ResourceProvider {
     public SubscriptionCreation subscribeWithStatus(String topicArn, String protocol,
                                                     String endpoint, String region,
                                                     Map<String, String> attributes) {
-        String topicKey = topicKey(region, topicArn);
-        if (topicStore.get(topicKey).isEmpty() && !ensureControlTowerManagedTopic(topicArn, region)) {
+        if (findTopic(topicArn, region).isEmpty() && !ensureControlTowerManagedTopic(topicArn, region)) {
             throw new AwsException("NotFound", "Topic does not exist.", 404);
         }
         if (protocol == null || protocol.isBlank()) {
@@ -1080,33 +1086,40 @@ public class SnsService implements Resettable, ResourceProvider {
         if (topicMaxMessageSize(topicArn, region) > DEFAULT_MAX_MESSAGE_SIZE) {
             requireLargePayloadProtocol(protocol);
         }
+        if (attributes != null) {
+            attributes.keySet().forEach(SnsService::requireWritableConfirmationAttribute);
+        }
 
-        Subscription subscription;
+        Subscription subscription = null;
+        boolean created = false;
         synchronized (this) {
             for (Subscription existing : subscriptionsByTopic(topicArn, region)) {
                 if (protocol.equals(existing.getProtocol())
                         && Objects.equals(endpoint, existing.getEndpoint())) {
                     requireMatchingSubscriptionAttributes(existing, attributes);
-                    return new SubscriptionCreation(existing, false);
+                    subscription = existing;
+                    break;
                 }
             }
-
-            String subscriptionArn = topicArn + ":" + UUID.randomUUID().toString();
-            subscription = new Subscription(subscriptionArn, topicArn, protocol, endpoint,
-                    regionResolver.getAccountId());
-            subscription.setAccountId(regionResolver.getAccountId());
-            if (attributes != null) subscription.getAttributes().putAll(attributes);
-
-            if (PENDING_CONFIRMATION_PROTOCOLS.contains(protocol)) {
-                String token = UUID.randomUUID().toString().replace("-", "")
-                        + UUID.randomUUID().toString().replace("-", "");
-                subscription.getAttributes().put("PendingConfirmation", "true");
-                subscription.getAttributes().put("ConfirmationToken", token);
-                LOG.infov("Subscription pending confirmation for {0} ({1}) to topic {2} in {3}",
-                        endpoint, protocol, topicArn, region);
+            if (subscription == null) {
+                String subscriptionArn = topicArn + ":" + UUID.randomUUID().toString();
+                subscription = new Subscription(subscriptionArn, topicArn, protocol, endpoint,
+                        regionResolver.getAccountId());
+                subscription.setAccountId(regionResolver.getAccountId());
+                if (attributes != null) {
+                    subscription.getAttributes().putAll(attributes);
+                }
+                boolean foreignQueue = "sqs".equals(protocol) && AwsArnUtils.isArnFor(endpoint, "sqs")
+                        && !regionResolver.getAccountId().equals(AwsArnUtils.parse(endpoint).accountId());
+                if (PENDING_CONFIRMATION_PROTOCOLS.contains(protocol) || foreignQueue) {
+                    String token = UUID.randomUUID().toString().replace("-", "")
+                            + UUID.randomUUID().toString().replace("-", "");
+                    subscription.getAttributes().put("PendingConfirmation", "true");
+                    subscription.getAttributes().put("ConfirmationToken", token);
+                }
+                subscriptionStore.put(subKey(region, subscriptionArn), subscription);
+                created = true;
             }
-
-            subscriptionStore.put(subKey(region, subscriptionArn), subscription);
         }
         if (attributes == null || attributes.isEmpty()) {
             LOG.infov("Subscribed {0} ({1}) to topic {2} in {3}", endpoint, protocol, topicArn, region);
@@ -1114,11 +1127,12 @@ public class SnsService implements Resettable, ResourceProvider {
             LOG.infov("Subscribed {0} ({1}) to topic {2} in {3} with attributes: {4}", endpoint, protocol, topicArn, region, attributes);
         }
 
-        if (("http".equals(protocol) || "https".equals(protocol)) && endpoint != null) {
+        if ("true".equals(subscription.getAttributes().get("PendingConfirmation"))
+                && Set.of("http", "https", "sqs").contains(protocol) && endpoint != null) {
             sendSubscriptionConfirmation(subscription, topicArn, region);
         }
 
-        return new SubscriptionCreation(subscription, true);
+        return new SubscriptionCreation(subscription, created);
     }
 
     private boolean ensureControlTowerManagedTopic(String topicArn, String region) {
@@ -1132,14 +1146,27 @@ public class SnsService implements Resettable, ResourceProvider {
     }
 
     public String confirmSubscription(String topicArn, String token, String region) {
-        if (topicStore.get(topicKey(region, topicArn)).isEmpty()) {
+        if (!AwsArnUtils.isArnFor(topicArn, "sns") || token == null || token.isBlank()) {
+            throw new AwsException("InvalidParameter", "TopicArn and Token are required.", 400);
+        }
+        // The confirmation link is unsigned. Its topic identifies the owner and Region; the
+        // emulator's default account and the recipient's identity must not select another store.
+        String topicRegion = AwsArnUtils.parse(topicArn).region();
+        if (findTopic(topicArn, topicRegion).isEmpty()) {
             throw new AwsException("NotFound", "Topic does not exist.", 404);
         }
-        for (Subscription sub : subscriptionsByTopic(topicArn, region)) {
+        for (AccountEntry<Subscription> entry : subscriptionEntriesByTopic(topicArn, topicRegion)) {
+            Subscription sub = entry.value();
             if (token.equals(sub.getAttributes().get("ConfirmationToken"))) {
                 sub.getAttributes().put("PendingConfirmation", "false");
                 sub.getAttributes().remove("ConfirmationToken");
-                subscriptionStore.put(subKey(region, sub.getSubscriptionArn()), sub);
+                if (subscriptionStore instanceof AccountAwareStorageBackend<Subscription> aware) {
+                    aware.getForAccountMigratingLegacy(entry.accountId(), entry.key(),
+                            legacy -> sub.getSubscriptionArn().equals(legacy.getSubscriptionArn()));
+                    aware.putForAccount(entry.accountId(), entry.key(), sub);
+                } else {
+                    subscriptionStore.put(entry.key(), sub);
+                }
                 LOG.infov("Confirmed subscription {0} for topic {1}", sub.getSubscriptionArn(), topicArn);
                 return sub.getSubscriptionArn();
             }
@@ -1683,6 +1710,7 @@ public class SnsService implements Resettable, ResourceProvider {
 
     public void setSubscriptionAttribute(String subscriptionArn, String attributeName,
                                          String attributeValue, String region) {
+        requireWritableConfirmationAttribute(attributeName);
         String key = subKey(region, subscriptionArn);
         Subscription sub = subscriptionStore.get(key)
                 .orElseThrow(() -> new AwsException("NotFound", "Subscription does not exist.", 404));
@@ -1691,6 +1719,12 @@ public class SnsService implements Resettable, ResourceProvider {
         }
         sub.getAttributes().put(attributeName, attributeValue);
         subscriptionStore.put(key, sub);
+    }
+
+    private static void requireWritableConfirmationAttribute(String name) {
+        if (name != null && CONFIRMATION_STATE_ATTRIBUTES.contains(name)) {
+            throw new AwsException("InvalidParameter", "Invalid parameter: AttributeName", 400);
+        }
     }
 
     private static void requireFirehoseRoleArn(String roleArn) {
@@ -2673,18 +2707,23 @@ public class SnsService implements Resettable, ResourceProvider {
     }
 
     private List<Subscription> subscriptionsByTopic(String topicArn, String region) {
-        List<Subscription> result = new ArrayList<>();
+        return subscriptionEntriesByTopic(topicArn, region).stream().map(AccountEntry::value).toList();
+    }
+
+    private List<AccountEntry<Subscription>> subscriptionEntriesByTopic(String topicArn, String region) {
         String prefix = "sub::" + region + "::";
-        List<Subscription> regional;
         if (subscriptionStore instanceof AccountAwareStorageBackend<Subscription> aware) {
-            String rawPrefix = AccountAwareStorageBackend.rawKey(aware.accountId(), prefix);
-            regional = aware.scanRaw(raw -> raw.startsWith(rawPrefix));
-        } else {
-            regional = subscriptionStore.scan(k -> k.startsWith(prefix));
+            return aware.scanAllAccountEntries(key -> key.startsWith(prefix)).stream()
+                    .filter(entry -> topicArn.equals(entry.value().getTopicArn())).toList();
         }
-        for (Subscription sub : regional) {
-            if (topicArn.equals(sub.getTopicArn())) {
-                result.add(sub);
+        List<AccountEntry<Subscription>> result = new ArrayList<>();
+        for (String k : subscriptionStore.keys()) {
+            if (k.startsWith(prefix)) {
+                subscriptionStore.get(k).ifPresent(sub -> {
+                    if (topicArn.equals(sub.getTopicArn())) {
+                        result.add(new AccountEntry<>(regionResolver.getAccountId(), k, sub));
+                    }
+                });
             }
         }
         return result;
@@ -2852,6 +2891,7 @@ public class SnsService implements Resettable, ResourceProvider {
         RuntimeException deliveryFailure = null;
         for (int attempt = 1; attempt <= SQS_SUBSCRIPTION_DELIVERY_ATTEMPTS; attempt++) {
             try {
+                requireSqsDeliveryAllowed(sub.getTopicArn(), sub.getEndpoint());
                 sqsService.sendMessage(queueUrl, body, null, messageGroupId,
                         messageDeduplicationId, sqsAttributes, null, ServicePrincipals.of("sns"), region);
                 LOG.debugv("Delivered SNS message to SQS: {0} ({1}) raw={2}",
@@ -2865,6 +2905,7 @@ public class SnsService implements Resettable, ResourceProvider {
         String deadLetterTargetArn = subscriptionDeadLetterTargetArn(sub);
         if (deadLetterTargetArn != null) {
             try {
+                requireSqsDeliveryAllowed(sub.getTopicArn(), deadLetterTargetArn);
                 String deadLetterRegion = extractRegionFromArn(deadLetterTargetArn);
                 if (deadLetterRegion == null) {
                     deadLetterRegion = region;
@@ -3065,7 +3106,10 @@ public class SnsService implements Resettable, ResourceProvider {
     }
 
     private void sendSubscriptionConfirmation(Subscription subscription, String topicArn, String region) {
-        if (httpClient == null) return;
+        boolean sqs = "sqs".equals(subscription.getProtocol());
+        if (!sqs && httpClient == null) {
+            return;
+        }
         try {
             String token = subscription.getAttributes().get("ConfirmationToken");
             String subscribeUrl = baseUrl + "/?Action=ConfirmSubscription&TopicArn=" + topicArn + "&Token=" + token;
@@ -3078,10 +3122,20 @@ public class SnsService implements Resettable, ResourceProvider {
             node.put("Message", "You have chosen to subscribe to the topic " + topicArn + ".\nTo confirm the subscription, visit the SubscribeURL included in this message.");
             node.put("SubscribeURL", subscribeUrl);
             node.put("Token", token);
-            messageSigner.sign(node, signatureVersion(topicStore.get(topicKey(region, topicArn)).orElse(null)),
+            messageSigner.sign(node, signatureVersion(findTopic(topicArn, region).orElse(null)),
                     "SigningCertURL");
             String body = objectMapper.writeValueAsString(node);
 
+            if (sqs) {
+                requireSqsDeliveryAllowed(topicArn, subscription.getEndpoint());
+                AwsArnUtils.Arn queue = AwsArnUtils.parse(subscription.getEndpoint());
+                boolean fifo = queue.resource().endsWith(".fifo");
+                String messageId = node.path("MessageId").asText();
+                sqsService.sendMessage(sqsArnToUrl(subscription.getEndpoint()), body, null,
+                        fifo ? messageId : null, fifo ? messageId : null, Map.of(), null,
+                        ServicePrincipals.of("sns"), queue.region());
+                return;
+            }
             HttpRequest request = HttpRequest.newBuilder()
                     .uri(URI.create(subscription.getEndpoint()))
                     .timeout(Duration.ofSeconds(5))
@@ -3094,6 +3148,14 @@ public class SnsService implements Resettable, ResourceProvider {
             postScreenedAsync(request, subscription.getEndpoint(), "Sent SubscriptionConfirmation");
         } catch (Exception e) {
             LOG.warnv("Failed to send SubscriptionConfirmation to {0}: {1}", subscription.getEndpoint(), e.getMessage());
+        }
+    }
+
+    private void requireSqsDeliveryAllowed(String topicArn, String queueArn) {
+        if (serviceCallAuthorizer != null && serviceCallAuthorizer.authorize(
+                "sns", "sqs:SendMessage", queueArn, topicArn,
+                AwsArnUtils.parse(topicArn).accountId()) != Decision.ALLOW) {
+            throw new AwsException("AccessDenied", "SNS cannot send to the SQS queue.", 403);
         }
     }
 
