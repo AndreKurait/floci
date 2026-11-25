@@ -825,6 +825,7 @@ public class SqsService implements Resettable, ResourceProvider {
                     "The specified queue does not exist.", 400);
         }
         queueStore.delete(storageKey);
+        redrivePolicyCache.remove(storageKey);
         GuardedMessageQueue removed = messagesByQueue.remove(storageKey);
         if (removed != null) {
             removed.close();
@@ -1836,6 +1837,7 @@ public class SqsService implements Resettable, ResourceProvider {
         }
         queue.setLastModifiedTimestamp(Instant.now());
         queueStore.put(storageKey, queue);
+        redrivePolicyCache.remove(storageKey);
         getOrCreateQueue(storageKey).activity().accessed();
         LOG.infov("Updated attributes for queue: {0}", queueUrl);
     }
