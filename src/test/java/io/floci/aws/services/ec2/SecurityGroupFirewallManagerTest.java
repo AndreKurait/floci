@@ -19,10 +19,12 @@ import io.floci.aws.core.common.docker.ContainerLifecycleManager;
 import io.floci.aws.core.common.docker.ContainerLifecycleManager.ContainerInfo;
 import io.floci.aws.core.common.docker.ContainerSpec;
 import io.floci.aws.core.common.docker.DockerHostResolver;
+import io.floci.aws.services.ec2.model.SecurityGroup;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
 import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 
@@ -66,6 +68,36 @@ import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 class SecurityGroupFirewallManagerTest {
+
+    @ParameterizedTest
+    @CsvSource({"222222222222,us-east-1", "111111111111,us-west-2"})
+    void policyRefreshAndMissingGroupQuarantineStayWithinTheOwningAccountAndRegion(
+            String otherAccount, String otherRegion) {
+        DockerClient docker = mock(DockerClient.class, RETURNS_DEEP_STUBS);
+        SecurityGroupFirewallManager manager = dnsManager(docker);
+        SecurityGroup own = new SecurityGroup();
+        own.setGroupId("sg-own");
+        SecurityGroup other = new SecurityGroup();
+        other.setGroupId("sg-other");
+        manager.register(new SecurityGroupNftCompiler.Endpoint("111111111111", "us-east-1", "vpc-own",
+                "eni-own", "10.0.1.10", "172.18.0.2", Set.of("sg-own"), List.of(own)),
+                "helper-own", Map.of());
+        manager.register(new SecurityGroupNftCompiler.Endpoint(otherAccount, otherRegion, "vpc-other",
+                "eni-other", "10.1.1.10", "172.18.0.3", Set.of("sg-other"), List.of(other)),
+                "helper-other", Map.of());
+        manager.refreshPolicies("111111111111", "us-east-1", Map.of("sg-own", own), Map.of());
+        clearInvocations(docker);
+        // An owned group disappearing still refuses the update and quarantines its own namespace.
+        doThrow(new IllegalStateException("injected quarantine-copy failure"))
+                .when(docker).copyArchiveToContainerCmd("helper-own");
+        assertThrows(IllegalStateException.class, () -> manager.refreshPolicies(
+                "111111111111", "us-east-1", Map.of(), Map.of()));
+        verify(docker).copyArchiveToContainerCmd("helper-own");
+        verify(docker, never()).copyArchiveToContainerCmd("helper-other");
+        verify(docker, never()).stopContainerCmd("helper-other");
+        assertEquals(Optional.of(new DnsClientVpcSource.ClientVpc(otherAccount, otherRegion, "vpc-other")),
+                manager.vpcForClient("172.18.0.3"));
+    }
 
     @ParameterizedTest
     @ValueSource(strings = {"172.18.0.2", "10.0.1.10"})

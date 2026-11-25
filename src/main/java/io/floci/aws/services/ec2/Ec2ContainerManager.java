@@ -201,7 +201,7 @@ public class Ec2ContainerManager {
     public void refreshSecurityGroups(String region, Map<String, SecurityGroup> groups,
                                       Map<String, List<String>> prefixLists) {
         if (firewallManager != null && firewallManager.enabled()) {
-            firewallManager.refreshPolicies(region, groups, prefixLists);
+            firewallManager.refreshPolicies(regionResolver.getAccountId(), region, groups, prefixLists);
         }
     }
 
