@@ -1303,7 +1303,8 @@ public class IamPolicyEvaluator {
             }
             if ("AWS".equalsIgnoreCase(type) || "*".equals(type)) {
                 for (String pattern : patterns) {
-                    if (pattern.equals(principalArn)) {
+                    if (pattern.equals(principalArn)
+                            || TrustPolicyPrincipalIds.isIdentityId(pattern) && pattern.equals(principal.identityId())) {
                         directMatch = true;
                         break;
                     }
@@ -1499,7 +1500,11 @@ public class IamPolicyEvaluator {
                 : extractRoleArnFromAssumedRole(principalArn);
         PrincipalMatch strongest = PrincipalMatch.NONE;
         for (String pattern : patterns) {
-            if (pattern.matches("\\d{12}")) {
+            if (TrustPolicyPrincipalIds.isIdentityId(pattern)) {
+                if (pattern.equals(principal.identityId())) {
+                    return PrincipalMatch.CALLER;
+                }
+            } else if (pattern.matches("\\d{12}")) {
                 if (pattern.equals(accountId)) {
                     strongest = PrincipalMatch.ACCOUNT;
                 }
