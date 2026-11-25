@@ -150,9 +150,16 @@ public class AcmPcaService implements Resettable, AcmPrivateCertificateAuthoriti
             PrivateCaCertificates.requireOwnCsr(csr, authority.csrPem());
         } else {
             parent = PrivateCaCertificates.certificate(authority.certificatePem());
-            // A CA certificate's path length must be below its issuer's; a root without one allows any.
-            if (pathLength != null && pathLength >= parent.getBasicConstraints()) {
-                throw invalid("The template path length must be less than the path length of the issuing CA");
+            if (pathLength != null) {
+                int subordinateCount = 0;
+                for (X509Certificate issuer : PrivateCaCertificates.certificates(chainOf(authority))) {
+                    if ((long) pathLength + subordinateCount >= issuer.getBasicConstraints()) {
+                        throw invalid("The template path length exceeds the remaining issuer chain allowance");
+                    }
+                    if (!issuer.getSubjectX500Principal().equals(issuer.getIssuerX500Principal())) {
+                        subordinateCount++;
+                    }
+                }
             }
         }
         Instant notBefore = PrivateCaRequests.validity(request, now, true);
