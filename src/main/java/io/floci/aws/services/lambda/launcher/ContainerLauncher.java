@@ -290,7 +290,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
         }
         env.addAll(awsEnv.sdkBaselineEnv(lambdaRegion,
                 awsConfigPath.isPresent() ? Optional.of("/opt/aws-config") : Optional.empty(),
-                awsEnv.flociEndpoint(dockerFlags.dnsServers().isEmpty()), roleCredentials, lambdaAccountId));
+                awsEnv.flociEndpointWithTls(dockerFlags.dnsServers().isEmpty()), roleCredentials, lambdaAccountId));
         LambdaRuntimeEnv.addFunctionEnvironment(env, fn, roleCredentials.isPresent());
         if (provisioned) {
             env.removeIf(value -> value.startsWith("AWS_LAMBDA_INITIALIZATION_TYPE="));

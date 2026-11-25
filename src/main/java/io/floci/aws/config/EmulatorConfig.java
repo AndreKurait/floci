@@ -3960,11 +3960,58 @@ public interface EmulatorConfig {
     }
 
     interface Ec2ServiceConfig {
+        /** Trusted network helper that prepares IMDS before the guest image starts. */
+        @WithDefault("floci/network-helper:local")
+        String metadataHelperImage();
+
         /** Optional full EC2 catalog file for locally built guest images. */
         Optional<String> imageCatalogPath();
 
         /** Optional JSON file of additional regional AWS-managed prefix lists. */
         Optional<String> managedPrefixListCatalogPath();
+
+        /**
+         * Explicit guest environment entries, each {@code KEY=VALUE}. Duplicate keys and
+         * Floci-owned identity, credential, region, endpoint and IMDS settings are rejected.
+         * Env: {@code FLOCI_SERVICES_EC2_EXTRA_ENV}, comma-separated; escape a comma as {@code \,}.
+         */
+        Optional<List<String>> extraEnv();
+
+        /**
+         * Guest process limits, each {@code name=soft[:hard]}; omitted hard equals soft and
+         * {@code -1} means unlimited. Unset keeps Docker's defaults.
+         * Env: {@code FLOCI_SERVICES_EC2_ULIMITS}, comma-separated.
+         */
+        Optional<List<String>> ulimits();
+
+        /**
+         * Docker privileged mode for guest containers. Security-group enforcement always
+         * disables it. Network and volume helpers retain their own privilege settings.
+         * Env: {@code FLOCI_SERVICES_EC2_PRIVILEGED}.
+         */
+        @WithDefault("true")
+        boolean privileged();
+
+        /**
+         * Linux capabilities to drop from guest containers, in addition to mandatory
+         * security-group restrictions. Set privileged=false for capability restrictions.
+         * Env: {@code FLOCI_SERVICES_EC2_CAP_DROP}, comma-separated.
+         */
+        Optional<List<String>> capDrop();
+
+        /**
+         * Read-only bind mounts supplied by the deployment before the guest starts.
+         * Sources are absolute Linux paths on the Docker daemon host, not the Floci process host.
+         * Indexed environment entries use {@code FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__SOURCE}
+         * and {@code FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__TARGET}.
+         */
+        @WithDefault("")
+        List<GuestReadOnlyBind> readOnlyBinds();
+
+        interface GuestReadOnlyBind {
+            String source();
+            String target();
+        }
 
         @WithDefault("true")
         boolean enabled();
@@ -3984,6 +4031,18 @@ public interface EmulatorConfig {
          */
         @WithDefault("false")
         boolean awsFaithfulPrivateIp();
+
+        /**
+         * Give EC2 guests Floci's HTTPS endpoint (FLOCI_SERVICES_EC2_GUEST_TLS_ENDPOINT). When true and TLS is
+         * enabled, a guest's {@code AWS_ENDPOINT_URL} names Floci over https, as a Lambda's does, and the
+         * self-signed server certificate also covers this host's interface addresses, the address a guest with
+         * its own resolver is given. Requests a guest sends then arrive with {@code aws:SecureTransport} true, as
+         * an instance's requests to AWS do, so a bucket policy that denies insecure transport admits them. The
+         * guest must trust Floci's CA: the bundle Floci copies in at {@code /etc/floci-ca-bundle.pem} does, a
+         * bundle the guest's own environment names may not. When false (the default) guests keep the HTTP endpoint.
+         */
+        @WithDefault("false")
+        boolean guestTlsEndpoint();
 
         /**
          * Whether an EC2 instance's Docker container IP is routable from the machines that

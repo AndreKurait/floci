@@ -25,6 +25,7 @@ import com.github.dockerjava.api.model.HostConfig;
 import com.github.dockerjava.api.model.Mount;
 import com.github.dockerjava.api.model.MountType;
 import com.github.dockerjava.api.model.Ports;
+import com.github.dockerjava.api.model.Ulimit;
 import com.github.dockerjava.api.model.Volume;
 import com.github.dockerjava.api.model.WaitContainerCondition;
 import com.github.dockerjava.core.command.WaitContainerResultCallback;
@@ -1898,6 +1899,12 @@ public class ContainerLifecycleManager {
         // Memory limit
         if (spec.hasMemoryLimit()) {
             hostConfig.withMemory(spec.memoryBytes());
+        }
+        if (!spec.ulimits().isEmpty()) {
+            hostConfig.withUlimits(spec.ulimits().entrySet().stream()
+                    .sorted(Map.Entry.comparingByKey())
+                    .map(entry -> new Ulimit(entry.getKey(), entry.getValue().soft(), entry.getValue().hard()))
+                    .toArray(Ulimit[]::new));
         }
         if (linux.memorySwapBytes() != null) {
             hostConfig.withMemorySwap(linux.memorySwapBytes());

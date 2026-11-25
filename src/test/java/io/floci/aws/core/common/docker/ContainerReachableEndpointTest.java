@@ -7,9 +7,12 @@ import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.parallel.ResourceLock;
 
+import java.net.InetAddress;
+import java.net.UnknownHostException;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
@@ -48,6 +51,7 @@ class ContainerReachableEndpointTest {
         when(embeddedDnsServer.getServerIp()).thenReturn(Optional.of("172.18.0.2"));
 
         assertEquals("http://" + EmbeddedDnsServer.DEFAULT_SUFFIX + ":4566", endpoint.baseUrl());
+        assertEquals("http://" + EmbeddedDnsServer.DEFAULT_SUFFIX + ":4566", endpoint.baseUrlWithTls(true));
     }
 
     @Test
@@ -57,6 +61,56 @@ class ContainerReachableEndpointTest {
         when(dockerHostResolver.resolve()).thenReturn("172.18.0.9");
 
         assertEquals("http://172.18.0.9:4566", endpoint.baseUrl(false));
+    }
+
+    @Test
+    void explicitDnsUsesTheSelectedWorkloadNetworkInsteadOfAnAmbiguousDockerHostname() {
+        ContainerDetector detector = mock(ContainerDetector.class);
+        CurrentContainerNetworkResolver networks = mock(CurrentContainerNetworkResolver.class);
+        EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
+        EmulatorConfig.LambdaServiceConfig lambda = mock(EmulatorConfig.LambdaServiceConfig.class);
+        when(config.services()).thenReturn(services);
+        when(services.lambda()).thenReturn(lambda);
+        when(lambda.dockerHostOverride()).thenReturn(Optional.of("multi-homed-floci"));
+        when(detector.isRunningInContainer()).thenReturn(true);
+        when(networks.resolveContainerIp()).thenReturn(Optional.of("172.29.71.2"));
+        DockerHostResolver resolver = new DockerHostResolver(config, detector, networks);
+        ContainerReachableEndpoint selected = new ContainerReachableEndpoint(
+                config, resolver, embeddedDnsServer, null, 4566);
+
+        assertEquals("multi-homed-floci", resolver.resolve());
+        assertEquals("http://172.29.71.2:4566", selected.baseUrl(false));
+    }
+
+    @Test
+    void explicitDnsResolvesTheDockerHostOverrideBeforePassingItToTheGuest() throws UnknownHostException {
+        when(dockerHostResolver.resolve()).thenReturn("localhost");
+        String address = InetAddress.getByName("localhost").getHostAddress();
+        String authority = address.contains(":") ? "[" + address + "]" : address;
+
+        assertEquals("http://" + authority + ":4566", endpoint.baseUrl(false));
+    }
+
+    @Test
+    void explicitDnsPreservesTheDockerHostsGatewayAlias() {
+        when(dockerHostResolver.resolve()).thenReturn("host.docker.internal");
+
+        assertEquals("http://host.docker.internal:4566", endpoint.baseUrl(false));
+    }
+
+    @Test
+    void explicitDnsRefusesAnUnresolvableDockerHost() {
+        when(dockerHostResolver.resolve()).thenReturn("floci-unresolvable.invalid");
+
+        assertThrows(IllegalStateException.class, () -> endpoint.baseUrl(false));
+    }
+
+    @Test
+    void explicitDnsFormatsIpv6AddressesAsUrlAuthorities() throws UnknownHostException {
+        when(dockerHostResolver.resolve()).thenReturn("::1");
+
+        assertEquals("http://[" + InetAddress.getByName("::1").getHostAddress() + "]:4566",
+                endpoint.baseUrl(false));
     }
 
     @Test
@@ -94,7 +148,7 @@ class ContainerReachableEndpointTest {
     }
 
     @Test
-    void tlsUsesPublicProxyPortNotInternalHttpPort() {
+    void tlsKeepsHttpForClientsWithoutCaTrustAndOffersHttpsOnTheSamePublicPort() {
         // TLS pins quarkus.http.port to a loopback-only backend (4510); the TlsProxyServer serves
         // floci.port, the only one a container can reach.
         when(tls.enabled()).thenReturn(true);
@@ -104,6 +158,8 @@ class ContainerReachableEndpointTest {
 
         assertEquals("http://172.18.0.2:4566", endpoint(4510).baseUrl());
         assertEquals("http://172.18.0.2:4566", endpoint(4510).baseUrl(false));
+        assertEquals("https://172.18.0.2:4566", endpoint(4510).baseUrlWithTls(true));
+        assertEquals("https://172.18.0.2:4566", endpoint(4510).baseUrlWithTls(false));
     }
 
     @Test
@@ -167,5 +223,25 @@ class ContainerReachableEndpointTest {
         when(dockerHostResolver.resolve()).thenReturn("172.18.0.2");
 
         assertEquals("http://172.18.0.2:4566", endpoint(4566).customResourceResponseBaseUrl());
+    }
+
+    @Test
+    void tlsUsesTheEmbeddedDnsNameCoveredByTheContainerTrustBundle() {
+        hostMappedTo4811();
+        when(tls.enabled()).thenReturn(true);
+        when(embeddedDnsServer.getServerIp()).thenReturn(Optional.of("172.18.0.2"));
+
+        assertEquals("https://" + EmbeddedDnsServer.DEFAULT_SUFFIX + ":4566", endpoint(4510).baseUrlWithTls(true));
+        when(config.hostname()).thenReturn(Optional.of("floci"));
+        assertEquals("https://floci:4566", endpoint(4510).baseUrlWithTls(true));
+    }
+
+    @Test
+    void tlsPreservesTheDockerHostsGatewayAliasWithoutEmbeddedDns() {
+        when(tls.enabled()).thenReturn(true);
+        when(config.port()).thenReturn(4566);
+        when(dockerHostResolver.resolve()).thenReturn("host.docker.internal");
+
+        assertEquals("https://host.docker.internal:4566", endpoint(4510).baseUrlWithTls(false));
     }
 }
