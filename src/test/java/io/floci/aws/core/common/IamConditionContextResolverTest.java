@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
+import io.floci.aws.services.amazonmq.AmazonMqConfigurationService;
 import io.floci.aws.services.dynamodb.DynamoDbFacade;
 import io.floci.aws.services.dynamodb.DynamoDbService;
 import io.floci.aws.services.dynamodb.backend.NativeDynamoDbBackend;
@@ -69,6 +70,7 @@ import static org.mockito.ArgumentMatchers.anyCollection;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -154,6 +156,81 @@ class IamConditionContextResolverTest {
                 lambdaWebServiceInstance, spellings(new ShapeNamingSpelling()), mock(Instance.class),
                 requestContext, new RegionResolver("us-east-1", "123456789012"), config,
                 null, serviceCatalog);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"mq:DescribeConfiguration", "mq:UpdateConfiguration", "mq:DeleteConfiguration",
+            "mq:DescribeConfigurationRevision", "mq:ListConfigurationRevisions"})
+    void mqStoredTagCaseVariantsRetainEveryValueForPolicyEvaluation(String action) {
+        AmazonMqConfigurationService configurations = mock(AmazonMqConfigurationService.class);
+        Instance<AmazonMqConfigurationService> instance = mock(Instance.class);
+        when(instance.isResolvable()).thenReturn(true);
+        when(instance.get()).thenReturn(configurations);
+        IamConditionContextResolver mqResolver = new IamConditionContextResolver(null, null, null, null, null,
+                spellings(new ShapeNamingSpelling()), mock(Instance.class), requestContext,
+                new RegionResolver("us-east-1", "123456789012"), config, null, serviceCatalog, instance);
+        ContainerRequestContext request = mock(ContainerRequestContext.class);
+        UriInfo uri = mock(UriInfo.class);
+        MultivaluedMap<String, String> parameters = new MultivaluedHashMap<>();
+        parameters.putSingle("configurationId", "owned-configuration");
+        when(request.getUriInfo()).thenReturn(uri);
+        when(uri.getPathParameters()).thenReturn(parameters);
+        Map<String, String> tags = new LinkedHashMap<>();
+        tags.put("Owner", "one");
+        tags.put("owner", "two");
+        when(configurations.tagsForAuthorization("owned-configuration")).thenReturn(tags);
+
+        Map<String, List<String>> conditions = mqResolver.resolve("mq", action, request);
+        assertEquals(Map.of("aws:ResourceTag/Owner", List.of("one", "two")), conditions);
+        for (String value : List.of("one", "two")) {
+            String policy = """
+                    {"Statement":[{"Effect":"Allow","Action":"mq:*","Resource":"*"},
+                    {"Effect":"Deny","Action":"mq:*","Resource":"*",
+                    "Condition":{"ForAnyValue:StringEquals":{"aws:ResourceTag/owner":"%s"}}}]}
+                    """.formatted(value);
+            assertEquals(Decision.DENY, evaluator.simulateCustomPolicy(List.of(policy), action, "*", conditions));
+        }
+        when(configurations.tagsForAuthorization("owned-configuration")).thenReturn(Map.of("Owner", "one"));
+        assertEquals(Map.of("aws:ResourceTag/Owner", List.of("one")), mqResolver.resolve("mq", action, request));
+        when(configurations.tagsForAuthorization("owned-configuration")).thenReturn(Map.of());
+        assertNull(mqResolver.resolve("mq", action, request));
+    }
+
+    @Test
+    void mqCreateReadsUncachedWireTagsAndRestoresTheBody() throws Exception {
+        byte[] wire = "{\"name\":\"owned\",\"tags\":{\"owner\":\"one\"}}".getBytes(StandardCharsets.UTF_8);
+        ContainerRequestContext ctx = mock(ContainerRequestContext.class);
+        when(ctx.getEntityStream()).thenReturn(new ByteArrayInputStream(wire));
+        when(ctx.getMediaType()).thenReturn(MediaType.APPLICATION_JSON_TYPE);
+        assertNull(ctx.getProperty(IamConditionContextResolver.BUFFERED_JSON_BODY));
+
+        Map<String, List<String>> actual = resolver.resolve("mq", "mq:CreateConfiguration", ctx);
+        assertEquals(Map.of("aws:RequestTag/owner", List.of("one"), "aws:TagKeys", List.of("owner")), actual);
+        ArgumentCaptor<InputStream> restored = ArgumentCaptor.forClass(InputStream.class);
+        verify(ctx).setEntityStream(restored.capture());
+        assertArrayEquals(wire, restored.getValue().readAllBytes());
+        ArgumentCaptor<JsonNode> cached = ArgumentCaptor.forClass(JsonNode.class);
+        verify(ctx).setProperty(eq(IamConditionContextResolver.BUFFERED_JSON_BODY), cached.capture());
+        assertEquals(mapper.readTree(wire), cached.getValue());
+
+        when(ctx.getProperty(IamConditionContextResolver.BUFFERED_JSON_BODY)).thenReturn(cached.getValue());
+        doThrow(new AssertionError("A cached body must not be consumed again")).when(ctx).getEntityStream();
+        assertEquals(actual, resolver.resolve("mq", "mq:CreateConfiguration", ctx));
+    }
+
+    @Test
+    void mqCreateRejectsNonStringTagsFromAnUncachedBodyBeforeAuthorization() throws Exception {
+        byte[] wire = "{\"name\":\"owned\",\"tags\":{\"owner\":1}}".getBytes(StandardCharsets.UTF_8);
+        ContainerRequestContext ctx = mock(ContainerRequestContext.class);
+        when(ctx.getEntityStream()).thenReturn(new ByteArrayInputStream(wire));
+        when(ctx.getMediaType()).thenReturn(MediaType.APPLICATION_JSON_TYPE);
+        AwsException refused = assertThrows(AwsException.class,
+                () -> resolver.resolve("mq", "mq:CreateConfiguration", ctx));
+        assertEquals("BadRequestException", refused.getErrorCode());
+        assertEquals(400, refused.getHttpStatus());
+        ArgumentCaptor<InputStream> restored = ArgumentCaptor.forClass(InputStream.class);
+        verify(ctx).setEntityStream(restored.capture());
+        assertArrayEquals(wire, restored.getValue().readAllBytes());
     }
 
     @Test
