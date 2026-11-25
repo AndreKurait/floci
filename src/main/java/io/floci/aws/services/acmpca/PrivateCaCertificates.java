@@ -209,6 +209,14 @@ final class PrivateCaCertificates {
         X509Certificate certificate = imported(text, ownCsr, now, false);
         X509Certificate root = chain.get(chain.size() - 1);
         try {
+            if (chain.contains(certificate)) {
+                throw new IllegalArgumentException("The chain must exclude the imported certificate");
+            }
+            if (certificate.getIssuerX500Principal().equals(certificate.getSubjectX500Principal())
+                    && new X509CertificateHolder(certificate.getEncoded()).isSignatureValid(
+                    new JcaContentVerifierProviderBuilder().build(certificate.getPublicKey()))) {
+                throw new IllegalArgumentException("A subordinate certificate must be signed by another CA");
+            }
             if (!root.getIssuerX500Principal().equals(root.getSubjectX500Principal())) {
                 throw new IllegalArgumentException("The chain must end in a self-signed root");
             }
