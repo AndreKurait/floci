@@ -59,6 +59,8 @@ class ApplicationAutoScalingEcsControlLoopIntegrationTest {
     private static final String CLUSTER = "aas-loop-cluster";
     private static final String SERVICE = "aas-loop-svc";
     private static final String RESOURCE_ID = "service/" + CLUSTER + "/" + SERVICE;
+    /** How many evaluation passes the service has to stay at its ceiling through. */
+    private static final int PASSES_AT_THE_CEILING = 30;
 
     @Inject
     AlarmEvaluator alarmEvaluator;
@@ -142,20 +144,22 @@ class ApplicationAutoScalingEcsControlLoopIntegrationTest {
                 "{\"Namespace\":\"AWS/ECS\",\"MetricData\":" + metricData + "}", CLOUDWATCH_JSON_CONTENT_TYPE);
 
         int maxCapacity = 10;
-        await().atMost(Duration.ofSeconds(30)).pollInterval(Duration.ofMillis(100)).untilAsserted(() -> {
-            AlarmEvaluatorTestAccess.evaluateNow(alarmEvaluator);
-            call(ECS_TARGET, "DescribeServices",
-                    "{\"cluster\":\"" + CLUSTER + "\",\"services\":[\"" + SERVICE + "\"]}")
-                    .then().body("services[0].desiredCount", equalTo(maxCapacity));
-        });
-
-        await().during(Duration.ofSeconds(3)).atMost(Duration.ofSeconds(10)).pollInterval(Duration.ofMillis(100))
+        await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(Duration.ofSeconds(30))
                 .untilAsserted(() -> {
                     AlarmEvaluatorTestAccess.evaluateNow(alarmEvaluator);
                     call(ECS_TARGET, "DescribeServices",
                             "{\"cluster\":\"" + CLUSTER + "\",\"services\":[\"" + SERVICE + "\"]}")
                             .then().body("services[0].desiredCount", equalTo(maxCapacity));
                 });
+
+        // A pass applies what it decides before it returns, so one that scaled past the ceiling, or back
+        // down from it, shows in the look right after it: the passes are counted, not timed.
+        for (int pass = 0; pass < PASSES_AT_THE_CEILING; pass++) {
+            AlarmEvaluatorTestAccess.evaluateNow(alarmEvaluator);
+            call(ECS_TARGET, "DescribeServices",
+                    "{\"cluster\":\"" + CLUSTER + "\",\"services\":[\"" + SERVICE + "\"]}")
+                    .then().body("services[0].desiredCount", equalTo(maxCapacity));
+        }
 
         call(AAS_TARGET, "DescribeScalingActivities", """
                 { "ServiceNamespace": "ecs", "ResourceId": "%s" }

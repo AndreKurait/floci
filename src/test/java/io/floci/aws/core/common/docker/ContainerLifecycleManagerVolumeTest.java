@@ -5,6 +5,8 @@ import com.github.dockerjava.api.command.CreateContainerCmd;
 import com.github.dockerjava.api.command.CreateContainerResponse;
 import com.github.dockerjava.api.command.CreateVolumeCmd;
 import com.github.dockerjava.api.command.CreateVolumeResponse;
+import com.github.dockerjava.api.command.InspectContainerCmd;
+import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.command.InspectVolumeCmd;
 import com.github.dockerjava.api.command.InspectVolumeResponse;
 import com.github.dockerjava.api.command.ListVolumesCmd;
@@ -14,12 +16,15 @@ import com.github.dockerjava.api.command.RemoveVolumeCmd;
 import com.github.dockerjava.api.command.StartContainerCmd;
 import com.github.dockerjava.api.command.StopContainerCmd;
 import com.github.dockerjava.api.command.WaitContainerCmd;
+import com.github.dockerjava.api.exception.ConflictException;
 import com.github.dockerjava.api.exception.DockerException;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.HostConfig;
 import com.github.dockerjava.core.command.WaitContainerResultCallback;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.services.lambda.launcher.ImageCacheService;
+import io.floci.aws.testing.TestTime;
+import io.floci.aws.testing.TimelineDeadlineWaits;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
@@ -29,13 +34,19 @@ import org.mockito.junit.jupiter.MockitoExtension;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.OptionalInt;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.IntConsumer;
 import java.util.function.IntFunction;
@@ -233,6 +244,92 @@ class ContainerLifecycleManagerVolumeTest {
         manager.stopAndRemoveStrict("container-id", () -> operations.add("logs"));
 
         assertEquals(List.of("logs"), operations);
+    }
+
+    @Test
+    void strictContainerCleanupRetainsOwnershipWhenTheRemovalWaitIsInterrupted() throws Exception {
+        String id = "still-removing";
+        Closeable logStream = mock(Closeable.class);
+        Closeable waitStream = mock(Closeable.class);
+        ConflictException removalFailure = removalStillInProgress(id, waitStream, true);
+
+        try {
+            IllegalStateException failure = assertTimeout(Duration.ofSeconds(10), () ->
+                    assertThrows(IllegalStateException.class, () -> manager.stopAndRemoveStrict(id, logStream)));
+            assertSame(removalFailure, failure.getCause());
+            assertTrue(Thread.currentThread().isInterrupted());
+            verify(logStream, never()).close();
+            verify(waitStream, atLeastOnce()).close();
+        } finally {
+            Thread.interrupted();
+        }
+    }
+
+    @Test
+    void strictContainerCleanupRetainsOwnershipWhenTheRemovalIsStillRunningAfterFiveSeconds() throws Exception {
+        TestTime time = TestTime.create();
+        TimelineDeadlineWaits waits = new TimelineDeadlineWaits(time);
+        manager = new ContainerLifecycleManager(dockerClient, imageCacheService, containerDetector, config,
+                RetryingTarCopier.DEFAULT_BACKOFF_MS, (callback, timeout, unit) -> {
+                    try {
+                        waits.bounded(unit.toNanos(timeout), callback::awaitCompletion);
+                        return true;
+                    } catch (TimeoutException expired) {
+                        return false;
+                    } catch (ExecutionException impossible) {
+                        throw new AssertionError(impossible);
+                    }
+                });
+        String id = "still-removing";
+        Closeable logStream = mock(Closeable.class);
+        Closeable waitStream = mock(Closeable.class);
+        ConflictException removalFailure = removalStillInProgress(id, waitStream, false);
+
+        ExecutorService caller = Executors.newSingleThreadExecutor();
+        try {
+            Future<?> cleanup = caller.submit(() -> manager.stopAndRemoveStrict(id, logStream));
+            waits.awaitWaiting(1);
+
+            time.advance(Duration.ofSeconds(5).minusNanos(1));
+            assertFalse(cleanup.isDone(), "the cleanup gave up before the removal had its five seconds");
+            verify(waitStream, never()).close();
+
+            time.advance(Duration.ofNanos(1));
+            ExecutionException failure = assertThrows(ExecutionException.class,
+                    () -> cleanup.get(5, TimeUnit.SECONDS));
+            IllegalStateException cleanupFailure = assertInstanceOf(IllegalStateException.class, failure.getCause());
+            assertSame(removalFailure, cleanupFailure.getCause());
+            verify(logStream, never()).close();
+            verify(waitStream, atLeastOnce()).close();
+        } finally {
+            caller.shutdownNow();
+        }
+    }
+
+    /** A stopped container whose removal conflicts with one in progress that never reports completion. */
+    private ConflictException removalStillInProgress(String id, Closeable waitStream, boolean interrupt) {
+        StopContainerCmd stop = mock(StopContainerCmd.class, RETURNS_SELF);
+        RemoveContainerCmd remove = mock(RemoveContainerCmd.class, RETURNS_SELF);
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        InspectContainerResponse response = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
+        WaitContainerCmd wait = mock(WaitContainerCmd.class, RETURNS_SELF);
+        when(dockerClient.stopContainerCmd(id)).thenReturn(stop);
+        when(dockerClient.removeContainerCmd(id)).thenReturn(remove);
+        ConflictException removalFailure = new ConflictException("removal already in progress");
+        doThrow(removalFailure).when(remove).exec();
+        when(dockerClient.inspectContainerCmd(id)).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(response);
+        when(response.getState().getRunning()).thenReturn(false);
+        when(dockerClient.waitContainerCmd(id)).thenReturn(wait);
+        when(wait.exec(any(WaitContainerResultCallback.class))).thenAnswer(call -> {
+            WaitContainerResultCallback callback = call.getArgument(0);
+            callback.onStart(waitStream);
+            if (interrupt) {
+                Thread.currentThread().interrupt();
+            }
+            return callback;
+        });
+        return removalFailure;
     }
 
     @Test

@@ -102,6 +102,7 @@ public class ContainerLifecycleManager {
     private final LongSupplier nanoTime;
     private final CreateWait createWait;
     private final GelfLogListener gelfLogListener;
+    private final RemovalWait removalWait;
 
     /** Volumes whose shared-ownership root has already been initialised this process (run-once guard). */
     private final ConcurrentHashMap<String, Boolean> initializedSharedVolumes = new ConcurrentHashMap<>();
@@ -171,6 +172,33 @@ public class ContainerLifecycleManager {
                                       LongSupplier nanoTime,
                                       CreateWait createWait,
                                       GelfLogListener gelfLogListener) {
+        this(dockerClient, streamingDockerClient, imageCacheService, containerDetector, config,
+                archiveRetryBackoffMillis, nanoTime, createWait, gelfLogListener,
+                WaitContainerResultCallback::awaitCompletion);
+    }
+
+    ContainerLifecycleManager(DockerClient dockerClient,
+                              ImageCacheService imageCacheService,
+                              ContainerDetector containerDetector,
+                              EmulatorConfig config,
+                              long archiveRetryBackoffMillis,
+                              RemovalWait removalWait) {
+        this(dockerClient, dockerClient, imageCacheService, containerDetector, config,
+                archiveRetryBackoffMillis, System::nanoTime, TimeUnit.NANOSECONDS::sleep,
+                GelfLogListener.disabled(), removalWait);
+    }
+
+    private ContainerLifecycleManager(DockerClient dockerClient,
+                                      DockerClient streamingDockerClient,
+                                      ImageCacheService imageCacheService,
+                                      ContainerDetector containerDetector,
+                                      EmulatorConfig config,
+                                      long archiveRetryBackoffMillis,
+                                      LongSupplier nanoTime,
+                                      CreateWait createWait,
+                                      GelfLogListener gelfLogListener,
+                                      RemovalWait removalWait) {
+        this.removalWait = removalWait;
         this.gelfLogListener = gelfLogListener;
         this.dockerClient = dockerClient;
         this.streamingDockerClient = streamingDockerClient;
@@ -194,6 +222,12 @@ public class ContainerLifecycleManager {
             LOG.warnv("{0}: a container that sends its log there will not start: {1}", e.getMessage(),
                     e.getCause() == null ? "" : e.getCause().getMessage());
         }
+    }
+
+    /** Bounded Docker removal wait; tests drive its deadline using their controlled timeline. */
+    @FunctionalInterface
+    interface RemovalWait {
+        boolean await(WaitContainerResultCallback callback, long timeout, TimeUnit unit) throws InterruptedException;
     }
 
     /** Pause between creation checks; tests advance the monotonic clock instead of sleeping. */
@@ -957,7 +991,7 @@ public class ContainerLifecycleManager {
     private boolean awaitConcurrentRemoval(String containerId) {
         try (WaitContainerResultCallback callback = new WaitContainerResultCallback()) {
             dockerClient.waitContainerCmd(containerId).withCondition(WaitContainerCondition.REMOVED).exec(callback);
-            callback.awaitCompletion(5, TimeUnit.SECONDS);
+            removalWait.await(callback, 5, TimeUnit.SECONDS);
         } catch (InterruptedException interrupted) {
             Thread.currentThread().interrupt();
             LOG.debugv("Interrupted waiting for container {0} removal", containerId);
