@@ -3,6 +3,8 @@ package io.floci.aws.services.elb;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.core.DefaultDockerClientConfig;
 import com.github.dockerjava.core.DockerClientImpl;
+import io.floci.aws.core.common.docker.ContainerDetector;
+import io.floci.aws.core.common.docker.CurrentContainerNetworkResolver;
 import io.floci.aws.core.common.docker.FlociDockerHttpClient;
 import io.floci.aws.testing.DockerAvailability;
 import io.quarkus.test.common.QuarkusTestResource;
@@ -35,6 +37,7 @@ class VpcInternalControlAwsApiPacketIntegrationTest extends VpcPublicAwsApiPacke
     public static class ControlNetwork implements QuarkusTestResourceLifecycleManager {
         private DockerClient docker;
         private String network;
+        private String runner;
 
         @Override
         public Map<String, String> start() {
@@ -49,11 +52,19 @@ class VpcInternalControlAwsApiPacketIntegrationTest extends VpcPublicAwsApiPacke
             try {
                 network = docker.createNetworkCmd().withName("floci-internal-api-" + UUID.randomUUID())
                         .withInternal(true).exec().getId();
-                String gateway = docker.inspectNetworkCmd().withNetworkId(network).exec()
+                String address = docker.inspectNetworkCmd().withNetworkId(network).exec()
                         .getIpam().getConfig().getFirst().getGateway();
+                runner = new CurrentContainerNetworkResolver(docker, new ContainerDetector())
+                        .resolveContainerId().orElse(null);
+                if (runner != null) {
+                    docker.connectToNetworkCmd().withContainerId(runner).withNetworkId(network).exec();
+                    String networkName = docker.inspectNetworkCmd().withNetworkId(network).exec().getName();
+                    address = docker.inspectContainerCmd(runner).exec().getNetworkSettings()
+                            .getNetworks().get(networkName).getIpAddress();
+                }
                 return Map.of("floci.services.docker-network", network,
-                        "floci.services.lambda.docker-host-override", gateway,
-                        "floci.dns.listen-address", gateway);
+                        "floci.services.lambda.docker-host-override", address,
+                        "floci.dns.listen-address", address);
             } catch (RuntimeException failure) {
                 try {
                     stop();
@@ -68,6 +79,10 @@ class VpcInternalControlAwsApiPacketIntegrationTest extends VpcPublicAwsApiPacke
         public void stop() {
             try {
                 if (network != null) {
+                    if (runner != null) {
+                        docker.disconnectFromNetworkCmd().withContainerId(runner).withNetworkId(network).exec();
+                        runner = null;
+                    }
                     docker.removeNetworkCmd(network).exec();
                     network = null;
                 }
