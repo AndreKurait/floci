@@ -14,6 +14,8 @@ import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.parallel.ResourceAccessMode;
 import org.junit.jupiter.api.parallel.ResourceLock;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.net.InetAddress;
 import java.net.SocketException;
@@ -35,11 +37,33 @@ import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /** The address the embedded DNS server gives the containers Floci launches. */
 @ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class EmbeddedDnsServerAddressTest {
+    @Test
+    void explicitListenerUsesItsAddressWithoutResolvingAContainer() throws Exception {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.dns().listenAddress()).thenReturn(Optional.of("127.0.0.2"));
+        CurrentContainerNetworkResolver resolver = mock(CurrentContainerNetworkResolver.class);
+
+        assertEquals("127.0.0.2", EmbeddedDnsServer.resolveServerIp(config, resolver));
+        verifyNoInteractions(resolver);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"0.0.0.0", "::1", "224.0.0.1", "resolver.example.test", "not an address"})
+    void listenerRequiresAConcreteIpv4Address(String value) {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.dns().listenAddress()).thenReturn(Optional.of(value));
+        CurrentContainerNetworkResolver resolver = mock(CurrentContainerNetworkResolver.class);
+
+        assertThrows(IllegalArgumentException.class, () -> EmbeddedDnsServer.resolveServerIp(config, resolver));
+        verifyNoInteractions(resolver);
+    }
+
 
     @Test
     void ownAddressIsThisContainersOnTheNetworkItsContainersJoin() throws Exception {
