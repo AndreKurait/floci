@@ -250,6 +250,15 @@ if starts RdsParameterGroupEngineDockerNightlyIntegrationTest; then
         [ -n "$MYSQL_DEFAULT" ] && pull "${MYSQL_DEFAULT%:*}:$version"
     done
 fi
+# Snapshot coverage names MySQL and MariaDB versions in its parameterized fixture.
+# Prefetch those exact images so the first API call does not also pay for a cold pull.
+if starts RdsMysqlSnapshotDockerNightlyIntegrationTest; then
+    SNAPSHOT_TEST="$(find src/test/java -name RdsMysqlSnapshotDockerNightlyIntegrationTest.java -print -quit)"
+    SNAPSHOT_IMAGES="$(awk -F'|' '/^[[:space:]]*"(mysql|mariadb)[[:space:]]*\|/ {
+        gsub(/[[:space:]"]/, "", $1); gsub(/[[:space:]]/, "", $2); print $1 ":" $2
+    }' "${SNAPSHOT_TEST:-/dev/null}")"
+    for image in $SNAPSHOT_IMAGES; do pull "$image"; done
+fi
 # The InfluxDB and k3s pins live in application.yml like the sidecars above.
 INFLUX_IMAGE="$(grep -oE 'default-image: *"influxdb:[^"]+"' src/main/resources/application.yml | grep -oE '"[^"]+"' | tr -d '"')"
 grep -q '/timestreaminfluxdb/' "$SHARD_FILE" && [ -n "$INFLUX_IMAGE" ] && pull "$INFLUX_IMAGE"
