@@ -107,7 +107,7 @@ class SnsHttpsSubscriptionTrustTest {
                 extraCaPath);
         when(config.effectiveBaseUrl()).thenReturn(BASE_URL);
         return new SnsService(StorageFactories.open(config, "memory"), config, new RegionResolver(REGION, ACCOUNT),
-                null, null, null, new ObjectMapper(), SnsMessageSigner.inMemory(BASE_URL));
+                null, null, null, new ObjectMapper(), SnsMessageSigner.inMemory(BASE_URL), null);
     }
 
     // A localhost HTTPS endpoint serving a certificate ca issued, queueing the SNS message type of each request.
