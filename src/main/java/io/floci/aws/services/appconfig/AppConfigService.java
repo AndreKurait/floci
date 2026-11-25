@@ -1,6 +1,7 @@
 package io.floci.aws.services.appconfig;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.PaginatedResult;
@@ -55,6 +56,7 @@ public class AppConfigService {
     private final AppConfigStorage<Deployment> deploymentStore;
     private final StorageBackend<String, String> activeConfigStore; // envId::profileId -> versionNumber
     private final Clock clock;
+    private final double deploymentTimeScale;
     private final RegionResolver regions;
     private final AppConfigAlarmMonitor alarms;
     private final Map<String, DeploymentPageToken> deploymentPageTokens = new ConcurrentHashMap<>();
@@ -65,6 +67,12 @@ public class AppConfigService {
     private static final Pattern ROLE_ARN = Pattern.compile("arn:" + AwsArnUtils.PARTITION_REGEX + ":iam::\\d{12}:role/.*");
 
     @Inject
+    public AppConfigService(StorageFactory storageFactory, RegionResolver regions,
+                            AppConfigAlarmMonitor alarms, EmulatorConfig config) {
+        this(storageFactory, regions, Clock.systemUTC(), alarms,
+                config.services().appconfig().deploymentTimeScale());
+    }
+
     public AppConfigService(StorageFactory storageFactory, RegionResolver regions, AppConfigAlarmMonitor alarms) {
         this(storageFactory, regions, Clock.systemUTC(), alarms);
     }
@@ -78,6 +86,16 @@ public class AppConfigService {
     }
 
     AppConfigService(StorageFactory storageFactory, RegionResolver regions, Clock clock, AppConfigAlarmMonitor alarms) {
+        this(storageFactory, regions, clock, alarms, 1.0);
+    }
+
+    AppConfigService(StorageFactory storageFactory, RegionResolver regions, Clock clock,
+                     AppConfigAlarmMonitor alarms, double deploymentTimeScale) {
+        if (!Double.isFinite(deploymentTimeScale) || deploymentTimeScale <= 0 || deploymentTimeScale > 1) {
+            throw new IllegalArgumentException(
+                    "floci.services.appconfig.deployment-time-scale must be greater than zero and at most one");
+        }
+        this.deploymentTimeScale = deploymentTimeScale;
         this.clock = clock;
         this.regions = regions;
         this.alarms = alarms;
@@ -864,15 +882,16 @@ public class AppConfigService {
         Instant started = Instant.parse(deployment.getStartedAt());
         int rolloutMinutes = deployment.getDeploymentDurationInMinutes() == null
                 ? 0 : deployment.getDeploymentDurationInMinutes();
-        Instant rolledOut = started.plus(Duration.ofMinutes(rolloutMinutes));
-        Instant completed = rolledOut.plus(Duration.ofMinutes(deployment.getFinalBakeTimeInMinutes()));
+        Duration rolloutDuration = deploymentDuration(rolloutMinutes);
+        Instant rolledOut = started.plus(rolloutDuration);
+        Instant completed = rolledOut.plus(deploymentDuration(deployment.getFinalBakeTimeInMinutes()));
         Instant now = clock.instant();
         String state;
         float percentage;
         if ("DEPLOYING".equals(deployment.getState()) && now.isBefore(rolledOut)) {
             state = "DEPLOYING";
             percentage = rolloutPercentage(deployment, Duration.between(started, now).toMillis(),
-                    Duration.ofMinutes(rolloutMinutes).toMillis());
+                    rolloutDuration.toMillis());
             if (deployment.getPercentageComplete() != null) {
                 percentage = Math.max(percentage, deployment.getPercentageComplete());
             }
@@ -892,6 +911,11 @@ public class AppConfigService {
         deploymentStore.put(refreshed.getApplicationId() + "::" + refreshed.getEnvironmentId()
                 + "::" + refreshed.getDeploymentNumber(), refreshed);
         return refreshed;
+    }
+
+    private Duration deploymentDuration(int minutes) {
+        return minutes == 0 ? Duration.ZERO
+                : Duration.ofMillis(Math.max(1L, Math.round(Duration.ofMinutes(minutes).toMillis() * deploymentTimeScale)));
     }
 
     /** Growth steps are evenly spaced across the rollout; bake begins after its full duration. */

@@ -257,3 +257,13 @@ aws appconfigdata get-latest-configuration \
   --configuration-token $TOKEN \
   --endpoint-url http://localhost:4566
 ```
+
+Local runs can opt into faster deployment timing with
+`FLOCI_SERVICES_APPCONFIG_DEPLOYMENT_TIME_SCALE`. The default `1.0` preserves the requested
+rollout and bake durations. A value greater than zero and at most one multiplies both durations:
+`0.001` runs a 30-minute rollout and 30-minute bake in 3.6 seconds.
+Strategy and deployment responses retain their requested minute values; progress and completion
+timestamps follow the scaled wall time. Alarm checks remain active during both phases.
+A positive phase lasts at least one millisecond. Keep this setting fixed when resuming a persisted
+run, since the configured scale also applies to its active deployments.
+
