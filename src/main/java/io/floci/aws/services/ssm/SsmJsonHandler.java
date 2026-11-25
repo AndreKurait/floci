@@ -51,14 +51,21 @@ public class SsmJsonHandler {
     private final SsmCommandService commandService;
     private final ObjectMapper objectMapper;
     private final IamEnforcementFilter iamEnforcementFilter;
+    private final SsmManagedNodeDiscovery managedNodeDiscovery;
 
     @Inject
     public SsmJsonHandler(SsmService ssmService, SsmCommandService commandService, ObjectMapper objectMapper,
-                          IamEnforcementFilter iamEnforcementFilter) {
+                          IamEnforcementFilter iamEnforcementFilter, SsmManagedNodeDiscovery managedNodeDiscovery) {
         this.ssmService = ssmService;
         this.commandService = commandService;
         this.objectMapper = objectMapper;
         this.iamEnforcementFilter = iamEnforcementFilter;
+        this.managedNodeDiscovery = managedNodeDiscovery;
+    }
+
+    public SsmJsonHandler(SsmService ssmService, SsmCommandService commandService, ObjectMapper objectMapper,
+                          IamEnforcementFilter iamEnforcementFilter) {
+        this(ssmService, commandService, objectMapper, iamEnforcementFilter, null);
     }
 
     public Response handle(String action, JsonNode request, String region, String authorization) {
@@ -1533,13 +1540,14 @@ public class SsmJsonHandler {
     }
 
     private Response handleDescribeInstanceInformation(JsonNode request, String region) {
-        List<InstanceInformation> instances = commandService.describeInstanceInformation(region);
+        PaginatedResult<InstanceInformation> page = managedNodeDiscovery.describe(request, region);
         ObjectNode response = objectMapper.createObjectNode();
         ArrayNode list = objectMapper.createArrayNode();
-        for (InstanceInformation info : instances) {
+        for (InstanceInformation info : page.items()) {
             list.add(instanceInfoToNode(info));
         }
         response.set("InstanceInformationList", list);
+        putNextToken(response, page);
         return Response.ok(response).build();
     }
 
