@@ -162,6 +162,15 @@ public class AppConfigController {
         return Response.noContent().build();
     }
 
+    @POST
+    @Path("/applications/{appId}/configurationprofiles/{profileId}/validators")
+    public Response validateConfiguration(@PathParam("appId") String appId,
+                                           @PathParam("profileId") String profileId,
+                                           @QueryParam("configuration_version") String configurationVersion) {
+        service.validateConfiguration(appId, profileId, configurationVersion);
+        return Response.noContent().build();
+    }
+
     // ──────────────────────────── Hosted Configuration Version ────────────────────────────
 
     @GET
