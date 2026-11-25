@@ -17,6 +17,11 @@ import static org.junit.jupiter.api.Assertions.*;
 class IamPrincipalTagsServiceTest {
     private static final Instant NOW = Instant.parse("2026-10-26T12:00:00Z");
     private static final String ACCOUNT = "000000000000";
+    private static final String TRUST = """
+            {"Version":"2012-10-17","Statement":[{
+              "Effect":"Allow","Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"
+            }]}
+            """;
     private final IamService iam = new IamService(new InMemoryStorage<>(), new InMemoryStorage<>(),
             new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
             new InMemoryStorage<>(), new RegionResolver("us-east-1", ACCOUNT), false, Clock.fixed(NOW, ZoneOffset.UTC));
@@ -51,7 +56,7 @@ class IamPrincipalTagsServiceTest {
 
     @Test
     void roleSessionUsesTheExactRolePathAndCurrentRoleTags() {
-        IamRole role = iam.createRole("Worker", "/team/", "{}", null, 3600, null);
+        IamRole role = iam.createRole("Worker", "/team/", TRUST, null, 3600, null);
         iam.tagRole("Worker", Map.of("department", "engineering"));
         iam.registerSession("ASIASESSION", "secret", "token", role.getArn(), NOW.plusSeconds(3600), null,
                 ACCOUNT, "worker", role.getRoleId() + ":worker");
@@ -64,13 +69,13 @@ class IamPrincipalTagsServiceTest {
 
     @Test
     void recreatedRoleDoesNotSupplyTagsToTheOriginalSession() {
-        IamRole original = iam.createRole("Worker", "/team/", "{}", null, 3600, null);
+        IamRole original = iam.createRole("Worker", "/team/", TRUST, null, 3600, null);
         iam.tagRole("Worker", Map.of("department", "engineering"));
         iam.registerSession("ASIAOLD", "secret", "token", original.getArn(), NOW.plusSeconds(3600), null,
                 ACCOUNT, "worker", original.getRoleId() + ":worker");
         assertEquals(List.of("engineering"), context("ASIAOLD").get("aws:PrincipalTag/department"));
         iam.deleteRole("Worker");
-        IamRole replacement = iam.createRole("Worker", "/team/", "{}", null, 3600, null);
+        IamRole replacement = iam.createRole("Worker", "/team/", TRUST, null, 3600, null);
         assertEquals(original.getArn(), replacement.getArn());
         assertNotEquals(original.getRoleId(), replacement.getRoleId());
         iam.tagRole("Worker", Map.of("department", "security"));
@@ -82,7 +87,7 @@ class IamPrincipalTagsServiceTest {
 
     @Test
     void aSessionWithoutRecordedRoleIdentityDoesNotSupplyTags() {
-        IamRole role = iam.createRole("Worker", "/team/", "{}", null, 3600, null);
+        IamRole role = iam.createRole("Worker", "/team/", TRUST, null, 3600, null);
         iam.tagRole("Worker", Map.of("department", "engineering"));
         iam.registerSession("ASIALEGACY", role.getArn(), NOW.plusSeconds(3600));
         assertFalse(context("ASIALEGACY").containsKey("aws:PrincipalTag/department"));
@@ -90,7 +95,7 @@ class IamPrincipalTagsServiceTest {
 
     @Test
     void aDifferentRolePathDoesNotSupplyTags() {
-        IamRole role = iam.createRole("Worker", "/team/", "{}", null, 3600, null);
+        IamRole role = iam.createRole("Worker", "/team/", TRUST, null, 3600, null);
         iam.tagRole("Worker", Map.of("department", "engineering"));
         iam.registerSession("ASIAWRONG", role.getArn().replace("/team/", "/other/"), NOW.plusSeconds(3600));
         assertFalse(context("ASIAWRONG").containsKey("aws:PrincipalTag/department"));
