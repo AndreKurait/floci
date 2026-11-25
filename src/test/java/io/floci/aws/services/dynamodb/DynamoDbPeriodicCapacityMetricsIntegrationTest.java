@@ -2,8 +2,11 @@ package io.floci.aws.services.dynamodb;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.floci.aws.services.cloudwatch.metrics.CloudWatchMetricsService;
 import io.floci.aws.testing.AwsTestClients;
+import io.floci.aws.testing.ManualClock;
 import io.quarkus.test.junit.QuarkusTest;
+import jakarta.inject.Inject;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -40,6 +43,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
 
 import static org.awaitility.Awaitility.await;
@@ -49,6 +53,8 @@ import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 @QuarkusTest
 @Timeout(210)
@@ -57,9 +63,14 @@ class DynamoDbPeriodicCapacityMetricsIntegrationTest {
     private static final ExecutionAttribute<Integer> WIRE_ID =
             new ExecutionAttribute<>("floci-ddb-periodic-capacity-metrics-wire-id");
     private static final String INDEX = "focused";
+    @Inject
+    DynamoDbService tables;
+    @Inject
+    CloudWatchMetricsService publishedMetrics;
     private final String table = "periodic-capacity-" + UUID.randomUUID();
     private final WireReceipt wire = new WireReceipt();
     private final Map<String, Object> observations = new LinkedHashMap<>();
+    private String account;
     private DynamoDbClient dynamo;
     private CloudWatchClient metrics;
     private Instant start;
@@ -71,7 +82,7 @@ class DynamoDbPeriodicCapacityMetricsIntegrationTest {
         boolean onDemand = testInfo.getTestMethod().orElseThrow().getName()
                 .equals("freshOnDemandTableDoesNotPublishProvisionedSamples");
         observations.put("billingMode", onDemand ? "PAY_PER_REQUEST" : "PROVISIONED");
-        String account = Long.toString(ThreadLocalRandom.current().nextLong(740000000000L, 749999999999L));
+        account = Long.toString(ThreadLocalRandom.current().nextLong(740000000000L, 749999999999L));
         dynamo = AwsTestClients.create(DynamoDbClient.builder().overrideConfiguration(config -> config
                         .apiCallTimeout(Duration.ofSeconds(8)).apiCallAttemptTimeout(Duration.ofSeconds(6))
                         .retryPolicy(RetryPolicy.none()).addExecutionInterceptor(wire)),
@@ -121,20 +132,42 @@ class DynamoDbPeriodicCapacityMetricsIntegrationTest {
     }
 
     @Test
-    void aFullyObservedIdleMinutePublishesRealZeroConsumptionPoints() {
+    void anObservedIdleMinutePublishesZeroOnlyAfterItCompletes() {
         observations.put("operation", "complete-idle-minute");
-        // Give the local periodic observer twenty seconds to see this new table before the selected minute.
-        Instant fullMinute = Instant.ofEpochSecond((Instant.now().getEpochSecond() + 79) / 60 * 60);
+        // Keep the controlled observer's interval separate from the normal scheduler's current minute.
+        Instant fullMinute = Instant.ofEpochSecond((Instant.now().getEpochSecond() / 60 - 3) * 60);
         Instant end = fullMinute.plusSeconds(60);
         observations.put("fullMinuteStart", fullMinute.toString());
         observations.put("fullMinuteEnd", end.toString());
-        await().atMost(Duration.ofSeconds(165)).pollInterval(Duration.ofMillis(100))
-                .until(() -> !Instant.now().isBefore(end.plusSeconds(20)));
-        await().atMost(Duration.ofSeconds(15)).pollInterval(Duration.ofMillis(500)).untilAsserted(() -> assertAll(
-                () -> idle("ConsumedReadCapacityUnits", false, fullMinute, end),
-                () -> idle("ConsumedWriteCapacityUnits", false, fullMinute, end),
-                () -> idle("ConsumedReadCapacityUnits", true, fullMinute, end),
-                () -> idle("ConsumedWriteCapacityUnits", true, fullMinute, end)));
+        observations.put("controlledObserverClock", true);
+        ManualClock clock = new ManualClock(fullMinute.minusSeconds(1));
+        DynamoDbService ownedTables = mock(DynamoDbService.class);
+        when(ownedTables.capacitySnapshots()).thenAnswer(ignored -> tables.capacitySnapshots().stream()
+                .filter(snapshot -> snapshot.accountId().equals(account)
+                        && snapshot.region().equals(Region.US_EAST_1.id())
+                        && snapshot.tableId().equals(initialTable.tableId())).toList());
+        DynamoDbCapacityMetrics observer = new DynamoDbCapacityMetrics(
+                ownedTables, publishedMetrics, clock, mock(ScheduledExecutorService.class), true);
+        try {
+            observer.tick();
+            clock.advance(Duration.ofSeconds(60));
+            observer.tick();
+            for (String metric : List.of("ConsumedReadCapacityUnits", "ConsumedWriteCapacityUnits")) {
+                for (boolean index : List.of(false, true)) {
+                    assertTrue(statistics(metric, index, fullMinute, end, 60, "Sum").datapoints().isEmpty(),
+                            "An incomplete idle minute must not publish a zero");
+                }
+            }
+            clock.advance(Duration.ofSeconds(1));
+            observer.tick();
+            assertAll(
+                    () -> idle("ConsumedReadCapacityUnits", false, fullMinute, end),
+                    () -> idle("ConsumedWriteCapacityUnits", false, fullMinute, end),
+                    () -> idle("ConsumedReadCapacityUnits", true, fullMinute, end),
+                    () -> idle("ConsumedWriteCapacityUnits", true, fullMinute, end));
+        } finally {
+            observer.stop();
+        }
         assertEquals(configuration(initialTable), configuration(describe()));
     }
 
