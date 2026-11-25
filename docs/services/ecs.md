@@ -281,6 +281,10 @@ at registration:
   `capabilities` always carry both an `add` and a `drop` list, as on AWS.
 - A `dependsOn` graph that names only containers of the same task definition and has no cycle.
 
+`RunTask` retains Floci's Fargate fallback when neither a launch type nor a request or cluster
+capacity-provider strategy is supplied. Request `launchType=EC2` to place tasks on registered
+ACTIVE container instances and use their instance metadata and instance-profile context.
+
 A launched Fargate task reports what AWS reports: `platformVersion` (with `LATEST` resolved to a
 concrete version, as AWS resolves it) and `platformFamily` (`Linux`, or the Windows Server family
 from the task definition's `runtimePlatform.operatingSystemFamily`), `connectivity` and

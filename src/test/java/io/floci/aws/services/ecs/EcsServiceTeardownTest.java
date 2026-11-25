@@ -61,7 +61,7 @@ class EcsServiceTeardownTest {
 
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
-    void stoppedTaskKeepsItsHandleUntilEphemeralVolumeCleanupSucceeds(boolean exitsNaturally) {
+    void stoppedTaskKeepsItsHandleUntilEphemeralVolumeCleanupSucceeds(boolean exitsNaturally) throws Exception {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.services().ecs().mock()).thenReturn(false);
         when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
@@ -100,6 +100,7 @@ class EcsServiceTeardownTest {
             service.reconcile();
         } else {
             service.stopTask(null, taskArn, null, REGION);
+            service.awaitPendingStops();
         }
         assertEquals("STOPPED", service.describeTasks(null, List.of(taskArn), REGION).getFirst().getLastStatus());
         assertTrue(handle.hasTaskVolumes());
@@ -309,7 +310,7 @@ class EcsServiceTeardownTest {
     }
 
     @Test
-    void stopTaskRecoversContainerIdsWhenTheRuntimeHandleIsMissing() {
+    void stopTaskRecoversContainerIdsWhenTheRuntimeHandleIsMissing() throws Exception {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.services().ecs().mock()).thenReturn(false);
         when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
@@ -349,6 +350,7 @@ class EcsServiceTeardownTest {
         service.stopManagedContainers();
         service.afterReset();
         service.stopTask(null, taskArn, null, REGION);
+        service.awaitPendingStops();
 
         verify(containerManager).stopTaskAndCollectExitCodes(argThat(
                 handle -> "docker-id".equals(handle.getContainerIds().get("app"))));
@@ -358,7 +360,7 @@ class EcsServiceTeardownTest {
     }
 
     @Test
-    void failedContainerRemovalKeepsTaskStoppingUntilReconciliationRetries() {
+    void failedContainerRemovalKeepsTaskStoppingUntilReconciliationRetries() throws Exception {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.services().ecs().mock()).thenReturn(false);
         when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
@@ -392,6 +394,7 @@ class EcsServiceTeardownTest {
                 EcsTask::getLastStatus, Duration.ofSeconds(5), "RUNNING");
 
         service.stopTask(null, taskArn, null, REGION);
+        service.awaitPendingStops();
         assertEquals("STOPPING", service.describeTasks(null, List.of(taskArn), REGION).getFirst().getLastStatus());
 
         // The tick's retry runs off the reconciler thread and lands the task once Docker is done.
@@ -402,7 +405,7 @@ class EcsServiceTeardownTest {
     }
 
     @Test
-    void removedContainerWithUnknownExitCodeStopsWithoutInventingSuccess() {
+    void removedContainerWithUnknownExitCodeStopsWithoutInventingSuccess() throws Exception {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.services().ecs().mock()).thenReturn(false);
         when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
@@ -436,7 +439,10 @@ class EcsServiceTeardownTest {
         awaitLastStatus(() -> service.describeTasks(null, List.of(taskArn), REGION).getFirst(),
                 EcsTask::getLastStatus, Duration.ofSeconds(5), "RUNNING");
 
-        EcsTask stopped = service.stopTask(null, taskArn, null, REGION);
+        // StopTask answers STOPPING, as on ECS; the teardown finishes afterwards.
+        assertEquals("STOPPING", service.stopTask(null, taskArn, null, REGION).getLastStatus());
+        service.awaitPendingStops();
+        EcsTask stopped = service.describeTasks(null, List.of(taskArn), REGION).getFirst();
         assertEquals("STOPPED", stopped.getLastStatus());
         assertNull(stopped.getContainers().getFirst().getExitCode());
         service.reconcile();
@@ -477,32 +483,17 @@ class EcsServiceTeardownTest {
         awaitLastStatus(() -> service.describeTasks(null, List.of(taskArn), REGION).getFirst(),
                 EcsTask::getLastStatus, Duration.ofSeconds(5), "RUNNING");
 
-        CompletableFuture<EcsTask> first = CompletableFuture.supplyAsync(() ->
-                service.stopTask(null, taskArn, null, REGION));
+        EcsTask first = service.stopTask(null, taskArn, null, REGION);
         try {
+            assertEquals("STOPPING", first.getLastStatus());
             assertTrue(teardownEntered.await(5, TimeUnit.SECONDS));
-            AtomicReference<Throwable> secondFailure = new AtomicReference<>();
-            Thread second = new Thread(() -> {
-                try {
-                    service.stopTask(null, taskArn, null, REGION);
-                } catch (Throwable failure) {
-                    secondFailure.set(failure);
-                }
-            });
-            second.start();
-
-            long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-            while (second.getState() != Thread.State.BLOCKED) {
-                assertTrue(second.isAlive(), "second stop finished without waiting for the first");
-                assertTrue(System.nanoTime() < deadline, "second stop never queued on the task");
-                Thread.onSpinWait();
-            }
+            // A second StopTask while the first teardown runs answers at once and starts no second one.
+            EcsTask second = CompletableFuture.supplyAsync(() -> service.stopTask(null, taskArn, null, REGION))
+                    .get(5, TimeUnit.SECONDS);
+            assertEquals("STOPPING", second.getLastStatus());
 
             finishTeardown.countDown();
-            first.get(5, TimeUnit.SECONDS);
-            second.join(5000);
-            assertFalse(second.isAlive(), "second stop did not finish");
-            assertNull(secondFailure.get());
+            service.awaitPendingStops();
             verify(containerManager, times(1)).stopTaskAndCollectExitCodes(handle);
             assertEquals("STOPPED", service.describeTasks(null, List.of(taskArn), REGION).getFirst().getLastStatus());
         } finally {
@@ -579,7 +570,7 @@ class EcsServiceTeardownTest {
     }
 
     @Test
-    void stoppedTaskRetriesTeardownUntilItsRemainingLogStreamIsReleased() {
+    void stoppedTaskRetriesTeardownUntilItsRemainingLogStreamIsReleased() throws Exception {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.services().ecs().mock()).thenReturn(false); // docker mode
         when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
@@ -617,6 +608,7 @@ class EcsServiceTeardownTest {
                 EcsTask::getLastStatus, Duration.ofSeconds(5), "RUNNING");
 
         service.stopTask(null, taskArn, null, REGION);
+        service.awaitPendingStops();
         verify(containerManager, times(1)).stopTaskAndCollectExitCodes(handle);
 
         service.reconcile();
