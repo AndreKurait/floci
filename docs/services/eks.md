@@ -42,6 +42,7 @@ or list operations. Resource tags are not retained for post-deletion policy cond
 | `UpdateClusterConfig` | Update a cluster's endpoint access, logging, authentication mode or upgrade policy |
 | `ListClusters` | List cluster names with pagination (`maxResults` 1-100 and `nextToken`) |
 | `DeleteCluster` | Delete a cluster |
+| `ListAccessPolicies` | List the bundled access-policy catalog with pagination |
 | `CreateAccessEntry` | Create STANDARD, EC2_LINUX or EC2 (EKS Auto Mode) access-entry metadata |
 | `DescribeAccessEntry` | Describe an access entry by IAM principal ARN |
 | `ListAccessEntries` | List principal ARNs with pagination |
@@ -76,6 +77,18 @@ or list operations. Resource tags are not retained for post-deletion policy cond
 
 ## Access-entry management
 
+`ListAccessPolicies` serves `GET /access-policies` without requiring a cluster or access entry.
+It returns policy names and global ARNs in the request's partition, under `accessPolicies`.
+`maxResults` defaults to 100 and accepts 1 through 100. Continue with the opaque `nextToken`;
+the final page omits it. IAM enforcement checks `eks:ListAccessPolicies` on `*`.
+
+The bundled catalog contains 39 names in `eks/access-policies.json`. Refresh it from
+EKS `ListAccessPolicies` with `make eks-access-policies-sync`; `make aws-data-check`
+validates the checked-in catalog offline, without requiring AWS credentials. The
+[AWS API reference](https://docs.aws.amazon.com/eks/latest/APIReference/API_ListAccessPolicies.html)
+defines the listing and pagination contract. The snapshot does not model policy availability
+by partition. Listing names does not expose policy contents or grant Kubernetes permissions.
+
 `CreateCluster` accepts `accessConfig.authenticationMode` (`CONFIG_MAP`, `API_AND_CONFIG_MAP`, or `API`) and `bootstrapClusterCreatorAdminPermissions`. The API default is `CONFIG_MAP`; access-entry operations require an ACTIVE cluster created with `API` or `API_AND_CONFIG_MAP`.
 
 The access-entry management operations support `STANDARD` (the default), `EC2_LINUX` and `EC2`. STANDARD accepts existing IAM users or roles, including principals in another account. EC2_LINUX requires a role in the cluster account and generates `system:node:{{EC2PrivateDNSName}}`; custom usernames and Kubernetes groups are not accepted for node entries. `EC2`, the type of EKS Auto Mode's node role, accepts roles only and generates `system:node:{{SessionName}}` in the `system:nodes` group; like AWS, it refuses Kubernetes groups, a username or an IAM user with AWS's messages, and access policies can be associated with it. When a cluster's EKS Auto Mode compute capability is turned on, by `CreateCluster` or `UpdateClusterConfig`, Floci makes the node role's `EC2` entry with `AmazonEKSAutoNodePolicy` on the cluster scope, as EKS does, unless the role already has an entry, IAM doesn't have the role, or the cluster's authentication mode is `CONFIG_MAP`. Tags supplied at creation are preserved. Repeating a create with the same client token and normalized parameters returns the existing entry. Listing accepts `maxResults` from 1 to 100 and cluster-specific `nextToken` values.
@@ -104,7 +117,7 @@ rejects instance credentials. Obtain fresh IMDS credentials after upgrading so t
 includes the stable role ID.
 
 !!! note "Authentication scope"
-    Non-worker IAM users and ordinary STS sessions retain the existing cluster-admin compatibility behavior. STANDARD entries, access policies, aws-auth ConfigMap, the cluster-creator bootstrap flag and automatic managed-node entries are not enforced by this change. Updating authentication mode, UpdateAccessEntry, ListAccessPolicies, and entry tag updates remain unimplemented. Native AL2023 images, bootstrap RBAC/CSR approval, CNI and worker networking are separate requirements for registration and Ready.
+    Non-worker IAM users and ordinary STS sessions retain the existing cluster-admin compatibility behavior. STANDARD entries, access policies, aws-auth ConfigMap, the cluster-creator bootstrap flag and automatic managed-node entries are not enforced by this change. Updating authentication mode, UpdateAccessEntry, and entry tag updates remain unimplemented. Native AL2023 images, bootstrap RBAC/CSR approval, CNI and worker networking are separate requirements for registration and Ready.
 
 ```bash
 aws --endpoint-url http://localhost:4566 eks create-cluster \
