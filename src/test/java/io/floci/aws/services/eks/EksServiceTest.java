@@ -1479,6 +1479,42 @@ class EksServiceTest {
     }
 
     @Test
+    void deleteClusterPreservesChildrenOfTheSameNamedClusterInAnotherRegion() {
+        RegionResolver resolver = spy(new RegionResolver("us-east-1", "000000000000"));
+        EksService service = new EksService(storageFactory, testConfig(), resolver, null, ec2Service,
+                new EksOidcService(storageFactory, new ObjectMapper()), mock(EksAccessEntryService.class),
+                mock(EksPodIdentityAssociationService.class));
+        for (String region : List.of("us-east-1", "us-west-2")) {
+            when(resolver.getRegion()).thenReturn(region);
+            CreateClusterRequest cluster = new CreateClusterRequest();
+            cluster.setName("regional-recreated");
+            cluster.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
+            service.createCluster(cluster);
+            List<String> subnets = List.of(Ec2Service.defaultSubnetId(region, "a", "000000000000"),
+                    Ec2Service.defaultSubnetId(region, "b", "000000000000"));
+            CreateNodeGroupRequest group = nodeGroupRequest("kept-group");
+            group.setSubnets(subnets);
+            service.createNodeGroup("regional-recreated", group);
+            CreateFargateProfileRequest profile = fargateProfileRequest("kept-profile");
+            profile.setSubnets(subnets);
+            service.createFargateProfile("regional-recreated", profile);
+        }
+
+        when(resolver.getRegion()).thenReturn("us-east-1");
+        service.deleteCluster("regional-recreated");
+        CreateClusterRequest replacement = new CreateClusterRequest();
+        replacement.setName("regional-recreated");
+        replacement.setRoleArn("arn:aws:iam::000000000000:role/eks-role");
+        service.createCluster(replacement);
+        assertEquals(List.of(), service.listNodeGroups("regional-recreated"));
+        assertEquals(List.of(), service.listFargateProfiles("regional-recreated"));
+
+        when(resolver.getRegion()).thenReturn("us-west-2");
+        assertEquals(List.of("kept-group"), service.listNodeGroups("regional-recreated"));
+        assertEquals(List.of("kept-profile"), service.listFargateProfiles("regional-recreated"));
+    }
+
+    @Test
     void deleteClusterDeletesAddons() {
         StorageFactory storageFactory = new StorageFactory(null, null) {
             @Override
