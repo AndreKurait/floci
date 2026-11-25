@@ -1,9 +1,13 @@
 package io.floci.aws.services.appconfig;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.storage.StorageFactory;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.RestAssured;
 import io.restassured.http.ContentType;
 import io.restassured.response.Response;
+import jakarta.inject.Inject;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
@@ -23,9 +27,14 @@ import static org.hamcrest.Matchers.equalTo;
 import static org.hamcrest.Matchers.nullValue;
 import static org.hamcrest.Matchers.startsWith;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @QuarkusTest
 class AppConfigLegacyIntegrationTest {
+    @Inject
+    StorageFactory storageFactory;
+    @Inject
+    RegionResolver regions;
     private String application;
     private String environment;
     private String profile;
@@ -207,8 +216,14 @@ class AppConfigLegacyIntegrationTest {
 
     @Test
     void deployedVersionWithoutHostedContentIsNotFound() {
-        String s3Profile = createProfile(Map.of("Name", "s3-settings", "LocationUri", "s3://bucket/settings.json"));
-        deploy(environment, s3Profile, "3sL4kqtJlcpXroDTDmJ");
+        String s3Profile = createProfile(Map.of("Name", "s3-settings", "LocationUri", "s3://bucket/settings.json",
+                "RetrievalRoleArn", "arn:aws:iam::" + regions.getAccountId() + ":role/legacy-source"));
+        AppConfigStorage<String> active = new AppConfigStorage<>(storageFactory, regions,
+                "appconfig", "appconfig-active-configs.json", new TypeReference<Map<String, String>>() {});
+        String activeKey = environment + "::" + s3Profile;
+        assertTrue(active.get(activeKey).isEmpty());
+        // Model a legacy active S3 version without retained bytes; current admission must retrieve content.
+        active.put(activeKey, "3sL4kqtJlcpXroDTDmJ");
         given().queryParam("client_id", "reader").get(path(environment, s3Profile))
                 .then().statusCode(404).body("__type", equalTo("ResourceNotFoundException"));
 
