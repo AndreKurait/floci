@@ -54,7 +54,8 @@ class Ec2ImageResourceArnTest {
 
     @Test
     void imageGrantCannotAuthorizeAnotherResourceInTheSameTagRequest() {
-        assertEquals(List.of("arn:aws:ec2:eu-west-1::image/ami-12345678", "*"),
+        assertEquals(List.of("arn:aws:ec2:eu-west-1::image/ami-12345678",
+                        "arn:aws:ec2:eu-west-1:111122223333:instance/i-12345678"),
                 resources("CreateTags", "ResourceId.1=ami-12345678&ResourceId.2=i-12345678",
                         "eu-west-1", "aws"));
     }

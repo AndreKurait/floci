@@ -312,6 +312,9 @@ public class ResourceArnBuilder {
             return List.of("*");
         }
         // These selectors require service semantics that a member-to-ARN template cannot infer.
+        if ("ec2:CopyImage".equals(operation)) {
+            return Ec2ResourceArns.of(operation, ctx, region, accountId, partition, null);
+        }
         if ("iam:CreateServiceLinkedRole".equals(operation)) {
             return serviceLinkedRoleArn(ctx, region, accountId, partition);
         }
