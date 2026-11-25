@@ -5,15 +5,21 @@ import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.HostConfig;
 import com.github.dockerjava.core.DefaultDockerClientConfig;
 import com.github.dockerjava.core.DockerClientImpl;
+import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.config.FlociCertificateAuthority;
 import io.floci.aws.core.common.CertificateReferenceResolver.CertificateMaterial;
+import io.floci.aws.core.common.dns.EmbeddedDnsServer;
+import io.floci.aws.core.common.docker.ContainerBuilder;
 import io.floci.aws.core.common.docker.ContainerExec;
+import io.floci.aws.core.common.docker.DockerHostResolver;
 import io.floci.aws.core.common.docker.FlociDockerHttpClient;
+import io.floci.aws.core.common.docker.LocallyBuiltHelperImage;
 import io.floci.aws.core.common.docker.RetryingTarCopier;
 import io.floci.aws.services.acm.CertificateGenerator.GeneratedCertificate;
 import io.floci.aws.services.acm.model.KeyAlgorithm;
 import io.floci.aws.services.elb.model.ClassicListener;
 import io.floci.aws.services.elb.model.ClassicLoadBalancer;
+import io.floci.aws.services.lambda.launcher.ImageCacheService;
 import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.api.parallel.ResourceAccessMode;
@@ -33,6 +39,7 @@ import java.util.Map;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.*;
 
 @ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class ElbClassicProxyPacketTest {
@@ -61,10 +68,18 @@ class ElbClassicProxyPacketTest {
                 .dockerHost(host).responseTimeout(Duration.ofSeconds(10)).build();
              DockerClient docker = DockerClientImpl.getInstance(DefaultDockerClientConfig.createDefaultConfigBuilder()
                      .withDockerHost(host.toString()).build(), transport)) {
+            EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+            when(config.docker().imagePullTimeoutSeconds()).thenReturn(300);
+            String helperImage = System.getProperty("floci.test.classic.helper-image", "floci/network-helper:local");
+            ContainerBuilder builder = new ContainerBuilder(config, mock(DockerHostResolver.class),
+                    mock(EmbeddedDnsServer.class));
+            LocallyBuiltHelperImage.ensureBuilt(docker, builder, helperImage, "floci/network-helper:local",
+                    "/docker/network-helper.Dockerfile");
+            String proxyImage = new ImageCacheService(docker, config).ensureImageExists(PROXY);
             List<String> created = new ArrayList<>();
             try {
                 planned(prefix + "-helper");
-                String helper = docker.createContainerCmd("floci/network-helper:local").withName(prefix + "-helper")
+                String helper = docker.createContainerCmd(builder.resolveImage(helperImage)).withName(prefix + "-helper")
                         .withLabels(Map.of("test-owner", prefix))
                         .withHostConfig(HostConfig.newHostConfig().withNetworkMode("none"))
                         .withEntrypoint("socat").withCmd(backendTls
@@ -95,7 +110,7 @@ class ElbClassicProxyPacketTest {
                             return material;
                         });
                 planned(prefix + "-proxy");
-                String proxy = docker.createContainerCmd(PROXY).withName(prefix + "-proxy").withUser("0")
+                String proxy = docker.createContainerCmd(proxyImage).withName(prefix + "-proxy").withUser("0")
                         .withLabels(Map.of("test-owner", prefix))
                         .withHostConfig(HostConfig.newHostConfig().withNetworkMode("container:" + helper))
                         .withEntrypoint("haproxy").withCmd("-W", "-db", "-f",

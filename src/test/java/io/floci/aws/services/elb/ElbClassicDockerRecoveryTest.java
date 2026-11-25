@@ -42,6 +42,8 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class ElbClassicDockerRecoveryTest {
+    private String recoveryImage = System.getProperty("floci.test.classic.recovery-image", "alpine:3.21");
+
     @TempDir
     Path journalDirectory;
 
@@ -54,6 +56,9 @@ class ElbClassicDockerRecoveryTest {
                 .dockerHost(host).responseTimeout(Duration.ofSeconds(10)).build();
              DockerClient docker = DockerClientImpl.getInstance(DefaultDockerClientConfig.createDefaultConfigBuilder()
                      .withDockerHost(host.toString()).build(), transport)) {
+            EmulatorConfig imageConfig = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+            when(imageConfig.docker().imagePullTimeoutSeconds()).thenReturn(300);
+            recoveryImage = new ImageCacheService(docker, imageConfig).ensureImageExists(recoveryImage);
             List<String> created = new ArrayList<>();
             try {
                 EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
@@ -130,7 +135,7 @@ class ElbClassicDockerRecoveryTest {
         Path directory = configured == null || configured.isBlank() ? journalDirectory : Path.of(configured);
         Path manifest = directory.resolve("docker-ownership.txt");
         Files.writeString(manifest, "planned " + name + "\n", StandardOpenOption.CREATE, StandardOpenOption.APPEND);
-        String id = docker.createContainerCmd("alpine:3.21").withName(name).withLabels(labels)
+        String id = docker.createContainerCmd(recoveryImage).withName(name).withLabels(labels)
                 .withHostConfig(HostConfig.newHostConfig().withNetworkMode(network))
                 .withCmd("sleep", "300").exec().getId();
         created.add(id);
