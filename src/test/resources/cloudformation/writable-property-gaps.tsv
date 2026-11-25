@@ -351,7 +351,6 @@ AWS::ElasticLoadBalancingV2::LoadBalancer	EnableCapacityReservationProvisionStab
 AWS::ElasticLoadBalancingV2::LoadBalancer	EnablePrefixForIpv6SourceNat	accepted and ignored
 AWS::ElasticLoadBalancingV2::LoadBalancer	EnforceSecurityGroupInboundRulesOnPrivateLinkTraffic	accepted and ignored
 AWS::ElasticLoadBalancingV2::LoadBalancer	Ipv4IpamPoolId	accepted and ignored
-AWS::ElasticLoadBalancingV2::LoadBalancer	LoadBalancerAttributes	accepted and ignored
 AWS::ElasticLoadBalancingV2::LoadBalancer	MinimumLoadBalancerCapacity	accepted and ignored
 AWS::ElasticLoadBalancingV2::TargetGroup	TargetControlPort	accepted and ignored
 AWS::ElasticLoadBalancingV2::TargetGroup	TargetGroupAttributes	accepted and ignored

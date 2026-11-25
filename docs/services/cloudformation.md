@@ -19,6 +19,11 @@ uses 3,600 seconds. Updates preserve the role's identity, and failed updates
 restore its previous duration. The limit controls new STS sessions without
 changing credentials already issued.
 
+`AWS::ElasticLoadBalancingV2::LoadBalancer` applies `LoadBalancerAttributes` on
+creation and update. Attributes omitted by an update retain their current values.
+A failed stack update restores only the attributes changed by that update,
+preserving changes to other attributes.
+
 ## Supported Actions
 
 <!-- floci:actions:start -->

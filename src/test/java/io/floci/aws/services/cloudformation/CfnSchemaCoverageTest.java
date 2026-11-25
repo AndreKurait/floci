@@ -131,7 +131,8 @@ class CfnSchemaCoverageTest {
      * {@code OpenApiDocuments.resolve} reads {@code Body} and {@code BodyS3Location}.
      */
     private static final Map<String, Set<String>> HELPER_READS = Map.of(
-            "OpenApiDocuments.resolve(", Set.of("Body", "BodyS3Location"));
+            "OpenApiDocuments.resolve(", Set.of("Body", "BodyS3Location"),
+            "ElbV2CfnLoadBalancerAttributes.declared(", Set.of("LoadBalancerAttributes"));
     /**
      * Calls that hand the whole resolved property object to the service request, so every writable
      * property of the type counts as read without a name appearing in the source. Explicit, one entry

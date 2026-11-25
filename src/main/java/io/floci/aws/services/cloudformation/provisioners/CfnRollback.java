@@ -79,6 +79,7 @@ public final class CfnRollback {
      * retained across a failed move back.
      */
     public static final String LOAD_BALANCER_SUBNETS_UPDATE_SNAPSHOT_ATTR = "__FlociLoadBalancerSubnetsUpdateSnapshot";
+    public static final String LOAD_BALANCER_ATTRIBUTES_UPDATE_SNAPSHOT_ATTR = "__FlociLoadBalancerAttributesUpdateSnapshot";
 
     /**
      * Holds what an update that kept an ELBv2 target group changed in its registrations: the targets
