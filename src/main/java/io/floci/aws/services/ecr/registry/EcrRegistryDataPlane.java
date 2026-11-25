@@ -773,9 +773,13 @@ public class EcrRegistryDataPlane {
         List<String> parameters = new ArrayList<>();
         if (parts.length == 2) {
             for (String parameter : parts[1].split("&")) {
-                String name = URLDecoder.decode(parameter.split("=", 2)[0], StandardCharsets.UTF_8);
-                if (!name.equals("from") && !name.equals("mount")) {
-                    parameters.add(parameter);
+                try {
+                    String name = URLDecoder.decode(parameter.split("=", 2)[0], StandardCharsets.UTF_8);
+                    if (!name.equals("from") && !name.equals("mount")) {
+                        parameters.add(parameter);
+                    }
+                } catch (IllegalArgumentException ignored) {
+                    // An invalid escape cannot name a mount parameter; discard it before forwarding.
                 }
             }
         }
@@ -945,8 +949,12 @@ public class EcrRegistryDataPlane {
         }
         for (String parameter : query.split("&")) {
             int separator = parameter.indexOf('=');
-            if (separator > 0 && name.equals(URLDecoder.decode(parameter.substring(0, separator), StandardCharsets.UTF_8))) {
-                return URLDecoder.decode(parameter.substring(separator + 1), StandardCharsets.UTF_8);
+            try {
+                if (separator > 0 && name.equals(URLDecoder.decode(parameter.substring(0, separator), StandardCharsets.UTF_8))) {
+                    return URLDecoder.decode(parameter.substring(separator + 1), StandardCharsets.UTF_8);
+                }
+            } catch (IllegalArgumentException ignored) {
+                // An invalid escape cannot select a namespace or mount; retain the normal authorization path.
             }
         }
         return "";
