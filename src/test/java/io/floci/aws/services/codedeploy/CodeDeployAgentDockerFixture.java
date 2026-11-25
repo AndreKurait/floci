@@ -5,6 +5,7 @@ import com.github.dockerjava.api.exception.NotFoundException;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.docker.ContainerExec;
 import io.floci.aws.core.common.docker.ContainerStorageHelper;
+import io.floci.aws.core.common.docker.DockerHostResolver;
 import io.floci.aws.services.ec2.AmiImageResolver;
 import io.floci.aws.services.ec2.Ec2Service;
 import io.floci.aws.services.ec2.ResolvedAmiImage;
@@ -108,6 +109,7 @@ abstract class CodeDeployAgentDockerFixture {
     }
 
     @Inject DockerClient docker;
+    @Inject DockerHostResolver dockerHostResolver;
     @Inject EmulatorConfig config;
     @Inject Ec2Service instances;
     @InjectMock AmiImageResolver images;
@@ -261,7 +263,8 @@ abstract class CodeDeployAgentDockerFixture {
         cleanup.addFirst(() -> ec2.deleteSubnet(request -> request.subnetId(subnet)));
         String gateway = docker.inspectNetworkCmd().withNetworkId("bridge").exec()
                 .getIpam().getConfig().getFirst().getGateway();
-        String agentEndpoint = "http://" + gateway + ":" + endpoint.getPort();
+        String agentHost = dockerHostResolver.resolveContainerIp().orElse(gateway);
+        String agentEndpoint = "http://" + agentHost + ":" + endpoint.getPort();
         scaling.createLaunchConfiguration(request -> request.launchConfigurationName(name)
                 .imageId("ami-codedeploy-agent").instanceType("t3.micro").iamInstanceProfile(name)
                 .userData(Base64.getEncoder().encodeToString(userData(agentEndpoint).getBytes(StandardCharsets.UTF_8))));
