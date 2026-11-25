@@ -131,7 +131,7 @@ Operation counts are exact. For dispatch-table services (Query and JSON 1.1) eac
 | [Application Auto Scaling](applicationautoscaling.md) | `POST /` + `X-Amz-Target: AnyScaleFrontendService.*` | JSON 1.1 | 13 |
 | [Elastic Beanstalk](elastic-beanstalk.md) | `POST /` with `Action=` or `Operation=` param | Query | 14 |
 | [CodeBuild](codebuild.md) | `POST /` + `X-Amz-Target: CodeBuild_20161006.*` | JSON 1.1 | 20 |
-| [AWS Batch](batch.md) | `/v1/...` | REST JSON | 19 |
+| [AWS Batch](batch.md) | `/v1/...` | REST JSON | 24 |
 | [CodeDeploy](codedeploy.md) | `POST /` + `X-Amz-Target: CodeDeploy_20141006.*` | JSON 1.1 | 35 |
 | [CodePipeline](codepipeline.md) | `POST /` + `X-Amz-Target: CodePipeline_20150709.*` | JSON 1.1 | 44 |
 | [AWS Signer](signer.md) | `/signing-profiles`, `/signing-jobs`, `/signing-platforms`, `/revocations` | REST JSON | 18 |
