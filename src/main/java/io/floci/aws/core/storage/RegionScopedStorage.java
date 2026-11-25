@@ -110,6 +110,9 @@ public final class RegionScopedStorage<V> implements StorageBackend<String, V> {
             boolean prefixed = regionPrefixed(stored);
             String region = prefixed ? stored.substring(0, stored.indexOf('/')) : regions.getDefaultRegion();
             String key = prefixed ? stored.substring(region.length() + 1) : stored;
+            if (!prefixed && delegate.get(prefix(region) + key).isPresent()) {
+                continue;
+            }
             delegate.get(stored).ifPresent(value -> entries.add(new RegionEntry<>(region, key, value)));
         }
         return entries;

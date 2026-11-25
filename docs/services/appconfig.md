@@ -14,6 +14,10 @@ polling against the application/environment/configuration ARN; a denied poll doe
 not consume its token. Passing retrieval or monitor roles also requires
 `iam:PassRole` for the AppConfig service. IAM enforcement remains disabled by default.
 
+`GetEnvironment` retains the application and environment IDs resolved for authorization
+and reads the environment by ID. Concurrent renames cannot redirect that request to
+another environment; deletion of the selected environment returns not found.
+
 Tagged `CreateApplication` and `CreateDeploymentStrategy` requests also require
 `appconfig:TagResource` on `application/*` or `deploymentstrategy/*` in the request's
 partition, account and Region. Both the create action and tagging action evaluate

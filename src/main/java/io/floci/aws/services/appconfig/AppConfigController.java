@@ -41,13 +41,15 @@ public class AppConfigController {
     private final AppConfigService service;
     private final AppConfigDataService dataService;
     private final ObjectMapper objectMapper;
+    private final AppConfigRequestTargets targets;
 
     @Inject
     public AppConfigController(AppConfigService service, AppConfigDataService dataService,
-                               ObjectMapper objectMapper) {
+                               ObjectMapper objectMapper, AppConfigRequestTargets targets) {
         this.service = service;
         this.dataService = dataService;
         this.objectMapper = objectMapper;
+        this.targets = targets;
     }
 
     // ──────────────────────────── Application ────────────────────────────
@@ -106,7 +108,7 @@ public class AppConfigController {
     @GET
     @Path("/applications/{appId}/environments/{envId}")
     public Response getEnvironment(@PathParam("appId") String appId, @PathParam("envId") String envId) {
-        return Response.ok(service.getEnvironment(appId, envId)).build();
+        return Response.ok(targets.getEnvironment(appId, envId)).build();
     }
 
     @PATCH

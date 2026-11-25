@@ -20,11 +20,14 @@ public class AppConfigResourceArns implements StoredResourceArns {
     private final AppConfigService appConfig;
     private final AppConfigDataService data;
     private final RegionResolver regions;
+    private final AppConfigRequestTargets targets;
 
-    public AppConfigResourceArns(AppConfigService appConfig, AppConfigDataService data, RegionResolver regions) {
+    public AppConfigResourceArns(AppConfigService appConfig, AppConfigDataService data, RegionResolver regions,
+                                 AppConfigRequestTargets targets) {
         this.appConfig = appConfig;
         this.data = data;
         this.regions = regions;
+        this.targets = targets;
     }
 
     @Override
@@ -50,7 +53,13 @@ public class AppConfigResourceArns implements StoredResourceArns {
             if (!APPLICATION_TYPES.contains(type) || !variables.containsKey("ApplicationId")) {
                 return Optional.empty();
             }
-            String application = appConfig.resolveApplication(variables.get("ApplicationId")).getId();
+            if ("environment".equals(type) && variables.containsKey("EnvironmentId")) {
+                AppConfigRequestTargets.EnvironmentTarget target = targets.environment(
+                        variables.get("ApplicationId"), variables.get("EnvironmentId"));
+                return Optional.of(regions.buildArn("appconfig", region,
+                        "application/" + target.applicationId() + "/environment/" + target.environmentId()));
+            }
+            String application = targets.application(variables.get("ApplicationId"));
             String parent = "application/" + application;
             String resource = switch (type) {
                 case "application" -> parent;

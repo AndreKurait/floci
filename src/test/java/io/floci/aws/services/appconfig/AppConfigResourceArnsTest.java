@@ -78,7 +78,7 @@ class AppConfigResourceArnsTest {
         String env = service.createEnvironment(app, Map.of("Name", "production")).getId();
         String profile = service.createConfigurationProfile(app,
                 Map.of("Name", "settings", "LocationUri", "hosted")).getId();
-        return new Fixture(service, data, new AppConfigResourceArns(service, data, regions), app, env, profile);
+        return new Fixture(service, data, new AppConfigResourceArns(service, data, regions, new AppConfigRequestTargets(service)), app, env, profile);
     }
 
     private record Fixture(AppConfigService service, AppConfigDataService data, AppConfigResourceArns arns,
