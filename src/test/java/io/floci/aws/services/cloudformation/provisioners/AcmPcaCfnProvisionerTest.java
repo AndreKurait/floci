@@ -99,6 +99,74 @@ class AcmPcaCfnProvisionerTest {
                 request.path("Tags").path(0).path("Value").asText())), eq("us-east-1"));
     }
 
+    @Test
+    void replacementDefersPriorDeletionUntilCommitAndRetriesFailures() throws Exception {
+        StackResource resource = replacedAuthority();
+        verify(service, never()).delete(any(), anyString());
+        assertEquals("prior", provisioner.updateCleanupPhysicalId(resource));
+        AwsException failure = new AwsException("InternalFailure", "delete unavailable", 500);
+        when(service.delete(any(), anyString())).thenThrow(failure).thenReturn(mapper.createObjectNode());
+        assertFalse(provisioner.completeUpdate(resource).complete());
+        assertTrue(provisioner.hasReplacementUpdate(resource));
+        assertTrue(provisioner.completeUpdate(resource).complete());
+        verify(service, times(2)).delete(argThat(request -> "prior".equals(
+                request.path("CertificateAuthorityArn").asText())), eq("us-east-1"));
+    }
+
+    @Test
+    void retainedPriorSurvivesCommitButFailedReplacementIsStillRemoved() throws Exception {
+        StackResource resource = replacedAuthority();
+        resource.setUpdateReplacePolicy("Retain");
+        assertTrue(provisioner.completeUpdate(resource).complete());
+        verify(service, never()).delete(any(), anyString());
+        resource = replacedAuthority();
+        resource.setUpdateReplacePolicy("Retain");
+        assertTrue(provisioner.rollbackUpdate(resource));
+        assertEquals("prior", resource.getPhysicalId());
+        assertEquals("prior-csr", resource.getAttributes().get("CertificateSigningRequest"));
+        verify(service).delete(argThat(request -> "replacement".equals(
+                request.path("CertificateAuthorityArn").asText())), eq("us-east-1"));
+    }
+
+    @Test
+    void failedReplacementRollbackKeepsDeleteForRetry() throws Exception {
+        StackResource resource = replacedAuthority();
+        AwsException failure = new AwsException("InternalFailure", "delete unavailable", 500);
+        when(service.delete(any(), anyString())).thenThrow(failure).thenReturn(mapper.createObjectNode());
+        assertSame(failure, assertThrows(AwsException.class, () -> provisioner.rollbackUpdate(resource)));
+        assertEquals("prior", resource.getPhysicalId());
+        assertTrue(provisioner.retainsFailedUpdateState(resource));
+        assertTrue(provisioner.rollbackUpdate(resource));
+        assertFalse(provisioner.hasReplacementUpdate(resource));
+        verify(service, times(2)).delete(argThat(request -> "replacement".equals(
+                request.path("CertificateAuthorityArn").asText())), eq("us-east-1"));
+    }
+
+    private StackResource replacedAuthority() throws Exception {
+        StackResource resource = new StackResource();
+        resource.setResourceType(TYPE);
+        resource.setPhysicalId("prior");
+        resource.getAttributes().put("Arn", "prior");
+        resource.getAttributes().put("CertificateSigningRequest", "prior-csr");
+        CloudFormationTemplateEngine engine = mock(CloudFormationTemplateEngine.class);
+        when(engine.resolve(any())).thenAnswer(call -> ((JsonNode) call.getArgument(0)).asText());
+        when(engine.resolveNodeOmittingNoValue(any())).thenAnswer(call -> call.getArgument(0));
+        when(engine.resolveNode(any())).thenAnswer(call -> call.getArgument(0));
+        ObjectNode props = (ObjectNode) mapper.readTree("""
+                {"Type":"SUBORDINATE","KeyAlgorithm":"RSA_2048","SigningAlgorithm":"SHA256WITHRSA",
+                 "Subject":{"CommonName":"Replacement"}}
+                """);
+        when(service.describe(any(), anyString())).thenReturn(mapper.createObjectNode()
+                .set("CertificateAuthority", mapper.createObjectNode().put("Arn", "prior")
+                        .put("Status", "PENDING_CERTIFICATE")));
+        when(service.create(any(), anyString())).thenReturn(mapper.createObjectNode()
+                .put("CertificateAuthorityArn", "replacement"));
+        when(service.csr(any(), anyString())).thenReturn(mapper.createObjectNode().put("Csr", "replacement-csr"));
+        provisioner.provision(resource, props, new ProvisionContext(engine, "us-east-1", "000000000000",
+                "stack", "prior"));
+        return resource;
+    }
+
     private StackResource updatedAuthority() throws Exception {
         StackResource resource = new StackResource();
         updateAuthority(resource, true);
