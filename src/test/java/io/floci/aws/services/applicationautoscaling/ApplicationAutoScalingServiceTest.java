@@ -12,6 +12,7 @@ import io.floci.aws.services.applicationautoscaling.model.TargetTrackingConfigur
 import io.floci.aws.services.cloudwatch.metrics.CloudWatchMetricsService;
 import io.floci.aws.services.cloudwatch.metrics.model.Dimension;
 import io.floci.aws.services.cloudwatch.metrics.model.MetricAlarm;
+import io.floci.aws.services.dynamodb.DynamoDbService;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
@@ -31,6 +32,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
@@ -72,7 +74,16 @@ class ApplicationAutoScalingServiceTest {
 
         service = new ApplicationAutoScalingService(
                 new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(),
-                new InMemoryStorage<>(), regionResolver, cloudWatch, mock(EcsCapacityAdjuster.class));
+                new InMemoryStorage<>(), regionResolver, cloudWatch, mock(EcsCapacityAdjuster.class), registrationDynamoDb());
+    }
+
+    private DynamoDbService registrationDynamoDb() {
+        DynamoDbService dynamoDb = mock(DynamoDbService.class);
+        doAnswer(call -> {
+            call.<DynamoDbRegistrationTarget>getArgument(5).publish();
+            return null;
+        }).when(dynamoDb).reconcileScalableTarget(anyString(), anyString(), anyInt(), anyInt(), anyString(), any());
+        return dynamoDb;
     }
 
     private ScalableTarget register() {
@@ -106,7 +117,7 @@ class ApplicationAutoScalingServiceTest {
         ApplicationAutoScalingService legacy = new ApplicationAutoScalingService(
                 new AccountAwareStorageBackend<>(raw, null, "000000000000"), new InMemoryStorage<>(),
                 new InMemoryStorage<>(), new InMemoryStorage<>(), new RegionResolver(REGION, "000000000000"),
-                cloudWatch, mock(EcsCapacityAdjuster.class));
+                cloudWatch, mock(EcsCapacityAdjuster.class), registrationDynamoDb());
         String arn = "arn:aws:application-autoscaling:" + REGION + ":000000000000:scalable-target/0123456789abcdef";
         ScalableTarget target = new ScalableTarget();
         target.setServiceNamespace(NAMESPACE);
