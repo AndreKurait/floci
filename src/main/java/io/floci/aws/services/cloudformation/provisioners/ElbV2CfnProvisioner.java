@@ -509,21 +509,23 @@ public class ElbV2CfnProvisioner implements CfnResourceProvisioner {
         if (props == null || !props.has("Targets")) {
             return targets;
         }
-        JsonNode declared = ctx.engine().resolveNodeOmittingNoValue(props.get("Targets"));
-        if (declared == null || !declared.isArray()) {
+        CfnPropertyTypes.Reader types = new CfnPropertyTypes.Reader(ctx.engine());
+        JsonNode declared = types.read("Targets", props.get("Targets"),
+                CfnPropertyTypes.propertyShape(TARGET_GROUP, "Targets"));
+        types.finish();
+        if (declared == null) {
             return targets;
         }
         for (int i = 0; i < declared.size(); i++) {
             JsonNode item = declared.get(i);
-            String id = ctx.resolveOptional(item, "Id");
-            if (id == null) {
+            if (!item.hasNonNull("Id")) {
                 throw new AwsException("InvalidRequest",
                         "Model validation failed (#/Targets/" + i + ": required key [Id] not found)", 400);
             }
             TargetDescription target = new TargetDescription();
-            target.setId(id);
-            target.setPort(ctx.resolveOptionalInt(item, "Port"));
-            target.setAvailabilityZone(ctx.resolveOptional(item, "AvailabilityZone"));
+            target.setId(item.path("Id").asText());
+            target.setPort(item.hasNonNull("Port") ? item.path("Port").intValue() : null);
+            target.setAvailabilityZone(item.path("AvailabilityZone").asText(null));
             targets.add(target);
         }
         return targets;

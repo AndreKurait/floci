@@ -676,6 +676,9 @@ Dynamic-reference expansion is currently scoped to these RDS credential properti
 
 ## ELBv2 target group targets
 
+Target declarations are validated against their modeled list, ID and integer port types before
+any target group is created or changed. Intrinsic functions resolve before validation.
+
 `AWS::ElasticLoadBalancingV2::TargetGroup` registers its `Targets` once the group is created, as
 `RegisterTargets` does, so `DescribeTargetHealth` reports them. A target is its `Id` and its `Port`,
 the group's port when it names none, so one instance can be declared on several ports. A Lambda

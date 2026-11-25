@@ -69,6 +69,7 @@ SHAPE_TYPES = {"structure", "list", "map", *SCALAR_SHAPES}
 # Types the provisioners rely on, each measured on CloudFormation: (shape, member) -> member shape,
 # and for a list or a map the shape of its items or values.
 ANCHORS = {
+    ("AWS::ElasticLoadBalancingV2::TargetGroup/TargetDescription", "Port"): "Integer",
     ("AWS::ElasticLoadBalancingV2::TargetGroup", "TargetGroupAttributes"): [
         "AWS::ElasticLoadBalancingV2::TargetGroup/TargetGroupAttribute"],
     ("AWS::ElasticLoadBalancingV2::TargetGroup/TargetGroupAttribute", "Key"): "String",
@@ -92,6 +93,7 @@ ANCHORS = {
 
 # Required members the provisioners rely on, measured the same way: shape -> its required members.
 REQUIRED_ANCHORS = {
+    "AWS::ElasticLoadBalancingV2::TargetGroup/TargetDescription": ["Id"],
     "AWS::ECS::TaskDefinition/ContainerDefinition": ["Name", "Image"],
     "AWS::ECS::TaskDefinition/Tmpfs": ["Size"],
     "AWS::SES::ConfigurationSetEventDestination": ["ConfigurationSetName", "EventDestination"],

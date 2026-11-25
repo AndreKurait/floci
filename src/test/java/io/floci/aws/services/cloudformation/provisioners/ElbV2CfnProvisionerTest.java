@@ -207,6 +207,28 @@ class ElbV2CfnProvisionerTest {
         return rule;
     }
 
+    @ParameterizedTest
+    @ValueSource(strings = {"{\"Targets\":{}}", "{\"Targets\":[{}]}",
+            "{\"Targets\":[{\"Id\":[],\"Port\":8080}]}",
+            "{\"Targets\":[{\"Id\":\"i-1\",\"Port\":\"not-a-port\"}]}"})
+    void malformedTargetModelsFailBeforeAnyServiceMutation(String json) throws Exception {
+        when(anyCreateTargetGroup(elb)).thenReturn(group);
+        AwsException failure = assertThrows(AwsException.class,
+                () -> provisioner.provision(tgResource, mapper.readTree(json), ctx()));
+        assertEquals(400, failure.getHttpStatus());
+        anyCreateTargetGroup(verify(elb, never()));
+        verify(elb, never()).registerTargets(any(), any(), any());
+    }
+
+    @Test
+    void aModeledTargetConvertsItsTextPortAndRetainsItsZone() throws Exception {
+        when(anyCreateTargetGroup(elb)).thenReturn(group);
+        provisioner.provision(tgResource, mapper.readTree("""
+                {"Targets":[{"Id":"i-123","Port":"8080","AvailabilityZone":"all"}]}
+                """), ctx());
+        assertEquals(List.of("i-123:8080:all"), registeredBy(1));
+    }
+
     @Test
     void declaresTheFiveTypes() {
         assertEquals(Set.of("AWS::ElasticLoadBalancingV2::LoadBalancer", "AWS::ElasticLoadBalancingV2::TargetGroup",
