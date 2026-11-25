@@ -11,6 +11,7 @@ import io.floci.aws.testing.InMemoryStorageFactory;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.time.Clock;
 import java.util.List;
 import java.util.Map;
 
@@ -63,7 +64,7 @@ class StackSetLegacyRecordsTest {
                 new TypeReference<Map<String, StackSetAutoDeploymentTarget>>() {})
                 .put(SET + "::" + OU, new StackSetAutoDeploymentTarget(SET, OU, List.of("eu-central-1")));
         service = new StackSetService(mock(CloudFormationService.class), storage, mock(OrganizationsService.class),
-                regions);
+                regions, Clock.systemUTC());
     }
 
     @Test

@@ -14,6 +14,7 @@ import io.floci.aws.services.s3.model.Part;
 import io.floci.aws.services.sns.SnsQueryHandler;
 import io.floci.aws.testing.ManualClock;
 import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
+import jakarta.enterprise.inject.Instance;
 import jakarta.ws.rs.core.HttpHeaders;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.Response;
@@ -74,7 +75,9 @@ class S3ControllerClockTest {
                 mock(RequestContext.class),
                 mock(IamService.class),
                 mock(IamEnforcementFilter.class),
+                mock(Instance.class),
                 mock(EmulatorConfig.class, RETURNS_DEEP_STUBS),
+                mock(S3VirtualHostFilter.class),
                 new ManualClock(NOW));
 
         Response response = controller.listObjects(bucket, null, null, null, null, null, null, null,
@@ -126,7 +129,9 @@ class S3ControllerClockTest {
                 mock(RequestContext.class),
                 mock(IamService.class),
                 mock(IamEnforcementFilter.class),
+                mock(Instance.class),
                 mock(EmulatorConfig.class, RETURNS_DEEP_STUBS),
+                mock(S3VirtualHostFilter.class),
                 new ManualClock(NOW));
 
         Response response = controller.putObject(bucket, key, null, null, null, "/source-bucket/source-key",
