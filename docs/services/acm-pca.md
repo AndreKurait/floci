@@ -136,7 +136,9 @@ or a production certificate authority.
 `CreateCertificateAuthority` does, so it starts in `PENDING_CERTIFICATE`. `Ref` and
 `Fn::GetAtt` `Arn` return its ARN, and `Fn::GetAtt` `CertificateSigningRequest` its
 CSR. `Tags` and `RevocationConfiguration` update in place; a change to any other
-property replaces the authority. Deleting the resource disables an `ACTIVE`
+property replaces the authority. In-place tag updates retain the previous tags until
+the stack commits; a failed update restores them, including failures in later resources.
+A failed tag restoration keeps its snapshot for rollback retry. Deleting the resource disables an `ACTIVE`
 authority, then deletes it. `AWS::ACMPCA::Certificate` and
 `AWS::ACMPCA::CertificateAuthorityActivation` are not provisioned: activate the
 authority with the API calls above.
