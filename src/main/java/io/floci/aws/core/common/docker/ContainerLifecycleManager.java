@@ -248,6 +248,15 @@ public class ContainerLifecycleManager {
         return createAndStart(spec, platform, true);
     }
 
+    /** Runs setup after creation and before startup, retaining ephemeral failure cleanup. */
+    public ContainerInfo createAndStartEphemeral(ContainerSpec spec, String platform,
+                                                 Consumer<String> beforeStart) {
+        String resolvedImage = platform == null
+                ? imageCacheService.ensureImageExists(spec.image())
+                : imageCacheService.ensureImageExists(spec.image(), platform);
+        return createAndStart(spec, resolvedImage, platform, true, beforeStart);
+    }
+
     private ContainerInfo createAndStart(ContainerSpec spec, boolean removeAnonymousVolumes) {
         String resolvedImage = imageCacheService.ensureImageExists(spec.image());
         return createAndStart(spec, resolvedImage, null, removeAnonymousVolumes, null);
