@@ -132,6 +132,10 @@ class AppConfigResourceTagsIntegrationTest {
                 try {
                     given().header("Authorization", authorization).get(resource.path()).then().statusCode(200)
                             .body("$", not(hasKey("tags")), "$", not(hasKey("Tags")));
+                    given().header("Authorization", authorization).contentType("application/json")
+                            .body("{\"Description\":\"wire-updated\"}").patch(resource.path()).then().statusCode(200)
+                            .body("$", not(hasKey("tags")), "$", not(hasKey("Tags")));
+                    assertEquals(INITIAL, client.listTagsForResource(request -> request.resourceArn(resource.arn())).tags());
                     String listPath = resource.path().substring(0, resource.path().lastIndexOf('/'));
                     given().header("Authorization", authorization).get(listPath).then().statusCode(200)
                             .body("Items.find { it.Id == '" + resource.id() + "' }", not(hasKey("tags")))
