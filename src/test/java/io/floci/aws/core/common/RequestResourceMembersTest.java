@@ -230,12 +230,14 @@ class RequestResourceMembersTest {
     @Test
     void theTableReadsItsNamespacesAndGivesEachTypeItNamesAnArnFormat() {
         RequestResourceMembers.Table table = RequestResourceMembers.table();
-        assertTrue(table.namespaces().containsAll(List.of("cognito-idp", "ecr", "elasticloadbalancing", "states")));
+        assertTrue(table.namespaces().containsAll(List.of("cloudformation", "cognito-idp", "ecr",
+                "elasticloadbalancing", "states")));
         assertTrue(table.namespaces().containsAll(List.of("lambda", "logs", "iam")));
         assertEquals(Set.of(), table.operations().keySet().stream()
                 .filter(operation -> !table.namespaces().contains(operation.substring(0, operation.indexOf(':'))))
                 .collect(Collectors.toSet()), "every operation read is one of a namespace read whole");
         assertTrue(table.namespaces().stream().noneMatch(table.notCovered()::contains));
+        assertTrue(table.operations().containsKey("cloudformation:GetTemplate"));
         assertTrue(table.operations().containsKey("rds:CreateDBParameterGroup"));
         assertTrue(table.operations().containsKey("rds:CreateDBProxy"));
         assertTrue(table.otherNamespaces().stream().noneMatch(table.notCovered()::contains));
