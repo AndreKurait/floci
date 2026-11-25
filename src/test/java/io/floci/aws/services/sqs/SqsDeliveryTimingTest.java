@@ -3,9 +3,12 @@ package io.floci.aws.services.sqs;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.services.sqs.model.Message;
+import io.floci.aws.testing.ParallelLocks;
 import io.floci.aws.testing.TestTime;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -27,6 +30,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  * polls and throttled move tasks at the durations a queue is really configured with, each asserted
  * one nanosecond before the instant and at it.
  */
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class SqsDeliveryTimingTest {
 
     private static final String REGION = "us-east-1";

@@ -9,7 +9,10 @@ import io.floci.aws.services.ecr.model.ImageMetadata;
 import io.floci.aws.services.ecr.model.LifecyclePolicyPreview;
 import io.floci.aws.services.ecr.model.Repository;
 import io.floci.aws.services.ecr.registry.RegistryHttpClient;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -29,6 +32,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.*;
 
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class EcrLifecyclePreviewStateTest {
 
     @Test

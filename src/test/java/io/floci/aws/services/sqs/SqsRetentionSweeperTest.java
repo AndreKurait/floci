@@ -4,9 +4,12 @@ import io.floci.aws.config.EmulatorConfig.SqsServiceConfig.EndpointStrategy;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.services.sqs.model.Message;
+import io.floci.aws.testing.ParallelLocks;
 import io.floci.aws.testing.TestTime;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.time.Duration;
 import java.util.List;
@@ -25,6 +28,7 @@ import static org.mockito.Mockito.verify;
  * The sweep that removes expired messages from storage nobody is reading, on a timeline the test
  * moves: it runs every 60 seconds, the first time 60 seconds after startup.
  */
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class SqsRetentionSweeperTest {
 
     private static final String REGION = "us-east-1";

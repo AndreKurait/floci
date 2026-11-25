@@ -19,9 +19,12 @@ import io.floci.aws.services.ecs.model.EcsTask;
 import io.floci.aws.services.ecs.model.LaunchType;
 import io.floci.aws.services.ecs.model.ServiceDeployment;
 import io.floci.aws.services.ecs.model.TaskDefinition;
+import io.floci.aws.testing.ParallelLocks;
 import io.floci.aws.testing.TestTime;
 import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.time.Clock;
 import java.time.Duration;
@@ -45,6 +48,7 @@ import static org.mockito.Mockito.when;
  * selected by task set id rather than by position in a listing: several minted in one clock tick
  * share a createdAt, so their order in the listing is map iteration order.
  */
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class EcsServiceDeploymentStatusTest {
 
     private static final String REGION = "us-east-1";

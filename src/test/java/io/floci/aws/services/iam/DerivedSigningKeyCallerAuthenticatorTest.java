@@ -1,8 +1,11 @@
 package io.floci.aws.services.iam;
 
 import io.floci.aws.core.common.Digests;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -23,6 +26,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /** The one-caller SigV4 gate: every refusal class, and the replay set. */
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class DerivedSigningKeyCallerAuthenticatorTest {
 
     static final String CALLER = "AKIDDERIVEDKEYCALLER01";

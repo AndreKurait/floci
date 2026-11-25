@@ -8,11 +8,14 @@ import io.floci.aws.services.ec2.Ec2Service;
 import io.floci.aws.services.ec2.model.Instance;
 import io.floci.aws.services.elb.model.ClassicHealthCheck;
 import io.floci.aws.services.elb.model.ClassicLoadBalancer;
+import io.floci.aws.testing.ParallelLocks;
 import io.vertx.core.Vertx;
 import io.vertx.core.http.HttpServer;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.time.Duration;
 import java.util.List;
@@ -26,6 +29,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class ElbClassicDisabledRuntimeHealthTest {
     private static final String ACCOUNT = "111111111111";
     private static final String REGION = "us-east-1";

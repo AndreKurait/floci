@@ -19,9 +19,12 @@ import io.floci.aws.services.ecs.model.NetworkConfiguration;
 import io.floci.aws.services.ecs.model.NetworkMode;
 import io.floci.aws.services.ecs.model.TaskDefinition;
 import io.floci.aws.services.ecs.model.TaskStatus;
+import io.floci.aws.testing.ParallelLocks;
 import io.floci.aws.testing.TestTime;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.lang.reflect.Field;
 import java.time.Clock;
@@ -59,6 +62,7 @@ import static org.mockito.Mockito.when;
  * services are built without CDI, so no scheduled tick ever runs: every task the tests see was
  * started by a reconcile pass the wait itself asked for.
  */
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class EcsServiceAwaitStableTest {
 
     private static final String REGION = "us-east-1";

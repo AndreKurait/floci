@@ -1,6 +1,7 @@
 package io.floci.aws.config;
 
 import io.floci.aws.core.common.Pem;
+import io.floci.aws.testing.ParallelLocks;
 import io.floci.aws.testing.TlsTrust;
 import io.floci.aws.testutil.FreePorts;
 import io.vertx.core.Vertx;
@@ -15,6 +16,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -50,6 +52,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 @Timeout(20)
+@ResourceLock(ParallelLocks.PORTS)
 class TlsProxyFallbackServiceTest {
     private static final String PAYLOAD = "GET /ping HTTP/1.1\r\nHost: retained.example\r\n"
             + "X-Fixture: unchanged\r\n\r\n";

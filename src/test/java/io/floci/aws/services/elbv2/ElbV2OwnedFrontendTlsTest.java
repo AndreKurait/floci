@@ -18,6 +18,7 @@ import io.floci.aws.services.elbv2.model.Listener;
 import io.floci.aws.services.elbv2.model.LoadBalancer;
 import io.floci.aws.services.elbv2.model.Rule;
 import io.floci.aws.services.route53.Route53Service;
+import io.floci.aws.testing.ParallelLocks;
 import io.floci.aws.testutil.FreePorts;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
@@ -26,6 +27,7 @@ import io.vertx.core.http.HttpServerOptions;
 import io.vertx.core.net.PemKeyCertOptions;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import javax.net.ssl.SNIHostName;
 import javax.net.ssl.SSLContext;
@@ -61,6 +63,7 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+@ResourceLock(ParallelLocks.PORTS)
 class ElbV2OwnedFrontendTlsTest {
     @Test
     @Timeout(30)

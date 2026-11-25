@@ -1,7 +1,10 @@
 package io.floci.aws.services.autoscaling;
 
 import com.sun.net.httpserver.HttpServer;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import software.amazon.awssdk.services.autoscaling.AutoScalingClient;
 
 import java.lang.reflect.Field;
@@ -15,6 +18,7 @@ import java.util.concurrent.CopyOnWriteArrayList;
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class AutoScalingStandbyLifecycleCleanupTest {
     @Test
     void actualCleanupContinuesAfterGroupDeletionFails() throws Exception {

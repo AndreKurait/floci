@@ -1,5 +1,6 @@
 package io.floci.aws.config;
 
+import io.floci.aws.testing.ParallelLocks;
 import io.floci.aws.testutil.FreePorts;
 import io.vertx.core.Vertx;
 import io.vertx.core.net.NetClient;
@@ -12,6 +13,7 @@ import io.vertx.core.net.SelfSignedCertificate;
 import io.vertx.core.net.SocketAddress;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
@@ -20,6 +22,7 @@ import java.util.concurrent.TimeUnit;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.Mockito.*;
 
+@ResourceLock(ParallelLocks.PORTS)
 class TlsProxyExternalPeerTest {
     @Test
     @Timeout(20)

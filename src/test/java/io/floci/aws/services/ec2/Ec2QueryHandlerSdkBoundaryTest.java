@@ -1,10 +1,13 @@
 package io.floci.aws.services.ec2;
 
+import io.floci.aws.testing.ParallelLocks;
 import jakarta.ws.rs.core.MultivaluedHashMap;
 import jakarta.ws.rs.core.MultivaluedMap;
 import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
 import software.amazon.awssdk.http.AbortableInputStream;
@@ -41,6 +44,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Uses the real SDK codecs and composed handler; HTTP routing and authentication need separate integration tests. */
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class Ec2QueryHandlerSdkBoundaryTest {
 
     private final HandlerHttpClient transport = new HandlerHttpClient(queryHandler(mockModeService()));

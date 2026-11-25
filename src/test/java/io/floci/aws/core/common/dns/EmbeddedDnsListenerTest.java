@@ -1,11 +1,14 @@
 package io.floci.aws.core.common.dns;
 
 // The Vert.x DatagramSocket is the server; the JDK socket is qualified at the client boundary.
+import io.floci.aws.testing.ParallelLocks;
 import io.vertx.core.Vertx;
 import io.vertx.core.datagram.DatagramSocket;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.condition.EnabledOnOs;
 import org.junit.jupiter.api.condition.OS;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.net.DatagramPacket;
 import java.net.InetAddress;
@@ -22,6 +25,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @EnabledOnOs(OS.LINUX)
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class EmbeddedDnsListenerTest {
 
     @Test

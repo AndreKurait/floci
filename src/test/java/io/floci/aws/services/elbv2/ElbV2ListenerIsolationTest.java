@@ -12,6 +12,7 @@ import io.floci.aws.services.elbv2.model.Action;
 import io.floci.aws.services.elbv2.model.Listener;
 import io.floci.aws.services.elbv2.model.LoadBalancer;
 import io.floci.aws.services.elbv2.model.Rule;
+import io.floci.aws.testing.ParallelLocks;
 import io.floci.aws.testutil.FreePorts;
 import io.vertx.core.Vertx;
 import io.vertx.core.buffer.Buffer;
@@ -20,6 +21,7 @@ import io.vertx.core.http.HttpServerOptions;
 import io.vertx.core.net.PemKeyCertOptions;
 import io.vertx.ext.web.Router;
 import org.junit.jupiter.api.Timeout;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -50,6 +52,7 @@ import static org.mockito.Mockito.when;
  * proxy's port. Before, a TCP listener created first parked every later listener on its port, so the HTTPS load
  * balancer's SNI route was never registered and its clients reached the emulator's own certificate.
  */
+@ResourceLock(ParallelLocks.PORTS)
 class ElbV2ListenerIsolationTest {
 
     private static final String REGION = "us-west-2";

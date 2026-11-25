@@ -3,8 +3,11 @@ package io.floci.aws.services.sqs;
 import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.services.sqs.model.Message;
 import io.floci.aws.services.sqs.model.Queue;
+import io.floci.aws.testing.ParallelLocks;
 import io.floci.aws.testing.ParkingStore;
 import io.floci.aws.testing.ThreadStates;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -20,6 +23,7 @@ import java.util.concurrent.TimeUnit;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class SqsQueueRegistrationTest {
     private static final String REGION = "us-east-1";
 

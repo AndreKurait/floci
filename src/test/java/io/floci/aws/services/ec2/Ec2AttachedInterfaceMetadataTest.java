@@ -6,8 +6,10 @@ import io.floci.aws.services.ec2.model.InstanceNetworkInterface;
 import io.floci.aws.services.ec2instanceconnect.InstanceConnectKeys;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.iam.model.SessionCredential;
+import io.floci.aws.testing.ParallelLocks;
 import io.vertx.core.json.JsonObject;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.time.Duration;
 import java.time.Instant;
@@ -21,6 +23,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 
+@ResourceLock(ParallelLocks.PORTS)
 class Ec2AttachedInterfaceMetadataTest {
 
     @Test
