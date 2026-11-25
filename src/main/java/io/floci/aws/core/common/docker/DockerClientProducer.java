@@ -1,0 +1,753 @@
+package io.floci.aws.core.common.docker;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.exception.DockerClientException;
+import com.github.dockerjava.core.DefaultDockerClientConfig;
+import com.github.dockerjava.core.DockerClientImpl;
+import com.github.dockerjava.core.SSLConfig;
+import com.github.dockerjava.core.util.CertificateUtils;
+import com.github.dockerjava.transport.DockerHttpClient;
+import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.core.common.Digests;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Disposes;
+import jakarta.enterprise.inject.Produces;
+import jakarta.inject.Inject;
+import org.jboss.logging.Logger;
+
+import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
+import java.io.IOException;
+import java.io.Serializable;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.security.cert.X509Certificate;
+import java.time.Duration;
+import java.util.Optional;
+import java.util.function.Function;
+
+/**
+ * CDI producer for the DockerClient beans.
+ */
+@ApplicationScoped
+public class DockerClientProducer {
+
+    private static final Logger LOG = Logger.getLogger(DockerClientProducer.class);
+
+    /**
+     * Docker Desktop's well-known named pipe on native Windows. Unlike the unix-socket default,
+     * this isn't reachable by simply bind-mounting a path: Windows has no equivalent of
+     * {@code /var/run/docker.sock}, so a platform-specific fallback is required.
+     */
+    private static final String WINDOWS_DEFAULT_DOCKER_HOST = "npipe:////./pipe/docker_engine";
+
+    /**
+     * The name Docker CLI uses for the built-in context that represents the platform default
+     * endpoint. It has no metadata file on disk, so encountering it means "no active context
+     * override; fall through to the hardcoded platform default".
+     */
+    private static final String DEFAULT_CONTEXT_NAME = "default";
+
+    private static final ObjectMapper DOCKER_CONTEXT_JSON_MAPPER = new ObjectMapper();
+
+    /** Bounds the connect and the answer of the Docker circuit breaker's confirming ping. */
+    static final Duration PING_TIMEOUT = Duration.ofSeconds(5);
+
+    /** The stat probe pool's connections: one HEAD per working directory parent, so a handful. */
+    private static final int STAT_POOL_MAX_CONNECTIONS = 4;
+
+    private final EmulatorConfig config;
+    private final DockerPoolGaugeLogger gaugeLogger;
+    private final DockerCircuitBreaker breaker;
+
+    @Inject
+    public DockerClientProducer(EmulatorConfig config) {
+        this.config = config;
+        this.gaugeLogger = new DockerPoolGaugeLogger(
+                validatePoolGaugeIntervalSeconds(config.docker().poolGaugeIntervalSeconds()));
+        int breakerThreshold = validateBreakerFailureThreshold(config.docker().breakerFailureThreshold());
+        // The probe interval only matters, and is only checked, while the breaker is on.
+        Duration probeInterval = breakerThreshold == 0 ? Duration.ZERO
+                : Duration.ofSeconds(validateBreakerProbeIntervalSeconds(config.docker().breakerProbeIntervalSeconds()));
+        this.breaker = new DockerCircuitBreaker(breakerThreshold, probeInterval);
+    }
+
+    /**
+     * Normalizes a Docker host value by prepending {@code tcp://} when no recognized
+     * URI scheme ({@code tcp://}, {@code unix://}, {@code npipe://}) is present.
+     *
+     * @param dockerHost the raw Docker host configuration value
+     * @return the normalized Docker host value, or the original value if it already has a scheme
+     */
+    static String normalizeDockerHost(String dockerHost) {
+        if (dockerHost == null) {
+            return null;
+        }
+        if (dockerHost.isEmpty()) {
+            return dockerHost;
+        }
+        String lower = dockerHost.toLowerCase();
+        if (lower.startsWith("tcp://") || lower.startsWith("unix://") || lower.startsWith("npipe://")) {
+            return dockerHost;
+        }
+        String normalized = "tcp://" + dockerHost;
+        LOG.infov("Docker host value ''{0}'' has no URI scheme; normalizing to ''{1}''", dockerHost, normalized);
+        return normalized;
+    }
+
+    /**
+     * The Docker CLI's standard directory-listing for a context's TLS client material, relative
+     * to that context's TLS storage directory: {@code contexts/tls/<context-hash>/docker/}.
+     */
+    private static final String CONTEXT_TLS_ENDPOINT_DIR = "docker";
+
+    /**
+     * The host and, when the active context carries TLS material of its own, the directory
+     * holding it ({@code ca.pem}, {@code cert.pem}, {@code key.pem}), resolved together so both
+     * can be applied consistently to the {@link DefaultDockerClientConfig.Builder}. {@code
+     * skipTlsVerify} mirrors the context's own {@code SkipTLSVerify} setting: when true, the
+     * client certificate is still presented, but the daemon's server certificate is not
+     * validated against the context's CA, matching what the Docker CLI itself does for such
+     * a context.
+     */
+    public record ResolvedDockerConnection(String host, Optional<Path> tlsCertPath, boolean skipTlsVerify) {
+    }
+
+    /**
+     * Resolves the Docker endpoint this process connects to, from {@code floci.docker.*} and the
+     * process environment ({@code DOCKER_HOST}, {@code DOCKER_CONFIG}, {@code DOCKER_CONTEXT}).
+     * This is the single resolution behind the {@link DockerClient} bean; anything that needs to
+     * know where the daemon lives, such as the ECS host-volume policy protecting the daemon
+     * socket, must derive it from here rather than re-implement part of the precedence.
+     *
+     * @param environment lookup for the standard Docker variables; {@code System::getenv} in
+     *     production, a map lookup in tests
+     */
+    public static ResolvedDockerConnection resolveDockerConnection(
+            EmulatorConfig.DockerConfig docker, Function<String, String> environment) {
+        Path dockerConfigDir = resolveDockerConfigDir(docker.dockerConfigPath(), environment.apply("DOCKER_CONFIG"));
+        return resolveDockerConnection(docker.dockerHost(), environment.apply("DOCKER_HOST"), isWindows(),
+                dockerConfigDir, environment.apply("DOCKER_CONTEXT"));
+    }
+
+    /**
+     * Resolves the effective Docker host to use when creating the client, reading the active
+     * Docker context from the current user's {@code ~/.docker} directory.
+     *
+     * @see #resolveEffectiveDockerHost(String, String, boolean, Path, String)
+     */
+    static String resolveEffectiveDockerHost(String configuredHost, String dockerHostEnv, boolean isWindows) {
+        return resolveEffectiveDockerHost(configuredHost, dockerHostEnv, isWindows, defaultDockerConfigDir(),
+                System.getenv("DOCKER_CONTEXT"));
+    }
+
+    /**
+     * @see #resolveEffectiveDockerHost(String, String, boolean, Path, String)
+     */
+    static String resolveEffectiveDockerHost(
+            String configuredHost, String dockerHostEnv, boolean isWindows, Path dockerConfigDir) {
+        return resolveEffectiveDockerHost(configuredHost, dockerHostEnv, isWindows, dockerConfigDir, null);
+    }
+
+    /**
+     * Resolves the effective Docker host to use when creating the client.
+     *
+     * Priority:
+     * 1. If {@code floci.docker.docker-host} is explicitly configured (non-default), use it.
+     * 2. Otherwise fall back to the standard {@code DOCKER_HOST} env var (normalized).
+     * 3. Otherwise resolve the active Docker context (e.g. Colima, OrbStack, Rancher Desktop,
+     *    Podman) from {@code dockerConfigDir}, the way the Docker CLI and Testcontainers do, and
+     *    use its endpoint if one is found. The active context is the standard {@code
+     *    DOCKER_CONTEXT} env var when set and non-blank, otherwise {@code config.json}'s
+     *    {@code currentContext} field.
+     * 4. Otherwise use the platform default: the unix socket on Linux/macOS, or Docker Desktop's
+     *    named pipe on native Windows, which has no {@code /var/run/docker.sock} equivalent, so
+     *    the unix-socket default is unreachable there unless a user overrides it manually.
+     *
+     * Both the configured value and the env var are normalized to ensure a valid URI scheme.
+     */
+    static String resolveEffectiveDockerHost(
+            String configuredHost, String dockerHostEnv, boolean isWindows, Path dockerConfigDir,
+            String dockerContextEnv) {
+        return resolveDockerConnection(configuredHost, dockerHostEnv, isWindows, dockerConfigDir, dockerContextEnv)
+                .host();
+    }
+
+    /**
+     * Resolves the effective Docker host together with the active context's TLS material, when
+     * it has any. See {@link #resolveEffectiveDockerHost(String, String, boolean, Path, String)}
+     * for the host resolution priority; TLS material is only ever sourced from an active,
+     * non-default context, never from {@code floci.docker.docker-host} or {@code DOCKER_HOST}
+     * (both of those already flow through docker-java's own {@code DOCKER_TLS_VERIFY} /
+     * {@code DOCKER_CERT_PATH} env-var handling).
+     */
+    static ResolvedDockerConnection resolveDockerConnection(
+            String configuredHost, String dockerHostEnv, boolean isWindows, Path dockerConfigDir,
+            String dockerContextEnv) {
+        String normalizedEnvHost = normalizeDockerHost(dockerHostEnv);
+        boolean atDefault = "unix:///var/run/docker.sock".equals(configuredHost);
+        if (atDefault && normalizedEnvHost != null && !normalizedEnvHost.isBlank()) {
+            return new ResolvedDockerConnection(normalizedEnvHost, Optional.empty(), false);
+        }
+        if (atDefault) {
+            DockerContextEndpoint contextEndpoint =
+                    resolveActiveDockerContextEndpoint(dockerConfigDir, dockerContextEnv);
+            if (contextEndpoint != null) {
+                String normalizedContextHost = normalizeDockerHost(contextEndpoint.host());
+                LOG.infov("No DOCKER_HOST override set; using endpoint ''{0}'' from the active "
+                        + "Docker context instead of the platform default.", normalizedContextHost);
+                return new ResolvedDockerConnection(normalizedContextHost, contextEndpoint.tlsCertPath(),
+                        contextEndpoint.skipTlsVerify());
+            }
+        }
+        if (atDefault && isWindows) {
+            LOG.infov("Docker host is at its unix-socket default on Windows, which has no "
+                    + "/var/run/docker.sock equivalent; using named pipe ''{0}'' instead.",
+                    WINDOWS_DEFAULT_DOCKER_HOST);
+            return new ResolvedDockerConnection(WINDOWS_DEFAULT_DOCKER_HOST, Optional.empty(), false);
+        }
+        return new ResolvedDockerConnection(normalizeDockerHost(configuredHost), Optional.empty(), false);
+    }
+
+    private static Path defaultDockerConfigDir() {
+        return Paths.get(System.getProperty("user.home", ""), ".docker");
+    }
+
+    /**
+     * Resolves the Docker config directory to use for context discovery, matching the Docker
+     * CLI's own precedence: {@code floci.docker.docker-config-path}, when configured, wins
+     * outright; otherwise the standard {@code DOCKER_CONFIG} env var relocates the whole
+     * {@code ~/.docker} directory; otherwise the {@code ~/.docker} default applies.
+     */
+    static Path resolveDockerConfigDir(Optional<String> configuredDockerConfigPath, String dockerConfigEnv) {
+        if (configuredDockerConfigPath != null && configuredDockerConfigPath.isPresent()
+                && !configuredDockerConfigPath.get().isBlank()) {
+            return Paths.get(configuredDockerConfigPath.get());
+        }
+        if (dockerConfigEnv != null && !dockerConfigEnv.isBlank()) {
+            return Paths.get(dockerConfigEnv);
+        }
+        return defaultDockerConfigDir();
+    }
+
+    private record DockerContextEndpoint(String host, Optional<Path> tlsCertPath, boolean skipTlsVerify) {
+    }
+
+    /**
+     * Resolves the Docker endpoint of the active Docker context, mirroring how the Docker CLI
+     * and Testcontainers' {@code DockerClientProviderStrategy} do it: read the active context
+     * name (the built-in {@code "default"} context has no endpoint of its own, so it is treated
+     * the same as no context being configured at all), then read that context's {@code Host}
+     * endpoint from its metadata file under {@code contexts/meta/}, along with any TLS client
+     * material under {@code contexts/tls/}.
+     *
+     * @return the resolved endpoint, or {@code null} if no active non-default context is
+     *         configured, its metadata is missing, or {@code config.json} is missing or malformed
+     */
+    private static DockerContextEndpoint resolveActiveDockerContextEndpoint(
+            Path dockerConfigDir, String dockerContextEnv) {
+        if (dockerConfigDir == null) {
+            return null;
+        }
+        String currentContext = resolveActiveDockerContextName(dockerConfigDir, dockerContextEnv);
+        if (currentContext == null || currentContext.isBlank() || DEFAULT_CONTEXT_NAME.equals(currentContext)) {
+            return null;
+        }
+        String host = readContextDockerHost(dockerConfigDir, currentContext);
+        if (host == null || host.isBlank()) {
+            return null;
+        }
+        return new DockerContextEndpoint(host, resolveActiveDockerContextTlsMaterial(dockerConfigDir, currentContext),
+                readContextSkipTlsVerify(dockerConfigDir, currentContext));
+    }
+
+    /**
+     * Resolves the name of the active Docker context, honoring the standard {@code DOCKER_CONTEXT}
+     * env var override before falling back to {@code config.json}'s {@code currentContext} field,
+     * matching the real Docker CLI's own precedence.
+     */
+    private static String resolveActiveDockerContextName(Path dockerConfigDir, String dockerContextEnv) {
+        if (dockerContextEnv != null && !dockerContextEnv.isBlank()) {
+            return dockerContextEnv;
+        }
+        return readCurrentContextName(dockerConfigDir.resolve("config.json"));
+    }
+
+    private static String readCurrentContextName(Path configJsonPath) {
+        if (!Files.isRegularFile(configJsonPath)) {
+            return null;
+        }
+        try {
+            JsonNode root = DOCKER_CONTEXT_JSON_MAPPER.readTree(configJsonPath.toFile());
+            if (root == null || root.isMissingNode()) {
+                return null;
+            }
+            JsonNode contextNode = root.get("currentContext");
+            return contextNode == null || contextNode.isNull() ? null : contextNode.asText();
+        } catch (IOException e) {
+            LOG.warnv("Could not read Docker config file ''{0}'' to resolve the active context: {1}",
+                    configJsonPath, e.getMessage());
+            return null;
+        }
+    }
+
+    private static String readContextDockerHost(Path dockerConfigDir, String contextName) {
+        Path metaFile = dockerConfigDir.resolve("contexts").resolve("meta")
+                .resolve(Digests.sha256Hex(contextName)).resolve("meta.json");
+        if (!Files.isRegularFile(metaFile)) {
+            return null;
+        }
+        try {
+            JsonNode root = DOCKER_CONTEXT_JSON_MAPPER.readTree(metaFile.toFile());
+            if (root == null || root.isMissingNode()) {
+                return null;
+            }
+            JsonNode hostNode = root.path("Endpoints").path("docker").get("Host");
+            return hostNode == null || hostNode.isNull() ? null : hostNode.asText();
+        } catch (IOException e) {
+            LOG.warnv("Could not read Docker context metadata file ''{0}'' for context ''{1}'': {2}",
+                    metaFile, contextName, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Reads the context's own {@code SkipTLSVerify} setting, defaulting to {@code false} (the
+     * same default the Docker CLI itself uses) when the field, the metadata file, or the
+     * {@code Endpoints.docker} section is absent or malformed.
+     */
+    private static boolean readContextSkipTlsVerify(Path dockerConfigDir, String contextName) {
+        Path metaFile = dockerConfigDir.resolve("contexts").resolve("meta")
+                .resolve(Digests.sha256Hex(contextName)).resolve("meta.json");
+        if (!Files.isRegularFile(metaFile)) {
+            return false;
+        }
+        try {
+            JsonNode root = DOCKER_CONTEXT_JSON_MAPPER.readTree(metaFile.toFile());
+            if (root == null || root.isMissingNode()) {
+                return false;
+            }
+            return root.path("Endpoints").path("docker").path("SkipTLSVerify").asBoolean(false);
+        } catch (IOException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Locates the active context's TLS client-certificate directory, mirroring how the Docker
+     * CLI stores it under {@code contexts/tls/<context-hash>/docker/} alongside the metadata
+     * directory. A context with no TLS material configured (a plaintext remote daemon, or a
+     * context pointing at a local unix socket or named pipe) simply has no such directory, and
+     * is left untouched here. Whether the context's own {@code SkipTLSVerify} setting is honored
+     * once material is found is resolved separately by {@link #readContextSkipTlsVerify}, since
+     * that flag is meaningless without TLS material to apply it to.
+     *
+     * <p>When the directory exists but is incomplete, that is treated as a broken TLS setup
+     * rather than silently connecting without a client certificate or falling back to plaintext.
+     *
+     * @return the TLS directory when all of {@code ca.pem}, {@code cert.pem} and {@code key.pem}
+     *         are present, or {@link Optional#empty()} when the context has no TLS material at all
+     * @throws IllegalStateException if the TLS directory exists but is missing one of those files
+     */
+    private static Optional<Path> resolveActiveDockerContextTlsMaterial(Path dockerConfigDir, String contextName) {
+        Path tlsDir = dockerConfigDir.resolve("contexts").resolve("tls")
+                .resolve(Digests.sha256Hex(contextName)).resolve(CONTEXT_TLS_ENDPOINT_DIR);
+        if (!Files.isDirectory(tlsDir)) {
+            return Optional.empty();
+        }
+        boolean hasCa = Files.isRegularFile(tlsDir.resolve("ca.pem"));
+        boolean hasCert = Files.isRegularFile(tlsDir.resolve("cert.pem"));
+        boolean hasKey = Files.isRegularFile(tlsDir.resolve("key.pem"));
+        if (hasCa && hasCert && hasKey) {
+            LOG.infov("Docker context ''{0}'' has TLS material at ''{1}''; using it for the "
+                    + "Docker client connection.", contextName, tlsDir);
+            return Optional.of(tlsDir);
+        }
+        if (hasCa || hasCert || hasKey) {
+            throw new IllegalStateException(String.format(
+                    "Docker context '%s' has an incomplete TLS material directory at '%s' "
+                            + "(expected ca.pem, cert.pem and key.pem); refusing to silently fall back "
+                            + "to an unauthenticated or unverified connection.", contextName, tlsDir));
+        }
+        return Optional.empty();
+    }
+
+    private static DefaultDockerClientConfig.Builder createDockerConfigBuilder() {
+        try {
+            return DefaultDockerClientConfig.createDefaultConfigBuilder();
+        } catch (IllegalArgumentException e) {
+            // DOCKER_HOST env var is set without a URI scheme (e.g. "10.37.124.101:2375").
+            // docker-java calls URI.create() on it immediately inside createDefaultConfigBuilder(),
+            // which throws before Floci's withDockerHost() override can take effect.
+            // Fall back to a fresh builder; the caller will supply the normalized host.
+            LOG.warnv("Could not initialize Docker config from environment "
+                    + "(DOCKER_HOST env var may be missing a URI scheme): {0}. "
+                    + "Using Floci''s configured host.", e.getMessage());
+            return new DefaultDockerClientConfig.Builder();
+        }
+    }
+
+    private static boolean isWindows() {
+        return System.getProperty("os.name", "").toLowerCase().contains("win");
+    }
+
+    /**
+     * Rejects a pool size below 1 with a message naming the setting, instead of leaving the
+     * connection pool to reject it with a generic error.
+     */
+    static int validateMaxConnections(int maxConnections) {
+        return requireAtLeastOne(maxConnections, "floci.docker.max-connections", "FLOCI_DOCKER_MAX_CONNECTIONS");
+    }
+
+    /** Same check as {@link #validateMaxConnections(int)}, for the streaming pool's setting. */
+    static int validateStreamingMaxConnections(int streamingMaxConnections) {
+        return requireAtLeastOne(streamingMaxConnections, "floci.docker.streaming-max-connections",
+                "FLOCI_DOCKER_STREAMING_MAX_CONNECTIONS");
+    }
+
+    /**
+     * Rejects a lease timeout below 1 second: httpclient5 reads zero as no timeout at all, so a
+     * call would wait forever on a full pool, and a negative value fails deep inside the client.
+     */
+    static int validateConnectionRequestTimeoutSeconds(int seconds) {
+        return requireAtLeastOne(seconds, "floci.docker.connection-request-timeout-seconds",
+                "FLOCI_DOCKER_CONNECTION_REQUEST_TIMEOUT_SECONDS");
+    }
+
+    static int validateApiTimeoutSeconds(int seconds) {
+        return requireAtLeastOne(seconds, "floci.docker.api-timeout-seconds", "FLOCI_DOCKER_API_TIMEOUT_SECONDS");
+    }
+
+    /** At 0 every pull would be given up at once, so a launch that needs an image could never start. */
+    public static int validateImagePullTimeoutSeconds(int seconds) {
+        return requireAtLeastOne(seconds, "floci.docker.image-pull-timeout-seconds",
+                "FLOCI_DOCKER_IMAGE_PULL_TIMEOUT_SECONDS");
+    }
+
+    /** 0 turns the pool gauge lines off; a negative interval names no schedule. */
+    static int validatePoolGaugeIntervalSeconds(int seconds) {
+        return requireAtLeastZero(seconds, "floci.docker.pool-gauge-interval-seconds",
+                "FLOCI_DOCKER_POOL_GAUGE_INTERVAL_SECONDS");
+    }
+
+    /** 0 turns the Docker circuit breaker off; a negative threshold is a misconfiguration. */
+    static int validateBreakerFailureThreshold(int threshold) {
+        return requireAtLeastZero(threshold, "floci.docker.breaker-failure-threshold",
+                "FLOCI_DOCKER_BREAKER_FAILURE_THRESHOLD");
+    }
+
+    static int validateBreakerProbeIntervalSeconds(int seconds) {
+        return requireAtLeastOne(seconds, "floci.docker.breaker-probe-interval-seconds",
+                "FLOCI_DOCKER_BREAKER_PROBE_INTERVAL_SECONDS");
+    }
+
+    /** 0 means the default, twice the CPUs Floci sees and at least 4; a negative value is a misconfiguration. */
+    static int validateMaxConcurrentLaunches(int value) {
+        return requireAtLeastZero(value, "floci.docker.max-concurrent-launches", "FLOCI_DOCKER_MAX_CONCURRENT_LAUNCHES");
+    }
+
+    private static int requireAtLeastOne(int value, String setting, String envVar) {
+        return requireAtLeast(1, value, setting, envVar);
+    }
+
+    private static int requireAtLeastZero(int value, String setting, String envVar) {
+        return requireAtLeast(0, value, setting, envVar);
+    }
+
+    private static int requireAtLeast(int minimum, int value, String setting, String envVar) {
+        if (value < minimum) {
+            throw new IllegalArgumentException(setting + " (" + envVar + ") must be at least " + minimum
+                    + ", got: " + value);
+        }
+        return value;
+    }
+
+    /**
+     * Control-plane DockerClient: create/start/stop/remove/copyArchive and every other
+     * short-lived call in Floci. Kept on its own connection pool, separate from the
+     * {@link StreamingDocker} bean, so long-lived streams can never occupy every lease in this
+     * pool and starve these short calls until httpclient5's connection-request timeout fires.
+     */
+    @Produces
+    @ApplicationScoped
+    public DockerClient dockerClient() {
+        return buildDockerClient(buildClientConfig(),
+                validateMaxConnections(config.docker().maxConnections()), "control-plane");
+    }
+
+    /**
+     * A small pool of its own for the archive stat probes issued beside the control-plane client's
+     * commands: docker-java has no command for the HEAD the working directory check needs, so the
+     * transport is called directly. Not the {@link #dockerClient()} bean's own pool: each produced
+     * client owns its connection evictor thread, whose release on CDI disposal the
+     * {@code DockerClientDisposalIntegrationTest} asserts, and sharing one transport between two
+     * beans would take the thread's context classloader from whichever built it first.
+     */
+    @Produces
+    @ApplicationScoped
+    public DockerHttpClient controlPlaneHttpClient() {
+        DefaultDockerClientConfig clientConfig = buildClientConfig();
+        Duration apiTimeout = Duration.ofSeconds(validateApiTimeoutSeconds(config.docker().apiTimeoutSeconds()));
+        FlociDockerHttpClient transport = newHttpClient(clientConfig, STAT_POOL_MAX_CONNECTIONS, apiTimeout,
+                Duration.ofSeconds(validateConnectionRequestTimeoutSeconds(
+                        config.docker().connectionRequestTimeoutSeconds())));
+        return wrapForRole(transport, "control-plane", apiTimeout, breaker, 0,
+                Duration.ofSeconds(config.docker().connectionRequestTimeoutSeconds()));
+    }
+
+    void disposeControlPlaneHttpClient(@Disposes DockerHttpClient client) throws IOException {
+        client.close();
+    }
+
+    /**
+     * Streaming DockerClient: container log-follow ({@link ContainerLogStreamer}), Lambda
+     * extension execs and Lambda exit watchers, Lambda Web attach streams, and the output of
+     * long-running execs (CodeBuild phases, SSM run commands, ECS Exec sessions, EKS audit log followers, ECR garbage collection, EC2 and EKS user data and EMR bootstrap actions). Each
+     * stream occupies a connection pool slot for its entire lifetime, so sharing the
+     * control-plane pool meant a fan-out of many concurrent streams exhausted it and blocked
+     * control-plane calls. Sized separately because {@code WarmPool}'s cap is per-function,
+     * so total live streams across distinct functions is unbounded.
+     */
+    @Produces
+    @StreamingDocker
+    @ApplicationScoped
+    public DockerClient streamingDockerClient() {
+        return buildDockerClient(buildClientConfig(),
+                validateStreamingMaxConnections(config.docker().streamingMaxConnections()), "streaming");
+    }
+
+    void disposeDockerClient(@Disposes DockerClient client) throws IOException {
+        gaugeLogger.unregister("control-plane");
+        breaker.close();
+        client.close();
+    }
+
+    /**
+     * Gives the breaker a ping that opens a one-connection transport of its own for each ping and closes it
+     * after, so a ping never waits for a pooled connection behind the calls whose failures it is confirming,
+     * {@link #PING_TIMEOUT} bounds the connect and the answer, and no transport outlives the client whose
+     * build set the probe. Pings are rare: one after a run of transport failures, then one per probe
+     * interval while the breaker is open.
+     */
+    private void usePingTransport(DefaultDockerClientConfig clientConfig) {
+        if (!breaker.isEnabled()) {
+            return;
+        }
+        breaker.useProbe(() -> {
+            try (FlociDockerHttpClient transport = newPingTransport(clientConfig, PING_TIMEOUT)) {
+                return DockerCircuitBreaker.pingOver(transport).ping();
+            } catch (IOException e) {
+                LOG.debugv("Closing the Docker breaker's ping transport failed: {0}", e.getMessage());
+                return DockerCircuitBreaker.PingResult.INCONCLUSIVE;
+            }
+        });
+    }
+
+    /** One connection whose connect, lease and answer are each bounded by {@code timeout}. */
+    static FlociDockerHttpClient newPingTransport(DefaultDockerClientConfig clientConfig, Duration timeout) {
+        return new FlociDockerHttpClient.Builder()
+                .dockerHost(clientConfig.getDockerHost())
+                .sslConfig(clientConfig.getSSLConfig())
+                .maxConnections(1)
+                .connectionTimeout(timeout)
+                .responseTimeout(timeout)
+                .connectionRequestTimeout(timeout)
+                .build();
+    }
+
+    void disposeStreamingDockerClient(@Disposes @StreamingDocker DockerClient client) throws IOException {
+        gaugeLogger.unregister("streaming");
+        client.close();
+    }
+
+    /**
+     * Builds the {@link DefaultDockerClientConfig} shared by both DockerClient beans (host and
+     * Docker-context resolution, optional Docker config path, and any TLS material the active
+     * context carries). The two beans differ only in connection pool size, never in how they
+     * reach the daemon.
+     */
+    private DefaultDockerClientConfig buildClientConfig() {
+        ResolvedDockerConnection connection = resolveDockerConnection(config.docker(), System::getenv);
+        String dockerHost = connection.host();
+
+        // createDefaultConfigBuilder() reads DOCKER_HOST directly from System.getenv() and passes
+        // it to withDockerHost(), which calls URI.create() immediately. If DOCKER_HOST is set
+        // without a URI scheme (e.g. "10.37.124.101:2375" in Bitbucket Pipelines), the
+        // URI.create() call throws before Floci's override takes effect. Fall back to a fresh
+        // builder in that case so we can supply the normalized host ourselves.
+        DefaultDockerClientConfig.Builder builder = createDockerConfigBuilder();
+        builder.withDockerHost(dockerHost);
+        config.docker().dockerConfigPath().ifPresent(path -> {
+            LOG.infov("Using Docker config path: {0}", path);
+            builder.withDockerConfig(path);
+        });
+        connection.tlsCertPath().ifPresent(path -> {
+            if (connection.skipTlsVerify()) {
+                LOG.infov("Using TLS material from the active Docker context at: {0}, with server "
+                        + "certificate verification skipped per the context''s SkipTLSVerify setting.",
+                        path);
+                builder.withCustomSslConfig(new SkipVerifySslConfig(path.toString()));
+            } else {
+                LOG.infov("Using TLS material from the active Docker context at: {0}", path);
+                builder.withDockerTlsVerify(true);
+                builder.withDockerCertPath(path.toString());
+            }
+        });
+        return builder.build();
+    }
+
+    private DockerClient buildDockerClient(DefaultDockerClientConfig clientConfig, int maxConnections, String role) {
+        LOG.infov("Creating {0} DockerClient pool (maxConnections={1}) for host: {2}",
+                role, maxConnections, clientConfig.getDockerHost());
+
+        Duration apiTimeout = Duration.ofSeconds(validateApiTimeoutSeconds(config.docker().apiTimeoutSeconds()));
+        FlociDockerHttpClient transport = newHttpClient(clientConfig, maxConnections, apiTimeout,
+                Duration.ofSeconds(validateConnectionRequestTimeoutSeconds(
+                        config.docker().connectionRequestTimeoutSeconds())));
+        gaugeLogger.register(role, transport::gauges);
+        int launchSlots = "control-plane".equals(role)
+                ? LaunchBulkheadDockerHttpClient.resolveSize(
+                        validateMaxConcurrentLaunches(config.docker().maxConcurrentLaunches()),
+                        Runtime.getRuntime().availableProcessors())
+                : 0;
+        if (launchSlots > 0) {
+            LOG.infov("At most {0} container creates and starts run at once", launchSlots);
+        }
+        Duration launchWait = Duration.ofSeconds(config.docker().connectionRequestTimeoutSeconds());
+        usePingTransport(clientConfig);
+        return newDockerClient(clientConfig,
+                wrapForRole(transport, role, apiTimeout, breaker, launchSlots, launchWait));
+    }
+
+    /**
+     * A DockerClient over {@code httpClient} whose stream callbacks run on virtual threads
+     * ({@link FlociDockerCmdExecFactory}). docker-java offers no other way to give its streams a thread of
+     * Floci's choosing than its deprecated exec-factory hook.
+     */
+    @SuppressWarnings("deprecation")
+    static DockerClient newDockerClient(DefaultDockerClientConfig clientConfig, DockerHttpClient httpClient) {
+        return DockerClientImpl.getInstance(clientConfig)
+                .withDockerCmdExecFactory(new FlociDockerCmdExecFactory(httpClient, clientConfig.getObjectMapper()));
+    }
+
+    static FlociDockerHttpClient newHttpClient(DefaultDockerClientConfig clientConfig, int maxConnections,
+                                               Duration apiTimeout, Duration connectionRequestTimeout) {
+        return new FlociDockerHttpClient.Builder()
+                .dockerHost(clientConfig.getDockerHost())
+                .sslConfig(clientConfig.getSSLConfig())
+                .maxConnections(maxConnections)
+                .connectionTimeout(Duration.ofSeconds(30))
+                .responseTimeout(apiTimeout)
+                .connectionRequestTimeout(connectionRequestTimeout)
+                .build();
+    }
+
+    /**
+     * Wraps the control-plane transport in {@link RetryingDockerHttpClient} so every short-lived
+     * docker call survives a transient socket drop. The streaming transport replays only container
+     * waits, as the control-plane one does: its other requests (log follow, attach, exec output)
+     * hold hijacked or long-lived streams that must never be replayed, and its exec-start calls are
+     * the one request retrying could turn into a re-run command. {@code callTimeout} bounds a retried
+     * control-plane call across its attempts and backoffs, so it is the longest one call waits on a
+     * silent daemon, not the length of each of its attempts.
+     */
+    static DockerHttpClient wrapForRole(DockerHttpClient transport, String role, Duration callTimeout) {
+        return wrapForRole(transport, role, callTimeout, null, 0, Duration.ZERO);
+    }
+
+    /**
+     * As {@link #wrapForRole(DockerHttpClient, String, Duration)}, with {@code breaker} (shared by both
+     * roles) between the retry layer and the transport, so an open breaker fails a call before the
+     * retry layer could replay it, and every attempt's outcome reaches the breaker. A null or disabled
+     * breaker leaves the transport as it is.
+     */
+    static DockerHttpClient wrapForRole(DockerHttpClient transport, String role, Duration callTimeout,
+                                        DockerCircuitBreaker breaker) {
+        return wrapForRole(transport, role, callTimeout, breaker, 0, Duration.ZERO);
+    }
+
+    /**
+     * As {@link #wrapForRole(DockerHttpClient, String, Duration)}, with the control-plane transport's
+     * container creates and starts limited to {@code launchSlots} at once ({@link
+     * LaunchBulkheadDockerHttpClient}), each waiting up to {@code launchWait} for a slot. The bulkhead sits
+     * under the retry layer, so a backoff never holds a slot. 0 slots leaves launches unbounded.
+     */
+    static DockerHttpClient wrapForRole(DockerHttpClient transport, String role, Duration callTimeout,
+                                        int launchSlots, Duration launchWait) {
+        return wrapForRole(transport, role, callTimeout, null, launchSlots, launchWait);
+    }
+
+    /**
+     * Both of the above. The bulkhead sits under the breaker, so an open breaker fails a launch at once
+     * instead of after a wait for a slot.
+     */
+    static DockerHttpClient wrapForRole(DockerHttpClient transport, String role, Duration callTimeout,
+                                        DockerCircuitBreaker breaker, int launchSlots, Duration launchWait) {
+        if (launchSlots > 0 && "control-plane".equals(role)) {
+            transport = new LaunchBulkheadDockerHttpClient(transport, launchSlots, launchWait);
+        }
+        if (breaker != null && breaker.isEnabled()) {
+            transport = new CircuitBreakingDockerHttpClient(transport, breaker);
+        }
+        if (!"control-plane".equals(role)) {
+            // The streaming transport replays only container waits, long-lived streams the call timeout never bounds.
+            return RetryingDockerHttpClient.forContainerWaits(transport);
+        }
+        LOG.info("Wrapping control-plane docker transport in transient-I/O retry");
+        return new RetryingDockerHttpClient(transport, callTimeout);
+    }
+
+    /**
+     * Presents the context's client certificate for mutual TLS, like {@code
+     * LocalDirectorySSLConfig}, but trusts the daemon's server certificate unconditionally
+     * instead of validating it against the context's CA. docker-java's own {@code
+     * LocalDirectorySSLConfig} always validates the server certificate, with no built-in way to
+     * skip that step, so a context with {@code SkipTLSVerify: true} needs a dedicated {@link
+     * SSLConfig} to reproduce the Docker CLI's own behavior for it.
+     */
+    private static final class SkipVerifySslConfig implements SSLConfig, Serializable {
+
+        private static final long serialVersionUID = 1L;
+        private static final X509TrustManager TRUST_ALL = new X509TrustManager() {
+            @Override
+            public void checkClientTrusted(X509Certificate[] chain, String authType) {
+            }
+
+            @Override
+            public void checkServerTrusted(X509Certificate[] chain, String authType) {
+            }
+
+            @Override
+            public X509Certificate[] getAcceptedIssuers() {
+                return new X509Certificate[0];
+            }
+        };
+
+        private final String dockerCertPath;
+
+        SkipVerifySslConfig(String dockerCertPath) {
+            this.dockerCertPath = dockerCertPath;
+        }
+
+        @Override
+        public SSLContext getSSLContext() {
+            try {
+                String keyPem = Files.readString(Path.of(dockerCertPath, "key.pem"));
+                String certPem = Files.readString(Path.of(dockerCertPath, "cert.pem"));
+                KeyManagerFactory keyManagerFactory =
+                        KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());
+                keyManagerFactory.init(CertificateUtils.createKeyStore(keyPem, certPem), "docker".toCharArray());
+                SSLContext sslContext = SSLContext.getInstance("TLSv1.2");
+                sslContext.init(keyManagerFactory.getKeyManagers(), new TrustManager[] {TRUST_ALL}, null);
+                return sslContext;
+            } catch (Exception e) {
+                throw new DockerClientException(e.getMessage(), e);
+            }
+        }
+    }
+}

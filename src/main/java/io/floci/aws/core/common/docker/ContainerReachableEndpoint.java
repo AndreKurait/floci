@@ -1,0 +1,148 @@
+package io.floci.aws.core.common.docker;
+
+import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.config.TlsCertificateManager;
+import io.floci.aws.core.common.dns.EmbeddedDnsServer;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import org.eclipse.microprofile.config.inject.ConfigProperty;
+
+import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.util.Optional;
+
+/**
+ * Computes the Floci base URL reachable from <em>inside</em> a Docker container that Floci launches.
+ *
+ * <p>When the embedded DNS server is active, containers built with
+ * {@code ContainerBuilder.Builder.withEmbeddedDns()} have it wired as their resolver and can reach Floci by
+ * the configured hostname (or the default DNS suffix). Otherwise we fall back to the raw Docker host
+ * address (e.g. {@code host.docker.internal} or the bridge IP) resolved by {@link DockerHostResolver}.
+ *
+ * <p>This is the single definition of "how a container reaches Floci", shared by:
+ * <ul>
+ *   <li>{@link LaunchedContainerAwsEnv}, which sets the AWS endpoint for Lambda, ECS, Flink and MWAA
+ *       containers</li>
+ *   <li>{@code Ec2ContainerManager}, for the {@code AWS_ENDPOINT_URL} of EC2 instance containers</li>
+ *   <li>{@code CustomResourceCfnProvisioner}, for the {@code ResponseURL} a custom resource
+ *       Lambda PUTs its result to</li>
+ *   <li>{@code FlociDuckClient}, for the S3 endpoint the DuckDB sidecar calls</li>
+ *   <li>{@code EksPodIdentityWebhook}, for the {@code AWS_ENDPOINT_URL} of EKS pods, through
+ *       {@link #baseUrl(boolean)} without the embedded DNS server, which a pod does not always resolve through</li>
+ *   <li>{@code EksClusterManager}, for the URL the k3s API server calls the Pod Identity admission webhook
+ *       on, through {@link #httpsBaseUrl(boolean)}</li>
+ * </ul>
+ *
+ * <p>Lambda pods on Kubernetes do not use it: {@code KubernetesFlociAddressResolver} builds their
+ * endpoint without the embedded DNS server.
+ */
+@ApplicationScoped
+public class ContainerReachableEndpoint {
+
+    private final EmulatorConfig config;
+    private final DockerHostResolver dockerHostResolver;
+    private final EmbeddedDnsServer embeddedDnsServer;
+    private final TlsCertificateManager tlsCertificates;
+    private final int httpPort;
+
+    @Inject
+    public ContainerReachableEndpoint(EmulatorConfig config,
+                                      DockerHostResolver dockerHostResolver,
+                                      EmbeddedDnsServer embeddedDnsServer,
+                                      TlsCertificateManager tlsCertificates,
+                                      @ConfigProperty(name = "quarkus.http.port") int httpPort) {
+        this.config = config;
+        this.dockerHostResolver = dockerHostResolver;
+        this.embeddedDnsServer = embeddedDnsServer;
+        this.tlsCertificates = tlsCertificates;
+        this.httpPort = httpPort;
+    }
+
+    /**
+     * The HTTP base URL reachable from inside a launched Docker container. The public listener
+     * accepts HTTP alongside HTTPS; clients with CA trust can select {@link #baseUrlWithTls(boolean)}.
+     *
+     * <p>The port is the one Floci listens on, not the port in {@code floci.base-url}: base-url
+     * advertises the host-facing address, which differs under a port mapping such as
+     * {@code -p 4811:4566} and is refused inside the Docker network. That is
+     * {@code quarkus.http.port}, which defaults to {@code floci.port} but can be overridden on its
+     * own; with TLS enabled the HTTP server moves to a loopback-only internal port and the public
+     * listener is {@code TlsProxyServer} on {@code floci.port}.
+     */
+    public String baseUrl() {
+        return baseUrl(true);
+    }
+
+    /** Selects the workload network before handing an address to a container with different DNS. */
+    public String baseUrl(boolean useEmbeddedDns) {
+        return baseUrl(useEmbeddedDns, "http");
+    }
+
+    /** Uses HTTPS when configured, for a client that receives the Floci CA trust bundle. */
+    public String baseUrlWithTls(boolean useEmbeddedDns) {
+        return baseUrl(useEmbeddedDns, config.tls().enabled() ? "https" : "http");
+    }
+
+    private String baseUrl(boolean useEmbeddedDns, String scheme) {
+        return scheme + "://" + authorityHost(host(useEmbeddedDns)) + ":" + port();
+    }
+
+    private static String authorityHost(String host) {
+        return host.contains(":") && !host.startsWith("[") ? "[" + host + "]" : host;
+    }
+
+    private String host(boolean useEmbeddedDns) {
+        String flociHostname;
+        if (useEmbeddedDns && embeddedDnsServer.getServerIp().isPresent()) {
+            flociHostname = config.hostname().orElse(EmbeddedDnsServer.DEFAULT_SUFFIX);
+        } else if (useEmbeddedDns) {
+            flociHostname = dockerHostResolver.resolve();
+        } else {
+            flociHostname = dockerHostResolver.resolveContainerIp().orElseGet(dockerHostResolver::resolve);
+        }
+        if (!useEmbeddedDns && !"host.docker.internal".equals(flociHostname)) {
+            try {
+                flociHostname = InetAddress.getByName(flociHostname).getHostAddress();
+            } catch (UnknownHostException e) {
+                throw new IllegalStateException("Cannot resolve the configured Floci Docker host", e);
+            }
+        }
+        // host.docker.internal is supplied through Docker's hosts mapping, independent of DNS.
+        return flociHostname;
+    }
+
+    /** The port of {@link #baseUrl()}: the one a launched container can reach Floci on. */
+    public int port() {
+        return config.tls().enabled() ? config.port() : httpPort;
+    }
+
+    /**
+     * The base URL a custom resource's {@code ResponseURL} names: {@link #baseUrl()}, over https
+     * where Floci serves TLS under a certificate that names the host.
+     *
+     * <p>AWS hands a custom resource a presigned Amazon S3 URL to PUT its response to
+     * (CloudFormation User Guide, CloudFormation custom resource request and response reference,
+     * ResponseURL), so a handler that PUTs with Node's {@code https} module, as AWS's own
+     * {@code cfn-response} does, refuses an http URL ({@code Protocol "http:" not supported}). With
+     * TLS enabled, {@code TlsProxyServer} serves https beside http on {@link EmulatorConfig#port()},
+     * and every container Floci launches trusts Floci's CA through {@code NODE_EXTRA_CA_CERTS} and
+     * the other bundle variables, so the https URL is reachable with no shim in the handler. A host
+     * the certificate does not name, an IP from {@code docker-host-override} or the container-IP
+     * fallback when the embedded DNS server cannot start, would fail the handler's certificate
+     * check where http works, so that URL stays http.
+     */
+    public String customResourceResponseBaseUrl() {
+        return httpsBaseUrl(true).orElseGet(this::baseUrl);
+    }
+
+    /**
+     * {@link #baseUrl(boolean)} over https, when Floci serves TLS under a certificate that names its host, so
+     * a client that verifies the name accepts it. Empty otherwise: with TLS off, or for a host the certificate
+     * does not name, such as an IP from {@code docker-host-override}, the container-IP fallback, or a
+     * name a user-provided certificate was not issued for.
+     */
+    public Optional<String> httpsBaseUrl(boolean useEmbeddedDns) {
+        String host = host(useEmbeddedDns);
+        return tlsCertificates.serves(host) ? Optional.of("https://" + authorityHost(host) + ":" + port()) : Optional.empty();
+    }
+}

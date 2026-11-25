@@ -264,9 +264,9 @@ describe('WebSocket Data-Plane', () => {
     let apiId: string;
 
     beforeAll(async () => {
-      const broadcastFn = await createLambda('broadcast', BROADCAST_HANDLER, {
-        FLOCI_ENDPOINT: 'http://host.docker.internal:4566',
-      }, true);
+      // Floci injects FLOCI_ENDPOINT into the function; the host gateway does not reach a
+      // port published on loopback only.
+      const broadcastFn = await createLambda('broadcast', BROADCAST_HANDLER, undefined, true);
       const echoFn = await createLambda('bc-echo', ECHO_HANDLER);
       apiId = await createWsApi('broadcast');
 

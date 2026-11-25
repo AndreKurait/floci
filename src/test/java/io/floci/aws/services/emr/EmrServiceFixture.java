@@ -1,0 +1,548 @@
+package io.floci.aws.services.emr;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.docker.ContainerLifecycleManager;
+import io.floci.aws.services.ec2.model.Instance;
+import io.floci.aws.services.emr.model.EmrCluster;
+import io.floci.aws.services.emr.model.EmrStep;
+import io.floci.aws.services.emrserverless.SessionServers;
+import io.floci.aws.services.emrserverless.SparkJobRunner;
+import io.floci.aws.services.eventbridge.EventBridgeService;
+import io.floci.aws.services.iam.IamService;
+import io.floci.aws.testing.InMemoryStorageFactory;
+import io.floci.aws.testing.MutableClock;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.function.BooleanSupplier;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.function.Supplier;
+
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
+
+/**
+ * An {@link EmrService} on in-memory storage, with a clock the test moves and wakeups the test runs,
+ * recording the {@code aws.emr} events it publishes. Each event is handed to {@link #target} as it is
+ * published, as EventBridge's first delivery is, and checked to be published once the service is let go,
+ * and, for a wakeup's, after it, as the timer's own thread never sends them. In the {@code docker} runner
+ * mode a step's thread, and a bootstrap's, is one the test runs, with {@link #runStepThread}.
+ */
+final class EmrServiceFixture {
+
+    static final String REGION = "us-east-1";
+    static final String ACCOUNT = "000000000000";
+
+    /** A rule's target, given each event as it is published. */
+    @FunctionalInterface
+    interface Target {
+        void deliver(JsonNode event) throws Exception;
+    }
+
+    private record Wakeup(Instant due, Runnable task) {}
+
+    /**
+     * A cluster's storage as what the service asked of it, each removal refused while {@link #refuse} is set, and
+     * {@link #whileCreating} run as each is made.
+     */
+    static final class RecordingStorage implements ClusterStorage {
+        // The address each cluster's HDFS answers at.
+        static final String HDFS_ADDRESS = "172.18.0.5";
+        // The Docker network of a cluster's own each cluster's HDFS is on.
+        static final String HDFS_NETWORK = "floci-aws-emr-hdfs";
+        final List<String> created = new ArrayList<>();
+        // Each HDFS started: its cluster, primary node's host name, image and Docker network.
+        final List<List<String>> hdfs = new ArrayList<>();
+        // Each HDFS's metastore service asked for.
+        final List<HiveMetastore> metastores = new ArrayList<>();
+        // Each HDFS's YARN asked for.
+        final List<Yarn> yarns = new ArrayList<>();
+        // Each cluster and S3 folder its YARN applications' logs were put in.
+        final List<List<String>> containerLogs = new ArrayList<>();
+        // Floci's address on a cluster's network, which a node running YARN gives its executors.
+        static final String FLOCI_ON_NETWORK = "http://floci:4566";
+        // Whether a cluster's primary node has a network of its own, as with a docker-network that is not shared.
+        boolean ownNetwork;
+        RuntimeException hdfsFailure;
+        // Runs as each HDFS starts, with what tells it the step is past starting.
+        Consumer<BooleanSupplier> whileStartingHdfs = stopped -> { };
+        final List<String> removed = new ArrayList<>();
+        final List<Set<String>> kept = new ArrayList<>();
+        // Each resize asked for: its cluster and the nodes it wants.
+        final List<ClusterStorage.Yarn> resizes = new ArrayList<>();
+        boolean refuse;
+        Runnable whileCreating = () -> { };
+        // Whether a cluster's network has an instance metadata relay, as where its steps have a network of Floci's.
+        boolean metadata;
+        // What a relay's start throws, if anything.
+        RuntimeException metadataFailure;
+        // Each relay started: its cluster and image; each instance given an address, by id; each address released.
+        final List<List<String>> relays = new ArrayList<>();
+        final List<Instance> given = new ArrayList<>();
+        final List<String> released = new ArrayList<>();
+        // Where each port of a primary node's web interfaces is reached, once the node is ready.
+        final Map<Integer, ContainerLifecycleManager.EndpointInfo> webInterfaces = new HashMap<>();
+        // The clusters whose history is kept; where each port of a kept history's container is reached, once it
+        // answers; what was asked of the histories, in order; and the clusters each sweep kept.
+        final Set<String> historiesKept = new HashSet<>();
+        final Map<Integer, ContainerLifecycleManager.EndpointInfo> historyInterfaces = new HashMap<>();
+        final List<String> historyEvents = new ArrayList<>();
+        final List<Set<String>> historySweeps = new ArrayList<>();
+        // Whether copying a cluster's event logs into its kept history fails.
+        boolean keepFails;
+        // How each cluster's nodes are known as EC2 instances.
+        final Map<String, Function<String, Instance>> identities = new HashMap<>();
+
+        @Override
+        public boolean metadataServed(String dockerNetwork) {
+            return metadata;
+        }
+
+        @Override
+        public String metadataNetwork(String clusterId, String accountId, String region, String relayImage,
+                                      String dockerNetwork) {
+            if (!metadata) {
+                return null;
+            }
+            relays.add(List.of(clusterId, relayImage));
+            if (metadataFailure != null) {
+                throw metadataFailure;
+            }
+            return HDFS_NETWORK;
+        }
+
+        @Override
+        public String metadataAddress(String clusterId, Instance instance) {
+            given.add(instance);
+            return "169.254.0." + given.size();
+        }
+
+        @Override
+        public void releaseMetadataAddress(String address) {
+            released.add(address);
+        }
+
+        @Override
+        public void identify(String clusterId, Function<String, Instance> nodes) {
+            identities.put(clusterId, nodes);
+        }
+
+        @Override
+        public SparkJobRunner.Storage volumes(String clusterId) {
+            return new SparkJobRunner.Storage(clusterId + "-home", clusterId + "-mnt");
+        }
+
+        @Override
+        public void create(String clusterId, String accountId, String region) {
+            created.add(clusterId);
+            whileCreating.run();
+        }
+
+        @Override
+        public boolean ownNetwork(String dockerNetwork) {
+            return ownNetwork;
+        }
+
+        @Override
+        public Optional<ContainerLifecycleManager.EndpointInfo> webInterface(String clusterId, int port) {
+            return Optional.ofNullable(webInterfaces.get(port));
+        }
+
+        @Override
+        public boolean keepHistory(String clusterId) {
+            if (keepFails) {
+                historyEvents.add("could not keep " + clusterId);
+                return false;
+            }
+            historyEvents.add("kept " + clusterId + (removed.contains(clusterId) ? " after its removal" : ""));
+            historiesKept.add(clusterId);
+            return true;
+        }
+
+        @Override
+        public boolean historyKept(String clusterId) {
+            return historiesKept.contains(clusterId);
+        }
+
+        @Override
+        public Optional<ContainerLifecycleManager.EndpointInfo> historyInterface(String clusterId, String accountId,
+                String region, Supplier<String> image, Consumer<String> released, String primaryHost, Yarn yarn,
+                int port) {
+            ContainerLifecycleManager.EndpointInfo endpoint = historyInterfaces.get(port);
+            if (endpoint == null) {
+                historyEvents.add("starting " + clusterId + " as " + primaryHost);
+            }
+            return Optional.ofNullable(endpoint);
+        }
+
+        @Override
+        public void stopHistory(String clusterId) {
+            historyEvents.add("stopped " + clusterId);
+        }
+
+        @Override
+        public void removeHistoriesBut(Set<String> kept) {
+            historySweeps.add(Set.copyOf(kept));
+        }
+
+        @Override
+        public void resize(String clusterId, Supplier<Yarn> yarn) {
+            resizes.add(yarn.get());
+        }
+
+        @Override
+        public void archiveContainerLogs(String clusterId, String accountId, String region, String logFolder) {
+            containerLogs.add(List.of(clusterId, logFolder));
+        }
+
+        @Override
+        public SparkJobRunner.Storage hdfs(String clusterId, String accountId, String region, String host,
+                                           String image, String dockerNetwork, HiveMetastore hiveMetastore,
+                                           Supplier<Yarn> yarn,
+                                           BooleanSupplier stopped) {
+            hdfs.add(Arrays.asList(clusterId, host, image, dockerNetwork, String.valueOf(hiveMetastore != null),
+                    hiveMetastore != null ? hiveMetastore.role() : null));
+            if (hiveMetastore != null) {
+                metastores.add(hiveMetastore);
+            }
+            if (yarn != null) {
+                yarns.add(yarn.get());
+            }
+            whileStartingHdfs.accept(stopped);
+            if (hdfsFailure != null) {
+                throw hdfsFailure;
+            }
+            SparkJobRunner.Storage storage = volumes(clusterId).withHdfs(host, HDFS_ADDRESS, HDFS_NETWORK);
+            if (hiveMetastore != null) {
+                storage = storage.withHiveMetastore("thrift://" + host + ":9083");
+            }
+            return yarn != null ? storage.withYarn(host, FLOCI_ON_NETWORK) : storage;
+        }
+
+        @Override
+        public boolean remove(String clusterId) {
+            removed.add(clusterId);
+            return !refuse;
+        }
+
+        @Override
+        public void removeAllBut(Set<String> kept) {
+            this.kept.add(kept);
+        }
+    }
+
+    /** Makes no image: answers {@link #IMAGE} for each, or throws {@link #failure} when it is set. */
+    static final class RecordingReleaseImages implements ReleaseImages {
+        static final String IMAGE = "sha256:" + "3".repeat(64);
+        // Each image asked for: its release, then the two it is made of, then whether it has Hive, and Pig.
+        final List<List<String>> asked = new ArrayList<>();
+        // The Trino image each one asked for has the CLI of, null for none, in the same order.
+        final List<String> trinoImages = new ArrayList<>();
+        // Each image released, by id.
+        final List<String> released = new ArrayList<>();
+        RuntimeException failure;
+
+        @Override
+        public String image(String releaseLabel, String sparkImage, String hiveImage, boolean withHive,
+                            boolean withPig, String trinoImage) {
+            asked.add(List.of(releaseLabel, sparkImage, hiveImage, String.valueOf(withHive), String.valueOf(withPig)));
+            trinoImages.add(trinoImage);
+            if (failure != null) {
+                throw failure;
+            }
+            return IMAGE;
+        }
+
+        @Override
+        public void released(String imageId) {
+            released.add(imageId);
+        }
+    }
+
+    final ObjectMapper objectMapper = new ObjectMapper();
+    final List<JsonNode> published = new ArrayList<>();
+    final MutableClock clock;
+    final EmrEventPublisher publisher;
+    // Not final: the events' check reads it, from the mock set up before the service is built.
+    EmrService service;
+    Target target = event -> { };
+    private final List<Wakeup> wakeups = new ArrayList<>();
+    private final List<Runnable> deliveries = new ArrayList<>();
+    // The docker runner mode's step threads, not yet run; a session server's thread may add one too.
+    private final List<Runnable> stepThreads = new CopyOnWriteArrayList<>();
+    // Whether the pool refuses what it is handed, as a pool shut down does.
+    volatile boolean threadsRefused;
+    private boolean waking;
+    final InMemoryStorageFactory storage;
+    private final SparkJobRunner runner;
+    private final BootstrapRunner bootstrap;
+    // The docker runner mode's; null in the immediate one.
+    final RecordingStorage clusterStorage;
+    final RecordingReleaseImages releaseImages;
+    private final IamService iam;
+    private final int[] durations;
+    // How the docker runner mode's session servers are asked whether they answer; null for no session servers.
+    private final SessionServers.Probe sessionProbe;
+
+    /** The service as configured by default, every duration 0. */
+    EmrServiceFixture() {
+        this(0, 0, 0);
+    }
+
+    EmrServiceFixture(int startupDelaySeconds, int stepDurationSeconds, int terminationDelaySeconds) {
+        this(new InMemoryStorageFactory(ACCOUNT), new MutableClock(), null, null, null, null, null, null,
+                startupDelaySeconds, stepDurationSeconds, terminationDelaySeconds);
+    }
+
+    /** The service as configured by default, every duration 0, on {@code storage}, so a test can seed its stores. */
+    static EmrServiceFixture on(InMemoryStorageFactory storage) {
+        return new EmrServiceFixture(storage, new MutableClock(), null, null, null, null, null, null, 0, 0, 0);
+    }
+
+    /** The service in the {@code docker} runner mode, every duration 0, its steps run by {@code runner}. */
+    static EmrServiceFixture docker(SparkJobRunner runner, IamService iam) {
+        return docker(runner, null, iam);
+    }
+
+    /** As {@link #docker(SparkJobRunner, IamService)}, its clusters' bootstrap actions run by {@code bootstrap}. */
+    static EmrServiceFixture docker(SparkJobRunner runner, BootstrapRunner bootstrap, IamService iam) {
+        return new EmrServiceFixture(new InMemoryStorageFactory(ACCOUNT), new MutableClock(), runner, bootstrap,
+                new RecordingStorage(), new RecordingReleaseImages(), iam, null, 0, 0, 0);
+    }
+
+    /**
+     * As {@link #docker(SparkJobRunner, IamService)}, its sessions' Spark Connect servers run by {@code runner} too,
+     * each on a thread of its own, and asked whether they answer by {@code probe}.
+     */
+    static EmrServiceFixture dockerSessions(SparkJobRunner runner, IamService iam, SessionServers.Probe probe) {
+        return new EmrServiceFixture(new InMemoryStorageFactory(ACCOUNT), new MutableClock(), runner, null,
+                new RecordingStorage(), new RecordingReleaseImages(), iam, probe, 0, 0, 0);
+    }
+
+    private EmrServiceFixture(InMemoryStorageFactory storage, MutableClock clock, SparkJobRunner runner,
+                              BootstrapRunner bootstrap, RecordingStorage clusterStorage,
+                              RecordingReleaseImages releaseImages, IamService iam,
+                              SessionServers.Probe sessionProbe, int... durations) {
+        this.sessionProbe = sessionProbe;
+        this.storage = storage;
+        this.clock = clock;
+        this.runner = runner;
+        this.bootstrap = bootstrap;
+        this.clusterStorage = clusterStorage;
+        this.releaseImages = releaseImages;
+        this.iam = iam;
+        this.durations = durations;
+        EventBridgeService eventBridge = mock(EventBridgeService.class);
+        doAnswer(invocation -> {
+            // The call that made the change has let go of the service by now.
+            assertFalse(Thread.holdsLock(service), "published while EmrService was held");
+            assertFalse(waking, "published by a wakeup itself");
+            JsonNode event = objectMapper.createObjectNode()
+                    .put("detail-type", invocation.<String>getArgument(1))
+                    .set("detail", objectMapper.readTree(invocation.<String>getArgument(2)));
+            published.add(event);
+            target.deliver(event);
+            return null;
+        }).when(eventBridge).publishServiceEvent(eq("aws.emr"), anyString(), anyString(), isNull(), eq(REGION));
+        RegionResolver regionResolver = new RegionResolver(REGION, ACCOUNT);
+        publisher = new EmrEventPublisher(eventBridge, objectMapper, regionResolver);
+        EmrService.Wakeups recorded = new EmrService.Wakeups() {
+            @Override
+            public void at(Instant due, Runnable task) {
+                wakeups.add(new Wakeup(due, task));
+            }
+
+            @Override
+            public void deliver(Runnable delivery) {
+                deliveries.add(delivery);
+            }
+        };
+        service = sessionProbe == null
+                ? new EmrService(storage, config(false), regionResolver, publisher, clock, recorded, runner, bootstrap,
+                        clusterStorage, releaseImages, this::handToThread, iam)
+                : new EmrService(storage, config(false), regionResolver, publisher, clock, recorded, runner, bootstrap,
+                        clusterStorage, releaseImages, this::handToThread, iam,
+                        new SessionServers(SessionServers.Kind.SPARK_CONNECT, runner,
+                                task -> Thread.ofPlatform().daemon().start(task), null, sessionProbe, clock));
+    }
+
+    /** A new service on the same storage and clock, as after a restart of Floci with persistent storage. */
+    EmrServiceFixture restart() {
+        return new EmrServiceFixture(storage, clock, runner, bootstrap, clusterStorage, releaseImages, iam,
+                sessionProbe, durations);
+    }
+
+    /** A new service on the same storage and clock, as {@link #restart} builds, in the {@code immediate} mode. */
+    EmrServiceFixture restartImmediate() {
+        return new EmrServiceFixture(storage, clock, null, null, null, null, iam, null, durations);
+    }
+
+    /**
+     * A new service on the same storage and clock, as {@link #restart} builds, but with {@code runner},
+     * its wakeups set on {@code wakeups}, and leftover drivers removed when it starts.
+     */
+    EmrService restartReconciling(SparkJobRunner runner, EmrService.Wakeups wakeups) {
+        return new EmrService(storage, config(true), new RegionResolver(REGION, ACCOUNT), publisher, clock, wakeups,
+                runner, bootstrap, clusterStorage, releaseImages, this::handToThread, iam);
+    }
+
+    /**
+     * A new service on the same storage and clock, as {@link #restart} builds, whose Hive steps run in the image
+     * {@code hiveImageTemplate} names, its steps' threads this fixture's, and its events not delivered.
+     */
+    EmrService withHiveImageTemplate(String hiveImageTemplate) {
+        EmulatorConfig config = config(false);
+        when(config.services().emr().hiveImageTemplate()).thenReturn(Optional.of(hiveImageTemplate));
+        return new EmrService(storage, config, new RegionResolver(REGION, ACCOUNT), publisher, clock,
+                mock(EmrService.Wakeups.class), runner, bootstrap, clusterStorage, releaseImages, this::handToThread,
+                iam);
+    }
+
+    /**
+     * A new service on the same storage and clock, as {@link #restart} builds, with Floci's Pig on, its steps' threads
+     * this fixture's, and its events not delivered.
+     */
+    EmrService withPig() {
+        EmulatorConfig config = config(false);
+        when(config.services().emr().pig().enabled()).thenReturn(true);
+        return new EmrService(storage, config, new RegionResolver(REGION, ACCOUNT), publisher, clock,
+                mock(EmrService.Wakeups.class), runner, bootstrap, clusterStorage, releaseImages, this::handToThread,
+                iam);
+    }
+
+    /**
+     * A new service on the same storage and clock, as {@link #restart} builds, with Floci's Trino on at its defaults,
+     * its steps' threads this fixture's, and its events not delivered.
+     */
+    EmrService withTrino() {
+        EmulatorConfig config = config(false);
+        when(config.services().emr().trino().enabled()).thenReturn(true);
+        when(config.services().emr().trino().image()).thenReturn("trinodb/trino:%s");
+        when(config.services().emr().trino().memoryMb()).thenReturn(2048);
+        return new EmrService(storage, config, new RegionResolver(REGION, ACCOUNT), publisher, clock,
+                mock(EmrService.Wakeups.class), runner, bootstrap, clusterStorage, releaseImages, this::handToThread,
+                iam);
+    }
+
+    /** A new service on the same storage and clock, as {@link #restart} builds, with this default release label. */
+    EmrService withDefaultReleaseLabel(String label) {
+        EmulatorConfig config = config(false);
+        when(config.services().emr().defaultReleaseLabel()).thenReturn(label);
+        return new EmrService(storage, config, new RegionResolver(REGION, ACCOUNT), publisher, clock,
+                mock(EmrService.Wakeups.class), runner, bootstrap, clusterStorage, releaseImages, this::handToThread,
+                iam);
+    }
+
+    private EmulatorConfig config(boolean reconcile) {
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().emr().defaultReleaseLabel()).thenReturn("emr-7.5.0");
+        when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566/");
+        when(config.services().emr().clusterStartupDelaySeconds()).thenReturn(durations[0]);
+        when(config.services().emr().stepDurationSeconds()).thenReturn(durations[1]);
+        when(config.services().emr().clusterTerminationDelaySeconds()).thenReturn(durations[2]);
+        when(config.services().emr().imageTemplate()).thenReturn(Optional.empty());
+        when(config.services().emr().hiveImageTemplate()).thenReturn(Optional.empty());
+        when(config.services().emr().dockerNetwork()).thenReturn(Optional.empty());
+        when(config.services().emr().yarnNodeMemoryMb()).thenReturn(4096);
+        when(config.services().emr().yarnNodeVcores()).thenReturn(4);
+        when(config.services().emr().yarnMaxWorkerNodes()).thenReturn(4);
+        when(config.services().emr().reconcileContainersOnStartup()).thenReturn(reconcile);
+        return config;
+    }
+
+    private void handToThread(Runnable task) {
+        if (threadsRefused) {
+            throw new RejectedExecutionException("The pool takes no more threads");
+        }
+        stepThreads.add(task);
+    }
+
+    /** Runs the oldest step thread not yet run, as the docker runner mode's pool would. */
+    void runStepThread() {
+        stepThreads.remove(0).run();
+    }
+
+    /** How many step threads have been started and not yet run. */
+    int stepThreadsWaiting() {
+        return stepThreads.size();
+    }
+
+    /**
+     * Moves the clock on by {@code duration} and runs the wakeups due by then, as the service's timer
+     * would, the ones they set included, each followed by the delivery of its events.
+     */
+    void pass(Duration duration) {
+        clock.advance(duration);
+        Instant now = clock.instant();
+        List<Wakeup> due;
+        while (!(due = wakeups.stream().filter(wakeup -> !wakeup.due().isAfter(now)).toList()).isEmpty()) {
+            wakeups.removeAll(due);
+            for (Wakeup wakeup : due) {
+                waking = true;
+                try {
+                    wakeup.task().run();
+                } finally {
+                    waking = false;
+                }
+                while (!deliveries.isEmpty()) {
+                    deliveries.remove(0).run();
+                }
+            }
+        }
+    }
+
+    /** The times of the wakeups not yet run. */
+    List<Instant> wakeupTimes() {
+        return wakeups.stream().map(Wakeup::due).toList();
+    }
+
+    /** Each event's state, a step's followed by its name. */
+    List<String> states() {
+        return published.stream().map(event -> {
+            JsonNode detail = event.path("detail");
+            return detail.has("stepId")
+                    ? detail.path("state").asText() + " " + detail.path("name").asText()
+                    : detail.path("state").asText();
+        }).toList();
+    }
+
+    /** Each step's state, in order. */
+    static List<String> stepStates(List<EmrStep> steps) {
+        return steps.stream().map(EmrStep::getState).toList();
+    }
+
+    static EmrCluster cluster(String name, boolean keepAlive, EmrStep... steps) {
+        EmrCluster cluster = new EmrCluster();
+        cluster.setName(name);
+        cluster.setKeepJobFlowAliveWhenNoSteps(keepAlive);
+        cluster.setSteps(new ArrayList<>(List.of(steps)));
+        return cluster;
+    }
+
+    static EmrStep step(String name) {
+        EmrStep step = new EmrStep();
+        step.setName(name);
+        step.setActionOnFailure("CONTINUE");
+        return step;
+    }
+}

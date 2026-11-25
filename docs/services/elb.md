@@ -50,6 +50,18 @@ through a suffix match or upstream DNS fallback.
 > see [ELB Classic (v1)](elb-classic.md). Requests are routed by their `Version` parameter:
 > `2015-12-01` here, `2012-06-01` there.
 
+## DNS alias targets
+
+The embedded DNS alias resolver identifies ALBs by their stored DNS name across
+accounts and requires the target's canonical hosted-zone ID. Names are case
+insensitive and may include a trailing dot or the `dualstack.` prefix. Ambiguous
+owners, mismatched hosted zones and unsupported target types are refused.
+
+A valid A target uses the bound emulator address with a 60-second TTL. An
+internet-facing ALB uses the caller VPC's public API transport when native public
+HTTPS routing is enabled on port 443. An unavailable address produces no data;
+the resolver does not synthesize an IPv6 address.
+
 ## Supported Actions
 
 ### Load Balancers
@@ -102,6 +114,11 @@ or the ALB's append/preserve/remove attribute. Shared-port TLS routing retains i
 
 HTTPS listeners require a default certificate. Supply one when creating a listener or changing an HTTP listener to HTTPS; an omitted certificate list on an existing HTTPS listener keeps its default.
 
+Listener responses carry the listener's default certificate in `Certificates`, and omit the
+member when the listener has none. The certificate list `AddListenerCertificates` builds is
+read through `DescribeListenerCertificates` rather than through a listener response, as the
+reference describes.
+
 With Floci TLS enabled, an ALB HTTPS listener on the AWS HTTPS proxy port
 (normally `443`) shares that socket with AWS API callbacks. TLS SNI must uniquely
 identify a listener by its load-balancer DNS name, host rules or certificate
@@ -110,8 +127,6 @@ unmatched names and clients without SNI continue to the API backend. The public
 Floci API port and non-HTTPS proxy-port collisions remain reserved. See
 [TLS shared-port routing](../configuration/tls.md) for limits.
 
-Listener responses omit `Certificates` when the listener has none. Configured certificates
-remain present in create, describe and modify responses.
 
 Creating an HTTPS or TLS listener without `SslPolicy` selects `ELBSecurityPolicy-2016-08`,
 matching AWS's default for API, CLI and CloudFormation creation. An explicit policy
@@ -222,11 +237,8 @@ Gateway Load Balancer listeners require omitted `Port` and `Protocol` fields on 
 - Load balancers return `active` after their required backend namespaces are ready.
   Native ALBs remain `provisioning` during preparation. Failed preparation attempts clean up
   their owned resources; a cleanup failure retains the failed balancer and ENI identities for deletion.
-- `CreateLoadBalancer` takes `Subnets` or `SubnetMappings` for every load balancer type, and both together are refused with `ValidationError`. An Application Load Balancer takes at least two: with one or none it returns `ValidationError` `At least two subnets in two different Availability Zones must be specified` and creates nothing. The count comes before any subnet is looked up, as on AWS, so one subnet that does not exist gets that error too. A Network or Gateway Load Balancer with neither returns `ValidationError` `At least one subnet must be specified`. CloudFormation refuses such an `AWS::ElasticLoadBalancingV2::LoadBalancer` the same way when it creates or replaces the balancer; an update that keeps the balancer and names no subnets leaves it on its subnets.
-- `SetSubnets`, like `CreateLoadBalancer`, takes `Subnets` or `SubnetMappings`, and both together are refused with `ValidationError`. With neither it returns the same `ValidationError` as `CreateLoadBalancer` for the balancer's type, `At least two subnets in two different Availability Zones must be specified` for an Application Load Balancer and `At least one subnet must be specified` for a Network or Gateway Load Balancer, and leaves the balancer on its subnets. A `SetSubnets` that names subnets is counted as `CreateLoadBalancer` counts them, following the two-zone rule its API reference states: one subnet for an Application Load Balancer, in `Subnets` or `SubnetMappings`, returns `ValidationError` `At least two subnets in two different Availability Zones must be specified` before any subnet is looked up, and leaves the balancer on its subnets. AWS does not document the error for this case, so Floci gives `CreateLoadBalancer`'s error, in the same order. A CloudFormation update that keeps an Application Load Balancer and names one subnet fails with that error and rolls back. A Network Load Balancer can be set onto one subnet. The `SetSubnets` API reference requires a Gateway Load Balancer's `Subnets` to include every subnet it is already on; Floci does not enforce that.
-- Single-zone Application Load Balancers (opt-in, off by default): AWS refuses an Application Load Balancer in fewer than two Availability Zones, as above. For local setups that model single-zone deployments, `floci.services.elbv2.single-zone-alb-accounts` (`FLOCI_SERVICES_ELBV2_SINGLE_ZONE_ALB_ACCOUNTS`, comma-separated 12-digit account ids; spaces around an id are ignored) lowers that minimum to one zone for the accounts it lists: for a listed account, `CreateLoadBalancer` and `SetSubnets` (including CloudFormation's) take an Application Load Balancer on one subnet, for either scheme. Neither `Subnets` nor `SubnetMappings` is still refused with the same message. Unlisted accounts, and every account while the setting is unset, keep the two-zone rule; Network and Gateway Load Balancers are unchanged. A value that is not a 12-digit account id is rejected during startup.
-- The two-zone rule above is the default regional zone policy, described under [Application Load Balancer zone policy](#application-load-balancer-zone-policy). Where that policy accepts one Availability Zone (Osaka, `ap-northeast-3`, by default, or a region set to `allow-single-zone`), `CreateLoadBalancer` and `SetSubnets` take an Application Load Balancer on one subnet for every account, and a request that names no subnets returns `ValidationError` `At least one subnet must be specified`.
-- Each subnet given to `CreateLoadBalancer` or `SetSubnets` must be in a different Availability Zone. Two subnets in the same zone return `InvalidConfigurationRequest` `A load balancer cannot be attached to multiple subnets in the same Availability Zone`, even where one zone is enough.
+- `CreateLoadBalancer` takes `Subnets` or `SubnetMappings`; specifying both is rejected with `ValidationError`. Application Load Balancers use the regional zone policy described below: by default, two distinct ordinary AZs are required in every region. Empty subnet requests remain invalid. Requests below the minimum return `ValidationError`: `At least two subnets in two different Availability Zones must be specified` (or `At least one subnet must be specified` when single-zone operation is enabled). Subnet-count checks precede lookup, and rejected requests create no load balancer. CloudFormation uses the same service validation; an update that keeps the balancer and omits subnets preserves its current subnets.
+- `SetSubnets` uses the same regional policy for `Subnets` and `SubnetMappings`. Specifying both, an empty request, or a request below the effective AZ minimum is rejected before mutation. Repeated zones return `InvalidConfigurationRequest`: `A load balancer cannot be attached to multiple subnets in the same Availability Zone`. With no subnets, NLB and GWLB return `ValidationError`: `At least one subnet must be specified`. AWS does not document the one-subnet ALB update error; Floci uses the create error and order. Each selected subnet must belong to the load balancer's VPC. Network Load Balancers may use one subnet. The AWS requirement that a Gateway Load Balancer retain every existing subnet is not currently enforced.
 - `DescribeProvisionedCapacity` is a Floci Query extension, using version `2015-12-01`
   and one `LoadBalancerArn`. Its `ProvisionedCapacity` has `MinimumLBCapacityUnits=0`,
   `Status=disabled` and `DecreasesRemaining=4`; `LastModifiedTime` is absent.
@@ -242,10 +254,14 @@ Gateway Load Balancer listeners require omitted `Port` and `Protocol` fields on 
 - EC2 refuses deletion of subnets and VPCs still referenced by load balancers with `DependencyViolation`. These account- and region-scoped dependencies follow persisted load balancer state; changing subnets or deleting the load balancer releases its old references. A CloudFormation update that names other subnets in `Subnets` or `SubnetMappings` moves the load balancer the way `SetSubnets` does, and a rolled-back update moves it back. An independent target group does not prevent subnet or VPC deletion.
 - HTTP listener sockets are preserved when listener actions change and are restarted only when socket-level settings such as port change.
 - Gateway listeners require `Protocol` and `Port` to be omitted on create and modify. Their control-plane response reports `GENEVE` without a port. CloudFormation preserves omitted gateway listener settings on create and update; other load balancer types retain their existing `HTTP` and port 80 defaults.
-- Instance targets are resolved through EC2 instance private addresses so local load balancer traffic can reach containers.
+- Instance targets are resolved through EC2 instance private addresses so local load balancer traffic can reach containers. An instance port that an ECS task on that container instance publishes resolves to the task's container instead, which is how an ECS service in `bridge` or `host` network mode serves an `instance` target group (see [ECS](ecs.md)).
 - Target health starts in `initial` state with reason `Elb.RegistrationInProgress` and is updated by Floci's health checker when monitoring is active.
-- A newly registered Application Load Balancer target (HTTP/HTTPS target group or Lambda target) becomes healthy after its first successful check. Network and Gateway target groups retain `HealthyThresholdCount` for initial admission. The threshold applies to every group when recovering from `unhealthy`.
+- A newly registered non-Lambda Application Load Balancer target (HTTP/HTTPS target group) becomes healthy after its first successful check. Network and Gateway target groups retain `HealthyThresholdCount` for initial admission. The threshold applies to every group when recovering from `unhealthy`.
+- Lambda target groups default to disabled health checks. A registered Lambda target with checks disabled reports `unavailable` and `Target.HealthCheckDisabled`. Checks may be enabled or disabled for Lambda groups; enabled checks currently report `healthy` without invoking the function. Disabling checks for any non-Lambda target group fails with `InvalidConfigurationRequest` before changing its settings. The message names the target type, for example `Health check enabled must be true for target groups with target type 'ip'`.
 - Health checks probe the target group's `HealthCheckPort` when it is a port number, and each target's own port when it is `traffic-port` (the default).
+- `HealthCheckProtocol` defaults to `HTTP` for `HTTP` and `HTTPS` target groups and for target type `alb`, and to `TCP` for every other protocol, as for Network and Gateway Load Balancers. A health check uses `HTTP`, `HTTPS` or `TCP`. `TCP` is refused for `HTTP` and `HTTPS` target groups and for target type `alb`. `GENEVE`, `TLS`, `UDP`, `TCP_UDP`, `QUIC` and `TCP_QUIC` are refused for every target group. Each refusal is a `ValidationError` naming the protocols the target group takes, such as `Health check protocol 'TCP' must be one of 'HTTP, HTTPS'`, from `CreateTargetGroup` and `ModifyTargetGroup` alike, and changes nothing.
+- A `TCP` check has no `HealthCheckPath` or `Matcher`. Naming either for one, the default `TCP` check included, is refused with `InvalidConfigurationRequest` (`Health check paths are not supported for TCP health checks`, and the same for matchers). Moving a `TCP` check to `HTTP` or `HTTPS` takes both, or `ModifyTargetGroup` answers `ValidationError` `Path and return code are required for layer 7 health checks.`. Moving a check to `TCP` drops its path and matcher.
+
 - For faster local readiness tests, set
   `floci.services.elbv2.max-health-check-interval-millis`, for example `100`.
   Zero, the default, preserves each target group's requested interval. A positive
@@ -259,10 +275,16 @@ Gateway Load Balancer listeners require omitted `Port` and `Protocol` fields on 
 - `CreateTargetGroup` and `ModifyTargetGroup` validate `HealthCheckIntervalSeconds`
   against the AWS range of 5 to 300 before changing stored settings or active timers.
 - Each `CreateListener` automatically creates an immutable default rule (`priority=default`, `isDefault=true`). This rule cannot be deleted; use `ModifyListener` to change its action.
+- `PathPatternConfig.RegexValues` supports regex conditions in `CreateRule`, `ModifyRule`, `DescribeRules`, and CloudFormation `ListenerRule`. Each expression is 1 to 128 characters; a condition accepts either glob `Values` or `RegexValues`. Rules containing path regexes allow at most three match evaluations per condition and five across the rule. Expressions match the whole request path, excluding its query string, and multiple expressions are ORed. Matching uses RE2/J with bounded, linear-time execution. Lookarounds, backreferences, atomic groups, possessive quantifiers, recursion, subroutines, and Unicode character classes are rejected. Escaped or quoted literal text remains valid. Existing `Values` glob matching is unchanged.
+- Mixed glob and regex values, invalid regex syntax, and excess per-rule match values return AWS's `ValidationError` messages. The syntax error does not echo the submitted pattern.
 - Rule priorities are unique per listener: `CreateRule` and `SetRulePriorities` only reject a priority held by another rule on the same listener. `SetRulePriorities` is atomic: all priority assignments are validated before any change is committed.
 - `DeleteTargetGroup` is rejected with `ResourceInUse` while the target group is referenced by any listener or rule.
 - HTTPS and TLS certificate ARNs must refer to existing IAM server certificates or ACM certificates. `CreateListener`, `ModifyListener` and `AddListenerCertificates` reject a blank or unknown ARN with `CertificateNotFound`. When `ModifyListener` changes the protocol to HTTPS or TLS, it checks any inherited certificate ARNs too. An HTTPS listener also needs a default certificate: `CreateListener` and `ModifyListener` reject an absent or empty effective certificate list with `InvalidConfigurationRequest`. A referenced IAM server certificate cannot be deleted: `DeleteServerCertificate` returns `DeleteConflict` until the certificate is removed from the listener. Writes recording a new IAM certificate reference hold IAM's certificate lock, so the certificate cannot be deleted between the check and the write. A refused change preserves the listener's previous port, protocol, policy and certificates.
-- `RemoveListenerCertificates` refuses removal of an HTTPS or TLS listener's default certificate with `OperationNotPermitted` (400) and preserves the certificate list. Use `ModifyListener` to replace the default certificate. Additional certificates can still be removed.
+- `RemoveListenerCertificates` refuses removal of an HTTPS or TLS listener's default certificate with `OperationNotPermitted` (400) and preserves the certificate list. Use `ModifyListener` to replace the default certificate. Additional certificates can still be removed. A default certificate the certificate list holds as well is refused too: the published sentence, that you cannot remove the default certificate for a listener, names no exception for that case, so the refusal is Floci's reading.
+- A listener's default certificate is one certificate. `CreateListener` and `ModifyListener` refuse a `Certificates` list naming more than one with `ValidationError` (400), the reference saying of that member on both operations that you must provide exactly one certificate. No published sentence gives the code a longer list is answered with, so the code is Floci's reading.
+- The certificate list is kept apart from the default certificate. A listener created through the API starts with an empty certificate list, and `AddListenerCertificates` adds to it, taking more than one certificate in a call: the API member reads as one certificate per call, while the Application Load Balancers guide adds three in one call of its own, and the guide's example is what Floci takes. `ModifyListener` replaces the default certificate and leaves the certificate list standing, so a default that was added to the list keeps serving SNI after it is replaced. `AddListenerCertificates` answers with the certificate list the add leaves behind rather than with the certificates the call named.
+- `DescribeListenerCertificates` names the default certificate with `IsDefault` true and each certificate in the certificate list with `IsDefault` false, so a certificate that is both appears twice. A listener's own `Certificates` member is its default certificate alone and carries no `IsDefault`, which is where the reference puts that member.
+- A load balancer's listeners share a certificate quota of 25, counting the certificates in their certificate lists and not their default certificates, which is the published Application Load Balancer quota and the number `DescribeAccountLimits` reports. `AddListenerCertificates` refuses the certificate that would pass it with `TooManyCertificates` (400). A TLS listener on a Network Load Balancer is held to the same ceiling, which is Floci's reading rather than a published number of its own.
 - `DeleteRule` is rejected with `OperationNotPermitted` for the default rule.
 - `DescribeSSLPolicies` returns a pre-seeded list of standard AWS SSL policies (`ELBSecurityPolicy-*`).
 - `DescribeAccountLimits` returns standard default limits (e.g., 50 load balancers per region, 100 target groups, etc.).
@@ -323,20 +345,19 @@ on the listener socket.
 
 ### Health checks
 
-For non-Lambda targets, TCP health checks open and close a connection without sending
-an application payload or evaluating the HTTP response-code matcher. HTTP and HTTPS
-checks send a GET to `HealthCheckPath`; HTTPS uses TLS independently of the target's
-application protocol. Checks use `HealthCheckPort`, or the target's traffic port when
-configured as `traffic-port`, and retain the configured health thresholds and deadline.
-
-TCP, TLS, UDP, TCP_UDP and GENEVE target groups default to TCP health checks. HTTP/HTTPS
-groups and target groups of type `alb` default to HTTP. TCP health checks are rejected
-for HTTP/HTTPS groups and target types `alb` and `lambda`; supported combinations are
-validated before creating or modifying the target group. Switching a TCP health check
-to HTTP or HTTPS requires an explicit health-check path and response-code matcher.
+For non-Lambda targets, the checker probes `HealthCheckPort`, or the target's traffic
+port when configured as `traffic-port`. With `HealthCheckProtocol=TCP` it opens a
+connection and passes once the target accepts it; `HealthCheckPath` and the matcher are
+not used. Otherwise it sends an HTTP or HTTPS GET to `HealthCheckPath`, and
+`HealthCheckProtocol` selects TLS independently of the target's application protocol.
+The response-code matcher (HTTP and HTTPS checks) and healthy/unhealthy thresholds
+affect target health.
 Lambda targets are not actively probed. In ELBv2 mock mode, sockets
-and active monitoring are disabled. The proxy can route to initial targets and fails
-open to registered targets when none are healthy, so a successful request alone does
+and active monitoring are disabled. While a target group has a `healthy` target, the
+proxy routes only to its `healthy` targets, so a newly registered target in `initial`
+state gets no requests until its first health check passes. When no target is
+`healthy`, the proxy fails open to every registered target, including `initial` ones
+and those in a group with health checks disabled, so a successful request alone does
 not prove that a health check passed.
 
 ### Security groups and PrivateLink
@@ -411,7 +432,7 @@ aws elbv2 create-load-balancer \
   --name my-alb \
   --type application \
   --scheme internet-facing \
-  --subnets subnet-default-us-east-1-a subnet-default-us-east-1-b
+  --subnets subnet-8068005281bb3dc6a subnet-c8ba5d8ce63635cea
 
 # Create a target group
 aws elbv2 create-target-group \
@@ -561,14 +582,14 @@ unhealthy thresholds still apply to real HTTP results.
 
 One Floci instance serves multiple regions. The ALB policy uses each request's
 region, including CloudFormation provisioning, rather than the server's default region.
-By default, ordinary ALB subnets require two distinct Availability Zones, except
-in Osaka (`ap-northeast-3`), where one is accepted. Empty subnet lists remain invalid.
+By default, ordinary ALB subnets require two distinct Availability Zones in every
+region, including Osaka (`ap-northeast-3`). Empty subnet lists remain invalid.
 Each selected subnet must belong to a different AZ, even when a single AZ is allowed.
 This applies to CreateLoadBalancer and SetSubnets; NLB and GWLB rules are unchanged.
 Local Zone and Outpost-specific placement is not implemented by this setting.
 
 To override this rule globally, set
-`FLOCI_SERVICES_ELBV2_ALB_ZONE_RULE=allow-single-zone` or `require-two-zones`.
+`FLOCI_SERVICES_ELBV2_ALB_ZONE_RULE=allow-single-zone`.
 The default is `aws`. Individual regions can override the global setting in YAML:
 
 ```yaml
@@ -577,7 +598,7 @@ floci:
     elbv2:
       alb-zone-rule: allow-single-zone
       alb-zone-rule-by-region:
-        us-east-1: require-two-zones
+        us-east-1: aws
         ap-northeast-3: aws
 ```
 
@@ -586,9 +607,16 @@ A per-region `aws` entry restores AWS behavior even when the global rule is over
 These explicit overrides intentionally change local compatibility; they do not
 change the AWS API shape or require a separate Floci process for each region.
 
-`floci.services.elbv2.single-zone-alb-accounts` is independent of this policy: an
-account it lists may use one zone in every region, including a region set to
-`require-two-zones`.
+CloudFormation rollback can restore a saved legacy ALB subnet list with repeated Availability Zones. This internal snapshot path still checks subnet existence, the zone minimum, and VPC membership; new API and stack-update requests continue to reject repeated zones.
+
+Classic VPC frontend ownership is stored in `elb-classic-frontends.json` through the
+ELB storage backend. An allocation intent precedes interface creation; internal
+interface metadata allows recovery if the interface identity was not yet recorded.
+Cleanup retains ownership until dependent resources and the interface are removed.
+Memory mode does not retain this journal across process exit, and hybrid mode keeps
+its configured asynchronous flush semantics. Keep the ELB and EC2 persistent data
+together when restoring a deployment. Process-crash and packet recovery require
+separate runtime qualification.
 
 Path-pattern `RegexValues` use a linear-time regex engine for admission and full-path matching.
 Lookarounds, backreferences, atomic groups, possessive quantifiers, recursion, subroutines,

@@ -1,0 +1,256 @@
+package io.floci.aws.core.common;
+
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.floci.aws.services.iam.IamActionRegistry;
+import jakarta.ws.rs.core.HttpHeaders;
+import jakarta.ws.rs.core.Response;
+import jakarta.ws.rs.core.UriInfo;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+/**
+ * The shared machinery behind floci's REST tag paths: resolve the owning service from the
+ * request ARN, then apply the {@link TagHandler} wire-shape choices for that service.
+ *
+ * <p>AWS distinguishes these services by hostname, but floci serves every service on a single
+ * port, so a tag path alone is ambiguous. Two paths need this dispatch and each has its own
+ * thin controller: {@code SharedTagsController} on {@code /tags/{arn}} (API Gateway, EKS,
+ * Scheduler, ...) and {@code V1TagsController} on {@code /v1/tags/{arn}} (AppSync, MSK).
+ * The two sets of handlers are kept apart by the {@link V1Tags} qualifier, so a service is
+ * only reachable on the path AWS actually defines for it.
+ */
+public class TagDispatcher {
+
+    private final Map<String, TagHandler> handlersByServiceKey;
+    private final RegionResolver regionResolver;
+    private final ObjectMapper objectMapper;
+
+    public TagDispatcher(Iterable<TagHandler> handlers,
+                         RegionResolver regionResolver,
+                         ObjectMapper objectMapper) {
+        Map<String, TagHandler> map = new HashMap<>();
+        for (TagHandler h : handlers) {
+            String serviceKey = h.serviceKey();
+            TagHandler existing = map.putIfAbsent(serviceKey, h);
+            if (existing != null) {
+                throw new IllegalStateException(
+                        "Duplicate TagHandler registration for service key '" + serviceKey
+                                + "': " + existing.getClass().getName()
+                                + " and " + h.getClass().getName());
+            }
+        }
+        this.handlersByServiceKey = Map.copyOf(map);
+        this.regionResolver = regionResolver;
+        this.objectMapper = objectMapper;
+    }
+
+    public ObjectNode emptyObject() {
+        return objectMapper.createObjectNode();
+    }
+
+    public Response listTagsForArn(HttpHeaders headers, String arn) {
+        TagHandler handler = resolveHandler(arn);
+        String region = regionResolver.resolveRegion(headers);
+        Map<String, String> tags = handler.listTags(region, arn);
+        return Response.ok(buildListResponse(handler, tags)).build();
+    }
+
+    public Response tagResourcePost(HttpHeaders headers, String arn, String body, Response successResponse) {
+        TagHandler handler = resolveHandler(arn);
+        if (handler.tagResourceUsesPut()) {
+            throw new AwsException("MethodNotAllowedException",
+                    "POST is not supported for " + handler.serviceKey() + " tag resources; use PUT.", 405);
+        }
+        return doTagResource(headers, handler, arn, body, successResponse);
+    }
+
+    public Response tagResourcePut(HttpHeaders headers, String arn, String body, Response successResponse) {
+        TagHandler handler = resolveHandler(arn);
+        if (!handler.tagResourceUsesPut()) {
+            throw new AwsException("MethodNotAllowedException",
+                    "PUT is not supported for " + handler.serviceKey() + " tag resources; use POST.", 405);
+        }
+        return doTagResource(headers, handler, arn, body, successResponse);
+    }
+
+    public Response doTagResource(HttpHeaders headers, TagHandler handler, String arn,
+                                  String body, Response successResponse) {
+        String region = regionResolver.resolveRegion(headers);
+        String effectiveBody = (body == null || body.isBlank()) ? "{}" : body;
+        try {
+            Optional<Map<String, String>> parsed = handler.parseTagResourceBody(arn, body);
+            Map<String, String> tags;
+            if (parsed.isPresent()) {
+                tags = parsed.get();
+            } else {
+                JsonNode node = handler.strictTagValidation()
+                        ? objectMapper.reader().with(DeserializationFeature.FAIL_ON_TRAILING_TOKENS)
+                                .readTree(effectiveBody)
+                        : objectMapper.readTree(effectiveBody);
+                tags = parseTags(handler, node);
+            }
+            handler.tagResource(region, arn, tags);
+            return successResponse;
+        } catch (AwsException e) {
+            throw e;
+        } catch (Exception e) {
+            String code = handler.strictTagValidation()
+                    ? handler.tagValidationErrorCode()
+                    : "BadRequestException";
+            throw new AwsException(code, e.getMessage(), 400);
+        }
+    }
+
+    public Response untagResourceForArn(HttpHeaders headers, UriInfo uriInfo, String arn, Response successResponse) {
+        return untagResourceForArn(headers, uriInfo, arn, successResponse, resolveHandler(arn));
+    }
+
+    public Response untagResourceForArn(HttpHeaders headers, UriInfo uriInfo, String arn,
+                                        Response successResponse, TagHandler handler) {
+        String region = regionResolver.resolveRegion(headers);
+        List<String> tagKeys = readTagKeys(handler, uriInfo);
+        handler.untagResource(region, arn, tagKeys);
+        return successResponse;
+    }
+
+    private ObjectNode buildListResponse(TagHandler handler, Map<String, String> tags) {
+        ObjectNode root = objectMapper.createObjectNode();
+        String key = handler.tagsBodyKey();
+        if (handler.tagsBodyIsList()) {
+            ArrayNode arr = root.putArray(key);
+            tags.forEach((k, v) -> {
+                ObjectNode entry = arr.addObject();
+                entry.put(handler.tagEntryKeyName(), k);
+                entry.put(handler.tagEntryValueName(), v);
+            });
+        } else {
+            ObjectNode tagsNode = root.putObject(key);
+            tags.forEach(tagsNode::put);
+        }
+        return root;
+    }
+
+    private Map<String, String> parseTags(TagHandler handler, JsonNode node) {
+        Map<String, String> tags = new HashMap<>();
+        String key = handler.tagsBodyKey();
+        if (handler.strictTagValidation() && !node.isObject()) {
+            throw SmithyValidationErrors.validationException(
+                    "Request payload must be a JSON object");
+        }
+        JsonNode tagNode = node.get(key);
+        if (tagNode == null || tagNode.isNull()) {
+            if (handler.strictTagValidation()) {
+                throw SmithyValidationErrors.validationException(
+                        SmithyValidationErrors.notNull(key));
+            }
+            return tags;
+        }
+        if (handler.tagsBodyIsList()) {
+            if (!tagNode.isArray()) {
+                if (handler.strictTagValidation()) {
+                    throw SmithyValidationErrors.validationException(
+                            "Value at '" + key + "' failed to satisfy constraint: Member must be a list");
+                }
+                return tags;
+            }
+            for (JsonNode entry : tagNode) {
+                JsonNode k = entry.get(handler.tagEntryKeyName());
+                JsonNode v = entry.get(handler.tagEntryValueName());
+                if (k == null || k.isNull() || v == null || v.isNull()) {
+                    if (handler.strictTagValidation()) {
+                        throw SmithyValidationErrors.validationException(
+                                "Tag entries at '" + key + "' must have non-null Key and Value");
+                    }
+                    continue;
+                }
+                if (handler.strictTagValidation() && (!k.isTextual() || !v.isTextual())) {
+                    throw SmithyValidationErrors.validationException(
+                            "Tag entries at '" + key
+                                    + "' must contain string Key and Value members");
+                }
+                tags.put(k.asText(), v.asText());
+            }
+        } else {
+            if (!tagNode.isObject()) {
+                if (handler.strictTagValidation()) {
+                    throw SmithyValidationErrors.validationException(
+                            "Value at '" + key + "' failed to satisfy constraint: Member must be a map");
+                }
+                return tags;
+            }
+            tagNode.fields().forEachRemaining(e -> {
+                if (handler.strictTagValidation() && !e.getValue().isTextual()) {
+                    throw SmithyValidationErrors.validationException(
+                            "Tag values at '" + key + "' must be strings");
+                }
+                tags.put(e.getKey(), e.getValue().asText());
+            });
+        }
+        return tags;
+    }
+
+    private List<String> readTagKeys(TagHandler handler, UriInfo uriInfo) {
+        String paramName = handler.tagKeysQueryName();
+        List<String> values = uriInfo.getQueryParameters().get(paramName);
+        if (handler.strictTagValidation() && !handler.allowEmptyTagKeys()
+                && (values == null || values.isEmpty())) {
+            throw SmithyValidationErrors.validationException(
+                    SmithyValidationErrors.notNull(paramName));
+        }
+        return (values == null) ? List.of() : List.copyOf(values);
+    }
+
+    public String readResourceArn(String body) {
+        try {
+            JsonNode node = objectMapper.readTree((body == null || body.isBlank()) ? "{}" : body);
+            return node.path("resourceArn").asText(null);
+        } catch (Exception e) {
+            throw new AwsException("BadRequestException", e.getMessage(), 400);
+        }
+    }
+
+    public TagHandler resolveHandler(String arn) {
+        String serviceKey;
+        try {
+            serviceKey = AwsArnUtils.parse(arn).service();
+        } catch (IllegalArgumentException e) {
+            throw invalidArn(arn);
+        }
+        TagHandler handler = handlersByServiceKey.get(serviceKey);
+        if (handler == null) {
+            // Surface an unregistered service as an invalid-ARN error so floci's
+            // internal routing isn't leaked to the client.
+            throw invalidArn(arn);
+        }
+        return handler;
+    }
+
+    /**
+     * The handler of the service the ARN names, for a request on a path that service's AWS model gives. AWS serves
+     * a service's tagging on its own routes only, telling the services apart by hostname, so a service whose IAM
+     * resources the generated table reads from its modeled routes ({@link RequestResources#readsNamespace}) is
+     * served on those paths alone: the bare {@code /tags}, or a path whose ARN's {@code /} is not encoded, is
+     * refused as an ARN this path does not serve when its model has no such path
+     * ({@link IamActionRegistry#modelRoutes}). A method its model does not give on the path is the handler's to
+     * answer.
+     */
+    public TagHandler resolveHandler(String arn, UriInfo uriInfo) {
+        TagHandler handler = resolveHandler(arn);
+        String service = AwsArnUtils.parse(arn).service();
+        if (RequestResources.readsNamespace(service) && !IamActionRegistry.modelRoutes(service, uriInfo)) {
+            throw invalidArn(arn);
+        }
+        return handler;
+    }
+
+    private static AwsException invalidArn(String arn) {
+        return new AwsException("BadRequestException", "Invalid resource ARN: " + arn, 400);
+    }
+}

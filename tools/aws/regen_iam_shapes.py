@@ -95,11 +95,14 @@ REQUIRED_BY_HAND = (
 #
 # A service-linked role's custom suffix answers `InvalidInput` rather than a validation error at
 # all, "Custom suffix is not allowed for <service>", which is a recorded refusal across roughly
-# eighty principals. `ServiceNamespaces` on `ListPoliciesGrantingServiceAccess` answers
-# `InvalidInput` too when the list arrives empty, and `Encoding` on `GetSSHPublicKey` is answered
+# eighty principals. `Encoding` on `GetSSHPublicKey` is answered
 # with the modelled `UnrecognizedPublicKeyEncoding` rather than as a constraint at all. The
 # simulators answer an empty `ActionNames`, `PolicyInputList` or `PolicySourceArn` with a sentence
-# of their own, "At least one ActionNames member is required.", which no capture here moves. And
+# of their own, "At least one ActionNames member is required.", which no capture here moves.
+# `PolicyInputList` keeps that only where the operation requires it, which is `SimulateCustomPolicy`:
+# on `SimulatePrincipalPolicy` the member is optional, so there is no sentence in front of the walk
+# to protect and the member is read here, a document held to the 131072 characters and the printable
+# set `policyDocumentType` declares. And
 # `TagKeys` on the untag operations is answered against the list as a whole, "Value at 'tagKeys'
 # failed to satisfy constraint: Member must satisfy constraint: [...]", where the walk names the
 # member that broke it under its own index: both forms are readings, and this is the one those
@@ -112,12 +115,19 @@ REQUIRED_BY_HAND = (
 # because a 2025 recording carried neither the offending value nor the permitted set; AWS names the
 # set, and answers an omitted `Status` as a required member rather than as a value outside it, so
 # all four are read here with their `required` lists intact.
+#
+# `ServiceNamespaces` on `ListPoliciesGrantingServiceAccess` came off this list on 2026-11-18. It
+# was held back because the operation answered an empty list with a sentence of its own, where the
+# cost of holding the whole member back is that no member of the list is read at all: a value
+# breaking the published pattern was answered `InvalidInput` where AWS answers `ValidationError`.
+# The member is read here now, each value held to `serviceNamespaceType` and the list to its own
+# bounds. An absent list is how an empty one arrives on this protocol, so it reads as the required
+# member the model declares rather than as the sentence that was never AWS's.
 MEMBERS_BY_HAND = {
     "CreateServiceLinkedRole": ("CustomSuffix",),
-    "ListPoliciesGrantingServiceAccess": ("ServiceNamespaces",),
     "GetSSHPublicKey": ("Encoding",),
     "SimulateCustomPolicy": ("ActionNames", "PolicyInputList"),
-    "SimulatePrincipalPolicy": ("ActionNames", "PolicyInputList", "PolicySourceArn"),
+    "SimulatePrincipalPolicy": ("ActionNames", "PolicySourceArn"),
     "UntagInstanceProfile": ("TagKeys",),
     "UntagMFADevice": ("TagKeys",),
     "UntagOpenIDConnectProvider": ("TagKeys",),
@@ -163,7 +173,13 @@ def enum_order(model: dict, orders: dict[str, tuple[str, ...]] | None = None) ->
 # account on 2026-10-31, quotes `[\w+=.@-]*` for it, without the comma this model admits and with a
 # `*` where the model sets a minimum of 1. Only AWS's message is in hand rather than its shape, so
 # the member carries a shape of its own here with AWS's text beside the model's: the message is the
-# captured one and a comma is still admitted, which nothing in hand settles either way.
+# captured one and a comma is still admitted.
+#
+# The comma is what AWS publishes for this member, not what aliasing it to a group name's shape
+# brought along: the API Reference entry for the operation, read on 2026-11-03, gives
+# `AWSServiceName` the same `[\w+=,.@-]+` and the same minimum of 1, so the pattern below stays the
+# published one. Why that settles it, and what a capture of a comma refused would move, is in
+# `docs/services/iam.md` rather than repeated here.
 QUOTED_PATTERNS = {
     ("CreateServiceLinkedRole", "AWSServiceName"): ("groupNameType", r"[\w+=,.@-]+", r"[\w+=.@-]*"),
 }

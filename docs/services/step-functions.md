@@ -177,9 +177,11 @@ With IAM enforcement enabled, the existing task authorizer checks the execution 
 permission to assume the task role, its trust policy, and the task role's permission to
 start the child. Account routing also works with enforcement disabled. The `.sync`
 polling and cancellation paths retain the task account; their additional IAM permissions
-are not evaluated. Lambda, API Gateway and SQS tasks evaluate `Credentials` themselves
-([Lambda](#lambda-tasks-under-iam-enforcement), [SQS](#sqs-tasks-under-iam-enforcement)); other
-integrations retain their existing credential handling.
+are not evaluated. Every other integration evaluates `Credentials` itself
+([Lambda](#lambda-tasks-under-iam-enforcement), [messaging](#messaging-tasks-under-iam-enforcement),
+[data](#data-tasks-under-iam-enforcement), [jobs](#job-tasks-under-iam-enforcement),
+[control](#control-tasks-under-iam-enforcement)), and so does a nested task in its `.waitForTaskToken`
+form, which this routing does not serve: it runs in the state machine's account.
 A foreign state-machine ARN without task credentials grants no account access.
 
 A missing or mismatched task role fails with `States.TaskFailed`. A target account
@@ -329,6 +331,9 @@ JSONPath state machines may resolve the limit from the Map input with `MaxItemsP
 JSONata state machines may use a `{% %}` expression in `MaxItems`. `MaxItems` and `MaxItemsPath`
 are mutually exclusive, and `MaxItemsPath` is rejected for JSONata state machines.
 
+Under IAM enforcement the reader needs `s3:GetObject` or `s3:ListBucket`: see
+[Distributed Map S3 calls](#distributed-map-s3-calls-under-iam-enforcement).
+
 ## Distributed Map ItemBatcher
 
 `ItemBatcher` hands each child execution a batch of items instead of a single item. The child input
@@ -360,6 +365,9 @@ absorbed failures to `FAILED_0.json`, each listed under the matching key of the 
 `ResultFiles`. A failed record carries `Error` and `Cause` in place of an output. Once the budget is
 spent, the state fails with `States.ExceedToleratedFailureThreshold` and the run emits
 `MapRunFailed`.
+
+Under IAM enforcement a `ResultWriter` export needs `s3:PutObject` on each of these files: see
+[Distributed Map S3 calls](#distributed-map-s3-calls-under-iam-enforcement).
 
 `DescribeMapRun` reports the declared values under `toleratedFailureCount` and
 `toleratedFailurePercentage`. A `Map` that declares neither keeps the earlier behaviour: the first
@@ -448,6 +456,10 @@ both carry the cause `The Task state in AWS Step Functions execution [<arn>] whi
 this resource was aborted`. A `StopExecution` that lands while the state waits ends the wait and
 stops the job with the same cause, and so does the execution's budget, and so does a failure in
 another branch of the `Parallel`, or in another iteration of the `Map`, that the `Task` is in.
+Stopping is best effort: an ECS task that is gone (`InvalidParameterException`) or already stopped,
+or a child execution that is gone (`ExecutionDoesNotExist`) or already ended, leaves the state
+ending as it would have; any other refusal fails it, with `ECS.<code>` or `StepFunctions.<code>`
+and the service's message, and any other failure with `States.Runtime`.
 An `addStep.sync` step is cancelled with `CancelSteps` instead, and the cluster of a
 `createCluster.sync` is left running (see [Amazon EMR tasks](#amazon-emr-tasks)). An EMR Serverless
 job run is cancelled, a started application stopped and a created one deleted (see
@@ -504,6 +516,17 @@ that matches, so an undefined condition in a later rule is never evaluated.
 
 The cause of a real execution carries the state prefix described under
 [The cause of a failure](#the-cause-of-a-failure).
+
+## JSONata constructed-array paths
+
+An indexed constructed array followed by a property path follows JSONata 2.0.6's
+sequence reduction rules. For example,
+`$exists([$states.input.Items.{'ok':true}][0].ok)` returns `false`, including when
+`Items` has one element. The unwrapped path returns no value, so using it directly
+as a state's `Output` fails with `States.QueryEvaluationError`.
+Group the array before indexing, `([$states.input.Items.{'ok':true}])[0].ok`,
+to read the first object's property. A standalone `[...][0]` still returns the
+first object.
 
 ## JSONata functions
 
@@ -666,11 +689,20 @@ function as `RoleArn.$`, or through JSONata. A role the execution role cannot as
 with `States.Permissions`, whose cause names the execution role's session and `sts:AssumeRole` on
 the role.
 
-## SQS tasks under IAM enforcement
+## Messaging tasks under IAM enforcement
 
-`arn:aws:states:::sqs:sendMessage`, `arn:aws:states:::aws-sdk:sqs:sendMessage` and their
-`.waitForTaskToken` forms are evaluated with [IAM enforcement](iam.md#resource-based-policies) on,
-each attempt in turn, so `Retry` and `Catch` see a refusal like any other task failure:
+These tasks and their `.waitForTaskToken` forms are evaluated with
+[IAM enforcement](iam.md#resource-based-policies) on:
+
+| Resource | Action | Resource evaluated | Refused with |
+|---|---|---|---|
+| `arn:aws:states:::sqs:sendMessage` | `sqs:SendMessage` | The queue `QueueUrl` names | `SQS.AccessDeniedException` |
+| `arn:aws:states:::aws-sdk:sqs:sendMessage` | `sqs:SendMessage` | The queue `QueueUrl` names | `Sqs.AccessDeniedException` |
+| `arn:aws:states:::sns:publish` | `sns:Publish` | `TopicArn`, else `TargetArn`, or `*` for a `PhoneNumber` | `SNS.AuthorizationErrorException` |
+| `arn:aws:states:::aws-sdk:sns:publish` | `sns:Publish` | `TopicArn`, else `TargetArn`, or `*` for a `PhoneNumber` | `Sns.AuthorizationErrorException` |
+| `arn:aws:states:::events:putEvents` | `events:PutEvents` | Each distinct event bus the entries name | `EventBridge.AccessDeniedException` |
+
+Each attempt is decided in turn, so `Retry` and `Catch` see a refusal like any other task failure:
 
 1. The execution role has to exist and to trust `states.amazonaws.com`, or the task fails with
    `States.Permissions`.
@@ -679,22 +711,285 @@ each attempt in turn, so `Retry` and `Catch` see a refusal like any other task f
    exist, fails the task with `States.TaskFailed` and the cause "The role X is not authorized to
    assume the task state's role, Y.", the form AWS answers a nested execution with. `Credentials`
    that do not resolve to an object holding only `RoleArn` fail with `States.Runtime`.
-3. The role the task ends up with has to be allowed `sqs:SendMessage` on the queue `QueueUrl` names,
-   or the task fails with `SQS.AccessDeniedException` (`Sqs.AccessDeniedException` for the
-   `aws-sdk` form), whose cause names the role's session and the kind of policy that refused it. The
-   queue is the one Floci's lookup reaches: the account and name in the URL's path, in the state
-   machine's Region. A request with no `QueueUrl` gets SQS's own error once the role has passed.
+3. The role the task ends up with has to be allowed the action on the resource, or the task fails with
+   the error in the table, whose cause names the role's session and the kind of policy that refused
+   it.
 
-The error names `States.Permissions` and `<prefix>.AccessDeniedException` are Floci's reading: they
-have not been verified against AWS. Only global condition keys are available to the policies. The
-queue's own policy (`SetQueueAttributes` or `AddPermission`) takes part as it does for a direct SQS
-request: within one account it or the role's policies can allow the send, and across accounts both
-have to. A role in another account, named by `Credentials`, is authorized as that role but the task
-still runs in the state machine's account. Nested executions are the only tasks that run in the
-role's account. With enforcement off nothing here is evaluated.
+The resource is the one Floci's lookup reaches, which is what the task then acts on:
 
-Integrations other than these, Lambda, API Gateway and nested executions are not evaluated yet: they
-run in the state machine's account whatever the execution role's policies say.
+- **SQS:** the account and name in the URL's path, in the state machine's Region.
+- **SNS:** the ARN as the request gives it. `PhoneNumber` comes first, since Floci sends the SMS
+  whatever else the request names.
+- **EventBridge:** the bus of the name `EventBusName` gives, or the default bus without one, in the
+  state machine's account and Region. An ARN counts for its name only, because that is the bus
+  `PutEvents` reaches from a task: a bus ARN naming another account or Region is evaluated, and sent
+  to, as the bus of that name in the state machine's. A direct `PutEvents` request under enforcement
+  evaluates the ARN as given. All the buses are evaluated before any entry is sent, so one refused
+  bus sends nothing. An entry EventBridge would reject, such as one without `Source`, still counts,
+  as for a direct `PutEvents`. The EventBridge User Guide states the check on every entry, and the
+  refusal of the whole request, for the Custom Event Bus. It does not describe Classic buses, and
+  Floci applies the same reading to them.
+
+A request that names no resource has only the role checks in the list above, and its service then
+answers it with its own error: no `QueueUrl`, a `TopicArn` or `TargetArn` that is not an SNS ARN or
+neither of them, an entry that is not an object, an `EventBusName` that is a malformed ARN, or no
+entries at all.
+
+A refused permission is named as the task's other errors from its service are: the integration's
+prefix and the exception the service's SDK raises. For SNS that is `AuthorizationErrorException`, the
+refusal `Publish` declares and the one a direct `Publish` under enforcement answers with, and for the
+others `AccessDeniedException`. `States.Permissions`, and these names for a refusal, are Floci's
+reading: they have not been verified against AWS. Only global condition keys are available to the
+policies.
+
+Resource policies take part as they do for a direct request under enforcement, for queues, topics and
+event buses:
+
+- **SQS:** the queue's own policy (`SetQueueAttributes` or `AddPermission`) or the role's policies
+  can allow the send within one account, and across accounts both have to.
+- **SNS:** a topic policy can grant `sns:Publish` to a role of the topic's account with no identity
+  policy, a Deny in it refuses a role its identity policy allows, and the default policy of a new
+  topic admits no role, because no role's call carries `aws:SourceOwner`. Across accounts both the
+  role's policies and the topic policy have to allow the publish.
+- **EventBridge:** the bus's policy (`PutPermission`) can grant `events:PutEvents` to a role of the
+  bus's account that it names, with no identity policy, and a Deny in it refuses a role its identity
+  policy allows. A statement naming only the account, the form `PutPermission` writes for a
+  `Principal` account id, leaves the decision to that account's IAM policies. Across accounts both the
+  role's policies and the bus policy have to allow the send.
+
+A role in another account, named by `Credentials`, is authorized as that role but the task still
+runs in the state machine's account. Nested executions are the only tasks that run in the role's
+account. With enforcement off nothing here is evaluated.
+
+Floci has no `aws-sdk:eventbridge:putEvents` integration: that resource fails with
+`States.TaskFailed` and "Unsupported resource" whether or not enforcement is on.
+
+## Data tasks under IAM enforcement
+
+These tasks and their `.waitForTaskToken` forms are evaluated with
+[IAM enforcement](iam.md#resource-based-policies) on, in the same steps and with the same role errors
+as [messaging tasks](#messaging-tasks-under-iam-enforcement):
+
+| Resource | Action | Resource evaluated | Refused with |
+|---|---|---|---|
+| `arn:aws:states:::dynamodb:putItem`, `getItem`, `deleteItem`, `updateItem`, `scan` | `dynamodb:PutItem` and so on | The table `TableName` names | `DynamoDB.AccessDeniedException` |
+| `arn:aws:states:::aws-sdk:dynamodb:<api>` | See below | See below | `DynamoDb.AccessDeniedException` |
+| `arn:aws:states:::s3:putObject`, `arn:aws:states:::aws-sdk:s3:putObject` | `s3:PutObject` | `arn:<partition>:s3:::<bucket>/<key>` | `S3.AccessDeniedException` |
+| `arn:aws:states:::aws-sdk:rdsdata:executeStatement` | `rds-data:ExecuteStatement`, `secretsmanager:GetSecretValue` | `ResourceArn`, `SecretArn` | `RdsData.AccessDeniedException` |
+| `arn:aws:states:::aws-sdk:redshiftdata:<api>` | `redshift-data:<Action>` and what authenticates the call | See below | `RedshiftData.AccessDeniedException` |
+
+The `aws-sdk:dynamodb` form is checked as a direct DynamoDB request under enforcement is:
+
+- **Most APIs:** `dynamodb:<Api>` on the table, stream or other resource the request names, an ARN as
+  given, or on `*` when it names none, which includes a `putItem` with no `TableName`.
+- **`batchGetItem`, `batchWriteItem`:** the API's action on each table in `RequestItems`.
+- **`transactWriteItems`, `transactGetItems`:** no action of their own. Each item needs its own, one of
+  `dynamodb:PutItem`, `DeleteItem`, `UpdateItem`, `ConditionCheckItem` or `GetItem`, on its table, with
+  `dynamodb:EnclosingOperation` available to the policy. A table named by ARN counts for its name, as
+  execution reads it in the state machine's account.
+- **`listTables`:** its action on the Region's `table/*` collection.
+- **`executeStatement`:** `dynamodb:PartiQLSelect`, `PartiQLInsert`, `PartiQLUpdate` or `PartiQLDelete`,
+  by what the statement does. `batchExecuteStatement` and `executeTransaction` are checked under their
+  own names on each table a statement names, as a direct request is.
+
+Every permission is evaluated before the call, so one refused table in a batch or a transaction writes
+nothing.
+
+The `aws-sdk:redshiftdata` form's statement operations (`describeStatement`, `cancelStatement`,
+`getStatementResult`, `getStatementResultV2`, `listStatements`, `listSessions`) act on no resource in
+the service reference, so they are checked on `*`. The others are checked on the cluster
+`ClusterIdentifier` names, the workgroup `WorkgroupName` names, or the target of the session
+`SessionId` names, with what an [EventBridge target](eventbridge.md) needs to authenticate:
+`secretsmanager:GetSecretValue` on `SecretArn`, `redshift-serverless:GetCredentials` on the workgroup,
+or `redshift:GetClusterCredentials` on the `dbuser` and `dbname` of a `DbUser`. A workgroup Floci does
+not hold is evaluated on `workgroup/*`.
+
+`secretsmanager:GetSecretValue` on an RDS Data `SecretArn` follows AWS's `AmazonRDSDataFullAccess`
+managed policy and the CDK's `grantDataApiAccess`, which grant it along with the Data API actions.
+
+A request whose member names nothing it can reach has only the role checks, and its service answers
+it: no `TableName` in an optimized task or no recognised item in a transaction, a transaction's table
+ARN that is malformed or in another Region, a DynamoDB `ResourceArn` or similar that is not an ARN, no
+`Bucket` or `Key`, an RDS Data `ResourceArn` that is not an ARN, or a Redshift Data request naming no
+target. An API a form does not serve keeps its existing answer: `dynamodb:query` and
+`aws-sdk:rdsdata:beginTransaction` are "Unsupported" whether or not enforcement is on, and
+`aws-sdk:redshiftdata` answers its own `ValidationException` for an operation it does not have.
+
+The S3 bucket is resolved as a direct request resolves it. A bucket name is one namespace across
+partitions, so a task can reach a bucket of another partition, and the object's ARN is evaluated in the
+bucket's partition, not the state machine's. A bucket policy takes part as it does for a direct
+request: it can grant `s3:PutObject` to a role of the bucket's account with no identity policy, and a
+Deny in it refuses a role its identity policy allows. Another account's bucket is `S3.NoSuchBucket` to
+an allowed role unless `floci.services.s3.global-bucket-namespace` is on, and with it on both the
+role's policy and the bucket's have to allow. A DynamoDB table named by an ARN of another account is
+refused, since no table policy can grant it here.
+
+`<prefix>.AccessDeniedException` is Floci's reading for these too and has not been verified against
+AWS. Apart from `dynamodb:EnclosingOperation`, only global condition keys are available to the
+policies: `dynamodb:LeadingKeys`, `dynamodb:Attributes` and the like are absent. Global tables are not
+treated apart. With enforcement off nothing here is evaluated.
+
+## Job tasks under IAM enforcement
+
+These tasks are evaluated with [IAM enforcement](iam.md#resource-based-policies) on, in the same steps
+and with the same role errors as [messaging tasks](#messaging-tasks-under-iam-enforcement). Each action
+and resource type comes from the Service Authorization Reference:
+
+| Resource | Action | Resource evaluated | Refused with |
+|---|---|---|---|
+| `arn:aws:states:::ecs:runTask`, with `.sync` or `.waitForTaskToken` | `ecs:RunTask` | The task definition revision ECS resolves `TaskDefinition` to | `ECS.AccessDeniedException` |
+| `arn:aws:states:::aws-sdk:ecs:updateService` | `ecs:UpdateService` | The service the request names | `Ecs.AccessDeniedException` |
+| `arn:aws:states:::aws-sdk:ecs:describeServices` | `ecs:DescribeServices` | Each service the request names | `Ecs.AccessDeniedException` |
+| `arn:aws:states:::aws-sdk:ecs:listServices` | `ecs:ListServices` | `*` | `Ecs.AccessDeniedException` |
+| `arn:aws:states:::elasticmapreduce:createCluster`, `.sync` | `elasticmapreduce:RunJobFlow` | `*` | `EMR.AccessDeniedException` |
+| `arn:aws:states:::elasticmapreduce:setClusterTerminationProtection` | `elasticmapreduce:SetTerminationProtection` | `cluster/<ClusterId>` | `EMR.AccessDeniedException` |
+| `arn:aws:states:::elasticmapreduce:terminateCluster`, `.sync` | `elasticmapreduce:TerminateJobFlows` | `cluster/<ClusterId>` | `EMR.AccessDeniedException` |
+| `arn:aws:states:::elasticmapreduce:addStep`, `.sync` | `elasticmapreduce:AddJobFlowSteps` | `cluster/<ClusterId>` | `EMR.AccessDeniedException` |
+| `arn:aws:states:::elasticmapreduce:cancelStep` | `elasticmapreduce:CancelSteps` | `cluster/<ClusterId>` | `EMR.AccessDeniedException` |
+| `arn:aws:states:::elasticmapreduce:modifyInstanceFleetByName` | `elasticmapreduce:ListInstanceFleets`, `ModifyInstanceFleet` | `cluster/<ClusterId>` | `EMR.AccessDeniedException` |
+| `arn:aws:states:::elasticmapreduce:modifyInstanceGroupByName` | `elasticmapreduce:ListInstanceGroups`, `ModifyInstanceGroups` | `cluster/<ClusterId>` | `EMR.AccessDeniedException` |
+| `arn:aws:states:::emr-serverless:createApplication`, `.sync` | `emr-serverless:CreateApplication` | `*` | `EmrServerless.AccessDeniedException` |
+| `arn:aws:states:::emr-serverless:startApplication`, `stopApplication`, `deleteApplication`, `.sync` | `emr-serverless:StartApplication` and so on | `/applications/<ApplicationId>` | `EmrServerless.AccessDeniedException` |
+| `arn:aws:states:::emr-serverless:startJobRun`, `.sync` | `emr-serverless:StartJobRun` | `/applications/<ApplicationId>` | `EmrServerless.AccessDeniedException` |
+| `arn:aws:states:::emr-serverless:cancelJobRun`, `.sync` | `emr-serverless:CancelJobRun` | `/applications/<ApplicationId>/jobruns/<JobRunId>` | `EmrServerless.AccessDeniedException` |
+
+A task definition is evaluated as the revision it resolves to, so a bare family, `family:revision` and
+the ARN give the same resource: `task-definition/<family>:<revision>`. A role allowed only an older
+revision is refused a bare family whose latest revision is newer.
+
+The ECS APIs are checked as the same call made directly is, from the generated request resources: a
+service is the one of that name in the request's `Cluster`, given by name or ARN, or in `default` with
+none, which `updateService` acts on, and a service ARN is evaluated as given as well, so one of another
+cluster than the request's needs the action on both. A task definition ECS does not have is evaluated on any
+revision, `task-definition/*:*`, and a service or cluster it does not have on the ARN the request
+names, so a role allowed nothing is refused before ECS answers.
+
+A ByName API needs its `List` action as well as its `Modify` one, since it reads the cluster's fleets or
+groups to find the id. Nothing documents this for a task: it is inferred from what the integration
+calls, and it is what the CDK's policies for these two tasks grant.
+
+`.sync` authorizes the starting call only: a job cannot fail midway through its wait for lack of a
+Describe permission, and the best-effort cancel of an abandoned job is not evaluated either. What the
+CDK grants a `.sync` task beyond that, such as `elasticmapreduce:DescribeStep` or `ecs:DescribeTasks`,
+is accepted but not needed here. `iam:PassRole` is not evaluated for the roles `runTask` or `createCluster`
+pass, nor a tagging action such as `elasticmapreduce:AddTags` for what they tag.
+
+An EMR Serverless API is checked as the same request made directly is, from the generated tables, on the
+request the integration sends: `startJobRun` also needs `iam:PassRole` on its `ExecutionRoleArn`, passed to
+`emr-serverless.amazonaws.com`, and `createApplication` and `startJobRun` need `emr-serverless:TagResource`
+for the `Tags` they send, on the application a create makes or the one a job run is checked on, with each
+tag as `aws:RequestTag/<key>` and the keys as `aws:TagKeys`, which the API's own action is checked with too.
+
+A request naming nothing it can reach has only the role checks, and its service answers it: no
+`TaskDefinition`, no `ClusterId`, no
+`ApplicationId`, or a `cancelJobRun` without `JobRunId`. A form an integration does not serve keeps
+its answer: `.waitForTaskToken` on EMR and EMR Serverless and `.sync` on an EMR API with no wait are
+"Unsupported" whether or not enforcement is on, and so is any API Floci does not have.
+
+`<prefix>.AccessDeniedException` is Floci's reading for these too and has not been verified against
+AWS; the prefix is the one each integration's other errors carry. EMR's own errors reach a task as
+`EMR.AmazonElasticMapReduceException` unless EMR models them, so AWS may word this one that way. Only
+global condition keys are available to the policies: `ecs:cluster` and the like are absent, so an Allow
+conditioned on them does not apply. With enforcement off nothing here is evaluated.
+
+## Control tasks under IAM enforcement
+
+With `floci.services.iam.enforcement-enabled`, these tasks are authorized like the
+[messaging tasks](#messaging-tasks-under-iam-enforcement), in the same order. Each action and resource
+type comes from the Service Authorization Reference:
+
+| Resource | Action | Resource evaluated | Refused with |
+|---|---|---|---|
+| `arn:aws:states:::aws-sdk:scheduler:createSchedule`, `updateSchedule`, `deleteSchedule` | `scheduler:CreateSchedule` and so on | As a direct request: `schedule/<GroupName>/<Name>`, Scheduler's `default` for a group left out | `Scheduler.AccessDeniedException` |
+| `arn:aws:states:::aws-sdk:cloudformation:<api>` | `cloudformation:<Action>` | See below | `CloudFormation.AccessDeniedException` |
+| `arn:aws:states:::http:invoke` | `states:InvokeHTTPEndpoint` | The state machine | `States.Http.AccessDeniedException` |
+| `arn:aws:states:::aws-sdk:ec2:describeRegions` | `ec2:DescribeRegions` | `*` | `Ec2.AccessDeniedException` |
+| `arn:aws:states:::aws-sdk:lambda:listEventSourceMappings` | `lambda:ListEventSourceMappings` | `*` | `Lambda.AccessDeniedException` |
+| `arn:aws:states:::aws-sdk:lambda:updateEventSourceMapping` | `lambda:UpdateEventSourceMapping` | `event-source-mapping:<UUID>` | `Lambda.AccessDeniedException` |
+| `arn:aws:states:::aws-sdk:secretsmanager:describeSecret` | `secretsmanager:DescribeSecret` | As a direct `DescribeSecret`: the secret's stored ARN, suffix included, or `secret:<SecretId>-??????` for a name no secret goes by | `SecretsManager.AccessDeniedException` |
+| `arn:aws:states:::aws-sdk:sfn:startExecution`, `startSyncExecution` | `states:StartExecution`, `states:StartSyncExecution` | The child state machine | `Sfn.AccessDeniedException` |
+| `arn:aws:states:::aws-sdk:sfn:sendTaskSuccess`, `sendTaskFailure` | `states:SendTaskSuccess`, `states:SendTaskFailure` | The activity or state machine waiting on the token | `Sfn.AccessDeniedException` |
+| `arn:aws:states:::aws-sdk:sfn:describeMapRun` | `states:DescribeMapRun` | The Map Run | `Sfn.AccessDeniedException` |
+| `arn:aws:states:::states:startExecution`, with `.sync`, `.sync:2` or `.waitForTaskToken` | `states:StartExecution` | The child state machine | `StepFunctions.AccessDeniedException` |
+
+A CloudFormation action is evaluated as the same request made directly is, from the generated request resources:
+on the stack or stack set the request names, under the id CloudFormation holds for it, so a name and the id it
+stands for are one resource: `stack/<StackName>/<id>` and `stackset/<StackSetName>:<id>`. A stack or stack set
+CloudFormation does not hold has its id open, `stack/<StackName>/*` or `stackset/<StackSetName>:*`, and a stack
+id it does not hold is evaluated as given. A request naming its stack by no `StackName` (a change set by its ARN
+alone, a `describeStackResources` by `PhysicalResourceId` alone, a `describeStacks` or `getTemplateSummary` with
+none) is on `*`, as are `validateTemplate`, `listStacks`, `listExports`, `createStackSet`, `listStackSets`,
+`describeOrganizationsAccess` and `activateOrganizationsAccess`, which have no resource type. An API the handler
+does not serve is evaluated the same way, and CloudFormation then answers it with `UnknownAction`.
+
+`states:InvokeHTTPEndpoint` has no resource type in the Service Authorization Reference, and the CDK grants
+it on `*`, while the Developer Guide's example scopes it to the state machine, so the state machine is what is
+evaluated: both policies allow it. The task gives `states:HTTPEndpoint` and `states:HTTPMethod`, both of which
+those policies use. The value of `states:HTTPEndpoint` is `ApiEndpoint` as resolved, without `QueryParameters`.
+The guide also requires `events:RetrieveConnectionCredentials` and the connection secret's Secrets Manager
+permissions. Floci does not evaluate them, although the task reads the connection to authorize its request:
+a role lacking them succeeds here and fails on AWS.
+
+A nested `states:startExecution` task does not refuse its execution role for not existing or not
+trusting Step Functions, as a Lambda task does not. It only needs the action, which a role that does not
+exist does not have. `.sync` needs the starting call alone, not `states:DescribeExecution`, `states:StopExecution`
+or the EventBridge permissions the CDK grants for its wait. With `Credentials`, a nested task other than
+the `.waitForTaskToken` form keeps the checks and errors of
+[nested task credentials](#nested-task-credentials).
+
+Every integration that evaluates a role is refused on its `.waitForTaskToken` form the same way: the refused
+task starts nothing and waits for nothing. With the permission, it calls its service and then waits on its
+token.
+
+A request naming nothing it can reach has only the role checks, and its service answers it: no `Name`, no
+`SecretId`, no `UUID`, no `ApiEndpoint`, a `StateMachineArn` or `MapRunArn` that is not one, or a token naming no
+task. A secret is evaluated as a direct `DescribeSecret` naming it is, from the generated request resources. An API
+Floci does not serve keeps its answer, whatever the role: it is "Unsupported", and the role is not checked, except a
+CloudFormation API, which is evaluated as above before CloudFormation answers it with `UnknownAction`.
+
+An activity task is not evaluated: the CDK's own task needs no permission for it, and the worker calling
+`GetActivityTask` is authorized by its own request. `Map`'s S3 calls are in
+[their own section](#distributed-map-s3-calls-under-iam-enforcement).
+
+`<prefix>.AccessDeniedException` and `States.Http.AccessDeniedException` are Floci's reading and have not
+been verified against AWS; a nested task with `Credentials` reports a refused action as
+`StepFunctions.AWSStepFunctionsException` or `Sfn.SfnException` instead, so a state machine catching this should
+name both. `iam:PassRole` is not evaluated for the roles a schedule or a stack names, and only
+the condition keys above and global ones are available to the policies. With enforcement off nothing here is
+evaluated.
+
+## Distributed Map S3 calls under IAM enforcement
+
+With `floci.services.iam.enforcement-enabled`, a Distributed `Map` makes its S3 calls as its execution role, which
+has to exist and to trust `states.amazonaws.com`. Each permission is evaluated before the call that needs it, on the
+ARN a direct request is checked on, in the bucket's own partition, and the bucket's policy can grant or deny it.
+
+| Field | Form | Action | Resource | Refused with |
+|---|---|---|---|---|
+| `ItemReader` | `arn:aws:states:::s3:getObject` (`JSON`, `JSONL`, `CSV`) | `s3:GetObject` | `<bucket>/<Key>` | `States.ItemReaderFailed` |
+| `ItemReader` | `arn:aws:states:::s3:listObjectsV2` | `s3:ListBucket`, with `s3:prefix` when the request has a `Prefix` | `<bucket>` | `States.ItemReaderFailed` |
+| `ResultWriter` | `arn:aws:states:::s3:putObject` | `s3:PutObject` | `<bucket>/<Prefix>/<run id>/SUCCEEDED_0.json`, `manifest.json`, and `FAILED_0.json` when a child failed | `States.ResultWriterFailed` |
+
+An execution role that does not exist or does not trust Step Functions is refused with `States.Permissions`. Each is
+a failure of the `Map` state, so its `Retry` and `Catch` apply. The refusal's cause names the action and the resource.
+
+A refused reader starts no Map run and no child. A refused writer fails the Map run after its children have run, as
+any other `ResultWriter` failure does. The keys of an export are known before its first write, so all of them are
+evaluated first and a refusal of any leaves nothing in the bucket.
+
+The export writes each file in a single `PutObject`, so the rest of what the CDK grants a `ResultWriter`,
+`s3:GetObject`, `s3:ListMultipartUploadParts` and `s3:AbortMultipartUpload`, is accepted but not needed here.
+
+A request naming nothing it can reach has only the role checks, and is answered as it would be without them: no
+`Bucket` or `Key`, or a bucket S3 does not have once the role is allowed. The `ResultWriter` Region check comes after
+the evaluation. `PARQUET` and `MANIFEST` make no S3 call here, so they keep their `States.ItemReaderFailed` whatever
+the role. A `WriterConfig` with no `Resource`, a Map over its input and an inline `Map` make no S3 call either, and
+need nothing. The tasks inside `ItemProcessor` are evaluated as any other task.
+
+A `Map` has no credentials of its own here: `Credentials` on the state, or inside `ItemReader` or `ResultWriter`, is
+not read. An execution with a [mock test case](#mocked-service-integrations) is evaluated on these calls too: a test
+case cannot mock a `Map`, so its S3 calls stay real, as an unmocked task's call in that execution does. `States.ItemReaderFailed` and `States.ResultWriterFailed` for a refusal are Floci's
+reading and have not been verified against AWS.
 
 ## Task credentials in history
 
@@ -746,9 +1041,9 @@ the wire and the task fails with `Sfn.StateMachineDoesNotExistException`.
 | `arn:aws:states:::aws-sdk:scheduler:deleteSchedule` | `{}` | `Scheduler.ResourceNotFoundException` |
 | `arn:aws:states:::aws-sdk:sns:publish` | `{MessageId}` | `Sns.NotFoundException` when the topic does not exist |
 
-Callback tokens are owned by the execution account. Foreign callbacks return
-`AccessDeniedException`; unknown tokens return `InvalidToken`. Recently closed tokens return
-`TaskTimedOut`. Closed-token classification retains at most 1,024 tokens for five minutes; older
+Callback tokens are owned by the execution account and region. Foreign-account callbacks return
+`AccessDeniedException`; callbacks sent to another region and unknown tokens return `InvalidToken`.
+Recently closed tokens return `TaskTimedOut`. Closed-token classification retains at most 1,024 tokens for five minutes; older
 or evicted tokens return `InvalidToken`. Invalid JSON output leaves a pending token available
 for a corrected callback. Token state remains in memory.
 
@@ -759,15 +1054,17 @@ timestamps. Opaque dictionary keys, including secret version IDs and ECS log
 options, retain their original spelling. `describeSecret` returns metadata without
 the secret value. Disabled services fail with a catchable service exception.
 
-The Lambda `updateEventSourceMapping` SDK task takes `Uuid` in JSONPath
-`Parameters` or JSONata `Arguments`. The direct Lambda REST API still uses `UUID`.
+Lambda `updateEventSourceMapping` tasks identify the mapping with `Uuid` in
+JSONPath `Parameters` or JSONata `Arguments`, following the Step Functions SDK
+parameter spelling. The direct Lambda API and existing task-result fields retain
+their `UUID` spelling.
 
 ECS `listServices` supports the same `MaxResults` and opaque `NextToken` as the
 direct ECS API. Lambda mapping tasks currently return an unpaginated list;
 `Marker` and `MaxItems` are rejected with `Lambda.InvalidParameterValueException`
-instead of being silently ignored. These six integrations do not evaluate the
-state-machine execution role's per-action IAM policies; among the task integrations, Lambda, API
-Gateway, nested executions and [SQS](#sqs-tasks-under-iam-enforcement) do. Name-based lookups use the
+instead of being silently ignored. Under IAM enforcement the [ECS](#job-tasks-under-iam-enforcement)
+and [Lambda and Secrets Manager](#control-tasks-under-iam-enforcement) ones evaluate the
+state-machine execution role's per-action IAM policies. Name-based lookups use the
 execution scope; explicit ARNs retain the underlying service's cross-account lookup
 behavior. The underlying services' validation still applies. They implement
 request-response calls, without job-completion polling.
@@ -1149,7 +1446,10 @@ the same two clocks as the other `.sync` integrations (see [Timeouts](#timeouts)
 fail the Task with `States.TaskFailed`, the describe response as the cause: a JSON string, which a
 `Catch` reads with `States.StringToJson` (for example its `Step.Status.State`). When
 the wait ends early, `addStep.sync` cancels its step with `CancelSteps`, as Step Functions "will make
-a best-effort attempt to cancel the task". A cluster is never terminated: "Step Functions does not
+a best-effort attempt to cancel the task": if EMR answers that the cluster is gone or that its release
+cannot cancel steps (`InvalidRequestException`), or reports the step past cancelling (a `FAILED` entry in
+`CancelStepsInfoList`), the Task ends as it would have; any other failure fails it. A
+cluster is never terminated: "Step Functions does not
 terminate an Amazon EMR cluster automatically if execution is stopped." EMR in Floci reaches each
 state at once, so every wait ends at its first poll.
 

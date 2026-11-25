@@ -87,6 +87,9 @@ def test_gradual_rollout_precedes_bake_and_can_be_stopped(
 @pytest.mark.parametrize("delete_previous", [False, True], ids=["restore", "deleted"])
 def test_deployment_rollback_restores_both_retrieval_apis(
         aws_config, client_config, unique_name, delete_previous, zero_padded, wait_for_completion, appconfig_clock):
+    if wait_for_completion and appconfig_clock.file is None and (zero_padded or delete_previous):
+        # Version padding and the deleted version do not change timing.
+        pytest.skip("Without the manual clock only the decimal restore case waits out a real one-minute bake")
     with ExitStack() as cleanup:
         client = boto3.client("appconfig", config=client_config, **aws_config)
         data = boto3.client("appconfigdata", config=client_config, **aws_config)
@@ -163,6 +166,27 @@ def test_deployment_rollback_restores_both_retrieval_apis(
             client.stop_deployment(**target)
         assert error.value.response["Error"]["Code"] == "BadRequestException"
         assert client.get_deployment(**target)["State"] == "BAKING"
+
+        if wait_for_completion:
+            if appconfig_clock.file is not None:
+                appconfig_clock.advance(59)
+                assert client.get_deployment(**target)["State"] == "BAKING"
+                # Overshoot: CompletedAt must be the scheduled boundary, not the observation time.
+                appconfig_clock.advance(30)
+            deadline = appconfig_clock.monotonic() + 75
+            while appconfig_clock.monotonic() < deadline:
+                observed = client.get_deployment(**target)
+                if observed["State"] == "COMPLETE":
+                    break
+                assert observed["State"] == "BAKING"
+                appconfig_clock.advance(1)
+            else:
+                pytest.fail("The one-minute final bake did not complete")
+            assert observed["CompletedAt"] - observed["StartedAt"] == timedelta(minutes=1)
+            with pytest.raises(ClientError) as error:
+                client.stop_deployment(**target)
+            assert error.value.response["Error"]["Code"] == "BadRequestException"
+            assert_content(versions[1], b'{"version":2}')
 
         if delete_previous:
             client.delete_hosted_configuration_version(

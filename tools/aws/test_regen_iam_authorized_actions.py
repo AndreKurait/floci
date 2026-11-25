@@ -117,6 +117,30 @@ def test_a_tagging_action_beside_several_leaves_them_several():
     assert found == {}
 
 
+def test_an_operation_named_for_no_action_is_the_one_of_its_actions_its_name_starts_with():
+    # CloudFront's CreateDistributionWithTags is no IAM action: AWS checks cloudfront:CreateDistribution, and the
+    # others it lists only for what the request adds (a connection group, a VPC origin, its tags).
+    found = r.authorized_actions_from([service("cloudfront", {"CreateDistributionWithTags": [
+        "cloudfront:CreateConnectionGroup", "cloudfront:CreateDistribution", "cloudfront:GetVpcOrigin",
+        "cloudfront:TagResource"]}, ["CreateConnectionGroup", "CreateDistribution", "GetVpcOrigin", "TagResource"])])
+    assert found == {"cloudfront": {"CreateDistributionWithTags": "cloudfront:CreateDistribution"}}
+
+
+def test_an_action_matching_a_name_only_in_case_is_not_its_prefix():
+    # API Gateway names its actions for HTTP verbs: PutIntegration lists apigateway:PUT beside others, which is no
+    # prefix of its name.
+    found = r.authorized_actions_from([service("apigateway", {"PutIntegration": [
+        "apigateway:PUT", "apigateway:POST"]}, ["PUT", "POST"])])
+    assert found == {}
+
+
+def test_a_plural_of_an_action_is_not_named_for_it():
+    # S3's DeleteObjects deletes several objects, each checked as s3:DeleteObject where it is deleted.
+    found = r.authorized_actions_from([service("s3", {"DeleteObjects": [
+        "s3:DeleteObject", "s3:DeleteObjectVersion"]}, ["DeleteObject", "DeleteObjectVersion"])])
+    assert found == {}
+
+
 def test_namespaces_and_operations_are_sorted():
     found = r.authorized_actions_from([
         service("sqs", {"SendMessageBatch": ["sqs:SendMessage"],
@@ -298,7 +322,7 @@ def test_generating_from_saved_files_writes_a_file_check_accepts(tmp_path):
 def no_routes(tmp_path) -> str:
     """A routes file reading no scope's routes."""
     routes = tmp_path / "rest-routes.json"
-    routes.write_text(json.dumps({"handRouted": {}, "models": {}}), encoding="utf-8")
+    routes.write_text(json.dumps({"models": {}}), encoding="utf-8")
     return str(routes)
 
 
@@ -343,12 +367,11 @@ def typed(namespace: str, actions: dict[str, list[str]]) -> dict:
                         for name, kinds in actions.items()]}
 
 
-ROUTES = {"handRouted": {"hand": "the rules route it alone"},
-          "models": {"svc": {"credentialScope": "svc"}, "svc-v2": {"credentialScope": "svc"},
-                     "other": {"credentialScope": "other"}, "hand": {"credentialScope": "hand"}}}
+ROUTES = {"models": {"svc": {"credentialScope": "svc"}, "svc-v2": {"credentialScope": "svc"},
+                     "other": {"credentialScope": "other"}}}
 
 
-def test_the_routed_scopes_are_every_models_but_the_hand_routed_ones():
+def test_the_routed_scopes_are_every_models():
     assert r.routed_namespaces(ROUTES) == ["other", "svc"]
 
 
@@ -398,3 +421,306 @@ def test_the_round_trip_lists_the_routed_scopes_actions(tmp_path):
     given = saved_sources(tmp_path / "later", ANCHOR_SERVICES + [typed("svc", {"ListThings": ["thing"]}),
                                                                  typed("other", {})])
     assert r.main(["--verify", "--source-dir", str(given), "--output", str(output)]) == 1
+
+
+# --------------------------------------------------------------------------- #
+# authorizedByMethod: the operations checked as the action their route's method names
+# --------------------------------------------------------------------------- #
+def by_method_service(operations: dict[str, list[str]], sdks: dict[str, list[str]] | None = None) -> dict:
+    """An API Gateway-like reference document: its methods are actions, beside actions of their own names."""
+    document = service("api", operations, ["GET", "POST", "PUT", "PATCH", "DELETE", "UpdatePolicy", "CreatePortal"])
+    for operation in document["Operations"]:
+        operation["SDK"] = [{"Name": name} for name in (sdks or {}).get(operation["Name"], ["api"])]
+    return document
+
+
+METHOD_ROUTES = {"models": {
+    "api": {"credentialScope": "api", "operations": {
+        "TagResource": {"method": "PUT", "requestUri": "/tags/{arn+}",
+                        "alternatives": [{"method": "POST", "requestUri": "/tags", "located": {"arn": "body"}}]},
+        "GetStage": {"method": "GET", "requestUri": "/apis/{id}/stages/{name}"},
+        "CreateApi": {"method": "POST", "requestUri": "/apis"},
+        "CreatePortal": {"method": "POST", "requestUri": "/portals"}}},
+    "api-v2": {"credentialScope": "api", "operations": {
+        "TagResource": {"method": "POST", "requestUri": "/v2/tags/{arn+}"},
+        "GetStage": {"method": "GET", "requestUri": "/v2/apis/{id}/stages/{name}"}}}}}
+
+
+def test_the_route_methods_are_each_routed_operations_alternatives_included():
+    assert r.route_methods(METHOD_ROUTES) == {"api": {
+        "CreateApi": ["POST"], "CreatePortal": ["POST"], "GetStage": ["GET"], "TagResource": ["POST", "PUT"]}}
+
+
+def test_an_operation_listing_the_action_of_each_of_its_routes_methods_is_authorized_by_method():
+    # TagResource is a PUT in one model and a POST in the other, and lists both beside the resource's PATCH;
+    # GetStage, listed for two SDK clients, is no single action, but each client's route is a GET.
+    documents = [by_method_service({"TagResource": ["api:PATCH", "api:POST", "api:PUT"],
+                                    "GetStage": ["api:GET"],
+                                    "CreateApi": ["api:POST", "api:UpdatePolicy", "iam:PassRole"]},
+                                   {"GetStage": ["api", "apiv2"]})]
+    methods = r.route_methods(METHOD_ROUTES)
+    assert r.authorized_by_method(documents, methods, r.authorized_actions_from(documents)) == {
+        "api": ["CreateApi", "GetStage", "TagResource"]}
+
+
+def test_an_operation_missing_the_action_of_one_of_its_routes_methods_keeps_its_own_name():
+    documents = [by_method_service({"TagResource": ["api:PATCH", "api:PUT"], "GetStage": ["api:GET"]},
+                                   {"GetStage": ["api", "apiv2"]})]
+    assert r.authorized_by_method(documents, r.route_methods(METHOD_ROUTES), {}) == {"api": ["GetStage"]}
+
+
+def test_an_operation_with_an_action_of_its_own_name_keeps_it():
+    documents = [by_method_service({"CreatePortal": ["api:CreatePortal", "api:POST"]})]
+    assert r.authorized_by_method(documents, r.route_methods(METHOD_ROUTES), {}) == {}
+
+
+def test_an_operation_the_one_action_shape_names_is_not_also_authorized_by_method():
+    documents = [by_method_service({"CreateApi": ["api:POST"]})]
+    renamed = r.authorized_actions_from(documents)
+    assert renamed == {"api": {"CreateApi": "api:POST"}}
+    assert r.authorized_by_method(documents, r.route_methods(METHOD_ROUTES), renamed) == {}
+
+
+def test_an_operation_listed_twice_must_list_its_methods_both_times():
+    documents = [by_method_service({"CreateApi": ["api:POST", "iam:PassRole"]})]
+    documents[0]["Operations"].append({"Name": "CreateApi", "AuthorizedActions": [{"Service": "api", "Name": "PUT"}]})
+    assert r.authorized_by_method(documents, r.route_methods(METHOD_ROUTES), {}) == {}
+
+
+def test_a_scope_authorized_by_method_the_reference_does_not_have_is_an_error():
+    with pytest.raises(ValueError, match="no namespace api"):
+        r.authorized_by_method([typed("other", {})], r.route_methods(METHOD_ROUTES), {})
+
+
+def test_the_operations_authorized_by_method_must_be_routed_sorted_and_named_once():
+    documents = ANCHOR_SERVICES + [by_method_service({"TagResource": ["api:POST", "api:PUT"]}), typed("other", {})]
+    methods = r.route_methods(METHOD_ROUTES)
+    document = r.build(documents, "a test", ["api"], methods)
+    assert document["authorizedByMethod"] == {"api": ["TagResource"]}
+    assert r.validate(document, ["api"], methods) == []
+    assert "authorizedByMethod lists api, a scope rest-routes.json reads no routes for" in r.validate(document, [])
+    document["authorizedByMethod"]["api"] = ["TagResource", "Missing"]
+    problems = r.validate(document, ["api"], methods)
+    assert "authorizedByMethod.api is not sorted, or repeats an operation" in problems
+    assert "authorizedByMethod lists api:Missing, which no route of api serves" in problems
+    document["authorizedByMethod"]["api"] = ["TagResource"]
+    document["authorizedActions"]["api"] = {"TagResource": "api:PUT"}
+    document["authorizedActions"] = dict(sorted(document["authorizedActions"].items()))
+    assert "api:TagResource is authorized by method and as api:PUT" in r.validate(document, ["api"], methods)
+    document["authorizedByMethod"] = {"api": []}
+    assert "authorizedByMethod.api is not a list of operation names" in r.validate(document, ["api"], methods)
+    del document["authorizedByMethod"]
+    assert "authorizedByMethod is missing" in r.validate(document, ["api"], methods)
+
+
+def test_verify_fails_on_an_operation_aws_no_longer_authorizes_by_method_and_reports_one_it_added():
+    untrue, added = r.verify_by_method_against({"api": ["CreateApi", "TagResource"]}, {"api": ["GetStage", "TagResource"]})
+    assert untrue == ["AWS no longer authorizes api:CreateApi by the methods of its routes"]
+    assert added == ["api:GetStage by method"]
+    assert r.verify_by_method_against({"api": ["TagResource"]}, {"api": ["TagResource"]}) == ([], [])
+
+
+def test_the_round_trip_lists_the_operations_authorized_by_method(tmp_path):
+    reference = by_method_service({"TagResource": ["api:PATCH", "api:POST", "api:PUT"], "GetStage": ["api:GET"]},
+                                  {"GetStage": ["api", "apiv2"]})
+    sources = saved_sources(tmp_path, ANCHOR_SERVICES + [reference])
+    routes = tmp_path / "rest-routes.json"
+    routes.write_text(json.dumps(METHOD_ROUTES), encoding="utf-8")
+    output = tmp_path / "iam-authorized-actions.json"
+    assert r.main(["--source-dir", str(sources), "--output", str(output), "--routes", str(routes)]) == 0
+    assert json.loads(output.read_text())["authorizedByMethod"] == {"api": ["GetStage", "TagResource"]}
+    assert r.main(["--check", "--output", str(output), "--routes", str(routes)]) == 0
+    assert r.main(["--verify", "--source-dir", str(sources), "--output", str(output), "--routes", str(routes)]) == 0
+    (tmp_path / "later").mkdir()
+    later = by_method_service({"TagResource": ["api:PATCH", "api:PUT"], "GetStage": ["api:GET"]},
+                              {"GetStage": ["api", "apiv2"]})
+    given = saved_sources(tmp_path / "later", ANCHOR_SERVICES + [later])
+    assert r.main(["--verify", "--source-dir", str(given), "--output", str(output), "--routes", str(routes)]) == 1
+
+
+# --------------------------------------------------------------------------- #
+# The S3 user guide's required actions, the namesake client and spellings
+# --------------------------------------------------------------------------- #
+S3_MODELS = {
+    "s3": {"credentialScope": "s3", "operations": {
+        "GetPublicAccessBlock": {"method": "GET", "requestUri": "/{Bucket}?publicAccessBlock"},
+        "PutPublicAccessBlock": {"method": "PUT", "requestUri": "/{Bucket}?publicAccessBlock"}}},
+    "s3control": {"credentialScope": "s3", "operations": {
+        "GetPublicAccessBlock": {"method": "GET", "requestUri": "/v20180820/configuration/publicAccessBlock"},
+        "PutPublicAccessBlock": {"method": "PUT", "requestUri": "/v20180820/configuration/publicAccessBlock"},
+        "GetAccessPointPolicy": {"method": "GET", "requestUri": "/v20180820/accesspoint/{name}/policy"}}},
+}
+VERSION_SENTENCES = {
+    "s3:GetObject": "Required if you want to get an object without specifying versionId in the request.",
+    "s3:GetObjectVersion": "Required if you want to get a specific version of an object by specifying versionId "
+                           "in the request.",
+}
+S3_PAGE = {
+    "ListObjectsV2": {"section": "Bucket operations and permissions", "required": ["s3:ListBucket"]},
+    "CopyObject": {"section": "Object operations and permissions", "required": ["s3:PutObject"],
+                   "either": {"actions": ["s3:GetObject", "s3:GetObjectVersion"], "sentences": VERSION_SENTENCES}},
+    "GetObject": {"section": "Object operations and permissions",
+                  "either": {"actions": ["s3:GetObject", "s3:GetObjectVersion"], "sentences": VERSION_SENTENCES}},
+    "GetPublicAccessBlock (Bucket-level)": {"section": "Bucket operations and permissions",
+                                            "required": ["s3:GetBucketPublicAccessBlock"]},
+    "PutPublicAccessBlock (Account-level)": {"section": "Account operations and permissions",
+                                             "required": ["s3:PutAccountPublicAccessBlock"]},
+    # The page's own error: S3 Control's account-level GetPublicAccessBlock, headed as another operation.
+    "GetAccessPointPolicy (Account-level)": {"section": "Account operations and permissions",
+                                             "required": ["s3:GetAccountPublicAccessBlock"]},
+    # A row several operations share is not one operation's.
+    "CreateStorageLensGroup, TagResource": {"section": "Account operations and permissions",
+                                            "required": ["s3:CreateStorageLensGroup", "s3:TagResource"]},
+}
+# The query parameters botocore gives each operation's request (`s3_query_parameters`).
+S3_QUERY = {"GetObject": ["partNumber", "versionId"], "CopyObject": [], "DeleteObjects": [],
+            **{operation: ["versionId"] for operation in (
+                "GetObjectAnnotation", "PutObjectAnnotation", "DeleteObjectAnnotation", "ListObjectAnnotations")}}
+
+
+def test_the_s3_user_guide_gives_an_operation_its_one_required_action():
+    actions, _, _ = r.s3_required(S3_PAGE, S3_MODELS, S3_QUERY)
+    assert actions == {"CopyObject": "s3:PutObject", "ListObjectsV2": "s3:ListBucket"}
+
+
+def test_an_operation_both_models_have_takes_the_pages_action_for_one_models_requests():
+    _, by_model, _ = r.s3_required(S3_PAGE, S3_MODELS, S3_QUERY)
+    # The Account-level row is S3 Control's, any other S3's. GetAccessPointPolicy is S3 Control's alone, so its level
+    # tells nothing apart; the measured entry gives the account-level GetPublicAccessBlock the page mislabels.
+    assert by_model == {"s3": {
+        "s3": {"GetPublicAccessBlock": "s3:GetBucketPublicAccessBlock"},
+        "s3control": {"GetPublicAccessBlock": "s3:GetAccountPublicAccessBlock",
+                      "PutPublicAccessBlock": "s3:PutAccountPublicAccessBlock"}}}
+
+
+def test_an_either_row_is_a_choice_by_the_parameter_its_sentences_name_unless_the_operation_requires_its_own():
+    _, _, versioned = r.s3_required(S3_PAGE, S3_MODELS, S3_QUERY)
+    assert versioned["s3"]["GetObject"] == {"parameter": "versionId", "without": "s3:GetObject",
+                                            "with": "s3:GetObjectVersion"}
+    # CopyObject's own action is s3:PutObject; its Either is about the source it copies.
+    assert "CopyObject" not in versioned["s3"]
+    assert versioned["s3"]["GetObjectAnnotation"]["with"] == "s3:GetObjectVersionAnnotation"
+
+
+def test_a_version_choice_is_read_only_where_botocore_gives_its_parameter_in_the_query():
+    deletes = {"section": "Object operations and permissions",
+               "either": {"actions": ["s3:DeleteObject", "s3:DeleteObjectVersion"], "sentences": {
+                   "s3:DeleteObject": "Required if you want to remove an object without specifying versionId in the "
+                                      "request.",
+                   "s3:DeleteObjectVersion": "Required if you want to remove a specific version of an object by "
+                                             "specifying versionId in the request."}}}
+    # DeleteObjects names each version in its body, so a request's query never says which it deletes.
+    _, _, versioned = r.s3_required({**S3_PAGE, "DeleteObjects": deletes}, S3_MODELS, S3_QUERY)
+    assert "DeleteObjects" not in versioned["s3"]
+    assert "GetObject" in versioned["s3"]
+
+
+def test_every_version_choice_is_listed_wherever_the_request_names_the_version():
+    deletes = {"section": "Object operations and permissions",
+               "either": {"actions": ["s3:DeleteObject", "s3:DeleteObjectVersion"], "sentences": {
+                   "s3:DeleteObject": "Required if you want to remove an object without specifying versionId in the "
+                                      "request.",
+                   "s3:DeleteObjectVersion": "Required if you want to remove a specific version of an object by "
+                                             "specifying versionId in the request."}}}
+    choices = r.s3_version_choices({**S3_PAGE, "DeleteObjects": deletes})
+    # DeleteObjects names its versions in its body, so it has no query choice, but its choice is still the page's.
+    assert choices["DeleteObjects"] == {"parameter": "versionId", "without": "s3:DeleteObject",
+                                        "with": "s3:DeleteObjectVersion"}
+    assert choices["GetObject"]["with"] == "s3:GetObjectVersion"
+    # CopyObject requires an action of its own, so its Either row is about its source, not its version.
+    assert "CopyObject" not in choices
+
+
+def test_a_measured_version_choice_by_a_parameter_botocore_gives_no_query_is_refused():
+    with pytest.raises(ValueError):
+        r.s3_required(S3_PAGE, S3_MODELS, {**S3_QUERY, "GetObjectAnnotation": []})
+
+
+def test_an_account_level_row_whose_s3_control_route_names_a_resource_is_refused():
+    named = {**S3_MODELS, "s3control": {"credentialScope": "s3", "operations": {
+        **S3_MODELS["s3control"]["operations"],
+        "PutPublicAccessBlock": {"method": "PUT", "requestUri": "/v20180820/bucket/{name}/publicAccessBlock"}}}}
+    with pytest.raises(ValueError):
+        r.s3_required(S3_PAGE, named, S3_QUERY)
+
+
+def test_the_query_parameters_are_read_from_botocores_s3_model(tmp_path):
+    directory = tmp_path / "s3" / "2006-03-01"
+    directory.mkdir(parents=True)
+    (directory / "service-2.json").write_text(json.dumps({
+        "operations": {"GetObject": {"input": {"shape": "GetObjectRequest"}},
+                       "DeleteObjects": {"input": {"shape": "DeleteObjectsRequest"}}},
+        "shapes": {"GetObjectRequest": {"members": {
+                       "Bucket": {"location": "uri", "locationName": "Bucket"},
+                       "VersionId": {"location": "querystring", "locationName": "versionId"}}},
+                   "DeleteObjectsRequest": {"members": {"Delete": {"locationName": "Delete"}}}}}), encoding="utf-8")
+    assert r.s3_query_parameters(tmp_path) == {"GetObject": ["versionId"], "DeleteObjects": []}
+
+
+def test_the_vendored_sections_are_assembled_in_one_place():
+    s3 = with_sdk_clients(service("s3", {"GetObject": ["s3:GetObject", "s3:GetObjectVersion"]},
+                                  ["GetObject", "GetObjectVersion"]), "s3", "s3control")
+    memorydb = service("memorydb", {"CreateACL": ["memorydb:CreateAcl"]}, ["CreateAcl"])
+    sections = r.vendored_sections([s3, memorydb], S3_PAGE, S3_MODELS, S3_QUERY, {})
+    assert set(sections) == {"authorizedByModel", "versioned", "spellings"}
+    assert sections["versioned"]["s3"]["GetObject"]["with"] == "s3:GetObjectVersion"
+    assert sections["authorizedByModel"]["s3"]["s3control"]["PutPublicAccessBlock"] == "s3:PutAccountPublicAccessBlock"
+    assert sections["spellings"] == {"memorydb": {"CreateACL": "memorydb:CreateAcl"}}
+    # A rename already gives the spelling, so the section does not repeat it.
+    assert r.vendored_sections([memorydb], S3_PAGE, S3_MODELS, S3_QUERY,
+                               {"memorydb": {"CreateACL": "memorydb:CreateAcl"}})["spellings"] == {"memorydb": {}}
+
+
+def test_a_measured_entry_with_no_link_or_one_the_page_gives_is_refused(monkeypatch):
+    with pytest.raises(ValueError):
+        r.s3_required({**S3_PAGE, "GetPublicAccessBlock (Account-level)": {
+            "section": "Account operations and permissions", "required": ["s3:GetAccountPublicAccessBlock"]}},
+            S3_MODELS, S3_QUERY)
+    monkeypatch.setattr(r, "MEASURED_BY_MODEL", {("s3", "s3control", "GetPublicAccessBlock"): (
+        "s3:GetAccountPublicAccessBlock", "the actions table says so")})
+    with pytest.raises(ValueError):
+        r.s3_required(S3_PAGE, S3_MODELS, S3_QUERY)
+
+
+def test_the_page_answers_an_s3_operation_the_reference_does_not_and_a_disagreement_fails():
+    s3 = service("s3", {"ListObjectsV2": ["s3:ListBucket", "s3:GetObjectAcl"], "CopyObject": ["s3:PutObject"]},
+                 ["ListBucket", "GetObjectAcl", "PutObject"])
+    assert r.authorized_actions([s3], S3_PAGE, S3_MODELS, S3_QUERY) == {
+        "s3": {"CopyObject": "s3:PutObject", "ListObjectsV2": "s3:ListBucket"}}
+    disagreeing = service("s3", {"ListObjectsV2": ["s3:GetObjectAcl"]}, ["ListBucket", "GetObjectAcl"])
+    # An operation both models have is answered for S3's requests alone, not in the map every model's request reads.
+    shared = service("s3", {"GetPublicAccessBlock": ["s3:GetBucketPublicAccessBlock"]}, ["GetBucketPublicAccessBlock"])
+    assert r.authorized_actions([with_sdk_clients(shared, "s3", "s3control")], S3_PAGE, S3_MODELS, S3_QUERY) == {}
+    with pytest.raises(ValueError):
+        r.authorized_actions([disagreeing], S3_PAGE, S3_MODELS, S3_QUERY)
+    # References without S3's read nothing of the page.
+    assert r.authorized_actions(ANCHOR_SERVICES, S3_PAGE, S3_MODELS, S3_QUERY) == r.authorized_actions_from(ANCHOR_SERVICES)
+
+
+def test_the_namesake_client_takes_the_one_answer_of_an_operation_several_clients_list():
+    lifecycle = with_sdk_clients(service("s3", {"GetBucketLifecycleConfiguration": [
+        "s3:GetLifecycleConfiguration", "s3express:GetLifecycleConfiguration"]}, ["GetLifecycleConfiguration"]),
+        "s3", "s3control")
+    assert r.namesake_by_model([lifecycle], {"s3", "s3control"}) == {
+        "s3": {"s3": {"GetBucketLifecycleConfiguration": "s3:GetLifecycleConfiguration"}}}
+    # A client whose routes are not vendored cannot be told from its request's route.
+    assert r.namesake_by_model([lifecycle], {"s3"}) == {}
+
+
+def test_an_action_spelled_otherwise_than_its_operation_keeps_the_references_spelling():
+    memorydb = service("memorydb", {"CreateACL": ["memorydb:CreateAcl"], "CreateCluster": ["memorydb:CreateCluster"]},
+                       ["CreateAcl", "CreateCluster"])
+    assert r.spellings([memorydb]) == {"memorydb": {"CreateACL": "memorydb:CreateAcl"}}
+
+
+def test_the_new_sections_are_built_only_for_references_with_s3_and_validated():
+    document = r.build(ANCHOR_SERVICES, "a test", [], page=S3_PAGE, models=S3_MODELS)
+    assert document["authorizedByModel"] == {} and document["versioned"] == {}
+    assert r.validate(document, []) == []
+    broken = dict(document, authorizedByModel={"s3": {"s3control": {"GetPublicAccessBlock": "sqs:SendMessage"}}},
+                  versioned={"s3": {"GetObject": {"parameter": "versionId", "without": "s3:GetObject"}}},
+                  spellings={"memorydb": {"CreateACL": "memorydb:CreateCluster"}})
+    problems = r.validate(broken, [])
+    assert any("authorizedByModel" in problem for problem in problems)
+    assert any("versioned" in problem for problem in problems)
+    assert any("spellings" in problem for problem in problems)

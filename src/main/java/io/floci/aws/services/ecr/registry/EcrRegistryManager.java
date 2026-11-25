@@ -1,0 +1,1146 @@
+package io.floci.aws.services.ecr.registry;
+
+import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.async.ResultCallback;
+import com.github.dockerjava.api.command.ExecCreateCmdResponse;
+import com.github.dockerjava.api.command.InspectExecResponse;
+import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.Container;
+import com.github.dockerjava.api.model.ContainerPort;
+import com.github.dockerjava.api.model.Frame;
+import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.core.common.AwsPartitions;
+import io.floci.aws.core.common.AwsRegions;
+import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.docker.ContainerBuilder;
+import io.floci.aws.core.common.docker.ContainerDetector;
+import io.floci.aws.core.common.docker.ContainerLifecycleManager;
+import io.floci.aws.core.common.docker.ContainerLifecycleManager.ContainerInfo;
+import io.floci.aws.core.common.docker.ContainerLifecycleManager.ContainerPresence;
+import io.floci.aws.core.common.docker.ContainerLifecycleManager.EndpointInfo;
+import io.floci.aws.core.common.docker.ContainerLogStreamer;
+import io.floci.aws.core.common.docker.ContainerNetworks;
+import io.floci.aws.core.common.docker.ContainerSpec;
+import io.floci.aws.core.common.docker.ContainerStorageHelper;
+import io.floci.aws.core.common.docker.CurrentContainerNetworkResolver;
+import io.floci.aws.core.common.docker.PortAllocator;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import org.jboss.logging.Logger;
+
+import java.io.Closeable;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.time.Clock;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Optional;
+import java.util.OptionalInt;
+import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Manages the lifecycle of the shared {@code registry:2} container that backs
+ * Floci's emulated ECR. There is one container per Floci instance, started
+ * lazily on first use and reused across restarts.
+ *
+ * <p>Methods that compute URIs ({@link #getRepositoryUri}, {@link #getProxyEndpoint})
+ * never start the registry. They read the account and region from {@link EmulatorConfig}
+ * and the port from {@link #advertisedPort()}, which inspects Floci's own container only
+ * when Floci runs in one and falls back to the configured port. Only
+ * {@link #ensureStarted()} manages the registry container.
+ */
+@ApplicationScoped
+public class EcrRegistryManager {
+
+    private static final Logger LOG = Logger.getLogger(EcrRegistryManager.class);
+    private static final int CONTAINER_INTERNAL_PORT = 5000;
+    private static final int REPOSITORY_DELETION_TIMEOUT_SECONDS = 10;
+    private static final int REPOSITORY_DELETION_KILL_GRACE_SECONDS = 1;
+    private static final Duration REGISTRY_STARTUP_TIMEOUT = Duration.ofSeconds(10);
+    private static final String NAMED_VOLUME = "ecr-registry-data";
+    private static final String REPOSITORIES_PATH = "/var/lib/registry/docker/registry/v2/repositories/";
+    private static final Pattern REVISION_LINK = Pattern.compile(".*/_manifests/revisions/sha256/([a-f0-9]{64})/link");
+    private static final int GC_KILL_GRACE_SECONDS = 2;
+    static final long RECONCILE_RETRY_MILLIS = 30_000;
+
+    /**
+     * Matches an AWS-shaped ECR image URI in any partition:
+     * {@code <account>.dkr.ecr.<region>.<dnsSuffix>/<repo>[:tag]}.
+     */
+    private static final Pattern AWS_ECR_URI = Pattern.compile(
+            "^([0-9]{12})\\.dkr\\.ecr\\.([a-z0-9-]+)\\." + AwsPartitions.dnsSuffixRegex() + "/(.+)$");
+
+    /** The host and port of a {@code repositoryUri} Floci's ECR hands out. */
+    private static final String FLOCI_REGISTRY_HOST = "localhost(?:\\.floci\\.io)?:[0-9]+";
+
+    /**
+     * The Region of an image in an ECR repository: in {@code <account>.dkr.ecr.<region>.<dnsSuffix>/<repo>}, AWS's
+     * form in any partition, or in {@code <account>.dkr.ecr.<region>.localhost:<port>/<repo>}, Floci's
+     * {@code repositoryUri} in the default URI style, or in {@code localhost:<port>/<account>/<region>/<repo>},
+     * Floci's in the path style.
+     */
+    private static final Pattern ECR_IMAGE_REGION = Pattern.compile("^(?:[0-9]{12}\\.dkr\\.ecr\\.([a-z0-9-]+)\\.(?:"
+            + AwsPartitions.dnsSuffixRegex() + "|" + FLOCI_REGISTRY_HOST + ")"
+            + "|" + FLOCI_REGISTRY_HOST + "/[0-9]{12}/([a-z0-9-]+))/.+$");
+
+    /** The account, Region and path of an image in an ECR repository, in {@link #ECR_IMAGE_REGION}'s forms. */
+    private static final Pattern ECR_IMAGE_PARTS = Pattern.compile("^(?:([0-9]{12})\\.dkr\\.ecr\\.([a-z0-9-]+)\\.(?:"
+            + AwsPartitions.dnsSuffixRegex() + "|" + FLOCI_REGISTRY_HOST + ")"
+            + "|" + FLOCI_REGISTRY_HOST + "/([0-9]{12})/([a-z0-9-]+))/(.+)$");
+
+    /**
+     * The container name actually in use. Differs from {@link #registryContainerName()} only when
+     * a legacy-named container surviving a pre-migration version was adopted.
+     */
+    private volatile String activeContainerName;
+
+    private final ContainerBuilder containerBuilder;
+    private final ContainerLifecycleManager lifecycleManager;
+    private final ContainerLogStreamer logStreamer;
+    private final ContainerDetector containerDetector;
+    private final CurrentContainerNetworkResolver currentContainerNetworkResolver;
+    private final PortAllocator portAllocator;
+    private final EmulatorConfig config;
+    private final RegionResolver regionResolver;
+    private volatile Clock clock;
+    private volatile Sleeper sleeper;
+
+    private volatile boolean started;
+    private volatile boolean ready;
+    private volatile boolean reconciled;
+    /** When a reconcile retry last failed, by {@link #clock}; 0 while none has. */
+    private volatile long reconcileRetryFailedAt;
+    // Bug #6150: Track active garbage collection window
+    private volatile boolean garbageCollecting;
+    private final Object writeAdmissionLock = new Object();
+    private int admittedWrites;
+    private volatile String activeGcExecId;
+    /** host:port Docker reports for the running registry; null until one is started or adopted. */
+    private volatile String registryAddress;
+    private volatile boolean unavailableLogged;
+    private volatile int hostPort;
+    private volatile String containerId;
+    private volatile Closeable logStream;
+    private volatile Consumer<List<String>> reconcileHook;
+    /** Whether the Docker daemon is Docker Desktop; null until the daemon has answered. */
+    private volatile Boolean dockerDesktop;
+
+    @Inject
+    public EcrRegistryManager(ContainerBuilder containerBuilder,
+                              ContainerLifecycleManager lifecycleManager,
+                              ContainerLogStreamer logStreamer,
+                              ContainerDetector containerDetector,
+                              CurrentContainerNetworkResolver currentContainerNetworkResolver,
+                              PortAllocator portAllocator,
+                              EmulatorConfig config,
+                              RegionResolver regionResolver) {
+        this(containerBuilder, lifecycleManager, logStreamer, containerDetector,
+                currentContainerNetworkResolver, portAllocator, config, regionResolver,
+                Clock.systemUTC(), Thread::sleep);
+    }
+
+    EcrRegistryManager(ContainerBuilder containerBuilder,
+                       ContainerLifecycleManager lifecycleManager,
+                       ContainerLogStreamer logStreamer,
+                       ContainerDetector containerDetector,
+                       CurrentContainerNetworkResolver currentContainerNetworkResolver,
+                       PortAllocator portAllocator,
+                       EmulatorConfig config,
+                       RegionResolver regionResolver,
+                       Clock clock,
+                       Sleeper sleeper) {
+        this.containerBuilder = containerBuilder;
+        this.lifecycleManager = lifecycleManager;
+        this.logStreamer = logStreamer;
+        this.containerDetector = containerDetector;
+        this.currentContainerNetworkResolver = currentContainerNetworkResolver;
+        this.portAllocator = portAllocator;
+        this.config = config;
+        this.regionResolver = regionResolver;
+        this.hostPort = config.services().ecr().registryBasePort();
+        this.clock = clock;
+        this.sleeper = sleeper;
+    }
+
+    @FunctionalInterface
+    interface Sleeper {
+        void sleep(long millis) throws InterruptedException;
+    }
+
+    void setClock(Clock clock) {
+        this.clock = clock;
+    }
+
+    void setSleeper(Sleeper sleeper) {
+        this.sleeper = sleeper;
+    }
+
+    /**
+     * Rewrites a real-AWS-shaped ECR image URI to point at Floci's loopback registry,
+     * starting the backing registry container on first use. Any image that doesn't
+     * match the AWS ECR URI shape (e.g. a plain Docker Hub reference or an image
+     * already pointing at Floci's registry) is returned unchanged, without starting
+     * the registry container, as is an AWS-shaped URI naming an image the Docker
+     * daemon already has (under the reference {@link ContainerBuilder#resolveImage}
+     * launches, so {@code floci.docker.image-registry-base} is honoured) while
+     * {@code floci.services.ecr.prefer-local-images} is on.
+     */
+    public String rewriteImageUri(String image) {
+        if (image == null) {
+            return null;
+        }
+        if (!config.services().ecr().enabled()) {
+            return image;
+        }
+        Matcher m = AWS_ECR_URI.matcher(image);
+        if (!m.matches()) {
+            return image;
+        }
+        if (config.services().ecr().preferLocalImages() && !config.services().iam().enforcementEnabled()) {
+            String resolved = containerBuilder.resolveImage(image);
+            if (isPresentOnDaemon(resolved)) {
+                LOG.infov("Using locally present image {0} as-is (not rewriting to the emulated ECR registry)", resolved);
+                return image;
+            }
+        }
+        String account = m.group(1);
+        String region = m.group(2);
+        String repoAndTag = m.group(3);
+        ensureStarted();
+        String rewritten;
+        if (dockerDesktop()) {
+            // Docker Desktop's daemon runs in a VM and dials localhost there, where a host port Docker
+            // chose for Floci's container is not bound. It sends any other registry name through its
+            // host proxy, which reaches the port, and pulls *.localhost over plain HTTP.
+            rewritten = account + ".dkr.ecr." + region + ".localhost:" + advertisedPort() + "/" + repoAndTag;
+        } else {
+            // Path style on localhost whatever style the API advertises. A daemon with the
+            // containerd image store, the default from Docker Engine 29, reaches only localhost and
+            // 127.0.0.1 over plain HTTP and takes every other name, *.localhost included, for an
+            // HTTPS registry: Floci's plain port cannot answer that, and its TLS port cannot prove
+            // itself to a daemon that does not trust Floci's CA.
+            rewritten = "localhost:" + advertisedPort() + "/" + internalRepoName(account, region, repoAndTag);
+        }
+        LOG.infov("Rewriting ECR image URI {0} -> {1}", image, rewritten);
+        return rewritten;
+    }
+
+    /**
+     * The repository, tag and digest named by an AWS-shaped or emulator ECR image reference.
+     */
+    public static Optional<EcrImage> ecrImage(String image) {
+        Matcher m = image != null ? ECR_IMAGE_PARTS.matcher(image) : null;
+        if (m == null || !m.matches()) {
+            return Optional.empty();
+        }
+        String path = m.group(5);
+        String digest = null;
+        int at = path.indexOf('@');
+        if (at >= 0) {
+            digest = path.substring(at + 1);
+            path = path.substring(0, at);
+        }
+        String tag = null;
+        int colon = path.lastIndexOf(':');
+        if (colon > path.lastIndexOf('/')) {
+            tag = path.substring(colon + 1);
+            path = path.substring(0, colon);
+        }
+        return Optional.of(new EcrImage(m.group(1) != null ? m.group(1) : m.group(3),
+                m.group(2) != null ? m.group(2) : m.group(4), path, digest == null && tag == null ? "latest" : tag,
+                digest));
+    }
+
+    /** An image in an ECR repository: its registry, Region and repository, and the tag or the digest asked for. */
+    public record EcrImage(String registryId, String region, String repository, String tag, String digest) {}
+
+    /** The Region of an AWS-shaped or emulator ECR reference, empty for an image outside ECR. */
+    public static Optional<String> imageRegion(String image) {
+        Matcher m = image != null ? ECR_IMAGE_REGION.matcher(image) : null;
+        if (m == null || !m.matches()) {
+            return Optional.empty();
+        }
+        return Optional.of(m.group(1) != null ? m.group(1) : m.group(2));
+    }
+
+    private boolean isPresentOnDaemon(String image) {
+        try {
+            lifecycleManager.getDockerClient().inspectImageCmd(image).exec();
+            return true;
+        } catch (NotFoundException e) {
+            return false;
+        } catch (RuntimeException e) {
+            LOG.debugv("Could not inspect image {0} on the Docker daemon ({1}); rewriting to the emulated ECR registry",
+                    image, e.getMessage());
+            return false;
+        }
+    }
+
+    private boolean dockerDesktop() {
+        Boolean cached = dockerDesktop;
+        if (cached != null) {
+            return cached;
+        }
+        try {
+            String os = lifecycleManager.getDockerClient().infoCmd().exec().getOperatingSystem();
+            cached = os != null && os.toLowerCase(Locale.ROOT).contains("docker desktop");
+        } catch (RuntimeException e) {
+            LOG.warnv("Could not read the operating system of the Docker daemon ({0}); pulling ECR images from localhost",
+                    e.getMessage());
+            return false;
+        }
+        dockerDesktop = cached;
+        return cached;
+    }
+
+    /** Returns the docker-pullable repository URI for the given account/region/name. */
+    public String getRepositoryUri(String accountId, String region, String repoName) {
+        if (config.services().ecr().nativeUri()) {
+            return nativeRegistryHost(accountId, region) + "/" + repoName;
+        }
+        return repositoryUri(accountId, region, repoName, tlsUriEnabled() ? "localhost.floci.io" : "localhost");
+    }
+
+    private String repositoryUri(String accountId, String region, String repoName, String domain) {
+        int port = advertisedPort();
+        String style = config.services().ecr().uriStyle();
+        if ("path".equalsIgnoreCase(style)) {
+            return domain + ":" + port + "/" + accountId + "/" + region + "/" + repoName;
+        }
+        return accountId + ".dkr.ecr." + region + "." + domain + ":" + port + "/" + repoName;
+    }
+
+    private static String nativeRegistryHost(String accountId, String region) {
+        return accountId + ".dkr.ecr." + region + "." + AwsRegions.dnsSuffixFor(region);
+    }
+
+    private boolean tlsUriEnabled() {
+        return config.services().ecr().tlsUri() && config.tls().enabled();
+    }
+
+    /**
+     * The address a blob can be fetched from through Floci's registry endpoint: the repository URI's
+     * host, with {@code /v2/<repository>/blobs/<digest>}, over the scheme the proxy endpoint uses.
+     */
+    public String blobUrl(String repositoryUri, String digest) {
+        int slash = repositoryUri.indexOf('/');
+        String endpoint = getProxyEndpoint();
+        String scheme = endpoint.substring(0, endpoint.indexOf("://"));
+        return scheme + "://" + repositoryUri.substring(0, slash) + "/v2/" + repositoryUri.substring(slash + 1)
+                + "/blobs/" + digest;
+    }
+
+    /**
+     * Returns the proxy endpoint a docker daemon should log into for any ECR repo.
+     *
+     * <p>An ECR registry is regional, so the region in the endpoint is the region of the
+     * calling request, matching the one in the {@link #getRepositoryUri} of every repository
+     * in that registry. A client logs in to this endpoint and then pushes to those URIs, so
+     * the two must name the same host.
+     */
+    public String getProxyEndpoint() {
+        return getProxyEndpoint(regionResolver.getAccountId(), regionResolver.getRegion());
+    }
+
+    public String getProxyEndpoint(String accountId, String region) {
+        if (config.services().ecr().nativeUri()) {
+            return "https://" + nativeRegistryHost(accountId, region);
+        }
+        if (tlsUriEnabled()) {
+            String host = "path".equalsIgnoreCase(config.services().ecr().uriStyle())
+                    ? "localhost.floci.io"
+                    : accountId + ".dkr.ecr."
+                            + region + ".localhost.floci.io";
+            return "https://" + host + ":" + advertisedPort();
+        }
+        String scheme = config.services().ecr().tlsEnabled() ? "https" : "http";
+        return scheme + "://" + accountId + ".dkr.ecr."
+                + region + ".localhost:" + advertisedPort();
+    }
+
+    /**
+     * The port in every registry address Floci hands out. The Docker daemon performs login, push
+     * and pull, and reaches Floci through the host port Floci's own container publishes for
+     * {@code floci.port}. Outside a container, or when that port is not published, it is
+     * {@code floci.port} itself.
+     */
+    public int advertisedPort() {
+        int port = config.port();
+        return currentContainerNetworkResolver.resolvePublishedPort(port).orElse(port);
+    }
+
+    /** Returns the effective registry port. Stable across calls once {@link #ensureStarted} runs. */
+    public int effectivePort() {
+        return hostPort;
+    }
+
+    /** Internal namespace prefix used to isolate cross-account/region repos within the shared registry. */
+    public String internalRepoName(String accountId, String region, String repoName) {
+        return accountId + "/" + region + "/" + repoName;
+    }
+
+    /**
+     * The registry endpoint reachable from other containers on the Docker network:
+     * the container name plus the container-internal port (not the published host port).
+     */
+    public String internalEndpoint() {
+        // In-network clients reach the registry by container name, so this must be the name the
+        // container actually has: a legacy-named survivor keeps resolving through its own name.
+        String name = activeContainerName != null ? activeContainerName : registryContainerName();
+        return "http://" + name + ":" + CONTAINER_INTERNAL_PORT;
+    }
+
+    /** Returns a {@link RegistryHttpClient} bound to the current registry endpoint. */
+    public RegistryHttpClient httpClient() {
+        if (containerDetector.isRunningInContainer()) {
+            // Not the container name: deleting the last repository replaces the container, and a
+            // name lookup Floci cached for the old one keeps answering with its address.
+            String address = registryAddress;
+            return new RegistryHttpClient(address != null ? "http://" + address : internalEndpoint());
+        }
+        return new RegistryHttpClient("http://localhost:" + effectivePort());
+    }
+
+    /**
+     * Registers a callback invoked once on first {@link #ensureStarted()} with the
+     * list of repository names known to the backing registry. EcrService uses this
+     * to recreate metadata entries for blobs whose metadata is missing (FR-013).
+     */
+    public void setReconcileHook(Consumer<List<String>> hook) {
+        this.reconcileHook = hook;
+    }
+
+    /**
+     * Reads the catalog into the reconcile hook again when the read at start failed, so a
+     * registry that answered its health check but not its catalog does not leave the
+     * repositories it holds without metadata. A no-op once a read succeeded, with no hook,
+     * or before the registry started. A retry that fails waits {@link #RECONCILE_RETRY_MILLIS}
+     * before the next, so a lookup made meanwhile does not pay a catalog read each time.
+     *
+     * <p>Holds the monitor {@link #ensureStarted()} and the storage deletes take, so the
+     * hook's metadata writes cannot interleave with a forced repository delete.
+     */
+    public synchronized void ensureCatalogReconciled() {
+        if (reconciled || reconcileHook == null || !started) {
+            return;
+        }
+        long now = clock.millis();
+        if (reconcileRetryFailedAt != 0 && now - reconcileRetryFailedAt < RECONCILE_RETRY_MILLIS) {
+            return;
+        }
+        runReconcileOnce();
+        reconcileRetryFailedAt = reconciled ? 0 : now;
+    }
+
+    /** Whether the registry's catalog has been read into the reconcile hook since it started. */
+    public boolean isCatalogReconciled() {
+        return reconciled;
+    }
+
+    /**
+     * Attempts {@link #ensureStarted()} and reports whether the backing registry is
+     * usable, instead of propagating the failure. Callers that only need repository
+     * metadata (ARN, URI, tags) use this so ECR's control plane keeps working when
+     * Floci itself runs inside Docker without access to a Docker daemon; the registry
+     * is retried on the next call and starts as soon as a daemon becomes reachable.
+     *
+     * @return true when the registry container is running
+     */
+    public boolean tryEnsureStarted() {
+        if (!config.services().ecr().enabled()) {
+            return false;
+        }
+        try {
+            ensureStarted();
+        } catch (RuntimeException e) {
+            if (!unavailableLogged) {
+                unavailableLogged = true;
+                LOG.warnv("ECR backing registry is unavailable ({0}). Repository metadata operations "
+                        + "continue to work; image push, pull and image queries stay disabled until a "
+                        + "Docker daemon is reachable.", e.getMessage());
+            }
+            return false;
+        }
+        if (started) {
+            unavailableLogged = false;
+        }
+        return started;
+    }
+
+    /**
+     * Lazily starts (or reuses) the {@code registry:2} container. Idempotent and
+     * thread-safe. Throws if Docker is unreachable or the registry does not become ready.
+     */
+    public void ensureStarted() {
+        if (!config.services().ecr().enabled()) {
+            throw new IllegalStateException("ECR is disabled, the backing registry is not started");
+        }
+        // Bug #6150: Fast-path probe avoids acquiring the monitor when already running
+        if (ready) {
+            ContainerPresence presence = lifecycleManager.presenceOf(containerId);
+            if (presence == ContainerPresence.RUNNING || presence == ContainerPresence.UNKNOWN) {
+                return;
+            }
+        }
+        ensureStartedSynchronized();
+    }
+
+    private synchronized void ensureStartedSynchronized() {
+        if (!config.services().ecr().enabled()) {
+            throw new IllegalStateException("ECR is disabled, the backing registry is not started");
+        }
+        if (started) {
+            ContainerPresence presence = lifecycleManager.presenceOf(containerId);
+            if (presence == ContainerPresence.RUNNING || presence == ContainerPresence.UNKNOWN) {
+                if (!ready) {
+                    completeStartup();
+                }
+                return;
+            }
+            String previousContainerId = containerId;
+            closeLogStream();
+            containerId = null;
+            registryAddress = null;
+            started = false;
+            ready = false;
+            // The recovered registry's catalog is read again: it can hold images the one read before did not.
+            reconciled = false;
+            reconcileRetryFailedAt = 0;
+            if (presence == ContainerPresence.ABSENT) {
+                portAllocator.release(hostPort);
+                hostPort = config.services().ecr().registryBasePort();
+            }
+            LOG.infov("ECR backing registry container {0} is {1}; recovering it without restarting Floci",
+                    previousContainerId, presence == ContainerPresence.ABSENT ? "gone" : "stopped");
+        }
+        String name = registryContainerName();
+
+        // Check for existing container to adopt. The registry survives shutdown by design and is
+        // adopted BY NAME, so look up the pre-migration name too: otherwise an upgraded emulator
+        // orphans the old container while it still holds the registry host port and its data.
+        Optional<Container> existing = lifecycleManager.findByName(name);
+        String adoptedName = name;
+        if (existing.isEmpty()) {
+            adoptedName = legacyRegistryContainerName();
+            existing = lifecycleManager.findByName(adoptedName);
+        }
+        if (existing.isPresent()) {
+            if (!hasLoopbackBinding(existing.get())) {
+                LOG.infov("Recreating ECR backing registry {0} with a loopback-only port binding", adoptedName);
+            } else if (!onAnotherNetwork(existing.get())) {
+                this.activeContainerName = adoptedName;
+                adoptExisting(existing.get());
+                completeStartup();
+                return;
+            }
+            // Recreated under the current name; the data volume is resolved by its own probe.
+            lifecycleManager.stopAndRemove(existing.get().getId(), null);
+        }
+        this.activeContainerName = name;
+
+        try {
+            this.hostPort = portAllocator.allocateAndStart(
+                    config.services().ecr().registryBasePort(),
+                    config.services().ecr().registryMaxPort(),
+                    port -> {
+                        ContainerInfo info = lifecycleManager.createAndStart(registryContainerSpec(name, port));
+                        this.containerId = info.containerId();
+                        rememberRegistryAddress(info);
+                        return port;
+                    });
+            attachLogStream(false);
+            this.started = true;
+            LOG.infov("Started ECR backing registry {0} on host port {1}", name, String.valueOf(hostPort));
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to start ECR backing registry container: " + e.getMessage(), e);
+        }
+        completeStartup();
+    }
+
+    private void completeStartup() {
+        awaitRegistryReady();
+        runReconcileOnce();
+        this.ready = true;
+    }
+
+    private ContainerSpec registryContainerSpec(String name, int port) {
+        List<String> env = new ArrayList<>(List.of(
+                "REGISTRY_STORAGE_DELETE_ENABLED=true",
+                "REGISTRY_HTTP_ADDR=0.0.0.0:" + CONTAINER_INTERNAL_PORT,
+                "REGISTRY_HTTP_RELATIVEURLS=true"
+        ));
+        ContainerBuilder.Builder specBuilder = containerBuilder.newContainer(config.services().ecr().registryImage())
+                .withName(name)
+                .withEnv(env)
+                .withLoopbackPortBinding(CONTAINER_INTERNAL_PORT, port)
+                .withDockerNetwork(resolveRegistryDockerNetwork())
+                .withLogRotation()
+                .withPushedLogs()
+                .withLabels(ContainerStorageHelper.resourceIdentityLabels(
+                        "ecr", null, regionResolver.getAccountId(), regionResolver.getDefaultRegion()));
+        addPersistenceMounts(specBuilder, env);
+        return specBuilder.build();
+    }
+
+    private String registryContainerName() {
+        return ContainerStorageHelper.dockerName(config, config.services().ecr().registryContainerName());
+    }
+
+    /** The name a pre-migration version gave this container; only for finding a survivor. */
+    private String legacyRegistryContainerName() {
+        return ContainerStorageHelper.legacyDockerName(config, config.services().ecr().registryContainerName());
+    }
+
+    /**
+     * The registry's data volume. It is a singleton with no persisted-name record, so probe: one
+     * created before the {@code floci-aws-} migration keeps its legacy name, and every image
+     * pushed into it, forever. Only when no legacy volume exists is the current name used.
+     */
+    private String registryVolumeName() {
+        String legacyName = ContainerStorageHelper.legacyDockerName(config, NAMED_VOLUME);
+        if (lifecycleManager.volumeExists(legacyName)) {
+            return legacyName;
+        }
+        return ContainerStorageHelper.dockerName(config, NAMED_VOLUME);
+    }
+
+    private void addPersistenceMounts(ContainerBuilder.Builder specBuilder, List<String> env) {
+        if (ContainerStorageHelper.isNamedVolumeMode(config)) {
+            String volumeName = registryVolumeName();
+            lifecycleManager.ensureVolume(volumeName);
+            specBuilder.withNamedVolume(volumeName, "/var/lib/registry");
+            return;
+        }
+
+        // Legacy host-path mode: host-persistent-path is an absolute path
+        boolean inContainer = containerDetector.isRunningInContainer();
+        String dataPath = Paths.get(config.services().ecr().dataPath(), "registry")
+                .toAbsolutePath().normalize().toString();
+        String persistentPath = Paths.get(config.storage().persistentPath())
+                .toAbsolutePath().normalize().toString();
+        String hostDataPath = dataPath.replace(persistentPath, config.storage().hostPersistentPath());
+        if (!inContainer) {
+            ensureDataDir();
+        }
+        specBuilder.withBind(hostDataPath, "/var/lib/registry");
+    }
+
+    // An adopted container carries history from before this process; only its new lines are wanted.
+    private void attachLogStream(boolean adopted) {
+        closeLogStream();
+        String shortId = containerId.length() >= 8 ? containerId.substring(0, 8) : containerId;
+        String logGroup = "/aws/ecr/registry";
+        String logStreamName = logStreamer.generateLogStreamName(shortId);
+        String region = regionResolver.getDefaultRegion();
+
+        this.logStream = adopted
+                ? logStreamer.attachPolledFromNow(containerId, logGroup, logStreamName, region, "ecr:registry")
+                : logStreamer.attachPolled(containerId, logGroup, logStreamName, region, "ecr:registry");
+    }
+
+    private void closeLogStream() {
+        Closeable previous = logStream;
+        logStream = null;
+        if (previous == null) {
+            return;
+        }
+        try {
+            previous.close();
+        } catch (Exception e) {
+            LOG.debugv("Could not close the previous ECR registry log stream: {0}", e.getMessage());
+        }
+    }
+
+    private Optional<String> resolveRegistryDockerNetwork() {
+        Optional<String> configured = config.services().ecr().dockerNetwork();
+        if (configured.isPresent() && !configured.get().isBlank()) {
+            return configured;
+        }
+        if (containerDetector.isRunningInContainer()) {
+            return currentContainerNetworkResolver.resolveNetworkName();
+        }
+        return Optional.empty();
+    }
+
+    private void runReconcileOnce() {
+        if (reconciled || reconcileHook == null) {
+            return;
+        }
+        try {
+            // The strict read: a catalog the registry failed to give is not an empty one, and taking
+            // it as one would leave the repositories it holds without metadata.
+            List<String> repos = httpClient().catalogStrict();
+            reconcileHook.accept(repos);
+            reconciled = true;
+        } catch (Exception e) {
+            LOG.warnv("ECR reconcile-on-startup failed: {0}", e.getMessage());
+        }
+    }
+
+    private void awaitRegistryReady() {
+        RegistryHttpClient registry = httpClient();
+        long deadline = System.nanoTime() + REGISTRY_STARTUP_TIMEOUT.toNanos();
+        while (true) {
+            if (Thread.currentThread().isInterrupted()) {
+                throw new IllegalStateException("Interrupted while waiting for the ECR backing registry");
+            }
+            long remaining = deadline - System.nanoTime();
+            if (remaining <= 0) {
+                throw new IllegalStateException("ECR backing registry did not become ready within "
+                        + REGISTRY_STARTUP_TIMEOUT.toSeconds() + " seconds");
+            }
+            if (registry.ping(Duration.ofNanos(Math.min(remaining, TimeUnit.SECONDS.toNanos(1))))) {
+                return;
+            }
+            try {
+                TimeUnit.NANOSECONDS.sleep(Math.min(TimeUnit.MILLISECONDS.toNanos(200),
+                        Math.max(0, deadline - System.nanoTime())));
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Interrupted while waiting for the ECR backing registry", e);
+            }
+        }
+    }
+
+    /** Value object returned by {@link #runGarbageCollect}. */
+    public record GcResult(String output, long durationMs) {}
+
+    /**
+     * Runs {@code registry garbage-collect} inside the running registry container
+     * to reclaim disk space after image deletions. Synchronized to prevent concurrent
+     * ECR operations during the GC window.
+     *
+     * @param timeoutSeconds max time to wait for the exec to complete
+     * @return captured stdout+stderr output from the GC run
+     * @throws IllegalStateException if the registry is not started
+     * @throws RuntimeException if the exec fails, exits non-zero, or times out
+     */
+    public GcResult runGarbageCollect(int timeoutSeconds) {
+        if (!started || containerId == null) {
+            throw new IllegalStateException("ECR registry is not started");
+        }
+        if (garbageCollecting) {
+            throw new IllegalStateException("ECR garbage collection is already in progress");
+        }
+
+        // Bug #6150: Atomically close write admission and drain admitted writes before starting GC
+        synchronized (writeAdmissionLock) {
+            if (garbageCollecting) {
+                throw new IllegalStateException("ECR garbage collection is already in progress");
+            }
+            garbageCollecting = true;
+            long deadline = System.currentTimeMillis() + TimeUnit.SECONDS.toMillis(timeoutSeconds);
+            while (admittedWrites > 0) {
+                long remaining = deadline - System.currentTimeMillis();
+                if (remaining <= 0) {
+                    garbageCollecting = false;
+                    writeAdmissionLock.notifyAll();
+                    throw new RuntimeException("garbage-collect timed out waiting for admitted writes to drain");
+                }
+                try {
+                    writeAdmissionLock.wait(remaining);
+                } catch (InterruptedException e) {
+                    garbageCollecting = false;
+                    writeAdmissionLock.notifyAll();
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("garbage-collect interrupted while waiting for admitted writes to drain", e);
+                }
+            }
+        }
+
+        // Bug #6150: Mutual exclusion with EcrService manifest delete/restore, pruneStorage, and
+        // deleteRepositoryStorage. Acquire the manager monitor ('this') only after admitted writes drain
+        // to prevent deadlock if an in-flight write requires ensureStartedSynchronized().
+        synchronized (this) {
+            if (!started || containerId == null) {
+                reopenWriteAdmission();
+                throw new IllegalStateException("ECR registry is not started");
+            }
+            boolean execStarted = false;
+            boolean execTerminated = false;
+            String execId = null;
+            try {
+                long startMs = System.currentTimeMillis();
+                StringBuilder output = new StringBuilder();
+
+                DockerClient dockerClient = lifecycleManager.getDockerClient();
+
+                ExecCreateCmdResponse exec = dockerClient
+                        .execCreateCmd(containerId)
+                        .withCmd("timeout", "-k", String.valueOf(GC_KILL_GRACE_SECONDS),
+                                String.valueOf(timeoutSeconds), "registry", "garbage-collect",
+                                "/etc/docker/registry/config.yml")
+                        .withAttachStdout(true)
+                        .withAttachStderr(true)
+                        .exec();
+
+                execId = exec.getId();
+                activeGcExecId = execId;
+                final String finalExecId = execId;
+
+                try {
+                    ResultCallback.Adapter<Frame> asyncCallback = lifecycleManager.getStreamingDockerClient()
+                            .execStartCmd(finalExecId)
+                            .exec(new ResultCallback.Adapter<Frame>() {
+                                @Override
+                                public void onNext(Frame frame) {
+                                    output.append(new String(frame.getPayload(), StandardCharsets.UTF_8));
+                                }
+
+                                @Override
+                                public void onComplete() {
+                                    super.onComplete();
+                                    confirmExecTerminated(finalExecId);
+                                }
+
+                                @Override
+                                public void onError(Throwable throwable) {
+                                    super.onError(throwable);
+                                    confirmExecTerminated(finalExecId);
+                                }
+                            });
+                    execStarted = true;
+                    boolean completed = asyncCallback
+                            .awaitCompletion(timeoutSeconds + GC_KILL_GRACE_SECONDS + 1, TimeUnit.SECONDS);
+
+                    if (!completed) {
+                        execTerminated = awaitTermination(dockerClient, finalExecId, 3);
+                        throw new RuntimeException("garbage-collect timed out after " + timeoutSeconds + "s");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    execTerminated = awaitTermination(dockerClient, finalExecId, 3);
+                    throw new RuntimeException("garbage-collect interrupted", e);
+                } catch (Throwable t) {
+                    if (!execStarted) {
+                        reopenWriteAdmission();
+                    }
+                    throw t;
+                }
+
+                InspectExecResponse inspect;
+                try {
+                    inspect = dockerClient.inspectExecCmd(finalExecId).exec();
+                } catch (Throwable t) {
+                    execTerminated = true;
+                    reopenWriteAdmission();
+                    throw new RuntimeException("failed to inspect garbage-collect exec " + finalExecId, t);
+                }
+                long durationMs = System.currentTimeMillis() - startMs;
+                Long exitCode = inspect != null ? inspect.getExitCodeLong() : null;
+
+                if (exitCode != null) {
+                    execTerminated = true;
+                }
+                if (exitCode == null) {
+                    throw new RuntimeException("garbage-collect did not exit (still running after await)");
+                }
+                if (exitCode != 0) {
+                    LOG.warnv("ECR GC exited with code {0}: {1}", exitCode, output);
+                    throw new RuntimeException("garbage-collect exited with code " + exitCode + ": " + output);
+                }
+
+                LOG.infov("ECR GC completed in {0}ms", durationMs);
+                return new GcResult(output.toString(), durationMs);
+            } finally {
+                if (!execStarted || execTerminated) {
+                    reopenWriteAdmission();
+                } else {
+                    LOG.errorv("ECR GC exec {0} did not confirm termination; write admission remains closed for storage safety", execId);
+                }
+            }
+        }
+    }
+
+    /** Removes repository manifest storage without removing descendant repository directories. */
+    public synchronized void deleteRepositoryStorage(String accountId, String region, String repositoryName) {
+        deleteRepositoryStorageByInternalName(internalRepoName(accountId, region, repositoryName));
+    }
+
+    /**
+     * Removes repository manifest storage for an already-resolved internal
+     * repository name. Used when the caller resolved a bare name (hostname-style
+     * pushes) that {@code internalRepoName} alone never addresses (issue #2444).
+     */
+    public synchronized void deleteRepositoryStorageByInternalName(String internalRepoName) {
+        ensureStarted();
+        if (!started || containerId == null) {
+            throw new IllegalStateException("ECR registry is not started");
+        }
+        String path = repositoryStoragePath(internalRepoName);
+        execInRegistry(containerId, "repository deletion", "rm", "-rf",
+                path + "/_layers", path + "/_manifests", path + "/_uploads");
+    }
+
+    /**
+     * The digests of every manifest the registry holds for one repository, untagged ones included, read from the
+     * revision links of its storage, since the distribution API lists tags only. A deleted manifest's link is gone,
+     * and a repository the registry never stored holds none.
+     */
+    public Set<String> heldManifestDigests(String internalRepoName) {
+        String id = containerId;
+        if (!started || id == null) {
+            throw new IllegalStateException("ECR registry is not started");
+        }
+        String revisions = repositoryStoragePath(internalRepoName) + "/_manifests/revisions/sha256";
+        String output = execInRegistry(id, "manifest listing", "sh", "-c",
+                "[ -d '" + revisions + "' ] || exit 0; find '" + revisions + "' -mindepth 2 -maxdepth 2 -name link");
+        Set<String> digests = new LinkedHashSet<>();
+        for (String line : output.split("\n")) {
+            Matcher revision = REVISION_LINK.matcher(line.trim());
+            if (revision.matches()) {
+                digests.add("sha256:" + revision.group(1));
+            }
+        }
+        return digests;
+    }
+
+    /**
+     * Runs {@code command} in the registry container under a bounded {@code timeout}, returning its output; one that
+     * times out, is interrupted or exits non-zero fails as {@code what}.
+     */
+    private String execInRegistry(String container, String what, String... command) {
+        List<String> bounded = new ArrayList<>(List.of("timeout", "-k",
+                String.valueOf(REPOSITORY_DELETION_KILL_GRACE_SECONDS),
+                String.valueOf(REPOSITORY_DELETION_TIMEOUT_SECONDS)));
+        bounded.addAll(List.of(command));
+        StringBuilder output = new StringBuilder();
+        DockerClient dockerClient = lifecycleManager.getDockerClient();
+        ExecCreateCmdResponse exec = dockerClient
+                .execCreateCmd(container)
+                .withCmd(bounded.toArray(String[]::new))
+                .withAttachStdout(true)
+                .withAttachStderr(true)
+                .exec();
+        try {
+            boolean completed = dockerClient.execStartCmd(exec.getId())
+                    .exec(new ResultCallback.Adapter<Frame>() {
+                        @Override
+                        public void onNext(Frame frame) {
+                            output.append(new String(frame.getPayload(), StandardCharsets.UTF_8));
+                        }
+                    })
+                    .awaitCompletion(REPOSITORY_DELETION_TIMEOUT_SECONDS
+                            + REPOSITORY_DELETION_KILL_GRACE_SECONDS + 1, TimeUnit.SECONDS);
+            if (!completed) {
+                throw new RuntimeException(what + " timed out");
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException(what + " interrupted", e);
+        }
+        Long exitCode = dockerClient.inspectExecCmd(exec.getId()).exec().getExitCodeLong();
+        if (exitCode == null || exitCode != 0) {
+            throw new RuntimeException(what + " failed: " + output);
+        }
+        return output.toString();
+    }
+
+    /** Stops the container if {@code keepRunningOnShutdown=false}. Called from EmulatorLifecycle hooks. */
+    public synchronized void shutdown() {
+        if (config.services().ecr().keepRunningOnShutdown()) {
+            if (started && containerId != null) {
+                LOG.infov("Leaving ECR backing registry container {0} running for next start-up", containerId);
+            }
+            return;
+        }
+        stopRegistry();
+        removeStorageIfConfigured();
+    }
+
+    /** Removes the shared registry storage after the final ECR repository is deleted. */
+    public synchronized void pruneStorage() {
+        if (!shouldPruneStorage()) {
+            return;
+        }
+        stopRegistry();
+        removeStorageIfConfigured();
+    }
+
+    private void stopRegistry() {
+        if (containerId == null) {
+            return;
+        }
+        lifecycleManager.stopAndRemove(containerId, logStream);
+        portAllocator.release(hostPort);
+        containerId = null;
+        registryAddress = null;
+        logStream = null;
+        started = false;
+        ready = false;
+        reconciled = false;
+        reconcileRetryFailedAt = 0;
+        reopenWriteAdmission();
+        hostPort = config.services().ecr().registryBasePort();
+    }
+
+    private void removeStorageIfConfigured() {
+        if (!shouldPruneStorage() || !ContainerStorageHelper.isNamedVolumeMode(config)) {
+            return;
+        }
+        ContainerStorageHelper.removeNamedVolume(config, lifecycleManager, registryVolumeName());
+    }
+
+    private boolean shouldPruneStorage() {
+        return "memory".equals(config.storage().mode()) || config.storage().pruneVolumesOnDelete();
+    }
+
+    private static String repositoryStoragePath(String repository) {
+        for (String segment : repository.split("/")) {
+            if (segment.isEmpty() || ".".equals(segment) || "..".equals(segment)) {
+                throw new IllegalArgumentException("Invalid registry repository path");
+            }
+        }
+        return REPOSITORIES_PATH + repository;
+    }
+
+    private void adoptExisting(Container existing) {
+        this.containerId = existing.getId();
+        try {
+            ContainerInfo info = lifecycleManager.adopt(containerId, List.of(CONTAINER_INTERNAL_PORT),
+                    containerBuilder.resolveDockerNetwork(resolveRegistryDockerNetwork()));
+            rememberRegistryAddress(info);
+            // The control plane reaches the backing registry through this published loopback
+            // binding when Floci runs on the host. In Docker, httpClient() uses the in-network address.
+            OptionalInt published = info.publishedHostPort(CONTAINER_INTERNAL_PORT);
+            if (published.isPresent()) {
+                this.hostPort = published.getAsInt();
+            } else {
+                LOG.warnv("Adopted ECR registry container {0} has no published binding for port {1}; keeping configured port {2}",
+                        containerId, String.valueOf(CONTAINER_INTERNAL_PORT), String.valueOf(hostPort));
+            }
+            attachLogStream(true);
+            this.started = true;
+            LOG.infov("Adopted existing ECR registry container {0} on host port {1}",
+                    containerId, String.valueOf(hostPort));
+        } catch (Exception e) {
+            closeLogStream();
+            LOG.warnv("Failed to adopt existing ECR registry container: {0}", e.getMessage());
+            this.started = false;
+            this.ready = false;
+            throw new RuntimeException("Failed to adopt existing ECR registry container: " + e.getMessage(), e);
+        }
+    }
+
+    private void rememberRegistryAddress(ContainerInfo info) {
+        EndpointInfo endpoint = info.getEndpoint(CONTAINER_INTERNAL_PORT);
+        this.registryAddress = endpoint != null ? endpoint.toString() : null;
+    }
+
+    // Floci in a container reaches the registry over the Docker network; on the host it uses the loopback port.
+    private boolean onAnotherNetwork(Container survivor) {
+        return containerDetector.isRunningInContainer() && ContainerNetworks.onAnotherNetwork(
+                survivor, containerBuilder.resolveDockerNetwork(resolveRegistryDockerNetwork()).orElse(null));
+    }
+
+    private static boolean hasLoopbackBinding(Container container) {
+        ContainerPort[] ports = container.getPorts();
+        if (ports == null) {
+            return false;
+        }
+        boolean found = false;
+        for (ContainerPort port : ports) {
+            if (port.getPrivatePort() != null && port.getPrivatePort() == CONTAINER_INTERNAL_PORT) {
+                if (port.getPublicPort() == null || !"127.0.0.1".equals(port.getIp())) {
+                    return false;
+                }
+                found = true;
+            }
+        }
+        return found;
+    }
+
+    private void ensureDataDir() {
+        try {
+            Path dir = Paths.get(config.services().ecr().dataPath(), "registry");
+            Files.createDirectories(dir);
+        } catch (IOException e) {
+            LOG.warnv("Could not create ECR data directory: {0}", e.getMessage());
+        }
+    }
+
+    // Bug #6150: Accessor for active garbage collection status
+    public boolean isGarbageCollecting() {
+        return garbageCollecting;
+    }
+
+    public boolean tryAcquireWriteAdmission() {
+        synchronized (writeAdmissionLock) {
+            if (garbageCollecting) {
+                return false;
+            }
+            admittedWrites++;
+            return true;
+        }
+    }
+
+    public void releaseWriteAdmission() {
+        synchronized (writeAdmissionLock) {
+            if (admittedWrites > 0) {
+                admittedWrites--;
+                if (admittedWrites == 0) {
+                    writeAdmissionLock.notifyAll();
+                }
+            }
+        }
+    }
+
+    boolean awaitTermination(DockerClient dockerClient, String execId, int maxSeconds) {
+        long deadline = clock.millis() + TimeUnit.SECONDS.toMillis(maxSeconds);
+        while (clock.millis() < deadline) {
+            try {
+                InspectExecResponse inspect = dockerClient.inspectExecCmd(execId).exec();
+                if (inspect != null && inspect.getExitCodeLong() != null) {
+                    return true;
+                }
+            } catch (Exception ignored) {
+            }
+            try {
+                // Bug #6150: Pause on every pass even if inspect throws to avoid tight spin loop
+                sleeper.sleep(200);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                return false;
+            }
+        }
+        return false;
+    }
+
+    void confirmExecTerminated(String execId) {
+        try {
+            DockerClient dockerClient = lifecycleManager.getDockerClient();
+            InspectExecResponse inspect = dockerClient.inspectExecCmd(execId).exec();
+            if (inspect != null && inspect.getExitCodeLong() != null) {
+                synchronized (writeAdmissionLock) {
+                    if (execId.equals(activeGcExecId)) {
+                        reopenWriteAdmission();
+                    }
+                }
+            }
+        } catch (Exception e) {
+            LOG.debugv("Failed to inspect exec {0} on completion: {1}", execId, e.getMessage());
+        }
+    }
+
+    private void reopenWriteAdmission() {
+        synchronized (writeAdmissionLock) {
+            garbageCollecting = false;
+            activeGcExecId = null;
+            writeAdmissionLock.notifyAll();
+        }
+    }
+
+    public boolean isStarted() {
+        return ready;
+    }
+}

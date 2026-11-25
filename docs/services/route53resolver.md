@@ -24,6 +24,9 @@
 | `DisassociateResolverRule` | Removes the association between a resolver rule and a VPC. |
 | `GetResolverRuleAssociation` | Returns a resolver rule association by id. |
 | `ListResolverRuleAssociations` | Lists all resolver rule associations. |
+| `UpdateResolverDnssecConfig` | Creates or updates a VPC's DNSSEC validation configuration and returns its terminal validation status. |
+| `GetResolverDnssecConfig` | Returns a stable DNSSEC validation configuration for an existing VPC, defaulting to `DISABLED` before its first update. |
+| `ListResolverDnssecConfigs` | Lists the region's DNSSEC validation configurations, leaving out disabled ones, filtered by `Filters` and paginated by `MaxResults` (default and maximum 100) and `NextToken`. |
 | `TagResource` | Adds or overwrites tags on a resolver endpoint, resolver rule or custom firewall domain list, by ARN. |
 | `UntagResource` | Removes tag keys from a resolver endpoint, resolver rule or custom firewall domain list; absent keys are ignored. |
 | `ListTagsForResource` | Lists a resource's tags, paginated by `MaxResults` (default and maximum 100) and `NextToken`. |
@@ -39,9 +42,10 @@ needs it present and stable without any create call. This logic predates the res
 this service and is untouched.
 
 Everything else (custom firewall domain lists, resolver endpoints, resolver rules,
-rule associations) is backed by real per-service storage, added this session. Ids use
-the project's standard random-suffix convention (`rslvr-fdl-...`, `rslvr-in-...` /
-`rslvr-out-...`, `rslvr-rr-...`, `rslvr-rrassoc-...`), distinct from the deterministic
+rule associations and DNSSEC configurations) is backed by real per-service storage,
+added this session. Ids use the project's standard random-suffix convention
+(`rslvr-fdl-...`, `rslvr-in-...` / `rslvr-out-...`, `rslvr-rr-...`,
+`rslvr-rrassoc-...`, `rdsc-...`), distinct from the deterministic
 managed-list ids. Resolver endpoint ids are direction-aware as in AWS: `rslvr-in-` for
 `INBOUND` (and `INBOUND_DELEGATION`), `rslvr-out-` for `OUTBOUND`. Any other `Direction`
 is rejected with `InvalidParameterException`.
@@ -135,6 +139,19 @@ internal domains so a rule for `.` cannot break the platform.
 to the upstream resolvers, which would answer with the wrong address for a name the rule placed
 elsewhere. Every other name resolves as usual. This needs no switch of its own: it applies wherever
 cluster DNS does, governed by `floci.services.eks.embedded-dns`.
+
+## IAM enforcement
+
+With IAM enforcement on, each action is checked on the resources the AWS Service Authorization
+Reference lists for it, read from the request: a resolver rule by its `ResolverRuleId`, an endpoint
+by its `ResolverEndpointId` and a firewall domain list by its `FirewallDomainListId`, each as
+`arn:aws:route53resolver:<region>:<account>:<type>/<id>`, the ARN this service mints, and a tag call
+on its `ResourceArn`. The reference's DNSSEC configuration format takes a `ResourceId`, which the
+request gives as the VPC's id, so `GetResolverDnssecConfig` and `UpdateResolverDnssecConfig` are
+checked on `resolver-dnssec-config/<vpc-id>`. A managed domain list, which AWS owns, is checked on
+the ARN this service gives it, the one `ListFirewallDomainLists` returns, not under the caller's
+account. `CreateOutpostResolver` is checked on `outpost-resolver/*`. The list actions name no
+resource and are checked on `*`.
 
 ## Limitations
 

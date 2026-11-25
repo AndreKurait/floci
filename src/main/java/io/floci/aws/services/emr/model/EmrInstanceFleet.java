@@ -1,0 +1,80 @@
+package io.floci.aws.services.emr.model;
+
+import io.quarkus.runtime.annotations.RegisterForReflection;
+
+import java.util.ArrayList;
+import java.util.List;
+
+/** An EMR instance fleet (MASTER | CORE | TASK). */
+@RegisterForReflection
+public class EmrInstanceFleet {
+
+    private String id;
+    private String name;
+    private String instanceFleetType;
+    private List<String> instanceTypes = new ArrayList<>();
+    private String instanceTypeConfigs;
+    private int targetOnDemandCapacity;
+    private int targetSpotCapacity;
+    private int provisionedOnDemandCapacity;
+    private int provisionedSpotCapacity;
+    private String state;
+    /** The LaunchSpecifications as given, raw JSON; null when none. */
+    private String launchSpecifications;
+    /** The ResizeSpecifications as given, or as ModifyInstanceFleet last set them, raw JSON; null when none. */
+    private String resizeSpecifications;
+    private String context;
+
+    public EmrInstanceFleet() {}
+
+    public String getId() { return id; }
+    public void setId(String id) { this.id = id; }
+
+    public String getName() { return name; }
+    public void setName(String name) { this.name = name; }
+
+    public String getInstanceFleetType() { return instanceFleetType; }
+    public void setInstanceFleetType(String instanceFleetType) { this.instanceFleetType = instanceFleetType; }
+
+    /** The instance types of its InstanceTypeConfigs, in their order. */
+    public List<String> getInstanceTypes() { return instanceTypes; }
+    public void setInstanceTypes(List<String> instanceTypes) { this.instanceTypes = instanceTypes; }
+
+    /** Its InstanceTypeConfigs as given, raw JSON; null for a fleet stored before they were kept. */
+    public String getInstanceTypeConfigs() { return instanceTypeConfigs; }
+    public void setInstanceTypeConfigs(String instanceTypeConfigs) { this.instanceTypeConfigs = instanceTypeConfigs; }
+
+    public int getTargetOnDemandCapacity() { return targetOnDemandCapacity; }
+    public void setTargetOnDemandCapacity(int targetOnDemandCapacity) {
+        this.targetOnDemandCapacity = targetOnDemandCapacity;
+    }
+
+    public int getTargetSpotCapacity() { return targetSpotCapacity; }
+    public void setTargetSpotCapacity(int targetSpotCapacity) { this.targetSpotCapacity = targetSpotCapacity; }
+
+    public int getProvisionedOnDemandCapacity() { return provisionedOnDemandCapacity; }
+    public void setProvisionedOnDemandCapacity(int provisionedOnDemandCapacity) {
+        this.provisionedOnDemandCapacity = provisionedOnDemandCapacity;
+    }
+
+    public int getProvisionedSpotCapacity() { return provisionedSpotCapacity; }
+    public void setProvisionedSpotCapacity(int provisionedSpotCapacity) {
+        this.provisionedSpotCapacity = provisionedSpotCapacity;
+    }
+
+    public String getState() { return state; }
+    public void setState(String state) { this.state = state; }
+
+    public String getLaunchSpecifications() { return launchSpecifications; }
+    public void setLaunchSpecifications(String launchSpecifications) {
+        this.launchSpecifications = launchSpecifications;
+    }
+
+    public String getResizeSpecifications() { return resizeSpecifications; }
+    public void setResizeSpecifications(String resizeSpecifications) {
+        this.resizeSpecifications = resizeSpecifications;
+    }
+
+    public String getContext() { return context; }
+    public void setContext(String context) { this.context = context; }
+}

@@ -1,0 +1,312 @@
+package io.floci.aws.services.codeartifact;
+
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
+import io.floci.aws.testing.ParallelLocks;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
+
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.io.InputStream;
+import java.net.InetSocketAddress;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.net.http.HttpTimeoutException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.Duration;
+import java.util.Map;
+import java.util.Optional;
+import java.util.concurrent.atomic.AtomicReference;
+
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+/**
+ * The wire contract towards the real public npm registry, exercised against a local {@code
+ * HttpServer} fake standing in for it, named {@code fake} in these tests rather than the real
+ * {@code public:npmjs} connection name.
+ */
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
+class NpmExternalConnectionClientTest {
+
+    private HttpServer server;
+    private NpmExternalConnectionClient client;
+
+    @BeforeEach
+    void startServer() throws IOException {
+        server = HttpServer.create(new InetSocketAddress("127.0.0.1", 0), 0);
+        server.start();
+        Map<String, String> baseUrls = Map.of("fake", "http://127.0.0.1:" + server.getAddress().getPort());
+        client = new NpmExternalConnectionClient(
+                HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5))
+                        .followRedirects(HttpClient.Redirect.NORMAL).build(),
+                baseUrls);
+    }
+
+    @AfterEach
+    void stopServer() {
+        server.stop(0);
+    }
+
+    @Test
+    void fetchPackumentReturnsTheRealBytesOnA200ForAnUnscopedPackage() throws IOException {
+        byte[] content = "{\"name\":\"widget\"}".getBytes(StandardCharsets.UTF_8);
+        server.createContext("/widget", exchange -> {
+            exchange.sendResponseHeaders(200, content.length);
+            exchange.getResponseBody().write(content);
+            exchange.close();
+        });
+
+        Optional<NpmExternalConnectionClient.FetchedAsset> result = client.fetchPackument("fake", null, "widget");
+
+        assertTrue(result.isPresent());
+        assertArrayEquals(content, result.get().content());
+    }
+
+    @Test
+    void fetchPackumentRetriesAConnectionResetBeforeReceivingTheBody() throws Exception {
+        HttpClient transport = mock(HttpClient.class);
+        HttpResponse<InputStream> response = mock(HttpResponse.class);
+        byte[] content = "{\"name\":\"widget\"}".getBytes(StandardCharsets.UTF_8);
+        when(response.statusCode()).thenReturn(200);
+        when(response.body()).thenReturn(new ByteArrayInputStream(content));
+        when(anySend(transport))
+                .thenThrow(new IOException("Connection reset"))
+                .thenReturn(response);
+        NpmExternalConnectionClient retryClient = clientWithTransport(transport);
+
+        Optional<NpmExternalConnectionClient.FetchedAsset> result =
+                retryClient.fetchPackument("fake", null, "widget");
+
+        assertTrue(result.isPresent());
+        assertArrayEquals(content, result.get().content());
+        anySend(verify(transport, times(2)));
+    }
+
+    @Test
+    void fetchPackumentDoesNotRetryARequestTimeout() throws Exception {
+        HttpClient transport = mock(HttpClient.class);
+        when(anySend(transport))
+                .thenThrow(new HttpTimeoutException("request timed out"));
+        NpmExternalConnectionClient retryClient = clientWithTransport(transport);
+
+        assertTrue(retryClient.fetchPackument("fake", null, "widget").isEmpty());
+
+        anySend(verify(transport));
+    }
+
+    @Test
+    void fetchPackumentStopsAfterTwoFailedTransportAttempts() throws Exception {
+        HttpClient transport = mock(HttpClient.class);
+        when(anySend(transport))
+                .thenThrow(new IOException("Connection reset"));
+        NpmExternalConnectionClient retryClient = clientWithTransport(transport);
+
+        assertTrue(retryClient.fetchPackument("fake", null, "widget").isEmpty());
+
+        anySend(verify(transport, times(2)));
+    }
+
+    @Test
+    void fetchPackumentDoesNotRetryAnHttpNotFoundResponse() throws Exception {
+        HttpClient transport = mock(HttpClient.class);
+        HttpResponse<InputStream> response = mock(HttpResponse.class);
+        when(response.statusCode()).thenReturn(404);
+        when(response.body()).thenReturn(new ByteArrayInputStream(new byte[0]));
+        when(anySend(transport)).thenReturn(response);
+        NpmExternalConnectionClient retryClient = clientWithTransport(transport);
+
+        assertTrue(retryClient.fetchPackument("fake", null, "widget").isEmpty());
+
+        anySend(verify(transport));
+    }
+
+    @Test
+    void fetchPackumentDoesNotReplayAPartiallyConsumedBody() throws Exception {
+        HttpClient transport = mock(HttpClient.class);
+        HttpResponse<InputStream> response = mock(HttpResponse.class);
+        InputStream body = mock(InputStream.class);
+        when(response.statusCode()).thenReturn(200);
+        when(response.body()).thenReturn(body);
+        when(body.transferTo(any())).thenThrow(new IOException("Connection reset while reading"));
+        when(anySend(transport)).thenReturn(response);
+        NpmExternalConnectionClient retryClient = clientWithTransport(transport);
+
+        assertTrue(retryClient.fetchPackument("fake", null, "widget").isEmpty());
+
+        anySend(verify(transport));
+        verify(body).close();
+    }
+
+    @Test
+    void fetchPackumentPreservesInterruptionWithoutRetrying() throws Exception {
+        HttpClient transport = mock(HttpClient.class);
+        when(anySend(transport))
+                .thenThrow(new InterruptedException("cancelled"));
+        NpmExternalConnectionClient retryClient = clientWithTransport(transport);
+
+        try {
+            assertTrue(retryClient.fetchPackument("fake", null, "widget").isEmpty());
+            assertTrue(Thread.currentThread().isInterrupted());
+            anySend(verify(transport));
+        } finally {
+            Thread.interrupted();
+        }
+    }
+
+    /**
+     * Confirmed live against the real registry: a scoped package's single-package resource needs
+     * its scope separator percent-encoded as {@code %2F} to reach the package itself rather than a
+     * sub-path of it ({@code @scope/name} with a literal slash 404s this exact endpoint there).
+     */
+    @Test
+    void fetchPackumentEscapesTheScopeSeparatorForAScopedPackage() throws IOException {
+        byte[] content = "{\"name\":\"@scope/widget\"}".getBytes(StandardCharsets.UTF_8);
+        AtomicReference<String> rawPath = new AtomicReference<>();
+        // Registered at the decoded path: com.sun.net.httpserver.HttpServer matches a context
+        // against the exchange's own decoded URI.getPath(), not its raw, still-percent-encoded
+        // form, so a literal slash would reach this same context just as easily; the real
+        // assertion below is on the raw path this handler actually received, not on which context
+        // matched.
+        server.createContext("/@scope/widget", exchange -> {
+            rawPath.set(exchange.getRequestURI().getRawPath());
+            exchange.sendResponseHeaders(200, content.length);
+            exchange.getResponseBody().write(content);
+            exchange.close();
+        });
+
+        Optional<NpmExternalConnectionClient.FetchedAsset> result = client.fetchPackument("fake", "scope", "widget");
+
+        assertTrue(result.isPresent());
+        assertArrayEquals(content, result.get().content());
+        assertEquals("/@scope%2Fwidget", rawPath.get());
+    }
+
+    @Test
+    void fetchPackumentReturnsEmptyOnA404() throws IOException {
+        server.createContext("/widget", exchange -> respondEmpty(exchange, 404));
+
+        Optional<NpmExternalConnectionClient.FetchedAsset> result = client.fetchPackument("fake", null, "widget");
+
+        assertFalse(result.isPresent());
+    }
+
+    @Test
+    void fetchPackumentReturnsEmptyForAnUnknownConnectionName() {
+        Optional<NpmExternalConnectionClient.FetchedAsset> result =
+                client.fetchPackument("public:npmjs", null, "widget");
+
+        assertFalse(result.isPresent());
+    }
+
+    @Test
+    void fetchTarballReturnsTheRealBytesOnA200ForAnUnscopedPackage() throws IOException {
+        byte[] content = "tarball-content".getBytes(StandardCharsets.UTF_8);
+        server.createContext("/widget/-/widget-1.0.0.tgz", exchange -> {
+            exchange.sendResponseHeaders(200, content.length);
+            exchange.getResponseBody().write(content);
+            exchange.close();
+        });
+
+        Optional<NpmExternalConnectionClient.FetchedAsset> result =
+                client.fetchTarball("fake", null, "widget", "1.0.0");
+
+        assertTrue(result.isPresent());
+        assertArrayEquals(content, result.get().content());
+    }
+
+    /**
+     * Confirmed live against the real registry: unlike the packument path, the tarball path keeps
+     * a literal {@code /} between the scope and the bare name, and the filename itself never
+     * carries the scope at all.
+     */
+    @Test
+    void fetchTarballUsesALiteralSlashAndTheBareNameForAScopedPackage() throws IOException {
+        byte[] content = "tarball-content".getBytes(StandardCharsets.UTF_8);
+        server.createContext("/@scope/widget/-/widget-1.0.0.tgz", exchange -> {
+            exchange.sendResponseHeaders(200, content.length);
+            exchange.getResponseBody().write(content);
+            exchange.close();
+        });
+
+        Optional<NpmExternalConnectionClient.FetchedAsset> result =
+                client.fetchTarball("fake", "scope", "widget", "1.0.0");
+
+        assertTrue(result.isPresent());
+        assertArrayEquals(content, result.get().content());
+    }
+
+    /**
+     * {@code fetchTarball(..., Path)} is the streamed sibling that a large tarball import
+     * actually uses: unlike the {@code byte[]} overload above, it writes straight to a file via
+     * an {@link AssetDigestingInputStream}-wrapped copy, so this confirms that wrapping still
+     * lands the real bytes on disk and reports their real size, not just that the plain {@code
+     * byte[]} path works.
+     */
+    @Test
+    void fetchTarballToAPathWritesTheRealBytesAndReportsTheirSize() throws IOException {
+        byte[] content = "tarball-content".getBytes(StandardCharsets.UTF_8);
+        server.createContext("/widget/-/widget-1.0.0.tgz", exchange -> {
+            exchange.sendResponseHeaders(200, content.length);
+            exchange.getResponseBody().write(content);
+            exchange.close();
+        });
+        Path destination = Files.createTempFile("npm-external-connection-test-", ".tgz");
+
+        try {
+            Optional<NpmExternalConnectionClient.FetchedFile> result =
+                    client.fetchTarball("fake", null, "widget", "1.0.0", destination);
+
+            assertTrue(result.isPresent());
+            assertEquals(content.length, result.get().size());
+            assertArrayEquals(content, Files.readAllBytes(destination));
+        } finally {
+            Files.deleteIfExists(destination);
+        }
+    }
+
+    @Test
+    void fetchTarballReturnsEmptyOnA404() throws IOException {
+        server.createContext("/widget/-/widget-1.0.0.tgz", exchange -> respondEmpty(exchange, 404));
+
+        Optional<NpmExternalConnectionClient.FetchedAsset> result =
+                client.fetchTarball("fake", null, "widget", "1.0.0");
+
+        assertFalse(result.isPresent());
+    }
+
+    @Test
+    void fetchTarballReturnsEmptyForAnUnknownConnectionName() {
+        Optional<NpmExternalConnectionClient.FetchedAsset> result =
+                client.fetchTarball("public:npmjs", null, "widget", "1.0.0");
+
+        assertFalse(result.isPresent());
+    }
+
+    private static NpmExternalConnectionClient clientWithTransport(HttpClient transport) {
+        return new NpmExternalConnectionClient(transport, Map.of("fake", "http://127.0.0.1"));
+    }
+
+    private static HttpResponse<InputStream> anySend(HttpClient transport) throws IOException, InterruptedException {
+        return transport.send(any(HttpRequest.class), any(HttpResponse.BodyHandler.class));
+    }
+
+    private static void respondEmpty(HttpExchange exchange, int status) throws IOException {
+        exchange.sendResponseHeaders(status, -1);
+        exchange.close();
+    }
+}

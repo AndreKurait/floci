@@ -1,0 +1,995 @@
+package io.floci.aws.services.ecr.registry;
+
+import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.config.NetworkExposureGuard;
+import io.floci.aws.core.common.AwsArnUtils;
+import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.AwsPartitions;
+import io.floci.aws.services.ecr.EcrService;
+import io.floci.aws.services.ecr.model.Repository;
+import io.vertx.core.Vertx;
+import io.vertx.core.buffer.Buffer;
+import io.vertx.core.http.HttpClient;
+import io.vertx.core.http.HttpClientOptions;
+import io.vertx.core.http.HttpClientRequest;
+import io.vertx.core.http.HttpClientResponse;
+import io.vertx.core.http.HttpMethod;
+import io.vertx.core.http.RequestOptions;
+import io.vertx.core.json.JsonArray;
+import io.vertx.core.json.JsonObject;
+import io.vertx.core.net.HostAndPort;
+import io.vertx.ext.web.Router;
+import io.vertx.ext.web.RoutingContext;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.event.Observes;
+import jakarta.inject.Inject;
+import org.jboss.logging.Logger;
+
+import java.net.URI;
+import java.net.URLDecoder;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Proxies OCI Distribution traffic through Floci so ECR repository policy applies to Docker pushes.
+ * Docker clients use the AWS-shaped repository URI while {@code registry:2} retains image storage.
+ */
+@ApplicationScoped
+public class EcrRegistryDataPlane {
+
+    private static final Logger LOG = Logger.getLogger(EcrRegistryDataPlane.class);
+    private static final Pattern ECR_HOST = Pattern.compile(
+            "^([0-9]{12})\\.dkr\\.ecr\\.([a-z0-9-]+)\\.localhost(?:\\.floci\\.io)?(?::[0-9]+)?$");
+    /**
+     * An account's registry host as AWS names it, {@code <account>.dkr.ecr.<region>.<dnsSuffix>}, which containerd sends
+     * as a mirror request's {@code ns} when an EKS node's registries.yaml mirrors it to Floci.
+     */
+    private static final Pattern AWS_ECR_HOST = Pattern.compile(
+            "^([0-9]{12})\\.dkr\\.ecr\\.([a-z0-9-]+)\\.(" + AwsPartitions.dnsSuffixRegex() + ")(?::[0-9]+)?$");
+    private static final Pattern NATIVE_ECR_HOST = Pattern.compile(
+            "^([0-9]{12})\\.dkr\\.ecr\\.([a-z0-9-]+)\\.(" + AwsPartitions.dnsSuffixRegex() + ")(?::443)?$");
+    private static final String MANIFESTS_PATH = "/manifests/";
+    private static final long REPOSITORY_LOCK_POLL_MILLIS = 5;
+    /**
+     * The most a manifest PUT waiting for its repository's write lock may buffer. A manifest
+     * is kilobytes of JSON with layer references, and a body past this is refused rather than
+     * held in memory; the plane-wide request limit is gigabytes, so nothing else bounds a
+     * body that waits.
+     */
+    private static final int WAITING_MANIFEST_BODY_LIMIT_BYTES = 4 * 1024 * 1024;
+    private static final Set<String> HOP_BY_HOP_HEADERS = Set.of(
+            "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+            "te", "trailers", "transfer-encoding", "upgrade");
+
+    private final EcrRegistryManager registryManager;
+    private final EcrService ecrService;
+    private final EmulatorConfig config;
+    private final Vertx vertx;
+
+    @Inject
+    EcrRegistryAuthorization authorization;
+
+    @Inject
+    public EcrRegistryDataPlane(EcrRegistryManager registryManager,
+                                EcrService ecrService,
+                                EmulatorConfig config,
+                                Vertx vertx) {
+        this.registryManager = registryManager;
+        this.ecrService = ecrService;
+        this.config = config;
+        this.vertx = vertx;
+    }
+
+    void register(@Observes Router router) {
+        router.route("/v2").handler(this::handle);
+        router.route("/v2/*").handler(this::handle);
+    }
+
+    private void handle(RoutingContext context) {
+        Optional<RegistryRequest> request = requestFor(
+                context.request().host(), context.request().path(), context.request().query(),
+                config.services().ecr().uriStyle());
+        if (request.isEmpty() || !config.services().ecr().enabled()) {
+            context.next();
+            return;
+        }
+
+        RegistryRequest selected = request.get();
+        try {
+            if (config.services().iam().enforcementEnabled()) {
+                String header = context.request().getHeader("Authorization");
+                boolean regionlessLogin = selected.region().isEmpty() && selected.repositoryName().isEmpty()
+                        && context.request().method() == HttpMethod.GET
+                        && ("/v2".equals(context.request().path()) || "/v2/".equals(context.request().path()));
+                EcrRegistryAuthorization.Identity identity = regionlessLogin
+                        ? authorization.authenticateLoginProbe(header)
+                        : authorization.authenticate(header, selected.region());
+                selected = requireRepositoryActions(context, selected, identity);
+            }
+        } catch (AwsException denied) {
+            context.response().putHeader("Docker-Distribution-API-Version", "registry/2.0");
+            if (denied.getHttpStatus() == 401) {
+                context.response().putHeader("WWW-Authenticate", "Basic realm=\"Amazon ECR\"");
+            }
+            registryError(context, denied.getHttpStatus(), denied.getErrorCode(), denied.getMessage());
+            return;
+        }
+
+        boolean isWrite = isWriteRequest(context.request().method());
+        // Bug #6150: Refuse mutating write requests with HTTP 503 while garbage collection runs
+        if (isWrite && !registryManager.tryAcquireWriteAdmission()) {
+            registryUnavailable(context, "ECR registry is temporarily unavailable while garbage collection is in progress.");
+            return;
+        }
+
+        context.request().pause();
+        RegistryRequest registryRequest = selected;
+        if (registryRequest.repositoryName().isEmpty()) {
+            admit(context, registryRequest, isWrite);
+        } else if (registryManager.isCatalogReconciled()) {
+            String storage;
+            try {
+                storage = ecrService.registryRepositoryName(
+                        registryRequest.repositoryName(), registryRequest.accountId(), registryRequest.region());
+            } catch (RuntimeException e) {
+                // The registry may have been recovered since its catalog was read, so a name that catalog does
+                // not place is checked against the registry running now before it is refused.
+                resolveAfterTheCatalogThenAdmit(context, registryRequest, isWrite);
+                return;
+            }
+            admit(context, registryRequest.withStorageRepositoryName(storage), isWrite);
+        } else {
+            resolveAfterTheCatalogThenAdmit(context, registryRequest, isWrite);
+        }
+    }
+
+    /**
+     * Until the catalog of the registry running now has been read, a name with no metadata cannot be told from a
+     * repository whose images the registry holds, so the registry is started, or recovered, and its catalog read
+     * first, off the event loop, before the name is resolved.
+     *
+     * <p>Exactly one of the client leaving and the read finishing takes the request on: a client that goes away
+     * meanwhile gives its write admission back at once, so garbage collection does not wait on a write that can
+     * no longer come.
+     */
+    private void resolveAfterTheCatalogThenAdmit(RoutingContext context, RegistryRequest registryRequest,
+                                                 boolean writeAdmitted) {
+        AtomicBoolean waiting = new AtomicBoolean(true);
+        context.response().closeHandler(closed -> {
+            if (waiting.compareAndSet(true, false) && writeAdmitted) {
+                registryManager.releaseWriteAdmission();
+            }
+        });
+        vertx.<String>executeBlocking(promise -> {
+            try {
+                registryManager.ensureStarted();
+                registryManager.ensureCatalogReconciled();
+                promise.complete(ecrService.registryRepositoryName(
+                        registryRequest.repositoryName(), registryRequest.accountId(), registryRequest.region()));
+            } catch (Exception e) {
+                promise.fail(e);
+            }
+        }).onComplete(result -> {
+            if (!waiting.compareAndSet(true, false)) {
+                return;
+            }
+            if (context.response().closed()) {
+                if (writeAdmitted) {
+                    registryManager.releaseWriteAdmission();
+                }
+            } else if (result.failed()) {
+                refuseUnresolved(context, registryRequest, writeAdmitted, result.cause());
+            } else {
+                try {
+                    admit(context, registryRequest.withStorageRepositoryName(result.result()), writeAdmitted);
+                } catch (Throwable t) {
+                    // admit gave back what it took. Off the router's call stack nothing else answers the failure,
+                    // so it gets the 500 the synchronous path's would.
+                    context.request().resume();
+                    context.fail(t);
+                }
+            }
+        });
+    }
+
+    /**
+     * Answers a request whose repository could not be resolved: {@code 404 NAME_UNKNOWN} for one nobody created, as
+     * ECR answers before any byte reaches the registry, and unavailable for anything else.
+     */
+    private void refuseUnresolved(RoutingContext context, RegistryRequest registryRequest,
+                                  boolean writeAdmissionHeld, Throwable failure) {
+        if (writeAdmissionHeld) {
+            registryManager.releaseWriteAdmission();
+        }
+        context.request().resume();
+        if (failure instanceof AwsException aws && "RepositoryNotFoundException".equals(aws.getErrorCode())) {
+            if (!context.response().ended() && !context.response().closed()) {
+                context.response().putHeader("Docker-Distribution-API-Version", "registry/2.0");
+                registryError(context, 404, "NAME_UNKNOWN", aws.getMessage());
+            }
+            return;
+        }
+        LOG.debugv(failure, "Could not resolve ECR repository {0} in registry {1}",
+                registryRequest.repositoryName(), registryRequest.accountId());
+        registryUnavailable(context);
+    }
+
+    /** Takes a resolved request on to its immutable-tag claim, its repository write lock and the registry. */
+    private void admit(RoutingContext context, RegistryRequest registryRequest, boolean writeAdmitted) {
+        boolean writeAdmissionHeld = writeAdmitted;
+        Exchange activeExchange = null;
+        String immutableTag = null;
+        boolean tagClaimed = false;
+        try {
+            immutableTag = immutableTag(context, registryRequest);
+            if (immutableTag != null) {
+                if (!ecrService.claimImmutableTag(immutableTag)) {
+                    context.request().resume();
+                    if (writeAdmissionHeld) {
+                        writeAdmissionHeld = false;
+                        registryManager.releaseWriteAdmission();
+                    }
+                    imageTagAlreadyExists(context, registryRequest);
+                    return;
+                }
+                tagClaimed = true;
+            }
+
+            Exchange exchange = new Exchange(immutableTag, manifestWriteRepository(context, registryRequest),
+                    isWriteRequest(context.request().method()));
+            activeExchange = exchange;
+            writeAdmissionHeld = false;
+            context.response().closeHandler(closed -> exchange.end());
+            context.request().exceptionHandler(failure -> exchange.end());
+
+            lockRepositoryWritesThenCheck(context, registryRequest, exchange);
+        } catch (Throwable t) {
+            if (activeExchange != null) {
+                activeExchange.end();
+            } else {
+                if (tagClaimed) {
+                    release(immutableTag);
+                }
+                if (writeAdmissionHeld) {
+                    registryManager.releaseWriteAdmission();
+                }
+            }
+            throw t;
+        }
+    }
+
+    /**
+     * The repository a manifest write must hold the write lock of, or null when the request
+     * moves no manifest: only PUT and DELETE below a repository's {@code manifests/} path change
+     * which manifest a tag resolves to, so blob uploads and reads pass untouched.
+     */
+    private static String manifestWriteRepository(RoutingContext context, RegistryRequest request) {
+        String method = context.request().method().name();
+        if (!"PUT".equals(method) && !"DELETE".equals(method)) {
+            return null;
+        }
+        return request.backendUri().startsWith("/v2/" + request.storageRepositoryName() + MANIFESTS_PATH)
+                ? request.storageRepositoryName()
+                : null;
+    }
+
+    /**
+     * A manifest write takes its repository's write lock before anything of it reaches the
+     * registry. That is the same lock BatchDeleteImage holds across the sequence that drops a
+     * shared manifest by digest and writes it back under its surviving tags, so a push that
+     * arrives during such a delete waits here instead of landing between the drop and the
+     * write-back and being overwritten by the restore. The event loop thread must not block on
+     * the lock, so each poll rechecks; a waiting PUT drains its body into memory rather than
+     * leaving it unread, which keeps the connection's flow-control window moving for the
+     * exchange that holds the lock. A client that goes away ends the exchange and the polling
+     * with it.
+     */
+    private void lockRepositoryWritesThenCheck(RoutingContext context, RegistryRequest request, Exchange exchange) {
+        if (exchange.ended() || exchange.holdingWriteLock()) {
+            return;
+        }
+        // Bug #6150: If GC began while polling for the repository write lock, refuse the queued write request
+        if (registryManager.isGarbageCollecting() && isWriteRequest(context.request().method())) {
+            exchange.end();
+            registryUnavailable(context, "ECR registry is temporarily unavailable while garbage collection is in progress.");
+            return;
+        }
+        String repository = exchange.writeLockRepository();
+        if (repository == null || ecrService.tryLockRepositoryWrites(repository)) {
+            exchange.writeLockAcquired();
+            if (exchange.waitingBodyReady()) {
+                checkTagAndProxy(context, request, exchange);
+            }
+            return;
+        }
+        drainWaitingBody(context, request, exchange);
+        vertx.setTimer(REPOSITORY_LOCK_POLL_MILLIS,
+                ignored -> lockRepositoryWritesThenCheck(context, request, exchange));
+    }
+
+    /**
+     * Reads the whole body of a manifest PUT that waits for its repository's write lock into
+     * memory, so its bytes do not sit unread in the client connection's flow-control window:
+     * on one HTTP/2 connection they would fill the window the exchange holding the lock needs
+     * for its own remaining bytes, and neither push would ever finish. The buffered bytes are
+     * replayed to the registry in the live request's place once the exchange has the lock. A
+     * manifest DELETE sends no body and keeps waiting paused as before, and a PUT that takes
+     * the lock on the first try streams its body untouched.
+     */
+    private void drainWaitingBody(RoutingContext context, RegistryRequest request, Exchange exchange) {
+        if (!"PUT".equals(context.request().method().name()) || !exchange.startWaitingBody()) {
+            return;
+        }
+        context.request().handler(chunk -> {
+            if (exchange.ended()) {
+                return;
+            }
+            if (!exchange.appendWaitingBody(chunk)) {
+                exchange.end();
+                failUnlessGone(context, 413);
+            }
+        });
+        context.request().endHandler(ignored -> {
+            if (exchange.ended() || !exchange.finishWaitingBody()) {
+                return;
+            }
+            if (exchange.holdingWriteLock()) {
+                checkTagAndProxy(context, request, exchange);
+            }
+        });
+        context.request().resume();
+    }
+
+    private String immutableTag(RoutingContext context, RegistryRequest request) {
+        if (request.tag() == null || !"PUT".equals(context.request().method().name())
+                || !ecrService.isImageTagImmutable(request.repositoryName(), request.accountId(), request.region())) {
+            return null;
+        }
+        return EcrService.immutableTagKey(request.accountId(), request.region(), request.repositoryName(), request.tag());
+    }
+
+    private void checkTagAndProxy(RoutingContext context, RegistryRequest request, Exchange exchange) {
+        String immutableTag = exchange.immutableTag;
+        vertx.<Boolean>executeBlocking(promise -> {
+            try {
+                registryManager.ensureStarted();
+                if (immutableTag == null) {
+                    promise.complete(false);
+                    return;
+                }
+                String existing = registryManager.httpClient().headManifestDigest(
+                        request.storageRepositoryName(),
+                        request.tag(), null);
+                promise.complete(existing != null);
+            } catch (Exception e) {
+                promise.fail(e);
+            }
+        }).onComplete(result -> {
+            if (exchange.ended()) {
+                // The client went away during the check: nothing of this exchange reaches the
+                // registry.
+                return;
+            }
+            if (exchange.isWrite() && registryManager.isGarbageCollecting()) {
+                context.request().resume();
+                exchange.end();
+                registryUnavailable(context, "ECR registry is temporarily unavailable while garbage collection is in progress.");
+                return;
+            }
+            if (result.failed()) {
+                context.request().resume();
+                exchange.end();
+                registryUnavailable(context);
+            } else if (result.result()) {
+                context.request().resume();
+                exchange.end();
+                imageTagAlreadyExists(context, request);
+            } else {
+                proxy(context, request, exchange);
+            }
+        });
+    }
+
+    private void proxy(RoutingContext context, RegistryRequest request, Exchange exchange) {
+        URI backend = URI.create(registryManager.httpClient().baseUrl());
+        RequestOptions options = new RequestOptions()
+                .setHost(backend.getHost())
+                .setPort(backend.getPort() == -1 ? 80 : backend.getPort())
+                .setURI(request.backendUri())
+                .setMethod(context.request().method());
+        // A registry connection of its own for every exchange, never a place in a shared pool's
+        // queue. An HTTP/2 client such as crane sends a whole push as streams on one connection,
+        // so a pool of any size can be full of its uploads while another of its streams waits,
+        // paused. The waiting stream's unread bytes hold that connection's flow-control window,
+        // the uploads that do have a registry connection stop receiving data, and none of them
+        // ever gives its connection back.
+        HttpClient client = exchange.open(vertx.createHttpClient(new HttpClientOptions().setConnectTimeout(5_000)));
+        client.request(options).onComplete(upstreamRequest -> {
+            if (upstreamRequest.failed()) {
+                context.request().resume();
+                exchange.end();
+                registryUnavailable(context);
+                return;
+            }
+            HttpClientRequest clientReq = upstreamRequest.result();
+            copyRequestHeaders(context, clientReq);
+            clientReq.response().onComplete(upstreamResponse -> {
+                if (upstreamResponse.failed()) {
+                    exchange.end();
+                    failUnlessGone(context, 502);
+                    return;
+                }
+                handleRegistryResponse(context, request, exchange, upstreamResponse.result());
+            });
+            Buffer waitingBody = exchange.replayBody();
+            if (waitingBody == null) {
+                clientReq.send(context.request()).onFailure(ignored -> {
+                    exchange.end();
+                    failUnlessGone(context, 502);
+                });
+                context.request().resume();
+            } else {
+                clientReq.send(waitingBody).onFailure(ignored -> {
+                    exchange.end();
+                    failUnlessGone(context, 502);
+                });
+            }
+        });
+    }
+
+    private void handleRegistryResponse(RoutingContext context, RegistryRequest request, Exchange exchange,
+                                        HttpClientResponse upstream) {
+        if (exchange.ended()) {
+            return;
+        }
+        Runnable update = exchange.holdingWriteLock() ? manifestMetadataUpdate(context, request, upstream) : null;
+        if (update == null) {
+            forwardResponse(context, request, exchange, upstream);
+            return;
+        }
+        upstream.pause();
+        exchange.updatingManifestMetadata = true;
+        vertx.executeBlocking(() -> {
+            try {
+                update.run();
+            } catch (RuntimeException firstFailure) {
+                LOG.debugv(firstFailure, "Retrying ECR manifest metadata update for {0}", request.storageRepositoryName());
+                update.run();
+            }
+            return null;
+        }, false).onComplete(result -> {
+            exchange.updatingManifestMetadata = false;
+            if (result.failed()) {
+                LOG.warnv(result.cause(), "Registry accepted {0} {1}, but the ECR manifest metadata update failed",
+                        context.request().method(), request.backendUri());
+            }
+            if (exchange.endRequested) {
+                exchange.end();
+            } else {
+                forwardResponse(context, request, exchange, upstream);
+            }
+        });
+    }
+
+    private Runnable manifestMetadataUpdate(RoutingContext context, RegistryRequest request,
+                                             HttpClientResponse upstream) {
+        HttpMethod method = context.request().method();
+        if (method == HttpMethod.PUT && upstream.statusCode() == 201) {
+            String digest = upstream.getHeader("Docker-Content-Digest");
+            if (digest != null && !digest.isBlank()) {
+                Instant pushedAt = Instant.now();
+                return () -> ecrService.recordImagePush(request.accountId(), request.region(),
+                        request.repositoryName(), digest, pushedAt);
+            }
+        }
+        if (method == HttpMethod.DELETE && upstream.statusCode() == 202) {
+            String path = context.request().path();
+            String digest = path.substring(path.lastIndexOf('/') + 1);
+            // Registry V2 deletes a manifest by digest. A tag alone does not identify this metadata.
+            if (digest.contains(":")) {
+                return () -> ecrService.removeImagePush(request.accountId(), request.region(),
+                        request.repositoryName(), digest);
+            }
+        }
+        return null;
+    }
+
+    private static void forwardResponse(RoutingContext context, RegistryRequest request, Exchange exchange,
+                                        HttpClientResponse upstream) {
+        copyResponseHeaders(context, upstream, request);
+        upstream.pipeTo(context.response()).onComplete(ignored -> exchange.end());
+    }
+
+    private static void registryUnavailable(RoutingContext context) {
+        registryUnavailable(context, "ECR registry is unavailable. Check Docker and registry connectivity. "
+                + "When running Floci in Docker, use a user-defined network shared with the registry "
+                + "(FLOCI_SERVICES_ECR_DOCKER_NETWORK).");
+    }
+
+    private static void registryUnavailable(RoutingContext context, String message) {
+        if (!context.response().ended() && !context.response().closed()) {
+            context.response().putHeader("Docker-Distribution-API-Version", "registry/2.0");
+            registryError(context, 503, "UNAVAILABLE", message);
+        }
+    }
+
+    private static boolean isWriteRequest(HttpMethod method) {
+        return method == HttpMethod.POST
+                || method == HttpMethod.PUT
+                || method == HttpMethod.PATCH
+                || method == HttpMethod.DELETE;
+    }
+
+    /** Answers {@code status} unless the response is already written or its client went away. */
+    private static void failUnlessGone(RoutingContext context, int status) {
+        if (!context.response().ended() && !context.response().closed()) {
+            context.response().setStatusCode(status).end();
+        }
+    }
+
+    private static void copyRequestHeaders(RoutingContext context, HttpClientRequest upstream) {
+        context.request().headers().forEach(header -> {
+            if (!HOP_BY_HOP_HEADERS.contains(header.getKey().toLowerCase())
+                    && !"host".equalsIgnoreCase(header.getKey())
+                    && !"authorization".equalsIgnoreCase(header.getKey())) {
+                upstream.headers().add(header.getKey(), header.getValue());
+            }
+        });
+        if (context.request().getHeader("Content-Length") == null
+                && ("chunked".equalsIgnoreCase(context.request().getHeader("Transfer-Encoding"))
+                || context.request().method() == HttpMethod.POST
+                || context.request().method() == HttpMethod.PUT
+                || context.request().method() == HttpMethod.PATCH)) {
+            upstream.setChunked(true);
+        }
+    }
+
+    private static void copyResponseHeaders(RoutingContext context,
+                                            HttpClientResponse upstream,
+                                            RegistryRequest request) {
+        context.response().setStatusCode(upstream.statusCode());
+        upstream.headers().forEach(header -> {
+            if (!HOP_BY_HOP_HEADERS.contains(header.getKey().toLowerCase())) {
+                String value = "location".equalsIgnoreCase(header.getKey())
+                        ? externalLocation(header.getValue(), request)
+                        : header.getValue();
+                context.response().putHeader(header.getKey(), value);
+            }
+        });
+    }
+
+    static String externalLocation(String location, RegistryRequest request) {
+        String prefix = "/v2/" + request.storageRepositoryName();
+        return location.replace(prefix, "/v2/" + request.clientRepositoryName());
+    }
+
+    private static void imageTagAlreadyExists(RoutingContext context, RegistryRequest request) {
+        String tag = request.tag() != null ? request.tag() : "";
+        String repository = request.repositoryName() != null ? request.repositoryName() : "";
+        String message = String.format(
+                "The image tag %s already exists in the %s repository and cannot be overwritten because the tag is immutable.",
+                tag, repository);
+        registryError(context, 400, "TAG_INVALID", message);
+    }
+
+    private static void registryError(RoutingContext context, int status, String code, String message) {
+        context.response().setStatusCode(status)
+                .putHeader("Content-Type", "application/json")
+                .end(new JsonObject().put("errors", new JsonArray().add(new JsonObject()
+                        .put("code", code).put("message", message))).encode());
+    }
+
+    private void release(String immutableTag) {
+        if (immutableTag != null) {
+            ecrService.releaseImmutableTag(immutableTag);
+        }
+    }
+
+    /**
+     * One proxied request: the registry client it opens once it gets that far, the immutable
+     * tag it holds, the repository write lock it holds once a manifest write has it, and the
+     * body a manifest PUT drains while it waits for that lock. It ends once, at whichever
+     * comes first of the registry's answer, a failure and the client going away; the close
+     * handler also fires after an exchange that ended normally, when another exchange may
+     * already hold the same tag.
+     */
+    private final class Exchange {
+
+        private final String immutableTag;
+        private final String writeLockRepository;
+        private final boolean isWrite;
+        private final AtomicBoolean writeLockHeld = new AtomicBoolean();
+        private final AtomicBoolean ended = new AtomicBoolean();
+        private final AtomicBoolean admissionReleased = new AtomicBoolean();
+        private Buffer waitingBody;
+        private boolean waitingBodyRead;
+        private boolean updatingManifestMetadata;
+        private boolean endRequested;
+        private HttpClient client;
+
+        private Exchange(String immutableTag, String writeLockRepository, boolean isWrite) {
+            this.immutableTag = immutableTag;
+            this.writeLockRepository = writeLockRepository;
+            this.isWrite = isWrite;
+        }
+
+        private boolean isWrite() {
+            return isWrite;
+        }
+
+        private boolean ended() {
+            return ended.get();
+        }
+
+        private String writeLockRepository() {
+            return writeLockRepository;
+        }
+
+        private boolean holdingWriteLock() {
+            return writeLockHeld.get();
+        }
+
+        private void writeLockAcquired() {
+            if (writeLockRepository != null) {
+                writeLockHeld.set(true);
+            }
+        }
+
+        /**
+         * Starts the buffer a waiting manifest PUT drains its body into, once: from here the
+         * bytes are read instead of left to hold the client connection's flow-control window.
+         */
+        private boolean startWaitingBody() {
+            if (waitingBody != null) {
+                return false;
+            }
+            waitingBody = Buffer.buffer();
+            return true;
+        }
+
+        /** Appends one chunk of the drained body, or refuses it past the buffering limit. */
+        private boolean appendWaitingBody(Buffer chunk) {
+            waitingBody.appendBuffer(chunk);
+            return waitingBody.length() <= WAITING_MANIFEST_BODY_LIMIT_BYTES;
+        }
+
+        /** Marks the drained body complete, once; the exchange may then continue to the registry. */
+        private boolean finishWaitingBody() {
+            if (waitingBodyRead) {
+                return false;
+            }
+            waitingBodyRead = true;
+            return true;
+        }
+
+        /** Whether nothing of a waiting body still holds the exchange back from the registry. */
+        private boolean waitingBodyReady() {
+            return waitingBody == null || waitingBodyRead;
+        }
+
+        /** The drained body to send the registry in the live request's place, or null. */
+        private Buffer replayBody() {
+            return waitingBodyRead ? waitingBody : null;
+        }
+
+        private HttpClient open(HttpClient registryClient) {
+            client = registryClient;
+            return registryClient;
+        }
+
+        private void releaseAdmission() {
+            if (isWrite && admissionReleased.compareAndSet(false, true)) {
+                registryManager.releaseWriteAdmission();
+            }
+        }
+
+        private void end() {
+            if (updatingManifestMetadata) {
+                // Keep the repository lock until the metadata write finishes, even on disconnect.
+                endRequested = true;
+                return;
+            }
+            if (!ended.compareAndSet(false, true)) {
+                return;
+            }
+            releaseWriteLock();
+            if (client == null) {
+                try {
+                    releaseAdmission();
+                } finally {
+                    release(immutableTag);
+                }
+                return;
+            }
+            // Closing the client closes the exchange's registry connection, which the registry
+            // sees and aborts on. The tag and write admission are free only once it is closed, so
+            // another write of the tag or garbage collection cannot start while this one can still
+            // reach the registry.
+            client.close().onComplete(closed -> {
+                try {
+                    releaseAdmission();
+                } finally {
+                    release(immutableTag);
+                }
+            });
+        }
+
+        private void releaseWriteLock() {
+            if (writeLockRepository != null && writeLockHeld.compareAndSet(true, false)) {
+                ecrService.unlockRepositoryWrites(writeLockRepository);
+            }
+        }
+    }
+
+    private RegistryRequest requireRepositoryActions(RoutingContext context, RegistryRequest request,
+                                                     EcrRegistryAuthorization.Identity identity) {
+        String path = context.request().path();
+        String method = context.request().method().name();
+        if (("/v2/".equals(path) || "/v2".equals(path)) && "GET".equals(method)) {
+            return request;
+        }
+        for (String action : actions(method, request.backendUri(), request.storageRepositoryName())) {
+            permit(context, identity, request, request.repositoryName(), action);
+        }
+        String mount = queryParameter(context.request().query(), "mount");
+        if (!"POST".equals(method) || mount.isBlank()) {
+            return request;
+        }
+        String from = queryParameter(context.request().query(), "from");
+        String storageFrom = null;
+        if (!from.isBlank()) {
+            Optional<RegistryRequest> source = requestFor(context.request().host(), "/v2/" + from + "/manifests/mount",
+                    context.request().query(), config.services().ecr().uriStyle());
+            if (source.isPresent() && source.get().accountId().equals(request.accountId())
+                    && source.get().region().equals(request.region())) {
+                try {
+                    permit(context, identity, source.get(), source.get().repositoryName(), "ecr:GetDownloadUrlForLayer");
+                    storageFrom = ecrService.registryRepositoryName(source.get().repositoryName(),
+                            source.get().accountId(), source.get().region());
+                } catch (AwsException unavailable) {
+                    if (unavailable.getHttpStatus() != 403 && unavailable.getHttpStatus() != 404) {
+                        throw unavailable;
+                    }
+                    // Distribution mount is optional: retain the authorized ordinary-upload path.
+                }
+            }
+        }
+        return request.withBackendUri(mountQuery(request.backendUri(), storageFrom, mount));
+    }
+
+    private static String mountQuery(String uri, String storageFrom, String mount) {
+        String[] parts = uri.split("\\?", 2);
+        List<String> parameters = new ArrayList<>();
+        if (parts.length == 2) {
+            for (String parameter : parts[1].split("&")) {
+                String name = URLDecoder.decode(parameter.split("=", 2)[0], StandardCharsets.UTF_8);
+                if (!name.equals("from") && !name.equals("mount")) {
+                    parameters.add(parameter);
+                }
+            }
+        }
+        if (storageFrom != null) {
+            parameters.add("from=" + URLEncoder.encode(storageFrom, StandardCharsets.UTF_8));
+            parameters.add("mount=" + URLEncoder.encode(mount, StandardCharsets.UTF_8));
+        }
+        return parts[0] + (parameters.isEmpty() ? "" : "?" + String.join("&", parameters));
+    }
+
+    private void permit(RoutingContext context, EcrRegistryAuthorization.Identity identity, RegistryRequest request,
+                        String repository, String action) {
+        if (!repository.matches("[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*")) {
+            throw new AwsException("DENIED", "Invalid repository name", 403);
+        }
+        Repository metadata = ecrService.registryRepository(repository, request.accountId(), request.region())
+                .orElseThrow(() -> new AwsException(
+                        "NAME_UNKNOWN", "Repository does not exist", 404));
+        String arn = AwsArnUtils.Arn.of(
+                "ecr", request.region(), request.accountId(), "repository/" + repository).toString();
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        conditions.put("aws:SecureTransport", List.of(Boolean.toString(context.request().isSSL())));
+        if (context.request().remoteAddress() != null) {
+            conditions.put("aws:SourceIp", List.of(context.request().remoteAddress().hostAddress()));
+        }
+        metadata.getTags().forEach((key, value) -> {
+            conditions.put("aws:ResourceTag/" + key, List.of(value));
+            conditions.put("ecr:ResourceTag/" + key, List.of(value));
+        });
+        authorization.requirePermission(identity, action, arn, metadata.getRepositoryPolicyText(), conditions);
+        if (identity.pullScope() != null) {
+            authorization.requirePullPermissions(identity, arn, metadata.getRepositoryPolicyText(), conditions);
+        }
+    }
+
+    static List<String> actions(String method, String backendUri, String storageRepository) {
+        String prefix = "/v2/" + storageRepository;
+        String path = backendUri.split("\\?", 2)[0];
+        if (storageRepository.isEmpty() || !path.startsWith(prefix + "/")) {
+            throw new AwsException("DENIED", "Unsupported registry operation", 403);
+        }
+        String operation = path.substring(prefix.length());
+        String action = null;
+        if (operation.startsWith("/manifests/")) {
+            action = switch (method) {
+                case "GET", "HEAD" -> "ecr:BatchGetImage";
+                case "PUT" -> "ecr:PutImage";
+                default -> null;
+            };
+        } else if (operation.startsWith("/blobs/uploads/")) {
+            action = switch (method) {
+                case "POST" -> "ecr:InitiateLayerUpload";
+                case "PATCH" -> "ecr:UploadLayerPart";
+                case "PUT" -> "ecr:CompleteLayerUpload";
+                default -> null;
+            };
+        } else if (operation.startsWith("/blobs/")) {
+            action = switch (method) {
+                case "GET" -> "ecr:GetDownloadUrlForLayer";
+                case "HEAD" -> "ecr:BatchCheckLayerAvailability";
+                default -> null;
+            };
+        } else if ("/tags/list".equals(operation) && "GET".equals(method)) {
+            action = "ecr:ListImages";
+        }
+        if (action == null) {
+            throw new AwsException("DENIED", "Unsupported registry operation", 403);
+        }
+        return List.of(action);
+    }
+
+    private static Matcher registryHost(String host) {
+        String value = host == null ? "" : host;
+        Matcher nativeHost = NATIVE_ECR_HOST.matcher(value);
+        if (nativeHost.matches() && AwsPartitions.forRegion(nativeHost.group(2))
+                .filter(partition -> partition.dnsSuffix().equals(nativeHost.group(3))).isPresent()) {
+            return nativeHost;
+        }
+        return ECR_HOST.matcher(value);
+    }
+
+    static Optional<RegistryRequest> requestFor(String host, String path, String query, String uriStyle) {
+        String registryPath = "/v2".equals(path) ? "/v2/" : path;
+        if (!registryPath.startsWith("/v2/")) {
+            return Optional.empty();
+        }
+        Matcher hostMatch = registryHost(host, query);
+        if (hostMatch != null) {
+            String repository = "/v2/".equals(registryPath) ? "" : repositoryName(registryPath.substring("/v2/".length()));
+            String storageRepositoryName = hostMatch.group(1) + "/" + hostMatch.group(2) + "/" + repository;
+            String backendUri = repository.isEmpty()
+                    ? registryPath + querySuffix(query, true)
+                    : "/v2/" + storageRepositoryName
+                            + registryPath.substring("/v2/".length() + repository.length())
+                            + querySuffix(query, true);
+            return Optional.of(new RegistryRequest(hostMatch.group(1), hostMatch.group(2), repository,
+                    storageRepositoryName, repository, backendUri,
+                    tag(path)));
+        }
+        // A loopback host is the address Floci itself hands a Docker daemon other than Docker Desktop
+        // for the ECS, Lambda and EMR Serverless images it pulls, path style in either URI style
+        // (see rewriteImageUri).
+        if (!"path".equalsIgnoreCase(uriStyle) && !isLoopbackHost(host)) {
+            return Optional.empty();
+        }
+
+        if ("/v2/".equals(registryPath)) {
+            return Optional.of(new RegistryRequest("", "", "", "", "", registryPath + querySuffix(query, true), null));
+        }
+
+        String[] segments = registryPath.substring("/v2/".length()).split("/", 3);
+        if (segments.length < 3 || !segments[0].matches("[0-9]{12}")
+                || !segments[1].matches("[a-z0-9-]+")) {
+            return Optional.empty();
+        }
+        String repository = repositoryName(segments[2]);
+        String storageRepositoryName = segments[0] + "/" + segments[1] + "/" + repository;
+        return Optional.of(new RegistryRequest(segments[0], segments[1], repository,
+                storageRepositoryName, storageRepositoryName,
+                registryPath + querySuffix(query, true), tag(registryPath)));
+    }
+
+    /**
+     * The registry a request is for: its host when that is a Floci repository host, else the registry a mirror request
+     * names in {@code ns}, a Floci repository host or an account's AWS registry host in that region's partition. A request
+     * with a native AWS registry host is also accepted on its standard HTTPS port.
+     */
+    private static Matcher registryHost(String host, String query) {
+        Matcher byHost = registryHost(host);
+        if (byHost.matches()) {
+            return byHost;
+        }
+        String namespace = queryParameter(query, "ns");
+        Matcher byNamespace = ECR_HOST.matcher(namespace);
+        if (byNamespace.matches()) {
+            return byNamespace;
+        }
+        Matcher mirrored = AWS_ECR_HOST.matcher(namespace);
+        return mirrored.matches() && AwsPartitions.forRegion(mirrored.group(2))
+                .filter(partition -> partition.dnsSuffix().equals(mirrored.group(3))).isPresent() ? mirrored : null;
+    }
+
+    private static boolean isLoopbackHost(String host) {
+        HostAndPort authority = host == null ? null : HostAndPort.parseAuthority(host, -1);
+        return authority != null && NetworkExposureGuard.isLoopback(authority.host());
+    }
+
+    private static String querySuffix(String query, boolean removeNamespace) {
+        if (query == null || query.isEmpty()) {
+            return "";
+        }
+        StringBuilder forwarded = new StringBuilder();
+        for (String parameter : query.split("&")) {
+            if (removeNamespace && parameter.startsWith("ns=")) {
+                continue;
+            }
+            if (!forwarded.isEmpty()) {
+                forwarded.append('&');
+            }
+            forwarded.append(parameter);
+        }
+        return forwarded.isEmpty() ? "" : "?" + forwarded;
+    }
+
+    private static String queryParameter(String query, String name) {
+        if (query == null || query.isEmpty()) {
+            return "";
+        }
+        for (String parameter : query.split("&")) {
+            int separator = parameter.indexOf('=');
+            if (separator > 0 && name.equals(URLDecoder.decode(parameter.substring(0, separator), StandardCharsets.UTF_8))) {
+                return URLDecoder.decode(parameter.substring(separator + 1), StandardCharsets.UTF_8);
+            }
+        }
+        return "";
+    }
+
+    private static String repositoryName(String path) {
+        int manifests = path.indexOf(MANIFESTS_PATH);
+        if (manifests >= 0) {
+            return path.substring(0, manifests);
+        }
+        int blobs = path.indexOf("/blobs/");
+        if (blobs >= 0) {
+            return path.substring(0, blobs);
+        }
+        int tags = path.indexOf("/tags/");
+        return tags >= 0 ? path.substring(0, tags) : path;
+    }
+
+    private static String tag(String path) {
+        int manifests = path.indexOf(MANIFESTS_PATH);
+        if (manifests < 0) {
+            return null;
+        }
+        String reference = path.substring(manifests + MANIFESTS_PATH.length());
+        return reference.isEmpty() || reference.contains("/") || reference.contains(":") ? null : reference;
+    }
+
+    record RegistryRequest(String accountId,
+                           String region,
+                           String repositoryName,
+                           String storageRepositoryName,
+                           String clientRepositoryName,
+                           String backendUri,
+                           String tag) {
+        RegistryRequest withBackendUri(String uri) {
+            return new RegistryRequest(accountId, region, repositoryName, storageRepositoryName,
+                    clientRepositoryName, uri, tag);
+        }
+
+        RegistryRequest withStorageRepositoryName(String storageRepositoryName) {
+            return new RegistryRequest(accountId, region, repositoryName, storageRepositoryName,
+                    clientRepositoryName,
+                    backendUri.replace("/v2/" + this.storageRepositoryName, "/v2/" + storageRepositoryName), tag);
+        }
+    }
+}

@@ -1,0 +1,403 @@
+package io.floci.aws.services.dynamodb.backend;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.storage.AccountAwareStorageBackend;
+import io.floci.aws.core.storage.StorageBackend;
+import io.floci.aws.core.storage.StorageFactory;
+import io.floci.aws.services.dynamodb.DynamoDbJsonHandler;
+import io.floci.aws.services.dynamodb.DynamoDbService;
+import io.floci.aws.services.dynamodb.DynamoDbStreamService;
+import io.floci.aws.services.dynamodb.DynamoDbStreamsJsonHandler;
+import io.floci.aws.services.dynamodb.DynamoDbTtlService;
+import io.floci.aws.services.dynamodb.KinesisStreamingForwarder;
+import io.floci.aws.services.dynamodb.NativeDynamoDbJsonHandler;
+import io.floci.aws.services.dynamodb.NativeDynamoDbStreamsJsonHandler;
+import io.floci.aws.services.dynamodb.NativeDynamoDbTableService;
+import io.floci.aws.services.dynamodb.backend.DynamoDbOperations.Api;
+import io.floci.aws.services.dynamodb.backend.DynamoDbOperations.Call;
+import io.floci.aws.services.dynamodb.backend.DynamoDbOperations.Reply;
+import io.floci.aws.services.dynamodb.backend.DynamoDbOperations.Scope;
+import io.floci.aws.services.dynamodb.backend.DynamoDbTableAccess.TimeToLive;
+import io.floci.aws.services.dynamodb.model.AttributeDefinition;
+import io.floci.aws.services.dynamodb.model.KeySchemaElement;
+import io.floci.aws.services.kinesis.KinesisService;
+import jakarta.ws.rs.core.Response;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.mockito.InOrder;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
+import static org.mockito.Mockito.inOrder;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+/** The native engine behind the DynamoDB seam, and the thin public handlers in front of it. */
+class DynamoDbNativeBackendTest {
+
+    private static final String ACCOUNT = "000000000000";
+    private static final String REGION = "us-east-1";
+    private static final Scope SCOPE = new Scope(ACCOUNT, REGION);
+    private static final String TABLE = "orders";
+
+    private final ObjectMapper mapper = new ObjectMapper();
+    private final List<StorageBackend<?, ?>> stores = new ArrayList<>();
+    private final KinesisStreamingForwarder forwarder = mock(KinesisStreamingForwarder.class);
+    private final DynamoDbTtlService ttl = mock(DynamoDbTtlService.class);
+    private NativeDynamoDbBackend backend;
+
+    @BeforeEach
+    void setUp() {
+        StorageFactory storageFactory = mock(StorageFactory.class);
+        when(storageFactory.create(anyString(), anyString(), any())).thenAnswer(invocation -> {
+            AccountAwareStorageBackend<Object> store = AccountAwareStorageBackend.inMemory(ACCOUNT);
+            stores.add(store);
+            return store;
+        });
+        EmulatorConfig streamConfig = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(streamConfig.services().dynamodb().streamShardCount()).thenReturn(1);
+        when(streamConfig.services().dynamodb().streamMaxRecords()).thenReturn(1000);
+        DynamoDbStreamService streams = new DynamoDbStreamService(mapper, storageFactory, streamConfig);
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.services().dynamodb().backend()).thenReturn("native");
+        DynamoDbService service = new DynamoDbService(storageFactory, new RegionResolver(REGION, ACCOUNT), streams,
+                forwarder, null, mapper, config);
+        NativeDynamoDbTableService tables = new NativeDynamoDbTableService(service, streams, mock(KinesisService.class));
+        backend = new NativeDynamoDbBackend(new NativeDynamoDbJsonHandler(service, tables, mapper,
+                        mock(EmulatorConfig.class, RETURNS_DEEP_STUBS)),
+                new NativeDynamoDbStreamsJsonHandler(streams, service, new RegionResolver(REGION, ACCOUNT), mapper),
+                tables, service, streams, ttl, mapper);
+    }
+
+    private Reply call(Api api, String action, JsonNode body) throws Exception {
+        return backend.execute(new Call(SCOPE, api, action, body));
+    }
+
+    private Reply createTable(String extraFields) throws Exception {
+        return call(Api.DYNAMODB, "CreateTable", json("""
+                {"TableName":"%s",
+                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+                 "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"}],
+                 "BillingMode":"PAY_PER_REQUEST"%s}
+                """.formatted(TABLE, extraFields)));
+    }
+
+    private JsonNode json(String text) throws Exception {
+        return mapper.readTree(text);
+    }
+
+    @Test
+    void lifecycleDrivesTheTtlSweep() {
+        backend.start();
+        verify(ttl).start();
+
+        backend.beforeReset();
+        verify(ttl).pause();
+
+        backend.afterReset();
+        verify(ttl).resume();
+
+        backend.stop();
+        verify(ttl).stop();
+    }
+
+    @Test
+    void stopEndsKinesisForwardingAfterTheTtlSweep() {
+        backend.stop();
+
+        InOrder order = inOrder(ttl, forwarder);
+        order.verify(ttl).stop();
+        order.verify(forwarder).clear();
+    }
+
+    @Test
+    void resetDropsTheEngineProcessState() throws Exception {
+        createTable(",\"StreamSpecification\":{\"StreamEnabled\":true,\"StreamViewType\":\"KEYS_ONLY\"}");
+        JsonNode transact = json("""
+                {"ClientRequestToken":"token-1",
+                 "TransactItems":[{"Put":{"TableName":"%s","Item":{"id":{"S":"a"}}}}]}
+                """.formatted(TABLE));
+        call(Api.DYNAMODB, "TransactWriteItems", transact);
+
+        // An emulator reset wipes Floci storage before it resets the engine.
+        stores.forEach(StorageBackend::clear);
+        backend.reset();
+        createTable("");
+        call(Api.DYNAMODB, "TransactWriteItems", transact);
+
+        Reply streams = call(Api.DYNAMODB_STREAMS, "ListStreams", mapper.createObjectNode());
+        assertEquals(0, streams.body().path("Streams").size());
+        JsonNode key = json("{\"id\":{\"S\":\"a\"}}");
+        assertEquals(key, backend.getItem(SCOPE, TABLE, key), "the reused token writes again");
+        verify(forwarder).clear();
+    }
+
+    @Test
+    void rawDeleteTableHonoursDeletionProtectionWhileTypedDeleteDoesNot() throws Exception {
+        createTable(",\"DeletionProtectionEnabled\":true");
+
+        AwsException refused = assertThrows(AwsException.class,
+                () -> call(Api.DYNAMODB, "DeleteTable", json("{\"TableName\":\"" + TABLE + "\"}")));
+        assertEquals("ValidationException", refused.getErrorCode());
+        assertTrue(backend.findTable(SCOPE, TABLE).isPresent());
+
+        backend.deleteTable(SCOPE, TABLE);
+
+        assertTrue(backend.findTable(SCOPE, TABLE).isEmpty());
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', textBlock = """
+            attribute_not_exist(id) | attribute_not_exist
+            NOT attribute_exist(id) | attribute_exist
+            ATTRIBUTE_EXISTS(id)    | ATTRIBUTE_EXISTS
+            """)
+    void typedScanRefusesAnUnknownFilterFunction(String filter, String function) throws Exception {
+        createTable("");
+        backend.putItem(SCOPE, TABLE, json("{\"id\":{\"S\":\"k\"}}"), null, null, null);
+
+        AwsException refused = assertThrows(AwsException.class,
+                () -> backend.scan(SCOPE, TABLE, filter, null, null, null, null, null));
+
+        assertEquals("ValidationException", refused.getErrorCode());
+        assertEquals("Invalid FilterExpression: Invalid function name; function: " + function, refused.getMessage());
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', textBlock = """
+            putItem    | nope(id)             | nope
+            putItem    | ATTRIBUTE_EXISTS(id) | ATTRIBUTE_EXISTS
+            updateItem | nope(id)             | nope
+            updateItem | ATTRIBUTE_EXISTS(id) | ATTRIBUTE_EXISTS
+            deleteItem | nope(id)             | nope
+            deleteItem | ATTRIBUTE_EXISTS(id) | ATTRIBUTE_EXISTS
+            """)
+    void typedWritesRefuseAnUnknownConditionFunction(String call, String condition, String function)
+            throws Exception {
+        createTable("");
+        JsonNode key = json("{\"id\":{\"S\":\"k\"}}");
+        backend.putItem(SCOPE, TABLE, key, null, null, null);
+
+        AwsException refused = assertThrows(AwsException.class, () -> {
+            switch (call) {
+                case "putItem" -> backend.putItem(SCOPE, TABLE, key, condition, null, null);
+                case "updateItem" -> backend.updateItem(SCOPE, TABLE, key, null, "SET n = :v", null,
+                        json("{\":v\":{\"N\":\"1\"}}"), "NONE", condition);
+                default -> backend.deleteItem(SCOPE, TABLE, key, condition, null, null);
+            }
+        });
+
+        assertEquals("ValidationException", refused.getErrorCode());
+        assertEquals("1 validation error detected: Invalid ConditionExpression: Invalid function name; function: "
+                + function, refused.getMessage());
+    }
+
+    @Test
+    void typedPutRefusesBetweenBoundsOfDifferentTypes() throws Exception {
+        createTable("");
+        JsonNode key = json("{\"id\":{\"S\":\"k\"}}");
+
+        AwsException refused = assertThrows(AwsException.class, () -> backend.putItem(SCOPE, TABLE, key,
+                "n BETWEEN :a AND :b", null, json("{\":a\":{\"N\":\"3\"},\":b\":{\"S\":\"3\"}}")));
+
+        assertEquals("ValidationException", refused.getErrorCode());
+        assertEquals("1 validation error detected: Invalid ConditionExpression: The BETWEEN operator requires "
+                + "same data type for lower and upper bounds; lower bound operand: AttributeValue: {N:3}, "
+                + "upper bound operand: AttributeValue: {S:3}", refused.getMessage());
+    }
+
+    @Test
+    void typedUpdateItemReturnsOnlyTheRequestedImage() throws Exception {
+        backend.createTable(SCOPE, TABLE, List.of(new KeySchemaElement("id", "HASH")),
+                List.of(new AttributeDefinition("id", "S")), 5L, 5L, List.of(), List.of());
+        JsonNode key = json("{\"id\":{\"S\":\"k\"}}");
+        backend.putItem(SCOPE, TABLE, json("{\"id\":{\"S\":\"k\"},\"n\":{\"N\":\"1\"}}"), null, null, null);
+        JsonNode names = json("{\"#n\":\"n\"}");
+
+        JsonNode newImage = backend.updateItem(SCOPE, TABLE, key, null, "SET #n = :v", names,
+                json("{\":v\":{\"N\":\"2\"}}"), "ALL_NEW", null);
+        JsonNode oldImage = backend.updateItem(SCOPE, TABLE, key, null, "SET #n = :v", names,
+                json("{\":v\":{\"N\":\"3\"}}"), "ALL_OLD", null);
+        JsonNode none = backend.updateItem(SCOPE, TABLE, key, null, "SET #n = :v", names,
+                json("{\":v\":{\"N\":\"4\"}}"), "NONE", null);
+        JsonNode updatedNew = backend.updateItem(SCOPE, TABLE, key, null, "SET #n = :v", names,
+                json("{\":v\":{\"N\":\"5\"}}"), "UPDATED_NEW", null);
+
+        assertEquals(json("{\"id\":{\"S\":\"k\"},\"n\":{\"N\":\"2\"}}"), newImage);
+        assertEquals(json("{\"id\":{\"S\":\"k\"},\"n\":{\"N\":\"2\"}}"), oldImage);
+        assertNull(none);
+        assertNull(updatedNew);
+        assertEquals(json("{\"id\":{\"S\":\"k\"},\"n\":{\"N\":\"5\"}}"), backend.getItem(SCOPE, TABLE, key));
+    }
+
+    @Test
+    void typedWritesStoreMapKeysInCodePointOrder() throws Exception {
+        backend.createTable(SCOPE, TABLE, List.of(new KeySchemaElement("id", "HASH")),
+                List.of(new AttributeDefinition("id", "S")), 5L, 5L, List.of(), List.of());
+        JsonNode key = json("{\"id\":{\"S\":\"k\"}}");
+
+        backend.putItem(SCOPE, TABLE,
+                json("{\"id\":{\"S\":\"k\"},\"m\":{\"M\":{\"z\":{\"S\":\"1\"},\"b\":{\"S\":\"2\"}}}}"),
+                null, null, null);
+        assertEquals("b,z", keys(backend.getItem(SCOPE, TABLE, key).get("m").get("M")));
+
+        backend.updateItem(SCOPE, TABLE, key, null, "SET p = :p", null,
+                json("{\":p\":{\"M\":{\"z\":{\"S\":\"1\"},\"b\":{\"S\":\"2\"}}}}"), "NONE", null);
+        assertEquals("b,z", keys(backend.getItem(SCOPE, TABLE, key).get("p").get("M")));
+
+        backend.updateItem(SCOPE, TABLE, key,
+                json("{\"q\":{\"Action\":\"PUT\",\"Value\":{\"M\":{\"z\":{\"S\":\"1\"},\"b\":{\"S\":\"2\"}}}}}"),
+                null, null, null, "NONE", null);
+        assertEquals("b,z", keys(backend.getItem(SCOPE, TABLE, key).get("q").get("M")));
+    }
+
+    private static String keys(JsonNode node) {
+        List<String> names = new ArrayList<>();
+        node.fieldNames().forEachRemaining(names::add);
+        return String.join(",", names);
+    }
+
+    @Test
+    void storedTagsAreTheTablesForItAndItsIndexesInTheArnsAccountAndRegionAndTaggingPutsANewMap() throws Exception {
+        call(Api.DYNAMODB, "CreateTable", json("""
+                {"TableName":"%s",
+                 "KeySchema":[{"AttributeName":"id","KeyType":"HASH"}],
+                 "AttributeDefinitions":[{"AttributeName":"id","AttributeType":"S"},
+                                         {"AttributeName":"customer","AttributeType":"S"}],
+                 "GlobalSecondaryIndexes":[{"IndexName":"byCustomer",
+                                            "KeySchema":[{"AttributeName":"customer","KeyType":"HASH"}],
+                                            "Projection":{"ProjectionType":"ALL"}}],
+                 "BillingMode":"PAY_PER_REQUEST",
+                 "Tags":[{"Key":"team","Value":"data"}]}
+                """.formatted(TABLE)));
+        String arn = backend.describeTable(SCOPE, TABLE).getTableArn();
+        Map<String, String> held = backend.listTagsOfResource(SCOPE, arn);
+
+        assertEquals(Map.of("team", "data"), backend.storedTags(arn));
+        assertEquals(Map.of("team", "data"), backend.storedTags(arn + "/index/byCustomer"));
+        assertEquals(Map.of(), backend.storedTags(arn + "/index/byStatus"));
+        assertEquals(Map.of(), backend.storedTags(arn + "/stream/2026-11-16T00:00:00.000"));
+        assertEquals(Map.of(), backend.storedTags(arn.replace(ACCOUNT, "111122223333")));
+        assertEquals(Map.of(), backend.storedTags(arn.replace(REGION, "us-west-2")));
+        assertEquals(Map.of(), backend.storedTags(arn.replace("arn:aws:", "arn:aws-cn:")));
+
+        backend.tagResource(SCOPE, arn, Map.of("stage", "prod"));
+        backend.untagResource(SCOPE, arn, List.of("team"));
+
+        assertEquals(Map.of("stage", "prod"), backend.storedTags(arn + "/index/byCustomer"));
+        assertEquals(Map.of("team", "data"), held);
+    }
+
+    @Test
+    void typedTimeToLiveIsWhatDescribeTimeToLiveReportsUnderTheScopesAccount() throws Exception {
+        Scope owner = new Scope("111122223333", REGION);
+        backend.createTable(owner, TABLE, List.of(new KeySchemaElement("id", "HASH")),
+                List.of(new AttributeDefinition("id", "S")), 5L, 5L, List.of(), List.of());
+        JsonNode describe = json("{\"TableName\":\"" + TABLE + "\"}");
+
+        assertEquals(new TimeToLive(false, null), backend.timeToLive(owner, TABLE));
+
+        backend.updateTimeToLive(owner, TABLE, "expiresAt", true);
+
+        assertEquals(new TimeToLive(true, "expiresAt"), backend.timeToLive(owner, TABLE));
+        JsonNode enabled = backend.execute(new Call(owner, Api.DYNAMODB, "DescribeTimeToLive", describe)).body();
+        assertEquals("ENABLED", enabled.path("TimeToLiveDescription").path("TimeToLiveStatus").asText());
+        assertEquals("expiresAt", enabled.path("TimeToLiveDescription").path("AttributeName").asText());
+
+        backend.updateTimeToLive(owner, TABLE, "expiresAt", false);
+
+        assertEquals(new TimeToLive(false, null), backend.timeToLive(owner, TABLE));
+        JsonNode disabled = backend.execute(new Call(owner, Api.DYNAMODB, "DescribeTimeToLive", describe)).body();
+        assertEquals("DISABLED", disabled.path("TimeToLiveDescription").path("TimeToLiveStatus").asText());
+    }
+
+    @Test
+    void unknownActionRepliesWithAJsonErrorBody() throws Exception {
+        Reply reply = call(Api.DYNAMODB, "NoSuchAction", mapper.createObjectNode());
+
+        assertEquals(400, reply.status());
+        assertEquals("UnknownOperationException", reply.body().path("__type").asText());
+        assertEquals("Operation NoSuchAction is not supported.", reply.body().path("message").asText());
+    }
+
+    @Test
+    void rawCallsRoundTripAnItem() throws Exception {
+        JsonNode item = json("{\"id\":{\"S\":\"a\"},\"v\":{\"S\":\"x\"}}");
+
+        assertEquals(200, createTable("").status());
+        ObjectNode put = mapper.createObjectNode().put("TableName", TABLE);
+        put.set("Item", item);
+        assertEquals(200, call(Api.DYNAMODB, "PutItem", put).status());
+        ObjectNode get = mapper.createObjectNode().put("TableName", TABLE);
+        get.set("Key", json("{\"id\":{\"S\":\"a\"}}"));
+        Reply reply = call(Api.DYNAMODB, "GetItem", get);
+
+        assertEquals(200, reply.status());
+        assertEquals(item, reply.body().path("Item"));
+    }
+
+    @Test
+    void streamsCallsReachTheStreamsHandler() throws Exception {
+        createTable(",\"StreamSpecification\":{\"StreamEnabled\":true,\"StreamViewType\":\"NEW_IMAGE\"}");
+
+        Reply reply = call(Api.DYNAMODB_STREAMS, "ListStreams", mapper.createObjectNode());
+
+        assertEquals(200, reply.status());
+        assertTrue(reply.body().path("Streams").isArray());
+        assertEquals(TABLE, reply.body().path("Streams").path(0).path("TableName").asText());
+    }
+
+    @Test
+    void scopeRejectsBlankAccountAndRegion() {
+        IllegalArgumentException account = assertThrows(IllegalArgumentException.class, () -> new Scope(" ", REGION));
+        IllegalArgumentException region = assertThrows(IllegalArgumentException.class, () -> new Scope(ACCOUNT, ""));
+
+        assertTrue(account.getMessage().contains("accountId"));
+        assertTrue(region.getMessage().contains("region"));
+        assertThrows(IllegalArgumentException.class, () -> new Scope(null, REGION));
+        assertThrows(IllegalArgumentException.class, () -> new Scope(ACCOUNT, null));
+    }
+
+    @Test
+    void thinHandlersPassTheCallersScopeAndRebuildTheReply() throws Exception {
+        List<Call> calls = new ArrayList<>();
+        JsonNode replyBody = json("{\"ok\":true}");
+        DynamoDbOperations recording = call -> {
+            calls.add(call);
+            return new Reply(201, replyBody, Map.of("X-Test", List.of("a", "b")));
+        };
+        RegionResolver resolver = new RegionResolver("eu-west-1", "111122223333");
+        JsonNode request = mapper.createObjectNode();
+
+        Response response = new DynamoDbJsonHandler(recording, resolver).handle("GetItem", request, "ap-south-1");
+        new DynamoDbJsonHandler(recording, resolver).handle("GetItem", request, null);
+        new DynamoDbStreamsJsonHandler(recording, resolver).handle("ListStreams", request, "ap-south-1");
+
+        assertEquals(new Call(new Scope("111122223333", "ap-south-1"), Api.DYNAMODB, "GetItem", request),
+                calls.get(0));
+        assertSame(request, calls.get(0).body());
+        assertEquals(new Scope("111122223333", "eu-west-1"), calls.get(1).scope());
+        assertEquals(Api.DYNAMODB_STREAMS, calls.get(2).api());
+        assertEquals(201, response.getStatus());
+        assertSame(replyBody, response.getEntity());
+        assertEquals(List.of("a", "b"), response.getStringHeaders().get("X-Test"));
+    }
+}

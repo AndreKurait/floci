@@ -1,0 +1,445 @@
+package io.floci.aws.services.eks;
+
+import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.ValidatableResponse;
+import org.junit.jupiter.api.MethodOrderer;
+import org.junit.jupiter.api.Order;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.TestMethodOrder;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+
+import java.util.UUID;
+
+import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.containsInAnyOrder;
+import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.hasKey;
+import static org.hamcrest.Matchers.hasSize;
+import static org.hamcrest.Matchers.not;
+import static org.hamcrest.Matchers.notNullValue;
+import static org.hamcrest.Matchers.nullValue;
+import static org.hamcrest.Matchers.startsWith;
+
+@QuarkusTest
+@TestMethodOrder(MethodOrderer.OrderAnnotation.class)
+class EksEncryptionLoggingIntegrationTest {
+
+    private static final String JSON = "application/json";
+    private static final String CLUSTER_WITH_ENC_LOG = "it-enc-log-cluster";
+    private static final String CLUSTER_DEFAULT = "it-default-enc-log-cluster";
+    private static final String KMS_KEY_ARN =
+            "arn:aws:kms:us-east-1:000000000000:key/12345678-1234-1234-1234-123456789012";
+
+    @Test
+    @Order(1)
+    void createClusterWithEncryptionConfigAndLoggingReturnsBothInWireResponse() {
+        String payload = "{"
+                + "\"name\":\"" + CLUSTER_WITH_ENC_LOG + "\","
+                + "\"roleArn\":\"arn:aws:iam::000000000000:role/eks-role\","
+                + "\"encryptionConfig\":[{"
+                + "  \"resources\":[\"secrets\"],"
+                + "  \"provider\":{\"keyArn\":\"" + KMS_KEY_ARN + "\"}"
+                + "}],"
+                + "\"logging\":{"
+                + "  \"clusterLogging\":[{"
+                + "    \"types\":[\"api\",\"audit\"],"
+                + "    \"enabled\":true"
+                + "  }]"
+                + "}"
+                + "}";
+
+        given().contentType(JSON)
+                .body(payload)
+                .when().post("/clusters")
+                .then().statusCode(200)
+                .body("cluster.name", equalTo(CLUSTER_WITH_ENC_LOG))
+                .body("cluster.encryptionConfig", hasSize(1))
+                .body("cluster.encryptionConfig[0].resources", hasSize(1))
+                .body("cluster.encryptionConfig[0].resources[0]", equalTo("secrets"))
+                .body("cluster.encryptionConfig[0].provider.keyArn", equalTo(KMS_KEY_ARN))
+                .body("cluster.logging.clusterLogging", hasSize(2))
+                .body("cluster.logging.clusterLogging[0].enabled", equalTo(true))
+                .body("cluster.logging.clusterLogging[0].types", containsInAnyOrder("api", "audit"))
+                .body("cluster.logging.clusterLogging[1].enabled", equalTo(false))
+                .body("cluster.logging.clusterLogging[1].types", containsInAnyOrder("authenticator", "controllerManager", "scheduler"));
+    }
+
+    @Test
+    @Order(2)
+    void describeClusterReturnsEncryptionConfigAndLoggingInWireResponse() {
+        given().contentType(JSON)
+                .when().get("/clusters/" + CLUSTER_WITH_ENC_LOG)
+                .then().statusCode(200)
+                .body("cluster.name", equalTo(CLUSTER_WITH_ENC_LOG))
+                .body("cluster.encryptionConfig", hasSize(1))
+                .body("cluster.encryptionConfig[0].resources", hasSize(1))
+                .body("cluster.encryptionConfig[0].resources[0]", equalTo("secrets"))
+                .body("cluster.encryptionConfig[0].provider.keyArn", equalTo(KMS_KEY_ARN))
+                .body("cluster.logging.clusterLogging", hasSize(2))
+                .body("cluster.logging.clusterLogging[0].enabled", equalTo(true))
+                .body("cluster.logging.clusterLogging[0].types", containsInAnyOrder("api", "audit"))
+                .body("cluster.logging.clusterLogging[1].enabled", equalTo(false))
+                .body("cluster.logging.clusterLogging[1].types", containsInAnyOrder("authenticator", "controllerManager", "scheduler"));
+    }
+
+    @Test
+    @Order(3)
+    void deleteClusterWithEncryptionAndLoggingCleansUp() {
+        given().contentType(JSON)
+                .when().delete("/clusters/" + CLUSTER_WITH_ENC_LOG)
+                .then().statusCode(200);
+    }
+
+    @Test
+    @Order(4)
+    void createClusterWithoutEncryptionConfigOrLoggingOmitsEncryptionConfigAndPopulatesDefaultLogging() {
+        String payload = "{"
+                + "\"name\":\"" + CLUSTER_DEFAULT + "\","
+                + "\"roleArn\":\"arn:aws:iam::000000000000:role/eks-role\""
+                + "}";
+
+        given().contentType(JSON)
+                .body(payload)
+                .when().post("/clusters")
+                .then().statusCode(200)
+                .body("cluster.name", equalTo(CLUSTER_DEFAULT))
+                .body("cluster.encryptionConfig", nullValue())
+                .body("cluster.logging.clusterLogging", hasSize(1))
+                .body("cluster.logging.clusterLogging[0].enabled", equalTo(false))
+                .body("cluster.logging.clusterLogging[0].types",
+                        containsInAnyOrder("api", "audit", "authenticator", "controllerManager", "scheduler"));
+    }
+
+    @Test
+    @Order(5)
+    void describeClusterWithoutEncryptionConfigOmitsEncryptionConfigAndReturnsDefaultLogging() {
+        given().contentType(JSON)
+                .when().get("/clusters/" + CLUSTER_DEFAULT)
+                .then().statusCode(200)
+                .body("cluster.name", equalTo(CLUSTER_DEFAULT))
+                .body("cluster.encryptionConfig", nullValue())
+                .body("cluster.logging.clusterLogging", hasSize(1))
+                .body("cluster.logging.clusterLogging[0].enabled", equalTo(false))
+                .body("cluster.logging.clusterLogging[0].types",
+                        containsInAnyOrder("api", "audit", "authenticator", "controllerManager", "scheduler"));
+    }
+
+    @Test
+    @Order(6)
+    void deleteClusterDefaultCleansUp() {
+        given().contentType(JSON)
+                .when().delete("/clusters/" + CLUSTER_DEFAULT)
+                .then().statusCode(200);
+    }
+
+    @Test
+    @Order(7)
+    void createClusterWithInvalidLogTypeReturns400() {
+        String payload = "{"
+                + "\"name\":\"it-invalid-log\","
+                + "\"roleArn\":\"arn:aws:iam::000000000000:role/eks-role\","
+                + "\"logging\":{"
+                + "  \"clusterLogging\":[{"
+                + "    \"types\":[\"invalidLogType\"],"
+                + "    \"enabled\":true"
+                + "  }]"
+                + "}"
+                + "}";
+
+        given().contentType(JSON)
+                .body(payload)
+                .when().post("/clusters")
+                .then().statusCode(400)
+                .body("message", equalTo("'invalidLogType' is not a valid log type"));
+    }
+
+    @Test
+    @Order(8)
+    void createClusterWithInvalidEncryptionResourcesReturns400() {
+        String payload = "{"
+                + "\"name\":\"it-invalid-enc-res\","
+                + "\"roleArn\":\"arn:aws:iam::000000000000:role/eks-role\","
+                + "\"encryptionConfig\":[{"
+                + "  \"resources\":[\"configmaps\"],"
+                + "  \"provider\":{\"keyArn\":\"" + KMS_KEY_ARN + "\"}"
+                + "}]"
+                + "}";
+
+        given().contentType(JSON)
+                .body(payload)
+                .when().post("/clusters")
+                .then().statusCode(400)
+                .body("message", equalTo("Invalid k8s resource and provider for encryption"));
+    }
+
+    @Test
+    @Order(9)
+    void createClusterWithMissingEncryptionKeyArnReturns400() {
+        String payload = "{"
+                + "\"name\":\"it-invalid-enc-key\","
+                + "\"roleArn\":\"arn:aws:iam::000000000000:role/eks-role\","
+                + "\"encryptionConfig\":[{"
+                + "  \"resources\":[\"secrets\"],"
+                + "  \"provider\":{\"keyArn\":\"\"}"
+                + "}]"
+                + "}";
+
+        given().contentType(JSON)
+                .body(payload)
+                .when().post("/clusters")
+                .then().statusCode(400)
+                .body("message", equalTo("Invalid k8s resource and provider for encryption"));
+    }
+
+    @Test
+    @Order(10)
+    void describeClusterDoesNotCarryExplicitVersion() {
+        String clusterName = "it-explicit-version-wire-test";
+        String payload = "{"
+                + "\"name\":\"" + clusterName + "\","
+                + "\"roleArn\":\"arn:aws:iam::000000000000:role/eks-role\","
+                + "\"version\":\"1.29\""
+                + "}";
+
+        given().contentType(JSON)
+                .body(payload)
+                .when().post("/clusters")
+                .then().statusCode(200)
+                .body("cluster.name", equalTo(clusterName))
+                .body("cluster.version", equalTo("1.29"))
+                .body("cluster", not(hasKey("explicitVersion")));
+
+        given().contentType(JSON)
+                .when().get("/clusters/" + clusterName)
+                .then().statusCode(200)
+                .body("cluster.name", equalTo(clusterName))
+                .body("cluster.version", equalTo("1.29"))
+                .body("cluster", not(hasKey("explicitVersion")));
+
+        given().contentType(JSON)
+                .when().delete("/clusters/" + clusterName)
+                .then().statusCode(200)
+                .body("cluster", not(hasKey("explicitVersion")));
+    }
+
+    private static final String ROLE_ARN = "arn:aws:iam::000000000000:role/eks-role";
+    private static final String LOGGING_AUDIT_ON =
+            "\"logging\":{\"clusterLogging\":[{\"types\":[\"audit\"],\"enabled\":true}]}";
+
+    private static String createClusterFrom(String name, String extraMembers) {
+        given().contentType(JSON)
+                .body("{\"name\":\"" + name + "\",\"roleArn\":\"" + ROLE_ARN + "\"" + extraMembers + "}")
+                .when().post("/clusters").then().statusCode(200);
+        return name;
+    }
+
+    private static void deleteCluster(String name) {
+        given().when().delete("/clusters/" + name);
+    }
+
+    @Test
+    void updateConfigReturnsALoggingUpdateThatDescribeUpdateFinds() {
+        String name = createClusterFrom("it-update-config-cluster", "");
+        try {
+            String id = given().contentType(JSON)
+                    .body("{" + LOGGING_AUDIT_ON + "}")
+                    .when().post("/clusters/" + name + "/update-config")
+                    .then().statusCode(200)
+                    .body("update.type", equalTo("LoggingUpdate"))
+                    .body("update.id", notNullValue())
+                    .extract().path("update.id");
+            given().contentType(JSON)
+                    .when().get("/clusters/" + name + "/updates/" + id)
+                    .then().statusCode(200)
+                    .body("update.id", equalTo(id))
+                    .body("update.type", equalTo("LoggingUpdate"));
+        } finally {
+            deleteCluster(name);
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', nullValues = "null", value = {
+            // two update families in one request
+            "{\"logging\":{\"clusterLogging\":[{\"types\":[\"audit\"],\"enabled\":true}]},"
+                    + "\"accessConfig\":{\"authenticationMode\":\"API_AND_CONFIG_MAP\"}}"
+                    + "|400|InvalidParameterException|Only one type of update can be allowed.",
+            "{\"resourcesVpcConfig\":{\"endpointPublicAccess\":true},"
+                    + "\"logging\":{\"clusterLogging\":[{\"types\":[\"audit\"],\"enabled\":true}]}}"
+                    + "|400|InvalidParameterException|Only one type of update can be allowed.",
+            "{\"upgradePolicy\":{\"supportType\":\"STANDARD\"},"
+                    + "\"accessConfig\":{\"authenticationMode\":\"API\"}}"
+                    + "|400|InvalidParameterException|Only one type of update can be allowed.",
+            // upgradePolicy: an unknown support type, and none at all
+            "{\"upgradePolicy\":{\"supportType\":\"BOGUS\"}}|400|InvalidParameterException|null",
+            "{\"upgradePolicy\":{}}|400|InvalidParameterException|null",
+            // a number where the model has a boolean, as createCluster refuses it
+            "{\"resourcesVpcConfig\":{\"endpointPublicAccess\":1}}|400|SerializationException|null",
+            // members UpdateClusterConfig does not support here
+            "{\"kubernetesNetworkConfig\":{\"ipFamily\":\"ipv4\"}}|400|InvalidParameterException|null",
+            "{\"deletionProtection\":true}|400|InvalidParameterException|null",
+            "{\"deletionProtection\":true,\"logging\":{\"clusterLogging\":[{\"types\":[\"audit\"],\"enabled\":true}]}}"
+                    + "|400|InvalidParameterException|null",
+            // accessConfig: unknown mode, and a move from API_AND_CONFIG_MAP back to CONFIG_MAP
+            "{\"accessConfig\":{\"authenticationMode\":\"BOGUS\"}}|400|InvalidParameterException|null",
+            "{\"accessConfig\":{\"authenticationMode\":\"CONFIG_MAP\"}}|400|InvalidParameterException|null"
+    })
+    void updateConfigRefusesWhatAwsRefuses(String body, int status, String type, String message) {
+        String name = createClusterFrom("it-update-refuse-" + UUID.randomUUID(),
+                ",\"accessConfig\":{\"authenticationMode\":\"API_AND_CONFIG_MAP\"}");
+        try {
+            ValidatableResponse response = given().contentType(JSON)
+                    .body(body)
+                    .when().post("/clusters/" + name + "/update-config")
+                    .then().statusCode(status).body("__type", equalTo(type));
+            if (message != null) {
+                response.body("message", equalTo(message));
+            }
+        } finally {
+            deleteCluster(name);
+        }
+    }
+
+    @Test
+    void aClusterGetsExtendedSupportUnlessItAsksForStandardAndAnUpdateChangesIt() {
+        String standard = "it-upgrade-standard-" + UUID.randomUUID();
+        String name = "it-upgrade-policy-" + UUID.randomUUID();
+        try {
+            createClusterFrom(standard, ",\"upgradePolicy\":{\"supportType\":\"STANDARD\"}");
+            createClusterFrom(name, "");
+            given().when().get("/clusters/" + standard).then().statusCode(200)
+                    .body("cluster.upgradePolicy.supportType", equalTo("STANDARD"));
+            given().when().get("/clusters/" + name).then().statusCode(200)
+                    .body("cluster.upgradePolicy.supportType", equalTo("EXTENDED"));
+
+            String id = given().contentType(JSON)
+                    .body("{\"upgradePolicy\":{\"supportType\":\"STANDARD\"}}")
+                    .when().post("/clusters/" + name + "/update-config")
+                    .then().statusCode(200)
+                    .body("update.type", equalTo("UpgradePolicyUpdate"))
+                    .body("update.status", equalTo("Successful"))
+                    .body("update.params", hasSize(1))
+                    .body("update.params[0].type", equalTo("UpgradePolicy"))
+                    .body("update.params[0].value", equalTo("{\"supportType\":\"STANDARD\"}"))
+                    .extract().path("update.id");
+            given().when().get("/clusters/" + name + "/updates/" + id).then().statusCode(200)
+                    .body("update.type", equalTo("UpgradePolicyUpdate"));
+            given().when().get("/clusters/" + name).then().statusCode(200)
+                    .body("cluster.upgradePolicy.supportType", equalTo("STANDARD"));
+        } finally {
+            deleteCluster(standard);
+            deleteCluster(name);
+        }
+    }
+
+    @Test
+    void standardSupportIsRefusedOnAVersionPastItsEndOfStandardSupport() {
+        String name = "it-upgrade-retired-" + UUID.randomUUID();
+        try {
+            given().contentType(JSON)
+                    .body("{\"name\":\"" + name + "\",\"roleArn\":\"" + ROLE_ARN + "\",\"version\":\"1.30\","
+                            + "\"upgradePolicy\":{\"supportType\":\"STANDARD\"}}")
+                    .when().post("/clusters")
+                    .then().statusCode(400).body("__type", equalTo("InvalidParameterException"))
+                    .body("message", equalTo("The requested Kubernetes version \"1.30\" is only supported under "
+                            + "extended support. Please change the supportType to extended support to create the "
+                            + "cluster."));
+            createClusterFrom(name, ",\"version\":\"1.30\"");
+            given().contentType(JSON)
+                    .body("{\"upgradePolicy\":{\"supportType\":\"STANDARD\"}}")
+                    .when().post("/clusters/" + name + "/update-config")
+                    .then().statusCode(400).body("__type", equalTo("InvalidParameterException"))
+                    .body("message", equalTo("The Kubernetes version \"1.30\" is not in standard support. Please "
+                            + "update the cluster to a version in standard support to change the supportType"));
+            given().when().get("/clusters/" + name).then().statusCode(200)
+                    .body("cluster.upgradePolicy.supportType", equalTo("EXTENDED"));
+        } finally {
+            deleteCluster(name);
+        }
+    }
+
+    @Test
+    void aClientRequestTokenReusedForAnotherUpgradePolicyIsRefused() {
+        String name = createClusterFrom("it-upgrade-token-" + UUID.randomUUID(), "");
+        try {
+            given().contentType(JSON)
+                    .body("{\"clientRequestToken\":\"policy-1\",\"upgradePolicy\":{\"supportType\":\"STANDARD\"}}")
+                    .when().post("/clusters/" + name + "/update-config")
+                    .then().statusCode(200);
+            given().contentType(JSON)
+                    .body("{\"clientRequestToken\":\"policy-1\",\"upgradePolicy\":{\"supportType\":\"EXTENDED\"}}")
+                    .when().post("/clusters/" + name + "/update-config")
+                    .then().statusCode(400).body("__type", equalTo("InvalidParameterException"));
+            given().when().get("/clusters/" + name).then().statusCode(200)
+                    .body("cluster.upgradePolicy.supportType", equalTo("STANDARD"));
+        } finally {
+            deleteCluster(name);
+        }
+    }
+
+    @Test
+    void updateConfigWithTheSameClientRequestTokenReturnsTheSameUpdate() {
+        String name = createClusterFrom("it-update-idempotent-" + UUID.randomUUID(), "");
+        try {
+            String body = "{\"clientRequestToken\":\"token-1\"," + LOGGING_AUDIT_ON + "}";
+            String first = given().contentType(JSON).body(body)
+                    .when().post("/clusters/" + name + "/update-config")
+                    .then().statusCode(200).extract().path("update.id");
+            given().contentType(JSON).body(body)
+                    .when().post("/clusters/" + name + "/update-config")
+                    .then().statusCode(200).body("update.id", equalTo(first));
+            given().contentType(JSON)
+                    .when().get("/clusters/" + name + "/updates/" + first)
+                    .then().statusCode(200).body("update.id", equalTo(first));
+        } finally {
+            deleteCluster(name);
+        }
+    }
+
+    @Test
+    void updateConfigRecordsCidrsAsJsonRefusesNoOpsAndScopesDescribeUpdateToTheCluster() {
+        String name = createClusterFrom("it-update-noop-" + UUID.randomUUID(), "");
+        try {
+            String cidrs = "\"publicAccessCidrs\":[\"203.0.113.5/32\"]";
+            given().contentType(JSON)
+                    .body("{\"resourcesVpcConfig\":{\"endpointPublicAccess\":true," + cidrs + "}}")
+                    .when().post("/clusters/" + name + "/update-config")
+                    .then().statusCode(200)
+                    .body("update.type", equalTo("EndpointAccessUpdate"))
+                    .body("update.params.find { it.type == 'PublicAccessCidrs' }.value",
+                            equalTo("[\"203.0.113.5/32\"]"));
+            String loggingId = given().contentType(JSON).body("{" + LOGGING_AUDIT_ON + "}")
+                    .when().post("/clusters/" + name + "/update-config")
+                    .then().statusCode(200).extract().path("update.id");
+            Object before = given().when().get("/clusters/" + name).then().statusCode(200).extract().path("cluster");
+
+            // both endpoints off
+            given().contentType(JSON)
+                    .body("{\"resourcesVpcConfig\":{\"endpointPublicAccess\":false,\"endpointPrivateAccess\":false}}")
+                    .when().post("/clusters/" + name + "/update-config")
+                    .then().statusCode(400).body("__type", equalTo("InvalidParameterException"));
+            // the stored flags and CIDRs again
+            given().contentType(JSON)
+                    .body("{\"resourcesVpcConfig\":{\"endpointPublicAccess\":true,"
+                            + "\"endpointPrivateAccess\":false," + cidrs + "}}")
+                    .when().post("/clusters/" + name + "/update-config")
+                    .then().statusCode(400).body("__type", equalTo("InvalidParameterException"))
+                    .body("message", startsWith("Cluster is already at the desired configuration"));
+            // api logs are already off
+            given().contentType(JSON)
+                    .body("{\"logging\":{\"clusterLogging\":[{\"types\":[\"api\"],\"enabled\":false}]}}")
+                    .when().post("/clusters/" + name + "/update-config")
+                    .then().statusCode(400).body("__type", equalTo("InvalidParameterException"))
+                    .body("message", equalTo("No changes needed for the logging config provided"));
+            given().when().get("/clusters/" + name).then().statusCode(200).body("cluster", equalTo(before));
+
+            given().contentType(JSON)
+                    .when().get("/clusters/" + name + "/updates/" + loggingId + "?addonName=vpc-cni")
+                    .then().statusCode(404).body("__type", equalTo("ResourceNotFoundException"))
+                    .body("message", equalTo("No update: " + loggingId + " found for addon: vpc-cni"));
+        } finally {
+            deleteCluster(name);
+        }
+    }
+}

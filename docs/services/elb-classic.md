@@ -37,6 +37,8 @@ selects Classic. With neither present the request goes to ELB v2.
 | DeleteLoadBalancer | Deletes a load balancer; deleting one that does not exist succeeds. |
 | CreateLoadBalancerListeners | Adds listeners. A conflicting listener on a port already in use is rejected with `DuplicateListener`. |
 | DeleteLoadBalancerListeners | Removes listeners by `LoadBalancerPorts`. |
+| CreateLoadBalancerPolicy / DescribeLoadBalancerPolicies / DeleteLoadBalancerPolicy | Manages SSL negotiation policy definitions and predefined policies. |
+| SetLoadBalancerPoliciesOfListener | Replaces a listener's policy assignments. Attached policies cannot be deleted. |
 | ConfigureHealthCheck | Replaces the health check and re-arms Floci's checker. |
 | RegisterInstancesWithLoadBalancer | Registers EC2 instances and returns the full registered set. |
 | DeregisterInstancesFromLoadBalancer | Removes instances and returns the remaining set. |
@@ -191,6 +193,13 @@ and [node ownership across zones](../design/classic-multiaz.md).
 
 ## Behavior Notes
 
+- HTTPS and SSL listeners receive the default SSL negotiation policy. Policy creation supports
+  predefined references and explicit boolean protocol/cipher attributes. Listener descriptions
+  include policy assignments, and load balancer descriptions include stored policy names.
+- Record mode permits clearing a listener's policies. Protected Classic TLS frontends reject
+  clearing every policy; explicit policy enforcement outside record mode requires those frontends.
+  Successful live TLS reload remains a separate runtime qualification requirement.
+
 - An omitted `InstanceProtocol` defaults to `HTTP` for HTTP/HTTPS listeners and
   `TCP` for TCP/SSL listeners. Explicit backend protocols remain unchanged.
   Creation, listener additions, persisted readback and identical listener retries
@@ -211,6 +220,9 @@ and [node ownership across zones](../design/classic-multiaz.md).
   frontends need no such rule: their traffic leaves the load balancer's own namespace.
 - Load balancer state is persisted through Floci storage, and on startup health checking is
   restarted for the load balancers of every account.
+- An explicitly requested, existing EC2 instance that is not registered returns `OutOfService`
+  with reason `Instance`. Missing instances return `InvalidInstance`; omitted instance IDs
+  enumerate registered instances and instances still draining.
 - A new load balancer gets AWS's default health check (`TCP:80`, interval 30, timeout 5,
   unhealthy 2, healthy 10) and AWS's default attributes (cross-zone off, access log off,
   connection draining off with a 300 second timeout, 60 second idle timeout).

@@ -12,7 +12,14 @@ Floci implements the CodeDeploy API — stored-state management for applications
 - `arn:aws:codedeploy:<region>:<account>:deploymentconfig:<name>`
 - `arn:aws:codedeploy:<region>:<account>:deployment:<id>`
 
-## Supported Operations (35 total)
+## Supported Operations (36 total)
+
+S3 Server revisions use the agent command lifecycle, with `DISALLOW`, `OVERWRITE`,
+and `RETAIN` file handling. Only one foreground S3 deployment is admitted per
+deployment group. Successful revisions are persisted for failure rollback and
+explicit `StopDeployment` rollback; a failed rollback does not start another
+rollback. Alarm-triggered rollback and request-stop-triggered automatic rollback
+are not implemented.
 
 ### Applications
 
@@ -248,6 +255,11 @@ For `computePlatform: ECS`, `CreateDeployment` performs a full blue/green traffi
 
 All hook fields are optional. A deployment without a test listener or test hook retains its existing production traffic flow.
 
+When the deployment group supplies `testTrafficRoute.listenerArns`, Floci shifts those
+listeners to the green target group before invoking `AfterAllowTestTraffic`. A failed
+test-listener update or validation hook fails the deployment before production traffic
+shifts. Stopping during the validation hook leaves production traffic unchanged.
+
 ### ECS Deployment Group Configuration
 
 ```json
@@ -365,3 +377,9 @@ aws --endpoint-url http://localhost:4566 deploy batch-get-deployment-targets \
 # List built-in deployment configs
 aws --endpoint-url http://localhost:4566 deploy list-deployment-configs
 ```
+
+
+## Agent command protocol
+
+The separate [agent command protocol](../design/codedeploy-agent-runtime.md)
+documents its operations, authentication and current execution limits.

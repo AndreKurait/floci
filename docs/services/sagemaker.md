@@ -13,6 +13,14 @@ Floci emulates SageMaker control-plane APIs and runs real Docker containers for 
 | Tags | `AddTags`, `ListTags`, `DeleteTags` |
 | Runtime | `POST /endpoints/{EndpointName}/invocations` |
 
+With IAM enforcement on, each action is checked on the resources the AWS Service Authorization
+Reference lists for it, read from the request: a model, an endpoint configuration, an endpoint or a
+training job by its name, as `arn:aws:sagemaker:<region>:<account>:<type>/<name>`, the ARN Floci
+mints, and a tag call on its `ResourceArn`. `CreateEndpoint` and `UpdateEndpoint` are checked on the
+endpoint their `EndpointName` names and the configuration their `EndpointConfigName` names, and
+`ListTags` on the resource its `ResourceArn` names; the other list actions name no resource and are
+checked on `*`. A create carrying `Tags` also needs `sagemaker:AddTags`.
+
 ## Supported Actions
 
 <!-- floci:actions:start -->
@@ -21,7 +29,7 @@ Floci emulates SageMaker control-plane APIs and runs real Docker containers for 
 | `CreateModel` | Registers a model from `PrimaryContainer` or `Containers`; rejects an empty `Containers` array rather than dereferencing it. |
 | `DescribeModel` | Returns a model by name, scoped to the calling region. |
 | `DeleteModel` | Deletes a model by name, scoped to the calling region. |
-| `ListModels` | Lists models for the calling region; supports `NameContains`, `MaxResults` (1-100), and `NextToken` pagination. |
+| `ListModels` | Lists models for the calling region; supports `NameContains`, `CreationTimeAfter`, `CreationTimeBefore`, `MaxResults` (1-100), and `NextToken` pagination. |
 | `CreateEndpointConfig` | Creates an endpoint configuration; every `ProductionVariants[].ModelName` must already exist. |
 | `DescribeEndpointConfig` | Returns an endpoint configuration by name, scoped to the calling region. |
 | `DeleteEndpointConfig` | Deletes an endpoint configuration by name, scoped to the calling region. |
@@ -85,6 +93,8 @@ Only the accelerator is substituted. An instance type also implies vCPU and memo
 `CreateEndpoint` starts the model image as a long-lived Docker container with command `serve`, port `8080`, `/ping` health checks, and `/invocations` runtime proxying. `ModelDataUrl` artifacts are downloaded from S3 and placed in `/opt/ml/model`.
 
 Endpoint containers are CPU-only for now; the `gpu` settings above apply to training jobs.
+
+Floci stops endpoint containers when it shuts down. With persistent storage, each endpoint that was `InService` or still `Creating` goes back to `Creating` when Floci starts again. Its container is started afresh from its endpoint config and model, `ModelDataUrl` included, and the endpoint reports `InService` once `/ping` answers. If the container can't be started, the endpoint reports `Failed` with the reason, for instance when its model was deleted. A container a crash left running is replaced, a `Failed` endpoint stays as it is, and one a crash left `Deleting` is deleted with its container. Endpoint containers are named after the endpoint's account, Region and name, so endpoints of the same name in two accounts or Regions don't share one.
 
 ## Examples
 

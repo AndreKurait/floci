@@ -1,0 +1,261 @@
+package io.floci.aws.services.cloudformation.provisioners;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import io.floci.aws.services.cloudformation.model.StackResource;
+import io.floci.aws.services.ecr.EcrService;
+import io.floci.aws.services.ecr.model.Repository;
+import jakarta.enterprise.context.ApplicationScoped;
+
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+
+/**
+ * Provisions {@code AWS::ECR::Repository}.
+ *
+ * <p>A create whose name already belongs to a repository fails, as it does on CloudFormation:
+ * {@code RepositoryAlreadyExistsException} propagates and the stack reports the failure instead of
+ * adopting a repository it does not own (and would later delete). The earlier adopt-on-conflict
+ * path existed for CDK bootstrap re-runs, but a re-run is an UpdateStack of the existing
+ * {@code CDKToolkit} stack, where the prior physical id already equals the fixed repository name
+ * and the update path below reconciles it in place.
+ */
+@ApplicationScoped
+public class EcrCfnProvisioner implements CfnResourceProvisioner {
+
+    private static final String REPOSITORY = "AWS::ECR::Repository";
+    private static final int REPOSITORY_NAME_MAX_LENGTH = 256;
+    /** What CreateRepository applies when ImageTagMutability is omitted. */
+    private static final String DEFAULT_IMAGE_TAG_MUTABILITY = "MUTABLE";
+
+    private final EcrService ecrService;
+
+    public EcrCfnProvisioner(EcrService ecrService) {
+        this.ecrService = ecrService;
+    }
+
+    @Override
+    public Set<String> resourceTypes() {
+        return Set.of(REPOSITORY);
+    }
+
+    @Override
+    public boolean serviceDisabled() {
+        return ecrService.isDisabled();
+    }
+
+    @Override
+    public String serviceEnabledFlag() {
+        return "floci.services.ecr.enabled";
+    }
+
+    @Override
+    public boolean hasReplacementUpdate(StackResource resource) {
+        return ReplacementCleanup.hasReplacement(resource);
+    }
+
+    @Override
+    public String updateCleanupPhysicalId(StackResource resource) {
+        return ReplacementCleanup.cleanupPhysicalId(resource);
+    }
+
+    @Override
+    public UpdateCleanupResult completeUpdate(StackResource resource) {
+        return ReplacementCleanup.complete(resource, (type, id, region) ->
+                CfnDeletes.safeDelete("ECR repository", id,
+                        () -> ecrService.deleteRepository(id, null, false, region),
+                        "RepositoryNotFoundException"));
+    }
+
+    @Override
+    public void clearUpdate(StackResource resource) {
+        ReplacementCleanup.clear(resource);
+    }
+
+    @Override
+    public boolean rollbackUpdate(StackResource resource) {
+        return ReplacementCleanup.rollback(resource, this::delete);
+    }
+
+    @Override
+    public void provision(StackResource r, JsonNode props, ProvisionContext ctx) {
+        if (ctx.isUpdate()) {
+            // Rolling this update back undoes it alone; only ContinueUpdateRollback retries the
+            // delete the last rollback could not make.
+            ReplacementCleanup.endRollbackRetry(r);
+        }
+        Map<String, String> attributesBefore = new HashMap<>(r.getAttributes());
+        // The engine's change decides whether the update replaces the repository: RepositoryName and
+        // EncryptionConfiguration are create-only in the registry. A named repository cannot be
+        // replaced under the same name.
+        boolean replaces = ctx.isUpdate() && ctx.changes(REPOSITORY, props).requiresReplacement();
+        String explicitName = ctx.resolveOptional(props, "RepositoryName");
+        // CDK bootstrap requires lower-case repository names; CFN-generated suffixes can include
+        // upper-case characters. Normalize to satisfy the AWS ECR repository name pattern. A
+        // replacing update that names nothing gets a fresh generated name, not the prior one.
+        String repoName = (replaces && (explicitName == null || explicitName.isBlank())
+                ? ctx.generatePhysicalName(r.getLogicalId(), REPOSITORY_NAME_MAX_LENGTH, true)
+                : ctx.stablePhysicalName(explicitName, r.getLogicalId(), REPOSITORY_NAME_MAX_LENGTH, true))
+                .toLowerCase();
+        if (replaces && ctx.reusesPriorEntity(repoName)) {
+            throw CfnExceptions.customNamedReplacement(repoName);
+        }
+
+        String mutability = ctx.resolveOptional(props, "ImageTagMutability");
+        Boolean scanOnPush = scanOnPush(props, ctx);
+        Map<String, String> tags = parseCfnTags(props != null ? props.get("Tags") : null, ctx);
+        String region = ctx.region();
+        String lifecyclePolicy = lifecyclePolicyText(props, ctx);
+        if (lifecyclePolicy != null) {
+            EcrService.validateLifecyclePolicyDocument(lifecyclePolicy);
+        }
+
+        // provision is also the update path. Only the repository this resource already owns is
+        // reconciled in place; a replacing update derives a different name and creates, and a name
+        // that already belongs to another repository fails the create as on CloudFormation.
+        boolean reusing = ctx.reusesPriorEntity(repoName);
+        // EncryptionConfiguration is create-only, so it is read only when the repository is created.
+        JsonNode encryption = props != null ? props.get("EncryptionConfiguration") : null;
+        Repository repo = reusing
+                ? reconcileExisting(repoName, mutability, scanOnPush, tags, region)
+                : ecrService.createRepository(repoName, null, mutability, scanOnPush,
+                        ctx.resolveOptional(encryption, "EncryptionType"), ctx.resolveOptional(encryption, "KmsKey"),
+                        tags, region);
+        if (!reusing) {
+            r.setPhysicalId(repoName);
+        }
+
+        // A repository this provision created and could not finish setting up is removed, or left
+        // to the create rollback or the next cleanup when that fails too.
+        CfnRollback.guarded(r, ctx, !reusing, () -> ecrService.deleteRepository(repoName, null, true, region),
+                () -> { }, () -> {
+            // Both policies are updatable: a template that declares one sets it, and on the update
+            // path a template that no longer declares one deletes it, tolerating "none set".
+            if (lifecyclePolicy != null) {
+                ecrService.putLifecyclePolicy(repoName, null, lifecyclePolicy, region);
+            } else if (reusing) {
+                CfnDeletes.safeDelete("ECR lifecycle policy", repoName,
+                        () -> ecrService.deleteLifecyclePolicy(repoName, null, region),
+                        "LifecyclePolicyNotFoundException");
+            }
+            String repositoryPolicy = repositoryPolicyText(props, ctx);
+            if (repositoryPolicy != null) {
+                ecrService.setRepositoryPolicy(repoName, null, repositoryPolicy, region);
+            } else if (reusing) {
+                CfnDeletes.safeDelete("ECR repository policy", repoName,
+                        () -> ecrService.deleteRepositoryPolicy(repoName, null, region),
+                        "RepositoryPolicyNotFoundException");
+            }
+        });
+
+        r.setPhysicalId(repoName);
+        r.getAttributes().put("Arn", repo.getRepositoryArn());
+        r.getAttributes().put("RepositoryUri", repo.getRepositoryUri());
+        // The repository the prior physical id named is deleted once the update commits, but only
+        // when it is empty: EmptyOnDelete is not read, and an empty-only delete is what AWS does
+        // by default. A create under an existing name fails, so a replacement here is always one
+        // this update created.
+        ReplacementCleanup.record(r, ctx, attributesBefore, replaces && !reusing);
+    }
+
+    @Override
+    public void delete(String resourceType, String physicalId, String region) {
+        CfnDeletes.safeDelete("ECR repository", physicalId,
+                () -> ecrService.deleteRepository(physicalId, null, true, region),
+                "RepositoryNotFoundException");
+    }
+
+    /**
+     * The update path for the repository this resource already owns. Tags are driven to the
+     * template's desired state (TagResource alone leaves unspecified tags in place, so dropped
+     * keys are untagged first), and so is ImageTagMutability: a template that no longer declares
+     * it means the MUTABLE default the API applies when the parameter is omitted, not "keep the
+     * previous value". ImageScanningConfiguration is applied only when declared, leaving the
+     * stored setting intact if an update drops it.
+     */
+    private Repository reconcileExisting(String repoName, String mutability, Boolean scanOnPush,
+                                         Map<String, String> tags, String region) {
+        List<String> stale = ProvisionContext.staleTagKeys(
+                ecrService.listTagsForResource(repoName, null, region), tags);
+        if (!stale.isEmpty()) {
+            ecrService.untagResource(repoName, null, stale, region);
+        }
+        if (!tags.isEmpty()) {
+            ecrService.tagResource(repoName, null, tags, region);
+        }
+        Repository repo = ecrService.putImageTagMutability(repoName, null,
+                mutability != null ? mutability : DEFAULT_IMAGE_TAG_MUTABILITY, region);
+        if (scanOnPush != null) {
+            repo = ecrService.putImageScanningConfiguration(repoName, null, scanOnPush, region);
+        }
+        return repo;
+    }
+
+    /** {@code ImageScanningConfiguration.ScanOnPush}, or null when the template declares none. */
+    private static Boolean scanOnPush(JsonNode props, ProvisionContext ctx) {
+        if (props == null || !props.has("ImageScanningConfiguration")) {
+            return null;
+        }
+        JsonNode config = ctx.engine().resolveNode(props.get("ImageScanningConfiguration"));
+        if (config == null || config.isNull() || config.isMissingNode() || !config.has("ScanOnPush")) {
+            return null;
+        }
+        JsonNode value = ctx.engine().resolveNode(config.get("ScanOnPush"));
+        if (value == null || value.isNull() || value.isMissingNode()) {
+            return null;
+        }
+        if (value.isBoolean()) {
+            return value.booleanValue();
+        }
+        String text = value.asText(null);
+        if (text == null || text.isBlank()) {
+            return null;
+        }
+        if ("true".equalsIgnoreCase(text)) {
+            return Boolean.TRUE;
+        }
+        if ("false".equalsIgnoreCase(text)) {
+            return Boolean.FALSE;
+        }
+        return null;
+    }
+
+    /** {@code LifecyclePolicy.LifecyclePolicyText}, or null when the template declares none. */
+    private static String lifecyclePolicyText(JsonNode props, ProvisionContext ctx) {
+        if (props == null || !props.has("LifecyclePolicy")) {
+            return null;
+        }
+        JsonNode lp = ctx.engine().resolveNode(props.get("LifecyclePolicy"));
+        String policyText = lp.path("LifecyclePolicyText").asText(null);
+        return policyText;
+    }
+
+    /** {@code RepositoryPolicyText} as a JSON string, or null when the template declares none. */
+    private static String repositoryPolicyText(JsonNode props, ProvisionContext ctx) {
+        if (props == null || !props.has("RepositoryPolicyText")) {
+            return null;
+        }
+        JsonNode pol = ctx.engine().resolveNode(props.get("RepositoryPolicyText"));
+        String policyText = pol.isTextual() ? pol.asText() : pol.toString();
+        return policyText == null || policyText.isEmpty() ? null : policyText;
+    }
+
+    /** See {@code KmsCfnProvisioner#parseCfnTags} for why this is copied rather than shared. */
+    private Map<String, String> parseCfnTags(JsonNode tagsNode, ProvisionContext ctx) {
+        tagsNode = ctx.engine().resolveNode(tagsNode);
+        Map<String, String> out = new HashMap<>();
+        if (tagsNode == null || tagsNode.isNull() || !tagsNode.isArray()) {
+            return out;
+        }
+        for (JsonNode entry : tagsNode) {
+            JsonNode resolved = ctx.engine().resolveNode(entry);
+            String key = resolved.path("Key").asText(null);
+            String value = resolved.path("Value").asText("");
+            if (key != null) {
+                out.put(key, value);
+            }
+        }
+        return out;
+    }
+}

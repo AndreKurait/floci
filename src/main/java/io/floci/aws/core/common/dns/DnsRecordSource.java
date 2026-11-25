@@ -1,0 +1,111 @@
+package io.floci.aws.core.common.dns;
+
+import java.util.Optional;
+
+/**
+ * A source of A records that {@link EmbeddedDnsServer} consults before forwarding a query
+ * upstream. Implemented by services that own a private DNS zone, so the DNS server stays
+ * independent of them: it discovers implementations through CDI rather than importing one.
+ *
+ * <p>An implementation answers only for names inside a zone it owns. An empty optional leaves
+ * the query to the next source or the upstream resolvers; a present answer with no addresses
+ * means the name is owned but has no A records. It runs outside any request context.
+ */
+public interface DnsRecordSource {
+
+    /** Stored public authority data only; this lookup must not perform recursive resolution. */
+    default Optional<DnsAnswer> resolveAuthoritative(String name, int type) {
+        return Optional.empty();
+    }
+
+    /** Supplies the receiving listener's address to local authoritative alias targets. */
+    default Optional<DnsAnswer> resolveAuthoritative(String name, int type, String listenerAddress) {
+        return resolveAuthoritative(name, type);
+    }
+
+    /** Carries both the receiving listener and querying VPC through public authority lookup. */
+    default Optional<DnsAnswer> resolveAuthoritative(String name, int type, String listenerAddress,
+                                                     DnsClientVpcSource.ClientVpc origin) {
+        return origin == null ? resolveAuthoritative(name, type, listenerAddress)
+                : resolveAuthoritative(name, type, origin);
+    }
+
+    /** A null origin identifies a query outside any known VPC. */
+    default Optional<DnsAnswer> resolveAuthoritative(String name, int type, DnsClientVpcSource.ClientVpc origin) {
+        return resolveAuthoritative(name, type);
+    }
+
+    /**
+     * Resolves an alias target from an owned resource and its canonical hosted-zone ID.
+     * This lookup must not query DNS, follow aliases, or substitute an emulator suffix.
+     */
+    default Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type) {
+        return Optional.empty();
+    }
+
+    default Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type,
+                                                   String listenerAddress) {
+        return resolveAliasTarget(name, hostedZoneId, type);
+    }
+
+    /** A named VPC entry point keeps a null origin distinct from a null listener address. */
+    default Optional<DnsAnswer> resolveAliasTargetInVpc(String name, String hostedZoneId, int type,
+                                                        DnsClientVpcSource.ClientVpc origin) {
+        return resolveAliasTarget(name, hostedZoneId, type, origin);
+    }
+
+    default Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type,
+                                                   String listenerAddress, DnsClientVpcSource.ClientVpc origin) {
+        return origin == null ? resolveAliasTarget(name, hostedZoneId, type, listenerAddress)
+                : resolveAliasTargetInVpc(name, hostedZoneId, type, origin);
+    }
+
+    /** Preserve the caller's VPC when an owned public API target selects its transport. */
+    default Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type,
+                                                   DnsClientVpcSource.ClientVpc origin) {
+        return resolveAliasTarget(name, hostedZoneId, type);
+    }
+
+    /**
+     * Resolves a resource behind an explicitly declared public peer. An owner may retain
+     * its shared transport after validating the resource's canonical zone and ready
+     * native frontend. Ordinary aliases keep their caller-scoped resolution.
+     */
+    default Optional<DnsAnswer> resolveDeclaredPublicAliasTarget(String name, String hostedZoneId, int type,
+                                                                 DnsClientVpcSource.ClientVpc origin) {
+        return resolveAliasTarget(name, hostedZoneId, type, origin);
+    }
+
+    default Optional<DnsAnswer> resolveDeclaredPublicAliasTarget(String name, String hostedZoneId, int type,
+                                                                 String listenerAddress,
+                                                                 DnsClientVpcSource.ClientVpc origin) {
+        return resolveDeclaredPublicAliasTarget(name, hostedZoneId, type, origin);
+    }
+
+    /**
+     * Resolves a query name to IPv4 addresses and their TTL. An empty optional means this
+     * source does not own the name. The name arrives without a trailing dot and in the case the client sent.
+     */
+    Optional<DnsAnswer> resolveIpv4(String name);
+
+    /** A source that only implements IPv4 still preserves name ownership for other query types. */
+    default Optional<DnsAnswer> resolve(String name, int type) {
+        return resolveIpv4(name).map(answer -> type == 1 ? answer
+                : answer.nameExists() ? DnsAnswer.noData() : DnsAnswer.nxDomain());
+    }
+
+    /** Private record sources must restrict their answers to the querying VPC's associations. */
+    default Optional<DnsAnswer> resolve(String name, int type, DnsClientVpcSource.ClientVpc origin) {
+        return resolve(name, type);
+    }
+
+    /**
+     * Answers only from zones scoped to {@code origin}'s VPC, such as Route 53 private hosted zones
+     * associated with it, or empty. The embedded DNS server lets such an answer take precedence over
+     * AWS endpoint spoofing for that VPC, so a source must not answer here for a name it would
+     * answer for every client.
+     */
+    default Optional<DnsAnswer> resolvePrivate(String name, int type, DnsClientVpcSource.ClientVpc origin) {
+        return Optional.empty();
+    }
+}

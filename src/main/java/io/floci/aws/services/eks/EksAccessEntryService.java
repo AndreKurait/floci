@@ -1,0 +1,514 @@
+package io.floci.aws.services.eks;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import io.floci.aws.core.common.AwsArnUtils;
+import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.EpochSeconds;
+import io.floci.aws.core.common.PaginatedResult;
+import io.floci.aws.core.common.Pagination;
+import io.floci.aws.core.storage.AccountAwareStorageBackend;
+import io.floci.aws.core.storage.StorageBackend;
+import io.floci.aws.core.storage.StorageFactory;
+import io.floci.aws.services.eks.model.AccessEntry;
+import io.floci.aws.services.eks.model.AccessScope;
+import io.floci.aws.services.eks.model.AssociateAccessPolicyRequest;
+import io.floci.aws.services.eks.model.AssociatedAccessPolicy;
+import io.floci.aws.services.eks.model.Cluster;
+import io.floci.aws.services.eks.model.ClusterStatus;
+import io.floci.aws.services.eks.model.CreateAccessEntryRequest;
+import io.floci.aws.services.eks.model.UpdateAccessEntryRequest;
+import io.floci.aws.services.iam.IamService;
+import io.floci.aws.services.iam.model.IamRole;
+import io.floci.aws.services.iam.model.IamUser;
+import io.quarkus.runtime.annotations.RegisterForReflection;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+
+import java.time.Clock;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.UUID;
+import java.util.function.Predicate;
+import java.util.function.UnaryOperator;
+
+/** Access-entry and access-policy management metadata; Kubernetes authorization is handled separately. */
+@ApplicationScoped
+public class EksAccessEntryService {
+    /** The type of the access entry of an EKS Auto Mode cluster's node role. */
+    static final String AUTO_MODE_NODE_TYPE = "EC2";
+    static final String AUTO_MODE_NODE_USERNAME = "system:node:{{SessionName}}";
+    static final String AUTO_MODE_NODE_POLICY = "AmazonEKSAutoNodePolicy";
+
+    private final StorageBackend<String, StoredEntry> entries;
+    private final IamService iam;
+    private final Clock clock;
+
+    @Inject
+    public EksAccessEntryService(StorageFactory factory, IamService iam) {
+        this(factory.create("eks", "eks-access-entries.json", new TypeReference<Map<String, StoredEntry>>() {}), iam);
+    }
+
+    EksAccessEntryService(StorageBackend<String, StoredEntry> entries, IamService iam) {
+        this(entries, iam, Clock.systemUTC());
+    }
+
+    EksAccessEntryService(StorageBackend<String, StoredEntry> entries, IamService iam, Clock clock) {
+        this.entries = entries;
+        this.iam = iam;
+        this.clock = clock;
+    }
+
+    @RegisterForReflection
+    public record StoredEntry(AccessEntry entry, String principalId, String clientRequestToken,
+                              List<AssociatedAccessPolicy> accessPolicies) {
+        public StoredEntry {
+            accessPolicies = accessPolicies == null ? List.of() : List.copyOf(accessPolicies);
+        }
+    }
+
+    @RegisterForReflection
+    public record Page(List<String> accessEntries, String nextToken) {}
+
+    @RegisterForReflection
+    public record PolicyPage(List<AssociatedAccessPolicy> associatedAccessPolicies, String nextToken) {}
+
+    public synchronized AssociatedAccessPolicy associate(Cluster cluster, String principal,
+                                                         AssociateAccessPolicyRequest request) {
+        StoredEntry stored = storedEntry(cluster, principal);
+        if (request == null || request.policyArn() == null) {
+            throw invalid("policyArn is required");
+        }
+        requireAccessPolicyArn(cluster, request.policyArn());
+        AccessScope scope = accessScope(request.accessScope());
+        if (!"STANDARD".equals(stored.entry().type()) && !AUTO_MODE_NODE_TYPE.equals(stored.entry().type())) {
+            throw new AwsException("InvalidRequestException",
+                    "Access policies can only be associated with STANDARD and EC2 access entries", 400);
+        }
+        double now = EpochSeconds.fromMillis(clock.millis());
+        double associatedAt = stored.accessPolicies().stream()
+                .filter(existing -> existing.policyArn().equals(request.policyArn()))
+                .mapToDouble(AssociatedAccessPolicy::associatedAt).findFirst().orElse(now);
+        AssociatedAccessPolicy association = new AssociatedAccessPolicy(request.policyArn(), scope, associatedAt, now);
+        List<AssociatedAccessPolicy> policies = new ArrayList<>(stored.accessPolicies());
+        policies.removeIf(existing -> existing.policyArn().equals(request.policyArn()));
+        policies.add(association);
+        policies.sort(Comparator.comparing(AssociatedAccessPolicy::policyArn));
+        entries.put(prefix(cluster) + principal, new StoredEntry(stored.entry(), stored.principalId(),
+                stored.clientRequestToken(), policies));
+        return association;
+    }
+
+    public synchronized PolicyPage listAccessPolicies(Cluster cluster, String principal, Integer maxResults,
+                                                      String nextToken) {
+        List<AssociatedAccessPolicy> policies = storedEntry(cluster, principal).accessPolicies();
+        // The newline ends the principal, so a token for role/a:b is not read as one for role/a.
+        PaginatedResult<AssociatedAccessPolicy> page = Pagination.paginate(policies, AssociatedAccessPolicy::policyArn,
+                pageSize(maxResults), nextToken, "policies:" + prefix(cluster) + principal + "\n",
+                token -> invalid("Invalid nextToken"));
+        return new PolicyPage(page.items(), page.nextToken());
+    }
+
+    public synchronized void disassociate(Cluster cluster, String principal, String policyArn) {
+        StoredEntry stored = storedEntry(cluster, principal);
+        requireAccessPolicyArn(cluster, policyArn);
+        List<AssociatedAccessPolicy> policies = stored.accessPolicies().stream()
+                .filter(existing -> !existing.policyArn().equals(policyArn)).toList();
+        if (policies.size() == stored.accessPolicies().size()) {
+            return; // EKS documents no error for a policy the entry does not hold
+        }
+        entries.put(prefix(cluster) + principal, new StoredEntry(stored.entry(), stored.principalId(),
+                stored.clientRequestToken(), policies));
+    }
+
+    private StoredEntry storedEntry(Cluster cluster, String principal) {
+        requireApiAccess(cluster);
+        return entries.get(prefix(cluster) + principal)
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Access entry not found", 404));
+    }
+
+    private static AccessScope accessScope(AccessScope scope) {
+        if (scope == null || scope.type() == null) {
+            throw invalid("accessScope.type is required");
+        }
+        List<String> namespaces = scope.namespaces() == null ? List.of() : scope.namespaces();
+        if ("cluster".equals(scope.type())) {
+            if (!namespaces.isEmpty()) {
+                throw invalid("namespaces can only be specified for a namespace access scope");
+            }
+            return new AccessScope("cluster", List.of());
+        }
+        if (!"namespace".equals(scope.type())) {
+            throw invalid("accessScope.type must be cluster or namespace");
+        }
+        if (namespaces.isEmpty() || namespaces.stream().anyMatch(namespace -> namespace == null || namespace.isBlank())) {
+            throw invalid("A namespace access scope requires nonempty namespace names");
+        }
+        // Terraform models namespaces as a set, so a repeated name must not come back twice.
+        return new AccessScope("namespace", List.copyOf(new LinkedHashSet<>(namespaces)));
+    }
+
+    public synchronized AccessEntry create(Cluster cluster, CreateAccessEntryRequest request) {
+        requireApiAccess(cluster);
+        if (request == null || request.principalArn() == null) {
+            throw invalid("principalArn is required");
+        }
+        String type = request.type() == null ? "STANDARD" : request.type();
+        if (!"STANDARD".equals(type) && !"EC2_LINUX".equals(type) && !AUTO_MODE_NODE_TYPE.equals(type)) {
+            throw invalid("Floci currently supports STANDARD, EC2_LINUX and EC2 access entries");
+        }
+        boolean node = "EC2_LINUX".equals(type);
+        if (node && (request.username() != null || request.kubernetesGroups() != null)) {
+            throw invalid("EC2_LINUX entries cannot specify username or kubernetesGroups");
+        }
+        boolean autoModeNode = AUTO_MODE_NODE_TYPE.equals(type);
+        if (autoModeNode && request.kubernetesGroups() != null) {
+            throw invalid("The specified kubernetesGroups is invalid: setting kubernetesGroups is not allowed when the "
+                    + "type is \"EC2\".");
+        }
+        if (autoModeNode && request.username() != null) {
+            throw invalid("The specified username is invalid: setting username is not allowed when the type is \"EC2\".");
+        }
+        String principal = request.principalArn();
+        AwsArnUtils.Arn arn = AwsArnUtils.isArn(principal) ? AwsArnUtils.parse(principal) : null;
+        AwsArnUtils.Arn clusterArn = AwsArnUtils.parse(cluster.getArn());
+        if (autoModeNode && arn != null && arn.resource().startsWith("user/")) {
+            throw invalid("AccessEntry principalArn must be IAM role when using types "
+                    + "[EC2_LINUX, EC2_WINDOWS, FARGATE_LINUX, HYBRID_LINUX, EC2]");
+        }
+        if (arn == null || !arn.partition().equals(clusterArn.partition())
+                || !"iam".equals(arn.service()) || !arn.region().isEmpty() || !arn.accountId().matches("[0-9]{12}")
+                || !(arn.resource().startsWith("role/") || (!node && arn.resource().startsWith("user/")))
+                || arn.resource().startsWith("role/aws-service-role/")
+                || principal.endsWith("/") || (node && !arn.accountId().equals(clusterArn.accountId()))) {
+            throw invalid("principalArn must identify an IAM principal; EC2_LINUX requires a role in the cluster account");
+        }
+        String name = principal.substring(principal.lastIndexOf('/') + 1);
+        boolean role = arn.resource().startsWith("role/");
+        String principalId = role
+                ? iam.findRole(arn.accountId(), name).filter(value -> principal.equals(value.getArn()))
+                        .map(IamRole::getRoleId).orElseThrow(() -> invalid("IAM role does not exist"))
+                : iam.findUser(arn.accountId(), name).filter(value -> principal.equals(value.getArn()))
+                        .map(IamUser::getUserId).orElseThrow(() -> invalid("IAM user does not exist"));
+        String username = node ? "system:node:{{EC2PrivateDNSName}}"
+                : autoModeNode ? AUTO_MODE_NODE_USERNAME : request.username();
+        if (username != null && !node && !autoModeNode && (username.isBlank()
+                || username.matches("^(system|eks|aws|amazon|iam):.*"))) {
+            throw invalid("Invalid username");
+        }
+        if (username != null && !node && !autoModeNode) {
+            for (String placeholder : List.of("{{SessionName}}", "{{SessionNameRaw}}")) {
+                int position = username.indexOf(placeholder);
+                if (position >= 0 && !username.substring(0, position).contains(":")) {
+                    throw invalid("A session-name placeholder must be preceded by a colon");
+                }
+            }
+        }
+        if (username == null) {
+            username = role ? AwsArnUtils.Arn.global(arn.partition(), "sts", arn.accountId(),
+                    "assumed-role/" + name + "/{{SessionName}}").toString() : principal;
+        }
+        List<String> groups = node || autoModeNode ? List.of("system:nodes")
+                : request.kubernetesGroups() == null ? List.of() : request.kubernetesGroups();
+        if (groups.stream().anyMatch(group -> group == null || group.isBlank())) {
+            throw invalid("kubernetesGroups must contain nonempty strings");
+        }
+        Map<String, String> tags = request.tags() == null ? Map.of() : request.tags();
+        if (tags.size() > 50 || tags.entrySet().stream().anyMatch(tag -> tag.getKey() == null
+                || tag.getKey().isEmpty() || tag.getKey().length() > 128 || tag.getValue() == null
+                || tag.getValue().length() > 256)) {
+            throw invalid("Invalid access entry tags");
+        }
+        String prefix = prefix(cluster);
+        String token = request.clientRequestToken();
+        if (token != null) {
+            for (StoredEntry stored : entries.scan(key -> key.startsWith(prefix))) {
+                if (token.equals(stored.clientRequestToken())) {
+                    AccessEntry previous = stored.entry();
+                    if (principal.equals(previous.principalArn()) && type.equals(previous.type())
+                            && username.equals(previous.username()) && groups.equals(previous.kubernetesGroups())
+                            && tags.equals(previous.tags())) {
+                        return previous;
+                    }
+                    throw invalid(EksAddonService.TOKEN_REUSED);
+                }
+            }
+        }
+        String key = prefix + principal;
+        if (entries.get(key).isPresent()) {
+            throw new AwsException("ResourceInUseException", "Access entry already exists", 409);
+        }
+        double now = EpochSeconds.fromMillis(clock.millis());
+        AccessEntry entry = new AccessEntry(entryArn(cluster, arn, role), cluster.getName(), principal,
+                type, username, List.copyOf(groups), Map.copyOf(tags), now, now);
+        entries.put(key, new StoredEntry(entry, principalId, token, List.of()));
+        return entry;
+    }
+
+    private static String entryArn(Cluster cluster, AwsArnUtils.Arn principal, boolean role) {
+        AwsArnUtils.Arn clusterArn = AwsArnUtils.parse(cluster.getArn());
+        String name = principal.resource().substring(principal.resource().lastIndexOf('/') + 1);
+        return new AwsArnUtils.Arn(clusterArn.partition(), "eks", clusterArn.region(), clusterArn.accountId(),
+                "access-entry/" + cluster.getName() + "/" + (role ? "role" : "user") + "/" + principal.accountId() + "/"
+                        + name + "/" + UUID.randomUUID()).toString();
+    }
+
+    /**
+     * Makes the access entry EKS makes for the node role when a cluster's EKS Auto Mode compute capability is turned
+     * on: type {@code EC2}, username {@code system:node:{{SessionName}}}, group {@code system:nodes}, with
+     * {@code AmazonEKSAutoNodePolicy} on the cluster. An entry the role already has is kept as it is. Nothing is made
+     * for a cluster whose authentication mode is {@code CONFIG_MAP}, which has no access entries, or for a role IAM
+     * doesn't have.
+     */
+    public synchronized void ensureAutoModeNodeEntry(Cluster cluster, String nodeRoleArn) {
+        if (nodeRoleArn == null || !AwsArnUtils.isArn(nodeRoleArn) || cluster.getAccessConfig() == null
+                || "CONFIG_MAP".equals(cluster.getAccessConfig().authenticationMode())) {
+            return;
+        }
+        String key = prefix(cluster) + nodeRoleArn;
+        if (entries.get(key).isPresent()) {
+            return;
+        }
+        AwsArnUtils.Arn arn = AwsArnUtils.parse(nodeRoleArn);
+        String name = arn.resource().substring(arn.resource().lastIndexOf('/') + 1);
+        Optional<String> roleId = arn.resource().startsWith("role/")
+                ? iam.findRole(arn.accountId(), name).filter(found -> nodeRoleArn.equals(found.getArn()))
+                        .map(IamRole::getRoleId)
+                : Optional.empty();
+        if (roleId.isEmpty()) {
+            return;
+        }
+        double now = EpochSeconds.fromMillis(clock.millis());
+        AccessEntry entry = new AccessEntry(entryArn(cluster, arn, true), cluster.getName(), nodeRoleArn,
+                AUTO_MODE_NODE_TYPE, AUTO_MODE_NODE_USERNAME, List.of("system:nodes"), Map.of(), now, now);
+        String policy = new AwsArnUtils.Arn(AwsArnUtils.parse(cluster.getArn()).partition(), "eks", "",
+                "aws", // partition-literal: the AWS-managed account, "aws" in every partition
+                "cluster-access-policy/" + AUTO_MODE_NODE_POLICY).toString();
+        entries.put(key, new StoredEntry(entry, roleId.get(), null,
+                List.of(new AssociatedAccessPolicy(policy, new AccessScope("cluster", List.of()), now, now))));
+    }
+
+    synchronized Optional<AccessEntry> workerEntry(Cluster cluster, String accountId, String principal, String roleId) {
+        requireApiAccess(cluster);
+        String key = prefix(cluster) + principal;
+        Optional<StoredEntry> stored = entries instanceof AccountAwareStorageBackend<StoredEntry> aware
+                ? aware.getForAccount(accountId, key) : entries.get(key);
+        return stored.filter(value -> roleId != null && roleId.equals(value.principalId()))
+                .map(StoredEntry::entry)
+                .filter(entry -> "EC2_LINUX".equals(entry.type()) || AUTO_MODE_NODE_TYPE.equals(entry.type()));
+    }
+
+    public synchronized AccessEntry describe(Cluster cluster, String principal) {
+        return storedEntry(cluster, principal).entry();
+    }
+
+    public synchronized AccessEntry update(String accountId, Cluster cluster, String principal,
+                                            UpdateAccessEntryRequest request) {
+        StoredEntry stored = storedUpdateTarget(accountId, cluster, principal, true)
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Access entry not found", 404));
+        if (request == null) {
+            throw invalid("Request is required");
+        }
+        AccessEntry current = stored.entry();
+        if (!"STANDARD".equals(current.type())
+                && (request.username() != null || request.kubernetesGroups() != null)) {
+            throw invalid("Node access entries cannot specify username or kubernetesGroups");
+        }
+        if (request.username() != null) {
+            validateUsername(request.username());
+        }
+        List<String> groups = request.kubernetesGroups();
+        if (groups != null && groups.stream().anyMatch(group -> group == null || group.isBlank())) {
+            throw invalid("kubernetesGroups must contain nonempty strings");
+        }
+        List<String> nextGroups = groups == null ? current.kubernetesGroups() : groups;
+        if (nextGroups != null) {
+            nextGroups = List.copyOf(nextGroups);
+        }
+        Map<String, String> nextTags = current.tags() == null ? null : Map.copyOf(current.tags());
+        AccessEntry updated = new AccessEntry(current.accessEntryArn(), current.clusterName(), current.principalArn(),
+                current.type(), request.username() == null ? current.username() : request.username(),
+                nextGroups, nextTags, current.createdAt(), EpochSeconds.fromMillis(clock.millis()));
+        Map<String, StoredEntry> replacement = Map.of(prefix(cluster) + principal,
+                new StoredEntry(updated, stored.principalId(), stored.clientRequestToken(), stored.accessPolicies()));
+        if (entries instanceof AccountAwareStorageBackend<StoredEntry> aware) {
+            aware.putAllAtomicallyForAccount(accountId, replacement);
+        } else {
+            entries.putAllAtomically(replacement);
+        }
+        return updated;
+    }
+
+    synchronized Optional<AccessEntry> findUpdateTarget(String accountId, Cluster cluster, String principal) {
+        return storedUpdateTarget(accountId, cluster, principal, false).map(StoredEntry::entry);
+    }
+
+    private Optional<StoredEntry> storedUpdateTarget(String accountId, Cluster cluster, String principal,
+                                                     boolean migrateLegacy) {
+        requireApiAccess(cluster);
+        AwsArnUtils.Arn clusterArn = AwsArnUtils.parse(cluster.getArn());
+        if (!accountId.equals(clusterArn.accountId())) {
+            return Optional.empty();
+        }
+        String key = prefix(cluster) + principal;
+        Predicate<StoredEntry> owner = value -> {
+            AccessEntry entry = value.entry();
+            if (entry == null || !principal.equals(entry.principalArn()) || !cluster.getName().equals(entry.clusterName())
+                    || !AwsArnUtils.isArnFor(entry.accessEntryArn(), "eks")) {
+                return false;
+            }
+            AwsArnUtils.Arn arn = AwsArnUtils.parse(entry.accessEntryArn());
+            return arn.accountId().equals(accountId) && arn.region().equals(clusterArn.region())
+                    && arn.partition().equals(clusterArn.partition())
+                    && arn.resource().startsWith("access-entry/" + cluster.getName() + "/");
+        };
+        Optional<StoredEntry> found;
+        if (entries instanceof AccountAwareStorageBackend<StoredEntry> aware) {
+            found = migrateLegacy ? aware.getForAccountMigratingLegacy(accountId, key, owner)
+                    : aware.getForAccount(accountId, key).or(() -> aware.getLegacyForAccount(accountId, key));
+        } else {
+            found = entries.get(key);
+        }
+        return found.filter(owner);
+    }
+
+    private static void validateUsername(String username) {
+        if (username.isBlank() || List.of("system:", "eks:", "aws:", "amazon:", "iam:").stream()
+                .anyMatch(username::startsWith)) {
+            throw invalid("Invalid username");
+        }
+        for (String placeholder : List.of("{{SessionName}}", "{{SessionNameRaw}}")) {
+            int position = username.indexOf(placeholder);
+            if (position >= 0 && !username.substring(0, position).contains(":")) {
+                throw invalid("A session-name placeholder must be preceded by a colon");
+            }
+        }
+    }
+
+    public synchronized void delete(Cluster cluster, String principal) {
+        describe(cluster, principal);
+        entries.delete(prefix(cluster) + principal);
+    }
+
+    public synchronized Page list(Cluster cluster, Integer maxResults, String nextToken) {
+        return list(cluster, maxResults, nextToken, null);
+    }
+
+    public synchronized Page list(Cluster cluster, Integer maxResults, String nextToken, String associatedPolicyArn) {
+        requireApiAccess(cluster);
+        String prefix = prefix(cluster);
+        List<String> principals = entries.scan(key -> key.startsWith(prefix)).stream()
+                .filter(stored -> associatedPolicyArn == null || stored.accessPolicies().stream()
+                        .anyMatch(policy -> policy.policyArn().equals(associatedPolicyArn)))
+                .map(stored -> stored.entry().principalArn()).toList();
+        PaginatedResult<String> page = Pagination.paginate(principals, principal -> principal, pageSize(maxResults),
+                nextToken, "entries:" + prefix, token -> invalid("Invalid nextToken"));
+        return new Page(page.items(), page.nextToken());
+    }
+
+    public synchronized void deleteClusterEntries(Cluster cluster) {
+        String prefix = prefix(cluster);
+        for (StoredEntry stored : entries.scan(key -> key.startsWith(prefix))) {
+            entries.delete(prefix + stored.entry().principalArn());
+        }
+    }
+
+    /**
+     * Applies {@code change} to the tags of the access entry {@code accessEntryArn} names on
+     * {@code cluster} and returns them, or empty when the cluster has no entry with that ARN. Entries
+     * are stored by principal, which the ARN does not carry whole, so the cluster's entries are
+     * searched. This is how TagResource, UntagResource and ListTagsForResource reach an entry.
+     */
+    public synchronized Optional<Map<String, String>> retag(Cluster cluster, String accessEntryArn,
+                                                            UnaryOperator<Map<String, String>> change) {
+        String prefix = prefix(cluster);
+        for (String key : entries.keys()) {
+            if (!key.startsWith(prefix)) {
+                continue;
+            }
+            Optional<StoredEntry> found = entries.get(key)
+                    .filter(stored -> accessEntryArn.equals(stored.entry().accessEntryArn()));
+            if (found.isPresent()) {
+                StoredEntry stored = found.get();
+                AccessEntry current = stored.entry();
+                Map<String, String> tags = Map.copyOf(change.apply(current.tags() == null ? Map.of() : current.tags()));
+                if (!tags.equals(current.tags())) {
+                    AccessEntry retagged = new AccessEntry(current.accessEntryArn(), current.clusterName(),
+                            current.principalArn(), current.type(), current.username(), current.kubernetesGroups(),
+                            tags, current.createdAt(), current.modifiedAt());
+                    entries.put(key, new StoredEntry(retagged, stored.principalId(), stored.clientRequestToken(),
+                            stored.accessPolicies()));
+                }
+                return Optional.of(tags);
+            }
+        }
+        return Optional.empty();
+    }
+
+    /**
+     * The tags of the access entry of {@code cluster} in {@code account} whose ARN is {@code accessEntryArn}, read in
+     * place.
+     */
+    Optional<Map<String, String>> tagsInAccount(String account, Cluster cluster, String accessEntryArn) {
+        String prefix = prefix(cluster);
+        for (String key : entries.keys()) {
+            if (!key.startsWith(prefix)) {
+                continue;
+            }
+            Optional<Map<String, String>> tags = AccountAwareStorageBackend.readInAccount(entries, account, key)
+                    .filter(stored -> accessEntryArn.equals(stored.entry().accessEntryArn()))
+                    .map(stored -> stored.entry().tags());
+            if (tags.isPresent()) {
+                return tags;
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static String prefix(Cluster cluster) {
+        // A recreated cluster must not inherit access entries or pagination tokens from its predecessor.
+        return cluster.getArn() + "/" + Objects.toString(cluster.getCreatedAt()) + "/";
+    }
+
+    private static void requireApiAccess(Cluster cluster) {
+        if (cluster.getAccessConfig() == null || "CONFIG_MAP".equals(cluster.getAccessConfig().authenticationMode())) {
+            throw new AwsException("InvalidRequestException", "Cluster authentication mode must be API or API_AND_CONFIG_MAP", 400);
+        }
+        if (cluster.getStatus() != ClusterStatus.ACTIVE) {
+            throw new AwsException("InvalidRequestException", "Cluster must be ACTIVE", 400);
+        }
+    }
+
+    static int pageSize(Integer maxResults) {
+        int limit = maxResults == null ? 100 : maxResults;
+        if (limit < 1 || limit > 100) {
+            throw invalid("maxResults must be between 1 and 100");
+        }
+        return limit;
+    }
+
+    private static void requireAccessPolicyArn(Cluster cluster, String policyArn) {
+        AwsArnUtils.Arn arn;
+        try {
+            arn = AwsArnUtils.parse(policyArn);
+        } catch (IllegalArgumentException e) {
+            throw invalid("policyArn must identify an EKS cluster access policy");
+        }
+        boolean accessPolicy = arn.partition().equals(AwsArnUtils.parse(cluster.getArn()).partition())
+                && arn.service().equals("eks")
+                && arn.region().isEmpty()
+                && arn.accountId().equals("aws") // partition-literal: the AWS-managed account, "aws" in every partition
+                && arn.resource().matches("cluster-access-policy/[A-Za-z0-9]+");
+        if (!accessPolicy) {
+            throw invalid("policyArn must identify an EKS cluster access policy");
+        }
+    }
+
+    private static AwsException invalid(String message) {
+        return new AwsException("InvalidParameterException", message, 400);
+    }
+}

@@ -1,0 +1,1714 @@
+package io.floci.aws.services.athena;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.core.common.AwsArnUtils;
+import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.CsvParser;
+import io.floci.aws.core.common.IamEnforcementFilter;
+import io.floci.aws.core.common.PaginatedResult;
+import io.floci.aws.core.common.Pagination;
+import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.RequestScopes;
+import io.floci.aws.core.storage.AccountAwareStorageBackend;
+import io.floci.aws.core.storage.StorageBackend;
+import io.floci.aws.core.storage.StorageFactory;
+import io.floci.aws.services.athena.model.CreateWorkGroupConfigurationRequest;
+import io.floci.aws.services.athena.model.CreateWorkGroupRequest;
+import io.floci.aws.services.athena.model.DataCatalog;
+import io.floci.aws.services.athena.model.ManagedQueryResultsConfiguration;
+import io.floci.aws.services.athena.model.ManagedQueryResultsConfigurationUpdates;
+import io.floci.aws.services.athena.model.PreparedStatement;
+import io.floci.aws.services.athena.model.QueryExecution;
+import io.floci.aws.services.athena.model.QueryExecutionContext;
+import io.floci.aws.services.athena.model.QueryExecutionState;
+import io.floci.aws.services.athena.model.ResultConfiguration;
+import io.floci.aws.services.athena.model.ResultConfigurationUpdates;
+import io.floci.aws.services.athena.model.ResultSet;
+import io.floci.aws.services.athena.model.UpdateWorkGroupRequest;
+import io.floci.aws.services.athena.model.WorkGroup;
+import io.floci.aws.services.athena.model.WorkGroupConfiguration;
+import io.floci.aws.services.athena.model.WorkGroupConfigurationUpdates;
+import io.floci.aws.services.athena.model.WorkGroupEngineVersionRequest;
+import io.floci.aws.services.athena.model.WorkGroupTag;
+import io.floci.aws.services.floci.duck.FlociDuckClient;
+import io.floci.aws.services.glue.GlueService;
+import io.floci.aws.services.glue.PartitionProjection;
+import io.floci.aws.services.glue.model.Column;
+import io.floci.aws.services.glue.model.Database;
+import io.floci.aws.services.glue.model.Table;
+import io.floci.aws.services.s3.S3Service;
+import io.floci.aws.services.s3.model.S3Object;
+import io.smallrye.common.vertx.VertxContext;
+import io.vertx.core.Vertx;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import org.jboss.logging.Logger;
+
+import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
+import java.io.InputStreamReader;
+import java.nio.charset.StandardCharsets;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
+import java.util.UUID;
+import java.util.function.Predicate;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+@ApplicationScoped
+public class AthenaService {
+
+    private static final Logger LOG = Logger.getLogger(AthenaService.class);
+    private static final Pattern DECIMAL_TYPE = Pattern.compile("DECIMAL\\((\\d+),\\s*(\\d+)\\)",
+            Pattern.CASE_INSENSITIVE);
+
+    /**
+     * A timestamp as DuckDB writes it to a result CSV: the seconds, then an optional fraction. Anything
+     * else ({@code infinity}, a BC date) is not one {@link #athenaTimestamp} pads.
+     */
+    private static final Pattern DUCKDB_TIMESTAMP = Pattern.compile(
+            "(\\d{4,}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2})(?:\\.(\\d+))?");
+    public static final String DEFAULT_CATALOG = "AwsDataCatalog";
+    private static final String DEFAULT_OUTPUT_BUCKET = "floci-athena-results";
+    private static final String DEFAULT_WORKGROUP = "primary";
+    private static final String START_QUERY_EXECUTION = "athena:StartQueryExecution";
+    private static final String DEFAULT_ENGINE_VERSION = "Athena engine version 3";
+    /** The engine version a workgroup selects when its request names none: AWS picks the version. */
+    private static final String AUTO_ENGINE_VERSION = "AUTO";
+    private static final long MIN_BYTES_SCANNED_CUTOFF_PER_QUERY = 10_000_000L;
+    private static final String WORKGROUP_RESOURCE = "workgroup/";
+    private static final String DATA_CATALOG_RESOURCE = "datacatalog/";
+    private static final Set<String> CATALOG_TYPES = Set.of("LAMBDA", "GLUE", "HIVE", "FEDERATED");
+    private static final Set<String> CONNECTION_TYPES = Set.of(
+            "DYNAMODB", "MYSQL", "POSTGRESQL", "REDSHIFT", "ORACLE", "SYNAPSE", "SQLSERVER", "DB2",
+            "OPENSEARCH", "BIGQUERY", "GOOGLECLOUDSTORAGE", "HBASE", "DOCUMENTDB", "CMDB", "TPCDS",
+            "TIMESTREAM", "SAPHANA", "SNOWFLAKE", "DATALAKEGEN2", "DB2AS400");
+    private static final Pattern CREATE_DATABASE_PATTERN = Pattern.compile(
+            "^\\s*CREATE\\s+(?:DATABASE|SCHEMA)\\s+"
+                    + "(IF\\s+NOT\\s+EXISTS\\s+)?"
+                    + "(?:`([^`]+)`|\\\"([^\\\"]+)\\\"|([a-zA-Z0-9_-]+))"
+                    + "(?:\\s+COMMENT\\s+'((?:''|[^'])*)')?"
+                    + "(?:\\s+LOCATION\\s+'((?:''|[^'])*)')?"
+                    + "(?:\\s+WITH\\s+DBPROPERTIES\\s*\\((.*?)\\))?"
+                    + "\\s*;?\\s*$",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final Pattern CREATE_DATABASE_PREFIX_PATTERN = Pattern.compile(
+            "^\\s*CREATE\\s+(?:DATABASE|SCHEMA)\\b",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+    private static final Pattern DATABASE_PROPERTY_PATTERN = Pattern.compile(
+            "\\s*'((?:''|[^'])*)'\\s*=\\s*'((?:''|[^'])*)'\\s*");
+    private static final Pattern RESULT_STATEMENT_PATTERN = Pattern.compile(
+            "^(?:SELECT|WITH|SHOW|DESCRIBE|DESC|EXPLAIN|VALUES)\\b",
+            Pattern.CASE_INSENSITIVE | Pattern.DOTALL);
+
+    private final StorageBackend<String, QueryExecution> queryStore;
+    private final StorageBackend<String, WorkGroup> workGroupStore;
+    private final StorageBackend<String, DataCatalog> dataCatalogStore;
+    private final StorageBackend<String, List<String>> resultColumnTypeStore;
+    // The Region each query execution was started in, by its id: the execution's own record is the API's shape, which
+    // carries none, and IAM checks a request naming the execution on its workgroup in that Region alone.
+    private final StorageBackend<String, String> queryRegionStore;
+    private final FlociDuckClient duckClient;
+    private final GlueService glueService;
+    private final S3Service s3Service;
+    private final EmulatorConfig config;
+    private final Vertx vertx;
+    private final GlueViewDdlBuilder ddlBuilder;
+    private final RegionResolver regionResolver;
+    private final AthenaHiveDdlExecutor hiveDdlExecutor;
+    private final AthenaIcebergStatements icebergStatements;
+    private final IamEnforcementFilter iamEnforcementFilter;
+
+    @Inject
+    public AthenaService(StorageFactory storageFactory,
+                         FlociDuckClient duckClient,
+                         GlueService glueService,
+                         S3Service s3Service,
+                         EmulatorConfig config,
+                         Vertx vertx,
+                         GlueViewDdlBuilder ddlBuilder,
+                         RegionResolver regionResolver,
+                         AthenaIcebergStatements icebergStatements,
+                         IamEnforcementFilter iamEnforcementFilter) {
+        this.queryStore = storageFactory.create("athena", "queries.json",
+                new TypeReference<>() {});
+        this.workGroupStore = storageFactory.create("athena", "workgroups.json",
+                new TypeReference<>() {});
+        this.dataCatalogStore = storageFactory.create("athena", "data-catalogs.json",
+                new TypeReference<>() {});
+        this.resultColumnTypeStore = storageFactory.create("athena", "query-result-column-types.json",
+                new TypeReference<>() {});
+        this.queryRegionStore = storageFactory.create("athena", "query-regions.json",
+                new TypeReference<>() {});
+        this.duckClient = duckClient;
+        this.glueService = glueService;
+        this.s3Service = s3Service;
+        this.config = config;
+        this.vertx = vertx;
+        this.ddlBuilder = ddlBuilder;
+        this.regionResolver = regionResolver;
+        this.icebergStatements = icebergStatements;
+        this.iamEnforcementFilter = iamEnforcementFilter;
+        this.hiveDdlExecutor = new AthenaHiveDdlExecutor(glueService, s3Service, icebergStatements);
+    }
+
+    public String startQueryExecution(String submitted,
+                                      String workGroup,
+                                      QueryExecutionContext context,
+                                      ResultConfiguration resultConfiguration) {
+        return startQueryExecution(submitted, workGroup, context, resultConfiguration, List.of());
+    }
+
+    /**
+     * Starts a query, binding {@code executionParameters} to its {@code ?} placeholders when it runs on the
+     * engine. They are not kept on the execution: AWS documents that "the list of parameters is not returned
+     * in the response".
+     */
+    public String startQueryExecution(String submitted,
+                                      String workGroup,
+                                      QueryExecutionContext context,
+                                      ResultConfiguration resultConfiguration,
+                                      List<String> executionParameters) {
+        // Athena takes one statement per query and rejects any other before an execution exists, with the
+        // AthenaErrorCode its InvalidRequestException carries for malformed SQL. The engine would otherwise run
+        // every statement of one that returns no rows, so a query that failed could still have written a table.
+        if (TrinoSqlCompatibility.holdsSeveralStatements(submitted)) {
+            throw new AwsException("InvalidRequestException", "Only one sql statement is allowed. Got: " + submitted,
+                    400, Map.of("AthenaErrorCode", "MALFORMED_QUERY"));
+        }
+        // Athena records, returns and runs the statement without the semicolons around it, so everything below,
+        // the execution's record included, reads that form.
+        String query = TrinoSqlCompatibility.recordedForm(submitted);
+        // Read when the query runs, on another thread, so a caller changing its list later changes nothing.
+        List<String> parameters = executionParameters == null ? List.of() : List.copyOf(executionParameters);
+        String id = UUID.randomUUID().toString();
+        String database = context != null && context.getDatabase() != null ? context.getDatabase() : "default";
+        QueryExecutionContext resolvedContext = context != null ? context : new QueryExecutionContext();
+        resolvedContext.setDatabase(database);
+        if (resolvedContext.getCatalog() == null || resolvedContext.getCatalog().isBlank()) {
+            resolvedContext.setCatalog(DEFAULT_CATALOG);
+        }
+
+        boolean createDatabaseStatement = CREATE_DATABASE_PREFIX_PATTERN.matcher(statementText(query)).find();
+        // Hive DDL runs against the Glue catalog, not the query engine. A statement that starts like one but
+        // does not parse fails the query with the parser's reason rather than reaching DuckDB.
+        AthenaHiveDdl.Statement hiveDdl = null;
+        AwsException invalidHiveDdl = null;
+        try {
+            hiveDdl = AthenaHiveDdl.parse(query);
+        } catch (AwsException e) {
+            invalidHiveDdl = e;
+        }
+        String s3TablesBucket = AthenaIcebergStatements.s3TablesBucket(resolvedContext.getCatalog());
+        // VACUUM reads the table's manifests, so it runs on the query engine like a query; in an S3 Tables catalog
+        // the executor refuses it at once.
+        AthenaHiveDdl.Vacuum vacuum = hiveDdl instanceof AthenaHiveDdl.Vacuum statement && s3TablesBucket == null
+                ? statement : null;
+        boolean hiveDdlStatement = (hiveDdl != null && vacuum == null) || invalidHiveDdl != null;
+        // AWS reports the result CSV object itself as the OutputLocation, not a
+        // directory prefix — the same key is written and returned to the client.
+        // Statements that do not return rows must not be wrapped in a result COPY.
+        String outputLocation = producesResultRows(query)
+                ? resolveOutputLocation(resultConfiguration, id)
+                : null;
+        ResultConfiguration resolvedResult = outputLocation != null
+                ? new ResultConfiguration(outputLocation)
+                : null;
+
+        QueryExecution execution = new QueryExecution(id, query, workGroup, resolvedResult, resolvedContext);
+        execution.storeRegion(regionResolver.getRegion());
+        if (createDatabaseStatement || hiveDdlStatement) {
+            execution.setStatementType("DDL");
+        }
+        execution.getStatus().setState(QueryExecutionState.RUNNING);
+        // Recorded before the execution, so no lookup finds the execution without its Region.
+        String startedIn = regionResolver.getRegion();
+        if (startedIn != null) {
+            queryRegionStore.put(id, startedIn);
+        }
+        queryStore.put(id, execution);
+
+        if (hiveDdlStatement) {
+            try {
+                if (invalidHiveDdl != null) {
+                    throw invalidHiveDdl;
+                }
+                if (s3TablesBucket == null) {
+                    requireGluePermissions(hiveDdl, database);
+                }
+                List<String> rows = hiveDdlExecutor.execute(hiveDdl, resolvedContext.getCatalog(), database);
+                if (outputLocation != null) {
+                    writeSingleColumnResult(id, outputLocation, "partition", rows);
+                }
+                markSucceeded(id, execution);
+            } catch (Exception e) {
+                markFailed(id, execution, e);
+            }
+            return id;
+        }
+
+        if (createDatabaseStatement) {
+            try {
+                CreateDatabaseDdl createDatabaseDdl = parseCreateDatabase(query);
+                if (createDatabaseDdl == null) {
+                    throw new AwsException("InvalidRequestException", "Invalid CREATE DATABASE statement", 400);
+                }
+                if (s3TablesBucket == null) {
+                    requireGluePermissions("CREATE DATABASE",
+                            Map.of("database", GlueService.normalizeName(createDatabaseDdl.name())), false);
+                }
+                if (s3TablesBucket != null) {
+                    // In an S3 Tables catalog a database is a namespace of the table bucket.
+                    icebergStatements.createNamespace(s3TablesBucket, createDatabaseDdl.name(),
+                            createDatabaseDdl.ifNotExists());
+                } else {
+                    createGlueDatabase(createDatabaseDdl);
+                }
+                markSucceeded(id, execution);
+            } catch (Exception e) {
+                markFailed(id, execution, e);
+            }
+            return id;
+        }
+
+        if (config.services().athena().mock()) {
+            markSucceeded(id, execution);
+            LOG.infov("Query {0} accepted (mock mode)", id);
+            return id;
+        }
+
+        // Submit async: the caller gets the ID immediately while execution runs in the background. The
+        // query outlives this request and must not share its CDI context, so it runs in a context of its
+        // own, as ReplayDispatcher runs a replay, as the account and in the Region it was started in: they
+        // decide the Glue catalog it reads and the stores its record and result column types go to.
+        String accountId = regionResolver.getAccountId();
+        String region = regionResolver.getRegion();
+        VertxContext.createNewDuplicatedContext(vertx.getOrCreateContext()).executeBlocking(() ->
+                RequestScopes.callAsChecked(accountId, region, () -> {
+                    // Athena fails a query that reads a table with an incomplete location template, or that
+                    // leaves an injected partition column unconstrained. It fails the query rather than the
+                    // submission, which is what throwing here produces.
+                    if (vacuum != null) {
+                        icebergStatements.vacuum(vacuum.ref(), database);
+                        return null;
+                    }
+                    // The parameters are bound into the statement, so the Iceberg rewrite and the engine both read
+                    // literals. A count that doesn't match fails the query here, before the checks below, as Trino
+                    // checks parameters before it analyzes a statement. Hive DDL never gets this far, and binds none.
+                    // Everything after this reads the bound statement, as if the values had been written in place: a
+                    // value bound as an expression can name a column, which must not pass the projection checks as
+                    // the `?` would, or a table, whose view the engine needs.
+                    String statement = TrinoSqlCompatibility.bindParameters(query, parameters);
+                    // A value bound as Athena binds it cannot add a statement (see bindParameters). The engine runs
+                    // every statement of a write, so the bound statement is checked again rather than trusted.
+                    if (TrinoSqlCompatibility.holdsSeveralStatements(statement)) {
+                        throw new AwsException("InvalidRequestException",
+                                "Only one sql statement is allowed. Got: " + statement, 400);
+                    }
+                    List<Table> projectionTables = tablesForProjectionCheck(database);
+                    PartitionProjection.assertLocationTemplatesComplete(statement, projectionTables);
+                    PartitionProjection.assertInjectedColumnsFiltered(statement, projectionTables);
+                    // S3 Tables catalogs the query names are attached under their own names; a write to an Iceberg
+                    // table of the default catalog goes through the engine's attachment of Glue's Iceberg catalog.
+                    AthenaIcebergStatements.S3TablesAttachment s3Tables = icebergStatements.s3TablesAttachment(
+                            statement, resolvedContext.getCatalog(), database);
+                    AthenaIcebergStatements.IcebergWrite icebergWrite = null;
+                    try {
+                        icebergWrite = icebergStatements.write(statement, resolvedContext.getCatalog(), database);
+                        String setupDdl = (s3Tables != null ? s3Tables.attachSql() : "")
+                                + (icebergWrite != null ? icebergWrite.setupSql() : "")
+                                + TrinoSqlCompatibility.FUNCTION_MACROS + ddlBuilder.build(database, statement)
+                                + (s3Tables != null ? s3Tables.searchPathSql() : "");
+                        String duckQuery = TrinoSqlCompatibility.translate(
+                                icebergWrite != null ? icebergWrite.query() : statement);
+                        if (outputLocation != null) {
+                            ensureOutputBucket(outputLocation);
+                        }
+                        // floci-duck runs a query that returns rows as COPY (<query>) TO ... on one line, so a line
+                        // comment ending the query would comment out the ) TO ... after it; a line break ends it.
+                        duckClient.execute(duckQuery + "\n", setupDdl, outputLocation, accountId);
+                        if (outputLocation != null) {
+                            resultColumnTypeStore.put(id, describeColumnTypes(duckQuery, setupDdl, accountId));
+                        }
+                    } finally {
+                        if (icebergWrite != null) {
+                            icebergStatements.finished(icebergWrite);
+                        }
+                        if (s3Tables != null) {
+                            icebergStatements.finished(s3Tables);
+                        }
+                    }
+                    return null;
+                })
+        ).onSuccess(v -> RequestScopes.runAs(accountId, region, () -> {
+            markSucceeded(id, execution);
+            LOG.infov("Query {0} succeeded", id);
+        })).onFailure(e -> RequestScopes.runAs(accountId, region, () -> {
+            markFailed(id, execution, e);
+            LOG.warnv("Query {0} failed: {1}", id, e.getMessage());
+        }));
+
+        return id;
+    }
+
+    /** Tables of the query's database, or none when the catalog cannot answer. */
+    private List<Table> tablesForProjectionCheck(String database) {
+        if (database == null || database.isBlank()) {
+            return List.of();
+        }
+        try {
+            List<Table> tables = glueService.getTables(database);
+            return tables == null ? List.of() : tables;
+        } catch (Exception e) {
+            LOG.debugv("Could not fetch tables for projection check on {0}: {1}", database, e.getMessage());
+            return List.of();
+        }
+    }
+
+    /** The stored query execution of the id; empty for one Athena holds none of. */
+    public Optional<QueryExecution> findQueryExecution(String id) {
+        return id == null ? Optional.empty() : queryStore.get(id);
+    }
+
+    /** The Region the query execution of the id was started in; empty for one whose Region Athena did not record. */
+    public Optional<String> findQueryExecutionRegion(String id) {
+        return id == null ? Optional.empty() : queryRegionStore.get(id);
+    }
+
+    public QueryExecution getQueryExecution(String id) {
+        return getQueryExecution(regionResolver.getRegion(), id);
+    }
+
+    public QueryExecution getQueryExecution(String region, String id) {
+        QueryExecution execution = findBatchQueryExecution(region, id);
+        if (execution == null) {
+            throw new AwsException("InvalidRequestException", "Query execution not found: " + id, 400);
+        }
+        return execution;
+    }
+
+    /** Legacy unprefixed rows belong to the default account; missing region means the configured default. */
+    QueryExecution findBatchQueryExecution(String region, String id) {
+        return findBatchQueryExecution(region, id, true);
+    }
+
+    /** IAM target discovery cannot write or migrate rows before the permission decision. */
+    QueryExecution findBatchQueryExecutionForAuthorization(String region, String id) {
+        return findBatchQueryExecution(region, id, false);
+    }
+
+    private QueryExecution findBatchQueryExecution(String region, String id, boolean migrateLegacy) {
+        Predicate<QueryExecution> inRegion = execution -> queryInRegion(execution, region);
+        Optional<QueryExecution> execution = batchScopedRead(queryStore, id, inRegion, migrateLegacy);
+        return execution.filter(inRegion).orElse(null);
+    }
+
+    synchronized List<WorkGroupTag> batchWorkGroupTags(String region, String name) {
+        return batchScopedRead(workGroupStore, workGroupKey(region, name), group -> true, false)
+                .map(group -> group.getTags() == null ? List.<WorkGroupTag>of() : List.copyOf(group.getTags()))
+                .orElse(List.of());
+    }
+
+    private <T> Optional<T> batchScopedRead(StorageBackend<String, T> backend, String key,
+                                             Predicate<T> legacyScope, boolean migrateLegacy) {
+        if (backend instanceof AccountAwareStorageBackend<T> accounts) {
+            String account = regionResolver.getAccountId();
+            if (!account.equals(regionResolver.getDefaultAccountId()) || AccountAwareStorageBackend.hasAccountPrefix(key)) {
+                return accounts.getForAccount(account, key);
+            }
+            if (migrateLegacy) {
+                return accounts.getForAccountMigratingLegacy(account, key, legacyScope);
+            }
+            return accounts.getForAccount(account, key)
+                    .or(() -> accounts.getLegacyForAccount(account, key).filter(legacyScope));
+        }
+        return backend.get(key);
+    }
+
+    public List<QueryExecution> listQueryExecutions() {
+        return queryStore.scan(k -> true);
+    }
+
+    private boolean queryInRegion(QueryExecution execution, String region) {
+        return Objects.equals(region,
+                execution.storedRegion() == null ? regionResolver.getDefaultRegion() : execution.storedRegion());
+    }
+
+    /** Listing reads eligible legacy rows in place, with explicitly scoped records taking precedence. */
+    private List<QueryExecution> queryHistory(String region) {
+        if (queryStore instanceof AccountAwareStorageBackend<QueryExecution> accounts) {
+            String account = regionResolver.getAccountId();
+            Map<String, QueryExecution> records = new LinkedHashMap<>();
+            for (QueryExecution execution : accounts.scanForAccount(account, key -> true)) {
+                records.put(execution.getQueryExecutionId(), execution);
+            }
+            if (account.equals(regionResolver.getDefaultAccountId())) {
+                for (QueryExecution execution : accounts.scanUnscopedLegacy(value -> true)) {
+                    records.putIfAbsent(execution.getQueryExecutionId(), execution);
+                }
+            }
+            return records.values().stream().filter(execution -> queryInRegion(execution, region)).toList();
+        }
+        return listQueryExecutions().stream().filter(execution -> queryInRegion(execution, region)).toList();
+    }
+
+    public PaginatedResult<QueryExecution> listQueryExecutionsPage(String region, String workGroup,
+                                                                   Integer maxResults, String nextToken) {
+        if (maxResults != null && (maxResults < 0 || maxResults > 50)) {
+            throw new AwsException("InvalidRequestException", "MaxResults must be between 0 and 50.", 400);
+        }
+        if (nextToken != null && (nextToken.isEmpty() || nextToken.length() > 1024)) {
+            throw new AwsException("InvalidRequestException", "NextToken must contain 1 to 1024 characters.", 400);
+        }
+        String group = workGroup == null ? DEFAULT_WORKGROUP : workGroup;
+        validateWorkGroupName(group);
+        if (!DEFAULT_WORKGROUP.equals(group)
+                && batchScopedRead(workGroupStore, workGroupKey(region, group), value -> true, false).isEmpty()) {
+            throw new AwsException("InvalidRequestException", "WorkGroup " + group + " is not found.", 400);
+        }
+        List<QueryExecution> executions = queryHistory(region).stream()
+                .filter(execution -> group.equals(Objects.requireNonNullElse(execution.getWorkGroup(), DEFAULT_WORKGROUP)))
+                .toList();
+        int limit = maxResults == null || maxResults == 0 ? 50 : maxResults;
+        return Pagination.paginate(executions, QueryExecution::getQueryExecutionId, limit, nextToken,
+                "ListQueryExecutions:" + regionResolver.getAccountId() + ":" + region + ":" + group,
+                token -> new AwsException("InvalidRequestException", "Invalid NextToken.", 400));
+    }
+
+    public void stopQueryExecution(String id) {
+        stopQueryExecution(regionResolver.getRegion(), id);
+    }
+
+    public void stopQueryExecution(String region, String id) {
+        QueryExecution execution = getQueryExecution(region, id);
+        synchronized (execution) {
+            if (isTerminal(execution.getStatus().getState())) {
+                return;
+            }
+            execution.getStatus().setState(QueryExecutionState.CANCELLED);
+            execution.getStatus().setCompletionDateTime(Instant.now());
+            queryStore.put(id, execution);
+        }
+    }
+
+    /** A terminal query is never rewritten: a late stop cannot cancel a finished query. */
+    private static boolean isTerminal(QueryExecutionState state) {
+        return state == QueryExecutionState.SUCCEEDED
+                || state == QueryExecutionState.FAILED
+                || state == QueryExecutionState.CANCELLED;
+    }
+
+    public synchronized WorkGroup createWorkGroup(CreateWorkGroupRequest request, String region) {
+        validateWorkGroupName(request.getName());
+        if (DEFAULT_WORKGROUP.equals(request.getName())) {
+            throw new AwsException("InvalidRequestException",
+                    DEFAULT_WORKGROUP + " workGroup could not be created", 400);
+        }
+        String key = workGroupKey(region, request.getName());
+        if (workGroupStore.get(key).isPresent()) {
+            throw new AwsException("InvalidRequestException", "WorkGroup already exists", 400);
+        }
+
+        WorkGroup workGroup = new WorkGroup();
+        workGroup.setName(request.getName());
+        workGroup.setDescription(request.getDescription());
+        workGroup.setState("ENABLED");
+        workGroup.setCreationTime(Instant.now());
+        workGroup.setTags(normalizeTags(request.getTags()));
+        workGroup.setConfiguration(normalizeWorkGroupConfiguration(request.getConfiguration()));
+        workGroupStore.put(key, workGroup);
+        return workGroup;
+    }
+
+    public Map<String, Object> getWorkGroup(String name, String region) {
+        String resolved = name == null || name.isBlank() ? DEFAULT_WORKGROUP : name;
+        if (DEFAULT_WORKGROUP.equals(resolved)) {
+            return toWorkGroupDetail(primaryWorkGroup(region));
+        }
+        return toWorkGroupDetail(requireWorkGroup(region, resolved));
+    }
+
+    public synchronized void updateWorkGroup(UpdateWorkGroupRequest request, String region) {
+        validateWorkGroupName(request.getWorkGroup());
+        validateWorkGroupDescription(request.getDescription());
+        validateWorkGroupState(request.getState());
+        validateWorkGroupConfigurationUpdates(request.getConfigurationUpdates());
+
+        WorkGroup workGroup = DEFAULT_WORKGROUP.equals(request.getWorkGroup())
+                ? primaryWorkGroup(region)
+                : requireWorkGroup(region, request.getWorkGroup());
+        if (request.getDescription() != null) {
+            workGroup.setDescription(request.getDescription());
+        }
+        if (request.getState() != null) {
+            workGroup.setState(request.getState());
+        }
+        WorkGroupConfiguration configuration = workGroup.getConfiguration();
+        if (configuration == null) {
+            configuration = defaultWorkGroupConfiguration();
+            workGroup.setConfiguration(configuration);
+        }
+        mergeWorkGroupConfiguration(configuration, request.getConfigurationUpdates());
+        workGroupStore.put(workGroupKey(region, workGroup.getName()), workGroup);
+    }
+
+    void removeWorkGroup(String name, String region) {
+        workGroupStore.delete(workGroupKey(region, name));
+    }
+
+    public void deleteWorkGroup(String name, String region) {
+        deleteWorkGroup(name, region, false);
+    }
+
+    public synchronized void deleteWorkGroup(String name, String region, boolean recursive) {
+        validatePreparedStatementDeletion(name, region, recursive);
+        workGroupStore.deleteAllAtomically(Set.of(workGroupKey(region, name)));
+    }
+
+    // Return the target monitor even when this service is accessed through a CDI client proxy.
+    Object workGroupLock() {
+        return this;
+    }
+
+    synchronized WorkGroup preparedStatementWorkGroup(String region, String name) {
+        return DEFAULT_WORKGROUP.equals(name) ? primaryWorkGroup(region) : requireWorkGroup(region, name);
+    }
+
+    synchronized void savePreparedStatements(String region, WorkGroup current,
+                                              Map<String, PreparedStatement> statements) {
+        workGroupStore.putAllAtomically(Map.of(workGroupKey(region, current.getName()),
+                current.withPreparedStatements(statements)));
+    }
+
+    synchronized void validatePreparedStatementDeletion(String name, String region, boolean recursive) {
+        if (!recursive && workGroupStore.get(workGroupKey(region, name))
+                .map(group -> !group.getPreparedStatements().isEmpty()).orElse(false)) {
+            throw new AwsException("InvalidRequestException",
+                    "WorkGroup contains prepared statements. Set RecursiveDeleteOption to true to delete it.", 400);
+        }
+    }
+
+
+    /**
+     * github.com/floci-io/floci/issues/2791: terraform-provider-aws calls this on every
+     * aws_athena_workgroup refresh, tags or not. Athena tags a workgroup or a data catalog and
+     * nothing else, so any other resource type is rejected. The built-in primary workgroup and
+     * AwsDataCatalog are synthesized rather than stored here and always answer with an empty
+     * list (CreateWorkGroup and CreateDataCatalog both reject those names, so neither can ever
+     * carry real tags).
+     */
+    public List<WorkGroupTag> listTagsForResource(String resourceArn) {
+        AwsArnUtils.Arn arn = parseAthenaResourceArn(resourceArn);
+        if (arn.resource().startsWith(WORKGROUP_RESOURCE)) {
+            String name = arn.resource().substring(WORKGROUP_RESOURCE.length());
+            if (DEFAULT_WORKGROUP.equals(name)) {
+                return List.of();
+            }
+            return requireWorkGroup(arn.region(), name).getTags();
+        }
+        String name = arn.resource().substring(DATA_CATALOG_RESOURCE.length());
+        if (DEFAULT_CATALOG.equals(name)) {
+            return List.of();
+        }
+        return requireTaggedDataCatalog(arn.region(), name, resourceArn).getTags();
+    }
+
+    /**
+     * The tags of the workgroup or the data catalog stored under {@code arn} in the account and Region it names, read
+     * in place and matched on the whole ARN; empty for an ARN naming nothing stored, the built-in {@code primary}
+     * workgroup and {@code AwsDataCatalog} included, which carry none.
+     */
+    public Map<String, String> storedTags(String arn) {
+        if (!AwsArnUtils.isArnFor(arn, "athena")) {
+            return Map.of();
+        }
+        AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+        String resource = parsed.resource();
+        if (!arn.equals(AwsArnUtils.Arn.of("athena", parsed.region(), parsed.accountId(), resource).toString())) {
+            return Map.of();
+        }
+        List<WorkGroupTag> tags = null;
+        if (resource.startsWith(WORKGROUP_RESOURCE) && resource.indexOf('/', WORKGROUP_RESOURCE.length()) < 0) {
+            tags = AccountAwareStorageBackend.readInAccount(workGroupStore, parsed.accountId(),
+                            workGroupKey(parsed.region(), resource.substring(WORKGROUP_RESOURCE.length())))
+                    .map(WorkGroup::getTags)
+                    .orElse(null);
+        } else if (resource.startsWith(DATA_CATALOG_RESOURCE)) {
+            tags = AccountAwareStorageBackend.readInAccount(dataCatalogStore, parsed.accountId(),
+                            catalogKey(parsed.region(), resource.substring(DATA_CATALOG_RESOURCE.length())))
+                    .map(DataCatalog::getTags)
+                    .orElse(null);
+        }
+        Map<String, String> byKey = new LinkedHashMap<>();
+        if (tags != null) {
+            for (WorkGroupTag tag : tags) {
+                if (tag.getKey() != null && tag.getValue() != null) {
+                    byKey.put(tag.getKey(), tag.getValue());
+                }
+            }
+        }
+        return byKey;
+    }
+
+    public synchronized void tagResource(String resourceArn, List<WorkGroupTag> tags) {
+        if (tags == null || tags.isEmpty()) {
+            throw new AwsException("InvalidRequestException", "Tags is required.", 400);
+        }
+        AwsArnUtils.Arn arn = parseAthenaResourceArn(resourceArn);
+        if (arn.resource().startsWith(WORKGROUP_RESOURCE)) {
+            String name = requireTaggableWorkGroupName(arn.resource());
+            WorkGroup workGroup = requireWorkGroup(arn.region(), name);
+            workGroup.setTags(mergeTags(workGroup.getTags(), tags));
+            workGroupStore.put(workGroupKey(arn.region(), name), workGroup);
+            return;
+        }
+        String name = requireTaggableCatalogName(arn.resource());
+        DataCatalog catalog = requireTaggedDataCatalog(arn.region(), name, resourceArn);
+        catalog.setTags(mergeTags(catalog.getTags(), tags));
+        dataCatalogStore.put(catalogKey(arn.region(), name), catalog);
+    }
+
+    public synchronized void untagResource(String resourceArn, List<String> tagKeys) {
+        if (tagKeys == null || tagKeys.isEmpty()) {
+            throw new AwsException("InvalidRequestException", "TagKeys is required.", 400);
+        }
+        AwsArnUtils.Arn arn = parseAthenaResourceArn(resourceArn);
+        if (arn.resource().startsWith(WORKGROUP_RESOURCE)) {
+            String name = requireTaggableWorkGroupName(arn.resource());
+            WorkGroup workGroup = requireWorkGroup(arn.region(), name);
+            workGroup.setTags(removeTags(workGroup.getTags(), tagKeys));
+            workGroupStore.put(workGroupKey(arn.region(), name), workGroup);
+            return;
+        }
+        String name = requireTaggableCatalogName(arn.resource());
+        DataCatalog catalog = requireTaggedDataCatalog(arn.region(), name, resourceArn);
+        catalog.setTags(removeTags(catalog.getTags(), tagKeys));
+        dataCatalogStore.put(catalogKey(arn.region(), name), catalog);
+    }
+
+    public List<Map<String, Object>> listWorkGroups(String region) {
+        List<Map<String, Object>> workGroups = new ArrayList<>();
+        workGroups.add(toWorkGroupDetail(primaryWorkGroup(region)));
+        workGroups.addAll(workGroupStore.scan(k -> k.startsWith(region + ":")).stream()
+                .filter(workGroup -> !DEFAULT_WORKGROUP.equals(workGroup.getName()))
+                .sorted(Comparator.comparing(WorkGroup::getName))
+                .map(this::toWorkGroupSummary)
+                .toList());
+        return workGroups;
+    }
+
+    public PaginatedResult<Map<String, Object>> listWorkGroupsPage(String region, int maxResults, String nextToken) {
+        if (maxResults < 1 || maxResults > 50) {
+            throw new AwsException("InvalidRequestException", "MaxResults must be between 1 and 50", 400);
+        }
+        if (nextToken != null && nextToken.isEmpty()) {
+            throw new AwsException("InvalidRequestException", "Invalid NextToken", 400);
+        }
+        return Pagination.paginate(listWorkGroups(region), workGroup -> {
+            String name = (String) workGroup.get("Name");
+            return DEFAULT_WORKGROUP.equals(name) ? "0" : "1" + name;
+        }, maxResults, nextToken, "ListWorkGroups:" + region,
+                token -> new AwsException("InvalidRequestException", "Invalid NextToken", 400));
+    }
+
+    /**
+     * The account's built-in Glue catalog first, then the catalogs registered through
+     * {@code CreateDataCatalog}, sorted by name.
+     */
+    public List<Map<String, Object>> listDataCatalogs(String region) {
+        List<Map<String, Object>> summaries = new ArrayList<>();
+        summaries.add(Map.of("CatalogName", DEFAULT_CATALOG, "Type", "GLUE"));
+        summaries.addAll(dataCatalogStore.scan(k -> k.startsWith(region + ":")).stream()
+                .sorted(Comparator.comparing(DataCatalog::getName))
+                .map(this::toCatalogSummary)
+                .toList());
+        return summaries;
+    }
+
+    public PaginatedResult<Map<String, Object>> listDataCatalogsPage(String region, Integer maxResults, String nextToken) {
+        int limit = maxResults == null ? 50 : maxResults;
+        if (limit < 2 || limit > 50) {
+            throw new AwsException("InvalidRequestException", "MaxResults must be between 2 and 50.", 400);
+        }
+        if (nextToken != null && (nextToken.isEmpty() || nextToken.length() > 1024)) {
+            throw new AwsException("InvalidRequestException", "NextToken must contain 1 to 1024 characters.", 400);
+        }
+        return Pagination.paginate(listDataCatalogs(region), catalog -> {
+            String name = (String) catalog.get("CatalogName");
+            return DEFAULT_CATALOG.equals(name) ? "0" : "1" + name;
+        }, limit, nextToken, "ListDataCatalogs:" + regionResolver.getAccountId() + ":" + region,
+                token -> new AwsException("InvalidRequestException", "Invalid NextToken.", 400));
+    }
+
+    public Map<String, Object> getDataCatalog(String region, String name) {
+        String resolved = name == null || name.isBlank() ? DEFAULT_CATALOG : name;
+        if (DEFAULT_CATALOG.equals(resolved)) {
+            return Map.of("Name", DEFAULT_CATALOG, "Type", "GLUE");
+        }
+        return toCatalogDetail(requireDataCatalog(region, resolved));
+    }
+
+    public Map<String, Object> createDataCatalog(String region,
+                                                 String name,
+                                                 String type,
+                                                 String description,
+                                                 Map<String, String> parameters,
+                                                 List<WorkGroupTag> tags) {
+        validateCatalogName(name);
+        if (DEFAULT_CATALOG.equals(name)) {
+            throw new AwsException("InvalidRequestException",
+                    DEFAULT_CATALOG + " is a reserved data catalog name.", 400);
+        }
+        validateCatalogType(type);
+        if (dataCatalogStore.get(catalogKey(region, name)).isPresent()) {
+            throw new AwsException("InvalidRequestException",
+                    "DataCatalog " + name + " already exists.", 400);
+        }
+
+        DataCatalog catalog = new DataCatalog();
+        catalog.setName(name);
+        catalog.setType(type);
+        catalog.setDescription(description);
+        catalog.setParameters(normalizeParameters(parameters));
+        // AWS creates LAMBDA, GLUE and HIVE catalogs synchronously and FEDERATED ones
+        // asynchronously. Registration is instantaneous here, so all four report the terminal
+        // status rather than a CREATE_IN_PROGRESS that no worker would ever advance.
+        catalog.setStatus("CREATE_COMPLETE");
+        catalog.setConnectionType(resolveConnectionType(type, catalog.getParameters()));
+        catalog.setTags(normalizeTags(tags));
+        dataCatalogStore.put(catalogKey(region, name), catalog);
+        return toCatalogDetail(catalog);
+    }
+
+    /**
+     * UpdateDataCatalog replaces Type, Description and Parameters wholesale, the way AWS does.
+     * Tags are untouched: they move only through TagResource and UntagResource.
+     */
+    public void updateDataCatalog(String region,
+                                  String name,
+                                  String type,
+                                  String description,
+                                  Map<String, String> parameters) {
+        validateCatalogName(name);
+        if (DEFAULT_CATALOG.equals(name)) {
+            throw new AwsException("InvalidRequestException",
+                    DEFAULT_CATALOG + " cannot be modified.", 400);
+        }
+        validateCatalogType(type);
+        DataCatalog catalog = requireDataCatalog(region, name);
+        catalog.setType(type);
+        catalog.setDescription(description);
+        catalog.setParameters(normalizeParameters(parameters));
+        catalog.setConnectionType(resolveConnectionType(type, catalog.getParameters()));
+        dataCatalogStore.put(catalogKey(region, name), catalog);
+    }
+
+    public Map<String, Object> deleteDataCatalog(String region, String name) {
+        validateCatalogName(name);
+        if (DEFAULT_CATALOG.equals(name)) {
+            throw new AwsException("InvalidRequestException",
+                    DEFAULT_CATALOG + " cannot be deleted.", 400);
+        }
+        DataCatalog catalog = requireDataCatalog(region, name);
+        dataCatalogStore.delete(catalogKey(region, name));
+        return toCatalogDetail(catalog);
+    }
+
+    public List<Map<String, Object>> listDatabases(String catalog) {
+        return glueService.getDatabases().stream()
+                .map(Database::getName)
+                .sorted()
+                .map(name -> Map.<String, Object>of("Name", name))
+                .toList();
+    }
+
+    public List<Map<String, Object>> listTableMetadata(String catalog, String database) {
+        return glueService.getTables(database).stream()
+                .sorted(Comparator.comparing(Table::getName))
+                .map(table -> tableMetadata(catalog, database, table))
+                .toList();
+    }
+
+    public Map<String, Object> getTableMetadata(String catalog, String database, String tableName) {
+        return tableMetadata(catalog, database, glueService.getTable(database, tableName));
+    }
+
+    public ResultSet getQueryResults(String id) {
+        return getQueryResults(regionResolver.getRegion(), id);
+    }
+
+    public ResultSet getQueryResults(String region, String id) {
+        QueryExecution execution = getQueryExecution(region, id);
+
+        if (execution.getStatus().getState() != QueryExecutionState.SUCCEEDED) {
+            throw new AwsException("InvalidRequestException", "Query has not succeeded yet", 400);
+        }
+
+        // DDL rows (SHOW PARTITIONS) come from the Glue catalog, not the query engine, so mock mode keeps them.
+        if (config.services().athena().mock() && !"DDL".equals(execution.getStatementType())
+                || execution.getResultConfiguration() == null
+                || execution.getResultConfiguration().getOutputLocation() == null) {
+            return new ResultSet(List.of(), new ResultSet.ResultSetMetadata(List.of()));
+        }
+
+        List<String> columnTypes = resultColumnTypeStore.get(id).orElse(List.of());
+        return readResultsFromS3(execution.getResultConfiguration().getOutputLocation(), id, columnTypes);
+    }
+
+    // ── private helpers ───────────────────────────────────────────────────────
+
+    private CreateDatabaseDdl parseCreateDatabase(String query) {
+        Matcher matcher = CREATE_DATABASE_PATTERN.matcher(statementText(query));
+        if (!matcher.matches()) {
+            return null;
+        }
+        String name = firstNonNull(matcher.group(2), matcher.group(3), matcher.group(4));
+        return new CreateDatabaseDdl(
+                name,
+                matcher.group(1) != null,
+                unescapeSqlString(matcher.group(5)),
+                unescapeSqlString(matcher.group(6)),
+                parseDatabaseProperties(matcher.group(7)));
+    }
+
+    private void createGlueDatabase(CreateDatabaseDdl statement) {
+        Database database = new Database(statement.name());
+        database.setDescription(statement.comment());
+        database.setLocationUri(statement.location());
+        database.setParameters(statement.properties());
+        try {
+            glueService.createDatabase(database);
+        } catch (AwsException e) {
+            if (!statement.ifNotExists() || !"AlreadyExistsException".equals(e.getErrorCode())) {
+                throw e;
+            }
+        }
+    }
+
+    private static Map<String, String> parseDatabaseProperties(String clause) {
+        if (clause == null) {
+            return null;
+        }
+        Map<String, String> properties = new LinkedHashMap<>();
+        int cursor = 0;
+        while (cursor < clause.length()) {
+            Matcher matcher = DATABASE_PROPERTY_PATTERN.matcher(clause);
+            matcher.region(cursor, clause.length());
+            if (!matcher.lookingAt()) {
+                throw new AwsException("InvalidRequestException", "Invalid database properties", 400);
+            }
+            properties.put(unescapeSqlString(matcher.group(1)), unescapeSqlString(matcher.group(2)));
+            cursor = matcher.end();
+            if (cursor == clause.length()) {
+                break;
+            }
+            if (clause.charAt(cursor) != ',') {
+                throw new AwsException("InvalidRequestException", "Invalid database properties", 400);
+            }
+            cursor++;
+            if (clause.substring(cursor).isBlank()) {
+                throw new AwsException("InvalidRequestException", "Invalid database properties", 400);
+            }
+        }
+        return properties;
+    }
+
+    private static boolean producesResultRows(String query) {
+        return RESULT_STATEMENT_PATTERN.matcher(statementText(query)).find();
+    }
+
+    private static String statementText(String query) {
+        String statement = query == null ? "" : query.stripLeading();
+        while (true) {
+            if (statement.startsWith("--")) {
+                int lineEnd = statement.indexOf('\n');
+                statement = lineEnd >= 0 ? statement.substring(lineEnd + 1).stripLeading() : "";
+                continue;
+            }
+            if (statement.startsWith("/*")) {
+                int commentEnd = statement.indexOf("*/", 2);
+                if (commentEnd < 0) {
+                    return statement;
+                }
+                statement = statement.substring(commentEnd + 2).stripLeading();
+                continue;
+            }
+            return statement;
+        }
+    }
+
+    private static String firstNonNull(String... values) {
+        for (String value : values) {
+            if (value != null) {
+                return value;
+            }
+        }
+        return null;
+    }
+
+    private static String unescapeSqlString(String value) {
+        return value == null ? null : value.replace("''", "'");
+    }
+
+    private void markSucceeded(String id, QueryExecution execution) {
+        synchronized (execution) {
+            if (isTerminal(execution.getStatus().getState())) {
+                return;
+            }
+            execution.getStatus().setState(QueryExecutionState.SUCCEEDED);
+            execution.getStatus().setCompletionDateTime(Instant.now());
+            queryStore.put(id, execution);
+        }
+    }
+
+    /**
+     * Fails the query as Athena does when the caller may not make the Glue requests a statement of the default catalog
+     * makes. Athena runs a DDL statement against the Glue Data Catalog with the caller's identity, and a denial fails
+     * the query rather than the request, its reason as AWS reports it: "Insufficient permissions to execute the query.
+     * User: <caller> is not authorized to perform: glue:GetDatabase on resource: arn:aws:glue:<region>:<account>:catalog
+     * because no identity-based policy allows the glue:GetDatabase action ". The requests each statement makes are
+     * the IAM table's, read from the permissions Athena's user guide gives each DDL statement, named as the guide
+     * names the statement; one it gives none makes none, and only a partitioned table's makes partition requests.
+     */
+    private void requireGluePermissions(AthenaHiveDdl.Statement statement, String contextDatabase) {
+        String documented = switch (statement) {
+            case AthenaHiveDdl.CreateTable create -> "CREATE TABLE";
+            case AthenaHiveDdl.CreateIcebergTable create -> "CREATE TABLE";
+            case AthenaHiveDdl.DropTable drop -> "DROP TABLE";
+            case AthenaHiveDdl.RepairTable repair -> "MSCK REPAIR TABLE";
+            default -> null;
+        };
+        if (documented == null) {
+            return;
+        }
+        // Glue names a database and a table in an ARN as it stores them, lowercase, however the query spells them.
+        String database = GlueService.normalizeName(
+                statement.ref().database() != null ? statement.ref().database() : contextDatabase);
+        String table = GlueService.normalizeName(statement.ref().table());
+        boolean partitioned = statement instanceof AthenaHiveDdl.DropTable && isPartitioned(database, table);
+        requireGluePermissions(documented, Map.of("database", database, "table", table), partitioned);
+    }
+
+    private void requireGluePermissions(String statement, Map<String, String> names, boolean partitioned) {
+        Optional<String> refusal = iamEnforcementFilter.statementRefusal(START_QUERY_EXECUTION, statement, names,
+                partitioned);
+        if (refusal.isPresent()) {
+            throw new AwsException("AccessDeniedException",
+                    "Insufficient permissions to execute the query. " + refusal.get() + " ", 400);
+        }
+    }
+
+    /**
+     * Whether the catalog holds the table with partition keys. A table it does not hold has none, so dropping it makes
+     * no partition request; any other failure to read the table fails the query, as the drop itself would.
+     */
+    private boolean isPartitioned(String database, String table) {
+        try {
+            Table held = glueService.getTable(database, table);
+            return held.getPartitionKeys() != null && !held.getPartitionKeys().isEmpty();
+        } catch (AwsException e) {
+            if (!"EntityNotFoundException".equals(e.getErrorCode())) {
+                throw e;
+            }
+            return false;
+        }
+    }
+
+    private void markFailed(String id, QueryExecution execution, Throwable failure) {
+        synchronized (execution) {
+            if (isTerminal(execution.getStatus().getState())) {
+                return;
+            }
+            execution.getStatus().setState(QueryExecutionState.FAILED);
+            execution.getStatus().setStateChangeReason(failure.getMessage());
+            queryStore.put(id, execution);
+        }
+    }
+
+    private record CreateDatabaseDdl(String name, boolean ifNotExists, String comment,
+                                     String location, Map<String, String> properties) {
+    }
+
+    private String resolveOutputLocation(ResultConfiguration rc, String queryId) {
+        String base = (rc != null && rc.getOutputLocation() != null && !rc.getOutputLocation().isBlank())
+                ? rc.getOutputLocation()
+                : "s3://" + DEFAULT_OUTPUT_BUCKET + "/results/";
+        return base.endsWith("/") ? base + queryId + ".csv" : base + "/" + queryId + ".csv";
+    }
+
+    private WorkGroupConfiguration normalizeWorkGroupConfiguration(CreateWorkGroupConfigurationRequest configuration) {
+        WorkGroupConfiguration normalized = defaultWorkGroupConfiguration();
+        if (configuration == null) {
+            return normalized;
+        }
+
+        if (configuration.getResultConfiguration() != null
+                && configuration.getResultConfiguration().getOutputLocation() != null
+                && !configuration.getResultConfiguration().getOutputLocation().isBlank()) {
+            normalized.setResultConfiguration(
+                    new ResultConfiguration(configuration.getResultConfiguration().getOutputLocation()));
+        }
+        if (configuration.getEnforceWorkGroupConfiguration() != null) {
+            normalized.setEnforceWorkGroupConfiguration(configuration.getEnforceWorkGroupConfiguration());
+        }
+        if (configuration.getPublishCloudWatchMetricsEnabled() != null) {
+            normalized.setPublishCloudWatchMetricsEnabled(configuration.getPublishCloudWatchMetricsEnabled());
+        }
+        if (configuration.getRequesterPaysEnabled() != null) {
+            normalized.setRequesterPaysEnabled(configuration.getRequesterPaysEnabled());
+        }
+        if (configuration.getBytesScannedCutoffPerQuery() != null) {
+            normalized.setBytesScannedCutoffPerQuery(configuration.getBytesScannedCutoffPerQuery());
+        }
+        if (configuration.getManagedQueryResultsConfiguration() != null) {
+            ManagedQueryResultsConfiguration requested = configuration.getManagedQueryResultsConfiguration();
+            ManagedQueryResultsConfiguration managed = new ManagedQueryResultsConfiguration();
+            managed.setEnabled(Boolean.TRUE.equals(requested.getEnabled()));
+            managed.setEncryptionConfiguration(copyOf(requested.getEncryptionConfiguration()));
+            normalized.setManagedQueryResultsConfiguration(managed);
+        }
+        if (configuration.getEnableMinimumEncryptionConfiguration() != null) {
+            normalized.setEnableMinimumEncryptionConfiguration(configuration.getEnableMinimumEncryptionConfiguration());
+        }
+        if (configuration.getEngineVersion() != null) {
+            String selectedEngineVersion = configuration.getEngineVersion().getSelectedEngineVersion();
+            boolean hasSelectedEngineVersion = selectedEngineVersion != null && !selectedEngineVersion.isBlank();
+
+            if (hasSelectedEngineVersion) {
+                QueryExecution.EngineVersion engineVersion = new QueryExecution.EngineVersion();
+                engineVersion.setSelectedEngineVersion(selectedEngineVersion);
+                engineVersion.setEffectiveEngineVersion(resolveEffectiveEngineVersion(selectedEngineVersion));
+                normalized.setEngineVersion(engineVersion);
+            }
+        }
+        return normalized;
+    }
+
+    private void mergeWorkGroupConfiguration(WorkGroupConfiguration configuration,
+                                             WorkGroupConfigurationUpdates updates) {
+        if (updates == null) {
+            return;
+        }
+
+        ResultConfigurationUpdates resultUpdates = updates.getResultConfigurationUpdates();
+        if (resultUpdates != null) {
+            if (Boolean.TRUE.equals(resultUpdates.getRemoveOutputLocation())) {
+                configuration.setResultConfiguration(null);
+            } else if (resultUpdates.getOutputLocation() != null) {
+                configuration.setResultConfiguration(new ResultConfiguration(resultUpdates.getOutputLocation()));
+            }
+        }
+        if (updates.getEnforceWorkGroupConfiguration() != null) {
+            configuration.setEnforceWorkGroupConfiguration(updates.getEnforceWorkGroupConfiguration());
+        }
+        if (updates.getPublishCloudWatchMetricsEnabled() != null) {
+            configuration.setPublishCloudWatchMetricsEnabled(updates.getPublishCloudWatchMetricsEnabled());
+        }
+        if (updates.getRequesterPaysEnabled() != null) {
+            configuration.setRequesterPaysEnabled(updates.getRequesterPaysEnabled());
+        }
+        if (Boolean.TRUE.equals(updates.getRemoveBytesScannedCutoffPerQuery())) {
+            configuration.setBytesScannedCutoffPerQuery(null);
+        } else if (updates.getBytesScannedCutoffPerQuery() != null) {
+            configuration.setBytesScannedCutoffPerQuery(updates.getBytesScannedCutoffPerQuery());
+        }
+        mergeManagedQueryResults(configuration, updates.getManagedQueryResultsConfigurationUpdates());
+        if (updates.getEnableMinimumEncryptionConfiguration() != null) {
+            configuration.setEnableMinimumEncryptionConfiguration(updates.getEnableMinimumEncryptionConfiguration());
+        }
+        if (updates.getEngineVersion() != null) {
+            String selectedEngineVersion = updates.getEngineVersion().getSelectedEngineVersion();
+            if (selectedEngineVersion != null) {
+                QueryExecution.EngineVersion engineVersion = new QueryExecution.EngineVersion();
+                engineVersion.setSelectedEngineVersion(selectedEngineVersion);
+                engineVersion.setEffectiveEngineVersion(resolveEffectiveEngineVersion(selectedEngineVersion));
+                configuration.setEngineVersion(engineVersion);
+            }
+        }
+    }
+
+    private static void mergeManagedQueryResults(WorkGroupConfiguration configuration,
+                                                 ManagedQueryResultsConfigurationUpdates updates) {
+        if (updates == null) {
+            return;
+        }
+        ManagedQueryResultsConfiguration managed = configuration.getManagedQueryResultsConfiguration();
+        if (managed == null) {
+            managed = new ManagedQueryResultsConfiguration();
+            managed.setEnabled(false);
+        }
+        if (updates.getEnabled() != null) {
+            managed.setEnabled(updates.getEnabled());
+        }
+        if (Boolean.TRUE.equals(updates.getRemoveEncryptionConfiguration())) {
+            managed.setEncryptionConfiguration(null);
+        } else if (updates.getEncryptionConfiguration() != null) {
+            managed.setEncryptionConfiguration(copyOf(updates.getEncryptionConfiguration()));
+        }
+        configuration.setManagedQueryResultsConfiguration(managed);
+    }
+
+    private static ManagedQueryResultsConfiguration.EncryptionConfiguration copyOf(
+            ManagedQueryResultsConfiguration.EncryptionConfiguration encryption) {
+        return encryption == null ? null : new ManagedQueryResultsConfiguration.EncryptionConfiguration(
+                encryption.getKmsKey());
+    }
+
+    private String resolveEffectiveEngineVersion(String selectedEngineVersion) {
+        if (selectedEngineVersion == null || selectedEngineVersion.isBlank() || "AUTO".equals(selectedEngineVersion)) {
+            return DEFAULT_ENGINE_VERSION;
+        }
+        return selectedEngineVersion;
+    }
+
+    /**
+     * What a workgroup reports for the members its request leaves out, as AWS does: no result
+     * location (a query names its own, or the workgroup uses managed results), the engine version
+     * {@code AUTO} resolved to the current one, and minimum encryption off.
+     */
+    private WorkGroupConfiguration defaultWorkGroupConfiguration() {
+        WorkGroupConfiguration configuration = new WorkGroupConfiguration();
+        configuration.setEnforceWorkGroupConfiguration(false);
+        configuration.setPublishCloudWatchMetricsEnabled(false);
+        configuration.setRequesterPaysEnabled(false);
+        configuration.setEngineVersion(defaultEngineVersion());
+        configuration.setEnableMinimumEncryptionConfiguration(false);
+        return configuration;
+    }
+
+    private QueryExecution.EngineVersion defaultEngineVersion() {
+        QueryExecution.EngineVersion engineVersion = new QueryExecution.EngineVersion();
+        engineVersion.setSelectedEngineVersion(AUTO_ENGINE_VERSION);
+        engineVersion.setEffectiveEngineVersion(DEFAULT_ENGINE_VERSION);
+        return engineVersion;
+    }
+
+    private WorkGroup primaryWorkGroup(String region) {
+        return workGroupStore.get(workGroupKey(region, DEFAULT_WORKGROUP)).orElseGet(() -> {
+            WorkGroup workGroup = new WorkGroup();
+            workGroup.setName(DEFAULT_WORKGROUP);
+            workGroup.setState("ENABLED");
+            WorkGroupConfiguration configuration = defaultWorkGroupConfiguration();
+            // AWS reports primary's result configuration as an empty object until a location is set.
+            configuration.setResultConfiguration(new ResultConfiguration());
+            workGroup.setConfiguration(configuration);
+            return workGroup;
+        });
+    }
+
+    private Map<String, Object> toWorkGroupDetail(WorkGroup workGroup) {
+        Map<String, Object> detail = new LinkedHashMap<>();
+        detail.put("Name", workGroup.getName());
+        detail.put("State", workGroup.getState());
+        if (workGroup.getDescription() != null) {
+            detail.put("Description", workGroup.getDescription());
+        }
+        if (workGroup.getCreationTime() != null) {
+            detail.put("CreationTime", workGroup.getCreationTime().getEpochSecond());
+        }
+        if (workGroup.getConfiguration() != null) {
+            detail.put("Configuration", workGroup.getConfiguration());
+        }
+        return detail;
+    }
+
+    private Map<String, Object> toWorkGroupSummary(WorkGroup workGroup) {
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("Name", workGroup.getName());
+        result.put("State", workGroup.getState());
+        return result;
+    }
+
+    private List<WorkGroupTag> normalizeTags(List<WorkGroupTag> tags) {
+        if (tags == null || tags.isEmpty()) {
+            return List.of();
+        }
+        return tags.stream()
+                .filter(Objects::nonNull)
+                .map(tag -> new WorkGroupTag(tag.getKey(), tag.getValue()))
+                .toList();
+    }
+
+    private List<WorkGroupTag> mergeTags(List<WorkGroupTag> current, List<WorkGroupTag> added) {
+        Map<String, String> merged = currentTagsByKey(current);
+        for (WorkGroupTag tag : added) {
+            if (tag == null || tag.getKey() == null || tag.getKey().isBlank()) {
+                throw new AwsException("InvalidRequestException", "Tag keys must not be empty.", 400);
+            }
+            merged.put(tag.getKey(), tag.getValue() == null ? "" : tag.getValue());
+        }
+        return toTagList(merged);
+    }
+
+    private List<WorkGroupTag> removeTags(List<WorkGroupTag> current, List<String> tagKeys) {
+        Map<String, String> remaining = currentTagsByKey(current);
+        tagKeys.forEach(remaining::remove);
+        return toTagList(remaining);
+    }
+
+    private Map<String, String> currentTagsByKey(List<WorkGroupTag> current) {
+        Map<String, String> byKey = new LinkedHashMap<>();
+        for (WorkGroupTag tag : normalizeTags(current)) {
+            if (tag.getKey() != null && !tag.getKey().isBlank()) {
+                byKey.put(tag.getKey(), tag.getValue());
+            }
+        }
+        return byKey;
+    }
+
+    private List<WorkGroupTag> toTagList(Map<String, String> values) {
+        List<WorkGroupTag> tags = new ArrayList<>();
+        values.forEach((key, value) -> tags.add(new WorkGroupTag(key, value)));
+        return tags;
+    }
+
+    /**
+     * Parses a ResourceARN for the tag operations and rejects anything Athena does not tag.
+     *
+     * <p>pgermosen (review, #3242): the service check matters. Without it, an ARN naming a
+     * completely different service (a Neptune workgroup/-shaped resource that happens to share
+     * this region and name, say) would resolve instead of being rejected the way a live account
+     * rejects a ResourceARN naming the wrong service.
+     */
+    private AwsArnUtils.Arn parseAthenaResourceArn(String resourceArn) {
+        if (resourceArn == null || resourceArn.isBlank()) {
+            throw new AwsException("InvalidRequestException", "ResourceARN is required.", 400);
+        }
+        AwsArnUtils.Arn arn;
+        try {
+            arn = AwsArnUtils.parse(resourceArn);
+        } catch (IllegalArgumentException e) {
+            throw new AwsException("InvalidRequestException", "Invalid ResourceARN: " + resourceArn, 400);
+        }
+        boolean taggable = "athena".equals(arn.service())
+                && (arn.resource().startsWith(WORKGROUP_RESOURCE)
+                        || arn.resource().startsWith(DATA_CATALOG_RESOURCE));
+        if (!taggable) {
+            throw new AwsException("InvalidRequestException",
+                    "ResourceARN " + resourceArn + " is not an Athena workgroup or data catalog.", 400);
+        }
+        return arn;
+    }
+
+    private WorkGroup requireWorkGroup(String region, String name) {
+        return workGroupStore.get(workGroupKey(region, name))
+                .orElseThrow(() -> new AwsException("InvalidRequestException",
+                        "WorkGroup " + name + " is not found.", 400));
+    }
+
+    /**
+     * Refuses a metadata read of a data catalog whose metadata is not the account's Glue Data Catalog, which Floci
+     * reads them from: a catalog of another type, or a Glue one registered for another account's catalog. Athena
+     * answers {@code MetadataException} when it cannot read a catalog's metastore, and {@code InvalidRequestException}
+     * for one it does not hold.
+     */
+    public void requireGlueCatalog(String region, String name) {
+        if (DEFAULT_CATALOG.equals(name)) {
+            return;
+        }
+        DataCatalog catalog = requireDataCatalog(region, name);
+        String catalogId = catalog.getParameters() == null ? null : catalog.getParameters().get("catalog-id");
+        if (!"GLUE".equals(catalog.getType()) || (catalogId != null && !catalogId.equals(regionResolver.getAccountId()))) {
+            throw new AwsException("MetadataException", "Unable to read the metadata of data catalog " + name + ".", 400);
+        }
+    }
+
+    private DataCatalog requireDataCatalog(String region, String name) {
+        return dataCatalogStore.get(catalogKey(region, name))
+                .orElseThrow(() -> new AwsException("InvalidRequestException",
+                        "DataCatalog " + name + " was not found.", 400));
+    }
+
+    /**
+     * The tag operations answer ResourceNotFoundException, which is the error the Athena API
+     * model declares for them. GetDataCatalog, UpdateDataCatalog and DeleteDataCatalog declare
+     * only InvalidRequestException, so they keep {@link #requireDataCatalog}.
+     */
+    private DataCatalog requireTaggedDataCatalog(String region, String name, String resourceArn) {
+        return dataCatalogStore.get(catalogKey(region, name))
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                        "Resource " + resourceArn + " was not found.", 400));
+    }
+
+    private String requireTaggableWorkGroupName(String resource) {
+        String name = resource.substring(WORKGROUP_RESOURCE.length());
+        if (DEFAULT_WORKGROUP.equals(name)) {
+            throw new AwsException("InvalidRequestException",
+                    "The " + DEFAULT_WORKGROUP + " workgroup cannot be tagged.", 400);
+        }
+        return name;
+    }
+
+    private String requireTaggableCatalogName(String resource) {
+        String name = resource.substring(DATA_CATALOG_RESOURCE.length());
+        if (DEFAULT_CATALOG.equals(name)) {
+            throw new AwsException("InvalidRequestException",
+                    DEFAULT_CATALOG + " cannot be tagged.", 400);
+        }
+        return name;
+    }
+
+    private Map<String, Object> toCatalogSummary(DataCatalog catalog) {
+        Map<String, Object> summary = new LinkedHashMap<>();
+        summary.put("CatalogName", catalog.getName());
+        summary.put("Type", catalog.getType());
+        summary.put("Status", catalog.getStatus());
+        if (catalog.getConnectionType() != null) {
+            summary.put("ConnectionType", catalog.getConnectionType());
+        }
+        return summary;
+    }
+
+    private Map<String, Object> toCatalogDetail(DataCatalog catalog) {
+        Map<String, Object> detail = new LinkedHashMap<>();
+        detail.put("Name", catalog.getName());
+        detail.put("Type", catalog.getType());
+        detail.put("Status", catalog.getStatus());
+        if (catalog.getDescription() != null) {
+            detail.put("Description", catalog.getDescription());
+        }
+        detail.put("Parameters", catalog.getParameters() == null ? Map.of() : catalog.getParameters());
+        if (catalog.getConnectionType() != null) {
+            detail.put("ConnectionType", catalog.getConnectionType());
+        }
+        return detail;
+    }
+
+    private static Map<String, String> normalizeParameters(Map<String, String> parameters) {
+        return parameters == null ? new LinkedHashMap<>() : new LinkedHashMap<>(parameters);
+    }
+
+    /**
+     * A FEDERATED catalog carries its connection type in the {@code connection-type} parameter.
+     * The other catalog types have none.
+     */
+    private static String resolveConnectionType(String type, Map<String, String> parameters) {
+        if (!"FEDERATED".equals(type) || parameters == null) {
+            return null;
+        }
+        String connectionType = parameters.get("connection-type");
+        if (connectionType == null) {
+            return null;
+        }
+        String normalized = connectionType.toUpperCase(Locale.ROOT);
+        return CONNECTION_TYPES.contains(normalized) ? normalized : null;
+    }
+
+    private static void validateCatalogName(String name) {
+        if (name == null || name.isBlank()) {
+            throw new AwsException("InvalidRequestException", "Name is required.", 400);
+        }
+        if (name.length() > 256) {
+            throw new AwsException("InvalidRequestException", "Name must be 1 to 256 characters.", 400);
+        }
+    }
+
+    private static void validateCatalogType(String type) {
+        if (type == null || type.isBlank()) {
+            throw new AwsException("InvalidRequestException", "Type is required.", 400);
+        }
+        if (!CATALOG_TYPES.contains(type)) {
+            throw new AwsException("InvalidRequestException",
+                    "Invalid data catalog type: " + type + ". Valid values are " + CATALOG_TYPES + ".", 400);
+        }
+    }
+
+    private String catalogKey(String region, String name) {
+        return region + ":" + name;
+    }
+
+    private String workGroupKey(String region, String name) {
+        return region + ":" + name;
+    }
+
+    static void validateWorkGroupName(String name) {
+        if (name == null || name.isBlank()) {
+            throw new AwsException("InvalidRequestException", "WorkGroup name is required", 400);
+        }
+        if (!name.matches("[A-Za-z0-9._-]{1,128}")) {
+            throw new AwsException("InvalidRequestException", "Invalid WorkGroup name: " + name, 400);
+        }
+    }
+
+    private void validateWorkGroupDescription(String description) {
+        if (description != null && description.length() > 1024) {
+            throw new AwsException("InvalidRequestException",
+                    "Description must be 0 to 1024 characters.", 400);
+        }
+    }
+
+    private void validateWorkGroupState(String state) {
+        if (state != null && !Set.of("ENABLED", "DISABLED").contains(state)) {
+            throw new AwsException("InvalidRequestException",
+                    "State must be ENABLED or DISABLED.", 400);
+        }
+    }
+
+    private void validateWorkGroupConfigurationUpdates(WorkGroupConfigurationUpdates updates) {
+        if (updates == null) {
+            return;
+        }
+        Long bytesScannedCutoff = updates.getBytesScannedCutoffPerQuery();
+        if (bytesScannedCutoff != null && bytesScannedCutoff < MIN_BYTES_SCANNED_CUTOFF_PER_QUERY) {
+            throw new AwsException("InvalidRequestException",
+                    "BytesScannedCutoffPerQuery must be at least "
+                            + MIN_BYTES_SCANNED_CUTOFF_PER_QUERY + ".", 400);
+        }
+        WorkGroupEngineVersionRequest engineVersion = updates.getEngineVersion();
+        if (engineVersion != null && engineVersion.getSelectedEngineVersion() != null
+                && engineVersion.getSelectedEngineVersion().isBlank()) {
+            throw new AwsException("InvalidRequestException",
+                    "SelectedEngineVersion must not be empty.", 400);
+        }
+    }
+
+    /** Writes {@code rows} as a one-column result CSV, the shape the query engine writes, typed varchar. */
+    private void writeSingleColumnResult(String id, String outputLocation, String column, List<String> rows) {
+        ensureOutputBucket(outputLocation);
+        StringBuilder csv = new StringBuilder(column).append('\n');
+        for (String row : rows) {
+            csv.append('"').append(row.replace("\"", "\"\"")).append("\"\n");
+        }
+        s3Service.putObject(extractBucket(outputLocation), extractKey(outputLocation),
+                csv.toString().getBytes(StandardCharsets.UTF_8), "text/csv", null);
+        resultColumnTypeStore.put(id, List.of("VARCHAR"));
+    }
+
+    private void ensureOutputBucket(String s3Path) {
+        String bucket = extractBucket(s3Path);
+        if (bucket != null) {
+            try {
+                s3Service.createBucket(bucket, config.defaultRegion());
+            } catch (Exception ignored) {}
+        }
+    }
+
+    /**
+     * The DuckDB type of each result column, in order. The result CSV carries only the column names,
+     * so the types come from DuckDB describing the same query, as the account that ran it. The query has already succeeded, so a
+     * failure here only costs the types: its columns are reported as varchar.
+     */
+    private List<String> describeColumnTypes(String query, String setupDdl, String accountId) {
+        try {
+            return duckClient.query("DESCRIBE " + query, setupDdl, accountId).stream()
+                    .map(column -> String.valueOf(column.get("column_type")))
+                    .toList();
+        } catch (RuntimeException e) {
+            LOG.warnv(e, "Could not describe the result columns of {0}; reporting them as varchar", query);
+            return List.of();
+        }
+    }
+
+    private static ResultSet.ColumnInfo columnInfo(String name, String duckType) {
+        ResultSet.ColumnInfo column = new ResultSet.ColumnInfo(DEFAULT_CATALOG, "", "", name, athenaType(duckType));
+        Matcher decimal = DECIMAL_TYPE.matcher(duckType.trim());
+        if (decimal.matches()) {
+            column.setPrecision(Integer.parseInt(decimal.group(1)));
+            column.setScale(Integer.parseInt(decimal.group(2)));
+        }
+        return column;
+    }
+
+    static String athenaType(String duckType) {
+        String type = duckType.toUpperCase(Locale.ROOT).trim();
+        if (type.endsWith("[]")) {
+            return "array";
+        }
+        int parameters = type.indexOf('(');
+        return switch (parameters < 0 ? type : type.substring(0, parameters)) {
+            // DuckDB widens COUNT_IF and SUM over a BIGINT to HUGEINT, where Trino keeps BIGINT.
+            // TODO: Athena (engine v3) fails a sum past BIGINT's range with NUMERIC_VALUE_OUT_OF_RANGE;
+            // DuckDB's HUGEINT holds it, so floci returns the out-of-range value typed bigint instead.
+            // Casting HUGEINT result columns back to BIGINT would make DuckDB fail the query too.
+            case "BIGINT", "HUGEINT", "UBIGINT" -> "bigint";
+            case "INTEGER" -> "integer";
+            case "SMALLINT" -> "smallint";
+            case "TINYINT" -> "tinyint";
+            case "DOUBLE" -> "double";
+            case "FLOAT" -> "float";
+            case "DECIMAL" -> "decimal";
+            case "BOOLEAN" -> "boolean";
+            case "DATE" -> "date";
+            case "TIMESTAMP", "TIMESTAMP_S", "TIMESTAMP_MS", "TIMESTAMP_NS" -> "timestamp";
+            case "TIMESTAMP WITH TIME ZONE" -> "timestamp with time zone";
+            case "TIME" -> "time";
+            case "TIME WITH TIME ZONE" -> "time with time zone";
+            case "BLOB" -> "varbinary";
+            case "STRUCT" -> "row";
+            case "MAP" -> "map";
+            case "JSON" -> "json";
+            default -> "varchar";
+        };
+    }
+
+    private ResultSet readResultsFromS3(String outputLocation, String queryId, List<String> columnTypes) {
+        try {
+            String bucket = extractBucket(outputLocation);
+            String prefix = extractKey(outputLocation);
+            if (bucket == null) {
+                return emptyResultSet();
+            }
+
+            List<S3Object> objects = s3Service.listObjects(bucket, prefix, null, 10);
+            Optional<S3Object> csv = objects.stream()
+                    .filter(o -> o.getKey().endsWith(".csv"))
+                    .findFirst()
+                    .map(o -> s3Service.getObject(bucket, o.getKey()));
+
+            if (csv.isEmpty()) {
+                return emptyResultSet();
+            }
+
+            return parseCsv(csv.get().getData(), columnTypes);
+        } catch (Exception e) {
+            LOG.warnv("Could not read query results for {0}: {1}", queryId, e.getMessage());
+            return emptyResultSet();
+        }
+    }
+
+    private ResultSet parseCsv(byte[] data, List<String> columnTypes) {
+        List<ResultSet.Row> rows = new ArrayList<>();
+        List<ResultSet.ColumnInfo> columns = new ArrayList<>();
+
+        try (BufferedReader reader = new BufferedReader(
+                new InputStreamReader(new ByteArrayInputStream(data), StandardCharsets.UTF_8))) {
+
+            String headerLine = reader.readLine();
+            if (headerLine == null) {
+                return emptyResultSet();
+            }
+
+            String[] headers = CsvParser.parseLine(headerLine).toArray(String[]::new);
+            List<String> athenaTypes = new ArrayList<>();
+            for (int i = 0; i < headers.length; i++) {
+                ResultSet.ColumnInfo column = columnInfo(headers[i],
+                        i < columnTypes.size() ? columnTypes.get(i) : "VARCHAR");
+                columns.add(column);
+                athenaTypes.add(column.getType());
+            }
+
+            // Header row is included in GetQueryResults per AWS spec
+            rows.add(toRow(headers, List.of()));
+
+            String line;
+            while ((line = reader.readLine()) != null) {
+                rows.add(toRow(CsvParser.parseLine(line).toArray(String[]::new), athenaTypes));
+            }
+        } catch (Exception e) {
+            LOG.debugv("CSV parse error: {0}", e.getMessage());
+        }
+
+        return new ResultSet(rows, new ResultSet.ResultSetMetadata(columns));
+    }
+
+    private Map<String, Object> tableMetadata(String catalog, String database, Table table) {
+        Map<String, Object> metadata = new LinkedHashMap<>();
+        metadata.put("Name", table.getName());
+        metadata.put("CreateTime", (table.getCreateTime() != null ? table.getCreateTime() : Instant.now()).getEpochSecond());
+        metadata.put("LastAccessTime", (table.getLastAccessTime() != null ? table.getLastAccessTime() : Instant.now()).getEpochSecond());
+        metadata.put("TableType", table.getTableType() != null ? table.getTableType() : "EXTERNAL_TABLE");
+        metadata.put("Columns", athenaColumns(table));
+        metadata.put("Parameters", table.getParameters() != null ? table.getParameters() : Map.of());
+        metadata.put("PartitionKeys", athenaColumns(table.getPartitionKeys()));
+        return metadata;
+    }
+
+    private List<Map<String, String>> athenaColumns(Table table) {
+        if (table.getStorageDescriptor() == null) {
+            return List.of();
+        }
+        return athenaColumns(table.getStorageDescriptor().getColumns());
+    }
+
+    private List<Map<String, String>> athenaColumns(List<Column> columns) {
+        if (columns == null) {
+            return List.of();
+        }
+        return columns.stream()
+                .map(column -> Map.of(
+                        "Name", column.getName(),
+                        "Type", glueTypeToAthena(column)
+                ))
+                .toList();
+    }
+
+    private String glueTypeToAthena(Column column) {
+        String type = column.getType() == null ? "string" : column.getType().toLowerCase(Locale.ROOT);
+        if (type.equals("string") || type.equals("char") || type.equals("varchar")
+                || type.startsWith("struct<") || type.startsWith("array<") || type.startsWith("map<")) {
+            return "varchar";
+        }
+        return type;
+    }
+
+    /** One result row, each value rendered as Athena renders a value of its column's type. */
+    private ResultSet.Row toRow(String[] values, List<String> athenaTypes) {
+        List<ResultSet.Datum> data = new ArrayList<>();
+        for (int i = 0; i < values.length; i++) {
+            String type = i < athenaTypes.size() ? athenaTypes.get(i) : "varchar";
+            data.add(new ResultSet.Datum("timestamp".equals(type) ? athenaTimestamp(values[i]) : values[i]));
+        }
+        return new ResultSet.Row(data);
+    }
+
+    /**
+     * A {@code timestamp} value as Athena renders it: with at least three fractional digits.
+     *
+     * <p>DuckDB writes the shortest form, {@code 2026-03-14 09:30:00}, where Athena writes
+     * {@code 2026-03-14 09:30:00.000}. A timestamp's rendering follows its precision, and on Athena
+     * nearly every timestamp has precision 3: a Hive table's columns, {@code CAST(... AS timestamp)},
+     * {@code current_timestamp}, and what {@code date_trunc} and interval arithmetic make of them.
+     * DuckDB's types don't carry that precision through expressions, so every {@code timestamp}
+     * result is padded alike. A value with more digits keeps them.
+     *
+     * <p>TODO: a literal has the precision it is written with, so Athena renders
+     * {@code TIMESTAMP '2026-03-14 09:30:00'} without a fraction, and this pads it. An Iceberg
+     * table's {@code timestamp} is {@code timestamp(6)} on Athena, which presumably renders six
+     * digits (unchecked). The result CSV object itself is written by floci-duck and keeps DuckDB's
+     * form, as does {@code CAST(ts AS varchar)} inside a query.
+     */
+    static String athenaTimestamp(String value) {
+        if (value == null) {
+            return null;
+        }
+        Matcher timestamp = DUCKDB_TIMESTAMP.matcher(value);
+        if (!timestamp.matches()) {
+            return value;
+        }
+        String fraction = timestamp.group(2) == null ? "" : timestamp.group(2);
+        return fraction.length() >= 3
+                ? value
+                : timestamp.group(1) + "." + fraction + "000".substring(fraction.length());
+    }
+
+    private String extractBucket(String s3Path) {
+        if (s3Path == null || !s3Path.startsWith("s3://")) {
+            return null;
+        }
+        String without = s3Path.substring(5);
+        int slash = without.indexOf('/');
+        return slash < 0 ? without : without.substring(0, slash);
+    }
+
+    private String extractKey(String s3Path) {
+        if (s3Path == null || !s3Path.startsWith("s3://")) {
+            return "";
+        }
+        String without = s3Path.substring(5);
+        int slash = without.indexOf('/');
+        return slash < 0 ? "" : without.substring(slash + 1);
+    }
+
+    private ResultSet emptyResultSet() {
+        return new ResultSet(List.of(), new ResultSet.ResultSetMetadata(List.of()));
+    }
+}

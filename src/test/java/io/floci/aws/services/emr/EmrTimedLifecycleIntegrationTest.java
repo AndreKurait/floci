@@ -1,0 +1,127 @@
+package io.floci.aws.services.emr;
+
+import io.floci.aws.testing.RestAssuredJsonUtils;
+import io.floci.aws.testing.S3EnforceAuthProfile;
+import io.quarkus.test.junit.QuarkusTest;
+import io.quarkus.test.junit.TestProfile;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+
+import java.util.List;
+
+import static io.floci.aws.testing.EmrRequests.emr;
+import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.hasItem;
+import static org.hamcrest.Matchers.hasSize;
+import static org.hamcrest.Matchers.nullValue;
+
+/**
+ * With the lifecycle durations set, a cluster is seen STARTING and TERMINATING, and its steps PENDING,
+ * over the wire. They are an hour long here, set by {@link S3EnforceAuthProfile}, so nothing moves on
+ * while the test runs.
+ */
+@QuarkusTest
+@TestProfile(S3EnforceAuthProfile.class)
+class EmrTimedLifecycleIntegrationTest {
+
+    @BeforeAll
+    static void configure() {
+        RestAssuredJsonUtils.configureAwsContentTypes();
+    }
+
+    @Test
+    void aStartingClusterKeepsItsStepsPendingAndShutsDownWhenTerminated() {
+        String clusterId = emr("RunJobFlow", "{\"Name\":\"hour-long\","
+                + "\"Instances\":{\"KeepJobFlowAliveWhenNoSteps\":true},"
+                + "\"Steps\":[{\"Name\":\"first\",\"HadoopJarStep\":{\"Jar\":\"command-runner.jar\"}},"
+                + "{\"Name\":\"second\",\"HadoopJarStep\":{\"Jar\":\"command-runner.jar\"}}]}")
+                .then().statusCode(200).extract().path("JobFlowId");
+        String firstId = emr("ListSteps", "{\"ClusterId\":\"" + clusterId + "\"}").then().statusCode(200)
+                .body("Steps.Status.State", equalTo(List.of("PENDING", "PENDING")))
+                .extract().path("Steps[1].Id");
+
+        emr("DescribeCluster", "{\"ClusterId\":\"" + clusterId + "\"}").then().statusCode(200)
+                .body("Cluster.Status.State", equalTo("STARTING"))
+                .body("Cluster.Status.Timeline.ReadyDateTime", nullValue());
+        emr("ListClusters", "{\"ClusterStates\":[\"STARTING\"]}").then().statusCode(200)
+                .body("Clusters.Id", hasItem(clusterId));
+        emr("CancelSteps", "{\"ClusterId\":\"" + clusterId + "\",\"StepIds\":[\"" + firstId + "\"]}")
+                .then().statusCode(200)
+                .body("CancelStepsInfoList[0].Status", equalTo("SUBMITTED"));
+        emr("DescribeStep", "{\"ClusterId\":\"" + clusterId + "\",\"StepId\":\"" + firstId + "\"}")
+                .then().statusCode(200)
+                .body("Step.Status.State", equalTo("CANCELLED"));
+        emr("TerminateJobFlows", "{\"JobFlowIds\":[\"" + clusterId + "\"]}").then().statusCode(200);
+
+        emr("DescribeCluster", "{\"ClusterId\":\"" + clusterId + "\"}").then().statusCode(200)
+                .body("Cluster.Status.State", equalTo("TERMINATING"))
+                .body("Cluster.Status.StateChangeReason.Code", equalTo("USER_REQUEST"));
+        emr("ListSteps", "{\"ClusterId\":\"" + clusterId + "\"}").then().statusCode(200)
+                .body("Steps.Status.State", equalTo(List.of("CANCELLED", "CANCELLED")));
+        emr("AddJobFlowSteps", "{\"JobFlowId\":\"" + clusterId + "\",\"Steps\":[{\"Name\":\"late\","
+                + "\"HadoopJarStep\":{\"Jar\":\"command-runner.jar\"}}]}")
+                .then().statusCode(400)
+                .body("__type", equalTo("ValidationException"))
+                .body("message", equalTo(
+                        "A job flow that is shutting down, terminated, or finished may not be modified."));
+    }
+
+    @Test
+    void aStartingClustersInstancesAreListedAsProvisionedWithNoneRunningYet() {
+        String clusterId = emr("RunJobFlow", "{\"Name\":\"provisioning\",\"Instances\":{"
+                + "\"KeepJobFlowAliveWhenNoSteps\":true,\"InstanceGroups\":["
+                + "{\"InstanceRole\":\"MASTER\",\"InstanceType\":\"m5.xlarge\",\"InstanceCount\":1},"
+                + "{\"InstanceRole\":\"CORE\",\"InstanceType\":\"m5.xlarge\",\"InstanceCount\":2}]}}")
+                .then().statusCode(200).extract().path("JobFlowId");
+
+        emr("ListInstanceGroups", "{\"ClusterId\":\"" + clusterId + "\"}").then().statusCode(200)
+                .body("InstanceGroups.Status.State", equalTo(List.of("PROVISIONING", "PROVISIONING")))
+                .body("InstanceGroups.RunningInstanceCount", equalTo(List.of(0, 0)));
+        List<String> ids = emr("ListInstances", "{\"ClusterId\":\"" + clusterId + "\"}").then().statusCode(200)
+                .body("Instances.Status.State", equalTo(List.of("PROVISIONING", "PROVISIONING", "PROVISIONING")))
+                .extract().path("Instances.Id");
+        // The filter keeps the states it names.
+        emr("ListInstances", "{\"ClusterId\":\"" + clusterId + "\",\"InstanceStates\":[\"RUNNING\"]}")
+                .then().statusCode(200)
+                .body("Instances", equalTo(List.of()));
+        emr("TerminateJobFlows", "{\"JobFlowIds\":[\"" + clusterId + "\"]}").then().statusCode(200);
+        emr("ListInstanceGroups", "{\"ClusterId\":\"" + clusterId + "\"}").then().statusCode(200)
+                .body("InstanceGroups.Status.State", equalTo(List.of("TERMINATING", "TERMINATING")))
+                .body("InstanceGroups.RunningInstanceCount", equalTo(List.of(0, 0)));
+        // While it ends, the same instances, still being provisioned, none of them running.
+        emr("ListInstances", "{\"ClusterId\":\"" + clusterId + "\",\"InstanceStates\":[\"PROVISIONING\"]}")
+                .then().statusCode(200)
+                .body("Instances.Id", equalTo(ids));
+        emr("ListInstances", "{\"ClusterId\":\"" + clusterId + "\",\"InstanceStates\":[\"RUNNING\"]}")
+                .then().statusCode(200)
+                .body("Instances", equalTo(List.of()));
+    }
+
+    @Test
+    void aStartingClustersFleetsKeepTheirInstancesListedWhileItEnds() {
+        String clusterId = emr("RunJobFlow", "{\"Name\":\"provisioning-fleets\",\"Instances\":{"
+                + "\"KeepJobFlowAliveWhenNoSteps\":true,\"InstanceFleets\":["
+                + "{\"InstanceFleetType\":\"MASTER\",\"TargetOnDemandCapacity\":1,"
+                + "\"InstanceTypeConfigs\":[{\"InstanceType\":\"m5.xlarge\"}]},"
+                + "{\"InstanceFleetType\":\"CORE\",\"TargetOnDemandCapacity\":2,"
+                + "\"InstanceTypeConfigs\":[{\"InstanceType\":\"m5.xlarge\"}]}]}}")
+                .then().statusCode(200).extract().path("JobFlowId");
+        List<String> ids = emr("ListInstances", "{\"ClusterId\":\"" + clusterId
+                        + "\",\"InstanceStates\":[\"PROVISIONING\"]}")
+                .then().statusCode(200)
+                .body("Instances.InstanceFleetId", hasSize(3))
+                .extract().path("Instances.Id");
+
+        emr("TerminateJobFlows", "{\"JobFlowIds\":[\"" + clusterId + "\"]}").then().statusCode(200);
+
+        emr("ListInstanceFleets", "{\"ClusterId\":\"" + clusterId + "\"}").then().statusCode(200)
+                .body("InstanceFleets.Status.State", equalTo(List.of("TERMINATING", "TERMINATING")))
+                .body("InstanceFleets.ProvisionedOnDemandCapacity", equalTo(List.of(0, 0)));
+        emr("ListInstances", "{\"ClusterId\":\"" + clusterId + "\",\"InstanceStates\":[\"PROVISIONING\"]}")
+                .then().statusCode(200)
+                .body("Instances.Id", equalTo(ids));
+        emr("ListInstances", "{\"ClusterId\":\"" + clusterId + "\",\"InstanceStates\":[\"RUNNING\"]}")
+                .then().statusCode(200)
+                .body("Instances", equalTo(List.of()));
+    }
+}

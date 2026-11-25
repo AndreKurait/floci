@@ -2,6 +2,42 @@
 
 **Protocol:** EC2 Query (XML) — `POST http://localhost:4566/` with `Action=` parameter
 
+A request acting on a network interface carries its `ec2:Vpc` and `ec2:Subnet` (as ARNs),
+`ec2:AvailabilityZone` and `ec2:NetworkInterfaceID`, read from the interface Floci holds:
+stored, held by an instance as its primary interface, or owned by a VPC endpoint, NAT
+gateway or Instance Connect endpoint. Which keys a resource type takes, and the member of
+its botocore shape each comes from, are generated from the Service Reference and botocore
+(`resourceKeys` in `iam-request-resources.json`). In a `CreateTags` or `DeleteTags` batch
+every interface is checked against its own keys and tags before any tag changes; another
+interface's VPC or tags cannot authorize it. Authorization reads do not create default resources.
+
+With IAM enforcement enabled, `CreateTags` and `DeleteTags` check every VPC endpoint ID
+against its endpoint ARN before changing any batch member. The generated request resource
+table learns the `vpce-` prefix from the EC2 `CreateVpcEndpoint` API reference's response
+examples, copied by `tools/aws/fetch_ec2_id_examples.py` and matched to botocore's output
+shapes. This also covers endpoints retained under legacy unprefixed storage keys.
+
+## Instance IAM authorization
+
+With IAM enforcement enabled, modeled instance-list operations, including `StartInstances`, `StopInstances`, `TerminateInstances`, and `RebootInstances`, authorize each requested instance ARN before changing any instance state.
+Policies can scope access to an exact instance ARN or use stored tags through `ec2:ResourceTag/<key>` and `aws:ResourceTag/<key>`.
+Creation-time `CreateNetworkInterface` tags also populate the regional IAM tag index.
+Later `CreateTags` and `DeleteTags` keep the ENI response and authorization tags in sync,
+and deleting the interface removes its indexed tags.
+A batch containing an unauthorized instance is denied in full, including when another instance in that batch is allowed.
+These checks also apply in EC2 mock mode.
+Target members and resource-tag condition keys come from generated AWS model and Service Reference data.
+Malformed percent escapes in a form body are rejected with a client error before authorization uses any partially decoded parameters.
+See the [AWS EC2 authorization reference](https://docs.aws.amazon.com/service-authorization/latest/reference/list_ec2.html) for supported resource types and condition keys.
+
+## Elastic IP IAM authorization
+
+With IAM enforcement enabled, `AssociateAddress` authorizes the requested allocation and
+instance or network interface against their individual ARNs and stored ownership tags.
+Every supplied target needs a grant, and an explicit deny on any target rejects the request
+before association. `ReleaseAddress` also resolves the allocation named by `AllocationId`,
+so policies can scope release to that allocation or its stored tags.
+
 ## Launch and cleanup IAM
 
 With IAM enforcement enabled, `RunInstances` checks the selected image, subnet,
@@ -81,6 +117,10 @@ Cloud images whose native systemd requires the named cgroup v1 hierarchy can
 select `systemd-v1`. It starts the image's native init in a delegated service
 hierarchy and supports native guest reboots. See the
 [runtime requirements and qualification limits](../design/ec2-systemd-v1.md).
+
+Systemd guests retain Floci's console/getty masks and runtime-specific cgroup setup.
+Privileged guests share the Docker host kernel and can load its modules; use images and
+user data trusted for that host. Security-group enforcement disables privileged mode.
 
 | EC2 state | Docker operation |
 |---|---|
@@ -206,14 +246,39 @@ EBS-only storage, and one network card supporting 3 interfaces and 10 IPv4 addre
 interface, following the [AWS R5 specifications](https://docs.aws.amazon.com/ec2/latest/instancetypes/mo.html).
 `DescribeInstanceTypes` and `DescribeInstanceTypeOfferings` use this same entry.
 
+The catalog also includes `i4i.large`: 2 vCPUs, 16 GiB of memory, Intel x86_64
+processors, 468 GB of local NVMe SSD storage, and one network card supporting
+3 interfaces and 10 IPv4 addresses per interface, following the
+[AWS storage optimized specifications](https://docs.aws.amazon.com/ec2/latest/instancetypes/so.html).
+Both describe APIs and the existing container resource limits use this entry.
+
 ### Processor manufacturer metadata
 
 `DescribeInstanceTypes` includes `ProcessorInfo.Manufacturer` for the bundled
-instance types. The values were captured from AWS in `us-east-1` on 2026-11-04:
-`AWS` for Graviton, `Intel` for the catalog's T2, T3, M5 and R5 types, and `AMD`
-for `t3a.nano`. The catalog stores these values explicitly; architecture alone
+instance types. For Graviton, T2, T3, M5, R5 and `t3a.nano`, the values were
+captured from AWS in `us-east-1` on 2026-11-04: `AWS` for Graviton, `Intel` for
+T2, T3, M5 and R5, and `AMD` for `t3a.nano`.
+
+The `i4i.large` value, `Intel`, comes from the AWS storage optimized specifications
+linked above. It was not part of that API capture.
+
+The catalog stores these values explicitly; architecture alone
 cannot distinguish Intel from AMD. See the AWS
 [ProcessorInfo API](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_ProcessorInfo.html).
+
+### AMD and Intel instance-type metadata
+
+The catalog includes virtual sizes of M7a, M8a, M7i, M8i, C7a and C7i,
+including 24xlarge and 48xlarge. CPU, memory, x86_64 architecture, AMD/Intel
+manufacturer and network metadata were captured from AWS `DescribeInstanceTypes`
+in us-east-1 on 2026-11-17. The AWS SDK regression fixture is
+`src/test/resources/ec2/x86-instance-types.csv`. Only sizes present in that
+capture are included; for example, there is no `m7i.medium`.
+
+These entries support architecture-compatible AMI selection and the existing
+synthetic offerings. They do not establish vendor-specific hardware performance,
+real AWS capacity or regional availability. The Docker host supplies actual CPU
+execution; a catalog entry does not turn an ARM guest into an x86 guest.
 
 ### Graviton instance-type metadata
 
@@ -223,6 +288,11 @@ The full catalog includes the virtual sizes of `c6g`, `c6gn`, `c7g`, `c8g`,
 `DescribeInstanceTypes` and the emulator's `DescribeInstanceTypeOfferings` use
 these same entries. Catalog consumers also use their ARM64 architecture and
 CPU/memory capacity for launch validation and container resource limits.
+
+`RunInstances` refuses an AMI whose architecture the instance type cannot run, as
+AWS does. An `x86_64` AMI on `m6g.large` answers `InvalidParameterValue` with
+`The architecture 'arm64' of the specified instance type does not match the
+architecture 'x86_64' of the specified AMI.`, so a Graviton type needs an `arm64` AMI.
 
 The values were captured from AWS `DescribeInstanceTypes` in `us-east-1` on
 2026-11-04, including each size's network-card/interface limits and each family's
@@ -604,23 +674,23 @@ lifecycle. The cloud-image-derived entry is a separate AMI ID and alias, so
 old behavior unless they choose `ami-ubuntu2404-cloud-arm64` or the
 `ami-ubuntu2404-cloud` alias.
 
-The Java metadata-driven builder lives at `io.github.hectorvent.floci.tools.ami.AmiImageTool`. Its recipe is checked in at `docker/ec2/ami-images/image-build-metadata.yaml`, and generated context/provenance defaults to `target/ami-images/<image-id>/`.
+The Java metadata-driven builder lives at `io.floci.aws.tools.ami.AmiImageTool`. Its recipe is checked in at `docker/ec2/ami-images/image-build-metadata.yaml`, and generated context/provenance defaults to `target/ami-images/<image-id>/`.
 
 ```bash
 ./mvnw -q -DskipTests compile exec:java \
-  -Dexec.mainClass=io.github.hectorvent.floci.tools.ami.AmiImageTool \
+  -Dexec.mainClass=io.floci.aws.tools.ami.AmiImageTool \
   -Dexec.args="plan --image-id ubuntu-24.04-arm64"
 
 ./mvnw -q -DskipTests compile exec:java \
-  -Dexec.mainClass=io.github.hectorvent.floci.tools.ami.AmiImageTool \
+  -Dexec.mainClass=io.floci.aws.tools.ami.AmiImageTool \
   -Dexec.args="generate --image-id ubuntu-24.04-arm64"
 
 ./mvnw -q -DskipTests compile exec:java \
-  -Dexec.mainClass=io.github.hectorvent.floci.tools.ami.AmiImageTool \
+  -Dexec.mainClass=io.floci.aws.tools.ami.AmiImageTool \
   -Dexec.args="build --image-id ubuntu-24.04-arm64"
 
 ./mvnw -q -DskipTests compile exec:java \
-  -Dexec.mainClass=io.github.hectorvent.floci.tools.ami.AmiImageTool \
+  -Dexec.mainClass=io.floci.aws.tools.ami.AmiImageTool \
   -Dexec.args="smoke --image-id ubuntu-24.04-arm64"
 ```
 
@@ -694,9 +764,18 @@ has an exact IP and TCP-port exception, while their application traffic remains 
 See [Lambda VPC configuration](lambda.md#vpcconfig-snapstart-loggingconfig-and-durableconfig)
 for execution and lifecycle limits.
 
-Security-group permissions on a host-published port use the source visible inside Docker. Docker Desktop may replace the original external-client address. The legacy socat application publisher is disabled while enforcement is enabled because it obscures that source. SSH is published directly by the protected namespace. Application host ports remain available through the legacy publisher only when enforcement is explicitly disabled. Direct managed container traffic uses the logical ENI identity.
+Rule and prefix-list updates refresh protected workloads in the caller's account and region.
+Workloads in other accounts keep their own groups and prefix-list entries.
 
-When enforcement is disabled, an instance's security groups can open a TCP port to a CIDR source and Floci publishes that port on the host so you can reach the app from `localhost`. For each opened port Floci starts a small `alpine/socat` sidecar container that binds an allocated host port (default range 30000–30999) and forwards it to the instance container's IP, with `TCP_NODELAY` on both sockets so a request the client sends as two small writes is not held for the first write's delayed ACK (about 40 ms per round trip otherwise). The listen socket also takes a `backlog` of 4096 (socat's default is 5), so a burst of connections is queued rather than silently dropped from a full accept queue; the kernel caps the backlog at `net.core.somaxconn`. This works both for rules present at launch and for rules added later with `authorize-security-group-ingress`; revoking the rule removes the forward. The mapping (`app port -> host port`) is written to the logs:
+Retired or replaced helpers retain their cleanup identity. If Docker removal fails,
+the namespace observer retries requested cleanup without discarding the replacement's
+DNS identity or admitting a helper while its removal is in progress.
+
+An ENI's IPv6 addresses are part of its identity too. A rule naming an IPv6 range matches a managed peer on any IPv6 address its ENI holds, and admits that peer's traffic only on its helper's Docker IPv6 address, never on its IPv4 one. On a Docker network without IPv6 the helper has no IPv6 address, so such a rule has nothing to match. `AssignIpv6Addresses` and `UnassignIpv6Addresses` update the ENI's firewall identity at once.
+
+Security-group permissions on a host-published port use the source visible inside Docker, and Docker can replace the original client address (Docker Desktop shows every host client as its gateway). So while enforcement is enabled, host-published access counts as traffic from outside the VPC: Floci publishes an application port only when an ingress rule opens it to every address, `0.0.0.0/0` or `::/0`, since such a rule admits a client whatever address it arrives with. A client's family is still seen on the host, so a port only `0.0.0.0/0` opens is published on the host's IPv4 addresses, one only `::/0` opens on its IPv6 addresses, and one both open on every address. The socat sidecar described below dials the instance through its protected namespace, on the instance's IPv4 address, or on its Docker IPv6 address when only `::/0` opens the port; on a Docker network without IPv6 such a port is not published. A port that only a narrower CIDR, a prefix list or a referenced group opens stays reachable on the direct container path, where the firewall sees the peer's own ENI identity. Authorizing a world-open rule after launch publishes the port. Revoking the last world-open rule closes the host listener. If egress permits TCP to every address and port in the address family the relay uses to reach the guest, revocation also closes existing connections immediately. With narrower egress, established connections can finish until the instance stops or terminates. SSH is published directly by the protected namespace.
+
+When enforcement is disabled, an instance's security groups can open a TCP port to any CIDR source and Floci publishes that port on the host so you can reach the app from `localhost`. For each opened port Floci starts a small `alpine/socat` sidecar container that binds an allocated host port (default range 30000–30999) and forwards it to the instance container's IP, with `TCP_NODELAY` on both sockets so a request the client sends as two small writes is not held for the first write's delayed ACK (about 40 ms per round trip otherwise). The listen socket also takes a `backlog` of 4096 (socat's default is 5), so a burst of connections is queued rather than silently dropped from a full accept queue; the kernel caps the backlog at `net.core.somaxconn`. This works both for rules present at launch and for rules added later with `authorize-security-group-ingress`; revoking the rule removes the forward. The mapping (`app port -> host port`) is written to the logs:
 
 ```
 Published EC2 instance i-0abc... app port 80 on host port 30000 (socat -> 172.17.0.3:80)
@@ -705,10 +784,11 @@ Published EC2 instance i-0abc... app port 80 on host port 30000 (socat -> 172.17
 Notes and limitations:
 
 - The app inside the instance must listen on `0.0.0.0` (not `127.0.0.1`) for the forward to reach it.
-- Only CIDR-sourced TCP rules are published. A port opened only to a referenced security group (or via a prefix list) is not published, matching AWS: those grant reachability from the referenced group's private IPs, not from the host. The source CIDR value itself is not enforced, so a CIDR-sourced port is reachable whether the rule is `0.0.0.0/0` or narrower.
+- Only CIDR-sourced TCP rules are published. A port opened only to a referenced security group (or via a prefix list) is not published, matching AWS: those grant reachability from the referenced group's private IPs, not from the host. With enforcement disabled the source CIDR value itself is not enforced, so a CIDR-sourced port is reachable whether the rule is `0.0.0.0/0` or narrower; with it enabled only a rule open to every address publishes the port, as described above.
 - Ports are aggregated across all of the instance's security groups, SSH (22) is never re-forwarded, and any single rule whose port span exceeds `max-published-ports-per-instance` (default 20) is skipped so an allow-all range cannot spawn thousands of sidecars. The total published per instance is capped at the same limit.
 - Stopping an instance tears down its forwards; starting it again does not automatically restore them (re-run `authorize-security-group-ingress`, or recreate the instance).
-- With enforcement disabled, set `publish-security-group-ports: false` (`FLOCI_SERVICES_EC2_PUBLISH_SECURITY_GROUP_PORTS=false`) to keep security groups as metadata only.
+- When Floci restarts, each running instance's forwards are brought in line with its current rules: a forward a rule no longer opens, or that enforcement no longer allows, is removed, and one the rules now open is published.
+- Set `publish-security-group-ports: false` (`FLOCI_SERVICES_EC2_PUBLISH_SECURITY_GROUP_PORTS=false`) to publish no application port; with enforcement disabled, that keeps security groups as metadata only.
 
 ## UserData
 
@@ -721,7 +801,9 @@ security groups deny ordinary egress.
 
 CloudFormation `AWS::EC2::VPCEndpoint` resolves `IpAddressType` on create and update, including parameter references. Omission, a selected `AWS::NoValue` branch, or `not-specified` uses the default `ipv4`; an explicitly empty value is rejected. Updates retain the existing replacement behavior; synthetic interfaces remain IPv4-only.
 
-CloudFormation `AWS::EC2::LaunchTemplate` stores `LaunchTemplateData.MetadataOptions`, and `AWS::EC2::Instance` launches with its own `MetadataOptions` over those of the launch template it names, as `RunInstances` merges them, so CDK's `requireImdsv2` sets `HttpTokens=required`. A block or member of the wrong type, such as `HttpTokens: [required]`, fails the resource with CloudFormation's type error, a member given as an empty or padded string fails an instance with `InvalidParameterValue` (a launch template stores it unchecked, as `CreateLaunchTemplate` does, and the instances launched from it fail), and `AWS::NoValue` leaves a member or the whole block out. A stack update checks the options before it changes anything, applies changed ones in place, returns options it no longer declares to their defaults, and puts them back if the stack update rolls back. An update that kept the instance and changed no EC2 setting, such as one that only declares the options the instance already has, rolls back in full. When the same update also changed the instance's type, security groups, user data, profile or tags, which have no in-place rollback, the options still go back but the stack ends `UPDATE_ROLLBACK_FAILED` for the instance ("Rollback is not implemented"). The options handling includes an update that changes or drops the instance's `LaunchTemplate` (another template or version, as `Fn::GetAtt LatestVersionNumber` gives after the template changes): AWS replaces the instance then, as `LaunchTemplate` is a replacement property, but Floci keeps it and applies what the new template declares, unless the `ImageId` or `KeyName` the template supplies changed, which replaces it. A change set still previews a literal `LaunchTemplate` change as a replacement.
+CloudFormation `AWS::EC2::LaunchTemplate` stores `LaunchTemplateData.MetadataOptions`, and `AWS::EC2::Instance` launches with its own `MetadataOptions` over those of the launch template it names, as `RunInstances` merges them, so CDK's `requireImdsv2` sets `HttpTokens=required`. A block or member of the wrong type, such as `HttpTokens: [required]`, fails the resource with CloudFormation's type error, a member given as an empty or padded string fails an instance with `InvalidParameterValue` (a launch template stores it unchecked, as `CreateLaunchTemplate` does, and the instances launched from it fail), and `AWS::NoValue` leaves a member or the whole block out. A stack update checks the options before it changes anything, applies changed ones in place, returns options it no longer declares to their defaults, and puts them back if the stack update rolls back. An update that kept the instance and changed no EC2 setting, such as one that only declares the options the instance already has, rolls back in full. When the same update also changed the instance's type, security groups, user data or tags, which have no in-place rollback, the options still go back but the stack ends `UPDATE_ROLLBACK_FAILED` for the instance ("Rollback is not implemented"). The options handling includes an update that changes or drops the instance's `LaunchTemplate` (another template or version, as `Fn::GetAtt LatestVersionNumber` gives after the template changes): AWS replaces the instance then, as `LaunchTemplate` is a replacement property, but Floci keeps it and applies what the new template declares, unless the `ImageId` or `KeyName` the template supplies changed, which replaces it. A change set still previews a literal `LaunchTemplate` change as a replacement.
+
+An `AWS::EC2::Instance` that declares no `IamInstanceProfile` launches with the profile of the launch template it names, as `RunInstances` does, and its own `IamInstanceProfile` wins when it declares one. A template profile that IAM does not know fails the instance with `InvalidParameterValue`. A stack update that moves the instance to a template version naming another profile, or none, changes or removes the instance's profile in place, the same way it applies the version's `MetadataOptions`, and a stack rollback puts the previous profile back, whether the instance declared it or its launch template did.
 
 ## Instance Metadata Service (IMDS)
 
@@ -772,6 +854,12 @@ On Linux, metadata and EC2 interface routing accept Docker transport addresses
 in `240.0.0.0/4`. Metadata still requires a remote unicast route and rejects
 guest-local destinations. Both paths reject loopback, link-local, multicast
 and limited-broadcast addresses.
+
+For EC2 guests, a working `iptables` or `nft` NAT backend routes link-local port `80` to the IMDS
+relay on port `42169`, leaving the guest's wildcard port `80` available. If no NAT backend works
+(for example, an offline image without firewall tools), Floci uses the older link-local port `80`
+listener to preserve IMDS access. That fallback can still conflict with a guest server binding
+`0.0.0.0:80`.
 
 `iam/info` returns the ARN and ID that IAM holds for the attached profile, and 404 when that
 profile is missing, has no role or does not match the attached ARN. An EKS cluster node, whose
@@ -836,6 +924,7 @@ their metadata version or parsers.
 | `GET /latest/meta-data/network/interfaces/macs/{mac}/subnet-id` | The interface's subnet |
 | `GET /latest/meta-data/network/interfaces/macs/{mac}/vpc-id` | The interface's VPC |
 | `GET /latest/meta-data/placement/availability-zone` | AZ |
+| `GET /latest/meta-data/placement/availability-zone-id` | AZ ID (for example `use1-az1`), the same ID `DescribeSubnets` reports for the zone |
 | `GET /latest/meta-data/placement/region` | Region |
 | `GET /latest/meta-data/services/` | Service metadata keys (`domain` and `partition`); also accepts the path without a trailing slash |
 | `GET /latest/meta-data/services/partition` | AWS partition for the instance's region |
@@ -871,7 +960,7 @@ Guests with an instance profile receive endpoint and region settings without Flo
 
 ### IMDS and SSM managed instances
 
-IMDS only knows about containers that Floci itself launched through `RunInstances`. That launch is what installs the link-local `169.254.169.254` proxy inside the container and maps the container's IP to its instance record. A restarted container (`StopInstances` then `StartInstances`) has a new network namespace, so once the instance is `running` `StartInstances` sets the proxy up again; an instance under security-group enforcement keeps its helper container's namespace, and the proxy with it.
+IMDS only knows about containers that Floci itself launched through `RunInstances`. That launch is what installs the link-local `169.254.169.254` proxy inside the container and maps the container's IP to its instance record. A restarted container (`StopInstances` then `StartInstances`) has a new network namespace, so once the instance is `running` `StartInstances` sets the proxy up again. An instance under security-group enforcement keeps its helper container's namespace; `StartInstances` attempts to migrate an older TCP/80 listener before starting the workload.
 
 The EC2 IMDS helper routes guest-originated TCP requests for `169.254.169.254:80` with one
 comment-owned `nat OUTPUT` DNAT rule in the guest's network namespace. It does not
@@ -895,8 +984,10 @@ To get a container that both answers IMDS (including instance profile credential
 When an EKS cluster is running, its synthesized node instance is registered and visible through the EC2 service:
 
 - **Visibility**: Exposed via `DescribeInstances` and `DescribeInstanceStatus` with its synthesized instance ID (`i-...`), type (`m5.large`), running state, VPC, subnet, launch time, and cluster tags (`Name`, `kubernetes.io/cluster/<cluster-name>=owned`, `eks:cluster-name=<cluster-name>`). It can be queried by ID, filtered, or listed with other instances.
-- **Operations**: Supports volume attachments (`AttachVolume`, `DetachVolume`), instance attribute inspection and modification, and resource tagging (`CreateTags`, `DeleteTags`, `DescribeTags`).
-- **Lifecycle protection**: Lifecycle actions that would mutate or delete the node through EC2 (`TerminateInstances`, `StopInstances`, `StartInstances`, `RebootInstances`), and `ModifyInstanceMetadataOptions`, which the node's IMDS would not see, are rejected with `OperationNotPermitted` (HTTP 400) as a Floci emulation limitation because the instance directly represents the underlying k3s cluster container. In real AWS, cluster node instances in an Auto Scaling group can be terminated or stopped and are subsequently replaced by the ASG. In Floci, the node instance lifecycle is managed solely through the EKS cluster lifecycle.
+- **Network interface**: A node holding an address in its subnet has a primary network interface there, at that address, holding the cluster security group, as an EKS node's interface does. With the [EKS VPC pod network](eks.md#vpc-pod-network) on, the interface also lists the node's IPv4 `/28` prefixes in `ipv4PrefixSet`, whose addresses its pods hold. A node whose subnet is not Docker-backed, or that got no address in it, has none. `DescribeInstances` reports the interface and the group with the instance, and `DescribeNetworkInterfaces` lists the interface as it lists an instance's launch-created one, with the same filters. Its ids derive from the cluster, so they survive a restart. The cluster security group cannot be deleted while the node holds it.
+- **Changes stored through EC2**: An action such as `ModifyInstanceAttribute` stores EC2's copy of the node. The copy keeps what the action changed, while the node's address, subnet and interfaces follow its cluster, which may replace the node. Deleting the cluster ends the node as terminating it would: the copy is dropped, and volumes attached to the node are detached, or deleted when their `DeleteOnTermination` is set.
+- **Operations**: Supports volume attachments (`AttachVolume`, `DetachVolume`), instance attribute inspection and modification, and resource tagging (`CreateTags`, `DeleteTags`, `DescribeTags`), its network interface's tags included.
+- **Lifecycle protection**: Lifecycle actions that would mutate or delete the node through EC2 (`TerminateInstances`, `StopInstances`, `StartInstances`, `RebootInstances`), `ModifyInstanceMetadataOptions`, which the node's IMDS would not see, and `ModifyNetworkInterfaceAttribute`, `AssignIpv6Addresses` and `UnassignIpv6Addresses` on its network interface are rejected with `OperationNotPermitted` (HTTP 400) as a Floci emulation limitation because the instance directly represents the underlying k3s cluster container. In real AWS, cluster node instances in an Auto Scaling group can be terminated or stopped and are subsequently replaced by the ASG. In Floci, the node instance lifecycle is managed solely through the EKS cluster lifecycle.
 
 ## Default Resources
 
@@ -904,14 +995,16 @@ Floci seeds the following resources on first use in each region so Terraform, th
 
 | Resource | ID | Details |
 |---|---|---|
-| Default VPC | `vpc-default` | CIDR `172.31.0.0/16` |
-| Default Subnet (AZ a) | `subnet-default-a` | CIDR `172.31.0.0/20` |
-| Default Subnet (AZ b) | `subnet-default-b` | CIDR `172.31.16.0/20` |
-| Default Subnet (AZ c) | `subnet-default-c` | CIDR `172.31.32.0/20` |
-| Default Security Group | `sg-default` | `groupName=default`, all-traffic egress |
-| Default Internet Gateway | `igw-default` | Attached to default VPC |
-| Main Route Table | `rtb-default` | Associated with default VPC |
-| Default Network ACL | `acl-default` | Allow-all, associated with the default subnets |
+| Default VPC | `vpc-<17 hex>` | CIDR `172.31.0.0/16`; derived from the region, stable across restarts |
+| Default Subnet (AZ a) | `subnet-<17 hex>` | CIDR `172.31.0.0/20`; derived from the region and zone |
+| Default Subnet (AZ b) | `subnet-<17 hex>` | CIDR `172.31.16.0/20`; derived from the region and zone |
+| Default Subnet (AZ c) | `subnet-<17 hex>` | CIDR `172.31.32.0/20`; derived from the region and zone |
+| Default Security Group | `sg-<17 hex>` | `groupName=default`, all-traffic egress; derived from the region |
+| Default Internet Gateway | `igw-<17 hex>` | Attached to default VPC; derived from the region |
+| Main Route Table | `rtb-<17 hex>` | Associated with default VPC; derived from the region |
+| Default Network ACL | `acl-<17 hex>` | Allow-all, associated with the default subnets; derived from the region |
+
+The exact ids are region-derived (a hash of the region, plus the zone or subnet where there is more than one) and differ between regions; discover the real ids through the Describe APIs rather than hard-coding them.
 
 ## Supported Actions
 
@@ -925,7 +1018,7 @@ naming different VPCs find nothing.
 
 | Action | Description |
 |--------|-------------|
-| RunInstances | Creates one or more local EC2 instances, starting Docker-backed runtime when not in mock mode. Security groups come from `SecurityGroupId.N` or, as Terraform sends them with an interface spec, from the primary interface's `NetworkInterface.1.SecurityGroupId.N`; both in one request is `InvalidParameterCombination`. A launch into a subnet with `AssignIpv6AddressOnCreation` and an associated IPv6 block gives the implicit primary interface one IPv6 address from that block (never one of its first four addresses or one a live instance interface in the subnet holds), reported as the instance's `ipv6Address` and in the interface's `ipv6AddressesSet`; `Ipv6AddressCount` and `Ipv6Address.N` on RunInstances are not read. |
+| RunInstances | Creates one or more local EC2 instances, starting Docker-backed runtime when not in mock mode. Security groups come from `SecurityGroupId.N` or, as Terraform sends them with an interface spec, from the primary interface's `NetworkInterface.1.SecurityGroupId.N`; both in one request is `InvalidParameterCombination`. A launch without groups uses the default security group of its subnet's VPC. An implicit primary interface in an IPv6-enabled subnet receives an allocated IPv6 address, as described below. |
 | CreateFleet | Creates an instant local fleet from launch-template configurations and on-demand or spot overrides. DryRun returns the AWS-compatible `DryRunOperation` error without launching instances. |
 | DescribeInstances | Lists or returns stored EC2 instances. |
 | TerminateInstances | Terminates instances and updates their stored lifecycle state. |
@@ -936,7 +1029,7 @@ naming different VPCs find nothing.
 | GetConsoleOutput | Returns a console log carrying the guest's SSH host keys between the `-----BEGIN SSH HOST KEY KEYS-----` and `-----END SSH HOST KEY KEYS-----` markers cloud-init prints, read from the running instance container. An instance that is not running, or whose container cannot be read, returns an empty log, as a just-launched one does on AWS. An instance in another region is `InvalidInstanceID.NotFound`. `DryRun=true` returns `DryRunOperation` before the instance is looked up, as on AWS. |
 | DescribeInstanceCreditSpecifications | Returns the CPU credit option of burstable performance instances. A named instance id reports the option the instance acquired at launch, either the explicit `CreditSpecification.CpuCredits` or the family default, `standard` for t2 and `unlimited` for t3, t3a and t4g. An id that is not a burstable performance instance reports `standard`, and only an unknown id is an error. Naming no id returns the instances on the unlimited option, including one that kept `unlimited` after a resize onto a non-burstable type. `Filter.N` supports the modeled `instance-id` and narrows whichever set the request selected. `MaxResults` accepts 5 through 1000 and cannot be combined with instance ids. `DryRun=true` returns `DryRunOperation`. |
 | DescribeInstanceAttribute | Returns a supported attribute for an instance. `ebsOptimized` reports what `RunInstances` (or its launch template) set; instances launched by CloudFormation, Auto Scaling or Fleet report `false`. |
-| ModifyInstanceAttribute | Updates supported mutable attributes for an instance. `UserData.Value` (base64) needs the instance stopped, as on AWS, and answers `IncorrectInstanceState` otherwise. |
+| ModifyInstanceAttribute | Updates supported mutable attributes for an instance. `UserData.Value` (base64) needs the instance stopped, as on AWS, and answers `IncorrectInstanceState` otherwise. A group or `SourceDestCheck` change on an instance with more than one network interface answers `InvalidInstanceID` ("There are multiple interfaces attached to instance..."), as on AWS; change each interface with `ModifyNetworkInterfaceAttribute` instead. |
 | ModifyInstanceMetadataOptions | Updates an instance's IMDS options, changing only the fields the request names. An EKS cluster node is refused with `OperationNotPermitted`. |
 
 ### VPCs
@@ -964,14 +1057,14 @@ address behavior.
 |--------|-------------|
 | CreateVpc | Creates a VPC with the requested CIDR block. `InstanceTenancy` accepts `default` or `dedicated`; `host` is rejected with `InvalidParameterValue`, as on AWS. `DryRun=true` is answered with `DryRunOperation` and creates nothing. A tag specification error keeps its own error; the CIDR block and the tenancy are checked only without `DryRun`. |
 | DescribeVpcs | Lists or returns stored VPCs. |
-| DeleteVpc | Deletes a VPC from the local EC2 store, together with its default security group and rules, main route table and default network ACL. Docker network cleanup waits for an in-flight creation and prevents queued attaches from recreating the deleted network. Fails with `DependencyViolation` while the VPC still has a subnet, a security group, route table or network ACL other than those defaults, a VPC endpoint, an attached internet gateway or egress-only internet gateway, a transit gateway attachment, an Elastic Load Balancing v2 load balancer, or anything still holding a network interface in one of its subnets: an instance that is not terminated, a NAT gateway that is not deleted or failed, a standalone network interface, or an interface endpoint. |
+| DeleteVpc | Deletes a VPC from the local EC2 store, together with its default security group and rules, main route table and default network ACL. Docker network cleanup waits for an in-flight creation and prevents queued attaches from recreating the deleted network. Fails with `DependencyViolation` while the VPC still has a subnet, a security group, route table or network ACL other than those defaults, a VPC endpoint, an attached internet gateway or egress-only internet gateway, a transit gateway attachment, an Elastic Load Balancing v2 load balancer, or anything still holding a network interface in one of its subnets: an instance that is not terminated, a NAT gateway that is not deleted or failed, a standalone network interface, an interface endpoint, or a Lambda function or published version configured in the VPC. |
 | ModifyVpcAttribute | Updates supported VPC attributes. |
 | DescribeVpcAttribute | Returns a supported VPC attribute. |
 | CreateDhcpOptions | Creates a DHCP options set with the supplied configurations and optional tags. |
 | DescribeDhcpOptions | Lists DHCP options sets by ID or filters, with paginated results. |
 | AssociateDhcpOptions | Associates an options set with a VPC; `default` leaves the VPC with no DHCP options. |
 | DeleteDhcpOptions | Deletes an unassociated DHCP options set. |
-| DescribeVpcEndpointServices | Lists common AWS interface endpoint services and S3 (gateway and interface) in every availability zone, named per partition (see [Partitions](../configuration/partitions.md)), followed by the [VPC endpoint services](#vpc-endpoint-services) the caller owns or is allowed to connect to. A `ServiceName` filter is echoed back as asked, except that the name of an endpoint service the caller may not see is refused with `InvalidServiceName`. |
+| DescribeVpcEndpointServices | Lists common AWS interface endpoint services and S3 and DynamoDB (gateway and interface) in every availability zone, named per partition (see [Partitions](../configuration/partitions.md)), followed by the [VPC endpoint services](#vpc-endpoint-services) the caller owns or is allowed to connect to. A `ServiceName` filter is echoed back as asked, except that the name of an endpoint service the caller may not see is refused with `InvalidServiceName`. |
 | CreateVpcEndpoint | Creates a VPC endpoint record, including its `PolicyDocument` and the per-subnet IPv4 and IPv6 addresses named by `SubnetConfiguration.N`. An endpoint to a [VPC endpoint service](#vpc-endpoint-services) must be of the service's type, and starts `pendingAcceptance` or `available` as the service decides. `IpAddressType` defaults to `ipv4`. Interface and gateway address types are stored as metadata. Synthesized endpoint interfaces still carry IPv4 only; IPv6 networking is not emulated. An `Ipv4` value outside the named subnet's CIDR, or among the first four or the last address AWS reserves in it, is rejected with `InvalidParameterValue`. `DryRun=true` is answered with `DryRunOperation` and creates nothing. |
 | DescribeVpcEndpoints | Lists or returns stored VPC endpoints, including their IP address type. `DryRun=true` returns `DryRunOperation`. |
 | ModifyVpcEndpoint | Associates or disassociates route tables, subnets and security groups, sets or resets the endpoint policy, and updates stored `IpAddressType` metadata. Omitting the type preserves its current value; malformed types are rejected before changes are applied. `SubnetConfiguration.N` replaces the addresses pinned for a subnet, under the same address validation as CreateVpcEndpoint. `DnsOptions` is accepted and ignored. `DryRun=true` is answered with `DryRunOperation` and changes nothing. |
@@ -990,7 +1083,7 @@ private gateway lifecycles are not modelled.
 |--------|-------------|
 | CreateSubnet | Creates a subnet in a VPC. `DryRun=true` is answered with `DryRunOperation` and creates nothing. A tag specification error or a missing `VpcId` or VPC keeps its own error; the CIDR block, zone, IPv6 block and overlap with other subnets are checked only without `DryRun`. |
 | DescribeSubnets | Lists or returns stored subnets. The `default-for-az` filter and its `defaultForAz` alias select default or non-default subnets; values are ORed and separate filters are ANDed. |
-| DeleteSubnet | Deletes a subnet from the local EC2 store. Fails with `DependencyViolation` while the subnet still has a transit gateway attachment, an Elastic Load Balancing v2 load balancer, or anything holding a network interface in it: an instance that is not terminated, a NAT gateway that is not deleted or failed, a standalone network interface, or an interface endpoint. |
+| DeleteSubnet | Deletes a subnet from the local EC2 store. Fails with `DependencyViolation` while the subnet still has a transit gateway attachment, an Elastic Load Balancing v2 load balancer, or anything holding a network interface in it: an instance that is not terminated, a NAT gateway that is not deleted or failed, a standalone network interface, an interface endpoint, or a Lambda function or published version whose `VpcConfig` names the subnet. |
 | ModifySubnetAttribute | Updates supported subnet attributes. |
 
 ### Security Groups
@@ -1013,14 +1106,14 @@ unscoped evaluation.
 |--------|-------------|
 | CreateSecurityGroup | Creates a security group in a VPC, the default VPC when `VpcId` is absent or empty. `DryRun=true` is answered with `DryRunOperation` and creates nothing. A tag specification error or a missing `GroupName`, `GroupDescription` or VPC keeps its own error; a taken group name is checked only without `DryRun`. |
 | DescribeSecurityGroups | Lists or returns stored security groups. |
-| DeleteSecurityGroup | Deletes a group and its rules by ID, or by name within the account and region's default VPC. Name lookup reports `VPCIdNotSpecified` when no default VPC exists. Default groups cannot be deleted. Existing network-interface, active-instance and other same-VPC group references report `DependencyViolation`; self-references do not prevent deletion. `DryRun` reports `DryRunOperation` without deleting the group or rules. |
+| DeleteSecurityGroup | Deletes a group and its rules by ID, or by name within the account and region's default VPC. Name lookup reports `VPCIdNotSpecified` when no default VPC exists. Default groups cannot be deleted. Existing network-interface, active-instance and other same-VPC group references report `DependencyViolation`; self-references do not prevent deletion. `DryRun` reports `DryRunOperation` without deleting the group or rules. Blank or malformed boolean values are rejected before deletion. |
 | AuthorizeSecurityGroupIngress | Adds inbound permissions for IPv4/IPv6 ranges, referenced groups or prefix lists. Stores one rule per source and canonicalizes CIDRs. An equivalent existing rule, or a duplicate within the request, returns `InvalidPermission.Duplicate` before any rule is written. Descriptions do not distinguish permissions. |
 | AuthorizeSecurityGroupEgress | Adds outbound permissions, with the same source types as the inbound call. |
 | RevokeSecurityGroupIngress | Removes only the named sources at the selected protocol and ports. Equivalent CIDRs and protocol numbers/names match (`6` is `tcp`); all-traffic (`-1`) ignores ports. A request without a source retains the existing whole-permission behavior. |
 | RevokeSecurityGroupEgress | Removes outbound permissions, matched the same way as the inbound call. |
 | GetSecurityGroupsForVpc | Lists the security groups belonging to one VPC, with the same filters as the describe call. |
 | DescribeSecurityGroupRules | Lists stored security group rules. |
-| ModifySecurityGroupRules | Updates supported fields on security group rules. Description updates are serialized with group deletion so an in-flight update cannot restore a deleted rule. |
+| ModifySecurityGroupRules | Applies only the nested `SecurityGroupRule.Description` field; other rule fields are ignored. Updates both rule and group views, serialized with deletion. Every rule must belong to the requested group before any update is applied. |
 | UpdateSecurityGroupRuleDescriptionsIngress | Updates or clears descriptions by rule ID or permission source, keeping rule IDs and tags. Updates both describe views. The selected group, direction, account and region must match. Supports default-VPC group names and `DryRun`. |
 | UpdateSecurityGroupRuleDescriptionsEgress | Updates outbound rule descriptions with the same selectors and validation as the inbound call. |
 
@@ -1280,9 +1373,12 @@ update in place.
 
 Two AWS-managed prefix lists exist in every region without being created —
 `com.amazonaws.<region>.s3` (`pl-63a5400a`) and `com.amazonaws.<region>.dynamodb`
-(`pl-02cd2c6b`) — matching the gateway endpoint services on AWS. They are owned by `AWS`,
-read-only, and served by both `DescribePrefixLists` and `DescribeManagedPrefixLists`;
-modifying or deleting one returns `UnsupportedOperation`.
+(`pl-02cd2c6b`) — matching the gateway endpoint services on AWS. Every region of the
+commercial `aws` partition also has `com.amazonaws.global.cloudfront.origin-facing`
+(`pl-3b927c52`), holding the CloudFront origin-facing ranges published in
+`ip-ranges.json`; like on AWS, it is absent from the China and GovCloud partitions. These
+lists are owned by `AWS`, read-only, and served by both `DescribePrefixLists` and
+`DescribeManagedPrefixLists`; modifying or deleting one returns `UnsupportedOperation`.
 
 Additional regional AWS-managed lists can be supplied through
 `FLOCI_SERVICES_EC2_MANAGED_PREFIX_LIST_CATALOG_PATH`. Set it to a readable JSON
@@ -1525,7 +1621,7 @@ back, and a new address that is already held fails the update and leaves the gat
 | DescribeInstanceConnectEndpoints | Lists endpoints; filters `instance-connect-endpoint-id`, `state`, `vpc-id`, `subnet-id`, `tag:<key>`, `tag-key`, `tag-value`. |
 | DeleteInstanceConnectEndpoint | Deletes an endpoint and answers with it in `delete-in-progress`. |
 
-A repeated `ClientToken` returns the endpoint the first call created (`IdempotentParameterMismatch` when reused with another subnet, security group set, `IpAddressType`, `PreserveClientIp` or tag set; tags added later with `CreateTags` do not count). While an endpoint exists, `DeleteSubnet` on its subnet and `DeleteVpc` on its VPC fail with `DependencyViolation`, as on AWS. The interface ID in an endpoint's `networkInterfaceIdSet` resolves in `DescribeNetworkInterfaces` while the endpoint exists: a requester-managed `ec2_instance_connect_endpoint` interface carrying the endpoint's private address, subnet, VPC and security groups. An unknown filter name is `InvalidParameterValue` even when no endpoint exists. `DescribeInstanceConnectEndpoints` pages by `MaxResults`/`NextToken` in endpoint ID order (`MaxResults` outside 1-50 is `InvalidMaxResults`), and `publicDnsNames` carries only the `ipv4` names. The endpoint's tunnel (`openTunnel`) is not served yet.
+A repeated `ClientToken` returns the endpoint the first call created (`IdempotentParameterMismatch` when reused with another subnet, security group set, `IpAddressType`, `PreserveClientIp` or tag set; tags added later with `CreateTags` do not count). While an endpoint exists, `DeleteSubnet` on its subnet and `DeleteVpc` on its VPC fail with `DependencyViolation`, as on AWS. The interface ID in an endpoint's `networkInterfaceIdSet` resolves in `DescribeNetworkInterfaces` while the endpoint exists: a requester-managed `ec2_instance_connect_endpoint` interface carrying the endpoint's private address, subnet, VPC and security groups. An unknown filter name is `InvalidParameterValue` even when no endpoint exists. `DescribeInstanceConnectEndpoints` pages by `MaxResults`/`NextToken` in endpoint ID order (`MaxResults` outside 1-50 is `InvalidMaxResults`), and `publicDnsNames` carries only the `ipv4` names. The endpoint's tunnel is real: see [EC2 Instance Connect](ec2-instance-connect.md#instance-connect-endpoint-tunnels).
 
 `FLOCI_NETWORK_VPC_ROUTING_ENABLED=true` additionally enables an experimental IPv4
 packet path from protected workloads through public NAT gateways to managed
@@ -1834,6 +1930,17 @@ latest version, and stored launch data unchanged.
 Exactly one of `LaunchTemplateId` and `LaunchTemplateName` is required, including
 on a dry run; missing or conflicting selectors fail before any state changes.
 
+With IAM enforcement enabled, `DeleteLaunchTemplate`, `CreateLaunchTemplateVersion`,
+`DeleteLaunchTemplateVersions`, and `ModifyLaunchTemplate` resolve a `LaunchTemplateName`
+selector in the caller's account and request region before evaluating the template's
+ID-based ARN. Exact-resource grants and explicit denies apply to both name and ID selectors.
+The request retains that resolved ID, so deleting and recreating a template under the same
+name cannot redirect an authorized mutation to the replacement. `CreateLaunchTemplate`
+authorizes a new template's ARN and preserves the duplicate-name error for an existing name.
+
+Deleting versions updates `$Latest` to the highest surviving version. New versions receive numbers
+above every previously issued version, including deleted versions, and the counter survives restart.
+
 `ModifyLaunchTemplate` honors `DryRun` for requests by template ID or name. A valid
 dry run returns `DryRunOperation` with HTTP 412 and leaves the default version,
 latest version, and stored launch data unchanged.
@@ -2024,14 +2131,21 @@ The `client-token` instance filter selects only matching launches.
 
 | Action | Description |
 |--------|-------------|
-| CreateNetworkInterface | Creates a standalone elastic network interface (ENI) in a subnet, unattached. `Ipv6AddressCount` assigns that many IPv6 addresses from the subnet's associated IPv6 block (never one of its first four addresses or one another interface in the subnet holds), reported in the interface's `ipv6AddressesSet`, with the first of them as its `ipv6Address`; without it, a subnet with `AssignIpv6AddressOnCreation` gives one, and `0` overrides that. A count on a subnet without an associated IPv6 block, or a negative one, is `InvalidParameterValue`; a count with `Ipv6Addresses.N`, `Ipv6Prefix.N` or `Ipv6PrefixCount` is `InvalidParameterCombination`. Specific addresses and prefixes are not assigned. An attached interface's IPv6 addresses appear on the instance. An interface a session of a service-linked role creates is requester-managed (`requesterManaged` true, and found by the `requester-managed` filter), as an interface an AWS service creates in the account on its behalf; its `requesterId`, which AWS fills with the service's own alias or account, is not reported. |
-| DescribeNetworkInterfaces | Lists network interfaces known to the local EC2 service, both an instance's implicit primary interface and standalone ENIs created via `CreateNetworkInterface`. The `ipv6-addresses.ipv6-address` filter matches a standalone ENI by one of its IPv6 addresses. |
+| CreateNetworkInterface | An interface created by a service-linked-role session is requester-managed. Creates a standalone elastic network interface (ENI) in a subnet, unattached. `Ipv6Addresses` names IPv6 addresses inside one of the subnet's IPv6 blocks; `Ipv6AddressCount` draws that many from the subnet. Left out, the subnet's `AssignIpv6AddressOnCreation` gives the interface one address; an explicit `0` overrides it. Create and describe responses also expose the first assigned IPv6 address as `ipv6Address`, omitting it when the interface has none. |
+| DescribeNetworkInterfaces | Lists network interfaces known to the local EC2 service: an instance's implicit primary interface, an EKS cluster node's primary interface, and standalone ENIs created via `CreateNetworkInterface`. |
 | AttachNetworkInterface | Attaches an available standalone ENI to a running or stopped instance at a device index. The ENI can be another account's that granted the caller `INSTANCE-ATTACH`. With VPC networks on and `FLOCI_SERVICES_EC2_VPC_NETWORKS_HOT_ATTACH_ENABLED=true`, an ENI in a VPC the instance holds no other interface in also becomes a device of the instance's container (hot attach): an endpoint on that VPC's network at the ENI's primary private IPv4, whose device the namespace owner gives the ENI's MAC address (Docker sets an endpoint MAC only when it creates a container, so this needs NET_ADMIN and `ip` in the namespace owner, as Floci's network helper has). With isolated VPC address spaces and `FLOCI_SERVICES_EC2_VPC_NETWORKS_HOT_ATTACH_ACROSS_ADDRESS_SPACES`, the device joins the instance's protected namespace instead (see below). The ENI stays record-only, and Floci logs why, when security-group enforcement is on without isolated address spaces, when isolated address spaces are on without that setting, when the instance already holds an interface in that VPC (Docker gives a container one endpoint per network), or in mock mode. |
 | DetachNetworkInterface | Detaches a standalone ENI by attachment ID, returning it to `available`, and removes the device a hot attach added. |
+| AssignIpv6Addresses | Gives a standalone ENI or an instance's launch-created interface the named IPv6 addresses (`Ipv6Addresses.N`) or a count drawn from its subnet (`Ipv6AddressCount`); one of the two is required. `assignedIpv6Addresses` lists only the addresses the call added. An address outside the subnet's IPv6 blocks answers `InvalidParameterValue`, one another interface holds `InvalidIPAddress.InUse`. Prefix delegation (`Ipv6Prefix`, `Ipv6PrefixCount`) answers `UnsupportedOperation`. |
+| UnassignIpv6Addresses | Removes the named IPv6 addresses (`Ipv6Addresses.N`) from an interface; `unassignedIpv6Addresses` lists only the ones it held. `Ipv6Prefix` answers `UnsupportedOperation`. |
+| ModifyNetworkInterfaceAttribute | Changes a standalone ENI or an instance's launch-created interface: its security groups (`SecurityGroupId.N`), `Description`, `SourceDestCheck`, or its attachment's `DeleteOnTermination`. On an instance's primary interface the groups and the check are the instance's too. With security-group enforcement on, a group change reaches the interface's firewall before it is stored. The members Floci does not apply (`EnablePrimaryIpv6`, `EnaSrdSpecification`, `ConnectionTrackingSpecification`, `AssociatePublicIpAddress`, `AssociatedSubnetIds`, and the attachment's `DefaultEnaQueueCount` and `EnaQueueCount`) answer `UnsupportedOperation` rather than `true` with nothing changed. |
 | DeleteNetworkInterface | Deletes a standalone ENI. Fails while the ENI is still attached, matching AWS. |
 | CreateNetworkInterfacePermission | The interface's owner grants another account `INSTANCE-ATTACH` over it. `EIP-ASSOCIATE` and `AwsService` are `UnsupportedOperation`. |
 | DescribeNetworkInterfacePermissions | The permissions granted over the caller's interfaces, by `NetworkInterfacePermissionId.N` and the five `network-interface-permission.*` filters; `MaxResults` 5-255, default 50. |
 | DeleteNetworkInterfacePermission | The interface's owner deletes a permission. Refused while the account it names has the interface attached to an instance, unless `Force` is `true`. |
+
+A standalone ENI created via `CreateNetworkInterface` can also be handed to `RunInstances` as an instance's primary interface (`NetworkInterface.1.NetworkInterfaceId` / `NetworkInterface.1.DeviceIndex`) instead of letting the instance create its own implicit one, the pattern Terraform's `aws_instance` resource uses for `network_interface { network_interface_id = ... }`. AWS only allows this for a single instance per launch call; `RunInstances` rejects it otherwise with `InvalidParameterCombination`.
+
+AWS takes one attribute per `ModifyNetworkInterfaceAttribute` call; Floci applies every attribute a call names. A route table's `CreateRoute` with a `NetworkInterfaceId` target is accepted but not recorded, since `Route` does not yet model an ENI target; a subsequent `plan` against such a route may show drift.
 
 A standalone ENI created via `CreateNetworkInterface` can also be handed to `RunInstances` as an instance's primary interface (`NetworkInterface.1.NetworkInterfaceId` / `NetworkInterface.1.DeviceIndex`) instead of letting the instance create its own implicit one, the pattern Terraform's `aws_instance` resource uses for `network_interface { network_interface_id = ... }`. AWS only allows this for a single instance per launch call; `RunInstances` rejects it otherwise with `InvalidParameterCombination`.
 
@@ -2060,9 +2174,35 @@ visible through `DescribeTags` and `DescribeNetworkInterfaces` after retention.
 owner can grant: another account's interface is `InvalidNetworkInterfaceID.NotFound`, as it is to
 every other action of that account.
 
+Floci accepts any ordinary 12-digit AWS account ID as an `INSTANCE-ATTACH` grantee.
+This is a Floci compatibility choice: AWS requires an AWS-authorized grantee account,
+so an ordinary account accepted here can be rejected by AWS with `OperationNotPermitted`.
+
 A repeated grant of the same permission to the same account answers the grant already in place.
 AWS documents no duplicate error for it; this is Floci's choice. Grants are kept on the interface,
 so they go when it is deleted.
+
+#### Interface and VPC endpoint IAM resources
+
+Resource-tag conditions use every concrete EC2 resource ARN's stored tags, including when a request
+from another service names an EC2 ARN. The lookup follows the ARN's account and Region; an omitted
+account, as on an image ARN, uses the caller's account.
+An untagged resource does not inherit another resource's tags. Wildcard resources retain their
+existing request context. Generated tag prefixes and per-target checks remain in effect.
+
+
+With IAM enforcement enabled, the generated request-resource catalog checks interface and VPC
+endpoint operations on their resource ARNs. Creating an interface also names its subnet and security
+groups; creating an endpoint also names its VPC, subnets, security groups and route tables.
+`ModifyVpcEndpoint` includes both added and removed resources. Tag requests recognize the interface
+ID prefix supplied by the pinned botocore model. Endpoint, attachment and endpoint-service IDs
+without a model-backed prefix remain checked on `*`.
+
+`DetachNetworkInterface` resolves the attachment's instance and interface in the caller's account
+and Region, then checks both resources. An attachment that cannot be resolved uses the caller's
+`instance/*` and `network-interface/*` resources for authorization before the service reports it
+missing. `DescribeNetworkInterfaces` and `DescribeNetworkInterfacePermissions` remain checked on
+`*`. Cross-account attachment follows the explicit interface permission described below.
 
 The account granted `INSTANCE-ATTACH` can then `AttachNetworkInterface` the interface to one of
 its own instances, as the [CreateNetworkInterfacePermission](https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_CreateNetworkInterfacePermission.html)
@@ -2084,7 +2224,6 @@ instance's account it is still another account's interface, and `DescribeNetwork
 not list it. The owner detaches it as any attachment of its interface, and terminating the
 instance returns it to `available`.
 
-`ModifyNetworkInterfaceAttribute` is not implemented: no example in the corpus that needed `CreateNetworkInterface` was found to need it. A route table's `CreateRoute` with a `NetworkInterfaceId` target is accepted but not recorded, since `Route` does not yet model an ENI target; a subsequent `plan` against such a route may show drift.
 
 ### Volumes
 
@@ -2104,10 +2243,11 @@ When `floci.services.ec2.volume-block-devices` is enabled (the default), attache
 - **Storage mechanism**: Backing sparse raw image files are allocated in Floci storage under `floci-aws-ec2-volumes` (named volume or host path). A privileged helper container (`floci-aws-ec2-volume-helper`, running `floci.services.ec2.volume-helper-image`, default `debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3`) manages Linux loop devices via `losetup`. It starts on the first volume operation and is removed when Floci shuts down; the backing files stay in storage.
 - **Target device nodes**: Inside privileged target instance containers, the corresponding device node is created at the requested path (for example `/dev/xvdf` or `/dev/sdf`) using `mknod` or a symlink to the loop device, matching the exact size specified during volume creation. Target containers can format filesystems (such as ext4 or xfs), mount them, and persist data across detach and reattach.
 - **Restart reconciliation**: When an instance container stops and starts, or when Floci restarts, attached volume device nodes are automatically restored inside the target container. Backing raw files remain preserved across reboots in persistent storage.
-- **Graceful degradation**: If Docker is unavailable, the target instance container is not running, or the container is not privileged, volume attachments degrade gracefully to metadata-only tracking without failing the API call.
-- **Deletion failures**: When the block-device manager is available but cannot delete a volume's backing storage, deletion returns `InternalError` and retains the volume record and tags for retry. A failed detach or a loop still held open preserves the backing file. Deletion attempts each detach once and returns while the file is still in use, so closing that handle cannot make a timed-out cleanup process erase data after the API returns. Retry deletion after releasing the handle. Container-backed termination ends volume attachments only after guest teardown, using the original caller's account. If that asynchronous cleanup fails, it logs the failure and preserves the volume for reconciliation or retry. A refused launch also removes its newly created volumes after successful teardown, including volumes whose original deletion policy would retain them. Rollback preserves that policy when termination fails and never deletes a volume still attached elsewhere. Cleanup after a failed launch and launch rollback also preserve storage on deletion failure.
+- **Metadata-only tracking**: Disabling `floci.services.ec2.volume-block-devices`, EC2 mock mode, unavailable Docker, or a missing or stopped target container retains metadata-only attachment without failing the API call. Stopped instances have their device nodes restored when started. Once physical attachment is attempted, helper, loop-device, or guest device-creation failures return `InternalError` without recording a successful attachment; partial guest devices and loop devices allocated by the failed attempt are cleaned up on a best-effort basis so attachment can be retried. Reused loop devices are retained on failure. Insufficient privileges can cause these failures. Restart reconciliation logs device-restoration failures and keeps the existing attachment records for a later retry.
 - **Platform requirements**: Requires a Linux Docker environment (native Linux Docker daemon, or Colima / Docker Desktop with a Linux virtual machine) and privileged instance containers.
-- **Unmodeled aspects**: Multi-attach is tracked at metadata level only. Ordinary volumes start unformatted like real EBS block devices. The opt-in image mount contract below prepares ext4; volume encryption at the block layer is not modeled. Root volume backing is logical (container rootfs); deleting that root on instance termination removes its metadata and tags without starting a raw block-device helper. Data and managed filesystem volumes still require successful backing-storage cleanup before their records disappear. For root volumes, `ModifyVolume` updates recorded root volume metadata without modifying container storage, while EBS data volume size increases expand the underlying raw backing file and refresh any attached loop device. Volume type, IOPS, and throughput changes remain recorded metadata without altering device characteristics.
+- **Unmodeled aspects**: Multi-attach is tracked at metadata level only. Ordinary volumes start unformatted; the opt-in image mount contract below can prepare ext4. Volume encryption at the block layer is not modeled. Root volume backing is logical (container rootfs); when `DeleteOnTermination` is enabled, termination removes its metadata and tags without invoking a raw block-device helper. Failed-launch rollback also skips that helper when deleting a logical root that termination preserved. Data volumes still use their backing-storage cleanup; `ModifyVolume` updates recorded root volume metadata without modifying container storage, while EBS data volume size increases expand the underlying raw backing file and refresh any attached loop device. Volume type, IOPS, and throughput changes remain recorded metadata without altering device characteristics.
+
+- **Deletion failures**: When the block-device manager is available but cannot delete a volume's backing storage, deletion returns `InternalError` and retains the volume record and tags for retry. A failed detach or a loop still held open preserves the backing file. Deletion attempts each detach once and returns while the file is still in use, so closing that handle cannot make a timed-out cleanup process erase data after the API returns. Retry deletion after releasing the handle. Container-backed termination ends volume attachments only after guest teardown, using the original caller's account. If that asynchronous cleanup fails, it logs the failure and preserves the volume for reconciliation or retry. A refused launch also removes its newly created volumes after successful teardown, including volumes whose original deletion policy would retain them. Rollback preserves that policy when termination fails and never deletes a volume still attached elsewhere. Cleanup after a failed launch and launch rollback also preserve storage on deletion failure.
 
 Validation matches AWS behavior:
 - Unknown volumes are rejected with `InvalidVolume.NotFound`.
@@ -2122,8 +2262,13 @@ Validation matches AWS behavior:
 
 | Action | Description |
 |--------|-------------|
-| CreateSnapshot | Creates completed, volume-derived snapshot metadata with requested tags in the caller's account and region. |
-| DescribeSnapshots | Lists or returns stored snapshots, filterable by id, owner, metadata and tags. |
+| DescribeSnapshots | Lists or returns stored snapshots, filterable by id and owner. |
+| CreateSnapshot | Snapshots a volume. The snapshot takes the volume's size and encryption, is owned by the caller and accepts `snapshot` tags from `TagSpecification`. |
+| DeleteSnapshot | Deletes a snapshot and its tags. A snapshot a registered AMI still uses fails with `InvalidSnapshot.InUse`. |
+| CopySnapshot | Copies a snapshot from `SourceRegion` into the request's region as a new snapshot the caller owns. |
+
+`CreateSnapshot` answers `pending`, as AWS does, and the copy completes within the call, so `DescribeSnapshots` reports the snapshot `completed` on the first poll. Snapshots hold no volume data: a volume created from one gets its size and encryption, not its contents. A copy reports `vol-ffffffff` as its volume, stays encrypted when its source is, and is encrypted when `Encrypted=true` or the destination region's encryption by default says so. The source's tags are not copied. All three actions honor `DryRun`: a request the real call would refuse keeps that error, and one that would succeed returns `DryRunOperation` and changes nothing.
+
 | DescribeImageAttribute | Returns an owned image's launch permission account IDs. |
 | ModifyImageAttribute | Adds or removes nested launch permission account IDs on an owned image. |
 | DescribeSnapshotAttribute | Returns an owned snapshot's create-volume permission account IDs. |
@@ -2273,13 +2418,13 @@ All three actions honor `DryRun`. A request that would otherwise succeed returns
 | DescribeIpams | Lists or returns stored IPAMs. |
 | ModifyIpam | Updates an IPAM's description, tier, metered account and operating regions. |
 | DeleteIpam | Deletes an IPAM and, leniently, the pools that belong to it. |
-| CreateIpamPool | Creates a pool under a scope, optionally sourced from a parent pool. |
+| CreateIpamPool | Creates a pool under a scope, optionally sourced from a parent pool. An `ipam-pool` `TagSpecification` tags it. |
 | DescribeIpamPools | Lists or returns stored pools. |
 | ModifyIpamPool | Updates a pool's description, auto-import flag and netmask-length bounds. |
 | DeleteIpamPool | Deletes a pool. |
 | ProvisionIpamPoolCidr | Provisions a CIDR onto a pool, validated against its source pool. |
 | GetIpamPoolCidrs | Returns a pool's provisioned CIDRs. |
-| AllocateIpamPoolCidr | Allocates a CIDR from a pool, by explicit CIDR or by netmask length. |
+| AllocateIpamPoolCidr | Allocates a CIDR from a pool, by explicit CIDR or by netmask length. An `ipam-pool-allocation` `TagSpecification` tags the allocation. |
 | ReleaseIpamPoolAllocation | Releases an allocation, returning its space to the pool. |
 | GetIpamPoolAllocations | Returns a pool's live allocations. |
 | AssociateIpamByoasn | Associates a BYOASN with a CIDR. |
@@ -2290,9 +2435,11 @@ This is what LZA needs end to end: the Organization stage delegates the IPAM adm
 
 Allocation is real rather than recorded. `AllocateIpamPoolCidr` by netmask length hands out the first free block that fits, skipping both live allocations and any space already provisioned onward to child pools, and reports `InsufficientCidrBlocks` when nothing fits. An explicit `Cidr` must fall inside a provisioned CIDR and must not overlap an existing allocation. `ProvisionIpamPoolCidr` on a pool with a source pool requires the CIDR to sit inside one of the parent's provisioned CIDRs. Releasing an allocation returns its space, so the next allocation of the same size reuses it.
 
+Pool and allocation tags are kept with the other EC2 tags, in the pool's own region even when an IPAM action is called from another region, so `CreateTags`, `DeleteTags` and `DescribeTags` in the pool's region work on them. `DescribeIpamPools` returns a pool's tags and its `tag:<key>` and `tag-key` filters match them; `AllocateIpamPoolCidr` and `GetIpamPoolAllocations` return an allocation's. Releasing an allocation removes its tags, and deleting a pool, directly or through `DeleteIpam`, removes the pool's tags and those of the allocations it still held. Tags are per account, as for every EC2 resource: the tags another account gives an allocation it makes from a shared pool stay in that account, so the owner's `GetIpamPoolAllocations` does not show them. The allocation records that account as its `resourceOwner`, and releasing the allocation or deleting its pool removes its tags both there and in the pool owner's account.
+
 `CreateIpam`, `CreateIpamPool`, `ProvisionIpamPoolCidr` and `AllocateIpamPoolCidr` honour `ClientToken` — the four IPAM operations that model it. A replay returns what the first call produced rather than creating a second resource: the same pool, the same provisioned CIDR, the same allocation id and CIDR, with pool consumption unchanged. This matters most on `AllocateIpamPoolCidr`, which LZA's `get-ipam-subnet-cidr` Lambda retries; without it each retry would burn another distinct CIDR out of the pool. Parameter differences on a replay are ignored rather than rejected as `IdempotentParameterMismatch`, and the token is not echoed in the response, matching the AWS output shapes. A token is scoped to the account that used it.
 
-Pool lookups deliberately fall back to an id-only scan across accounts, so a RAM-shared pool resolves from a workload account and region. That fallback covers reads and allocation only: `AllocateIpamPoolCidr` from an account that does not own the pool succeeds and writes the allocation back to the owner's partition rather than forking a copy into the caller's. Mutations of the pool itself — `ModifyIpamPool`, `DeleteIpamPool`, `ProvisionIpamPoolCidr` — are owner-only, as are `ModifyIpam` and `DeleteIpam`, and a non-owner gets `InvalidIpamPoolId.NotFound` or `InvalidIpamId.NotFound`, which is what AWS returns for a resource you cannot act on. `ReleaseIpamPoolAllocation` stays on the cross-account path, since no per-allocation caller is tracked to check ownership against.
+Pool lookups deliberately fall back to an id-only scan across accounts, so a RAM-shared pool resolves from a workload account and region. That fallback covers reads and allocation only: `AllocateIpamPoolCidr` from an account that does not own the pool succeeds and writes the allocation back to the owner's partition rather than forking a copy into the caller's. Mutations of the pool itself — `ModifyIpamPool`, `DeleteIpamPool`, `ProvisionIpamPoolCidr` — are owner-only, as are `ModifyIpam` and `DeleteIpam`, and a non-owner gets `InvalidIpamPoolId.NotFound` or `InvalidIpamId.NotFound`, which is what AWS returns for a resource you cannot act on. `ReleaseIpamPoolAllocation` stays on the cross-account path and does not check which account made the allocation.
 
 The delegated administrator is stored organization-wide rather than per account, so every member account reads the same value and delegating a second, different account conflicts with `InvalidParameterValue` no matter which account asks.
 
@@ -2304,6 +2451,7 @@ State is reported settled rather than transitional, as elsewhere in this service
 
 | Environment variable | Default | Description |
 |---|---|---|
+| `FLOCI_SERVICES_EC2_NATIVE_INIT_APPARMOR_PROFILE` | unset (`unconfined`) | AppArmor profile selected by the native init helper. A custom profile must already be loaded on the workload Docker host and permit its mount and namespace operations. Floci does not install host profiles. |
 | `FLOCI_SERVICES_EC2_PRIVILEGED` | `true` | Docker privileged mode for guest containers; security-group enforcement always disables it |
 | `FLOCI_SERVICES_EC2_CAP_DROP` | unset | Comma-separated Linux capabilities to drop from unprivileged guest containers, in addition to mandatory security-group restrictions |
 | `FLOCI_SERVICES_EC2_CAP_ADD` | unset | Comma-separated Linux capabilities to add to unprivileged guest containers; security-group enforcement still removes `NET_ADMIN` and `NET_RAW`; overlap with `CAP_DROP` refuses launch |
@@ -2447,8 +2595,11 @@ anyway: each subnet allocates static addresses from its own CIDR. The default mo
 Docker IPAM the whole VPC range; isolated address spaces configure the native interface directly.
 
 An address a subnet picks on its own is never one that an instance, network interface or NAT
-gateway in the subnet already holds. With shared address spaces, default subnet ids are the
-same in every account, so those subnets share a network and what any account holds there counts.
+gateway of the account in the subnet already holds. Each account's VPC has a network of its own,
+the default VPC included, whose id every account shares: a network for any account but the
+default one carries the account in its name. As two accounts' default VPCs declare the same
+`172.31.0.0/16`, the second one's network takes a range from `fallback-pool`, as overlapping
+CIDRs do.
 With isolated address spaces, only the owning account's resources reserve an address.
 
 In the default mode the declared CIDR is used verbatim whenever it can be. It cannot be when it is absent, malformed,
@@ -2812,6 +2963,68 @@ Under `none` the rule still runs, but a mock instance has only the Elastic IP, i
 Otherwise a mock instance's address appears whether DescribeInstances or DescribeInstanceStatus
 observes the launch first. A terminated mock instance has no public address, and stopping it does not bring it
 back.
+
+### IPv6 launch metadata and interface creation
+
+IMDS lists attached interfaces under `meta-data/network/interfaces/macs/`. Each MAC answers
+its device number, interface ID, local hostname and primary IPv4 address, MAC, owner,
+security group IDs and names, subnet ID and VPC ID. Attaching or detaching an interface
+refreshes these answers for existing metadata sessions without extending their expiry.
+An unknown MAC or missing value returns 404. Subnet and VPC IPv4 CIDR categories and
+secondary private IPv4 addresses in `local-ipv4s` are not served.
+
+An implicit primary interface launched into a subnet with `AssignIpv6AddressOnCreation` and an associated IPv6 block receives one address through the shared collision-aware allocator. `DescribeInstances` and IMDS report the primary address and per-interface IPv6 addresses, subnet blocks and VPC blocks. These metadata changes do not enable guest IPv6 routing.
+
+`CreateNetworkInterface` rejects `Ipv6AddressCount` combined with explicit IPv6 addresses or prefixes. `DescribeNetworkInterfaces` supports the `ipv6-addresses.ipv6-address` filter. Attached and supplied primary interfaces retain their subnet and VPC IPv6 metadata.
+
+### Metadata namespace helper configuration
+
+The metadata namespace factory uses `floci.services.ec2.metadata-helper-image`
+(`FLOCI_SERVICES_EC2_METADATA_HELPER_IMAGE`), defaulting to the locally built
+`floci/network-helper:local` recipe. Its SSH binding uses
+`floci.services.ec2.ssh-host-bind-address`
+(`FLOCI_SERVICES_EC2_SSH_HOST_BIND_ADDRESS`), defaulting to `127.0.0.1`.
+Docker launches create the metadata helper and prepare its link-local route before
+starting the guest. A failed routing command prevents guest startup. Termination
+retains a helper that could not be removed so a later termination call can retry
+its cleanup. Existing standalone containers retain their legacy restart path.
+
+### Opt-in NAT packet runtime limits
+
+The opt-in VPC packet runtime supports single-address public NAT gateways.
+Creation and secondary-address updates reject additional addresses before allocating
+or releasing them. Empty secondary-address updates preserve the primary address.
+With packet routing disabled, management operations retain their secondary-address
+support. This runtime restriction is a local implementation limit.
+
+### Native peer declarations
+
+`FLOCI_EC2_NATIVE_PEER_DEPENDENCIES` declares deployment-owned control dependencies as a JSON array of
+`hostname`, private IPv4 `address`, and TCP `port` objects. The default is `[]`.
+Declarations use exact canonical DNS names and require matching control-connection admission on the
+protected EC2 endpoint. DNS admission belongs to the currently registered namespace and is withdrawn
+when that namespace is retired or replaced. Unrelated names retain normal DNS resolution.
+
+### Native peer policy attestation
+
+The existing `/_floci/info` endpoint reports `ec2_native_peer_dependencies` with the
+parsed deployment policy's `contract`, `count`, and canonical `sha256`. It does not
+expose peer addresses. The shared health endpoints advertise
+`features.ec2_native_peer_dependencies: 1`. These fields identify the configured
+policy; they do not establish that a guest is running or that a network path is reachable.
+
+### Guest environment and process limits
+
+`FLOCI_SERVICES_EC2_EXTRA_ENV` accepts comma-separated `KEY=VALUE` entries.
+Escape a literal comma with a backslash. Empty values are supported; duplicate
+keys and Floci-owned identity, credential, endpoint, region and metadata settings
+are rejected. These variables apply only to guest containers.
+
+`FLOCI_SERVICES_EC2_ULIMITS` accepts comma-separated `name=soft[:hard]` entries,
+for example `memlock=-1,nofile=1024000,nproc=1024:2048`. An omitted hard limit
+equals the soft limit; `-1` means unlimited. Invalid ranges and duplicate names
+are rejected before mount preparation or guest allocation. Unset limits retain
+Docker defaults.
 
 Capacity reservation moves publish the source, destination and retry token as one storage
 batch. Persistent and WAL write failures return `InternalError` without publishing the

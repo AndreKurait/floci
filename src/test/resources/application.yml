@@ -29,6 +29,8 @@ floci:
     # listen-address: 127.0.0.1                    # FLOCI_DNS_LISTEN_ADDRESS
     # authoritative-suffixes:                     # FLOCI_DNS_AUTHORITATIVE_SUFFIXES
     container-fallback-enabled: true
+    # Test runners must not change container DNS by opening the bridge listener.
+    bridge-listener-enabled: false
   partitions:
     strict: false
     allow-unknown-regions: false
@@ -40,6 +42,8 @@ floci:
     wal:
       compaction-interval-ms: 60000
     services:
+      rekognition:
+        flush-interval-ms: 60000
       ssm:
         flush-interval-ms: 60000
       dynamodb:
@@ -50,6 +54,7 @@ floci:
         # Includes per-version runtime-management settings.
         flush-interval-ms: 60000
       cloudwatchlogs:
+        # Includes saved Logs Insights query definitions.
         flush-interval-ms: 60000
       cloudwatchmetrics:
         flush-interval-ms: 60000
@@ -106,6 +111,8 @@ floci:
         flush-interval-ms: 60000
       emrserverless:
         flush-interval-ms: 60000
+      emrcontainers:
+        flush-interval-ms: 60000
       lakeformation:
         flush-interval-ms: 60000
 
@@ -149,6 +156,7 @@ floci:
     log-max-size: "10m"
     log-max-file: "3"
     resource-namespace: ""
+    pool-gauge-interval-seconds: 0  # no pool gauge lines in test output
 
   services:
     ssm:
@@ -167,6 +175,7 @@ floci:
       enforce-auth: false
       default-presign-expiry-seconds: 3600
       global-bucket-namespace: false
+      restore-completion-delay-seconds: 0
       lifecycle-sweep-enabled: false   # tests run the sweep themselves, so no bucket's rules apply behind another test's back
       lifecycle-sweep-interval-seconds: 60
     dynamodb:
@@ -174,11 +183,13 @@ floci:
       vector-index-allocation-seconds: 0
       vector-index-backfill-seconds: 0
       latest-restorable-lag-seconds: 0
+      randomize-attribute-order: true
       backend: native
     sns:
       enabled: true
     lambda:
       enabled: true
+      reconcile-containers-on-startup: true
       container-drain-timeout-seconds: 15
       docker-flags: ""
       # additional-docker-networks: []
@@ -208,6 +219,7 @@ floci:
       issued-session-verification-enabled: false
       lambda-identity-verification-enabled: false
       seed-deployer-principal: false
+      seed-deployer-access-key-id: floci
       # bootstrap-principals-file: /run/secrets/floci-bootstrap.json  # explicit owner-only local IAM administrators
       # service-principal-memberships-path: unset; tests explicitly select their local fixture.
     msk:
@@ -231,6 +243,7 @@ floci:
       proxy-max-port: 6399
       default-image: "valkey/valkey:8"
       default-memcached-image: "memcached:1.6"
+      shell-less-backend: false
     memorydb:
       enabled: true
       mock: false
@@ -244,6 +257,8 @@ floci:
       snapshot-sweep-interval-seconds: 60
       snapshot-copy-enabled: false
       snapshot-copy-sweep-interval-seconds: 60
+      scheduled-actions-enabled: false
+      scheduled-action-sweep-interval-seconds: 60
       default-port: 5439
       image-version: postgres:15-alpine
       poll-interval-ms: 1000
@@ -254,6 +269,7 @@ floci:
       proxy-backend-connect-timeout-millis: 5000
       proxy-max-connections: 2000
       spectrum-max-rows: 1000000
+      spectrum-lake-formation-enforcement: false
     rds:
       enabled: true
       mock: false
@@ -273,6 +289,7 @@ floci:
       enabled: true
       mock: true
       port: 0
+      backend: docker
     redshift-data:
       enabled: true
       result-ttl-hours: 24
@@ -318,6 +335,8 @@ floci:
       default-recovery-window-days: 30
     kinesis:
       enabled: true
+      creating-delay-millis: 0
+      updating-delay-millis: 0
       list-shards-next-token-ttl-millis: 300000
     firehose:
       enabled: true
@@ -370,25 +389,29 @@ floci:
       proxy-base-port: 9400
       proxy-max-port: 9499
     ec2:
-      # Opt-in guest IPv6 routing. FLOCI_SERVICES_EC2_GUEST_IPV6
       guest-ipv6: false
       native-peer-dependencies: '${FLOCI_EC2_NATIVE_PEER_DEPENDENCIES:[]}'
       # Opt-in Standard On-Demand vCPU admission. FLOCI_SERVICES_EC2_ENFORCE_VCPU_QUOTAS
       enforce-vcpu-quotas: false
-      # Optional external catalog; includeDefaultImages in the file retains bundled images.
+      # Optional complete catalog override for locally built guest images.
+      native-init-apparmor-profile: ${FLOCI_SERVICES_EC2_NATIVE_INIT_APPARMOR_PROFILE:}
       image-catalog-path: ${FLOCI_SERVICES_EC2_IMAGE_CATALOG_PATH:}
       managed-prefix-list-catalog-path: ${FLOCI_SERVICES_EC2_MANAGED_PREFIX_LIST_CATALOG_PATH:}
+      # Guest options do not change helper container settings.
       extra-env: ${FLOCI_SERVICES_EC2_EXTRA_ENV:}
       ulimits: ${FLOCI_SERVICES_EC2_ULIMITS:}
       privileged: true
       cap-drop: ${FLOCI_SERVICES_EC2_CAP_DROP:}
+      # read-only-binds:
+      #   - source: /srv/guest-inputs/ca.pem
+      #     target: /etc/guest-ca.pem
       cap-add: ${FLOCI_SERVICES_EC2_CAP_ADD:}
       enabled: true
       imds-port: 9169
       metadata-helper-image: floci/network-helper:local
+      ssh-host-bind-address: 127.0.0.1
       ssh-port-range-start: 2200
       ssh-port-range-end: 2299
-      ssh-host-bind-address: "127.0.0.1"
       publish-security-group-ports: true
       app-port-range-start: 30000
       app-port-range-end: 30999
@@ -401,12 +424,14 @@ floci:
       mock-public-address-pool:
       instance-resource-limits: true
       aws-faithful-private-ip: false
+      hot-attach-network-interfaces: ${FLOCI_SERVICES_EC2_HOT_ATTACH_NETWORK_INTERFACES:false}
       # container-ips-routable: true  # see src/main/resources/application.yml
       # Off explicitly, not merely by implication of mock: true above. Tests must not create or
       # reconcile Docker networks on whatever daemon CI happens to have.
       vpc-networks:
         enabled: false
         isolate-address-spaces: false
+        internal: false
         hot-attach-enabled: false                  # FLOCI_SERVICES_EC2_VPC_NETWORKS_HOT_ATTACH_ENABLED
         hot-attach-across-address-spaces: false     # FLOCI_SERVICES_EC2_VPC_NETWORKS_HOT_ATTACH_ACROSS_ADDRESS_SPACES
     ecs:
@@ -427,6 +452,7 @@ floci:
     ecr:
       enabled: true
       tls-uri: false
+      lifecycle-sweep-enabled: false   # tests run the sweep themselves, so no repository's policy applies behind another test's back
       native-uri: false
     ui:
       enabled: true
@@ -496,7 +522,7 @@ floci:
       max-capacity-reservation-ids: 1
     applicationautoscaling:
       enabled: true
-      scheduled-action-interval-seconds: 1
+      scheduled-action-interval-seconds: ${FLOCI_SERVICES_APPLICATIONAUTOSCALING_SCHEDULED_ACTION_INTERVAL_SECONDS:1}
     elasticbeanstalk:
       enabled: true
     transfer:
@@ -571,6 +597,8 @@ floci:
       enabled: true
     efs:
       enabled: true
+    ec2instanceconnect:
+      enabled: true
     organizations:
       enabled: true
     rum:
@@ -584,6 +612,10 @@ floci:
     emrserverless:
       enabled: true
       job-run-duration-seconds: 0   # 0 = BATCH job runs succeed as soon as they start
+      runner-mode: immediate
+    emrcontainers:
+      enabled: true
+      job-run-duration-seconds: 0   # 0 = a job run completes as soon as it is submitted
       runner-mode: immediate
     ssoadmin:
       enabled: true
@@ -619,6 +651,10 @@ floci:
     appintegrations:
       enabled: true
     dlm:
+      enabled: true
+    signer:
+      enabled: true
+    xray:
       enabled: true
     cognitoidentity:
       enabled: true
@@ -657,6 +693,9 @@ floci:
       enabled: true
     codeartifact:
       enabled: true
+    quicksight:
+      enabled: true
+      embed-base-url: ${floci.base-url}
     marketplace:
       enabled: true
     dms:

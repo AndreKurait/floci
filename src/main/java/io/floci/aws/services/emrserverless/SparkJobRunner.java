@@ -1,0 +1,406 @@
+package io.floci.aws.services.emrserverless;
+
+import io.floci.aws.core.common.docker.ContainerLifecycleManager;
+
+import java.time.Duration;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+
+/**
+ * Runs a Spark application, or a Hive query, to its end, in the EMR services' {@code docker} runner mode: an
+ * EMR Serverless job run, or a step of an EMR cluster. The service holds the run's state and calls this
+ * off the request thread; {@link EmrServerlessSparkRunner} is the Docker implementation, and a test
+ * supplies its own.
+ */
+public interface SparkJobRunner {
+
+    /**
+     * Runs {@code job} and returns how it ended, telling {@code progress} once its Spark driver runs and
+     * when it passes its timeout. Blocks until then. A run {@code progress} reports as cancelled before
+     * its driver runs never starts it.
+     */
+    Outcome run(Job job, Progress progress);
+
+    /**
+     * Stops the run's driver, now or as soon as it starts, so {@link #run} returns {@link Outcome#halted};
+     * a run {@link #run} has already returned from is left as it is.
+     */
+    void stop(String runId);
+
+    /**
+     * Sends the run's running driver SIGTERM and lets it end as it will, where {@link #stop} ends it at once: a driver
+     * that handles the signal may clean up first, and one that ignores it runs on. {@link #run} then returns its exit
+     * code. Without a driver running yet there is nothing to interrupt, so the run is stopped; that is all a runner
+     * that cannot signal its drivers does.
+     */
+    default void interrupt(String runId) {
+        stop(runId);
+    }
+
+    /**
+     * Where Floci reaches the Spark UI of run {@code runId}'s driver while its container runs, for an EMR Serverless
+     * Spark run or session; empty for any other run, and before or after its container runs.
+     */
+    default Optional<ContainerLifecycleManager.EndpointInfo> driverUi(String runId) {
+        return Optional.empty();
+    }
+
+    /**
+     * Whether the drivers of EMR Serverless Spark runs and sessions on {@code dockerNetwork} (null for the default)
+     * serve their Spark UI for Floci to open ({@link #driverUi}).
+     */
+    default boolean servesDriverUis(String dockerNetwork) {
+        return false;
+    }
+
+    /**
+     * Removes the drivers of {@code service}'s runs an earlier Floci process left running, which no thread
+     * follows any more. The service calls it before any run of its own can start.
+     */
+    void removeLeftoverDrivers(String service);
+
+    /**
+     * Removes the driver of {@code service}'s run {@code runId} where an earlier Floci process left it running, as one
+     * {@link #removeLeftoverDrivers} could not remove; a driver this process runs is left alone.
+     */
+    default void removeLeftoverDriver(String service, String runId) {
+    }
+
+    /** What a run tells the service, and asks it, while it goes. */
+    interface Progress {
+
+        /** The run's Spark driver runs. */
+        void started();
+
+        /**
+         * The port the run's job listens on ({@link Job#listenPort}) is reachable from Floci at {@code host} and
+         * {@code port}, now its driver's container runs; what listens there may not be ready yet.
+         */
+        default void listening(String host, int port) {
+        }
+
+        /**
+         * The run resolved the custom image its job names for {@code workerType} ({@link Job#customImage} for its
+         * driver, {@link Executors#image} for its executors) to the image whose manifest digest is {@code digest}, and
+         * runs that image as that worker type.
+         */
+        default void imageResolved(WorkerType workerType, String digest) {
+        }
+
+        /** The run has passed its timeout, and its driver is about to be stopped. */
+        void timedOut();
+
+        /**
+         * Whether the run was cancelled, or is gone, as after a reset: its driver must not start, and one
+         * that runs is stopped.
+         */
+        boolean cancelled();
+
+        /**
+         * How long each of the run's executors' workers ran, from its start to its end, where its executors had
+         * containers of their own, told as the run ends.
+         */
+        default void executorsRan(List<Duration> lifetimes) {
+        }
+
+        /**
+         * The inline session policy the run's credentials are scoped by, so that its permissions are what its
+         * execution role and the policy both allow; null for none.
+         */
+        default String sessionPolicy() {
+            return null;
+        }
+    }
+
+    /** What a run's container runs as: its driver, or one of its executors. */
+    enum WorkerType {
+        DRIVER,
+        EXECUTOR
+    }
+
+    /** What a run's driver runs: Spark's {@code spark-submit}, or Hive's {@code hive}. */
+    enum Engine {
+        SPARK,
+        HIVE
+    }
+
+    /**
+     * What a run needs: the service it belongs to and its id there, which name its container; its account
+     * and Region; its release; its engine; the image template and Docker network to run it in (a null template
+     * is the release's public EMR Serverless image for the engine, a null network the global default);
+     * {@code customImage}, when not null, the image the run's application names, which it runs in place of the
+     * template's, resolved
+     * again for each run; the execution role whose credentials it gets; the {@code spark-defaults} properties
+     * that apply to it;
+     * {@code application}, what follows Floci's own settings on {@code spark-submit}'s command line (the
+     * run's options, then its application and that application's arguments), or on {@code hive}'s for a Hive run
+     * (its settings, then its query files and parameters); or {@code command}, when not
+     * null, what the container runs in place of {@code spark-submit}, where a {@code spark-submit} it starts
+     * gets Floci's settings and the {@code spark-defaults} as defaults (its {@code application} is then
+     * empty), or, for a Hive run, what runs in place of {@code hive}, followed by Floci's settings and the
+     * {@code application} (an EMR step's {@code hive-script ... --args}); how long it may run
+     * ({@link Duration#ZERO} for no limit); the S3 folder its driver's {@code stdout.gz} and
+     * {@code stderr.gz} go to once it ends, ending in a slash (null for none); where in CloudWatch Logs
+     * its driver's output goes while it runs (null for nowhere but Floci's log); the environment variables
+     * its container gets besides Floci's own, which they replace where a name is the same (empty for none);
+     * its {@code spark.archives}, each a path with, after a {@code #}, the directory it is unpacked to, of
+     * which those in S3 are unpacked into the container's working directory before the driver starts (empty
+     * for none); the storage of the cluster it runs on (null for none, as for an EMR Serverless run); the
+     * {@code core-site.xml} properties its {@code hadoop} command gets, on a cluster, after those of the
+     * cluster's storage, which they replace where a name is the same (empty for none); the
+     * {@code log4j2.properties} lines its Spark gets after those of its configuration, which they replace where
+     * a key is the same (empty for none); on a cluster, the {@code mapred-site.xml} properties its
+     * MapReduce gets, the {@code log4j.properties} lines and the {@code hadoop-env.sh} exports its {@code hadoop}
+     * command gets (each empty for none); for an EMR Serverless Spark run, where its executors run, in
+     * containers of their own (null for Spark's local mode, in the driver's container); and the Docker platform
+     * its containers run, as its application's architecture names it with {@code honour-architectures} on,
+     * {@code linux/amd64} or {@code linux/arm64} (null for the Docker host's own); and the port in its driver's
+     * container that something there listens on for Floci, which Floci reaches through the Docker host's loopback
+     * interface only, as {@link Progress#listening} tells (0 for none); and whether an EMR Serverless Spark run's or
+     * session's driver keeps its Spark event logs, in a Docker volume of its own, for its Spark History Server once it
+     * has ended ({@link EmrServerlessHistories}).
+     */
+    record Job(String service, String runId, String accountId, String region, String releaseLabel, Engine engine,
+               String imageTemplate, String customImage, String dockerNetwork, String executionRole,
+               Map<String, String> sparkDefaults, List<String> application, List<String> command, Duration timeout,
+               String logFolder, CloudWatchLogs cloudWatchLogs, Map<String, String> environment,
+               List<String> archives, Storage storage, Map<String, String> coreSite,
+               Map<String, String> sparkLog4j2, Map<String, String> mapredSite, Map<String, String> hadoopLog4j,
+               Map<String, String> hadoopEnvironment, Executors executors, String platform, int listenPort,
+               boolean keepsEventLogs, boolean interruptible, String imagePullSourceArn) {
+
+        /** A job whose driver listens on no port for Floci. */
+        public Job(String service, String runId, String accountId, String region, String releaseLabel, Engine engine,
+                   String imageTemplate, String customImage, String dockerNetwork, String executionRole,
+                   Map<String, String> sparkDefaults, List<String> application, List<String> command,
+                   Duration timeout, String logFolder, CloudWatchLogs cloudWatchLogs,
+                   Map<String, String> environment, List<String> archives, Storage storage,
+                   Map<String, String> coreSite, Map<String, String> sparkLog4j2, Map<String, String> mapredSite,
+                   Map<String, String> hadoopLog4j, Map<String, String> hadoopEnvironment, Executors executors,
+                   String platform) {
+            this(service, runId, accountId, region, releaseLabel, engine, imageTemplate, customImage, dockerNetwork,
+                    executionRole, sparkDefaults, application, command, timeout, logFolder, cloudWatchLogs,
+                    environment, archives, storage, coreSite, sparkLog4j2, mapredSite, hadoopLog4j,
+                    hadoopEnvironment, executors, platform, 0, false, false, null);
+        }
+
+        /** A job on the Docker host's own platform. */
+        public Job(String service, String runId, String accountId, String region, String releaseLabel, Engine engine,
+                   String imageTemplate, String customImage, String dockerNetwork, String executionRole,
+                   Map<String, String> sparkDefaults, List<String> application, List<String> command,
+                   Duration timeout, String logFolder, CloudWatchLogs cloudWatchLogs,
+                   Map<String, String> environment, List<String> archives, Storage storage,
+                   Map<String, String> coreSite, Map<String, String> sparkLog4j2, Map<String, String> mapredSite,
+                   Map<String, String> hadoopLog4j, Map<String, String> hadoopEnvironment, Executors executors) {
+            this(service, runId, accountId, region, releaseLabel, engine, imageTemplate, customImage, dockerNetwork,
+                    executionRole, sparkDefaults, application, command, timeout, logFolder, cloudWatchLogs,
+                    environment, archives, storage, coreSite, sparkLog4j2, mapredSite, hadoopLog4j,
+                    hadoopEnvironment, executors, null);
+        }
+
+        /** This job, on {@code storage}. */
+        public Job onStorage(Storage storage) {
+            return new Job(service, runId, accountId, region, releaseLabel, engine, imageTemplate, customImage,
+                    dockerNetwork, executionRole, sparkDefaults, application, command, timeout, logFolder,
+                    cloudWatchLogs, environment, archives, storage, coreSite, sparkLog4j2, mapredSite, hadoopLog4j,
+                    hadoopEnvironment, executors, platform, listenPort, keepsEventLogs, interruptible, imagePullSourceArn);
+        }
+
+        /** This job, run in {@code image}. */
+        public Job inImage(String image) {
+            return new Job(service, runId, accountId, region, releaseLabel, engine, image, customImage, dockerNetwork,
+                    executionRole, sparkDefaults, application, command, timeout, logFolder, cloudWatchLogs, environment,
+                    archives, storage, coreSite, sparkLog4j2, mapredSite, hadoopLog4j, hadoopEnvironment, executors,
+                    platform, listenPort, keepsEventLogs, interruptible, imagePullSourceArn);
+        }
+
+        /** This job, its executors where {@code executors} has them. */
+        public Job withExecutors(Executors executors) {
+            return new Job(service, runId, accountId, region, releaseLabel, engine, imageTemplate, customImage,
+                    dockerNetwork, executionRole, sparkDefaults, application, command, timeout, logFolder,
+                    cloudWatchLogs, environment, archives, storage, coreSite, sparkLog4j2, mapredSite, hadoopLog4j,
+                    hadoopEnvironment, executors, platform, listenPort, keepsEventLogs, interruptible, imagePullSourceArn);
+        }
+
+        /** This job, its driver listening on {@code port} for Floci (0 for none). */
+        public Job listeningOn(int port) {
+            return new Job(service, runId, accountId, region, releaseLabel, engine, imageTemplate, customImage,
+                    dockerNetwork, executionRole, sparkDefaults, application, command, timeout, logFolder,
+                    cloudWatchLogs, environment, archives, storage, coreSite, sparkLog4j2, mapredSite, hadoopLog4j,
+                    hadoopEnvironment, executors, platform, port, keepsEventLogs, interruptible, imagePullSourceArn);
+        }
+
+        /** This job, its containers on {@code network} (null for the global default). */
+        public Job onNetwork(String network) {
+            return new Job(service, runId, accountId, region, releaseLabel, engine, imageTemplate, customImage,
+                    network, executionRole, sparkDefaults, application, command, timeout, logFolder, cloudWatchLogs,
+                    environment, archives, storage, coreSite, sparkLog4j2, mapredSite, hadoopLog4j, hadoopEnvironment,
+                    executors, platform, listenPort, keepsEventLogs, interruptible, imagePullSourceArn);
+        }
+
+        /** This job, its Spark event logs kept for its Spark History Server once it ends. */
+        public Job keepingEventLogs() {
+            return new Job(service, runId, accountId, region, releaseLabel, engine, imageTemplate, customImage,
+                    dockerNetwork, executionRole, sparkDefaults, application, command, timeout, logFolder,
+                    cloudWatchLogs, environment, archives, storage, coreSite, sparkLog4j2, mapredSite, hadoopLog4j,
+                    hadoopEnvironment, executors, platform, listenPort, true, interruptible, imagePullSourceArn);
+        }
+
+        /**
+         * This job, its driver's process sent the signals its container gets by an init process, as Docker's
+         * {@code --init} runs one, so that {@link SparkJobRunner#interrupt} reaches it: a container's own first process
+         * ignores SIGTERM unless it handles it.
+         */
+        public Job asInterruptible() {
+            return new Job(service, runId, accountId, region, releaseLabel, engine, imageTemplate, customImage,
+                    dockerNetwork, executionRole, sparkDefaults, application, command, timeout, logFolder,
+                    cloudWatchLogs, environment, archives, storage, coreSite, sparkLog4j2, mapredSite, hadoopLog4j,
+                    hadoopEnvironment, executors, platform, listenPort, keepsEventLogs, true, imagePullSourceArn);
+        }
+
+        /** This job, its containers run for {@code platform} (null for the Docker host's own). */
+        public Job withPlatform(String platform) {
+            return new Job(service, runId, accountId, region, releaseLabel, engine, imageTemplate, customImage,
+                    dockerNetwork, executionRole, sparkDefaults, application, command, timeout, logFolder,
+                    cloudWatchLogs, environment, archives, storage, coreSite, sparkLog4j2, mapredSite, hadoopLog4j,
+                    hadoopEnvironment, executors, platform, listenPort, keepsEventLogs, interruptible, imagePullSourceArn);
+        }
+
+        /** The owning application's identity for pulling its custom image. */
+        public Job withImagePullSourceArn(String sourceArn) {
+            return new Job(service, runId, accountId, region, releaseLabel, engine, imageTemplate, customImage,
+                    dockerNetwork, executionRole, sparkDefaults, application, command, timeout, logFolder,
+                    cloudWatchLogs, environment, archives, storage, coreSite, sparkLog4j2, mapredSite, hadoopLog4j,
+                    hadoopEnvironment, executors, platform, listenPort, keepsEventLogs, interruptible, sourceArn);
+        }
+
+    }
+
+    /**
+     * An EMR Serverless Spark run's executors, each in a container of its own, as each has a worker of its own on EMR
+     * Serverless: at most {@code containers} at once; in {@code image}, the application's custom image for its
+     * executors, or the release's EMR Serverless image when null; and none that would take the workers of
+     * {@code application}'s runs, its drivers' among them, past its maximum capacity: {@code vcpus}, {@code memoryGb}
+     * and {@code diskGb} in all, each 0 for no limit, as that capacity "is cumulative across all workers at any given
+     * point in time". {@code application} names the application its runs share that capacity in, or is null for a
+     * run that shares it with none.
+     */
+    record Executors(int containers, String image, long vcpus, long memoryGb, long diskGb, String application) {
+    }
+
+    /**
+     * An EMR cluster's storage: the Docker volumes every one of its steps' containers mounts, {@code home} at
+     * {@code /home/hadoop} and {@code mnt} at {@code /mnt}; its HDFS, whose NameNode is on the cluster's primary
+     * node, named {@code hdfsHost}, which a step's container reaches at {@code hdfsAddress} on the Docker network
+     * {@code hdfsNetwork}, the cluster's own, which the container joins (all three null until it runs, the network
+     * also on the host's own network, which steps share with it); and, on a cluster with Hive or HCatalog, the URI of
+     * the Hive metastore service on that node, or null; how many copies of a block its HDFS keeps, when its core
+     * nodes hold it, else 0; the host of the Spark History Server on that node, which reads its Spark applications'
+     * event logs, or null where it runs none; and the host of the YARN timeline server on that node, which Tez logs its
+     * DAGs to, or null where it runs none.
+     */
+    record Storage(String home, String mnt, String hdfsHost, String hdfsAddress, String hdfsNetwork,
+                   String hiveMetastore, String resourceManager, String flociEndpoint, int replication,
+                   String metadataAddress, String sparkHistoryServer, String timelineServer) {
+
+        /**
+         * The component label of an EMR cluster's HDFS container, which carries its service's labels as a driver
+         * does but is the cluster's storage's to keep or remove, not a driver.
+         */
+        public static final String HDFS_COMPONENT = "emr-hdfs";
+
+        /** The component label of an EMR cluster's core or task node's container, its storage's as the HDFS is. */
+        public static final String NODE_COMPONENT = "emr-node";
+
+        /** A cluster's volumes, before its HDFS runs. */
+        public Storage(String home, String mnt) {
+            this(home, mnt, null, null, null, null, null, null, 0, null, null, null);
+        }
+
+        /** This storage, its HDFS's NameNode on {@code host}, at {@code address} on {@code network}. */
+        public Storage withHdfs(String host, String address, String network) {
+            return new Storage(home, mnt, host, address, network, hiveMetastore, resourceManager, flociEndpoint,
+                    replication, metadataAddress, sparkHistoryServer,
+                    timelineServer);
+        }
+
+        /** This storage, its Hive metastore service at {@code uri}. */
+        public Storage withHiveMetastore(String uri) {
+            return new Storage(home, mnt, hdfsHost, hdfsAddress, hdfsNetwork, uri, resourceManager, flociEndpoint,
+                    replication, metadataAddress, sparkHistoryServer,
+                    timelineServer);
+        }
+
+        /**
+         * This storage, YARN's ResourceManager on {@code host}, its executors reaching Floci at {@code flociEndpoint},
+         * Floci's address on the HDFS's network.
+         */
+        public Storage withYarn(String host, String flociEndpoint) {
+            return new Storage(home, mnt, hdfsHost, hdfsAddress, hdfsNetwork, hiveMetastore, host, flociEndpoint,
+                    replication, metadataAddress, sparkHistoryServer,
+                    timelineServer);
+        }
+
+        /** This storage, its HDFS keeping {@code copies} copies of a block on its core nodes. */
+        public Storage withReplication(int copies) {
+            return new Storage(home, mnt, hdfsHost, hdfsAddress, hdfsNetwork, hiveMetastore, resourceManager,
+                    flociEndpoint, copies, metadataAddress, sparkHistoryServer,
+                    timelineServer);
+        }
+
+        /**
+         * This storage, a Spark History Server on {@code host}, the primary node, reading its applications' event logs.
+         */
+        public Storage withSparkHistoryServer(String host) {
+            return new Storage(home, mnt, hdfsHost, hdfsAddress, hdfsNetwork, hiveMetastore, resourceManager,
+                    flociEndpoint, replication, metadataAddress, host, timelineServer);
+        }
+
+        /** This storage, YARN's timeline server on {@code host}, which Tez's application masters log their DAGs to. */
+        public Storage withTimelineServer(String host) {
+            return new Storage(home, mnt, hdfsHost, hdfsAddress, hdfsNetwork, hiveMetastore, resourceManager,
+                    flociEndpoint, replication, metadataAddress, sparkHistoryServer, host);
+        }
+
+        /**
+         * This storage, the step's container given {@code address}, a link-local one, on the HDFS's network, where its
+         * cluster's instance metadata relay answers it as the cluster's primary node.
+         */
+        public Storage withMetadataAddress(String address) {
+            return new Storage(home, mnt, hdfsHost, hdfsAddress, hdfsNetwork, hiveMetastore, resourceManager,
+                    flociEndpoint, replication, address, sparkHistoryServer,
+                    timelineServer);
+        }
+    }
+
+    /**
+     * A log group in the run's account and Region, and the log streams the driver's standard output and
+     * standard error go to in it, either null for that output to go nowhere but Floci's log.
+     */
+    record CloudWatchLogs(String logGroup, String stdoutStream, String stderrStream) {
+    }
+
+    /**
+     * How a run ended: its driver's exit code, or that it ran out of time, was stopped, or could not
+     * start ({@code failure} says why).
+     */
+    record Outcome(Integer exitCode, boolean timedOut, boolean stopped, String failure) {
+
+        public static Outcome exitedWith(int exitCode) {
+            return new Outcome(exitCode, false, false, null);
+        }
+
+        public static Outcome outOfTime() {
+            return new Outcome(null, true, false, null);
+        }
+
+        public static Outcome halted() {
+            return new Outcome(null, false, true, null);
+        }
+
+        public static Outcome couldNotStart(String failure) {
+            return new Outcome(null, false, false, failure);
+        }
+    }
+}

@@ -1,0 +1,348 @@
+package io.floci.aws.services.emr;
+
+import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.exception.ConflictException;
+import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.Image;
+import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.config.EmulatorConfig.EcsServiceConfig.ImagePullBehavior;
+import io.floci.aws.core.common.Digests;
+import io.floci.aws.core.common.docker.ContainerBuilder;
+import io.floci.aws.core.common.docker.ContainerLifecycleManager;
+import io.floci.aws.core.common.docker.ContainerStorageHelper;
+import io.floci.aws.core.common.docker.RetryingTarCopier;
+import io.floci.aws.services.emrserverless.EmrServerlessSparkRunner;
+import io.floci.aws.services.lambda.launcher.ImageCacheService;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream;
+import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
+import org.jboss.logging.Logger;
+
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
+
+/**
+ * Makes, on the Docker daemon, the images a release's clusters run in: its EMR Serverless image with the HDFS,
+ * MapReduce and YARN of its EMR Serverless Hive image, which the EMR Serverless image's Hadoop client lacks, and for a
+ * cluster with Hive the Hive image's Hive and Tez too, the two being built on one Hadoop and one Java.
+ * A container of the EMR Serverless image, never started, gets the Hive image's folders streamed in from another,
+ * never started either, and is committed, as a bootstrap's container is. The two images ship different builds of
+ * {@code emr-serverless-goodies-common} under one name, so Tez keeps the Hive image's in a folder of its own, its links
+ * leading there, and the Hive image's Hadoop configuration, which puts Tez on the class path, goes to
+ * {@link EmrServerlessSparkRunner#HIVE_HADOOP_CONF}, for Hive alone. The image is named after its release, the ids of
+ * the two images and what is copied, so a newer pull of either, or a change to what is copied, makes another, and it is
+ * kept for the release's next cluster; the one a newer pull makes replaces those of its kind made before
+ * ({@link #KIND_LABEL}). A release of the AWS runtime for Apache Spark has no Hive image, and another
+ * release's HDFS and YARN do not run on its newer Hadoop, so its image gets the whole of that release's Hadoop, in a
+ * folder apart, which only its primary node's daemons run from. For a cluster with Pig, which no AWS image carries,
+ * the image gets Tez, as Pig's scripts run on it, and Apache Pig, downloaded as it is made ({@link PigDistribution}),
+ * whose checksum its name holds. For a cluster with Floci's Trino, it gets Trino's CLI from the Trino image the
+ * cluster's coordinator runs, never started either, and EMR's {@code trino-cli} command ({@link EmrTrino#COMMAND}),
+ * and its name holds that image's id.
+ */
+@ApplicationScoped
+public class EmrReleaseImages implements ReleaseImages {
+
+    private static final Logger LOG = Logger.getLogger(EmrReleaseImages.class);
+    private static final String SERVICE = "emr";
+    private static final String COMPONENT = "emr-release";
+    // An image's kind: its release, the names of the two images it is made of, and what is copied. The image made after
+    // a newer pull of either replaces the others of its kind.
+    static final String KIND_LABEL = "io.floci.emr-release.kind";
+    private static final String EMR_SHARE = "/usr/share/aws/emr";
+    private static final String GOODIES = EMR_SHARE + "/serverless-goodies/lib";
+    private static final String HIVE_GOODIES = "serverless-goodies-hive/lib";
+    // What the Hive image adds for a cluster without Hive: the Hadoop services the EMR Serverless image lacks, which its
+    // own Hadoop's client links name.
+    static final List<Copy> HADOOP_COPIES = List.of(
+            new Copy("/usr/lib/hadoop-hdfs", "/usr/lib"),
+            new Copy("/usr/lib/hadoop-mapreduce", "/usr/lib"),
+            new Copy("/usr/lib/hadoop-yarn", "/usr/lib"));
+    // What it adds for a cluster with Hive: Hive and Tez, those Hadoop services, their configuration and commands,
+    // EMR's s3-dist-cp among them, and the two folders kept apart.
+    static final List<Copy> COPIES = List.of(
+            new Copy("/usr/lib/hive", "/usr/lib"),
+            new Copy("/usr/lib/tez", "/usr/lib"),
+            new Copy("/usr/lib/hadoop-hdfs", "/usr/lib"),
+            new Copy("/usr/lib/hadoop-mapreduce", "/usr/lib"),
+            new Copy("/usr/lib/hadoop-yarn", "/usr/lib"),
+            new Copy("/usr/lib/bigtop-groovy", "/usr/lib"),
+            new Copy("/etc/hive", "/etc"),
+            new Copy("/etc/tez", "/etc"),
+            new Copy(EMR_SHARE + "/s3-dist-cp", EMR_SHARE),
+            new Copy("/usr/bin/hive", "/usr/bin"),
+            new Copy("/usr/bin/beeline", "/usr/bin"),
+            new Copy("/usr/bin/hiveserver2", "/usr/bin"),
+            new Copy("/usr/bin/hplsql", "/usr/bin"),
+            new Copy("/usr/bin/s3-dist-cp", "/usr/bin"),
+            Copy.to("/etc/hadoop/conf", EmrServerlessSparkRunner.HIVE_HADOOP_CONF),
+            new Copy(GOODIES, EMR_SHARE, HIVE_GOODIES));
+    // What a cluster with Pig and without Hive adds to those Hadoop services: Tez, which Pig runs its scripts on, with
+    // its configuration and the goodies its links lead to, kept apart as for Hive.
+    static final List<Copy> TEZ_COPIES = List.of(
+            new Copy("/usr/lib/tez", "/usr/lib"),
+            new Copy("/etc/tez", "/etc"),
+            new Copy(GOODIES, EMR_SHARE, HIVE_GOODIES));
+    // What a cluster with Floci's Trino adds, from Trino's image: Trino's CLI, for its trino-cli (EmrTrino.COMMAND).
+    static final Copy TRINO_CLI = new Copy(EmrTrino.IMAGE_CLI, "/usr/lib",
+            EmrTrino.CLI.substring("/usr/lib/".length()));
+    private static final String HADOOP_APART = "/opt";
+    // What it adds for a release of the AWS runtime for Apache Spark: another release's Hadoop, whole and kept apart.
+    static final List<Copy> HADOOP_APART_COPIES = List.of(
+            new Copy("/usr/lib/hadoop", HADOOP_APART),
+            new Copy("/usr/lib/hadoop-hdfs", HADOOP_APART),
+            new Copy("/usr/lib/hadoop-mapreduce", HADOOP_APART),
+            new Copy("/usr/lib/hadoop-yarn", HADOOP_APART));
+
+    // One making at a time for each kind of image, from the ids its two names lead to once it has the lock, so one made
+    // of images a newer pull has since replaced is never made after the newer one, to remove it; another thread asking
+    // for the same image waits, then finds it there.
+    private final Map<String, Object> making = new ConcurrentHashMap<>();
+    // The images given to a step or a bootstrap that has not ended, by id, with how many hold each: none of them is
+    // removed, as no container of it may be there yet to keep it.
+    private final Map<String, Integer> held = new ConcurrentHashMap<>();
+
+    private final ContainerLifecycleManager lifecycleManager;
+    private final ContainerBuilder containerBuilder;
+    private final ImageCacheService imageCacheService;
+    private final EmulatorConfig config;
+    private final PigDistribution pigDistribution;
+
+    @Inject
+    public EmrReleaseImages(ContainerLifecycleManager lifecycleManager, ContainerBuilder containerBuilder,
+                            ImageCacheService imageCacheService, EmulatorConfig config,
+                            PigDistribution pigDistribution) {
+        this.lifecycleManager = lifecycleManager;
+        this.containerBuilder = containerBuilder;
+        this.imageCacheService = imageCacheService;
+        this.config = config;
+        this.pigDistribution = pigDistribution;
+    }
+
+    /** The folder of a release's image holding the Hadoop its primary node's daemons run from, or null for its own. */
+    static String hadoopFolder(String releaseLabel) {
+        return EmrServerlessSparkRunner.sparkRuntime(releaseLabel) ? HADOOP_APART : null;
+    }
+
+    /**
+     * The image's id: the image is made from the two as a container of either would run them, pulled when missing, and
+     * the ids their names lead to now, so a newer pull of either, which moves its name, makes another. A step gets
+     * the id, as it gets a bootstrap image's, so the image-registry-base Floci prefixes image names with does not send
+     * it to a registry for an image only this daemon has.
+     */
+    @Override
+    public String image(String releaseLabel, String sparkImage, String hiveImage, boolean withHive,
+                        boolean withPig, String trinoImage) {
+        List<Copy> copies = copies(releaseLabel, withHive, withPig);
+        PigDistribution pig = withPig && hadoopFolder(releaseLabel) == null ? pigDistribution : null;
+        String trino = trinoImage != null ? containerBuilder.resolveImage(trinoImage) : null;
+        // What is copied, the Pig written after it, by its checksum, and Trino's CLI with its command.
+        String content = copies + (pig != null ? "\n" + pig.identity() : "")
+                + (trino != null ? "\n" + TRINO_CLI + "\n" + EmrTrino.COMMAND : "");
+        String spark = containerBuilder.resolveImage(sparkImage);
+        String hive = containerBuilder.resolveImage(hiveImage);
+        String repository = ContainerStorageHelper.dockerName(config, COMPONENT);
+        String kind = Digests.sha256Hex(releaseLabel + "\n" + spark + "\n" + hive + "\n" + content
+                + (trino != null ? "\n" + trino : "")).substring(0, 12);
+        synchronized (making.computeIfAbsent(repository + ":" + kind, name -> new Object())) {
+            String sparkId = imageCacheService.resolveForLaunch(spark, ImagePullBehavior.PREFER_CACHED, null)
+                    .imageId();
+            String hiveId = imageCacheService.resolveForLaunch(hive, ImagePullBehavior.PREFER_CACHED, null).imageId();
+            String trinoId = trino != null
+                    ? imageCacheService.resolveForLaunch(trino, ImagePullBehavior.PREFER_CACHED, null).imageId() : null;
+            String tag = releaseLabel + "-" + Digests.sha256Hex(sparkId + "\n" + hiveId + "\n" + content
+                    + (trinoId != null ? "\n" + trinoId : "")).substring(0, 12);
+            DockerClient docker = lifecycleManager.getDockerClient();
+            try {
+                return hold(docker.inspectImageCmd(repository + ":" + tag).exec().getId());
+            } catch (NotFoundException e) {
+                LOG.infov("Making {0}:{1} for EMR clusters {2}, from {3} and {4}", repository, tag,
+                        (withHive ? "with Hive" : "without Hive") + (pig != null ? ", with Pig" : "")
+                                + (trino != null ? ", with Trino's CLI from " + trino : ""), spark, hive);
+            }
+            String user = docker.inspectImageCmd(sparkId).exec().getConfig().getUser();
+            Map<String, String> labels = new LinkedHashMap<>();
+            labels.put(ContainerStorageHelper.SERVICE_LABEL, SERVICE);
+            labels.put(ContainerStorageHelper.COMPONENT_LABEL, COMPONENT);
+            labels.put(ContainerStorageHelper.OWNER_LABEL, ContainerStorageHelper.ownerIdentity(config));
+            labels.put(KIND_LABEL, kind);
+            // Downloaded and checked before any container is made, and read again by a copy Docker makes retry.
+            Path pigArchive;
+            try {
+                pigArchive = pig != null ? pig.download() : null;
+            } catch (IOException e) {
+                throw new UncheckedIOException(e.getMessage(), e);
+            }
+            String made;
+            List<String> containers = new ArrayList<>();
+            try {
+                String target = docker.createContainerCmd(sparkId).withLabels(labels).exec().getId();
+                containers.add(target);
+                String source = docker.createContainerCmd(hiveId).withLabels(labels).exec().getId();
+                containers.add(source);
+                for (Copy copy : copies) {
+                    RetryingTarCopier.copyStreamed(docker, target, copy.into(), copy.from(),
+                            out -> copy(docker.copyArchiveFromContainerCmd(source, copy.from()).exec(), out, copy));
+                }
+                if (pigArchive != null) {
+                    RetryingTarCopier.copyStreamed(docker, target, PigDistribution.FOLDER, PigDistribution.HOME,
+                            out -> PigDistribution.write(pigArchive, out));
+                    RetryingTarCopier.copyBytes(docker, target, PigDistribution.COMMAND_FOLDER, PigDistribution.NAME,
+                            PigDistribution.COMMAND.getBytes(StandardCharsets.UTF_8), 0755);
+                }
+                if (trinoId != null) {
+                    String cli = docker.createContainerCmd(trinoId).withLabels(labels).exec().getId();
+                    containers.add(cli);
+                    RetryingTarCopier.copyStreamed(docker, target, TRINO_CLI.into(), TRINO_CLI.from(),
+                            out -> copy(docker.copyArchiveFromContainerCmd(cli, TRINO_CLI.from()).exec(), out,
+                                    TRINO_CLI));
+                    RetryingTarCopier.copyBytes(docker, target, EmrTrino.COMMAND_FOLDER, EmrTrino.COMMAND_NAME,
+                            EmrTrino.COMMAND.getBytes(StandardCharsets.UTF_8), 0755);
+                }
+                made = lifecycleManager.commit(target, repository, tag,
+                        user == null || user.isBlank() ? "root" : user, labels);
+            } finally {
+                for (String container : containers) {
+                    try {
+                        docker.removeContainerCmd(container).withForce(true).exec();
+                    } catch (RuntimeException e) {
+                        LOG.warnv("Could not remove container {0}, left from making {1}:{2}: {3}", container,
+                                repository, tag, e.getMessage());
+                    }
+                }
+                if (pigArchive != null) {
+                    try {
+                        Files.deleteIfExists(pigArchive);
+                    } catch (IOException e) {
+                        LOG.warnv("Could not remove {0}, the Apache Pig downloaded for {1}:{2}: {3}", pigArchive,
+                                repository, tag, e.getMessage());
+                    }
+                }
+            }
+            removeReplaced(docker, labels, made, repository + ":" + tag);
+            return hold(made);
+        }
+    }
+
+    // Another release's Hadoop for an emr-spark-* release, which has neither Hive nor Pig; Hive, Tez and those Hadoop
+    // services for a cluster with Hive; Tez and those services for one with Pig alone; those services alone otherwise.
+    static List<Copy> copies(String releaseLabel, boolean withHive, boolean withPig) {
+        if (hadoopFolder(releaseLabel) != null) {
+            return HADOOP_APART_COPIES;
+        }
+        if (withHive) {
+            return COPIES;
+        }
+        if (withPig) {
+            List<Copy> copies = new ArrayList<>(HADOOP_COPIES);
+            copies.addAll(TEZ_COPIES);
+            return List.copyOf(copies);
+        }
+        return HADOOP_COPIES;
+    }
+
+    @Override
+    public void released(String imageId) {
+        held.computeIfPresent(imageId, (id, holders) -> holders > 1 ? holders - 1 : null);
+    }
+
+    // The image is held, under its kind's lock, until released(), before a step or a bootstrap gets its id.
+    private String hold(String imageId) {
+        held.merge(imageId, 1, Integer::sum);
+        return imageId;
+    }
+
+    /**
+     * Removes the images of {@code kind} that {@code made}, named {@code name}, replaces: made before a newer pull of
+     * either image, which no cluster asks for again, as the ids it would now be made of lead to {@code made}. One a
+     * step or a bootstrap holds stays, and so does one a container still uses, as Docker refuses to remove it without
+     * force, each until the next newer one is made. One made before images were labelled with their kind is left. The
+     * new image is there either way, so a failure to remove the others fails nothing, and is logged.
+     */
+    private void removeReplaced(DockerClient docker, Map<String, String> kind, String made, String name) {
+        List<Image> images;
+        try {
+            images = docker.listImagesCmd().withLabelFilter(kind).exec();
+        } catch (RuntimeException e) {
+            LOG.warnv(e, "Could not list the EMR release images {0} replaces: {1}", name, e.getMessage());
+            return;
+        }
+        for (Image image : images) {
+            if (made.equals(image.getId()) || held.containsKey(image.getId())
+                    || (image.getRepoTags() != null && Arrays.asList(image.getRepoTags()).contains(name))) {
+                continue;
+            }
+            try {
+                docker.removeImageCmd(image.getId()).exec();
+                LOG.infov("Removed EMR release image {0}, which {1} replaces", image.getId(), name);
+            } catch (ConflictException e) {
+                LOG.debugv("Kept EMR release image {0}, which a container still uses: {1}", image.getId(),
+                        e.getMessage());
+            } catch (RuntimeException e) {
+                LOG.warnv(e, "Could not remove EMR release image {0}, which {1} replaces: {2}", image.getId(), name,
+                        e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Writes the archive Docker gave of {@code copy}'s source, whose entries start with its name, to {@code out} as
+     * {@code copy} puts it in its folder: under its own name, after the folders of one made of several, and with a
+     * link into the EMR Serverless image's goodies leading to the Hive image's copy of them instead.
+     */
+    static void copy(InputStream archive, OutputStream out, Copy copy) throws IOException {
+        String name = copy.from().substring(copy.from().lastIndexOf('/') + 1);
+        try (InputStream source = archive;
+             TarArchiveInputStream in = new TarArchiveInputStream(source);
+             TarArchiveOutputStream tar = RetryingTarCopier.newTarStream(out)) {
+            for (int slash = copy.as().indexOf('/'); slash > 0; slash = copy.as().indexOf('/', slash + 1)) {
+                tar.putArchiveEntry(new TarArchiveEntry(copy.as().substring(0, slash + 1)));
+                tar.closeArchiveEntry();
+            }
+            TarArchiveEntry entry;
+            while ((entry = in.getNextEntry()) != null) {
+                entry.setName(renamed(entry.getName(), name, copy.as()));
+                if (entry.isLink()) {
+                    entry.setLinkName(renamed(entry.getLinkName(), name, copy.as()));
+                } else if (entry.isSymbolicLink() && entry.getLinkName().startsWith(GOODIES + "/")) {
+                    entry.setLinkName(EMR_SHARE + "/" + HIVE_GOODIES + entry.getLinkName().substring(GOODIES.length()));
+                }
+                tar.putArchiveEntry(entry);
+                in.transferTo(tar);
+                tar.closeArchiveEntry();
+            }
+        }
+    }
+
+    // An archive's path under the name it was made with, under the copy's instead.
+    private static String renamed(String path, String name, String as) {
+        return path.equals(name) || path.startsWith(name + "/") ? as + path.substring(name.length()) : path;
+    }
+
+    /** A path of the Hive image, a file or a folder, copied into the image made's folder {@code into} as {@code as}. */
+    record Copy(String from, String into, String as) {
+
+        /** {@code from} copied into a folder of the image made under its own name. */
+        Copy(String from, String into) {
+            this(from, into, from.substring(from.lastIndexOf('/') + 1));
+        }
+
+        /** {@code from} copied to the path {@code to}, whose folder the image made has. */
+        static Copy to(String from, String to) {
+            return new Copy(from, to.substring(0, to.lastIndexOf('/')), to.substring(to.lastIndexOf('/') + 1));
+        }
+    }
+}

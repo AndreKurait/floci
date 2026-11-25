@@ -1,0 +1,2080 @@
+package io.floci.aws.services.emrserverless;
+
+import com.github.dockerjava.api.async.ResultCallback;
+import com.github.dockerjava.api.command.InspectContainerResponse;
+import com.github.dockerjava.api.exception.ConflictException;
+import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.Container;
+import com.github.dockerjava.api.model.Frame;
+import com.github.dockerjava.api.model.StreamType;
+import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.config.EmulatorConfig.EcsServiceConfig.ImagePullBehavior;
+import io.floci.aws.core.common.AwsArnUtils;
+import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.ContainerTeardown;
+import io.floci.aws.core.common.RequestScopes;
+import io.floci.aws.core.common.S3Uri;
+import io.floci.aws.core.common.XmlBuilder;
+import io.floci.aws.core.common.docker.ContainerBuilder;
+import io.floci.aws.core.common.docker.ContainerExec;
+import io.floci.aws.core.common.docker.ContainerLaunches;
+import io.floci.aws.core.common.docker.ContainerLifecycleManager;
+import io.floci.aws.core.common.docker.ContainerLiveness;
+import io.floci.aws.core.common.docker.ContainerLogStreamer;
+import io.floci.aws.core.common.docker.ContainerSpec;
+import io.floci.aws.core.common.docker.ContainerStorageHelper;
+import io.floci.aws.core.common.docker.LaunchedContainerAwsEnv;
+import io.floci.aws.core.common.docker.RetryingTarCopier;
+import io.floci.aws.services.ecr.registry.EcrRegistryManager;
+import io.floci.aws.services.ecr.registry.EcrWorkloadImagePull;
+import io.floci.aws.services.iam.model.SessionCreds;
+import io.floci.aws.services.lambda.launcher.ImageCacheService.LaunchImage;
+import io.floci.aws.services.lambda.launcher.LambdaExecutionRoleCredentials;
+import io.floci.aws.services.s3.S3Service;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
+import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream;
+import org.jboss.logging.Logger;
+
+import java.io.BufferedOutputStream;
+import java.io.ByteArrayInputStream;
+import java.io.Closeable;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.OutputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.security.SecureRandom;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayDeque;
+import java.util.ArrayList;
+import java.util.Deque;
+import java.util.HexFormat;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.TimeUnit;
+import java.util.function.BooleanSupplier;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+import java.util.zip.GZIPOutputStream;
+
+/**
+ * Runs a Spark application's {@code spark-submit} in a container of an EMR Serverless image, for an EMR
+ * Serverless job run or an EMR step. The image's own entrypoint hands over to a script EMR Serverless
+ * supplies at run time, which the public image lacks, so the runner starts {@code spark-submit} itself,
+ * in local mode, the container holding the driver and its executors, unless the job's executors run in containers of
+ * their own, as an EMR Serverless run's do ({@link SparkExecutors}), or on its cluster's YARN, as a step's do. The
+ * container reaches Floci as the
+ * other containers Floci launches do, with the run's execution role as its credentials, and S3A, which
+ * takes {@code s3://} on every release, is pointed at Floci's S3. With TLS on, every JVM in the container
+ * trusts Floci's CA, through the Java trust store copied in before it starts, and the run's archives in S3
+ * are unpacked into its working directory before the driver starts. The driver's output goes to
+ * Floci's log and, while it runs, to the run's CloudWatch log streams, when it has some; once it ends, its
+ * standard output and error go, gzipped, to the run's log folder in Floci's S3, when it has one. An EMR step's
+ * container mounts its cluster's storage and reaches its cluster's HDFS, where {@code hdfs://} paths, and paths
+ * without a scheme, lead, and a step's {@code hadoop} command, and a MapReduce job its {@code spark-submit}
+ * starts, reach Floci's S3 and run MapReduce in local mode, with the cluster's Hadoop configuration. A Hive run
+ * starts {@code hive} in a container of the release's EMR Serverless Hive image instead, with Tez in local mode in
+ * Hive's JVM, S3A on Floci's S3 and the Glue Data Catalog client, the image's metastore, on Floci's Glue; an EMR
+ * step's in the image of its cluster, which holds Spark and Hive, on its storage, with the cluster's HDFS and the
+ * cluster's own metastore.
+ */
+@ApplicationScoped
+public class EmrServerlessSparkRunner implements SparkJobRunner, ContainerTeardown {
+
+    private static final Logger LOG = Logger.getLogger(EmrServerlessSparkRunner.class);
+    // Where a run's secret, which its master, workers and driver share, comes from.
+    private static final SecureRandom SECRETS = new SecureRandom();
+    private static final String SPARK_SUBMIT = "/usr/lib/spark/bin/spark-submit";
+    private static final String HIVE = "/usr/bin/hive";
+    // hive's option for a setting, and its single-dash form.
+    private static final String HIVECONF_OPTION = "--hiveconf";
+    private static final String HIVECONF_SHORT_OPTION = "-hiveconf";
+    private static final String SPARK_DEFAULTS_VARIABLE = "FLOCI_SPARK_DEFAULTS";
+    private static final String HADOOP_SITE_VARIABLE = "FLOCI_HADOOP_SITE";
+    private static final String SPARK_LOG4J2_VARIABLE = "FLOCI_SPARK_LOG4J2";
+    private static final String MAPRED_SITE_VARIABLE = "FLOCI_MAPRED_SITE";
+    // The copies of a block a cluster's core nodes keep, as an hdfs-site.xml property: there, as the image's own says two
+    // and a Hadoop client reads hdfs-site.xml after core-site.xml.
+    private static final String HDFS_SITE_VARIABLE = "FLOCI_HDFS_SITE";
+    // Where a step on its cluster's YARN finds the ResourceManager, as a yarn-site.xml property, a Hadoop client reading
+    // yarn-site.xml after core-site.xml.
+    private static final String YARN_SITE_VARIABLE = "FLOCI_YARN_SITE";
+    // How a command's Tez, Pig's among them, runs its DAGs, as tez-site.xml properties (see tezSite).
+    private static final String TEZ_SITE_VARIABLE = "FLOCI_TEZ_SITE";
+    // The folder of a step's image holding the Hadoop its cluster's nodes run from, which its hadoop command runs from
+    // on YARN, as the MapReduce home the local job runner uses has no YARN client to speak of.
+    private static final String HADOOP_ROOT_VARIABLE = "FLOCI_HADOOP_ROOT";
+    // S3A's AWS SDK, in the folder a release keeps it in or in the jar the others keep it in, each harmless where it is
+    // not.
+    private static final List<String> AWS_SDK_JARS = List.of("/usr/share/aws/aws-java-sdk-v2/*",
+            "/usr/share/aws/emr/serverless-goodies/lib/emr-serverless-spark-goodies.jar");
+    // The java.base packages Hadoop 3.4's JVMs reach into, which Java 17 opens only when told, through
+    // JDK_JAVA_OPTIONS, which Java 9 on reads and Java 8, on which a release may run and which refuses the options
+    // themselves, ignores.
+    private static final List<String> YARN_OPENED_PACKAGES = List.of("java.lang", "java.lang.reflect",
+            "java.lang.invoke", "java.util", "java.util.concurrent", "java.util.regex", "java.net", "java.io",
+            "java.nio", "sun.nio.ch", "sun.nio.cs", "sun.security.action", "sun.util.calendar");
+    private static final String HADOOP_LOG4J_VARIABLE = "FLOCI_HADOOP_LOG4J";
+    private static final String HADOOP_ENV_VARIABLE = "FLOCI_HADOOP_ENV";
+    private static final Pattern SHELL_NAME = Pattern.compile("[A-Za-z_][A-Za-z0-9_]*");
+    // The port of a cluster's NameNode, HDFS's own default, which hdfs:// paths and those without a scheme
+    // ("hdfs:// (or no prefix)") reach through the cluster's primary node.
+    private static final int HDFS_PORT = 8020;
+    /** The ports of a cluster's MapReduce JobHistory server on its primary node, Hadoop's own defaults. */
+    public static final int JOB_HISTORY_PORT = 10020;
+    public static final int JOB_HISTORY_WEB_PORT = 19888;
+    /** A cluster's Spark History Server's port, "Spark HistoryServer | http://master-public-dns-name:18080/". */
+    public static final int SPARK_HISTORY_WEB_PORT = 18080;
+    /**
+     * Where a cluster's Spark applications keep their event logs, which its Spark History Server reads: "By default,
+     * Amazon EMR stores event logs in the /var/log/spark/apps directory of HDFS".
+     */
+    public static final String SPARK_EVENT_LOGS = "/var/log/spark/apps";
+    // Spark's default checkpoint manager goes through Hadoop's FileContext, which refuses an hdfs:// path without a
+    // host, though "hdfs:///path-to-data" and "/path-to-data" "would resolve to the same location in HDFS", as the
+    // Management Guide puts it; so a streaming query keeps its checkpoints through the file system instead.
+    private static final SparkSetting FILE_SYSTEM_CHECKPOINTS = new SparkSetting(
+            "spark.sql.streaming.checkpointFileManagerClass",
+            "org.apache.spark.sql.execution.streaming.FileSystemBasedCheckpointFileManager");
+    // Where Hadoop's local job runner puts a job's files, -files and -archives among them: a folder of the local
+    // file system, whose files it then names by their path alone, which leads to the cluster's HDFS (see
+    // localJobHdfsSettings).
+    private static final String MAPRED_STAGING = "/tmp/hadoop/mapred/staging";
+    // A step's MapReduce runs in the JVM that starts it, as there is no YARN to run it on.
+    private static final String MAPRED_SITE = "<property><name>mapreduce.framework.name</name><value>local</value>"
+            + "</property><property><name>mapreduce.jobtracker.staging.root.dir</name><value>" + MAPRED_STAGING
+            + "</value></property>";
+    // The image's Hadoop log4j.properties is empty, so a hadoop command logs nothing, a streaming job's reason for
+    // failing included; one that is empty logs to standard error instead, in the layout of the step log lines the
+    // Management Guide shows ("ERROR org.apache.hadoop.streaming.StreamJob (main): Error Launching job : ...").
+    private static final List<String> HADOOP_CONSOLE_LOG = List.of(
+            "hadoop.root.logger=INFO,console",
+            "log4j.rootLogger=${hadoop.root.logger}",
+            "log4j.appender.console=org.apache.log4j.ConsoleAppender",
+            "log4j.appender.console.target=System.err",
+            "log4j.appender.console.layout=org.apache.log4j.PatternLayout",
+            "log4j.appender.console.layout.ConversionPattern=%d{ISO8601} %p %c (%t): %m%n");
+    // MapReduce, which a streaming job, the LZO indexer and any other hadoop jar run in, is only in Spark's shaded
+    // Hadoop client, and S3A's AWS SDK only in the jar Spark's own S3A finds it in; links to them make up the hadoop
+    // command's MapReduce home, whose jars it puts after its own, whatever HADOOP_CLASSPATH a command sets. The names
+    // are those of the emr-7.5.0 and emr-7.10.0 images; one another image lacks is named on standard error, as a job
+    // that needs it fails later, on its class path.
+    private static final String MAPRED_HOME = "/tmp/floci-mapreduce";
+    // No source gives AWS's wording for this; it is Floci's.
+    private static final String MISSING_JAR = "Floci: this image has no $jar, so the hadoop command may not find"
+            + " MapReduce or S3A's AWS SDK.";
+    private static final List<String> MAPRED_JARS = List.of(
+            "/usr/lib/spark/jars/hadoop-client-api-*.jar",
+            "/usr/lib/spark/jars/hadoop-client-runtime-*.jar",
+            "/usr/lib/spark/jars/emr-serverless-spark-goodies.jar");
+    /**
+     * The {@code sudo} a cluster's bootstrap actions and steps find first on their PATH, as EMR's nodes have one and
+     * the image none: its options are dropped, each with its value where it takes one, given apart or after an
+     * {@code =}, and its command, with any NAME=value before it, runs as it is, as whoever runs it, root in a bootstrap
+     * action and the {@code hadoop} user in a step.
+     */
+    public static final String SUDO = String.join("\n",
+            "#!/bin/bash",
+            "while [ $# -gt 0 ]; do",
+            "  case \"$1\" in",
+            "    -u|-g|-C|-D|-p|-r|-t|-T|-U|--user|--group|--close-from|--chdir|--prompt|--role|--type"
+                    + "|--command-timeout|--other-user) shift 2 ;;",
+            "    --) shift; break ;;",
+            "    -*) shift ;;",
+            "    *) break ;;",
+            "  esac",
+            "done",
+            "exec env \"$@\"");
+    /** Writes {@link #SUDO} to /tmp/floci-bin/sudo, a folder that is there already. */
+    public static final String SUDO_FILE = String.join("\n", "cat > /tmp/floci-bin/sudo <<'SUDO'", SUDO, "SUDO");
+    /** The variable naming the instance role of an EMR cluster's container, MASTER, CORE or TASK (see NODE_INFO). */
+    public static final String INSTANCE_ROLE_VARIABLE = "FLOCI_INSTANCE_ROLE";
+    /** The file an EMR node's {@code isMaster} is in, which the EMR Management Guide's bootstrap action reads. */
+    public static final String INSTANCE_FILE = "/mnt/var/lib/info/instance.json";
+    /** The file an EMR node's {@code instanceRole} is in, which AWS's Knowledge Center reads with jq. */
+    public static final String EXTRA_INSTANCE_DATA_FILE = "/mnt/var/lib/instance-controller/extraInstanceData.json";
+    // Run as the image's user with the node's role as $1: each file written whole, then moved in place, so a step
+    // starting beside another, which shares its /mnt, reads it whole too.
+    private static final String NODE_INFO_FILES = String.join("\n",
+            "w() { t=$(mktemp \"$1.XXXXXX\") && printf \"%s\\n\" \"$2\" > \"$t\" && chmod 644 \"$t\""
+                    + " && mv -f \"$t\" \"$1\"; }",
+            "m=false; [ \"$1\" != MASTER ] || m=true",
+            "mkdir -p /mnt/var/lib/info /mnt/var/lib/instance-controller"
+                    + " && w " + INSTANCE_FILE + " \"{\\\"isMaster\\\": $m}\""
+                    + " && w " + EXTRA_INSTANCE_DATA_FILE + " \"{\\\"instanceRole\\\": \\\"$1\\\"}\"");
+    /**
+     * Where {@link #INSTANCE_ROLE_VARIABLE} names a role, writes what AWS documents of the files an EMR node keeps
+     * about itself, and only that: {@link #INSTANCE_FILE}'s {@code isMaster}, as the EMR Management Guide's bootstrap
+     * action reads it ("grep isMaster /mnt/var/lib/info/instance.json | grep false" on a node that is not the primary),
+     * and {@link #EXTRA_INSTANCE_DATA_FILE}'s {@code instanceRole}, which AWS's Knowledge Center reads with jq and
+     * compares, lowercased, with master, core and task, given as the API's {@code InstanceRoleType} names it. Written
+     * as the image's user, whose /mnt is, so a folder made there is that user's too, as Hive's metastore, which writes
+     * under /mnt/var/lib, runs as that user.
+     */
+    public static final String NODE_INFO = String.join("\n",
+            "if [ -n \"${" + INSTANCE_ROLE_VARIABLE + ":-}\" ]; then",
+            "  as=; [ \"$(id -u)\" != 0 ] || as=\"setpriv --reuid=hadoop --regid=hadoop --clear-groups\"",
+            "  $as bash -c '" + NODE_INFO_FILES + "' floci \"$" + INSTANCE_ROLE_VARIABLE + "\" || exit",
+            "fi");
+    // A Spark configuration of the container's own: a copy of the folder a spark-env export of SPARK_CONF_DIR names,
+    // else of the image's, links followed, whose log4j2.properties ends with the job's lines, passed in
+    // SPARK_LOG4J2_VARIABLE, a later line winning. What is added to a file starts on a line of its own, as the
+    // image's log4j2.properties has no line break at its end.
+    private static final List<String> SPARK_CONF_COPY = List.of(
+            "conf=/tmp/floci-spark-conf",
+            "mkdir -p \"$conf\"",
+            "cp -rL \"${SPARK_CONF_DIR:-/usr/lib/spark/conf}/.\" \"$conf\" 2>/dev/null",
+            "if [ -n \"${" + SPARK_LOG4J2_VARIABLE + ":-}\" ]; then",
+            "  printf '\\n%s\\n' \"$" + SPARK_LOG4J2_VARIABLE + "\" >> \"$conf/log4j2.properties\"",
+            "fi",
+            "export SPARK_CONF_DIR=\"$conf\"");
+    // On a cluster, the hadoop command, and MapReduce in a step's spark-submit, get its HDFS and Floci's S3 too,
+    // through a copy of its Hadoop configuration (the image's, or the folder a spark-env export names), links followed,
+    // whose core-site.xml takes in the original's through Hadoop's XInclude, whatever its XML, by a name relative to
+    // the folder, which Spark ships to YARN's containers on a cluster that runs it, then HADOOP_SITE_VARIABLE's
+    // properties, which win (see hadoopSite), and whose mapred-site.xml runs MapReduce in local mode the same way (see
+    // mapredSite), as a command's tez-site.xml does Tez (see tezSite). The cluster's hadoop-log4j lines follow the
+    // log4j.properties, on a line of their own, a later key winning, and its hadoop-env exports start the hadoop-env.sh
+    // the hadoop command reads, ahead of the image's own lines, which add to HADOOP_CLASSPATH rather than set it, so a
+    // HADOOP_CLASSPATH the cluster sets keeps the LZO codec the image's core-site.xml names. The hadoop script runs
+    // only once its HDFS, MapReduce and YARN homes name folders that are there, and the image has /usr/lib/hadoop
+    // alone, without MapReduce, so the MapReduce home is Floci's (see MAPRED_HOME). The image's hdfs command cannot
+    // run, so hdfs dfs runs as hadoop fs, and its hadoop-streaming names a jar it does not have, so the one it has
+    // runs. A step's command can run sudo, as on EMR, which the image does not have, so it finds Floci's first (see
+    // SUDO).
+    private static final List<String> HADOOP_CONF_SETUP = List.of(
+            "if [ -n \"${" + HADOOP_SITE_VARIABLE + ":-}\" ]; then",
+            "  hadoop_conf=/tmp/floci-hadoop-conf source_conf=\"${HADOOP_CONF_DIR:-/etc/hadoop/conf}\"",
+            "  mkdir -p \"$hadoop_conf\" /tmp/floci-bin " + MAPRED_HOME,
+            "  cp -rL \"$source_conf/.\" \"$hadoop_conf\" 2>/dev/null",
+            "  site() {",
+            "    include=",
+            "    if [ -f \"$hadoop_conf/$1\" ]; then",
+            "      mv \"$hadoop_conf/$1\" \"$hadoop_conf/floci-original-$1\"",
+            "      include=\"<xi:include href=\\\"floci-original-$1\\\"/>\"",
+            "    fi",
+            "    printf '%s\\n' '<configuration xmlns:xi=\"http://www.w3.org/2001/XInclude\">' \"$include\" \"$2\""
+                    + " '</configuration>' > \"$hadoop_conf/$1\"",
+            "  }",
+            "  site core-site.xml \"$" + HADOOP_SITE_VARIABLE + "\"",
+            "  site mapred-site.xml \"$" + MAPRED_SITE_VARIABLE + "\"",
+            "  if [ -n \"${" + HDFS_SITE_VARIABLE + ":-}\" ]; then",
+            "    site hdfs-site.xml \"$" + HDFS_SITE_VARIABLE + "\"",
+            "  fi",
+            "  if [ -n \"${" + YARN_SITE_VARIABLE + ":-}\" ]; then",
+            "    site yarn-site.xml \"$" + YARN_SITE_VARIABLE + "\"",
+            "  fi",
+            "  if [ -n \"${" + TEZ_SITE_VARIABLE + ":-}\" ]; then",
+            "    site tez-site.xml \"$" + TEZ_SITE_VARIABLE + "\"",
+            "  fi",
+            "  if [ ! -s \"$hadoop_conf/log4j.properties\" ]; then",
+            "    printf '%s\\n' '" + String.join("' '", HADOOP_CONSOLE_LOG) + "' > \"$hadoop_conf/log4j.properties\"",
+            "  fi",
+            "  if [ -n \"${" + HADOOP_LOG4J_VARIABLE + ":-}\" ]; then",
+            "    printf '\\n%s\\n' \"$" + HADOOP_LOG4J_VARIABLE + "\" >> \"$hadoop_conf/log4j.properties\"",
+            "  fi",
+            "  if [ -n \"${" + HADOOP_ENV_VARIABLE + ":-}\" ]; then",
+            "    { printf '%s\\n' \"$" + HADOOP_ENV_VARIABLE + "\"; cat \"$hadoop_conf/hadoop-env.sh\" 2>/dev/null; }"
+                    + " > \"$hadoop_conf/floci-hadoop-env.sh\"",
+            "    mv \"$hadoop_conf/floci-hadoop-env.sh\" \"$hadoop_conf/hadoop-env.sh\"",
+            "  fi",
+            "  printf '%s\\n' '#!/bin/bash' 'if [ \"$1\" = dfs ]; then shift; exec hadoop fs \"$@\"; fi'"
+                    + " 'echo \"hdfs $1: only hdfs dfs runs here, as hadoop fs\" >&2' 'exit 1' > /tmp/floci-bin/hdfs",
+            "  printf '%s\\n' '#!/bin/bash' 'exec hadoop jar /usr/lib/hadoop/hadoop-streaming.jar \"$@\"'"
+                    + " > /tmp/floci-bin/hadoop-streaming",
+            "  " + SUDO_FILE,
+            "  chmod +x /tmp/floci-bin/hdfs /tmp/floci-bin/hadoop-streaming /tmp/floci-bin/sudo",
+            "  for jar in " + String.join(" ", MAPRED_JARS) + "; do",
+            "    if [ -f \"$jar\" ]; then ln -sf \"$jar\" " + MAPRED_HOME + "/;",
+            "    else echo \"" + MISSING_JAR + "\" >&2; fi",
+            "  done",
+            "  export HADOOP_CONF_DIR=\"$hadoop_conf\" PATH=\"/tmp/floci-bin:$PATH\"",
+            "  export HADOOP_HDFS_HOME=\"${HADOOP_HDFS_HOME:-/usr/lib/hadoop}\"",
+            "  export HADOOP_MAPRED_HOME=\"${HADOOP_MAPRED_HOME:-" + MAPRED_HOME + "}\"",
+            "  export HADOOP_YARN_HOME=\"${HADOOP_YARN_HOME:-/usr/lib/hadoop}\"",
+            // On YARN the hadoop command, and so hadoop-streaming and hdfs dfs, runs from the nodes' Hadoop, its homes
+            // set for it alone, so a spark-submit in the same step keeps the Hadoop the release gives Spark.
+            "  if [ -n \"${" + HADOOP_ROOT_VARIABLE + ":-}\" ]; then",
+            "    r=$" + HADOOP_ROOT_VARIABLE,
+            "    printf '%s\\n' '#!/bin/bash'"
+                    + " \"export HADOOP_HOME=$r/hadoop HADOOP_COMMON_HOME=$r/hadoop"
+                    + " HADOOP_LIBEXEC_DIR=$r/hadoop/libexec HADOOP_HDFS_HOME=$r/hadoop-hdfs"
+                    + " HADOOP_MAPRED_HOME=$r/hadoop-mapreduce HADOOP_YARN_HOME=$r/hadoop-yarn\""
+                    + " 'export HADOOP_CLASSPATH=\"${HADOOP_CLASSPATH:-}:" + String.join(":", AWS_SDK_JARS) + "\"'"
+                    + " \"exec $r/hadoop/bin/hadoop \\\"\\$@\\\"\" > /tmp/floci-bin/hadoop",
+            "    printf '%s\\n' '#!/bin/bash'"
+                    + " \"exec /tmp/floci-bin/hadoop jar $r/hadoop-mapreduce/hadoop-streaming.jar \\\"\\$@\\\"\""
+                    + " > /tmp/floci-bin/hadoop-streaming",
+            "    chmod +x /tmp/floci-bin/hadoop /tmp/floci-bin/hadoop-streaming",
+            "  fi",
+            "fi");
+    /**
+     * The lines a step's command gets after those of Pig's own {@code pig.properties}, a later key winning, in a Pig
+     * configuration of the container's own ({@link #PIG_CONF}), which {@code PIG_CONF_DIR} names; set for a cluster
+     * with Pig.
+     */
+    public static final String PIG_PROPERTIES_VARIABLE = "FLOCI_PIG_PROPERTIES";
+    /** The lines that follow those of that configuration's {@code log4j.properties}, its template's where it has none. */
+    public static final String PIG_LOG4J_VARIABLE = "FLOCI_PIG_LOG4J";
+    /** The lines that start that configuration's {@code pig-env.sh}, which Pig's launcher reads. */
+    public static final String PIG_ENV_VARIABLE = "FLOCI_PIG_ENV";
+    /** Where a step's command has its Pig configuration. */
+    public static final String PIG_CONF = "/tmp/floci-pig-conf";
+    // On a cluster with Pig, a command's pig reads a configuration of its own: a copy of the one PIG_CONF_DIR names, or
+    // Pig's, links followed, whose pig.properties, log4j.properties and pig-env.sh get the cluster's lines.
+    private static final List<String> PIG_CONF_SETUP = List.of(
+            "if [ -n \"${" + PIG_PROPERTIES_VARIABLE + ":-}\" ]; then",
+            "  mkdir -p " + PIG_CONF,
+            "  cp -rL \"${PIG_CONF_DIR:-/usr/lib/pig/conf}/.\" " + PIG_CONF + " 2>/dev/null",
+            "  printf '\\n%s\\n' \"$" + PIG_PROPERTIES_VARIABLE + "\" >> " + PIG_CONF + "/pig.properties",
+            "  if [ -n \"${" + PIG_LOG4J_VARIABLE + ":-}\" ]; then",
+            "    if [ ! -f " + PIG_CONF + "/log4j.properties ]; then",
+            "      cp " + PIG_CONF + "/log4j.properties.template " + PIG_CONF + "/log4j.properties 2>/dev/null",
+            "    fi",
+            "    printf '\\n%s\\n' \"$" + PIG_LOG4J_VARIABLE + "\" >> " + PIG_CONF + "/log4j.properties",
+            "  fi",
+            "  if [ -n \"${" + PIG_ENV_VARIABLE + ":-}\" ]; then",
+            "    { printf '%s\\n' \"$" + PIG_ENV_VARIABLE + "\"; cat " + PIG_CONF + "/pig-env.sh 2>/dev/null; }"
+                    + " > " + PIG_CONF + "/floci-pig-env.sh",
+            "    mv " + PIG_CONF + "/floci-pig-env.sh " + PIG_CONF + "/pig-env.sh",
+            "  fi",
+            "  export PIG_CONF_DIR=" + PIG_CONF,
+            "fi");
+    // A step on a cluster, or one whose job has log4j2.properties lines, runs spark-submit after this.
+    private static final String SPARK_CONF_WRAPPER = wrapper(SPARK_CONF_COPY, HADOOP_CONF_SETUP);
+    // A command runs after this sets up a Spark configuration of its own, so a spark-submit it starts runs
+    // locally on Floci's S3: the image's spark-defaults.conf names EMR Serverless's resource manager as its
+    // master, which a system property cannot override, so its master and that manager's lines give way to
+    // local mode, Floci's settings and the job's spark-defaults, passed in SPARK_DEFAULTS_VARIABLE.
+    private static final String COMMAND_WRAPPER = wrapper(SPARK_CONF_COPY, List.of(
+            "touch \"$conf/spark-defaults.conf\"",
+            "sed -i -e '/^spark\\.master[[:space:]]/d' -e '/^spark\\.submit\\.deployMode[[:space:]]/d'"
+                    + " -e '/^spark\\.submit\\.customResourceManager/d' \"$conf/spark-defaults.conf\"",
+            "printf '\\n%s\\n' \"$" + SPARK_DEFAULTS_VARIABLE + "\" >> \"$conf/spark-defaults.conf\""),
+            HADOOP_CONF_SETUP, PIG_CONF_SETUP);
+    // The archives a driver needs in its working directory are put in this folder of its container, each in a
+    // numbered folder of its own, which the copy creates.
+    private static final String ARCHIVES_FOLDER = "/tmp/floci-archives";
+    // While an archive is streamed in, a stop is looked for after each this many bytes, as Progress.cancelled()
+    // takes the run service's lock.
+    private static final long STOP_LOOK_BYTES = 4L * 1024 * 1024;
+    private static final int ARCHIVE_BUFFER_BYTES = 64 * 1024;
+    // Gets each archive's file and the directory it goes to, then "--" and what runs after, and unpacks each into
+    // the working directory as Spark's Utils.unpack does: a .jar or .zip unzipped, a .tar.gz, .tgz or .tar
+    // untarred, and any other file copied.
+    private static final String ARCHIVES_WRAPPER = String.join("\n",
+            "shopt -s nocasematch",
+            "while [ \"$1\" != -- ]; do",
+            "  case \"$1\" in",
+            "    *.jar|*.zip) mkdir -p \"$2\" && unzip -q -o \"$1\" -d \"$2\" ;;",
+            "    *.tar.gz|*.tgz|*.tar) mkdir -p \"$2\" && tar -xf \"$1\" -C \"$2\" ;;",
+            "    *) cp \"$1\" \"$2\" ;;",
+            "  esac || exit",
+            "  shift 2",
+            "done",
+            "shift",
+            "exec \"$@\"");
+    private static final String DEFAULT_IMAGE =
+            "public.ecr.aws/emr-serverless/spark/%s:latest"; // partition-literal: ECR Public's registry host, where AWS publishes the base images; image-template overrides it
+    // The AWS runtime for Apache Spark (emr-spark-8.0.0 on) publishes its images under spark4/ instead.
+    private static final String SPARK_RUNTIME_DEFAULT_IMAGE =
+            "public.ecr.aws/emr-serverless/spark4/%s:latest"; // partition-literal: ECR Public's registry host, where AWS publishes the base images; image-template overrides it
+    private static final String HIVE_DEFAULT_IMAGE =
+            "public.ecr.aws/emr-serverless/hive/%s:latest"; // partition-literal: ECR Public's registry host, where AWS publishes the base images; hive-image-template overrides it
+    // Hive's settings beside Floci's Hadoop ones. The image's Tez runs its DAGs through EMR Serverless's own container
+    // plugins, which the public image cannot reach, so where there is no YARN Tez runs them in local mode, in Hive's
+    // JVM (see hiveOnYarnSettings for where there is). The port range its client talks to it on is a placeholder EMR
+    // Serverless fills.
+    private static final List<SparkSetting> HIVE_SETTINGS = List.of(
+            new SparkSetting("tez.local.mode", "true"),
+            new SparkSetting("tez.am.client.am.port-range", "40000-40100"));
+    // A command's Tez where there is no YARN: in local mode, in the JVM that starts it, which has Tez's jars already,
+    // its tasks' output read where it is written, as Pig's own Tez local mode has it.
+    private static final List<SparkSetting> TEZ_LOCAL_SETTINGS = List.of(
+            new SparkSetting("tez.local.mode", "true"),
+            new SparkSetting("tez.ignore.lib.uris", "true"),
+            new SparkSetting("tez.runtime.optimize.local.fetch", "true"));
+    // On a cluster, Hive's metastore is the cluster's own, as "Hive records metastore information in a MySQL database
+    // on the primary node's file system": the metastore service on its primary node (see EmrClusterStorage), in place
+    // of the Glue Data Catalog client the image's hive-site names, or, where that does not run, an embedded Derby
+    // database in the cluster's /mnt, whose tables DataNucleus creates on first use. A cluster's hive-site replaces
+    // them, with the Glue Data Catalog's client factory for one.
+    private static final SparkSetting HIVE_CLUSTER_CLIENT = new SparkSetting("hive.metastore.client.factory.class",
+            "org.apache.hadoop.hive.ql.metadata.SessionHiveMetaStoreClientFactory");
+    private static final List<SparkSetting> HIVE_EMBEDDED_METASTORE = List.of(
+            new SparkSetting("javax.jdo.option.ConnectionURL",
+                    "jdbc:derby:;databaseName=/mnt/var/lib/hive/metastore_db;create=true"),
+            new SparkSetting("hive.metastore.schema.verification", "false"),
+            new SparkSetting("datanucleus.schema.autoCreateAll", "true"));
+    // Hive logs to a file in the folder EMR Serverless names in LOGS_DIR, its HIVE_LOG, apart from the driver's standard
+    // output and error.
+    private static final List<String> HIVE_ENVIRONMENT = List.of("LOGS_DIR=/tmp/floci-hive-logs");
+    private static final String HIVE_SCRATCH_VARIABLE = "FLOCI_HIVE_SCRATCH";
+    // Set for a Hive step on a cluster, whose shell commands (Hive's "!") find the sudo a step has (see SUDO).
+    private static final String CLUSTER_STEP_VARIABLE = "FLOCI_CLUSTER_STEP";
+    /**
+     * Where an EMR cluster's image with Hive keeps its Hive image's Hadoop configuration, which puts Tez on the class
+     * path, apart from the one its other steps' Hadoop reads; Hive runs with it where an image has it.
+     */
+    public static final String HIVE_HADOOP_CONF = "/etc/hadoop/conf.hive";
+    private static final String HIVE_LIB = "/usr/lib/hive/lib";
+    /**
+     * Leaves Hive one AWS SDK v2, before Hive starts, as root. An {@code emr-6.x} Hive image's lib folder has the stock
+     * SDK's modules, ahead on Hive's class path of the SDK inside Tez's plug-in, EMR's own build and the only one with
+     * an S3 client. S3A, which {@code s3://} is here, then builds the plug-in's S3 client on the stock {@code sdk-core},
+     * which on {@code emr-6.15.0} fails with {@code NoSuchFieldError: AWS_S3_DISABLE_EXPRESS_SESSION_AUTH}. The modules
+     * the plug-in also holds go, by name, which is all but CloudWatch's two.
+     */
+    public static final String HIVE_ONE_SDK = "for core in " + HIVE_LIB + "/sdk-core-2.*.jar; do"
+            + " [ -e /usr/lib/tez/tez-emr-serverless.jar ] && for module in annotations apache-client auth aws-core"
+            + " aws-json-protocol aws-query-protocol endpoints-spi http-client-spi json-utils metrics-spi"
+            + " netty-nio-client profiles protocol-core regions sdk-core third-party-jackson-core utils;"
+            + " do rm -f \"" + HIVE_LIB + "/$module-${core##*/sdk-core-}\"; done; done";
+    private static final String HIVE_SCRATCHDIR = "hive.exec.scratchdir";
+    // The user every EMR Serverless image runs as: a custom one sets "the USER back to hadoop:hadoop".
+    private static final String IMAGE_USER = "hadoop";
+    // Starts hive as the image's user, after what EMR Serverless's runtime would do. The image's tez-site.xml takes
+    // Tez's addresses from variables that runtime sets: Tez in local mode listens on every address of the container
+    // and names it by its host name, which its own client connects to. Hive puts Tez's staging folder under the
+    // session's scratch folder, which a run puts in S3, and Tez in local mode copies it to the same path on the local
+    // file system (LocalClient), a copy that silently does nothing where the image's user cannot create that path, at
+    // the root of the container for one; so the container starts as root, makes that path its user's, then runs hive
+    // as that user, in that user's home, as a Spark image's working directory is: Tez in local mode puts each task's
+    // files in the working directory, and the Hive image names none, which leaves the root. In an EMR cluster's image
+    // with Hive, Hive reads its own Hadoop configuration (HIVE_HADOOP_CONF), and a step on a cluster finds SUDO first on
+    // its PATH, as a Spark step does.
+    private static final String HIVE_WRAPPER = String.join("\n",
+            "host=$(hostname)",
+            "export CLIENT_AM_BIND_ADDRESS=0.0.0.0 TASK_AM_BIND_ADDRESS=0.0.0.0 SHUFFLE_BIND_ADDRESS=0.0.0.0",
+            "export CLIENT_AM_HOSTNAME=\"$host\" TASK_AM_HOSTNAME=\"$host\" HOST_ADDRESS_LOCAL=\"$host\"",
+            "if [ -n \"${" + HIVE_SCRATCH_VARIABLE + ":-}\" ]; then",
+            "  mkdir -p \"$" + HIVE_SCRATCH_VARIABLE + "\" && chown " + IMAGE_USER + ":" + IMAGE_USER + " \"$"
+                    + HIVE_SCRATCH_VARIABLE + "\" || exit",
+            "fi",
+            "if [ -d " + HIVE_HADOOP_CONF + " ]; then export HADOOP_CONF_DIR=" + HIVE_HADOOP_CONF + "; fi",
+            "if [ -n \"${" + CLUSTER_STEP_VARIABLE + ":-}\" ]; then",
+            "  mkdir -p /tmp/floci-bin || exit",
+            "  " + SUDO_FILE,
+            "  chmod 755 /tmp/floci-bin/sudo",
+            "  export PATH=\"/tmp/floci-bin:$PATH\"",
+            "fi",
+            NODE_INFO,
+            HIVE_ONE_SDK,
+            "export HOME=~" + IMAGE_USER,
+            "cd \"$HOME\" || exit",
+            // The image's user has no other group, as Docker starts it.
+            "exec setpriv --reuid=" + IMAGE_USER + " --regid=" + IMAGE_USER + " --clear-groups \"$@\"");
+    // "The default behavior for shutdown is to have no grace period": immediate termination.
+    private static final int STOP_TIMEOUT_SECONDS = 0;
+    // The characters a backslash escapes inside double quotes; before any other it is kept.
+    private static final String DOUBLE_QUOTE_ESCAPES = "\"\\$`\n";
+    // How often a running driver is looked at, as Batch's runner looks at its jobs.
+    private static final Duration POLL_INTERVAL = Duration.ofMillis(250);
+    private static final String GZIP = "application/x-gzip";
+    // How long reading an ended driver's output may take; Docker's log rotation bounds its size.
+    private static final Duration LOG_READ_TIMEOUT = Duration.ofSeconds(60);
+
+    // The runs inside run(); a stop for a run not here comes after its driver has gone, and is dropped.
+    private final ContainerLaunches launches = new ContainerLaunches();
+    // What the workers of each application's runs with executors of their own hold, by application, while any runs.
+    private final Map<String, SparkExecutors.Capacity> capacities = new ConcurrentHashMap<>();
+    // Where Floci reaches the Spark UI of each EMR Serverless Spark run's driver, by run, while its container runs.
+    private final Map<String, ContainerLifecycleManager.EndpointInfo> driverUis = new ConcurrentHashMap<>();
+    // The runs asked to interrupt their driver, which the thread watching each sends it SIGTERM for.
+    private final Set<String> interrupts = ConcurrentHashMap.newKeySet();
+
+    private final ContainerBuilder containerBuilder;
+    private final ContainerLifecycleManager lifecycleManager;
+    private final ContainerLogStreamer logStreamer;
+    private final LaunchedContainerAwsEnv awsEnv;
+    private final LambdaExecutionRoleCredentials roleCredentials;
+    private final S3Service s3Service;
+    private final EcrRegistryManager ecrRegistryManager;
+    private final EcrWorkloadImagePull imagePulls;
+    private final EmulatorConfig config;
+    private final Clock clock;
+    private final Duration pollInterval;
+
+    @Inject
+    public EmrServerlessSparkRunner(ContainerBuilder containerBuilder, ContainerLifecycleManager lifecycleManager,
+                                    ContainerLogStreamer logStreamer, LaunchedContainerAwsEnv awsEnv,
+                                    LambdaExecutionRoleCredentials roleCredentials, S3Service s3Service,
+                                    EcrRegistryManager ecrRegistryManager, EmulatorConfig config, Clock clock,
+                                    EcrWorkloadImagePull imagePulls) {
+        this(containerBuilder, lifecycleManager, logStreamer, awsEnv, roleCredentials, s3Service, ecrRegistryManager,
+                config, clock, POLL_INTERVAL, imagePulls);
+    }
+
+    public EmrServerlessSparkRunner(ContainerBuilder containerBuilder, ContainerLifecycleManager lifecycleManager,
+                                    ContainerLogStreamer logStreamer, LaunchedContainerAwsEnv awsEnv,
+                                    LambdaExecutionRoleCredentials roleCredentials, S3Service s3Service,
+                                    EcrRegistryManager ecrRegistryManager, EmulatorConfig config, Clock clock) {
+        this(containerBuilder, lifecycleManager, logStreamer, awsEnv, roleCredentials, s3Service, ecrRegistryManager,
+                config, clock, POLL_INTERVAL, null);
+    }
+
+    EmrServerlessSparkRunner(ContainerBuilder containerBuilder, ContainerLifecycleManager lifecycleManager,
+                             ContainerLogStreamer logStreamer, LaunchedContainerAwsEnv awsEnv,
+                             LambdaExecutionRoleCredentials roleCredentials, S3Service s3Service,
+                             EcrRegistryManager ecrRegistryManager, EmulatorConfig config, Clock clock,
+                             Duration pollInterval) {
+        this(containerBuilder, lifecycleManager, logStreamer, awsEnv, roleCredentials, s3Service, ecrRegistryManager,
+                config, clock, pollInterval, null);
+    }
+
+    EmrServerlessSparkRunner(ContainerBuilder containerBuilder, ContainerLifecycleManager lifecycleManager,
+                             ContainerLogStreamer logStreamer, LaunchedContainerAwsEnv awsEnv,
+                             LambdaExecutionRoleCredentials roleCredentials, S3Service s3Service,
+                             EcrRegistryManager ecrRegistryManager, EmulatorConfig config, Clock clock,
+                             Duration pollInterval, EcrWorkloadImagePull imagePulls) {
+        this.containerBuilder = containerBuilder;
+        this.lifecycleManager = lifecycleManager;
+        this.logStreamer = logStreamer;
+        this.awsEnv = awsEnv;
+        this.roleCredentials = roleCredentials;
+        this.s3Service = s3Service;
+        this.ecrRegistryManager = ecrRegistryManager;
+        this.imagePulls = imagePulls;
+        this.config = config;
+        this.clock = clock;
+        this.pollInterval = pollInterval;
+    }
+
+    @Override
+    public Outcome run(Job given, Progress progress) {
+        String network = containerBuilder.resolveDockerNetwork(Optional.ofNullable(given.dockerNetwork())).orElse(null);
+        // On the network it resolves to, which tells whether its executors run apart and its driver serves its UI.
+        Job job = (executorsApart(given, network) ? given : given.withExecutors(null)).onNetwork(network);
+        ContainerLaunches.Launch launch = launches.begin(job.runId());
+        Optional<SessionCreds> credentials = Optional.empty();
+        Closeable logHandle = null;
+        SparkExecutors executors = null;
+        SparkExecutors.Capacity capacity = null;
+        try {
+            // A cancel before the run was in launches had nothing to stop, so it is read here.
+            if (progress.cancelled()) {
+                return Outcome.halted();
+            }
+            credentials = roleCredentials.forRole(job.executionRole(), job.accountId(), job.runId(),
+                    progress.sessionPolicy());
+            Map<String, String> labels = new LinkedHashMap<>(ContainerStorageHelper.resourceIdentityLabels(
+                    job.service(), job.runId(), job.accountId(), job.region()));
+            // The deployment that started the driver, which removeLeftoverDrivers() goes by.
+            labels.put(ContainerStorageHelper.OWNER_LABEL, ContainerStorageHelper.ownerIdentity(config));
+            // A step on its cluster's YARN, whose executors run on the primary node, reaches Floci at Floci's address on
+            // the cluster's network, which its container joins too, and its executors get its AWS environment.
+            boolean onYarn = onYarn(job);
+            String endpoint = onYarn ? job.storage().flociEndpoint() : awsEnv.flociEndpoint();
+            List<String> executorEnvironment = onYarn
+                    ? awsEnv.sdkBaselineEnv(job.region(), Optional.empty(), endpoint, credentials, job.accountId())
+                    : List.of();
+            List<Archive> archives = archives(job);
+            List<String> awsEnvironment = awsEnv.sdkBaselineEnv(job.region(), Optional.empty(), credentials,
+                    job.accountId());
+            // Pulled, when it is not the driver's, before the driver starts rather than while it waits for executors.
+            String executorImage = job.executors() != null ? executorImage(job, progress) : null;
+            String secret = job.executors() != null ? newSecret() : null;
+            ContainerBuilder.Builder container = containerBuilder.newContainer(launchImage(job, progress))
+                    .withName(ContainerStorageHelper.dockerName(config, job.service() + "-" + job.runId()))
+                    .withEnv(environment(awsEnvironment, job.environment()));
+            if (job.interruptible()) {
+                container.withInit();
+            }
+            // bash -c's script gets "floci" as its $0, and what runs after it as its arguments, "$@".
+            if (job.engine() == Engine.HIVE) {
+                List<String> hive = hiveArguments(job, endpoint, executorEnvironment);
+                List<String> entrypoint = new ArrayList<>(List.of("/bin/bash", "-c", HIVE_WRAPPER, "floci"));
+                entrypoint.addAll(job.command() != null ? job.command() : List.of(HIVE));
+                container.withUser("root")
+                        .withEntrypoint(entrypoint)
+                        .withCmd(hive)
+                        .withEnv(HIVE_ENVIRONMENT);
+                if (job.storage() != null) {
+                    container.withEnv(CLUSTER_STEP_VARIABLE, "1");
+                }
+                String scratch = hiveScratchMirror(hive);
+                if (scratch != null) {
+                    container.withEnv(HIVE_SCRATCH_VARIABLE, scratch);
+                }
+            } else if (job.command() == null) {
+                List<String> sparkSubmit = new ArrayList<>();
+                if (!job.sparkLog4j2().isEmpty() || job.storage() != null) {
+                    sparkSubmit.addAll(List.of("/bin/bash", "-c", SPARK_CONF_WRAPPER, "floci"));
+                }
+                List<String> arguments = sparkSubmitArguments(job, endpoint, executorEnvironment);
+                if (job.executors() != null) {
+                    sparkSubmit.addAll(List.of("/bin/bash", "-c", SparkExecutors.DRIVER_WRAPPER, "floci"));
+                    container.withEnv(SparkExecutors.SECRET_VARIABLE, secret);
+                }
+                sparkSubmit.add(SPARK_SUBMIT);
+                if (job.executors() != null) {
+                    sparkSubmit.add(String.valueOf(SparkExecutors.optionCount(arguments)));
+                }
+                container.withEntrypoint(unpackingFirst(archives, sparkSubmit))
+                        .withCmd(arguments);
+            } else {
+                container.withEntrypoint(unpackingFirst(archives, List.of("/bin/bash", "-c", COMMAND_WRAPPER, "floci")))
+                        .withCmd(job.command())
+                        .withEnv(SPARK_DEFAULTS_VARIABLE, sparkDefaultsFile(job, endpoint, executorEnvironment));
+            }
+            if (!job.sparkLog4j2().isEmpty()) {
+                container.withEnv(SPARK_LOG4J2_VARIABLE, sparkLog4j2File(job));
+            }
+            if (job.storage() != null) {
+                // A step runs on its cluster's primary node, whose files say so.
+                container.withNamedVolume(job.storage().home(), "/home/hadoop")
+                        .withNamedVolume(job.storage().mnt(), "/mnt")
+                        .withEnv(INSTANCE_ROLE_VARIABLE, "MASTER");
+                // The primary node's name leads to its HDFS, as the cluster's DNS resolves it.
+                if (job.storage().hdfsHost() != null) {
+                    container.withExtraHost(job.storage().hdfsHost(), job.storage().hdfsAddress());
+                }
+            }
+            // Hive's settings reach it as --hiveconf settings, so only a Spark job's container sets up Hadoop.
+            if (job.storage() != null && job.engine() == Engine.SPARK) {
+                container.withEnv(HADOOP_SITE_VARIABLE, hadoopSite(job, endpoint))
+                        .withEnv(MAPRED_SITE_VARIABLE, mapredSite(job, executorEnvironment));
+                if (onYarn) {
+                    container.withEnv(HADOOP_ROOT_VARIABLE, hadoopRoot(job))
+                            .withEnv(YARN_SITE_VARIABLE, siteProperty("yarn.resourcemanager.hostname",
+                                    job.storage().resourceManager()));
+                }
+                if (job.command() != null) {
+                    container.withEnv(TEZ_SITE_VARIABLE, tezSite(job, executorEnvironment));
+                }
+                if (job.storage() != null && job.storage().replication() > 0) {
+                    container.withEnv(HDFS_SITE_VARIABLE, siteProperty("dfs.replication",
+                            String.valueOf(job.storage().replication())));
+                }
+                if (!job.hadoopLog4j().isEmpty()) {
+                    container.withEnv(HADOOP_LOG4J_VARIABLE, hadoopLog4jFile(job));
+                }
+                if (!job.hadoopEnvironment().isEmpty()) {
+                    container.withEnv(HADOOP_ENV_VARIABLE, hadoopEnvFile(job));
+                }
+            }
+            if (job.listenPort() > 0) {
+                // Reached through Floci alone, so published on the host's loopback interface only.
+                container.withLoopbackPortBinding(job.listenPort(), 0);
+            }
+            if (servesDriverUi(job)) {
+                container.withLoopbackPortBinding(SparkExecutors.DRIVER_UI_PORT, 0);
+                if (job.keepsEventLogs()) {
+                    // Its event logs, where the release's image writes them, in a volume of its own that its Spark
+                    // History Server reads once it has ended; Docker fills a new volume with the image's folder, its
+                    // owner the image's user.
+                    String volume = EmrServerlessHistories.volume(config, job.runId());
+                    lifecycleManager.ensureVolume(volume, EmrServerlessHistories.labels(config, job.runId(),
+                            job.accountId(), job.region(), EmrServerlessHistories.VOLUME_COMPONENT));
+                    container.withNamedVolume(volume, EmrServerlessHistories.EVENT_LOGS);
+                }
+            }
+            ContainerSpec spec = container
+                    .withDockerNetwork(Optional.ofNullable(job.dockerNetwork()))
+                    .withHostDockerInternalOnLinux()
+                    .withEmbeddedDns()
+                    .withLogRotation()
+                    .withLabels(labels)
+                    .withJavaTrustStore()
+                    .build();
+            // For the application's architecture, or the Docker host's own where it names none.
+            String containerId = job.platform() == null ? lifecycleManager.create(spec)
+                    : lifecycleManager.create(spec, job.platform());
+            launch.started(containerId);
+            // A cluster's HDFS is on a network of its own, which only its steps join; on YARN the executors there reach
+            // the driver at the name its container has on it.
+            // With an address there, the cluster's instance metadata relay answers it as the cluster's primary node.
+            if (onYarn) {
+                lifecycleManager.ensureConnected(containerId, job.storage().hdfsNetwork(), driverHost(job),
+                        job.storage().metadataAddress());
+            } else if (job.storage() != null && job.storage().hdfsNetwork() != null) {
+                lifecycleManager.connectToNetwork(containerId, job.storage().hdfsNetwork(),
+                        job.storage().metadataAddress());
+            }
+            // A stop, a reset or a shutdown while the image was pulled, the trust store copied or the archives put
+            // in is read now, before the driver starts; one before an archive or while it streams in puts in no
+            // more of them.
+            BooleanSupplier stopped = () -> launch.stopRequested() || progress.cancelled();
+            putArchives(job, archives, containerId, stopped);
+            if (stopped.getAsBoolean()) {
+                return Outcome.halted();
+            }
+            ContainerLifecycleManager.ContainerInfo info = lifecycleManager.startCreated(containerId, spec);
+            logHandle = attachLog(containerId, job);
+            // Found before the run is told it runs, so that a link to its UI then finds it.
+            ContainerLifecycleManager.EndpointInfo driverUi = servesDriverUi(job)
+                    ? info.getEndpoint(SparkExecutors.DRIVER_UI_PORT) : null;
+            if (driverUi != null) {
+                driverUis.put(job.runId(), driverUi);
+            }
+            progress.started();
+            if (job.listenPort() > 0) {
+                ContainerLifecycleManager.EndpointInfo listening = info.getEndpoint(job.listenPort());
+                progress.listening(listening.host(), listening.port());
+            }
+            if (job.executors() != null) {
+                capacity = joinCapacity(job.executors().application());
+                executors = new SparkExecutors(job.executors(), driver(containerId),
+                        executorContainers(job, executorImage, network,
+                                lifecycleManager.resolveContainerNetworkIp(containerId, network), secret,
+                                awsEnvironment, labels),
+                        capacity, System::nanoTime);
+            }
+            Outcome outcome = awaitEnd(containerId, job, launch, progress, executors);
+            writeLogs(job, launch);
+            return outcome;
+        } catch (InterruptedException e) {
+            // Floci is shutting down: its teardown stops the driver.
+            Thread.currentThread().interrupt();
+            return Outcome.halted();
+        } catch (RuntimeException e) {
+            if (launch.stopRequested()) {
+                // A reset removed the driver while it was being watched.
+                return Outcome.halted();
+            }
+            LOG.warnv(e, "Spark run {0} of {1} could not run", job.runId(), job.service());
+            return Outcome.couldNotStart(e.getMessage());
+        } finally {
+            driverUis.remove(job.runId());
+            interrupts.remove(job.runId());
+            // The executors go with their driver, however the run ended, and their workers' share of the
+            // application's capacity with them.
+            if (executors != null) {
+                executors.removeAll();
+                progress.executorsRan(executors.lifetimes());
+            }
+            if (capacity != null) {
+                leaveCapacity(job.executors().application(), capacity);
+            }
+            String unclaimed = launches.end(job.runId(), launch);
+            if (unclaimed != null) {
+                killInterruptible(job, unclaimed);
+                lifecycleManager.stopAndRemove(unclaimed, logHandle, STOP_TIMEOUT_SECONDS);
+            } else if (logHandle != null) {
+                // Floci's teardown claimed the driver, but the log stream is still this run's to close.
+                lifecycleManager.closeLogStreamAfterContainerStop(logHandle);
+            }
+            credentials.ifPresent(session -> roleCredentials.unregister(job.accountId(), session.accessKeyId()));
+        }
+    }
+
+    @Override
+    public Optional<ContainerLifecycleManager.EndpointInfo> driverUi(String runId) {
+        return Optional.ofNullable(driverUis.get(runId));
+    }
+
+    @Override
+    public boolean servesDriverUis(String dockerNetwork) {
+        return ownNetwork(containerBuilder.resolveDockerNetwork(Optional.ofNullable(dockerNetwork)).orElse(null));
+    }
+
+    /**
+     * Whether a job's driver serves its Spark UI for Floci to open: an EMR Serverless Spark run's or session's, which
+     * GetDashboardForJobRun and GetResourceDashboard link to while it runs, on a network where its container has an
+     * address of its own, as on the host's network every driver's UI would be on the host's port. The release's image
+     * turns the UI off ({@code spark.ui.enabled false} in its {@code spark-defaults}); a run's own settings may still
+     * do so.
+     */
+    static boolean servesDriverUi(Job job) {
+        return EmrServerlessJobRunService.SERVICE.equals(job.service()) && job.engine() == Engine.SPARK
+                && ownNetwork(job.dockerNetwork());
+    }
+
+    @Override
+    public void stop(String runId) {
+        ContainerLaunches.Launch launch = launches.get(runId);
+        if (launch != null) {
+            // run() reads it once the driver's container is up and at each look at the driver after, and
+            // removes the driver itself: a stop makes no Docker call, so no Docker error can lose it.
+            launch.requestStop();
+        }
+    }
+
+    /**
+     * Asks the thread watching the run's running driver to send its container SIGTERM, which the container's init
+     * process passes on to the driver ({@link Job#asInterruptible}), and to let the run end as the driver does. Like
+     * {@link #stop}, it makes no Docker call, so the caller is never held up by Docker. A run whose driver has not
+     * started yet is not interrupted here: its caller reports it cancelled until then.
+     */
+    @Override
+    public void interrupt(String runId) {
+        if (launches.get(runId) != null) {
+            interrupts.add(runId);
+        }
+    }
+
+    // Sends the driver's container SIGTERM; one Docker cannot send it to is stopped instead, so the run still ends.
+    private void sendSigterm(String containerId, Job job, ContainerLaunches.Launch launch) {
+        try {
+            lifecycleManager.getDockerClient().killContainerCmd(containerId).withSignal("SIGTERM").exec();
+        } catch (NotFoundException | ConflictException e) {
+            // Gone, or no longer running: the next look finds it ended.
+        } catch (RuntimeException e) {
+            LOG.warnv(e, "Could not send SIGTERM to the driver of Spark run {0}; stopping it", job.runId());
+            launch.requestStop();
+        }
+    }
+
+    /**
+     * Sends an interruptible job's driver container SIGKILL, where it still runs, before it is stopped: Docker's stop
+     * sends SIGTERM first, which the container's init process passes on to the driver, so a driver stopped at once
+     * would get a SIGTERM to handle ({@link Job#asInterruptible}).
+     */
+    private void killInterruptible(Job job, String containerId) {
+        if (!job.interruptible()) {
+            return;
+        }
+        try {
+            lifecycleManager.getDockerClient().killContainerCmd(containerId).exec();
+        } catch (NotFoundException | ConflictException e) {
+            // Gone, or no longer running: nothing to kill.
+        } catch (RuntimeException e) {
+            // Docker's stop that follows sends SIGKILL at its end anyway.
+            LOG.warnv(e, "Could not kill the driver of Spark run {0}", job.runId());
+        }
+    }
+
+    /**
+     * Stops every run inside {@link #run}, so a reset or a shutdown orphans none: a running driver is
+     * stopped and removed now, and one whose image is still being pulled as soon as its container is up.
+     */
+    @Override
+    public void stopManagedContainers() {
+        launches.stopAll(lifecycleManager, STOP_TIMEOUT_SECONDS);
+    }
+
+    /**
+     * Removes the drivers of {@code service}'s runs an earlier Floci process left running, which no thread
+     * follows any more: their runs are {@code FAILED} once read, so nothing would ever stop them. The
+     * service calls this before it hands a run to {@link #run}, so every driver of this deployment it
+     * finds is a leftover.
+     */
+    @Override
+    public void removeLeftoverDrivers(String service) {
+        String owner = ContainerStorageHelper.ownerIdentity(config);
+        ContainerStorageHelper.LabelAliases aliases = ContainerStorageHelper.CONTAINER_LABEL_ALIASES;
+        try {
+            List<Container> containers = aliases.listByLabels(
+                    Map.of(ContainerStorageHelper.SERVICE_LABEL, service, ContainerStorageHelper.OWNER_LABEL, owner),
+                    filter -> lifecycleManager.getDockerClient().listContainersCmd()
+                            .withShowAll(true)
+                            .withLabelFilter(filter)
+                            .exec(),
+                    Container::getId);
+            for (Container container : containers) {
+                Map<String, String> labels = container.getLabels() != null ? container.getLabels() : Map.of();
+                // A live EMR cluster's HDFS, which its storage keeps, carries the service's labels too.
+                String component = labels.get(ContainerStorageHelper.COMPONENT_LABEL);
+                if (Storage.HDFS_COMPONENT.equals(component) || Storage.NODE_COMPONENT.equals(component)) {
+                    continue;
+                }
+                if (aliases.consistent(container.getId(), labels)
+                        && aliases.matches(labels, ContainerStorageHelper.OWNER_LABEL, owner)) {
+                    lifecycleManager.removeIfExists(container.getId());
+                    LOG.infov("Removed {0} Spark {1} {2}, left running by an earlier Floci process", service,
+                            SparkExecutors.COMPONENT.equals(component) ? "executor" : "driver", container.getId());
+                }
+            }
+        } catch (RuntimeException e) {
+            LOG.warnv("Could not remove the {0} Spark drivers an earlier Floci process left: {1}", service,
+                    e.getMessage());
+        }
+    }
+
+    @Override
+    public void removeLeftoverDriver(String service, String runId) {
+        if (launches.get(runId) != null) {
+            return;
+        }
+        try {
+            lifecycleManager.findByName(ContainerStorageHelper.dockerName(config, service + "-" + runId))
+                    .ifPresent(container -> {
+                        lifecycleManager.removeIfExists(container.getId());
+                        LOG.infov("Removed {0} Spark driver {1} of {2}, left running by an earlier Floci process",
+                                service, container.getId(), runId);
+                    });
+        } catch (RuntimeException e) {
+            LOG.warnv("Could not remove the {0} Spark driver of {1} an earlier Floci process left: {2}", service,
+                    runId, e.getMessage());
+        }
+    }
+
+    // Floci's log always gets the driver's output, and the job's CloudWatch log streams too when it has some.
+    private Closeable attachLog(String containerId, Job job) {
+        String prefix = job.service() + ":" + job.runId();
+        CloudWatchLogs cloudWatch = job.cloudWatchLogs();
+        if (cloudWatch == null) {
+            return logStreamer.attachConsoleOnly(containerId, prefix);
+        }
+        return logStreamer.attachByStreamForAccount(job.accountId(), containerId, cloudWatch.logGroup(),
+                cloudWatch.stdoutStream(), cloudWatch.stderrStream(), job.region(), prefix);
+    }
+
+    /**
+     * The folder {@code path} names under {@code logUri}, the S3 location a service writes its logs to, or
+     * null when there is none: {@code path} follows {@code logUri} after one slash, whether or not
+     * {@code logUri} ends in one.
+     */
+    public static String logFolder(String logUri, String path) {
+        if (logUri == null || logUri.isBlank()) {
+            return null;
+        }
+        int end = logUri.length();
+        while (end > 0 && logUri.charAt(end - 1) == '/') {
+            end--;
+        }
+        return logUri.substring(0, end) + "/" + path;
+    }
+
+    /**
+     * Puts a process's gzipped standard output and error at {@code stdout.gz} and {@code stderr.gz} in
+     * {@code folder}, an S3 folder ending in a slash, in any of the Hadoop schemes, as {@code accountId} in
+     * {@code region}.
+     */
+    public static void putLogs(S3Service s3Service, String accountId, String region, String folder, byte[] stdout,
+                               byte[] stderr) {
+        putLogs(s3Service, accountId, region, folder, new ByteArrayInputStream(stdout),
+                new ByteArrayInputStream(stderr));
+    }
+
+    /** As the other {@code putLogs} does, with each file read from a stream, so it need not be held in memory. */
+    public static void putLogs(S3Service s3Service, String accountId, String region, String folder,
+                               InputStream stdout, InputStream stderr) {
+        S3Uri location = S3Uri.parseAnyScheme(folder);
+        RequestScopes.runAs(accountId, region, () -> {
+            s3Service.putObjectFromStream(location.bucket(), location.key() + "stdout.gz", stdout, GZIP, Map.of());
+            s3Service.putObjectFromStream(location.bucket(), location.key() + "stderr.gz", stderr, GZIP, Map.of());
+        });
+    }
+
+    /** Puts one gzipped log, read from {@code gzipped}, at {@code key} in {@code bucket}, as {@code accountId}. */
+    public static void putLog(S3Service s3Service, String accountId, String region, String bucket, String key,
+                              InputStream gzipped) {
+        RequestScopes.runAs(accountId, region,
+                () -> s3Service.putObjectFromStream(bucket, key, gzipped, GZIP, Map.of()));
+    }
+
+    /**
+     * The image a release's Spark runs use: {@code imageTemplate}, with {@code %s} standing for the release
+     * label, or, when it is null, the release's public EMR Serverless image.
+     */
+    public static String image(String imageTemplate, String releaseLabel) {
+        return image(imageTemplate, releaseLabel, Engine.SPARK);
+    }
+
+    /** The image a release's runs on {@code engine} use, as the other {@code image} says, Hive's for Hive. */
+    public static String image(String imageTemplate, String releaseLabel, Engine engine) {
+        String template = imageTemplate != null ? imageTemplate
+                : engine == Engine.HIVE ? HIVE_DEFAULT_IMAGE
+                : sparkRuntime(releaseLabel) ? SPARK_RUNTIME_DEFAULT_IMAGE : DEFAULT_IMAGE;
+        return template.formatted(releaseLabel);
+    }
+
+    /** Whether {@code releaseLabel} is a release of the AWS runtime for Apache Spark, emr-spark-8.0.0 on. */
+    public static boolean sparkRuntime(String releaseLabel) {
+        return releaseLabel.startsWith("emr-spark-");
+    }
+
+    /** A driver's environment: Floci's own variables, then the job's, one of which replaces Floci's of its name. */
+    static List<String> environment(List<String> flocis, Map<String, String> jobs) {
+        Map<String, String> byName = new LinkedHashMap<>();
+        for (String variable : flocis) {
+            int equals = variable.indexOf('=');
+            byName.put(equals < 0 ? variable : variable.substring(0, equals), variable);
+        }
+        jobs.forEach((name, value) -> byName.put(name, name + "=" + value));
+        return new ArrayList<>(byName.values());
+    }
+
+    /**
+     * A job's archives in S3, which its driver finds in its working directory: each with the file it is put at, in
+     * a folder of its own, and the directory it is unpacked to, named as Spark names it, by what follows its
+     * {@code #} or else by its file's name. Spark alone unpacks the others, into its own files folder.
+     */
+    static List<Archive> archives(Job job) {
+        List<Archive> archives = new ArrayList<>();
+        for (String archive : job.archives()) {
+            int hash = archive.indexOf('#');
+            String path = hash < 0 ? archive : archive.substring(0, hash);
+            if (!S3Uri.isS3(path)) {
+                continue;
+            }
+            S3Uri location = S3Uri.parseAnyScheme(path);
+            String name = location.key().substring(location.key().lastIndexOf('/') + 1);
+            if (name.isEmpty()) {
+                throw new IllegalArgumentException("The archive " + archive + " names no object.");
+            }
+            String file = ARCHIVES_FOLDER + "/" + (archives.size() + 1) + "/" + name;
+            archives.add(new Archive(path, location, file, hash < 0 ? name : archive.substring(hash + 1)));
+        }
+        return archives;
+    }
+
+    /** {@code entrypoint}, after the wrapper that unpacks {@code archives} into the working directory, if any. */
+    static List<String> unpackingFirst(List<Archive> archives, List<String> entrypoint) {
+        if (archives.isEmpty()) {
+            return entrypoint;
+        }
+        // bash -c's script gets "floci" as its $0, then each archive's file and directory, "--" and the entrypoint.
+        List<String> unpacking = new ArrayList<>(List.of("/bin/bash", "-c", ARCHIVES_WRAPPER, "floci"));
+        for (Archive archive : archives) {
+            unpacking.add(archive.file());
+            unpacking.add(archive.directory());
+        }
+        unpacking.add("--");
+        unpacking.addAll(entrypoint);
+        return unpacking;
+    }
+
+    /**
+     * Whether a job's executors run in containers of their own: an EMR Serverless Spark run's that says so, on a
+     * network of containers; on the host's, or in another container's namespace, the executors' and the master's
+     * ports would meet another run's, so they run in the driver's container.
+     */
+    static boolean executorsApart(Job job, String network) {
+        return job.executors() != null && job.engine() == Engine.SPARK && job.command() == null
+                && job.storage() == null && ownNetwork(network);
+    }
+
+    // Whether a container on the network has an address of its own, rather than the host's or another container's.
+    private static boolean ownNetwork(String network) {
+        return !"host".equals(network) && (network == null || !network.startsWith("container:"));
+    }
+
+    private static String newSecret() {
+        byte[] secret = new byte[32];
+        SECRETS.nextBytes(secret);
+        return HexFormat.of().formatHex(secret);
+    }
+
+    // The capacity an application's runs share, which a run joins when its driver starts; a run of no application
+    // shares it with none.
+    SparkExecutors.Capacity joinCapacity(String application) {
+        if (application == null) {
+            return new SparkExecutors.Capacity().joined();
+        }
+        return capacities.compute(application,
+                (key, shared) -> (shared != null ? shared : new SparkExecutors.Capacity()).joined());
+    }
+
+    // A run leaves the capacity it shared, which goes once no run shares it.
+    void leaveCapacity(String application, SparkExecutors.Capacity capacity) {
+        if (application == null) {
+            return;
+        }
+        capacities.computeIfPresent(application, (key, shared) -> shared == capacity && shared.left() ? null : shared);
+    }
+
+    // The driver's container, answering through curl in it, which every EMR Serverless image has, or nothing, as
+    // when the container has just ended.
+    SparkExecutors.Driver driver(String containerId) {
+        return (port, path) -> {
+            try {
+                ContainerExec.Result result = ContainerExec.run(lifecycleManager.getDockerClient(), containerId,
+                        new String[]{"curl", "-sf", "-m", "2", "http://127.0.0.1:" + port + path}, 5);
+                return result.exitCode() == 0 ? result.stdout() : null;
+            } catch (RuntimeException e) {
+                LOG.debugv("Could not ask the driver in container {0}: {1}", containerId, e.getMessage());
+                return null;
+            }
+        };
+    }
+
+    // The image a job's executors run in: the application's for its executors, pulled for every run as the driver's
+    // custom image is, else the release's, pulled when missing, as a driver with a custom image does not pull it.
+    private String executorImage(Job job, Progress progress) {
+        if (job.executors().image() == null) {
+            return lifecycleManager.resolveImageForLaunch(image(job.imageTemplate(), job.releaseLabel(), Engine.SPARK),
+                    ImagePullBehavior.PREFER_CACHED, job.platform()).imageId();
+        }
+        return customImageForLaunch(job, WorkerType.EXECUTOR, job.executors().image(), progress);
+    }
+
+    /**
+     * A job's executors' containers: each a standalone worker, named after the run and its number, on the driver's
+     * network, which finds the master at the driver's address, with the run's secret, the AWS environment the driver
+     * has but for its own variables, Floci's trust store, and the driver's labels, so a reset and the leftover sweep
+     * find it as they find the driver.
+     */
+    SparkExecutors.Containers executorContainers(Job job, String image, String network, String driverAddress,
+                                                 String secret, List<String> awsEnvironment,
+                                                 Map<String, String> driverLabels) {
+        Map<String, String> labels = new LinkedHashMap<>(driverLabels);
+        labels.put(ContainerStorageHelper.COMPONENT_LABEL, SparkExecutors.COMPONENT);
+        return new SparkExecutors.Containers() {
+            @Override
+            public SparkExecutors.Worker start(int index, SparkExecutors.Size size) {
+                ContainerSpec spec = containerBuilder.newContainer(image)
+                        .withName(ContainerStorageHelper.dockerName(config,
+                                job.service() + "-" + job.runId() + "-executor-" + index))
+                        .withEnv(awsEnvironment)
+                        .withEnv(SparkExecutors.SECRET_VARIABLE, secret)
+                        .withEnv(SparkExecutors.MASTER_VARIABLE, driverAddress)
+                        .withEnv(SparkExecutors.CORES_VARIABLE, String.valueOf(size.cores()))
+                        .withEnv(SparkExecutors.MEMORY_VARIABLE, String.valueOf(size.memoryMib()))
+                        .withEntrypoint(List.of("/bin/bash", "-c", SparkExecutors.WORKER_SCRIPT))
+                        .withDockerNetwork(Optional.ofNullable(job.dockerNetwork()))
+                        .withHostDockerInternalOnLinux()
+                        .withEmbeddedDns()
+                        .withLogRotation()
+                        .withLabels(labels)
+                        .withJavaTrustStore()
+                        .build();
+                String containerId = (job.platform() == null ? lifecycleManager.createAndStart(spec)
+                        : lifecycleManager.createAndStart(spec, job.platform())).containerId();
+                try {
+                    return new SparkExecutors.Worker(containerId,
+                            lifecycleManager.resolveContainerNetworkIp(containerId, network));
+                } catch (RuntimeException e) {
+                    // Not yet the run's to remove, so removed here.
+                    try {
+                        lifecycleManager.stopAndRemove(containerId, null, STOP_TIMEOUT_SECONDS);
+                    } catch (RuntimeException removal) {
+                        e.addSuppressed(removal);
+                    }
+                    throw e;
+                }
+            }
+
+            @Override
+            public boolean running(String containerId) {
+                return lifecycleManager.probeContainer(containerId) != ContainerLiveness.NOT_RUNNING;
+            }
+
+            @Override
+            public void remove(String containerId) {
+                lifecycleManager.stopAndRemove(containerId, null, STOP_TIMEOUT_SECONDS);
+            }
+        };
+    }
+
+    /**
+     * The image a run's driver starts from: the release's, or the template's, or the application's custom
+     * image. A custom image's ECR URI leads to Floci's own registry, as a Lambda function's or an ECS task's
+     * does, and the image is pulled for every run, as an ECS task's is, so a tag pushed again is what the next
+     * run gets ("New workloads submitted after the update automatically will use the new image"). The driver
+     * starts from the image id that pull resolved, which a later push cannot move. Either is pulled for the run's
+     * platform, its application's architecture.
+     */
+    private String launchImage(Job job, Progress progress) {
+        if (job.customImage() == null) {
+            return image(job.imageTemplate(), job.releaseLabel(), job.engine());
+        }
+        return customImageForLaunch(job, WorkerType.DRIVER, job.customImage(), progress);
+    }
+
+    /**
+     * The image id a custom image resolves to for this run's {@code workerType}, pulled from Floci's own registry for
+     * the run's platform, {@code progress} told its manifest digest, which GetJobRun reports: "To identify which image
+     * version each job is running, the GetJobRun API response returns the resolvedImageDigest for that specific job".
+     * An image the registry holds no digest for, one never pulled from or pushed to it, reports none.
+     */
+    private String customImageForLaunch(Job job, WorkerType workerType, String customImage, Progress progress) {
+        String image = containerBuilder.resolveImage(ecrRegistryManager.rewriteImageUri(customImage));
+        LaunchImage launched;
+        if (config.services().iam().enforcementEnabled() && "emr-serverless".equals(job.service())
+                && EcrRegistryManager.ecrImage(image).isPresent()) {
+            if (imagePulls == null || !AwsArnUtils.isArnFor(job.imagePullSourceArn(), "emr-serverless")) {
+                throw new AwsException("AccessDeniedException", "The application's image-pull identity is unavailable", 403);
+            }
+            AwsArnUtils.Arn source = AwsArnUtils.parse(job.imagePullSourceArn());
+            if (!source.accountId().equals(job.accountId()) || !source.region().equals(job.region())) {
+                throw new AwsException("AccessDeniedException", "The application's image-pull identity is unavailable", 403);
+            }
+            launched = imagePulls.withEmrServerlessPull(image, job.imagePullSourceArn(),
+                    credentials -> lifecycleManager.resolveImageForLaunch(
+                            image, ImagePullBehavior.DEFAULT, job.platform(), credentials));
+        } else {
+            launched = lifecycleManager.resolveImageForLaunch(image, ImagePullBehavior.DEFAULT, job.platform());
+        }
+        if (launched.manifestDigest() != null) {
+            progress.imageResolved(workerType, launched.manifestDigest());
+        }
+        return launched.imageId();
+    }
+
+    /**
+     * Puts each archive in the created container, for its entrypoint to unpack: read from Floci's S3 as the run's
+     * account and streamed in, so Floci holds little of it however large it is. One that cannot be read fails
+     * the run, naming it. Once the run is {@code stopped}, no other archive is put in, and the one streaming in
+     * stops, leaving run() to read the stop.
+     */
+    private void putArchives(Job job, List<Archive> archives, String containerId, BooleanSupplier stopped) {
+        for (Archive archive : archives) {
+            if (stopped.getAsBoolean()) {
+                return;
+            }
+            S3Uri location = archive.location();
+            try {
+                RequestScopes.runAs(job.accountId(), job.region(),
+                        () -> s3Service.headObject(location.bucket(), location.key()));
+            } catch (AwsException e) {
+                throw new IllegalArgumentException(
+                        "Could not read the archive " + archive.path() + ": " + e.getMessage(), e);
+            }
+            try {
+                // Extracted at the root, the entry is the file's path without its leading slash.
+                RetryingTarCopier.copyStreamed(lifecycleManager.getDockerClient(), containerId, "/", archive.path(),
+                        out -> {
+                            try (S3Service.ObjectRead read = RequestScopes.callAs(job.accountId(), job.region(),
+                                    () -> s3Service.openObject(location.bucket(), location.key(), null));
+                                 TarArchiveOutputStream tar = RetryingTarCopier.newTarStream(out)) {
+                                TarArchiveEntry entry = new TarArchiveEntry(archive.file().substring(1));
+                                entry.setSize(read.object().getSize());
+                                entry.setMode(0644);
+                                tar.putArchiveEntry(entry);
+                                transferUntilStopped(read.body(), tar, stopped);
+                                tar.closeArchiveEntry();
+                            }
+                        });
+            } catch (RuntimeException e) {
+                // A copy the stop ended, or one whose container a reset removed.
+                if (stopped.getAsBoolean()) {
+                    return;
+                }
+                throw e;
+            }
+        }
+    }
+
+    /** Copies {@code in} to {@code out}, failing once the run is {@code stopped}, as looked at each few MiB. */
+    private static void transferUntilStopped(InputStream in, OutputStream out, BooleanSupplier stopped)
+            throws IOException {
+        byte[] buffer = new byte[ARCHIVE_BUFFER_BYTES];
+        long sinceLook = 0;
+        for (int read = in.read(buffer); read >= 0; read = in.read(buffer)) {
+            out.write(buffer, 0, read);
+            sinceLook += read;
+            if (sinceLook >= STOP_LOOK_BYTES) {
+                sinceLook = 0;
+                if (stopped.getAsBoolean()) {
+                    throw new IOException("the job run was stopped");
+                }
+            }
+        }
+    }
+
+    /** {@link #sparkSubmitArguments(Job, String, List)} for a job whose executors run in its driver's JVM. */
+    static List<String> sparkSubmitArguments(Job job, String flociEndpoint) {
+        return sparkSubmitArguments(job, flociEndpoint, List.of());
+    }
+
+    /**
+     * {@code spark-submit}'s arguments: local mode, or YARN for a step on its cluster's (see {@link #yarnSettings}),
+     * or, for a run whose executors run in containers of their own, no master, which the driver's container gives
+     * after the run's own options with what no run may change ({@link SparkExecutors#DRIVER_WRAPPER}), and the
+     * driver's UI on, which Floci follows the driver through,
+     * S3A on Floci's S3 for {@code s3://} and {@code s3a://}
+     * paths, the cluster's HDFS for {@code hdfs://} paths and those without a scheme on a step, then the run's
+     * {@code spark-defaults} and its own options, which win over what comes before them, then its
+     * application and that application's arguments. Before release 7.10.0
+     * {@code s3://} is EMRFS, which ignores the endpoint setting, so it is switched to S3A. S3A writes
+     * are committed through commit data the writer keeps in memory, without which EMR's committer finds
+     * none and a write is silently lost.
+     */
+    static List<String> sparkSubmitArguments(Job job, String flociEndpoint, List<String> executorEnvironment) {
+        List<String> arguments = new ArrayList<>();
+        if (job.executors() == null) {
+            arguments.addAll(List.of("--master", master(job)));
+        }
+        for (SparkSetting setting : sparkSettings(job, flociEndpoint, executorEnvironment)) {
+            conf(arguments, setting.key(), setting.value());
+        }
+        arguments.addAll(job.application());
+        return arguments;
+    }
+
+    /** {@link #sparkDefaultsFile(Job, String, List)} for a job whose executors run in its driver's JVM. */
+    static String sparkDefaultsFile(Job job, String flociEndpoint) {
+        return sparkDefaultsFile(job, flociEndpoint, List.of());
+    }
+
+    /**
+     * The {@code spark-defaults.conf} lines a command's own {@code spark-submit} runs with: local mode, or YARN, then
+     * the settings {@link #sparkSubmitArguments} passes, a later line winning over an earlier one, and the
+     * submit's own options over them all. Spark reads the file as a {@code Properties} file, so each
+     * key and value is escaped for it, to reach Spark as the job gave it.
+     */
+    static String sparkDefaultsFile(Job job, String flociEndpoint, List<String> executorEnvironment) {
+        StringBuilder file = new StringBuilder("spark.master " + master(job));
+        for (SparkSetting setting : sparkSettings(job, flociEndpoint, executorEnvironment)) {
+            file.append('\n').append(propertiesEscaped(setting.key(), true)).append(' ')
+                    .append(propertiesEscaped(String.valueOf(setting.value()), false));
+        }
+        return file.toString();
+    }
+
+    /**
+     * {@code hive}'s arguments: Floci's S3 and Glue, as a Spark run gets them, Tez on its cluster's YARN, whose
+     * containers get {@code executorEnvironment} as Spark's executors do, or else in local mode, and on a cluster its
+     * HDFS and metastore, each a {@code --hiveconf}, which a later one replaces, then the run's own arguments.
+     */
+    static List<String> hiveArguments(Job job, String flociEndpoint, List<String> executorEnvironment) {
+        List<SparkSetting> settings = new ArrayList<>(hadoopSettings(job, flociEndpoint));
+        settings.addAll(onYarn(job) ? hiveOnYarnSettings(job, executorEnvironment) : HIVE_SETTINGS);
+        if (job.storage() != null) {
+            settings.addAll(hdfsSettings(job.storage()));
+            settings.addAll(hiveClusterSettings(job.storage()));
+        }
+        List<String> arguments = new ArrayList<>();
+        for (SparkSetting setting : settings) {
+            addHiveSetting(arguments, setting.key(), setting.value());
+        }
+        arguments.addAll(job.application());
+        return arguments;
+    }
+
+    /** Each of {@code properties} as {@code hive}'s {@code --hiveconf name=value}, in their order. */
+    public static List<String> hiveSettings(Map<String, String> properties) {
+        List<String> arguments = new ArrayList<>();
+        properties.forEach((name, value) -> addHiveSetting(arguments, name, value));
+        return arguments;
+    }
+
+    private static void addHiveSetting(List<String> arguments, String name, String value) {
+        arguments.add(HIVECONF_OPTION);
+        arguments.add(name + "=" + value);
+    }
+
+    /**
+     * The local folder Tez in local mode needs for a Hive session's staging folder, or null when there is none to make:
+     * where the path of {@code hive}'s scratch folder, the last {@code hive.exec.scratchdir} its arguments set, leads
+     * on the local file system, when that folder is in S3, then the folder of the user Hive runs as, which Hive puts
+     * the session's folders in. Hive's default scratch folder is local already. The path is the container's, so it is
+     * built with {@code /} whatever Floci runs on, normalized as Hadoop normalizes the staging folder's.
+     * <p>
+     * Hive's CLI takes a setting as {@code --hiveconf name=value} or {@code --hiveconf=name=value}, with one dash or
+     * two, and a setting without an {@code =} takes its value from the next argument, unless that is an option.
+     */
+    static String hiveScratchMirror(List<String> hiveArguments) {
+        String scratch = null;
+        for (int i = 0; i < hiveArguments.size(); i++) {
+            String argument = hiveArguments.get(i);
+            String setting = null;
+            if (argument.startsWith(HIVECONF_OPTION + "=") || argument.startsWith(HIVECONF_SHORT_OPTION + "=")) {
+                setting = argument.substring(argument.indexOf('=') + 1);
+            } else if ((HIVECONF_OPTION.equals(argument) || HIVECONF_SHORT_OPTION.equals(argument))
+                    && i + 1 < hiveArguments.size()) {
+                setting = hiveArguments.get(++i);
+            }
+            if (HIVE_SCRATCHDIR.equals(setting)) {
+                boolean valued = i + 1 < hiveArguments.size() && !hiveArguments.get(i + 1).startsWith("-");
+                scratch = valued ? hiveArguments.get(++i) : null;
+            } else if (setting != null && setting.startsWith(HIVE_SCRATCHDIR + "=")) {
+                scratch = setting.substring(HIVE_SCRATCHDIR.length() + 1);
+            }
+        }
+        if (scratch == null || !S3Uri.isS3(scratch)) {
+            return null;
+        }
+        Deque<String> segments = new ArrayDeque<>();
+        for (String segment : (S3Uri.parseAnyScheme(scratch).key() + "/" + IMAGE_USER).split("/")) {
+            if ("..".equals(segment)) {
+                segments.pollLast();
+            } else if (!segment.isEmpty() && !".".equals(segment)) {
+                segments.addLast(segment);
+            }
+        }
+        return "/" + String.join("/", segments);
+    }
+
+    /**
+     * The {@code core-site.xml} properties a step's {@code hadoop} command gets: Floci's S3 and Glue, as its
+     * {@code spark-submit} gets them, its cluster's HDFS, then the job's {@code core-site}, which wins, as a
+     * later property does in one file.
+     */
+    static String hadoopSite(Job job, String flociEndpoint) {
+        List<SparkSetting> settings = new ArrayList<>(hadoopSettings(job, flociEndpoint));
+        settings.addAll(onYarn(job) ? yarnJobHdfsSettings(job.storage()) : localJobHdfsSettings(job.storage()));
+        List<String> properties = new ArrayList<>();
+        for (SparkSetting setting : settings) {
+            properties.add(siteProperty(setting.key(), setting.value()));
+        }
+        job.coreSite().forEach((name, value) -> properties.add(siteProperty(name, value)));
+        return String.join("\n", properties);
+    }
+
+    /**
+     * The lines a job's Spark gets after those of its configuration's {@code log4j2.properties}, which Log4j
+     * reads as a {@code Properties} file, so each key and value is escaped for it.
+     */
+    static String sparkLog4j2File(Job job) {
+        return propertiesLines(job.sparkLog4j2());
+    }
+
+    /**
+     * The {@code mapred-site.xml} properties a step's MapReduce gets. On its cluster's YARN, Floci's settings for that,
+     * whose containers get {@code executorEnvironment} as Spark's executors do, then its cluster's {@code mapred-site},
+     * which replaces them; where there is no YARN to run a job on, its cluster's {@code mapred-site}, then Floci's local
+     * mode and staging folder, which win.
+     */
+    static String mapredSite(Job job, List<String> executorEnvironment) {
+        List<String> properties = new ArrayList<>();
+        if (onYarn(job)) {
+            yarnMapReduceSettings(job, executorEnvironment)
+                    .forEach(setting -> properties.add(siteProperty(setting.key(), setting.value())));
+            job.mapredSite().forEach((name, value) -> properties.add(siteProperty(name, value)));
+            return String.join("\n", properties);
+        }
+        job.mapredSite().forEach((name, value) -> properties.add(siteProperty(name, value)));
+        properties.add(MAPRED_SITE);
+        return String.join("\n", properties);
+    }
+
+    // A MapReduce job on the cluster's YARN: its application master and tasks find Hadoop in the nodes' layout, which
+    // yarn.application.classpath's default does not name, and S3A's AWS SDK, reach Floci with the step's AWS environment,
+    // and are sized for a NodeManager as Spark's executors are. The image's core-site.xml names the LZO codec, so its
+    // jars come too. Its client asks the cluster's JobHistory server about it once its application master has ended.
+    private static List<SparkSetting> yarnMapReduceSettings(Job job, List<String> executorEnvironment) {
+        String root = hadoopRoot(job);
+        List<String> classPath = new ArrayList<>(hadoopLayout(root));
+        classPath.addAll(AWS_SDK_JARS);
+        String environment = containerEnvironment(executorEnvironment,
+                "HADOOP_MAPRED_HOME=" + root + "/hadoop-mapreduce");
+        return List.of(
+                new SparkSetting("mapreduce.framework.name", "yarn"),
+                new SparkSetting("mapreduce.application.classpath", String.join(",", classPath)),
+                new SparkSetting("yarn.app.mapreduce.am.env", environment),
+                new SparkSetting("mapreduce.map.env", environment),
+                new SparkSetting("mapreduce.reduce.env", environment),
+                new SparkSetting("yarn.app.mapreduce.am.resource.mb", "1024"),
+                new SparkSetting("mapreduce.map.memory.mb", "768"),
+                new SparkSetting("mapreduce.reduce.memory.mb", "768"),
+                jobHistory(job), jobHistoryWeb(job));
+    }
+
+    // The cluster's MapReduce JobHistory server on its primary node, which a MapReduce job's client asks about it once
+    // its application master has ended, and its web pages.
+    private static SparkSetting jobHistory(Job job) {
+        return new SparkSetting("mapreduce.jobhistory.address",
+                job.storage().resourceManager() + ":" + JOB_HISTORY_PORT);
+    }
+
+    private static SparkSetting jobHistoryWeb(Job job) {
+        return new SparkSetting("mapreduce.jobhistory.webapp.address",
+                job.storage().resourceManager() + ":" + JOB_HISTORY_WEB_PORT);
+    }
+
+    /**
+     * The {@code tez-site.xml} properties a step's command gets, so that Tez, which Pig runs a script on by default,
+     * runs its DAGs on its cluster's YARN, as Hive's does there, or, where there is no YARN to run them on, in the JVM
+     * that starts them, without the jars a YARN container is given.
+     */
+    static String tezSite(Job job, List<String> executorEnvironment) {
+        List<SparkSetting> settings = new ArrayList<>();
+        if (onYarn(job)) {
+            settings.addAll(tezOnYarnSettings(job, executorEnvironment, List.of()));
+            settings.add(new SparkSetting("tez.task.resource.memory.mb", "768"));
+        } else {
+            settings.addAll(TEZ_LOCAL_SETTINGS);
+        }
+        List<String> properties = new ArrayList<>();
+        settings.forEach(setting -> properties.add(siteProperty(setting.key(), setting.value())));
+        return String.join("\n", properties);
+    }
+
+    // Hive's Tez on the cluster's YARN, sized as its tasks are by Hive's own settings: a task's two virtual cores never
+    // match the one YARN's default scheduler grants, so Tez would give each container back. A query that runs MapReduce
+    // instead, its hive.execution.engine set to mr, asks the cluster's JobHistory server about its jobs.
+    private static List<SparkSetting> hiveOnYarnSettings(Job job, List<String> executorEnvironment) {
+        String root = hadoopRoot(job);
+        List<SparkSetting> settings = new ArrayList<>(tezOnYarnSettings(job, executorEnvironment,
+                List.of(root + "/hive/lib/hive-exec.jar"), "HIVE_HOME=" + root + "/hive"));
+        settings.add(new SparkSetting("hive.tez.container.size", "768"));
+        settings.add(new SparkSetting("hive.tez.cpu.vcores", "1"));
+        settings.add(jobHistory(job));
+        settings.add(jobHistoryWeb(job));
+        return settings;
+    }
+
+    // Tez on the cluster's YARN, its containers given classPath, then Tez's and Hadoop's jars, and variables, then
+    // TEZ_HOME. The image's tez-site.xml names EMR Serverless's own plugins, whose stock counterparts are in the same
+    // jars, named here as Tez's own defaults are; its port ranges and addresses are placeholders EMR Serverless fills,
+    // and its compression needs a native library the image lacks. An application master says where it is by
+    // ${env.NM_HOST}, which is left for its own node to fill in: the settings are read on the step's side first, and
+    // $NM_HOST or an env of the step's would be filled in there. Where the cluster's primary node runs the YARN
+    // timeline server, the application master logs its DAGs there, through the timeline server's REST interface, which
+    // the Tez UI reads.
+    private static List<SparkSetting> tezOnYarnSettings(Job job, List<String> executorEnvironment,
+                                                        List<String> classPath, String... variables) {
+        String root = hadoopRoot(job);
+        List<String> containerClassPath = new ArrayList<>(List.of("$PWD/*"));
+        containerClassPath.addAll(classPath);
+        containerClassPath.addAll(List.of(root + "/tez/*", root + "/tez/lib/*"));
+        containerClassPath.addAll(hadoopLayout(root));
+        List<String> containerVariables = new ArrayList<>(List.of(variables));
+        containerVariables.add("TEZ_HOME=" + root + "/tez");
+        String environment = containerEnvironment(executorEnvironment, containerVariables.toArray(String[]::new));
+        List<SparkSetting> settings = new ArrayList<>(List.of(
+                new SparkSetting("yarn.resourcemanager.hostname", job.storage().resourceManager()),
+                new SparkSetting("tez.local.mode", "false"),
+                new SparkSetting("tez.framework.client", "org.apache.tez.client.TezYarnClient"),
+                new SparkSetting("tez.am.class", "org.apache.tez.dag.app.DAGAppMaster"),
+                new SparkSetting("tez.task.class", "org.apache.tez.runtime.task.TezChild"),
+                new SparkSetting("tez.am.yarn.scheduler.class", "org.apache.tez.dag.app.rm.YarnTaskSchedulerService"),
+                new SparkSetting("tez.am.yarn.communicator.class", "org.apache.tez.dag.app.TezTaskCommunicatorImpl"),
+                new SparkSetting("tez.am.yarn.container-launcher.class",
+                        "org.apache.tez.dag.app.launcher.TezContainerLauncherImpl"),
+                new SparkSetting("tez.am.shuffle.auxiliary-service.id", "mapreduce_shuffle"),
+                new SparkSetting("tez.am.client.am.port-range", "40000-40100"),
+                new SparkSetting("tez.am.task.am.port-range", "40101-40200"),
+                new SparkSetting("tez.am.client.am.hostname", "${env.NM_HOST}"),
+                new SparkSetting("tez.am.task.am.hostname", "${env.NM_HOST}"),
+                new SparkSetting("tez.am.client.am.bind-host", "0.0.0.0"),
+                new SparkSetting("tez.am.task.am.bind-host", "0.0.0.0"),
+                new SparkSetting("tez.shuffle.bind-host", "0.0.0.0"),
+                new SparkSetting("tez.lib.uris", "file://" + root + "/tez/,file://" + root + "/tez/lib/"),
+                new SparkSetting("tez.use.cluster.hadoop-libs", "false"),
+                new SparkSetting("tez.cluster.additional.classpath.prefix", String.join(":", containerClassPath)),
+                new SparkSetting("tez.am.launch.env", environment),
+                new SparkSetting("tez.task.launch.env", environment),
+                new SparkSetting("tez.am.resource.memory.mb", "1024"),
+                new SparkSetting("tez.runtime.intermediate-output.should-compress", "false"),
+                new SparkSetting("tez.runtime.intermediate-input.is-compressed", "false")));
+        String timeline = job.storage().timelineServer();
+        if (timeline != null) {
+            settings.add(new SparkSetting("tez.history.logging.service.class",
+                    "org.apache.tez.dag.history.logging.ats.ATSHistoryLoggingService"));
+            settings.add(new SparkSetting("yarn.timeline-service.enabled", "true"));
+            settings.add(new SparkSetting("yarn.timeline-service.hostname", timeline));
+        }
+        return settings;
+    }
+
+    // The folders holding Hadoop on a cluster's nodes, as a class path's entries; the LZO codec's beside them.
+    private static List<String> hadoopLayout(String root) {
+        return List.of(root + "/hadoop-mapreduce/*", root + "/hadoop-mapreduce/lib/*", root + "/hadoop/*",
+                root + "/hadoop/lib/*", root + "/hadoop-hdfs/*", root + "/hadoop-hdfs/lib/*", root + "/hadoop-yarn/*",
+                root + "/hadoop-yarn/lib/*", "/usr/lib/hadoop-lzo/lib/*");
+    }
+
+    // A YARN container's environment as Hadoop's settings take it, comma-separated: the options Java 17 needs, the
+    // variables given, then the step's AWS environment.
+    private static String containerEnvironment(List<String> executorEnvironment, String... variables) {
+        List<String> environment = new ArrayList<>(List.of("JDK_JAVA_OPTIONS=" + yarnJavaOptions()));
+        environment.addAll(List.of(variables));
+        environment.addAll(executorEnvironment);
+        return String.join(",", environment);
+    }
+
+    // Where the Hadoop of a job's cluster's nodes is in its image: an emr-spark-* release's in the folder EmrReleaseImages
+    // keeps it apart in.
+    private static String hadoopRoot(Job job) {
+        return sparkRuntime(job.releaseLabel()) ? "/opt" : "/usr/lib";
+    }
+
+    /** The JVM options that open to Hadoop's classes the packages it reaches into, which Java 8 ignores. */
+    public static String yarnJavaOptions() {
+        return javaBaseOpens(YARN_OPENED_PACKAGES);
+    }
+
+    /** The JVM options that open these {@code java.base} packages to the classes on the class path. */
+    public static String javaBaseOpens(List<String> packages) {
+        return packages.stream().map(name -> "--add-opens=java.base/" + name + "=ALL-UNNAMED")
+                .collect(Collectors.joining(" "));
+    }
+
+    /** The lines a step's {@code hadoop} command gets after those of its {@code log4j.properties}. */
+    static String hadoopLog4jFile(Job job) {
+        return propertiesLines(job.hadoopLog4j());
+    }
+
+    /**
+     * The lines that start a step's {@code hadoop-env.sh}: an export of each {@code hadoop-env} variable, as given,
+     * in single quotes, with no shell expansion, as its {@code spark-env} ones are. A name a shell cannot export
+     * is left out, as its line would run what it holds.
+     */
+    static String hadoopEnvFile(Job job) {
+        return exportLines(job.hadoopEnvironment());
+    }
+
+    /**
+     * An export of each of {@code variables}, as given, in single quotes, with no shell expansion. A name a shell cannot
+     * export is left out, as its line would run what it holds.
+     */
+    public static String exportLines(Map<String, String> variables) {
+        List<String> lines = new ArrayList<>();
+        variables.forEach((name, value) -> {
+            if (SHELL_NAME.matcher(name).matches()) {
+                lines.add("export " + name + "='" + value.replace("'", "'\\''") + "'");
+            }
+        });
+        return String.join("\n", lines);
+    }
+
+    /** Each property as a line {@code Properties.load} reads back as it is. */
+    public static String propertiesLines(Map<String, String> properties) {
+        List<String> lines = new ArrayList<>();
+        properties.forEach((key, value) ->
+                lines.add(propertiesEscaped(key, true) + " = " + propertiesEscaped(value, false)));
+        return String.join("\n", lines);
+    }
+
+    private static String siteProperty(String name, String value) {
+        return "<property><name>" + XmlBuilder.escape(name) + "</name><value>" + XmlBuilder.escape(value)
+                + "</value></property>";
+    }
+
+    // A wrapper's script: the lines of each part, in order, then what it runs.
+    @SafeVarargs
+    private static String wrapper(List<String>... parts) {
+        List<String> lines = new ArrayList<>(List.of(NODE_INFO));
+        for (List<String> part : parts) {
+            lines.addAll(part);
+        }
+        lines.add("exec \"$@\"");
+        return String.join("\n", lines);
+    }
+
+    // A backslash starts an escape and a line break ends a setting; in a key, whitespace, '=' and ':' end it,
+    // and a leading '#' or '!' makes the line a comment; the spaces a value starts with are skipped.
+    private static String propertiesEscaped(String text, boolean key) {
+        StringBuilder escaped = new StringBuilder();
+        boolean leading = true;
+        for (char c : text.toCharArray()) {
+            switch (c) {
+                case '\\' -> escaped.append("\\\\");
+                case '\n' -> escaped.append("\\n");
+                case '\r' -> escaped.append("\\r");
+                case '\t' -> escaped.append("\\t");
+                case '\f' -> escaped.append("\\f");
+                case ' ' -> escaped.append(key || leading ? "\\ " : " ");
+                case '=', ':', '#', '!' -> escaped.append(key ? "\\" : "").append(c);
+                default -> escaped.append(c);
+            }
+            leading = leading && c == ' ';
+        }
+        return escaped.toString();
+    }
+
+    // Floci's Hadoop settings: S3A on Floci's S3, and the Glue Data Catalog client on Floci's Glue, in the job's
+    // account. Given none, the client from emr-7.10.0 asks STS for it, through a client no setting points at Floci.
+    private static List<SparkSetting> hadoopSettings(Job job, String flociEndpoint) {
+        return hadoopSettings(job.region(), job.accountId(), flociEndpoint);
+    }
+
+    /**
+     * The {@code --hiveconf} settings a cluster's Hive metastore service gets, so that it reaches the S3 locations of
+     * tables as the cluster's steps do: Floci's S3 through S3A.
+     */
+    public static List<String> hiveMetastoreSettings(String region, String accountId, String flociEndpoint) {
+        List<String> arguments = new ArrayList<>();
+        for (SparkSetting setting : hadoopSettings(region, accountId, flociEndpoint)) {
+            addHiveSetting(arguments, setting.key(), setting.value());
+        }
+        return arguments;
+    }
+
+    private static List<SparkSetting> hadoopSettings(String region, String accountId, String flociEndpoint) {
+        return List.of(
+                new SparkSetting("fs.s3a.endpoint", flociEndpoint),
+                new SparkSetting("fs.s3a.endpoint.region", region),
+                new SparkSetting("fs.s3a.path.style.access", "true"),
+                new SparkSetting("fs.s3a.committer.magic.track.commits.in.memory.enabled", "true"),
+                new SparkSetting("fs.s3.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem"),
+                new SparkSetting("fs.AbstractFileSystem.s3.impl", "org.apache.hadoop.fs.s3a.S3A"),
+                new SparkSetting("aws.glue.endpoint", flociEndpoint),
+                new SparkSetting("hive.metastore.glue.catalogid", accountId),
+                new SparkSetting("aws.region", region));
+    }
+
+    // A cluster's HDFS, as Hadoop settings: its NameNode, on the cluster's primary node, which hdfs:// paths without a
+    // host, and paths without a scheme, lead to, and, as it is a client that says how many copies of a block it writes
+    // and the image's hdfs-site.xml says two, the copies its core nodes keep; none before it runs.
+    private static List<SparkSetting> hdfsSettings(Storage storage) {
+        if (storage == null || storage.hdfsHost() == null) {
+            return List.of();
+        }
+        List<SparkSetting> settings = new ArrayList<>();
+        settings.add(new SparkSetting("fs.defaultFS", "hdfs://" + storage.hdfsHost() + ":" + HDFS_PORT));
+        if (storage.replication() > 0) {
+            settings.add(new SparkSetting("dfs.replication", String.valueOf(storage.replication())));
+        }
+        return settings;
+    }
+
+    // The cluster's HDFS for a MapReduce job on its YARN, its staging folder there with the rest, by HDFS's own client.
+    private static List<SparkSetting> yarnJobHdfsSettings(Storage storage) {
+        List<SparkSetting> settings = new ArrayList<>(hdfsSettings(storage));
+        settings.add(new SparkSetting("fs.hdfs.impl", "org.apache.hadoop.hdfs.DistributedFileSystem"));
+        return settings;
+    }
+
+    // The cluster's HDFS for a MapReduce job in local mode, which reads the core-site.xml of the hadoop command's
+    // configuration, a custom JAR's in the driver included: Hadoop's JobResourceUploader copies a job's files to
+    // MAPRED_STAGING, on the local file system, then drops that folder's scheme, so the job looks for them at the
+    // same path of the cluster's HDFS. The hdfs scheme is therefore a view of the cluster's HDFS in which that one
+    // folder is the local one; the view names its mount table after the host alone. Spark and Hive keep HDFS's own
+    // client (see sparkSettings), as Hive casts an hdfs:// file system to it to look up its encryption zones.
+    private static List<SparkSetting> localJobHdfsSettings(Storage storage) {
+        List<SparkSetting> settings = new ArrayList<>(hdfsSettings(storage));
+        if (!settings.isEmpty()) {
+            String mountTable = "fs.viewfs.mounttable." + storage.hdfsHost();
+            settings.add(new SparkSetting("fs.hdfs.impl", "org.apache.hadoop.fs.viewfs.ViewFileSystemOverloadScheme"));
+            settings.add(new SparkSetting("fs.viewfs.overload.scheme.target.hdfs.impl",
+                    "org.apache.hadoop.hdfs.DistributedFileSystem"));
+            settings.add(new SparkSetting(mountTable + ".link." + MAPRED_STAGING, "file://" + MAPRED_STAGING));
+            settings.add(new SparkSetting(mountTable + ".linkFallback",
+                    "hdfs://" + storage.hdfsHost() + ":" + HDFS_PORT));
+        }
+        return settings;
+    }
+
+    // The cluster's metastore, for its Hive steps (see HIVE_CLUSTER_CLIENT).
+    private static List<SparkSetting> hiveClusterSettings(Storage storage) {
+        List<SparkSetting> settings = new ArrayList<>(List.of(HIVE_CLUSTER_CLIENT));
+        if (storage.hiveMetastore() != null) {
+            settings.add(new SparkSetting("hive.metastore.uris", storage.hiveMetastore()));
+        } else {
+            settings.addAll(HIVE_EMBEDDED_METASTORE);
+        }
+        return settings;
+    }
+
+    // Floci's settings, then the job's spark-defaults, in the order a later one wins. Spark's own Hadoop configuration
+    // takes HDFS's client back from the core-site.xml's view, for Spark and its Hive client, which writes a Hive table
+    // in HDFS only through it. On a cluster with Hive or HCatalog, Spark's Hive client uses the cluster's metastore
+    // too, as Spark's default catalog "always connects to a Hive metastore" (the Release Guide's "Use an Iceberg
+    // cluster with Spark") and its "Using HCatalog" has Spark SQL read a table the HCat CLI made; a spark-hive-site
+    // naming its client factory, the Glue Data Catalog's say, still wins.
+    private static List<SparkSetting> sparkSettings(Job job, String flociEndpoint, List<String> executorEnvironment) {
+        List<SparkSetting> hadoop = new ArrayList<>(hadoopSettings(job, flociEndpoint));
+        List<SparkSetting> hdfs = hdfsSettings(job.storage());
+        hadoop.addAll(hdfs);
+        if (!hdfs.isEmpty()) {
+            hadoop.add(new SparkSetting("fs.hdfs.impl", "org.apache.hadoop.hdfs.DistributedFileSystem"));
+        }
+        if (job.storage() != null && job.storage().hiveMetastore() != null) {
+            hadoop.add(new SparkSetting("hive.metastore.uris", job.storage().hiveMetastore()));
+        }
+        List<SparkSetting> settings = new ArrayList<>();
+        hadoop.forEach(setting -> settings.add(new SparkSetting("spark.hadoop." + setting.key(), setting.value())));
+        if (job.storage() != null) {
+            settings.add(FILE_SYSTEM_CHECKPOINTS);
+        }
+        if (onYarn(job)) {
+            settings.addAll(yarnSettings(job, executorEnvironment));
+        }
+        // The driver's UI, which a dashboard link opens, and which Floci follows a driver with executors of its own
+        // through. Its kill links, which any container on the network reaches, are off: for a driver with executors of
+        // its own, after the run's own settings (SparkExecutors.DRIVER_WRAPPER); for any other, unless the run turns
+        // them on.
+        if (servesDriverUi(job)) {
+            settings.add(new SparkSetting("spark.ui.enabled", "true"));
+            if (job.executors() == null) {
+                settings.add(new SparkSetting("spark.ui.killEnabled", "false"));
+            }
+        }
+        job.sparkDefaults().forEach((key, value) -> settings.add(new SparkSetting(key, value)));
+        return settings;
+    }
+
+    /** Whether a job is a step on its cluster's YARN, which its primary node runs. */
+    static boolean onYarn(Job job) {
+        return job.storage() != null && job.storage().resourceManager() != null;
+    }
+
+    private static String master(Job job) {
+        return onYarn(job) ? "yarn" : "local[*]";
+    }
+
+    // The name a step's container has on its cluster's network, which a client-mode driver is reached at.
+    static String driverHost(Job job) {
+        return job.runId().toLowerCase(Locale.ROOT);
+    }
+
+    // A step's Spark on its cluster's YARN: the ResourceManager on the primary node; Spark's jars from the node's image,
+    // which is the step's; executors and a cluster-mode driver sized for the NodeManager rather than the image's 14 GB
+    // ("determined by the core and task instance types" on EMR), which the cluster's spark-defaults and the step's own
+    // options replace; a client-mode driver reached at the container's name on the cluster's network; where the
+    // primary node runs a Spark History Server, as on a cluster with Spark, its event logs in the cluster's HDFS, where
+    // the server reads them, which the application's tracking URL leads to once it has ended; and the step's AWS
+    // environment for each executor and a cluster-mode driver, as its container has it.
+    private static List<SparkSetting> yarnSettings(Job job, List<String> executorEnvironment) {
+        List<SparkSetting> settings = new ArrayList<>(List.of(
+                new SparkSetting("spark.hadoop.yarn.resourcemanager.hostname", job.storage().resourceManager()),
+                new SparkSetting("spark.yarn.jars", "local:/usr/lib/spark/jars/*"),
+                new SparkSetting("spark.executor.memory", "1g"),
+                new SparkSetting("spark.executor.cores", "1"),
+                new SparkSetting("spark.driver.memory", "2g"),
+                new SparkSetting("spark.driver.cores", "1"),
+                new SparkSetting("spark.driver.host", driverHost(job)),
+                new SparkSetting("spark.driver.bindAddress", "0.0.0.0")));
+        String history = job.storage().sparkHistoryServer();
+        if (history != null) {
+            settings.add(new SparkSetting("spark.eventLog.enabled", "true"));
+            settings.add(new SparkSetting("spark.eventLog.dir", "hdfs://" + SPARK_EVENT_LOGS));
+            settings.add(new SparkSetting("spark.yarn.historyServer.address", history + ":" + SPARK_HISTORY_WEB_PORT));
+        }
+        for (String variable : executorEnvironment) {
+            int equals = variable.indexOf('=');
+            String name = variable.substring(0, equals);
+            String value = variable.substring(equals + 1);
+            settings.add(new SparkSetting("spark.executorEnv." + name, value));
+            settings.add(new SparkSetting("spark.yarn.appMasterEnv." + name, value));
+        }
+        return settings;
+    }
+
+    private record SparkSetting(String key, String value) {
+    }
+
+    /**
+     * A job's archive in S3: its path and where that is, the file it is put at in the container, and the directory
+     * of the working directory it is unpacked to.
+     */
+    record Archive(String path, S3Uri location, String file, String directory) {
+    }
+
+    /**
+     * {@code spark-submit} parameters given as one string, as EMR Serverless's
+     * {@code sparkSubmitParameters}, split as a POSIX shell would split them: on whitespace, except inside single
+     * or double quotes. Outside quotes a backslash takes the next character as it is; inside double quotes
+     * only a {@code "}, {@code \}, {@code $}, {@code `} or newline, and before any other character it is
+     * kept. A backslash before a newline continues the line, and both go.
+     */
+    public static List<String> splitParameters(String parameters) {
+        List<String> words = new ArrayList<>();
+        if (parameters == null) {
+            return words;
+        }
+        StringBuilder word = new StringBuilder();
+        boolean inWord = false;
+        char quote = 0;
+        for (int i = 0; i < parameters.length(); i++) {
+            char c = parameters.charAt(i);
+            if (quote == '\'') {
+                if (c == '\'') {
+                    quote = 0;
+                } else {
+                    word.append(c);
+                }
+            } else if (c == '\\' && i + 1 < parameters.length()
+                    && (quote == 0 || DOUBLE_QUOTE_ESCAPES.indexOf(parameters.charAt(i + 1)) >= 0)) {
+                char escaped = parameters.charAt(++i);
+                if (escaped != '\n') {
+                    word.append(escaped);
+                    inWord = true;
+                }
+            } else if (quote == '"') {
+                if (c == '"') {
+                    quote = 0;
+                } else {
+                    word.append(c);
+                }
+            } else if (c == '\'' || c == '"') {
+                quote = c;
+                inWord = true;
+            } else if (Character.isWhitespace(c)) {
+                if (inWord) {
+                    words.add(word.toString());
+                    word.setLength(0);
+                    inWord = false;
+                }
+            } else {
+                word.append(c);
+                inWord = true;
+            }
+        }
+        if (inWord) {
+            words.add(word.toString());
+        }
+        return words;
+    }
+
+    private static void conf(List<String> arguments, String key, String value) {
+        arguments.add("--conf");
+        arguments.add(key + "=" + value);
+    }
+
+    /**
+     * How the running driver ends: with its exit code, by a stop, or at the run's timeout, which
+     * {@code progress} hears before the driver is stopped. A stop, and a run {@code progress} reports
+     * cancelled or gone, are read at every look, so they end the run whether or not the driver would ever
+     * exit by itself, as a STREAMING run's does not, and run() then removes the driver: one a run started
+     * while a reset's teardown was passing is stopped once the reset has removed its run. Each look at the
+     * container is one short control-plane call, so a run holds no Docker connection while its driver runs.
+     */
+    private Outcome awaitEnd(String containerId, Job job, ContainerLaunches.Launch launch, Progress progress,
+                             SparkExecutors executors) throws InterruptedException {
+        Instant deadline = job.timeout().isZero() ? null : clock.instant().plus(job.timeout());
+        while (!launch.stopRequested() && !progress.cancelled()) {
+            if (interrupts.remove(job.runId())) {
+                sendSigterm(containerId, job, launch);
+            }
+            if (executors != null) {
+                executors.follow();
+            }
+            InspectContainerResponse.ContainerState state =
+                    lifecycleManager.getDockerClient().inspectContainerCmd(containerId).exec().getState();
+            if (!Boolean.TRUE.equals(state.getRunning())) {
+                if (launch.stopRequested()) {
+                    return Outcome.halted();
+                }
+                Long exitCode = state.getExitCodeLong();
+                return Outcome.exitedWith(exitCode != null ? exitCode.intValue() : -1);
+            }
+            if (deadline != null && !clock.instant().isBefore(deadline)) {
+                LOG.infov("Spark run {0} of {1} passed its execution timeout of {2}", job.runId(), job.service(),
+                        job.timeout());
+                progress.timedOut();
+                return Outcome.outOfTime();
+            }
+            Thread.sleep(pollInterval.toMillis());
+        }
+        return Outcome.halted();
+    }
+
+    /**
+     * Writes the ended driver's standard output and error, each gzipped, to {@code stdout.gz} and
+     * {@code stderr.gz} in the job's log folder, while its container is still the run's. A driver a cancel or
+     * its timeout ended is still running, so it is stopped first, and then changes nothing more and leaves
+     * all it wrote; run() removes it after. One Floci's teardown took leaves nothing. Logs that cannot be
+     * written, to a bucket that does not exist say, leave the run as it ended.
+     */
+    private void writeLogs(Job job, ContainerLaunches.Launch launch) {
+        String containerId = launch.container();
+        if (job.logFolder() == null || containerId == null) {
+            return;
+        }
+        // Closed however the read ends, which ends Docker's stream and the compressors, and its files deleted after:
+        // Docker closes the callback as its stream completes, before the files are read.
+        DriverOutput output = null;
+        try {
+            output = new DriverOutput();
+            killInterruptible(job, containerId);
+            lifecycleManager.stop(containerId, STOP_TIMEOUT_SECONDS);
+            lifecycleManager.getDockerClient().logContainerCmd(containerId)
+                    .withStdOut(true)
+                    .withStdErr(true)
+                    .withFollowStream(false)
+                    .withTimestamps(false)
+                    .exec(output);
+            if (!output.awaitCompletion(LOG_READ_TIMEOUT.toMillis(), TimeUnit.MILLISECONDS)) {
+                throw new IOException("reading the driver's output took longer than " + LOG_READ_TIMEOUT);
+            }
+            try (InputStream stdout = output.gzipped(StreamType.STDOUT);
+                 InputStream stderr = output.gzipped(StreamType.STDERR)) {
+                putLogs(s3Service, job.accountId(), job.region(), job.logFolder(), stdout, stderr);
+            }
+        } catch (InterruptedException e) {
+            // Floci is shutting down: the run ends as its driver did, without its logs.
+            Thread.currentThread().interrupt();
+        } catch (IOException | RuntimeException e) {
+            LOG.warnv("Could not write the logs of Spark run {0} of {1} to {2}: {3}", job.runId(), job.service(),
+                    job.logFolder(), e.getMessage());
+        } finally {
+            if (output != null) {
+                output.discard();
+            }
+        }
+    }
+
+    /**
+     * An ended driver's output as Docker gives it, each stream gzipped as it arrives: what is not
+     * standard error, as a container with a terminal gives, is standard output. Closing it, as Docker does
+     * once it has sent everything, or the reader does whichever way the read ends, ends Docker's stream and
+     * the compressors, and a frame that still comes after is dropped.
+     */
+    private static final class DriverOutput extends ResultCallback.Adapter<Frame> {
+        // Each stream gzipped into a file of its own, which a long run's output never holds in memory.
+        private final Path stdout;
+        private final Path stderr;
+        private final GZIPOutputStream stdoutGzip;
+        private final GZIPOutputStream stderrGzip;
+        // Guarded by this.
+        private boolean compressorsClosed;
+
+        DriverOutput() throws IOException {
+            Path out = Files.createTempFile("floci-driver-", ".stdout.gz");
+            try {
+                stderr = Files.createTempFile("floci-driver-", ".stderr.gz");
+            } catch (IOException e) {
+                Files.deleteIfExists(out);
+                throw e;
+            }
+            stdout = out;
+            GZIPOutputStream stdoutCompressor = null;
+            try {
+                stdoutCompressor = new GZIPOutputStream(new BufferedOutputStream(Files.newOutputStream(stdout)));
+                stderrGzip = new GZIPOutputStream(new BufferedOutputStream(Files.newOutputStream(stderr)));
+            } catch (IOException e) {
+                if (stdoutCompressor != null) {
+                    stdoutCompressor.close();
+                }
+                deleteFiles();
+                throw e;
+            }
+            stdoutGzip = stdoutCompressor;
+        }
+
+        @Override
+        public synchronized void onNext(Frame frame) {
+            if (compressorsClosed) {
+                return;
+            }
+            try {
+                (frame.getStreamType() == StreamType.STDERR ? stderrGzip : stdoutGzip).write(frame.getPayload());
+            } catch (IOException e) {
+                onError(e);
+            }
+        }
+
+        // A stream's whole gzipped output, once Docker has sent everything, read from its file.
+        synchronized InputStream gzipped(StreamType stream) throws IOException {
+            closeCompressors();
+            return Files.newInputStream(stream == StreamType.STDERR ? stderr : stdout);
+        }
+
+        @Override
+        public void close() throws IOException {
+            try {
+                super.close();
+            } finally {
+                synchronized (this) {
+                    closeCompressors();
+                }
+            }
+        }
+
+        // Closes it, if Docker has not, and deletes its files, once they have been read or the read has failed.
+        void discard() {
+            try {
+                close();
+            } catch (IOException e) {
+                LOG.debugv("Could not close the driver's output: {0}", e.getMessage());
+            } finally {
+                deleteFiles();
+            }
+        }
+
+        private void deleteFiles() {
+            for (Path file : List.of(stdout, stderr)) {
+                try {
+                    Files.deleteIfExists(file);
+                } catch (IOException e) {
+                    LOG.warnv("Could not delete the driver output file {0}: {1}", file, e.getMessage());
+                }
+            }
+        }
+
+        // Guarded by this. Closing a compressor writes its trailer and frees its deflater, once only.
+        private void closeCompressors() throws IOException {
+            compressorsClosed = true;
+            try {
+                stdoutGzip.close();
+            } finally {
+                stderrGzip.close();
+            }
+        }
+    }
+}

@@ -103,6 +103,17 @@ floci:
     # Via env var: FLOCI_DNS_SPOOF_AWS_ENDPOINTS=true
     spoof-aws-endpoints: false
 
+    # When Floci runs natively: a resolver on 127.0.0.1:<port> for the host's own resolver,
+    # answering the same names (Cloud Map <service>.<namespace>, Route 53 private zones) and
+    # refusing the rest.
+    # Via env var: FLOCI_DNS_HOST_PORT=5354
+    # host-port: 5354
+
+    # When Floci runs natively on a host with a docker0 bridge: listen on that bridge's
+    # address, port 53, for the containers Floci launches (needs root or CAP_NET_BIND_SERVICE).
+    # Via env var: FLOCI_DNS_BRIDGE_LISTENER_ENABLED=false
+    bridge-listener-enabled: true
+
   auth:
     validate-signatures: false               # Set to true to verify SigV4 signatures for every service (S3: header, presigned URL, presigned POST; others: header)
     presign-secret: local-emulator-secret    # HMAC secret for S3 pre-signed URL verification
@@ -120,8 +131,13 @@ floci:
     log-max-size: "10m"                      # Max size per container log file before rotation
     log-max-file: "3"                        # Number of rotated log files to retain
     docker-host: unix:///var/run/docker.sock # Docker daemon socket (shared by Lambda, RDS, ElastiCache)
-    max-connections: 1024                    # Docker client connection pool; each live Lambda container holds 1
-    streaming-max-connections: 512           # Separate pool for container log-follow streams
+    max-connections: 1024                    # Docker client connection pool for short calls
+    streaming-max-connections: 3072          # Separate pool for streams; each live Lambda container holds 2, plus 1 per extension
+    pool-gauge-interval-seconds: 60          # Log Docker pool use every N seconds while a pool is busy; 0 = off
+    breaker-failure-threshold: 3             # Consecutive Docker call attempts (each retry counts) failing at the transport before Floci pings the daemon and fails calls fast if it is gone; 0 = off
+    breaker-probe-interval-seconds: 5        # Seconds between pings while the daemon is unreachable
+    max-concurrent-launches: 0               # Most container creates and starts at once; 0 = twice the CPUs, at least 4
+    events-exit-detection: false             # Watch Lambda exits through one Docker events stream instead of a wait per container
     log-poll-interval-millis: 1000           # How often a long-lived service container's log is read (it is not followed)
     log-driver-mode: false                   # Opt-in: service containers push their logs over GELF; needs a daemon that can reach Floci
     log-driver-port: 12201                   # Fixed port of the log-driver listener; Docker dials it on every container start
@@ -150,6 +166,7 @@ floci:
 
     dynamodb:
       enabled: true
+      transaction-conflicts-enabled: false    # reject requests that reach a transaction's busy items, as AWS does (native only)
       backend: native                         # native | local (forward calls to DynamoDB Local)
       # local-endpoint: http://dynamodb-local:8000  # DynamoDB Local base URL, required when backend is local
       local-connect-timeout-seconds: 2        # Seconds to wait for a connection to DynamoDB Local
@@ -177,7 +194,7 @@ floci:
       container-idle-timeout-seconds: 300     # Remove idle containers after this
       init-timeout-seconds: 10                # Time a cold runtime has to request its first invocation; the function's Timeout wins when longer
       # warm-pool-max-per-function:           # Idle containers kept per function (default max(4, cpus))
-      warm-pool-max-total: 0                  # Idle containers kept across all functions; 0 = unbounded
+      warm-pool-max-total: 128                # Idle containers kept across all functions; 0 = unbounded
       region-concurrency-limit: 1000          # Concurrent executions ceiling per region
       unreserved-concurrency-min: 100         # Minimum unreserved capacity PutFunctionConcurrency must leave
       hot-reload:
@@ -199,6 +216,8 @@ floci:
       enabled: true
       enforcement-enabled: false        # Set to true to enforce IAM policies on all requests
       seed-deployer-principal: false    # Set to true to create a local floci-deployer admin principal
+      seed-deployer-access-key-id: floci  # Access key ID of the seeded deployer's key
+
       # bootstrap-principals-file: /run/secrets/floci-bootstrap.json  # explicit owner-only account administrators
 
     networkfirewall:
@@ -215,6 +234,8 @@ floci:
       proxy-base-port: 6379
       proxy-max-port: 6399
       default-image: "valkey/valkey:8"
+      shell-less-backend: false               # true = image has no shell or CLI: flags as container arguments, snapshots via SAVE over RESP + Docker archive API
+      shell-less-backend-dbfilename: dump.rdb # snapshot file the server loads at startup; a restore places the snapshot under it
 
     rds:
       enabled: true
@@ -247,6 +268,7 @@ floci:
 
     cloudwatchmetrics:
       enabled: true
+      max-stored-datapoints: 100000   # per account, in each namespace Floci publishes itself (AWS/SQS, AWS/Redshift); oldest dropped first, 0 keeps all
 
     secretsmanager:
       enabled: true
@@ -335,6 +357,8 @@ floci:
       keep-running-on-shutdown: true
       uri-style: hostname                     # hostname | path
       prefer-local-images: true
+      lifecycle-sweep-enabled: true           # apply repository lifecycle policies in the background
+      lifecycle-sweep-interval-seconds: 60
 ```
 
 ### Initialization hooks
@@ -423,10 +447,10 @@ Floci ships with `quarkus.log.min-level: TRACE`, so raising a single category to
 
 ```bash
 # SQS: log SendMessage/ReceiveMessage/DeleteMessage bodies and attributes
-QUARKUS_LOG_CATEGORY__IO_GITHUB_HECTORVENT_FLOCI_SERVICES_SQS__LEVEL=TRACE
+QUARKUS_LOG_CATEGORY__IO_FLOCI_AWS_SERVICES_SQS__LEVEL=TRACE
 
 # DynamoDB: log PutItem/GetItem/UpdateItem/DeleteItem items, Query/Scan counts
-QUARKUS_LOG_CATEGORY__IO_GITHUB_HECTORVENT_FLOCI_SERVICES_DYNAMODB__LEVEL=TRACE
+QUARKUS_LOG_CATEGORY__IO_FLOCI_AWS_SERVICES_DYNAMODB__LEVEL=TRACE
 ```
 
 **Or in `application.yml`:**
@@ -435,9 +459,9 @@ QUARKUS_LOG_CATEGORY__IO_GITHUB_HECTORVENT_FLOCI_SERVICES_DYNAMODB__LEVEL=TRACE
 quarkus:
   log:
     category:
-      "io.github.hectorvent.floci.services.sqs":
+      "io.floci.aws.services.sqs":
         level: TRACE
-      "io.github.hectorvent.floci.services.dynamodb":
+      "io.floci.aws.services.dynamodb":
         level: TRACE
 ```
 
@@ -446,7 +470,7 @@ quarkus:
 ```java
 new GenericContainer<>("floci/floci:latest")
     .withExposedPorts(4566)
-    .withEnv("QUARKUS_LOG_CATEGORY__IO_GITHUB_HECTORVENT_FLOCI_SERVICES_SQS__LEVEL", "TRACE");
+    .withEnv("QUARKUS_LOG_CATEGORY__IO_FLOCI_AWS_SERVICES_SQS__LEVEL", "TRACE");
 ```
 
 TRACE output includes the payload alongside the existing DEBUG line:

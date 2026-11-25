@@ -1,0 +1,182 @@
+package io.floci.aws.testing;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.floci.aws.services.sqs.SqsService;
+import io.restassured.response.Response;
+import org.awaitility.Awaitility;
+
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+
+import static io.floci.aws.testing.EnforcementFixtures.auth;
+import static io.restassured.RestAssured.given;
+
+/** Step Functions calls a test makes as one account, and the state machines it leaves to {@code cleanup}. */
+public final class StepFunctionsTestClient {
+
+    /** A trust policy letting Step Functions assume the role: what an execution role needs. */
+    public static final String STATES_TRUST = """
+            {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:AssumeRole",
+             "Principal":{"Service":"states.amazonaws.com"}}]}
+            """;
+    /** A trust policy naming another service, so Step Functions may not assume the role. */
+    public static final String LAMBDA_TRUST = """
+            {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:AssumeRole",
+             "Principal":{"Service":"lambda.amazonaws.com"}}]}
+            """;
+
+    private static final ObjectMapper MAPPER = new ObjectMapper();
+    private static final Duration POLL_INTERVAL = Duration.ofMillis(25);
+
+    private final int port;
+    private final PartitionCleanup cleanup;
+
+    public StepFunctionsTestClient(int port, PartitionCleanup cleanup) {
+        this.port = port;
+        this.cleanup = cleanup;
+    }
+
+    public static String allow(String resource, String... actions) {
+        return policy(List.of(Map.of("Effect", "Allow", "Action", List.of(actions), "Resource", resource)));
+    }
+
+    /** A policy document holding {@code statements}. */
+    public static String policy(List<Map<String, Object>> statements) {
+        try {
+            return MAPPER.writeValueAsString(Map.of("Version", "2012-10-17", "Statement", statements));
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    public String role(String account, String namePrefix, String trust, String policy) {
+        return EnforcementFixtures.createRole(cleanup, port, account, "/", namePrefix + UUID.randomUUID(), trust, policy);
+    }
+
+    /** A bucket {@code account} creates in {@code region}, removed again by {@code cleanup}. */
+    public String bucket(String account, String region, String namePrefix) {
+        String name = namePrefix + UUID.randomUUID();
+        String authorization = auth(account, region, "s3");
+        given().port(port).header("Authorization", authorization)
+                .body("us-east-1".equals(region) ? "" : "<CreateBucketConfiguration><LocationConstraint>" + region
+                        + "</LocationConstraint></CreateBucketConfiguration>")
+                .put("/" + name).then().statusCode(200);
+        cleanup.register(() -> EnforcementFixtures.removeBucket(port, authorization, name));
+        return name;
+    }
+
+    /** Puts {@code policy} on {@code bucket} as {@code account}. */
+    public void setBucketPolicy(String account, String bucket, String policy) {
+        given().port(port).header("Authorization", auth(account, "s3")).body(policy)
+                .queryParam("policy", "").put("/" + bucket).then().statusCode(200);
+    }
+
+    public SqsTestQueue queue(SqsService service, String account, String region, String namePrefix) {
+        SqsTestQueue queue = SqsTestQueue.create(service, account, region, namePrefix);
+        cleanup.register(queue::delete);
+        return queue;
+    }
+
+    public String machine(String account, String namePrefix, Map<String, Object> task, String role) throws Exception {
+        return machineWithDefinition(account, namePrefix, MAPPER.writeValueAsString(
+                Map.of("StartAt", "Send", "States", Map.of("Send", task))), role);
+    }
+
+    public String machineWithDefinition(String account, String namePrefix, String definition, String role) {
+        return createMachine(account, namePrefix, definition, "STANDARD", role);
+    }
+
+    public Response request(String account, String action, Map<String, ?> input) {
+        return json(account, "states", "AWSStepFunctions." + action, "application/x-amz-json-1.0", input);
+    }
+
+    /**
+     * A JSON-protocol request to the service a task calls, signed as {@code account} for {@code signingName}, so a
+     * test reads and sets up the resources a task reaches in the account its execution runs in.
+     */
+    public Response json(String account, String signingName, String target, String contentType, Map<String, ?> body) {
+        return given().port(port).header("Authorization", auth(account, signingName))
+                .header("X-Amz-Target", target)
+                .contentType(contentType).body(MAPPER.valueToTree(body).toString()).post("/");
+    }
+
+    /** Creates a state machine in us-east-1, which the end of the test stops and deletes. */
+    public String createMachine(String account, String namePrefix, String definition, String type, String role) {
+        return createMachineNamed(account, namePrefix + UUID.randomUUID(), definition, type, role);
+    }
+
+    /** {@link #createMachine} under the exact {@code name}, for a test that needs the machine's ARN up front. */
+    public String createMachineNamed(String account, String name, String definition, String type, String role) {
+        String arn = "arn:aws:states:us-east-1:" + account + ":stateMachine:" + name;
+        cleanup.register(() -> removeMachine(account, arn));
+        Response created = request(account, "CreateStateMachine", Map.of(
+                "name", name, "definition", definition, "type", type, "roleArn", role));
+        created.then().statusCode(200);
+        return created.jsonPath().getString("stateMachineArn");
+    }
+
+    public String start(String account, String machine, String input) {
+        Response started = request(account, "StartExecution", Map.of("stateMachineArn", machine, "input", input));
+        started.then().statusCode(200);
+        return started.jsonPath().getString("executionArn");
+    }
+
+    /** Polls until the execution ends: nothing in the API waits for a standard workflow. */
+    public Response terminal(String account, String execution, int seconds) {
+        return Awaitility.await("execution " + execution + " to leave RUNNING")
+                .atMost(Duration.ofSeconds(seconds))
+                .pollDelay(Duration.ZERO)
+                .pollInterval(POLL_INTERVAL)
+                .until(() -> {
+                    Response response = request(account, "DescribeExecution", Map.of("executionArn", execution));
+                    response.then().statusCode(200);
+                    return response;
+                }, response -> !"RUNNING".equals(response.jsonPath().getString("status")));
+    }
+
+    /** Polls until the execution's history holds an event of {@code eventType}. */
+    public void await(String account, String execution, String eventType, int seconds) throws Exception {
+        Awaitility.await("history event " + eventType + " in " + execution)
+                .atMost(Duration.ofSeconds(seconds))
+                .pollDelay(Duration.ZERO)
+                .pollInterval(POLL_INTERVAL)
+                .until(() -> !eventsOfType(account, execution, eventType).isEmpty());
+    }
+
+    public List<JsonNode> eventsOfType(String account, String execution, String type) throws Exception {
+        Response history = request(account, "GetExecutionHistory", Map.of("executionArn", execution));
+        history.then().statusCode(200);
+        List<JsonNode> events = new ArrayList<>();
+        for (JsonNode event : MAPPER.readTree(history.asString()).path("events")) {
+            if (type.equals(event.path("type").asText())) {
+                events.add(event);
+            }
+        }
+        return events;
+    }
+
+    /** A trust policy letting {@code roleArn} assume the role, as a task's {@code Credentials} role needs. */
+    public static String trusting(String roleArn) {
+        return """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:AssumeRole",
+                 "Principal":{"AWS":"%s"}}]}
+                """.formatted(roleArn);
+    }
+
+    private void removeMachine(String account, String arn) {
+        Response executions = request(account, "ListExecutions", Map.of("stateMachineArn", arn));
+        if (executions.statusCode() == 200) {
+            for (Map<String, String> execution : executions.jsonPath().<Map<String, String>>getList("executions")) {
+                if ("RUNNING".equals(execution.get("status"))) {
+                    request(account, "StopExecution", Map.of("executionArn", execution.get("executionArn")))
+                            .then().statusCode(200);
+                }
+            }
+        }
+        request(account, "DeleteStateMachine", Map.of("stateMachineArn", arn)).then().statusCode(200);
+    }
+}

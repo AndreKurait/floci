@@ -1,0 +1,384 @@
+package io.floci.aws.services.cloudwatch.metrics;
+
+import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.storage.InMemoryStorage;
+import io.floci.aws.services.cloudwatch.metrics.model.MetricAlarm;
+import io.floci.aws.services.cloudwatch.metrics.model.MetricDatum;
+import io.floci.aws.testing.InMemoryStorageFactory;
+import jakarta.enterprise.inject.Instance;
+import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
+
+import java.time.Clock;
+import java.time.Instant;
+import java.time.ZoneOffset;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyDouble;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
+import static org.mockito.Mockito.doReturn;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+class AlarmEvaluatorTest {
+
+    private static final String REGION = "us-east-1";
+    private static final String POLICY_ARN =
+            "arn:aws:autoscaling:us-east-1:000000000000:scalingPolicy:x:resource/ecs/y:policyName/z";
+
+    private final CloudWatchMetricsService metricsService = spy(new CloudWatchMetricsService(
+            new InMemoryStorage<>(), new InMemoryStorage<>(), new RegionResolver(REGION, "000000000000")));
+    @SuppressWarnings("unchecked")
+    private final Instance<AlarmActionHandler> handlers = mock(Instance.class);
+    private final AlarmActionHandler handler = mock(AlarmActionHandler.class);
+    private final AlarmEvaluator evaluator = new AlarmEvaluator(metricsService, handlers);
+
+    private MetricAlarm alarm() {
+        MetricAlarm alarm = new MetricAlarm();
+        alarm.setAlarmName("TargetTracking-svc-AlarmHigh-abc");
+        alarm.setRegion(REGION);
+        alarm.setNamespace("AWS/ECS");
+        alarm.setMetricName("CPUUtilization");
+        alarm.setStatistic("Average");
+        alarm.setPeriod(60);
+        alarm.setEvaluationPeriods(3);
+        alarm.setThreshold(50.0);
+        alarm.setComparisonOperator("GreaterThanThreshold");
+        alarm.setActionsEnabled(true);
+        alarm.setAlarmActions(List.of(POLICY_ARN));
+        metricsService.putMetricAlarm(alarm, REGION);
+        return alarm;
+    }
+
+    private static List<CloudWatchMetricsService.Datapoint> datapoints(double... values) {
+        List<CloudWatchMetricsService.Datapoint> points = new ArrayList<>();
+        Instant now = Instant.now();
+        for (int i = 0; i < values.length; i++) {
+            points.add(new CloudWatchMetricsService.Datapoint(
+                    now.minusSeconds(60L * (values.length - i)),
+                    1, values[i], values[i], values[i], values[i], "Percent"));
+        }
+        return points;
+    }
+
+    private void stubMetrics(List<CloudWatchMetricsService.Datapoint> points) {
+        doReturn(points).when(metricsService).getMetricStatistics(
+                any(), any(), any(), any(), any(), anyInt(), any(), any(), anyString());
+    }
+
+    @Test
+    void includesFinalSecondOfCompletedPeriodButExcludesCurrentPeriod() {
+        MetricAlarm alarm = alarm();
+        alarm.setEvaluationPeriods(1);
+        when(handlers.iterator()).thenAnswer(invocation -> List.<AlarmActionHandler>of().iterator());
+        doAnswer(invocation -> {
+            Instant end = invocation.getArgument(4);
+            int period = invocation.getArgument(5);
+            long boundary = ((end.getEpochSecond() + period - 1) / period) * period;
+            MetricDatum completed = new MetricDatum();
+            completed.setMetricName(alarm.getMetricName());
+            completed.setTimestamp(boundary - 1);
+            completed.setValue(90.0);
+            MetricDatum current = new MetricDatum();
+            current.setMetricName(alarm.getMetricName());
+            current.setTimestamp(boundary);
+            current.setValue(0.0);
+            metricsService.putMetricData(alarm.getNamespace(), List.of(completed, current), REGION);
+            Object result = invocation.callRealMethod();
+            assertEquals(List.of(new CloudWatchMetricsService.Datapoint(
+                    Instant.ofEpochSecond(boundary - period), 1, 90.0, 90.0, 90.0, 90.0, "None")), result);
+            return result;
+        }).when(metricsService).getMetricStatistics(
+                any(), any(), any(), any(), any(), anyInt(), any(), any(), anyString());
+
+        evaluator.evaluate(alarm);
+
+        verify(metricsService).setAlarmState(
+                eq(alarm.getAlarmName()), eq("ALARM"), anyString(), any(), eq(REGION));
+    }
+
+    @Test
+    void injectedClockExcludesTheCurrentPeriodAtAnExactBoundary() {
+        CloudWatchMetricsService realMetrics = spy(new CloudWatchMetricsService(
+                new InMemoryStorageFactory("000000000000"), new RegionResolver(REGION, "000000000000")));
+        MetricAlarm alarm = alarm();
+        alarm.setEvaluationPeriods(1);
+        realMetrics.putMetricAlarm(alarm, REGION);
+        Instant boundary = Instant.parse("2026-11-17T12:01:00Z");
+        realMetrics.putMetricData(alarm.getNamespace(), List.of(
+                MetricDatum.of(alarm.getMetricName(), "Percent", 90, List.of(), boundary.getEpochSecond() - 1),
+                MetricDatum.of(alarm.getMetricName(), "Percent", 0, List.of(), boundary.getEpochSecond())), REGION);
+        when(handlers.iterator()).thenAnswer(invocation -> List.<AlarmActionHandler>of().iterator());
+        AlarmEvaluator fixed = new AlarmEvaluator(realMetrics, handlers,
+                Clock.fixed(boundary.plusSeconds(10), ZoneOffset.UTC), mock(ScheduledExecutorService.class));
+
+        fixed.evaluate(alarm);
+
+        verify(realMetrics).getMetricStatistics(any(), any(), any(), any(), eq(boundary),
+                eq(60), any(), any(), eq(REGION));
+        verify(realMetrics).setAlarmState(eq(alarm.getAlarmName()), eq("ALARM"), anyString(), any(), eq(REGION));
+    }
+
+    @Test
+    void transitionsToAlarmAndDispatchesWhenThresholdBreachedForAllPeriods() {
+        stubMetrics(datapoints(80, 85, 90));
+        when(handlers.iterator()).thenAnswer(inv -> List.of(handler).iterator());
+        when(handler.supports(POLICY_ARN)).thenReturn(true);
+
+        MetricAlarm alarm = alarm();
+        evaluator.evaluate(alarm);
+
+        verify(metricsService).setAlarmState(
+                eq(alarm.getAlarmName()), eq("ALARM"), anyString(), any(), eq(REGION));
+        verify(handler).handle(eq(POLICY_ARN), eq(alarm), eq(90.0), eq(REGION));
+    }
+
+    @Test
+    void redispatchesOnEveryTickWhileStillInAlarm() {
+        stubMetrics(datapoints(80, 85, 90));
+        when(handlers.iterator()).thenAnswer(inv -> List.of(handler).iterator());
+        when(handler.supports(POLICY_ARN)).thenReturn(true);
+
+        MetricAlarm alarm = alarm();
+        alarm.setStateValue("ALARM");
+        evaluator.evaluate(alarm);
+
+        verify(handler).handle(eq(POLICY_ARN), eq(alarm), eq(90.0), eq(REGION));
+    }
+
+    /**
+     * AWS reaches {@code INSUFFICIENT_DATA} only when every period in the evaluation range is
+     * empty; a range holding fewer real datapoints than {@code EvaluationPeriods} is still
+     * evaluated on the real data it does have.
+     */
+    @Test
+    void insufficientDataOnlyWhenTheWholeEvaluationRangeIsEmpty() {
+        stubMetrics(List.of());
+
+        MetricAlarm alarm = alarm();
+        alarm.setStateValue("OK");
+        evaluator.evaluate(alarm);
+
+        verify(metricsService).setAlarmState(
+                eq(alarm.getAlarmName()), eq("INSUFFICIENT_DATA"), anyString(), any(), eq(REGION));
+    }
+
+    @Test
+    void transitionsBackToOkWhenNoLongerBreaching() {
+        stubMetrics(datapoints(10, 15, 20));
+
+        MetricAlarm alarm = alarm();
+        alarm.setStateValue("ALARM");
+        evaluator.evaluate(alarm);
+
+        verify(metricsService).setAlarmState(
+                eq(alarm.getAlarmName()), eq("OK"), anyString(), any(), eq(REGION));
+        verify(handler, never()).handle(anyString(), any(), anyDouble(), anyString());
+    }
+
+    @Test
+    void skipsAlarmsMissingEvaluableConfig() {
+        MetricAlarm alarm = new MetricAlarm();
+        alarm.setAlarmName("hand-created-no-metric-config");
+        alarm.setRegion(REGION);
+
+        evaluator.evaluate(alarm);
+
+        verify(metricsService, never()).getMetricStatistics(
+                any(), any(), any(), any(), any(), anyInt(), any(), any(), anyString());
+    }
+
+    @Test
+    void evaluatesAlarmsConfiguredWithExtendedStatisticOnly() {
+        MetricAlarm alarm = new MetricAlarm();
+        alarm.setAlarmName("p99-only-alarm");
+        alarm.setRegion(REGION);
+        alarm.setNamespace("AWS/ApplicationELB");
+        alarm.setMetricName("TargetResponseTime");
+        alarm.setExtendedStatistic("p99");
+        alarm.setPeriod(300);
+        alarm.setEvaluationPeriods(1);
+        alarm.setThreshold(1.0);
+        alarm.setComparisonOperator("GreaterThanThreshold");
+
+        assertDoesNotThrow(() -> evaluator.evaluate(alarm));
+
+        verify(metricsService).getMetricStatistics(
+                any(), any(), any(), any(), any(), eq(300), eq(List.of("p99")), any(), eq(REGION));
+    }
+
+    @Test
+    void evaluateAllSurvivesAllAlarmsThrowing() {
+        when(metricsService.allOwnedAlarms()).thenThrow(new RuntimeException("storage hiccup"));
+
+        assertDoesNotThrow(evaluator::evaluateAll);
+    }
+
+    @Test
+    void actionsDisabledSuppressesDispatchEvenOnBreach() {
+        stubMetrics(datapoints(80, 85, 90));
+
+        MetricAlarm alarm = alarm();
+        alarm.setActionsEnabled(false);
+        evaluator.evaluate(alarm);
+
+        verify(handler, never()).handle(anyString(), any(), anyDouble(), anyString());
+    }
+
+    @Test
+    void disableDuringMetricEvaluationPreventsDispatchFromTheCapturedAlarm() throws Exception {
+        MetricAlarm alarm = alarm();
+        CountDownLatch evaluationStarted = new CountDownLatch(1);
+        CountDownLatch continueEvaluation = new CountDownLatch(1);
+        when(handlers.iterator()).thenAnswer(invocation -> List.of(handler).iterator());
+        when(handler.supports(POLICY_ARN)).thenReturn(true);
+        doAnswer(invocation -> {
+            evaluationStarted.countDown();
+            assertTrue(continueEvaluation.await(10, TimeUnit.SECONDS), "Evaluation was not released");
+            Instant end = invocation.getArgument(4);
+            List<CloudWatchMetricsService.Datapoint> points = new ArrayList<>();
+            for (int i = 0; i < 3; i++) {
+                points.add(new CloudWatchMetricsService.Datapoint(
+                        end.minusSeconds(60L * (i + 1)), 1, 80, 80, 80, 80, "Percent"));
+            }
+            return points;
+        }).when(metricsService).getMetricStatistics(
+                any(), any(), any(), any(), any(), anyInt(), any(), any(), anyString());
+
+        try (ExecutorService worker = Executors.newSingleThreadExecutor()) {
+            try {
+                Future<?> evaluation = worker.submit(evaluator::evaluateAll);
+                assertTrue(evaluationStarted.await(10, TimeUnit.SECONDS), "Evaluation did not read the alarm");
+                metricsService.setAlarmActionsEnabled(List.of(alarm.getAlarmName()), false, REGION);
+                continueEvaluation.countDown();
+                evaluation.get(10, TimeUnit.SECONDS);
+
+                assertEquals("ALARM", metricsService.allAlarms().getFirst().getStateValue());
+                verify(handler, never()).handle(anyString(), any(), anyDouble(), anyString());
+                metricsService.setAlarmActionsEnabled(List.of(alarm.getAlarmName()), true, REGION);
+                evaluator.evaluateAll();
+                verify(handler).handle(eq(POLICY_ARN), any(), eq(80.0), eq(REGION));
+            } finally {
+                continueEvaluation.countDown();
+            }
+        } finally {
+            evaluator.stop();
+        }
+    }
+
+    @Test
+    void dispatchesTheMostRecentBreachingValueEvenWhenTheLatestDatapointDoesNot() {
+        stubMetrics(datapoints(90, 85, 20));
+        when(handlers.iterator()).thenAnswer(inv -> List.of(handler).iterator());
+        when(handler.supports(POLICY_ARN)).thenReturn(true);
+
+        MetricAlarm alarm = alarm();
+        alarm.setDatapointsToAlarm(2);
+        evaluator.evaluate(alarm);
+
+        verify(handler).handle(eq(POLICY_ARN), eq(alarm), eq(85.0), eq(REGION));
+    }
+
+    @Test
+    void treatMissingDataBreachingCountsGapsAsBreaching() {
+        stubMetrics(datapoints(80));
+        when(handlers.iterator()).thenAnswer(inv -> List.<AlarmActionHandler>of().iterator());
+
+        MetricAlarm alarm = alarm();
+        alarm.setStateValue("OK");
+        alarm.setTreatMissingData("breaching");
+        evaluator.evaluate(alarm);
+
+        verify(metricsService).setAlarmState(
+                eq(alarm.getAlarmName()), eq("ALARM"), anyString(), any(), eq(REGION));
+    }
+
+    @Test
+    void missingDataAlarmWithNoRealBreachingDatapointDispatchesNaN() {
+        stubMetrics(datapoints(20));
+        when(handlers.iterator()).thenAnswer(inv -> List.of(handler).iterator());
+        when(handler.supports(POLICY_ARN)).thenReturn(true);
+
+        MetricAlarm alarm = alarm();
+        alarm.setStateValue("OK");
+        alarm.setTreatMissingData("breaching");
+        alarm.setDatapointsToAlarm(2);
+        evaluator.evaluate(alarm);
+
+        verify(metricsService).setAlarmState(
+                eq(alarm.getAlarmName()), eq("ALARM"), anyString(), any(), eq(REGION));
+        verify(handler).handle(eq(POLICY_ARN), eq(alarm), eq(Double.NaN), eq(REGION));
+    }
+
+    @Test
+    void treatMissingDataNotBreachingDoesNotCountGapsTowardAlarm() {
+        stubMetrics(datapoints(80));
+
+        MetricAlarm alarm = alarm();
+        alarm.setStateValue("ALARM");
+        alarm.setTreatMissingData("notBreaching");
+        evaluator.evaluate(alarm);
+
+        verify(metricsService).setAlarmState(
+                eq(alarm.getAlarmName()), eq("OK"), anyString(), any(), eq(REGION));
+    }
+
+    @Test
+    void queriesAPeriodAlignedWindowRegardlessOfWhenTheTickFires() {
+        stubMetrics(datapoints(80, 85, 90));
+        when(handlers.iterator()).thenAnswer(inv -> List.<AlarmActionHandler>of().iterator());
+
+        evaluator.evaluate(alarm());
+
+        ArgumentCaptor<Instant> startCaptor = ArgumentCaptor.forClass(Instant.class);
+        verify(metricsService).getMetricStatistics(
+                any(), any(), any(), startCaptor.capture(), any(), anyInt(), any(), any(), anyString());
+        assertEquals(0, startCaptor.getValue().getEpochSecond() % 60);
+    }
+
+    @Test
+    void treatMissingDataIgnoreLeavesStateUntouched() {
+        stubMetrics(datapoints(80));
+
+        MetricAlarm alarm = alarm();
+        alarm.setStateValue("OK");
+        alarm.setTreatMissingData("ignore");
+        evaluator.evaluate(alarm);
+
+        verify(metricsService, never()).setAlarmState(
+                anyString(), anyString(), anyString(), any(), anyString());
+    }
+
+    @Test
+    void treatMissingDataIgnoreStillRetriesDispatchWhileAlreadyInAlarm() {
+        stubMetrics(datapoints(80));
+        when(handlers.iterator()).thenAnswer(inv -> List.of(handler).iterator());
+        when(handler.supports(POLICY_ARN)).thenReturn(true);
+
+        MetricAlarm alarm = alarm();
+        alarm.setStateValue("ALARM");
+        alarm.setTreatMissingData("ignore");
+        evaluator.evaluate(alarm);
+
+        verify(metricsService, never()).setAlarmState(
+                anyString(), anyString(), anyString(), any(), anyString());
+        verify(handler).handle(eq(POLICY_ARN), eq(alarm), eq(80.0), eq(REGION));
+    }
+}

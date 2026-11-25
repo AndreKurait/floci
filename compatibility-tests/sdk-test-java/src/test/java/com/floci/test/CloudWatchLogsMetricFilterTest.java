@@ -29,6 +29,7 @@ import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Supplier;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -369,11 +370,11 @@ class CloudWatchLogsMetricFilterTest {
     private static void assertSeries(String metric, Instant minute, List<Dimension> dimensions, JsonNode expected)
             throws Exception {
         boolean present = expected != null && expected.has("Sum");
+        List<String> recorded = present ? MetricFilterQueryAssertions.recorded(expected) : List.of();
         List<Statistic> statistics = MetricFilterQueryAssertions.STATISTICS.stream().map(Statistic::fromValue).toList();
         List<Datapoint> points = awaitSeries(
                 () -> statistics(metric, minute, dimensions, statistics), expected, Duration.ofSeconds(10));
         assertThat(points).as(metric + " at " + minute + " " + dimensions).hasSize(present ? 1 : 0);
-        List<String> recorded = present ? MetricFilterQueryAssertions.recorded(expected) : List.of();
         if (present) {
             Datapoint point = points.get(0);
             assertThat(point.timestamp()).isEqualTo(minute);
@@ -409,13 +410,17 @@ class CloudWatchLogsMetricFilterTest {
             throws InterruptedException {
         boolean present = expected != null && expected.has("Sum");
         List<String> recorded = present ? MetricFilterQueryAssertions.recorded(expected) : List.of();
-        long deadline = System.nanoTime() + timeout.toNanos();
-        List<Datapoint> points = read.get();
-        while (present && !matchesSeries(points, expected, recorded) && System.nanoTime() < deadline) {
-            Thread.sleep(50);
-            points = read.get();
+        AtomicReference<List<Datapoint>> lastRead = new AtomicReference<>(List.of());
+        if (present) {
+            TestFixtures.await(() -> {
+                lastRead.set(read.get());
+                return matchesSeries(lastRead.get(), expected, recorded);
+            }, "CloudWatch metric series", "all recorded statistics " + expected,
+                    timeout.toNanos(), 50, () -> "; last read: " + lastRead.get());
+        } else {
+            lastRead.set(read.get());
         }
-        return points;
+        return lastRead.get();
     }
 
     private static boolean matchesSeries(List<Datapoint> points, JsonNode expected, List<String> recorded) {

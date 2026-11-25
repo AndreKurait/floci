@@ -27,6 +27,8 @@ Tests run against a live Floci instance using standard SDK calls.
 | `Ec2Tests`                       | EC2 instances, VPCs, security groups, subnets            |
 | `AppSyncTest`                    | GraphQL API CRUDL, data sources, resolvers, functions, types, API keys, tags, schema validation |
 | `EcsTests`                       | ECS clusters, task definitions, services                 |
+| `PaymentCryptographyDataPlaneTest` | Payment Cryptography data plane: encrypt, decrypt, MAC |
+| `PaymentCryptographyPinTest`     | Payment Cryptography PIN operations: generate, verify, translate |
 
 ## Adding a New Test
 

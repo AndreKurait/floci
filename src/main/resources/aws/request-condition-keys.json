@@ -2,8 +2,8 @@
   "_source": {
     "generator": "tools/aws/regen_request_condition_keys.py",
     "reference": "https://servicereference.us-east-1.amazonaws.com/",
-    "botocore": "botocore 1.43.118 (installed package)",
-    "note": "make request-condition-keys-check re-derives members from botocore; make request-condition-keys-verify checks actions against AWS."
+    "botocore": "botocore 1.44.9 (local/aws/botocore)",
+    "note": "make request-condition-keys-check re-derives members, their shapes and the protocols from botocore; make request-condition-keys-verify checks actions against AWS."
   },
   "actions": {
     "account:DisableRegion": [
@@ -14,6 +14,22 @@
     ],
     "account:GetRegionOptStatus": [
       "account:TargetRegion"
+    ],
+    "ec2-instance-connect:OpenTunnel": [
+      "ec2-instance-connect:MaxTunnelDuration",
+      "ec2-instance-connect:privateIpAddress",
+      "ec2-instance-connect:remotePort"
+    ],
+    "eks:CreateCluster": [
+      "eks:authenticationMode",
+      "eks:bootstrapClusterCreatorAdminPermissions",
+      "eks:endpointPrivateAccess",
+      "eks:endpointPublicAccess"
+    ],
+    "eks:UpdateClusterConfig": [
+      "eks:authenticationMode",
+      "eks:endpointPrivateAccess",
+      "eks:endpointPublicAccess"
     ],
     "lambda:CreateWebFunction": [
       "lambda:Request/WebFunctionAuthType"
@@ -40,6 +56,11 @@
     "redshift:GetClusterCredentials": [
       "redshift:DbUser"
     ],
+    "route53:ChangeResourceRecordSets": [
+      "route53:ChangeResourceRecordSetsActions",
+      "route53:ChangeResourceRecordSetsNormalizedRecordNames",
+      "route53:ChangeResourceRecordSetsRecordTypes"
+    ],
     "ssm:CreateResourceDataSync": [
       "ssm:SyncType"
     ],
@@ -51,6 +72,16 @@
     ],
     "ssm:UpdateResourceDataSync": [
       "ssm:SyncType"
+    ],
+    "sts:AssumeRole": [
+      "sts:ExternalId",
+      "sts:RoleSessionName"
+    ],
+    "sts:AssumeRoleWithSAML": [
+      "sts:RoleSessionName"
+    ],
+    "sts:AssumeRoleWithWebIdentity": [
+      "sts:RoleSessionName"
     ]
   },
   "members": {
@@ -67,6 +98,42 @@
     "account:GetRegionOptStatus": {
       "account:TargetRegion": [
         "RegionName"
+      ]
+    },
+    "ec2-instance-connect:OpenTunnel": {
+      "ec2-instance-connect:MaxTunnelDuration": [
+        "maxTunnelDuration"
+      ],
+      "ec2-instance-connect:privateIpAddress": [
+        "privateIpAddress"
+      ],
+      "ec2-instance-connect:remotePort": [
+        "remotePort"
+      ]
+    },
+    "eks:CreateCluster": {
+      "eks:authenticationMode": [
+        "accessConfig.authenticationMode"
+      ],
+      "eks:bootstrapClusterCreatorAdminPermissions": [
+        "accessConfig.bootstrapClusterCreatorAdminPermissions"
+      ],
+      "eks:endpointPrivateAccess": [
+        "resourcesVpcConfig.endpointPrivateAccess"
+      ],
+      "eks:endpointPublicAccess": [
+        "resourcesVpcConfig.endpointPublicAccess"
+      ]
+    },
+    "eks:UpdateClusterConfig": {
+      "eks:authenticationMode": [
+        "accessConfig.authenticationMode"
+      ],
+      "eks:endpointPrivateAccess": [
+        "resourcesVpcConfig.endpointPrivateAccess"
+      ],
+      "eks:endpointPublicAccess": [
+        "resourcesVpcConfig.endpointPublicAccess"
       ]
     },
     "lambda:CreateWebFunction": {
@@ -89,6 +156,17 @@
         "DbUser"
       ]
     },
+    "route53:ChangeResourceRecordSets": {
+      "route53:ChangeResourceRecordSetsActions": [
+        "ChangeBatch.Changes.Change.Action"
+      ],
+      "route53:ChangeResourceRecordSetsNormalizedRecordNames": [
+        "ChangeBatch.Changes.Change.ResourceRecordSet.Name"
+      ],
+      "route53:ChangeResourceRecordSetsRecordTypes": [
+        "ChangeBatch.Changes.Change.ResourceRecordSet.Type"
+      ]
+    },
     "ssm:CreateResourceDataSync": {
       "ssm:SyncType": [
         "SyncType"
@@ -108,6 +186,86 @@
       "ssm:SyncType": [
         "SyncType"
       ]
+    },
+    "sts:AssumeRole": {
+      "sts:ExternalId": [
+        "ExternalId"
+      ],
+      "sts:RoleSessionName": [
+        "RoleSessionName"
+      ]
+    },
+    "sts:AssumeRoleWithWebIdentity": {
+      "sts:RoleSessionName": [
+        "RoleSessionName"
+      ]
     }
+  },
+  "memberShapes": {
+    "account:DisableRegion": {
+      "RegionName": "RegionName"
+    },
+    "account:EnableRegion": {
+      "RegionName": "RegionName"
+    },
+    "account:GetRegionOptStatus": {
+      "RegionName": "RegionName"
+    },
+    "eks:CreateCluster": {
+      "accessConfig.authenticationMode": "AuthenticationMode",
+      "accessConfig.bootstrapClusterCreatorAdminPermissions": "BoxedBoolean",
+      "resourcesVpcConfig.endpointPrivateAccess": "BoxedBoolean",
+      "resourcesVpcConfig.endpointPublicAccess": "BoxedBoolean"
+    },
+    "eks:UpdateClusterConfig": {
+      "accessConfig.authenticationMode": "AuthenticationMode",
+      "resourcesVpcConfig.endpointPrivateAccess": "BoxedBoolean",
+      "resourcesVpcConfig.endpointPublicAccess": "BoxedBoolean"
+    },
+    "lambda:CreateWebFunction": {
+      "endpointConfig.authType": "AuthType"
+    },
+    "lambda:CreateWebFunctionEndpoint": {
+      "authType": "AuthType"
+    },
+    "lambda:UpdateWebFunctionEndpoint": {
+      "authType": "AuthType"
+    },
+    "redshift:GetClusterCredentials": {
+      "DbUser": "String"
+    },
+    "route53:ChangeResourceRecordSets": {
+      "ChangeBatch.Changes.Change.Action": "ChangeAction",
+      "ChangeBatch.Changes.Change.ResourceRecordSet.Name": "DNSName",
+      "ChangeBatch.Changes.Change.ResourceRecordSet.Type": "RRType"
+    },
+    "ssm:CreateResourceDataSync": {
+      "SyncType": "ResourceDataSyncType"
+    },
+    "ssm:DeleteResourceDataSync": {
+      "SyncType": "ResourceDataSyncType"
+    },
+    "ssm:ListResourceDataSync": {
+      "SyncType": "ResourceDataSyncType"
+    },
+    "ssm:UpdateResourceDataSync": {
+      "SyncType": "ResourceDataSyncType"
+    },
+    "sts:AssumeRole": {
+      "ExternalId": "externalIdType",
+      "RoleSessionName": "roleSessionNameType"
+    },
+    "sts:AssumeRoleWithWebIdentity": {
+      "RoleSessionName": "roleSessionNameType"
+    }
+  },
+  "protocols": {
+    "account": "rest-json",
+    "eks": "rest-json",
+    "lambda": "rest-json",
+    "redshift": "query",
+    "route53": "rest-xml",
+    "ssm": "json",
+    "sts": "query"
   }
 }

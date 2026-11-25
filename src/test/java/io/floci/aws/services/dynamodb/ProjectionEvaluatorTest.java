@@ -1,0 +1,428 @@
+package io.floci.aws.services.dynamodb;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.floci.aws.core.common.AwsException;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
+
+import java.util.Set;
+
+import static org.junit.jupiter.api.Assertions.*;
+
+/**
+ * Unit tests for ProjectionExpression evaluation over list indices. Paths sharing a
+ * prefix must merge into one reconstructed structure, and projected list indices must
+ * compact to ascending source order, matching real DynamoDB. Mirrors the paritysuite
+ * dynamodb-conformance tier1 projection cases.
+ */
+class ProjectionEvaluatorTest {
+
+    private static final ObjectMapper mapper = new ObjectMapper();
+
+    private static ObjectNode listItem() {
+        return readValue("""
+                {
+                  "pk": {"S": "p"},
+                  "l": {"L": [
+                    {"M": {
+                      "a": {"S": "a0"},
+                      "b": {"S": "b0"},
+                      "m": {"M": {"x": {"S": "x0"}, "y": {"S": "y0"}}},
+                      "n": {"L": [
+                        {"M": {"p": {"S": "p00"}, "q": {"S": "q00"}}},
+                        {"M": {"p": {"S": "p01"}, "q": {"S": "q01"}}}
+                      ]}
+                    }},
+                    {"M": {"a": {"S": "a1"}, "b": {"S": "b1"}}},
+                    {"M": {"a": {"S": "a2"}, "b": {"S": "b2"}, "c": {"S": "c2"}}}
+                  ]}
+                }
+                """);
+    }
+
+    @Test
+    void projectsMultipleListIndicesCompactedAndIndexOrdered() {
+        ObjectNode item = readValue("""
+                {"mylist": {"L": [{"S": "zero"}, {"S": "one"}, {"S": "two"}]}}
+                """);
+
+        ObjectNode result = ProjectionEvaluator.project(item, "#l[2], #l[0]",
+                readValue("""
+                        {"#l": "mylist"}
+                        """));
+
+        JsonNode list = result.get("mylist").get("L");
+        assertEquals(2, list.size(), "both requested elements must survive");
+        assertEquals("zero", list.get(0).get("S").asText());
+        assertEquals("two", list.get(1).get("S").asText());
+    }
+
+    @Test
+    void mergesTwoScalarPathsUnderOneListIndex() {
+        ObjectNode result = ProjectionEvaluator.project(listItem(), "l[0].a, l[0].b", null);
+
+        JsonNode list = result.get("l").get("L");
+        assertEquals(1, list.size());
+        JsonNode element = list.get(0).get("M");
+        assertEquals("a0", element.get("a").get("S").asText());
+        assertEquals("b0", element.get("b").get("S").asText());
+        assertNull(element.get("m"), "unprojected sibling must be dropped");
+    }
+
+    @Test
+    void mergesScalarSiblingAndNestedMapSiblingUnderOneListIndex() {
+        ObjectNode result = ProjectionEvaluator.project(listItem(), "l[0].a, l[0].m.x", null);
+
+        JsonNode element = result.get("l").get("L").get(0).get("M");
+        assertEquals("a0", element.get("a").get("S").asText());
+        assertEquals("x0", element.get("m").get("M").get("x").get("S").asText());
+        assertNull(element.get("m").get("M").get("y"), "only x was projected inside m");
+        assertNull(element.get("b"), "unprojected sibling must be dropped");
+    }
+
+    @Test
+    void mergesTwoPathsSharingAnElementOfANestedList() {
+        ObjectNode result = ProjectionEvaluator.project(listItem(), "l[0].n[0].p, l[0].n[0].q", null);
+
+        JsonNode outer = result.get("l").get("L");
+        assertEquals(1, outer.size());
+        JsonNode inner = outer.get(0).get("M").get("n").get("L");
+        assertEquals(1, inner.size(), "both paths share inner index 0");
+        assertEquals("p00", inner.get(0).get("M").get("p").get("S").asText());
+        assertEquals("q00", inner.get(0).get("M").get("q").get("S").asText());
+    }
+
+    @Test
+    void keepsDistinctInnerListIndicesSeparateUnderOneSharedOuterIndex() {
+        ObjectNode result = ProjectionEvaluator.project(listItem(), "l[0].n[0].p, l[0].n[1].q", null);
+
+        JsonNode inner = result.get("l").get("L").get(0).get("M").get("n").get("L");
+        assertEquals(2, inner.size());
+        assertEquals("p00", inner.get(0).get("M").get("p").get("S").asText());
+        assertNull(inner.get(0).get("M").get("q"));
+        assertEquals("q01", inner.get(1).get("M").get("q").get("S").asText());
+        assertNull(inner.get(1).get("M").get("p"));
+    }
+
+    @Test
+    void mergesSharedIndexAndKeepsDistinctIndexSeparateCompacted() {
+        ObjectNode result = ProjectionEvaluator.project(listItem(), "l[0].a, l[0].b, l[2].c", null);
+
+        JsonNode list = result.get("l").get("L");
+        assertEquals(2, list.size(), "index 0 (merged) and index 2 compact to two elements");
+        assertEquals("a0", list.get(0).get("M").get("a").get("S").asText());
+        assertEquals("b0", list.get(0).get("M").get("b").get("S").asText());
+        assertEquals("c2", list.get(1).get("M").get("c").get("S").asText());
+        assertNull(list.get(1).get("M").get("a"));
+    }
+
+    @Test
+    void rejectsNonNumericListIndexAsSyntaxError() {
+        AwsException ex = assertThrows(AwsException.class,
+                () -> ProjectionEvaluator.project(mapper.createObjectNode(), "l[a]", null));
+        assertEquals("ValidationException", ex.getErrorCode());
+        assertEquals("Invalid ProjectionExpression: Syntax error; token: \"a\", near: \"[a]\"",
+                ex.getMessage());
+    }
+
+    @Test
+    void rejectsEmptyListIndexAsSyntaxError() {
+        AwsException ex = assertThrows(AwsException.class,
+                () -> ProjectionEvaluator.project(mapper.createObjectNode(), "l[]", null));
+        assertEquals("ValidationException", ex.getErrorCode());
+        assertEquals("Invalid ProjectionExpression: Syntax error; token: \"]\", near: \"[]\"",
+                ex.getMessage());
+    }
+
+    @Test
+    void rejectsListIndexAboveTheAllowableRange() {
+        AwsException ex = assertThrows(AwsException.class,
+                () -> ProjectionEvaluator.project(mapper.createObjectNode(), "l[999999999999999999999]", null));
+        assertEquals("ValidationException", ex.getErrorCode());
+        assertEquals("Invalid ProjectionExpression: List index is not within the allowable range; "
+                + "index: [999999999999999999999]", ex.getMessage());
+    }
+
+    @Test
+    void rejectsFirstListIndexPastTheAllowableRange() {
+        AwsException ex = assertThrows(AwsException.class,
+                () -> ProjectionEvaluator.project(mapper.createObjectNode(), "l[2147483648]", null));
+        assertEquals("ValidationException", ex.getErrorCode());
+        assertEquals("Invalid ProjectionExpression: List index is not within the allowable range; "
+                + "index: [2147483648]", ex.getMessage());
+    }
+
+    @Test
+    void rejectsUnicodeDigitListIndexAsSyntaxError() {
+        AwsException ex = assertThrows(AwsException.class,
+                () -> ProjectionEvaluator.project(mapper.createObjectNode(), "l[１２３]", null));
+        assertEquals("ValidationException", ex.getErrorCode());
+        assertEquals("Invalid ProjectionExpression: Syntax error; token: \"１\", near: \"[１２\"",
+                ex.getMessage());
+    }
+
+    @Test
+    void rejectsLeadingZeroListIndexAsSyntaxError() {
+        AwsException ex = assertThrows(AwsException.class,
+                () -> ProjectionEvaluator.project(mapper.createObjectNode(), "l[001]", null));
+        assertEquals("ValidationException", ex.getErrorCode());
+        assertEquals("Invalid ProjectionExpression: Syntax error; token: \"0\", near: \"001\"",
+                ex.getMessage());
+    }
+
+    @Test
+    void rejectsLongZeroPaddedListIndexAsSyntaxError() {
+        AwsException ex = assertThrows(AwsException.class,
+                () -> ProjectionEvaluator.project(mapper.createObjectNode(), "l[0000000000001]", null));
+        assertEquals("ValidationException", ex.getErrorCode());
+        assertEquals("Invalid ProjectionExpression: Syntax error; token: \"0\", near: \"000\"",
+                ex.getMessage());
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', textBlock = """
+            pk, _x                | Syntax error; token: "_", near: ", _x"
+            a._x                  | Syntax error; token: "_", near: "._x"
+            ,a                    | Syntax error; token: ",", near: ",a"
+            a,                    | Syntax error; token: "<EOF>", near: ","
+            a b                   | Syntax error; token: "b", near: "a b"
+            a..b                  | Syntax error; token: ".", near: "..b"
+            a[], b                | Syntax error; token: "]", near: "[],"
+            a[01]                 | Syntax error; token: "1", near: "01]"
+            [0]                   | Syntax error; token: "[", near: "[0"
+            a.[0]                 | Syntax error; token: "[", near: ".[0"
+            a[0]b                 | Syntax error; token: "b", near: "]b"
+            a[1                   | Syntax error; token: "<EOF>", near: "1"
+            a, and                | Syntax error; token: "and", near: ", and"
+            size(a)               | Syntax error; token: "(", near: "size(a"
+            a#b                   | Syntax error; token: "#b", near: "a#b"
+            :v                    | Syntax error; token: ":v", near: ":v"
+            a.1                   | Syntax error; token: "1", near: ".1"
+            aé                    | Syntax error; token: "é", near: "aé"
+            a[4294967295], ,      | Syntax error; token: ",", near: ", ,"
+            a[2147483648], #u     | List index is not within the allowable range; index: [2147483648]
+            '#u, a[2147483648]'   | An expression attribute name used in the document path is not defined; attribute name: #u
+            name, a[2147483648]   | Attribute name is a reserved keyword; reserved keyword: name
+            a, a, b[2147483648]   | Two document paths overlap with each other; must remove or rewrite one of these paths; path one: [a], path two: [a]
+            """)
+    void readsTheExpressionWithTheLexerOfTheOtherExpressions(String expression, String message) {
+        AwsException ex = assertThrows(AwsException.class,
+                () -> ProjectionEvaluator.validateExpression(expression, null));
+        assertEquals("Invalid ProjectionExpression: " + message, ex.getMessage());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"a[ 1 ]", "a . b", " a", "a,\tb", "contains, begins_with, attribute_exists", "a[2147483647]"})
+    void acceptsWhatDynamoDbReads(String expression) {
+        assertDoesNotThrow(() -> ProjectionEvaluator.validateExpression(expression, null));
+    }
+
+    @Test
+    void readsSpacesInsideAPath() {
+        ObjectNode result = ProjectionEvaluator.project(listItem(), "l [ 0 ]", null);
+        assertEquals(1, result.get("l").get("L").size());
+    }
+
+    @Test
+    void acceptsSizeAsAnAttributeName() {
+        assertDoesNotThrow(() -> ProjectionEvaluator.validateExpression("size, a.SIZE", null));
+    }
+
+    @Test
+    void allowableIndexBeyondTheListJustDropsTheAttribute() {
+        ObjectNode result = ProjectionEvaluator.project(listItem(), "l[2147483647]", null);
+        assertNull(result.get("l"), "an in-range index past the list end matches nothing");
+    }
+
+    private static ObjectNode bracketKeyedItem() {
+        return readValue("""
+                {
+                  "pk": {"S": "p"},
+                  "data": {"M": {
+                    "settings": {"M": {
+                      "[alpha]": {"L": [{"S": "one"}, {"S": "two"}]},
+                      "[beta]": {"L": [{"S": "three"}]}
+                    }},
+                    "[0]": {"S": "literal-zero-key"},
+                    "a.b": {"S": "dotted-key"},
+                    "a[0]": {"S": "indexed-looking-key"},
+                    "a": {"M": {"b": {"S": "real-nested"}}}
+                  }},
+                  "list": {"L": [{"S": "first"}, {"S": "second"}]}
+                }
+                """);
+    }
+
+    @Test
+    void aliasResolvingToBracketedNameIsALiteralMapKey() {
+        ObjectNode result = ProjectionEvaluator.project(bracketKeyedItem(), "#data.settings.#key",
+                readValue("""
+                        {"#data": "data", "#key": "[alpha]"}
+                        """));
+
+        ObjectNode settings = (ObjectNode) result.get("data").get("M").get("settings").get("M");
+        assertEquals(2, settings.get("[alpha]").get("L").size());
+        assertEquals("one", settings.get("[alpha]").get("L").get(0).get("S").asText());
+        assertNull(settings.get("[beta]"), "unprojected sibling bracketed key must be dropped");
+    }
+
+    @Test
+    void aliasResolvingToBracketZeroIsNotAListIndex() {
+        ObjectNode result = ProjectionEvaluator.project(bracketKeyedItem(), "#data.#zero",
+                readValue("""
+                        {"#data": "data", "#zero": "[0]"}
+                        """));
+
+        assertEquals("literal-zero-key", result.get("data").get("M").get("[0]").get("S").asText());
+        assertNull(result.get("data").get("L"), "a literal [0] alias must not index a list");
+    }
+
+    @Test
+    void aliasResolvingToDottedNameIsOneSegment() {
+        ObjectNode result = ProjectionEvaluator.project(bracketKeyedItem(), "#data.#dotted",
+                readValue("""
+                        {"#data": "data", "#dotted": "a.b"}
+                        """));
+
+        ObjectNode data = (ObjectNode) result.get("data").get("M");
+        assertEquals("dotted-key", data.get("a.b").get("S").asText());
+        assertNull(data.get("a"), "a dotted alias must not traverse into the real nested map");
+    }
+
+    @Test
+    void aliasResolvingToIndexedLookingNameIsOneSegment() {
+        ObjectNode result = ProjectionEvaluator.project(bracketKeyedItem(), "#data.#indexed",
+                readValue("""
+                        {"#data": "data", "#indexed": "a[0]"}
+                        """));
+
+        ObjectNode data = (ObjectNode) result.get("data").get("M");
+        assertEquals("indexed-looking-key", data.get("a[0]").get("S").asText());
+        assertNull(data.get("a"), "an indexed-looking alias must not index the real attribute");
+    }
+
+    @Test
+    void bracketedAliasFollowedByListIndexIndexesItsValue() {
+        ObjectNode result = ProjectionEvaluator.project(bracketKeyedItem(), "#data.settings.#key[1]",
+                readValue("""
+                        {"#data": "data", "#key": "[alpha]"}
+                        """));
+
+        ObjectNode settings = (ObjectNode) result.get("data").get("M").get("settings").get("M");
+        assertEquals(1, settings.get("[alpha]").get("L").size());
+        assertEquals("two", settings.get("[alpha]").get("L").get(0).get("S").asText());
+    }
+
+    @Test
+    void realIndexSuffixOnAliasedListStillIndexes() {
+        ObjectNode result = ProjectionEvaluator.project(bracketKeyedItem(), "#list[0]",
+                readValue("""
+                        {"#list": "list"}
+                        """));
+
+        assertEquals(1, result.get("list").get("L").size());
+        assertEquals("first", result.get("list").get("L").get(0).get("S").asText());
+    }
+
+    @Test
+    void topLevelAttributesKeepsBracketedAliasLiteral() {
+        Set<String> attributes = ProjectionEvaluator.topLevelAttributes("#key.x, #list[0]",
+                readValue("""
+                        {"#key": "[alpha]", "#list": "list"}
+                        """));
+
+        assertEquals(Set.of("[alpha]", "list"), attributes);
+    }
+
+    @Test
+    void rejectsDuplicatePathsAsAnOverlap() {
+        AwsException ex = assertThrows(AwsException.class,
+                () -> ProjectionEvaluator.validateExpression("a, a", null));
+        assertEquals("ValidationException", ex.getErrorCode());
+        assertEquals("Invalid ProjectionExpression: Two document paths overlap with each other; "
+                + "must remove or rewrite one of these paths; path one: [a], path two: [a]",
+                ex.getMessage());
+    }
+
+    @Test
+    void rejectsTwoAliasesResolvingToOneAttribute() {
+        AwsException ex = assertThrows(AwsException.class,
+                () -> ProjectionEvaluator.validateExpression("#a, #b", readValue("""
+                        {"#a": "a", "#b": "a"}
+                        """)));
+        assertEquals("Invalid ProjectionExpression: Two document paths overlap with each other; "
+                + "must remove or rewrite one of these paths; path one: [a], path two: [a]",
+                ex.getMessage());
+    }
+
+    @Test
+    void rejectsParentAndChildPaths() {
+        AwsException ex = assertThrows(AwsException.class,
+                () -> ProjectionEvaluator.validateExpression("a, a.b.c", null));
+        assertEquals("Invalid ProjectionExpression: Two document paths overlap with each other; "
+                + "must remove or rewrite one of these paths; path one: [a], path two: [a, b, c]",
+                ex.getMessage());
+    }
+
+    @Test
+    void reportsOverlappingPathsInRequestOrder() {
+        AwsException ex = assertThrows(AwsException.class,
+                () -> ProjectionEvaluator.validateExpression("a.b, a", null));
+        assertEquals("Invalid ProjectionExpression: Two document paths overlap with each other; "
+                + "must remove or rewrite one of these paths; path one: [a, b], path two: [a]",
+                ex.getMessage());
+    }
+
+    @ParameterizedTest
+    @CsvSource(delimiter = '|', textBlock = """
+            '#u, name'     | An expression attribute name used in the document path is not defined; attribute name: #u
+            name, #u       | Attribute name is a reserved keyword; reserved keyword: name
+            a[0].name      | Attribute name is a reserved keyword; reserved keyword: name
+            STATUS         | Attribute name is a reserved keyword; reserved keyword: STATUS
+            true           | Attribute name is a reserved keyword; reserved keyword: true
+            a, a.b, name   | Two document paths overlap with each other; must remove or rewrite one of these paths; path one: [a], path two: [a, b]
+            a, name, a.b   | Attribute name is a reserved keyword; reserved keyword: name
+            a, a.b, #u     | Two document paths overlap with each other; must remove or rewrite one of these paths; path one: [a], path two: [a, b]
+            a.b, c.d, c, a | Two document paths overlap with each other; must remove or rewrite one of these paths; path one: [c, d], path two: [c]
+            """)
+    void checksEachPathInWrittenOrder(String expression, String message) {
+        AwsException ex = assertThrows(AwsException.class,
+                () -> ProjectionEvaluator.validateExpression(expression, null));
+        assertEquals("Invalid ProjectionExpression: " + message, ex.getMessage());
+    }
+
+    @Test
+    void rejectsAListAndOneOfItsElements() {
+        AwsException ex = assertThrows(AwsException.class,
+                () -> ProjectionEvaluator.validateExpression("l, l[0]", null));
+        assertEquals("Invalid ProjectionExpression: Two document paths overlap with each other; "
+                + "must remove or rewrite one of these paths; path one: [l], path two: [l, [0]]",
+                ex.getMessage());
+    }
+
+    @Test
+    void keepsDistinctSiblingPaths() {
+        assertDoesNotThrow(() -> ProjectionEvaluator.validateExpression("a.b, a.c, l[0], l[1]", null));
+    }
+
+    @Test
+    void rejectsAnUndefinedExpressionAttributeName() {
+        AwsException ex = assertThrows(AwsException.class,
+                () -> ProjectionEvaluator.validateExpression("#undef", null));
+        assertEquals("ValidationException", ex.getErrorCode());
+        assertEquals("Invalid ProjectionExpression: An expression attribute name used in the document path "
+                + "is not defined; attribute name: #undef", ex.getMessage());
+    }
+
+    private static ObjectNode readValue(String json) {
+        try {
+            return (ObjectNode) mapper.readTree(json);
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+    }
+}

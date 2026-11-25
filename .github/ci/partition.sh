@@ -5,24 +5,33 @@ Usage: partition.sh <all-classes.txt> <shard-total> <shard-index>
 
 <all-classes.txt> holds one test class per line in surefire includesFile path
 format (io/github/.../FooTest, no extension). Classes sharing a @TestProfile are
-assigned to the SAME shard atomically: per-shard Quarkus augmentation cost is
+assigned to the SAME shard atomically, except known slow classes: per-shard Quarkus augmentation cost is
 (distinct profiles in shard) x ~5.4s, so splitting a profile group pays its
 augmentation once per shard it touches. Profile-less classes fill the remainder.
+Recorded CI timings weight classes while keeping their profile groups together.
+Explicit SLOW_CLASSES overrides are separate groups when their run time would
+otherwise be invisible to a partition that balances class counts. These are
+separate groups even when they share a profile: saving one augmentation must
+not force minutes of Docker work onto the same shard.
 
-Slow suites use recorded CI seconds from test-durations.json. New and fast
-classes cost one second, so every class participates without timing history.
 Deterministic: sorted inputs, greedy least-loaded bin-packing, no RNG/timestamps.
 Exit 2 on bad arguments or an unreadable input file.
 """
 import json
 import math
-import os
 from pathlib import Path
+import os
 import re
 import sys
 
-AUGMENTATION_WEIGHT = 10  # estimated seconds per distinct test profile
+AUGMENTATION_WEIGHT = 10  # one augmentation ~ 5.4s ~ 10 average test classes
 
+# Classes that take far longer than the suite's average, keyed by class name so package renames
+# retain their weight, as {"ClassName": seconds}. None today: the EMR runner (651s on GitHub's
+# runners on 2026-11-12) and the Hive steps now run only in the nightly checks. The tests pass
+# their own through PARTITION_SLOW_CLASSES, a JSON object of the same shape.
+SLOW_CLASSES = json.loads(os.environ.get('PARTITION_SLOW_CLASSES', '{}'))
+SECONDS_PER_CLASS = 1.2  # the suite's mean: 4212s over 3451 classes on 2026-11-09
 
 def durations():
     path = Path(__file__).with_name('test-durations.json')
@@ -36,6 +45,20 @@ def durations():
         raise ValueError('test durations must map class paths to positive finite seconds')
     return seconds
 
+
+def weight(cls, seconds):
+    """Recorded timings retain profile groups; explicit slow overrides may split them."""
+    override = SLOW_CLASSES.get(cls.rsplit('/', 1)[-1])
+    if override is not None:
+        return round(override / SECONDS_PER_CLASS)
+    recorded = seconds.get(cls)
+    return 1 if recorded is None else recorded / SECONDS_PER_CLASS
+
+def warn_of_stale_slow_classes(classes):
+    """A renamed class would quietly lose its weight, so name it where the run's annotations show it."""
+    known = {c.rsplit('/', 1)[-1] for c in classes}
+    for name in sorted(set(SLOW_CLASSES) - known):
+        print(f'::warning title=partition.sh::stale SLOW_CLASSES key: no test class named {name}', file=sys.stderr)
 
 def profile_groups(test_root):
     """Map class-path -> profile key from @TestProfile usages in src/test."""
@@ -71,6 +94,7 @@ def main():
     if not (1 <= index <= total):
         sys.exit(f'partition.sh: shard index {index} outside 1..{total}')
 
+    warn_of_stale_slow_classes(classes)
     prof = profile_groups('src/test/java')
     groups = {}
     plain = []
@@ -79,21 +103,23 @@ def main():
         if key is None:
             plain.append(c)
         else:
+            if c.rsplit('/', 1)[-1] in SLOW_CLASSES and weight(c, seconds) > 1:
+                key = (key, c)
+            else:
+                key = (key, '')
             groups.setdefault(key, []).append(c)
 
     load = [0] * total
     shard_of = {}
-    weight = lambda cls: seconds.get(cls, 1)
-    group_weight = lambda members: AUGMENTATION_WEIGHT + sum(weight(c) for c in members)
-    # Heaviest groups first; ties broken by name for determinism.
-    for key, members in sorted(groups.items(), key=lambda kv: (-group_weight(kv[1]), kv[0])):
+    # Heaviest first; ties broken by name for determinism.
+    for key, members in sorted(groups.items(), key=lambda kv: (-sum(weight(c, seconds) for c in kv[1]), kv[0])):
         target = min(range(total), key=lambda s: (load[s], s))
-        load[target] += group_weight(members)
+        load[target] += AUGMENTATION_WEIGHT + sum(weight(c, seconds) for c in members)
         for c in members:
             shard_of[c] = target
-    for c in sorted(plain, key=lambda cls: (-weight(cls), cls)):
+    for c in sorted(plain, key=lambda c: (-weight(c, seconds), c)):
         target = min(range(total), key=lambda s: (load[s], s))
-        load[target] += weight(c)
+        load[target] += weight(c, seconds)
         shard_of[c] = target
 
     out = sorted(c for c, s in shard_of.items() if s == index - 1)

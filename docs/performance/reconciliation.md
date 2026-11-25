@@ -222,7 +222,7 @@ mkdir -p target/performance-classes
 javac -cp "$FLOCI_BENCHMARK_CP" -d target/performance-classes "$FLOCI_BENCHMARK_SOURCE"
 java -XX:ActiveProcessorCount=8 -Xms128m -Xmx2g \
   -cp "target/performance-classes:$FLOCI_BENCHMARK_CP" \
-  io.github.hectorvent.floci.services.sqs.SqsIdlePollBenchmark \
+  io.floci.aws.services.sqs.SqsIdlePollBenchmark \
   baseline "$(git rev-parse HEAD)" 100 20 3
 ```
 

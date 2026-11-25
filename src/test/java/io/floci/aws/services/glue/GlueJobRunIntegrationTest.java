@@ -1,0 +1,71 @@
+package io.floci.aws.services.glue;
+
+import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.testing.GlueRequests;
+import io.floci.aws.testing.RestAssuredJsonUtils;
+import io.quarkus.test.junit.QuarkusTest;
+import io.restassured.response.ValidatableResponse;
+import jakarta.inject.Inject;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.Test;
+
+import java.util.UUID;
+
+import static org.hamcrest.Matchers.equalTo;
+import static org.hamcrest.Matchers.hasItem;
+import static org.hamcrest.Matchers.matchesPattern;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+
+@QuarkusTest
+class GlueJobRunIntegrationTest {
+
+    private static final String ACCOUNT_ID = "000000000000";
+    private static final String REGION = "us-east-1";
+    private static final String ROLE = "arn:aws:iam::" + ACCOUNT_ID + ":role/my-role";
+
+    @Inject
+    EmulatorConfig config;
+
+    @BeforeAll
+    static void configureRestAssured() {
+        RestAssuredJsonUtils.configureAwsContentTypes();
+    }
+
+    private static ValidatableResponse call(String action, String body) {
+        return GlueRequests.call(action, ACCOUNT_ID, REGION, body);
+    }
+
+    @Test
+    void jobRunStartsSucceedsAndIsRemovedWithItsJob() {
+        String jobName = "run-job-" + UUID.randomUUID().toString().substring(0, 8);
+        call("CreateJob", """
+                { "Name": "%s", "Role": "%s", "Command": { "Name": "glueetl" } }
+                """.formatted(jobName, ROLE)).statusCode(200);
+
+        String runId = call("StartJobRun", "{ \"JobName\": \"" + jobName + "\" }")
+                .statusCode(200)
+                .body("JobRunId", matchesPattern("jr_[0-9a-f]{64}"))
+                .extract().path("JobRunId");
+
+        call("GetJobRun", "{ \"JobName\": \"" + jobName + "\", \"RunId\": \"" + runId + "\" }")
+                .statusCode(200)
+                .body("JobRun.Id", equalTo(runId))
+                .body("JobRun.JobRunState", equalTo("SUCCEEDED"));
+
+        call("ListJobs", "{}")
+                .statusCode(200)
+                .body("JobNames", hasItem(jobName));
+
+        call("DeleteJob", "{ \"JobName\": \"" + jobName + "\" }").statusCode(200);
+
+        call("GetJobRuns", "{ \"JobName\": \"" + jobName + "\" }")
+                .statusCode(400)
+                .body("__type", equalTo("EntityNotFoundException"));
+    }
+
+    @Test
+    void scriptsAreNotRunUnlessTheRunnerModeIsDocker() {
+        assertEquals("immediate", config.services().glue().runnerMode());
+        assertEquals("public.ecr.aws/glue/aws-glue-libs:5", config.services().glue().image());
+    }
+}

@@ -1,0 +1,1885 @@
+package io.floci.aws.services.kinesis;
+
+import com.fasterxml.jackson.core.type.TypeReference;
+import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.core.common.AwsArnUtils;
+import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.Digests;
+import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.resource.ExplorerResource;
+import io.floci.aws.core.resource.ResourceProvider;
+import io.floci.aws.core.resource.SupportedResourceType;
+import io.floci.aws.core.storage.AccountAwareStorageBackend;
+import io.floci.aws.core.storage.StorageBackend;
+import io.floci.aws.core.storage.StorageFactory;
+import io.floci.aws.services.kinesis.model.KinesisConsumer;
+import io.floci.aws.services.kinesis.model.KinesisRecord;
+import io.floci.aws.services.kinesis.model.KinesisShard;
+import io.floci.aws.services.kinesis.model.KinesisStream;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import org.jboss.logging.Logger;
+
+import java.math.BigInteger;
+import java.nio.charset.StandardCharsets;
+import java.time.Clock;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Base64;
+import java.util.Collections;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.PriorityQueue;
+import java.util.Set;
+import java.util.WeakHashMap;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.regex.Pattern;
+
+import static io.floci.aws.core.storage.AccountAwareStorageBackend.putInAccount;
+
+@ApplicationScoped
+public class KinesisService implements ResourceProvider {
+    private static final Logger LOG = Logger.getLogger(KinesisService.class);
+    private static final Set<String> VALID_SHARD_LEVEL_METRICS = Set.of(
+            "IncomingBytes", "IncomingRecords", "OutgoingBytes", "OutgoingRecords",
+            "WriteProvisionedThroughputExceeded", "ReadProvisionedThroughputExceeded",
+            "IteratorAgeMilliseconds", "ALL");
+    private static final Set<String> VALID_STREAM_MODES = Set.of("PROVISIONED", "ON_DEMAND");
+    private static final String DEFAULT_STREAM_MODE = "PROVISIONED";
+    private static final int DEFAULT_INSPECTION_RECORD_LIMIT = 100;
+    private static final int MAX_INSPECTION_RECORD_LIMIT = 1000;
+    // MaxRecordSizeInKiB bounds, as AWS constrains them on CreateStream and
+    // UpdateMaxRecordSize. The per-stream default lives on KinesisStream.
+    private static final int MIN_RECORD_SIZE_KIB = 1024;
+    private static final int MAX_RECORD_SIZE_KIB = 10240;
+    private static final int MAX_RECORDS_PER_REQUEST = 500;
+    private static final int MAX_REQUEST_SIZE_BYTES = 10 * 1024 * 1024;
+    private static final Pattern VALID_RESOURCE_TAG_CHARACTERS =
+            Pattern.compile("[\\p{L}\\p{Nd}\\s_./=+%@:-]*", Pattern.UNICODE_CHARACTER_CLASS);
+    /**
+     * UpdateShardCount's documented default limits: the per-account/region shard-per-stream
+     * ceiling, and how many scaling calls a stream may take in a rolling 24-hour window.
+     */
+    private static final int MAX_SHARDS_PER_STREAM = 10000;
+    private static final int MAX_SHARD_COUNT_UPDATES_PER_DAY = 10;
+    private static final Duration SHARD_COUNT_UPDATE_WINDOW = Duration.ofHours(24);
+    private static final String UNIFORM_SCALING = "UNIFORM_SCALING";
+    private static final String MIN_HASH_KEY_VALUE = "0";
+    private static final String INITIAL_SEQUENCE_NUMBER = "0";
+    private static final BigInteger MIN_HASH_KEY = BigInteger.ZERO;
+    private static final BigInteger MAX_HASH_KEY =
+            new BigInteger("340282366920938463463374607431768211455");
+    private static final BigInteger HASH_KEY_SPACE_SIZE = MAX_HASH_KEY.add(BigInteger.ONE);
+
+    private final StorageBackend<String, KinesisStream> store;
+    private final StorageBackend<String, KinesisConsumer> consumerStore;
+    private final RegionResolver regionResolver;
+    private final Clock clock;
+    private final long creatingDelayMillis;
+    private final long updatingDelayMillis;
+    private final KinesisResourcePolicies resourcePolicies;
+    private final AtomicLong sequenceGenerator = new AtomicLong(System.currentTimeMillis());
+    // One monitor per stream key, handed out by lockFor. Serializes sequence allocation + shard
+    // append + persist so the in-memory log, the assigned sequence order and the WAL write order
+    // all agree, and serializes every other read-modify-write on a stream against deleteStream.
+    private final ConcurrentHashMap<String, Object> streamAppendLocks = new ConcurrentHashMap<>();
+    // Stream objects are replaced on reload; weak keys avoid retaining deleted streams.
+    private final Map<KinesisStream, List<OpenShardRange>> openShardRangeIndexes =
+            Collections.synchronizedMap(new WeakHashMap<>());
+    // Package-private test seam, run inside the append critical section after the sequence is
+    // allocated and before the record is appended. Default no-op in production.
+    Runnable putRecordAppendHook = () -> {};
+    // Package-private test seam, run after the pre-lock resolve/validation and before the append
+    // lock is acquired. Lets a test deterministically wedge a producer in the window where a
+    // concurrent deleteStream can win the lock first, exercising the in-lock re-resolve guard.
+    // Default no-op in production.
+    Runnable putRecordBeforeLockHook = () -> {};
+
+    @Inject
+    public KinesisService(StorageFactory factory, RegionResolver regionResolver, EmulatorConfig config) {
+        this(factory.create("kinesis", "kinesis-streams.json",
+                        new TypeReference<Map<String, KinesisStream>>() {}),
+                factory.create("kinesis", "kinesis-consumers.json",
+                        new TypeReference<Map<String, KinesisConsumer>>() {}),
+                regionResolver, Clock.systemUTC(),
+                config.services().kinesis().creatingDelayMillis(),
+                config.services().kinesis().updatingDelayMillis());
+    }
+
+    public KinesisService(StorageFactory factory, RegionResolver regionResolver) {
+        this(factory.create("kinesis", "kinesis-streams.json",
+                        new TypeReference<Map<String, KinesisStream>>() {}),
+                factory.create("kinesis", "kinesis-consumers.json",
+                        new TypeReference<Map<String, KinesisConsumer>>() {}),
+                regionResolver);
+    }
+
+    KinesisService(StorageBackend<String, KinesisStream> store,
+                   StorageBackend<String, KinesisConsumer> consumerStore,
+                   RegionResolver regionResolver) {
+        this(store, consumerStore, regionResolver, Clock.systemUTC());
+    }
+
+    /**
+     * Test seam: lets retention-period expiry be exercised deterministically instead
+     * of depending on wall-clock time. Production code always goes through the public/{@code @Inject}
+     * constructors, which pin the system clock.
+     */
+    KinesisService(StorageBackend<String, KinesisStream> store,
+                   StorageBackend<String, KinesisConsumer> consumerStore,
+                   RegionResolver regionResolver, Clock clock) {
+        this(store, consumerStore, regionResolver, clock, 0, 0);
+    }
+
+    KinesisService(StorageBackend<String, KinesisStream> store,
+                   StorageBackend<String, KinesisConsumer> consumerStore,
+                   RegionResolver regionResolver, Clock clock,
+                   long creatingDelayMillis, long updatingDelayMillis) {
+        if (creatingDelayMillis < 0 || updatingDelayMillis < 0) {
+            throw new IllegalArgumentException("Kinesis status delays must be non-negative");
+        }
+        this.store = store;
+        this.consumerStore = consumerStore;
+        this.regionResolver = regionResolver;
+        this.clock = clock;
+        this.resourcePolicies = new KinesisResourcePolicies(store, consumerStore, regionResolver, this::lockFor, clock);
+        this.creatingDelayMillis = creatingDelayMillis;
+        this.updatingDelayMillis = updatingDelayMillis;
+    }
+
+    private void requireActive(KinesisStream stream) {
+        String status = streamStatus(stream);
+        if (!"ACTIVE".equals(status)) {
+            throw new AwsException("ResourceInUseException",
+                    "Stream " + stream.getStreamName() + " is not ACTIVE (current state: " + status + ")", 400);
+        }
+    }
+
+    String streamStatus(KinesisStream stream) {
+        return stream.getStreamStatus(clock.instant());
+    }
+
+    void requireWritableStream(KinesisStream stream) {
+        String status = streamStatus(stream);
+        if (!"ACTIVE".equals(status) && !"UPDATING".equals(status)) {
+            throw new AwsException("ResourceNotFoundException",
+                    "Stream " + stream.getStreamName() + " is not ready (current state: " + status + ")", 400);
+        }
+    }
+
+    private void enterStatusWindow(KinesisStream stream, String status, long delayMillis) {
+        if (delayMillis == 0) {
+            stream.setStatusWindow("ACTIVE", null);
+        } else {
+            stream.setStatusWindow(status, clock.instant().plusMillis(delayMillis));
+        }
+    }
+
+    private void beginStatusUpdate(KinesisStream stream) {
+        enterStatusWindow(stream, "UPDATING", updatingDelayMillis);
+    }
+
+    public KinesisStream createStream(String streamName, int shardCount, String region) {
+        return createStream(streamName, shardCount, null, region);
+    }
+
+    public KinesisStream createStream(String streamName, int shardCount, String streamMode, String region) {
+        return createStream(streamName, shardCount, streamMode, null, region);
+    }
+
+    /**
+     * @param maxRecordSizeInKiB CreateStream's optional MaxRecordSizeInKiB; null leaves the stream
+     *                           at the AWS default. It is a distinct value from 0, which AWS
+     *                           rejects as below the documented minimum.
+     */
+    public KinesisStream createStream(String streamName, int shardCount, String streamMode,
+                                      Integer maxRecordSizeInKiB, String region) {
+        return createStream(streamName, shardCount, streamMode, maxRecordSizeInKiB, Map.of(), region);
+    }
+
+    public KinesisStream createStream(String streamName, int shardCount, String streamMode,
+                                      Integer maxRecordSizeInKiB, Map<String, String> tags, String region) {
+        return createStream(streamName, shardCount, streamMode, maxRecordSizeInKiB, tags, null, region);
+    }
+
+    public KinesisStream createStream(String streamName, int shardCount, String streamMode,
+                                      Integer maxRecordSizeInKiB, Map<String, String> tags,
+                                      Integer retentionPeriodHours, String region) {
+        if (shardCount < 1) {
+            throw new AwsException("ValidationException", "1 validation error detected: Value '" + shardCount
+                    + "' at 'shardCount' failed to satisfy constraint: "
+                    + "Member must have value greater than or equal to 1", 400);
+        }
+        String resolvedMode = streamMode != null ? streamMode : DEFAULT_STREAM_MODE;
+        validateStreamMode(resolvedMode);
+        if (maxRecordSizeInKiB != null) {
+            validateMaxRecordSize(maxRecordSizeInKiB, "InvalidArgumentException");
+        }
+        if (retentionPeriodHours != null && (retentionPeriodHours < 24 || retentionPeriodHours > 8760)) {
+            throw new AwsException("InvalidArgumentException",
+                    "Retention period must be between 24 and 8760 hours", 400);
+        }
+
+        String storageKey = regionKey(region, streamName);
+        synchronized (lockFor(storageKey)) {
+            if (store.get(storageKey).isPresent()) {
+                throw new AwsException("ResourceInUseException", "Stream already exists: " + streamName, 400);
+            }
+            validateTagCapacity(Map.of(), tags);
+
+            String arn = regionResolver.buildArn("kinesis", region, "stream/" + streamName);
+            KinesisStream stream = new KinesisStream(streamName, arn);
+            stream.setStreamCreationTimestamp(clock.instant());
+            stream.setAccountId(regionResolver.getAccountId());
+            stream.setStreamMode(resolvedMode);
+            stream.getTags().putAll(tags);
+            if (retentionPeriodHours != null) {
+                stream.setRetentionPeriodHours(retentionPeriodHours);
+            }
+            enterStatusWindow(stream, "CREATING", creatingDelayMillis);
+            if (maxRecordSizeInKiB != null) {
+                stream.setMaxRecordSizeInKiB(maxRecordSizeInKiB);
+            }
+
+            for (int i = 0; i < shardCount; i++) {
+                String shardId = String.format("shardId-%012d", i);
+                stream.getShards().add(new KinesisShard(shardId,
+                        shardStartingHashKey(i, shardCount),
+                        shardEndingHashKey(i, shardCount),
+                        INITIAL_SEQUENCE_NUMBER));
+            }
+
+            store.put(storageKey, stream);
+            LOG.infov("Created Kinesis stream: {0} in region {1} with {2} shards (mode: {3})",
+                    streamName, region, shardCount, resolvedMode);
+            return stream;
+        }
+    }
+
+    public void updateStreamMode(String streamName, String streamMode, String region) {
+        validateStreamMode(streamMode);
+        String key = regionKey(region, streamName);
+        synchronized (lockFor(key)) {
+            KinesisStream stream = resolveStream(streamName, region);
+            requireActive(stream);
+            // Same-mode is a no-op. Mirrors the same-value behaviour in
+            // increase/decreaseStreamRetentionPeriod (see #342). Avoids breaking
+            // terraform-provider-aws which calls UpdateStreamMode on every refresh.
+            if (streamMode.equals(stream.getStreamMode())) {
+                return;
+            }
+            beginStatusUpdate(stream);
+            stream.setStreamMode(streamMode);
+            store.put(key, stream);
+            LOG.infov("Updated stream mode for {0} to {1}", streamName, streamMode);
+        }
+    }
+
+    public static void validateStreamMode(String streamMode) {
+        if (streamMode == null || !VALID_STREAM_MODES.contains(streamMode)) {
+            throw new AwsException("InvalidArgumentException",
+                    "StreamMode must be PROVISIONED or ON_DEMAND, got: " + streamMode, 400);
+        }
+    }
+
+    public List<KinesisStream> listStreamDetails(String region) {
+        String prefix = region + "::";
+        return store.scan(key -> key.startsWith(prefix)).stream()
+                .sorted(Comparator.comparing(KinesisStream::getStreamName))
+                .toList();
+    }
+
+    public KinesisStream describeStream(String streamName, String region) {
+        return resolveStream(streamName, region);
+    }
+
+    public KinesisStream describeStreamForAccount(String accountId, String streamName, String region) {
+        return resolveStreamForAccount(accountId, streamName, region);
+    }
+
+    /**
+     * The stream whose own ARN is {@code streamArn}, in the caller's account and {@code region}. A
+     * name alone, or an ARN for another account, region or resource type, names no stream here.
+     */
+    public KinesisStream describeStreamByArn(String streamArn, String region) {
+        String streamName = streamArn.substring(streamArn.lastIndexOf('/') + 1);
+        KinesisStream stream = resolveStream(streamName, region);
+        if (!streamArn.equals(stream.getStreamArn())) {
+            throw new AwsException("ResourceNotFoundException", "Stream " + streamName + " not found", 400);
+        }
+        return stream;
+    }
+
+    public String getResourcePolicy(String resourceArn, String region) {
+        return resourcePolicies.get(resourceArn, region);
+    }
+
+    public void putResourcePolicy(String resourceArn, String policy, String region) {
+        resourcePolicies.put(resourceArn, policy, region);
+    }
+
+    public void deleteResourcePolicy(String resourceArn, String region) {
+        resourcePolicies.delete(resourceArn, region);
+    }
+
+    /** Read-only ownership-checked context for the three resource-policy IAM actions. */
+    public Map<String, String> resourcePolicyTags(String resourceArn, String region) {
+        return resourcePolicies.tags(resourceArn, region);
+    }
+
+    public KinesisConsumer registerStreamConsumer(String streamArn, String consumerName, String region) {
+        return registerStreamConsumer(streamArn, consumerName, Map.of(), region);
+    }
+
+    public KinesisConsumer registerStreamConsumer(String streamArn, String consumerName,
+                                                   Map<String, String> tags, String region) {
+        validateResourceTagLimit(Map.of(), tags);
+        String streamKey = regionKey(region, streamNameFromTagArn(streamArn));
+        synchronized (lockFor(streamKey)) {
+            String consumerArn = streamArn + "/consumer/" + consumerName + ":" + clock.millis();
+            synchronized (consumerStore) {
+                String parentGeneration = resourcePolicies.clearConsumerPolicy(consumerArn, region);
+                if (parentGeneration == null) {
+                    throw new AwsException("ResourceNotFoundException", "Stream " + streamArn + " not found", 400);
+                }
+                KinesisConsumer consumer = new KinesisConsumer(consumerName, consumerArn, streamArn);
+                consumer.setConsumerCreationTimestamp(clock.instant());
+                consumer.setPolicyStreamGeneration(parentGeneration);
+                consumer.setTags(tags);
+                consumerStore.put(regionKey(region, consumerArn), consumer);
+                LOG.infov("Registered Kinesis consumer: {0} for stream {1}", consumerName, streamArn);
+                return consumer;
+            }
+        }
+    }
+
+    public void deregisterStreamConsumer(String streamArn, String consumerName, String consumerArn, String region) {
+        String resolvedArn = consumerArn;
+        if (resolvedArn == null && streamArn != null && consumerName != null) {
+            synchronized (consumerStore) {
+                resolvedArn = consumerStore.scan(k -> true).stream()
+                        .filter(c -> c.getStreamArn().equals(streamArn) && c.getConsumerName().equals(consumerName))
+                        .findFirst().map(KinesisConsumer::getConsumerArn).orElse(null);
+            }
+        }
+        if (resolvedArn != null) {
+            String key = resourcePolicies.consumerKey(resolvedArn, region);
+            synchronized (lockFor(key)) {
+                synchronized (consumerStore) {
+                    resourcePolicies.clearConsumerPolicy(resolvedArn, region);
+                    consumerStore.delete(regionKey(region, resolvedArn));
+                    LOG.infov("Deregistered Kinesis consumer: {0}", resolvedArn);
+                }
+            }
+        }
+    }
+
+    public KinesisConsumer describeStreamConsumer(String streamArn, String consumerName, String consumerArn, String region) {
+        if (consumerArn != null) {
+            return consumerStore.get(region + "::" + consumerArn)
+                    .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Consumer not found", 400));
+        }
+        return consumerStore.scan(k -> true).stream()
+                .filter(c -> c.getStreamArn().equals(streamArn) && c.getConsumerName().equals(consumerName))
+                .findFirst()
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Consumer not found", 400));
+    }
+
+    public List<KinesisConsumer> listStreamConsumers(String streamArn, String region) {
+        return consumerStore.scan(k -> true).stream()
+                .filter(c -> c.getStreamArn().equals(streamArn))
+                .toList();
+    }
+
+    public void deleteStream(String streamName, String region) {
+        // Internal callers (CloudFormation delete) treat an already-gone stream as deleted.
+        deleteStream(streamName, true, true, region);
+    }
+
+    public void deleteStream(String streamName, boolean enforceConsumerDeletion, String region) {
+        deleteStream(streamName, enforceConsumerDeletion, false, region);
+    }
+
+    private void deleteStream(String streamName, boolean enforceConsumerDeletion, boolean missingIsDeleted,
+                              String region) {
+        String storageKey = regionKey(region, streamName);
+        // Delete under the per-stream monitor every writer takes, so the delete is serialized with
+        // any in-flight append, split, merge or metadata write on this stream. See lockFor for why
+        // the monitor is deliberately left in the map.
+        synchronized (lockFor(storageKey)) {
+            if (missingIsDeleted && store.get(storageKey).isEmpty()) {
+                return;
+            }
+            KinesisStream stream = resolveStream(streamName, region);
+            synchronized (consumerStore) {
+                List<KinesisConsumer> consumers = listStreamConsumers(stream.getStreamArn(), region);
+                if (!consumers.isEmpty() && !enforceConsumerDeletion) {
+                    throw new AwsException("ResourceInUseException",
+                            "Stream " + streamName + " has registered consumers", 400);
+                }
+                for (KinesisConsumer consumer : consumers) {
+                    consumerStore.delete(regionKey(region, consumer.getConsumerArn()));
+                }
+            }
+            store.delete(storageKey);
+        }
+        LOG.infov("Deleted Kinesis stream: {0}", streamName);
+    }
+
+    public void addTagsToStream(String streamName, Map<String, String> tags, String region) {
+        String key = regionKey(region, streamName);
+        synchronized (lockFor(key)) {
+            KinesisStream stream = resolveStream(streamName, region);
+            requireActive(stream);
+            validateTagCapacity(stream.getTags(), tags);
+            stream.setTags(withTags(stream.getTags(), tags));
+            store.put(key, stream);
+        }
+    }
+
+    public void removeTagsFromStream(String streamName, List<String> tagKeys, String region) {
+        String key = regionKey(region, streamName);
+        synchronized (lockFor(key)) {
+            KinesisStream stream = resolveStream(streamName, region);
+            requireActive(stream);
+            stream.setTags(withoutTags(stream.getTags(), tagKeys));
+            store.put(key, stream);
+        }
+    }
+
+    public Map<String, String> listTagsForStream(String streamName, String region) {
+        return resolveStream(streamName, region).getTags();
+    }
+
+    public void tagResource(String resourceArn, Map<String, String> tags, String region) {
+        if (isConsumerTagResource(resourceArn, region)) {
+            String key = regionKey(region, resourceArn);
+            synchronized (consumerStore) {
+                KinesisConsumer consumer = resolveConsumerForTags(key);
+                validateResourceTagLimit(consumer.getTags(), tags);
+                consumer.setTags(withTags(consumer.getTags(), tags));
+                consumerStore.put(key, consumer);
+            }
+            return;
+        }
+        String streamName = streamNameFromTagArn(resourceArn);
+        String key = regionKey(region, streamName);
+        synchronized (lockFor(key)) {
+            KinesisStream stream = describeStreamByArn(resourceArn, region);
+            requireActive(stream);
+            validateResourceTagLimit(stream.getTags(), tags);
+            stream.setTags(withTags(stream.getTags(), tags));
+            store.put(key, stream);
+        }
+    }
+
+    public void untagResource(String resourceArn, List<String> tagKeys, String region) {
+        if (isConsumerTagResource(resourceArn, region)) {
+            String key = regionKey(region, resourceArn);
+            synchronized (consumerStore) {
+                KinesisConsumer consumer = resolveConsumerForTags(key);
+                consumer.setTags(withoutTags(consumer.getTags(), tagKeys));
+                consumerStore.put(key, consumer);
+            }
+            return;
+        }
+        String streamName = streamNameFromTagArn(resourceArn);
+        String key = regionKey(region, streamName);
+        synchronized (lockFor(key)) {
+            KinesisStream stream = describeStreamByArn(resourceArn, region);
+            requireActive(stream);
+            stream.setTags(withoutTags(stream.getTags(), tagKeys));
+            store.put(key, stream);
+        }
+    }
+
+    /**
+     * A new map holding {@code tags} and {@code added}: a tag call gives the resource a new map, under its lock, so a
+     * lookup reads one whole set.
+     */
+    private static Map<String, String> withTags(Map<String, String> tags, Map<String, String> added) {
+        Map<String, String> merged = new HashMap<>(tags);
+        merged.putAll(added);
+        return merged;
+    }
+
+    /** A new map holding {@code tags} without {@code removed}, as {@link #withTags}. */
+    private static Map<String, String> withoutTags(Map<String, String> tags, List<String> removed) {
+        Map<String, String> remaining = new HashMap<>(tags);
+        removed.forEach(remaining::remove);
+        return remaining;
+    }
+
+    /**
+     * The tags of the stream whose ARN is {@code streamArn} in {@code account}, read in place under the key the
+     * handlers read, the stream's name in the ARN's Region, and matched on the whole ARN it records; none when there
+     * is no such stream.
+     */
+    Map<String, String> streamTagsInAccount(String account, String streamArn, String streamName) {
+        return AccountAwareStorageBackend.readInAccount(store, account,
+                        regionKey(AwsArnUtils.parse(streamArn).region(), streamName))
+                .filter(stream -> streamArn.equals(stream.getStreamArn()))
+                .map(KinesisStream::getTags).orElse(Map.of());
+    }
+
+    /**
+     * The tags of the consumer whose ARN is {@code consumerArn} in {@code account}, read in place under the key the
+     * handlers read, the ARN in its Region; none when there is no such consumer.
+     */
+    Map<String, String> consumerTagsInAccount(String account, String consumerArn) {
+        return AccountAwareStorageBackend.readInAccount(consumerStore, account,
+                        regionKey(AwsArnUtils.parse(consumerArn).region(), consumerArn))
+                .map(KinesisConsumer::getTags).orElse(Map.of());
+    }
+
+    public Map<String, String> listTagsForResource(String resourceArn, String region) {
+        if (isConsumerTagResource(resourceArn, region)) {
+            synchronized (consumerStore) {
+                return new HashMap<>(resolveConsumerForTags(regionKey(region, resourceArn)).getTags());
+            }
+        }
+        String streamName = streamNameFromTagArn(resourceArn);
+        synchronized (lockFor(regionKey(region, streamName))) {
+            return new HashMap<>(describeStreamByArn(resourceArn, region).getTags());
+        }
+    }
+
+    private boolean isConsumerTagResource(String resourceArn, String region) {
+        AwsArnUtils.Arn arn = AwsArnUtils.parseIfArnIn(resourceArn, "kinesis", region)
+                .orElseThrow(() -> new AwsException("InvalidArgumentException",
+                        "ResourceARN must name a Kinesis resource in this region", 400));
+        if (!arn.accountId().equals(regionResolver.getAccountId())) {
+            throw new AwsException("ResourceNotFoundException", "Kinesis resource not found", 400);
+        }
+        if (!arn.resource().startsWith("stream/")) {
+            throw new AwsException("InvalidArgumentException", "ResourceARN must name a stream or consumer", 400);
+        }
+        return arn.resource().contains("/consumer/");
+    }
+
+    private String streamNameFromTagArn(String resourceArn) {
+        return AwsArnUtils.parse(resourceArn).resource().substring("stream/".length());
+    }
+
+    private KinesisConsumer resolveConsumerForTags(String key) {
+        return consumerStore.get(key)
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Consumer not found", 400));
+    }
+
+    private void validateResourceTagLimit(Map<String, String> current, Map<String, String> added) {
+        for (Map.Entry<String, String> entry : added.entrySet()) {
+            if (entry.getKey() == null || !VALID_RESOURCE_TAG_CHARACTERS.matcher(entry.getKey()).matches()
+                    || entry.getKey().regionMatches(true, 0, "aws:", 0, 4)
+                    || entry.getValue() == null || !VALID_RESOURCE_TAG_CHARACTERS.matcher(entry.getValue()).matches()) {
+                throw new AwsException("InvalidArgumentException", "Invalid tag key or value", 400);
+            }
+        }
+        validateTagCapacity(current, added);
+    }
+
+    public static void validateTagCapacity(Map<String, String> current, Map<String, String> added) {
+        Set<String> keys = new HashSet<>(current.keySet());
+        keys.addAll(added.keySet());
+        if (keys.size() > 50 && added.keySet().stream().anyMatch(key -> !current.containsKey(key))) {
+            throw new AwsException("LimitExceededException", "A Kinesis resource can have at most 50 tags", 400);
+        }
+    }
+
+    public void startStreamEncryption(String streamName, String encryptionType, String keyId, String region) {
+        String key = regionKey(region, streamName);
+        synchronized (lockFor(key)) {
+            KinesisStream stream = resolveStream(streamName, region);
+            requireActive(stream);
+            beginStatusUpdate(stream);
+            stream.setEncryptionType(encryptionType);
+            stream.setKeyId(keyId);
+            store.put(key, stream);
+        }
+    }
+
+    public void increaseStreamRetentionPeriod(String streamName, int retentionPeriodHours, String region) {
+        String key = regionKey(region, streamName);
+        synchronized (lockFor(key)) {
+            KinesisStream stream = resolveStream(streamName, region);
+            if (retentionPeriodHours > 8760) {
+                throw new AwsException("InvalidArgumentException",
+                        "Retention period must not exceed 8760 hours (365 days)", 400);
+            }
+            if (retentionPeriodHours < stream.getRetentionPeriodHours()) {
+                throw new AwsException("InvalidArgumentException",
+                        "Requested retention period (" + retentionPeriodHours +
+                        " hours) must not be less than current retention period (" +
+                        stream.getRetentionPeriodHours() + " hours)", 400);
+            }
+            // Same value is a no-op on real AWS despite the API doc wording ("must be more than
+            // current"). Proof: terraform-provider-aws calls IncreaseStreamRetentionPeriod on
+            // stream creation unconditionally when retention_period is set (stream.go Create path),
+            // so every default-retention TF stream would fail if AWS rejected same-value. See #342.
+            if (retentionPeriodHours == stream.getRetentionPeriodHours()) {
+                return;
+            }
+            requireActive(stream);
+            stream.setRetentionPeriodHours(retentionPeriodHours);
+            store.put(key, stream);
+            LOG.infov("Increased retention period for stream {0} to {1} hours", streamName, retentionPeriodHours);
+        }
+    }
+
+    public void decreaseStreamRetentionPeriod(String streamName, int retentionPeriodHours, String region) {
+        String key = regionKey(region, streamName);
+        synchronized (lockFor(key)) {
+            KinesisStream stream = resolveStream(streamName, region);
+            if (retentionPeriodHours < 24) {
+                throw new AwsException("InvalidArgumentException",
+                        "Retention period must not be less than 24 hours", 400);
+            }
+            if (retentionPeriodHours > stream.getRetentionPeriodHours()) {
+                throw new AwsException("InvalidArgumentException",
+                        "Requested retention period (" + retentionPeriodHours +
+                        " hours) must not be greater than current retention period (" +
+                        stream.getRetentionPeriodHours() + " hours)", 400);
+            }
+            // Same value is a no-op on real AWS (mirrors IncreaseStreamRetentionPeriod). See #342.
+            if (retentionPeriodHours == stream.getRetentionPeriodHours()) {
+                return;
+            }
+            requireActive(stream);
+            stream.setRetentionPeriodHours(retentionPeriodHours);
+            store.put(key, stream);
+            LOG.infov("Decreased retention period for stream {0} to {1} hours", streamName, retentionPeriodHours);
+        }
+    }
+
+    public Set<String> enableEnhancedMonitoring(String streamName, List<String> metrics, String region) {
+        String key = regionKey(region, streamName);
+        synchronized (lockFor(key)) {
+            KinesisStream stream = resolveStream(streamName, region);
+            Set<String> current = new HashSet<>(stream.getEnhancedMonitoringMetrics());
+            Set<String> desired = resolveMetrics(metrics);
+            stream.getEnhancedMonitoringMetrics().addAll(desired);
+            store.put(key, stream);
+            LOG.infov("Enabled enhanced monitoring for stream {0}: {1}", streamName, desired);
+            return current;
+        }
+    }
+
+    public Set<String> disableEnhancedMonitoring(String streamName, List<String> metrics, String region) {
+        String key = regionKey(region, streamName);
+        synchronized (lockFor(key)) {
+            KinesisStream stream = resolveStream(streamName, region);
+            Set<String> current = new HashSet<>(stream.getEnhancedMonitoringMetrics());
+            Set<String> toRemove = resolveMetrics(metrics);
+            stream.getEnhancedMonitoringMetrics().removeAll(toRemove);
+            store.put(key, stream);
+            LOG.infov("Disabled enhanced monitoring for stream {0}: {1}", streamName, toRemove);
+            return current;
+        }
+    }
+
+    private Set<String> resolveMetrics(List<String> metrics) {
+        if (metrics.isEmpty()) {
+            throw new AwsException("InvalidArgumentException",
+                    "ShardLevelMetrics must contain at least one metric", 400);
+        }
+        // Validate all entries before expanding ALL
+        for (String m : metrics) {
+            if (!VALID_SHARD_LEVEL_METRICS.contains(m)) {
+                throw new AwsException("InvalidArgumentException",
+                        "Invalid ShardLevelMetric: " + m, 400);
+            }
+        }
+        if (metrics.contains("ALL")) {
+            Set<String> all = new HashSet<>(VALID_SHARD_LEVEL_METRICS);
+            all.remove("ALL");
+            return all;
+        }
+        return new HashSet<>(metrics);
+    }
+
+    public void stopStreamEncryption(String streamName, String region) {
+        String key = regionKey(region, streamName);
+        synchronized (lockFor(key)) {
+            KinesisStream stream = resolveStream(streamName, region);
+            requireActive(stream);
+            beginStatusUpdate(stream);
+            stream.setEncryptionType("NONE");
+            stream.setKeyId(null);
+            store.put(key, stream);
+        }
+    }
+
+    public void splitShard(String streamName, String shardId, String newStartingHashKey, String region) {
+        String key = regionKey(region, streamName);
+        // Share the producer critical section so a split can't race an append: selectShard runs
+        // under the same lock, so a producer never appends to a parent a completed split has closed.
+        synchronized (lockFor(key)) {
+            // Resolve under the lock so a concurrent deleteStream (same monitor) cannot leave us
+            // mutating and re-persisting a stale, deleted instance.
+            KinesisStream stream = resolveStream(streamName, region);
+            requireActive(stream);
+            splitShardOnStream(stream, shardId, newStartingHashKey, () -> beginStatusUpdate(stream));
+            store.put(key, stream);
+            LOG.infov("Split shard {0} in stream {1}", shardId, streamName);
+        }
+    }
+
+    private void splitShardOnStream(KinesisStream stream, String shardId, String newStartingHashKey) {
+        splitShardOnStream(stream, shardId, newStartingHashKey, () -> {});
+    }
+
+    private void splitShardOnStream(KinesisStream stream, String shardId, String newStartingHashKey,
+                                    Runnable beforeMutation) {
+        KinesisShard parent = stream.getShards().stream()
+                .filter(s -> s.getShardId().equals(shardId))
+                .findFirst()
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Shard " + shardId + " not found", 400));
+
+        if (parent.isClosed()) {
+            throw new AwsException("InvalidArgumentException", "Shard " + shardId + " is already closed", 400);
+        }
+
+        List<KinesisShard> legacyOpenShards = legacyOpenShardsToNormalize(stream);
+        KinesisShard.HashKeyRange parentRange = effectiveOpenShardRange(parent, legacyOpenShards);
+        BigInteger splitPoint;
+        try {
+            splitPoint = new BigInteger(newStartingHashKey);
+        } catch (NumberFormatException | NullPointerException expected) {
+            throw new AwsException("InvalidArgumentException",
+                    "NewStartingHashKey " + newStartingHashKey + " is not a valid hash key", 400);
+        }
+        BigInteger parentStart = new BigInteger(parentRange.startingHashKey());
+        BigInteger parentEnd = new BigInteger(parentRange.endingHashKey());
+        if (splitPoint.compareTo(parentStart) <= 0 || splitPoint.compareTo(parentEnd) > 0) {
+            throw new AwsException("InvalidArgumentException",
+                    "NewStartingHashKey must be inside the parent shard's hash range.", 400);
+        }
+        String start = parentRange.startingHashKey();
+        String end = parentRange.endingHashKey();
+        String leftEnd = subtractOne(newStartingHashKey);
+        beforeMutation.run();
+        normalizeOpenShardRanges(stream, legacyOpenShards);
+
+        parent.setClosed(true);
+        parent.setSequenceNumberRange(new KinesisShard.SequenceNumberRange(
+                parent.getSequenceNumberRange().startingSequenceNumber(),
+                String.valueOf(sequenceGenerator.get())));
+
+        // Derive both child ids from the base size WITHOUT relying on the first add: nextShardId
+        // is size-based, so two sequential adds would either collide (both ids computed pre-add)
+        // or expose a half-published topology (child1 visible before child2). Compute base+0 and
+        // base+1 up front so the ids stay distinct, then publish BOTH children in one atomic
+        // CopyOnWriteArrayList.addAll, so a lock-free reader can never observe {parent, child1}
+        // without child2.
+        int base = stream.getShards().size();
+        KinesisShard child1 = new KinesisShard(String.format("shardId-%012d", base), start,
+                leftEnd, String.valueOf(sequenceGenerator.get()));
+        child1.setParentShardId(shardId);
+
+        KinesisShard child2 = new KinesisShard(String.format("shardId-%012d", base + 1),
+                newStartingHashKey, end, String.valueOf(sequenceGenerator.get()));
+        child2.setParentShardId(shardId);
+
+        stream.getShards().addAll(List.of(child1, child2));
+    }
+
+    public void mergeShards(String streamName, String shardId, String adjacentShardId, String region) {
+        String key = regionKey(region, streamName);
+        synchronized (lockFor(key)) {
+            // Resolve under the lock so a concurrent deleteStream (same monitor) cannot leave us
+            // mutating and re-persisting a stale, deleted instance.
+            KinesisStream stream = resolveStream(streamName, region);
+            requireActive(stream);
+            mergeShardsOnStream(stream, shardId, adjacentShardId, () -> beginStatusUpdate(stream));
+            store.put(key, stream);
+            LOG.infov("Merged shards {0} and {1} in stream {2}", shardId, adjacentShardId, streamName);
+        }
+    }
+
+    private void mergeShardsOnStream(KinesisStream stream, String shardId, String adjacentShardId) {
+        mergeShardsOnStream(stream, shardId, adjacentShardId, () -> {});
+    }
+
+    private void mergeShardsOnStream(KinesisStream stream, String shardId, String adjacentShardId,
+                                     Runnable beforeMutation) {
+        KinesisShard shard1 = stream.getShards().stream()
+                .filter(s -> s.getShardId().equals(shardId))
+                .findFirst()
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Shard " + shardId + " not found", 400));
+        KinesisShard shard2 = stream.getShards().stream()
+                .filter(s -> s.getShardId().equals(adjacentShardId))
+                .findFirst()
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Shard " + adjacentShardId + " not found", 400));
+
+        if (shard1.isClosed() || shard2.isClosed()) {
+            throw new AwsException("InvalidArgumentException", "One or both shards are already closed", 400);
+        }
+        List<KinesisShard> legacyOpenShards = legacyOpenShardsToNormalize(stream);
+        KinesisShard.HashKeyRange range1 = effectiveOpenShardRange(shard1, legacyOpenShards);
+        KinesisShard.HashKeyRange range2 = effectiveOpenShardRange(shard2, legacyOpenShards);
+        BigInteger start1 = new BigInteger(range1.startingHashKey());
+        BigInteger end1 = new BigInteger(range1.endingHashKey());
+        BigInteger start2 = new BigInteger(range2.startingHashKey());
+        BigInteger end2 = new BigInteger(range2.endingHashKey());
+        if (!end1.add(BigInteger.ONE).equals(start2) && !end2.add(BigInteger.ONE).equals(start1)) {
+            throw new AwsException("InvalidArgumentException", "Shards must have adjacent hash ranges.", 400);
+        }
+        String start = start1.min(start2).toString();
+        String end = end1.max(end2).toString();
+        beforeMutation.run();
+        normalizeOpenShardRanges(stream, legacyOpenShards);
+
+        shard1.setClosed(true);
+        shard2.setClosed(true);
+        String seq = String.valueOf(sequenceGenerator.get());
+        shard1.setSequenceNumberRange(new KinesisShard.SequenceNumberRange(shard1.getSequenceNumberRange().startingSequenceNumber(), seq));
+        shard2.setSequenceNumberRange(new KinesisShard.SequenceNumberRange(shard2.getSequenceNumberRange().startingSequenceNumber(), seq));
+
+        KinesisShard child = new KinesisShard(nextShardId(stream), start, end, seq);
+        child.setParentShardId(shardId);
+        child.setAdjacentParentShardId(adjacentShardId);
+
+        stream.getShards().add(child);
+    }
+
+    private String nextShardId(KinesisStream stream) {
+        return String.format("shardId-%012d", stream.getShards().size());
+    }
+
+
+
+    private String subtractOne(String val) {
+        return new BigInteger(val).subtract(BigInteger.ONE).toString();
+    }
+
+    public record UpdateShardCountResult(String streamName, String streamArn,
+                                          int currentShardCount, int targetShardCount) {}
+
+    /**
+     * Reshards a stream to {@code targetShardCount} open shards using uniform scaling: the only
+     * scaling type AWS documents. The asynchronous status window begins before potentially
+     * blocking normalization so callers observe the same lifecycle as the individual reshard
+     * APIs; after normalization, the first persistence write records that status and rolling-window
+     * marker before topology staging. The topology changes are staged on a separate shard list and
+     * published with one final storage write after every split or merge validates. The staged list
+     * reuses existing shard instances, so this protects persisted writes and rollback rather than
+     * providing a lock-free snapshot to readers of mutable shard objects. The staged
+     * operations use the same lineage rules as {@link #splitShard} and {@link #mergeShards}, so
+     * parent and adjacent-parent relationships remain identical to calling those APIs by hand;
+     * a failed commit restores the original shard state and rolling-window history.
+     */
+    public UpdateShardCountResult updateShardCount(String streamName, int targetShardCount, String scalingType, String region) {
+        if (!UNIFORM_SCALING.equals(scalingType)) {
+            throw new AwsException("InvalidArgumentException",
+                    "ScalingType must be UNIFORM_SCALING, got: " + scalingType, 400);
+        }
+        if (targetShardCount < 1) {
+            throw new AwsException("InvalidArgumentException",
+                    "TargetShardCount must be at least 1, got: " + targetShardCount, 400);
+        }
+
+        String key = regionKey(region, streamName);
+        int currentOpenShardCount;
+        synchronized (lockFor(key)) {
+            KinesisStream stream = resolveStream(streamName, region);
+
+            if ("ON_DEMAND".equals(stream.getStreamMode())) {
+                throw new AwsException("ValidationException",
+                        "UpdateShardCount is only supported for data streams with the provisioned capacity mode.",
+                        400);
+            }
+            requireActive(stream);
+
+            currentOpenShardCount = (int) stream.getShards().stream().filter(s -> !s.isClosed()).count();
+            validateTargetShardCount(streamName, currentOpenShardCount, targetShardCount);
+            List<Instant> updateTimestamps = nextShardCountUpdateTimestamps(stream);
+            List<KinesisShard> originalShards = stream.getShards();
+            List<ShardState> originalShardStates = originalShards.stream()
+                    .map(KinesisService::snapshotShardState)
+                    .toList();
+            List<Instant> originalTimestamps = stream.getShardCountUpdateTimestamps();
+            String originalStreamStatus = stream.getStreamStatus(clock.instant());
+            Instant originalStatusTransitionDeadline = stream.getStatusTransitionDeadline();
+            boolean writeAttempted = false;
+            try {
+                // Publish the asynchronous status transition before the potentially blocking
+                // range normalization. This preserves the existing Kinesis lifecycle: callers can
+                // observe UPDATING while the first normalization/split is underway.
+                beginStatusUpdate(stream);
+                KinesisStream staged = copyStreamForReshard(stream);
+                normalizeOpenShardRanges(staged);
+                stream.setShardCountUpdateTimestamps(updateTimestamps);
+                staged.setShardCountUpdateTimestamps(updateTimestamps);
+                writeAttempted = true;
+                store.put(key, stream);
+
+                // Stage the topology on a separate shard-list while retaining the original shard
+                // instances. Retaining those instances preserves their lifecycle callbacks and
+                // lets a failed commit restore every mutable field in place for existing callers.
+                applyUniformScaling(staged, currentOpenShardCount, targetShardCount);
+
+                // Preserve the identity of the object returned by create/describe. Several callers
+                // retain that object and expect a successful reshard to update it in place. The
+                // stream's volatile shard-list reference is replaced only after staging is done.
+                copyReshardState(staged, stream);
+                writeAttempted = true;
+                store.put(key, stream);
+            } catch (RuntimeException | Error failure) {
+                // StorageBackend.put may publish the object before reporting a persistence error.
+                // Restore the same stream and shard instances so both in-memory callers and a
+                // backend that retained the reference see the original topology and rolling slot.
+                originalShardStates.forEach(KinesisService::restoreShardState);
+                stream.setShards(originalShards);
+                stream.setShardCountUpdateTimestamps(originalTimestamps);
+                stream.setStreamStatus(originalStreamStatus);
+                stream.setStatusTransitionDeadline(originalStatusTransitionDeadline);
+                openShardRangeIndexes.remove(stream);
+                if (writeAttempted) {
+                    try {
+                        // PersistentStorage writes through on every put; rewrite the restored value
+                        // when the status or final topology write reached the backend before failing.
+                        store.put(key, stream);
+                    } catch (RuntimeException | Error rollbackFailure) {
+                        failure.addSuppressed(rollbackFailure);
+                    }
+                }
+                throw failure;
+            }
+
+            return new UpdateShardCountResult(streamName, stream.getStreamArn(), currentOpenShardCount, targetShardCount);
+        }
+    }
+
+    private KinesisStream copyStreamForReshard(KinesisStream source) {
+        KinesisStream copy = new KinesisStream();
+        copy.setStreamName(source.getStreamName());
+        copy.setStreamArn(source.getStreamArn());
+        copy.setAccountId(source.getAccountId());
+        copy.setStreamStatus(source.getStreamStatus(clock.instant()));
+        copy.setStatusTransitionDeadline(source.getStatusTransitionDeadline());
+        copy.setResourcePolicyGeneration(source.getResourcePolicyGeneration());
+        copy.setResourcePolicies(source.getResourcePolicies());
+        copy.setRetentionPeriodHours(source.getRetentionPeriodHours());
+        copy.setStreamCreationTimestamp(source.getStreamCreationTimestamp());
+        copy.setTags(source.getTags() == null ? new HashMap<>() : new HashMap<>(source.getTags()));
+        copy.setEncryptionType(source.getEncryptionType());
+        copy.setKeyId(source.getKeyId());
+        copy.setStreamMode(source.getStreamMode());
+        copy.setEnhancedMonitoringMetrics(source.getEnhancedMonitoringMetrics() == null
+                ? new HashSet<>() : new HashSet<>(source.getEnhancedMonitoringMetrics()));
+        copy.setMaxRecordSizeInKiB(source.getMaxRecordSizeInKiB());
+        copy.setShardCountUpdateTimestamps(source.getShardCountUpdateTimestamps() == null
+                ? new ArrayList<>() : new ArrayList<>(source.getShardCountUpdateTimestamps()));
+        // Keep the original shard instances so status-window and normalization callbacks remain
+        // observable while the staged stream owns an independent topology list.
+        copy.setShards(new ArrayList<>(source.getShards()));
+        return copy;
+    }
+
+    private record ShardState(KinesisShard shard, String parentShardId, String adjacentParentShardId,
+                              KinesisShard.HashKeyRange hashKeyRange,
+                              KinesisShard.SequenceNumberRange sequenceNumberRange, boolean closed,
+                              Instant creationTimestamp) {}
+
+    private static ShardState snapshotShardState(KinesisShard shard) {
+        return new ShardState(shard, shard.getParentShardId(), shard.getAdjacentParentShardId(),
+                shard.getHashKeyRange(), shard.getSequenceNumberRange(), shard.isClosed(),
+                shard.getCreationTimestamp());
+    }
+
+    private static void restoreShardState(ShardState state) {
+        KinesisShard target = state.shard();
+        target.setParentShardId(state.parentShardId());
+        target.setAdjacentParentShardId(state.adjacentParentShardId());
+        target.setHashKeyRange(state.hashKeyRange());
+        target.setSequenceNumberRange(state.sequenceNumberRange());
+        target.setClosed(state.closed());
+        target.setCreationTimestamp(state.creationTimestamp());
+    }
+
+    private void copyReshardState(KinesisStream source, KinesisStream target) {
+        // The staged stream owns a separate shard-list. Reuse its already-prepared shard objects
+        // instead of cloning every retained record a second time during publication.
+        target.setShards(source.getShards());
+        openShardRangeIndexes.remove(target);
+        target.setStreamStatus(source.getStreamStatus(clock.instant()));
+        target.setStatusTransitionDeadline(source.getStatusTransitionDeadline());
+        target.setShardCountUpdateTimestamps(new ArrayList<>(source.getShardCountUpdateTimestamps()));
+    }
+
+    /**
+     * Enforces UpdateShardCount's documented default limits. The minimum bound rounds up for an
+     * odd current shard count ({@code (n + 1) / 2}), so current=5 accepts target=3 but rejects
+     * target=2; AWS documents only "below half" with no stated rounding, so the rounding direction
+     * here is Floci's own call, chosen as the more conservative reading. AWS's separate 10 TPS
+     * call-rate limit on this action is not enforced: Floci does not simulate real-time request
+     * throttling for any action.
+     */
+    private void validateTargetShardCount(String streamName, int currentOpenShardCount, int targetShardCount) {
+        int maxAllowed = currentOpenShardCount * 2;
+        int minAllowed = (currentOpenShardCount + 1) / 2;
+        if (targetShardCount > maxAllowed) {
+            throw new AwsException("LimitExceededException",
+                    "TargetShardCount of " + targetShardCount + " for stream " + streamName
+                            + " exceeds double the current open shard count of " + currentOpenShardCount + ".", 400);
+        }
+        if (targetShardCount < minAllowed) {
+            throw new AwsException("LimitExceededException",
+                    "TargetShardCount of " + targetShardCount + " for stream " + streamName
+                            + " is below half the current open shard count of " + currentOpenShardCount + ".", 400);
+        }
+        if (targetShardCount > MAX_SHARDS_PER_STREAM) {
+            throw new AwsException("LimitExceededException",
+                    "TargetShardCount of " + targetShardCount + " exceeds the shard limit of "
+                            + MAX_SHARDS_PER_STREAM + " shards per stream.", 400);
+        }
+        if (currentOpenShardCount > MAX_SHARDS_PER_STREAM && targetShardCount >= MAX_SHARDS_PER_STREAM) {
+            throw new AwsException("LimitExceededException",
+                    "Stream " + streamName + " already has more than " + MAX_SHARDS_PER_STREAM
+                            + " shards; it can only be scaled down below that limit.", 400);
+        }
+    }
+
+    /** Enforces the "no more than ten UpdateShardCount calls per rolling 24 hours" default limit. */
+    private List<Instant> nextShardCountUpdateTimestamps(KinesisStream stream) {
+        Instant now = clock.instant();
+        Instant windowStart = now.minus(SHARD_COUNT_UPDATE_WINDOW);
+        List<Instant> recent = new ArrayList<>(stream.getShardCountUpdateTimestamps().stream()
+                .filter(t -> t.isAfter(windowStart))
+                .toList());
+        if (recent.size() >= MAX_SHARD_COUNT_UPDATES_PER_DAY) {
+            throw new AwsException("LimitExceededException",
+                    "Stream " + stream.getStreamName() + " has already been scaled "
+                            + MAX_SHARD_COUNT_UPDATES_PER_DAY + " times in the past 24 hours.", 400);
+        }
+        recent.add(now);
+        return recent;
+    }
+
+    /**
+     * Reaches {@code targetShardCount} open shards by splitting the widest open shards (scale up)
+     * or merging the narrowest disjoint adjacent pairs (scale down), so the resulting topology
+     * stays as close to equal-width as the existing shard layout allows.
+     */
+    private void applyUniformScaling(KinesisStream stream, int currentOpenShardCount, int targetShardCount) {
+        if (targetShardCount > currentOpenShardCount) {
+            int splitsNeeded = targetShardCount - currentOpenShardCount;
+            List<KinesisShard> splitCandidates = stream.getShards().stream()
+                    .filter(s -> !s.isClosed())
+                    .sorted(Comparator.comparing(KinesisService::hashRangeWidth).reversed()
+                            .thenComparing(KinesisShard::getShardId))
+                    .limit(splitsNeeded)
+                    .toList();
+            for (KinesisShard parent : splitCandidates) {
+                splitShardOnStream(stream, parent.getShardId(), midpointHashKey(parent.getHashKeyRange()));
+            }
+        } else if (targetShardCount < currentOpenShardCount) {
+            int mergesNeeded = currentOpenShardCount - targetShardCount;
+            List<KinesisShard> openByHashKey = stream.getShards().stream()
+                    .filter(s -> !s.isClosed())
+                    .sorted(Comparator.comparing(s -> new BigInteger(s.getHashKeyRange().startingHashKey())))
+                    .toList();
+
+            List<int[]> narrowestFirstDisjointPairs = narrowestFirstDisjointAdjacentPairs(openByHashKey);
+            for (int i = 0; i < mergesNeeded; i++) {
+                int[] pair = narrowestFirstDisjointPairs.get(i);
+                KinesisShard shard1 = openByHashKey.get(pair[0]);
+                KinesisShard shard2 = openByHashKey.get(pair[1]);
+                mergeShardsOnStream(stream, shard1.getShardId(), shard2.getShardId());
+            }
+        }
+    }
+
+    /**
+     * Every disjoint adjacent-pair merge candidate among {@code openByHashKey}, narrowest
+     * combined hash-range width first. Only the fixed (0,1), (2,3), ... parity pairing is
+     * considered: those pairs never share a shard, so merging any prefix of this list is always
+     * valid regardless of how many merges are actually needed, and picking the narrowest pairs
+     * first keeps the resulting topology as close to equal-width as the existing layout allows.
+     */
+    private static List<int[]> narrowestFirstDisjointAdjacentPairs(List<KinesisShard> openByHashKey) {
+        List<int[]> pairs = new ArrayList<>();
+        for (int i = 0; i + 1 < openByHashKey.size(); i += 2) {
+            pairs.add(new int[]{i, i + 1});
+        }
+        pairs.sort(Comparator.comparing(pair ->
+                hashRangeWidth(openByHashKey.get(pair[0])).add(hashRangeWidth(openByHashKey.get(pair[1])))));
+        return pairs;
+    }
+
+    private static BigInteger hashRangeWidth(KinesisShard shard) {
+        BigInteger start = new BigInteger(shard.getHashKeyRange().startingHashKey());
+        BigInteger end = new BigInteger(shard.getHashKeyRange().endingHashKey());
+        return end.subtract(start).add(BigInteger.ONE);
+    }
+
+    private static String midpointHashKey(KinesisShard.HashKeyRange range) {
+        BigInteger start = new BigInteger(range.startingHashKey());
+        BigInteger end = new BigInteger(range.endingHashKey());
+        BigInteger width = end.subtract(start).add(BigInteger.ONE);
+        return start.add(width.divide(BigInteger.TWO)).toString();
+    }
+
+    public record PutRecordResult(String sequenceNumber, String shardId) {}
+
+    public String putRecord(String streamName, byte[] data, String partitionKey, String region) {
+        return putRecordWithShardId(streamName, data, partitionKey, region).sequenceNumber();
+    }
+
+    /** Record size as AWS measures it: the data blob plus the partition key. */
+    static int recordSize(int dataBytes, String partitionKey) {
+        return dataBytes
+                + (partitionKey != null ? partitionKey.getBytes(StandardCharsets.UTF_8).length : 0);
+    }
+
+    public void validateRecordSize(KinesisStream stream, byte[] data, String partitionKey) {
+        int size = recordSize(data != null ? data.length : 0, partitionKey);
+        int max = stream.getMaxRecordSizeInKiB() * 1024;
+        if (size > max) {
+            throw new AwsException("InvalidArgumentException",
+                    "Record size (data + partition key) of " + size + " bytes exceeds the maximum of "
+                            + max + " bytes.", 400);
+        }
+    }
+
+    /**
+     * The request-wide PutRecords caps. Both reject the whole request rather than failing records
+     * individually, because PutRecordsResultEntry.ErrorCode carries only throughput and internal
+     * errors — the same reason the per-record size check aborts the batch.
+     */
+    void validateRecordCount(int recordCount) {
+        if (recordCount < 1) {
+            throw new AwsException("InvalidArgumentException",
+                    "A PutRecords request requires at least one record.", 400);
+        }
+        if (recordCount > MAX_RECORDS_PER_REQUEST) {
+            throw new AwsException("InvalidArgumentException",
+                    "A PutRecords request supports at most " + MAX_RECORDS_PER_REQUEST
+                            + " records, got " + recordCount + ".", 400);
+        }
+    }
+
+    void validateRequestSize(long totalBytes) {
+        if (totalBytes > MAX_REQUEST_SIZE_BYTES) {
+            throw new AwsException("InvalidArgumentException",
+                    "A PutRecords request (data + partition keys) is limited to " + MAX_REQUEST_SIZE_BYTES
+                            + " bytes, got " + totalBytes + ".", 400);
+        }
+    }
+
+    /**
+     * The bounds are the same on both actions but the code each publishes for a violation is not:
+     * UpdateMaxRecordSize documents ValidationException for an out-of-range size, while CreateStream
+     * reserves ValidationException for the on-demand case and describes InvalidArgumentException as
+     * "a specified parameter exceeds its restrictions".
+     */
+    private static void validateMaxRecordSize(int maxRecordSizeInKiB, String errorCode) {
+        if (maxRecordSizeInKiB < MIN_RECORD_SIZE_KIB || maxRecordSizeInKiB > MAX_RECORD_SIZE_KIB) {
+            throw new AwsException(errorCode,
+                    "MaxRecordSizeInKiB must be between " + MIN_RECORD_SIZE_KIB + " and "
+                            + MAX_RECORD_SIZE_KIB + ", got " + maxRecordSizeInKiB + ".", 400);
+        }
+    }
+
+    public void updateMaxRecordSize(String streamName, int maxRecordSizeInKiB, String region) {
+        String key = regionKey(region, streamName);
+        synchronized (lockFor(key)) {
+            KinesisStream stream = resolveStream(streamName, region);
+            validateMaxRecordSize(maxRecordSizeInKiB, "ValidationException");
+            if ("ON_DEMAND".equals(stream.getStreamMode())) {
+                throw new AwsException("ValidationException",
+                        "UpdateMaxRecordSize is only supported for data streams with the provisioned capacity mode.",
+                        400);
+            }
+            requireActive(stream);
+            beginStatusUpdate(stream);
+            stream.setMaxRecordSizeInKiB(maxRecordSizeInKiB);
+            store.put(key, stream);
+            LOG.infov("Updated max record size for {0} to {1} KiB", streamName, maxRecordSizeInKiB);
+        }
+    }
+
+    void validateExplicitHashKey(String explicitHashKey) {
+        if (explicitHashKey != null) {
+            parseExplicitHashKey(explicitHashKey);
+        }
+    }
+
+    public PutRecordResult putRecordWithShardId(String streamName, byte[] data, String partitionKey, String region) {
+        return putRecordWithShardId(streamName, data, partitionKey, null, region);
+    }
+
+    public PutRecordResult putRecordWithShardId(String streamName, byte[] data, String partitionKey,
+                                                String explicitHashKey, String region) {
+        return putRecordInternal(null, streamName, data, partitionKey, explicitHashKey, region);
+    }
+
+    /**
+     * Append a record on behalf of a specific account. Used by producers that run outside request scope
+     * (the DynamoDB TTL sweep and DynamoDB→Kinesis CDC forwarding) so the record lands in the table
+     * owner's stream rather than the ambient/default account's same-named stream. A {@code null}
+     * accountId behaves exactly like {@link #putRecord}.
+     */
+    public String putRecordForAccount(String accountId, String streamName, byte[] data, String partitionKey,
+                                      String region) {
+        return putRecordInternal(accountId, streamName, data, partitionKey, null, region).sequenceNumber();
+    }
+
+    private PutRecordResult putRecordInternal(String accountId, String streamName, byte[] data,
+                                              String partitionKey, String explicitHashKey, String region) {
+        String key = regionKey(region, streamName);
+        putRecordBeforeLockHook.run();
+
+        // Serialize shard selection, sequence allocation, append and persistence per stream so
+        // concurrent producers can neither lose an append (plain ArrayList) nor store records
+        // out of sequence order (which would break AT_/AFTER_SEQUENCE_NUMBER scans and WAL replay).
+        // The lock is keyed on region+streamName (NOT the account): an account-qualified key would stop
+        // explicit-account appends from serializing against request-path producers on the same stream,
+        // reintroducing the append race. Cross-account same-named streams therefore share one monitor
+        // (over-coarse but safe).
+        synchronized (lockFor(key)) {
+            // Resolve under the lock, not before it. Resolving a legacy unprefixed stream MIGRATES it,
+            // which is a write: the explicit-account path moves it into the account partition behind an
+            // ownership predicate, while AccountAwareStorageBackend.get adopts it into the request
+            // account with no ownership check and no synchronization. Resolved outside this monitor,
+            // an ambient producer and the owner's producer could migrate the same stream concurrently
+            // and fork it across partitions. deleteStream holds this same monitor too, so a stream
+            // deleted before we get here is absent and this fails like any other missing stream rather
+            // than appending to a stale instance and resurrecting it.
+            KinesisStream current = resolveStreamForAccountMigrating(accountId, streamName, region);
+            requireWritableStream(current);
+            // A missing or not-yet-active stream reports ResourceNotFoundException ahead of an
+            // invalid ExplicitHashKey. Size validation runs against the same lock-protected instance
+            // that shard selection and the append use.
+            validateExplicitHashKey(explicitHashKey);
+            validateRecordSize(current, data, partitionKey);
+            KinesisShard shard = selectShard(current, partitionKey, explicitHashKey);
+            pruneExpiredRecords(current, shard);
+            String sequenceNumber = String.valueOf(sequenceGenerator.incrementAndGet());
+            putRecordAppendHook.run();
+            KinesisRecord record = new KinesisRecord(data, partitionKey, sequenceNumber, clock.instant());
+            shard.addRecord(record);
+            putInAccount(store, accountId, key, current);
+            return new PutRecordResult(sequenceNumber, shard.getShardId());
+        }
+    }
+
+    /**
+     * The checks PutRecord makes before it appends, for a dry run: the stream exists and takes writes, and the
+     * explicit hash key and the record's size are valid.
+     */
+    public void checkPutRecord(String streamName, byte[] data, String partitionKey, String explicitHashKey,
+                               String region) {
+        KinesisStream stream = resolveStream(streamName, region);
+        requireWritableStream(stream);
+        validateExplicitHashKey(explicitHashKey);
+        validateRecordSize(stream, data, partitionKey);
+    }
+
+    /** What a dry run of {@code operation} answers when the call would have succeeded (measured on AWS). */
+    static AwsException dryRunOperation(String operation) {
+        return new AwsException("DryRunOperationException", "DryRunOperation validation succeeded while calling "
+                + operation + " operation.: Request would have succeeded, but DryRun flag is set.", 400);
+    }
+
+    public String getShardIterator(String streamName, String shardId, String type, String sequenceNumber, String region) {
+        return getShardIterator(streamName, shardId, type, sequenceNumber, null, region);
+    }
+
+    public String getShardIterator(String streamName, String shardId, String type, String sequenceNumber,
+                                   Long timestampMillis, String region) {
+        KinesisStream stream = resolveStream(streamName, region);
+        // Format: streamName|shardId|type|sequenceNumber|index|timestampMillis
+        // The 6th slot was added for AT_TIMESTAMP; empty for other iterator types.
+        // Old 5-part iterators still decode via split(-1) compatibility in getRecords.
+        // For LATEST the sequenceNumber slot carries the shard tip's sequence number at
+        // iterator creation time (see resolveIteratorSequenceNumber), so records written
+        // afterwards are visible to getRecords, and retention pruning of older records
+        // can never shift what this iterator resolves to.
+        String raw = String.format("%s|%s|%s|%s|%d|%s",
+                streamName, shardId, type,
+                resolveIteratorSequenceNumber(stream, shardId, type, sequenceNumber),
+                0,
+                timestampMillis != null ? timestampMillis.toString() : "");
+        return Base64.getEncoder().encodeToString(raw.getBytes(StandardCharsets.UTF_8));
+    }
+
+    // A shard iterator is an opaque token we mint; a client that replays a garbage one gets
+    // InvalidArgumentException, not a 500 from an unguarded base64 decode or Integer.parse.
+    private String[] decodeShardIterator(String shardIterator) {
+        byte[] decoded;
+        try {
+            decoded = Base64.getDecoder().decode(shardIterator);
+        } catch (IllegalArgumentException e) {
+            throw new AwsException("InvalidArgumentException", "Invalid shard iterator", 400);
+        }
+        // Use limit=-1 so trailing empty slots round-trip and old 5-part iterators still work.
+        String[] parts = new String(decoded, StandardCharsets.UTF_8).split(Pattern.quote("|"), -1);
+        if (parts.length < 5) {
+            throw new AwsException("InvalidArgumentException", "Invalid shard iterator", 400);
+        }
+        return parts;
+    }
+
+    /**
+     * The sequence-number reference encoded into a freshly-minted shard iterator. For LATEST this
+     * is the shard's current tip record's sequence number (or {@code ""} if the shard has no
+     * records yet); getRecords resolves it with the same sequence-number lookup used for
+     * AFTER_SEQUENCE_NUMBER. A raw record-count/index snapshot would be invalidated by
+     * retention pruning removing earlier records and shifting every later record's index; a
+     * sequence number is stable under pruning since sequence numbers are never reused. Every other
+     * iterator type passes its caller-supplied sequence number (or {@code ""}) straight through.
+     *
+     * <p>AWS validates the shard at GetShardIterator time for every iterator type, which the shard
+     * lookup below still performs regardless of type.
+     */
+    private String resolveIteratorSequenceNumber(KinesisStream stream, String shardId, String type,
+                                                  String sequenceNumber) {
+        KinesisShard shard = stream.getShards().stream()
+                .filter(s -> s.getShardId().equals(shardId))
+                .findFirst()
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Shard not found", 400));
+        if (!"LATEST".equals(type)) {
+            return sequenceNumber != null ? sequenceNumber : "";
+        }
+        List<KinesisRecord> records = shard.getRecords();
+        return records.isEmpty() ? "" : records.get(records.size() - 1).getSequenceNumber();
+    }
+
+    private int parseIteratorIndex(String value) {
+        try {
+            return Integer.parseInt(value);
+        } catch (NumberFormatException e) {
+            throw new AwsException("InvalidArgumentException", "Invalid shard iterator", 400);
+        }
+    }
+
+    public Map<String, Object> getRecords(String shardIterator, Integer limit, String region) {
+        String[] parts = decodeShardIterator(shardIterator);
+
+        String streamName = parts[0];
+        String shardId = parts[1];
+        String type = parts[2];
+        String startSeq = parts[3];
+        int lastIndex = parseIteratorIndex(parts[4]);
+        Long timestampMillis = null;
+        if (parts.length >= 6 && !parts[5].isEmpty()) {
+            try {
+                timestampMillis = Long.parseLong(parts[5]);
+            } catch (NumberFormatException e) {
+                throw new AwsException("InvalidArgumentException", "Invalid timestamp in shard iterator", 400);
+            }
+        }
+
+        ShardReadSnapshot read = snapshotShard(null, streamName, shardId, region);
+        KinesisShard.RecordsSnapshot snapshot = read.records();
+        List<KinesisRecord> allRecords = snapshot.records();
+        int startIndex = 0;
+
+        // Simple implementation of iterator types.
+        // LATEST resolves the same way as AFTER_SEQUENCE_NUMBER: it was encoded (at
+        // GetShardIterator time) as the shard tip's sequence number, so records appended after the
+        // iterator was obtained are returned. Resolving by sequence number rather than the shard's
+        // raw index/count means retention pruning of earlier records (which shifts
+        // every later record's array index) can never invalidate this reference: if the
+        // referenced record has itself since been pruned, every record before it was necessarily
+        // pruned too (pruning only ever removes a contiguous prefix), so falling through to the
+        // startIndex=0 default below still correctly resumes at the oldest still-retained record.
+        if ("TRIM_HORIZON".equals(type)) {
+            startIndex = legacyResumeIndex(snapshot, lastIndex);
+        } else if ("AT_SEQUENCE_NUMBER".equals(type)) {
+            for (int i = 0; i < allRecords.size(); i++) {
+                if (allRecords.get(i).getSequenceNumber().equals(startSeq)) {
+                    startIndex = i;
+                    break;
+                }
+            }
+        } else if ("AFTER_SEQUENCE_NUMBER".equals(type) || "LATEST".equals(type)) {
+             for (int i = 0; i < allRecords.size(); i++) {
+                if (allRecords.get(i).getSequenceNumber().equals(startSeq)) {
+                    startIndex = i + 1;
+                    break;
+                }
+            }
+        } else if ("AT_TIMESTAMP".equals(type)) {
+            if (timestampMillis == null) {
+                throw new AwsException("InvalidArgumentException",
+                        "AT_TIMESTAMP iterator requires a Timestamp", 400);
+            }
+            // First record with ApproximateArrivalTimestamp >= requested timestamp.
+            // If none match (all records predate timestamp or shard is empty), start past end (no records returned, caught up).
+            startIndex = allRecords.size();
+            for (int i = 0; i < allRecords.size(); i++) {
+                Instant arr = allRecords.get(i).getApproximateArrivalTimestamp();
+                if (arr != null && arr.toEpochMilli() >= timestampMillis) {
+                    startIndex = i;
+                    break;
+                }
+            }
+        }
+
+        return recordsPage(streamName, shardId, read, startIndex, limit);
+    }
+
+    public record ChildShard(String shardId, List<String> parentShards, KinesisShard.HashKeyRange hashKeyRange) {}
+
+    private record ShardReadSnapshot(KinesisShard.RecordsSnapshot records, boolean closed,
+                                     List<ChildShard> children) {}
+
+    private ShardReadSnapshot snapshotShard(String accountId, String streamName, String shardId, String region) {
+        // Share the append/reshard monitor so a terminal snapshot includes the final append and topology.
+        synchronized (lockFor(regionKey(region, streamName))) {
+            KinesisStream stream = resolveStreamForAccount(accountId, streamName, region);
+            KinesisShard shard = stream.getShards().stream()
+                    .filter(candidate -> candidate.getShardId().equals(shardId))
+                    .findFirst()
+                    .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Shard not found", 400));
+            pruneExpiredRecords(stream, shard);
+            List<ChildShard> children = new ArrayList<>();
+            if (shard.isClosed()) {
+                for (KinesisShard child : stream.getShards()) {
+                    if (shardId.equals(child.getParentShardId()) || shardId.equals(child.getAdjacentParentShardId())) {
+                        List<String> parents = new ArrayList<>();
+                        if (child.getParentShardId() != null) {
+                            parents.add(child.getParentShardId());
+                        }
+                        if (child.getAdjacentParentShardId() != null) {
+                            parents.add(child.getAdjacentParentShardId());
+                        }
+                        children.add(new ChildShard(child.getShardId(), List.copyOf(parents), child.getHashKeyRange()));
+                    }
+                }
+            }
+            return new ShardReadSnapshot(shard.snapshotRecords(), shard.isClosed(), List.copyOf(children));
+        }
+    }
+
+    private Map<String, Object> recordsPage(String streamName, String shardId, ShardReadSnapshot read,
+                                             int startIndex, Integer limit) {
+        List<KinesisRecord> allRecords = read.records().records();
+        int max = limit != null ? Math.min(limit, 1000) : 1000;
+        List<KinesisRecord> result = new ArrayList<>();
+        int nextIndex = startIndex;
+        for (int i = startIndex; i < allRecords.size() && result.size() < max; i++) {
+            result.add(allRecords.get(i));
+            nextIndex = i + 1;
+        }
+        boolean terminal = read.closed() && nextIndex >= allRecords.size();
+        Map<String, Object> response = new HashMap<>();
+        response.put("Records", result);
+        response.put("NextShardIterator", terminal ? null
+                : buildContinuationIterator(streamName, shardId, allRecords, nextIndex));
+        response.put("MillisBehindLatest", computeMillisBehindLatest(allRecords, nextIndex));
+        if (terminal) {
+            response.put("ChildShards", read.children());
+        }
+        return response;
+    }
+
+    public record PeekedRecord(String shardId, KinesisRecord record) {}
+
+    /**
+     * Returns up to {@code limit} of the most-recent records across all (or one) shard.
+     * Records are returned in ascending arrival-timestamp order (oldest first).
+     *
+     * <p>With no pagination cursor, {@value MAX_INSPECTION_RECORD_LIMIT} is a hard ceiling
+     * on the total number of records reachable in a single call regardless of the {@code limit}
+     * parameter.
+     */
+    public List<PeekedRecord> peekRecords(String streamName, String shardId, Integer limit, String region) {
+        KinesisStream stream = resolveStream(streamName, region);
+        int resolvedLimit = resolveInspectionRecordLimit(limit);
+        if (resolvedLimit == 0) {
+            return List.of();
+        }
+
+        if (shardId != null && !shardId.isBlank()) {
+            boolean exists = stream.getShards().stream().anyMatch(shard -> shard.getShardId().equals(shardId));
+            if (!exists) {
+                throw new AwsException("ResourceNotFoundException", "Shard " + shardId + " not found", 400);
+            }
+        }
+
+        Comparator<PeekedRecord> oldestFirst = Comparator.comparing(
+                peeked -> peeked.record().getApproximateArrivalTimestamp(),
+                Comparator.nullsFirst(Comparator.naturalOrder()));
+        PriorityQueue<PeekedRecord> newest = new PriorityQueue<>(oldestFirst);
+        stream.getShards().stream()
+                .filter(shard -> shardId == null || shardId.isBlank() || shard.getShardId().equals(shardId))
+                .forEach(shard -> {
+                    pruneExpiredRecords(stream, shard);
+                    shard.getRecords().forEach(record -> {
+                        newest.add(new PeekedRecord(shard.getShardId(), record));
+                        if (newest.size() > resolvedLimit) {
+                            newest.poll();
+                        }
+                    });
+                });
+
+        return newest.stream()
+                .sorted(Comparator.comparing(peeked -> peeked.record().getApproximateArrivalTimestamp(),
+                        Comparator.nullsLast(Comparator.naturalOrder()))).toList();
+    }
+
+    /**
+     * Resolves the caller-supplied limit to a value in {@code [0, MAX_INSPECTION_RECORD_LIMIT]}.
+     * Both ends are clamped silently, consistent with the behaviour of
+     * {@link #getRecords} and {@link #getRecordsForAccount}.
+     */
+    private int resolveInspectionRecordLimit(Integer limit) {
+        if (limit == null) {
+            return DEFAULT_INSPECTION_RECORD_LIMIT;
+        }
+        return Math.max(0, Math.min(limit, MAX_INSPECTION_RECORD_LIMIT));
+    }
+
+    /**
+     * Time delta in ms between the last record returned and the shard tip.
+     * Zero when caught up, the shard is empty, or no records were returned.
+     */
+    private long computeMillisBehindLatest(List<KinesisRecord> allRecords, int nextIndex) {
+        if (nextIndex <= 0 || nextIndex >= allRecords.size()) {
+            return 0L;
+        }
+        Instant lastReturned = allRecords.get(nextIndex - 1).getApproximateArrivalTimestamp();
+        Instant tip = allRecords.get(allRecords.size() - 1).getApproximateArrivalTimestamp();
+        if (lastReturned == null || tip == null) {
+            return 0L;
+        }
+        return Math.max(0L, tip.toEpochMilli() - lastReturned.toEpochMilli());
+    }
+
+    /**
+     * Earlier versions encoded a continuation as TRIM_HORIZON plus a raw index into the shard's
+     * log, and Firehose persists such iterators as checkpoints. Pruning shifts that index, so
+     * subtract the records pruned since.
+     */
+    private static int legacyResumeIndex(KinesisShard.RecordsSnapshot snapshot, int index) {
+        long resumeIndex = Math.max(0, index - snapshot.prunedRecordCount());
+        return (int) Math.min(resumeIndex, snapshot.records().size());
+    }
+
+    /**
+     * Builds the {@code NextShardIterator} a GetRecords call returns, positioned just after the
+     * last record delivered (or at the log's start if none were). Encoded as
+     * AFTER_SEQUENCE_NUMBER against the sequence number of the last-returned record (or, if
+     * nothing has been returned yet, the original TRIM_HORIZON/index-0 convention) rather than a
+     * raw resume index: retention pruning removes a prefix of the shard's record
+     * list, which would silently shift a raw index, but never invalidates a sequence number.
+     */
+    private String buildContinuationIterator(String streamName, String shardId,
+                                              List<KinesisRecord> allRecords, int nextIndex) {
+        if (nextIndex <= 0) {
+            return Base64.getEncoder().encodeToString(
+                    String.format("%s|%s|%s|%s|%d|", streamName, shardId, "TRIM_HORIZON", "", 0)
+                            .getBytes(StandardCharsets.UTF_8));
+        }
+        String resumeAfterSequenceNumber = allRecords.get(nextIndex - 1).getSequenceNumber();
+        return Base64.getEncoder().encodeToString(
+                String.format("%s|%s|%s|%s|%d|", streamName, shardId, "AFTER_SEQUENCE_NUMBER",
+                                resumeAfterSequenceNumber, 0)
+                        .getBytes(StandardCharsets.UTF_8));
+    }
+
+    /**
+     * Lazily expires records older than {@code stream}'s current retention period from
+     * {@code shard}, per the documented Kinesis retention-period contract: records past the
+     * retention window become inaccessible, and decreasing the retention period makes
+     * newly-out-of-window records inaccessible almost immediately. There is no background sweep
+     * (YAGNI): every put and read touches only the shard(s) it actually visits, so pruning happens
+     * on that shard's next put or read after the record ages out.
+     */
+    private void pruneExpiredRecords(KinesisStream stream, KinesisShard shard) {
+        Instant cutoff = clock.instant().minus(Duration.ofHours(stream.getRetentionPeriodHours()));
+        shard.pruneRecordsBefore(cutoff);
+    }
+
+    private KinesisStream resolveStream(String streamName, String region) {
+        return store.get(regionKey(region, streamName))
+                .orElseThrow(() -> new AwsException("ResourceNotFoundException", "Stream " + streamName + " not found", 400));
+    }
+
+    private KinesisStream resolveStreamForAccount(String accountId, String streamName, String region) {
+        if (accountId != null && store instanceof AccountAwareStorageBackend<KinesisStream> aware) {
+            return aware.getForAccount(accountId, regionKey(region, streamName))
+                    .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                            "Stream " + streamName + " not found", 400));
+        }
+        return resolveStream(streamName, region);
+    }
+
+    /**
+     * Resolve for an out-of-request-scope PRODUCER (CDC forwarding, TTL sweep), migrating a legacy
+     * unprefixed stream into the account partition on write, mirroring the ambient {@code store.get()}
+     * fallback the producer used before account-scoping, so an installation with an existing CDC
+     * destination and an unmigrated stream keeps forwarding after upgrade. Ownership is validated by the
+     * stream's own accountId/ARN so one tenant cannot adopt another's unprefixed stream.
+     */
+    private KinesisStream resolveStreamForAccountMigrating(String accountId, String streamName, String region) {
+        if (accountId != null && store instanceof AccountAwareStorageBackend<KinesisStream> aware) {
+            return aware.getForAccountMigratingLegacy(accountId, regionKey(region, streamName),
+                            s -> accountId.equals(s.getAccountId())
+                                    || (s.getStreamArn() != null && s.getStreamArn().contains(":" + accountId + ":")))
+                    .orElseThrow(() -> new AwsException("ResourceNotFoundException",
+                            "Stream " + streamName + " not found", 400));
+        }
+        return resolveStream(streamName, region);
+    }
+
+    public String getShardIteratorForAccount(String accountId, String streamName, String shardId,
+                                             String type, String sequenceNumber, String region) {
+        return getShardIteratorForAccount(accountId, streamName, shardId, type, sequenceNumber,
+                null, region);
+    }
+
+    public String getShardIteratorForAccount(String accountId, String streamName, String shardId,
+                                             String type, String sequenceNumber, Long timestampMillis,
+                                             String region) {
+        KinesisStream stream = resolveStreamForAccount(accountId, streamName, region);
+        String raw = String.format("%s|%s|%s|%s|%d|%s",
+                streamName, shardId, type,
+                resolveIteratorSequenceNumber(stream, shardId, type, sequenceNumber),
+                0,
+                timestampMillis != null ? timestampMillis.toString() : "");
+        return Base64.getEncoder().encodeToString(raw.getBytes(StandardCharsets.UTF_8));
+    }
+
+    public Map<String, Object> getRecordsForAccount(String accountId, String shardIterator,
+                                                    Integer limit, String region) {
+        String[] parts = decodeShardIterator(shardIterator);
+        String streamName = parts[0];
+        String shardId = parts[1];
+        String type = parts[2];
+        String startSeq = parts[3];
+        int lastIndex = parseIteratorIndex(parts[4]);
+        Long timestampMillis = null;
+        if (parts.length >= 6 && !parts[5].isEmpty()) {
+            try {
+                timestampMillis = Long.parseLong(parts[5]);
+            } catch (NumberFormatException e) {
+                throw new AwsException("InvalidArgumentException", "Invalid timestamp in shard iterator", 400);
+            }
+        }
+
+        ShardReadSnapshot read = snapshotShard(accountId, streamName, shardId, region);
+        KinesisShard.RecordsSnapshot snapshot = read.records();
+        List<KinesisRecord> allRecords = snapshot.records();
+        int startIndex = 0;
+        // LATEST resolves the same way as AFTER_SEQUENCE_NUMBER (see the longer explanation in
+        // getRecords, above): it was encoded at GetShardIterator time as the shard tip's sequence
+        // number, which retention pruning of earlier records can never invalidate.
+        if ("TRIM_HORIZON".equals(type)) {
+            startIndex = legacyResumeIndex(snapshot, lastIndex);
+        } else if ("AFTER_SEQUENCE_NUMBER".equals(type) || "LATEST".equals(type)) {
+            for (int i = 0; i < allRecords.size(); i++) {
+                if (allRecords.get(i).getSequenceNumber().equals(startSeq)) {
+                    startIndex = i + 1;
+                    break;
+                }
+            }
+        } else if ("AT_TIMESTAMP".equals(type)) {
+            if (timestampMillis == null) {
+                throw new AwsException("InvalidArgumentException",
+                        "AT_TIMESTAMP iterator requires a Timestamp", 400);
+            }
+            startIndex = allRecords.size();
+            for (int i = 0; i < allRecords.size(); i++) {
+                Instant arrival = allRecords.get(i).getApproximateArrivalTimestamp();
+                if (arrival != null && arrival.toEpochMilli() >= timestampMillis) {
+                    startIndex = i;
+                    break;
+                }
+            }
+        }
+
+        return recordsPage(streamName, shardId, read, startIndex, limit);
+    }
+
+    private KinesisShard selectShard(KinesisStream stream, String partitionKey, String explicitHashKey) {
+        List<OpenShardRange> ranges = openShardRangeIndexes.get(stream);
+        if (ranges == null) {
+            normalizeOpenShardRanges(stream);
+            ranges = stream.getShards().stream()
+                    .filter(shard -> !shard.isClosed())
+                    .map(shard -> new OpenShardRange(shard,
+                            new BigInteger(shard.getHashKeyRange().startingHashKey()),
+                            new BigInteger(shard.getHashKeyRange().endingHashKey())))
+                    .sorted(Comparator.comparing(OpenShardRange::start))
+                    .toList();
+            openShardRangeIndexes.put(stream, ranges);
+        }
+        BigInteger hashKey = explicitHashKey != null ? parseExplicitHashKey(explicitHashKey)
+                : new BigInteger(1, Digests.md5(partitionKey.getBytes(StandardCharsets.UTF_8)));
+        return selectShardByHashKey(ranges, hashKey);
+    }
+
+    private KinesisShard selectShardByHashKey(List<OpenShardRange> ranges, BigInteger hashKey) {
+        int low = 0;
+        int high = ranges.size() - 1;
+        while (low <= high) {
+            int middle = (low + high) >>> 1;
+            OpenShardRange range = ranges.get(middle);
+            if (hashKey.compareTo(range.start()) < 0) {
+                high = middle - 1;
+            } else if (hashKey.compareTo(range.end()) > 0) {
+                low = middle + 1;
+            } else if (!range.shard().isClosed()) {
+                return range.shard();
+            } else {
+                break;
+            }
+        }
+        throw new AwsException("InvalidArgumentException",
+                "ExplicitHashKey does not map to an open shard.", 400);
+    }
+
+    private record OpenShardRange(KinesisShard shard, BigInteger start, BigInteger end) {}
+
+    // Only untouched legacy streams can be evenly repartitioned. Repartitioning a stream that
+    // already has split/merge children would silently change those children's persisted ranges.
+    private void normalizeOpenShardRanges(KinesisStream stream) {
+        normalizeOpenShardRanges(stream, legacyOpenShardsToNormalize(stream));
+    }
+
+    private void normalizeOpenShardRanges(KinesisStream stream, List<KinesisShard> legacyOpenShards) {
+        openShardRangeIndexes.remove(stream);
+        int openShardCount = legacyOpenShards.size();
+        for (int i = 0; i < openShardCount; i++) {
+            legacyOpenShards.get(i).setHashKeyRange(new KinesisShard.HashKeyRange(
+                    shardStartingHashKey(i, openShardCount),
+                    shardEndingHashKey(i, openShardCount)));
+        }
+    }
+
+    private static KinesisShard.HashKeyRange effectiveOpenShardRange(
+            KinesisShard shard, List<KinesisShard> legacyOpenShards) {
+        if (legacyOpenShards.isEmpty()) {
+            return shard.getHashKeyRange();
+        }
+        int index = legacyOpenShards.indexOf(shard);
+        return new KinesisShard.HashKeyRange(
+                shardStartingHashKey(index, legacyOpenShards.size()),
+                shardEndingHashKey(index, legacyOpenShards.size()));
+    }
+
+    private static List<KinesisShard> legacyOpenShardsToNormalize(KinesisStream stream) {
+        List<KinesisShard> openShards = stream.getShards().stream()
+                .filter(shard -> !shard.isClosed())
+                .sorted(Comparator.comparing(KinesisShard::getShardId))
+                .toList();
+        if (openShards.size() <= 1 || openShardRangesDisjoint(openShards)) {
+            return List.of();
+        }
+        if (openShards.stream().anyMatch(shard -> shard.getParentShardId() != null
+                || shard.getAdjacentParentShardId() != null
+                || !MIN_HASH_KEY_VALUE.equals(shard.getHashKeyRange().startingHashKey())
+                || !MAX_HASH_KEY.toString().equals(shard.getHashKeyRange().endingHashKey()))) {
+            throw new AwsException("InvalidArgumentException",
+                    "Overlapping open shard hash ranges cannot be normalized safely.", 400);
+        }
+        return openShards;
+    }
+
+    private static boolean openShardRangesDisjoint(List<KinesisShard> openShards) {
+        List<KinesisShard> byStartingHashKey = openShards.stream()
+                .sorted(Comparator.comparing(shard -> new BigInteger(shard.getHashKeyRange().startingHashKey())))
+                .toList();
+        for (int i = 1; i < byStartingHashKey.size(); i++) {
+            BigInteger previousEnd =
+                    new BigInteger(byStartingHashKey.get(i - 1).getHashKeyRange().endingHashKey());
+            BigInteger currentStart =
+                    new BigInteger(byStartingHashKey.get(i).getHashKeyRange().startingHashKey());
+            if (currentStart.compareTo(previousEnd) <= 0) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static BigInteger parseExplicitHashKey(String explicitHashKey) {
+        if (explicitHashKey.isBlank()
+                || !explicitHashKey.chars().allMatch(c -> c >= '0' && c <= '9')) {
+            throw new AwsException("InvalidArgumentException",
+                    "ExplicitHashKey must be a decimal integer.", 400);
+        }
+
+        if (!MIN_HASH_KEY_VALUE.equals(explicitHashKey) && explicitHashKey.startsWith(MIN_HASH_KEY_VALUE)) {
+            throw new AwsException("InvalidArgumentException",
+                    "ExplicitHashKey must not contain leading zeroes.", 400);
+        }
+
+        BigInteger hashKey = new BigInteger(explicitHashKey);
+        if (hashKey.compareTo(MIN_HASH_KEY) < 0 || hashKey.compareTo(MAX_HASH_KEY) > 0) {
+            throw new AwsException("InvalidArgumentException",
+                    "ExplicitHashKey must be between " + MIN_HASH_KEY + " and " + MAX_HASH_KEY + ".", 400);
+        }
+        return hashKey;
+    }
+
+    private static String shardStartingHashKey(int shardIndex, int shardCount) {
+        return HASH_KEY_SPACE_SIZE
+                .multiply(BigInteger.valueOf(shardIndex))
+                .divide(BigInteger.valueOf(shardCount))
+                .toString();
+    }
+
+    private static String shardEndingHashKey(int shardIndex, int shardCount) {
+        if (shardIndex == shardCount - 1) {
+            return MAX_HASH_KEY.toString();
+        }
+        return new BigInteger(shardStartingHashKey(shardIndex + 1, shardCount))
+                .subtract(BigInteger.ONE)
+                .toString();
+    }
+
+    private String regionKey(String region, String name) {
+        return region + "::" + name;
+    }
+
+    /**
+     * The monitor guarding a stream key. Every path that mutates a stored stream takes it: record
+     * appends, split and merge, the metadata writes, and {@link #deleteStream}.
+     *
+     * <p>Holding it is only half the contract: a writer must also resolve the stream inside the
+     * monitor. A stream resolved before the monitor was acquired may already have been deleted, and
+     * persisting that stale instance would resurrect it or clobber a stream since recreated under
+     * the same name.
+     *
+     * <p>Monitors are never removed. One stable monitor per key is a bounded leak, whereas dropping
+     * one on delete would let a writer that already resolved the stream create a fresh monitor and
+     * persist the deleted instance under it, defeating the serialization.
+     */
+    private Object lockFor(String storageKey) {
+        return streamAppendLocks.computeIfAbsent(storageKey, k -> new Object());
+    }
+
+    // ─── Resource Explorer 2 ───────────────────────────────────────────────────
+
+    @Override
+    public List<ExplorerResource> getResources() {
+        List<ExplorerResource> resources = new ArrayList<>();
+        for (KinesisStream stream : store.scan(k -> true)) {
+            String arn = stream.getStreamArn();
+            if (arn == null) {
+                continue;
+            }
+            AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+            resources.add(new ExplorerResource(
+                    arn, "kinesis:stream", "kinesis",
+                    parsed.region(), parsed.accountId(),
+                    stream.getStreamCreationTimestamp() != null
+                            ? stream.getStreamCreationTimestamp() : clock.instant(),
+                    stream.getTags() != null ? stream.getTags() : Map.of()));
+        }
+        return resources;
+    }
+
+    @Override
+    public Set<SupportedResourceType> getSupportedResourceTypes() {
+        return Set.of(new SupportedResourceType("kinesis:stream", "kinesis", true));
+    }
+}

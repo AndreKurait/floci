@@ -36,7 +36,7 @@ transport. This does not add Memcached transit encryption.
 
 ## User access strings
 
-For non-cluster-mode Redis/Valkey replication groups and serverless caches, the auth
+For Redis/Valkey replication groups, cluster-mode groups included, and serverless caches, the auth
 proxy applies each associated user's `AccessString` to a private backend ACL identity.
 Valkey enforces command, key and Pub/Sub channel permissions. Authenticating a
 subscribe-only user does not grant `SET` or `FLUSHALL`. The backend default account
@@ -52,23 +52,39 @@ are denied as well, preventing backend persistence operations and outbound key m
 These restrictions protect private backend credentials and key boundaries. AWS lists these among its
 [restricted cache commands](https://docs.aws.amazon.com/AmazonElastiCache/latest/dg/SupportedCommands.html).
 
+In a cluster-mode group, each node has a proxy of its own, which applies the access string on that
+node when the user signs in there. A client that follows a `MOVED` redirect signs in to the other
+node's proxy, as it does on AWS. Sessions on a cluster node also cannot run the `CLUSTER`
+subcommands ElastiCache restricts, which change the cluster's topology, slots or failover state:
+`ADDSLOTS`, `ADDSLOTSRANGE`, `BUMPEPOCH`, `DELSLOTS`, `DELSLOTSRANGE`, `FAILOVER`, `FLUSHSLOTS`,
+`FORGET`, `LINKS`, `MEET`, `REPLICATE`, `RESET`, `SAVECONFIG`, `SET-CONFIG-EPOCH` and `SETSLOT`.
+Before the first node disables its `default` account, Floci gives every node a private replication
+user and sets `masteruser` and `masterauth` to it, so replication keeps authenticating. A
+cluster-mode group nobody signs in to with a user never gets that password, which its unrestricted
+sessions could otherwise read with `CONFIG GET masterauth`.
+
 `ModifyUser` with `AccessString` or `AppendAccessString` is installed on the backend at once
-for every replication group and serverless cache that holds the user, so it applies to connections
-that are already open. A change that cannot be installed, such as one with a selector, is logged and
-the open sessions keep their old permissions until the user authenticates again. Other
+for every replication group, every node of a cluster-mode group and every serverless cache that
+holds the user, so it applies to connections that are already open. A change that cannot be
+installed, such as one with a selector, is logged and the open sessions keep their old permissions
+until the user authenticates again. Other
 changes, such as adding a user to a group or associating a user group with a cache, are
 installed on the next successful authentication; reconnect to apply them promptly.
-Re-authentication on an already relayed connection uses the backend protocol directly, so
-reconnect through the proxy with frontend credentials.
 Revoked members' existing sessions are not proactively disconnected by this change.
 ACL selectors are rejected before backend changes: a selector can grant permissions
 independently of the root rules used to protect private backend credentials. Read-only
 `ACL` commands are also unavailable through these sessions.
 
-**Known limitation:** cluster-mode RBAC fails closed. Configuring replication credentials
-across all nodes is still required before disabling their default accounts. Such connections
-are rejected rather than being relayed with unrestricted permissions. Cluster-mode caches
-without user associations retain their existing behavior.
+## Signing in again
+
+A connection can send `AUTH`, or `HELLO` with `AUTH`, again after it has signed in, to refresh an
+IAM token or to switch to another user. The proxy checks those credentials as it does at sign-in,
+for caches with users and for caches with an AUTH token. Accepted credentials switch the
+connection to that user and its access string. Refused credentials get `WRONGPASS` and leave the
+connection signed in as before, as Valkey does. An `AUTH` or `HELLO` over 64 KiB, too large to
+check, is refused the same way. The client's password or token never reaches the backend: the proxy
+relays the command with the backend user's private credentials instead. A cache
+without authentication relays these commands to the engine as sent.
 
 ## Supported Management Actions
 
@@ -76,9 +92,12 @@ without user associations retain their existing behavior.
 | Action | Description |
 | --- | --- |
 | `ValidateIamAuthToken` | Validate an IAM auth token (data-plane auth) |
-| `CreateReplicationGroup` | Start a new Redis/Valkey cluster; `AtRestEncryptionEnabled`, `KmsKeyId` (resolved to the key ARN), `SnapshotRetentionLimit`, `SnapshotWindow`, `Tags` and `UserGroupIds` are kept and returned, with the group `ARN`. `UserGroupIds` needs `TransitEncryptionEnabled` or an `AuthToken` |
+| `CreateReplicationGroup` | Start a new Redis/Valkey cluster; `AtRestEncryptionEnabled`, `KmsKeyId` (resolved to the key ARN), `SnapshotRetentionLimit`, `SnapshotWindow`, `Tags`, `UserGroupIds` and `LogDeliveryConfigurations` are kept and returned, with the group `ARN`. Each enabled log delivery configuration reads back as `active`, or as `error` with a `Message` when it names a CloudWatch Logs group that does not exist (the group is not created); Floci delivers no logs. `UserGroupIds` needs `TransitEncryptionEnabled` or an `AuthToken` |
 | `DescribeReplicationGroups` | List clusters and their connection info |
 | `ModifyReplicationGroup` | Modify `SnapshotRetentionLimit` and `SnapshotWindow`, and the associated user groups (`UserGroupIdsToAdd`, `UserGroupIdsToRemove`, `RemoveUserGroups`). A cache with user groups no longer takes its AUTH token, `AuthTokenUpdateStrategy=DELETE` removes the token when adding a user group, and removing the last user group leaves the cache without access control. Changing the AUTH token (`ROTATE`, `SET`) is not supported |
+| `IncreaseReplicaCount` | Raise a cluster-mode-disabled group's replicas to `NewReplicaCount` (up to 5), with `ApplyImmediately=true`. See [Replicas and failover](#replicas-and-failover) |
+| `DecreaseReplicaCount` | Lower a cluster-mode-disabled group's replicas to `NewReplicaCount`, with `ApplyImmediately=true`; `ReplicasToRemove` is not supported |
+| `TestFailover` | Promote the next member of node group `0001` of a cluster-mode-disabled group with automatic failover enabled |
 | `DeleteReplicationGroup` | Stop and remove a cluster |
 | `CreateUser` | Create a user with password, no-password-required or IAM authentication, set through `AuthenticationMode` or the top-level `Passwords` and `NoPasswordRequired` |
 | `DescribeUsers` | List ElastiCache users |
@@ -107,6 +126,9 @@ without user associations retain their existing behavior.
 | `AddTagsToResource` | - |
 | `RemoveTagsFromResource` | - |
 | `ListTagsForResource` | Read stored tags for supported ElastiCache resource ARNs |
+| `CreateSnapshot` | Take a manual snapshot of a cluster-mode-disabled replication group, named by `ReplicationGroupId` or by one of its `CacheClusterId`s: the RDB file of its backend, `available` as soon as the call returns. See [Snapshots](#snapshots) |
+| `DescribeSnapshots` | List manual snapshots matching every one of `SnapshotName`, `ReplicationGroupId`, `CacheClusterId` and `SnapshotSource`, paged by `MaxRecords` and `Marker` |
+| `DeleteSnapshot` | Delete a snapshot and its RDB archive |
 <!-- floci:actions:end -->
 
 ### Serverless caches and user groups
@@ -141,8 +163,8 @@ security-group placement, KMS encryption and snapshot schedules are metadata; th
 autoscaling, VPC networking, encryption or snapshot storage. Snapshot restore and final snapshots
 are rejected explicitly. Engine/version transitions are rejected; supported major versions are
 Valkey 8, Redis 7 and Memcached 1.6. With Docker unavailable, metadata operations still work and
-connections require a reachable Docker daemon and a runtime restart. Snapshot APIs and serverless
-pagination are not implemented.
+connections require a reachable Docker daemon and a runtime restart. Serverless snapshot APIs and
+serverless pagination are not implemented.
 
 ### Single-node Redis/Valkey clusters
 
@@ -328,6 +350,61 @@ replication group is gone. The reference counts from the moment `CreateReplicati
 the name, not from when the group is stored, so a delete that lands while that create is still
 provisioning its container is refused too.
 
+### IAM enforcement
+
+With IAM enforcement on, each action is checked on the resources the AWS Service Authorization
+Reference lists for it, read from the request: a cache cluster by its `CacheClusterId`, a
+replication group by its `ReplicationGroupId`, a parameter group by its `CacheParameterGroupName`, a
+subnet group by its `CacheSubnetGroupName`, a snapshot by its `SnapshotName`, a user by its `UserId`,
+a user group by its `UserGroupId` (and, for `ModifyUserGroup`, each user its `UserIdsToAdd` and
+`UserIdsToRemove` name) and a serverless cache by its `ServerlessCacheName`, each as
+`arn:aws:elasticache:<region>:<account>:<type>:<name>`, the ARN ElastiCache mints. The tagging
+calls name their resource in `ResourceName`, which is not read, so they are checked on `*`, as is a
+Describe action naming no resource.
+
+## Replicas and failover
+
+The members of a cluster-mode-disabled replication group share one backend, so a replica is a
+member cache cluster the group reports (`MemberClusters`, `NodeGroupMembers`), not a second server.
+`IncreaseReplicaCount` and `DecreaseReplicaCount` change the members at once, so `ApplyImmediately`
+must be `true` (AWS does not support `false` either), between 0 and 5 replicas, and at least one
+while Multi-AZ is enabled. New members take the next numbers, and a decrease removes the
+highest-numbered replicas, never the primary. `TestFailover` with `NodeGroupId` `0001` makes the next
+member the primary and the old primary a replica, as each `CurrentRole` then reports; the data and
+the endpoints stay as they are. It needs automatic failover enabled and at least one replica.
+Cluster-mode-enabled groups are refused with `InvalidParameterValue`.
+
+## Snapshots
+
+`CreateSnapshot` saves the backend's dataset (`SAVE`) and keeps the RDB file with the snapshot
+record, so the snapshot is `available` when the call returns; a `SAVE` the server refuses, as
+it does while another save runs, fails the call with `InvalidReplicationGroupState`. `CreateReplicationGroup` with
+`SnapshotName` starts a new cluster-mode-disabled group and loads that file into its backend
+before the group is listed or its endpoint accepts connections; a group the file could not be
+loaded into is rolled back like any failed create. A snapshot whose file is missing is refused
+with `InvalidSnapshotState` before any group is created. A group cannot be deleted or modified
+while its snapshot is being taken, and a `CacheClusterId` given with a `ReplicationGroupId`
+must be one of that group's members. `CreateSnapshot` keeps its `Tags`, which
+`ListTagsForResource`, `AddTagsToResource` and `RemoveTagsFromResource` read and change through the
+snapshot's ARN. `DescribeSnapshots` returns snapshots in name order, `MaxRecords` (20 to 50, default
+50) at a time, with a `Marker` for the next page.
+
+Snapshots outlive the group they were taken from, as on AWS. They are taken of
+cluster-mode-disabled replication groups only: a cluster-mode-enabled group, a standalone cache
+cluster or a group without a running backend is refused, as is seeding a cluster-mode-enabled
+group. Automatic snapshots, `CopySnapshot` and `FinalSnapshotIdentifier` are not modeled.
+
+A group created from a snapshot starts with the snapshot file already in its backend's data
+directory (the image's working directory, where a server started without `--dir` keeps its data),
+so the server loads it at startup. No backend runs with `--enable-debug-command`, which a Redis
+before 7.0 refuses to start with, and `DEBUG` is never used. The file is placed under the name set
+by `floci.services.elasticache.shell-less-backend-dbfilename`
+(`FLOCI_SERVICES_ELASTICACHE_SHELL_LESS_BACKEND_DBFILENAME`, default `dump.rdb`, the name Redis and
+Valkey load), and Floci checks the server's `dir`, and its `dbfilename` when it reports one, once
+it is up. If the file cannot be placed, or the server cannot start with it, the new group's
+container is removed and the create fails with `InvalidSnapshotState`; the group the snapshot came
+from and the snapshot are not touched.
+
 ## Engine version and backend image
 
 `EngineVersion` is control-plane metadata. For Redis/Valkey replication groups and
@@ -355,6 +432,60 @@ describe responses report the stored request metadata.
 Memcached uses the separate `floci.services.elasticache.default-memcached-image`
 (`FLOCI_SERVICES_ELASTICACHE_DEFAULT_MEMCACHED_IMAGE`) setting, default `memcached:1.6`.
 
+### Images with no shell or CLI
+
+By default Floci starts the backend through the image's `VALKEY_EXTRA_FLAGS` hook and takes
+snapshots with the `valkey-cli` or `redis-cli` inside the container, which only images built like
+`valkey/valkey` provide. An image that has no shell and no CLI, such as a distroless
+Redis-compatible image, needs the other path, which is selected by
+`floci.services.elasticache.shell-less-backend` (`FLOCI_SERVICES_ELASTICACHE_SHELL_LESS_BACKEND`).
+It is `false` by default and is never inferred from the image name, so which path runs is always the
+one you configured. MemoryDB is not affected by it.
+
+With `shell-less-backend` set to `true`:
+
+- The server flags are passed as container arguments (`--port 6379 --protected-mode no
+  --loglevel verbose`, plus the cluster-mode flags for a cluster-mode group) instead of the
+  `VALKEY_EXTRA_FLAGS` environment variable. The image's own default arguments are replaced by
+  these, and the image must accept them.
+- `CreateSnapshot` runs `SAVE`, reads `CONFIG GET dir` and `CONFIG GET dbfilename` over the RESP
+  connection to the backend, and copies the file out of the container through the Docker archive
+  API. No command is executed inside the container.
+- `CreateReplicationGroup` with `SnapshotName` places the snapshot file before the server starts,
+  as on the default path.
+- `floci.services.elasticache.shell-less-backend-dbfilename`
+  (`FLOCI_SERVICES_ELASTICACHE_SHELL_LESS_BACKEND_DBFILENAME`, default `dump.rdb`) names the file
+  the server loads from its data directory at startup. A restore places the snapshot under this
+  name on either path, and a snapshot falls back to it when the server does not report
+  `dbfilename`. Set it to the name your image's server uses.
+
+An image used this way has to:
+
+- accept the server flags above as arguments, including the cluster-mode flags
+  (`--cluster-enabled`, `--cluster-announce-*`) for a cluster-mode group;
+- answer `SAVE`, `CONFIG GET dir` and `CONFIG GET dbfilename`, write its snapshot to a file in its
+  data directory and load a file of that name from there at startup (Floci checks `dir`, and
+  `dbfilename` when the server reports one, after a restore);
+- support ACL users with access strings (`ACL SETUSER`, `AUTH`), because the proxy enforces user
+  groups through the backend's ACL and passes the backend's `-NOPERM` replies on to the client.
+  An image without ACL support works only for groups with no user group.
+
+The backend's port is published the way it is for the default image, so the container is reached
+only through the proxy in the usual setup. A snapshot of a group that has user groups, taken once
+a user has connected, is refused because Floci's own connection to the backend is not
+authenticated; the default path has the same limit.
+
+For example, with the KiviDB image, whose server keeps its snapshot as `dump.kdb`:
+
+```bash
+FLOCI_SERVICES_ELASTICACHE_DEFAULT_IMAGE=ghcr.io/kividbio/kividb:v1.2.2
+FLOCI_SERVICES_ELASTICACHE_SHELL_LESS_BACKEND=true
+FLOCI_SERVICES_ELASTICACHE_SHELL_LESS_BACKEND_DBFILENAME=dump.kdb
+```
+
+A snapshot is a file in the server's own format, so it restores into a backend of the same kind:
+do not restore a snapshot taken from one engine into another.
+
 ## Configuration
 
 | Variable | Default | Description |
@@ -363,6 +494,8 @@ Memcached uses the separate `floci.services.elasticache.default-memcached-image`
 | `FLOCI_SERVICES_ELASTICACHE_PROXY_BASE_PORT` | `6379` | First host port in the ElastiCache proxy range |
 | `FLOCI_SERVICES_ELASTICACHE_PROXY_MAX_PORT` | `6399` | Last host port in the ElastiCache proxy range |
 | `FLOCI_SERVICES_ELASTICACHE_DEFAULT_IMAGE` | `valkey/valkey:8` | Docker image for Redis/Valkey containers |
+| `FLOCI_SERVICES_ELASTICACHE_SHELL_LESS_BACKEND` | `false` | Start and snapshot the backend for an image with no shell or CLI: [see above](#images-with-no-shell-or-cli) |
+| `FLOCI_SERVICES_ELASTICACHE_SHELL_LESS_BACKEND_DBFILENAME` | `dump.rdb` | Snapshot file name the server loads at startup; a restore places the snapshot under it on either path |
 
 ### Docker Compose
 
@@ -426,6 +559,21 @@ aws elasticache create-user \
   --no-no-password-required \
   --endpoint-url $AWS_ENDPOINT_URL
 ```
+
+### IAM connection lifetime and transactions
+
+As on AWS, a connection signed in with an IAM token is closed 12 hours after it signed in. Sending
+`AUTH` or `HELLO` with a new token gives it another 12 hours, and signing in again as a user
+without IAM ends the limit.
+
+IAM re-authentication is not supported inside `MULTI`/`EXEC`. An `AUTH` or `HELLO` for an IAM user
+inside a transaction is refused with `ERR Command not allowed inside a transaction`, and `EXEC` then
+aborts the transaction with `EXECABORT`. AWS does not document its reply, so this one is Floci's
+reading. An image older than Valkey 8 refuses it with `ERR MULTI calls can not be nested` instead,
+and runs the rest of the transaction. Another user's `AUTH` inside a transaction is queued and runs
+with `EXEC`, as in Valkey. It leaves the 12 hours as they were, since Floci cannot see whether
+`EXEC` runs it. Lua scripts cannot send `AUTH` or `HELLO` at all: the engine refuses both from a
+script.
 
 ### Transit encryption mode metadata
 

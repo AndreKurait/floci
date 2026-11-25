@@ -1,0 +1,570 @@
+package io.floci.aws.services.route53;
+
+import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.config.LocalStackParity;
+import io.floci.aws.core.common.DomainNames;
+import io.floci.aws.core.common.dns.DnsAnswer;
+import io.floci.aws.core.common.dns.DnsClientVpcSource.ClientVpc;
+import io.floci.aws.core.common.dns.DnsLookupHelper;
+import io.floci.aws.core.common.dns.DnsRecord;
+import io.floci.aws.core.common.dns.DnsRecordSource;
+import io.floci.aws.core.common.dns.EmbeddedDnsServer;
+import io.floci.aws.services.route53.model.AliasTarget;
+import io.floci.aws.services.route53.model.ResourceRecord;
+import io.floci.aws.services.route53.model.ResourceRecordSet;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import org.jboss.logging.Logger;
+
+import java.net.InetAddress;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Optional;
+import java.util.Set;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.function.Function;
+import java.util.function.LongUnaryOperator;
+import java.util.function.ToIntFunction;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Resolves private IPv4/SRV records and public A/AAAA/TXT/NS/SOA records for the embedded DNS server.
+ *
+ * <p>Discovered via CDI as a {@link DnsRecordSource} implementation, keeping
+ * the embedded DNS server decoupled from Route 53 service classes.
+ */
+@ApplicationScoped
+public class Route53DnsRecordSource implements DnsRecordSource {
+
+    private static final Logger LOG = Logger.getLogger(Route53DnsRecordSource.class);
+    private static final int MAX_CNAME_DEPTH = 8;
+    private static final int MAX_DNS_ANSWERS = 8;
+    private static final ThreadLocal<Integer> OWNED_TARGET_HOPS = ThreadLocal.withInitial(() -> 0);
+    private static final Pattern EC2_PRIVATE_DNS_NAME =
+            Pattern.compile("^ip-(\\d{1,3})-(\\d{1,3})-(\\d{1,3})-(\\d{1,3})\\.ec2\\.internal$", Pattern.CASE_INSENSITIVE);
+
+    private static final List<String> BUILTIN_SUFFIXES = EmbeddedDnsServer.BUILTIN_SUFFIXES;
+
+    private final Route53Service route53Service;
+    private final DnsLookupHelper dnsLookupHelper;
+    private final EmbeddedDnsServer embeddedDnsServer;
+    private final LongUnaryOperator weightedDraw;
+    private final Set<String> flociSuffixes = new LinkedHashSet<>();
+
+    public Route53DnsRecordSource(Route53Service route53Service) {
+        this(route53Service, null, new DnsLookupHelper(), null);
+    }
+
+    public Route53DnsRecordSource(Route53Service route53Service, EmulatorConfig config) {
+        this(route53Service, config, new DnsLookupHelper(config), null);
+    }
+
+    public Route53DnsRecordSource(Route53Service route53Service, EmulatorConfig config, DnsLookupHelper dnsLookupHelper) {
+        this(route53Service, config, dnsLookupHelper, null);
+    }
+
+    @Inject
+    public Route53DnsRecordSource(Route53Service route53Service, EmulatorConfig config,
+                                  DnsLookupHelper dnsLookupHelper, EmbeddedDnsServer embeddedDnsServer) {
+        this(route53Service, config, dnsLookupHelper, embeddedDnsServer,
+                bound -> ThreadLocalRandom.current().nextLong(bound));
+    }
+
+    Route53DnsRecordSource(Route53Service route53Service, EmulatorConfig config,
+                          DnsLookupHelper dnsLookupHelper, EmbeddedDnsServer embeddedDnsServer,
+                          LongUnaryOperator weightedDraw) {
+        this.route53Service = route53Service;
+        this.dnsLookupHelper = dnsLookupHelper != null ? dnsLookupHelper : new DnsLookupHelper(config);
+        this.embeddedDnsServer = embeddedDnsServer;
+        this.weightedDraw = weightedDraw;
+        this.flociSuffixes.addAll(BUILTIN_SUFFIXES);
+        if (config != null) {
+            config.hostname().ifPresent(this.flociSuffixes::add);
+            if (config.dns() != null) {
+                LocalStackParity.withDnsSuffixes(config.dns().extraSuffixes()).ifPresent(this.flociSuffixes::addAll);
+            }
+        }
+    }
+
+    @Override
+    public Optional<DnsAnswer> resolveAuthoritative(String name, int type) {
+        return resolveAuthoritative(name, type, (ClientVpc) null);
+    }
+
+    @Override
+    public Optional<DnsAnswer> resolveAuthoritative(String name, int type, ClientVpc origin) {
+        return resolveAuthoritative(name, type,
+                embeddedDnsServer == null ? null : embeddedDnsServer.getServerIp().orElse(null), origin);
+    }
+
+    @Override
+    public Optional<DnsAnswer> resolveAuthoritative(String name, int type, String listenerAddress) {
+        return resolveAuthoritative(name, type, listenerAddress, null);
+    }
+
+    @Override
+    public Optional<DnsAnswer> resolveAuthoritative(String name, int type, String listenerAddress,
+                                                     ClientVpc origin) {
+        if (name == null || name.isBlank() || (type != 1 && type != 2 && type != 6 && type != 16 && type != 28)) {
+            return Optional.empty();
+        }
+        if (route53Service.isCoveredByPrivateZone(name, origin)) {
+            return Optional.empty();
+        }
+        List<Route53Service.PublicDnsZone> zones = route53Service.publicDnsZones(name);
+        if (zones.isEmpty()) {
+            return Optional.empty();
+        }
+        if (zones.size() != 1) {
+            return Optional.of(DnsAnswer.refused());
+        }
+        Route53Service.PublicDnsZone zone = zones.getFirst();
+        String normalized = Route53Service.normalizeName(name).toLowerCase(Locale.ROOT);
+        String apex = Route53Service.normalizeName(zone.name()).toLowerCase(Locale.ROOT);
+        // A delegation ends this zone's authority. Serving the parent's negative answer below
+        // that cut, or flattening an unsupported routing policy, would hide real records.
+        boolean delegated = zone.records().stream().anyMatch(record -> "NS".equals(record.getType())
+                && !Route53Service.normalizeName(record.getName()).equalsIgnoreCase(apex)
+                && DomainNames.isWithin(normalized, Route53Service.normalizeName(record.getName())));
+        if (delegated) {
+            return Optional.of(DnsAnswer.refused());
+        }
+        ResourceRecordSet soaSet = zone.records().stream()
+                .filter(record -> "SOA".equals(record.getType())
+                        && Route53Service.normalizeName(record.getName()).equalsIgnoreCase(apex))
+                .findFirst().orElse(null);
+        if (soaSet == null || soaSet.getRecords() == null || soaSet.getRecords().size() != 1) {
+            return Optional.of(DnsAnswer.refused());
+        }
+        List<DnsRecord> answers = new ArrayList<>();
+        int ttl = Integer.MAX_VALUE;
+        boolean upstream = false;
+        try {
+            String recordType = switch (type) {
+                case 1 -> "A";
+                case 28 -> "AAAA";
+                case 2 -> "NS";
+                case 6 -> "SOA";
+                default -> "TXT";
+            };
+            // A CNAME owns its name for every query type. As in a private zone, the answer is
+            // flattened to the target's A records.
+            for (ResourceRecordSet record : selectPublicRecords(zone.matchingRecords(), "CNAME")) {
+                Optional<DnsAnswer> target = record.getAliasTarget() != null ? Optional.empty()
+                        : resolveCnameTarget(record, new HashSet<>(), 0, origin);
+                if (target.isEmpty()) {
+                    return Optional.of(DnsAnswer.refused());
+                }
+                if (type == 1) {
+                    answers.addAll(target.orElseThrow().records());
+                    ttl = Math.min(ttl, target.orElseThrow().ttlSeconds());
+                }
+            }
+            for (ResourceRecordSet record : selectPublicRecords(zone.matchingRecords(), recordType)) {
+                AliasTarget alias = record.getAliasTarget();
+                if (alias != null) {
+                    if (embeddedDnsServer == null || (type != 1 && type != 28)
+                            || Boolean.TRUE.equals(record.getMultiValueAnswer()) || record.getTtl() != null
+                            || record.getRecords() != null && !record.getRecords().isEmpty()) {
+                        return Optional.of(DnsAnswer.refused());
+                    }
+                    DnsAnswer target = embeddedDnsServer.resolvePublicAliasTarget(
+                            normalized, alias.getDnsName(), alias.getHostedZoneId(), type, listenerAddress, origin)
+                            .orElseGet(DnsAnswer::refused);
+                    if (target.responseCode() != 0 || target.records().stream().anyMatch(value -> value.type() != type)) {
+                        return Optional.of(DnsAnswer.refused());
+                    }
+                    answers.addAll(target.records());
+                    upstream |= target.upstream();
+                    ttl = Math.min(ttl, target.ttlSeconds());
+                    continue;
+                }
+                if (record.getRecords() == null) {
+                    return Optional.of(DnsAnswer.refused());
+                }
+                for (ResourceRecord value : record.getRecords()) {
+                    if (value == null || value.getValue() == null) {
+                        return Optional.of(DnsAnswer.refused());
+                    }
+                    DnsRecord answer = switch (type) {
+                        case 1, 28 -> new DnsRecord.Address(type, value.getValue());
+                        case 2 -> new DnsRecord.Ns(value.getValue());
+                        case 6 -> new DnsRecord.Soa(value.getValue());
+                        default -> new DnsRecord.Txt(value.getValue());
+                    };
+                    answer.data();
+                    answers.add(answer);
+                }
+                ttl = Math.min(ttl, publicTtlOf(record));
+            }
+            boolean exists = !zone.matchingRecords().isEmpty() || zone.records().stream()
+                    .anyMatch(record -> Route53Service.normalizeName(record.getName()).toLowerCase(Locale.ROOT)
+                            .endsWith("." + normalized));
+            DnsAnswer answer = answers.isEmpty() ? (exists ? DnsAnswer.noData() : DnsAnswer.nxDomain())
+                    : DnsAnswer.typedRecords(answers, ttl);
+            ResourceRecord soaValue = soaSet.getRecords().getFirst();
+            if (soaValue == null || soaValue.getValue() == null) {
+                return Optional.of(DnsAnswer.refused());
+            }
+            DnsRecord.Soa soa = new DnsRecord.Soa(soaValue.getValue());
+            soa.data();
+            DnsAnswer authoritative = answer.withAuthority(apex, soa, publicTtlOf(soaSet));
+            return Optional.of(upstream ? authoritative.viaUpstream() : authoritative);
+        } catch (IllegalArgumentException e) {
+            LOG.debugv("Cannot encode public DNS records for {0}: {1}", name, e.getMessage());
+            return Optional.of(DnsAnswer.refused());
+        }
+    }
+
+    private DnsAnswer buildPublicRecords(String name, int type, List<ResourceRecordSet> sets,
+                                        Function<String, DnsRecord> recordFactory, String listenerAddress, ClientVpc origin) {
+        if (sets.stream().noneMatch(record -> record.getAliasTarget() != null)) {
+            return buildRecords(name, sets, recordFactory, Route53DnsRecordSource::publicTtlOf);
+        }
+        if (sets.size() != 1 || embeddedDnsServer == null || (type != 1 && type != 28)) {
+            return DnsAnswer.refused();
+        }
+        ResourceRecordSet record = sets.getFirst();
+        AliasTarget alias = record.getAliasTarget();
+        if (record.getSetIdentifier() != null || record.getWeight() != null || record.getRegion() != null
+                || record.getFailover() != null || record.getHealthCheckId() != null
+                || Boolean.TRUE.equals(record.getMultiValueAnswer())
+                || record.getTtl() != null
+                || record.getRecords() != null && !record.getRecords().isEmpty()) {
+            return DnsAnswer.refused();
+        }
+        // A single simple alias still answers when unhealthy, since there is no alternative record.
+        DnsAnswer target = embeddedDnsServer.resolvePublicAliasTarget(name,
+                alias.getDnsName(), alias.getHostedZoneId(), type, listenerAddress, origin).orElseGet(DnsAnswer::refused);
+        if (target.responseCode() != 0 || target.records().stream().anyMatch(value -> value.type() != type)) {
+            return DnsAnswer.refused();
+        }
+        return target;
+    }
+
+    @Override
+    public Optional<DnsAnswer> resolve(String name, int type) {
+        return resolve(name, type, null);
+    }
+
+    private Optional<DnsAnswer> resolveSrv(String name, ClientVpc origin) {
+        if (name == null || name.isBlank() || !route53Service.isCoveredByPrivateZone(name, origin)) {
+            return Optional.empty();
+        }
+        List<ResourceRecordSet> sets = route53Service.findPrivateRecordsForName(name, origin);
+        DnsAnswer answer = buildRecords(name, sets.stream()
+                .filter(set -> "SRV".equalsIgnoreCase(set.getType())).toList(),
+                Route53DnsRecordSource::srvRecord, Route53DnsRecordSource::ttlOf);
+        if (answer.responseCode() != 0 || !answer.isEmpty()) {
+            return Optional.of(answer);
+        }
+        return Optional.of(!sets.isEmpty() || route53Service.hasPrivateRecordsBeneath(name, origin)
+                ? DnsAnswer.noData() : DnsAnswer.nxDomain());
+    }
+
+    private static DnsRecord srvRecord(String value) {
+        String[] fields = value.trim().split("\\s+");
+        if (fields.length != 4) {
+            throw new IllegalArgumentException("SRV record must contain priority, weight, port and target");
+        }
+        return new DnsRecord.Srv(Integer.parseInt(fields[0]), Integer.parseInt(fields[1]),
+                Integer.parseInt(fields[2]), fields[3]);
+    }
+
+    private static DnsAnswer buildRecords(String name, List<ResourceRecordSet> sets,
+                                         Function<String, DnsRecord> recordFactory,
+                                         ToIntFunction<ResourceRecordSet> ttlReader) {
+        List<DnsRecord> records = new ArrayList<>();
+        int ttl = Integer.MAX_VALUE;
+        try {
+            for (ResourceRecordSet set : sets) {
+                if (set.getSetIdentifier() != null || set.getAliasTarget() != null
+                        || set.getWeight() != null || set.getRegion() != null
+                        || set.getFailover() != null || set.getHealthCheckId() != null
+                        || set.getRecords() == null) {
+                    return DnsAnswer.refused();
+                }
+                for (ResourceRecord value : set.getRecords()) {
+                    if (value == null || value.getValue() == null) {
+                        return DnsAnswer.refused();
+                    }
+                    DnsRecord record = recordFactory.apply(value.getValue());
+                    record.data();
+                    records.add(record);
+                }
+                ttl = Math.min(ttl, ttlReader.applyAsInt(set));
+            }
+        } catch (IllegalArgumentException e) {
+            LOG.debugv("Cannot encode DNS records for {0}: {1}", name, e.getMessage());
+            return DnsAnswer.refused();
+        }
+        return records.isEmpty() ? DnsAnswer.noData() : DnsAnswer.typedRecords(records, ttl);
+    }
+
+    private List<ResourceRecordSet> selectPublicRecords(List<ResourceRecordSet> records, String type) {
+        List<ResourceRecordSet> matching = records.stream().filter(record -> type.equals(record.getType())).toList();
+        if (matching.size() > 1 && matching.stream().anyMatch(record -> record.getAliasTarget() != null)
+                && matching.stream().anyMatch(record -> record.getWeight() == null)) {
+            throw new IllegalArgumentException("Multiple simple public alias records");
+        }
+        return Route53RecordSelection.select(records, type, weightedDraw);
+    }
+
+    @Override
+    public Optional<DnsAnswer> resolveIpv4(String name) {
+        return resolveIpv4(name, null);
+    }
+
+    @Override
+    public Optional<DnsAnswer> resolvePrivate(String name, int type, ClientVpc origin) {
+        // resolve(name, type, origin) answers only names a private zone associated with origin covers.
+        return origin == null ? Optional.empty() : resolve(name, type, origin);
+    }
+
+    @Override
+    public Optional<DnsAnswer> resolve(String name, int type, ClientVpc origin) {
+        if (type == 33) {
+            return resolveSrv(name, origin);
+        }
+        return resolveIpv4(name, origin).map(answer -> type == 1 ? answer
+                : answer.nameExists() ? DnsAnswer.noData() : DnsAnswer.nxDomain());
+    }
+
+    private Optional<DnsAnswer> resolveIpv4(String name, ClientVpc origin) {
+        if (name == null || name.isBlank()) {
+            return Optional.empty();
+        }
+        if (!route53Service.isCoveredByPrivateZone(name, origin)) {
+            return Optional.empty();
+        }
+        DnsAnswer answer = resolveAddresses(name, new HashSet<>(), 0, origin);
+        if (answer.addresses().size() > MAX_DNS_ANSWERS) {
+            answer = DnsAnswer.records(answer.addresses().subList(0, MAX_DNS_ANSWERS), answer.ttlSeconds());
+        }
+        return Optional.of(answer);
+    }
+
+    private DnsAnswer resolveAddresses(String qname, Set<String> visited, int depth, ClientVpc origin) {
+        if (depth > MAX_CNAME_DEPTH) {
+            return DnsAnswer.noData();
+        }
+        String normalized = Route53Service.normalizeName(qname).toLowerCase(Locale.ROOT);
+        if (!visited.add(normalized)) {
+            return DnsAnswer.noData();
+        }
+
+        List<ResourceRecordSet> recordSets = route53Service.findPrivateRecordsForName(qname, origin);
+        if (recordSets.isEmpty()) {
+            return route53Service.hasPrivateRecordsBeneath(qname, origin) ? DnsAnswer.noData() : DnsAnswer.nxDomain();
+        }
+
+        // 1. Direct A records
+        Set<String> addresses = new LinkedHashSet<>();
+        int ttl = Integer.MAX_VALUE;
+        for (ResourceRecordSet rrs : recordSets) {
+            if ("A".equalsIgnoreCase(rrs.getType())) {
+                if (rrs.getRecords() != null) {
+                    for (ResourceRecord rr : rrs.getRecords()) {
+                        String val = rr.getValue();
+                        if (isIpv4(val)) {
+                            addresses.add(val.trim());
+                            ttl = Math.min(ttl, ttlOf(rrs));
+                        }
+                    }
+                }
+                AliasTarget alias = rrs.getAliasTarget();
+                if (alias != null && alias.getDnsName() != null && !alias.getDnsName().isBlank()) {
+                    String cleanAlias = DnsLookupHelper.normalizeTarget(alias.getDnsName());
+                    // An alias record has no TTL of its own; Route 53 answers with the target's.
+                    if (route53Service.isCoveredByPrivateZone(cleanAlias, origin)) {
+                        DnsAnswer target = resolveAddresses(cleanAlias, visited, depth + 1, origin);
+                        if (!target.isEmpty()) {
+                            addresses.addAll(target.addresses());
+                            ttl = Math.min(ttl, target.ttlSeconds());
+                        }
+                    } else {
+                        List<String> resolved = resolveOutsidePrivateZones(cleanAlias, origin);
+                        if (!resolved.isEmpty()) {
+                            addresses.addAll(resolved);
+                            ttl = Math.min(ttl, DnsAnswer.DEFAULT_TTL_SECONDS);
+                        }
+                    }
+                }
+            }
+        }
+        if (!addresses.isEmpty()) {
+            return DnsAnswer.records(List.copyOf(addresses), ttl);
+        }
+
+        // 2. CNAME records
+        for (ResourceRecordSet rrs : recordSets) {
+            if ("CNAME".equalsIgnoreCase(rrs.getType())) {
+                Optional<DnsAnswer> target = resolveCnameTarget(rrs, visited, depth, origin);
+                if (target.isPresent()) {
+                    return target.orElseThrow();
+                }
+            }
+        }
+
+        return DnsAnswer.noData();
+    }
+
+    /** The A records a CNAME's target resolves to, or empty when the record names no target. */
+    private Optional<DnsAnswer> resolveCnameTarget(ResourceRecordSet rrs, Set<String> visited, int depth,
+                                                   ClientVpc origin) {
+        if (rrs.getRecords() == null || rrs.getRecords().isEmpty()) {
+            return Optional.empty();
+        }
+        String target = rrs.getRecords().get(0).getValue();
+        if (target == null || target.isBlank()) {
+            return Optional.empty();
+        }
+        String cleanTarget = DnsLookupHelper.normalizeTarget(target);
+        // The answer is flattened to A records, so it can be cached only as long
+        // as the shortest-lived record in the chain.
+        int cnameTtl = ttlOf(rrs);
+        if (route53Service.isCoveredByPrivateZone(cleanTarget, origin)) {
+            DnsAnswer targetAnswer = resolveAddresses(cleanTarget, visited, depth + 1, origin);
+            if (targetAnswer.isEmpty()) {
+                return Optional.of(targetAnswer);
+            }
+            return Optional.of(DnsAnswer.records(targetAnswer.addresses(),
+                    Math.min(cnameTtl, targetAnswer.ttlSeconds())));
+        }
+        // A target a record source owns (a public zone, or a load balancer name) answers as a direct
+        // query for it would, ahead of spoofing. A public target can chase back into this source, so
+        // the hops through the server count against the same depth limit as a private chain.
+        int hops = OWNED_TARGET_HOPS.get();
+        if (embeddedDnsServer != null && hops >= MAX_CNAME_DEPTH) {
+            return Optional.of(DnsAnswer.noData());
+        }
+        Optional<DnsAnswer> owned = Optional.empty();
+        if (embeddedDnsServer != null) {
+            OWNED_TARGET_HOPS.set(hops + 1);
+            try {
+                owned = embeddedDnsServer.resolveOwnedName(cleanTarget, 1, origin);
+            } finally {
+                OWNED_TARGET_HOPS.set(hops);
+            }
+        }
+        if (owned != null && owned.isPresent()) {
+            DnsAnswer answer = owned.orElseThrow();
+            return Optional.of(DnsAnswer.records(answer.addresses(), Math.min(cnameTtl, answer.ttlSeconds())));
+        }
+        return Optional.of(DnsAnswer.records(resolveOutsidePrivateZones(cleanTarget, origin),
+                Math.min(cnameTtl, DnsAnswer.DEFAULT_TTL_SECONDS)));
+    }
+
+    private List<String> resolveOutsidePrivateZones(String name, ClientVpc origin) {
+        // A target the embedded server spoofs (an AWS endpoint name, for example the vpce name a
+        // centralized endpoint's zone aliases) gets the emulator's spoofed address for this client.
+        Optional<String> emulator = embeddedDnsServer == null ? Optional.empty() : embeddedDnsServer.emulatorAddress(name, origin);
+        if (emulator != null && emulator.isPresent()) {
+            return List.of(emulator.orElseThrow());
+        }
+        if (matchesFlociSuffix(name)) {
+            return getLocalFlociAddress().map(List::of).orElse(List.of());
+        }
+        Optional<String> ec2Ip = resolveEc2PrivateDnsName(name);
+        if (ec2Ip.isPresent()) {
+            return List.of(ec2Ip.get());
+        }
+        return dnsLookupHelper.resolveIpv4(name);
+    }
+
+    private static int publicTtlOf(ResourceRecordSet record) {
+        Long ttl = record.getTtl();
+        if (ttl == null || ttl < 0 || ttl > Integer.MAX_VALUE) {
+            throw new IllegalArgumentException("Invalid public record TTL");
+        }
+        return ttl.intValue();
+    }
+
+    private static int ttlOf(ResourceRecordSet rrs) {
+        Long ttl = rrs.getTtl();
+        if (ttl == null || ttl < 0) {
+            return DnsAnswer.DEFAULT_TTL_SECONDS;
+        }
+        return (int) Math.min(ttl, Integer.MAX_VALUE);
+    }
+
+    private boolean matchesFlociSuffix(String name) {
+        if (name == null || name.isBlank()) {
+            return false;
+        }
+        String lower = name.toLowerCase();
+        for (String suffix : flociSuffixes) {
+            String s = suffix.toLowerCase();
+            if (DomainNames.isWithin(lower, s)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * The address the embedded DNS server answers Floci's own names with, so a record pointing at one resolves as the
+     * name itself does. The host's own lookup takes the first of this container's networks by name, which after a crash
+     * can be one Floci made and is still on; it answers only where that server has no address.
+     */
+    private Optional<String> getLocalFlociAddress() {
+        Optional<String> serverIp = embeddedDnsServer != null ? embeddedDnsServer.getServerIp() : Optional.empty();
+        if (serverIp.isPresent()) {
+            return serverIp;
+        }
+        try {
+            return Optional.of(InetAddress.getLocalHost().getHostAddress());
+        } catch (Exception e) {
+            LOG.debugv("Failed to determine local host address: {0}", e.getMessage());
+            return Optional.of("127.0.0.1");
+        }
+    }
+
+    private Optional<String> resolveEc2PrivateDnsName(String name) {
+        if (name == null || name.isEmpty()) {
+            return Optional.empty();
+        }
+        Matcher matcher = EC2_PRIVATE_DNS_NAME.matcher(name);
+        if (!matcher.matches()) {
+            return Optional.empty();
+        }
+
+        StringBuilder address = new StringBuilder();
+        for (int i = 1; i <= 4; i++) {
+            int octet = Integer.parseInt(matcher.group(i));
+            if (octet > 255) {
+                return Optional.empty();
+            }
+            if (i > 1) {
+                address.append('.');
+            }
+            address.append(octet);
+        }
+        return Optional.of(address.toString());
+    }
+
+    private static boolean isIpv4(String s) {
+        if (s == null || s.isBlank()) {
+            return false;
+        }
+        String[] parts = s.trim().split("\\.", -1);
+        if (parts.length != 4) {
+            return false;
+        }
+        for (String part : parts) {
+            try {
+                int n = Integer.parseInt(part);
+                if (n < 0 || n > 255) {
+                    return false;
+                }
+            } catch (NumberFormatException e) {
+                return false;
+            }
+        }
+        return true;
+    }
+}

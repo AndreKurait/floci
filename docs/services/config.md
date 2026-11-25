@@ -87,6 +87,26 @@ An omitted or empty list selects all recorders; one unknown name returns
 | `UntagResource` | Remove tags from a Config resource |
 | `ListTagsForResource` | List tags on a Config resource |
 
+## IAM enforcement
+
+With IAM enforcement on, each action is checked on the resources the AWS Service Authorization
+Reference lists for it, read from the request. A config rule, a configuration recorder and a
+conformance pack carry an id Config mints in their ARNs (`config-rule/<id>`,
+`configuration-recorder/<name>/<id>`, `conformance-pack/<name>/<id>`), so a request naming one by
+its name is checked on the ARN Config stores it under. One Config holds none of is checked on its
+name with the id open (`conformance-pack/<name>/*`), or on `config-rule/*` for a rule. The tag
+calls are checked on their `ResourceArn`.
+
+A `PutConfigRule` is checked on the rule its `ConfigRuleArn` or `ConfigRuleId` names, which is the
+rule it updates (below), and on `*` when it names neither, as a new rule does and an update by
+`ConfigRuleName` alone does. `PutConfigurationRecorder` is checked on the recorder its
+`ConfigurationRecorder` structure's `name` names, the ARN Config stores it under, or
+`configuration-recorder/<name>/*` for a new one. `PutAggregationAuthorization` is checked on
+`arn:aws:config:<region>:<account>:aggregation-authorization/<AuthorizedAccountId>/<AuthorizedAwsRegion>`,
+in the caller's account, the ARN Config gives the authorization. `DeleteAggregationAuthorization`,
+`StartConfigRulesEvaluation`, the delivery channel and retention calls and the Describe and
+compliance summaries that name no single rule are checked on `*`.
+
 ## Configuration
 
 | Variable | Default | Description |
@@ -207,14 +227,28 @@ aws configservice delete-config-rule --config-rule-name s3-bucket-versioning
       `DeleteAggregationAuthorization` on an authorization that does not exist succeeds,
       because the Config API models no "not found" error for that operation.
     - `TagResource`, `UntagResource` and `ListTagsForResource` answer
-      `ResourceNotFoundException` for a config rule, conformance pack or aggregation
-      authorization ARN that does not name an existing resource in the caller's account and
-      region. ARNs of resource kinds Floci does not model (configuration aggregators, stored
-      queries, organization rules and packs, recorders) are accepted without a check.
+      `ResourceNotFoundException` for a config rule, conformance pack, aggregation
+      authorization or configuration recorder ARN that does not name an existing resource in the
+      caller's account and region. ARNs of resource kinds Floci does not model (configuration
+      aggregators, stored queries, organization rules and packs) are accepted without an existence check.
+    - `PutConfigRule` updates the rule its `ConfigRuleArn` names, else the one its `ConfigRuleId`
+      names, else the one its `ConfigRuleName` names, as the PutConfigRule reference lets an update
+      name its rule by any of the three; a rule named by its ARN or id keeps its name. An ARN or id
+      that names no rule answers `InvalidParameterValueException`, in Floci's wording.
     - `PutConfigRule` applies its `Tags` only when it creates the rule; a later
       `PutConfigRule` for the same rule leaves its tags unchanged, as AWS documents. Use
       `TagResource` and `UntagResource` to change them. `DeleteConfigRule` drops the rule's tags.
-    - `PutConfigRule` and `PutAggregationAuthorization` reject more than 50 `Tags`, a tag
-      without a 1-128 character `Key`, or a `Value` over 256 characters with
-      `InvalidParameterValueException`, and store nothing. A tag with no `Value` is stored with
-      an empty value.
+      `PutConfigurationRecorder` and `DeleteConfigurationRecorder` do the same for the recorder.
+    - Every request is checked by `RequestConstraintCheck` against the types, required
+      members, bounds, patterns and enums generated from botocore's AWS Config service model.
+      `tools/aws/regen_config_shapes.py` vendors every operation's input constraints;
+      `make aws-data-sync` regenerates them and `make aws-data-check` checks for drift. A
+      violation answers `ValidationException`, or `InvalidLimitException` for a `Limit` out of
+      range where the operation models that error, in Floci's own wording. CloudFormation
+      checks an `AWS::Config::ConfigRule` against `PutConfigRule`'s constraints the same way,
+      so a property outside them fails the resource with that message.
+    - `PutConfigRule`, `PutAggregationAuthorization` and `PutConfigurationRecorder` reject more
+      than 50 `Tags`, a `Key` outside 1-128 characters or a `Value` over 256 characters with
+      `ValidationException`, and a tag without a `Key` with the operation's modelled error
+      (`InvalidParameterValueException` for the first two). They store nothing. A tag with no
+      `Value` is stored with an empty value.

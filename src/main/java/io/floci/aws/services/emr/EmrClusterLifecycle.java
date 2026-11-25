@@ -1,0 +1,541 @@
+package io.floci.aws.services.emr;
+
+import io.floci.aws.services.emr.model.EmrCluster;
+import io.floci.aws.services.emr.model.EmrErrorDetail;
+import io.floci.aws.services.emr.model.EmrInstanceFleet;
+import io.floci.aws.services.emr.model.EmrInstanceGroup;
+import io.floci.aws.services.emr.model.EmrStep;
+
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * A cluster's and its steps' lifecycle, as the Management Guide gives it in "Understanding the cluster
+ * lifecycle" and "Running steps to process data". A cluster is STARTING, then BOOTSTRAPPING, then
+ * RUNNING while it runs its steps, in the order they were added and at most its StepConcurrencyLevel
+ * at a time, then WAITING, or TERMINATING and TERMINATED when it ends after them. Each change falls due
+ * at a time worked out from three durations and the times already recorded, and {@link #advance} makes
+ * every change due by a given time, in the order they fall due, queuing the event of each state the
+ * guide's event tables report. With the durations at 0, every change falls due at the time of the call
+ * that leads to it. Without a {@link StepExecution} nothing runs and a step completes by time; with one,
+ * a step runs for real, and ends, COMPLETED or FAILED, when {@link #stepEnded} says so. Likewise, with a
+ * {@link BootstrapExecution} a cluster with bootstrap actions runs them for real, and is BOOTSTRAPPING until
+ * {@link #bootstrapEnded} says they are done.
+ */
+final class EmrClusterLifecycle {
+
+    static final String STARTING = "STARTING";
+    static final String BOOTSTRAPPING = "BOOTSTRAPPING";
+    static final String PROVISIONING = "PROVISIONING";
+    static final String RUNNING = "RUNNING";
+    static final String WAITING = "WAITING";
+    static final String TERMINATING = "TERMINATING";
+    static final String TERMINATED = "TERMINATED";
+    static final String PENDING = "PENDING";
+    // The ActionOnFailure of a step that names none.
+    static final String DEFAULT_ACTION_ON_FAILURE = "TERMINATE_CLUSTER";
+    static final String COMPLETED = "COMPLETED";
+    static final String CANCEL_PENDING = "CANCEL_PENDING";
+    static final String CANCELLED = "CANCELLED";
+    static final String FAILED = "FAILED";
+    static final String TERMINATED_WITH_ERRORS = "TERMINATED_WITH_ERRORS";
+    // FailureDetails.Reason: "In the case where the service cannot successfully determine the root cause of
+    // the failure, it returns "Unknown Error" as a reason." Floci never determines it.
+    private static final String UNKNOWN_ERROR = "Unknown Error";
+    private static final String STEP_FAILURE = "STEP_FAILURE";
+    static final String BOOTSTRAP_FAILURE = "BOOTSTRAP_FAILURE";
+    static final String INTERNAL_ERROR = "INTERNAL_ERROR";
+    // "If a cluster terminates because of a failure, ... the cluster state is set to TERMINATED_WITH_ERRORS."
+    private static final Set<String> FAILURES = Set.of(STEP_FAILURE, BOOTSTRAP_FAILURE, INTERNAL_ERROR);
+    // The reason a cluster a failed step ends gives: the console's for a Snowplow cluster on its forum, and
+    // mrjob's mock EMR.
+    private static final String SHUT_DOWN_AS_STEP_FAILED = "Shut down as step failed";
+    private static final Pattern RELEASE_LABEL = Pattern.compile("emr-(\\d{1,6})\\.(\\d{1,6})(?:\\..*)?");
+
+    private final Duration startup;
+    private final Duration stepRun;
+    private final Duration termination;
+    private final EmrEventPublisher events;
+    // Null when steps complete by time.
+    private final StepExecution execution;
+    // Null when a cluster's bootstrap actions are done by time.
+    private final BootstrapExecution bootstrapping;
+
+    /**
+     * Runs the steps a cluster starts, in the {@code docker} runner mode. Each call only sets work going
+     * and returns: a step's end comes back later through {@link #stepEnded}, never from inside the call.
+     */
+    interface StepExecution {
+
+        /** {@code step} of {@code cluster} has just gone RUNNING. */
+        void start(EmrCluster cluster, EmrStep step, String region);
+
+        /**
+         * {@code step}, which was RUNNING, has just been cancelled: with {@code terminateProcess} its process is killed
+         * at once, and else sent SIGTERM and left to end.
+         */
+        void stop(EmrStep step, boolean terminateProcess);
+    }
+
+    /**
+     * Runs the bootstrap actions of the clusters that have some, in the {@code docker} runner mode. Each call
+     * only sets work going and returns: their end comes back later through {@link #bootstrapEnded}.
+     */
+    interface BootstrapExecution {
+
+        /** {@code cluster}, which has bootstrap actions, has just gone BOOTSTRAPPING. */
+        void start(EmrCluster cluster, String region);
+
+        /** {@code cluster} is ending while its bootstrap actions still run. */
+        void stop(EmrCluster cluster);
+    }
+
+    EmrClusterLifecycle(int startupDelaySeconds, int stepDurationSeconds, int terminationDelaySeconds,
+                        EmrEventPublisher events, StepExecution execution, BootstrapExecution bootstrapping) {
+        this.startup = seconds("cluster-startup-delay-seconds", startupDelaySeconds);
+        this.stepRun = seconds("step-duration-seconds", stepDurationSeconds);
+        this.termination = seconds("cluster-termination-delay-seconds", terminationDelaySeconds);
+        this.events = events;
+        this.execution = execution;
+        this.bootstrapping = bootstrapping;
+    }
+
+    private static Duration seconds(String setting, int value) {
+        if (value < 0) {
+            throw new IllegalArgumentException("floci.services.emr." + setting + " must not be negative: " + value);
+        }
+        return Duration.ofSeconds(value);
+    }
+
+    /** A new cluster, STARTING at {@code now}, with its steps PENDING. */
+    void start(EmrCluster cluster, Instant now, String region) {
+        cluster.setState(STARTING);
+        instancesFollow(cluster);
+        cluster.setCreationDateTime(now);
+        events.queue(events.clusterStateChange(cluster, STARTING, now), region);
+        submit(cluster, cluster.getSteps(), now, region);
+    }
+
+    /**
+     * {@code steps}, already on the cluster's list, added at {@code now}: "The state of all steps is set
+     * to PENDING", and a cluster that is ready starts what it has room for. Adding none changes nothing.
+     */
+    void submit(EmrCluster cluster, List<EmrStep> steps, Instant now, String region) {
+        if (steps.isEmpty()) {
+            return;
+        }
+        for (EmrStep step : steps) {
+            step.setState(PENDING);
+            step.setCreationDateTime(now);
+            if (step.getActionOnFailure() == null) {
+                step.setActionOnFailure(DEFAULT_ACTION_ON_FAILURE);
+            }
+            events.queue(events.stepStatusChange(cluster, step, PENDING), region);
+        }
+        if (RUNNING.equals(cluster.getState()) || WAITING.equals(cluster.getState())) {
+            runSteps(cluster, now, region);
+        }
+    }
+
+    /**
+     * Ends the cluster for {@code code}: TERMINATING from {@code now}, then TERMINATED. TerminateJobFlows:
+     * "When a job flow is shut down, any step not yet completed is canceled".
+     */
+    void terminate(EmrCluster cluster, String code, String message, Instant now, String region) {
+        // Its bootstraps stop: the primary node's and its nodes', or, past BOOTSTRAPPING, those of the nodes a resize
+        // added, which run where its own ran in a container.
+        if (BOOTSTRAPPING.equals(cluster.getState()) ? !bootstrapTimed(cluster)
+                : bootstrapping != null && cluster.getBootstrapImage() != null) {
+            bootstrapping.stop(cluster);
+        }
+        cluster.setState(TERMINATING);
+        instancesFollow(cluster);
+        cluster.setStateChangeReasonCode(code);
+        cluster.setStateChangeMessage(message);
+        cluster.setTerminatingDateTime(now);
+        for (EmrStep step : cluster.getSteps()) {
+            if (PENDING.equals(step.getState()) || holdsAPlace(step)) {
+                cancelStep(cluster, step, now, region);
+            }
+        }
+    }
+
+    /**
+     * CancelSteps for one step: null once its cancel is under way, or why it cannot be. CancelSteps: "When you
+     * use Amazon EMR releases 5.28.0 and later, you can cancel steps that are in a PENDING or RUNNING state",
+     * and it "is idempotent but asynchronous". A RUNNING step whose driver runs is CANCEL_PENDING, "cancelled
+     * at Time and is pending cancellation" as the guide's step events put it, until its driver is gone
+     * ({@link #stepEnded}), and keeps its place among the running steps meanwhile: "Canceling a running step does
+     * not allow a pending step to start running, assuming no change to stepConcurrencyLevel". One that completes
+     * by time, nothing running it, is CANCELLED at once and makes room for the next PENDING one.
+     *
+     * <p>The Management Guide's "Cancel steps": with {@code SEND_INTERRUPT}, the default, "EMR sends a SIGTERM signal
+     * to the step", which may catch it "to terminate descendant step processes or wait for them to complete"; with
+     * {@code TERMINATE_PROCESS} ({@code terminateProcess}) "EMR sends a SIGKILL signal to the step and all its
+     * descendant processes which terminates them immediately". A step whose SEND_INTERRUPT cancel is pending is
+     * killed by a TERMINATE_PROCESS one.
+     */
+    String cancel(EmrCluster cluster, EmrStep step, Instant now, String region, boolean terminateProcess) {
+        if (CANCEL_PENDING.equals(step.getState())) {
+            if (terminateProcess && step.isInterrupted()) {
+                step.setInterrupted(false);
+                execution.stop(step, true);
+            }
+            return null;
+        }
+        boolean running = RUNNING.equals(step.getState()) && cancelsRunningSteps(cluster.getReleaseLabel());
+        if (!running && !PENDING.equals(step.getState())) {
+            return "Step is not in a cancellable state: " + step.getState();
+        }
+        if (running && !timed(step)) {
+            step.setState(CANCEL_PENDING);
+            step.setInterrupted(!terminateProcess);
+            events.queue(events.stepCancelPending(cluster, step, now), region);
+            execution.stop(step, terminateProcess);
+            return null;
+        }
+        cancelStep(cluster, step, now, region);
+        if (running) {
+            runSteps(cluster, now, region);
+        }
+        return null;
+    }
+
+    /**
+     * The cluster's StepConcurrencyLevel changed: a RUNNING cluster starts what it now has room for. A
+     * lower level lets the steps already running complete, as the guide says EMR does.
+     */
+    void concurrencyChanged(EmrCluster cluster, Instant now, String region) {
+        if (RUNNING.equals(cluster.getState())) {
+            runSteps(cluster, now, region);
+        }
+    }
+
+    /** Makes every change due by {@code now}, in the order they fall due; true when there was one. */
+    boolean advance(EmrCluster cluster, Instant now, String region) {
+        boolean changed = false;
+        Instant due;
+        while ((due = nextChange(cluster)) != null && !due.isAfter(now)) {
+            change(cluster, due, region);
+            changed = true;
+        }
+        return changed;
+    }
+
+    /** When the cluster's next change falls due, or null while it waits for a call. */
+    Instant nextChange(EmrCluster cluster) {
+        return switch (cluster.getState()) {
+            case STARTING -> cluster.getCreationDateTime().plus(startup.dividedBy(2));
+            case BOOTSTRAPPING -> bootstrapTimed(cluster) ? cluster.getCreationDateTime().plus(startup) : null;
+            case RUNNING -> cluster.getSteps().stream()
+                    .filter(step -> RUNNING.equals(step.getState()) && timed(step))
+                    .map(step -> step.getStartDateTime().plus(stepRun))
+                    .min(Comparator.naturalOrder())
+                    .orElse(null);
+            case TERMINATING -> cluster.getTerminatingDateTime().plus(termination);
+            default -> null;
+        };
+    }
+
+    private void change(EmrCluster cluster, Instant at, String region) {
+        switch (cluster.getState()) {
+            case STARTING -> {
+                cluster.setState(BOOTSTRAPPING);
+                // Its instances are up before its bootstrap actions run on them.
+                instancesFollow(cluster);
+                if (bootstrapping != null && cluster.getBootstrapActions() != null) {
+                    cluster.setBootstrapInContainer(true);
+                    bootstrapping.start(cluster, region);
+                }
+            }
+            case BOOTSTRAPPING -> ready(cluster, at, region);
+            case RUNNING -> {
+                for (EmrStep step : cluster.getSteps()) {
+                    if (RUNNING.equals(step.getState()) && timed(step)
+                            && !step.getStartDateTime().plus(stepRun).isAfter(at)) {
+                        step.setState(COMPLETED);
+                        step.setEndDateTime(at);
+                        events.queue(events.stepStatusChange(cluster, step, COMPLETED), region);
+                    }
+                }
+                runSteps(cluster, at, region);
+            }
+            case TERMINATING -> {
+                String ended = FAILURES.contains(cluster.getStateChangeReasonCode())
+                        ? TERMINATED_WITH_ERRORS : TERMINATED;
+                cluster.setState(ended);
+                cluster.setEndDateTime(at);
+                releaseInstanceCapacity(cluster);
+                events.queue(events.clusterStateChange(cluster, ended, at), region);
+            }
+            default -> throw new IllegalStateException("Nothing falls due for a " + cluster.getState() + " cluster");
+        }
+    }
+
+    /**
+     * The bootstrap actions a cluster ran for real have ended: when {@code failureCode} is null they all
+     * succeeded and left {@code image}, which its steps run in, and the cluster is ready to run them;
+     * otherwise the cluster ends, for {@code failureCode} and {@code message}, with {@code errorDetails} as
+     * its Status.ErrorDetails.
+     */
+    void bootstrapEnded(EmrCluster cluster, String image, String failureCode, String message,
+                        List<EmrErrorDetail> errorDetails, Instant at, String region) {
+        cluster.setBootstrapInContainer(false);
+        if (failureCode != null) {
+            cluster.setErrorDetails(new ArrayList<>(errorDetails));
+            terminate(cluster, failureCode, message, at, region);
+            return;
+        }
+        cluster.setBootstrapImage(image);
+        ready(cluster, at, region);
+    }
+
+    // Bootstrapping is done: the cluster runs its steps.
+    private void ready(EmrCluster cluster, Instant at, String region) {
+        cluster.setReadyDateTime(at);
+        cluster.setState(RUNNING);
+        instancesFollow(cluster);
+        runSteps(cluster, at, region);
+    }
+
+    /**
+     * Starts PENDING steps in the order they were added while the cluster has room: "pending steps in
+     * queue transition to running state in the order they were submitted". With none left, the
+     * cluster is done.
+     */
+    private void runSteps(EmrCluster cluster, Instant at, String region) {
+        long running = cluster.getSteps().stream().filter(EmrClusterLifecycle::holdsAPlace).count();
+        // The model allows 1 to 256; Floci stores any level it is given, and a lower one would never start a step.
+        int level = Math.max(1, cluster.getStepConcurrencyLevel());
+        List<EmrStep> started = new ArrayList<>();
+        for (EmrStep step : cluster.getSteps()) {
+            if (running >= level) {
+                break;
+            }
+            if (PENDING.equals(step.getState())) {
+                step.setState(RUNNING);
+                step.setStartDateTime(at);
+                step.setRunInContainer(execution != null);
+                events.queue(events.stepStatusChange(cluster, step, RUNNING), region);
+                started.add(step);
+                running++;
+            }
+        }
+        if (running > 0) {
+            // A WAITING cluster's "ready to run steps" no longer holds; no source gives a RUNNING one's reason.
+            cluster.setState(RUNNING);
+            cluster.setStateChangeReasonCode(null);
+            cluster.setStateChangeMessage(null);
+        } else {
+            finish(cluster, at, region);
+        }
+        if (execution != null) {
+            started.forEach(step -> execution.start(cluster, step, region));
+        }
+    }
+
+    /**
+     * A step run for real has ended: COMPLETED when {@code failure} is null, otherwise FAILED, with
+     * {@code failure} as its FailureDetails message, and its ActionOnFailure taken. A CANCEL_PENDING one is
+     * CANCELLED, however its driver ended, and takes no action: "Canceling a running step does not trigger the
+     * step ActionOnFailure". Either way the cluster goes on as it would once a step is done.
+     */
+    void stepEnded(EmrCluster cluster, EmrStep step, String failure, Instant at, String region) {
+        if (CANCEL_PENDING.equals(step.getState())) {
+            // Its driver has ended, so there is nothing left to kill.
+            step.setInterrupted(false);
+            cancelStep(cluster, step, at, region);
+            runSteps(cluster, at, region);
+            return;
+        }
+        step.setEndDateTime(at);
+        if (failure == null) {
+            step.setState(COMPLETED);
+            events.queue(events.stepStatusChange(cluster, step, COMPLETED), region);
+            runSteps(cluster, at, region);
+            return;
+        }
+        step.setState(FAILED);
+        step.setFailureReason(UNKNOWN_ERROR);
+        step.setFailureMessage(failure);
+        events.queue(events.stepStatusChange(cluster, step, FAILED), region);
+        actOnFailure(cluster, step, at, region);
+    }
+
+    /**
+     * A failed step's ActionOnFailure, as the API reference's Step and the Management Guide give it.
+     * TERMINATE_CLUSTER (TERMINATE_JOB_FLOW before it) ends the cluster, unless it is set to wait after
+     * its steps and protected from termination: then it "continues". CANCEL_AND_WAIT "Cancels any pending
+     * steps and returns the cluster to the WAITING state", and on a cluster set to end after its steps
+     * "the cluster terminates without executing subsequent steps". CONTINUE "Continues to the next step in
+     * the queue". "If the step concurrency level of a cluster is greater than one, step ActionOnFailure
+     * feature will not activate", and with level 1 but other steps still running (the level was lowered
+     * while they ran) "TERMINATE_CLUSTER ActionOnFailure may activate, but CANCEL_AND_WAIT ActionOnFailure
+     * will not".
+     */
+    private void actOnFailure(EmrCluster cluster, EmrStep step, Instant at, String region) {
+        String action = step.getActionOnFailure();
+        boolean activates = cluster.getStepConcurrencyLevel() <= 1;
+        boolean terminates = "TERMINATE_CLUSTER".equals(action) || "TERMINATE_JOB_FLOW".equals(action);
+        if (activates && terminates && (cluster.isAutoTerminate() || !cluster.isTerminationProtected())) {
+            terminate(cluster, STEP_FAILURE, SHUT_DOWN_AS_STEP_FAILED, at, region);
+            return;
+        }
+        // The failed step is FAILED by now; one whose cancel is pending still runs until its driver is gone.
+        boolean othersRunning = cluster.getSteps().stream().anyMatch(EmrClusterLifecycle::holdsAPlace);
+        if (activates && "CANCEL_AND_WAIT".equals(action) && !othersRunning) {
+            if (cluster.isAutoTerminate()) {
+                terminate(cluster, STEP_FAILURE, SHUT_DOWN_AS_STEP_FAILED, at, region);
+                return;
+            }
+            for (EmrStep pending : cluster.getSteps()) {
+                if (PENDING.equals(pending.getState())) {
+                    cancelStep(cluster, pending, at, region);
+                }
+            }
+        }
+        runSteps(cluster, at, region);
+    }
+
+    /**
+     * The cluster has no step left to run: it waits for more, or, set to end after its steps, ends
+     * without waiting. One created without steps waits either way.
+     */
+    private void finish(EmrCluster cluster, Instant at, String region) {
+        if (cluster.isAutoTerminate() && !cluster.getSteps().isEmpty()) {
+            terminate(cluster, "ALL_STEPS_COMPLETED", "All steps completed.", at, region);
+            return;
+        }
+        cluster.setState(WAITING);
+        cluster.setStateChangeReasonCode(cluster.getSteps().isEmpty() ? null : "ALL_STEPS_COMPLETED");
+        cluster.setStateChangeMessage("Cluster ready to run steps.");
+        events.queue(events.clusterStateChange(cluster, WAITING, at), region);
+    }
+
+    private void cancelStep(EmrCluster cluster, EmrStep step, Instant at, String region) {
+        // Running, or left to end after a SIGTERM: a step its cluster's end cancels has its process killed.
+        boolean going = RUNNING.equals(step.getState()) || step.isInterrupted();
+        step.setState(CANCELLED);
+        step.setInterrupted(false);
+        step.setEndDateTime(at);
+        events.queue(events.stepStatusChange(cluster, step, CANCELLED), region);
+        if (going && !timed(step)) {
+            execution.stop(step, true);
+        }
+    }
+
+    /**
+     * Whether a RUNNING step completes by time: every step without a {@link StepExecution}, including one
+     * a {@code docker} runner mode started before a restart into the {@code immediate} one.
+     */
+    private boolean timed(EmrStep step) {
+        return execution == null || !step.isRunInContainer();
+    }
+
+    /**
+     * Whether a BOOTSTRAPPING cluster is done by time: every one without a {@link BootstrapExecution} or
+     * without bootstrap actions, including one a {@code docker} runner mode started before a restart into the
+     * {@code immediate} one.
+     */
+    private boolean bootstrapTimed(EmrCluster cluster) {
+        return bootstrapping == null || !cluster.isBootstrapInContainer();
+    }
+
+    /** Whether {@code step} takes one of its cluster's StepConcurrencyLevel places: RUNNING, or CANCEL_PENDING. */
+    static boolean holdsAPlace(EmrStep step) {
+        return RUNNING.equals(step.getState()) || CANCEL_PENDING.equals(step.getState());
+    }
+
+    /** TERMINATED, or TERMINATED_WITH_ERRORS: the cluster has ended. */
+    static boolean isTerminated(String state) {
+        return TERMINATED.equals(state) || TERMINATED_WITH_ERRORS.equals(state);
+    }
+
+    /**
+     * The state a cluster's instance groups and fleets are in while it is in {@code clusterState}, Floci's reading, as
+     * no source says when theirs apply: PROVISIONING while it starts, as the guide's events have an instance fleet's
+     * "Provisioning ... is complete" end it, then BOOTSTRAPPING, RUNNING while it runs or waits, and TERMINATING as
+     * it ends; TERMINATED once it has (see releaseInstanceCapacity).
+     */
+    static String instancesState(String clusterState) {
+        return switch (clusterState) {
+            case STARTING -> PROVISIONING;
+            case BOOTSTRAPPING -> BOOTSTRAPPING;
+            case TERMINATING -> TERMINATING;
+            default -> RUNNING;
+        };
+    }
+
+    /**
+     * An instance group in {@code state}: none of its instances running while they are provisioned, every one it asks
+     * for from its cluster's bootstrap on, which runs on them; as it ends they run until they are gone.
+     */
+    static void groupIn(EmrInstanceGroup group, String state) {
+        group.setState(state);
+        if (PROVISIONING.equals(state)) {
+            group.setRunningInstanceCount(0);
+        } else if (!TERMINATING.equals(state)) {
+            group.setRunningInstanceCount(group.getRequestedInstanceCount());
+        }
+    }
+
+    /** An instance fleet in {@code state}, its capacity provisioned as {@link #groupIn} has a group's instances run. */
+    static void fleetIn(EmrInstanceFleet fleet, String state) {
+        fleet.setState(state);
+        if (PROVISIONING.equals(state)) {
+            fleet.setProvisionedOnDemandCapacity(0);
+            fleet.setProvisionedSpotCapacity(0);
+        } else if (!TERMINATING.equals(state)) {
+            fleet.setProvisionedOnDemandCapacity(fleet.getTargetOnDemandCapacity());
+            fleet.setProvisionedSpotCapacity(fleet.getTargetSpotCapacity());
+        }
+    }
+
+    // The cluster's instance groups and fleets, but those that have ended, in the state its own puts them in.
+    private static void instancesFollow(EmrCluster cluster) {
+        String state = instancesState(cluster.getState());
+        for (EmrInstanceGroup group : cluster.getInstanceGroups()) {
+            if (!TERMINATED.equals(group.getState())) {
+                groupIn(group, state);
+            }
+        }
+        for (EmrInstanceFleet fleet : cluster.getInstanceFleets()) {
+            if (!TERMINATED.equals(fleet.getState())) {
+                fleetIn(fleet, state);
+            }
+        }
+    }
+
+    private static void releaseInstanceCapacity(EmrCluster cluster) {
+        for (EmrInstanceGroup group : cluster.getInstanceGroups()) {
+            group.setState(TERMINATED);
+            // One that ended while it was provisioned ran none, and the instances it asked for, which ListInstances
+            // listed, have ended, as an ended fleet's targets say what it ran.
+            group.setTerminatedInstanceCount(group.getRunningInstanceCount() > 0 ? group.getRunningInstanceCount()
+                    : group.getRequestedInstanceCount());
+            group.setRunningInstanceCount(0);
+        }
+        for (EmrInstanceFleet fleet : cluster.getInstanceFleets()) {
+            fleet.setState(TERMINATED);
+            fleet.setProvisionedOnDemandCapacity(0);
+            fleet.setProvisionedSpotCapacity(0);
+        }
+    }
+
+    /** Releases from 5.28.0 cancel RUNNING steps; a label not of the emr-x.y form is taken as current. */
+    static boolean cancelsRunningSteps(String releaseLabel) {
+        Matcher matcher = RELEASE_LABEL.matcher(releaseLabel == null ? "" : releaseLabel);
+        if (!matcher.matches()) {
+            return true;
+        }
+        int major = Integer.parseInt(matcher.group(1));
+        int minor = Integer.parseInt(matcher.group(2));
+        return major > 5 || (major == 5 && minor >= 28);
+    }
+}

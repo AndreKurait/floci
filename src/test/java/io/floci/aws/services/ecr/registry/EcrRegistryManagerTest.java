@@ -1,0 +1,1359 @@
+package io.floci.aws.services.ecr.registry;
+
+import com.github.dockerjava.api.DockerClient;
+import com.github.dockerjava.api.async.ResultCallback;
+import com.github.dockerjava.api.command.ExecCreateCmd;
+import com.github.dockerjava.api.command.ExecCreateCmdResponse;
+import com.github.dockerjava.api.command.ExecStartCmd;
+import com.github.dockerjava.api.command.InfoCmd;
+import com.github.dockerjava.api.command.InspectExecCmd;
+import com.github.dockerjava.api.command.InspectExecResponse;
+import com.github.dockerjava.api.command.InspectImageCmd;
+import com.github.dockerjava.api.command.InspectImageResponse;
+import com.github.dockerjava.api.exception.DockerClientException;
+import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.Container;
+import com.github.dockerjava.api.model.ContainerNetwork;
+import com.github.dockerjava.api.model.ContainerNetworkSettings;
+import com.github.dockerjava.api.model.ContainerPort;
+import com.github.dockerjava.api.model.Frame;
+import com.github.dockerjava.api.model.Info;
+import com.github.dockerjava.api.model.StreamType;
+import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.docker.ContainerBuilder;
+import io.floci.aws.core.common.docker.ContainerDetector;
+import io.floci.aws.core.common.docker.ContainerLifecycleManager;
+import io.floci.aws.core.common.docker.ContainerLifecycleManager.ContainerPresence;
+import io.floci.aws.core.common.docker.ContainerLogStreamer;
+import io.floci.aws.core.common.docker.ContainerSpec;
+import io.floci.aws.core.common.docker.CurrentContainerNetworkResolver;
+import io.floci.aws.core.common.docker.HostBlindPortAllocator;
+import io.floci.aws.core.common.docker.PortAllocator;
+import io.floci.aws.testing.ManualClock;
+import io.floci.aws.testing.ParallelLocks;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceLock;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.Mockito;
+
+import java.io.Closeable;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.OptionalInt;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
+
+/**
+ * Unit tests for {@link EcrRegistryManager} startup behavior. Uses a real
+ * {@link PortAllocator} that skips the host probe ({@link HostBlindPortAllocator}) and a mocked Docker layer so the
+ * failure path can be exercised without a Docker daemon or free host ports.
+ */
+@ResourceLock(ParallelLocks.PORTS)
+class EcrRegistryManagerTest {
+
+    private static final int BASE_PORT = 6100;
+    private static final int MAX_PORT = 6101; // pool of exactly two ports
+    private static final String REGISTRY_NAME = "floci-aws-test-ecr-registry";
+    private static final String AWS_ECR_IMAGE = "123456789012.dkr.ecr.us-east-1.amazonaws.com/backend-user:1";
+
+    private PortAllocator portAllocator;
+    private ContainerLifecycleManager lifecycleManager;
+    private ContainerLogStreamer logStreamer;
+    private ContainerDetector containerDetector;
+    private CurrentContainerNetworkResolver currentContainerNetworkResolver;
+    private EmulatorConfig config;
+    private EmulatorConfig.DockerConfig docker;
+    private EmulatorConfig.EcrServiceConfig ecr;
+    private EmulatorConfig.StorageConfig storage;
+    private ContainerBuilder containerBuilder;
+    private ContainerBuilder.Builder builder;
+    private DockerClient dockerClient;
+    private InspectImageCmd inspectImage;
+    private RegionResolver regionResolver;
+    private EcrRegistryManager manager;
+
+    @BeforeEach
+    void setUp() {
+        portAllocator = new HostBlindPortAllocator();
+
+        containerBuilder = Mockito.mock(ContainerBuilder.class);
+        builder = Mockito.mock(ContainerBuilder.Builder.class, Mockito.RETURNS_SELF);
+        when(containerBuilder.newContainer(anyString())).thenReturn(builder);
+        when(containerBuilder.resolveImage(anyString())).thenAnswer(inv -> inv.getArgument(0));
+        // Echoes its input, so a test sees which network the manager asked to resolve.
+        when(containerBuilder.resolveDockerNetwork(any())).thenAnswer(inv -> inv.<Optional<String>>getArgument(0).map(n -> "resolved:" + n));
+        when(builder.build()).thenReturn(new ContainerSpec("test-image"));
+
+        lifecycleManager = Mockito.mock(ContainerLifecycleManager.class);
+        when(lifecycleManager.findByName(anyString())).thenReturn(Optional.empty());
+        when(lifecycleManager.presenceOf(anyString())).thenReturn(ContainerPresence.RUNNING);
+        dockerClient = Mockito.mock(DockerClient.class);
+        inspectImage = Mockito.mock(InspectImageCmd.class);
+        when(lifecycleManager.getDockerClient()).thenReturn(dockerClient);
+        when(dockerClient.inspectImageCmd(anyString())).thenReturn(inspectImage);
+        Mockito.doThrow(new NotFoundException("No such image")).when(inspectImage).exec();
+
+        logStreamer = Mockito.mock(ContainerLogStreamer.class);
+        when(logStreamer.generateLogStreamName(anyString())).thenReturn("registry-log-stream");
+        containerDetector = Mockito.mock(ContainerDetector.class);
+        currentContainerNetworkResolver = Mockito.mock(CurrentContainerNetworkResolver.class);
+        regionResolver = Mockito.spy(new RegionResolver("us-east-1", "000000000000"));
+
+        config = Mockito.mock(EmulatorConfig.class);
+        ecr = Mockito.mock(EmulatorConfig.EcrServiceConfig.class);
+        docker = Mockito.mock(EmulatorConfig.DockerConfig.class);
+        storage = Mockito.mock(EmulatorConfig.StorageConfig.class);
+        when(config.services()).thenReturn(Mockito.mock(EmulatorConfig.ServicesConfig.class));
+        when(config.services().ecr()).thenReturn(ecr);
+        when(config.services().iam()).thenReturn(Mockito.mock(EmulatorConfig.IamServiceConfig.class));
+        when(config.port()).thenReturn(4566);
+        when(config.docker()).thenReturn(docker);
+        when(config.storage()).thenReturn(storage);
+        when(docker.resourceNamespace()).thenReturn(Optional.empty());
+        // Empty host-persistent-path selects named-volume mode (no host bind-mount logic).
+        when(storage.hostPersistentPath()).thenReturn("");
+        when(storage.mode()).thenReturn("persistent");
+        when(ecr.registryContainerName()).thenReturn(REGISTRY_NAME);
+        when(ecr.registryImage()).thenReturn("registry:2");
+        when(ecr.registryBasePort()).thenReturn(BASE_PORT);
+        when(ecr.registryMaxPort()).thenReturn(MAX_PORT);
+        when(ecr.dockerNetwork()).thenReturn(Optional.empty());
+        when(ecr.preferLocalImages()).thenReturn(true);
+        when(ecr.enabled()).thenReturn(true);
+
+        manager = Mockito.spy(new EcrRegistryManager(containerBuilder, lifecycleManager, logStreamer,
+                containerDetector, currentContainerNetworkResolver, portAllocator, config, regionResolver));
+        Mockito.doAnswer(invocation -> {
+            RegistryHttpClient client = Mockito.spy((RegistryHttpClient) invocation.callRealMethod());
+            Mockito.doReturn(true).when(client).ping(any(Duration.class));
+            return client;
+        }).when(manager).httpClient();
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void startupWaitsForRegistryWithoutReconciliation(boolean adopt) throws Exception {
+        configureStartup(adopt);
+        RegistryHttpClient registry = Mockito.mock(RegistryHttpClient.class);
+        Mockito.doReturn(registry).when(manager).httpClient();
+        CountDownLatch waiting = new CountDownLatch(1);
+        CountDownLatch ready = new CountDownLatch(1);
+        AtomicInteger probes = new AtomicInteger();
+        when(registry.ping(any(Duration.class))).thenAnswer(invocation -> {
+            if (probes.getAndIncrement() == 0) {
+                return false;
+            }
+            waiting.countDown();
+            assertTrue(ready.await(5, TimeUnit.SECONDS));
+            return true;
+        });
+        try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
+            Future<?> startup = executor.submit(manager::ensureStarted);
+            try {
+                assertTrue(waiting.await(2, TimeUnit.SECONDS),
+                        "Startup must keep checking an unready registry even without a reconciliation hook");
+                assertFalse(startup.isDone());
+                assertFalse(manager.isStarted(), "An unready registry must not be published as started");
+                ready.countDown();
+                startup.get(2, TimeUnit.SECONDS);
+                assertTrue(manager.isStarted());
+            } finally {
+                ready.countDown();
+                startup.cancel(true);
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void readinessTimeoutCanRecoverTheSameContainer(boolean adopt) {
+        configureStartup(adopt);
+        RegistryHttpClient registry = Mockito.mock(RegistryHttpClient.class);
+        Mockito.doReturn(registry).when(manager).httpClient();
+        when(registry.ping(any(Duration.class))).thenAnswer(invocation -> {
+            Duration timeout = invocation.getArgument(0);
+            assertTrue(timeout.isPositive() && timeout.compareTo(Duration.ofSeconds(1)) <= 0);
+            return false;
+        });
+
+        RuntimeException error = assertThrows(RuntimeException.class, manager::ensureStarted);
+        assertTrue(error.getMessage().contains("did not become ready within 10 seconds"));
+        assertFalse(manager.isStarted());
+
+        configureStartup(true);
+        when(registry.ping(any(Duration.class))).thenReturn(true);
+        manager.ensureStarted();
+        assertTrue(manager.isStarted());
+        verify(lifecycleManager, times(adopt ? 0 : 1)).createAndStart(any());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void interruptedStartupPreservesCancellationAndOwnedCleanup(boolean adopt) {
+        configureStartup(adopt);
+        RegistryHttpClient registry = Mockito.mock(RegistryHttpClient.class);
+        Mockito.doReturn(registry).when(manager).httpClient();
+        when(registry.ping(any(Duration.class))).thenAnswer(invocation -> {
+            Thread.currentThread().interrupt();
+            return false;
+        });
+
+        try {
+            RuntimeException error = assertThrows(RuntimeException.class, manager::ensureStarted);
+            assertTrue(error.getMessage().contains("Interrupted while waiting"));
+            assertTrue(Thread.currentThread().isInterrupted());
+            assertFalse(manager.isStarted());
+        } finally {
+            Thread.interrupted();
+        }
+        manager.shutdown();
+        verify(lifecycleManager).stopAndRemove(eq("startup-registry"), any());
+    }
+
+    private void configureStartup(boolean adopt) {
+        ContainerLifecycleManager.ContainerInfo info =
+                new ContainerLifecycleManager.ContainerInfo("startup-registry", Map.of());
+        if (adopt) {
+            Container container = Mockito.mock(Container.class);
+            when(container.getId()).thenReturn(info.containerId());
+            when(container.getPorts()).thenReturn(new ContainerPort[] {
+                    new ContainerPort().withPrivatePort(5000).withPublicPort(BASE_PORT)
+                            .withType("tcp").withIp("127.0.0.1")});
+            when(lifecycleManager.findByName(REGISTRY_NAME)).thenReturn(Optional.of(container));
+            when(lifecycleManager.adopt(info.containerId(), List.of(5000), Optional.empty())).thenReturn(info);
+        } else {
+            when(lifecycleManager.createAndStart(any())).thenReturn(info);
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void ensureStartedWaitsForRegistryHttpWhenStartingOrAdopting(boolean adopt) {
+        ContainerLifecycleManager.ContainerInfo info =
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of());
+        if (adopt) {
+            Container existing = Mockito.mock(Container.class);
+            when(existing.getId()).thenReturn("container-id");
+            when(existing.getPorts()).thenReturn(new ContainerPort[] {
+                    new ContainerPort().withIp("127.0.0.1").withPrivatePort(5000).withPublicPort(BASE_PORT)
+            });
+            when(lifecycleManager.findByName(REGISTRY_NAME)).thenReturn(Optional.of(existing));
+            when(lifecycleManager.adopt("container-id", List.of(5000), Optional.empty())).thenReturn(info);
+        } else {
+            when(lifecycleManager.createAndStart(any())).thenReturn(info);
+        }
+
+        RegistryHttpClient client = registryClient();
+        manager.ensureStarted();
+
+        verify(client).ping(any(Duration.class));
+        manager.ensureStarted();
+        verify(client).ping(any(Duration.class));
+    }
+
+    @Test
+    void ensureStartedRetriesReadinessAfterHealthCheckFails() {
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+        RegistryHttpClient client = registryClient();
+        when(client.ping(any(Duration.class)))
+                .thenThrow(new IllegalStateException("Registry is not healthy"))
+                .thenReturn(true);
+
+        assertFalse(manager.tryEnsureStarted());
+        assertTrue(manager.tryEnsureStarted());
+
+        verify(client, times(2)).ping(any(Duration.class));
+        verify(lifecycleManager).createAndStart(any());
+    }
+
+    @Test
+    void ensureStartedReconcilesOnlyAfterHttpReadiness() throws Exception {
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+        List<String> events = new ArrayList<>();
+        RegistryHttpClient client = Mockito.mock(RegistryHttpClient.class);
+        when(client.baseUrl()).thenReturn("http://localhost:" + BASE_PORT);
+        when(client.catalogStrict()).thenAnswer(invocation -> {
+            events.add("catalog");
+            return List.of("repository");
+        });
+        Mockito.doReturn(client).when(manager).httpClient();
+        when(client.ping(any(Duration.class))).thenAnswer(invocation -> {
+            events.add("healthy");
+            return true;
+        });
+        manager.setReconcileHook(repositories -> {
+            assertEquals(List.of("repository"), repositories);
+            events.add("reconciled");
+        });
+
+        manager.ensureStarted();
+
+        assertEquals(List.of("healthy", "catalog", "reconciled"), events);
+    }
+
+    @Test
+    void aCatalogTheRegistryFailedToGiveIsReadAgainRatherThanTakenAsEmpty() throws Exception {
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+        RegistryHttpClient client = registryClient();
+        when(client.catalogStrict())
+                .thenThrow(new IOException("Registry catalog returned 500"))
+                .thenReturn(List.of("legacy/service"));
+        List<List<String>> reconciled = new ArrayList<>();
+        manager.setReconcileHook(reconciled::add);
+
+        manager.ensureStarted();
+
+        assertFalse(manager.isCatalogReconciled());
+        assertTrue(reconciled.isEmpty());
+
+        manager.ensureCatalogReconciled();
+        manager.ensureCatalogReconciled();
+
+        assertTrue(manager.isCatalogReconciled());
+        assertEquals(List.of(List.of("legacy/service")), reconciled);
+        verify(client, times(2)).catalogStrict();
+    }
+
+    @Test
+    void aFailedCatalogRetryWaitsBeforeTheNextRead() throws Exception {
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+        ManualClock clock = new ManualClock(Instant.parse("2026-11-21T00:00:00Z"));
+        manager.setClock(clock);
+        RegistryHttpClient client = registryClient();
+        when(client.catalogStrict()).thenThrow(new IOException("Registry catalog returned 500"));
+        manager.setReconcileHook(repositories -> { });
+
+        manager.ensureStarted();
+        manager.ensureCatalogReconciled();
+        clock.advance(Duration.ofMillis(EcrRegistryManager.RECONCILE_RETRY_MILLIS - 1));
+        manager.ensureCatalogReconciled();
+
+        verify(client, times(2)).catalogStrict();
+
+        clock.advance(Duration.ofMillis(1));
+        manager.ensureCatalogReconciled();
+
+        verify(client, times(3)).catalogStrict();
+        assertFalse(manager.isCatalogReconciled());
+    }
+
+    @Test
+    void aCatalogRetryWaitsForTheRegistryToStart() throws Exception {
+        RegistryHttpClient client = registryClient();
+        manager.setReconcileHook(repositories -> { });
+
+        manager.ensureCatalogReconciled();
+
+        verify(client, never()).catalogStrict();
+        assertFalse(manager.isCatalogReconciled());
+    }
+
+    @Test
+    void aRecoveredRegistryHasItsCatalogReadAgain() throws Exception {
+        when(lifecycleManager.createAndStart(any()))
+                .thenReturn(new ContainerLifecycleManager.ContainerInfo("first-container", Map.of()))
+                .thenReturn(new ContainerLifecycleManager.ContainerInfo("second-container", Map.of()));
+        RegistryHttpClient client = registryClient();
+        when(client.catalogStrict()).thenReturn(List.of()).thenReturn(List.of("restored/service"));
+        List<List<String>> reconciled = new ArrayList<>();
+        manager.setReconcileHook(reconciled::add);
+
+        manager.ensureStarted();
+        when(lifecycleManager.presenceOf("first-container")).thenReturn(ContainerPresence.ABSENT);
+        manager.ensureStarted();
+
+        assertTrue(manager.isCatalogReconciled());
+        assertEquals(List.of(List.of(), List.of("restored/service")), reconciled);
+    }
+
+    /** A registry client the manager uses in place of HTTP, answering the health check at once. */
+    private RegistryHttpClient registryClient() {
+        RegistryHttpClient client = Mockito.mock(RegistryHttpClient.class);
+        when(client.ping(any(Duration.class))).thenReturn(true);
+        when(client.baseUrl()).thenReturn("http://localhost:" + BASE_PORT);
+        Mockito.doReturn(client).when(manager).httpClient();
+        return client;
+    }
+
+    @Test
+    void ensureStartedLabelsContainerWithResourceIdentity() {
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+
+        manager.ensureStarted();
+
+        verify(builder).withLabels(Map.of(
+                "io.floci", "aws",
+                "io.floci.service", "ecr",
+                "io.floci.account", "000000000000",
+                "io.floci.region", "us-east-1"));
+    }
+
+    @Test
+    void ensureStartedDoesNotBlockWhenAlreadyRunning() throws Exception {
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+        when(lifecycleManager.presenceOf("container-id")).thenReturn(ContainerPresence.RUNNING);
+        manager.ensureStarted();
+        assertTrue(manager.isStarted());
+
+        CountDownLatch lockAcquired = new CountDownLatch(1);
+        CountDownLatch finishLock = new CountDownLatch(1);
+        Thread holder = new Thread(() -> {
+            synchronized (manager) {
+                lockAcquired.countDown();
+                try {
+                    finishLock.await(5, TimeUnit.SECONDS);
+                } catch (InterruptedException ignored) {}
+            }
+        });
+        holder.start();
+        assertTrue(lockAcquired.await(2, TimeUnit.SECONDS));
+
+        try {
+            CompletableFuture<Void> call = CompletableFuture.runAsync(() -> manager.ensureStarted());
+            call.get(2, TimeUnit.SECONDS);
+        } finally {
+            finishLock.countDown();
+            holder.join();
+        }
+    }
+
+    @Test
+    void ensureStartedBindsTheBackingRegistryToLoopbackOnly() {
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+
+        manager.ensureStarted();
+
+        verify(builder).withLoopbackPortBinding(eq(5000), anyInt());
+    }
+
+    @Test
+    void ensureStarted_releasesPortWhenDockerStartFails_soPoolIsNotExhausted() {
+        when(lifecycleManager.createAndStart(any()))
+                .thenThrow(new RuntimeException("Cannot connect to the Docker daemon"));
+
+        // Far more attempts than the two-port pool. Every attempt must surface the
+        // real Docker failure. If the reserved port were leaked on failure, the pool
+        // would exhaust after two attempts and later calls would instead fail with
+        // "No free port available" — the symptom this test guards against.
+        for (int attempt = 0; attempt < 6; attempt++) {
+            RuntimeException ex = assertThrows(RuntimeException.class, manager::ensureStarted);
+            assertTrue(ex.getMessage().contains("Failed to start ECR backing registry container"),
+                    "attempt " + attempt + " should surface the Docker failure, got: " + ex.getMessage());
+            assertFalse(ex.getMessage().contains("No free port available"),
+                    "port pool leaked on attempt " + attempt + ": " + ex.getMessage());
+        }
+        // Only a host-port collision moves on to the next port; any other failure is not retried.
+        verify(lifecycleManager, times(6)).createAndStart(any());
+    }
+
+    @Test
+    void ensureStarted_triesTheNextPortWhenDockerReportsTheChosenPortInUse() {
+        when(lifecycleManager.createAndStart(any()))
+                .thenThrow(new RuntimeException("Bind for 127.0.0.1:6100 failed: port is already allocated"))
+                .thenReturn(new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+
+        manager.ensureStarted();
+
+        assertEquals(MAX_PORT, manager.effectivePort());
+        verify(builder).withLoopbackPortBinding(5000, BASE_PORT);
+        verify(builder).withLoopbackPortBinding(5000, MAX_PORT);
+        assertEquals(BASE_PORT, portAllocator.allocate(BASE_PORT, MAX_PORT), "the refused port must be released");
+    }
+
+    @Test
+    void ensureStarted_namesTheRefusedPortsWhenEveryPortInTheRangeIsInUse() {
+        when(lifecycleManager.createAndStart(any()))
+                .thenThrow(new RuntimeException("listen tcp4 127.0.0.1:6100: bind: address already in use"));
+
+        RuntimeException ex = assertThrows(RuntimeException.class, manager::ensureStarted);
+
+        assertTrue(ex.getMessage().contains("[6100, 6101]") && ex.getMessage().contains("6100-6101"),
+                ex.getMessage());
+        verify(lifecycleManager, times(2)).createAndStart(any());
+        assertFalse(manager.isStarted());
+        assertEquals(BASE_PORT, portAllocator.allocate(BASE_PORT, MAX_PORT), "refused ports must be released");
+        assertEquals(MAX_PORT, portAllocator.allocate(BASE_PORT, MAX_PORT), "refused ports must be released");
+    }
+
+    @Test
+    void tryEnsureStarted_reportsFailureInsteadOfThrowingWhenDockerIsUnreachable() {
+        // Floci running inside Docker without a mounted daemon socket. The control plane
+        // must keep working, so the failure is reported rather than propagated.
+        when(lifecycleManager.createAndStart(any()))
+                .thenThrow(new RuntimeException("Cannot connect to the Docker daemon"));
+
+        for (int attempt = 0; attempt < 6; attempt++) {
+            assertFalse(manager.tryEnsureStarted(), "attempt " + attempt + " should report unavailable");
+        }
+        assertFalse(manager.isStarted());
+    }
+
+    @Test
+    void tryEnsureStarted_ecrDisabled_reportsUnavailableWithoutCreatingTheContainer() {
+        when(ecr.enabled()).thenReturn(false);
+
+        assertFalse(manager.tryEnsureStarted());
+
+        assertFalse(manager.isStarted());
+        verify(lifecycleManager, never()).findByName(anyString());
+        verify(lifecycleManager, never()).createAndStart(any());
+    }
+
+    @Test
+    void ensureStarted_ecrDisabled_refusesWithoutCreatingTheContainer() {
+        when(ecr.enabled()).thenReturn(false);
+
+        assertThrows(IllegalStateException.class, () -> manager.ensureStarted());
+
+        verify(lifecycleManager, never()).createAndStart(any());
+    }
+
+    @Test
+    void rewriteImageUri_ecrDisabled_returnsAwsEcrUriUnchangedWithoutStartingRegistry() {
+        when(ecr.enabled()).thenReturn(false);
+
+        String rewritten = manager.rewriteImageUri(AWS_ECR_IMAGE);
+
+        assertEquals(AWS_ECR_IMAGE, rewritten);
+        verify(lifecycleManager, never()).findByName(anyString());
+        verify(lifecycleManager, never()).createAndStart(any());
+    }
+
+    @Test
+    void tryEnsureStarted_reportsSuccessOnceTheRegistryStarts() {
+        when(lifecycleManager.createAndStart(any()))
+                .thenReturn(new ContainerLifecycleManager.ContainerInfo("0123456789abcdef", Map.of()));
+
+        assertTrue(manager.tryEnsureStarted());
+        assertTrue(manager.isStarted());
+    }
+
+    @Test
+    void tryEnsureStarted_recreatesRegistryWhenStartedContainerDisappears() throws Exception {
+        when(lifecycleManager.createAndStart(any()))
+                .thenReturn(new ContainerLifecycleManager.ContainerInfo("first-container", Map.of()))
+                .thenReturn(new ContainerLifecycleManager.ContainerInfo("second-container", Map.of()));
+        Closeable firstLogStream = Mockito.mock(Closeable.class);
+        Closeable secondLogStream = Mockito.mock(Closeable.class);
+        when(logStreamer.attachPolled(anyString(), anyString(), anyString(), anyString(), anyString()))
+                .thenReturn(firstLogStream, secondLogStream);
+
+        assertTrue(manager.tryEnsureStarted());
+        when(lifecycleManager.presenceOf("first-container")).thenReturn(ContainerPresence.ABSENT);
+
+        assertTrue(manager.tryEnsureStarted());
+
+        verify(lifecycleManager, Mockito.times(2)).createAndStart(any());
+        verify(builder, Mockito.times(2)).withLoopbackPortBinding(5000, BASE_PORT);
+        verify(firstLogStream).close();
+    }
+
+    @Test
+    void ensureStarted_restartsStoppedRegistryByAdoptingIt() {
+        when(lifecycleManager.createAndStart(any()))
+                .thenReturn(new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+        manager.ensureStarted();
+
+        Container existing = Mockito.mock(Container.class);
+        when(existing.getId()).thenReturn("container-id");
+        when(existing.getPorts()).thenReturn(new ContainerPort[] {
+                new ContainerPort().withIp("127.0.0.1").withPrivatePort(5000).withPublicPort(BASE_PORT)
+        });
+        when(lifecycleManager.presenceOf("container-id")).thenReturn(ContainerPresence.STOPPED);
+        when(lifecycleManager.findByName(REGISTRY_NAME)).thenReturn(Optional.of(existing));
+        // Floci in a container with no configured network: the registry was created on Floci's own.
+        when(containerDetector.isRunningInContainer()).thenReturn(true);
+        when(currentContainerNetworkResolver.resolveNetworkName()).thenReturn(Optional.of("floci_net"));
+        when(lifecycleManager.adopt("container-id", List.of(5000), Optional.of("resolved:floci_net")))
+                .thenReturn(new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+
+        manager.ensureStarted();
+
+        verify(lifecycleManager).adopt("container-id", List.of(5000), Optional.of("resolved:floci_net"));
+        verify(lifecycleManager).createAndStart(any());
+        assertTrue(manager.isStarted());
+    }
+
+    @Test
+    void ensureStarted_doesNotReplaceRegistryWhenContainerPresenceIsUnknown() {
+        when(lifecycleManager.createAndStart(any()))
+                .thenReturn(new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+        manager.ensureStarted();
+        when(lifecycleManager.presenceOf("container-id")).thenReturn(ContainerPresence.UNKNOWN);
+
+        manager.ensureStarted();
+
+        verify(lifecycleManager).createAndStart(any());
+        verify(lifecycleManager).findByName(REGISTRY_NAME);
+        assertTrue(manager.isStarted());
+    }
+
+    @Test
+    void httpClient_usesRegistryContainerDnsWhenRunningInsideDocker() {
+        when(containerDetector.isRunningInContainer()).thenReturn(true);
+
+        assertEquals("http://" + REGISTRY_NAME + ":5000", manager.httpClient().baseUrl());
+    }
+
+    @Test
+    void httpClient_usesTheStartedRegistrysAddressInsideDocker() {
+        when(containerDetector.isRunningInContainer()).thenReturn(true);
+        when(lifecycleManager.createAndStart(any())).thenReturn(containerAt("container-id", "172.18.0.3"));
+
+        manager.ensureStarted();
+
+        assertEquals("http://172.18.0.3:5000", manager.httpClient().baseUrl());
+    }
+
+    @Test
+    void httpClient_followsTheRegistryWhenDeletingTheLastRepositoryReplacesIt() {
+        when(containerDetector.isRunningInContainer()).thenReturn(true);
+        when(storage.pruneVolumesOnDelete()).thenReturn(true);
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                containerAt("old-container", "172.18.0.3"), containerAt("new-container", "172.18.0.9"));
+        manager.ensureStarted();
+
+        manager.pruneStorage();
+        assertEquals("http://" + REGISTRY_NAME + ":5000", manager.httpClient().baseUrl());
+
+        manager.ensureStarted();
+        assertEquals("http://172.18.0.9:5000", manager.httpClient().baseUrl());
+    }
+
+    @Test
+    void httpClient_forgetsTheAddressOfARegistryThatDisappeared() {
+        when(containerDetector.isRunningInContainer()).thenReturn(true);
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                containerAt("old-container", "172.18.0.3"), containerAt("new-container", "172.18.0.9"));
+        manager.ensureStarted();
+        when(lifecycleManager.presenceOf("old-container")).thenReturn(ContainerPresence.ABSENT);
+
+        manager.ensureStarted();
+
+        assertEquals("http://172.18.0.9:5000", manager.httpClient().baseUrl());
+    }
+
+    private static ContainerLifecycleManager.ContainerInfo containerAt(String containerId, String ip) {
+        return new ContainerLifecycleManager.ContainerInfo(containerId,
+                Map.of(5000, new ContainerLifecycleManager.EndpointInfo(ip, 5000)));
+    }
+
+    @Test
+    void freshlyCreatedRegistryStreamsItsCompleteLog() {
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+
+        manager.ensureStarted();
+
+        verify(logStreamer).attachPolled(eq("container-id"), eq("/aws/ecr/registry"), any(), eq("us-east-1"), eq("ecr:registry"));
+        verify(logStreamer, never()).attachPolledFromNow(any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void adoptedRegistryStreamsOnlyNewLinesInsteadOfReplayingItsHistory() {
+        Container existing = Mockito.mock(Container.class);
+        when(existing.getId()).thenReturn("0123456789abcdef");
+        when(existing.getPorts()).thenReturn(new ContainerPort[] {
+                new ContainerPort().withIp("127.0.0.1").withPrivatePort(5000).withPublicPort(BASE_PORT + 1)
+        });
+        when(lifecycleManager.findByName(REGISTRY_NAME)).thenReturn(Optional.of(existing));
+        when(lifecycleManager.adopt("0123456789abcdef", List.of(5000), Optional.empty()))
+                .thenReturn(new ContainerLifecycleManager.ContainerInfo("0123456789abcdef",
+                        Map.of(5000, new ContainerLifecycleManager.EndpointInfo("172.17.0.5", 5000)),
+                        Map.of(5000, BASE_PORT + 1)));
+
+        manager.ensureStarted();
+
+        verify(logStreamer).attachPolledFromNow(eq("0123456789abcdef"), eq("/aws/ecr/registry"), any(), eq("us-east-1"), eq("ecr:registry"));
+        verify(logStreamer, never()).attachPolled(any(), any(), any(), any(), any());
+    }
+
+    @Test
+    void adoptTracksPrivateBackingPortWhenRunningInsideDocker() {
+        // In container mode httpClient() uses the registry's in-network port. The adopted
+        // published binding remains the host-mode fallback for control-plane image operations.
+        when(containerDetector.isRunningInContainer()).thenReturn(true);
+        Container existing = Mockito.mock(Container.class);
+        when(existing.getId()).thenReturn("0123456789abcdef");
+        when(existing.getPorts()).thenReturn(new ContainerPort[] {
+                new ContainerPort().withIp("127.0.0.1").withPrivatePort(5000).withPublicPort(BASE_PORT + 1)
+        });
+        when(lifecycleManager.findByName(REGISTRY_NAME)).thenReturn(Optional.of(existing));
+        when(lifecycleManager.adopt("0123456789abcdef", List.of(5000), Optional.empty()))
+                .thenReturn(new ContainerLifecycleManager.ContainerInfo("0123456789abcdef",
+                        Map.of(5000, new ContainerLifecycleManager.EndpointInfo("172.17.0.5", 5000)),
+                        Map.of(5000, BASE_PORT + 1)));
+
+        manager.ensureStarted();
+
+        assertEquals(BASE_PORT + 1, manager.effectivePort());
+        assertEquals("http://000000000000.dkr.ecr.us-east-1.localhost:4566", manager.getProxyEndpoint());
+    }
+
+    @Test
+    void adoptKeepsConfiguredPortWhenNoPublishedBindingExists() {
+        Container existing = Mockito.mock(Container.class);
+        when(existing.getId()).thenReturn("0123456789abcdef");
+        when(existing.getPorts()).thenReturn(new ContainerPort[] {
+                new ContainerPort().withIp("127.0.0.1").withPrivatePort(5000).withPublicPort(BASE_PORT)
+        });
+        when(lifecycleManager.findByName(REGISTRY_NAME)).thenReturn(Optional.of(existing));
+        when(lifecycleManager.adopt("0123456789abcdef", List.of(5000), Optional.empty()))
+                .thenReturn(new ContainerLifecycleManager.ContainerInfo("0123456789abcdef", Map.of()));
+
+        manager.ensureStarted();
+
+        assertEquals(BASE_PORT, manager.effectivePort());
+    }
+
+    @Test
+    void legacyPublicBackingRegistryIsRecreatedWithLoopbackBinding() {
+        Container existing = Mockito.mock(Container.class);
+        when(existing.getId()).thenReturn("0123456789abcdef");
+        when(existing.getPorts()).thenReturn(new ContainerPort[] {
+                new ContainerPort().withIp("0.0.0.0").withPrivatePort(5000).withPublicPort(BASE_PORT)
+        });
+        when(lifecycleManager.findByName(REGISTRY_NAME)).thenReturn(Optional.of(existing));
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+
+        manager.ensureStarted();
+
+        verify(lifecycleManager).stopAndRemove("0123456789abcdef", null);
+        verify(builder).withLoopbackPortBinding(eq(5000), anyInt());
+    }
+
+    @Test
+    void survivorOnAnotherDockerNetworkIsRecreatedKeepingItsVolume() {
+        when(containerDetector.isRunningInContainer()).thenReturn(true);
+        when(currentContainerNetworkResolver.resolveNetworkName()).thenReturn(Optional.of("net-b"));
+        Container survivor = loopbackSurvivorOn("net-a");
+        when(lifecycleManager.findByName(REGISTRY_NAME)).thenReturn(Optional.of(survivor));
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+
+        manager.ensureStarted();
+
+        verify(lifecycleManager, never()).adopt(anyString(), any(), any());
+        verify(lifecycleManager).stopAndRemove("0123456789abcdef", null);
+        verify(builder).withDockerNetwork(Optional.of("net-b"));
+        verify(builder).withNamedVolume(anyString(), eq("/var/lib/registry"));
+        verify(lifecycleManager, never()).removeVolume(anyString());
+        assertTrue(manager.isStarted());
+    }
+
+    @Test
+    void survivorOnFlocisDockerNetworkIsAdopted() {
+        when(containerDetector.isRunningInContainer()).thenReturn(true);
+        when(currentContainerNetworkResolver.resolveNetworkName()).thenReturn(Optional.of("net-b"));
+        Container survivor = loopbackSurvivorOn("resolved:net-b");
+        when(lifecycleManager.findByName(REGISTRY_NAME)).thenReturn(Optional.of(survivor));
+        when(lifecycleManager.adopt("0123456789abcdef", List.of(5000), Optional.of("resolved:net-b")))
+                .thenReturn(new ContainerLifecycleManager.ContainerInfo("0123456789abcdef", Map.of()));
+
+        manager.ensureStarted();
+
+        verify(lifecycleManager, never()).stopAndRemove(anyString(), any());
+        verify(lifecycleManager, never()).createAndStart(any());
+        assertTrue(manager.isStarted());
+    }
+
+    @Test
+    void survivorOnAnotherDockerNetworkIsAdoptedWhenFlociRunsOnTheHost() {
+        Container survivor = loopbackSurvivorOn("net-a");
+        when(lifecycleManager.findByName(REGISTRY_NAME)).thenReturn(Optional.of(survivor));
+        when(ecr.dockerNetwork()).thenReturn(Optional.of("net-b"));
+        when(lifecycleManager.adopt("0123456789abcdef", List.of(5000), Optional.of("resolved:net-b")))
+                .thenReturn(new ContainerLifecycleManager.ContainerInfo("0123456789abcdef", Map.of()));
+
+        manager.ensureStarted();
+
+        verify(lifecycleManager, never()).stopAndRemove(anyString(), any());
+        verify(lifecycleManager, never()).createAndStart(any());
+        assertTrue(manager.isStarted());
+    }
+
+    private static Container loopbackSurvivorOn(String network) {
+        Container existing = Mockito.mock(Container.class);
+        when(existing.getId()).thenReturn("0123456789abcdef");
+        when(existing.getPorts()).thenReturn(new ContainerPort[] {
+                new ContainerPort().withIp("127.0.0.1").withPrivatePort(5000).withPublicPort(BASE_PORT)
+        });
+        when(existing.getNetworkSettings()).thenReturn(
+                new ContainerNetworkSettings().withNetworks(Map.of(network, new ContainerNetwork())));
+        return existing;
+    }
+
+    @Test
+    void httpClient_usesNamespacedRegistryContainerDnsWhenConfigured() {
+        when(containerDetector.isRunningInContainer()).thenReturn(true);
+        when(docker.resourceNamespace()).thenReturn(Optional.of("run/one"));
+
+        assertEquals("http://floci-aws-run-one-test-ecr-registry:5000", manager.httpClient().baseUrl());
+    }
+
+    @Test
+    void rewriteImageUri_matchesAChinaEcrUri_rewritesToLocalRegistry() {
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+
+        String rewritten = manager.rewriteImageUri("123456789012.dkr.ecr.cn-north-1.amazonaws.com.cn/backend-user:1");
+
+        assertEquals("localhost:4566/123456789012/cn-north-1/backend-user:1", rewritten);
+    }
+
+    @Test
+    void rewriteImageUri_matchesAwsEcrUri_rewritesToLocalRegistryAndStartsIt() {
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+
+        String rewritten = manager.rewriteImageUri("123456789012.dkr.ecr.us-east-1.amazonaws.com/backend-user:1");
+
+        assertEquals("localhost:4566/123456789012/us-east-1/backend-user:1", rewritten);
+        verify(lifecycleManager).createAndStart(any());
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "hostname, false, false, 000000000000.dkr.ecr.us-east-1.localhost:4566/app, http://000000000000.dkr.ecr.us-east-1.localhost:4566",
+            "hostname, true, false, 000000000000.dkr.ecr.us-east-1.localhost:4566/app, http://000000000000.dkr.ecr.us-east-1.localhost:4566",
+            "hostname, false, true, 000000000000.dkr.ecr.us-east-1.localhost:4566/app, http://000000000000.dkr.ecr.us-east-1.localhost:4566",
+            "hostname, true, true, 000000000000.dkr.ecr.us-east-1.localhost.floci.io:4566/app, https://000000000000.dkr.ecr.us-east-1.localhost.floci.io:4566",
+            "path, false, false, localhost:4566/000000000000/us-east-1/app, http://000000000000.dkr.ecr.us-east-1.localhost:4566",
+            "path, true, false, localhost:4566/000000000000/us-east-1/app, http://000000000000.dkr.ecr.us-east-1.localhost:4566",
+            "path, false, true, localhost:4566/000000000000/us-east-1/app, http://000000000000.dkr.ecr.us-east-1.localhost:4566",
+            "path, true, true, localhost.floci.io:4566/000000000000/us-east-1/app, https://localhost.floci.io:4566"
+    })
+    void advertisedUrisRequireBothTlsAndOptIn(String style, boolean globalTls, boolean tlsUris,
+                                             String repositoryUri, String proxyEndpoint) {
+        EmulatorConfig.TlsConfig tls = Mockito.mock(EmulatorConfig.TlsConfig.class);
+        when(config.tls()).thenReturn(tls);
+        when(tls.enabled()).thenReturn(globalTls);
+        when(ecr.uriStyle()).thenReturn(style);
+        when(ecr.tlsUri()).thenReturn(tlsUris);
+
+        assertEquals(repositoryUri, manager.getRepositoryUri("000000000000", "us-east-1", "app"));
+        assertEquals(proxyEndpoint, manager.getProxyEndpoint());
+        verify(lifecycleManager, never()).createAndStart(any());
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "hostname, localhost:4566/123456789012/us-east-1/backend-user:1",
+            "path, localhost:4566/123456789012/us-east-1/backend-user:1"
+    })
+    void automaticImageRewritesKeepLoopbackWhenTlsUrisAreAdvertised(String style, String expectedImage) {
+        EmulatorConfig.TlsConfig tls = Mockito.mock(EmulatorConfig.TlsConfig.class);
+        when(config.tls()).thenReturn(tls);
+        when(tls.enabled()).thenReturn(true);
+        when(ecr.uriStyle()).thenReturn(style);
+        when(ecr.tlsUri()).thenReturn(true);
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+
+        assertTrue(manager.getRepositoryUri("123456789012", "us-east-1", "backend-user")
+                .contains("localhost.floci.io:"));
+        assertEquals(expectedImage, manager.rewriteImageUri(AWS_ECR_IMAGE));
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "false, http://000000000000.dkr.ecr.eu-central-1.localhost:4566",
+            "true, https://000000000000.dkr.ecr.eu-central-1.localhost.floci.io:4566"
+    })
+    void getProxyEndpoint_nonDefaultRequestRegion_followsTheRequestRegion(boolean tlsUris,
+                                                                         String proxyEndpoint) {
+        EmulatorConfig.TlsConfig tls = Mockito.mock(EmulatorConfig.TlsConfig.class);
+        when(config.tls()).thenReturn(tls);
+        when(tls.enabled()).thenReturn(tlsUris);
+        when(ecr.uriStyle()).thenReturn("hostname");
+        when(ecr.tlsUri()).thenReturn(tlsUris);
+        Mockito.doReturn("eu-central-1").when(regionResolver).getRegion();
+
+        // A docker login target that named another region than the push target would be unusable.
+        assertEquals(proxyEndpoint, manager.getProxyEndpoint());
+        assertTrue(manager.getRepositoryUri("000000000000", "eu-central-1", "app")
+                .startsWith(proxyEndpoint.substring(proxyEndpoint.indexOf("://") + 3) + "/"));
+        verify(regionResolver, never()).getDefaultRegion();
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "hostname, false, 000000000000.dkr.ecr.us-east-1.localhost:54321/app, http://000000000000.dkr.ecr.us-east-1.localhost:54321",
+            "path, false, localhost:54321/000000000000/us-east-1/app, http://000000000000.dkr.ecr.us-east-1.localhost:54321",
+            "hostname, true, 000000000000.dkr.ecr.us-east-1.localhost.floci.io:54321/app, https://000000000000.dkr.ecr.us-east-1.localhost.floci.io:54321",
+            "path, true, localhost.floci.io:54321/000000000000/us-east-1/app, https://localhost.floci.io:54321"
+    })
+    void advertisedUrisUseTheHostPortTheFlociContainerPublishes(String style, boolean tlsUris,
+                                                                String repositoryUri, String proxyEndpoint) {
+        EmulatorConfig.TlsConfig tls = Mockito.mock(EmulatorConfig.TlsConfig.class);
+        when(config.tls()).thenReturn(tls);
+        when(tls.enabled()).thenReturn(tlsUris);
+        when(ecr.uriStyle()).thenReturn(style);
+        when(ecr.tlsUri()).thenReturn(tlsUris);
+        // docker run -p 54321:4566: the Docker daemon logs in, pushes and pulls through the host port.
+        when(currentContainerNetworkResolver.resolvePublishedPort(4566)).thenReturn(OptionalInt.of(54321));
+
+        assertEquals(repositoryUri, manager.getRepositoryUri("000000000000", "us-east-1", "app"));
+        assertEquals(proxyEndpoint, manager.getProxyEndpoint());
+        verify(lifecycleManager, never()).createAndStart(any());
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "hostname, localhost:54321/123456789012/us-east-1/backend-user:1",
+            "path, localhost:54321/123456789012/us-east-1/backend-user:1"
+    })
+    void rewriteImageUri_flociPublishedOnAnotherHostPort_pointsTheDaemonAtThePublishedPort(String style,
+                                                                                         String expectedImage) {
+        when(ecr.uriStyle()).thenReturn(style);
+        when(currentContainerNetworkResolver.resolvePublishedPort(4566)).thenReturn(OptionalInt.of(54321));
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+
+        assertEquals(expectedImage, manager.rewriteImageUri(AWS_ECR_IMAGE));
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "hostname, false",
+            "path, false",
+            "hostname, true",
+            "path, true"
+    })
+    void rewriteImageUri_dockerDesktop_pointsTheDaemonAtTheHostnameItProxiesToTheHost(String style,
+                                                                                       boolean tlsUris) {
+        EmulatorConfig.TlsConfig tls = Mockito.mock(EmulatorConfig.TlsConfig.class);
+        when(config.tls()).thenReturn(tls);
+        when(tls.enabled()).thenReturn(tlsUris);
+        when(ecr.uriStyle()).thenReturn(style);
+        when(ecr.tlsUri()).thenReturn(tlsUris);
+        when(currentContainerNetworkResolver.resolvePublishedPort(4566)).thenReturn(OptionalInt.of(54321));
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+        dockerOperatingSystem("Docker Desktop");
+
+        // Desktop's daemon dials localhost inside its VM, where a host port Docker chose is not bound.
+        assertEquals("123456789012.dkr.ecr.us-east-1.localhost:54321/backend-user:1",
+                manager.rewriteImageUri(AWS_ECR_IMAGE));
+    }
+
+    @Test
+    void rewriteImageUri_linuxDaemon_keepsLocalhost() {
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+        dockerOperatingSystem("Ubuntu 24.04.1 LTS");
+
+        assertEquals("localhost:4566/123456789012/us-east-1/backend-user:1",
+                manager.rewriteImageUri(AWS_ECR_IMAGE));
+    }
+
+    @Test
+    void rewriteImageUri_daemonInfoFails_keepsLocalhostAndAsksAgain() {
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+        InfoCmd infoCmd = Mockito.mock(InfoCmd.class);
+        Info info = Mockito.mock(Info.class);
+        when(dockerClient.infoCmd()).thenReturn(infoCmd);
+        when(infoCmd.exec()).thenThrow(new DockerClientException("daemon unavailable")).thenReturn(info);
+        when(info.getOperatingSystem()).thenReturn("Docker Desktop");
+
+        assertEquals("localhost:4566/123456789012/us-east-1/backend-user:1",
+                manager.rewriteImageUri(AWS_ECR_IMAGE));
+        assertEquals("123456789012.dkr.ecr.us-east-1.localhost:4566/backend-user:1",
+                manager.rewriteImageUri(AWS_ECR_IMAGE));
+    }
+
+    @Test
+    void rewriteImageUri_dockerDesktop_asksTheDaemonOnce() {
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+        dockerOperatingSystem("Docker Desktop");
+
+        manager.rewriteImageUri(AWS_ECR_IMAGE);
+        assertEquals("123456789012.dkr.ecr.us-east-1.localhost:4566/backend-user:1",
+                manager.rewriteImageUri(AWS_ECR_IMAGE));
+
+        verify(dockerClient, times(1)).infoCmd();
+    }
+
+    private void dockerOperatingSystem(String operatingSystem) {
+        InfoCmd infoCmd = Mockito.mock(InfoCmd.class);
+        Info info = Mockito.mock(Info.class);
+        when(dockerClient.infoCmd()).thenReturn(infoCmd);
+        when(infoCmd.exec()).thenReturn(info);
+        when(info.getOperatingSystem()).thenReturn(operatingSystem);
+    }
+
+    @Test
+    void advertisedUrisKeepFlociPortWhenItIsNotPublishedFromAContainer() {
+        when(config.port()).thenReturn(4577);
+        when(currentContainerNetworkResolver.resolvePublishedPort(4577)).thenReturn(OptionalInt.empty());
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+
+        assertEquals("000000000000.dkr.ecr.us-east-1.localhost:4577/app",
+                manager.getRepositoryUri("000000000000", "us-east-1", "app"));
+        assertEquals("http://000000000000.dkr.ecr.us-east-1.localhost:4577", manager.getProxyEndpoint());
+        assertEquals("localhost:4577/123456789012/us-east-1/backend-user:1",
+                manager.rewriteImageUri(AWS_ECR_IMAGE));
+        verify(currentContainerNetworkResolver, Mockito.atLeastOnce()).resolvePublishedPort(4577);
+    }
+
+    @Test
+    void tlsUriOptInDoesNotReplaceTheLegacyEcrTlsSetting() {
+        when(ecr.tlsEnabled()).thenReturn(true);
+
+        assertEquals("http://" + REGISTRY_NAME + ":5000", manager.internalEndpoint());
+        assertEquals("000000000000.dkr.ecr.us-east-1.localhost:4566/app",
+                manager.getRepositoryUri("000000000000", "us-east-1", "app"));
+        assertEquals("https://000000000000.dkr.ecr.us-east-1.localhost:4566", manager.getProxyEndpoint());
+    }
+
+    @Test
+    void rewriteImageUri_pathStyleConfig_usesPathStyleUri() {
+        when(ecr.uriStyle()).thenReturn("path");
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+
+        String rewritten = manager.rewriteImageUri("123456789012.dkr.ecr.us-east-1.amazonaws.com/backend-user:1");
+
+        assertEquals("localhost:4566/123456789012/us-east-1/backend-user:1", rewritten);
+    }
+
+    @Test
+    void rewriteImageUri_nonEcrImage_passesThroughWithoutStartingRegistry() {
+        String rewritten = manager.rewriteImageUri("nginx:latest");
+
+        assertEquals("nginx:latest", rewritten);
+        verify(lifecycleManager, Mockito.never()).createAndStart(any());
+    }
+
+    @Test
+    void rewriteImageUri_nullImage_returnsNull() {
+        assertNull(manager.rewriteImageUri(null));
+    }
+
+    @Test
+    void rewriteImageUri_imagePresentOnDaemon_returnsUnchangedWithoutStartingRegistry() {
+        Mockito.doReturn(new InspectImageResponse()).when(inspectImage).exec();
+
+        String rewritten = manager.rewriteImageUri(AWS_ECR_IMAGE);
+
+        assertEquals(AWS_ECR_IMAGE, rewritten);
+        verify(dockerClient).inspectImageCmd(AWS_ECR_IMAGE);
+        verify(lifecycleManager, Mockito.never()).createAndStart(any());
+    }
+
+    @Test
+    void rewriteImageUri_enforcedPullOfLocallyPresentAwsReferenceStillUsesEmulatorRegistry() {
+        when(config.services().iam().enforcementEnabled()).thenReturn(true);
+        Mockito.doReturn(new InspectImageResponse()).when(inspectImage).exec();
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+
+        assertEquals("localhost:4566/123456789012/us-east-1/backend-user:1",
+                manager.rewriteImageUri(AWS_ECR_IMAGE));
+        verify(dockerClient, never()).inspectImageCmd(AWS_ECR_IMAGE);
+        verify(lifecycleManager).createAndStart(any());
+    }
+
+    @Test
+    void rewriteImageUri_imagePresentOnDaemon_preferLocalImagesOff_rewritesWithoutInspecting() {
+        when(ecr.preferLocalImages()).thenReturn(false);
+        Mockito.doReturn(new InspectImageResponse()).when(inspectImage).exec();
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+
+        String rewritten = manager.rewriteImageUri(AWS_ECR_IMAGE);
+
+        assertEquals("localhost:4566/123456789012/us-east-1/backend-user:1", rewritten);
+        verify(dockerClient, Mockito.never()).inspectImageCmd(anyString());
+    }
+
+    @Test
+    void rewriteImageUri_imageRegistryBaseConfigured_inspectsResolvedReference() {
+        String mirrored = "ghcr.io/floci-io/mirror/" + AWS_ECR_IMAGE;
+        when(containerBuilder.resolveImage(AWS_ECR_IMAGE)).thenReturn(mirrored);
+        Mockito.doReturn(new InspectImageResponse()).when(inspectImage).exec();
+
+        String rewritten = manager.rewriteImageUri(AWS_ECR_IMAGE);
+
+        assertEquals(AWS_ECR_IMAGE, rewritten);
+        verify(dockerClient).inspectImageCmd(mirrored);
+        verify(dockerClient, Mockito.never()).inspectImageCmd(AWS_ECR_IMAGE);
+        verify(lifecycleManager, Mockito.never()).createAndStart(any());
+    }
+
+    @Test
+    void rewriteImageUri_imageRegistryBaseConfigured_unprefixedLocalImageDoesNotCount() {
+        String mirrored = "ghcr.io/floci-io/mirror/" + AWS_ECR_IMAGE;
+        when(containerBuilder.resolveImage(AWS_ECR_IMAGE)).thenReturn(mirrored);
+        InspectImageCmd inspectUnprefixed = Mockito.mock(InspectImageCmd.class);
+        Mockito.doReturn(new InspectImageResponse()).when(inspectUnprefixed).exec();
+        when(dockerClient.inspectImageCmd(AWS_ECR_IMAGE)).thenReturn(inspectUnprefixed);
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+
+        String rewritten = manager.rewriteImageUri(AWS_ECR_IMAGE);
+
+        assertEquals("localhost:4566/123456789012/us-east-1/backend-user:1", rewritten);
+        verify(dockerClient).inspectImageCmd(mirrored);
+        verify(lifecycleManager).createAndStart(any());
+    }
+
+    @Test
+    void rewriteImageUri_daemonInspectFails_rewritesToLocalRegistry() {
+        Mockito.doThrow(new DockerClientException("daemon unavailable")).when(inspectImage).exec();
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+
+        String rewritten = manager.rewriteImageUri(AWS_ECR_IMAGE);
+
+        assertEquals("localhost:4566/123456789012/us-east-1/backend-user:1", rewritten);
+        verify(lifecycleManager).createAndStart(any());
+    }
+
+    @Test
+    void pruneStorageRemovesTheRegistryAndVolumeWhenConfigured() {
+        when(storage.pruneVolumesOnDelete()).thenReturn(true);
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+        manager.ensureStarted();
+
+        manager.pruneStorage();
+
+        verify(lifecycleManager).stopAndRemove(Mockito.eq("container-id"), Mockito.isNull());
+        verify(lifecycleManager).removeVolume("floci-aws-ecr-registry-data");
+    }
+
+    @Test
+    void pruneStorageRetainsTheRegistryWhenVolumePruningIsDisabled() {
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+        manager.ensureStarted();
+
+        manager.pruneStorage();
+
+        verify(lifecycleManager, Mockito.never()).stopAndRemove(anyString(), Mockito.isNull());
+        verify(lifecycleManager, Mockito.never()).removeVolume(anyString());
+    }
+
+    @Test
+    void shutdownRemovesTheRegistryVolumeWhenItIsNotRetained() {
+        when(storage.pruneVolumesOnDelete()).thenReturn(true);
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+        manager.ensureStarted();
+
+        manager.shutdown();
+
+        verify(lifecycleManager).stopAndRemove(Mockito.eq("container-id"), Mockito.isNull());
+        verify(lifecycleManager).removeVolume("floci-aws-ecr-registry-data");
+    }
+
+    @Test
+    void deleteRepositoryStorageBoundsCleanupAndPreservesNestedRepositories() {
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+        DockerClient dockerClient = Mockito.mock(DockerClient.class);
+        ExecCreateCmd execCreate = Mockito.mock(ExecCreateCmd.class, Mockito.RETURNS_SELF);
+        ExecCreateCmdResponse exec = Mockito.mock(ExecCreateCmdResponse.class);
+        when(exec.getId()).thenReturn("exec-id");
+        when(execCreate.exec()).thenReturn(exec);
+        when(dockerClient.execCreateCmd("container-id")).thenReturn(execCreate);
+        ExecStartCmd execStart = Mockito.mock(ExecStartCmd.class);
+        when(execStart.exec(any())).thenAnswer(invocation -> {
+            @SuppressWarnings("unchecked")
+            ResultCallback<Frame> callback = invocation.getArgument(0);
+            callback.onComplete();
+            return callback;
+        });
+        when(dockerClient.execStartCmd("exec-id")).thenReturn(execStart);
+        InspectExecCmd inspect = Mockito.mock(InspectExecCmd.class);
+        InspectExecResponse result = Mockito.mock(InspectExecResponse.class);
+        when(result.getExitCodeLong()).thenReturn(0L);
+        when(inspect.exec()).thenReturn(result);
+        when(dockerClient.inspectExecCmd("exec-id")).thenReturn(inspect);
+        when(lifecycleManager.getDockerClient()).thenReturn(dockerClient);
+
+        manager.deleteRepositoryStorage("000000000000", "us-east-1", "team/app");
+
+        verify(execCreate).withCmd("timeout", "-k", "1", "10", "rm", "-rf",
+                "/var/lib/registry/docker/registry/v2/repositories/000000000000/us-east-1/team/app/_layers",
+                "/var/lib/registry/docker/registry/v2/repositories/000000000000/us-east-1/team/app/_manifests",
+                "/var/lib/registry/docker/registry/v2/repositories/000000000000/us-east-1/team/app/_uploads");
+    }
+
+    /** The registry's API lists tags only; untagged manifests are read from the revision links of its storage. */
+    @Test
+    void heldManifestDigestsAreReadFromTheRevisionLinks() {
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+        String revisions = "/var/lib/registry/docker/registry/v2/repositories/000000000000/us-east-1/team/app"
+                + "/_manifests/revisions/sha256";
+        String first = "a".repeat(64);
+        String second = "0123456789abcdef".repeat(4);
+        DockerClient dockerClient = Mockito.mock(DockerClient.class);
+        ExecCreateCmd execCreate = Mockito.mock(ExecCreateCmd.class, Mockito.RETURNS_SELF);
+        ExecCreateCmdResponse exec = Mockito.mock(ExecCreateCmdResponse.class);
+        when(exec.getId()).thenReturn("exec-id");
+        when(execCreate.exec()).thenReturn(exec);
+        when(dockerClient.execCreateCmd("container-id")).thenReturn(execCreate);
+        ExecStartCmd execStart = Mockito.mock(ExecStartCmd.class);
+        when(execStart.exec(any())).thenAnswer(invocation -> {
+            @SuppressWarnings("unchecked")
+            ResultCallback<Frame> callback = invocation.getArgument(0);
+            callback.onNext(new Frame(StreamType.STDOUT, (revisions + "/" + first + "/link\n" + revisions + "/"
+                    + second + "/link\n" + revisions + "/not-a-digest/link\n").getBytes(StandardCharsets.UTF_8)));
+            callback.onComplete();
+            return callback;
+        });
+        when(dockerClient.execStartCmd("exec-id")).thenReturn(execStart);
+        InspectExecCmd inspect = Mockito.mock(InspectExecCmd.class);
+        InspectExecResponse result = Mockito.mock(InspectExecResponse.class);
+        when(result.getExitCodeLong()).thenReturn(0L);
+        when(inspect.exec()).thenReturn(result);
+        when(dockerClient.inspectExecCmd("exec-id")).thenReturn(inspect);
+        when(lifecycleManager.getDockerClient()).thenReturn(dockerClient);
+        manager.ensureStarted();
+
+        assertEquals(Set.of("sha256:" + first, "sha256:" + second),
+                manager.heldManifestDigests("000000000000/us-east-1/team/app"));
+        verify(execCreate).withCmd("timeout", "-k", "1", "10", "sh", "-c", "[ -d '" + revisions + "' ] || exit 0; "
+                + "find '" + revisions + "' -mindepth 2 -maxdepth 2 -name link");
+    }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void runGarbageCollectTimeoutWithExecStillRunningKeepsAdmissionClosed() throws Exception {
+        ManualClock clock = new ManualClock(Instant.now());
+        manager.setClock(clock);
+        manager.setSleeper(millis -> clock.advance(Duration.ofMillis(millis)));
+
+        when(lifecycleManager.createAndStart(any()))
+                .thenReturn(new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+        when(lifecycleManager.presenceOf("container-id")).thenReturn(ContainerPresence.RUNNING);
+        manager.ensureStarted();
+
+        ExecCreateCmd execCreateCmd = Mockito.mock(ExecCreateCmd.class, Mockito.RETURNS_SELF);
+        ExecCreateCmdResponse execResponse = Mockito.mock(ExecCreateCmdResponse.class);
+        when(dockerClient.execCreateCmd("container-id")).thenReturn(execCreateCmd);
+        when(execCreateCmd.exec()).thenReturn(execResponse);
+        when(execResponse.getId()).thenReturn("gc-exec-1");
+        ExecStartCmd execStartCmd = Mockito.mock(ExecStartCmd.class, Mockito.RETURNS_SELF);
+        // The collection's output holds its connection for minutes, so it streams on the streaming client.
+        DockerClient streamingDockerClient = Mockito.mock(DockerClient.class);
+        when(lifecycleManager.getStreamingDockerClient()).thenReturn(streamingDockerClient);
+        when(streamingDockerClient.execStartCmd("gc-exec-1")).thenReturn(execStartCmd);
+        ResultCallback.Adapter<Frame> execCallback = Mockito.mock(ResultCallback.Adapter.class);
+        when(execStartCmd.exec(any())).thenReturn(execCallback);
+        when(execCallback.awaitCompletion(anyLong(), any())).thenReturn(false);
+        InspectExecCmd inspectCmd = Mockito.mock(InspectExecCmd.class);
+        InspectExecResponse inspectResponse = Mockito.mock(InspectExecResponse.class);
+        when(dockerClient.inspectExecCmd("gc-exec-1")).thenReturn(inspectCmd);
+        when(inspectCmd.exec()).thenReturn(inspectResponse);
+        when(inspectResponse.getExitCodeLong()).thenReturn(null);
+
+        assertThrows(RuntimeException.class, () -> manager.runGarbageCollect(1));
+        assertTrue(manager.isGarbageCollecting());
+        assertFalse(manager.tryAcquireWriteAdmission());
+
+        when(inspectResponse.getExitCodeLong()).thenReturn(0L);
+        manager.confirmExecTerminated("gc-exec-1");
+        assertFalse(manager.isGarbageCollecting());
+        assertTrue(manager.tryAcquireWriteAdmission());
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "123456789012.dkr.ecr.eu-west-1.amazonaws.com/spark/custom:7.5.0, eu-west-1",
+            "123456789012.dkr.ecr.cn-north-1.amazonaws.com.cn/spark/custom:7.5.0, cn-north-1",
+            "000000000000.dkr.ecr.us-east-1.localhost:4566/spark/custom:7.5.0, us-east-1",
+            "000000000000.dkr.ecr.us-east-1.localhost.floci.io:4566/spark/custom:7.5.0, us-east-1",
+            "localhost:4566/000000000000/us-west-2/spark/custom:7.5.0, us-west-2",
+            "localhost.floci.io:4566/000000000000/us-west-2/spark/custom:7.5.0, us-west-2"
+    })
+    void anImageInAnEcrRepositoryHasItsRepositorysRegion(String image, String region) {
+        assertEquals(Optional.of(region), EcrRegistryManager.imageRegion(image));
+    }
+
+    @Test
+    void anImageOutsideEcrHasNoRegion() {
+        for (String image : List.of("public.ecr.aws/emr-serverless/spark/emr-7.5.0:latest", "python:3.12",
+                "localhost:5000/spark/custom:7.5.0", "registry.internal/123456789012/us-east-1/spark:7.5.0",
+                "123456789012.dkr.ecr.us-east-1.registry.internal/spark/custom:7.5.0",
+                "123456789012.dkr.ecr.us-east-1.amazonaws.com.example.com/spark/custom:7.5.0")) {
+            assertEquals(Optional.empty(), EcrRegistryManager.imageRegion(image), image);
+        }
+        assertEquals(Optional.empty(), EcrRegistryManager.imageRegion(null));
+    }
+
+    @Test
+    void anImageInAnEcrRepositoryNamesItsRepositoryAndTheTagOrDigestItAsksFor() {
+        String digest = "sha256:" + "d".repeat(64);
+        assertEquals(Optional.of(new EcrRegistryManager.EcrImage("123456789012", "us-east-1", "spark/custom", "7.5.0",
+                null)), EcrRegistryManager.ecrImage("123456789012.dkr.ecr.us-east-1.amazonaws.com/spark/custom:7.5.0"));
+        assertEquals(Optional.of(new EcrRegistryManager.EcrImage("000000000000", "us-west-2", "spark", null, digest)),
+                EcrRegistryManager.ecrImage("localhost:4566/000000000000/us-west-2/spark@" + digest));
+        // Neither a tag nor a digest asks for latest.
+        assertEquals(Optional.of(new EcrRegistryManager.EcrImage("000000000000", "eu-west-1", "spark", "latest",
+                null)), EcrRegistryManager.ecrImage("000000000000.dkr.ecr.eu-west-1.localhost:4566/spark"));
+        assertEquals(Optional.empty(), EcrRegistryManager.ecrImage("python:3.12"));
+    }
+    @ParameterizedTest
+    @CsvSource({"us-east-1,amazonaws.com", "cn-north-1,amazonaws.com.cn", "us-gov-west-1,amazonaws.com"})
+    void nativeRegistryAddressesMatchAuthorizationAndPartition(String region, String suffix) {
+        when(ecr.nativeUri()).thenReturn(true);
+        when(ecr.uriStyle()).thenReturn("path");
+        String host = "123456789012.dkr.ecr." + region + "." + suffix;
+        assertEquals(host + "/team/image", manager.getRepositoryUri("123456789012", region, "team/image"));
+        assertEquals("https://" + host, manager.getProxyEndpoint("123456789012", region));
+        verify(lifecycleManager, never()).getDockerClient();
+    }
+
+    @Test
+    void explicitRegistryAuthorizationPreservesDefaultLocalEndpointStyle() {
+        assertEquals("http://123456789012.dkr.ecr.eu-west-1.localhost:4566",
+                manager.getProxyEndpoint("123456789012", "eu-west-1"));
+    }
+
+}

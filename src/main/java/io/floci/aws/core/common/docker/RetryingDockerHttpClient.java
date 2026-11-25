@@ -1,0 +1,217 @@
+package io.floci.aws.core.common.docker;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.github.dockerjava.transport.DockerHttpClient;
+import org.jboss.logging.Logger;
+
+import java.io.IOException;
+import java.time.Duration;
+import java.util.function.LongSupplier;
+import java.util.function.Predicate;
+
+/**
+ * Decorates a {@link DockerHttpClient} with the {@link DockerRetry} policy so every docker call
+ * travelling over the shared daemon socket survives a transient mid-call drop ({@code Broken
+ * pipe}, {@code Connection reset}) without each call site having to wrap itself.
+ *
+ * <p>The daemon drops connections under fan-out load (an LZA Bootstrap stage firing ~15 CodeBuild
+ * actions, a Prepare stage at six live containers), and docker-java surfaces the blip as
+ * {@code RuntimeException(IOException)} from inside {@code execute()}, which is exactly where
+ * this decorator sits. Guarding call sites one at a time was fixed three separate times
+ * ({@code createContainerCmd}, {@code startContainerCmd}, {@code ensureVolume}) while ~60 other
+ * docker call sites stayed bare; one guard at the transport boundary covers them all, including
+ * every call added later.
+ *
+ * <p>A request is only retried when replaying it cannot change semantics:
+ * <ul>
+ *   <li>Its body, if any, must live in {@code bodyBytes()}, a plain {@code byte[]} the transport
+ *       re-reads from scratch on every attempt. A request whose body is only available as a
+ *       one-shot {@code InputStream} (the tar upload of {@code copyArchiveToContainerCmd}) may
+ *       have been partially consumed by the failed attempt and is never replayed.</li>
+ *   <li>It must not carry {@code hijackedInput()} (bidirectional attach streams).</li>
+ *   <li>Its path must not contain {@code /exec}: {@code POST /exec/{id}/start} re-runs a shell
+ *       command whose first run may have executed before the socket died, a worse bug than the
+ *       one retrying fixes. The {@code contains} spelling (not {@code startsWith}) also covers
+ *       exec-create ({@code POST /containers/{id}/exec}), where a replay would merely leak an
+ *       unused exec ID; that conservative breadth costs nothing.</li>
+ *   <li>Its method and route must be on the allowlist: {@code GET} and {@code HEAD} always;
+ *       {@code DELETE}, whose replay after a lost response answers 404 and every caller tolerates
+ *       that; {@code PUT} (archive upload, already limited to a byte-array body above); and
+ *       {@code POST} only for a container start or stop (a replay gets 304), a wait, an image pull,
+ *       a named volume create (docker returns the existing volume) and a named container create (the
+ *       caller adopts the container on a 409). Every other {@code POST} is never replayed: commit
+ *       would make a second image, pause/unpause/kill a 409 for a state that already changed,
+ *       rename a name conflict, restart a second restart, network create a swallowed 409, network
+ *       connect/disconnect a spurious conflict, and an unnamed create a second container. A call
+ *       added later gets retries only once someone has reasoned about its replay.</li>
+ * </ul>
+ *
+ * <p>Idempotency of what a replay <em>means</em> stays the call site's job: docker answers a
+ * replayed start of an already-running container with HTTP 304 (raised above this transport as
+ * {@code NotModifiedException} and treated as success by the caller), and {@code ensureVolume}
+ * re-checks existence so a replayed create finds the volume the lost response landed.
+ */
+public final class RetryingDockerHttpClient implements DockerHttpClient {
+
+    private static final Logger LOG = Logger.getLogger(RetryingDockerHttpClient.class);
+    private static final ObjectMapper JSON = new ObjectMapper();
+
+    /**
+     * Mirrors the per-call-site policy this decorator replaces: six attempts at 500ms
+     * exponential backoff (capped by {@link DockerRetry#BACKOFF_CAP_MS}) rides out the
+     * several-second socket saturation a fan-out build wave causes.
+     */
+    static final int MAX_ATTEMPTS = 6;
+    static final long BACKOFF_MS = 500L;
+
+    private final DockerHttpClient delegate;
+    private final int maxAttempts;
+    private final long backoffMillis;
+    private final Predicate<Request> replayable;
+    /**
+     * One limit across a call's attempts and backoffs (see {@link DockerRetry#call(int, long, Duration,
+     * DockerRetry.DockerCall)}), the Docker call timeout, so retries cannot stretch a call to several
+     * times it; null for none.
+     */
+    private final Duration callDeadline;
+    private final LongSupplier nanoTime;
+    private final DockerRetry.BackoffWait backoffWait;
+
+    public RetryingDockerHttpClient(DockerHttpClient delegate) {
+        this(delegate, (Duration) null);
+    }
+
+    /** @param callDeadline the longest a call may take across its attempts, or null for no limit */
+    public RetryingDockerHttpClient(DockerHttpClient delegate, Duration callDeadline) {
+        this(delegate, MAX_ATTEMPTS, BACKOFF_MS, RetryingDockerHttpClient::isReplayable, callDeadline,
+                System::nanoTime, Thread::sleep);
+    }
+
+    RetryingDockerHttpClient(DockerHttpClient delegate, int maxAttempts, long backoffMillis) {
+        this(delegate, maxAttempts, backoffMillis, RetryingDockerHttpClient::isReplayable, null,
+                System::nanoTime, Thread::sleep);
+    }
+
+    /** With a clock and a backoff wait of the test's own, so a deadline is checked without sleeping. */
+    RetryingDockerHttpClient(DockerHttpClient delegate, int maxAttempts, long backoffMillis, Duration callDeadline,
+                             LongSupplier nanoTime, DockerRetry.BackoffWait backoffWait) {
+        this(delegate, maxAttempts, backoffMillis, RetryingDockerHttpClient::isReplayable, callDeadline,
+                nanoTime, backoffWait);
+    }
+
+    private RetryingDockerHttpClient(DockerHttpClient delegate, int maxAttempts, long backoffMillis,
+                                     Predicate<Request> replayable, Duration callDeadline,
+                                     LongSupplier nanoTime, DockerRetry.BackoffWait backoffWait) {
+        this.delegate = delegate;
+        this.maxAttempts = maxAttempts;
+        this.backoffMillis = backoffMillis;
+        this.replayable = replayable;
+        this.callDeadline = callDeadline;
+        this.nanoTime = nanoTime;
+        this.backoffWait = backoffWait;
+    }
+
+    /**
+     * A decorator that replays only container waits, for the streaming transport. A wait that fails
+     * before the daemon answers is replayed as it is on the control-plane transport, while the
+     * streaming transport's other requests, exec starts and log and attach streams, are never
+     * replayed.
+     */
+    static RetryingDockerHttpClient forContainerWaits(DockerHttpClient delegate) {
+        return forContainerWaits(delegate, MAX_ATTEMPTS, BACKOFF_MS);
+    }
+
+    static RetryingDockerHttpClient forContainerWaits(DockerHttpClient delegate, int maxAttempts,
+                                                      long backoffMillis) {
+        // No call timeout: a container wait is a long-lived stream, which the deadline never bounds.
+        return new RetryingDockerHttpClient(delegate, maxAttempts, backoffMillis,
+                request -> isReplayable(request) && isContainerWait(request), null, System::nanoTime, Thread::sleep);
+    }
+
+    @Override
+    public Response execute(Request request) {
+        if (!replayable.test(request)) {
+            return delegate.execute(request);
+        }
+        // A long-lived stream has no response timeout, so the call timeout does not bound its retries either.
+        Duration deadline = FlociDockerHttpClient.isLongLivedStream(request) ? null : callDeadline;
+        return DockerRetry.call(maxAttempts, backoffMillis, deadline, nanoTime, backoffWait,
+                () -> delegate.execute(request));
+    }
+
+    /**
+     * Whether re-executing {@code request} after a transient failure is semantically safe.
+     * {@code bodyBytes()} takes precedence over {@code body()} exactly as it does in the
+     * transport itself: when both are set the transport sends the bytes and never touches the
+     * stream, so the request replays cleanly.
+     */
+    static boolean isReplayable(Request request) {
+        if (request.hijackedInput() != null) {
+            return false;
+        }
+        if (request.path().contains("/exec")) {
+            return false;
+        }
+        if (request.bodyBytes() == null && request.body() != null) {
+            return false;
+        }
+        return switch (request.method()) {
+            case "GET", "HEAD", "DELETE", "PUT" -> true;
+            case "POST" -> isReplayablePost(request);
+            default -> false;
+        };
+    }
+
+    /** The {@code POST} routes whose replay after a lost response leaves the same outcome. */
+    private static boolean isReplayablePost(Request request) {
+        String path = request.path();
+        String route = route(path);
+        if (route.endsWith("/containers/create")) {
+            String query = route.length() < path.length() ? path.substring(route.length() + 1) : "";
+            for (String param : query.split("&")) {
+                if (param.startsWith("name=")) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (route.endsWith("/volumes/create")) {
+            return hasVolumeName(request.bodyBytes());
+        }
+        return route.endsWith("/start") || route.endsWith("/stop") || route.endsWith("/wait")
+                || route.endsWith("/images/create");
+    }
+
+    private static boolean isContainerWait(Request request) {
+        return "POST".equals(request.method()) && route(request.path()).endsWith("/wait");
+    }
+
+    /** A request path without its query string. */
+    private static String route(String path) {
+        int queryStart = path.indexOf('?');
+        return queryStart < 0 ? path : path.substring(0, queryStart);
+    }
+
+    /**
+     * Whether a volume create names its volume. A replayed named create returns the existing
+     * volume; a replayed unnamed one makes a second volume and orphans the first.
+     */
+    private static boolean hasVolumeName(byte[] body) {
+        if (body == null || body.length == 0) {
+            return false;
+        }
+        try {
+            JsonNode name = JSON.readTree(body).get("Name");
+            return name != null && name.isTextual() && !name.asText().isBlank();
+        } catch (IOException e) {
+            LOG.debugv(e, "Not replaying a volume create whose body is not JSON");
+            return false;
+        }
+    }
+
+    @Override
+    public void close() throws IOException {
+        delegate.close();
+    }
+}

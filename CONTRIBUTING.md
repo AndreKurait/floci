@@ -2,7 +2,7 @@
 
 Thank you for your interest in contributing! Floci is a community-driven project and all contributions are welcome.
 
-**Join us on [Slack](https://join.slack.com/t/floci/shared_invite/zt-3tjn02s3q-A00kEjJ1cZxsg_imTfy6Cw)**: it is the fastest way to reach maintainers. Ask about AWS behaviour, sanity-check an approach before you build it, or get unstuck on a PR.
+**Join us on [Slack](https://floci.io/slack)**: it is the fastest way to reach maintainers. Ask about AWS behaviour, sanity-check an approach before you build it, or get unstuck on a PR.
 
 ## Ways to Contribute
 
@@ -250,7 +250,8 @@ service you need already has a `*CfnProvisioner`, add your type there; otherwise
     "not emulated" stays distinguishable from "forgotten".
     A new type also needs its row in `schema-surface.tsv` (same directory): run
     `make cfn-schema-surface-sync`. A writable property the provisioner never reads goes in
-    `writable-property-gaps.tsv`.
+    `writable-property-gaps.tsv`. A provisioner arm that calls `droppedProperties` records, for each
+    writable property it reads, what a drop does in `drop-policy.tsv` (same directory).
 
 `SqsCfnProvisioner` is the smallest reference implementation; `Ec2LaunchTemplateCfnProvisioner`
 shows update-in-place and replacement handling; `LogsCfnProvisioner` shows a full reconcile-vs-replace

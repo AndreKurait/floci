@@ -1,0 +1,414 @@
+package io.floci.aws.services.batch;
+
+import com.github.dockerjava.api.command.InspectContainerResponse;
+import com.github.dockerjava.api.exception.NotFoundException;
+import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.core.common.ContainerTeardown;
+import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.dns.EmbeddedDnsServer;
+import io.floci.aws.core.common.docker.ContainerBuilder;
+import io.floci.aws.core.common.docker.ContainerDetector;
+import io.floci.aws.core.common.docker.ContainerLifecycleManager;
+import io.floci.aws.core.common.docker.ContainerLogStreamer;
+import io.floci.aws.core.common.docker.ContainerSpec;
+import io.floci.aws.core.common.docker.ContainerStorageHelper;
+import io.floci.aws.core.common.docker.RunLabelledContainers;
+import io.floci.aws.services.batch.model.BatchJob;
+import io.floci.aws.services.batch.model.BatchKeyValue;
+import io.floci.aws.services.batch.model.BatchNodeExecution;
+import io.floci.aws.services.batch.model.BatchResourceRequirement;
+import io.floci.aws.services.batch.model.BatchRunResult;
+import io.floci.aws.services.ec2.Ec2Service;
+import io.floci.aws.services.ec2.VpcContainerLeases;
+import io.floci.aws.services.ec2.VpcDependencyProvider;
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import org.jboss.logging.Logger;
+
+import java.io.Closeable;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+
+@ApplicationScoped
+public class BatchDockerRunner implements ContainerTeardown, VpcDependencyProvider {
+
+    /** The label naming the Floci process that created a job container, set by {@link #jobLabels}. */
+    static final String RUN_LABEL = "io.floci.batch.run";
+
+    private static final Logger LOG = Logger.getLogger(BatchDockerRunner.class);
+    private static final String LOG_GROUP = "/aws/batch/job";
+
+    // Containers of jobs currently inside run(); drained on emulator shutdown so a
+    // SIGTERM mid-job does not orphan the container.
+    private final ConcurrentHashMap<String, String> inFlightContainers = new ConcurrentHashMap<>();
+    private final Set<String> stopRequestedJobs = ConcurrentHashMap.newKeySet();
+
+    private final ContainerBuilder containerBuilder;
+    private final ContainerLifecycleManager lifecycleManager;
+    private final ContainerLogStreamer logStreamer;
+    private final EmulatorConfig config;
+    private final ContainerDetector containerDetector;
+    private final RegionResolver regionResolver;
+    /** The VPC address each running job container holds, given back once the container is gone. */
+    private final VpcContainerLeases vpcLeases;
+    /** This run's job containers, so a later run knows the ones a crash leaves for leftovers. */
+    private final RunLabelledContainers runContainers;
+    private final RunTimer timer;
+
+    @Inject
+    public BatchDockerRunner(ContainerBuilder containerBuilder,
+                             ContainerLifecycleManager lifecycleManager,
+                             ContainerLogStreamer logStreamer,
+                             EmulatorConfig config,
+                             ContainerDetector containerDetector,
+                             RegionResolver regionResolver,
+                             Ec2Service ec2Service) {
+        this(containerBuilder, lifecycleManager, logStreamer, config, containerDetector,
+                regionResolver, ec2Service, RunTimer.SYSTEM);
+    }
+
+    BatchDockerRunner(ContainerBuilder containerBuilder, ContainerLifecycleManager lifecycleManager,
+                      ContainerLogStreamer logStreamer, EmulatorConfig config,
+                      ContainerDetector containerDetector, RunTimer timer) {
+        this(containerBuilder, lifecycleManager, logStreamer, config, containerDetector, null, null, timer);
+    }
+
+    BatchDockerRunner(ContainerBuilder containerBuilder, ContainerLifecycleManager lifecycleManager,
+                      ContainerLogStreamer logStreamer, EmulatorConfig config,
+                      ContainerDetector containerDetector, RegionResolver regionResolver,
+                      Ec2Service ec2Service, RunTimer timer) {
+        this.containerBuilder = containerBuilder;
+        this.lifecycleManager = lifecycleManager;
+        this.logStreamer = logStreamer;
+        this.config = config;
+        this.containerDetector = containerDetector;
+        this.regionResolver = regionResolver;
+        this.vpcLeases = new VpcContainerLeases(ec2Service, "Batch job", () -> lifecycleManager.getDockerClient());
+        this.runContainers = new RunLabelledContainers(lifecycleManager, config, "batch", RUN_LABEL, LOG);
+        this.timer = timer;
+    }
+
+    /** The wall clock run results are stamped with, and how a run waits for its container to exit. */
+    interface RunTimer {
+        RunTimer SYSTEM = new RunTimer() {
+            @Override
+            public long currentTimeMillis() {
+                return System.currentTimeMillis();
+            }
+
+            @Override
+            public long nanoTime() {
+                return System.nanoTime();
+            }
+
+            @Override
+            public void sleepMillis(long millis) throws InterruptedException {
+                Thread.sleep(millis);
+            }
+        };
+
+        long currentTimeMillis();
+
+        /** A monotonic reading in nanoseconds, like {@link System#nanoTime()}. */
+        long nanoTime();
+
+        void sleepMillis(long millis) throws InterruptedException;
+    }
+
+    /**
+     * Runs one attempt of {@code job} in a container; with a {@code subnetId}, from the job's compute environment,
+     * the container joins that subnet's VPC network first.
+     */
+    public BatchRunResult run(BatchJob job, int attemptNumber, String subnetId) {
+        String logStreamName = logStreamer.generateLogStreamName(
+                job.getJobDefinitionName() + "/default/" + job.getJobId());
+        String containerName = ContainerStorageHelper.dockerName(config, "batch-" + job.getJobId() + "-" + attemptNumber);
+        return runContainer(job, job.getJobId(), containerName, logStreamName,
+                "batch:" + job.getJobName() + ":" + job.getJobId(),
+                job.getContainerImage(), "Job definition container image is missing",
+                job.getResolvedCommand(), buildEnvironment(job, attemptNumber), job.getResourceRequirements(),
+                subnetId);
+    }
+
+    // A distinct inFlightContainers key per node, since nodes of one job run concurrently.
+    public BatchRunResult run(BatchJob job, int attemptNumber, BatchNodeExecution node, String subnetId) {
+        String logStreamName = logStreamer.generateLogStreamName(
+                job.getJobDefinitionName() + "/default/" + job.getJobId() + "/" + node.getNodeIndex());
+        String containerName = ContainerStorageHelper.dockerName(config,
+                "batch-" + job.getJobId() + "-" + attemptNumber + "-node" + node.getNodeIndex());
+        String inFlightKey = job.getJobId() + "#node" + node.getNodeIndex();
+        return runContainer(job, inFlightKey, containerName, logStreamName,
+                "batch:" + job.getJobName() + ":" + job.getJobId() + ":node" + node.getNodeIndex(),
+                node.getContainerImage(), "Node " + node.getNodeIndex() + " container image is missing",
+                node.getResolvedCommand(), buildNodeEnvironment(job, attemptNumber, node), node.getResourceRequirements(),
+                subnetId);
+    }
+
+    private BatchRunResult runContainer(BatchJob job, String inFlightKey, String containerName, String logStreamName,
+                                        String logSourceLabel, String image, String missingImageMessage,
+                                        List<String> command, List<String> env,
+                                        List<BatchResourceRequirement> resourceRequirements, String subnetId) {
+        long startedAt = timer.currentTimeMillis();
+        Closeable logHandle = null;
+        String containerId = null;
+
+        try {
+            if (stopRequestedJobs.contains(job.getJobId())) {
+                return stopped(startedAt, logStreamName);
+            }
+            if (image == null || image.isBlank()) {
+                return failed(startedAt, logStreamName, missingImageMessage);
+            }
+
+            ContainerBuilder.Builder builder = containerBuilder.newContainer(image)
+                    .withName(containerName)
+                    .withEnv(env)
+                    .withDockerNetwork(config.services().batch().dockerNetwork())
+                    .withHostDockerInternalOnLinux()
+                    .withEmbeddedDns()
+                    .withLogRotation()
+                    .withJavaTrustStore()
+                    .withLabels(jobLabels(job));
+
+            if (command != null && !command.isEmpty()) {
+                builder.withCmd(command);
+            }
+            applyResourceRequirements(builder, resourceRequirements, job.getJobId());
+
+            ContainerSpec spec = builder.build();
+            // Job state does not outlive the process, so a crash's job containers have nothing left to finish.
+            runContainers.removeLeftovers();
+            containerId = lifecycleManager.create(spec);
+            inFlightContainers.put(inFlightKey, containerId);
+            // AWS Batch runs the job on an instance or Fargate task in its compute environment's subnets; the
+            // command is the entrypoint, so the container joins that network before it starts.
+            vpcLeases.join(job.getAccountId(), job.getRegion(), null, subnetId, containerId, job.getJobId());
+            lifecycleManager.startCreated(containerId, spec);
+            if (stopRequestedJobs.contains(job.getJobId())) {
+                releaseAndStop(inFlightKey, containerId, null);
+                return stopped(startedAt, logStreamName);
+            }
+            logHandle = logStreamer.attach(containerId, LOG_GROUP, logStreamName, job.getRegion(), logSourceLabel);
+            if (stopRequestedJobs.contains(job.getJobId())) {
+                releaseAndStop(inFlightKey, containerId, logHandle);
+                return stopped(startedAt, logStreamName);
+            }
+
+            Integer exitCode = waitForExit(containerId, timeout(job));
+            long stoppedAt = timer.currentTimeMillis();
+            releaseAndStop(inFlightKey, containerId, logHandle);
+            if (exitCode == null) {
+                return new BatchRunResult(137, "Job timed out", logStreamName, startedAt, stoppedAt, true);
+            }
+            return new BatchRunResult(exitCode, exitCode == 0 ? null : "Container exited with code " + exitCode,
+                    logStreamName, startedAt, stoppedAt, false);
+        } catch (Exception e) {
+            LOG.warnv("Batch Docker job {0} failed: {1}", job.getJobId(), e.getMessage());
+            if (containerId != null) {
+                releaseAndStop(inFlightKey, containerId, logHandle);
+            }
+            return failed(startedAt, logStreamName, e.getMessage());
+        }
+    }
+
+    /** A job container's labels: its resource identity, and the deployment and run that created it. */
+    private Map<String, String> jobLabels(BatchJob job) {
+        Map<String, String> labels = new LinkedHashMap<>(ContainerStorageHelper.resourceIdentityLabels(
+                "batch", job.getJobId(), job.getAccountId(), job.getRegion()));
+        labels.putAll(runContainers.labels());
+        return labels;
+    }
+
+    /**
+     * A running job's network interface is in its subnet, so DeleteSubnet refuses it until the job's container is
+     * gone, as on AWS; a compute environment's subnets alone hold none here, since Floci runs no idle instances.
+     */
+    @Override
+    public boolean hasSubnetDependency(String region, String subnetId) {
+        return vpcLeases.holdsSubnet(regionResolver.getAccountId(), region, subnetId);
+    }
+
+    @Override
+    public boolean hasVpcDependency(String region, String vpcId) {
+        return vpcLeases.holdsVpc(regionResolver.getAccountId(), region, vpcId);
+    }
+
+    public void requestStop(String jobId) {
+        stopRequestedJobs.add(jobId);
+    }
+
+    public void stopJob(String jobId) {
+        for (Map.Entry<String, String> entry : new ConcurrentHashMap<>(inFlightContainers).entrySet()) {
+            if (!entry.getKey().equals(jobId) && !entry.getKey().startsWith(jobId + "#node")) {
+                continue;
+            }
+            if (inFlightContainers.remove(entry.getKey(), entry.getValue())) {
+                try {
+                    lifecycleManager.stopAndRemove(entry.getValue(), null);
+                    vpcLeases.releaseIfGone(entry.getValue());
+                } catch (Exception e) {
+                    LOG.warnv("Failed to stop Batch container for job {0}: {1}", jobId, e.getMessage());
+                }
+            }
+        }
+    }
+
+    public void clearStopRequest(String jobId) {
+        stopRequestedJobs.remove(jobId);
+    }
+
+    // Whoever wins the map removal owns the stop. stopManagedContainers() may have
+    // claimed the container first during shutdown, but the log stream is still ours.
+    private void releaseAndStop(String jobId, String containerId, Closeable logHandle) {
+        if (inFlightContainers.remove(jobId, containerId)) {
+            lifecycleManager.stopAndRemove(containerId, logHandle);
+        } else if (logHandle != null) {
+            try {
+                logHandle.close();
+            } catch (Exception e) {
+                LOG.debugv("Error closing log stream for job {0}: {1}", jobId, e.getMessage());
+            }
+        }
+        // Whoever removed the container, its address goes back once Docker confirms it gone.
+        vpcLeases.releaseIfGone(containerId);
+    }
+
+    /**
+     * Stops the containers of jobs still inside {@link #run} on emulator shutdown;
+     * without this a SIGTERM mid-job orphans the container.
+     */
+    @Override
+    public void stopManagedContainers() {
+        for (Map.Entry<String, String> entry : new ConcurrentHashMap<>(inFlightContainers).entrySet()) {
+            if (inFlightContainers.remove(entry.getKey(), entry.getValue())) {
+                try {
+                    lifecycleManager.stopAndRemove(entry.getValue(), null);
+                    vpcLeases.releaseIfGone(entry.getValue());
+                } catch (Exception e) {
+                    LOG.warnv("Failed to stop Batch container for job {0} on shutdown: {1}",
+                            entry.getKey(), e.getMessage());
+                }
+            }
+        }
+    }
+
+    private BatchRunResult failed(long startedAt, String logStreamName, String reason) {
+        return new BatchRunResult(1, reason, logStreamName, startedAt, timer.currentTimeMillis(), false);
+    }
+
+    private BatchRunResult stopped(long startedAt, String logStreamName) {
+        return new BatchRunResult(137, "Job terminated", logStreamName,
+                startedAt, timer.currentTimeMillis(), false);
+    }
+
+    private List<String> buildEnvironment(BatchJob job, int attemptNumber) {
+        List<String> env = baseEnvironment(job, attemptNumber);
+        appendEnvironment(env, job.getResolvedEnvironment());
+        return env;
+    }
+
+    private List<String> buildNodeEnvironment(BatchJob job, int attemptNumber, BatchNodeExecution node) {
+        List<String> env = baseEnvironment(job, attemptNumber);
+        int numNodes = job.getNodeProperties() != null && job.getNodeProperties().getNumNodes() != null
+                ? job.getNodeProperties().getNumNodes() : 1;
+        int mainNode = job.getNodeProperties() != null && job.getNodeProperties().getMainNode() != null
+                ? job.getNodeProperties().getMainNode() : 0;
+        env.add("AWS_BATCH_JOB_NODE_INDEX=" + node.getNodeIndex());
+        env.add("AWS_BATCH_JOB_MAIN_NODE_INDEX=" + mainNode);
+        env.add("AWS_BATCH_JOB_NUM_NODES=" + numNodes);
+        appendEnvironment(env, node.getResolvedEnvironment());
+        return env;
+    }
+
+    private List<String> baseEnvironment(BatchJob job, int attemptNumber) {
+        List<String> env = new ArrayList<>();
+        env.add("AWS_REGION=" + job.getRegion());
+        env.add("AWS_DEFAULT_REGION=" + job.getRegion());
+        env.add("AWS_ACCESS_KEY_ID=test");
+        env.add("AWS_SECRET_ACCESS_KEY=test");
+        env.add("AWS_SESSION_TOKEN=test");
+        String hostname = resolveEndpointHostname();
+        String endpoint = "http://" + hostname + ":" + config.port();
+        env.add("FLOCI_ENDPOINT=" + endpoint);
+        env.add("AWS_ENDPOINT_URL=" + endpoint);
+        env.add("FLOCI_HOSTNAME=" + hostname);
+        env.add("AWS_BATCH_JOB_ID=" + job.getJobId());
+        env.add("AWS_BATCH_JOB_ATTEMPT=" + attemptNumber);
+        env.add("AWS_BATCH_JQ_NAME=" + job.getJobQueueName());
+        env.add("AWS_BATCH_CE_NAME=local");
+        return env;
+    }
+
+    private void appendEnvironment(List<String> env, List<BatchKeyValue> resolvedEnvironment) {
+        if (resolvedEnvironment == null) {
+            return;
+        }
+        for (BatchKeyValue kv : resolvedEnvironment) {
+            env.add(kv.getName() + "=" + (kv.getValue() != null ? kv.getValue() : ""));
+        }
+    }
+
+    String resolveEndpointHostname() {
+        if (containerDetector.isRunningInContainer()) {
+            return config.hostname().orElse(EmbeddedDnsServer.DEFAULT_SUFFIX);
+        }
+        return "host.docker.internal";
+    }
+
+    private void applyResourceRequirements(ContainerBuilder.Builder builder,
+                                           List<BatchResourceRequirement> resourceRequirements, String jobId) {
+        if (resourceRequirements == null) {
+            return;
+        }
+        for (BatchResourceRequirement requirement : resourceRequirements) {
+            if (!"MEMORY".equalsIgnoreCase(requirement.getType()) || requirement.getValue() == null) {
+                continue;
+            }
+            try {
+                builder.withMemoryMb(Integer.parseInt(requirement.getValue()));
+            } catch (NumberFormatException e) {
+                LOG.warnv("Ignoring invalid Batch MEMORY resource value for job {0}: {1}",
+                        jobId, requirement.getValue());
+            }
+            return;
+        }
+    }
+
+    private Duration timeout(BatchJob job) {
+        if (job.getTimeout() == null || job.getTimeout().getAttemptDurationSeconds() == null) {
+            return Duration.ZERO;
+        }
+        return Duration.ofSeconds(job.getTimeout().getAttemptDurationSeconds());
+    }
+
+    private Integer waitForExit(String containerId, Duration timeout) throws InterruptedException {
+        // Measured on the monotonic timer, so setting the host's clock cannot end or extend an attempt.
+        long started = timer.nanoTime();
+        while (timeout.isZero() || timer.nanoTime() - started <= timeout.toNanos()) {
+            Integer exitCode = getExitCodeIfStopped(containerId);
+            if (exitCode != null) {
+                return exitCode;
+            }
+            timer.sleepMillis(250);
+        }
+        return null;
+    }
+
+    private Integer getExitCodeIfStopped(String containerId) {
+        try {
+            InspectContainerResponse inspect = lifecycleManager.getDockerClient().inspectContainerCmd(containerId).exec();
+            if (Boolean.TRUE.equals(inspect.getState().getRunning())) {
+                return null;
+            }
+            Long exitCode = inspect.getState().getExitCodeLong();
+            return exitCode != null ? exitCode.intValue() : 0;
+        } catch (NotFoundException e) {
+            return 1;
+        }
+    }
+}

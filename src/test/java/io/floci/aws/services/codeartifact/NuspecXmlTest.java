@@ -1,0 +1,166 @@
+package io.floci.aws.services.codeartifact;
+
+import org.junit.jupiter.api.Test;
+
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.util.List;
+import java.util.Optional;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
+
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+
+class NuspecXmlTest {
+
+    private static final String NUSPEC = "<?xml version=\"1.0\"?>"
+            + "<package xmlns=\"http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd\">"
+            + "<metadata><id>Demo.Package</id><version>1.0.0</version><authors>me</authors>"
+            + "<description>A description.</description></metadata></package>";
+
+    @Test
+    void parseReadsIdVersionAndDescriptionThroughTheDefaultNamespace() {
+        NuspecXml.Metadata metadata = NuspecXml.parse(NUSPEC.getBytes(StandardCharsets.UTF_8));
+
+        assertEquals("Demo.Package", metadata.id());
+        assertEquals("1.0.0", metadata.version());
+        assertEquals(Optional.of("A description."), metadata.description());
+    }
+
+    @Test
+    void parseRejectsAMissingRequiredElement() {
+        String nuspec = "<?xml version=\"1.0\"?><package><metadata><id>Demo</id></metadata></package>";
+
+        assertThrows(IllegalStateException.class, () -> NuspecXml.parse(nuspec.getBytes(StandardCharsets.UTF_8)));
+    }
+
+    /**
+     * A DOCTYPE declaration is rejected outright rather than silently resolved: this is the one
+     * observable way to confirm external entity expansion is actually disabled, since a
+     * successful parse of a benign payload alone wouldn't distinguish "XXE is disabled" from
+     * "this particular payload didn't need an external entity anyway."
+     */
+    @Test
+    void parseRejectsADoctypeDeclarationRatherThanResolvingIt() {
+        String maliciousNuspec = "<?xml version=\"1.0\"?><!DOCTYPE package [<!ENTITY xxe SYSTEM \"file:///etc/"
+                + "hostname\">]><package><metadata><id>&xxe;</id><version>1.0.0</version></metadata></package>";
+
+        assertThrows(IllegalStateException.class,
+                () -> NuspecXml.parse(maliciousNuspec.getBytes(StandardCharsets.UTF_8)));
+    }
+
+    @Test
+    void extractFromNupkgFindsTheRootNuspecEntryInsideTheZip() throws Exception {
+        byte[] nupkg = buildNupkg(NUSPEC);
+
+        NuspecXml.Metadata metadata = NuspecXml.extractFromNupkg(nupkg);
+
+        assertEquals("Demo.Package", metadata.id());
+    }
+
+    /**
+     * {@code extractFromNupkg(Path)} is the streamed sibling a large {@code .nupkg} push actually
+     * uses: confirms it reads the same real {@code .nuspec} entry straight off disk, not just that
+     * the {@code byte[]} overload parses it from a resident array.
+     */
+    @Test
+    void extractFromNupkgFromAPathFindsTheRootNuspecEntryTheSameWayAsTheByteArrayOverload() throws IOException {
+        byte[] nupkg = buildNupkg(NUSPEC);
+        Path staged = Files.createTempFile("nuspec-xml-test-", ".nupkg");
+
+        try {
+            Files.write(staged, nupkg);
+
+            NuspecXml.Metadata metadata = NuspecXml.extractFromNupkg(staged);
+
+            assertEquals("Demo.Package", metadata.id());
+            assertEquals("1.0.0", metadata.version());
+        } finally {
+            Files.deleteIfExists(staged);
+        }
+    }
+
+    /** The manifest must sit at the archive root; a same-suffix entry nested in a subdirectory doesn't count. */
+    @Test
+    void extractFromNupkgIgnoresANestedNuspecSuffixedEntry() {
+        byte[] nupkg = buildNupkg(null);
+
+        assertThrows(IllegalStateException.class, () -> NuspecXml.extractFromNupkg(nupkg));
+    }
+
+    /**
+     * Found by Qodo review: a highly-compressible entry can expand to far more than the overall
+     * upload's own, already-checked, compressed byte count, so the bound has to apply to the
+     * decompressed stream, not just the request body. The repeated character below compresses to
+     * a tiny fraction of its real size, matching exactly that shape.
+     */
+    @Test
+    void extractFromNupkgRejectsANuspecEntryThatDecompressesPastTheSizeLimit() {
+        String oversizedDescription = "A".repeat(2 * 1024 * 1024);
+        String nuspec = "<?xml version=\"1.0\"?><package><metadata><id>Demo</id><version>1.0.0</version>"
+                + "<description>" + oversizedDescription + "</description></metadata></package>";
+        byte[] nupkg = buildNupkg(nuspec);
+
+        assertThrows(IllegalStateException.class, () -> NuspecXml.extractFromNupkg(nupkg));
+    }
+
+    @Test
+    void dependenciesFlattensEveryTargetFrameworkGroupAndAllowsTheSamePackageTwice() {
+        String nuspec = "<?xml version=\"1.0\"?><package><metadata><id>Demo</id><version>1.0.0</version>"
+                + "<dependencies>"
+                + "<group targetFramework=\"net6.0\"><dependency id=\"Newtonsoft.Json\" version=\"13.0.1\"/></group>"
+                + "<group targetFramework=\"netstandard2.0\"><dependency id=\"Newtonsoft.Json\" version=\"12.0.3\"/>"
+                + "<dependency id=\"NoVersion\"/></group>"
+                + "</dependencies></metadata></package>";
+
+        List<NuspecXml.RawDependency> dependencies = NuspecXml.dependencies(nuspec.getBytes(StandardCharsets.UTF_8));
+
+        assertEquals(3, dependencies.size());
+        assertEquals(new NuspecXml.RawDependency("Newtonsoft.Json", "13.0.1"), dependencies.get(0));
+        assertEquals(new NuspecXml.RawDependency("Newtonsoft.Json", "12.0.3"), dependencies.get(1));
+        assertEquals(new NuspecXml.RawDependency("NoVersion", null), dependencies.get(2));
+    }
+
+    @Test
+    void dependenciesHandlesTheLegacySchemaWithNoGroupWrapper() {
+        String nuspec = "<?xml version=\"1.0\"?><package><metadata><id>Demo</id><version>1.0.0</version>"
+                + "<dependencies><dependency id=\"Old.Style\" version=\"1.2.3\"/></dependencies>"
+                + "</metadata></package>";
+
+        List<NuspecXml.RawDependency> dependencies = NuspecXml.dependencies(nuspec.getBytes(StandardCharsets.UTF_8));
+
+        assertEquals(List.of(new NuspecXml.RawDependency("Old.Style", "1.2.3")), dependencies);
+    }
+
+    @Test
+    void dependenciesIsEmptyWhenTheNuspecDeclaresNone() {
+        List<NuspecXml.RawDependency> dependencies = NuspecXml.dependencies(NUSPEC.getBytes(StandardCharsets.UTF_8));
+
+        assertTrue(dependencies.isEmpty());
+    }
+
+    private static byte[] buildNupkg(String rootNuspecOrNull) {
+        try {
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            try (ZipOutputStream zip = new ZipOutputStream(out)) {
+                if (rootNuspecOrNull != null) {
+                    zip.putNextEntry(new ZipEntry("Demo.Package.nuspec"));
+                    zip.write(rootNuspecOrNull.getBytes(StandardCharsets.UTF_8));
+                    zip.closeEntry();
+                } else {
+                    zip.putNextEntry(new ZipEntry("package/services/metadata/core-properties/fake.nuspec"));
+                    zip.write("not a real manifest".getBytes(StandardCharsets.UTF_8));
+                    zip.closeEntry();
+                }
+            }
+            return out.toByteArray();
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+}

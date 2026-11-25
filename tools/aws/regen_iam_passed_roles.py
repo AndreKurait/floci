@@ -78,13 +78,14 @@ SERVICE_SUFFIX = ".amazonaws.com"
 # The IAM namespaces whose operations this file reads: those Floci serves over the JSON and Query
 # protocols and Smithy RPC v2 CBOR, and the REST ones whose routes Floci authorizes by operation.
 NAMESPACES = (
-    "appconfig", "application-autoscaling", "athena", "autoscaling", "budgets", "cloudformation", "cloudtrail",
+    "appconfig", "application-autoscaling", "aps", "athena", "autoscaling", "budgets", "cloudformation", "cloudtrail",
     "cloudwatch", "codebuild", "codedeploy", "codepipeline", "cognito-identity", "cognito-idp",
     "comprehend", "config", "datasync", "dms", "dsql", "ec2", "ecr", "ecs", "eks", "elasticmapreduce",
-    "events", "firehose", "glue", "iam", "kinesis", "kinesisanalytics", "lambda", "logs", "pipes",
-    "rds", "redshift", "redshift-serverless", "rekognition", "resource-groups", "s3", "sagemaker", "scheduler",
-    "secretsmanager", "servicecatalog", "ses", "sns", "ssm", "states", "swf", "textract",
-    "transcribe", "transfer", "translate",
+    "emr-containers", "emr-serverless", "events", "firehose", "glue", "iam", "kinesis", "kinesisanalytics", "lambda",
+    "logs", "pipes",
+    "rds", "redshift", "redshift-serverless", "rekognition", "resource-groups", "s3", "s3tables", "sagemaker",
+    "scheduler", "secretsmanager", "servicecatalog", "ses", "sns", "ssm", "states", "swf", "textract",
+    "transcribe", "transfer", "translate", "wafv2",
 )
 
 # Namespaces Floci serves whose operations list iam:PassRole but are not read here yet, each with
@@ -94,7 +95,6 @@ NOT_COVERED = {
     "access-analyzer": "REST routes no rule maps yet",
     "airflow": "REST routes no rule maps yet",
     "appsync": "REST routes no rule maps yet",
-    "aps": "REST routes no rule maps yet",
     "aws-marketplace": "REST routes no rule maps yet",
     "backup": "REST routes no rule maps yet",
     "batch": "REST routes no rule maps yet",
@@ -103,7 +103,6 @@ NOT_COVERED = {
     "cloudfront": "REST routes no rule maps yet",
     "dlm": "REST routes no rule maps yet",
     "elasticfilesystem": "REST routes no rule maps yet",
-    "emr-serverless": "REST routes no rule maps yet",
     "es": "REST routes no rule maps yet",
     "fis": "REST routes no rule maps yet",
     "guardduty": "REST routes no rule maps yet",
@@ -111,8 +110,8 @@ NOT_COVERED = {
     "kafka": "REST routes no rule maps yet",
     "macie2": "REST routes no rule maps yet",
     "mq": "REST routes no rule maps yet",
+    "quicksight": "metadata-only REST subset; role passing and iam:PassRole checks are not implemented",
     "rum": "REST routes no rule maps yet",
-    "s3tables": "REST routes no rule maps yet",
 }
 
 # A member that names a role: Role, RoleArn, RoleName, their plurals, and an Update or Override of one.
@@ -224,7 +223,6 @@ BY_HAND = {
     "scheduler:CreateSchedule": "the target's role",
     "scheduler:UpdateSchedule": "the target's role",
     "states:CreateStateMachine": "the state machine's role",
-    "states:TestState": "the test state execution role",
     "states:UpdateStateMachine": "the state machine's role",
 }
 
@@ -244,6 +242,15 @@ BY_HAND.update({
 })
 
 NO_ROLE_MEMBER = "no member of the request names a role"
+# For an operation no botocore release models, as a legacy one the SDKs dropped.
+NO_SUCH_OPERATION = "botocore's model has no such operation"
+# For an operation the reference lists that no model of the pinned botocore has, one AWS has shipped since the
+# pin. It lasts until a bump brings the operation in, when entry_for reads the role its request names.
+NOT_IN_BOTOCORE = "the pinned botocore does not have the operation yet, so its request cannot be read"
+# For an operation the pinned botocore has without the member that names its role, one AWS has added to the request
+# since the pin. NOT_READ wins over what the request names, so take the entry out with the bump that brings the
+# member in, and entry_for reads it.
+MEMBER_NOT_IN_BOTOCORE = "the pinned botocore does not have the member naming the role yet, so it cannot be read"
 RUNBOOK_PARAMETER = "the role is a parameter of the runbook it runs, not a member of the request"
 XML_BODY = "the request body is XML, which PassedRoles does not read"
 
@@ -257,20 +264,21 @@ NOT_READ = {
     "config:PutOrganizationConformancePack": NO_ROLE_MEMBER,
     "config:PutRemediationConfigurations": RUNBOOK_PARAMETER,
     "dms:CreateInstanceProfile": NO_ROLE_MEMBER,
+    "dms:CreateReplicationTask": NO_ROLE_MEMBER,
     "dms:ModifyInstanceProfile": NO_ROLE_MEMBER,
+    "dms:ModifyReplicationTask": NO_ROLE_MEMBER,
     "ec2:RequestSpotFleet": "the request names its roles in EC2's own protocol, one of them as an instance profile",
     "ecs:CreateDaemon": "the roles are the daemon task definition's, which only a lookup finds",
-    "ecs:CreateGateway": "botocore's model has no such operation",
     "ecs:UpdateDaemon": "the roles are the daemon task definition's, which only a lookup finds",
-    "ecs:UpdateGateway": "botocore's model has no such operation",
     "eks:UpdateClusterConfig": "the reference passes the node role to ec2 or eks and nothing says which",
     "elasticmapreduce:RunJobFlow": "JobFlowRole names an instance profile, and the reference passes the roles "
                                    "to three services without saying which goes where",
     "elasticmapreduce:UpdateStudio": NO_ROLE_MEMBER,
     "glue:GetJob": NO_ROLE_MEMBER,
     "glue:GetJobs": NO_ROLE_MEMBER,
-    "lambda:AddEventSource": "botocore's model has no such operation",
+    "lambda:AddEventSource": NO_SUCH_OPERATION,
     "logs:CreateImportTask": "the reference passes the role to cloudtrail or logs and nothing says which",
+    "logs:StartQuery": NO_ROLE_MEMBER,
     "rds:CreateBlueGreenDeployment": NO_ROLE_MEMBER,
     "s3:CreateAccessGrantsLocation": XML_BODY,
     "s3:PutBucketReplication": XML_BODY,
@@ -582,9 +590,11 @@ def entry_for(operation: str, passed_to: list[str], models: dict[str, dict]) -> 
     """What the file says for one operation, from its services and the models of its namespace."""
     if operation in BY_HAND:
         return {"passedTo": passed_to, "byHand": BY_HAND[operation]}
+    name = operation.split(":", 1)[1]
     if operation in NOT_READ:
         return {"passedTo": passed_to, "notRead": NOT_READ[operation]}
-    name = operation.split(":", 1)[1]
+    if not any(name in model["operations"] for model in models.values()):
+        return {"passedTo": passed_to, "notRead": NOT_IN_BOTOCORE}
     members: dict[str, bool] = {}
     for model in models.values():
         for path, by_name in role_members(model, name).items():

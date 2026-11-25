@@ -29,7 +29,7 @@ Floci implements the EC2 Auto Scaling API — stored-state management for launch
 | `CreateAutoScalingGroup` | Creates a group with min/max/desired capacity, AZs, tags, launch configuration, launch template, or mixed instances policy; starts capacity reconciliation loop |
 | `DescribeAutoScalingGroups` | Filtered by name list; returns all if no filter; includes current instance list with lifecycle state and mixed instances policy shape when configured |
 | `UpdateAutoScalingGroup` | Updates capacity bounds, cooldown, launch source, AZs |
-| `DeleteAutoScalingGroup` | `ForceDelete=true` terminates all instances before deletion |
+| `DeleteAutoScalingGroup` | `ForceDelete=true` terminates all instances before deletion, except in an [EKS nodegroup's group](eks.md#auto-scaling-group) |
 | `DescribeTags` | Group tags; filters `auto-scaling-group`, `key`, `value`, `propagate-at-launch` (values ORed, filters ANDed); `MaxRecords`/`NextToken` paging |
 | `CreateOrUpdateTags` | Creates or updates group tags and their propagate-at-launch setting |
 | `DeleteTags` | Removes named group tags |
@@ -331,19 +331,19 @@ always excludes `Standby` members, including when `Wait` (the AWS default) or
 
 | Operation | Notes |
 |---|---|
-| `AttachLoadBalancerTargetGroups` | Attaches ELB v2 target group ARNs; new instances auto-registered on InService |
-| `DetachLoadBalancerTargetGroups` | Detaches target groups; instances deregistered |
+| `AttachLoadBalancerTargetGroups` | Attaches ELB v2 target group ARNs and registers the group's `InService` instances with the ones it adds, as AWS does; the reconciler registers each later instance as it comes into service |
+| `DetachLoadBalancerTargetGroups` | Detaches target groups and deregisters the group's instances from them, as AWS does; a target group already deleted is detached all the same. An EKS nodegroup's node stays registered with a target group another nodegroup's group still has attached |
 | `DescribeLoadBalancerTargetGroups` | Lists target groups attached to a group |
-| `AttachLoadBalancers` | Classic ELB attachment (stored; no ELB v1 routing) |
-| `DetachLoadBalancers` | Classic ELB detachment |
+| `AttachLoadBalancers` | Attaches Classic Load Balancers by name and registers the group's `InService` instances with the ones it adds, as AWS does; the reconciler registers each later instance as it comes into service. Floci runs no Classic data plane ([Classic ELB](elb-classic.md)) |
+| `DetachLoadBalancers` | Detaches Classic Load Balancers and deregisters the group's instances from them, as AWS does; a load balancer already deleted is detached all the same. An EKS nodegroup's node stays registered with a load balancer another nodegroup's group still has attached |
 | `DescribeLoadBalancers` | Lists classic ELBs attached to a group |
 
 ### Traffic Sources
 
 | Operation | Notes |
 |---|---|
-| `AttachTrafficSources` | Unified elb/elbv2/vpc-lattice attachment API; stored per identifier with its type |
-| `DetachTrafficSources` | Removes a traffic source by identifier |
+| `AttachTrafficSources` | Unified elb/elbv2/vpc-lattice attachment API; stored per identifier with its type. The group's `InService` instances are registered with an `elbv2` or `elb` source it adds, as with a target group or a Classic Load Balancer |
+| `DetachTrafficSources` | Removes a traffic source by identifier, deregistering the group's instances from an `elbv2` or `elb` source |
 | `DescribeTrafficSources` | Lists attached sources, optionally filtered by type; every source reports `InService` |
 
 ### Lifecycle Hooks
@@ -404,6 +404,10 @@ are not implemented yet.
 |---|---|
 | `DescribeScalingActivities` | Returns the activity log for a group; activities recorded on scale-out and scale-in events |
 
+The optional `ActivityIds` filter selects matching activities within the requested group,
+account and region. Matches retain newest-first order, repeated IDs do not duplicate results,
+and unknown IDs are ignored. Omitting the filter returns the full matching activity history.
+
 ### Metadata
 
 | Operation | Notes |
@@ -436,6 +440,7 @@ The reconciler keeps active capacity aligned with `DesiredCapacity`:
 - **Scale-out**: calls `RunInstances` with the group's launch configuration; new instances are tracked as `Pending` until the EC2 state transitions to `running`, at which point they move to `InService` and are registered with all attached ELB v2 target groups.
 - **Scale-in**: selects unprotected `InService` instances, persists them as `Terminating`, and deregisters them from target groups and Classic load balancers before terminating EC2.
 - Activity records are written on each scale-out and scale-in event.
+- **EKS nodegroups**: the group EKS keeps for a managed nodegroup is left alone. Its instance is the cluster's node, which the reconciler never launches, terminates or replaces, so attaching a target group to such a group registers the node at once and detaching it deregisters the node, and operations that would terminate, replace or move the node are refused. See the [EKS nodegroup Auto Scaling group](eks.md#auto-scaling-group).
 
 For protected Classic frontends, scale-in, instance refresh and explicit
 `TerminateInstanceInAutoScalingGroup` requests wait for actual proxy sessions to
@@ -590,6 +595,8 @@ aws autoscaling set-desired-capacity \
 Launch configurations accept an IAM instance profile name or ARN. Unknown and foreign profiles fail creation with `ValidationError`. At launch, the reconciler resolves a stored name to its ARN in the owning account. `CreateAutoScalingGroup` and `UpdateAutoScalingGroup` refuse, with `ValidationError`, a launch template that names both an instance profile name and an ARN, directly or through the mixed instances policy.
 
 Launch-configuration metadata options (`HttpTokens`, `HttpEndpoint`, and `HttpPutResponseHopLimit`) round-trip through Query and CloudFormation and reach EC2 launches. CloudFormation resolves intrinsics inside the block, so `Fn::If` and `AWS::NoValue` can select or omit the block or any of its members. When the structure is omitted it stays absent from `DescribeLaunchConfigurations`; a supplied partial structure reports defaults for unspecified fields. Launch templates, mixed-instance templates and EC2 Fleet launches likewise forward their existing metadata options.
+
+For scale-in and instance refresh, Classic load balancer deregistration starts before EC2 termination. Instances remain in the group while any Classic frontend reports active draining; a later reconciliation pass terminates them after draining completes. Failed drain lookups retain the instances for retry.
 
 ### Reconciliation scheduling
 

@@ -1,0 +1,535 @@
+package io.floci.aws.services.eks;
+
+import io.quarkus.test.junit.QuarkusTest;
+import io.quarkus.test.junit.mockito.InjectSpy;
+import org.junit.jupiter.api.Test;
+import org.mockito.Mockito;
+
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+
+import static io.floci.aws.testing.EksRequests.eks;
+import static io.floci.aws.testing.EnforcementFixtures.auth;
+import static io.floci.aws.testing.IamTestPolicies.EMPTY_POLICY_DOCUMENT;
+import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.*;
+
+@QuarkusTest
+class EksAddonIntegrationTest {
+
+    private static final String REGION = "us-east-1";
+
+    @InjectSpy
+    EksClusterManager clusterManager;
+
+    /**
+     * The Pod Identity address answers while the agent add-on is installed: CreateAddon starts it and
+     * DeleteAddon stops it, except with preserve, which leaves the agent running on EKS. Other add-ons
+     * leave it alone.
+     */
+    @Test
+    void thePodIdentityAgentsAddressFollowsItsAddon() {
+        String account = "123456789012";
+        String name = "addon-agent-" + UUID.randomUUID().toString().substring(0, 8);
+        String basePath = "/clusters/" + name + "/addons";
+        createCluster(account, name, "1.30");
+        try {
+            for (String addon : List.of("eks-pod-identity-agent", "coredns")) {
+                given().header("Authorization", auth(account, "eks")).contentType("application/json")
+                        .body(Map.of("addonName", addon)).post(basePath).then().statusCode(200);
+            }
+            Mockito.verify(clusterManager, Mockito.times(1))
+                    .podIdentityAgentChanged(Mockito.argThat(cluster -> name.equals(cluster.getName())));
+
+            given().header("Authorization", auth(account, "eks")).queryParam("preserve", true)
+                    .delete(basePath + "/eks-pod-identity-agent").then().statusCode(200);
+            given().header("Authorization", auth(account, "eks"))
+                    .delete(basePath + "/coredns").then().statusCode(200);
+            Mockito.verify(clusterManager, Mockito.times(1)).podIdentityAgentChanged(Mockito.any());
+
+            given().header("Authorization", auth(account, "eks")).contentType("application/json")
+                    .body(Map.of("addonName", "eks-pod-identity-agent")).post(basePath).then().statusCode(200);
+            given().header("Authorization", auth(account, "eks"))
+                    .delete(basePath + "/eks-pod-identity-agent").then().statusCode(200);
+            Mockito.verify(clusterManager, Mockito.times(3))
+                    .podIdentityAgentChanged(Mockito.argThat(cluster -> name.equals(cluster.getName())));
+        } finally {
+            deleteCluster(account, name);
+        }
+    }
+
+    @Test
+    void addonLifecycleRoundTrip() {
+        String account = "123456789012";
+        String name = "addon-it-" + UUID.randomUUID().toString().substring(0, 8);
+        String roleName = "role-" + name;
+        String roleArn = "arn:aws:iam::" + account + ":role/" + roleName;
+        String basePath = "/clusters/" + name + "/addons";
+
+        createRole(account, roleName);
+        createCluster(account, name, "1.30");
+
+        try {
+            // 1. Create addon
+            Map<String, Object> createReq = Map.of(
+                    "addonName", "vpc-cni",
+                    "addonVersion", "v1.18.1-eksbuild.1",
+                    "serviceAccountRoleArn", roleArn,
+                    "configurationValues", "{\"env\":{\"ENABLE_PREFIX_DELEGATION\":\"true\"}}",
+                    "clientRequestToken", "token-addon-1",
+                    "tags", Map.of("environment", "test")
+            );
+
+            eks(account, REGION)
+                    .body(createReq)
+                    .post(basePath)
+                    .then()
+                    .statusCode(200)
+                    .contentType(containsString("application/json"))
+                    .body("addon.clusterName", equalTo(name))
+                    .body("addon.addonName", equalTo("vpc-cni"))
+                    .body("addon.addonVersion", equalTo("v1.18.1-eksbuild.1"))
+                    .body("addon.status", equalTo("ACTIVE"))
+                    .body("addon.serviceAccountRoleArn", equalTo(roleArn))
+                    .body("addon.configurationValues", equalTo("{\"env\":{\"ENABLE_PREFIX_DELEGATION\":\"true\"}}"))
+                    .body("addon.tags.environment", equalTo("test"))
+                    .body("addon.health.issues", empty())
+                    .body("addon.podIdentityAssociations", empty())
+                    .body("addon.owner", equalTo("aws"))
+                    .body("addon.publisher", equalTo("eks"))
+                    .body("addon.addonArn", startsWith("arn:aws:eks:us-east-1:" + account + ":addon/" + name + "/vpc-cni/"))
+                    .body("addon.createdAt", instanceOf(Number.class))
+                    .body("addon.modifiedAt", instanceOf(Number.class));
+
+            // 2. Idempotent retry with same parameters and token
+            eks(account, REGION)
+                    .body(createReq)
+                    .post(basePath)
+                    .then()
+                    .statusCode(200)
+                    .body("addon.addonName", equalTo("vpc-cni"));
+
+            // 3. Conflicting request with same token fails
+            Map<String, Object> conflictReq = Map.of(
+                    "addonName", "vpc-cni",
+                    "addonVersion", "v1.18.1-eksbuild.1",
+                    "clientRequestToken", "token-addon-1",
+                    "tags", Map.of("environment", "production")
+            );
+            eks(account, REGION)
+                    .body(conflictReq)
+                    .post(basePath)
+                    .then()
+                    .statusCode(400)
+                    .contentType(containsString("application/json"))
+                    .body("__type", equalTo("InvalidParameterException"));
+
+            // 4. Duplicate creation with different token fails (409)
+            Map<String, Object> duplicateReq = Map.of(
+                    "addonName", "vpc-cni",
+                    "clientRequestToken", "token-addon-2"
+            );
+            eks(account, REGION)
+                    .body(duplicateReq)
+                    .post(basePath)
+                    .then()
+                    .statusCode(409)
+                    .contentType(containsString("application/json"))
+                    .body("__type", equalTo("ResourceInUseException"));
+
+            // 5. Describe addon
+            eks(account, REGION)
+                    .get(basePath + "/vpc-cni")
+                    .then()
+                    .statusCode(200)
+                    .contentType(containsString("application/json"))
+                    .body("addon.addonName", equalTo("vpc-cni"))
+                    .body("addon.status", equalTo("ACTIVE"))
+                    .body("addon.addonVersion", equalTo("v1.18.1-eksbuild.1"));
+
+            // 6. Update addon
+            String updatedRoleName = "updated-" + roleName;
+            String updatedRoleArn = "arn:aws:iam::" + account + ":role/" + updatedRoleName;
+            createRole(account, updatedRoleName);
+
+            Map<String, Object> updateReq = Map.of(
+                    "addonVersion", "v1.18.5-eksbuild.1",
+                    "serviceAccountRoleArn", updatedRoleArn,
+                    "configurationValues", "{\"env\":{\"ENABLE_PREFIX_DELEGATION\":\"false\"}}"
+            );
+            String updateId = eks(account, REGION)
+                    .body(updateReq)
+                    .post(basePath + "/vpc-cni/update")
+                    .then()
+                    .statusCode(200)
+                    .contentType(containsString("application/json"))
+                    .body("update.status", equalTo("Successful"))
+                    .body("update.type", equalTo("AddonUpdate"))
+                    .body("update.id", notNullValue())
+                    .extract().path("update.id");
+
+            // Verify DescribeUpdate (called by Terraform aws_eks_addon waiter)
+            eks(account, REGION)
+                    .queryParam("addonName", "vpc-cni")
+                    .get("/clusters/" + name + "/updates/" + updateId)
+                    .then()
+                    .statusCode(200)
+                    .contentType(containsString("application/json"))
+                    .body("update.id", equalTo(updateId))
+                    .body("update.status", equalTo("Successful"))
+                    .body("update.type", equalTo("AddonUpdate"));
+
+            // Verify describe shows updated values
+            eks(account, REGION)
+                    .get(basePath + "/vpc-cni")
+                    .then()
+                    .statusCode(200)
+                    .body("addon.addonVersion", equalTo("v1.18.5-eksbuild.1"))
+                    .body("addon.serviceAccountRoleArn", equalTo(updatedRoleArn))
+                    .body("addon.configurationValues", equalTo("{\"env\":{\"ENABLE_PREFIX_DELEGATION\":\"false\"}}"));
+
+            // 7. List addons
+            eks(account, REGION)
+                    .get(basePath)
+                    .then()
+                    .statusCode(200)
+                    .contentType(containsString("application/json"))
+                    .body("addons", hasSize(1))
+                    .body("addons[0]", equalTo("vpc-cni"));
+
+            // 8. Delete addon
+            eks(account, REGION)
+                    .delete(basePath + "/vpc-cni")
+                    .then()
+                    .statusCode(200)
+                    .contentType(containsString("application/json"))
+                    .body("addon.addonName", equalTo("vpc-cni"))
+                    .body("addon.status", equalTo("DELETING"));
+
+            // 9. Describe after delete returns 404
+            eks(account, REGION)
+                    .get(basePath + "/vpc-cni")
+                    .then()
+                    .statusCode(404)
+                    .body("__type", equalTo("ResourceNotFoundException"));
+        } finally {
+            deleteCluster(account, name);
+        }
+    }
+
+    @Test
+    void describeAddonVersionsEndpoints() {
+        String account = "123456789012";
+
+        // Query all supported versions
+        eks(account, REGION)
+                .get("/addons/supported-versions")
+                .then()
+                .statusCode(200)
+                .contentType(containsString("application/json"))
+                .body("addons", hasSize(greaterThanOrEqualTo(5)))
+                .body("addons.addonName", hasItems("vpc-cni", "coredns", "kube-proxy", "eks-pod-identity-agent", "aws-ebs-csi-driver"));
+
+        // Query with addonName filter
+        eks(account, REGION)
+                .queryParam("addonName", "vpc-cni")
+                .get("/addons/supported-versions")
+                .then()
+                .statusCode(200)
+                .body("addons", hasSize(1))
+                .body("addons[0].addonName", equalTo("vpc-cni"))
+                .body("addons[0].addonVersions", not(empty()));
+
+        // Query with kubernetesVersion filter
+        eks(account, REGION)
+                .queryParam("addonName", "vpc-cni")
+                .queryParam("kubernetesVersion", "1.29")
+                .get("/addons/supported-versions")
+                .then()
+                .statusCode(200)
+                .body("addons", hasSize(1))
+                .body("addons[0].addonName", equalTo("vpc-cni"))
+                .body("addons[0].addonVersions.addonVersion", hasItem("v1.18.1-eksbuild.1"));
+
+        // Unknown addon name returns empty list 200
+        eks(account, REGION)
+                .queryParam("addonName", "non-existent-addon")
+                .get("/addons/supported-versions")
+                .then()
+                .statusCode(200)
+                .body("addons", empty());
+    }
+
+    @Test
+    void addonPodIdentityAssociationLifecycleIntegration() {
+        String account = "123456789012";
+        String name = "addon-pia-" + UUID.randomUUID().toString().substring(0, 8);
+        String roleName = "role-" + name;
+        String roleArn = "arn:aws:iam::" + account + ":role/" + roleName;
+        String basePath = "/clusters/" + name + "/addons";
+
+        createRole(account, roleName);
+        createCluster(account, name, "1.29");
+
+        try {
+            // Create addon with pod identity association
+            Map<String, Object> createReq = Map.of(
+                    "addonName", "vpc-cni",
+                    "podIdentityAssociations", List.of(
+                            Map.of("serviceAccount", "aws-node", "roleArn", roleArn)
+                    )
+            );
+
+            eks(account, REGION)
+                    .body(createReq)
+                    .post(basePath)
+                    .then()
+                    .statusCode(200)
+                    .body("addon.podIdentityAssociations", hasSize(1));
+
+            // Verify the association was created under kube-system namespace
+            eks(account, REGION)
+                    .get("/clusters/" + name + "/pod-identity-associations")
+                    .then()
+                    .statusCode(200)
+                    .body("associations", hasSize(1))
+                    .body("associations[0].namespace", equalTo("kube-system"))
+                    .body("associations[0].serviceAccount", equalTo("aws-node"));
+
+            // Delete addon with preserve=false (default) -> deletes association
+            eks(account, REGION)
+                    .delete(basePath + "/vpc-cni")
+                    .then()
+                    .statusCode(200);
+
+            eks(account, REGION)
+                    .get("/clusters/" + name + "/pod-identity-associations")
+                    .then()
+                    .statusCode(200)
+                    .body("associations", empty());
+
+            // Re-creating addon with same association succeeds (no ResourceInUseException)
+            eks(account, REGION)
+                    .body(createReq)
+                    .post(basePath)
+                    .then()
+                    .statusCode(200)
+                    .body("addon.addonName", equalTo("vpc-cni"));
+        } finally {
+            deleteCluster(account, name);
+        }
+    }
+
+    @Test
+    void addonOnClusterVersionOutsideCatalogRangeIntegration() {
+        String account = "123456789012";
+        String name = "addon-k8s-" + UUID.randomUUID().toString().substring(0, 8);
+        String basePath = "/clusters/" + name + "/addons";
+
+        // Newer than every version the catalog and the k3s map cover; this test runs EKS in mock mode.
+        createCluster(account, name, "1.40");
+        try {
+            // Create with no version resolves default version on cluster outside catalog range
+            eks(account, REGION)
+                    .body(Map.of("addonName", "vpc-cni"))
+                    .post(basePath)
+                    .then()
+                    .statusCode(200)
+                    .body("addon.addonName", equalTo("vpc-cni"))
+                    .body("addon.status", equalTo("ACTIVE"))
+                    .body("addon.addonVersion", notNullValue());
+
+            // In-place update with catalog version succeeds
+            eks(account, REGION)
+                    .body(Map.of("addonVersion", "v1.18.1-eksbuild.1"))
+                    .post(basePath + "/vpc-cni/update")
+                    .then()
+                    .statusCode(200)
+                    .body("update.status", equalTo("Successful"));
+
+            // In-place update with unknown version fails
+            eks(account, REGION)
+                    .body(Map.of("addonVersion", "v99.0.0"))
+                    .post(basePath + "/vpc-cni/update")
+                    .then()
+                    .statusCode(400)
+                    .body("__type", equalTo("InvalidParameterException"));
+        } finally {
+            deleteCluster(account, name);
+        }
+    }
+
+    @Test
+    void clusterDeletionCleansAddons() {
+        String account = "123456789012";
+        String name = "addon-clean-" + UUID.randomUUID().toString().substring(0, 8);
+        String basePath = "/clusters/" + name + "/addons";
+
+        createCluster(account, name, "1.29");
+
+        eks(account, REGION)
+                .body(Map.of("addonName", "vpc-cni"))
+                .post(basePath)
+                .then()
+                .statusCode(200);
+
+        // Delete cluster
+        deleteCluster(account, name);
+
+        // Recreate cluster with same name
+        createCluster(account, name, "1.29");
+        try {
+            // Addons must be empty on recreated cluster
+            eks(account, REGION)
+                    .get(basePath)
+                    .then()
+                    .statusCode(200)
+                    .body("addons", empty());
+        } finally {
+            deleteCluster(account, name);
+        }
+    }
+
+    @Test
+    void routeCollisionsAndMissingCluster() {
+        String account = "123456789012";
+
+        // Missing cluster returns 404 JSON, not S3 NoSuchBucket XML
+        eks(account, REGION)
+                .get("/clusters/nonexistent-cluster/addons")
+                .then()
+                .statusCode(404)
+                .contentType(containsString("application/json"))
+                .body("__type", equalTo("ResourceNotFoundException"));
+
+        // Unknown addon creation parameter error
+        String name = "addon-err-" + UUID.randomUUID().toString().substring(0, 8);
+        createCluster(account, name, "1.29");
+        try {
+            eks(account, REGION)
+                    .body(Map.of("addonName", "unknown-addon"))
+                    .post("/clusters/" + name + "/addons")
+                    .then()
+                    .statusCode(400)
+                    .contentType(containsString("application/json"))
+                    .body("__type", equalTo("InvalidParameterException"));
+        } finally {
+            deleteCluster(account, name);
+        }
+    }
+
+    @Test
+    void ebsCsiDriverLifecycleIntegration() {
+        String account = "123456789012";
+        String name = "addon-ebs-" + UUID.randomUUID().toString().substring(0, 8);
+        String roleName = "role-" + name;
+        String roleArn = "arn:aws:iam::" + account + ":role/" + roleName;
+        String basePath = "/clusters/" + name + "/addons";
+
+        createRole(account, roleName);
+        createCluster(account, name, "1.30");
+
+        try {
+            // 1. Create aws-ebs-csi-driver addon without specifying version (resolves the catalog's 1.30 default)
+            Map<String, Object> createReq = Map.of(
+                    "addonName", "aws-ebs-csi-driver",
+                    "serviceAccountRoleArn", roleArn
+            );
+
+            eks(account, REGION)
+                    .body(createReq)
+                    .post(basePath)
+                    .then()
+                    .statusCode(200)
+                    .contentType(containsString("application/json"))
+                    .body("addon.clusterName", equalTo(name))
+                    .body("addon.addonName", equalTo("aws-ebs-csi-driver"))
+                    .body("addon.addonVersion", equalTo(EksAddonServiceTest.catalogDefault("aws-ebs-csi-driver", "1.30")))
+                    .body("addon.status", equalTo("ACTIVE"))
+                    .body("addon.owner", equalTo("aws"))
+                    .body("addon.publisher", equalTo("eks"))
+                    .body("addon.serviceAccountRoleArn", equalTo(roleArn));
+
+            // 2. Describe addon returns it
+            eks(account, REGION)
+                    .get(basePath + "/aws-ebs-csi-driver")
+                    .then()
+                    .statusCode(200)
+                    .contentType(containsString("application/json"))
+                    .body("addon.addonName", equalTo("aws-ebs-csi-driver"))
+                    .body("addon.addonVersion", equalTo(EksAddonServiceTest.catalogDefault("aws-ebs-csi-driver", "1.30")))
+                    .body("addon.status", equalTo("ACTIVE"));
+
+            // 3. Filter describe-addon-versions by addonName
+            eks(account, REGION)
+                    .queryParam("addonName", "aws-ebs-csi-driver")
+                    .get("/addons/supported-versions")
+                    .then()
+                    .statusCode(200)
+                    .body("addons", hasSize(1))
+                    .body("addons[0].addonName", equalTo("aws-ebs-csi-driver"))
+                    .body("addons[0].type", equalTo("storage"))
+                    .body("addons[0].owner", equalTo("aws"))
+                    .body("addons[0].publisher", equalTo("eks"));
+
+            // 4. Filter describe-addon-versions by addonName and kubernetesVersion
+            eks(account, REGION)
+                    .queryParam("addonName", "aws-ebs-csi-driver")
+                    .queryParam("kubernetesVersion", "1.32")
+                    .get("/addons/supported-versions")
+                    .then()
+                    .statusCode(200)
+                    .body("addons", hasSize(1))
+                    .body("addons[0].addonName", equalTo("aws-ebs-csi-driver"))
+                    .body("addons[0].addonVersions.addonVersion", hasItem("v1.38.1-eksbuild.1"));
+        } finally {
+            deleteCluster(account, name);
+            deleteRole(account, roleName);
+        }
+    }
+
+    private static void createRole(String account, String roleName) {
+        given().header("Authorization", auth(account, "iam"))
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "CreateRole")
+                .formParam("RoleName", roleName)
+                .formParam("Path", "/")
+                .formParam("AssumeRolePolicyDocument", EMPTY_POLICY_DOCUMENT)
+                .post("/")
+                .then()
+                .statusCode(200);
+    }
+
+    private static void deleteRole(String account, String roleName) {
+        given().header("Authorization", auth(account, "iam"))
+                .contentType("application/x-www-form-urlencoded")
+                .formParam("Action", "DeleteRole")
+                .formParam("RoleName", roleName)
+                .post("/")
+                .then()
+                .statusCode(200);
+    }
+
+    private static void createCluster(String account, String name, String version) {
+        Map<String, Object> req = Map.of(
+                "name", name,
+                "roleArn", "arn:aws:iam::" + account + ":role/eks-role",
+                "version", version,
+                "accessConfig", Map.of(
+                        "authenticationMode", "API",
+                        "bootstrapClusterCreatorAdminPermissions", false
+                )
+        );
+        eks(account, REGION)
+                .body(req)
+                .post("/clusters")
+                .then()
+                .statusCode(200);
+    }
+
+    private static void deleteCluster(String account, String name) {
+        eks(account, REGION)
+                .delete("/clusters/" + name);
+    }
+}

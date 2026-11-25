@@ -43,9 +43,9 @@ Inflation is bounded to 10 MiB; the ordinary log-event validation still applies.
 | `TagLogGroup` | Tag a log group |
 | `UntagLogGroup` | Remove tags |
 | `ListTagsLogGroup` | List tags |
-| `TagResource` | Tag a log group, delivery source, delivery destination or delivery by ARN |
-| `UntagResource` | Remove tags from a log group, delivery source, delivery destination or delivery by ARN |
-| `ListTagsForResource` | List tags for a log group, delivery source, delivery destination or delivery ARN |
+| `TagResource` | Tag a log group, cross-account destination, delivery source, delivery destination or delivery by ARN |
+| `UntagResource` | Remove tags from a log group, cross-account destination, delivery source, delivery destination or delivery by ARN |
+| `ListTagsForResource` | List tags for a log group, cross-account destination, delivery source, delivery destination or delivery ARN |
 | `PutSubscriptionFilter` | Create or update a subscription filter (see [Subscription filters](#subscription-filters)) |
 | `DescribeSubscriptionFilters` | List subscription filters on a log group |
 | `DeleteSubscriptionFilter` | Delete a subscription filter |
@@ -55,7 +55,7 @@ Inflation is bounded to 10 MiB; the ordinary log-event validation still applies.
 | `TestMetricFilter` | Run a filter pattern over sample messages and return the matches with their extracted values |
 | `PutResourcePolicy` | Create or update an account-level resource policy |
 | `DescribeResourcePolicies` | List account-level resource policies |
-| `PutDestination` | Create or update a cross-account subscription destination |
+| `PutDestination` | Create or update a cross-account subscription destination, with optional tags on creation |
 | `PutDestinationPolicy` | Create or update the access policy for a destination |
 | `DescribeDestinations` | List logical destinations in the current account and Region, with prefix and pagination |
 | `DeleteDestination` | Remove a logical destination without deleting its target |
@@ -66,6 +66,9 @@ Inflation is bounded to 10 MiB; the ordinary log-event validation still applies.
 | `StartQuery` | Start a Logs Insights query (see [Logs Insights](#logs-insights)) |
 | `GetQueryResults` | Get the status and results of a Logs Insights query |
 | `StopQuery` | Stop a query that has not completed yet |
+| `PutQueryDefinition` | Create or replace a saved Logs Insights query definition |
+| `DescribeQueryDefinitions` | List saved queries, with name prefix and query language filters and pagination |
+| `DeleteQueryDefinition` | Delete a saved query definition by ID |
 | `PutDeliverySource` | Create or replace a vended-log delivery source (see [Vended log delivery](#vended-log-delivery)) |
 | `GetDeliverySource` | Return a delivery source |
 | `DeleteDeliverySource` | Delete a delivery source no delivery uses |
@@ -154,6 +157,32 @@ metric filters and subscription filters use: terms, quoted phrases, `?` alternat
 exclusions, JSON and space-delimited patterns. An invalid pattern is refused with
 `InvalidParameterException`, and so is a request that names no log group by `logGroupName` or
 `logGroupIdentifier`.
+
+### Saved query definitions
+
+`PutQueryDefinition`, `DescribeQueryDefinitions`, and `DeleteQueryDefinition` store and manage
+saved Logs Insights queries, including the metadata used by Terraform's
+`aws_cloudwatch_query_definition`. Definitions are isolated by account and region and use the
+configured CloudWatch Logs storage mode, including persistence across restarts.
+
+Create a definition with `name` and `queryString`; pass its returned `queryDefinitionId` to
+update it. Updates replace the definition, so omitting `logGroupNames` or `parameters` clears
+those lists. `queryLanguage` defaults to `CWLI`; `SQL` and `PPL` are also stored as metadata.
+Query parameters are supported for `CWLI` definitions. Saving a definition does not execute or
+validate its query syntax, and does not extend the query execution subset described below.
+Log group names can be saved before their groups exist.
+
+`clientToken` retries are scoped to the account and region and retain the original request and
+returned ID independently of later updates. Repeating that request returns the same ID without
+overwriting newer content; reusing its token with different input returns `InvalidParameterException`.
+Floci retains these records until emulator reset, including after the definition is deleted, so
+a delayed retry cannot recreate a deleted definition. They use the same storage mode as definitions.
+During reset, saves and deletes return `ServiceUnavailableException` until the reset hooks resume writes.
+
+`DescribeQueryDefinitions` accepts `queryDefinitionNamePrefix`, `queryLanguage`, and
+`maxResults` from 1 to 1000. Pass the returned `nextToken` with the same account, region, and
+filters for the next page; the final page omits it. Tokens expire after 24 hours or an emulator
+restart. Updating or deleting an unknown definition returns `ResourceNotFoundException`.
 
 ### Account policies
 
@@ -244,8 +273,9 @@ configuration and does not deliver the source's logs.
   this account." (likewise for a Delivery Destination and a Delivery).
 - With IAM enforcement on, each action is authorized on the resources the AWS Service Authorization
   Reference lists for it: the source, destination or delivery it names, and for `CreateDelivery` the
-  source, the destination and the new delivery; `DeleteDeliverySource` on the source it deletes. The
-  Describe actions are authorized on `*`, as the reference lists no resource for them.
+  source, the destination and the new delivery; `DeleteDeliverySource` on the delivery destinations the
+  deliveries from the source it deletes send to, the type the reference lists for it, and on `*` for a source
+  with none. The Describe actions are authorized on `*`, as the reference lists no resource for them.
 
 Not modelled: delivery destination policies (`PutDeliveryDestinationPolicy` and its siblings), and
 record field defaults for sources other than an EventBridge event bus.
@@ -429,12 +459,13 @@ The bare-colon spelling is a client-compatibility tolerance: the
 documents the canonical ARN, not that spelling. This tolerance does not change other APIs' ARN handling.
 
 `StartQuery` / `GetQueryResults` / `StopQuery` run a **subset** of the Logs Insights
-query language. Supported commands:
+query language. As on AWS, `StartQuery` rejects a `queryString` longer than 10,000 characters
+with `InvalidParameterException`. Supported commands:
 
 | Command | Notes |
 |---|---|
 | `fields a, b, ...` | Projection. Defaults to `@timestamp, @message`. `display` is an alias |
-| `filter <field> = 'v'` | Equality. `!=` and `==` are also accepted; `where` is an alias |
+| `filter <field> = 'v'` | Equality. `!=` and `==` are also accepted; `where` is an alias. An unquoted value must be a number and compares by value, so `n = 2` matches `2` and `2.0`. Comparisons can be joined with `or` (any case) and grouped with parentheses, for example `filter (type = 'A' or type = 'B')` |
 | `sort <field> [asc\|desc]` | `order` is an alias |
 | `dedup <field, ...>` | Keeps the first row per unique tuple, applied after sorting |
 | `limit N` | The effective cap is the smallest of this value, the `StartQuery` `limit` parameter, and `FLOCI_SERVICES_CLOUDWATCHLOGS_MAX_EVENTS_PER_QUERY` |
@@ -452,14 +483,12 @@ degrade silently, so it is worth knowing how each case behaves:
 | Input | Result |
 |---|---|
 | An unsupported command (`stats`, `parse`, ...) | The query fails. Logged as `Unsupported command: stats` |
-| A `filter` whose operator is not `=`, `!=` or `==` — for example `<`, `<=`, `>`, `>=`, `like /ERROR/` or `=~ /ERROR/` | The query fails. Logged as `Unsupported filter expression: ...`. Exception: an unquoted `=` anywhere in the expression, as in `like /a=b/`, is taken as the equality operator, so that query completes with **no** rows and no warning |
-| A `filter` combining conditions with `and` / `or` — for example `filter level = 'ERROR' and status = 200` | Only the leftmost operator is parsed; the rest of the line becomes the compared value. With `=` nothing matches and you get **no** rows; with `!=` everything matches and you get **every** row (up to the limit). `status` is `Complete` and no warning is logged |
+| A `filter` whose operator is not `=`, `!=` or `==`, for example `<`, `<=`, `>`, `>=`, `like /ERROR/` or `=~ /ERROR/` | The query fails. Logged as `Unsupported filter expression: ...` |
+| A `filter` using `and`, `not` or `\|\|`, or with text after the value, as in `filter level = 'ERROR' x` | The query fails. AWS evaluates `and` and `not`, ignores the trailing text, and rejects an unparenthesized `\|\|` at `StartQuery` with `MalformedQueryException` (use `or`) |
+| A blank query, or an empty stage as in a trailing `\|` | The query fails. AWS rejects it at `StartQuery` |
+| A `filter` with a backslash escape, a backtick-quoted field name, an expression such as `1+1` in place of the field, or an unquoted value that is not a number, such as `level = ERROR` or `n = 1+1` | The query fails. AWS interprets them |
 | A projected field that does not exist | Rendered as an empty string. No warning |
 | A `sort` direction other than `asc` / `desc` | Treated as ascending. No warning |
-
-When a `Complete` result set looks narrower or wider than intended, check the query for a
-compound `filter` or a stray `=` first: those cases produce neither a failure nor a warning. The
-only log line is the usual INFO summary, `Logs Insights query <id>: scanned ... -> <n> row(s)`.
 
 For matching events by a pattern, `FilterLogEvents` is the more predictable option today: it
 applies the filter pattern syntax (`?ERROR ?WARN`, `{ $.level = "ERROR" }`, and so on) as AWS does.
@@ -599,7 +628,27 @@ An existing native rule with the same name is not adopted by a stack.
 
 ## CloudWatch Metrics {#metrics}
 
-**Protocol:** Query (XML) and JSON 1.0 (both supported)
+**Protocol:** Query (XML), JSON 1.0, and OTLP/HTTP.
+
+`GetMetricStatistics` and `GetMetricData` exclude samples exactly at `EndTime`, so
+adjacent query windows do not count their shared boundary twice. A whole-second sample
+before a fractional-second `EndTime` remains included.
+
+The OTLP HTTP metrics endpoint accepts `POST /v1/metrics` with `application/json` or
+`application/x-protobuf`, optionally gzip-compressed. Requests are stored separately from classic
+CloudWatch metrics, retaining their OTLP resource, scope and metric data. The uncompressed request
+limit is 5 MiB and a request may contain at most 1,000 data points. Floci checks each datapoint's
+timestamp, the limit of 150 resource, scope and datapoint attributes combined, and the 40,000-byte
+metadata limit. Attribute strings are limited to 1,024 UTF-16 code units. Storage follows the
+`cloudwatchmetrics` storage configuration. Metric querying through PromQL is not yet supported, and
+the endpoint does not yet implement every CloudWatch OTLP validation rule. Invalid requests return OTLP `google.rpc.Status`
+bodies. When only part of a request is invalid, Floci returns an OTLP partial-success response and
+stores only the accepted datapoints. Empty or untyped metrics produce a partial-success message
+without increasing the rejected datapoint count.
+Stored batches expire 14 days after ingestion and are removed on a later ingestion in the same account
+and region. Cleanup runs at most once per minute for each account and region.
+With IAM enforcement enabled, requests require AWS credentials and the `cloudwatch:PutMetricData`
+permission. Bearer-token authentication for this endpoint is not implemented.
 
 JSON 1.0 `PutMetricData` accepts `Content-Encoding: gzip`, as documented in the
 [AWS API reference](https://docs.aws.amazon.com/AmazonCloudWatch/latest/APIReference/API_PutMetricData.html).
@@ -629,14 +678,33 @@ An invalid version or action, including an action outside the 2013 model such as
 streams and resource tags, returns HTTP 404 `InvalidAction`; an absent action returns
 HTTP 404 `UnknownOperationException`. IAM policies use the `cloudwatch` action prefix.
 
+With IAM enforcement on, each action is checked on the resources the AWS Service Authorization
+Reference lists for it, read from the request: an alarm by its `AlarmName` or each of its
+`AlarmNames`, as `arn:aws:cloudwatch:<region>:<account>:alarm:<name>`; a dashboard by its
+`DashboardName` or each of its `DashboardNames`, as `arn:aws:cloudwatch::<account>:dashboard/<name>`,
+with no Region; a metric stream by its `Name` or each of its `Names`, as
+`arn:aws:cloudwatch:<region>:<account>:metric-stream/<name>`; and a tag call on its `ResourceARN`.
+`PutMetricData`, `GetMetricData`, `GetMetricStatistics`, `ListMetrics`, `ListDashboards` and
+`ListMetricStreams` name no resource and are checked on `*`, as is a `DescribeAlarms` naming no alarm.
+
 JSON `PutMetricData` accepts a gzip-compressed body (`Content-Encoding: gzip`), which the AWS
 CLI, boto3 and the other SDKs that call CloudWatch over JSON send by default for any body of
 10 KiB or more. With signature validation and IAM enforcement on, the signature is checked over
-the compressed bytes as sent and IAM decides the request before the body is decompressed. As on
-the CBOR protocol, the decompressed body is limited to 10 MiB: a larger one returns HTTP 413
-`PayloadTooLargeException`, a body that cannot be decompressed returns HTTP 400
+the compressed bytes as sent and IAM decides the request before the body is decompressed. The
+decompressed body is limited to 5 MiB: a larger one returns HTTP 413
+`RequestEntityTooLargeException`, a body that cannot be decompressed returns HTTP 400
 `InvalidRequestException`, and an empty body reads as no input. Other JSON operations do not
 decompress their body.
+
+JSON and Query metric publication require finite numeric values in the inclusive range -2^360
+through 2^360. They reject incomplete `StatisticValues` sets and datums combining `Value` with
+`StatisticValues` before storing any part of the batch. Missing statistics return `MissingParameter`;
+invalid values and non-object statistics return `InvalidParameterValue`; combining scalar and
+statistics returns `InvalidParameterCombination`. JSON bodies use the corresponding SDK exception
+shape names. `Values` accepts 1 to 150 numeric samples with optional matching, nonnegative
+`Counts`; omitted counts default to one. The public JSON and Query APIs normalize these weighted
+samples without expanding their counts and reject combinations with `Value` or `StatisticValues`.
+The console's supported numeric values use the same bounds.
 
 **Endpoint:** `http://localhost:4566/`. Query: GET or POST; JSON: POST.
 
@@ -709,12 +777,39 @@ Composite alarms support boolean rules over alarm states. Request `AlarmTypes` c
 action lists are stored but not executed. Action suppression is not implemented and is
 rejected with `ValidationError`.
 
+### Metric storage {#metric-storage}
+
+Every datapoint is one entry in the metric store, which is held in memory and written out as a
+whole: about 500 bytes of JSON each in `cwmetrics.json`. Services that publish their own metrics
+fill it without a `PutMetricData` call: an active SQS queue adds 8 to 11 datapoints a minute.
+
+Floci therefore keeps at most 100,000 datapoints per account in each namespace it publishes
+itself, `AWS/SQS` and `AWS/Redshift` (`FLOCI_SERVICES_CLOUDWATCHMETRICS_MAX_STORED_DATAPOINTS`).
+Once a minute, an account holding more than that in one of those namespaces loses its oldest
+datapoints there, by datapoint timestamp and whichever metrics they belong to, until nine tenths
+of the ceiling are left. A store loaded from disk above the ceiling is cut back the same way a
+minute after startup. With the default, 50 active queues keep about four hours of history; raise
+the ceiling to keep more, up to the 15 days those datapoints are kept for, or set it to `0` to
+keep them all.
+
+Datapoints in any other namespace are never dropped for the ceiling, so what a client writes with
+`PutMetricData` under its own namespace stays.
+
 ### Metric alarm updates
 
 Updating a metric alarm preserves its current state, state reason, state timestamps and tags.
 Tags supplied to `PutMetricAlarm` apply only when creating an alarm; use `TagResource` and
 `UntagResource` to change existing tags. `SetAlarmState` requires `StateReason` and rejects
 missing or unknown state values before changing the alarm.
+
+`PutMetricAlarm` refuses an `EvaluationInterval` on an alarm configured with `MetricName` or `Metrics`
+with `InvalidParameterCombination`: the API reference allows it only with `EvaluationCriteria`, which
+Floci does not model and accepts without keeping the interval. Over Query and through CloudFormation an
+integer outside 10 to 3600, of any size, is a `ValidationError`; a value that is not an integer is an
+`InvalidParameterValue` over Query, a `SerializationException` over JSON and CBOR (as is a number beyond
+32 bits) and a failed resource through CloudFormation. AWS documents none of these answers. An
+`AWS::CloudWatch::Alarm` fails the same way on create and on update, so a stack that sets the property
+cannot change that alarm until its template drops it.
 
 `StateTransitionedTimestamp` records when an alarm's `StateValue` last changed, while
 `StateUpdatedTimestamp` moves on every state update, including one that keeps the value.
@@ -813,6 +908,9 @@ update this setting through the Query and current JSON APIs, preserving the alar
 actions, tags, and other configuration. They accept up to 100 names, ignore nonexistent
 alarms, and validate the whole request before updating any alarm. Enabling actions does not
 replay notifications for transitions that occurred while disabled.
+Query requests validate all supplied numeric member indexes, including names after a gap.
+The metric evaluator checks current stored action settings before dispatch; disabling does
+not cancel actions that have already passed that check.
 Scaling action retries remain independent.
 Failures are logged per target without blocking other targets. Notifications include a
 single-metric `Trigger`; durable retries, FIFO topics, and metric-math payloads are not covered.

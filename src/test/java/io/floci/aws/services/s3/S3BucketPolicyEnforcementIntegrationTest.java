@@ -1,0 +1,1320 @@
+package io.floci.aws.services.s3;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import io.floci.aws.core.common.AwsCanonicalUserId;
+import io.floci.aws.services.cloudtrail.CloudTrailLogWriter;
+import io.floci.aws.testing.CloudTrailLogFiles;
+import io.floci.aws.testing.EnforcementFixtures;
+import io.floci.aws.testing.PartitionCleanup;
+import io.floci.aws.testing.RestAssuredJsonUtils;
+import io.floci.aws.testing.S3IamEnforcementProfile;
+import io.floci.aws.testutil.S3RequestSigner;
+import io.quarkus.test.common.http.TestHTTPResource;
+import io.quarkus.test.junit.QuarkusTest;
+import io.quarkus.test.junit.TestProfile;
+import io.restassured.response.ExtractableResponse;
+import io.restassured.response.Response;
+import io.restassured.specification.RequestSpecification;
+import jakarta.inject.Inject;
+import org.junit.jupiter.api.BeforeAll;
+import org.junit.jupiter.api.BeforeEach;
+import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.extension.RegisterExtension;
+
+import java.io.IOException;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
+import java.util.Map;
+import java.util.UUID;
+
+import static io.floci.aws.testing.CloudTrailRequests.invokeCloudTrail;
+import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.equalTo;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+
+@QuarkusTest
+@TestProfile(S3IamEnforcementProfile.class)
+class S3BucketPolicyEnforcementIntegrationTest {
+
+    private static final String REGION = "us-east-1";
+    private static final String ACCOUNT_A = "111122223333";
+    private static final String ACCOUNT_B = "222233334444";
+    private static final S3RequestSigner ROOT_SIGNER = S3RequestSigner.signedAs("test", "test");
+
+    @TestHTTPResource("/")
+    URI endpoint;
+
+    @Inject
+    CloudTrailLogWriter writer;
+
+    @BeforeAll
+    static void configureRestAssured() {
+        RestAssuredJsonUtils.configureAwsContentTypes();
+    }
+
+    @RegisterExtension
+    final PartitionCleanup cleanup = new PartitionCleanup();
+
+    @Test
+    void crossAccountListingRequiresAndHonorsTheOwnersBucketPolicy() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String ownerName = "list-owner-" + suffix;
+        String readerName = "list-reader-" + suffix;
+        cleanup.register(() -> EnforcementFixtures.removeUser(endpoint.getPort(), auth(ACCOUNT_A, "iam"), ownerName));
+        Credentials owner = createAccountAdmin(ownerName, ACCOUNT_A);
+        cleanup.register(() -> EnforcementFixtures.removeUser(endpoint.getPort(), auth(ACCOUNT_B, "iam"), readerName));
+        Credentials reader = createAccountAdmin(readerName, ACCOUNT_B);
+        String bucket = "owner-listing-" + suffix;
+        cleanup.register(() -> EnforcementFixtures.removeBucket(endpoint.getPort(), owner.signer(), bucket));
+        createBucketAs(bucket, owner.signer());
+        try {
+            given().filter(owner.signer()).body("owned-data").put("/" + bucket + "/object.txt")
+                    .then().statusCode(200);
+            for (String query : new String[]{"", "?list-type=2"}) {
+                given().filter(reader.signer()).get("/" + bucket + query)
+                        .then().statusCode(403).body(containsString("AccessDenied"));
+            }
+            given().filter(owner.signer()).body("""
+                    {"Version":"2012-10-17","Statement":[{
+                      "Effect":"Allow","Principal":{"AWS":"%s"},"Action":"s3:ListBucket",
+                      "Resource":"arn:aws:s3:::%s"}]}
+                    """.formatted(reader.userArn(), bucket))
+                    .put("/" + bucket + "?policy").then().statusCode(200);
+            for (String query : new String[]{"", "?list-type=2"}) {
+                given().filter(reader.signer()).get("/" + bucket + query)
+                        .then().statusCode(200).body(containsString("<Key>object.txt</Key>"));
+            }
+            given().filter(owner.signer()).delete("/" + bucket + "?policy").then().statusCode(204);
+            given().filter(reader.signer()).get("/" + bucket + "?list-type=2")
+                    .then().statusCode(403).body(containsString("AccessDenied"));
+        } finally {
+            given().filter(owner.signer()).delete("/" + bucket + "/object.txt");
+            given().filter(owner.signer()).delete("/" + bucket);
+        }
+    }
+
+    /**
+     * Within the bucket's account S3 refuses with the caller, the resource and the policy that refused it, and
+     * CloudTrail records the message S3 answered.
+     */
+    @Test
+    void aRefusalNamesTheCallerTheResourceAndThePolicyThatRefusedIt() throws IOException {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        Credentials owner = adminOf("message-owner-" + suffix, ACCOUNT_A);
+        Credentials reader = userOf("message-reader-" + suffix, ACCOUNT_A);
+        String bucket = bucketWithObject("denied-message-" + suffix, owner);
+        String logs = "denied-message-logs-" + suffix;
+        cleanup.register(() -> EnforcementFixtures.removeBucket(endpoint.getPort(), owner.signer(), logs));
+        createBucketAs(logs, owner.signer());
+        String trail = "denied-message-" + suffix;
+        cloudTrail("CreateTrail", "{\"Name\":\"" + trail + "\",\"S3BucketName\":\"" + logs + "\"}");
+        cleanup.register(() -> cloudTrail("DeleteTrail", "{\"Name\":\"" + trail + "\"}"));
+        cloudTrail("PutEventSelectors", "{\"TrailName\":\"" + trail + "\",\"EventSelectors\":[{\"ReadWriteType\":"
+                + "\"All\",\"IncludeManagementEvents\":false,\"DataResources\":[{\"Type\":\"AWS::S3::Object\","
+                + "\"Values\":[\"arn:aws:s3:::" + bucket + "/\"]}]}]}");
+        cloudTrail("StartLogging", "{\"Name\":\"" + trail + "\"}");
+
+        String message = deniedMessage(reader, bucket);
+
+        assertEquals("User: " + reader.userArn() + " is not authorized to perform: s3:GetObject on resource: "
+                + "\"arn:aws:s3:::" + bucket + "/object.txt\" because no identity-based policy allows the s3:GetObject "
+                + "action", message);
+        writer.flushNow();
+        JsonNode record = CloudTrailLogFiles.records(logs, owner.signer()).stream()
+                .filter(r -> "GetObject".equals(r.path("eventName").asText()))
+                .filter(r -> "AccessDenied".equals(r.path("errorCode").asText()))
+                .findFirst().orElseThrow();
+        assertEquals(message, record.path("errorMessage").asText());
+    }
+
+    @Test
+    void aBucketPolicysExplicitDenyIsNamedAsAResourceBasedPolicys() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        Credentials owner = adminOf("deny-owner-" + suffix, ACCOUNT_A);
+        String bucket = bucketWithObject("bucket-deny-" + suffix, owner);
+        putBucketPolicyAs(bucket, """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Deny","Principal":{"AWS":"%s"},
+                  "Action":"s3:GetObject","Resource":"arn:aws:s3:::%s/*"}]}
+                """.formatted(owner.userArn(), bucket), owner.signer());
+
+        assertEquals("User: " + owner.userArn() + " is not authorized to perform: s3:GetObject on resource: "
+                + "\"arn:aws:s3:::" + bucket + "/object.txt\" with an explicit deny in a resource-based policy",
+                deniedMessage(owner, bucket));
+    }
+
+    @Test
+    void anIdentityPolicysExplicitDenyIsNamedAsAnIdentityBasedPolicys() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        Credentials owner = adminOf("identity-owner-" + suffix, ACCOUNT_A);
+        String callerName = "identity-denied-" + suffix;
+        Credentials caller = adminOf(callerName, ACCOUNT_A);
+        putUserPolicy(callerName, "DenyRead", """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Deny","Action":"s3:GetObject","Resource":"*"}]}""",
+                ACCOUNT_A);
+        String bucket = bucketWithObject("identity-deny-" + suffix, owner);
+        String refusal = "User: " + caller.userArn() + " is not authorized to perform: s3:GetObject on resource: "
+                + "\"arn:aws:s3:::" + bucket + "/object.txt\" with an explicit deny in an identity-based policy";
+
+        assertEquals(refusal, deniedMessage(caller, bucket));
+        // A copy's source is checked apart from the request, and refused with the same message.
+        assertEquals(refusal, given().filter(caller.signer()).header("x-amz-copy-source", "/" + bucket + "/object.txt")
+                .put("/" + bucket + "/copy.txt").then().statusCode(403).extract().xmlPath().getString("Error.Message"));
+    }
+
+    /** "Cross-account requests outside of the same organization return a generic Access Denied message." */
+    @Test
+    void aCallerFromAnotherAccountIsToldAccessDeniedAlone() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        Credentials owner = adminOf("cross-owner-" + suffix, ACCOUNT_A);
+        Credentials reader = adminOf("cross-reader-" + suffix, ACCOUNT_B);
+        String bucket = bucketWithObject("cross-denied-" + suffix, owner);
+
+        assertEquals("Access Denied", deniedMessage(reader, bucket));
+    }
+
+    /** An account administrator for S3, removed after the test. */
+    private Credentials adminOf(String userName, String accountId) {
+        cleanup.register(() -> EnforcementFixtures.removeUser(endpoint.getPort(), auth(accountId, "iam"), userName));
+        return createAccountAdmin(userName, accountId);
+    }
+
+    /** A user with no policy, removed after the test. */
+    private Credentials userOf(String userName, String accountId) {
+        cleanup.register(() -> EnforcementFixtures.removeUser(endpoint.getPort(), auth(accountId, "iam"), userName));
+        return createUser(userName, accountId);
+    }
+
+    /** {@code bucket}, owned by {@code owner} and holding {@code object.txt}, removed after the test. */
+    private String bucketWithObject(String bucket, Credentials owner) {
+        cleanup.register(() -> EnforcementFixtures.removeBucket(endpoint.getPort(), owner.signer(), bucket));
+        createBucketAs(bucket, owner.signer());
+        putObjectAs(bucket, "object.txt", "data", owner.signer());
+        return bucket;
+    }
+
+    /** The message S3 refuses {@code caller}'s read of {@code object.txt} with. */
+    private static String deniedMessage(Credentials caller, String bucket) {
+        return given().filter(caller.signer()).get("/" + bucket + "/object.txt")
+                .then().statusCode(403).extract().xmlPath().getString("Error.Message");
+    }
+
+    private static void cloudTrail(String action, String body) {
+        invokeCloudTrail(auth(ACCOUNT_A, "cloudtrail"), action, body).then().statusCode(200);
+    }
+
+    record Credentials(String accessKeyId, String secretAccessKey, String userArn) {
+        S3RequestSigner signer() {
+            return S3RequestSigner.signedAs(accessKeyId, secretAccessKey);
+        }
+    }
+
+    private static String auth(String accessKeyId, String service) {
+        return "AWS4-HMAC-SHA256 Credential=" + accessKeyId + "/20260629/" + REGION + "/" + service
+                + "/aws4_request, SignedHeaders=host, Signature=abc";
+    }
+
+    private static Credentials createUser(String userName, String accountId) {
+        given()
+                .formParam("Action", "CreateUser")
+                .formParam("UserName", userName)
+                .header("Authorization", auth(accountId, "iam"))
+        .when()
+                .post("/")
+        .then()
+                .statusCode(200);
+
+        ExtractableResponse<Response> response = given()
+                .formParam("Action", "CreateAccessKey")
+                .formParam("UserName", userName)
+                .header("Authorization", auth(accountId, "iam"))
+        .when()
+                .post("/")
+        .then()
+                .statusCode(200)
+                .extract();
+
+        String accessKeyId = response.path("CreateAccessKeyResponse.CreateAccessKeyResult.AccessKey.AccessKeyId");
+        String secretAccessKey = response.path("CreateAccessKeyResponse.CreateAccessKeyResult.AccessKey.SecretAccessKey");
+        String userArn = "arn:aws:iam::" + accountId + ":user/" + userName;
+        return new Credentials(accessKeyId, secretAccessKey, userArn);
+    }
+
+    private static Credentials createUserWithCredentials(String userName) {
+        return createUser(userName, "000000000000");
+    }
+
+    private static Credentials createAccountAdmin(String userName, String accountId) {
+        Credentials credentials = createUser(userName, accountId);
+        putUserPolicy(userName, "S3Admin", """
+                {
+                  "Version": "2012-10-17",
+                  "Statement": [
+                    {
+                      "Effect": "Allow",
+                      "Action": "s3:*",
+                      "Resource": "*"
+                    }
+                  ]
+                }""", accountId);
+        return credentials;
+    }
+
+    private static void putUserPolicy(String userName, String policyName, String policyDocument, String accountId) {
+        given()
+                .formParam("Action", "PutUserPolicy")
+                .formParam("UserName", userName)
+                .formParam("PolicyName", policyName)
+                .formParam("PolicyDocument", policyDocument)
+                .header("Authorization", auth(accountId, "iam"))
+        .when()
+                .post("/")
+        .then()
+                .statusCode(200);
+    }
+
+    private static String createPolicy(String policyName, String policyDocument, String accountId) {
+        ExtractableResponse<Response> response = given()
+                .formParam("Action", "CreatePolicy")
+                .formParam("PolicyName", policyName)
+                .formParam("PolicyDocument", policyDocument)
+                .header("Authorization", auth(accountId, "iam"))
+        .when()
+                .post("/")
+        .then()
+                .statusCode(200)
+                .extract();
+        return response.path("CreatePolicyResponse.CreatePolicyResult.Policy.Arn");
+    }
+
+    private static void putUserPermissionsBoundary(String userName, String boundaryArn, String accountId) {
+        given()
+                .formParam("Action", "PutUserPermissionsBoundary")
+                .formParam("UserName", userName)
+                .formParam("PermissionsBoundary", boundaryArn)
+                .header("Authorization", auth(accountId, "iam"))
+        .when()
+                .post("/")
+        .then()
+                .statusCode(200);
+    }
+
+    private static void createBucket(String bucketName) {
+        createBucketAs(bucketName, ROOT_SIGNER);
+    }
+
+    private static void createBucketAs(String bucketName, S3RequestSigner signer) {
+        given()
+                .filter(signer)
+        .when()
+                .put("/" + bucketName)
+        .then()
+                .statusCode(200);
+    }
+
+    private static void putObject(String bucketName, String key, String content) {
+        putObjectAs(bucketName, key, content, ROOT_SIGNER);
+    }
+
+    private static void putObjectAs(String bucketName, String key, String content, S3RequestSigner signer) {
+        given()
+                .filter(signer)
+                .contentType("text/plain")
+                .body(content)
+        .when()
+                .put("/" + bucketName + "/" + key)
+        .then()
+                .statusCode(200);
+    }
+
+    private static void putBucketPolicy(String bucketName, String policyDocument) {
+        putBucketPolicyAs(bucketName, policyDocument, ROOT_SIGNER);
+    }
+
+    private static void putBucketPolicyAs(String bucketName, String policyDocument, S3RequestSigner signer) {
+        given()
+                .filter(signer)
+                .contentType("application/json")
+                .body(policyDocument)
+        .when()
+                .put("/" + bucketName + "?policy")
+        .then()
+            .statusCode(200);
+    }
+
+    @Test
+    void signedIamUserMatchesPrincipalIsAwsServiceFalseInIdentityPolicy() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String bucket = "principal-service-" + suffix;
+        String userName = "principal-service-" + suffix;
+        createBucket(bucket);
+        putObject(bucket, "data.txt", "data");
+
+        Credentials user = createUserWithCredentials(userName);
+        putUserPolicy(userName, "ReadWhenIamPrincipal", """
+                {
+                  "Version": "2012-10-17",
+                  "Statement": {
+                    "Effect": "Allow",
+                    "Action": "s3:GetObject",
+                    "Resource": "arn:aws:s3:::%s/data.txt",
+                    "Condition": {"Bool": {"aws:PrincipalIsAWSService": "false"}}
+                  }
+                }""".formatted(bucket), "000000000000");
+
+        given()
+                .filter(user.signer())
+        .when()
+                .get("/" + bucket + "/data.txt")
+        .then()
+                .statusCode(200)
+                .body(equalTo("data"));
+    }
+
+    @Test
+    void aRoleSessionsPrincipalArnInABucketPolicyIsItsRolesArn() {
+        // S3 evaluates the bucket policy itself (s3.enforce-auth, and the CopyObject source check),
+        // and there aws:PrincipalArn is the ARN of the role that was assumed, not the session's: a
+        // Deny keyed on the role's ARN fires, one keyed on the session ARN does not.
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String bucket = "bp-role-session-" + suffix;
+        String role = "bp-role-" + suffix;
+        String roleArn = "arn:aws:iam::000000000000:role/team/" + role;
+        createBucket(bucket);
+        putObject(bucket, "denied/x.txt", "denied");
+        putObject(bucket, "session/x.txt", "session");
+        given().formParam("Action", "CreateRole").formParam("RoleName", role).formParam("Path", "/team/")
+                .formParam("AssumeRolePolicyDocument", """
+                        {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+                          "Principal":{"AWS":"arn:aws:iam::000000000000:root"},"Action":"sts:AssumeRole"}]}""")
+                .header("Authorization", auth("000000000000", "iam")).when().post("/").then().statusCode(200);
+        given().formParam("Action", "PutRolePolicy").formParam("RoleName", role).formParam("PolicyName", "s3")
+                .formParam("PolicyDocument", """
+                        {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}""")
+                .header("Authorization", auth("000000000000", "iam")).when().post("/").then().statusCode(200);
+        ExtractableResponse<Response> assumed = given().formParam("Action", "AssumeRole")
+                .formParam("RoleArn", roleArn).formParam("RoleSessionName", "sx")
+                .header("Authorization", auth("000000000000", "sts")).when().post("/")
+                .then().statusCode(200).extract();
+        String sessionArn = assumed.path("AssumeRoleResponse.AssumeRoleResult.AssumedRoleUser.Arn");
+        S3RequestSigner session = S3RequestSigner.signedAs(
+                assumed.path("AssumeRoleResponse.AssumeRoleResult.Credentials.AccessKeyId"),
+                assumed.path("AssumeRoleResponse.AssumeRoleResult.Credentials.SecretAccessKey"),
+                assumed.path("AssumeRoleResponse.AssumeRoleResult.Credentials.SessionToken"));
+        putBucketPolicy(bucket, """
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::%1$s/denied/*",
+                   "Condition":{"ArnEquals":{"aws:PrincipalArn":"%2$s"}}},
+                  {"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::%1$s/session/*",
+                   "Condition":{"ArnEquals":{"aws:PrincipalArn":"%3$s"}}}]}""".formatted(bucket, roleArn, sessionArn));
+
+        given().filter(session).when().get("/" + bucket + "/session/x.txt")
+                .then().statusCode(200).body(equalTo("session"));
+        given().filter(session).when().get("/" + bucket + "/denied/x.txt")
+                .then().statusCode(403);
+        given().filter(session).header("x-amz-copy-source", "/" + bucket + "/session/x.txt")
+                .when().put("/" + bucket + "/copied-session.txt")
+                .then().statusCode(200);
+        given().filter(session).header("x-amz-copy-source", "/" + bucket + "/denied/x.txt")
+                .when().put("/" + bucket + "/copied-denied.txt")
+                .then().statusCode(403);
+    }
+
+    @Test
+    void aBucketPolicyReadsTheCallersPrincipalKeys() {
+        // S3 evaluates the bucket policy itself under s3.enforce-auth, so the keys that say who is
+        // calling belong on the context it builds too: an inverted Condition on one of them matches
+        // a caller the key is absent for, which fires a Deny the policy meant to leave alone. Each
+        // key is read through the principal the guide publishes it for, aws:username being the one
+        // an IAM user has and a role session does not.
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String bucket = "bp-principal-keys-" + suffix;
+        String userName = "bp-keys-user-" + suffix;
+        createBucket(bucket);
+        putObject(bucket, "userid/x.txt", "userid");
+        putObject(bucket, "type/x.txt", "type");
+        putObject(bucket, "username/x.txt", "username");
+        S3RequestSigner session = sessionOfRoleUnderTeamPath("bp-keys-role-" + suffix, "000000000000");
+        S3RequestSigner user = createAccountAdmin(userName, "000000000000").signer();
+        putBucketPolicy(bucket, """
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::%1$s/userid/*",
+                   "Condition":{"StringNotLike":{"aws:userid":"AROA*:sx"}}},
+                  {"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::%1$s/type/*",
+                   "Condition":{"StringNotEquals":{"aws:PrincipalType":"AssumedRole"}}},
+                  {"Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::%1$s/username/*",
+                   "Condition":{"StringNotEquals":{"aws:username":"%2$s"}}}]}""".formatted(bucket, userName));
+
+        given().filter(session).when().get("/" + bucket + "/userid/x.txt")
+                .then().statusCode(200).body(equalTo("userid"));
+        given().filter(session).when().get("/" + bucket + "/type/x.txt")
+                .then().statusCode(200).body(equalTo("type"));
+        given().filter(user).when().get("/" + bucket + "/username/x.txt")
+                .then().statusCode(200).body(equalTo("username"));
+    }
+
+    @Test
+    void aBucketPolicyNamingTheCallersAccountGrantsACrossAccountCopy() {
+        // The CopyObject source check matched a bucket policy's Principal against the caller's ARN as
+        // a string, so a grant to the caller's account let it read the object but not copy it.
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String source = "bp-account-" + suffix;
+        S3RequestSigner owner = sourceBucketInAccountA(source);
+        S3RequestSigner reader = createAccountAdmin("reader-" + suffix, ACCOUNT_B).signer();
+        String destination = "bp-account-dst-" + suffix;
+        createBucketAs(destination, reader);
+
+        allowGetObject(owner, source, "{\"AWS\":\"" + ACCOUNT_B + "\"}");
+
+        assertReadAndCopy(reader, source, destination, 200);
+    }
+
+    @Test
+    void aBucketPolicyNamingARoleWithAPathGrantsItsSessions() {
+        // S3's own checks matched a role session through a role ARN rebuilt from the session ARN,
+        // which drops the role's path, so a grant naming role/team/<name> never reached it.
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String source = "bp-path-" + suffix;
+        S3RequestSigner owner = sourceBucketInAccountA(source);
+        S3RequestSigner session = sessionOfRoleUnderTeamPath("bp-path-role-" + suffix, ACCOUNT_B);
+        String destination = "bp-path-dst-" + suffix;
+        createBucketAs(destination, createAccountAdmin("dst-owner-" + suffix, ACCOUNT_B).signer());
+
+        allowGetObject(owner, source, "{\"AWS\":\"arn:aws:iam::" + ACCOUNT_B + ":role/team/bp-path-role-" + suffix + "\"}");
+
+        assertReadAndCopy(session, source, destination, 200);
+    }
+
+    @Test
+    void aBucketPolicyNamingAnAccountByItsCanonicalIdGrantsThatAccount() {
+        // A bucket policy can name an account by its S3 canonical user ID (IAM User Guide, "AWS
+        // account principals"): the 64-hex value S3 reports as owner, which Floci derives from
+        // the account. The account ID itself still matches, for policies written when Floci
+        // reported the account as the canonical ID.
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String source = "bp-canonical-" + suffix;
+        S3RequestSigner owner = sourceBucketInAccountA(source);
+        S3RequestSigner reader = createAccountAdmin("reader-" + suffix, ACCOUNT_B).signer();
+        String destination = "bp-canonical-dst-" + suffix;
+        createBucketAs(destination, reader);
+
+        allowGetObject(owner, source, "{\"CanonicalUser\":\"999988887777\"}");
+        assertReadAndCopy(reader, source, destination, 403);
+
+        allowGetObject(owner, source, "{\"CanonicalUser\":\"" + ACCOUNT_B + "\"}");
+        assertReadAndCopy(reader, source, destination, 200);
+
+        allowGetObject(owner, source,
+                "{\"CanonicalUser\":\"" + AwsCanonicalUserId.forAccount(ACCOUNT_B) + "\"}");
+        assertReadAndCopy(reader, source, destination, 200);
+
+        allowGetObject(owner, source,
+                "{\"CanonicalUser\":\"" + AwsCanonicalUserId.forAccount(ACCOUNT_A) + "\"}");
+        assertReadAndCopy(reader, source, destination, 403);
+    }
+
+    @Test
+    void aBucketPolicyReadsTheRequestTime() {
+        // aws:CurrentTime and aws:EpochTime are "always included in the request context", so the
+        // context S3 builds for its own bucket-policy check carries them too. A cross-account read
+        // needs that check's Allow, so a grant conditioned on the request time is refused when
+        // they are missing there.
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String source = "bp-time-" + suffix;
+        S3RequestSigner owner = sourceBucketInAccountA(source);
+        putObjectAs(source, "current/o.txt", "current", owner);
+        putObjectAs(source, "epoch/o.txt", "epoch", owner);
+        S3RequestSigner reader = createAccountAdmin("reader-" + suffix, ACCOUNT_B).signer();
+
+        putBucketPolicyAs(source, requestTimeGrant(source, "DateLessThan", "NumericLessThan"), owner);
+        given().filter(reader).when().get("/" + source + "/current/o.txt").then().statusCode(403);
+        given().filter(reader).when().get("/" + source + "/epoch/o.txt").then().statusCode(403);
+
+        putBucketPolicyAs(source, requestTimeGrant(source, "DateGreaterThan", "NumericGreaterThan"), owner);
+        given().filter(reader).when().get("/" + source + "/current/o.txt")
+                .then().statusCode(200).body(equalTo("current"));
+        given().filter(reader).when().get("/" + source + "/epoch/o.txt")
+                .then().statusCode(200).body(equalTo("epoch"));
+    }
+
+    /**
+     * Grants account B {@code current/*} on a {@code dateOperator} condition on
+     * {@code aws:CurrentTime}, and {@code epoch/*} on a {@code numericOperator} one on
+     * {@code aws:EpochTime}, both against January 1, 2020.
+     */
+    private static String requestTimeGrant(String bucket, String dateOperator, String numericOperator) {
+        return """
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Principal":{"AWS":"%1$s"},"Action":"s3:GetObject",
+                   "Resource":"arn:aws:s3:::%2$s/current/*",
+                   "Condition":{"%3$s":{"aws:CurrentTime":"2020-01-01T00:00:00Z"}}},
+                  {"Effect":"Allow","Principal":{"AWS":"%1$s"},"Action":"s3:GetObject",
+                   "Resource":"arn:aws:s3:::%2$s/epoch/*",
+                   "Condition":{"%4$s":{"aws:EpochTime":"1577836800"}}}]}"""
+                .formatted(ACCOUNT_B, bucket, dateOperator, numericOperator);
+    }
+
+    /** Creates a bucket in account A holding {@code o.txt}, and returns its owner, an account-A administrator. */
+    private static S3RequestSigner sourceBucketInAccountA(String bucket) {
+        S3RequestSigner owner = createAccountAdmin("owner-" + bucket, ACCOUNT_A).signer();
+        createBucketAs(bucket, owner);
+        putObjectAs(bucket, "o.txt", "payload", owner);
+        return owner;
+    }
+
+    private static void allowGetObject(S3RequestSigner owner, String bucket, String principal) {
+        putBucketPolicyAs(bucket, """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":%s,
+                  "Action":"s3:GetObject","Resource":"arn:aws:s3:::%s/*"}]}""".formatted(principal, bucket), owner);
+    }
+
+    private static void assertReadAndCopy(S3RequestSigner caller, String source, String destination, int status) {
+        given().filter(caller).when().get("/" + source + "/o.txt").then().statusCode(status);
+        given().filter(caller).header("x-amz-copy-source", "/" + source + "/o.txt")
+                .when().put("/" + destination + "/" + UUID.randomUUID() + ".txt").then().statusCode(status);
+    }
+
+    /** A session of a role under the {@code /team/} path, allowed s3:* by its own policy. */
+    private static S3RequestSigner sessionOfRoleUnderTeamPath(String role, String accountId) {
+        given().formParam("Action", "CreateRole").formParam("RoleName", role).formParam("Path", "/team/")
+                .formParam("AssumeRolePolicyDocument", """
+                        {"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+                          "Principal":{"AWS":"arn:aws:iam::%s:root"},"Action":"sts:AssumeRole"}]}""".formatted(accountId))
+                .header("Authorization", auth(accountId, "iam")).when().post("/").then().statusCode(200);
+        given().formParam("Action", "PutRolePolicy").formParam("RoleName", role).formParam("PolicyName", "s3")
+                .formParam("PolicyDocument", """
+                        {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}""")
+                .header("Authorization", auth(accountId, "iam")).when().post("/").then().statusCode(200);
+        ExtractableResponse<Response> assumed = given().formParam("Action", "AssumeRole")
+                .formParam("RoleArn", "arn:aws:iam::" + accountId + ":role/team/" + role)
+                .formParam("RoleSessionName", "sx")
+                .header("Authorization", auth(accountId, "sts")).when().post("/")
+                .then().statusCode(200).extract();
+        return S3RequestSigner.signedAs(
+                assumed.path("AssumeRoleResponse.AssumeRoleResult.Credentials.AccessKeyId"),
+                assumed.path("AssumeRoleResponse.AssumeRoleResult.Credentials.SecretAccessKey"),
+                assumed.path("AssumeRoleResponse.AssumeRoleResult.Credentials.SessionToken"));
+    }
+
+    @Test
+    void enforcesBucketPolicyForSignedCallers() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String bucket = "bp-enforce-" + suffix;
+        String key = "secret.txt";
+        String content = "classified data";
+
+        createBucket(bucket);
+        putObject(bucket, key, content);
+
+        Credentials alice = createUserWithCredentials("alice-" + suffix);
+        Credentials bob = createUserWithCredentials("bob-" + suffix);
+        Credentials charlie = createUserWithCredentials("charlie-" + suffix);
+
+        // Policy allows Alice on object, Bob on bucket, explicitly denies Charlie on object
+        String policy = """
+                {
+                  "Version": "2012-10-17",
+                  "Statement": [
+                    {
+                      "Effect": "Allow",
+                      "Principal": {"AWS": "%s"},
+                      "Action": "s3:GetObject",
+                      "Resource": "arn:aws:s3:::%s/*"
+                    },
+                    {
+                      "Effect": "Allow",
+                      "Principal": {"AWS": "%s"},
+                      "Action": "s3:ListBucket",
+                      "Resource": "arn:aws:s3:::%s"
+                    },
+                    {
+                      "Effect": "Deny",
+                      "Principal": {"AWS": "%s"},
+                      "Action": "s3:GetObject",
+                      "Resource": "arn:aws:s3:::%s/*"
+                    }
+                  ]
+                }""".formatted(alice.userArn(), bucket, bob.userArn(), bucket, charlie.userArn(), bucket);
+        putBucketPolicy(bucket, policy);
+
+        // 1. Matching caller gets 200
+        given()
+                .filter(S3RequestSigner.signedAs(alice.accessKeyId(), alice.secretAccessKey()))
+        .when()
+                .get("/" + bucket + "/" + key)
+        .then()
+                .statusCode(200)
+                .body(equalTo(content));
+
+        // 2. Mismatched caller gets wire-correct 403 XML body with Resource element
+        given()
+                .filter(S3RequestSigner.signedAs(bob.accessKeyId(), bob.secretAccessKey()))
+        .when()
+                .get("/" + bucket + "/" + key)
+        .then()
+                .statusCode(403)
+                .body(containsString("<Code>AccessDenied</Code>"))
+                .body(containsString("<Resource>/" + bucket + "/" + key + "</Resource>"))
+                .body(containsString("<RequestId>"));
+
+        // 3. Explicit deny wins
+        given()
+                .filter(S3RequestSigner.signedAs(charlie.accessKeyId(), charlie.secretAccessKey()))
+        .when()
+                .get("/" + bucket + "/" + key)
+        .then()
+                .statusCode(403)
+                .body(containsString("<Code>AccessDenied</Code>"))
+                .body(containsString("<Resource>/" + bucket + "/" + key + "</Resource>"));
+
+        // 4. Bucket-level action authorization and resource formatting
+        given()
+                .filter(S3RequestSigner.signedAs(bob.accessKeyId(), bob.secretAccessKey()))
+        .when()
+                .get("/" + bucket)
+        .then()
+                .statusCode(200);
+
+        given()
+                .filter(S3RequestSigner.signedAs(alice.accessKeyId(), alice.secretAccessKey()))
+        .when()
+                .get("/" + bucket)
+        .then()
+                .statusCode(403)
+                .body(containsString("<Code>AccessDenied</Code>"))
+                .body(containsString("<Resource>/" + bucket + "</Resource>"));
+    }
+
+    @Test
+    void crossAccountPrimaryRequestRequiresBothIdentityAndBucketPolicyAllows() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String bucket = "cross-bucket-" + suffix;
+        String key = "cross-test.txt";
+        String content = "cross-account data";
+
+        Credentials accountAAdmin = createAccountAdmin("admin-a-" + suffix, ACCOUNT_A);
+        createBucketAs(bucket, accountAAdmin.signer());
+        putObjectAs(bucket, key, content, accountAAdmin.signer());
+
+        Credentials userB = createUser("user-b-" + suffix, ACCOUNT_B);
+
+        // Account A bucket policy allows User B to GetObject
+        String bucketPolicy = """
+                {
+                  "Version": "2012-10-17",
+                  "Statement": [
+                    {
+                      "Effect": "Allow",
+                      "Principal": {"AWS": "%s"},
+                      "Action": "s3:GetObject",
+                      "Resource": "arn:aws:s3:::%s/*"
+                    }
+                  ]
+                }""".formatted(userB.userArn(), bucket);
+        putBucketPolicyAs(bucket, bucketPolicy, accountAAdmin.signer());
+
+        // 1. User B has bucket policy allow but NO identity policy allow -> 403 AccessDenied with Resource
+        given()
+                .filter(userB.signer())
+        .when()
+                .get("/" + bucket + "/" + key)
+        .then()
+                .statusCode(403)
+                .body(containsString("<Code>AccessDenied</Code>"))
+                .body(containsString("<Resource>/" + bucket + "/" + key + "</Resource>"));
+
+        // 2. Grant identity policy to User B -> now both allow -> 200 OK
+        putUserPolicy(
+                "user-b-" + suffix,
+                "ReadCrossBucket",
+                """
+                {
+                  "Version": "2012-10-17",
+                  "Statement": [
+                    {
+                      "Effect": "Allow",
+                      "Action": "s3:GetObject",
+                      "Resource": "arn:aws:s3:::%s/*"
+                    }
+                  ]
+                }""".formatted(bucket),
+                ACCOUNT_B);
+
+        given()
+                .filter(userB.signer())
+        .when()
+                .get("/" + bucket + "/" + key)
+        .then()
+                .statusCode(200)
+                .body(equalTo(content));
+    }
+
+    @Test
+    void bucketOwnerPrivateMultipartCanBeCompletedByAuthorizedOtherAccount() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String bucket = "cross-private-multipart-" + suffix;
+        String key = "object.txt";
+        String body = "completed by another account";
+
+        Credentials owner = createAccountAdmin("private-owner-" + suffix, ACCOUNT_A);
+        createBucketAs(bucket, owner.signer());
+        Credentials writer = createUser("private-writer-" + suffix, ACCOUNT_B);
+        putUserPolicy("private-writer-" + suffix, "WriteCrossBucket", """
+                {
+                  "Version": "2012-10-17",
+                  "Statement": [{
+                    "Effect": "Allow",
+                    "Action": "s3:PutObject",
+                    "Resource": "arn:aws:s3:::%s/*"
+                  }]
+                }""".formatted(bucket), ACCOUNT_B);
+        putBucketPolicyAs(bucket, """
+                {
+                  "Version": "2012-10-17",
+                  "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": {"AWS": "%s"},
+                    "Action": "s3:PutObject",
+                    "Resource": "arn:aws:s3:::%s/*"
+                  }]
+                }""".formatted(writer.userArn(), bucket), owner.signer());
+
+        String uploadId = given()
+                .filter(owner.signer())
+                .header("x-amz-acl", "private")
+        .when()
+                .post("/" + bucket + "/" + key + "?uploads")
+        .then()
+                .statusCode(200)
+                .extract().xmlPath().getString("InitiateMultipartUploadResult.UploadId");
+        String partETag = given()
+                .filter(owner.signer())
+                .body(body)
+        .when()
+                .put("/" + bucket + "/" + key + "?partNumber=1&uploadId=" + uploadId)
+        .then()
+                .statusCode(200)
+                .extract().header("ETag");
+
+        given()
+                .filter(writer.signer())
+                .contentType("application/xml")
+                .body("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"
+                        + partETag + "</ETag></Part></CompleteMultipartUpload>")
+        .when()
+                .post("/" + bucket + "/" + key + "?uploadId=" + uploadId)
+        .then()
+                .statusCode(200);
+        given()
+                .filter(owner.signer())
+        .when()
+                .get("/" + bucket + "/" + key)
+        .then()
+                .statusCode(200)
+                .body(equalTo(body));
+    }
+
+    @Test
+    void sameAccountDirectUserBypassesBoundaryOnPrimaryRequest() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String bucket = "boundary-bucket-" + suffix;
+        String key = "data.txt";
+        String content = "boundary bypass data";
+
+        createBucket(bucket);
+        putObject(bucket, key, content);
+
+        // Create boundary policy that only allows dynamodb:* (blocks s3:GetObject)
+        String boundaryPolicy = """
+                {
+                  "Version": "2012-10-17",
+                  "Statement": [
+                    {
+                      "Effect": "Allow",
+                      "Action": "dynamodb:*",
+                      "Resource": "*"
+                    }
+                  ]
+                }""";
+        String boundaryArn = createPolicy("boundary-" + suffix, boundaryPolicy, "000000000000");
+
+        String userName = "alice-bnd-" + suffix;
+        Credentials alice = createUserWithCredentials(userName);
+        putUserPermissionsBoundary(userName, boundaryArn, "000000000000");
+
+        // Identity policy allows s3:GetObject (would be blocked by boundary alone)
+        putUserPolicy(userName, "S3Read", """
+                {
+                  "Version": "2012-10-17",
+                  "Statement": [
+                    {
+                      "Effect": "Allow",
+                      "Action": "s3:GetObject",
+                      "Resource": "arn:aws:s3:::%s/*"
+                    }
+                  ]
+                }""".formatted(bucket), "000000000000");
+
+        // 1. Bucket policy grants to account root: boundary is NOT bypassed -> 403
+        String accountGrantPolicy = """
+                {
+                  "Version": "2012-10-17",
+                  "Statement": [
+                    {
+                      "Effect": "Allow",
+                      "Principal": {"AWS": "arn:aws:iam::000000000000:root"},
+                      "Action": "s3:GetObject",
+                      "Resource": "arn:aws:s3:::%s/*"
+                    }
+                  ]
+                }""".formatted(bucket);
+        putBucketPolicy(bucket, accountGrantPolicy);
+
+        given()
+                .filter(alice.signer())
+        .when()
+                .get("/" + bucket + "/" + key)
+        .then()
+                .statusCode(403)
+                .body(containsString("<Code>AccessDenied</Code>"))
+                .body(containsString("<Resource>/" + bucket + "/" + key + "</Resource>"));
+
+        // 2. Bucket policy directly names Alice's user ARN: boundary IS bypassed -> 200
+        String directUserPolicy = """
+                {
+                  "Version": "2012-10-17",
+                  "Statement": [
+                    {
+                      "Effect": "Allow",
+                      "Principal": {"AWS": "%s"},
+                      "Action": "s3:GetObject",
+                      "Resource": "arn:aws:s3:::%s/*"
+                    }
+                  ]
+                }""".formatted(alice.userArn(), bucket);
+        putBucketPolicy(bucket, directUserPolicy);
+
+        given()
+                .filter(alice.signer())
+        .when()
+                .get("/" + bucket + "/" + key)
+        .then()
+                .statusCode(200)
+                .body(equalTo(content));
+    }
+
+    @Test
+    void sameAccountPrimaryRequestNeedsOnlyOneAllowAcrossBothPolicies() {
+        String suffix = UUID.randomUUID().toString().substring(0, 8);
+        String bucket = "bp-either-" + suffix;
+
+        createBucket(bucket);
+
+        String developerName = "dev-" + suffix;
+        Credentials developer = createUserWithCredentials(developerName);
+        String writerName = "writer-" + suffix;
+        Credentials writer = createUserWithCredentials(writerName);
+        putUserPolicy(writerName, "WriteBucket", """
+                {
+                  "Version": "2012-10-17",
+                  "Statement": [
+                    {
+                      "Effect": "Allow",
+                      "Action": "s3:PutObject",
+                      "Resource": "arn:aws:s3:::%s/*"
+                    }
+                  ]
+                }""".formatted(bucket), "000000000000");
+
+        putBucketPolicy(bucket, """
+                {
+                  "Version": "2012-10-17",
+                  "Statement": [
+                    {
+                      "Effect": "Allow",
+                      "Principal": {"AWS": "%s"},
+                      "Action": ["s3:GetObject", "s3:PutObject"],
+                      "Resource": "arn:aws:s3:::%s/*"
+                    }
+                  ]
+                }""".formatted(developer.userArn(), bucket));
+
+        // 1. Bucket policy alone grants the developer, who has no identity policy at all
+        given()
+                .filter(developer.signer())
+                .contentType("text/plain")
+                .body("bucket policy only")
+        .when()
+                .put("/" + bucket + "/from-bucket-policy.txt")
+        .then()
+                .statusCode(200);
+
+        // 2. Identity policy alone grants the writer, whom the bucket policy never names
+        given()
+                .filter(writer.signer())
+                .contentType("text/plain")
+                .body("identity policy only")
+        .when()
+                .put("/" + bucket + "/from-identity-policy.txt")
+        .then()
+                .statusCode(200);
+
+        // 3. An explicit deny in the bucket policy overrides the writer's identity allow
+        putBucketPolicy(bucket, """
+                {
+                  "Version": "2012-10-17",
+                  "Statement": [
+                    {
+                      "Effect": "Allow",
+                      "Principal": {"AWS": "%s"},
+                      "Action": ["s3:GetObject", "s3:PutObject"],
+                      "Resource": "arn:aws:s3:::%s/*"
+                    },
+                    {
+                      "Effect": "Deny",
+                      "Principal": {"AWS": "%s"},
+                      "Action": "s3:PutObject",
+                      "Resource": "arn:aws:s3:::%s/*"
+                    }
+                  ]
+                }""".formatted(developer.userArn(), bucket, writer.userArn(), bucket));
+
+        given()
+                .filter(writer.signer())
+                .contentType("text/plain")
+                .body("denied by bucket policy")
+        .when()
+                .put("/" + bucket + "/denied-by-bucket-policy.txt")
+        .then()
+                .statusCode(403)
+                .body(containsString("<Code>AccessDenied</Code>"));
+
+        // 4. An explicit deny in the identity policy overrides the developer's bucket-policy allow
+        putUserPolicy(developerName, "DenyWrite", """
+                {
+                  "Version": "2012-10-17",
+                  "Statement": [
+                    {
+                      "Effect": "Deny",
+                      "Action": "s3:PutObject",
+                      "Resource": "arn:aws:s3:::%s/*"
+                    }
+                  ]
+                }""".formatted(bucket), "000000000000");
+
+        given()
+                .filter(developer.signer())
+                .contentType("text/plain")
+                .body("denied by identity policy")
+        .when()
+                .put("/" + bucket + "/denied-by-identity-policy.txt")
+        .then()
+                .statusCode(403)
+                .body(containsString("<Code>AccessDenied</Code>"));
+    }
+
+    private String bucketKey;
+    private String otherKey;
+
+    @BeforeEach
+    void createNativeEncryptionKeys() {
+        bucketKey = createNativeEncryptionKey();
+        otherKey = createNativeEncryptionKey();
+    }
+
+    private String createNativeEncryptionKey() {
+        String key = given().header("Authorization", auth(ACCOUNT_A, "kms"))
+                .contentType("application/x-amz-json-1.1").header("X-Amz-Target", "TrentService.CreateKey")
+                .body("{}".getBytes(StandardCharsets.UTF_8)).post("/").then().statusCode(200).extract().path("KeyMetadata.Arn");
+        cleanup.register(() -> given().header("Authorization", auth(ACCOUNT_A, "kms"))
+                .contentType("application/x-amz-json-1.1").header("X-Amz-Target", "TrentService.ScheduleKeyDeletion")
+                .body(("{\"KeyId\":\"" + key + "\",\"PendingWindowInDays\":7}").getBytes(StandardCharsets.UTF_8))
+                .post("/").then().statusCode(200));
+        return key;
+    }
+
+
+    /** The refusals and the admission are what S3 answered under these two statements, measured 2026-10-30. */
+    @Test
+    void aPutIsJudgedByItsOwnEncryptionHeadersNotTheBucketsDefault() {
+        EncryptionFixture fixture = kmsOnlyBucket();
+
+        assertEncryptedPut(fixture, "none.txt", null, null, 403);
+        assertEncryptedPut(fixture, "aes.txt", "AES256", null, 403);
+        assertEncryptedPut(fixture, "bucket-key.txt", "aws:kms", bucketKey, 200);
+        assertEncryptedPut(fixture, "other-key.txt", "aws:kms", otherKey, 403);
+        assertEncryptedPut(fixture, "no-key.txt", "aws:kms", null, 403);
+    }
+
+    @Test
+    void aCopyIsJudgedByItsOwnEncryptionHeaders() {
+        EncryptionFixture fixture = kmsOnlyBucket();
+        assertEncryptedPut(fixture, "source.txt", "aws:kms", bucketKey, 200);
+        String source = "/" + fixture.bucket() + "/source.txt";
+
+        given().filter(fixture.user().signer()).header("x-amz-copy-source", source)
+                .put("/" + fixture.bucket() + "/plain-copy.txt")
+                .then().statusCode(403).body(containsString("<Code>AccessDenied</Code>"));
+        given().filter(fixture.user().signer()).header("x-amz-copy-source", source)
+                .header(SSE, "aws:kms")
+                .header(SSE_KEY, bucketKey)
+                .put("/" + fixture.bucket() + "/encrypted-copy.txt")
+                .then().statusCode(200);
+    }
+
+    @Test
+    void anAllowOnTheEncryptionKeyAdmitsOnlyTheMatchingPut() {
+        EncryptionFixture fixture = allowOnlyBucket("s3:x-amz-server-side-encryption", "aws:kms");
+
+        assertEncryptedPut(fixture, "kms.txt", "aws:kms", null, 200);
+        assertEncryptedPut(fixture, "aes.txt", "AES256", null, 403);
+        assertEncryptedPut(fixture, "none.txt", null, null, 403);
+    }
+
+    @Test
+    void anAllowOnTheKmsKeyIdKeyAdmitsOnlyTheMatchingPut() {
+        EncryptionFixture fixture = allowOnlyBucket("s3:x-amz-server-side-encryption-aws-kms-key-id", bucketKey);
+
+        assertEncryptedPut(fixture, "bucket-key.txt", "aws:kms", bucketKey, 200);
+        assertEncryptedPut(fixture, "other-key.txt", "aws:kms", otherKey, 403);
+        assertEncryptedPut(fixture, "no-key.txt", "aws:kms", null, 403);
+    }
+
+    /**
+     * A multipart upload under the same two statements. A part sends neither header, so it is judged
+     * by what its upload recorded, the bucket's default included for an upload that asked for none.
+     * AWS does not document this; it was measured on S3 on 2026-10-30, each case here as S3 answered it.
+     */
+    @Test
+    void anUploadOpenedWithTheBucketsKeyHasItsPartsAdmittedAndStandsUnderThatKey() {
+        EncryptionFixture fixture = kmsOnlyBucket();
+        S3RequestSigner user = fixture.user().signer();
+
+        String uploadId = given().filter(user).header(SSE, "aws:kms").header(SSE_KEY, bucketKey)
+                .post("/" + fixture.bucket() + "/large.bin?uploads")
+                .then().statusCode(200)
+                .extract().xmlPath().getString("InitiateMultipartUploadResult.UploadId");
+        String etag = uploadPart(user, fixture, "large.bin", uploadId)
+                .then().statusCode(200).extract().header("ETag");
+        given().filter(user).contentType("application/xml")
+                .body("<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>" + etag
+                        + "</ETag></Part></CompleteMultipartUpload>")
+                .post("/" + fixture.bucket() + "/large.bin?uploadId=" + uploadId)
+                .then().statusCode(200);
+
+        given().filter(user).head("/" + fixture.bucket() + "/large.bin")
+                .then().statusCode(200)
+                .header(SSE, equalTo("aws:kms"))
+                .header(SSE_KEY, equalTo(bucketKey));
+    }
+
+    @Test
+    void anUploadOpenedWithNoEncryptionUnderThePolicyIsRefusedAndNoObjectStands() {
+        EncryptionFixture fixture = kmsOnlyBucket();
+
+        given().filter(fixture.user().signer()).post("/" + fixture.bucket() + "/plain.bin?uploads")
+                .then().statusCode(403).body(containsString("AccessDenied"));
+
+        given().filter(fixture.owner()).head("/" + fixture.bucket() + "/plain.bin").then().statusCode(404);
+    }
+
+    @Test
+    void aPartOfAnUploadThatRecordedTheSseS3DefaultIsRefusedAndNoObjectStands() {
+        EncryptionFixture fixture = bucketWithoutDefaultEncryption();
+        String uploadId = given().filter(fixture.user().signer()).post("/" + fixture.bucket() + "/plain.bin?uploads")
+                .then().statusCode(200)
+                .extract().xmlPath().getString("InitiateMultipartUploadResult.UploadId");
+        putKmsOnlyPolicy(fixture);
+
+        uploadPart(fixture.user().signer(), fixture, "plain.bin", uploadId)
+                .then().statusCode(403).body(containsString("AccessDenied"));
+
+        given().filter(fixture.owner()).head("/" + fixture.bucket() + "/plain.bin").then().statusCode(404);
+        given().filter(fixture.owner()).delete("/" + fixture.bucket() + "/plain.bin?uploadId=" + uploadId)
+                .then().statusCode(204);
+    }
+
+    @Test
+    void aPartOfAnUploadOpenedWithNoEncryptionIsJudgedByTheDefaultItRecorded() {
+        String suffix = suffix();
+        EncryptionFixture fixture = encryptionBucket("kms-default-" + suffix,
+                encryptionUser("kms-default-user-" + suffix, ALLOW_S3_AND_KMS), suffix, true);
+        String uploadId = given().filter(fixture.user().signer()).post("/" + fixture.bucket() + "/default.bin?uploads")
+                .then().statusCode(200)
+                .extract().xmlPath().getString("InitiateMultipartUploadResult.UploadId");
+        putKmsOnlyPolicy(fixture);
+
+        uploadPart(fixture.user().signer(), fixture, "default.bin", uploadId).then().statusCode(200);
+
+        given().filter(fixture.owner()).delete("/" + fixture.bucket() + "/default.bin?uploadId=" + uploadId)
+                .then().statusCode(204);
+    }
+
+    @Test
+    void aPartOfAnUploadThatRecordedAnotherEncryptionIsRefused() {
+        EncryptionFixture fixture = bucketWithoutDefaultEncryption();
+        String uploadId = given().filter(fixture.user().signer()).header(SSE, "AES256")
+                .post("/" + fixture.bucket() + "/aes.bin?uploads")
+                .then().statusCode(200)
+                .extract().xmlPath().getString("InitiateMultipartUploadResult.UploadId");
+        putKmsOnlyPolicy(fixture);
+
+        uploadPart(fixture.user().signer(), fixture, "aes.bin", uploadId)
+                .then().statusCode(403).body(containsString("AccessDenied"));
+
+        given().filter(fixture.owner()).delete("/" + fixture.bucket() + "/aes.bin?uploadId=" + uploadId)
+                .then().statusCode(204);
+    }
+
+    @Test
+    void aPartNamingAnUploadNotHeldAnswersNoSuchUpload() {
+        EncryptionFixture fixture = kmsOnlyBucket();
+
+        uploadPart(fixture.user().signer(), fixture, "unknown.bin", "no-such-upload")
+                .then().statusCode(404).body(containsString("NoSuchUpload"));
+    }
+
+    @Test
+    void aPutNamingAnUploadButNoPartIsAnObjectWriteAndIsChecked() {
+        EncryptionFixture fixture = kmsOnlyBucket();
+        S3RequestSigner unpermitted = encryptionUser("unpermitted-" + suffix(), null).signer();
+
+        given().filter(unpermitted).contentType("text/plain").body("a write")
+                .put("/" + fixture.bucket() + "/written.txt?uploadId=no-such-upload")
+                .then().statusCode(403).body(containsString("AccessDenied"));
+
+        given().filter(fixture.owner()).head("/" + fixture.bucket() + "/written.txt").then().statusCode(404);
+    }
+
+    @Test
+    void aPutNamingAHeldUploadButNoPartIsJudgedByItsOwnHeaders() {
+        EncryptionFixture fixture = kmsOnlyBucket();
+        S3RequestSigner kmsOnly = encryptionUser("kms-only-identity-" + suffix(), """
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Action":"s3:*","Resource":"*",
+                   "Condition":{"StringEquals":{"s3:x-amz-server-side-encryption":"aws:kms"}}}]}""").signer();
+        String uploadId = given().filter(kmsOnly).header(SSE, "aws:kms").header(SSE_KEY, bucketKey)
+                .post("/" + fixture.bucket() + "/held.bin?uploads")
+                .then().statusCode(200)
+                .extract().xmlPath().getString("InitiateMultipartUploadResult.UploadId");
+
+        given().filter(kmsOnly).contentType("text/plain").body("a write")
+                .put("/" + fixture.bucket() + "/written.txt?uploadId=" + uploadId)
+                .then().statusCode(403).body(containsString("AccessDenied"));
+
+        given().filter(fixture.owner()).delete("/" + fixture.bucket() + "/held.bin?uploadId=" + uploadId)
+                .then().statusCode(204);
+    }
+
+    @Test
+    void aPartCopyNamingAnUploadNotHeldIsChecked() {
+        EncryptionFixture fixture = kmsOnlyBucket();
+        S3RequestSigner unpermitted = encryptionUser("unpermitted-" + suffix(), null).signer();
+
+        given().filter(unpermitted).header("x-amz-copy-source", "/" + fixture.bucket() + "/source.txt")
+                .put("/" + fixture.bucket() + "/copied.bin?partNumber=1&uploadId=no-such-upload")
+                .then().statusCode(403).body(containsString("AccessDenied"));
+    }
+
+    private record EncryptionFixture(String bucket, S3RequestSigner owner, Credentials user) {
+    }
+
+    private static final String SSE = "x-amz-server-side-encryption";
+    private static final String SSE_KEY = "x-amz-server-side-encryption-aws-kms-key-id";
+    private static final String ALLOW_S3_AND_KMS = """
+            {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:*","kms:*"],"Resource":"*"}]}""";
+
+    private static void assertEncryptedPut(EncryptionFixture fixture, String key, String encryption, String kmsKeyId,
+                                           int status) {
+        RequestSpecification request = given().filter(fixture.user().signer()).contentType("text/plain").body(key);
+        if (encryption != null) {
+            request.header(SSE, encryption);
+        }
+        if (kmsKeyId != null) {
+            request.header(SSE_KEY, kmsKeyId);
+        }
+        request.put("/" + fixture.bucket() + "/" + key).then().statusCode(status);
+    }
+
+    private static Response uploadPart(S3RequestSigner signer, EncryptionFixture fixture, String key, String uploadId) {
+        return given().filter(signer).contentType("application/octet-stream").body("a part".getBytes())
+                .put("/" + fixture.bucket() + "/" + key + "?partNumber=1&uploadId=" + uploadId);
+    }
+
+    /** A bucket defaulting to {@code aws:kms} that denies any other put, and a user allowed {@code s3:*} and {@code kms:*}. */
+    private EncryptionFixture kmsOnlyBucket() {
+        String suffix = suffix();
+        EncryptionFixture fixture = encryptionBucket("kms-only-" + suffix,
+                encryptionUser("kms-only-user-" + suffix, ALLOW_S3_AND_KMS), suffix, true);
+        putKmsOnlyPolicy(fixture);
+        return fixture;
+    }
+
+    /** A bucket with no default encryption and no policy yet, and a user allowed {@code s3:*} and {@code kms:*}. */
+    private EncryptionFixture bucketWithoutDefaultEncryption() {
+        String suffix = suffix();
+        return encryptionBucket("multipart-" + suffix,
+                encryptionUser("multipart-user-" + suffix, ALLOW_S3_AND_KMS), suffix, false);
+    }
+
+    /** Denies a put that does not name {@code aws:kms}, or names a key other than the bucket's. */
+    private void putKmsOnlyPolicy(EncryptionFixture fixture) {
+        putBucketPolicyAs(fixture.bucket(), """
+                {"Version":"2012-10-17","Statement":[
+                  {"Sid":"DenyUnencryptedPuts","Effect":"Deny","Principal":"*","Action":"s3:PutObject",
+                   "Resource":"arn:aws:s3:::%1$s/*",
+                   "Condition":{"StringNotEquals":{"s3:x-amz-server-side-encryption":"aws:kms"}}},
+                  {"Sid":"DenyWrongKmsKey","Effect":"Deny","Principal":"*","Action":"s3:PutObject",
+                   "Resource":"arn:aws:s3:::%1$s/*",
+                   "Condition":{"StringNotEqualsIfExists":{"s3:x-amz-server-side-encryption-aws-kms-key-id":"%2$s"}}}]}
+                """.formatted(fixture.bucket(), bucketKey), fixture.owner());
+    }
+
+    /** A bucket whose policy alone allows a user with no identity policy, on {@code key} being {@code value}. */
+    private EncryptionFixture allowOnlyBucket(String key, String value) {
+        String suffix = suffix();
+        EncryptionFixture fixture = encryptionBucket("allow-only-" + suffix,
+                encryptionUser("allow-only-user-" + suffix, null), suffix, true);
+        putBucketPolicyAs(fixture.bucket(), """
+                {"Version":"2012-10-17","Statement":[
+                  {"Effect":"Allow","Principal":{"AWS":"%s"},"Action":"s3:PutObject",
+                   "Resource":"arn:aws:s3:::%s/*",
+                   "Condition":{"StringEquals":{"%s":"%s"}}}]}
+                """.formatted(fixture.user().userArn(), fixture.bucket(), key, value), fixture.owner());
+        return fixture;
+    }
+
+    private static String suffix() {
+        return UUID.randomUUID().toString().substring(0, 8);
+    }
+
+    private Credentials encryptionUser(String userName, String policy) {
+        cleanup.register(() -> EnforcementFixtures.removeUser(endpoint.getPort(), auth(ACCOUNT_A, "iam"), userName));
+        Credentials user = createUser(userName, ACCOUNT_A);
+        putUserPolicy(userName, "FixtureKmsAccess", """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"kms:*","Resource":"*"}]}
+                """, ACCOUNT_A);
+        if (policy != null) {
+            putUserPolicy(userName, "AllowEncryptedPuts", policy, ACCOUNT_A);
+        }
+        return user;
+    }
+
+    private EncryptionFixture encryptionBucket(String bucket, Credentials user, String suffix, boolean kmsDefault) {
+        String ownerName = "encryption-owner-" + suffix;
+        cleanup.register(() -> EnforcementFixtures.removeUser(endpoint.getPort(), auth(ACCOUNT_A, "iam"), ownerName));
+        Credentials owner = createAccountAdmin(ownerName, ACCOUNT_A);
+        cleanup.register(() -> EnforcementFixtures.removeBucket(endpoint.getPort(), owner.signer(), bucket));
+        createBucketAs(bucket, owner.signer());
+        if (kmsDefault) {
+            given().filter(owner.signer()).contentType("application/xml").body("""
+                    <ServerSideEncryptionConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Rule>
+                      <ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm>
+                        <KMSMasterKeyID>%s</KMSMasterKeyID></ApplyServerSideEncryptionByDefault>
+                    </Rule></ServerSideEncryptionConfiguration>""".formatted(bucketKey))
+                    .put("/" + bucket + "?encryption").then().statusCode(200);
+        }
+        return new EncryptionFixture(bucket, owner.signer(), user);
+    }
+}

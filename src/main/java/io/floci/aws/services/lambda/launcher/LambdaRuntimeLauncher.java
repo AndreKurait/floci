@@ -1,0 +1,31 @@
+package io.floci.aws.services.lambda.launcher;
+
+import io.floci.aws.services.lambda.model.LambdaFunction;
+
+import java.util.List;
+
+/**
+ * Starts and stops Lambda execution environments. Implementations back each
+ * environment with a concrete runtime: a Docker container ({@link ContainerLauncher}),
+ * a Kubernetes pod ({@code KubernetesPodLauncher}) or a local process ({@link ProcessLauncher}). Selected at startup by
+ * {@code floci.services.lambda.executor}.
+ */
+public interface LambdaRuntimeLauncher {
+
+    ContainerHandle launch(LambdaFunction fn);
+
+    default boolean supportsProvisionedConcurrency() {
+        return false;
+    }
+
+    default ContainerHandle launchProvisioned(LambdaFunction fn) {
+        throw new UnsupportedOperationException("Provisioned concurrency is not supported by this Lambda executor");
+    }
+
+    void stop(ContainerHandle handle);
+
+    default void retireFunctionCode(List<LambdaFunction> deletedFunctions) {
+    }
+
+    boolean isAlive(ContainerHandle handle);
+}

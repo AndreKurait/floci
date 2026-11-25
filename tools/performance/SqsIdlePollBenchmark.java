@@ -1,9 +1,9 @@
-package io.github.hectorvent.floci.services.sqs;
+package io.floci.aws.services.sqs;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import io.github.hectorvent.floci.core.storage.InMemoryStorage;
-import io.github.hectorvent.floci.services.sqs.model.Message;
-import io.github.hectorvent.floci.services.sqs.model.Queue;
+import io.floci.aws.core.storage.InMemoryStorage;
+import io.floci.aws.services.sqs.model.Message;
+import io.floci.aws.services.sqs.model.Queue;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
