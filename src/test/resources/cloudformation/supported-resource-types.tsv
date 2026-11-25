@@ -22,6 +22,7 @@ AWS::ApiGatewayV2::Stage	ApiGatewayV2CfnProvisioner
 AWS::ApiGatewayV2::VpcLink	ApiGatewayV2CfnProvisioner
 AWS::AppConfig::Application	AppConfigCfnProvisioner
 AWS::AppConfig::ConfigurationProfile	AppConfigCfnProvisioner
+AWS::AppConfig::Deployment	AppConfigDeploymentCfnProvisioner
 AWS::AppConfig::DeploymentStrategy	AppConfigCfnProvisioner
 AWS::AppConfig::Environment	AppConfigCfnProvisioner
 AWS::AppConfig::HostedConfigurationVersion	AppConfigHostedVersionCfnProvisioner
