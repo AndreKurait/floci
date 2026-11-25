@@ -44,6 +44,8 @@ it: a member the caller omits is reset to its default rather than carried over, 
 the AWS behaviour ("if you don't provide a value for a parameter, Amazon Cognito sets it to
 its default value"). Roles, role mappings and principal tag attribute maps are set by their
 own operations, are not part of the `IdentityPool` shape, and survive the replace.
+An already configured `DeveloperProviderName` must be supplied unchanged: replacing or
+omitting it is rejected before the pool or its existing identity links are changed.
 
 `TagResource` writes into the same store as `IdentityPoolTags`, so a tag added by ARN is
 visible on the next `DescribeIdentityPool` and vice versa.
