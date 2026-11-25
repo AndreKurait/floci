@@ -4,6 +4,7 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.IamEnforcementFilter;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.HybridStorage;
@@ -395,7 +396,8 @@ class AthenaPreparedStatementServiceTest {
             resolver = mock(RegionResolver.class);
             when(resolver.getAccountId()).thenReturn("000000000000");
             athena = new AthenaService(factory, mock(FlociDuckClient.class), mock(GlueService.class),
-                    mock(S3Service.class), config, mock(Vertx.class), mock(GlueViewDdlBuilder.class), resolver, mock(AthenaIcebergStatements.class));
+                    mock(S3Service.class), config, mock(Vertx.class), mock(GlueViewDdlBuilder.class), resolver,
+                    mock(AthenaIcebergStatements.class), mock(IamEnforcementFilter.class));
             service = new AthenaPreparedStatementService(athena);
         }
 
