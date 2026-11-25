@@ -3673,3 +3673,86 @@ def test_a_resource_named_after_its_path_or_signed_for_is_checked():
                 {"type": "group", "fill": {"GroupNameWithPath": "NewGroupName"}, "renames": "GroupName"},
                 dict(signer, signer="yes"), dict(signer, types=["user", "group"]), dict(signer, fill={})):
         assert r._resource_problems("iam:Op", bad, types, USERS_FORMATS), bad
+
+
+def reference_endpoint_model():
+    return {"ec2": {"operations": {"CreateVpcEndpoint": {"output": {"shape": "Result"}}}, "shapes": {
+        "Result": {"type": "structure", "members": {"VpcEndpoint": {
+            "shape": "VpcEndpoint", "locationName": "vpcEndpoint"}}},
+        "VpcEndpoint": {"type": "structure", "members": {"VpcEndpointId": {
+            "shape": "VpcEndpointId", "locationName": "vpcEndpointId"}}},
+        "VpcEndpointId": {"type": "string"},
+    }}}
+
+
+def reference_endpoint_source(value="vpce-abc12345"):
+    return {"operations": {"CreateVpcEndpoint": {"examples": [
+        {"path": ["vpcEndpoint", "vpcEndpointId"], "value": value}]}}}
+
+
+def test_reference_prefix_comes_from_the_response_value_and_modeled_shape():
+    models = reference_endpoint_model()
+    assert r.reference_id_prefixes(models, ("vpc-endpoint",), reference_endpoint_source()) == {
+        "vpc-endpoint": "vpce-"}
+    assert r.reference_id_prefixes(models, ("vpc-endpoint",), reference_endpoint_source("changed-12345678")) == {
+        "vpc-endpoint": "changed-"}
+    models["ec2"]["shapes"]["VpcEndpoint"]["members"]["VpcEndpointId"]["shape"] = "String"
+    models["ec2"]["shapes"]["String"] = {"type": "string"}
+    assert r.reference_id_prefixes(models, ("vpc-endpoint",), reference_endpoint_source()) == {
+        "vpc-endpoint": "vpce-"}
+    members = models["ec2"]["shapes"]["VpcEndpoint"]["members"]
+    members["UnrelatedId"] = members.pop("VpcEndpointId")
+    assert r.reference_id_prefixes(models, ("vpc-endpoint",), reference_endpoint_source()) == {}
+
+
+def test_reference_example_path_drift_and_conflicting_prefixes_fail_closed():
+    models = reference_endpoint_model()
+    source = reference_endpoint_source()
+    source["operations"]["CreateVpcEndpoint"]["examples"][0]["path"] = ["missing"]
+    with pytest.raises(ValueError, match="not in botocore"):
+        r.reference_id_prefixes(models, ("vpc-endpoint",), source)
+    source = reference_endpoint_source()
+    source["operations"]["CreateVpcEndpoint"]["examples"] += reference_endpoint_source("other-12345678")[
+        "operations"]["CreateVpcEndpoint"]["examples"]
+    with pytest.raises(ValueError, match="conflicting"):
+        r.reference_id_prefixes(models, ("vpc-endpoint",), source)
+
+
+def test_documented_prefix_refuses_to_override_conflicting_botocore_evidence(monkeypatch, tmp_path):
+    source = tmp_path / "examples.json"
+    source.write_text(json.dumps(reference_endpoint_source()))
+    monkeypatch.setattr(r.fetch_ec2_id_examples, "OUTPUT", source)
+    models = reference_endpoint_model()
+    assert r.documented_id_prefixes("ec2", models) == {"vpc-endpoint": "vpce-"}
+    monkeypatch.setattr(r, "namespace_id_prefixes", lambda *args: {"vpc-endpoint": "other-"})
+    with pytest.raises(ValueError, match="disagree"):
+        r.documented_id_prefixes("ec2", models)
+
+
+def test_vendored_ec2_examples_resolve_through_the_actual_pinned_response_members():
+    data, _ = r.resolve_botocore_data(None)
+    models = r.load_models(data, {"ec2"})
+    source = json.loads(r.fetch_ec2_id_examples.OUTPUT.read_text())
+    assert r.reference_id_prefixes(models, r.ID_TARGETS["ec2"], source)["vpc-endpoint"] == "vpce-"
+    assert r.documented_id_prefixes("ec2", models, r.load_examples(data, {"ec2"}))["vpc-endpoint"] == "vpce-"
+
+
+def test_identifier_reference_verification_reports_unavailable_pages(monkeypatch):
+    def unavailable(url):
+        raise OSError("offline")
+    monkeypatch.setattr(r.fetch_ec2_id_examples, "fetch_url", unavailable)
+    with pytest.raises(OSError, match="could not verify EC2 identifier examples"):
+        r.verify_id_examples()
+
+
+def test_reference_prefix_supplements_generic_lists_without_changing_typed_endpoint_deletion():
+    data, _ = r.resolve_botocore_data(None)
+    models = r.load_models(data, {"ec2"})
+    known = r.namespace_id_prefixes("ec2", models, r.load_examples(data, {"ec2"}))
+    generic = r.documented_id_prefixes("ec2", models, r.load_examples(data, {"ec2"}))
+    formats = {"vpc-endpoint": "arn:${Partition}:ec2:${Region}:${Account}:vpc-endpoint/${VpcEndpointId}"}
+    for operation in ("ec2:CreateTags", "ec2:DeleteTags"):
+        assert r.id_targets(operation, ["vpc-endpoint"], formats, models, known, generic)["prefixes"] == {
+            "vpc-endpoint": "vpce-"}
+    assert r.id_targets("ec2:DeleteVpcEndpoints", ["vpc-endpoint"], formats, models, known, generic) == \
+        r.id_targets("ec2:DeleteVpcEndpoints", ["vpc-endpoint"], formats, models, known)
