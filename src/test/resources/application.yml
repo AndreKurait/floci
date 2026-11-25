@@ -355,6 +355,9 @@ floci:
       proxy-base-port: 9400
       proxy-max-port: 9499
     ec2:
+      extra-env: ${FLOCI_SERVICES_EC2_EXTRA_ENV:}
+      ulimits: ${FLOCI_SERVICES_EC2_ULIMITS:}
+      # read-only-binds: omitted means no deployment mounts.
       # Opt-in Standard On-Demand vCPU admission. FLOCI_SERVICES_EC2_ENFORCE_VCPU_QUOTAS
       enforce-vcpu-quotas: false
       # Optional complete catalog override for locally built guest images.
@@ -362,6 +365,7 @@ floci:
       managed-prefix-list-catalog-path: ${FLOCI_SERVICES_EC2_MANAGED_PREFIX_LIST_CATALOG_PATH:}
       enabled: true
       imds-port: 9169
+      metadata-helper-image: floci/network-helper:local
       ssh-port-range-start: 2200
       ssh-port-range-end: 2299
       publish-security-group-ports: true

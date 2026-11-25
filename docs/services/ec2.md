@@ -220,6 +220,91 @@ metadata.
 
 Any unrecognized AMI ID (including real AWS AMI IDs like `ami-0abc12345678`) falls back to the catalog `defaultDockerImage` (`public.ecr.aws/amazonlinux/amazonlinux:2023` by default).
 
+### Images with their own startup command
+
+Set `guestRuntime: image` on an AMI entry in an external catalog selected with
+`FLOCI_SERVICES_EC2_IMAGE_CATALOG_PATH` to run the Docker image's declared
+ENTRYPOINT and CMD without either override:
+
+```yaml
+defaultDockerImage: example/base:1
+images:
+  - imageId: ami-local-worker
+    dockerImage: example/worker:1
+    name: local-worker
+    description: Worker with its own startup command
+    architecture: arm64
+    creationDate: '2026-10-08T00:00:00.000Z'
+    guestRuntime: image
+```
+
+The image must provide a working startup command. This mode does not add the
+systemd mounts, install an init system, or establish application readiness.
+The normal EC2 networking, resource limits, metadata, SSH and UserData behavior
+still applies. Omitted `guestRuntime` and unknown AMI IDs retain the `minimal`
+runtime; selecting `image` on one entry does not change other entries.
+
+### Guest startup files
+
+Deployment configuration can supply read-only files or directories before the
+guest's first process starts:
+
+```yaml
+floci:
+  services:
+    ec2:
+      read-only-binds:
+        - source: /srv/guest-inputs/ca.pem
+          target: /etc/guest-ca.pem
+```
+
+The equivalent environment variables are
+`FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__SOURCE` and
+`FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__TARGET`; increment the index for more mounts.
+Both paths must be normalized absolute Linux paths, including when the Floci
+process runs on Windows. Sources must already exist on the Docker daemon host.
+Docker refuses a missing source without creating it.
+Duplicate targets and replacing the guest root are rejected before guest
+resources are allocated.
+
+These mounts apply to EC2 guest containers in every runtime mode. Helpers retain
+their own configuration. Image ENTRYPOINT/CMD, process limits, metadata and
+credential selection keep their existing behavior. A stop/start retains the
+container's mounts. Mount configuration is a deployment input, not an EC2 API
+extension.
+
+When a mount replaces `/etc` or `/etc/resolv.conf`, the guest receives a literal-IP
+`AWS_ENDPOINT_URL` so its configured DNS does not need to resolve the emulator host.
+`floci.services.ec2.privileged` defaults to `true`; set it to `false` to run guests
+without privileged mode. `floci.services.ec2.cap-drop` accepts capabilities to drop
+from guest containers. Security-group enforcement always disables privileged mode
+and keeps its existing network-capability restrictions. These settings apply to
+guests, not the trusted metadata helper.
+
+### Binding registered AMIs to local images
+
+An external catalog entry can declare `registrationNames`, an optional list of
+exact `RegisterImage` names:
+
+```yaml
+    guestRuntime: image
+    registrationNames:
+      - local-worker-release
+```
+
+Registering `Name=local-worker-release` then binds the generated AMI ID to that
+catalog entry. RunInstances uses its Docker image, guest runtime and Docker
+platform. An omitted architecture inherits the catalog architecture; an
+explicit mismatch returns `InvalidParameterValue` before registration.
+Duplicate or blank registration names make the catalog invalid. Names are
+case-sensitive, with no wildcard or prefix matching.
+
+CopyImage retains this binding across regions through its source ancestry.
+CreateImage and CopyImage use their explicit source, even when the output name
+matches another registration binding. Names without a declared binding retain
+the existing metadata registration and default-image fallback behavior.
+The mapping does not import snapshot bytes or prove that a guest boots.
+
 ### Cloud-image-derived AMI guests
 
 The `ami-ubuntu2404-cloud` entry is an experimental Ubuntu 24.04 guest image built from Canonical cloud-image artifacts, not from the Docker-library `ubuntu:24.04` image. It is intended for EC2 workflows that need packages such as `systemd` and `cloud-init` to match a real Ubuntu cloud image more closely.
@@ -287,7 +372,10 @@ Notes and limitations:
 
 `UserData` must be base64-encoded in the request (matching the AWS wire format). Floci decodes it, copies the script into `/var/lib/user-data.sh` inside the container, and executes the script directly after SSH key injection so the script shebang selects the interpreter. Output is captured and logged.
 
-EC2 containers receive `AWS_EC2_METADATA_SERVICE_ENDPOINT` for IMDS and `AWS_ENDPOINT_URL` for AWS service API calls back to Floci.
+EC2 containers receive `AWS_EC2_METADATA_SERVICE_ENDPOINT=http://169.254.169.254`
+for IMDS and `AWS_ENDPOINT_URL` for AWS service API calls back to Floci. The
+metadata endpoint uses the instance's prepared link-local route, including when
+security groups deny ordinary egress.
 
 CloudFormation `AWS::EC2::VPCEndpoint` resolves `IpAddressType` on create and update, including parameter references. Omission, a selected `AWS::NoValue` branch, or `not-specified` uses the default `ipv4`; an explicitly empty value is rejected. Updates retain the existing replacement behavior; synthetic interfaces remain IPv4-only.
 
@@ -297,19 +385,43 @@ An `AWS::EC2::Instance` that declares no `IamInstanceProfile` launches with the 
 
 ## Instance Metadata Service (IMDS)
 
-Floci runs an IMDS-compatible HTTP server on port `9169` of the host. Each launched container receives the environment variable `AWS_EC2_METADATA_SERVICE_ENDPOINT` pointing to this server.
+Floci runs an IMDS-compatible HTTP server on port `9169` of the host. The
+instance's link-local route forwards metadata requests to this server.
 
-Inside each launched container, the link-local address `169.254.169.254` is a proxy to this
-server. The helper shells that install and start the proxy clear `LD_LIBRARY_PATH`,
-`PYTHONPATH` and `PYTHONHOME` before running system tools, so an application's library search
-path and Python installation do not reach the package manager, `socat` and `curl`. The
-container's configured environment and the application's processes keep these variables. The
-proxy is ready once an IMDSv2 token request with a 60-second TTL succeeds and that token reads the
+Before starting a guest image, Floci prepares its network in a trusted helper container.
+The guest joins that network namespace with its normal ENTRYPOINT and CMD. This prevents
+an early metadata request from reaching the Docker host's metadata service while Floci
+is still setting up the guest. The helper also owns the published SSH port and VPC network
+attachment. Stop/start keeps the namespace; termination removes both containers.
+
+The helper image is configured by `floci.services.ec2.metadata-helper-image`
+(`FLOCI_SERVICES_EC2_METADATA_HELPER_IMAGE`). The default `floci/network-helper:local` is
+built from Floci's bundled Dockerfile when absent. A custom value must identify an
+available image with a shell, `ip`, `iptables`, and `curl`. With security-group enforcement
+enabled, Floci prepares metadata in the existing firewall helper instead.
+
+Inside this namespace, the link-local address `169.254.169.254` routes to Floci's metadata
+server. Routing is ready once an IMDSv2 token request with a 60-second TTL succeeds and that token reads the
 instance ID. The check bypasses any HTTP proxy the image configures, a failed or empty token
 response does not fall back to a tokenless request, and the check passes on an instance that
-requires tokens.
+requires tokens. Failed setup prevents the guest image from starting. With `HttpEndpoint`
+disabled, the route is still installed, but the token readiness check is omitted so the
+instance can boot with metadata disabled.
 
-For EC2 guests, a working `iptables` or `nft` NAT backend routes link-local port `80` to the IMDS
+`HttpEndpoint=disabled` makes the local metadata server return HTTP 404 with no
+body for metadata and token requests, including requests using a previously
+issued token. Changes through `ModifyInstanceMetadataOptions` take effect
+without restarting the guest. The HTTP 404 is a local-emulator response; Floci
+keeps the route in place so disabled metadata cannot fall through to the host.
+Default helper images are rebuilt when their bundled Dockerfile changes, so
+an older Docker cache receives the current routing tools.
+
+Recreate containers launched by older Floci versions to receive the helper namespace.
+
+New prepared namespaces route link-local port `80` directly to Floci's metadata backend
+and refuse launch if that route cannot be installed. Existing unmarked guest containers
+retain their legacy relay during restart: a working `iptables` or `nft` NAT backend routes
+link-local port `80` to the IMDS
 relay on port `42169`, leaving the guest's wildcard port `80` available. If no NAT backend works
 (for example, an offline image without firewall tools), Floci uses the older link-local port `80`
 listener to preserve IMDS access. That fallback can still conflict with a guest server binding

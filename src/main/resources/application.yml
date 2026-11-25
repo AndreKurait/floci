@@ -839,6 +839,11 @@ floci:
       proxy-max-port: 9499
       keep-running-on-shutdown: false
     ec2:
+      extra-env: ${FLOCI_SERVICES_EC2_EXTRA_ENV:}
+      ulimits: ${FLOCI_SERVICES_EC2_ULIMITS:}
+      # read-only-binds:               # Paths belong to the Docker daemon host.
+      #   - source: /srv/guest-inputs/ca.pem
+      #     target: /etc/guest-ca.pem
       # Opt-in Standard On-Demand vCPU admission. FLOCI_SERVICES_EC2_ENFORCE_VCPU_QUOTAS
       enforce-vcpu-quotas: false
       # Optional complete catalog override for locally built guest images.
@@ -846,6 +851,7 @@ floci:
       managed-prefix-list-catalog-path: ${FLOCI_SERVICES_EC2_MANAGED_PREFIX_LIST_CATALOG_PATH:}
       enabled: true
       imds-port: 9169
+      metadata-helper-image: floci/network-helper:local
       # Sweep EC2 containers left on the daemon by a previous run that died mid-launch or
       # mid-terminate (SIGKILL, OOM, docker kill), which no surviving record refers to.
       # Scoped to this deployment's own containers; stopped instances are never swept.
