@@ -1211,8 +1211,7 @@ public class EmrHandler {
         ArrayNode arr = response.putArray("Instances");
         boolean terminated = EmrClusterLifecycle.isTerminated(cluster.getState());
         List<String> states = stringList(request.path("InstanceStates"));
-        if ((!states.isEmpty() && !states.contains(terminated ? "TERMINATED" : "RUNNING"))
-                || (terminated && !withinTerminatedInstanceRetention(cluster.getEndDateTime(), service.now()))) {
+        if (terminated && !withinTerminatedInstanceRetention(cluster.getEndDateTime(), service.now())) {
             return Response.ok(response).build();
         }
         String groupId = text(request, "InstanceGroupId");
