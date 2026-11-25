@@ -4,6 +4,7 @@ import io.floci.aws.testing.CfnStackWaits;
 import io.quarkus.test.junit.QuarkusTest;
 import org.junit.jupiter.api.Test;
 
+import java.time.Duration;
 import java.util.function.BooleanSupplier;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -277,12 +278,6 @@ class CloudFormationSmallMetadataIntegrationTest {
 
     /** DeleteStack runs asynchronously, so poll until the resource is gone or time out. */
     private static void awaitGone(BooleanSupplier gone, String message) throws InterruptedException {
-        for (int i = 0; i < 100; i++) {
-            if (gone.getAsBoolean()) {
-                return;
-            }
-            Thread.sleep(50);
-        }
-        throw new AssertionError(message);
+        CfnStackWaits.awaitState(Duration.ofSeconds(5), gone::getAsBoolean, isGone -> isGone, isGone -> message);
     }
 }
