@@ -59,8 +59,59 @@ fabricated result:
 `SetLoadBalancerPoliciesForBackendServer`, `SetLoadBalancerPoliciesOfListener`,
 `SetLoadBalancerListenerSSLCertificate`.
 
-Floci also does not run a Classic **data plane**: listener ports are recorded but no socket is
-opened and no traffic is forwarded. Only the control plane and health checking are emulated.
+## HTTP data plane
+
+With `FLOCI_SERVICES_ELB_MOCK=false`, Floci's shared HTTP edge forwards requests addressed to an
+existing Classic load balancer's DNS name or an unambiguous public Route53 alias/CNAME chain.
+The alias target DNS name and hosted-zone ID must match the load balancer. Public endpoints
+select the resource's account, independently of the client's API credentials.
+
+Requests stream to healthy registered EC2 instances using the same address as their health
+checks: the modeled container address, or the registered instance's DNS name for external compute.
+DNS resolution happens outside the HTTP event loop and each connection uses the validated IP.
+Requests use the listener's `InstancePort`. Host, method, raw path/query, authorization headers, request body
+and response status/body are preserved. No external DNS target is contacted. Deregistration,
+failed health checks, record changes and load-balancer deletion take effect without restarting.
+
+This serves HTTP backends for HTTP listeners and HTTPS listeners behind Floci's existing TLS
+edge. It does not install the listener's ACM certificate on that edge. TCP/SSL forwarding,
+HTTPS backends, cookie stickiness and connection draining remain unsupported. An owned endpoint
+with no healthy registered instance returns 503. Classic never forwards unresolved, deleted or
+ambiguous endpoints. Hosts without a current Classic resource binding continue through the shared
+edge's existing routing, including API Gateway and S3 custom domains. Multiple competing weighted
+records, latency/failover records and independent Route53 health checks are not selected.
+
+## Protected frontends
+
+`FLOCI_SERVICES_ELB_VPC_FRONTENDS=true` enables an experimental packet path for an
+internal Classic load balancer in one IPv4 subnet. It requires real ELB operation,
+EC2 VPC networks, native private addresses and security-group enforcement. A
+digest-pinned stock HAProxy process runs inside the load balancer's firewall
+namespace and binds its EC2 network interface's private address. The embedded
+DNS source returns that address for the load balancer's native DNS name.
+
+Frontend ingress is checked before TCP or TLS reaches a listener. HTTPS and SSL
+listeners use their declared IAM or ACM certificate. Backend connections and the
+configured health probes originate from the load balancer's private address, so
+an instance's rule referencing the frontend security group is exercised too.
+The shared HTTP edge refuses protected load balancers; it cannot bypass their
+firewall.
+
+This first mode reconstructs the runtime on listener, health-check, backend,
+subnet or group-attachment changes; the private address can change, and clients
+must resolve it again after those updates. Security-group rule edits reconcile
+the existing firewall directly. Multiple subnets, IPv6, connection draining and
+access logging are not supported in this mode. Route53 aliases need separate
+qualification. Deletion retains the
+interface reservation if retiring its namespace fails, allowing cleanup to be
+retried without reallocating a live address.
+
+With `FLOCI_NETWORK_VPC_ROUTING_ENABLED=true`, this mode also accepts
+internet-facing Classic frontends in one IPv4 subnet. Protected callers use
+native VPC routes and a public NAT gateway; the frontend sees that gateway's
+allocated Elastic IP, and its ingress rules must permit that source.
+Both VPCs need their required internet-gateway routes. See
+[public routing and its limits](../design/vpc-public-routing.md).
 
 ## Behavior Notes
 
@@ -102,6 +153,8 @@ opened and no traffic is forwarded. Only the control plane and health checking a
 |---|---|---|
 | `FLOCI_SERVICES_ELB_ENABLED` | `true` | Enable or disable the Classic ELB service |
 | `FLOCI_SERVICES_ELB_MOCK` | `false` | When `true`, never probe: a registered instance is `InService` immediately |
+| `FLOCI_SERVICES_ELB_VPC_FRONTENDS` | `false` | Enable protected frontends; internet-facing frontends additionally require VPC routing |
+| `FLOCI_SERVICES_ELB_PROXY_IMAGE` | Digest-pinned `haproxy:3.2-alpine` | Listener process used by protected frontends |
 
 ## Examples
 
