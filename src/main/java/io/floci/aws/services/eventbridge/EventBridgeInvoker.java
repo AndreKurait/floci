@@ -11,6 +11,7 @@ import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.RequestScopes;
+import io.floci.aws.core.common.ServiceCallAuthorizer;
 import io.floci.aws.core.common.ServicePrincipals;
 import io.floci.aws.core.common.ServiceRegistry;
 import io.floci.aws.core.common.SsrfProtection;
@@ -28,6 +29,7 @@ import io.floci.aws.services.eventbridge.model.RedshiftDataParameters;
 import io.floci.aws.services.eventbridge.model.Target;
 import io.floci.aws.services.firehose.FirehoseService;
 import io.floci.aws.services.firehose.model.Record;
+import io.floci.aws.services.iam.IamPolicyEvaluator.Decision;
 import io.floci.aws.services.kinesis.KinesisService;
 import io.floci.aws.services.lambda.LambdaService;
 import io.floci.aws.services.lambda.model.InvocationType;
@@ -81,6 +83,7 @@ public class EventBridgeInvoker {
     private static final ThreadLocal<Integer> BUS_TO_BUS_DEPTH = ThreadLocal.withInitial(() -> 0);
 
     private final LambdaService lambdaService;
+    private final ServiceCallAuthorizer serviceCallAuthorizer;
     private final SqsService sqsService;
     private final SnsService snsService;
     private final BatchService batchService;
@@ -108,11 +111,13 @@ public class EventBridgeInvoker {
                               EcsJsonHandler ecsJsonHandler, StepFunctionsService stepFunctionsService,
                               RedshiftDataService redshiftDataService, RedshiftTargetAuthorizer redshiftTargetAuthorizer,
                               ServiceRegistry serviceRegistry, RegionResolver regionResolver, ObjectMapper objectMapper,
-                              EmulatorConfig config, AppSyncTargetInvoker appSyncTargetInvoker) {
+                              EmulatorConfig config, AppSyncTargetInvoker appSyncTargetInvoker,
+                              ServiceCallAuthorizer serviceCallAuthorizer) {
         this(lambdaService, sqsService, snsService, batchService, firehoseService, kinesisService, eventBridgeService,
                 ecsService, ecsJsonHandler, stepFunctionsService, redshiftDataService, redshiftTargetAuthorizer,
                 serviceRegistry, regionResolver, objectMapper, config,
-                apiDestinationClient(ContainerCaBundle.sslContext(config).orElse(null)), appSyncTargetInvoker);
+                apiDestinationClient(ContainerCaBundle.sslContext(config).orElse(null)), appSyncTargetInvoker,
+                serviceCallAuthorizer);
     }
 
     public EventBridgeInvoker(LambdaService lambdaService, SqsService sqsService, SnsService snsService,
@@ -124,7 +129,7 @@ public class EventBridgeInvoker {
                               EmulatorConfig config, AppSyncTargetInvoker appSyncTargetInvoker) {
         this(lambdaService, sqsService, snsService, batchService, firehoseService, null, eventBridgeService,
                 ecsService, ecsJsonHandler, stepFunctionsService, redshiftDataService, redshiftTargetAuthorizer,
-                serviceRegistry, regionResolver, objectMapper, config, appSyncTargetInvoker);
+                serviceRegistry, regionResolver, objectMapper, config, appSyncTargetInvoker, null);
     }
 
     private static HttpClient apiDestinationClient(SSLContext sslContext) {
@@ -181,7 +186,7 @@ public class EventBridgeInvoker {
                                EmulatorConfig config, HttpClient httpClient, AppSyncTargetInvoker appSyncTargetInvoker) {
         this(lambdaService, sqsService, snsService, batchService, firehoseService, null, eventBridgeService,
                 ecsService, ecsJsonHandler, stepFunctionsService, redshiftDataService, redshiftTargetAuthorizer,
-                serviceRegistry, regionResolver, objectMapper, config, httpClient, appSyncTargetInvoker);
+                serviceRegistry, regionResolver, objectMapper, config, httpClient, appSyncTargetInvoker, null);
     }
 
     private EventBridgeInvoker(LambdaService lambdaService, SqsService sqsService, SnsService snsService,
@@ -190,8 +195,10 @@ public class EventBridgeInvoker {
                                EcsJsonHandler ecsJsonHandler, StepFunctionsService stepFunctionsService,
                                RedshiftDataService redshiftDataService, RedshiftTargetAuthorizer redshiftTargetAuthorizer,
                                ServiceRegistry serviceRegistry, RegionResolver regionResolver, ObjectMapper objectMapper,
-                               EmulatorConfig config, HttpClient httpClient, AppSyncTargetInvoker appSyncTargetInvoker) {
+                               EmulatorConfig config, HttpClient httpClient, AppSyncTargetInvoker appSyncTargetInvoker,
+                               ServiceCallAuthorizer serviceCallAuthorizer) {
         this.lambdaService = lambdaService;
+        this.serviceCallAuthorizer = serviceCallAuthorizer;
         this.sqsService = sqsService;
         this.snsService = snsService;
         this.batchService = batchService;
@@ -260,6 +267,12 @@ public class EventBridgeInvoker {
 
         try {
             if (arn.contains(":lambda:") || arn.contains(":function:")) {
+                String sourceAccount = AwsArnUtils.isArn(ruleArn) ? AwsArnUtils.parse(ruleArn).accountId() : null;
+                if (serviceCallAuthorizer != null && serviceCallAuthorizer.authorize(
+                        "events", "lambda:InvokeFunction", arn, ruleArn, sourceAccount) == Decision.DENY) {
+                    throw new AwsException("AccessDeniedException",
+                            "EventBridge is not authorized to invoke the Lambda target.", 403);
+                }
                 lambdaService.invokeArn(arn, payload.getBytes(), InvocationType.Event);
                 LOG.debugv("EventBridge delivered to Lambda: {0}", arn);
             } else if (arn.contains(":sqs:")) {

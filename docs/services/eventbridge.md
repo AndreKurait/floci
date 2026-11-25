@@ -448,6 +448,7 @@ aws events put-targets \
 - The dead-letter queue must be a standard SQS queue in the rule's region, as in AWS. It may be in another account. Any other queue, and any failure to send to it, is logged as a `WARN`.
 - A retry uses the target's current definition, so `PutTargets` changes apply to pending retries, and a target removed with `RemoveTargets` stops being retried.
 - An accepted asynchronous Lambda invocation counts as delivered. A later function error is handled by Lambda's own retry and destination settings, not by the rule.
+- With IAM enforcement enabled, Lambda delivery requires its resource policy to allow the EventBridge service principal on the exact target ARN, including a version or alias qualifier. Source-rule ARN and account conditions apply. A missing or revoked grant produces a permission failure for the rule's dead-letter handling; an unqualified function grant does not authorize an alias target.
 - Pending retries are kept in memory and are dropped by an emulator reset or restart.
 - An `AWS::Events::Rule` target in a CloudFormation template keeps its `RetryPolicy`, `DeadLetterConfig`, `RoleArn`, `EcsParameters` and `AppSyncParameters`, which reach the rule as `PutTargets` would set them. A value of another type than the resource schema declares for them fails the rule before it is created, with the message CloudFormation gives.
 
