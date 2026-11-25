@@ -1,5 +1,6 @@
 package io.floci.aws.services.elb;
 
+import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.model.Container;
 import io.floci.aws.core.common.docker.ContainerExec;
 import io.floci.aws.core.common.docker.ContainerStorageHelper;
@@ -119,9 +120,10 @@ class ElbOverlappingVpcPacketIntegrationTest extends ElbClassicLambdaNatPacketIn
                             .get(ContainerStorageHelper.SECURITY_GROUP_HELPER_LABEL))).toList();
             assertEquals(1, workers.size());
             String helper = namespace(workers.getFirst().getId()).getId();
-            String transport = docker.inspectContainerCmd(helper).exec().getNetworkSettings().getNetworks()
-                    .values().stream().map(network -> network.getIpAddress())
-                    .filter(address -> address != null && !address.isBlank()).findFirst().orElseThrow();
+            InspectContainerResponse inspected = docker.inspectContainerCmd(helper).exec();
+            String controlNetwork = docker.inspectNetworkCmd().withNetworkId(inspected.getHostConfig().getNetworkMode())
+                    .exec().getName();
+            String transport = inspected.getNetworkSettings().getNetworks().get(controlNetwork).getIpAddress();
             assertEquals(account, firewall.vpcForClient(transport).orElseThrow().accountId());
             assertEquals(vpc, firewall.vpcForClient(transport).orElseThrow().vpcId());
             expected.put(helper, answer);

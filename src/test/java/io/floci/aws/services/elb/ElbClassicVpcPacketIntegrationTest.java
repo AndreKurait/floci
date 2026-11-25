@@ -105,7 +105,8 @@ class ElbClassicVpcPacketIntegrationTest {
     void prepare() throws Exception {
         assumeTrue(DockerAvailability.isAvailable(), "Docker is required for protected Classic packets");
         Files.writeString(imageContext.resolve("Dockerfile"),
-                "FROM " + TestImages.BUSYBOX + "\nRUN mkdir -p /var/lib\n");
+                "FROM " + TestImages.BUSYBOX + "\nRUN mkdir -p /var/lib\n"
+                        + "LABEL floci.test.fixture=" + UUID.randomUUID() + "\n");
         StringBuilder buildOutput = new StringBuilder();
         BuildImageResultCallback callback = new BuildImageResultCallback() {
             @Override
