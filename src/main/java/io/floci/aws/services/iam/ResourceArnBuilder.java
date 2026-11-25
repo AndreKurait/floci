@@ -6,6 +6,7 @@ import io.floci.aws.core.common.AwsRegions;
 import io.floci.aws.core.common.RequestPathLabels;
 import io.floci.aws.core.common.RequestResources;
 import io.floci.aws.core.common.StoredResourceArns;
+import io.floci.aws.services.memorydb.MemoryDbParameterGroupTarget;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
@@ -91,6 +92,12 @@ public class ResourceArnBuilder {
                                        String region, String accountId, String partition) {
         if (credentialScope == null) {
             return List.of("*");
+        }
+        if ("memorydb".equals(credentialScope)) {
+            JsonNode body = readJsonBody(ctx);
+            if (MemoryDbParameterGroupTarget.claims(operation, body)) {
+                return List.of(MemoryDbParameterGroupTarget.resourceArn(operation, body, partition, region, accountId));
+            }
         }
         return namedResources(credentialScope, operation, ctx, region, accountId, partition);
     }
