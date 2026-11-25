@@ -25,7 +25,8 @@ public class NetworkInterface {
     /**
      * Whether AWS itself manages this interface, rather than the account it is billed to.
      * False for anything a customer created; true for the service-owned interfaces AWS
-     * creates on the customer's behalf, of which an interface VPC endpoint's is one.
+     * creates on the customer's behalf, of which an interface VPC endpoint's is one, and for
+     * an interface a session of a service-linked role creates.
      */
     private boolean requesterManaged;
     /**
