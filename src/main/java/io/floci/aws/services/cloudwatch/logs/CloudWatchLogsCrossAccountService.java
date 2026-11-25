@@ -211,7 +211,14 @@ public class CloudWatchLogsCrossAccountService {
         validateDestinationName(name);
         String arn = regionResolver.buildArn("logs", region, "destination:" + name);
         resolveDestination(arn, region);
-        destinations.delete(destinationKey(region, name));
+        if (destinations instanceof AccountAwareStorageBackend<?> raw) {
+            @SuppressWarnings("unchecked")
+            AccountAwareStorageBackend<LogDestination> aware = (AccountAwareStorageBackend<LogDestination>) raw;
+            aware.deleteMatchingIncludingLegacyAtomically(destination -> arn.equals(destination.getArn())
+                    && name.equals(destination.getDestinationName()));
+        } else {
+            destinations.delete(destinationKey(region, name));
+        }
     }
 
     private static LogDestination copyDestination(LogDestination original) {
