@@ -2,6 +2,7 @@ package io.floci.aws.services.iam;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsRegions;
 import io.floci.aws.core.common.RequestPathLabels;
 import io.floci.aws.core.common.RequestResources;
@@ -91,6 +92,11 @@ public class ResourceArnBuilder {
                                        String region, String accountId, String partition) {
         if (credentialScope == null) {
             return List.of("*");
+        }
+        if ("iot".equals(credentialScope) && "iot:DeleteJob".equals(operation)) {
+            String jobId = ctx.getUriInfo().getPathParameters().getFirst("jobId");
+            return List.of(jobId == null ? "*"
+                    : new AwsArnUtils.Arn(partition, "iot", region, accountId, "job/" + jobId).toString());
         }
         return namedResources(credentialScope, operation, ctx, region, accountId, partition);
     }
