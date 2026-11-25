@@ -226,6 +226,7 @@ public class KinesisService implements ResourceProvider {
 
         String arn = regionResolver.buildArn("kinesis", region, "stream/" + streamName);
         KinesisStream stream = new KinesisStream(streamName, arn);
+        stream.setStreamCreationTimestamp(clock.instant());
         stream.setAccountId(regionResolver.getAccountId());
         stream.setStreamMode(resolvedMode);
         stream.getTags().putAll(tags);
@@ -312,8 +313,9 @@ public class KinesisService implements ResourceProvider {
     public KinesisConsumer registerStreamConsumer(String streamArn, String consumerName,
                                                    Map<String, String> tags, String region) {
         validateResourceTagLimit(Map.of(), tags);
-        String consumerArn = streamArn + "/consumer/" + consumerName + ":" + System.currentTimeMillis();
+        String consumerArn = streamArn + "/consumer/" + consumerName + ":" + clock.millis();
         KinesisConsumer consumer = new KinesisConsumer(consumerName, consumerArn, streamArn);
+        consumer.setConsumerCreationTimestamp(clock.instant());
         consumer.getTags().putAll(tags);
         // Same lock order as deleteStream (stream monitor, then consumerStore), so a registration
         // cannot land between a delete's consumer sweep and its removal of the stream.
@@ -324,6 +326,7 @@ public class KinesisService implements ResourceProvider {
                 consumerStore.put(regionKey(region, consumerArn), consumer);
             }
         }
+
         LOG.infov("Registered Kinesis consumer: {0} for stream {1}", consumerName, streamArn);
         return consumer;
     }
@@ -1000,6 +1003,7 @@ public class KinesisService implements ResourceProvider {
 
     /** Enforces the "no more than ten UpdateShardCount calls per rolling 24 hours" default limit. */
     private List<Instant> nextShardCountUpdateTimestamps(KinesisStream stream) {
+
         Instant now = clock.instant();
         Instant windowStart = now.minus(SHARD_COUNT_UPDATE_WINDOW);
         List<Instant> recent = new ArrayList<>(stream.getShardCountUpdateTimestamps().stream()
@@ -1826,7 +1830,7 @@ public class KinesisService implements ResourceProvider {
                     arn, "kinesis:stream", "kinesis",
                     parsed.region(), parsed.accountId(),
                     stream.getStreamCreationTimestamp() != null
-                            ? stream.getStreamCreationTimestamp() : Instant.now(),
+                            ? stream.getStreamCreationTimestamp() : clock.instant(),
                     stream.getTags() != null ? stream.getTags() : Map.of()));
         }
         return resources;
