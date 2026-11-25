@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
+import io.floci.aws.services.amazonmq.AmazonMqConfigurationService;
 import io.floci.aws.services.dynamodb.DynamoDbFacade;
 import io.floci.aws.services.dynamodb.DynamoDbService;
 import io.floci.aws.services.dynamodb.backend.NativeDynamoDbBackend;
@@ -155,6 +156,44 @@ class IamConditionContextResolverTest {
                 lambdaWebServiceInstance, spellings(new ShapeNamingSpelling()), mock(Instance.class),
                 requestContext, new RegionResolver("us-east-1", "123456789012"), config,
                 null, serviceCatalog);
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"mq:DescribeConfiguration", "mq:UpdateConfiguration", "mq:DeleteConfiguration",
+            "mq:DescribeConfigurationRevision", "mq:ListConfigurationRevisions"})
+    void mqStoredTagCaseVariantsRetainEveryValueForPolicyEvaluation(String action) {
+        AmazonMqConfigurationService configurations = mock(AmazonMqConfigurationService.class);
+        Instance<AmazonMqConfigurationService> instance = mock(Instance.class);
+        when(instance.isResolvable()).thenReturn(true);
+        when(instance.get()).thenReturn(configurations);
+        IamConditionContextResolver mqResolver = new IamConditionContextResolver(null, null, null, null, null,
+                spellings(new ShapeNamingSpelling()), mock(Instance.class), requestContext,
+                new RegionResolver("us-east-1", "123456789012"), config, null, serviceCatalog, instance);
+        ContainerRequestContext request = mock(ContainerRequestContext.class);
+        UriInfo uri = mock(UriInfo.class);
+        MultivaluedMap<String, String> parameters = new MultivaluedHashMap<>();
+        parameters.putSingle("configurationId", "owned-configuration");
+        when(request.getUriInfo()).thenReturn(uri);
+        when(uri.getPathParameters()).thenReturn(parameters);
+        Map<String, String> tags = new LinkedHashMap<>();
+        tags.put("Owner", "one");
+        tags.put("owner", "two");
+        when(configurations.tagsForAuthorization("owned-configuration")).thenReturn(tags);
+
+        Map<String, List<String>> conditions = mqResolver.resolve("mq", action, request);
+        assertEquals(Map.of("aws:ResourceTag/Owner", List.of("one", "two")), conditions);
+        for (String value : List.of("one", "two")) {
+            String policy = """
+                    {"Statement":[{"Effect":"Allow","Action":"mq:*","Resource":"*"},
+                    {"Effect":"Deny","Action":"mq:*","Resource":"*",
+                    "Condition":{"ForAnyValue:StringEquals":{"aws:ResourceTag/owner":"%s"}}}]}
+                    """.formatted(value);
+            assertEquals(Decision.DENY, evaluator.simulateCustomPolicy(List.of(policy), action, "*", conditions));
+        }
+        when(configurations.tagsForAuthorization("owned-configuration")).thenReturn(Map.of("Owner", "one"));
+        assertEquals(Map.of("aws:ResourceTag/Owner", List.of("one")), mqResolver.resolve("mq", action, request));
+        when(configurations.tagsForAuthorization("owned-configuration")).thenReturn(Map.of());
+        assertNull(mqResolver.resolve("mq", action, request));
     }
 
     @Test

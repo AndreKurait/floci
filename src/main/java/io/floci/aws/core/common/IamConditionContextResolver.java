@@ -324,9 +324,9 @@ public class IamConditionContextResolver {
             return null;
         }
         String id = ctx.getUriInfo().getPathParameters().getFirst("configurationId");
-        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        Map<String, List<String>> conditions = new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
         mqConfigurations.get().tagsForAuthorization(id).forEach((key, value) ->
-                conditions.put(RESOURCE_TAG_PREFIX + key, List.of(value)));
+                conditions.computeIfAbsent(RESOURCE_TAG_PREFIX + key, ignored -> new ArrayList<>()).add(value));
         return conditions;
     }
 

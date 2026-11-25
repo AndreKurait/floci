@@ -194,6 +194,25 @@ class AmazonMqConfigurationIamIntegrationTest {
     }
 
     @Test
+    void storedCaseVariantTagValuesBothReachSignedIamDenials() throws Exception {
+        Owned configuration = create(root, "case-variants", Map.of("Owner", "one", "owner", "two"));
+        try (User user = user(allow("mq:DescribeConfiguration", configuration.arn())); MqClient caller = client(user)) {
+            assertEquals(configuration.id(), describe(caller, configuration).id());
+            for (String value : List.of("one", "two")) {
+                String deny = """
+                        {"Effect":"Deny","Action":"mq:DescribeConfiguration","Resource":"%s",
+                        "Condition":{"ForAnyValue:StringEquals":{"aws:ResourceTag/owner":"%s"}}}
+                        """.formatted(configuration.arn(), value);
+                policy(user, allow("mq:DescribeConfiguration", configuration.arn()) + "," + deny);
+                denied(() -> describe(caller, configuration));
+                assertEquals(configuration.tags(), describe(root, configuration).tags());
+            }
+            policy(user, allow("mq:DescribeConfiguration", configuration.arn()));
+            assertEquals(configuration.id(), describe(caller, configuration).id());
+        }
+    }
+
+    @Test
     void exactResourceGrantCannotReadMutateOrDeleteSibling() throws Exception {
         Owned a = create(root, "allowed", Map.of("owner", marker));
         Owned b = create(root, "sibling", Map.of("owner", marker));
