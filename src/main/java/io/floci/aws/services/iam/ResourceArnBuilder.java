@@ -364,6 +364,19 @@ public class ResourceArnBuilder {
                 return session;
             }
         }
+        if ("lambda:GetRuntimeManagementConfig".equals(operation)
+                || "lambda:PutRuntimeManagementConfig".equals(operation)) {
+            return List.of(runtimeManagementArn(ctx, region, accountId));
+        }
+        if ("kms:RetireGrant".equals(operation)) {
+            JsonNode body = readJsonBody(ctx);
+            if (body != null && body.path("GrantToken").isTextual()) {
+                String grantKey = grantKeyArn(body.path("GrantToken").textValue(), null, region);
+                if (grantKey != null) {
+                    return List.of(grantKey);
+                }
+            }
+        }
         if (operation != null && operation.startsWith(credentialScope + ":") && RequestResources.reads(operation)) {
             return namedResources(credentialScope, operation, ctx, region, accountId, partition);
         }
@@ -486,10 +499,6 @@ public class ResourceArnBuilder {
         }
         if ("mq:CreateConfiguration".equals(operation) || "mq:ListConfigurations".equals(operation)) {
             return List.of("*");
-        }
-        if ("lambda:GetRuntimeManagementConfig".equals(operation)
-                || "lambda:PutRuntimeManagementConfig".equals(operation)) {
-            return List.of(runtimeManagementArn(ctx, region, accountId));
         }
         if ("cloudformation".equals(credentialScope) && CloudFormationDriftService.handles(operation)) {
             if ("cloudformation:DescribeStackDriftDetectionStatus".equals(operation)) {

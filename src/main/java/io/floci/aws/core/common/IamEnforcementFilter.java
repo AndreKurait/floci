@@ -1411,8 +1411,10 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                                   String region, String accountId, String akid) {
         for (int resourceIndex = 0; resourceIndex < resources.size(); resourceIndex++) {
             String resource = resources.get(resourceIndex);
+            String policyScope = action.equals(operationAction) ? credentialScope
+                    : catalog.canonicalCredentialScope(action.split(":", 2)[0]);
             List<ResourcePolicyProvider.ResourcePolicy> resourcePolicies =
-                    resolveResourcePolicies(credentialScope, operationAction, resource);
+                    resolveResourcePolicies(policyScope, action, resource);
             String resourceOwnerAccountId = resourcePolicies.isEmpty() ? null : resourcePolicies.getFirst().ownerAccountId();
             List<String> policyDocs = resourcePolicies.stream()
                     .map(ResourcePolicyProvider.ResourcePolicy::policyDocument)

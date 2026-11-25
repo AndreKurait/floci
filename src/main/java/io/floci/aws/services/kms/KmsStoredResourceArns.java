@@ -1,5 +1,6 @@
 package io.floci.aws.services.kms;
 
+import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.StoredResourceArns;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -45,6 +46,15 @@ public class KmsStoredResourceArns implements StoredResourceArns {
                 : Optional.empty();
     }
 
+    @Override
+    public Optional<String> resolveStoredArn(String arn) {
+        if (!AwsArnUtils.isArnFor(arn, "kms")) {
+            return Optional.empty();
+        }
+        AwsArnUtils.Arn parsed = AwsArnUtils.parse(arn);
+        return kms.findKeyArnOfAccount(arn, parsed.accountId(), parsed.region());
+    }
+
     /** Whether KMS uses the key for a request another service forwards: enabled, not disabled or pending deletion. */
     @Override
     public boolean usable(String arn) {
@@ -81,7 +91,14 @@ public class KmsStoredResourceArns implements StoredResourceArns {
     /** The key a base64 ciphertext blob was encrypted under, as KMS reads it out of the blob to decrypt it. */
     private Optional<String> ciphertextKey(String blob, String region) {
         try {
-            return Optional.ofNullable(kms.decryptToKeyArn(Base64.getDecoder().decode(blob), region));
+            byte[] ciphertext = Base64.getDecoder().decode(blob);
+            Optional<String> key = Optional.ofNullable(kms.decryptToKeyArn(ciphertext, region));
+            if (key.isPresent()) {
+                return key;
+            }
+            return kms.foreignCiphertextOwner(ciphertext, region, regionResolver.getAccountId())
+                    .flatMap(owner -> kms.ciphertextKeyId(ciphertext)
+                            .flatMap(id -> kms.findKeyArnOfAccount(id, owner, region)));
         } catch (IllegalArgumentException e) {
             return Optional.empty();
         }
