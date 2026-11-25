@@ -108,7 +108,7 @@ class LambdaAliasProvisionedConcurrencyCfnProvisionerTest {
     }
 
     @Test
-    void newlyCreatedAliasDuringUpdateRemainsWhenCapacityIsReady() throws Exception {
+    void newlyCreatedAliasDuringUpdateRecordsDisplacedAliasWhenCapacityIsReady() throws Exception {
         alias();
         when(pool.put(anyString(), anyString(), anyString(), eq(2), anyString()))
                 .thenReturn(status(2, 2, "READY", null));
@@ -121,8 +121,39 @@ class LambdaAliasProvisionedConcurrencyCfnProvisionerTest {
 
         assertEquals(ARN, resource.getPhysicalId());
         assertFalse(resource.getAttributes().containsKey(CfnRollback.ROLLBACK_OWNED_ATTR));
-        assertFalse(resource.getAttributes().containsKey(CfnRollback.REPLACEMENT_CLEANUP_ATTR));
+        assertEquals(Set.of(update.priorPhysicalId()), ReplacementCleanup.owedPhysicalIds(resource));
         verify(lambda, never()).deleteAlias(anyString(), anyString(), anyString());
+        UpdateCleanupResult cleanup = provisioner.completeUpdate(resource);
+        assertTrue(cleanup.applicable());
+        assertTrue(cleanup.complete());
+        assertEquals(update.priorPhysicalId(), cleanup.previousPhysicalId());
+        verify(lambda).deleteAlias("us-east-1", "pc-function", "prior");
+        verify(lambda, never()).deleteAlias("us-east-1", "pc-function", "live");
+    }
+
+    @Test
+    void successfulReplacementRollbackRestoresPriorIdentityAndAttributes() throws Exception {
+        alias();
+        when(pool.put(anyString(), anyString(), anyString(), eq(2), anyString()))
+                .thenReturn(status(2, 2, "READY", null));
+        ProvisionContext create = context();
+        String priorArn = ARN.replace(":live", ":prior");
+        ProvisionContext update = new ProvisionContext(create.engine(), create.region(), create.accountId(),
+                create.stackName(), priorArn);
+        StackResource resource = resource();
+        resource.setPhysicalId(priorArn);
+        resource.getAttributes().put("AliasArn", priorArn);
+        resource.getAttributes().put("PriorMarker", "retained");
+
+        provisioner.provision(resource, properties(), update);
+
+        assertTrue(provisioner.rollbackUpdate(resource));
+        assertEquals(priorArn, resource.getPhysicalId());
+        assertEquals(priorArn, resource.getAttributes().get("AliasArn"));
+        assertEquals("retained", resource.getAttributes().get("PriorMarker"));
+        verify(lambda).deleteAlias("us-east-1", "pc-function", "live");
+        verify(lambda, never()).deleteAlias("us-east-1", "pc-function", "prior");
+        assertFalse(provisioner.completeUpdate(resource).applicable());
     }
 
     @ParameterizedTest
