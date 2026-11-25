@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.services.cloudformation.CloudFormationDriftService;
+import io.floci.aws.services.cloudformation.CloudFormationDriftSnapshot;
 import io.floci.aws.services.dynamodb.DynamoDbConditionKeys;
 import io.floci.aws.services.dynamodb.DynamoDbFacade;
 import io.floci.aws.services.dynamodb.DynamoDbPartiQLParser;
@@ -102,6 +104,9 @@ public class IamConditionContextResolver {
     public static final String SERVER_SIDE_ENCRYPTION_KMS_KEY_ID = "s3:x-amz-server-side-encryption-aws-kms-key-id";
     static final String REQUEST_AUTH_TYPE = "lambda:Request/WebFunctionAuthType";
     static final String RESOURCE_AUTH_TYPE = "lambda:Resource/WebFunctionAuthType";
+
+    @Inject
+    Instance<CloudFormationDriftService> driftService;
 
     private final Instance<DynamoDbFacade> dynamoDbFacade;
     private final Instance<Ec2Service> ec2Service;
@@ -275,6 +280,7 @@ public class IamConditionContextResolver {
     public Map<String, List<String>> resolve(String credentialScope, String action,
                                              ContainerRequestContext ctx) {
         return switch (credentialScope) {
+            case "cloudformation" -> driftConditionContext(action, ctx);
             case "s3" -> s3ConditionContext(action, ctx);
             case "ec2" -> ec2ConditionContext(action, ctx);
             case "dynamodb" -> dynamoDbConditionContext(action, ctx);
@@ -283,6 +289,21 @@ public class IamConditionContextResolver {
             case "lambda" -> lambdaConditionContext(action, ctx);
             default -> requestMemberConditions(action, ctx);
         };
+    }
+
+    private Map<String, List<String>> driftConditionContext(String action, ContainerRequestContext ctx) {
+        if (!CloudFormationDriftService.handles(action)
+                || "cloudformation:DescribeStackDriftDetectionStatus".equals(action)
+                || driftService == null || !driftService.isResolvable()) {
+            return null;
+        }
+        String account = requestContext.getAccountId() == null ? config.defaultAccountId() : requestContext.getAccountId();
+        String region = requestContext.getRegion() == null ? config.defaultRegion() : requestContext.getRegion();
+        CloudFormationDriftSnapshot stack = driftService.get().authorizationTarget(
+                formParameters(ctx).get("StackName"), region, account);
+        Map<String, List<String>> context = new LinkedHashMap<>();
+        stack.tags().forEach((key, value) -> context.put("aws:ResourceTag/" + key, List.of(value)));
+        return context;
     }
 
     /**
