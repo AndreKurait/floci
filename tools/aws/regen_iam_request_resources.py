@@ -340,6 +340,7 @@ import argparse
 import json
 import re
 import sys
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -570,12 +571,16 @@ PERMISSION_SOURCES: dict[str, Path] = {
     "dynamodb": REPO_ROOT / "tools/aws/sources/dynamodb-permissions.json",
     "iam": REPO_ROOT / "tools/aws/sources/iam-identifiers.json",
 }
-# The script that writes each namespace's permission source, whose pages `verify_permission_sources` reads it against.
+# The script that writes each namespace's permission source, whose pages `verify_sources` reads it against.
 PERMISSION_FETCHERS = {
     "kms": fetch_kms_api_permissions,
     "dynamodb": fetch_dynamodb_permissions,
     "iam": fetch_iam_identifiers,
 }
+
+# Fetched API response examples supplement the identifier prefixes in botocore.
+ID_EXAMPLE_SOURCES = {"ec2": fetch_ec2_id_examples.OUTPUT}
+ID_EXAMPLE_FETCHERS = {"ec2": fetch_ec2_id_examples}
 
 # ---------------------------------------------------------------------------------------------------------------------
 # REQUIRED_TYPE_SOURCE: which resource types each action of a granted namespace always acts on, as its page of the
@@ -2819,7 +2824,7 @@ def reference_id_prefixes(models: dict[str, dict], kinds: tuple[str, ...], sourc
     member still names the type, while its locationName matches the copied XML path.
     """
     found: dict[str, str] = {}
-    model = models.get("ec2")
+    model = models.get(source["namespace"])
     if model is None:
         return found
     for operation, record in source["operations"].items():
@@ -2856,18 +2861,28 @@ def reference_id_prefixes(models: dict[str, dict], kinds: tuple[str, ...], sourc
     return found
 
 
+@dataclass(frozen=True)
+class IdPrefixes:
+    prefixes: dict[str, str]
+    typed: frozenset[str]
+
+
 def documented_id_prefixes(namespace: str, models: dict[str, dict],
-                           examples: dict[str, dict] | None = None) -> dict[str, str] | None:
-    """Supplement botocore's examples with fetched EC2 API examples, rejecting conflicts."""
+                           examples: dict[str, dict] | None = None) -> IdPrefixes | None:
+    """One prefix map, retaining which types botocore supports for typed-list readers."""
     known = namespace_id_prefixes(namespace, models, examples)
-    if namespace != "ec2" or known is None:
-        return known
-    source = json.loads(fetch_ec2_id_examples.OUTPUT.read_text(encoding="utf-8"))
+    if known is None:
+        return None
+    typed = frozenset(known)
+    path = ID_EXAMPLE_SOURCES.get(namespace)
+    if path is None:
+        return IdPrefixes(known, typed)
+    source = json.loads(path.read_text(encoding="utf-8"))
     for kind, prefix in reference_id_prefixes(models, ID_TARGETS[namespace], source).items():
         if kind in known and known[kind] != prefix:
             raise ValueError(f"botocore and API reference prefixes disagree for {kind}")
         known[kind] = prefix
-    return known
+    return IdPrefixes(known, typed)
 
 
 def namespace_id_prefixes(namespace: str, models: dict[str, dict],
@@ -2905,25 +2920,29 @@ def patterned_id_prefixes(models: dict[str, dict], kinds: tuple[str, ...]) -> di
 
 
 def id_targets(operation: str, types: list[str], formats: dict[str, str], models: dict[str, dict],
-               known: dict[str, str] | None = None,
-               generic_known: dict[str, str] | None = None) -> dict | None:
+               known: dict[str, str] | IdPrefixes | None = None) -> dict | None:
     """An id list, in model and EC2 Query spelling, with each type `ID_TARGETS` reads by id's discriminator, the prefix
     botocore gives its ids (`id_prefixes` or named shape patterns): the list a type's ARN variable names, when
     JSON named resources coexist with it or the EC2 request names nothing else
     the action acts on, or else the request's list of whatever resources it acts on (`Resources`, of the tagging
-    calls). `generic_known` supplements only generic resource lists with reference examples:
-    already typed lists retain their existing readers. None when neither list is present."""
+    calls). None when the request has neither, and the ordinary rules read it. A prefix only the vendored API
+    reference examples give (`documented_id_prefixes`) reads the tagging calls' generic list, never a typed list."""
     configured = ID_TARGETS.get(namespace_of(operation)) or MIXED_ID_TARGETS.get(namespace_of(operation))
     if configured is None:
         return None
     known = known if known is not None else namespace_id_prefixes(namespace_of(operation), models)
+    if isinstance(known, IdPrefixes):
+        typed = known.typed
+        known = known.prefixes
+    else:
+        typed = frozenset(known)
     found = None
     for model in models.values():
         spec = model["operations"].get(operation.split(":", 1)[1], {})
         if "input" not in spec or not ({"ec2", "json"} & set(_protocols(model))):
             continue
         members = model["shapes"][spec["input"]["shape"]].get("members", {})
-        variables = {variable for kind in known if kind in types and kind in formats
+        variables = {variable for kind in typed if kind in types and kind in formats
                      for variable in set(VARIABLE_RE.findall(formats[kind])) - KNOWN_VARIABLES}
         candidates = [name for name, member in members.items()
                       if _strings(model, model["shapes"][member["shape"]]) == "[]"
@@ -2938,8 +2957,8 @@ def id_targets(operation: str, types: list[str], formats: dict[str, str], models
         member = members.get(member_name) if member_name else None
         if member is None or _strings(model, model["shapes"][member["shape"]]) != "[]":
             continue
-        selected = generic_known if generic_known is not None and not candidates else known
-        prefixes = {kind: prefix for kind, prefix in selected.items() if kind in types and kind in formats}
+        prefixes = {kind: prefix for kind, prefix in known.items()
+                    if kind in types and kind in formats and (not candidates or kind in typed)}
         if candidates:
             # A list a type's ARN variable names holds that type's ids alone, and it is all the request acts on only
             # when the request names nothing else the action acts on: a launch's `SecurityGroupIds` sit beside its
@@ -2992,8 +3011,8 @@ def ec2_query_members(operation: str, models: dict[str, dict], named: set[str]) 
 
 
 def entry_for(operation: str, upstream: dict, formats: dict[str, str], models: dict[str, dict],
-              known: dict[str, str] | None = None, forwarded: dict[str, dict] | None = None,
-              routed: list[dict] | None = None, generic_known: dict[str, str] | None = None) -> dict:
+              known: dict[str, str] | IdPrefixes | None = None, forwarded: dict[str, dict] | None = None,
+              routed: list[dict] | None = None) -> dict:
     """What the file says for one operation, `forwarded` being what the file records of each action a `MEASURED` entry
     names, and `routed` the resources its routes name where AWS authorizes them as their method (`routed_resources`),
     which are then its resources. `upstream` gives, for a namespace with vendored permissions, the resource types of
@@ -3006,7 +3025,7 @@ def entry_for(operation: str, upstream: dict, formats: dict[str, str], models: d
     arn_members = {member for member, values in patterns.items()
                    if (kind_of(member) == "identifier" or stem(member) in ("", "resource"))
                    and values and all(only_arn(value) for value in values)}
-    targets = (id_targets(operation, types, formats, models, known, generic_known)
+    targets = (id_targets(operation, types, formats, models, known)
                if namespace_of(operation) in ID_TARGETS or namespace_of(operation) in MIXED_ID_TARGETS else None)
     if targets is not None and namespace_of(operation) == "ec2":
         return {"action": upstream["action"], "types": types, "resources": [], "targets": targets}
@@ -4881,20 +4900,16 @@ def build(documents: list[dict], provenance: str, data: Path, botocore: str) -> 
                                              for action in document.get("Actions", [])}
                           for document in documents if document["Name"] in PERMISSION_SOURCES}
     operations = {}
-    prefixes = {namespace: namespace_id_prefixes(namespace, load_models(data, set(namespaces[namespace])),
-                                                 load_examples(data, set(namespaces[namespace])))
+    prefixes = {namespace: documented_id_prefixes(namespace, load_models(data, set(namespaces[namespace])),
+                                                  load_examples(data, set(namespaces[namespace])))
                 for namespace in (*ID_TARGETS, *MIXED_ID_TARGETS) if namespace in namespaces}
-    generic_prefixes = {namespace: documented_id_prefixes(namespace, load_models(data, set(namespaces[namespace])),
-                                                          load_examples(data, set(namespaces[namespace])))
-                        for namespace in prefixes if namespace in ID_TARGETS}
     for operation, value in sorted(covered.items()):
         models = load_models(data, set(namespaces[namespace_of(operation)]))
         if namespace_of(operation) in permission_actions:
             value = {**value, "actions": permission_actions[namespace_of(operation)]}
         operations[operation] = entry_for(operation, value, {**formats.get(namespace_of(operation), {}),
                                                              **path_formats.get(namespace_of(operation), {})}, models,
-                                          prefixes.get(namespace_of(operation)), forwarded, routed.get(operation),
-                                          generic_prefixes.get(namespace_of(operation)))
+                                          prefixes.get(namespace_of(operation)), forwarded, routed.get(operation))
     unqualified = unqualified_types(formats, operations, namespaces, data)
     return {
         "_source": {
@@ -5550,20 +5565,16 @@ def derive(document: dict, data: Path) -> list[str]:
     if document.get("pathFormats", {}) != path_formats:
         problems.append(f"the file gives {json.dumps(document.get('pathFormats', {}))} as route types, the path "
                         f"sources and botocore give {json.dumps(path_formats)}")
-    prefixes = {namespace: namespace_id_prefixes(namespace, load_models(data, set(document["namespaces"][namespace])),
-                                                 load_examples(data, set(document["namespaces"][namespace])))
-                for namespace in ID_TARGETS if namespace in document["namespaces"]}
-    generic_prefixes = {namespace: documented_id_prefixes(
-        namespace, load_models(data, set(document["namespaces"][namespace])),
-        load_examples(data, set(document["namespaces"][namespace]))) for namespace in prefixes}
+    prefixes = {namespace: documented_id_prefixes(namespace, load_models(data, set(document["namespaces"][namespace])),
+                                                  load_examples(data, set(document["namespaces"][namespace])))
+                for namespace in (*ID_TARGETS, *MIXED_ID_TARGETS) if namespace in document["namespaces"]}
     for operation, entry in document["operations"].items():
         namespace = namespace_of(operation)
         models = load_models(data, set(document["namespaces"][namespace]))
         expected = entry_for(operation, {"action": entry["action"], "types": entry["types"],
                                          **({"actions": entry["actions"]} if "actions" in entry else {})},
                              {**document["arnFormats"].get(namespace, {}), **path_formats.get(namespace, {})}, models,
-                             prefixes.get(namespace), document["forwardedActions"], routed.get(operation),
-                             generic_prefixes.get(namespace))
+                             prefixes.get(namespace), document["forwardedActions"], routed.get(operation))
         if expected != entry:
             problems.append(f"{operation}: the file has {json.dumps(entry)}, botocore gives {json.dumps(expected)}")
     return problems
@@ -5637,12 +5648,12 @@ def verify_path_sources() -> list[str]:
     return untrue
 
 
-def verify_permission_sources() -> list[str]:
-    """A vendored permission source whose pages AWS has changed."""
+def verify_sources(sources: dict[str, Path], fetchers: dict) -> list[str]:
+    """A vendored source whose pages AWS has changed."""
     untrue: list[str] = []
-    for namespace, path in sorted(PERMISSION_SOURCES.items()):
+    for namespace, path in sorted(sources.items()):
         source = json.loads(path.read_text(encoding="utf-8"))
-        fetcher = PERMISSION_FETCHERS[namespace]
+        fetcher = fetchers[namespace]
         try:
             changed = fetcher.stale(source, *fetcher.fetch_all())
         except (OSError, ValueError) as e:
@@ -5749,8 +5760,8 @@ def main(argv: list[str] | None = None) -> int:
         try:
             untrue += verify_statements(document, documents)
             untrue += verify_path_sources()
-            untrue += verify_id_examples()
-            untrue += verify_permission_sources()
+            untrue += verify_sources({**PERMISSION_SOURCES, **ID_EXAMPLE_SOURCES},
+                                     {**PERMISSION_FETCHERS, **ID_EXAMPLE_FETCHERS})
             untrue += verify_required_type_source()
         except OSError as e:
             print(f"error: {e}", file=sys.stderr)

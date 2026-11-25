@@ -57,14 +57,22 @@ def fetch_url(url: str) -> str:
 def build(pages: dict[str, str]) -> dict:
     return {
         "_source": {"fetcher": "tools/aws/fetch_ec2_id_examples.py",
-                    "retrieved": datetime.now(timezone.utc).strftime("%Y-%m-%d")},
+                    "retrieved": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                    "pages": list(PAGES.values())},
+        "namespace": "ec2",
         "operations": {operation: {"page": url, "examples": read_examples(operation, pages[url])}
                        for operation, url in PAGES.items()},
     }
 
 
 def stale(vendored: dict, pages: dict[str, str]) -> bool:
-    return vendored.get("operations") != build(pages)["operations"]
+    built = build(pages)
+    return any(vendored.get(key) != built[key] for key in ("namespace", "operations"))
+
+
+def fetch_all(fetch=None) -> tuple[dict[str, str]]:
+    fetch = fetch or fetch_url
+    return ({url: fetch(url) for url in PAGES.values()},)
 
 
 def main(argv: list[str] | None = None, fetch=fetch_url) -> int:
@@ -72,7 +80,7 @@ def main(argv: list[str] | None = None, fetch=fetch_url) -> int:
     parser.add_argument("--verify", action="store_true")
     args = parser.parse_args(argv)
     try:
-        pages = {url: fetch(url) for url in PAGES.values()}
+        pages, = fetch_all(fetch)
         result = build(pages)
         if args.verify:
             if stale(json.loads(OUTPUT.read_text()), pages):

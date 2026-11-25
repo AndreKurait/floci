@@ -52,3 +52,11 @@ def test_verification_detects_changed_examples_and_ignores_retrieval_date(tmp_pa
     output.write_text(json.dumps(source))
     assert f.main(["--verify"], fetch) == 0
     assert f.main(["--verify"], lambda url: page(RESPONSE.replace("vpce-abc12345", "vpce-ffffffff"))) == 1
+
+
+def test_source_declares_namespace_and_pages_for_shared_verification():
+    source = f.build({url: page(RESPONSE) for url in f.PAGES.values()})
+    assert source["namespace"] == "ec2"
+    assert source["_source"]["pages"] == list(f.PAGES.values())
+    source["namespace"] = "other"
+    assert f.stale(source, {url: page(RESPONSE) for url in f.PAGES.values()})
