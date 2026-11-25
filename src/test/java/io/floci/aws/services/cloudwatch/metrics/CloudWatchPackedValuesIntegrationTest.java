@@ -53,6 +53,11 @@ class CloudWatchPackedValuesIntegrationTest {
             assertEquals(22650.0, point.sum());
             assertEquals(1.0, point.minimum());
             assertEquals(150.0, point.maximum());
+            Map<String, Double> percentiles = client.getMetricStatistics(request -> request.namespace(namespace)
+                    .metricName("Latency").startTime(timestamp.minusSeconds(1)).endTime(timestamp.plusSeconds(1))
+                    .period(60).extendedStatistics("p0", "p50", "p100"))
+                    .datapoints().getFirst().extendedStatistics();
+            assertEquals(Map.of("p0", 1.0, "p50", 75.0, "p100", 150.0), percentiles);
         }
     }
 }
