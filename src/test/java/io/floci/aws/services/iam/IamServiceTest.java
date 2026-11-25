@@ -2984,7 +2984,7 @@ class IamServiceTest {
                 new InMemoryStorage<>(), null, "000000000000");
         IamService service = iamService(false, new InMemoryStorage<>(), sessions,
                 new RegionResolver("us-gov-west-1", accountId));
-        IamRole role = service.createRole("worker", "/service-role/", "{}", null, 3600, null);
+        IamRole role = service.createRole("worker", "/service-role/", TRUST_POLICY, null, 3600, null);
         Instant expires = Instant.now().plusSeconds(900);
         service.registerSessionForAccount(accountId, accessKeyId, "secret", "token", role.getArn(), expires,
                 null, "service-call", role.getRoleId() + ":service-call");
