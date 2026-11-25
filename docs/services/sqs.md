@@ -218,6 +218,8 @@ Under either setting every form is accepted as input. That covers the AWS URL, t
 
 ## Queue policies under IAM enforcement
 
+`GetQueueUrl` accepts `QueueOwnerAWSAccountId` to look up a named queue in another account, in both Query and JSON requests. Without an owner it looks in the caller's account. With IAM enforcement enabled, the caller's identity policy and the owner's queue policy must both allow `sqs:GetQueueUrl` on the owner's queue ARN; an explicit deny still refuses the request. `CreateQueue` always creates in the caller's account.
+
 With `floci.services.iam.enforcement-enabled` on, a queue's `Policy` attribute, written by
 `SetQueueAttributes` or `AddPermission`, takes part in the decision as IAM's policy evaluation logic
 describes. Within one account either the policy or the caller's identity policies can allow a call,

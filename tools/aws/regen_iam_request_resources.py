@@ -1759,7 +1759,11 @@ def account_members(models: dict[str, dict], operation: str) -> list[str]:
                 and model["shapes"].get(qualifier.group(1), {}).get("type") == "structure"
             if member.get("location") in BODY_LOCATIONS and shape["type"] == "string" and not of_another \
                     and (shape.get("pattern") in ACCOUNT_ID_PATTERNS
-                         or (name in account_names and not CREATING_RE.match(operation))):
+                         or (name in account_names and not CREATING_RE.match(operation))
+                         or (not CREATING_RE.match(operation) and name.lower().endswith("accountid")
+                             and re.match(r"^(?:\(optional\) )?the (?:amazon web services|aws) account id "
+                                          r"of the account that created the ",
+                                          _lead_text(member.get("documentation"))))):
                 found.add(name)
     return sorted(found)
 
