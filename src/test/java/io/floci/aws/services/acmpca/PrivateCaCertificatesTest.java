@@ -4,7 +4,10 @@ import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.Pem;
 import org.bouncycastle.asn1.x509.BasicConstraints;
 import org.bouncycastle.asn1.x509.Extension;
+import org.bouncycastle.asn1.x509.GeneralName;
+import org.bouncycastle.asn1.x509.GeneralSubtree;
 import org.bouncycastle.asn1.x509.KeyUsage;
+import org.bouncycastle.asn1.x509.NameConstraints;
 import org.bouncycastle.cert.X509v3CertificateBuilder;
 import org.bouncycastle.cert.jcajce.JcaX509CertificateConverter;
 import org.bouncycastle.operator.jcajce.JcaContentSignerBuilder;
@@ -12,6 +15,7 @@ import org.bouncycastle.pkcs.PKCS10CertificationRequest;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.math.BigInteger;
 import java.security.cert.X509Certificate;
@@ -97,6 +101,58 @@ class PrivateCaCertificatesTest {
                 PrivateCaCertificates.pem(subordinate), List.of(anchor), child.csrPem(), now));
 
         assertEquals("InvalidRequestException", failure.getErrorCode());
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {false, true})
+    void subordinateImportRejectsNameConstraintsOnAnyIssuer(boolean constrainedRoot) throws Exception {
+        PrivateCaCertificates.KeyMaterial rootKey = PrivateCaCertificates.create(Map.of("CommonName", "Root"));
+        PrivateCaCertificates.KeyMaterial intermediateKey = PrivateCaCertificates.create(Map.of("CommonName", "Intermediate"));
+        PrivateCaCertificates.KeyMaterial childKey = PrivateCaCertificates.create(Map.of("CommonName", "ca.example.com"));
+        Instant now = Instant.now();
+        X509Certificate anchor = issuer(rootKey, rootKey, now, constrainedRoot);
+        X509Certificate intermediate = issuer(intermediateKey, rootKey, now, !constrainedRoot);
+        X509Certificate child = PrivateCaCertificates.issue(PrivateCaCertificates.csr(childKey.csrPem()),
+                intermediateKey.privateKeyPem(), intermediate, 0, now.minusSeconds(60), now.plusSeconds(3600));
+
+        AwsException failure = assertThrows(AwsException.class, () -> PrivateCaCertificates.importedSubordinate(
+                PrivateCaCertificates.pem(child), List.of(intermediate, anchor), childKey.csrPem(), now));
+
+        assertEquals("InvalidRequestException", failure.getErrorCode());
+    }
+
+    @Test
+    void subordinateImportAcceptsUnconstrainedIssuerChain() throws Exception {
+        PrivateCaCertificates.KeyMaterial rootKey = PrivateCaCertificates.create(Map.of("CommonName", "Root"));
+        PrivateCaCertificates.KeyMaterial intermediateKey = PrivateCaCertificates.create(Map.of("CommonName", "Intermediate"));
+        PrivateCaCertificates.KeyMaterial childKey = PrivateCaCertificates.create(Map.of("CommonName", "ca.example.com"));
+        Instant now = Instant.now();
+        X509Certificate anchor = issuer(rootKey, rootKey, now, false);
+        X509Certificate intermediate = issuer(intermediateKey, rootKey, now, false);
+        X509Certificate child = PrivateCaCertificates.issue(PrivateCaCertificates.csr(childKey.csrPem()),
+                intermediateKey.privateKeyPem(), intermediate, 0, now.minusSeconds(60), now.plusSeconds(3600));
+
+        assertEquals(child, PrivateCaCertificates.importedSubordinate(
+                PrivateCaCertificates.pem(child), List.of(intermediate, anchor), childKey.csrPem(), now));
+    }
+
+    private static X509Certificate issuer(PrivateCaCertificates.KeyMaterial subject,
+                                         PrivateCaCertificates.KeyMaterial signer, Instant now,
+                                         boolean constrained) throws Exception {
+        PKCS10CertificationRequest request = PrivateCaCertificates.csr(subject.csrPem());
+        PKCS10CertificationRequest signerRequest = PrivateCaCertificates.csr(signer.csrPem());
+        X509v3CertificateBuilder builder = new X509v3CertificateBuilder(signerRequest.getSubject(), BigInteger.ONE,
+                Date.from(now.minusSeconds(60)), Date.from(now.plusSeconds(7200)),
+                request.getSubject(), request.getSubjectPublicKeyInfo());
+        builder.addExtension(Extension.basicConstraints, true, new BasicConstraints(true));
+        builder.addExtension(Extension.keyUsage, true, new KeyUsage(KeyUsage.keyCertSign));
+        if (constrained) {
+            builder.addExtension(Extension.nameConstraints, true, new NameConstraints(
+                    new GeneralSubtree[] {new GeneralSubtree(new GeneralName(GeneralName.dNSName, ".example.com"))},
+                    null));
+        }
+        return new JcaX509CertificateConverter().getCertificate(builder.build(
+                new JcaContentSignerBuilder("SHA256withRSA").build(Pem.parsePrivateKey(signer.privateKeyPem()))));
     }
 
     private static X509Certificate root(PrivateCaCertificates.KeyMaterial material, Instant now, int seconds) {
