@@ -3,6 +3,7 @@ package io.floci.aws.services.ec2;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.InspectContainerResponse;
+import com.github.dockerjava.api.exception.DockerException;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.Container;
 import com.github.dockerjava.api.model.ContainerNetwork;
@@ -200,7 +201,7 @@ public class Ec2ContainerManager {
     public void refreshSecurityGroups(String region, Map<String, SecurityGroup> groups,
                                       Map<String, List<String>> prefixLists) {
         if (firewallManager != null && firewallManager.enabled()) {
-            firewallManager.refreshPolicies(region, groups, prefixLists);
+            firewallManager.refreshPolicies(regionResolver.getAccountId(), region, groups, prefixLists);
         }
     }
 
@@ -240,13 +241,15 @@ public class Ec2ContainerManager {
             throw new IllegalStateException("EC2 workload network namespace is not Floci protected");
         }
         Map<String, ContainerNetwork> networks = helper.getNetworkSettings().getNetworks();
-        String address = SecurityGroupFirewallManager.firstAddress(networks, ContainerNetwork::getIpAddress)
-                .orElseThrow(() -> new IllegalStateException("EC2 firewall helper has no Docker IP"));
+        String address = Ec2PublicAddressRouting.primaryAddress(helper);
+        String privateAddress = Ec2PublicAddressRouting.privateAddress(helper, instance.getContainerBridgeIp());
         return new ProtectedNamespace(helperId, address,
-                SecurityGroupFirewallManager.firstAddress(networks, ContainerNetwork::getGlobalIPv6Address).orElse(null));
+                SecurityGroupFirewallManager.firstAddress(networks, ContainerNetwork::getGlobalIPv6Address).orElse(null),
+                privateAddress);
     }
 
-    private record ProtectedNamespace(String helperId, String transportAddress, String transportIpv6Address) {}
+    private record ProtectedNamespace(String helperId, String transportAddress, String transportIpv6Address,
+                                      String privateAddress) {}
 
     /**
      * The container whose network namespace this one joined through a {@code container:} network
@@ -255,6 +258,11 @@ public class Ec2ContainerManager {
     private static String namespaceOwnerId(InspectContainerResponse container) {
         String mode = container.getHostConfig() == null ? null : container.getHostConfig().getNetworkMode();
         return mode != null && mode.startsWith("container:") ? mode.substring("container:".length()) : null;
+    }
+
+    private String instanceAccount(Instance instance) {
+        // Launch workers need the resource owner even when no request scope is active.
+        return instance.getOwnerId() != null ? instance.getOwnerId() : regionResolver.getAccountId();
     }
 
     public void restoreSecurityGroups(Instance instance, String region, List<SecurityGroup> groups,
@@ -271,10 +279,12 @@ public class Ec2ContainerManager {
         InstanceNetworkInterface eni = instance.getNetworkInterfaces().getFirst();
         String logical = instance.getLogicalPrivateIpAddress() != null
                 ? instance.getLogicalPrivateIpAddress() : eni.getPrivateIpAddress();
-        firewallManager.register(new SecurityGroupNftCompiler.Endpoint(regionResolver.getAccountId(), region,
+        firewallManager.register(new SecurityGroupNftCompiler.Endpoint(instanceAccount(instance), region,
                 instance.getVpcId(), eni.getNetworkInterfaceId(), logical, eni.getIpv6Addresses(), address,
                 namespace.transportIpv6Address(), instance.getSecurityGroups().stream()
-                        .map(GroupIdentifier::getGroupId).collect(Collectors.toSet()), groups), helperId, prefixLists);
+                        .map(GroupIdentifier::getGroupId).collect(Collectors.toSet()), groups, List.of(), true,
+                address.equals(namespace.privateAddress()) ? Set.of() : Set.of(namespace.privateAddress())),
+                helperId, prefixLists);
     }
 
     @Inject
@@ -563,7 +573,7 @@ public class Ec2ContainerManager {
                 String containerIp = started.namespace() == null
                         ? waitForContainerBridgeIp(containerId, instanceId, instance)
                         : started.namespace().transportAddress();
-                if (vpcAddress != null && started.namespace() == null) {
+                if (vpcAddress != null) {
                     // The VPC address is the one Floci reports and the one peers in the same VPC
                     // dial. The bridge address still identifies this container to IMDS, because
                     // the default route, and so the source address of its metadata requests, is
@@ -590,7 +600,8 @@ public class Ec2ContainerManager {
                     return;
                 }
 
-                refreshMetadataAddresses(instance, containerId);
+                refreshMetadataAddresses(instance,
+                        started.namespace() == null ? containerId : started.namespace().helperId());
 
                 // Set public-facing addresses only for instances due one, by the rule mock instances
                 // follow too, or holding an Elastic IP their interface carries, which RunInstances
@@ -686,6 +697,7 @@ public class Ec2ContainerManager {
             String eniId = null;
             String containerId = null;
             boolean recorded = false;
+            String protectedVpcAddress = null;
             try {
                 if (firewallManager != null && firewallManager.enabled()) {
                     if (instance.getNetworkInterfaces() == null || instance.getNetworkInterfaces().isEmpty()) {
@@ -695,12 +707,19 @@ public class Ec2ContainerManager {
                     eniId = eni.getNetworkInterfaceId();
                     instance.setLogicalPrivateIpAddress(eni.getPrivateIpAddress());
                     namespace = firewallManager.createNamespace("ec2", instanceId,
-                            regionResolver.getAccountId(), region, Optional.empty(), Map.of(22, sshHostPort));
-                    firewallManager.register(new SecurityGroupNftCompiler.Endpoint(regionResolver.getAccountId(),
+                            instanceAccount(instance), region, Optional.empty(), Map.of(22, sshHostPort));
+                    protectedVpcAddress = vpcNetworkManager.attach(instance.getOwnerId(), region,
+                            instance.getVpcId(), instance.getSubnetId(), namespace.helperId(), leasedPrivateIp)
+                            .map(network -> leasedPrivateIp).orElse(null);
+                    if (vpcNetworkManager.enabled() && protectedVpcAddress == null) {
+                        throw new IllegalStateException("Protected EC2 namespace could not attach to its VPC");
+                    }
+                    firewallManager.register(new SecurityGroupNftCompiler.Endpoint(instanceAccount(instance),
                             region, instance.getVpcId(), eniId, eni.getPrivateIpAddress(), eni.getIpv6Addresses(),
                             namespace.transportAddress(), namespace.transportIpv6Address(),
                             instance.getSecurityGroups().stream().map(g -> g.getGroupId())
-                                    .collect(Collectors.toSet()), groups),
+                                    .collect(Collectors.toSet()), groups, List.of(), true,
+                            protectedVpcAddress == null ? Set.of() : Set.of(protectedVpcAddress)),
                             namespace.helperId(), prefixLists);
                 }
                 ContainerSpec spec = buildContainerSpec(containerName, image, region, serviceEndpoint, imdsEndpoint,
@@ -726,7 +745,7 @@ public class Ec2ContainerManager {
                 String vpcAddress = namespace == null
                         ? vpcNetworkManager.attach(instance.getOwnerId(), region, instance.getVpcId(), instance.getSubnetId(),
                                 containerId, leasedPrivateIp).map(network -> leasedPrivateIp).orElse(null)
-                        : null;
+                        : protectedVpcAddress;
                 lifecycleManager.startCreated(containerId, spec);
                 return new StartedContainer(containerId, sshHostPort, vpcAddress, namespace, eniId);
             } catch (Exception e) {
@@ -1193,7 +1212,7 @@ public class Ec2ContainerManager {
                 if (namespace != null) {
                     // The helper survives a workload stop. Migrate its old TCP/80 listener before
                     // a restarted guest can bind a wildcard HTTP server during boot.
-                    protectedMetadataAddress = namespace.transportAddress();
+                    protectedMetadataAddress = namespace.privateAddress();
                     retainedMetadataRegistration = metadataServer.registeredContainer(protectedMetadataAddress)
                             .filter(registered -> registered == instance).isPresent();
                     metadataServer.registerContainer(protectedMetadataAddress, instanceId, instance);
@@ -1209,11 +1228,11 @@ public class Ec2ContainerManager {
                     }
                 }
                 // A protected workload shares the helper's namespace, so it has no Docker network
-                // attachment of its own to rediscover: the helper keeps the transport address
+                // attachment of its own to rediscover: the helper keeps its private address
                 // across the workload's stop/start, exactly as launch used it.
                 String containerIp = namespace == null
                         ? waitForContainerBridgeIp(containerId, instanceId)
-                        : namespace.transportAddress();
+                        : namespace.privateAddress();
                 if (containerIp != null && !containerIp.isBlank()) {
                     instance.setContainerBridgeIp(containerIp);
                     refreshServiceNetworkIp(instance);
@@ -1231,8 +1250,9 @@ public class Ec2ContainerManager {
                     if (namespace == null) {
                         metadataServer.registerContainer(containerIp, instanceId, instance);
                     }
-                    refreshImdsSourceRegistration(instance, containerId, containerIp);
-                    refreshMetadataAddresses(instance, containerId);
+                    String networkContainer = namespace == null ? containerId : namespace.helperId();
+                    refreshImdsSourceRegistration(instance, networkContainer, containerIp);
+                    refreshMetadataAddresses(instance, networkContainer);
                     // A plain restart loses its link-local address; a protected helper was
                     // prepared before starting the workload.
                     setUpMetadataEndpoint = namespace == null;
@@ -1406,7 +1426,24 @@ public class Ec2ContainerManager {
             return false;
         }
 
-        String containerIp = getContainerBridgeIp(containerId);
+        ProtectedNamespace namespace;
+        try {
+            namespace = protectedNamespace(instance);
+        } catch (DockerException e) {
+            LOG.warnv("Could not inspect the network namespace of EC2 instance {0}, keeping known IMDS addresses: {1}",
+                    instance.getInstanceId(), e.getMessage());
+            Set<String> known = new HashSet<>();
+            if (instance.getContainerBridgeIp() != null && !instance.getContainerBridgeIp().isBlank()) {
+                known.add(instance.getContainerBridgeIp());
+            }
+            if (instance.getImdsSourceIp() != null && !instance.getImdsSourceIp().isBlank()) {
+                known.add(instance.getImdsSourceIp());
+            }
+            known.forEach(address -> metadataServer.registerContainer(address, instance.getInstanceId(), instance));
+            return !known.isEmpty();
+        }
+        String networkContainer = namespace == null ? containerId : namespace.helperId();
+        String containerIp = namespace == null ? getContainerBridgeIp(networkContainer) : namespace.privateAddress();
         if (containerIp == null || containerIp.isBlank()) {
             containerIp = instance.getContainerBridgeIp();
         }
@@ -1422,13 +1459,15 @@ public class Ec2ContainerManager {
         }
         instance.setContainerBridgeIp(containerIp);
         refreshServiceNetworkIp(instance);
-        exposeReachablePrivateAddress(instance, containerIp, config.services().ec2().awsFaithfulPrivateIp());
+        if (namespace == null) {
+            exposeReachablePrivateAddress(instance, containerIp, config.services().ec2().awsFaithfulPrivateIp());
+        }
         if (instance.getPublicIpAddress() != null || AutomaticPublicAddress.isDue(instance, true)) {
             exposeReachablePublicAddress(instance);
         }
         metadataServer.registerContainer(containerIp, instance.getInstanceId(), instance);
-        refreshImdsSourceRegistration(instance, containerId, containerIp);
-        refreshMetadataAddresses(instance, containerId);
+        refreshImdsSourceRegistration(instance, networkContainer, containerIp);
+        refreshMetadataAddresses(instance, networkContainer);
         return true;
     }
 

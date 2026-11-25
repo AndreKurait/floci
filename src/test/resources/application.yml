@@ -13,6 +13,8 @@ quarkus:
 floci:
   base-url: "http://localhost:4566"
   network:
+    vpc-routing:
+      enabled: false
     security-group-enforcement:
       enabled: true
       helper-image: floci/network-helper:local
@@ -129,6 +131,9 @@ floci:
     reject-unknown-service-scope: true
 
   dns:
+    # Host DNS remains opt-in; listener tests use their own addresses and ephemeral ports.
+    # listen-address: 127.0.0.1                    # FLOCI_DNS_LISTEN_ADDRESS
+    container-fallback-enabled: true
     # Tests run natively; with the bridge listener on, a runner allowed to bind port 53 would change
     # how every container a test launches resolves names.
     bridge-listener-enabled: false
@@ -171,6 +176,7 @@ floci:
       reconcile-containers-on-startup: true
       container-drain-timeout-seconds: 15
       docker-flags: ""
+      # additional-docker-networks: []
       honour-architectures: false
       zip-max-entries: 100000
       async-retry-delay-seconds: 1
@@ -420,6 +426,8 @@ floci:
     elb:
       enabled: true
       mock: true
+      vpc-frontends: false
+      proxy-image: haproxy:3.2-alpine@sha256:5893840576071e6217cd52ebdcc14f454c6f7a631056fa6f4e0f40d3cac4215b
     elbv2:
       enabled: true
       mock: true
