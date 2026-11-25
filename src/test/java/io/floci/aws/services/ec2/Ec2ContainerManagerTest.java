@@ -155,6 +155,7 @@ import static org.mockito.Mockito.when;
 import static org.mockito.Mockito.withSettings;
 
 @ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
+@ResourceLock(ParallelLocks.CONFIG_MAPPING)
 class Ec2ContainerManagerTest {
 
     @Test
@@ -5968,7 +5969,7 @@ class Ec2ContainerManagerTest {
         Instance instance = instance("i-labeltest");
         harness.manager.launch(instance, "ubuntu:24.04", null, "us-west-2");
 
-        verify(harness.builder, timeout(2000)).withLabels(Map.of(
+        verify(harness.builder, timeout(2000).times(2)).withLabels(Map.of(
                 "io.floci", "aws",
                 "io.floci.service", "ec2",
                 "io.floci.resource-id", "i-labeltest",
