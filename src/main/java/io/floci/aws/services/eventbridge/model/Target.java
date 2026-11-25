@@ -38,6 +38,7 @@ public class Target {
         this(source.id, source.arn, source.input, source.inputPath);
         roleArn = source.roleArn;
         inputTransformer = source.inputTransformer;
+        kinesisParameters = source.kinesisParameters;
         sqsParameters = source.sqsParameters;
         batchParameters = source.batchParameters;
         ecsParameters = source.ecsParameters;

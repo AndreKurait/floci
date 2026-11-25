@@ -287,7 +287,7 @@ class CloudFormationAppConfigIntegrationTest {
                 client.deleteStack(request -> request.stackName(stack));
                 CfnStackWaits.awaitStackDeleted(stack);
                 for (String arn : resourceTagArns(before)) {
-                    appconfig().get("/tags/" + arn).then().statusCode(404);
+                    appconfig().get("/tags/{arn}", arn).then().statusCode(404);
                 }
             } finally {
                 deleteStack(stack);
@@ -297,7 +297,7 @@ class CloudFormationAppConfigIntegrationTest {
 
     private static void assertResourceTags(Map<String, String> outputs, Map<String, String> expected) {
         for (String arn : resourceTagArns(outputs)) {
-            assertEquals(expected, appconfig().get("/tags/" + arn).then().statusCode(200)
+            assertEquals(expected, appconfig().get("/tags/{arn}", arn).then().statusCode(200)
                     .extract().jsonPath().getMap("Tags", String.class, String.class), arn);
         }
     }
@@ -452,7 +452,7 @@ class CloudFormationAppConfigIntegrationTest {
     }
 
     private static Map<String, String> applicationTags(String applicationId) {
-        JsonPath body = appconfig().get("/tags/arn:aws:appconfig:us-east-1:000000000000:application/" + applicationId)
+        JsonPath body = appconfig().get("/tags/{arn}", "arn:aws:appconfig:us-east-1:000000000000:application/" + applicationId)
                 .then().statusCode(200).extract().jsonPath();
         return body.getMap("Tags", String.class, String.class);
     }
