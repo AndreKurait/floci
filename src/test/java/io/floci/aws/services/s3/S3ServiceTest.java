@@ -3,11 +3,16 @@ package io.floci.aws.services.s3;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.IamEnforcementFilter;
 import io.floci.aws.core.common.PaginatedResult;
 import io.floci.aws.core.common.RegionResolver;
+import io.floci.aws.core.common.RequestContext;
 import io.floci.aws.core.storage.HybridStorage;
 import io.floci.aws.core.storage.InMemoryStorage;
+import io.floci.aws.services.iam.IamService;
+import io.floci.aws.services.kms.KmsService;
 import io.floci.aws.services.lambda.LambdaService;
 import io.floci.aws.services.lambda.model.InvocationType;
 import io.floci.aws.services.lambda.model.LambdaFunction;
@@ -22,6 +27,7 @@ import io.floci.aws.services.s3.model.ObjectAttributeName;
 import io.floci.aws.services.s3.model.PutObjectOptions;
 import io.floci.aws.services.s3.model.S3Object;
 import io.floci.aws.services.s3.model.WebsiteConfiguration;
+import io.floci.aws.testing.InMemoryStorageFactory;
 import org.junit.jupiter.api.Assumptions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -42,11 +48,13 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.time.Clock;
 import java.util.ArrayList;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
@@ -59,6 +67,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
 
 import static org.junit.jupiter.api.Assertions.*;
+import static org.mockito.Mockito.RETURNS_DEEP_STUBS;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -396,8 +405,20 @@ class S3ServiceTest {
 
     @Test
     void putObjectWithKmsKeepsTheKeyId() {
+        InMemoryStorageFactory factory = new InMemoryStorageFactory("000000000000");
+        RegionResolver regions = new RegionResolver("us-east-1", "000000000000");
+        KmsService kms = new KmsService(factory, regions);
+        String kmsKeyId = kms.createKey("object key", "us-east-1").getArn();
+        S3KmsEncryption encryption = new S3KmsEncryption(kms, mock(IamEnforcementFilter.class),
+                new RequestContext(), regions, mock(IamService.class));
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        when(config.storage().persistentPath()).thenReturn(tempDir.toString());
+        when(config.storage().mode()).thenReturn("persistent");
+        when(config.storage().services().s3().mode()).thenReturn(Optional.of("persistent"));
+        when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
+        s3Service = new S3Service(factory, config, null, null, null, null, null,
+                regions, new ObjectMapper(), null, Clock.systemUTC(), encryption);
         s3Service.createBucket("test-bucket", "us-east-1");
-        String kmsKeyId = "arn:aws:kms:us-east-1:000000000000:key/test-key";
 
         S3Object put = s3Service.putObject(
                 "test-bucket",
@@ -412,6 +433,8 @@ class S3ServiceTest {
 
         assertEquals("aws:kms", put.getServerSideEncryption());
         assertEquals(kmsKeyId, put.getSseKmsKeyId());
+        assertArrayEquals("data".getBytes(StandardCharsets.UTF_8),
+                s3Service.getObject("test-bucket", "kms-with-key-id.txt").getData());
     }
 
     @Test

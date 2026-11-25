@@ -112,6 +112,26 @@ class IamConditionContextResolverTest {
         assertNull(resolver.resolve("eks", "eks:UpdateClusterConfig", request));
     }
 
+    @Test
+    void kmsCallerAccountDoesNotRequireAnEncryptionContext() {
+        ContainerRequestContext request = mock(ContainerRequestContext.class);
+        when(request.getProperty("floci.bufferedJsonBody")).thenReturn(json("{\"KeyId\":\"key\"}"));
+        assertEquals(Map.of("kms:CallerAccount", List.of("123456789012")),
+                resolver.resolve("kms", "kms:DescribeKey", request));
+    }
+
+    @Test
+    void kmsCallerAccountCannotBeOverriddenByRequestMembers() {
+        ContainerRequestContext request = mock(ContainerRequestContext.class);
+        when(request.getProperty("floci.bufferedJsonBody")).thenReturn(json("""
+                {"CallerAccount":"999999999999", "EncryptionContext":{"purpose":"test"}}
+                """));
+        Map<String, List<String>> conditions = resolver.resolve("kms", "kms:Encrypt", request);
+        assertEquals(List.of("123456789012"), conditions.get("kms:CallerAccount"));
+        assertEquals(List.of("test"), conditions.get("kms:EncryptionContext:purpose"));
+        assertEquals(List.of("purpose"), conditions.get("kms:EncryptionContextKeys"));
+    }
+
     @SuppressWarnings("unchecked")
     @BeforeEach
     void setUp() {
