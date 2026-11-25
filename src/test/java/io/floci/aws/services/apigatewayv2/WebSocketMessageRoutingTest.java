@@ -242,8 +242,7 @@ class WebSocketMessageRoutingTest {
         assertTrue(response.contains("sendMessage-handler"),
                 "Response should indicate the sendMessage route handled it, got: " + response);
 
-        ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-        Thread.sleep(500);
+        WebSocketTestSupport.closeAndAwait(ws);
     }
 
     // ──────────────────────────── Test 2: Route to $default when no match ────────────────────────────
@@ -265,8 +264,7 @@ class WebSocketMessageRoutingTest {
         assertTrue(response.contains("default-handler"),
                 "Response should indicate the $default route handled it, got: " + response);
 
-        ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-        Thread.sleep(500);
+        WebSocketTestSupport.closeAndAwait(ws);
     }
 
     // ──────────────────────────── Test 3: Error frame when no match and no $default ────────────────────────────
@@ -293,8 +291,7 @@ class WebSocketMessageRoutingTest {
             assertTrue(response.contains("No route found") || response.contains("no route"),
                     "Error frame should indicate no route found, got: " + response);
 
-            ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-            Thread.sleep(500);
+            WebSocketTestSupport.closeAndAwait(ws);
         } finally {
             // Re-create the $default route
             defaultRouteId = given()
@@ -328,8 +325,7 @@ class WebSocketMessageRoutingTest {
         assertTrue(response.contains("default-handler"),
                 "Response should indicate the $default route handled it, got: " + response);
 
-        ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-        Thread.sleep(500);
+        WebSocketTestSupport.closeAndAwait(ws);
     }
 
     // ──────────────────────────── Test 5: Error frame for non-JSON with no $default ────────────────────────────
@@ -356,8 +352,7 @@ class WebSocketMessageRoutingTest {
             assertTrue(response.contains("Could not route message") || response.contains("could not route"),
                     "Error frame should indicate message could not be routed, got: " + response);
 
-            ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-            Thread.sleep(500);
+            WebSocketTestSupport.closeAndAwait(ws);
         } finally {
             // Re-create the $default route
             defaultRouteId = given()
@@ -391,8 +386,7 @@ class WebSocketMessageRoutingTest {
         assertTrue(response.contains("sendMessage-handler"),
                 "Response should indicate the chat route's Lambda handled it, got: " + response);
 
-        ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-        Thread.sleep(500);
+        WebSocketTestSupport.closeAndAwait(ws);
     }
 
     // ──────────────────────────── Test 7: Non-string field value converted to string ────────────────────────────
@@ -427,8 +421,7 @@ class WebSocketMessageRoutingTest {
             assertTrue(response.contains("42"),
                     "Response should come from the route matching '42', got: " + response);
 
-            ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-            Thread.sleep(500);
+            WebSocketTestSupport.closeAndAwait(ws);
         } finally {
             // Clean up the numeric route
             given().when().delete("/v2/apis/" + wsApiId + "/routes/" + numericRouteId)
@@ -455,8 +448,7 @@ class WebSocketMessageRoutingTest {
         assertTrue(response.contains("default-handler"),
                 "Response should indicate the $default route handled it, got: " + response);
 
-        ws.sendClose(WebSocket.NORMAL_CLOSURE, "done").join();
-        Thread.sleep(500);
+        WebSocketTestSupport.closeAndAwait(ws);
     }
 
     // ──────────────────────────── Cleanup ────────────────────────────

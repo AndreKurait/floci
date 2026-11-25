@@ -618,10 +618,13 @@ class SqsEventSourcePollerTest {
         when(executorService.invoke(eq(fn), any(byte[].class), eq(InvocationType.RequestResponse)))
                 .thenReturn(new InvokeResult());
 
+        // The first poll buffers one record of the two the batch needs
         awaitPoll(poller.pollAndInvoke(esm));
+        verify(executorService, never()).invoke(any(), any(), any());
+
+        // The second poll fills the batch, which is delivered without waiting for the window
         awaitPoll(poller.pollAndInvoke(esm));
         verify(executorService).invoke(eq(fn), any(byte[].class), eq(InvocationType.RequestResponse));
-
         verify(sqsService).deleteMessage(esm.getQueueUrl(), "rh-m1", "us-east-1");
         verify(sqsService).deleteMessage(esm.getQueueUrl(), "rh-m2", "us-east-1");
     }
