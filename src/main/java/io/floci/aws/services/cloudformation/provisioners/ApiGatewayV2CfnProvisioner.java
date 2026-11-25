@@ -1349,7 +1349,8 @@ public class ApiGatewayV2CfnProvisioner implements CfnResourceProvisioner {
             req.put("stageVariables", stageVariables);
         }
 
-        if (!ctx.isUpdate() || replacingChild(r, apiId, ctx) || !stageName.equals(ctx.priorPhysicalId())) {
+        if (!ctx.isUpdate() || replacingChild(r, apiId, ctx)
+                || stageName != null && !stageName.equals(ctx.priorPhysicalId())) {
             apiGatewayV2Service.createStage(region, apiId, req);
             r.setPhysicalId(stageName);
         } else {
