@@ -25,6 +25,7 @@ import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
 import org.mockito.InOrder;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -62,6 +63,7 @@ class EcsContainerManagerDockerFlagsTest {
             + "-v /run/aoscp/ca.pem:/etc/aoscp/ca.pem:ro --env SSL_CERT_FILE=/etc/aoscp/ca.pem";
 
     private ContainerBuilder.Builder builder;
+    private List<Map<String, String>> labelMapsPerBuild;
     private ContainerLifecycleManager lifecycleManager;
     private LaunchedContainerAwsEnv awsEnv;
     private EmulatorConfig config;
@@ -72,7 +74,16 @@ class EcsContainerManagerDockerFlagsTest {
     void setUp() {
         builder = mock(ContainerBuilder.Builder.class, RETURNS_SELF);
         ContainerBuilder containerBuilder = mock(ContainerBuilder.class);
-        when(containerBuilder.newContainer(anyString())).thenReturn(builder);
+        // One label map per container built, so per-container labels can be told apart.
+        labelMapsPerBuild = new ArrayList<>();
+        when(containerBuilder.newContainer(anyString())).thenAnswer(invocation -> {
+            labelMapsPerBuild.add(new LinkedHashMap<>());
+            return builder;
+        });
+        when(builder.withLabels(any())).thenAnswer(invocation -> {
+            labelMapsPerBuild.getLast().putAll(invocation.getArgument(0));
+            return builder;
+        });
         when(containerBuilder.resolveImage(anyString())).thenAnswer(invocation -> invocation.getArgument(0));
 
         lifecycleManager = mock(ContainerLifecycleManager.class);
@@ -229,6 +240,65 @@ class EcsContainerManagerDockerFlagsTest {
         assertEquals("search", effective.get("com.example.team"), effective.toString());
         assertEquals("ecs", effective.get(ContainerStorageHelper.SERVICE_LABEL), effective.toString());
         assertNotEquals("spoofed", effective.get(ContainerStorageHelper.ECS_RUN_LABEL), effective.toString());
+    }
+
+    /**
+     * Every task container carries the labels the ECS agent sets on it (docker_task_engine.go, after
+     * the definition's dockerLabels, so they override a duplicate there): the task ARN, the container
+     * name, the task definition family and revision, and the cluster. Tools on the container instance
+     * find a task's containers by them, the way they would on an ECS host.
+     */
+    @Test
+    void taskContainersCarryTheEcsAgentLabels() {
+        EcsTask task = task();
+        task.setClusterArn("arn:aws:ecs:eu-west-1:123456789012:cluster/app-cluster");
+        TaskDefinition taskDef = taskDefinition(container("app"), container("sidecar"));
+        taskDef.setRevision(7);
+
+        manager.startTask(task, taskDef, null, "eu-west-1");
+
+        List<Map<String, String>> perContainer = effectiveLabelsPerContainer(2);
+        for (int i = 0; i < 2; i++) {
+            Map<String, String> effective = perContainer.get(i);
+            assertEquals(task.getTaskArn(), effective.get("com.amazonaws.ecs.task-arn"), effective.toString());
+            assertEquals(task.getClusterArn(), effective.get("com.amazonaws.ecs.cluster"), effective.toString());
+            assertEquals("app-api", effective.get("com.amazonaws.ecs.task-definition-family"),
+                    effective.toString());
+            assertEquals("7", effective.get("com.amazonaws.ecs.task-definition-version"), effective.toString());
+        }
+        assertEquals(List.of("app", "sidecar"), perContainer.stream()
+                .map(labels -> labels.get("com.amazonaws.ecs.container-name")).toList());
+    }
+
+    /**
+     * The agent's labels override a definition's dockerLabels with the same key, as on ECS, and Floci's
+     * own ownership labels still win over both.
+     */
+    @Test
+    void ecsAgentLabelsOverrideDockerLabelsAndFlociOwnershipStillWins() {
+        EcsTask task = task();
+        task.setClusterArn("arn:aws:ecs:eu-west-1:123456789012:cluster/app-cluster");
+        ContainerDefinition app = container("app");
+        app.setDockerLabels(Map.of(
+                "com.amazonaws.ecs.task-arn", "arn:aws:ecs:eu-west-1:123456789012:task/app-cluster/spoofed",
+                "com.amazonaws.ecs.container-name", "spoofed",
+                ContainerStorageHelper.SERVICE_LABEL, "spoofed"));
+
+        manager.startTask(task, taskDefinition(app), null, "eu-west-1");
+
+        Map<String, String> effective = effectiveLabelsPerContainer(1).getFirst();
+        assertEquals(task.getTaskArn(), effective.get("com.amazonaws.ecs.task-arn"), effective.toString());
+        assertEquals("app", effective.get("com.amazonaws.ecs.container-name"), effective.toString());
+        assertEquals("ecs", effective.get(ContainerStorageHelper.SERVICE_LABEL), effective.toString());
+    }
+
+    /**
+     * The labels each started container was built with, in start order, merged the way the builder
+     * merges them (later withLabels calls win). Each container gets its own builder from newContainer.
+     */
+    private List<Map<String, String>> effectiveLabelsPerContainer(int containers) {
+        assertEquals(containers, labelMapsPerBuild.size(), labelMapsPerBuild.toString());
+        return labelMapsPerBuild;
     }
 
     /** The env built from the task definition and baseline (not the docker-flags' --env list). */
