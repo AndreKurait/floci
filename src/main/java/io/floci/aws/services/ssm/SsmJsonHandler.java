@@ -49,16 +49,24 @@ public class SsmJsonHandler {
 
     private final SsmService ssmService;
     private final SsmCommandService commandService;
+    private final SsmInventoryService inventoryService;
     private final ObjectMapper objectMapper;
     private final IamEnforcementFilter iamEnforcementFilter;
 
     @Inject
-    public SsmJsonHandler(SsmService ssmService, SsmCommandService commandService, ObjectMapper objectMapper,
+    public SsmJsonHandler(SsmService ssmService, SsmCommandService commandService,
+                          SsmInventoryService inventoryService, ObjectMapper objectMapper,
                           IamEnforcementFilter iamEnforcementFilter) {
         this.ssmService = ssmService;
         this.commandService = commandService;
+        this.inventoryService = inventoryService;
         this.objectMapper = objectMapper;
         this.iamEnforcementFilter = iamEnforcementFilter;
+    }
+
+    public SsmJsonHandler(SsmService ssmService, SsmCommandService commandService, ObjectMapper objectMapper,
+                          IamEnforcementFilter iamEnforcementFilter) {
+        this(ssmService, commandService, null, objectMapper, iamEnforcementFilter);
     }
 
     public Response handle(String action, JsonNode request, String region, String authorization) {
@@ -87,6 +95,11 @@ public class SsmJsonHandler {
             case "ListCommandInvocations" -> handleListCommandInvocations(request, region);
             case "CancelCommand" -> handleCancelCommand(request, region);
             case "DescribeInstanceInformation" -> handleDescribeInstanceInformation(request, region);
+            case "PutInventory" -> {
+                inventoryService.putInventory(request, region);
+                yield Response.ok(objectMapper.createObjectNode()).build();
+            }
+            case "ListInventoryEntries" -> Response.ok(inventoryService.listInventoryEntries(request, region)).build();
             // Service settings (LZA ssm-block-public-document-sharing)
             case "GetServiceSetting" -> handleGetServiceSetting(request, region);
             case "UpdateServiceSetting" -> handleUpdateServiceSetting(request, region);
