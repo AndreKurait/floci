@@ -54,6 +54,7 @@ class ElbClassicProcessRecoveryTest {
     private static final String ACCOUNT = "111111111111";
     private static final String REGION = "us-east-1";
     private static final int CRASH_EXIT = 73;
+    private String recoveryImage = System.getProperty("floci.test.classic.recovery-image", "alpine:3.21");
 
     @TempDir
     Path directory;
@@ -84,6 +85,9 @@ class ElbClassicProcessRecoveryTest {
         Path plannedNames = directory.resolve("containers");
         Files.writeString(plannedNames, "");
         try (DockerClient docker = realDocker()) {
+            EmulatorConfig imageConfig = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+            when(imageConfig.docker().imagePullTimeoutSeconds()).thenReturn(300);
+            recoveryImage = new ImageCacheService(docker, imageConfig).ensureImageExists(recoveryImage);
             try {
                 runChild("docker-namespace", CRASH_EXIT);
                 List<String> names = Files.readAllLines(plannedNames);
@@ -114,7 +118,7 @@ class ElbClassicProcessRecoveryTest {
     private void runChild(String mode, int expectedExit) throws Exception {
         Path output = directory.resolve(mode + ".log");
         ProcessBuilder builder = new ProcessBuilder(Path.of(System.getProperty("java.home"), "bin", "java").toString(),
-                "-XX:+EnableDynamicAgentLoading", "-cp",
+                "-XX:+EnableDynamicAgentLoading", "-Dfloci.test.classic.recovery-image=" + recoveryImage, "-cp",
                 System.getProperty("surefire.test.class.path", System.getProperty("java.class.path")),
                 ElbClassicProcessRecoveryTest.class.getName(), directory.toString(), mode);
         builder.redirectErrorStream(true).redirectOutput(output.toFile());
@@ -266,7 +270,7 @@ class ElbClassicProcessRecoveryTest {
         String name = "classic-process-" + directory.getFileName() + "-" + suffix;
         Files.writeString(directory.resolve("containers"), name + "\n", StandardOpenOption.APPEND);
         recordContainer("planned " + name);
-        String id = docker.createContainerCmd("alpine:3.21").withName(name).withLabels(labels)
+        String id = docker.createContainerCmd(System.getProperty("floci.test.classic.recovery-image", "alpine:3.21")).withName(name).withLabels(labels)
                 .withCmd("sleep", "300").withHostConfig(HostConfig.newHostConfig().withNetworkMode(network)).exec().getId();
         recordContainer("created " + id + " " + name);
         docker.startContainerCmd(id).exec();

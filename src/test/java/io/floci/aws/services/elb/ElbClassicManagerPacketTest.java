@@ -15,6 +15,7 @@ import io.floci.aws.core.common.docker.ContainerLifecycleManager;
 import io.floci.aws.core.common.docker.ContainerSpec;
 import io.floci.aws.core.common.docker.DockerHostResolver;
 import io.floci.aws.core.common.docker.FlociDockerHttpClient;
+import io.floci.aws.core.common.docker.LocallyBuiltHelperImage;
 import io.floci.aws.core.common.docker.RetryingTarCopier;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
@@ -79,7 +80,14 @@ class ElbClassicManagerPacketTest {
                 when(config.services().elb().vpcFrontends()).thenReturn(true);
                 when(config.services().ec2().awsFaithfulPrivateIp()).thenReturn(true);
                 when(config.services().elb().proxyImage()).thenReturn(PROXY);
-                String helper = create(docker, created, prefix + "-helper", Map.of("test-owner", prefix), "none");
+                when(config.docker().imagePullTimeoutSeconds()).thenReturn(300);
+                String helperImage = System.getProperty("floci.test.classic.helper-image", "floci/network-helper:local");
+                ContainerBuilder builder = new ContainerBuilder(config, mock(DockerHostResolver.class),
+                        mock(EmbeddedDnsServer.class));
+                LocallyBuiltHelperImage.ensureBuilt(docker, builder, helperImage, "floci/network-helper:local",
+                        "/docker/network-helper.Dockerfile");
+                String helper = create(docker, created, prefix + "-helper", Map.of("test-owner", prefix), "none",
+                        builder.resolveImage(helperImage));
                 RetryingTarCopier.copyBytes(docker, helper, "/tmp", "backend.sh",
                         ("printf 'HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nowned-backend'\n"
                                 + "cat > /dev/null\n").getBytes(StandardCharsets.UTF_8), 0600);
@@ -125,8 +133,7 @@ class ElbClassicManagerPacketTest {
                 AccountAwareStorageBackend<ElbClassicFrontendManager.Ownership> store =
                         AccountAwareStorageBackend.inMemory("111111111111");
                 doReturn(store).when(factory).create(eq("elb"), eq("elb-classic-frontends.json"), any());
-                ImageCacheService images = mock(ImageCacheService.class);
-                when(images.ensureImageExists(PROXY)).thenReturn(PROXY);
+                ImageCacheService images = new ImageCacheService(docker, config);
                 ContainerLifecycleManager lifecycle = spy(new ContainerLifecycleManager(docker, docker,
                         images, mock(ContainerDetector.class), config));
                 doAnswer(call -> {
@@ -136,8 +143,6 @@ class ElbClassicManagerPacketTest {
                     record(created, id);
                     return id;
                 }).when(lifecycle).create(any(ContainerSpec.class));
-                ContainerBuilder builder = new ContainerBuilder(config, mock(DockerHostResolver.class),
-                        mock(EmbeddedDnsServer.class));
                 ElbClassicFrontendManager manager = new ElbClassicFrontendManager(config, ec2, firewall,
                         networks, builder, lifecycle, new ObjectMapper(), mock(IamService.class),
                         mock(AcmService.class), routing, factory);
@@ -222,10 +227,10 @@ class ElbClassicManagerPacketTest {
     private static final String PROXY = "haproxy:3.2-alpine@sha256:5893840576071e6217cd52ebdcc14f454c6f7a631056fa6f4e0f40d3cac4215b";
 
     private String create(DockerClient docker, List<String> created, String name,
-                                 Map<String, String> labels, String network) throws IOException {
+                                 Map<String, String> labels, String network, String image) throws IOException {
         Path manifest = ownershipJournal();
         Files.writeString(manifest, "planned " + name + "\n", StandardOpenOption.CREATE, StandardOpenOption.APPEND);
-        String id = docker.createContainerCmd("floci/network-helper:local").withName(name).withLabels(labels)
+        String id = docker.createContainerCmd(image).withName(name).withLabels(labels)
                 .withHostConfig(HostConfig.newHostConfig().withNetworkMode(network))
                 .withCmd("sleep", "300").exec().getId();
         created.add(id);
