@@ -601,6 +601,63 @@ class CodeArtifactPypiExternalConnectionImporterTest {
         }
     }
 
+    @Test
+    void serializesHyphenatedSdistAndUnderscoredWheelImports() throws Exception {
+        String sdist = "is-even-0.0.0.tar.gz";
+        String wheel = "is_even-0.0.0-py3-none-any.whl";
+        byte[] index = simpleIndexJson(List.of("0.0.0"), sdist, wheel);
+        CountDownLatch backgroundWriteStarted = new CountDownLatch(1);
+        CountDownLatch releaseBackgroundWrite = new CountDownLatch(1);
+        CountDownLatch requestedWheelFetched = new CountDownLatch(1);
+        AtomicBoolean wheelWritten = new AtomicBoolean();
+        AtomicInteger wheelWrites = new AtomicInteger();
+        AtomicReference<Thread> requestingThread = new AtomicReference<>();
+        when(externalConnectionClient.fetchSimpleIndex(eq("public:pypi"), anyString()))
+                .thenReturn(Optional.of(new PypiExternalConnectionClient.FetchedAsset(index)));
+        stubFetchFile(urlFor(sdist), SDIST_CONTENT);
+        when(externalConnectionClient.fetchFile(eq("public:pypi"), eq(urlFor(wheel)), any(Path.class)))
+                .thenAnswer(invocation -> {
+            Path destination = invocation.getArgument(2);
+            Files.write(destination, WHEEL_CONTENT);
+            if (Thread.currentThread() == requestingThread.get()) {
+                requestedWheelFetched.countDown();
+            }
+            return Optional.of(new PypiExternalConnectionClient.FetchedFile(WHEEL_CONTENT.length));
+        });
+        when(pypiserver.listPackageVersionAssetNames(anyString(), anyString(), anyString(), any(), anyString(),
+                anyString())).thenAnswer(invocation -> wheelWritten.get() ? List.of(sdist, wheel) : List.of());
+        when(service.retainedVersionOriginConnection(anyString(), anyString(), anyString(), anyString(),
+                anyString(), any(), anyString(), anyString())).thenReturn(Optional.of("public:pypi"));
+        when(service.retainAssetUnderVersionFence(any(), any(), any(), any(), any(), any(), any(), any(), anyLong(),
+                anyLong(), anyLong(), any(), eq(wheel), anyLong(), any())).thenAnswer(invocation -> {
+            if (wheelWrites.incrementAndGet() != 1) {
+                return new CodeArtifactService.AssetRetentionAttemptResult(true, false);
+            }
+            backgroundWriteStarted.countDown();
+            assertTrue(releaseBackgroundWrite.await(5, TimeUnit.SECONDS));
+            wheelWritten.set(true);
+            return new CodeArtifactService.AssetRetentionAttemptResult(true, true);
+        });
+        ExecutorService pool = Executors.newSingleThreadExecutor();
+        try {
+            assertTrue(importer.tryImportAsset(REGION, DOMAIN, OWNER, REPOSITORY, REPO_ID, sdist));
+            assertTrue(backgroundWriteStarted.await(5, TimeUnit.SECONDS));
+            Future<Boolean> requested = pool.submit(() -> {
+                requestingThread.set(Thread.currentThread());
+                return importer.tryImportAsset(REGION, DOMAIN, OWNER, REPOSITORY, REPO_ID, wheel);
+            });
+            assertTrue(requestedWheelFetched.await(5, TimeUnit.SECONDS));
+            ThreadStates.awaitBlockedOrDone(requestingThread, requested);
+            releaseBackgroundWrite.countDown();
+            assertTrue(requested.get(5, TimeUnit.SECONDS), "the existing sibling must remain downloadable");
+            assertEquals(1, wheelWrites.get(), "normalized package aliases must share the write lock");
+        } finally {
+            releaseBackgroundWrite.countDown();
+            pool.shutdownNow();
+            importer.shutdown();
+        }
+    }
+
     private static String urlFor(String filename) {
         return "https://files.pythonhosted.org/packages/aa/bb/" + filename;
     }

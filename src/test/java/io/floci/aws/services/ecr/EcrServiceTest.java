@@ -22,6 +22,7 @@ import io.floci.aws.services.ecr.registry.EcrRegistryManager;
 import io.floci.aws.services.ecr.registry.RegistryHttpClient;
 import io.floci.aws.testing.ParallelLocks;
 import io.floci.aws.testing.ParkingStore;
+import io.floci.aws.testing.ThreadStates;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
@@ -33,10 +34,12 @@ import java.io.OutputStream;
 import java.net.ConnectException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
 import java.util.Collections;
+import java.util.EnumSet;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
@@ -1405,14 +1408,10 @@ class EcrServiceTest {
         }
     }
 
-    /** Polls until the waiter is parked on the lock's semaphore, so it holds the entry. */
-    private static void awaitParkedOnTheLock(Thread waiter) throws InterruptedException {
-        long deadline = System.currentTimeMillis() + 5_000;
-        while (waiter.getState() != Thread.State.WAITING) {
-            assertTrue(System.currentTimeMillis() < deadline,
-                    "the waiting writer never parked on the lock");
-            Thread.sleep(5);
-        }
+    /** Returns once the waiter is parked on the lock's semaphore, so it holds the entry. */
+    private static void awaitParkedOnTheLock(Thread waiter) {
+        ThreadStates.awaitState(waiter, EnumSet.of(Thread.State.WAITING), Duration.ofSeconds(5),
+                "the waiting writer");
     }
 
     @Test

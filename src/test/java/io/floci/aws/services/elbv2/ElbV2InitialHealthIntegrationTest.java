@@ -77,7 +77,8 @@ class ElbV2InitialHealthIntegrationTest {
                 groupArn = createTargetGroup("initial-health-wire", backend.port(), "HealthyThresholdCount", 10);
                 registerTarget(groupArn, "127.0.0.1", backend.port());
                 String registeredGroupArn = groupArn;
-                await().atMost(Duration.ofSeconds(5)).untilAsserted(() -> {
+                await().atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).untilAsserted(() -> {
                     assertEquals(List.of("healthy"), targetHealth(registeredGroupArn, "State"));
                     assertEquals(List.of(), targetHealth(registeredGroupArn, "Reason"));
                 });
@@ -105,7 +106,8 @@ class ElbV2InitialHealthIntegrationTest {
                 registerTarget(groupArn, "127.0.0.1", serving.port());
                 String listenerArn = createListener(loadBalancerArn, groupArn, listenerPort);
                 String registeredGroupArn = groupArn;
-                await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                await().atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).untilAsserted(() ->
                         assertEquals(List.of("healthy"), targetHealth(registeredGroupArn, "State")));
 
                 HttpClient.Builder transport = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1)
@@ -127,7 +129,8 @@ class ElbV2InitialHealthIntegrationTest {
                 }
                 URI address = URI.create(protocol.toString().toLowerCase() + "://localhost:" + listenerPort + "/");
                 try (HttpClient wire = transport.build()) {
-                    await().atMost(Duration.ofSeconds(5)).ignoreException(IOException.class)
+                    await().atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).ignoreException(IOException.class)
                             .untilAsserted(() -> assertEquals("serving", response(wire, address)));
                     registerTarget(groupArn, "127.0.0.1", replacement.port());
                     assertTrue(replacement.probeStarted().await(5, TimeUnit.SECONDS),
@@ -140,7 +143,8 @@ class ElbV2InitialHealthIntegrationTest {
                     assertEquals(0, replacement.requests().get());
                     assertThat(targetHealth(groupArn, "State"), containsInAnyOrder("healthy", "initial"));
                     releaseReplacementProbe.countDown();
-                    await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+                    await().atMost(Duration.ofSeconds(5))
+                .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).untilAsserted(() ->
                             assertEquals(List.of("healthy", "healthy"), targetHealth(registeredGroupArn, "State")));
                     Set<String> admittedResponses = new HashSet<>();
                     for (int request = 0; request < 10; request++) {
