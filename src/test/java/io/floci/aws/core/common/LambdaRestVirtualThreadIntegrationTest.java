@@ -92,7 +92,7 @@ class LambdaRestVirtualThreadIntegrationTest {
             observed.put(target, new Scope(context.getAccountId(), context.getRegion()));
             waiting.countDown();
             return released.get(10, TimeUnit.SECONDS);
-        }).when(lambdaService).invoke(anyString(), anyString(), any(), any(), any(), any(), any());
+        }).when(lambdaService).invoke(anyString(), anyString(), any(), any(), any(), any(), any(), any());
         doAnswer(call -> {
             Scope target = targets.get(call.getArgument(0));
             assertEquals(InvocationType.RequestResponse, call.getArgument(2));
