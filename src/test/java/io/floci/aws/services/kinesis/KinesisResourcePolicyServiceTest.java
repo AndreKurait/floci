@@ -11,11 +11,13 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
+import java.nio.charset.StandardCharsets;
 import java.time.Clock;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -37,6 +39,66 @@ class KinesisResourcePolicyServiceTest {
     private final RegionResolver regions = new RegionResolver(REGION, ACCOUNT);
     private final KinesisService service = new KinesisService(streams, consumers, regions,
             Clock.fixed(Instant.parse("2026-01-01T00:00:00Z"), ZoneOffset.UTC));
+
+    @Test
+    void policySizeUsesUtf8BytesAndPreservesThePreviousDocument() {
+        String arn = service.createStream("target", 1, REGION).getStreamArn();
+        String policy = POLICY.replace("\"Effect\"", "\"Sid\":\"é\",\"Effect\"");
+        String limit = policy + " ".repeat(20 * 1024 - policy.getBytes(StandardCharsets.UTF_8).length);
+        service.putResourcePolicy(arn, limit, REGION);
+        assertEquals(limit, service.getResourcePolicy(arn, REGION));
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.putResourcePolicy(arn, limit + " ", REGION));
+        assertEquals("InvalidArgumentException", error.getErrorCode());
+        assertEquals(limit, service.getResourcePolicy(arn, REGION));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"\"*\"", "\"kinesis:*\"", "[\"kinesis:GetRecords\",\"kinesis:Get*\"]"})
+    void wildcardActionsCannotReplaceAStoredPolicy(String action) {
+        String arn = service.createStream("target", 1, REGION).getStreamArn();
+        service.putResourcePolicy(arn, POLICY, REGION);
+        String invalid = POLICY.replace("\"kinesis:GetRecords\"", action);
+        AwsException error = assertThrows(AwsException.class,
+                () -> service.putResourcePolicy(arn, invalid, REGION));
+        assertEquals("InvalidArgumentException", error.getErrorCode());
+        assertEquals(POLICY, service.getResourcePolicy(arn, REGION));
+    }
+
+    @Test
+    void registrationRejectsMissingAndDeletedParentsWithoutPublishingConsumers() {
+        String arn = regions.buildArn("kinesis", REGION, "stream/target");
+        AwsException absent = assertThrows(AwsException.class,
+                () -> service.registerStreamConsumer(arn, "child", REGION));
+        assertEquals("ResourceNotFoundException", absent.getErrorCode());
+        assertTrue(consumers.isEmpty());
+        service.createStream("target", 1, REGION);
+        service.deleteStream("target", REGION);
+        AwsException deleted = assertThrows(AwsException.class,
+                () -> service.registerStreamConsumer(arn, "child", REGION));
+        assertEquals("ResourceNotFoundException", deleted.getErrorCode());
+        assertTrue(consumers.isEmpty());
+    }
+
+    @Test
+    void legacyTagsUseStoredOwnershipForNondefaultAccountsWithoutMigration() {
+        AccountAwareStorageBackend<KinesisStream> scoped =
+                new AccountAwareStorageBackend<>(streams, null, "999999999999");
+        AccountAwareStorageBackend<KinesisConsumer> scopedConsumers =
+                new AccountAwareStorageBackend<>(consumers, null, "999999999999");
+        KinesisService local = new KinesisService(scoped, scopedConsumers, regions);
+        String arn = service.createStream("target", 1, REGION).getStreamArn();
+        String child = service.registerStreamConsumer(arn, "child", Map.of("scope", "consumer"), REGION).getConsumerArn();
+        service.addTagsToStream("target", Map.of("scope", "stream"), REGION);
+        assertEquals(Map.of("scope", "stream"), local.resourcePolicyTags(arn, REGION));
+        assertEquals(Map.of("scope", "consumer"), local.resourcePolicyTags(child, REGION));
+        assertEquals(Set.of(REGION + "::target"), streams.keys());
+        assertEquals(Set.of(REGION + "::" + child), consumers.keys());
+        KinesisStream stream = streams.get(REGION + "::target").orElseThrow();
+        stream.setAccountId("222222222222");
+        assertThrows(AwsException.class, () -> local.resourcePolicyTags(arn, REGION));
+        assertSame(stream, streams.get(REGION + "::target").orElseThrow());
+    }
 
     @Test
     void exactDocumentsAreIndependentForParentChildrenAndSibling() {

@@ -27,7 +27,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import static io.floci.aws.services.kinesis.KinesisResourcePolicyServiceTest.*;
 import static org.junit.jupiter.api.Assertions.*;
 
-class KinesisResourcePolicyTagCompositionTest {
+class KinesisResourcePolicyTagCompositionServiceTest {
     private final RegionResolver regions = new RegionResolver(REGION, ACCOUNT);
     private final Clock clock = Clock.fixed(Instant.parse("2026-01-01T00:00:00Z"), ZoneOffset.UTC);
 
