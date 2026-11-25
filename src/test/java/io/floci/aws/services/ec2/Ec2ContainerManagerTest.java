@@ -3,6 +3,8 @@ package io.floci.aws.services.ec2;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.async.ResultCallback;
 import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
+import com.github.dockerjava.api.command.CreateContainerCmd;
+import com.github.dockerjava.api.command.CreateContainerResponse;
 import com.github.dockerjava.api.command.ExecCreateCmd;
 import com.github.dockerjava.api.command.ExecCreateCmdResponse;
 import com.github.dockerjava.api.command.ExecStartCmd;
@@ -25,6 +27,7 @@ import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.Frame;
 import com.github.dockerjava.api.model.HostConfig;
 import com.github.dockerjava.api.model.Info;
+import com.github.dockerjava.api.model.Mount;
 import com.github.dockerjava.api.model.NetworkSettings;
 import com.github.dockerjava.api.model.StreamType;
 import io.floci.aws.config.EmulatorConfig;
@@ -46,8 +49,11 @@ import io.floci.aws.services.ec2.model.InstanceState;
 import io.floci.aws.services.ec2.net.VpcNetworkManager;
 import io.floci.aws.services.ec2.portforward.Ec2PortForwardManager;
 import io.floci.aws.services.ec2instanceconnect.InstanceConnectKeys;
+import io.floci.aws.services.lambda.launcher.ImageCacheService;
 import io.floci.aws.testing.HelperShellFixture;
 import io.floci.aws.testing.ParallelLocks;
+import io.smallrye.config.EnvConfigSource;
+import io.smallrye.config.SmallRyeConfigBuilder;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -55,6 +61,7 @@ import org.junit.jupiter.api.parallel.ResourceAccessMode;
 import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.stubbing.Answer;
 
@@ -88,18 +95,19 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
+import java.util.stream.Collectors;
 import java.util.zip.GZIPOutputStream;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
-import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Answers.RETURNS_DEEP_STUBS;
 import static org.mockito.Answers.RETURNS_SELF;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyInt;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anySet;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.argThat;
@@ -110,7 +118,6 @@ import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doReturn;
-import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -3170,6 +3177,160 @@ class Ec2ContainerManagerTest {
 
     @Test
     void launchProducesContainerSpecWithCatalogMemoryAndCpuLimits() throws Exception {
+        ContainerSpec spec = launchWithRealBuilder(ResolvedAmiImage.minimal("ubuntu:24.04"));
+
+        assertEquals(1024L * 1024 * 1024, spec.memoryBytes());
+        assertEquals(2_000_000_000L, spec.nanoCpus());
+        assertEquals(List.of("tail", "-f", "/dev/null"), spec.cmd());
+        assertNull(spec.entrypoint());
+        assertTrue(spec.ulimits().isEmpty());
+        assertEquals(8, spec.env().size());
+    }
+
+    @Test
+    void launchImageRuntimePreservesImageStartupThroughDockerCreate() throws Exception {
+        ContainerSpec spec = launchWithRealBuilder(new ResolvedAmiImage(
+                "example/worker:1", ResolvedAmiImage.IMAGE_RUNTIME, false, "linux/arm64"));
+
+        assertNull(spec.cmd());
+        assertNull(spec.entrypoint());
+        assertNull(spec.cgroupnsMode());
+        assertTrue(spec.mounts().isEmpty());
+        assertTrue(spec.binds().isEmpty());
+        assertEquals(1024L * 1024 * 1024, spec.memoryBytes());
+        assertEquals(2_000_000_000L, spec.nanoCpus());
+        assertEquals("ec2", spec.labels().get(Ec2ContainerManager.LABEL_SERVICE));
+        assertTrue(spec.env().contains("AWS_EC2_INSTANCE_ID=i-spec-limits"));
+
+        DockerClient dockerClient = mock(DockerClient.class, RETURNS_DEEP_STUBS);
+        when(dockerClient.infoCmd().exec().getNCPU()).thenReturn(8);
+        CreateContainerCmd createCmd = mock(CreateContainerCmd.class, RETURNS_SELF);
+        when(dockerClient.createContainerCmd(spec.image())).thenReturn(createCmd);
+        CreateContainerResponse response = mock(CreateContainerResponse.class);
+        when(response.getId()).thenReturn(TEST_CONTAINER_ID);
+        when(createCmd.exec()).thenReturn(response);
+        ImageCacheService imageCache = mock(ImageCacheService.class);
+        when(imageCache.ensureImageExists(spec.image(), "linux/arm64")).thenReturn(spec.image());
+        EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
+        ContainerLifecycleManager lifecycle = new ContainerLifecycleManager(
+                dockerClient, dockerClient, imageCache, mock(ContainerDetector.class), config);
+
+        assertEquals(TEST_CONTAINER_ID, lifecycle.create(spec, "linux/arm64"));
+
+        verify(createCmd).withPlatform("linux/arm64");
+        verify(createCmd, never()).withCmd(anyList());
+        verify(createCmd, never()).withCmd(any(String[].class));
+        verify(createCmd, never()).withEntrypoint(anyList());
+        verify(createCmd, never()).withEntrypoint(any(String[].class));
+        verify(createCmd).exec();
+    }
+
+    @Test
+    void launchSystemdRuntimeRetainsInitAndMountsInContainerSpec() throws Exception {
+        ContainerSpec spec = launchWithRealBuilder(new ResolvedAmiImage(
+                "example/cloud:1", ResolvedAmiImage.SYSTEMD_RUNTIME, true, "linux/arm64"));
+
+        assertEquals(List.of("/sbin/init", "systemd.mask=getty@.service", "systemd.mask=autovt@.service",
+                "systemd.mask=console-getty.service", "systemd.mask=container-getty@.service",
+                "systemd.mask=serial-getty@.service", "systemd.mask=getty-static.service"), spec.cmd());
+        assertNull(spec.entrypoint());
+        assertEquals("private", spec.cgroupnsMode());
+        assertEquals(Set.of("/run", "/run/lock"),
+                spec.mounts().stream().map(Mount::getTarget).collect(Collectors.toSet()));
+        Set<String> consolePaths = new HashSet<>();
+        consolePaths.add("/dev/console");
+        for (int tty = 0; tty < 64; tty++) {
+            consolePaths.add("/dev/tty" + tty);
+        }
+        assertEquals(consolePaths, spec.binds().stream().map(bind -> bind.getVolume().getPath())
+                .collect(Collectors.toSet()));
+        assertTrue(spec.binds().stream().allMatch(bind -> "/dev/null".equals(bind.getPath())
+                && bind.getAccessMode() == AccessMode.ro));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"minimal", "systemd", "image"})
+    void configuredGuestOptionsReachAllRuntimeModes(String runtime) throws Exception {
+        ContainerSpec spec = launchConfiguredGuest(new ResolvedAmiImage(
+                "example/guest:1", runtime, "systemd".equals(runtime), "linux/arm64"), Map.of(
+                "FLOCI_SERVICES_EC2_EXTRA_ENV", "CUSTOM_MODE=ready,TEXT=a\\,b=c,EMPTY=,AWS_CA_BUNDLE=/public/ca.pem",
+                "FLOCI_SERVICES_EC2_ULIMITS", "memlock=-1,nofile=1024000,nproc=1024:2048"),
+                false, false, false);
+
+        assertTrue(spec.env().containsAll(List.of(
+                "CUSTOM_MODE=ready", "TEXT=a,b=c", "EMPTY=", "AWS_CA_BUNDLE=/public/ca.pem",
+                "AWS_EC2_INSTANCE_ID=i-spec-limits", "AWS_REGION=us-west-2",
+                "AWS_ENDPOINT_URL=http://localhost.floci.io:4680",
+                "AWS_EC2_METADATA_SERVICE_ENDPOINT=http://floci:9169", "AWS_ACCESS_KEY_ID=test")));
+        assertEquals("systemd".equals(runtime) ? 13 : 12, spec.env().size());
+        assertEquals(Map.of(
+                "memlock", new ContainerSpec.ResourceLimit(-1, -1),
+                "nofile", new ContainerSpec.ResourceLimit(1024000, 1024000),
+                "nproc", new ContainerSpec.ResourceLimit(1024, 2048)), spec.ulimits());
+        assertEquals(1024L * 1024 * 1024, spec.memoryBytes());
+        assertEquals(2_000_000_000L, spec.nanoCpus());
+        assertNull(spec.entrypoint());
+        if ("image".equals(runtime)) {
+            assertNull(spec.cmd());
+        } else {
+            assertEquals("systemd".equals(runtime) ? List.of("/sbin/init", "systemd.mask=getty@.service", "systemd.mask=autovt@.service",
+                "systemd.mask=console-getty.service", "systemd.mask=container-getty@.service",
+                "systemd.mask=serial-getty@.service", "systemd.mask=getty-static.service")
+                    : List.of("tail", "-f", "/dev/null"), spec.cmd());
+        }
+        assertEquals("systemd".equals(runtime) ? "private" : null, spec.cgroupnsMode());
+    }
+
+    @Test
+    void configuredGuestOptionsPreserveInstanceProfileAndProtectedNamespace() throws Exception {
+        ContainerSpec spec = launchConfiguredGuest(ResolvedAmiImage.minimal("ubuntu:24.04"), Map.of(
+                "FLOCI_SERVICES_EC2_EXTRA_ENV", "CUSTOM_MODE=ready",
+                "FLOCI_SERVICES_EC2_ULIMITS", "memlock=-1,nofile=1024000"),
+                true, true, false);
+
+        assertEquals("container:firewall-helper", spec.networkMode());
+        assertFalse(spec.privileged());
+        assertTrue(spec.portBindings().isEmpty());
+        assertTrue(spec.env().contains("CUSTOM_MODE=ready"));
+        assertFalse(spec.env().stream().anyMatch(value -> value.startsWith("AWS_ACCESS_KEY_ID=")
+                || value.startsWith("AWS_SECRET_ACCESS_KEY=") || value.startsWith("AWS_SESSION_TOKEN=")));
+        assertEquals(new ContainerSpec.ResourceLimit(-1, -1), spec.ulimits().get("memlock"));
+        assertEquals(new ContainerSpec.ResourceLimit(1024000, 1024000), spec.ulimits().get("nofile"));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "INHERITED_WITHOUT_VALUE", "=value", "BAD KEY=value", "DUP=one,DUP=two",
+            "AWS_EC2_INSTANCE_ID=other", "AWS_REGION=other", "AWS_DEFAULT_REGION=other",
+            "AWS_ACCESS_KEY_ID=other", "AWS_SECRET_ACCESS_KEY=other", "AWS_SESSION_TOKEN=other",
+            "AWS_ENDPOINT_URL=http://other", "AWS_ENDPOINT_URL_S3=http://other",
+            "AWS_EC2_METADATA_SERVICE_ENDPOINT=http://other", "AWS_EC2_METADATA_DISABLED=true",
+            "AWS_PROFILE=other", "AWS_SHARED_CREDENTIALS_FILE=/other",
+            "AWS_WEB_IDENTITY_TOKEN_FILE=/other", "AWS_CONTAINER_CREDENTIALS_FULL_URI=http://other",
+            "AWS_IGNORE_CONFIGURED_ENDPOINT_URLS=true"
+    })
+    void invalidEnvironmentRefusesBeforePortsHelpersOrWorkload(String entries) throws Exception {
+        assertNull(launchConfiguredGuest(ResolvedAmiImage.minimal("ubuntu:24.04"),
+                Map.of("FLOCI_SERVICES_EC2_EXTRA_ENV", entries), true, true, true));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "nofile", "nofile=-2", "nofile=3:2", "nofile=-1:2", "nofile=1,nofile=2",
+            "nofile=1:2:3", "not-a-limit=1", "nofile=9223372036854775808"
+    })
+    void invalidProcessLimitsRefuseBeforePortsHelpersOrWorkload(String entries) throws Exception {
+        assertNull(launchConfiguredGuest(ResolvedAmiImage.minimal("ubuntu:24.04"),
+                Map.of("FLOCI_SERVICES_EC2_ULIMITS", entries), true, false, true));
+    }
+
+    private static ContainerSpec launchWithRealBuilder(ResolvedAmiImage image) throws Exception {
+        return launchConfiguredGuest(image, Map.of(), false, false, false);
+    }
+
+    private static ContainerSpec launchConfiguredGuest(ResolvedAmiImage image, Map<String, String> environment,
+                                                       boolean protectedNamespace, boolean instanceProfile,
+                                                       boolean refused) throws Exception {
         Ec2ContainerManager.containerBridgeIpAttempts = 1;
         Ec2ContainerManager.containerBridgeIpPollMillis = 1;
 
@@ -3183,14 +3344,13 @@ class Ec2ContainerManagerTest {
 
         EmulatorConfig config = mock(EmulatorConfig.class);
         EmulatorConfig.ServicesConfig services = mock(EmulatorConfig.ServicesConfig.class);
-        EmulatorConfig.Ec2ServiceConfig ec2 = mock(EmulatorConfig.Ec2ServiceConfig.class);
+        EmulatorConfig.Ec2ServiceConfig ec2 = new SmallRyeConfigBuilder()
+                .withSources(new EnvConfigSource(environment, 300))
+                .withMapping(EmulatorConfig.class).build()
+                .getConfigMapping(EmulatorConfig.class).services().ec2();
         when(config.services()).thenReturn(services);
         when(services.ec2()).thenReturn(ec2);
         when(services.dockerNetwork()).thenReturn(Optional.empty());
-        when(ec2.sshPortRangeStart()).thenReturn(2200);
-        when(ec2.sshPortRangeEnd()).thenReturn(2299);
-        when(ec2.imdsPort()).thenReturn(9169);
-        when(ec2.instanceResourceLimits()).thenReturn(true);
 
         EmulatorConfig.DockerConfig docker = mock(EmulatorConfig.DockerConfig.class);
         when(docker.logMaxSize()).thenReturn("10m");
@@ -3207,6 +3367,7 @@ class Ec2ContainerManagerTest {
         ContainerLifecycleManager lifecycleManager = mock(ContainerLifecycleManager.class);
         ArgumentCaptor<ContainerSpec> specCaptor = ArgumentCaptor.forClass(ContainerSpec.class);
         when(lifecycleManager.create(specCaptor.capture())).thenReturn(TEST_CONTAINER_ID);
+        when(lifecycleManager.create(specCaptor.capture(), anyString())).thenReturn(TEST_CONTAINER_ID);
         when(lifecycleManager.isContainerRunning(TEST_CONTAINER_ID)).thenReturn(true);
 
         DockerClient dockerClient = mock(DockerClient.class);
@@ -3217,6 +3378,11 @@ class Ec2ContainerManagerTest {
         VpcNetworkManager vpcNetworkManager = mock(VpcNetworkManager.class);
         RegionResolver regionResolver = mock(RegionResolver.class);
         when(regionResolver.getAccountId()).thenReturn("000000000000");
+        SecurityGroupFirewallManager firewall = mock(SecurityGroupFirewallManager.class);
+        when(firewall.enabled()).thenReturn(protectedNamespace);
+        when(firewall.createNamespace(eq("ec2"), eq("i-spec-limits"), eq("000000000000"),
+                eq("us-west-2"), eq(Optional.empty()), eq(Map.of(22, 2201))))
+                .thenReturn(new SecurityGroupFirewallManager.Namespace("firewall-helper", "172.18.0.12"));
 
         Ec2ContainerManager manager = new Ec2ContainerManager(
                 realBuilder,
@@ -3233,6 +3399,7 @@ class Ec2ContainerManagerTest {
                 mock(ContainerNetworkReachability.class),
                 vpcNetworkManager,
                 reachableEndpoint,
+                firewall,
                 new Ec2InstanceTypeCatalog());
 
         InspectContainerCmd inspect = mock(InspectContainerCmd.class);
@@ -3242,13 +3409,42 @@ class Ec2ContainerManagerTest {
 
         Instance instance = instance("i-spec-limits");
         instance.setInstanceType("t3.micro");
+        if (instanceProfile) {
+            instance.setIamInstanceProfileArn("arn:aws:iam::000000000000:instance-profile/test");
+        }
+        InstanceNetworkInterface eni = new InstanceNetworkInterface();
+        eni.setNetworkInterfaceId("eni-options");
+        eni.setPrivateIpAddress("10.0.0.12");
+        instance.setNetworkInterfaces(List.of(eni));
 
-        manager.launch(instance, "ubuntu:24.04", null, "us-west-2");
-        awaitUntil(() -> "running".equals(instance.getState().getName()), Duration.ofSeconds(2));
-
-        ContainerSpec capturedSpec = specCaptor.getValue();
-        assertEquals(1024L * 1024 * 1024, capturedSpec.memoryBytes());
-        assertEquals(2_000_000_000L, capturedSpec.nanoCpus());
+        try {
+            manager.launch(instance, image, null, "us-west-2");
+            awaitUntil(() -> (refused ? "terminated" : "running").equals(instance.getState().getName()),
+                    Duration.ofSeconds(2));
+            if (refused) {
+                verify(portAllocator, never()).allocate(anyInt(), anyInt());
+                verify(firewall, never()).createNamespace(anyString(), anyString(), anyString(), anyString(),
+                        any(), any());
+                verify(lifecycleManager, never()).create(any());
+                verify(lifecycleManager, never()).create(any(), anyString());
+                return null;
+            }
+            if (protectedNamespace) {
+                verify(firewall).createNamespace("ec2", "i-spec-limits", "000000000000",
+                        "us-west-2", Optional.empty(), Map.of(22, 2201));
+                if (image.dockerPlatform() == null) {
+                    verify(lifecycleManager, times(1)).create(any());
+                } else {
+                    verify(lifecycleManager, times(1)).create(any(), anyString());
+                }
+            }
+            ContainerSpec unrelated = realBuilder.newContainer("example/unrelated-helper:1").build();
+            assertTrue(unrelated.env().isEmpty());
+            assertTrue(unrelated.ulimits().isEmpty());
+            return specCaptor.getValue();
+        } finally {
+            manager.stop();
+        }
     }
 
     /** Stubs the daemon reachability probe every launch makes before touching Docker. */

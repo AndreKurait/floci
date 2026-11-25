@@ -355,6 +355,8 @@ floci:
       proxy-base-port: 9400
       proxy-max-port: 9499
     ec2:
+      extra-env: ${FLOCI_SERVICES_EC2_EXTRA_ENV:}
+      ulimits: ${FLOCI_SERVICES_EC2_ULIMITS:}
       # Opt-in Standard On-Demand vCPU admission. FLOCI_SERVICES_EC2_ENFORCE_VCPU_QUOTAS
       enforce-vcpu-quotas: false
       # Optional complete catalog override for locally built guest images.
