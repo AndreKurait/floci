@@ -383,6 +383,9 @@ public class SecretsManagerJsonHandler {
         if (secret.getLastChangedDate() != null) {
             response.put("LastChangedDate", EpochSeconds.fromInstant(secret.getLastChangedDate()));
         }
+        if (secret.getLastAccessedDate() != null) {
+            response.put("LastAccessedDate", EpochSeconds.fromInstant(secret.getLastAccessedDate()));
+        }
         if (secret.getDeletedDate() != null) {
             response.put("DeletedDate", EpochSeconds.fromInstant(secret.getDeletedDate()));
         }
