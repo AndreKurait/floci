@@ -141,6 +141,32 @@ jobs:
           persist-credentials: false
           ref: ${{ inputs.source-ref }}
 
+      - &restore-maven-wrapper
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.m2/wrapper/dists
+          key: maven-wrapper-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('.mvn/wrapper/maven-wrapper.properties') }}
+
+      # source-ref can select a revision that predates the repository's bootstrap script.
+      - &bootstrap-maven
+        name: Bootstrap Maven distribution
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in 1 2 3; do
+              if timeout --kill-after=5s 60s env MVNW_VERBOSE=true ./mvnw --version; then
+                  exit 0
+              else
+                  status=$?
+              fi
+              if (( attempt < 3 )); then
+                  echo "::warning::Maven wrapper bootstrap attempt $attempt failed (exit $status); retrying."
+                  sleep 5
+              fi
+          done
+          echo "::error::Maven wrapper bootstrap failed after three attempts."
+          exit "$status"
+
       - name: Resolve source revision
         id: source
         shell: bash
@@ -183,6 +209,9 @@ jobs:
           cache: maven
           github-token: ${{ github.token }}
 
+      - *restore-maven-wrapper
+      - *bootstrap-maven
+
       - name: Build native executable
         # Quarkus 3.39 switches on -H:+AOTSingleCallsiteInline for Mandrel 25.0.4+. The generated
         # REST invokers for AwsQueryController.dispatch and AwsJson11Controller.handle are each the
@@ -222,6 +251,9 @@ jobs:
           distribution: mandrel
           cache: maven
           github-token: ${{ github.token }}
+
+      - *restore-maven-wrapper
+      - *bootstrap-maven
 
       - name: Build native executable
         # Quarkus 3.39 switches on -H:+AOTSingleCallsiteInline for Mandrel 25.0.4+. The generated
