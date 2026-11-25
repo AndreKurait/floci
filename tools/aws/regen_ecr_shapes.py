@@ -20,6 +20,7 @@ from request_shapes import REPO_ROOT
 OUTPUT = REPO_ROOT / "src/main/resources/aws/ecr-request-shapes.json"
 MODEL = Path("ecr/2015-09-21")
 OPERATIONS = (
+    "StartLifecyclePolicyPreview", "GetLifecyclePolicyPreview",
     "GetAccountSetting", "PutAccountSetting",
     "RegisterPullTimeUpdateExclusion", "DeregisterPullTimeUpdateExclusion", "ListPullTimeUpdateExclusions",
     "PutRegistryPolicy", "GetRegistryPolicy", "DeleteRegistryPolicy",
