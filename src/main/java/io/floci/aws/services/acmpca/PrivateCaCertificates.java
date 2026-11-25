@@ -209,10 +209,24 @@ final class PrivateCaCertificates {
         X509Certificate certificate = imported(text, ownCsr, now, false);
         X509Certificate root = chain.get(chain.size() - 1);
         try {
+            if (chain.contains(certificate)) {
+                throw new IllegalArgumentException("The chain must exclude the imported certificate");
+            }
+            if (certificate.getIssuerX500Principal().equals(certificate.getSubjectX500Principal())
+                    && new X509CertificateHolder(certificate.getEncoded()).isSignatureValid(
+                    new JcaContentVerifierProviderBuilder().build(certificate.getPublicKey()))) {
+                throw new IllegalArgumentException("A subordinate certificate must be signed by another CA");
+            }
             if (!root.getIssuerX500Principal().equals(root.getSubjectX500Principal())) {
                 throw new IllegalArgumentException("The chain must end in a self-signed root");
             }
             root.verify(root.getPublicKey());
+            requireCaSigningProfile(root);
+            for (X509Certificate issuer : chain) {
+                if (issuer.getExtensionValue(Extension.nameConstraints.getId()) != null) {
+                    throw new IllegalArgumentException("Imported issuer name constraints are not supported");
+                }
+            }
             List<X509Certificate> path = new ArrayList<>();
             path.add(certificate);
             path.addAll(chain.subList(0, chain.size() - 1));
@@ -225,6 +239,16 @@ final class PrivateCaCertificates {
         } catch (Exception failure) {
             throw new AwsException("InvalidRequestException",
                     "The certificate chain must validate the certificate up to a self-signed root", 400);
+        }
+    }
+
+    private static void requireCaSigningProfile(X509Certificate certificate) {
+        Set<String> critical = certificate.getCriticalExtensionOIDs();
+        boolean[] usage = certificate.getKeyUsage();
+        if (certificate.getBasicConstraints() < 0 || critical == null
+                || !critical.contains(Extension.basicConstraints.getId())
+                || usage == null || usage.length <= 5 || !usage[5]) {
+            throw new IllegalArgumentException("A CA certificate needs critical CA constraints and keyCertSign");
         }
     }
 
@@ -245,12 +269,7 @@ final class PrivateCaCertificates {
             }
             certificate.checkValidity(Date.from(now));
             Set<String> critical = certificate.getCriticalExtensionOIDs();
-            boolean[] usage = certificate.getKeyUsage();
-            if (certificate.getBasicConstraints() < 0 || critical == null
-                    || !critical.contains(Extension.basicConstraints.getId())
-                    || usage == null || usage.length <= 5 || !usage[5]) {
-                throw new IllegalArgumentException("A CA certificate needs critical CA constraints and keyCertSign");
-            }
+            requireCaSigningProfile(certificate);
             // This bounded issuer does not implement imported name/policy constraints.
             if (!Set.of(Extension.basicConstraints.getId(), Extension.keyUsage.getId(),
                     Extension.subjectAlternativeName.getId()).containsAll(critical)

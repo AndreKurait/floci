@@ -7,6 +7,7 @@ import io.floci.aws.testing.PartitionCleanup;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.TestProfile;
+import io.restassured.parsing.Parser;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.api.extension.AfterEachCallback;
@@ -20,6 +21,7 @@ import software.amazon.awssdk.services.acmpca.model.CertificateAuthority;
 import software.amazon.awssdk.services.acmpca.model.ListCertificateAuthoritiesResponse;
 
 import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.HashSet;
 import java.util.LinkedHashSet;
@@ -27,6 +29,8 @@ import java.util.Set;
 import java.util.UUID;
 
 import static io.floci.aws.testing.EnforcementFixtures.auth;
+import static io.restassured.RestAssured.given;
+import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.*;
 
 @QuarkusTest
@@ -70,6 +74,12 @@ class AcmPcaIamEnforcementIntegrationTest {
                     assertTrue(scoped.getCertificateAuthorityCsr(request -> request.certificateAuthorityArn(first))
                             .csr().contains("BEGIN CERTIFICATE REQUEST"));
                     forbidden(() -> describe(scoped, second));
+                    given().port(endpoint.getPort()).contentType("application/x-amz-json-1.1")
+                            .header("Authorization", auth(scopedKey, "acm-pca"))
+                            .header("X-Amz-Target", "ACMPrivateCA.DescribeCertificateAuthority")
+                            .body(("{\"CertificateAuthorityArn\":\"" + second + "\"}").getBytes(StandardCharsets.UTF_8))
+                            .post("/").then().statusCode(400).parser("application/x-amz-json-1.1", Parser.JSON)
+                            .body("__type", equalTo("AccessDeniedException"));
                     forbidden(() -> create(scoped, marker));
                     forbidden(() -> denied.getCertificateAuthorityCsr(request -> request.certificateAuthorityArn(first)));
                     forbidden(() -> explicitDeny.deleteCertificateAuthority(request -> request
@@ -302,7 +312,8 @@ class AcmPcaIamEnforcementIntegrationTest {
 
     private static void forbidden(Runnable operation) {
         AcmPcaException denied = assertThrows(AcmPcaException.class, operation::run);
-        assertEquals(400, denied.statusCode());
+        // The SDK selects RPC v2 CBOR; the JSON request above retains its 400 contract.
+        assertEquals(403, denied.statusCode());
         assertEquals("AccessDeniedException", denied.awsErrorDetails().errorCode());
     }
 }

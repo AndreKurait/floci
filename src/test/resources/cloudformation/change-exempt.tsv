@@ -1,4 +1,3 @@
-AWS::ACMPCA::CertificateAuthority	compares live create-only configuration; reconciles revocation and tags directly, with replacement cleanup
 AWS::ApiGateway::Account	update not yet on the engine's changes (#6606)
 AWS::ApiGateway::ApiKey	update not yet on the engine's changes (#6606)
 AWS::ApiGateway::BasePathMapping	prior entity found by reusesPriorEntity; moves to the engine's decision with the create-only work

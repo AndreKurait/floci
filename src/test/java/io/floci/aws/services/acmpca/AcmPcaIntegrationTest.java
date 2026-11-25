@@ -77,6 +77,32 @@ class AcmPcaIntegrationTest {
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     @Test
+    void receiptFailurePreservesEarlierCleanupFailure() {
+        Owned owned = new Owned("cleanup-and-receipt-failure", "us-east-1");
+        IllegalStateException cleanupFailure = new IllegalStateException("cleanup failed");
+        owned.cleanupAssertions.add(() -> {
+            throw cleanupFailure;
+        });
+
+        AssertionError failure = assertThrows(AssertionError.class, owned::close);
+
+        assertSame(cleanupFailure, failure.getCause());
+        assertEquals(1, cleanupFailure.getSuppressed().length);
+        assertInstanceOf(AssertionError.class, cleanupFailure.getSuppressed()[0]);
+    }
+
+    @Test
+    void receiptFailureAloneFailsCleanup() {
+        Owned owned = new Owned("receipt-failure", "us-east-1");
+
+        AssertionError failure = assertThrows(AssertionError.class, owned::close);
+
+        assertEquals("Owned CA disable/delete verification failed", failure.getMessage());
+        assertInstanceOf(AssertionError.class, failure.getCause());
+        assertEquals(0, failure.getCause().getSuppressed().length);
+    }
+
+    @Test
     void supplementaryTagCharactersRoundTripAtTheLimits() {
         try (Owned owned = new Owned("unicode-tags", "us-east-1")) {
             String ca = owned.create(owned.client, UUID.randomUUID().toString());
@@ -264,6 +290,7 @@ class AcmPcaIntegrationTest {
                                         .keyCertSign(false).crlSign(false).dataEncipherment(true))
                                 .extendedKeyUsage(usage -> usage.extendedKeyUsageType("CODE_SIGNING")))).build())
                 .certificateArn();
+        assertNotEquals(originalArn, overriddenArn);
         GetCertificateResponse original = owned.client.getCertificate(input -> input
                 .certificateAuthorityArn(ca).certificateArn(originalArn));
         GetCertificateResponse overridden = owned.client.getCertificate(input -> input
@@ -682,7 +709,15 @@ class AcmPcaIntegrationTest {
                     }
                 }
             }
-            wire.save(caseName, marker, failure == null);
+            try {
+                wire.save(caseName, marker, failure == null);
+            } catch (Throwable receiptFailure) {
+                if (failure == null) {
+                    failure = receiptFailure;
+                } else {
+                    failure.addSuppressed(receiptFailure);
+                }
+            }
             if (failure != null) {
                 throw new AssertionError("Owned CA disable/delete verification failed", failure);
             }

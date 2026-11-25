@@ -44,6 +44,7 @@ import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -532,6 +533,78 @@ class AcmServiceTest {
         Certificate exported = service.exportCertificate(arn, passphrase, REGION);
         assertEquals(stored.getCertificateBody(), exported.getCertificateBody());
         assertEquals(ca.caPem(), exported.getCertificateChain());
+    }
+
+    @ParameterizedTest
+    @EnumSource(value = KeyAlgorithm.class, names = {"RSA_2048", "EC_prime256v1"})
+    void renewPreservesManagedMaterialWhenItsIssuerDisappears(KeyAlgorithm algorithm) throws Exception {
+        FlociCertificateAuthority managed = FlociCertificateAuthority.loadOrCreate(tempDir.resolve("managed"));
+        AcmPrivateCertificateAuthorities authorities = mock();
+        Instance<AcmPrivateCertificateAuthorities> providers = mock();
+        when(providers.isResolvable()).thenReturn(true);
+        when(providers.get()).thenReturn(authorities);
+        when(authorities.find(PCA_ARN, REGION)).thenReturn(Optional.of(
+                new AcmPrivateCertificateAuthorities.PrivateCertificateAuthority(
+                        true, managed.issuer(), managed.caPem())));
+        service.privateAuthorities = providers;
+        Certificate requested = service.requestCertificate("managed.example.test", List.of(), ValidationMethod.DNS,
+                null, algorithm, PCA_ARN, null, Map.of("team", "managed"), REGION);
+        Certificate issued = service.renewCertificate(requested.getArn(), REGION);
+        assertEquals("SUCCESS", issued.getRenewalStatus());
+        Pem.parseCertificate(issued.getCertificateBody()).verify(managed.certificate().getPublicKey());
+        issued.setManagedPrivateAuthority(false); // Older stored certificates have no origin flag.
+        String body = issued.getCertificateBody();
+        String key = issued.getPrivateKey();
+        String chain = issued.getCertificateChain();
+        when(authorities.find(PCA_ARN, REGION)).thenReturn(Optional.empty());
+
+        Certificate unchanged = service.renewCertificate(issued.getArn(), REGION);
+
+        assertEquals(body, unchanged.getCertificateBody());
+        assertEquals(key, unchanged.getPrivateKey());
+        assertEquals(chain, unchanged.getCertificateChain());
+        assertEquals(issued.getSerial(), unchanged.getSerial());
+        assertEquals(issued.getNotAfter(), unchanged.getNotAfter());
+        assertEquals(PCA_ARN, unchanged.getCertAuthorityArn());
+        assertEquals(Map.of("team", "managed"), unchanged.getTags());
+        assertEquals("FAILED", service.describeCertificate(issued.getArn(), REGION).getRenewalStatus());
+        assertEquals(CertificateStatus.ISSUED, unchanged.getStatus());
+        assertTrue(unchanged.getRenewalUpdatedAt() != null);
+        assertEquals(body, service.getCertificate(issued.getArn(), REGION).getCertificateBody());
+        assertEquals(managed.certificate().getSubjectX500Principal(), ca.certificate().getSubjectX500Principal(),
+                "matching issuer names must not authorize fallback to a different key");
+        Pem.parseCertificate(unchanged.getCertificateBody()).verify(managed.certificate().getPublicKey());
+    }
+
+    @Test
+    void managedOriginSurvivesStoredRenewalEvenWhenItsKeyMatchesTheLocalCa() throws Exception {
+        AcmPrivateCertificateAuthorities authorities = mock();
+        Instance<AcmPrivateCertificateAuthorities> providers = mock();
+        when(providers.isResolvable()).thenReturn(true);
+        when(providers.get()).thenReturn(authorities);
+        when(authorities.find(PCA_ARN, REGION)).thenReturn(Optional.of(
+                new AcmPrivateCertificateAuthorities.PrivateCertificateAuthority(true, ca.issuer(), ca.caPem())));
+        service.privateAuthorities = providers;
+        Certificate requested = service.requestCertificate("shared-key.example.test", List.of(), ValidationMethod.DNS,
+                null, KeyAlgorithm.EC_prime256v1, PCA_ARN, null, Map.of(), REGION);
+        Certificate issued = service.renewCertificate(requested.getArn(), REGION);
+        ObjectMapper mapper = new ObjectMapper().findAndRegisterModules();
+        Certificate restored = mapper.readValue(mapper.writeValueAsBytes(issued), Certificate.class);
+        InMemoryStorage<String, Certificate> store = new InMemoryStorage<>();
+        store.put(REGION + "::" + restored.extractCertificateId(), restored);
+        RegionResolver resolver = mock();
+        when(resolver.getAccountId()).thenReturn("000000000000");
+        AcmService reloaded = new AcmService(store, generator, ca, resolver, 0);
+        String body = restored.getCertificateBody();
+        String key = restored.getPrivateKey();
+
+        Certificate unchanged = reloaded.renewCertificate(restored.getArn(), REGION);
+
+        assertEquals(body, unchanged.getCertificateBody());
+        assertEquals(key, unchanged.getPrivateKey());
+        assertEquals("FAILED", unchanged.getRenewalStatus());
+        assertTrue(unchanged.isManagedPrivateAuthority());
+        assertEquals(PCA_ARN, unchanged.getCertAuthorityArn());
     }
 
     @Test

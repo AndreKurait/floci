@@ -62,6 +62,10 @@ public class AcmPcaCfnProvisioner implements CfnResourceProvisioner {
 
     @Override
     public void provision(StackResource r, JsonNode props, ProvisionContext ctx) {
+        if (ctx.isUpdate()) {
+            ReplacementCleanup.endRollbackRetry(r);
+        }
+        Map<String, String> attributesBefore = new LinkedHashMap<>(r.getAttributes());
         ObjectNode create = MAPPER.createObjectNode().put("CertificateAuthorityType", required(ctx, props, "Type"));
         ObjectNode configuration = create.putObject("CertificateAuthorityConfiguration")
                 .put("KeyAlgorithm", required(ctx, props, "KeyAlgorithm"))
@@ -88,9 +92,11 @@ public class AcmPcaCfnProvisioner implements CfnResourceProvisioner {
         JsonNode existing = ctx.isUpdate() ? findExisting(ctx.priorPhysicalId(), ctx.region()) : null;
         String arn;
         if (existing != null && !"DELETED".equals(existing.path("Status").asText())
+                && !ctx.changes(TYPE, props).requiresReplacement()
                 && sameCreateOnlyProperties(existing, create)) {
             arn = existing.path("Arn").asText();
             acmPcaService.validateRevocationConfiguration(create);
+            snapshotTags(r, arn, ctx.region());
             reconcileTags(arn, tags, ctx.region());
             if (revocation != null && Set.of("ACTIVE", "DISABLED").contains(existing.path("Status").asText())) {
                 ObjectNode update = request(arn);
@@ -99,12 +105,10 @@ public class AcmPcaCfnProvisioner implements CfnResourceProvisioner {
             }
         } else {
             arn = acmPcaService.create(create, ctx.region()).path("CertificateAuthorityArn").asText();
-            if (existing != null) {
-                deletePriorOrUnwind(r, existing.path("Arn").asText(), arn, ctx.region());
-            }
         }
         r.setPhysicalId(arn);
         r.getAttributes().put("Arn", arn);
+        ReplacementCleanup.record(r, ctx, attributesBefore);
         r.getAttributes().put("CertificateSigningRequest", acmPcaService.csr(request(arn), ctx.region()).path("Csr").asText());
     }
 
@@ -121,22 +125,6 @@ public class AcmPcaCfnProvisioner implements CfnResourceProvisioner {
             }
             acmPcaService.delete(request(physicalId), region);
         }, "ResourceNotFoundException");
-    }
-
-    /**
-     * Removes the authority a replacement supersedes. If that fails, the update fails and the previous
-     * StackResource is restored without the new ARN, so the authority this attempt created is removed here.
-     */
-    private void deletePriorOrUnwind(StackResource r, String priorArn, String newArn, String region) {
-        try {
-            delete(r.getResourceType(), priorArn, region);
-        } catch (AwsException failure) {
-            LOG.warnv("Could not delete certificate authority {0} replaced by {1}, removing the replacement: {2}",
-                    priorArn, newArn, failure.getMessage());
-            delete(r.getResourceType(), newArn, region);
-            r.getAttributes().put(CfnRollback.UPDATE_ROLLBACK_RESTORED_ATTR, "true");
-            throw failure;
-        }
     }
 
     private JsonNode findExisting(String arn, String region) {
@@ -162,17 +150,71 @@ public class AcmPcaCfnProvisioner implements CfnResourceProvisioner {
                 && wanted.path("KeyAlgorithm").asText().equals(stored.path("KeyAlgorithm").asText())
                 && wanted.path("SigningAlgorithm").asText().equals(stored.path("SigningAlgorithm").asText())
                 && wanted.path("Subject").equals(stored.path("Subject"))
-                && wanted.path("CsrExtensions").equals(stored.path("CsrExtensions"))
                 && desired.path("KeyStorageSecurityStandard").asText("FIPS_140_2_LEVEL_3_OR_HIGHER")
                         .equals(existing.path("KeyStorageSecurityStandard").asText("FIPS_140_2_LEVEL_3_OR_HIGHER"))
                 && desired.path("UsageMode").asText("GENERAL_PURPOSE").equals(existing.path("UsageMode").asText());
     }
 
-    private void reconcileTags(String arn, Map<String, String> desired, String region) {
+    private void snapshotTags(StackResource resource, String arn, String region) {
+        ObjectNode snapshot = MAPPER.createObjectNode().put("arn", arn).put("region", region);
+        Map<String, String> current = currentTags(arn, region);
+        CfnRollback.putTagSnapshot(snapshot, current.keySet(), current);
+        resource.getAttributes().put(CfnRollback.ACM_PCA_TAGS_SNAPSHOT_ATTR, snapshot.toString());
+    }
+
+    @Override
+    public boolean retainsFailedUpdateState(StackResource resource) {
+        return resource.getAttributes().containsKey(CfnRollback.ACM_PCA_TAGS_SNAPSHOT_ATTR)
+                || ReplacementCleanup.hasReplacement(resource);
+    }
+
+    @Override
+    public boolean rollbackUpdate(StackResource resource) {
+        if (ReplacementCleanup.rollback(resource, this::delete)) {
+            return true;
+        }
+        JsonNode snapshot = CfnRollback.updateSnapshot(resource, CfnRollback.ACM_PCA_TAGS_SNAPSHOT_ATTR);
+        if (snapshot == null) {
+            return false;
+        }
+        reconcileTags(snapshot.path("arn").asText(), CfnRollback.snapshotTags(snapshot),
+                snapshot.path("region").asText());
+        clearUpdate(resource);
+        return true;
+    }
+
+    @Override
+    public UpdateCleanupResult completeUpdate(StackResource resource) {
+        resource.getAttributes().remove(CfnRollback.ACM_PCA_TAGS_SNAPSHOT_ATTR);
+        return ReplacementCleanup.complete(resource, this::delete);
+    }
+
+    @Override
+    public void clearUpdate(StackResource resource) {
+        ReplacementCleanup.clear(resource);
+        resource.getAttributes().remove(CfnRollback.ACM_PCA_TAGS_SNAPSHOT_ATTR);
+    }
+
+    @Override
+    public boolean hasReplacementUpdate(StackResource resource) {
+        return ReplacementCleanup.hasReplacement(resource);
+    }
+
+    @Override
+    public String updateCleanupPhysicalId(StackResource resource) {
+        return ReplacementCleanup.cleanupPhysicalId(resource);
+    }
+
+    private Map<String, String> currentTags(String arn, String region) {
         Map<String, String> current = new LinkedHashMap<>();
         for (JsonNode tag : acmPcaService.listTags(request(arn), region).path("Tags")) {
             current.put(tag.path("Key").asText(), tag.path("Value").asText());
         }
+        return current;
+    }
+
+    private void reconcileTags(String arn, Map<String, String> desired, String region) {
+        Map<String, String> current = currentTags(arn, region);
         List<String> stale = ProvisionContext.staleTagKeys(current, desired);
         if (!stale.isEmpty()) {
             ArrayNode keys = MAPPER.createArrayNode();

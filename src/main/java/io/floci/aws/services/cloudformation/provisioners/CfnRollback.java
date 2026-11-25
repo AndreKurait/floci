@@ -385,6 +385,9 @@ public final class CfnRollback {
      */
     public static final String METRIC_FILTER_UPDATE_SNAPSHOT_ATTR = "__FlociMetricFilterUpdateSnapshot";
 
+    /** Prior authority tags and owner-scoped address, retained until rollback or stack commit succeeds. */
+    public static final String ACM_PCA_TAGS_SNAPSHOT_ATTR = "__FlociAcmPcaTagsSnapshot";
+
     /**
      * Holds the pipe a rename displaced: the name it still lives under, the region that addresses
      * it, how many times deleting it has been attempted, and when the replacement was created.
