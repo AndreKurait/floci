@@ -754,9 +754,9 @@ class IamTagOnCreateEnforcementIntegrationTest {
         response.statusCode(403).body(containsString("not authorized to perform: " + action));
     }
 
-    /** A JSON-protocol service refuses with {@code AccessDeniedException}, which those protocols send as a 400. */
+    /** JSON denials use the service-specific status and retain the missing permission. */
     private static void refusedJson(ValidatableResponse response, String action) {
-        response.statusCode(400).body(containsString("AccessDeniedException"))
+        response.statusCode(action.startsWith("kms:") ? 403 : 400).body(containsString("AccessDeniedException"))
                 .body(containsString("not authorized to perform: " + action));
     }
 
