@@ -924,11 +924,11 @@ class IamRequestResourceEnforcementIntegrationTest {
                 + "\"Condition\":{\"StringEquals\":{\"aws:ResourceTag/team\":\"data\"}}}");
         send(user, "ssm", "AmazonSSM.GetParameter", "1.1", "{\"Name\":\"" + tagged + "\"}").statusCode(200);
         refusedJson(send(user, "ssm", "AmazonSSM.GetParameter", "1.1", "{\"Name\":\"" + other + "\"}"),
-                "ssm:GetParameter");
+                "ssm:GetParameter", 403);
         send(user, "ssm", "AmazonSSM.DescribeDocument", "1.1", "{\"Name\":\"" + taggedDocument + "\"}")
                 .statusCode(200);
         refusedJson(send(user, "ssm", "AmazonSSM.DescribeDocument", "1.1", "{\"Name\":\"" + otherDocument + "\"}"),
-                "ssm:DescribeDocument");
+                "ssm:DescribeDocument", 403);
     }
 
     /** An SSM String parameter of the name, tagged with the team, deleted afterwards. */
@@ -4122,7 +4122,11 @@ class IamRequestResourceEnforcementIntegrationTest {
 
     /** A JSON-protocol service refuses with {@code AccessDeniedException}, which those protocols send as a 400. */
     private static void refusedJson(ValidatableResponse response, String action) {
-        response.statusCode(400).body(containsString("AccessDeniedException"))
+        refusedJson(response, action, 400);
+    }
+
+    private static void refusedJson(ValidatableResponse response, String action, int status) {
+        response.statusCode(status).body(containsString("AccessDeniedException"))
                 .body(containsString("not authorized to perform: " + action)).body(not(containsString("NotFound")));
     }
 
