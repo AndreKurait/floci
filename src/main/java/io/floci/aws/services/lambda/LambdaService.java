@@ -1292,9 +1292,13 @@ public class LambdaService implements ResourceProvider, VpcDependencyProvider {
         String name = fn.getFunctionName();
         List<String> referencing = aliasStore == null ? List.of()
                 : aliasStore.list(region, name).stream()
-                        .filter(alias -> qualifier.equals(alias.getFunctionVersion())
-                                || (alias.getRoutingConfig() != null
-                                && alias.getRoutingConfig().containsKey(qualifier)))
+                        .filter(alias -> {
+                            if (qualifier.equals(alias.getFunctionVersion())) {
+                                return true;
+                            }
+                            Map<String, Double> routing = alias.getRoutingConfig();
+                            return routing != null && routing.containsKey(qualifier);
+                        })
                         .map(LambdaAlias::getName)
                         .toList();
         if (!referencing.isEmpty()) {
