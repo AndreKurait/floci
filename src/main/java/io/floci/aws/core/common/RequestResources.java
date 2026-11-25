@@ -501,7 +501,8 @@ public final class RequestResources {
                 continue;
             }
             if (resource.arn() != null) {
-                for (String named : values(form, body, resource.arn())) {
+                for (String value : values(form, body, resource.arn())) {
+                    String named = resourceSelector(operation, resource.arn(), value);
                     if (longerFormat(named, resource.types(), formats)) {
                         continue;
                     }
@@ -615,7 +616,8 @@ public final class RequestResources {
         Set<String> arns = new LinkedHashSet<>();
         for (RequestResourceMembers.Created created : creates) {
             RequestResourceMembers.ArnFormat parentFormat = formats.get(created.parent());
-            for (String named : values(form, body, created.arn())) {
+            for (String value : values(form, body, created.arn())) {
+                String named = resourceSelector(operation, created.arn(), value);
                 if (!parentFormat.pattern().matcher(named).matches()) {
                     continue;
                 }
@@ -627,6 +629,19 @@ public final class RequestResources {
             }
         }
         return List.copyOf(arns);
+    }
+
+    /**
+     * Execution starts accept Step Functions Local's test-case suffix. The handler runs the state machine before
+     * that suffix, so authorization and the execution ARN use that same identity. Other operations retain it.
+     */
+    private static String resourceSelector(String operation, RequestResourceMembers.Member member, String value) {
+        if (("states:StartExecution".equals(operation) || "states:StartSyncExecution".equals(operation))
+                && "stateMachineArn".equals(member.name())) {
+            int separator = value.indexOf('#');
+            return separator < 0 ? value : value.substring(0, separator);
+        }
+        return value;
     }
 
     /**
