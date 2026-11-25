@@ -5881,6 +5881,14 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
     public void registerSessionForAccount(String accountId, String sessionAccessKeyId, String secretAccessKey,
                                           String sessionToken, String roleArn, Instant expiration,
                                           String sessionPolicyDocument, String roleSessionName) {
+        registerSessionForAccount(accountId, sessionAccessKeyId, secretAccessKey, sessionToken, roleArn,
+                expiration, sessionPolicyDocument, roleSessionName, null);
+    }
+
+    /** Stores an explicitly owned session with the identity its credentials resolve to. */
+    public void registerSessionForAccount(String accountId, String sessionAccessKeyId, String secretAccessKey,
+                                          String sessionToken, String roleArn, Instant expiration,
+                                          String sessionPolicyDocument, String roleSessionName, String assumedRoleId) {
         if (accountId == null || accountId.isBlank()) {
             throw new IllegalArgumentException("Session account ID must not be blank");
         }
@@ -5888,6 +5896,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 sessionAccessKeyId, secretAccessKey, sessionToken, roleArn, expiration, sessionPolicyDocument,
                 accountId);
         session.setRoleSessionName(roleSessionName);
+        session.setAssumedRoleId(assumedRoleId);
         putSessionForAccount(accountId, sessionAccessKeyId, issuedNow(session));
     }
 
