@@ -135,12 +135,15 @@ public class AppConfigDataService {
         session.setRequiredMinimumPollIntervalInSeconds(pollInterval);
 
         String activeVersion = appConfigService.getActiveVersion(session.getEnvironmentId(), session.getConfigurationProfileId());
-        
+        boolean changed = activeVersion != null && !activeVersion.equals(session.getLastConfigurationVersion());
+
         HostedConfigurationVersion version = null;
-        if (activeVersion != null && !activeVersion.equals(session.getLastConfigurationVersion())) {
+        if (activeVersion != null) {
             try {
                 version = appConfigService.getHostedConfigurationVersion(session.getApplicationId(), session.getConfigurationProfileId(), Integer.parseInt(activeVersion));
-                session.setLastConfigurationVersion(activeVersion);
+                if (changed) {
+                    session.setLastConfigurationVersion(activeVersion);
+                }
             } catch (Exception e) {
                 LOG.warnv("Active version {0} not found for session {1}", activeVersion, session.getId());
             }
@@ -158,12 +161,18 @@ public class AppConfigDataService {
             ConfigurationProfile profile = appConfigService.getConfigurationProfile(
                     session.getApplicationId(), session.getConfigurationProfileId());
             ResolvedContent resolved = resolveContent(profile, version, accept);
-            content = resolved.bytes();
+            if (changed) {
+                content = resolved.bytes();
+            }
             contentType = resolved.contentType();
         }
-        String versionLabel = (version != null) ? String.valueOf(version.getVersionNumber()) : "";
+        String configurationVersion = version != null && changed ? Integer.toString(version.getVersionNumber()) : "";
+        String versionLabel = "";
+        if (version != null) {
+            versionLabel = changed ? version.getVersionLabel() : null;
+        }
 
-        return new ConfigurationData(content, contentType, versionLabel, nextToken,
+        return new ConfigurationData(content, contentType, configurationVersion, versionLabel, nextToken,
                 pollInterval);
     }
 
@@ -351,6 +360,6 @@ public class AppConfigDataService {
 
     public record LegacyConfiguration(byte[] content, String contentType, String configurationVersion) {}
 
-    public record ConfigurationData(byte[] content, String contentType, String configurationVersion,
+    public record ConfigurationData(byte[] content, String contentType, String configurationVersion, String versionLabel,
                                     String nextPollConfigurationToken, int nextPollIntervalInSeconds) {}
 }
