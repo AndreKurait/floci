@@ -1811,6 +1811,8 @@ public class S3Controller {
         S3Service.RequestAuthorization authorization = requestAuthorization(httpHeaders, uriInfo);
         s3Service.authorizeSignedRequest(authorization);
         String iamCredential = iamCredential(httpHeaders, uriInfo);
+        Map<String, List<String>> signatureConditions = S3SignatureConditions.request(
+                httpHeaders.getHeaderString("Authorization"), uriInfo.getQueryParameters());
         List<XmlParser.KeyVersion> authorizedEntries = new ArrayList<>();
         List<S3Service.DeleteError> authorizationErrors = new ArrayList<>();
         // With an access check on, an entry may bypass a lock only when the bypass was checked for it,
@@ -1820,7 +1822,7 @@ public class S3Controller {
         Set<XmlParser.KeyVersion> bypassingEntries = new HashSet<>();
         for (XmlParser.KeyVersion entry : entries) {
             try {
-                authorizeDeleteEntryIdentity(iamCredential, bucket, entry);
+                authorizeDeleteEntryIdentity(iamCredential, bucket, entry, signatureConditions);
                 s3Service.authorizeDeleteObject(bucket, entry.key(), entry.versionId(), authorization);
                 authorizeDeleteETagRead(bucket, entry.key(), entry.eTag(), authorization);
                 boolean overrides = bypass && s3Service.deleteOverridesGovernanceRetention(
@@ -1828,7 +1830,8 @@ public class S3Controller {
                 if (overrides) {
                     // The bypass is a permission of its own, so IAM evaluates it against the caller's
                     // policies as it does the delete, not only the bucket-policy check that follows.
-                    authorizeEntryIdentity(iamCredential, "s3:BypassGovernanceRetention", bucket, entry.key());
+                    authorizeEntryIdentity(iamCredential, "s3:BypassGovernanceRetention",
+                            bucket, entry.key(), signatureConditions);
                     s3Service.authorizeObjectWrite(bucket, entry.key(),
                             "s3:BypassGovernanceRetention", authorization);
                 }
@@ -1965,19 +1968,22 @@ public class S3Controller {
      * its own global condition keys, as it does for a single-key delete. S3's error for a denied entry
      * reads "Access Denied", not the filter's message for a whole-request denial.
      */
-    private void authorizeDeleteEntryIdentity(String iamCredential, String bucket, XmlParser.KeyVersion entry) {
+    private void authorizeDeleteEntryIdentity(String iamCredential, String bucket, XmlParser.KeyVersion entry,
+                                              Map<String, List<String>> signatureConditions) {
         String action = entry.versionId() == null ? "s3:DeleteObject" : "s3:DeleteObjectVersion";
-        authorizeEntryIdentity(iamCredential, action, bucket, entry.key());
+        authorizeEntryIdentity(iamCredential, action, bucket, entry.key(), signatureConditions);
         if (isETagCondition(entry.eTag())) {
-            authorizeEntryIdentity(iamCredential, "s3:GetObject", bucket, entry.key());
+            authorizeEntryIdentity(iamCredential, "s3:GetObject", bucket, entry.key(), signatureConditions);
         }
     }
 
     /** Evaluates one action on one DeleteObjects entry's object, answering a denial as S3 does per key. */
-    private void authorizeEntryIdentity(String iamCredential, String action, String bucket, String key) {
+    private void authorizeEntryIdentity(String iamCredential, String action, String bucket, String key,
+                                        Map<String, List<String>> signatureConditions) {
         String resource = S3ResourceArns.object(s3Service.bucketPartition(bucket), bucket, key);
         try {
-            iamEnforcementFilter.authorizeAdditionalResource(iamCredential, action, resource);
+            iamEnforcementFilter.authorizeAdditionalResource(
+                    iamCredential, action, resource, null, null, signatureConditions);
         } catch (AwsException e) {
             if ("AccessDenied".equals(e.getErrorCode())) {
                 throw new AwsException("AccessDenied", "Access Denied", 403);
@@ -4155,7 +4161,9 @@ public class S3Controller {
             throw new AwsException("InvalidArgument",
                 "KMS key ID requires aws:kms or aws:kms:dsse server-side encryption.", 400);
         }
-        Map<String, List<String>> requestConditions = S3ObjectActions.encryptionConditions(encryption, kmsKeyId);
+        Map<String, List<String>> requestConditions = new HashMap<>(
+                S3ObjectActions.encryptionConditions(encryption, kmsKeyId));
+        requestConditions.putAll(S3SignatureConditions.post(lcFields));
 
         /*
          * IamEnforcementFilter's own filter() method only ever sees the Authorization header or,
@@ -4330,7 +4338,8 @@ public class S3Controller {
         // Route through the same bucket-policy/ACL check every other S3 write path uses, so this
         // path automatically inherits any future strengthening there too.
         s3Service.authorizeObjectWrite(bucket, key, null, "s3:PutObject",
-            withTransport(new S3Service.RequestAuthorization(true, accessKeyId, sessionToken)), requestConditions);
+            withTransport(new S3Service.RequestAuthorization(true, accessKeyId, sessionToken, null, algorithm)),
+            requestConditions);
 
         validatePolicyExpiration(policy);
         validatePolicyConditions(policy, bucket, fields, contentLength);
@@ -4760,11 +4769,9 @@ public class S3Controller {
         String action = source.versionId() == null ? "s3:GetObject" : "s3:GetObjectVersion";
         String resource = S3ResourceArns.object(
                 s3Service.bucketPartition(source.bucket()), source.bucket(), source.objectKey());
-        S3Service.SignedPrincipalResourcePolicyEvaluation resourcePolicyEvaluation =
-                s3Service.signedPrincipalResourcePolicyDecision(
-                        source.bucket(), action, resource, authorization);
         iamEnforcementFilter.authorizeAdditionalResource(iamCredential(httpHeaders, uriInfo), action, resource,
-                resourcePolicyEvaluation.decision(), resourcePolicyEvaluation.resourceOwnerAccountId());
+                null, null, S3SignatureConditions.request(
+                        httpHeaders.getHeaderString("Authorization"), uriInfo.getQueryParameters()));
         s3Service.authorizeGetObject(
                 source.bucket(), source.objectKey(), source.versionId(), authorization);
     }
@@ -4804,10 +4811,9 @@ public class S3Controller {
         if (checksIdentity) {
             String resource = S3ResourceArns.object(
                     s3Service.bucketPartition(destBucket), destBucket, destKey);
-            S3Service.SignedPrincipalResourcePolicyEvaluation resourcePolicyEvaluation =
-                    s3Service.signedPrincipalResourcePolicyDecision(destBucket, action, resource, authorization);
             iamEnforcementFilter.authorizeAdditionalResource(credential, action, resource,
-                    resourcePolicyEvaluation.decision(), resourcePolicyEvaluation.resourceOwnerAccountId());
+                    null, null, S3SignatureConditions.request(
+                            httpHeaders.getHeaderString("Authorization"), uriInfo.getQueryParameters()));
         }
         s3Service.authorizeObjectCreationSetting(destBucket, destKey, action, authorization, null);
     }
@@ -4828,7 +4834,9 @@ public class S3Controller {
         ResourcePolicyDecision policyDecision = s3Service.ownsBucket(bucket) ? null : ResourcePolicyDecision.NEUTRAL;
         for (String action : actions) {
             iamEnforcementFilter.authorizeAdditionalResource(
-                    credential, action, resource, policyDecision);
+                    credential, action, resource, policyDecision, null,
+                    S3SignatureConditions.request(httpHeaders.getHeaderString("Authorization"),
+                            uriInfo.getQueryParameters()));
         }
     }
 
@@ -4842,7 +4850,7 @@ public class S3Controller {
             return authorization;
         }
         return new S3Service.RequestAuthorization(authorization.signed(), authorization.accessKeyId(),
-                authorization.sessionToken(), routingContext.request().isSSL());
+                authorization.sessionToken(), routingContext.request().isSSL(), authorization.signatureVersion());
     }
 
     /**

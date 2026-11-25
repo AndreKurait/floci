@@ -1398,8 +1398,8 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
      * covered by its signed policy document and do not correspond to what {@code S3Controller}
      * actually applies to the uploaded object, so trusting one here would let an attacker satisfy a
      * tag-scoped grant condition with a header the object is never actually tagged with. Only the
-     * caller-identity {@code aws:PrincipalArn} and the server-derived global keys, including
-     * the connection's TLS state, are safe to add.
+     * caller-identity {@code aws:PrincipalArn}, explicit signing facts from the service and
+     * server-derived global keys, including the connection's TLS state, are safe to add.
      */
     public void authorizeAdditionalResource(
             String authorizationHeader,
@@ -1409,6 +1409,18 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             String resourceOwnerAccountId) {
         authorizeAdditionalResource(authorizationHeader, action, resource, resourcePolicyDecision,
                 resourceOwnerAccountId, null, null);
+    }
+
+    /** Carries service-parsed authentication facts to a secondary resource's policy evaluation. */
+    public void authorizeAdditionalResource(
+            String authorizationHeader,
+            String action,
+            String resource,
+            ResourcePolicyDecision resourcePolicyDecision,
+            String resourceOwnerAccountId,
+            Map<String, List<String>> requestConditions) {
+        authorizeAdditionalResource(authorizationHeader, action, resource, resourcePolicyDecision,
+                resourceOwnerAccountId, null, requestConditions);
     }
 
     /**
