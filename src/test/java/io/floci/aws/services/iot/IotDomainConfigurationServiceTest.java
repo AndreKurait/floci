@@ -10,9 +10,11 @@ import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.storage.InMemoryStorage;
 import io.floci.aws.services.iot.model.IotDomainConfiguration;
 import io.floci.aws.testing.ParallelLocks;
+import io.floci.aws.testing.TestTime;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.parallel.ResourceLock;
 
+import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -47,9 +49,10 @@ class IotDomainConfigurationServiceTest {
     private final ObjectMapper mapper = new ObjectMapper();
     /** What DescribeEndpoint answers; tests change it to model a restart with another address. */
     private final AtomicReference<String> endpointAddress = new AtomicReference<>("localhost:4566");
+    private final TestTime time = TestTime.create();
     private final IotDomainConfigurationService service = new IotDomainConfigurationService(
             new InMemoryStorage<>(), new RegionResolver(REGION, "000000000000"), endpointConfig(endpointAddress),
-            mock(TlsCertificateManager.class));
+            mock(TlsCertificateManager.class), time.clock());
 
     private static EmulatorConfig endpointConfig(AtomicReference<String> endpointAddress) {
         EmulatorConfig config = mock(EmulatorConfig.class);
@@ -466,24 +469,25 @@ class IotDomainConfigurationServiceTest {
     }
 
     @Test
-    void updateFlipsTheStatusAndRecordsWhenItChanged() throws InterruptedException {
+    void updateFlipsTheStatusAndRecordsWhenItChanged() {
         Instant createdAt = service.createDomainConfiguration("iot-domain", customDomainRequest(), REGION)
                 .getLastStatusChangeDate();
-        Thread.sleep(10);
+        assertEquals(time.now(), createdAt);
+        time.advance(Duration.ofHours(1));
 
         IotDomainConfiguration updated = service.updateDomainConfiguration("iot-domain",
                 mapper.createObjectNode().put("domainConfigurationStatus", "DISABLED"), REGION);
 
         assertEquals("DISABLED", updated.getDomainConfigurationStatus());
-        assertTrue(updated.getLastStatusChangeDate().isAfter(createdAt));
+        assertEquals(createdAt.plus(Duration.ofHours(1)), updated.getLastStatusChangeDate());
         assertEquals("DISABLED", service.describeDomainConfiguration("iot-domain", REGION).getDomainConfigurationStatus());
     }
 
     @Test
-    void updateWithTheSameStatusKeepsLastStatusChangeDate() throws InterruptedException {
+    void updateWithTheSameStatusKeepsLastStatusChangeDate() {
         Instant createdAt = service.createDomainConfiguration("iot-domain", customDomainRequest(), REGION)
                 .getLastStatusChangeDate();
-        Thread.sleep(10);
+        time.advance(Duration.ofHours(1));
 
         IotDomainConfiguration updated = service.updateDomainConfiguration("iot-domain",
                 mapper.createObjectNode().put("domainConfigurationStatus", "ENABLED"), REGION);
