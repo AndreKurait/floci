@@ -1,7 +1,9 @@
 package io.floci.aws.services.stepfunctions;
 
+import io.floci.aws.core.common.EpochSeconds;
 import io.floci.aws.services.stepfunctions.model.HistoryEvent;
 
+import java.time.Clock;
 import java.util.AbstractList;
 import java.util.Collection;
 import java.util.List;
@@ -19,6 +21,7 @@ final class HistoryChain {
     private final AtomicLong producedEventCount;
     private final AtomicBoolean ended;
     private final HistoryChain parent;
+    private final Clock clock;
     private volatile boolean abandoned;
     private String activeStateType;
     private boolean iterationStarted;
@@ -27,27 +30,34 @@ final class HistoryChain {
     private long tailEventId;
 
     private HistoryChain(List<HistoryEvent> history, AtomicLong producedEventCount, AtomicBoolean ended,
-                         HistoryChain parent, long lastEventId) {
+                         HistoryChain parent, long lastEventId, Clock clock) {
         this.history = history;
         this.producedEventCount = producedEventCount;
         this.ended = ended;
         this.parent = parent;
+        this.clock = clock;
         this.lastEventId = lastEventId;
         this.tailEventId = lastEventId;
     }
 
     /** Starts at 0, not at ExecutionStarted. AWS leaves the first state's Entered event unchained. */
     static HistoryChain of(List<HistoryEvent> history) {
-        return new HistoryChain(history, new AtomicLong(history.size()), new AtomicBoolean(), null, 0L);
+        return of(history, Clock.systemUTC());
+    }
+
+    /** Every event of the chain, and of the chains forked from it, is stamped on {@code clock}. */
+    static HistoryChain of(List<HistoryEvent> history, Clock clock) {
+        return new HistoryChain(history, new AtomicLong(history.size()), new AtomicBoolean(), null, 0L, clock);
     }
 
     /** A Distributed Map item is a child execution. Its events are counted, not kept. */
     static HistoryChain ofChildExecution() {
-        return new HistoryChain(new CountOnlyHistory(), new AtomicLong(), new AtomicBoolean(), null, 0L);
+        return new HistoryChain(new CountOnlyHistory(), new AtomicLong(), new AtomicBoolean(), null, 0L,
+                Clock.systemUTC());
     }
 
     HistoryChain fork() {
-        return new HistoryChain(history, producedEventCount, ended, this, lastEventId);
+        return new HistoryChain(history, producedEventCount, ended, this, lastEventId, clock);
     }
 
     boolean isBranch() {
@@ -246,6 +256,7 @@ final class HistoryChain {
                 AslExecutor.countTowardsHistoryEventLimit(producedEventCount);
             }
             HistoryEvent event = new HistoryEvent();
+            event.setTimestamp(EpochSeconds.fromMillis(clock.millis()));
             event.setId(history.size() + 1L);
             event.setPreviousEventId(previousEventId);
             event.setType(type);
