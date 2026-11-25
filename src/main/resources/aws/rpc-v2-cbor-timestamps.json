@@ -1,7 +1,7 @@
 {
   "_source": {
     "generator": "tools/aws/regen_rpcv2_cbor_timestamps.py",
-    "botocore": "botocore 1.43.118 (local/aws/botocore)"
+    "botocore": "botocore 1.44.9 (installed package)"
   },
   "services": {
     "ACMPrivateCA": [
@@ -118,7 +118,8 @@
     "Textract": [
       "AfterCreationTime",
       "BeforeCreationTime",
-      "CreationTime"
+      "CreationTime",
+      "LastModifiedTime"
     ],
     "Transcribe": [
       "CompletionTime",
