@@ -373,7 +373,8 @@ class CloudFormationAppConfigIntegrationTest {
     }
 
     private static Map<String, String> applicationTags(String applicationId) {
-        JsonPath body = appconfig().get("/tags/arn:aws:appconfig:us-east-1:000000000000:application/" + applicationId)
+        JsonPath body = appconfig().get("/tags/{arn}",
+                        "arn:aws:appconfig:us-east-1:000000000000:application/" + applicationId)
                 .then().statusCode(200).extract().jsonPath();
         return body.getMap("Tags", String.class, String.class);
     }
