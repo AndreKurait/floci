@@ -57,6 +57,7 @@ AWS::CloudTrail::Trail	reads only droppedProperties; not yet on ctx.changes
 AWS::CloudWatch::Alarm	update not yet on the engine's changes (#6606)
 AWS::CloudWatch::CompositeAlarm	prior entity found by reusesPriorEntity; moves to the engine's decision with the create-only work
 AWS::CloudWatch::Dashboard	prior entity found by reusesPriorEntity; moves to the engine's decision with the create-only work
+AWS::CloudWatch::InsightRule	compares the prior ARN and reconciles owned rule state and tags with a rollback snapshot
 AWS::CodeBuild::Project	wholesale request builder: the whole property node goes to the service
 AWS::CodePipeline::CustomActionType	wholesale request builder: the whole property node goes to the service
 AWS::CodePipeline::Pipeline	wholesale request builder: the whole property node goes to the service
