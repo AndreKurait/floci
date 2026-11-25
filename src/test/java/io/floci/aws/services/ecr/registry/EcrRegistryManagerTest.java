@@ -1231,4 +1231,22 @@ class EcrRegistryManagerTest {
                 null)), EcrRegistryManager.ecrImage("000000000000.dkr.ecr.eu-west-1.localhost:4566/spark"));
         assertEquals(Optional.empty(), EcrRegistryManager.ecrImage("python:3.12"));
     }
+
+    @ParameterizedTest
+    @CsvSource({"us-east-1,amazonaws.com", "cn-north-1,amazonaws.com.cn", "us-gov-west-1,amazonaws.com"})
+    void nativeRegistryAddressesMatchAuthorizationAndPartition(String region, String suffix) {
+        when(ecr.nativeUri()).thenReturn(true);
+        when(ecr.uriStyle()).thenReturn("path");
+        String host = "123456789012.dkr.ecr." + region + "." + suffix;
+        assertEquals(host + "/team/image", manager.getRepositoryUri("123456789012", region, "team/image"));
+        assertEquals("https://" + host, manager.getProxyEndpoint("123456789012", region));
+        verify(lifecycleManager, never()).getDockerClient();
+    }
+
+    @Test
+    void explicitRegistryAuthorizationPreservesDefaultLocalEndpointStyle() {
+        assertEquals("http://123456789012.dkr.ecr.eu-west-1.localhost:4566",
+                manager.getProxyEndpoint("123456789012", "eu-west-1"));
+    }
+
 }

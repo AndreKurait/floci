@@ -57,6 +57,8 @@ public class EcrRegistryDataPlane {
      */
     private static final Pattern AWS_ECR_HOST = Pattern.compile(
             "^([0-9]{12})\\.dkr\\.ecr\\.([a-z0-9-]+)\\.(" + AwsPartitions.dnsSuffixRegex() + ")(?::[0-9]+)?$");
+    private static final Pattern NATIVE_ECR_HOST = Pattern.compile(
+            "^([0-9]{12})\\.dkr\\.ecr\\.([a-z0-9-]+)\\.(" + AwsPartitions.dnsSuffixRegex() + ")(?::443)?$");
     private static final String MANIFESTS_PATH = "/manifests/";
     private static final long REPOSITORY_LOCK_POLL_MILLIS = 5;
     /**
@@ -836,6 +838,16 @@ public class EcrRegistryDataPlane {
         return List.of(action);
     }
 
+    private static Matcher registryHost(String host) {
+        String value = host == null ? "" : host;
+        Matcher nativeHost = NATIVE_ECR_HOST.matcher(value);
+        if (nativeHost.matches() && AwsPartitions.forRegion(nativeHost.group(2))
+                .filter(partition -> partition.dnsSuffix().equals(nativeHost.group(3))).isPresent()) {
+            return nativeHost;
+        }
+        return ECR_HOST.matcher(value);
+    }
+
     static Optional<RegistryRequest> requestFor(String host, String path, String query, String uriStyle) {
         String registryPath = "/v2".equals(path) ? "/v2/" : path;
         if (!registryPath.startsWith("/v2/")) {
@@ -879,11 +891,11 @@ public class EcrRegistryDataPlane {
 
     /**
      * The registry a request is for: its host when that is a Floci repository host, else the registry a mirror request
-     * names in {@code ns}, a Floci repository host or an account's AWS registry host in that region's partition. A request
-     * with an AWS registry host in its {@code Host} header is not routed here.
+     * names in {@code ns}, a Floci repository host or an account's AWS registry host in that region's partition.
+     * Native AWS registry hosts are accepted directly on their default HTTPS port.
      */
     private static Matcher registryHost(String host, String query) {
-        Matcher byHost = ECR_HOST.matcher(host == null ? "" : host);
+        Matcher byHost = registryHost(host);
         if (byHost.matches()) {
             return byHost;
         }
