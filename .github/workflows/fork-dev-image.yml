@@ -15,6 +15,7 @@ jobs:
   test:
     if: github.repository == 'AndreKurait/floci' && github.ref == 'refs/heads/dev'
     permissions:
+      actions: write
       contents: read
     uses: ./.github/workflows/ci.yml
     with:
