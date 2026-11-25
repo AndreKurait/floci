@@ -325,12 +325,12 @@ class VpcHotAttachAcrossAddressSpacesPacketIntegrationTest {
 
     private void listen(String helper, String address, int port) {
         assertEquals(0, execute(helper, "sh", "-c", "socat TCP4-LISTEN:$2,bind=$1,reuseaddr,fork"
-                + " SYSTEM:'printf ok' >/tmp/listen-$2.log 2>&1 &", "listen", address, String.valueOf(port)).exitCode());
+                + " SYSTEM:'read request; printf ok' >/tmp/listen-$2.log 2>&1 &", "listen", address, String.valueOf(port)).exitCode());
         await().atMost(Duration.ofSeconds(5)).until(() ->
                 execute(helper, "ss", "-H", "-lnt").stdout().contains(address + ":" + port + " "));
     }
 
-    /** One TCP exchange; the listeners answer "ok" without reading. */
+    /** One line-delimited TCP exchange; listeners consume the request before closing their reply. */
     private ContainerExec.Result request(String helper, String source, String address, int port) {
         String bind = source == null ? "" : ",bind=" + source;
         return execute(helper, "sh", "-c", "printf 'hello\\n' | socat -T 3 - TCP4:$1:$2,connect-timeout=2$3",
