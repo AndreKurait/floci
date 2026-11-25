@@ -295,6 +295,56 @@ restoration. The table and target stores do not share a transaction. Persistence
 errors hidden by a backend, compensation failures, intermediate reads and process
 loss retain their backend-specific limits.
 
+## Local secondary index reads
+
+A Query filter can use only attributes projected into the local secondary index,
+even with `ALL_ATTRIBUTES`. A Scan that selects `ALL_ATTRIBUTES` or requests an
+unprojected attribute evaluates its filter against the fetched full items.
+A projected-only Scan or `COUNT` evaluates its filter against the index projection.
+
+When a read fetches base items through a local secondary index, consumed capacity
+includes every evaluated base item before filtering. Filtering out one or all
+returned items does not remove that fetch cost. The original `INDEXES` response
+and the table's consumed-capacity metric use the same captured charge.
+
+## CloudWatch capacity metrics
+
+With the native backend and CloudWatch Metrics enabled, `PutItem`, `GetItem`,
+`DeleteItem`, `UpdateItem`, `Query`, `Scan`, `BatchWriteItem` and `BatchGetItem`
+publish their actual consumed capacity in `AWS/DynamoDB`, even when
+`ReturnConsumedCapacity` is omitted or `NONE`. Table and local secondary index
+usage share `TableName`; global secondary index usage has both `TableName` and
+`GlobalSecondaryIndexName`. Conditional write refusals publish their consumed
+write cost while preserving the ordinary error response.
+
+Read `ConsumedReadCapacityUnits` and `ConsumedWriteCapacityUnits` with `Sum` and
+a 60-second period. A fully observed idle minute has an actual zero sample.
+Provisioned tables and global secondary indexes publish
+`ProvisionedReadCapacityUnits` and `ProvisionedWriteCapacityUnits` at five-minute
+boundaries and when a changed capacity is observed. Fresh on-demand resources
+have no provisioned samples; switching to on-demand retains historical samples.
+
+Publication follows completed item operations and retains their captured account,
+Region, table identity and numeric cost. A later `BatchWriteItem` failure publishes
+only operations that returned before the failure. A failed `BatchGetItem` does
+not retain read usage accumulated before its failure. Metric-storage exceptions
+do not change an accepted item operation. Synchronous storage latency can still delay its
+response. The item and metric stores share no transaction.
+
+Retries are held in memory for up to one hour, with a maximum of 4,096 pending
+samples. Idle discovery tracks up to 10,000 resources and 100,000 resource/metric
+minutes; overload suppresses uncertain idle claims. Reset and shutdown discard
+publisher state, and process loss can lose pending metrics. Publication checks
+the current table identity and GSI membership, but does not serialize CloudWatch
+storage with a concurrent table or index deletion. Metric history older than
+15 days is removed. Five-minute gauges sample observed changes rather than
+reconstructing an exact time-weighted history.
+
+This covers the eight native item APIs. Transactions, PartiQL, TTL, imports,
+DynamoDB Local and vector-specific metrics are separate paths. It supplies metrics
+for local workloads; DynamoDB policy-driven Application Auto Scaling adjustment
+is not implemented by this producer.
+
 ## DynamoDB Local backend
 
 By default Floci stores tables in its own engine, the `native` backend. With
