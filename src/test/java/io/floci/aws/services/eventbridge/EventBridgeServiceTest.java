@@ -20,6 +20,7 @@ import io.floci.aws.services.eventbridge.model.RuleState;
 import io.floci.aws.services.eventbridge.model.Target;
 import io.floci.aws.services.resourcegroupstagging.ResourceGroupsTaggingService;
 import io.floci.aws.testing.PartitionMatrix;
+import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
@@ -32,6 +33,9 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mockito;
 
+import java.math.BigDecimal;
+import java.time.Instant;
+import java.time.temporal.ChronoUnit;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -104,6 +108,59 @@ class EventBridgeServiceTest {
 
         assertEquals(ReplayState.CANCELLING, cancelled.getState());
         verify(replayDispatcherMock).requestCancel(replay.getReplayArn());
+    }
+
+    @ParameterizedTest
+    @MethodSource("eventTimestampCases")
+    void eventEnvelopePreservesExplicitTimeAndKeepsGeneratedWholeSeconds(
+            Object supplied, boolean request, String expected) throws Exception {
+        service.putRule("timestamp-rule", null, "{\"source\":[\"example.app\"]}", null, RuleState.ENABLED,
+                null, null, null, REGION);
+        Target target = new Target();
+        target.setId("queue");
+        target.setArn("arn:aws:sqs:us-east-1:000000000000:events");
+        service.putTargets("timestamp-rule", null, List.of(target), REGION);
+        Map<String, Object> entry = new HashMap<>(Map.of(
+                "Source", "example.app", "DetailType", "Example", "Detail", "{}"));
+        if (supplied != null) {
+            entry.put("Time", supplied);
+        }
+        Instant before = Instant.now().truncatedTo(ChronoUnit.SECONDS);
+
+        if (request) {
+            EventBridgeHandler handler = new EventBridgeHandler(service, OBJECT_MAPPER);
+            try (Response response = handler.handle("PutEvents",
+                    OBJECT_MAPPER.valueToTree(Map.of("Entries", List.of(entry))), REGION)) {
+                assertEquals(200, response.getStatus());
+                assertEquals(0, ((JsonNode) response.getEntity()).path("FailedEntryCount").asInt());
+            }
+        } else {
+            assertEquals(0, service.putEvents(List.of(entry), REGION).failedCount());
+        }
+
+        ArgumentCaptor<String> json = ArgumentCaptor.forClass(String.class);
+        verify(dispatcherMock).dispatch(anyString(), eq(target), json.capture(), eq(REGION), any());
+        String actual = OBJECT_MAPPER.readTree(json.getValue()).path("time").asText();
+        if (expected != null) {
+            assertEquals(expected, actual);
+        } else {
+            Instant generated = Instant.parse(actual);
+            assertEquals(0, generated.getNano());
+            assertFalse(generated.isBefore(before));
+            assertFalse(generated.isAfter(Instant.now()));
+        }
+    }
+
+    static Stream<Arguments> eventTimestampCases() {
+        return Stream.of(
+                Arguments.of(null, false, null),
+                Arguments.of(null, true, null),
+                Arguments.of(Instant.parse("2026-01-02T03:04:05.123456789Z"), false,
+                        "2026-01-02T03:04:05.123456789Z"),
+                Arguments.of(new BigDecimal("1700000000.125"), true, "2023-11-14T22:13:20.125Z"),
+                Arguments.of(BigDecimal.ZERO, true, "1970-01-01T00:00:00Z"),
+                Arguments.of(new BigDecimal("-0.125"), true, "1969-12-31T23:59:59.875Z")
+        );
     }
 
     // ──────────────────────────── Event Buses ────────────────────────────
