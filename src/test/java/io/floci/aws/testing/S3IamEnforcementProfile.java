@@ -11,6 +11,9 @@ import java.util.Map;
  * distinct profile class, and keeps every one it built for the rest of the test JVM, so they share
  * this one rather than each declaring their own.
  *
+ * {@code S3CrossAccountNotificationSdkIntegrationTest} also uses this profile for signed
+ * cross-account notification delivery.
+ *
  * <p>The overrides, and who relies on them:
  * <ul>
  *   <li>{@code floci.services.s3.enforce-auth=true} makes S3 verify every signature and run its own
