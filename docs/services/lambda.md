@@ -528,6 +528,10 @@ disabled fails with Lambda's error as the resource status reason.
     drain window `Σreserved-inflight + unreserved-inflight` can briefly
     exceed `region-concurrency-limit`.
 
+The local `/_api/{functionName}/{path}` proxy invokes a function with an API Gateway v1 proxy event.
+It reads the response `Content-Type` header without regard to casing, including `content-type`;
+a response body without that header defaults to `application/json`.
+
 Function URLs are also reachable directly on `/{proxy:.*}` under the Lambda URL controller, which routes the request into the normal `Invoke` path.
 
 `ListFunctionUrlConfigs` lists the unpublished function's URL and its alias URLs.
