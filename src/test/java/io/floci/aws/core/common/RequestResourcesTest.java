@@ -606,17 +606,19 @@ class RequestResourcesTest {
     }
 
     /**
-     * Step Functions Local's {@code <stateMachineArn>#<test case>} is no ARN AWS has, and neither botocore nor the
-     * Service Reference says to read it otherwise, so a request giving one is checked on it as given.
+     * Execution starts run the machine before Step Functions Local's {@code #<test case>} suffix. Other operations
+     * keep the selector whole.
      */
     @Test
-    void aStateMachinesTestCaseIsCheckedAsGiven() {
-        assertEquals(List.of(MACHINE + "#HappyPath"), of("states:StartExecution",
+    void aStateMachinesTestCaseIsCheckedOnTheMachineItRuns() {
+        assertEquals(List.of(MACHINE), of("states:StartExecution",
                 json("{\"stateMachineArn\":\"" + MACHINE + "#HappyPath\"}")));
+        assertEquals(List.of(MACHINE), of("states:StartSyncExecution",
+                json("{\"stateMachineArn\":\"" + MACHINE + "#\"}")));
         assertEquals(List.of(MACHINE + "#x"), of("states:DescribeStateMachine",
                 json("{\"stateMachineArn\":\"" + MACHINE + "#x\"}")));
         assertEquals(List.of("arn:aws:states:us-east-1:000000000000:execution:orders:*"), created("states:StartExecution",
-                json("{\"stateMachineArn\":\"" + MACHINE + "\"}")));
+                json("{\"stateMachineArn\":\"" + MACHINE + "#HappyPath\"}")));
     }
 
     /**
