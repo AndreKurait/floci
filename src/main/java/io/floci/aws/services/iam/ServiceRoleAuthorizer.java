@@ -59,6 +59,12 @@ public class ServiceRoleAuthorizer {
      */
     public Optional<String> refusal(String roleArn, String accountId, String servicePrincipal,
                                     String sourceArn, List<Permission> permissions) {
+        return refusal(roleArn, accountId, servicePrincipal, sourceArn, accountId, permissions);
+    }
+
+    /** As above, with the source account independent of the account that owns the service role. */
+    public Optional<String> refusal(String roleArn, String accountId, String servicePrincipal,
+                                    String sourceArn, String sourceAccountId, List<Permission> permissions) {
         if (!config.services().iam().enforcementEnabled()) {
             return Optional.empty();
         }
@@ -81,7 +87,7 @@ public class ServiceRoleAuthorizer {
             return Optional.of("The role " + roleArn + " does not exist.");
         }
         if (!trustEvaluator.allowsService(role.get().getAssumeRolePolicyDocument(), servicePrincipal,
-                sourceArn, accountId)) {
+                sourceArn, sourceAccountId)) {
             return Optional.of("The role " + roleArn + " does not trust " + servicePrincipal + ".");
         }
         CallerContext caller = iamService.resolvePrincipalContext(role.get().getArn());

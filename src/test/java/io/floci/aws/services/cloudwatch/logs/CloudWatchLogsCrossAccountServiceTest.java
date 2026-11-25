@@ -9,6 +9,7 @@ import io.floci.aws.core.storage.PersistentStorage;
 import io.floci.aws.services.cloudwatch.logs.model.LogDestination;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.mockito.Mockito;
 
 import java.nio.file.Path;
 import java.util.List;
@@ -23,7 +24,8 @@ class CloudWatchLogsCrossAccountServiceTest {
 
     private final CloudWatchLogsCrossAccountService service = new CloudWatchLogsCrossAccountService(
             new InMemoryStorage<>(), new InMemoryStorage<>(),
-            new RegionResolver(REGION, "000000000000"), new ObjectMapper());
+            new RegionResolver(REGION, "000000000000"), new ObjectMapper(),
+            Mockito.mock(CloudWatchLogsDestinationTargetService.class));
 
     @Test
     void destinationTagsSurvivePersistentStorageReload(@TempDir Path tempDir) {
@@ -32,7 +34,8 @@ class CloudWatchLogsCrossAccountServiceTest {
         RegionResolver regionResolver = new RegionResolver(REGION, "000000000000");
         PersistentStorage<String, LogDestination> firstStore = new PersistentStorage<>(file, type);
         CloudWatchLogsCrossAccountService first = new CloudWatchLogsCrossAccountService(
-                firstStore, new InMemoryStorage<>(), regionResolver, new ObjectMapper());
+                firstStore, new InMemoryStorage<>(), regionResolver, new ObjectMapper(),
+                Mockito.mock(CloudWatchLogsDestinationTargetService.class));
         LogDestination destination = first.putDestination("persisted-tags",
                 "arn:aws:kinesis:us-east-1:000000000000:stream/logs",
                 "arn:aws:iam::000000000000:role/logs", Map.of("team", "red"), REGION);
@@ -41,14 +44,16 @@ class CloudWatchLogsCrossAccountServiceTest {
         PersistentStorage<String, LogDestination> secondStore = new PersistentStorage<>(file, type);
         secondStore.load();
         CloudWatchLogsCrossAccountService second = new CloudWatchLogsCrossAccountService(
-                secondStore, new InMemoryStorage<>(), regionResolver, new ObjectMapper());
+                secondStore, new InMemoryStorage<>(), regionResolver, new ObjectMapper(),
+                Mockito.mock(CloudWatchLogsDestinationTargetService.class));
         assertEquals(Map.of("team", "red", "env", "dev"), second.listDestinationTags(destination.getArn(), REGION));
         second.untagDestination(destination.getArn(), List.of("team"), REGION);
 
         PersistentStorage<String, LogDestination> thirdStore = new PersistentStorage<>(file, type);
         thirdStore.load();
         CloudWatchLogsCrossAccountService third = new CloudWatchLogsCrossAccountService(
-                thirdStore, new InMemoryStorage<>(), regionResolver, new ObjectMapper());
+                thirdStore, new InMemoryStorage<>(), regionResolver, new ObjectMapper(),
+                Mockito.mock(CloudWatchLogsDestinationTargetService.class));
         assertEquals(Map.of("env", "dev"), third.listDestinationTags(destination.getArn(), REGION));
     }
 
