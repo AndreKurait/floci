@@ -54,14 +54,16 @@ public class AthenaStoredResourceArns implements StoredResourceArns {
      * id runs in, {@code primary} for one naming none, as Athena checks a request naming it: an execution's in the
      * Region it was started in, whichever Region the request is sent to, so neither a grant on another Region's
      * workgroup of the same name nor a request sent to another Region passes a check its own workgroup refuses; a named
-     * query's in the Region of the request, which holds it. None for an id Athena holds none of, or an execution whose
-     * Region it did not record, so a request naming one is checked as naming no workgroup.
+     * query's in the Region of the request, which holds it. None for an id Athena holds none of, or a scoped execution whose
+     * Region it did not record, so a request naming one is checked as naming no workgroup. An unscoped legacy execution instead uses
+     * its stored Region or the configured legacy default; discovery reads every record in place.
      */
     @Override
     public List<String> through(String member, String value, String region) {
         return switch (member) {
             case "QueryExecutionId" -> athena.findQueryExecution(value)
                     .flatMap(execution -> athena.findQueryExecutionRegion(value)
+                            .or(() -> athena.findLegacyQueryExecutionRegion(value))
                             .map(startedIn -> workGroupArn(startedIn, execution.getWorkGroup())))
                     .stream().toList();
             case "NamedQueryId" -> namedQueries.findNamedQuery(region, value)
