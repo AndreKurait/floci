@@ -12,6 +12,7 @@ import io.floci.aws.core.common.RequestContext;
 import io.floci.aws.core.storage.AccountAwareStorageBackend;
 import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
+import io.floci.aws.services.acm.AcmCertificateReferenceProvider.CertificateReference;
 import io.floci.aws.services.appsync.graphql.SchemaCreationWorker;
 import io.floci.aws.services.appsync.graphql.SchemaRegistry;
 import io.floci.aws.services.appsync.graphql.auth.LambdaAuthorizerCache;
@@ -1495,5 +1496,17 @@ public class AppSyncService {
             }
         }
         return null;
+    }
+
+    /** Reads live certificate references without acquiring this service's mutation lock. */
+    public List<CertificateReference> acmCertificateReferences() {
+        List<CertificateReference> references = new ArrayList<>();
+        for (DomainName domain : domainStore.scan(k -> true)) {
+            String certificateArn = domain.getCertificateArn();
+            if (certificateArn != null && !certificateArn.isBlank() && domain.getDomainNameArn() != null) {
+                references.add(new CertificateReference(certificateArn, domain.getDomainNameArn()));
+            }
+        }
+        return references;
     }
 }
