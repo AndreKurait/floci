@@ -73,6 +73,66 @@ import static org.mockito.Mockito.when;
 class CloudFormationServiceRollbackTest {
 
     @Test
+    void parentUpdateWithoutTokenClearsDirectChildOperationTokens() throws Exception {
+        assertParentUpdateClearsDirectChildTokens(null);
+    }
+
+    @Test
+    void parentUpdateWithTokenDoesNotReuseDirectChildOperationTokens() throws Exception {
+        assertParentUpdateClearsDirectChildTokens("parent-update-token");
+    }
+
+    private void assertParentUpdateClearsDirectChildTokens(String parentToken) throws Exception {
+        when(provisioner.completeUpdate(any())).thenReturn(UpdateCleanupResult.notApplicable());
+        AtomicReference<String> childInS3 = new AtomicReference<>(treeChildTemplate());
+        AtomicReference<String> grandchildInS3 = new AtomicReference<>(previousGrandchildTemplate());
+        serveTreeTemplates(childInS3, grandchildInS3);
+        createNestedTree(treeParentTemplate());
+        List<String> childNames = List.of("rollback-tree-Child", "rollback-tree-Child-Grandchild");
+        List<String> directTemplates = List.of(treeChildTemplate(), previousGrandchildTemplate());
+        List<List<StackEvent>> histories = new ArrayList<>();
+        for (int index = 0; index < childNames.size(); index++) {
+            String childName = childNames.get(index);
+            String directTemplate = '{' + "\"Description\":\"direct update\"," + directTemplates.get(index).substring(1);
+            service.createChangeSet(childName, "direct", "UPDATE", directTemplate, null,
+                    Map.of(), List.of(), null, REGION, ACCOUNT);
+            service.executeChangeSetWithToken(childName, "direct", REGION, "direct-token-" + index)
+                    .get(30, TimeUnit.SECONDS);
+            Stack child = service.describeStacks(childName, REGION, ACCOUNT).getFirst();
+            assertEquals("UPDATE_COMPLETE", child.getStatus());
+            assertEquals("direct-token-" + index, child.getClientRequestToken());
+            assertTrue(child.eventsSnapshot().stream()
+                    .anyMatch(event -> ("direct-token-" + childNames.indexOf(childName))
+                            .equals(event.getClientRequestToken())));
+            histories.add(child.eventsSnapshot());
+        }
+        grandchildInS3.set(previousGrandchildTemplate().replace("previous", "changed"));
+        service.createChangeSet("rollback-tree", "parent-update", "UPDATE", treeParentTemplate(), null,
+                Map.of(), List.of(), null, REGION, ACCOUNT);
+        service.executeChangeSetWithToken("rollback-tree", "parent-update", REGION, parentToken)
+                .get(30, TimeUnit.SECONDS);
+        Stack parent = service.describeStacks("rollback-tree", REGION, ACCOUNT).getFirst();
+        assertEquals("UPDATE_COMPLETE", parent.getStatus());
+        assertEquals(parentToken, parent.getClientRequestToken());
+        for (int index = 0; index < childNames.size(); index++) {
+            Stack child = service.describeStacks(childNames.get(index), REGION, ACCOUNT).getFirst();
+            List<StackEvent> history = histories.get(index);
+            List<StackEvent> newEvents = child.eventsSnapshot().stream()
+                    .filter(event -> !history.contains(event)).toList();
+            assertEquals("UPDATE_COMPLETE", child.getStatus());
+            assertFalse(newEvents.isEmpty());
+            for (StackEvent event : newEvents) {
+                assertNull(event.getClientRequestToken(), event.getResourceStatus());
+            }
+            assertTrue(child.eventsSnapshot().containsAll(history));
+            String directToken = "direct-token-" + index;
+            assertTrue(history.stream().anyMatch(event -> directToken.equals(event.getClientRequestToken())));
+        }
+        assertEquals("changed", service.describeStacks(childNames.getLast(), REGION, ACCOUNT)
+                .getFirst().getOutputs().get("Revision"));
+    }
+
+    @Test
     void unchangedParent_schedulesNestedWorkWhenOnlyGrandchildTemplateChanges() throws Exception {
         assertGrandchildUpdate(true);
     }
