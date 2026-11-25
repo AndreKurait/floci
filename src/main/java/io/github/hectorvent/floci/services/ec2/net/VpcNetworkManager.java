@@ -611,10 +611,11 @@ public class VpcNetworkManager {
                 NativeVpcAddressSpace.attach(dockerClient, config, vpc.accountId, vpc.region,
                         networkName, vpc.effective, subnet.effective, containerId, address, ipv6);
             } else {
+                ContainerNetwork endpoint = ipv6 ? ipv6Endpoint() : new ContainerNetwork();
                 dockerClient.connectToNetworkCmd()
                         .withContainerId(containerId)
                         .withNetworkId(networkName)
-                        .withContainerNetwork(new ContainerNetwork()
+                        .withContainerNetwork(endpoint
                                 .withIpamConfig(new ContainerNetwork.Ipam().withIpv4Address(address)))
                         .exec();
             }
@@ -906,6 +907,17 @@ public class VpcNetworkManager {
         Map<String, ContainerNetwork> networks = inspection.getNetworkSettings() == null
                 ? null : inspection.getNetworkSettings().getNetworks();
         return networks == null ? Map.of() : networks;
+    }
+
+    /**
+     * Enables IPv6 only on this endpoint at attachment. Docker disables it on IPv4-only bridges despite the
+     * namespace's all/default settings, and the helper's read-only /proc/sys prevents changing it from inside.
+     */
+    public static ContainerNetwork ipv6Endpoint() {
+        ContainerNetwork endpoint = new ContainerNetwork();
+        DockerObjectAccessor.overrideRawValue(endpoint, "DriverOpts", Map.of(
+                "com.docker.network.endpoint.sysctls", "net.ipv6.conf.IFNAME.disable_ipv6=0"));
+        return endpoint;
     }
 
     /** Revalidates the account, VPC attachment and actual interface before routing or restoration. */

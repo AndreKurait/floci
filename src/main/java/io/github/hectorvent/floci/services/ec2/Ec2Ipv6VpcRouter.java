@@ -61,7 +61,7 @@ final class Ec2Ipv6VpcRouter {
                 .orElseThrow(() -> new IllegalStateException("No IPv6 router address for subnet " + subnetId));
         String id = ensureStarted();
         try {
-            ContainerNetwork endpoint = new ContainerNetwork();
+            ContainerNetwork endpoint = VpcNetworkManager.ipv6Endpoint();
             if (!isolated) {
                 endpoint.withIpamConfig(new ContainerNetwork.Ipam().withIpv4Address(address));
             }
@@ -164,6 +164,8 @@ final class Ec2Ipv6VpcRouter {
                         + " if ($i == \"link/ether\" && tolower($(i+1)) == tolower(a))"
                         + " {sub(/@.*/, \"\", $2); sub(/:$/, \"\", $2); print $2}}' | head -n1)",
                 "[ -n \"$dev\" ] || { echo \"no interface has MAC $1\" >&2; exit 3; }",
+                "[ \"$(sysctl -n \"net.ipv6.conf.$dev.disable_ipv6\")\" = 0 ]"
+                        + " || { echo \"IPv6 is not enabled on attached interface $dev\" >&2; exit 4; }",
                 "ip -4 addr flush dev \"$dev\"",
                 "ip -6 addr replace fe80:ec2::1/64 dev \"$dev\" nodad",
                 "ip -6 route replace \"$2\" dev \"$dev\"");

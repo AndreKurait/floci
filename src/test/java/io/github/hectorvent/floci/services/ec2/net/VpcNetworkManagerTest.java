@@ -1040,6 +1040,61 @@ class VpcNetworkManagerTest {
     }
 
     @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void onlyDualStackGuestAttachmentsRequestEndpointIpv6(boolean ipv6) {
+        manager.declareVpc(REGION, "vpc-1", "10.0.0.0/16");
+        manager.declareSubnet(REGION, "vpc-1", "subnet-a", "10.0.1.0/24");
+        String address = manager.allocatePrivateIp(REGION, "subnet-a").orElseThrow();
+        assertTrue(manager.attach(REGION, "vpc-1", "subnet-a", "instance-1", address, ipv6).isPresent());
+        ArgumentCaptor<ContainerNetwork> endpoint = ArgumentCaptor.forClass(ContainerNetwork.class);
+        verify(docker.connectToNetworkCmd()).withContainerNetwork(endpoint.capture());
+        JsonNode sent = new ObjectMapper().valueToTree(endpoint.getValue());
+        assertEquals(address, sent.path("IPAMConfig").path("IPv4Address").asText());
+        if (ipv6) {
+            assertEquals(Map.of("com.docker.network.endpoint.sysctls", "net.ipv6.conf.IFNAME.disable_ipv6=0"),
+                    new ObjectMapper().convertValue(sent.required("DriverOpts"), Map.class));
+        } else {
+            assertFalse(sent.has("DriverOpts"), sent.toString());
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void onlyDualStackNativeAttachmentsRequestEndpointIpv6(boolean ipv6) {
+        ObjectMapper mapper = new ObjectMapper();
+        Map<String, ContainerNetwork> endpoints = new LinkedHashMap<>();
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(docker.inspectContainerCmd("helper")).thenReturn(inspect);
+        when(inspect.exec()).thenAnswer(call -> mapper.convertValue(Map.of(
+                "Config", Map.of("Labels", Map.of(
+                        ContainerStorageHelper.OWNER_LABEL, ContainerStorageHelper.ownerIdentity(config),
+                        ContainerStorageHelper.ACCOUNT_LABEL, "111111111111",
+                        ContainerStorageHelper.REGION_LABEL, REGION,
+                        ContainerStorageHelper.SECURITY_GROUP_HELPER_LABEL, "true")),
+                "HostConfig", Map.of("NetworkMode", "bridge"),
+                "NetworkSettings", Map.of("Networks", endpoints)), InspectContainerResponse.class));
+        ConnectToNetworkCmd connect = docker.connectToNetworkCmd();
+        when(connect.exec()).thenAnswer(call -> {
+            endpoints.put("native-vpc", mapper.convertValue(Map.of("MacAddress", INTERFACE_MAC,
+                    "IPAddress", "172.20.0.2", "IPPrefixLen", 16), ContainerNetwork.class));
+            return null;
+        });
+        stubNativeDeviceCommands(INTERFACE_MAC, "10.0.1.10", 2);
+        NativeVpcAddressSpace.attach(docker, config, "111111111111", REGION, "native-vpc",
+                Cidr4.parse("10.0.0.0/16").orElseThrow(), Cidr4.parse("10.0.1.0/24").orElseThrow(),
+                "helper", "10.0.1.10", ipv6);
+        ArgumentCaptor<ContainerNetwork> endpoint = ArgumentCaptor.forClass(ContainerNetwork.class);
+        verify(connect).withContainerNetwork(endpoint.capture());
+        JsonNode sent = mapper.valueToTree(endpoint.getValue());
+        assertEquals(-1, sent.required("GwPriority").intValue());
+        assertEquals(ipv6, sent.has("DriverOpts"), sent.toString());
+        if (ipv6) {
+            assertEquals("net.ipv6.conf.IFNAME.disable_ipv6=0",
+                    sent.required("DriverOpts").required("com.docker.network.endpoint.sysctls").asText());
+        }
+    }
+
+    @ParameterizedTest
     @ValueSource(strings = {"", "10.0.1.99"})
     void failedAttachCannotFallBackToAnUnconnectedOrDifferentAddress(String observedAddress) {
         String address = prepareUncertainAttach();

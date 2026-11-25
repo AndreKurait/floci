@@ -3131,6 +3131,8 @@ public class Ec2ContainerManager {
                 "set -eu",
                 "vpc=$(ip -o -4 addr show | awk -v a=\"$1\" '{split($4, p, \"/\"); sub(/@.*/, \"\", $2); if (p[1] == a) print $2}' | head -n1)",
                 "[ -n \"$vpc\" ] || { echo \"no interface holds $1\" >&2; exit 3; }",
+                "[ \"$(sysctl -n \"net.ipv6.conf.$vpc.disable_ipv6\")\" = 0 ]"
+                        + " || { echo \"IPv6 is not enabled on attached interface $vpc\" >&2; exit 4; }",
                 "for dev in $(ls /sys/class/net); do",
                 "  [ \"$dev\" = lo ] && continue",
                 "  [ \"$dev\" = \"$vpc\" ] && continue",

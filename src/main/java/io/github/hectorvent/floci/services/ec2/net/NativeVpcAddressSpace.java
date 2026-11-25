@@ -57,7 +57,7 @@ final class NativeVpcAddressSpace {
         boolean connected = false;
         try {
             if (!attachments.containsKey(network)) {
-                ContainerNetwork endpoint = new ContainerNetwork();
+                ContainerNetwork endpoint = ipv6 ? VpcNetworkManager.ipv6Endpoint() : new ContainerNetwork();
                 DockerObjectAccessor.overrideRawValue(endpoint, "GwPriority", -1);
                 docker.connectToNetworkCmd().withContainerId(helper).withNetworkId(network)
                         .withContainerNetwork(endpoint).exec();
