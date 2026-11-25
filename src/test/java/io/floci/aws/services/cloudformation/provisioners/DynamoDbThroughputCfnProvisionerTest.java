@@ -433,12 +433,25 @@ class DynamoDbThroughputCfnProvisionerTest {
     void updateOfAnOnDemandTableLeavesCapacityAlone() throws Exception {
         existingTable(table(0, 0, true));
 
-        provisioner.provision(existingResource(), props(ON_DEMAND_WARM),
+        provisioner.provision(existingResource(), props("""
+                        {"TableName":"orders","BillingMode":"PAY_PER_REQUEST",
+                         "WarmThroughput":{"ReadUnitsPerSecond":24000,"WriteUnitsPerSecond":8000}}
+                        """),
                 updateCtx("{\"TableName\":\"orders\",\"BillingMode\":\"PAY_PER_REQUEST\"}"));
 
         ThroughputChange change = updatedThroughput();
         assertNull(change.table().capacity());
-        assertEquals(new WarmUnits(12000L, 4000L), change.table().warm());
+        assertEquals(new WarmUnits(24000L, 8000L), change.table().warm());
+    }
+
+    @Test
+    void updateOfAnOnDemandTableAtItsDefaultWarmThroughputMakesNoCall() throws Exception {
+        existingTable(table(0, 0, true));
+
+        provisioner.provision(existingResource(), props(ON_DEMAND_WARM),
+                updateCtx("{\"TableName\":\"orders\",\"BillingMode\":\"PAY_PER_REQUEST\"}"));
+
+        verify(tableService, never()).updateThroughput(anyString(), any(), anyString());
     }
 
     @Test
