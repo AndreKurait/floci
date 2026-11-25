@@ -85,6 +85,16 @@ public class S3TablesController {
     }
 
     @PUT
+    @Path("/buckets/{tableBucketARN}/storage-class")
+    public Response putTableBucketStorageClass(@Context HttpHeaders headers,
+                                               @Encoded @PathParam("tableBucketARN") String tableBucketArn,
+                                               Map<String, Object> request) {
+        service.putTableBucketStorageClass(decode(tableBucketArn),
+                request == null ? null : request.get("storageClassConfiguration"), region(headers));
+        return Response.ok().build();
+    }
+
+    @PUT
     @Path("/buckets/{tableBucketARN}/policy")
     public Response putTableBucketPolicy(@Context HttpHeaders headers, @Encoded @PathParam("tableBucketARN") String tableBucketArn,
                                          Map<String, Object> request) {
@@ -180,6 +190,15 @@ public class S3TablesController {
                 ? service.getTableByArn(tableArn, region(headers))
                 : service.getTable(tableBucketArn, namespace, name, region(headers));
         return Response.ok(tableRepresentation(table)).build();
+    }
+
+    @GET
+    @Path("/tables/{tableBucketARN}/{namespace}/{name}/storage-class")
+    public Response getTableStorageClass(@Context HttpHeaders headers,
+                                         @Encoded @PathParam("tableBucketARN") String tableBucketArn,
+                                         @PathParam("namespace") String namespace, @PathParam("name") String name) {
+        return Response.ok(Map.of("storageClassConfiguration",
+                service.getTableStorageClass(decode(tableBucketArn), namespace, name, region(headers)))).build();
     }
 
     @GET
