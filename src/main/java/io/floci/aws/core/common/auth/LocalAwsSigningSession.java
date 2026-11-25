@@ -45,6 +45,13 @@ public final class LocalAwsSigningSession implements AutoCloseable {
                 roleArn, session.expiration, null, accountId, sessionName, assumedRoleId));
     }
 
+    /** Opens task-role credentials in their explicit account, independent of the workflow request scope. */
+    public static LocalAwsSigningSession assumedRoleForAccount(IamService iam, String accountId, String roleArn,
+                                                                String sessionName, String assumedRoleId) {
+        return open(iam, accountId, session -> iam.registerSessionForAccount(accountId, session.accessKey,
+                session.secret, session.token, roleArn, session.expiration, null, sessionName, assumedRoleId));
+    }
+
     private static LocalAwsSigningSession open(IamService iam, String accountId, Consumer<LocalAwsSigningSession> register) {
         LocalAwsSigningSession session = new LocalAwsSigningSession(iam, accountId);
         try {

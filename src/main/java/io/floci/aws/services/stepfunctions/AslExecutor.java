@@ -991,7 +991,8 @@ public class AslExecutor {
         boolean nestedTask = NestedTaskCredentials.isNested(StatesIntegration.parse(resource).orElse(null));
         JsonNode credentials = null;
         boolean readCredentials = stateDef.has("Credentials")
-                && (iamEnforcementEnabled() || (mockedInvocation == null && nestedTask));
+                && (iamEnforcementEnabled() || (mockedInvocation == null
+                && (nestedTask || SdkComputeTaskInvoker.supports(StatesIntegration.parse(resource).orElse(null)))));
         // Otherwise only the scheduled event reads them, and what it cannot read it leaves out.
         boolean recordCredentialsOnly = stateDef.has("Credentials") && !readCredentials && !isActivity;
         JsonNode recordedCredentials = null;
@@ -1575,7 +1576,7 @@ public class AslExecutor {
 
         if (SdkManagementTaskInvoker.supports(integration)) {
             return sdkManagementTaskInvoker.invoke(integration, input,
-                    regionResolver.regionOf(sm.getStateMachineArn()));
+                    regionResolver.regionOf(sm.getStateMachineArn()), sm, credentialsRoleArn);
         }
 
         // ECS optimized integration: arn:<partition>:states:::ecs:runTask (request-response, .sync, .waitForTaskToken).
