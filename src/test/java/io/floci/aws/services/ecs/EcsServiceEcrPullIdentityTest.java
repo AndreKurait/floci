@@ -11,8 +11,11 @@ import io.floci.aws.services.ecs.model.ContainerInstance;
 import io.floci.aws.services.ecs.model.EcsTask;
 import io.floci.aws.services.ecs.model.LaunchType;
 import io.floci.aws.testing.InMemoryStorageFactory;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.time.Clock;
 import java.util.ArrayList;
@@ -25,6 +28,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class EcsServiceEcrPullIdentityTest {
     private static final String ACCOUNT = "111111111111";
     private static final String REGION = "us-east-1";

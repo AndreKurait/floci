@@ -360,7 +360,7 @@ class EcrRegistryAuthenticationHttpTest {
     @Test
     void authorizedMountKeepsItsSourceAfterCatalogRecovery() throws Exception {
         when(manager.isCatalogReconciled()).thenReturn(false);
-        String token = "Basic " + auth.issue().authorizationToken();
+        String token = "Basic " + auth.issue("us-east-1").authorizationToken();
         assertEquals(200, request(HttpMethod.POST,
                 "/v2/app/blobs/uploads/?mount=sha256:abc&from=team/source", token));
         assertTrue(forwardedUri.get().contains("from=111111111111%2Fus-east-1%2Fteam%2Fsource"));
@@ -370,7 +370,7 @@ class EcrRegistryAuthenticationHttpTest {
 
     @Test
     void awsMirrorNamespaceStillChecksTheIssuedCallersCurrentPermission() throws Exception {
-        String token = "Basic " + auth.issue().authorizationToken();
+        String token = "Basic " + auth.issue("us-east-1").authorizationToken();
         String path = "/v2/app/manifests/latest?ns=111111111111.dkr.ecr.us-east-1.amazonaws.com";
         assertEquals(200, request(HttpMethod.GET, path, token, "floci:4566"));
         assertEquals("/v2/111111111111/us-east-1/app/manifests/latest", forwardedUri.get());

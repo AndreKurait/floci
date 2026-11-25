@@ -16,10 +16,13 @@ import com.github.dockerjava.api.model.HostConfig;
 import com.github.dockerjava.core.command.WaitContainerResultCallback;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.services.lambda.launcher.ImageCacheService;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -52,6 +55,7 @@ import static org.mockito.Mockito.when;
  */
 @ExtendWith(MockitoExtension.class)
 @DisplayName("ContainerLifecycleManager — default emulator labels")
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class ContainerLifecycleManagerLabelsTest {
 
     @Mock

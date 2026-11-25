@@ -154,7 +154,7 @@ class EcrRegistryDataPlaneTest {
     }
 
     @Test
-    void anAwsRegistryHostIsServedOnlyAsAMirrorRequestsNamespaceInItsRegionsPartition() {
+    void awsRegistryHostsAndMirrorNamespacesStayInTheirRegionsPartition() {
         // A region under another partition's suffix names no registry.
         assertFalse(EcrRegistryDataPlane.requestFor("172.17.0.1:4566", "/v2/app/manifests/v1",
                 "ns=111122223333.dkr.ecr.cn-north-1.amazonaws.com", "hostname").isPresent());
@@ -163,9 +163,16 @@ class EcrRegistryDataPlaneTest {
         // Another registry's namespace, such as a public registry's, is not Floci's.
         assertFalse(EcrRegistryDataPlane.requestFor("172.17.0.1:4566", "/v2/library/nginx/manifests/1",
                 "ns=docker.io", "hostname").isPresent());
-        // A request sent to the AWS host itself is not a mirror request.
-        assertFalse(EcrRegistryDataPlane.requestFor("111122223333.dkr.ecr.us-east-1.amazonaws.com",
-                "/v2/app/manifests/v1", null, "hostname").isPresent());
+        EcrRegistryDataPlane.RegistryRequest nativeRequest = EcrRegistryDataPlane.requestFor(
+                "111122223333.dkr.ecr.us-east-1.amazonaws.com", "/v2/app/manifests/v1", null, "hostname")
+                .orElseThrow();
+        assertEquals("111122223333", nativeRequest.accountId());
+        assertEquals("us-east-1", nativeRequest.region());
+        assertEquals("/v2/111122223333/us-east-1/app/manifests/v1", nativeRequest.backendUri());
+        EcrRegistryDataPlane.RegistryRequest explicitMirrorPort = EcrRegistryDataPlane.requestFor(
+                "172.17.0.1:4566", "/v2/app/manifests/v1",
+                "ns=111122223333.dkr.ecr.eu-west-1.amazonaws.com%3A443", "hostname").orElseThrow();
+        assertEquals("/v2/111122223333/eu-west-1/app/manifests/v1", explicitMirrorPort.backendUri());
     }
 
     @Test

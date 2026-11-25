@@ -12,8 +12,11 @@ import io.floci.aws.services.iam.IamPolicyEvaluator;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.iam.model.CallerContext;
 import io.floci.aws.services.iam.model.IamRole;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Clock;
@@ -30,6 +33,7 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class EcrWorkloadImagePullTest {
     private static final String ACCOUNT = "111111111111";
     private static final String REGION = "us-east-1";

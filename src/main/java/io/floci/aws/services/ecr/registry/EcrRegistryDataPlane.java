@@ -5,7 +5,6 @@ import io.floci.aws.config.NetworkExposureGuard;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.AwsPartitions;
-import io.floci.aws.core.common.AwsRegions;
 import io.floci.aws.services.ecr.EcrService;
 import io.floci.aws.services.ecr.model.Repository;
 import io.vertx.core.Vertx;
@@ -934,7 +933,8 @@ public class EcrRegistryDataPlane {
             return byNamespace;
         }
         Matcher mirrored = AWS_ECR_HOST.matcher(namespace);
-        return mirrored.matches() && AwsRegions.dnsSuffixFor(mirrored.group(2)).equals(mirrored.group(3)) ? mirrored : null;
+        return mirrored.matches() && AwsPartitions.forRegion(mirrored.group(2))
+                .filter(partition -> partition.dnsSuffix().equals(mirrored.group(3))).isPresent() ? mirrored : null;
     }
 
     private static boolean isLoopbackHost(String host) {

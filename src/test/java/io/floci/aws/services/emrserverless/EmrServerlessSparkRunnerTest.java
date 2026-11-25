@@ -2564,6 +2564,23 @@ class EmrServerlessSparkRunnerTest {
         return container;
     }
 
+    @Test
+    void jobCopiesKeepImagePullOwnershipAndGracefulCancellationTogether() {
+        String sourceArn = "arn:aws:emr-serverless:eu-west-1:123456789012:/applications/app-one";
+        SparkJobRunner.Job base = job(Duration.ZERO).withImagePullSourceArn(sourceArn).asInterruptible();
+        List<SparkJobRunner.Job> copies = List.of(base.onStorage(new SparkJobRunner.Storage("home", "mnt")),
+                base.inImage("custom:latest"), base.withExecutors(null), base.listeningOn(1234),
+                base.onNetwork("owned-network"), base.keepingEventLogs(), base.withPlatform("linux/arm64"),
+                base.asInterruptible(), job(Duration.ZERO).asInterruptible().withImagePullSourceArn(sourceArn));
+        for (SparkJobRunner.Job copy : copies) {
+            assertEquals(sourceArn, copy.imagePullSourceArn());
+            assertTrue(copy.interruptible());
+        }
+        assertEquals(sourceArn, job(Duration.ZERO).withImagePullSourceArn(sourceArn)
+                .keepingEventLogs().imagePullSourceArn());
+        assertFalse(job(Duration.ZERO).withImagePullSourceArn(sourceArn).keepingEventLogs().interruptible());
+    }
+
     private static SparkJobRunner.Job job(Duration timeout) {
         return job(List.of("s3://bucket/jobs/app.jar"), Map.of(), timeout);
     }

@@ -1420,9 +1420,9 @@ class ContainerLauncherTest {
                 new ContainerReachableEndpoint(config, dockerHostResolver, embeddedDnsServer, null, 4566);
         ContainerLauncher authorized = new ContainerLauncher(
                 new ContainerBuilder(config, dockerHostResolver, embeddedDnsServer), lifecycleManager,
-                streamingDockerClient, logStreamer, imageResolver, runtimeApiServerFactory, dockerHostResolver,
+                streamingDockerClient, dockerHttp, logStreamer, imageResolver, runtimeApiServerFactory, dockerHostResolver,
                 config, regionResolver, ecrRegistryManager, layerService, new LaunchedContainerAwsEnv(endpoint),
-                executionRoleCredentials, ec2Service, pulls);
+                executionRoleCredentials, ec2Service, mock(DockerExitEvents.class), pulls);
         LambdaFunction function = new LambdaFunction();
         function.setFunctionName("image");
         function.setPackageType("Image");
@@ -1448,9 +1448,9 @@ class ContainerLauncherTest {
                 new ContainerReachableEndpoint(config, dockerHostResolver, embeddedDnsServer, null, 4566);
         ContainerLauncher authorized = new ContainerLauncher(
                 new ContainerBuilder(config, dockerHostResolver, embeddedDnsServer), lifecycleManager,
-                streamingDockerClient, logStreamer, imageResolver, runtimeApiServerFactory, dockerHostResolver,
+                streamingDockerClient, dockerHttp, logStreamer, imageResolver, runtimeApiServerFactory, dockerHostResolver,
                 config, regionResolver, ecrRegistryManager, layerService, new LaunchedContainerAwsEnv(endpoint),
-                executionRoleCredentials, ec2Service, pulls);
+                executionRoleCredentials, ec2Service, mock(DockerExitEvents.class), pulls);
         LambdaFunction function = new LambdaFunction();
         function.setFunctionName("image");
         function.setPackageType("Image");
