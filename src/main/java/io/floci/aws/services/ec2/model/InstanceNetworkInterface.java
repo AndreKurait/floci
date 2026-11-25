@@ -123,6 +123,7 @@ public class InstanceNetworkInterface {
         copy.deviceIndex = deviceIndex;
         copy.attachTime = attachTime;
         copy.deleteOnTermination = deleteOnTermination;
+        copy.sharedNetworkContainerId = sharedNetworkContainerId;
         return copy;
     }
 }

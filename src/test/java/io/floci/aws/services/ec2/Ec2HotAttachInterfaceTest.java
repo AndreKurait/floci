@@ -186,6 +186,25 @@ class Ec2HotAttachInterfaceTest {
     @ParameterizedTest
     @NullSource
     @ValueSource(strings = {"helper-1", "different-helper"})
+    void interfaceSnapshotRetainsThePhysicalOwnershipNeededForRecovery(String owner) {
+        Ec2ContainerManager manager = manager();
+        InstanceNetworkInterface attached = customer();
+        attached.setSharedNetworkContainerId(owner);
+
+        manager.restoreAttachedNetworkInterfaces(instanceWith(primary(), attached.copy()));
+
+        if ("helper-1".equals(owner)) {
+            verify(vpcNetworks).restoreInterface("000000000000", REGION, "vpc-customer",
+                    "helper-1", "172.31.5.9", MAC);
+        } else {
+            verify(vpcNetworks, never()).restoreInterface(anyString(), anyString(), anyString(),
+                    anyString(), anyString(), anyString());
+        }
+    }
+
+    @ParameterizedTest
+    @NullSource
+    @ValueSource(strings = {"helper-1", "different-helper"})
     void restoredMetadataRepairsOnlyItsRecordedNamespace(String owner) throws Exception {
         Ec2ContainerManager manager = manager();
         InstanceNetworkInterface attached = customer();
