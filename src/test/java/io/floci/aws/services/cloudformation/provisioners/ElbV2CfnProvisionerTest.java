@@ -37,6 +37,7 @@ import java.util.stream.Collectors;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -152,6 +153,7 @@ class ElbV2CfnProvisionerTest {
         });
         when(engine.resolveNode(any())).thenAnswer(inv -> inv.getArgument(0));
         when(engine.resolveNodeOmittingNoValue(any())).thenAnswer(inv -> inv.getArgument(0));
+        when(engine.omitNoValue(any())).thenAnswer(inv -> inv.getArgument(0));
         // resolveStringList delegates to the real engine method; for the literal arrays these
         // tests use it just walks the array and calls resolve(...) per element, stubbed above.
         when(engine.resolveStringList(any())).thenCallRealMethod();
@@ -1317,6 +1319,56 @@ class ElbV2CfnProvisionerTest {
         verify(elb, never()).modifyTargetGroup(any(), any(), any(), any(), any(),
                 any(), any(), any(), any(), any(), any());
         assertFalse(tgResource.getAttributes().containsKey(HEALTH_SNAPSHOT));
+    }
+
+    @Test
+    void registrationFailureRestoresDeclaredAttributesAndHealthIndependently() {
+        priorHealth();
+        when(elb.describeTargetGroupAttributes(REGION, TG_ARN))
+                .thenReturn(Map.of("proxy_protocol_v2.enabled", "false"));
+        ObjectNode desired = changedHealth(target("10.0.0.5", 70000, null));
+        desired.putArray("TargetGroupAttributes").addObject()
+                .put("Key", "proxy_protocol_v2.enabled").put("Value", "true");
+        AwsException refusal = refusingRegistration();
+
+        assertSame(refusal, assertThrows(AwsException.class,
+                () -> keptTargetGroupUpdatedTo(List.of(), desired, null)));
+
+        verify(elb).modifyTargetGroupAttributes(REGION, TG_ARN, Map.of("proxy_protocol_v2.enabled", "true"));
+        verify(elb).restoreTargetGroupAttributes(REGION, TG_ARN, Map.of("proxy_protocol_v2.enabled", "false"));
+        verifyHealthRestored(1);
+        verify(elb, never()).deregisterTargets(any(), any(), any());
+        assertFalse(tgResource.getAttributes().containsKey(CfnRollback.TARGET_GROUP_ATTRIBUTES_UPDATE_SNAPSHOT_ATTR));
+        assertFalse(tgResource.getAttributes().containsKey(HEALTH_SNAPSHOT));
+    }
+
+    @Test
+    void failedAttributeUndoStillRestoresHealthAndCarriesItsSnapshotForRetry() {
+        priorHealth();
+        Map<String, String> prior = Map.of("proxy_protocol_v2.enabled", "false");
+        when(elb.describeTargetGroupAttributes(REGION, TG_ARN)).thenReturn(prior);
+        ObjectNode desired = changedHealth(target("10.0.0.5", 70000, null));
+        desired.putArray("TargetGroupAttributes").addObject()
+                .put("Key", "proxy_protocol_v2.enabled").put("Value", "true");
+        AwsException undoFailure = internalFailure();
+        doThrow(undoFailure).doNothing().when(elb).restoreTargetGroupAttributes(REGION, TG_ARN, prior);
+        AwsException refusal = refusingRegistration();
+
+        assertSame(refusal, assertThrows(AwsException.class,
+                () -> keptTargetGroupUpdatedTo(List.of(), desired, null)));
+
+        assertEquals(List.of(undoFailure), List.of(refusal.getSuppressed()));
+        verifyHealthRestored(1);
+        assertTrue(tgResource.getAttributes().containsKey(CfnRollback.UPDATE_ROLLBACK_FAILURE_ATTR));
+        assertTrue(tgResource.getAttributes().containsKey(CfnRollback.TARGET_GROUP_ATTRIBUTES_UPDATE_SNAPSHOT_ATTR));
+        restored.setPhysicalId(TG_ARN);
+        restored.setResourceType(tgResource.getResourceType());
+        provisioner.mergeFailedUpdateResourceTracking(restored, tgResource);
+        assertTrue(restored.getAttributes().containsKey(CfnRollback.TARGET_GROUP_ATTRIBUTES_UPDATE_SNAPSHOT_ATTR));
+        assertTrue(provisioner.rollbackUpdate(restored));
+        verify(elb, times(2)).restoreTargetGroupAttributes(REGION, TG_ARN, prior);
+        assertFalse(restored.getAttributes().containsKey(CfnRollback.TARGET_GROUP_ATTRIBUTES_UPDATE_SNAPSHOT_ATTR));
+        verify(elb, never()).deregisterTargets(any(), any(), any());
     }
 
     @Test
