@@ -560,7 +560,7 @@ class CodeDeployServiceTest {
     void ecsDeployment_refusedForAGroupWithoutAService_leavesNoDeploymentBehind() {
         service.createApplication(REGION, "ecs-app", "ECS", null);
         service.createDeploymentGroup(REGION, "ecs-app", "bare-group", "CodeDeployDefault.ECSAllAtOnce", ROLE_ARN,
-                Map.of());
+                Map.of(), List.of());
         String appSpec = """
                 {"version": 0.0, "Resources": [{"TargetService": {"Type": "AWS::ECS::Service",
                   "Properties": {"TaskDefinition": "web:2",

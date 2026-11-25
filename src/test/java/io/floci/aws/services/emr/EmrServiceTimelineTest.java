@@ -74,7 +74,8 @@ class EmrServiceTimelineTest {
     }
 
     private int listedInstances(String clusterId) {
-        JsonNode answer = (JsonNode) new EmrHandler(service, objectMapper).handle("ListInstances",
+        JsonNode answer = (JsonNode) new EmrHandler(service, mock(EmrStudioService.class),
+                mock(EmrNotebookExecutionService.class), mock(EmrAppUiService.class), objectMapper).handle("ListInstances",
                 objectMapper.createObjectNode().put("ClusterId", clusterId)
                         .set("InstanceStates", objectMapper.createArrayNode().add("TERMINATED")),
                 REGION).getEntity();
