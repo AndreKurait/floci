@@ -1,5 +1,6 @@
 package io.floci.aws.services.ec2;
 
+import io.netty.util.NetUtil;
 import io.floci.aws.services.ec2.model.IpPermission;
 import io.floci.aws.services.ec2.model.SecurityGroup;
 
@@ -30,8 +31,33 @@ public final class SecurityGroupNftCompiler {
                            String logicalAddress, List<String> logicalIpv6Addresses,
                            String transportAddress, String transportIpv6Address,
                            Set<String> groupIds, List<SecurityGroup> groups,
-                           List<ControlConnection> controlConnections, boolean instanceMetadataAllowed) {
+                           List<ControlConnection> controlConnections, boolean instanceMetadataAllowed,
+                           Set<String> additionalTransportAddresses) {
 
+
+        public Endpoint(String accountId, String region, String vpcId, String eniId,
+                        String logicalAddress, List<String> logicalIpv6Addresses,
+                        String transportAddress, String transportIpv6Address,
+                        Set<String> groupIds, List<SecurityGroup> groups,
+                        List<ControlConnection> controlConnections, boolean instanceMetadataAllowed) {
+            this(accountId, region, vpcId, eniId, logicalAddress, logicalIpv6Addresses, transportAddress,
+                    transportIpv6Address, groupIds, groups, controlConnections, instanceMetadataAllowed, Set.of());
+        }
+
+        public Endpoint(String accountId, String region, String vpcId, String eniId,
+                        String logicalAddress, String transportAddress, Set<String> groupIds,
+                        List<SecurityGroup> groups, List<ControlConnection> controlConnections,
+                        boolean instanceMetadataAllowed, Set<String> additionalTransportAddresses) {
+            this(accountId, region, vpcId, eniId, logicalAddress, List.of(), transportAddress, null,
+                    groupIds, groups, controlConnections, instanceMetadataAllowed, additionalTransportAddresses);
+        }
+
+        public Endpoint(String accountId, String region, String vpcId, String eniId,
+                        String logicalAddress, String transportAddress, Set<String> groupIds,
+                        List<SecurityGroup> groups, Set<String> additionalTransportAddresses) {
+            this(accountId, region, vpcId, eniId, logicalAddress, transportAddress, groupIds, groups,
+                    List.of(), true, additionalTransportAddresses);
+        }
 
         public Endpoint(String accountId, String region, String vpcId, String eniId,
                         String logicalAddress, String transportAddress, Set<String> groupIds,
@@ -57,6 +83,10 @@ public final class SecurityGroupNftCompiler {
         }
 
         public Endpoint {
+            additionalTransportAddresses = Set.copyOf(additionalTransportAddresses);
+            if (additionalTransportAddresses.stream().anyMatch(address -> !literal(address))) {
+                throw new IllegalArgumentException("Transport addresses must be literal IP addresses");
+            }
             controlConnections = List.copyOf(controlConnections);
             logicalIpv6Addresses = logicalIpv6Addresses == null ? List.of() : List.copyOf(logicalIpv6Addresses);
         }
@@ -64,13 +94,15 @@ public final class SecurityGroupNftCompiler {
         /** The same ENI identity with the policy the manager re-resolved. */
         public Endpoint withPolicy(Set<String> groupIds, List<SecurityGroup> groups) {
             return new Endpoint(accountId, region, vpcId, eniId, logicalAddress, logicalIpv6Addresses,
-                    transportAddress, transportIpv6Address, groupIds, groups, controlConnections, instanceMetadataAllowed);
+                    transportAddress, transportIpv6Address, groupIds, groups, controlConnections, instanceMetadataAllowed,
+                    additionalTransportAddresses);
         }
 
         /** The same ENI and policy, holding {@code addresses} as its IPv6 addresses now. */
         public Endpoint withIpv6Addresses(List<String> addresses) {
             return new Endpoint(accountId, region, vpcId, eniId, logicalAddress, addresses, transportAddress,
-                    transportIpv6Address, groupIds, groups, controlConnections, instanceMetadataAllowed);
+                    transportIpv6Address, groupIds, groups, controlConnections, instanceMetadataAllowed,
+                    additionalTransportAddresses);
         }
 
         SecurityGroupPolicy.Peer peer(String address) {
@@ -94,7 +126,22 @@ public final class SecurityGroupNftCompiler {
                     }
                 }
             }
+            for (String transport : additionalTransportAddresses.stream().sorted().toList()) {
+                if (NetUtil.isValidIpV4Address(transport) && literal(logicalAddress)) {
+                    identities.add(new AddressIdentity(logicalAddress, transport));
+                } else if (NetUtil.isValidIpV6Address(transport)) {
+                    for (String address : logicalIpv6Addresses) {
+                        if (literal(address)) {
+                            identities.add(new AddressIdentity(address, transport));
+                        }
+                    }
+                }
+            }
             return identities;
+        }
+
+        List<String> transportAddresses() {
+            return transports();
         }
 
         /** Every Docker address the endpoint's traffic can carry, whether or not an identity uses it. */
@@ -106,7 +153,8 @@ public final class SecurityGroupNftCompiler {
             if (literal(transportIpv6Address)) {
                 transports.add(transportIpv6Address);
             }
-            return transports;
+            additionalTransportAddresses.stream().sorted().forEach(transports::add);
+            return List.copyOf(new LinkedHashSet<>(transports));
         }
     }
 

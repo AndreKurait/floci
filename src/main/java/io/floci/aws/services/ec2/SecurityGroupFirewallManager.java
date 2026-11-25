@@ -81,7 +81,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         return config.network().securityGroupEnforcement().enabled();
     }
 
-    /** The DNS packet carries the helper's transport address, not the ENI's logical private IP. */
+    /** Resolve the caller only from addresses actually attached to an admitted namespace. */
     @Override
     public Optional<ClientVpc> vpcForClient(String clientAddress) {
         if (clientAddress == null || clientAddress.isBlank()) {
@@ -116,7 +116,8 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                     && container.getNetworkSettings().getNetworks() != null) {
                 Set<String> addresses = new HashSet<>();
                 container.getNetworkSettings().getNetworks().values().stream()
-                        .map(ContainerNetwork::getIpAddress)
+                        .flatMap(network -> java.util.stream.Stream.of(
+                                network.getIpAddress(), network.getGlobalIPv6Address()))
                         .filter(address -> address != null && !address.isBlank()).forEach(addresses::add);
                 liveAddresses.put(container.getId(), addresses);
             }
@@ -134,6 +135,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 });
             }
         });
+        retired.forEach(this::removeDnsOrigin);
         retireEndpoints(retired);
     }
 
@@ -141,6 +143,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         for (DnsOrigin origin : retired) {
             ProtectedEndpoint current = endpoints.get(origin.eniId());
             if (current != null && current.dnsOrigin() == origin) {
+                removeDnsOrigin(current);
                 endpoints.remove(origin.eniId());
                 pendingHelperCleanup.computeIfAbsent(origin.eniId(), ignored -> new HashSet<>())
                         .add(current.helperId());
@@ -156,9 +159,13 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     }
 
     private void removeDnsOrigin(ProtectedEndpoint protectedEndpoint) {
-        SecurityGroupNftCompiler.Endpoint endpoint = protectedEndpoint.endpoint();
-        dnsOrigins.computeIfPresent(endpoint.transportAddress(),
-                (address, current) -> current == protectedEndpoint.dnsOrigin() ? null : current);
+        removeDnsOrigin(protectedEndpoint.dnsOrigin());
+    }
+
+    private void removeDnsOrigin(DnsOrigin origin) {
+        origin.transportAddresses().forEach(transport ->
+                dnsOrigins.computeIfPresent(transport,
+                        (address, current) -> current == origin ? null : current));
     }
 
     @PostConstruct
@@ -359,9 +366,10 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
     /** Registers only after the default-deny table exists, before workload startup. */
     public synchronized void register(SecurityGroupNftCompiler.Endpoint endpoint, String helperId,
                                       Map<String, List<String>> prefixLists) {
+        List<String> addresses = endpoint.transportAddresses();
         if (endpoints.values().stream().map(ProtectedEndpoint::endpoint)
                 .anyMatch(existing -> !existing.eniId().equals(endpoint.eniId())
-                        && existing.transportAddress().equals(endpoint.transportAddress()))) {
+                        && existing.transportAddresses().stream().anyMatch(addresses::contains))) {
             quarantine(helperId);
             throw new IllegalStateException("Two managed ENIs share a Docker transport address");
         }
@@ -374,7 +382,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             }
             ProtectedEndpoint admitted = endpoints.get(endpoint.eniId());
             if (admitted != null) {
-                dnsOrigins.put(endpoint.transportAddress(), admitted.dnsOrigin());
+                addresses.forEach(address -> dnsOrigins.put(address, admitted.dnsOrigin()));
                 pendingHelperCleanup.values().forEach(helpers -> helpers.remove(helperId));
                 pendingHelperCleanup.values().removeIf(Set::isEmpty);
             }
@@ -449,7 +457,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
             return;
         }
         endpoints.put(eniId, new ProtectedEndpoint(current.endpoint().withIpv6Addresses(addresses),
-                current.helperId(), current.prefixLists()));
+                current.helperId(), current.prefixLists(), current.dnsOrigin()));
         try {
             reconcileAll();
         } catch (RuntimeException e) {
@@ -492,7 +500,7 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         }
     }
 
-    private record DnsOrigin(String eniId, String helperId, ClientVpc vpc) {}
+    private record DnsOrigin(String eniId, String helperId, ClientVpc vpc, List<String> transportAddresses) {}
 
     /** Refreshes every affected EC2 instance and ECS task after a control-plane rule change. */
     public synchronized void refreshPolicies(String region, Map<String, SecurityGroup> groups,
@@ -614,7 +622,8 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
         private ProtectedEndpoint(SecurityGroupNftCompiler.Endpoint endpoint, String helperId,
                                   Map<String, List<String>> prefixLists) {
             this(endpoint, helperId, prefixLists, new DnsOrigin(endpoint.eniId(), helperId,
-                    new ClientVpc(endpoint.accountId(), endpoint.region(), endpoint.vpcId())));
+                    new ClientVpc(endpoint.accountId(), endpoint.region(), endpoint.vpcId()),
+                    endpoint.transportAddresses()));
         }
     }
 }

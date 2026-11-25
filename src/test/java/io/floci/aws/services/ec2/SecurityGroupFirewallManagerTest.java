@@ -67,6 +67,47 @@ import static org.mockito.Mockito.when;
 
 class SecurityGroupFirewallManagerTest {
 
+    @ParameterizedTest
+    @ValueSource(strings = {"172.18.0.2", "10.0.1.10"})
+    void losingEitherInterfaceWithdrawsBothDnsOriginsBeforeWaitingForTheFirewall(String survivingAddress)
+            throws Exception {
+        DockerClient dockerClient = mock(DockerClient.class);
+        ListContainersCmd listing = mock(ListContainersCmd.class, RETURNS_SELF);
+        when(dockerClient.listContainersCmd()).thenReturn(listing);
+        Container observed = dnsHelper("helper-a", "running", survivingAddress);
+        when(listing.exec()).thenReturn(List.of(observed));
+        SecurityGroupFirewallManager manager = dnsManager(dockerClient);
+        manager.register(new SecurityGroupNftCompiler.Endpoint("111111111111", "us-east-1", "vpc-a",
+                "eni-a", "10.0.1.10", "172.18.0.2", Set.of(), List.of(), Set.of("10.0.1.10")),
+                "helper-a", Map.of());
+        assertTrue(manager.vpcForClient("172.18.0.2").isPresent());
+        assertTrue(manager.vpcForClient("10.0.1.10").isPresent());
+
+        try (ExecutorService executor = Executors.newSingleThreadExecutor()) {
+            Future<?> retirement;
+            synchronized (manager) {
+                retirement = executor.submit(manager::retireDnsOrigins);
+                await().atMost(2, TimeUnit.SECONDS).until(() -> manager.vpcForClient("172.18.0.2").isEmpty()
+                        && manager.vpcForClient("10.0.1.10").isEmpty());
+            }
+            retirement.get(2, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
+    void aNewPrimaryAddressCannotTakeAnExistingVpcInterfaceIdentity() {
+        SecurityGroupFirewallManager manager = dnsManager(mock(DockerClient.class));
+        manager.register(new SecurityGroupNftCompiler.Endpoint("111111111111", "us-east-1", "vpc-a",
+                "eni-a", "10.0.1.10", "172.18.0.2", Set.of(), List.of(), Set.of("10.0.1.10")),
+                "helper-a", Map.of());
+
+        assertThrows(IllegalStateException.class, () -> registerOrigin(
+                manager, "eni-b", "helper-b", "10.0.1.10", "vpc-b"));
+        assertEquals(Optional.of(new DnsClientVpcSource.ClientVpc("111111111111", "us-east-1", "vpc-a")),
+                manager.vpcForClient("10.0.1.10"));
+        assertTrue(manager.vpcForClient("172.18.0.2").isPresent());
+    }
+
     @Test
     void dnsLookupDoesNotWaitForTheFirewallMonitor() throws Exception {
         SecurityGroupFirewallManager manager = dnsManager(mock(DockerClient.class));
@@ -153,6 +194,23 @@ class SecurityGroupFirewallManagerTest {
             }
             retirement.get(2, TimeUnit.SECONDS);
         }
+    }
+
+    @Test
+    void ipv6PolicyRefreshRetainsDnsRetirementIdentity() {
+        DockerClient dockerClient = mock(DockerClient.class);
+        ListContainersCmd listing = mock(ListContainersCmd.class, RETURNS_SELF);
+        when(dockerClient.listContainersCmd()).thenReturn(listing);
+        when(listing.exec()).thenReturn(List.of());
+        SecurityGroupFirewallManager manager = dnsManager(dockerClient);
+        registerOrigin(manager, "eni-a", "helper-a", "172.18.0.2", "vpc-a");
+        manager.updateIpv6Addresses("eni-a", List.of("2001:db8::10"));
+        clearInvocations(manager);
+
+        manager.retireDnsOrigins();
+
+        assertTrue(manager.vpcForClient("172.18.0.2").isEmpty());
+        verify(manager).reconcileAll();
     }
 
     @Test
@@ -364,7 +422,7 @@ class SecurityGroupFirewallManagerTest {
             removing.countDown();
             assertTrue(release.await(5, TimeUnit.SECONDS));
             return null;
-        }).when(lifecycle).removeIfExists("helper-eni-0");
+        }).when(lifecycle).removeIfExistsStrict("helper-eni-0");
         try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
             Future<?> retirement = executor.submit(() -> manager.unregister("eni-0"));
             try {

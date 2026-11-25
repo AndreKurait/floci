@@ -19,6 +19,74 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 class SecurityGroupNftCompilerTest {
 
     @Test
+    void everyAttachedAddressUsesTheManagedPeersVpcBoundary() {
+        SecurityGroup group = new SecurityGroup();
+        group.setVpcId("vpc-1");
+        group.setOwnerId("000000000000");
+        IpPermission permission = new IpPermission();
+        permission.setIpProtocol("tcp");
+        permission.setFromPort(443);
+        permission.setToPort(443);
+        IpRange cidr = new IpRange();
+        cidr.setCidrIp("0.0.0.0/0");
+        permission.getIpRanges().add(cidr);
+        group.getIpPermissions().add(permission);
+        group.getIpPermissionsEgress().add(permission);
+        SecurityGroupNftCompiler.Endpoint target = endpoint("eni-a", "10.0.0.2", "172.17.0.2", group);
+        SecurityGroupNftCompiler.Endpoint allowed = new SecurityGroupNftCompiler.Endpoint(
+                "000000000000", "us-east-1", "vpc-1", "eni-b", "10.0.0.3", "172.17.0.3",
+                Set.of("sg-1"), List.of(group), Set.of("10.0.0.3"));
+        SecurityGroupNftCompiler.Endpoint denied = new SecurityGroupNftCompiler.Endpoint(
+                "000000000000", "us-east-1", "vpc-2", "eni-c", "10.1.0.3", "172.17.0.4",
+                Set.of("sg-1"), List.of(group), Set.of("10.1.0.3"));
+
+        String nft = SecurityGroupNftCompiler.compile(target, List.of(allowed, denied), Map.of());
+
+        for (String direction : List.of("ingress ip saddr ", "egress ip daddr ")) {
+            for (String address : List.of("172.17.0.3", "10.0.0.3")) {
+                assertTrue(nft.contains(direction + address + " tcp dport 443 accept"));
+            }
+            for (String address : List.of("172.17.0.4", "10.1.0.3")) {
+                String drop = direction + address + " drop";
+                assertFalse(nft.contains(direction + address + " tcp dport 443 accept"));
+                assertTrue(nft.contains(drop));
+                assertTrue(nft.indexOf(drop) < nft.indexOf(direction + "0.0.0.0/0 tcp dport 443 accept"));
+            }
+        }
+    }
+
+    @Test
+    void additionalTransportsRetainTheirAddressFamilyAcrossPolicyAndIpv6Refresh() {
+        SecurityGroup group = ipv6Group("2600:1f18:0:a600::/64");
+        SecurityGroupNftCompiler.Endpoint target = endpoint("eni-a", "10.0.0.2", "172.17.0.2", group);
+        SecurityGroupNftCompiler.Endpoint peer = new SecurityGroupNftCompiler.Endpoint(
+                "000000000000", "us-east-1", "vpc-1", "eni-b", "10.0.0.3",
+                List.of("2600:1f18:0:a600::20"), "172.17.0.3", "fd00::3", Set.of("sg-1"), List.of(group),
+                List.of(new SecurityGroupNftCompiler.ControlConnection("172.17.0.1", 12000)), false,
+                Set.of("10.0.0.3", "fd01::3"));
+        SecurityGroupNftCompiler.Endpoint refreshed = peer.withPolicy(peer.groupIds(), peer.groups())
+                .withIpv6Addresses(peer.logicalIpv6Addresses());
+
+        String nft = SecurityGroupNftCompiler.compile(target, List.of(refreshed), Map.of());
+
+        assertTrue(nft.contains("ingress ip6 saddr fd01::3 tcp dport 443 accept"));
+        assertFalse(nft.contains("ingress ip saddr 10.0.0.3 tcp dport 443 accept"));
+        assertTrue(nft.contains("ingress ip saddr 10.0.0.3 drop"));
+        assertEquals(peer.additionalTransportAddresses(), refreshed.additionalTransportAddresses());
+        assertEquals(peer.controlConnections(), refreshed.controlConnections());
+        assertFalse(refreshed.instanceMetadataAllowed());
+    }
+
+    @Test
+    void extraTransportAddressesCannotInjectNetworksOrNftExpressions() {
+        for (String address : List.of("10.0.0.0/8", "private.example", "10.0.0.3 accept")) {
+            assertThrows(IllegalArgumentException.class, () -> new SecurityGroupNftCompiler.Endpoint(
+                    "000000000000", "us-east-1", "vpc-1", "eni-a", "10.0.0.2", "172.17.0.2",
+                    Set.of(), List.of(), Set.of(address)));
+        }
+    }
+
+    @Test
     void managedPeersAreCheckedBeforeDockerAddressCidrs() {
         SecurityGroup group = new SecurityGroup();
         group.setVpcId("vpc-1");
