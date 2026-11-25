@@ -59,6 +59,8 @@ class AthenaDirectQueryLegacyIamIntegrationTest {
     void deniedNativeDirectActionPreservesAllLegacyKeysAndObjects(String action) throws Exception {
         AccountAwareStorageBackend<QueryExecution> queryStore = factory.create("athena", "queries.json",
                 new TypeReference<Map<String, QueryExecution>>() {});
+        AccountAwareStorageBackend<String> regionStore = factory.create("athena", "query-regions.json",
+                new TypeReference<Map<String, String>>() {});
         AccountAwareStorageBackend<WorkGroup> groupStore = factory.create("athena", "workgroups.json",
                 new TypeReference<Map<String, WorkGroup>>() {});
         StorageBackend<String, QueryExecution> queries = rawBackend(queryStore);
@@ -91,6 +93,7 @@ class AthenaDirectQueryLegacyIamIntegrationTest {
                     },
                     () -> assertSame(legacy, queries.get(id).orElse(null)),
                     () -> assertTrue(queries.get(account + "/" + id).isEmpty()),
+                    () -> assertTrue(regionStore.getForAccount(account, id).isEmpty()),
                     () -> assertSame(group, groups.get(groupKey).orElse(null)),
                     () -> assertTrue(groups.get(account + "/" + groupKey).isEmpty()),
                     () -> assertEquals(beforeQuery, MAPPER.valueToTree(legacy)),
@@ -99,11 +102,23 @@ class AthenaDirectQueryLegacyIamIntegrationTest {
                     + "\",\"Resource\":\"" + resource + "\"," + condition + "}";
             try (AthenaClient allowed = caller(allowedPolicy)) {
                 invoke(allowed, action, id, name);
+                invoke(allowed, action, id, name);
+            }
+            try (AthenaClient elsewhere = caller(allowedPolicy, Region.US_WEST_2)) {
+                AthenaException error = assertThrows(AthenaException.class,
+                        () -> invoke(elsewhere, action, id, name));
+                assertEquals(400, error.statusCode());
+                assertTrue(List.of("AccessDeniedException", "InvalidRequestException")
+                        .contains(error.awsErrorDetails().errorCode()));
+            }
+            if (!action.equals("ListQueryExecutions")) {
+                assertEquals(REGION, regionStore.getForAccount(account, id).orElseThrow());
             }
             assertSame(group, groups.get(groupKey).orElseThrow());
             assertTrue(groups.get(account + "/" + groupKey).isEmpty());
             assertEquals(beforeQuery, MAPPER.valueToTree(legacy));
         } finally {
+            regionStore.deleteForAccount(account, id);
             queries.delete(id);
             queries.delete(account + "/" + id);
             groups.delete(groupKey);
@@ -112,13 +127,17 @@ class AthenaDirectQueryLegacyIamIntegrationTest {
     }
 
     private AthenaClient caller(String statements) {
+        return caller(statements, Region.US_EAST_1);
+    }
+
+    private AthenaClient caller(String statements, Region region) {
         String user = "direct-legacy-caller-" + UUID.randomUUID();
         String iamAuth = auth("test", "iam");
         UserCredentials credentials = EnforcementFixtures.createUser(cleanup, endpoint.getPort(), iamAuth, user);
         EnforcementFixtures.putUserPolicy(endpoint.getPort(), iamAuth, user, "direct-legacy",
                 "{\"Version\":\"2012-10-17\",\"Statement\":[" + statements + "]}");
         return AwsTestClients.create(AthenaClient.builder(), credentials.accessKeyId(),
-                credentials.secretAccessKey(), Region.US_EAST_1);
+                credentials.secretAccessKey(), region);
     }
 
     private static Object invoke(AthenaClient client, String action, String id, String group) {
