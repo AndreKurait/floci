@@ -70,6 +70,20 @@ public Floci port. Client-supplied `Forwarded` and `X-Forwarded-For` headers rem
 subject to the configured forwarding policy; the TCP proxy does not use them to
 choose the client's address.
 
+ALB HTTPS listeners can share the proxy's AWS HTTPS port, configured by
+`FLOCI_TLS_AWS_HTTPS_PORT` (default `443`). The proxy reads the TLS ClientHello
+and forwards a uniquely declared ALB hostname to a loopback listener that serves
+the ALB's configured certificate. Other names, and connections without SNI,
+continue to the AWS API backend. The public Floci API port remains reserved.
+Unencrypted HTTP or TCP load-balancer listeners cannot share a proxy port.
+
+Shared-port routing uses the load balancer's DNS name, listener host rules and
+certificate hostnames. It does not infer an ALB destination merely because only
+one listener exists. A ClientHello must arrive within five seconds; its handshake
+payload is limited to 64 KiB and its buffered wire prefix to 128 KiB. Fragmented
+TLS records are supported. Removing or replacing a listener removes its route
+without taking down the API proxy.
+
 ## Local CA and Server Certificate
 
 When `FLOCI_TLS_ENABLED=true` and no custom certificate is provided, Floci keeps a local root CA at `{persistent-path}/tls/floci-root-ca.crt` (key `floci-root-ca.key`, owner-only) and issues its server certificate `floci-server.crt` from it at startup. The server certificate:

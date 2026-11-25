@@ -19,11 +19,13 @@ import org.jboss.logging.Logger;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.IntConsumer;
+import java.util.function.ToIntFunction;
 
 /**
  * A TCP proxy server that enables HTTP and HTTPS on the same port (LocalStack parity).
@@ -45,6 +47,8 @@ import java.util.function.IntConsumer;
  * {@code cfn-response} callbacks hardcode {@code https://} and ignore the ResponseURL port,
  * so they PUT to 443 regardless of Floci's configured port; binding 443 lets those callbacks
  * reach Floci. The extra binding is skipped when the port is {@code 0} or equals the public port.
+ * HTTPS load balancers may register a loopback backend for declared SNI hostnames on this
+ * extra port; all other traffic retains the API backend.
  *
  * <p>Both listen on the configured {@code quarkus.http.host}, not the loopback pin
  * {@link TlsConfigSource} applies to Quarkus itself, and a non-loopback host needs the same consent
@@ -84,6 +88,31 @@ public class TlsProxyServer {
      * registered with nothing serving it.
      */
     private final List<IntConsumer> portReleasedHandlers = new CopyOnWriteArrayList<>();
+    private final Map<Integer, SharedTlsRoute> sharedTlsRoutes = new ConcurrentHashMap<>();
+
+    private record SharedTlsRoute(Object owner, ToIntFunction<String> backend) {}
+
+    /** Registers a loopback TLS backend while this proxy retains the public socket. */
+    public boolean registerTlsRoute(int port, Object owner, ToIntFunction<String> backend) {
+        if (port == config.port() || !reservesPort(port)) {
+            return false;
+        }
+        sharedTlsRoutes.compute(port, (ignored, existing) -> {
+            if (existing != null && existing.owner() != owner) {
+                throw new IllegalStateException("Another listener owns the shared TLS route");
+            }
+            return new SharedTlsRoute(owner, backend);
+        });
+        if (!reservesPort(port)) {
+            unregisterTlsRoute(port, owner);
+            return false;
+        }
+        return true;
+    }
+
+    public void unregisterTlsRoute(int port, Object owner) {
+        sharedTlsRoutes.computeIfPresent(port, (ignored, existing) -> existing.owner() == owner ? null : existing);
+    }
 
     /** Registers a callback invoked when a bind fails and the port stops being reserved. */
     public void onPortReleased(IntConsumer handler) {
@@ -200,38 +229,20 @@ public class TlsProxyServer {
                 frontSocket.handler(null);
                 frontSocket.pause();
 
-                // Inspect first byte to determine protocol
+                boolean tls = buffer.length() > 0 && buffer.getByte(0) == TLS_HANDSHAKE;
+                int port = frontSocket.localAddress().port();
+                if (tls && sharedTlsRoutes.containsKey(port)) {
+                    readClientHello(frontSocket, buffer, port);
+                    return;
+                }
                 int backendPort;
-                if (buffer.length() > 0 && buffer.getByte(0) == TLS_HANDSHAKE) {
+                if (tls) {
                     backendPort = httpsBackendPort;
                 } else {
                     backendPort = httpBackendPort;
                 }
 
-                // Connect to the appropriate backend
-                client.connect(backendPort, "127.0.0.1").onComplete(ar -> {
-                    if (ar.succeeded()) {
-                        NetSocket backSocket = ar.result();
-
-                        SocketAddress source = frontSocket.remoteAddress();
-                        SocketAddress destination = frontSocket.localAddress();
-                        String family = source.hostAddress().contains(":") ? "TCP6" : "TCP4";
-                        Buffer initial = Buffer.buffer("PROXY " + family + " " + source.hostAddress() + " "
-                                + destination.hostAddress() + " " + source.port() + " " + destination.port() + "\r\n");
-                        backSocket.write(initial.appendBuffer(buffer));
-
-                        // Bi-directional pipe — pipeTo handles end-of-stream
-                        // propagation and will resume the paused frontSocket.
-                        frontSocket.pipeTo(backSocket).onFailure(err ->
-                                LOG.debugv("TLS proxy: pipe front→back failed: {0}", err.getMessage()));
-                        backSocket.pipeTo(frontSocket).onFailure(err ->
-                                LOG.debugv("TLS proxy: pipe back→front failed: {0}", err.getMessage()));
-                    } else {
-                        LOG.warnv("TLS proxy: failed to connect to backend port {0}: {1}",
-                                String.valueOf(backendPort), ar.cause().getMessage());
-                        frontSocket.close();
-                    }
-                });
+                connectBackend(frontSocket, buffer, backendPort);
             });
 
             // Resume to receive the first buffer
@@ -239,8 +250,70 @@ public class TlsProxyServer {
         };
     }
 
+    private void readClientHello(NetSocket socket, Buffer first, int port) {
+        TlsClientHello hello = new TlsClientHello();
+        Buffer pending = Buffer.buffer();
+        long timer = vertx.setTimer(5000, ignored -> socket.close());
+        socket.closeHandler(ignored -> {
+            vertx.cancelTimer(timer);
+            hello.close();
+        });
+        Handler<Buffer> read = bytes -> {
+            try {
+                if (bytes.length() > 131072 - pending.length()) {
+                    socket.close();
+                    return;
+                }
+                pending.appendBuffer(bytes);
+                if (!hello.append(bytes)) {
+                    socket.resume();
+                    return;
+                }
+                socket.pause();
+                socket.handler(null);
+                vertx.cancelTimer(timer);
+                SharedTlsRoute route = sharedTlsRoutes.get(port);
+                int selected = route == null || hello.hostname() == null
+                        ? 0 : route.backend().applyAsInt(hello.hostname());
+                hello.close();
+                connectBackend(socket, pending, selected > 0 ? selected : httpsBackendPort);
+            } catch (RuntimeException failure) {
+                LOG.debugv("TLS proxy: invalid or unavailable shared TLS route: {0}", failure.getMessage());
+                socket.close();
+            }
+        };
+        socket.handler(read);
+        read.handle(first);
+    }
+
+    private void connectBackend(NetSocket frontSocket, Buffer buffer, int backendPort) {
+        client.connect(backendPort, "127.0.0.1").onComplete(ar -> {
+            if (ar.succeeded()) {
+                NetSocket backSocket = ar.result();
+
+                SocketAddress source = frontSocket.remoteAddress();
+                SocketAddress destination = frontSocket.localAddress();
+                String family = source.hostAddress().contains(":") ? "TCP6" : "TCP4";
+                Buffer initial = Buffer.buffer("PROXY " + family + " " + source.hostAddress() + " "
+                        + destination.hostAddress() + " " + source.port() + " " + destination.port() + "\r\n");
+                backSocket.write(initial.appendBuffer(buffer));
+
+                // pipeTo propagates end-of-stream and resumes the paused client.
+                frontSocket.pipeTo(backSocket).onFailure(err ->
+                        LOG.debugv("TLS proxy: pipe front→back failed: {0}", err.getMessage()));
+                backSocket.pipeTo(frontSocket).onFailure(err ->
+                        LOG.debugv("TLS proxy: pipe back→front failed: {0}", err.getMessage()));
+            } else {
+                LOG.warnv("TLS proxy: failed to connect to backend port {0}: {1}",
+                        String.valueOf(backendPort), ar.cause().getMessage());
+                frontSocket.close();
+            }
+        });
+    }
+
     @PreDestroy
     void stop() {
+        sharedTlsRoutes.clear();
         for (NetServer server : proxyServers) {
             server.close();
         }

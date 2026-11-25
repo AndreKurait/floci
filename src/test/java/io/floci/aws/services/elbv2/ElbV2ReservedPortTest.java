@@ -193,7 +193,7 @@ class ElbV2ReservedPortTest {
         listener.setDefaultCertificate(certificateArn);
         LoadBalancer loadBalancer = new LoadBalancer();
         loadBalancer.setDnsName("tls.example.test");
-        when(dataPlane.elbV2Service.getLoadBalancer(region, listener.getLoadBalancerArn())).thenReturn(loadBalancer);
+        when(dataPlane.elbV2Service.getLoadBalancerForListener(region, listener.getListenerArn(), listener.getLoadBalancerArn())).thenReturn(loadBalancer);
         CertificateGenerator generator = new CertificateGenerator();
         CertificateGenerator.GeneratedCertificate old = generator.generateSelfSignedCertificate(
                 "tls.example.test", List.of(), KeyAlgorithm.RSA_2048);
@@ -259,7 +259,7 @@ class ElbV2ReservedPortTest {
             listener.setDefaultCertificate(certificateArn);
             LoadBalancer loadBalancer = new LoadBalancer();
             loadBalancer.setDnsName(name + ".example.test");
-            when(dataPlane.elbV2Service.getLoadBalancer("us-west-2", listener.getLoadBalancerArn()))
+            when(dataPlane.elbV2Service.getLoadBalancerForListener("us-west-2", listener.getListenerArn(), listener.getLoadBalancerArn()))
                     .thenReturn(loadBalancer);
             CertificateGenerator.GeneratedCertificate certificate = generator.generateSelfSignedCertificate(
                     name + ".example.test", List.of(), KeyAlgorithm.RSA_2048);
@@ -325,7 +325,7 @@ class ElbV2ReservedPortTest {
             listener.setProtocol("HTTP");
             LoadBalancer loadBalancer = new LoadBalancer();
             loadBalancer.setDnsName(name + ".example.test");
-            when(dataPlane.elbV2Service.getLoadBalancer("us-west-2", listener.getLoadBalancerArn()))
+            when(dataPlane.elbV2Service.getLoadBalancerForListener("us-west-2", listener.getListenerArn(), listener.getLoadBalancerArn()))
                     .thenReturn(loadBalancer);
         }
         try {
@@ -379,7 +379,7 @@ class ElbV2ReservedPortTest {
             listener.setProtocol("HTTP");
             LoadBalancer loadBalancer = new LoadBalancer();
             loadBalancer.setDnsName(name + ".example.test");
-            when(dataPlane.elbV2Service.getLoadBalancer("us-west-2", listener.getLoadBalancerArn()))
+            when(dataPlane.elbV2Service.getLoadBalancerForListener("us-west-2", listener.getListenerArn(), listener.getLoadBalancerArn()))
                     .thenReturn(loadBalancer);
         }
         try {
@@ -445,7 +445,7 @@ class ElbV2ReservedPortTest {
         listener.setProtocol("HTTP");
         LoadBalancer loadBalancer = new LoadBalancer();
         loadBalancer.setDnsName("retry.example.test");
-        when(dataPlane.elbV2Service.getLoadBalancer("us-west-2", listener.getLoadBalancerArn()))
+        when(dataPlane.elbV2Service.getLoadBalancerForListener("us-west-2", listener.getListenerArn(), listener.getLoadBalancerArn()))
                 .thenReturn(loadBalancer);
         try {
             if ("failed-future".equals(stage)) {
@@ -507,7 +507,7 @@ class ElbV2ReservedPortTest {
             listener.setProtocol("HTTP");
             LoadBalancer loadBalancer = new LoadBalancer();
             loadBalancer.setDnsName(name + ".example.test");
-            when(dataPlane.elbV2Service.getLoadBalancer("us-west-2", listener.getLoadBalancerArn()))
+            when(dataPlane.elbV2Service.getLoadBalancerForListener("us-west-2", listener.getListenerArn(), listener.getLoadBalancerArn()))
                     .thenReturn(loadBalancer);
         }
         try {
