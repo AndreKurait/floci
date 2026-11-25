@@ -113,7 +113,7 @@ class KinesisServiceTest {
         clock.advance(Duration.ofSeconds(2));
         mutate.accept(service);
         assertEquals(operation.startsWith("Remove") || operation.startsWith("Untag")
-                ? Map.of() : Map.of("env", "prod"), stream.getTags());
+                ? Map.of() : Map.of("env", "prod"), service.describeStream("my-stream", REGION).getTags());
     }
 
     @Test

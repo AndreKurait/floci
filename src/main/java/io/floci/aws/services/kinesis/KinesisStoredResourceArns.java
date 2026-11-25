@@ -1,6 +1,7 @@
 package io.floci.aws.services.kinesis;
 
 import io.floci.aws.core.common.AwsArnUtils;
+import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.StoredResourceArns;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -16,7 +17,6 @@ public class KinesisStoredResourceArns implements StoredResourceArns {
 
     private static final String NAMESPACE = "kinesis";
     private static final String STREAM = "stream/";
-    private static final String CONSUMER = "/consumer/";
 
     private final KinesisService kinesis;
     private final RegionResolver regionResolver;
@@ -43,7 +43,8 @@ public class KinesisStoredResourceArns implements StoredResourceArns {
      * handlers read: an ARN of another account names none. A consumer's ARN, a stream's with {@code /consumer/} and
      * the consumer after it, reads the consumer held under that ARN; a stream's reads the stream of its name, matched
      * on the whole ARN it records. A tag without a value reads as an empty one. Tag calls give the resource a new map,
-     * so the read is of one whole set.
+     * so the read is of one whole set. Ownership-matching legacy rows are read without migration, including
+     * nondefault accounts; a retained consumer must still belong to its current parent generation.
      */
     @Override
     public Map<String, String> storedTags(String arn) {
@@ -56,9 +57,10 @@ public class KinesisStoredResourceArns implements StoredResourceArns {
         if (!parsed.accountId().equals(account) || !resource.startsWith(STREAM)) {
             return Map.of();
         }
-        Map<String, String> tags = resource.contains(CONSUMER)
-                ? kinesis.consumerTagsInAccount(account, arn)
-                : kinesis.streamTagsInAccount(account, arn, resource.substring(STREAM.length()));
-        return StoredResourceArns.withEmptyValues(tags);
+        try {
+            return StoredResourceArns.withEmptyValues(kinesis.resourcePolicyTags(arn, parsed.region()));
+        } catch (AwsException missingOrForeign) {
+            return Map.of();
+        }
     }
 }

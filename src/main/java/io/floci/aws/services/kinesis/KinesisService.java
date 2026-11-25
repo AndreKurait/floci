@@ -333,13 +333,16 @@ public class KinesisService implements ResourceProvider {
     public KinesisConsumer registerStreamConsumer(String streamArn, String consumerName,
                                                    Map<String, String> tags, String region) {
         validateResourceTagLimit(Map.of(), tags);
-        String streamKey = regionKey(region, streamNameFromTagArn(streamArn));
-        synchronized (lockFor(streamKey)) {
-            describeStreamByArn(streamArn, region);
+        String streamName = streamNameFromTagArn(streamArn);
+        synchronized (lockFor(regionKey(region, streamName))) {
             String consumerArn = streamArn + "/consumer/" + consumerName + ":" + clock.millis();
+            String parentGeneration = resourcePolicies.clearConsumerPolicy(consumerArn, region);
+            if (parentGeneration == null) {
+                throw new AwsException("ResourceNotFoundException", "Stream " + streamName + " not found", 400);
+            }
             KinesisConsumer consumer = new KinesisConsumer(consumerName, consumerArn, streamArn);
             consumer.setConsumerCreationTimestamp(clock.instant());
-            consumer.setPolicyStreamGeneration(resourcePolicies.clearConsumerPolicy(consumerArn, region));
+            consumer.setPolicyStreamGeneration(parentGeneration);
             consumer.setTags(tags);
             // Keep the stream-then-consumer-store lock order used by stream deletion.
             synchronized (consumerStore) {

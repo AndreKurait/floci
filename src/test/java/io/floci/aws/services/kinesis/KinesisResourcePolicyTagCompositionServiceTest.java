@@ -78,6 +78,9 @@ class KinesisResourcePolicyTagCompositionServiceTest {
         KinesisConsumer original = service.registerStreamConsumer(parent, "child", Map.of("owner", "old"), REGION);
         String child = original.getConsumerArn();
         service.deleteStream("target", REGION);
+        assertTrue(consumers.get(REGION + "::" + child).isEmpty());
+        // A legacy persisted consumer must still be fenced when restored after its parent was deleted.
+        consumers.put(REGION + "::" + child, original);
         service.createStream("target", 1, REGION);
         service.putResourcePolicy(parent, POLICY, REGION);
         assertThrows(AwsException.class, () -> service.tagResource(child, Map.of("owner", "new"), REGION));
