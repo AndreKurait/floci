@@ -6,6 +6,15 @@
     "note": "make request-condition-keys-check re-derives members, their shapes and the protocols from botocore; make request-condition-keys-verify checks actions against AWS."
   },
   "actions": {
+    "account:DisableRegion": [
+      "account:TargetRegion"
+    ],
+    "account:EnableRegion": [
+      "account:TargetRegion"
+    ],
+    "account:GetRegionOptStatus": [
+      "account:TargetRegion"
+    ],
     "ec2-instance-connect:OpenTunnel": [
       "ec2-instance-connect:MaxTunnelDuration",
       "ec2-instance-connect:privateIpAddress",
@@ -64,6 +73,21 @@
     ]
   },
   "members": {
+    "account:DisableRegion": {
+      "account:TargetRegion": [
+        "RegionName"
+      ]
+    },
+    "account:EnableRegion": {
+      "account:TargetRegion": [
+        "RegionName"
+      ]
+    },
+    "account:GetRegionOptStatus": {
+      "account:TargetRegion": [
+        "RegionName"
+      ]
+    },
     "ec2-instance-connect:OpenTunnel": {
       "ec2-instance-connect:MaxTunnelDuration": [
         "maxTunnelDuration"
@@ -146,6 +170,15 @@
     }
   },
   "memberShapes": {
+    "account:DisableRegion": {
+      "RegionName": "RegionName"
+    },
+    "account:EnableRegion": {
+      "RegionName": "RegionName"
+    },
+    "account:GetRegionOptStatus": {
+      "RegionName": "RegionName"
+    },
     "eks:CreateCluster": {
       "accessConfig.authenticationMode": "AuthenticationMode",
       "accessConfig.bootstrapClusterCreatorAdminPermissions": "BoxedBoolean",
@@ -183,6 +216,7 @@
     }
   },
   "protocols": {
+    "account": "rest-json",
     "eks": "rest-json",
     "lambda": "rest-json",
     "redshift": "query",
