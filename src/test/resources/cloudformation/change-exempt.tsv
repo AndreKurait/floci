@@ -58,6 +58,7 @@ AWS::CloudWatch::Alarm	update not yet on the engine's changes (#6606)
 AWS::CloudWatch::CompositeAlarm	prior entity found by reusesPriorEntity; moves to the engine's decision with the create-only work
 AWS::CloudWatch::Dashboard	prior entity found by reusesPriorEntity; moves to the engine's decision with the create-only work
 AWS::CodeBuild::Project	wholesale request builder: the whole property node goes to the service
+AWS::CodeDeploy::DeploymentGroup	uses recorded parent application, prior physical identity and droppedProperties to reconcile mutable fields
 AWS::CodePipeline::CustomActionType	wholesale request builder: the whole property node goes to the service
 AWS::CodePipeline::Pipeline	wholesale request builder: the whole property node goes to the service
 AWS::CodePipeline::Webhook	wholesale request builder: the whole property node goes to the service
