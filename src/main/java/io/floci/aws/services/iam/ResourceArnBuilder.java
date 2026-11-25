@@ -329,6 +329,16 @@ public class ResourceArnBuilder {
             String tagged = labels(credentialScope, ctx).get("resourceArn");
             return List.of(S3ControlArnUtils.parse(tagged).map(AwsArnUtils.Arn::toString).orElse("*"));
         }
+        // Access-entry updates resolve the held target without migrating legacy records before authorization.
+        if ("eks".equals(credentialScope) && "eks:UpdateAccessEntry".equals(operation)) {
+            String[] updatePath = IamActionRegistry.routedPath(ctx).substring(1).split("/", 4);
+            if (eksService == null || updatePath.length != 4 || !"clusters".equals(updatePath[0])
+                    || !"access-entries".equals(updatePath[2])) {
+                return List.of("*");
+            }
+            return List.of(eksService.get().findAccessEntryUpdateTarget(pathSegment(updatePath[1]), pathSegment(updatePath[3]))
+                    .map(entry -> entry.accessEntryArn()).orElse("*"));
+        }
         if (operation != null && operation.startsWith(credentialScope + ":") && RequestResources.reads(operation)) {
             return namedResources(credentialScope, operation, ctx, region, accountId, partition);
         }
@@ -451,15 +461,6 @@ public class ResourceArnBuilder {
         }
         if ("mq:CreateConfiguration".equals(operation) || "mq:ListConfigurations".equals(operation)) {
             return List.of("*");
-        }
-        if ("eks".equals(credentialScope) && "eks:UpdateAccessEntry".equals(operation)) {
-            String[] updatePath = IamActionRegistry.routedPath(ctx).substring(1).split("/", 4);
-            if (eksService == null || updatePath.length != 4 || !"clusters".equals(updatePath[0])
-                    || !"access-entries".equals(updatePath[2])) {
-                return List.of("*");
-            }
-            return List.of(eksService.get().findAccessEntryUpdateTarget(pathSegment(updatePath[1]), pathSegment(updatePath[3]))
-                    .map(entry -> entry.accessEntryArn()).orElse("*"));
         }
         if ("ec2".equals(credentialScope)) {
             if ("ec2:DescribePlacementGroups".equals(operation)) {
