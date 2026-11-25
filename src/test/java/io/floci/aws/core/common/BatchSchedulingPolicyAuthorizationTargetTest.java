@@ -73,8 +73,9 @@ class BatchSchedulingPolicyAuthorizationTargetTest {
         when(uri.getRequestUri()).thenReturn(URI.create("http://localhost/v1/tags/unrelated%2Fpath"));
         ResourceInfo route = mock(ResourceInfo.class);
         doReturn(V1TagsController.class).when(route).getResourceClass();
-        when(route.getResourceMethod()).thenReturn(AbstractTagsController.class.getMethod(
-                "tagResourcePost", HttpHeaders.class, String.class, String.class));
+        doReturn(AbstractTagsController.class.getMethod(
+                "tagResourcePost", HttpHeaders.class, UriInfo.class, String.class, String.class))
+                .when(route).getResourceMethod();
         assertEquals("batch:TagResource", new IamActionRegistry().resolveMatchedRoute("batch", route, request));
         assertEquals(List.of(arn), new ResourceArnBuilder(new ObjectMapper(), null, null)
                 .buildResources("batch", "batch:TagResource", request, "us-east-1", "123456789012", "aws"));
