@@ -639,7 +639,8 @@ class CodePipelineRetryRollbackTest {
         return await("execution " + executionId + " to reach " + expected).atMost(Duration.ofSeconds(10))
                 .pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10))
                 .until(() -> getExecution(pipelineName, executionId),
-                        execution -> expected.equals(execution.path("status").asText()));
+                        execution -> expected.equals(execution.path("status").asText())
+                                && !service.activeRuns.contains(ACCOUNT + ":" + executionId));
     }
 
     private List<JsonNode> actionDetails(String pipelineName, String executionId) {
