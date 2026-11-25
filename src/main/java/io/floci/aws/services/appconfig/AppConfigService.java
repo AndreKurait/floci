@@ -828,7 +828,7 @@ public class AppConfigService implements Resettable {
         DeploymentStrategy strategy = getDeploymentStrategy(strategyId);
         validateDeploymentTiming(strategy);
         if (alarms != null) {
-            alarms.rollbackCause(environment.getMonitors());
+            alarms.validateMonitors(environment.getMonitors());
         }
 
         // Refuse invalid content before assigning a deployment number or changing the active version.
