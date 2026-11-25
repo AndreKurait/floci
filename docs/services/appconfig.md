@@ -25,6 +25,15 @@ child-resource and deployment creation tags remain outside this admission scope.
 
 The management plane allows you to create and manage applications, environments, configuration profiles, and hosted configuration versions.
 
+Hosted versions accept a case-sensitive `VersionLabel` of 1–64 characters containing at least
+one non-numeric character. Labels are unique among versions still stored in the profile and
+are returned by create, get and list. Deleting a version releases its label.
+`LatestVersionNumber` checks the highest version currently stored (zero for an empty profile);
+a mismatch returns `ConflictException` without creating a version. Version numbers continue
+increasing after deletion and persist across restart. Lists support `MaxResults`, `NextToken`,
+and exact or trailing-asterisk prefix label filters. A label filter excludes unlabeled versions.
+Hosted deployment and validation requests still select configurations by numeric version.
+
 ### Supported Operations
 
 - `CreateApplication`
@@ -43,6 +52,7 @@ The management plane allows you to create and manage applications, environments,
 - `ValidateConfiguration`
 - `CreateHostedConfigurationVersion`
 - `GetHostedConfigurationVersion`
+- `ListHostedConfigurationVersions`
 - `DeleteHostedConfigurationVersion`
 - `CreateDeploymentStrategy`
 - `GetDeploymentStrategy`
