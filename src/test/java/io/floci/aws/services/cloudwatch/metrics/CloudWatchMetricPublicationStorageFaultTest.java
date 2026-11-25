@@ -62,6 +62,47 @@ class CloudWatchMetricPublicationStorageFaultTest {
         }
     }
 
+    @ParameterizedTest
+    @CsvSource({"persistent", "hybrid", "wal"})
+    void repeatedSamplesSurviveReloadWithoutChangingTheSnapshotFormat(String mode) {
+        StorageBackend<String, MetricDatum> actual = backend(mode);
+        List<CloudWatchMetricsService.Datapoint> expected;
+        try {
+            actual.load();
+            CloudWatchMetricsService service = metrics(new AccountAwareStorageBackend<>(actual, null, ACCOUNT));
+            MetricDatum datum = MetricDatum.of("Value", "Count", 7, List.of(), 120);
+            service.publishRepeatedMetricForAccount(ACCOUNT, "App", datum, REGION, "repeated", 100);
+            service.publishRepeatedMetricForAccount(ACCOUNT, "App", datum, REGION, "repeated", 101);
+            expected = repeatedStatistics(service);
+            assertEquals(707, expected.getFirst().sum());
+            assertEquals(101, expected.getFirst().sampleCount());
+            assertRepeatedDistribution(actual);
+            assertEquals(1, actual.keys().size());
+            actual.flush();
+        } finally { StorageTestBackends.close(actual); }
+        StorageBackend<String, MetricDatum> reloaded = backend(mode);
+        try {
+            reloaded.load();
+            assertEquals(expected, repeatedStatistics(metrics(new AccountAwareStorageBackend<>(reloaded, null, ACCOUNT))));
+            assertRepeatedDistribution(reloaded);
+        } finally { StorageTestBackends.close(reloaded); }
+    }
+
+    private static void assertRepeatedDistribution(StorageBackend<String, MetricDatum> storage) {
+        assertEquals(1, storage.keys().size());
+        MetricDatum sample = storage.get(storage.keys().iterator().next()).orElseThrow();
+        assertEquals(7, sample.getValue());
+        assertEquals(101, sample.getSampleCount());
+        assertEquals(707, sample.getSum());
+        assertEquals(7, sample.getMinimum());
+        assertEquals(7, sample.getMaximum());
+    }
+
+    private static List<CloudWatchMetricsService.Datapoint> repeatedStatistics(CloudWatchMetricsService service) {
+        return service.getMetricStatistics("App", "Value", List.of(), Instant.ofEpochSecond(120),
+                Instant.ofEpochSecond(179), 60, List.of("Sum", "SampleCount", "Minimum", "Maximum"), "Count", REGION);
+    }
+
     private StorageBackend<String, MetricDatum> backend(String mode) {
         Path snapshot = directory.resolve(mode.equals("wal") ? "metrics-snapshot.json" : "metrics.json");
         return StorageTestBackends.create(mode, snapshot, directory.resolve("metrics.wal"), TYPE, 3_600_000);
