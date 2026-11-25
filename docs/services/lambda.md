@@ -104,7 +104,8 @@ provisions it from a stack. A SAM function's `EventInvokeConfig` expands into th
 `sam deploy` does: on `$LATEST`, or on the `AutoPublishAlias` alias, with the inline role policy for
 each destination and the SQS queue or SNS topic SAM creates when a destination gives only its `Type`.
 Asynchronous invocations apply its retry, event age, destination settings, and dead-letter queue
-configurations (`DeadLetterConfig`).
+configurations (`DeadLetterConfig`). Deleting the whole function removes its asynchronous invocation
+settings for every qualifier, so recreating the same name starts without the deleted function's settings.
 
 ### Deployment package storage
 
