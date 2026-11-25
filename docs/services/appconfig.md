@@ -125,6 +125,11 @@ If the previous hosted configuration version has been deleted, the stop is rejec
 with `BadRequestException` before changing the active version or stopping the deployment.
 Older persisted deployments without completion timestamps cannot be reverted because
 that window cannot be verified.
+
+Completed reverts preserve `StartedAt` and `CompletedAt`. They prepend a
+`REVERT_COMPLETED` event with `TriggeredBy: USER` and the revert time, retaining all
+recorded event history. Environment state aggregation, ordinary deployment start
+and completion events, and event `ActionInvocations` fields remain unimplemented.
 Explicit stop/revert bypasses alarm reads, so an unhealthy or deleted monitor does not prevent recovery.
 
 ## Data Plane (AppConfigData) {#data-plane}

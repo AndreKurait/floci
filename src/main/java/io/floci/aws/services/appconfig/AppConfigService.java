@@ -782,7 +782,15 @@ public class AppConfigService {
         }
         deployment.setState(completed ? "REVERTED" : "ROLLED_BACK");
         deployment.setPercentageComplete(0.0f);
-        deployment.setCompletedAt(clock.instant().toString());
+        if (completed) {
+            List<DeploymentEvent> events = new ArrayList<>();
+            events.add(new DeploymentEvent("REVERT_COMPLETED", "Deployment reverted by user request",
+                    clock.instant().toString(), "USER"));
+            events.addAll(deployment.getEventLog());
+            deployment.setEventLog(events);
+        } else {
+            deployment.setCompletedAt(clock.instant().toString());
+        }
         if (alarmCause != null) {
             List<DeploymentEvent> events = new ArrayList<>();
             events.add(new DeploymentEvent("ROLLBACK_COMPLETED", alarmCause,
