@@ -132,7 +132,7 @@ def test_the_vendored_table_covers_its_namespaces():
         "route53:ChangeResourceRecordSets"]
     assert document["memberShapes"]["route53:ChangeResourceRecordSets"][
         "ChangeBatch.Changes.Change.ResourceRecordSet.Name"] == "DNSName"
-    assert document["protocols"] == {"eks": "rest-json", "lambda": "rest-json",
+    assert document["protocols"] == {"ssm": "json", "eks": "rest-json", "lambda": "rest-json",
                                      "redshift": "query", "route53": "rest-xml", "sts": "query"}
 
 
