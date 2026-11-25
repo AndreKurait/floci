@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RequestContext;
+import io.floci.aws.core.common.StripedLocks;
 import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
 import io.floci.aws.services.ec2.Ec2Service;
@@ -31,6 +32,7 @@ public class SsmEc2RegistrationService {
     private final IamService iam;
     private final Ec2Service ec2;
     private final RequestContext context;
+    private final StripedLocks registrationLocks = new StripedLocks(64);
 
     @RegisterForReflection
     public record Registration(String instanceId, String publicKey, String keyType, Instant registeredAt) {}
@@ -69,14 +71,16 @@ public class SsmEc2RegistrationService {
             throw new AwsException("ValidationException",
                     "PublicKey must be an RSA public key and PublicKeyType must be Rsa or rsa.", 400);
         }
-        if (iam.ec2InstanceIdentitySession(verified.getAccessKeyId()).orElse(null) != verified
-                || context.getVerifiedSession() != verified) {
-            throw denied();
-        }
         String key = region + "::" + instanceId;
-        Registration current = registrations.get(key).orElse(null);
-        if (current == null || !Objects.equals(current.publicKey(), publicKey)) {
-            registrations.put(key, new Registration(instanceId, publicKey, keyType, Instant.now()));
+        synchronized (registrationLocks.lockFor(context.getAccountId() + "::" + key)) {
+            if (iam.ec2InstanceIdentitySession(verified.getAccessKeyId()).orElse(null) != verified
+                    || context.getVerifiedSession() != verified) {
+                throw denied();
+            }
+            Registration current = registrations.get(key).orElse(null);
+            if (current == null || !Objects.equals(current.publicKey(), publicKey)) {
+                registrations.put(key, new Registration(instanceId, publicKey, keyType, Instant.now()));
+            }
         }
         // Online status comes from the agent's subsequent UpdateInstanceInformation heartbeat.
         return Map.of("InstanceId", instanceId);

@@ -1,6 +1,7 @@
 package io.floci.aws.services.ec2;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.floci.aws.core.common.Digests;
 import io.floci.aws.services.ec2.model.Instance;
 import io.floci.aws.services.ec2.model.InstanceState;
 import io.floci.aws.services.iam.IamService;
@@ -20,7 +21,9 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import software.amazon.awssdk.auth.credentials.AwsSessionCredentials;
 import software.amazon.awssdk.auth.signer.Aws4Signer;
+import software.amazon.awssdk.auth.signer.AwsS3V4Signer;
 import software.amazon.awssdk.auth.signer.params.Aws4SignerParams;
+import software.amazon.awssdk.auth.signer.params.AwsS3V4SignerParams;
 import software.amazon.awssdk.http.SdkHttpFullRequest;
 import software.amazon.awssdk.http.SdkHttpMethod;
 import software.amazon.awssdk.regions.Region;
@@ -37,6 +40,7 @@ import java.util.Map;
 
 import static io.restassured.RestAssured.given;
 import static org.hamcrest.Matchers.equalTo;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -153,6 +157,41 @@ class SsmEc2RegistrationIntegrationTest {
     }
 
     @Test
+    void registrationRejectsAnUnsignedPayloadEvenWithAValidSignature() throws Exception {
+        String body = registration(instance.getInstanceId(), publicKey);
+        byte[] bytes = body.getBytes(StandardCharsets.UTF_8);
+        URI signingEndpoint = new URI("https", null, endpoint.getHost(), endpoint.getPort(), "/", null, null);
+        SdkHttpFullRequest request = SdkHttpFullRequest.builder().uri(signingEndpoint).method(SdkHttpMethod.POST)
+                .putHeader("X-Amz-Target", "AmazonSSM.RegisterManagedInstance")
+                .putHeader("Content-Type", "application/x-amz-json-1.1")
+                .contentStreamProvider(() -> new ByteArrayInputStream(bytes)).build();
+        SdkHttpFullRequest signed = AwsS3V4Signer.create().sign(request, AwsS3V4SignerParams.builder()
+                .awsCredentials(AwsSessionCredentials.create(credential.getAccessKeyId(),
+                        credential.getSecretAccessKey(), credential.getSessionToken()))
+                .signingName("ssm").signingRegion(Region.of(REGION)).enablePayloadSigning(false)
+                .enableChunkedEncoding(false).build());
+        assertEquals("UNSIGNED-PAYLOAD", signed.firstMatchingHeader("x-amz-content-sha256").orElseThrow());
+        RequestSpecification client = given().config(RestAssuredConfig.config().encoderConfig(
+                EncoderConfig.encoderConfig().appendDefaultContentCharsetToContentTypeIfUndefined(false)));
+        signed.headers().forEach((name, values) -> values.forEach(value -> client.header(name, value)));
+        client.body(bytes).post("/").then().defaultParser(Parser.JSON).statusCode(403)
+                .body("__type", equalTo("InvalidSignatureException"));
+        signed("RegisterManagedInstance", REGION, body, body, false).then().statusCode(200);
+    }
+
+    @Test
+    void registrationRequiresAnyDeclaredPayloadDigestToMatchTheBody() throws Exception {
+        String body = registration(instance.getInstanceId(), publicKey);
+        signedWithHash(body, Digests.sha256Hex(body.getBytes(StandardCharsets.UTF_8))).then().statusCode(200);
+        signedWithHash(body, "0".repeat(64)).then().defaultParser(Parser.JSON).statusCode(403)
+                .body("__type", equalTo("InvalidSignatureException"));
+    }
+
+    private Response signedWithHash(String body, String hash) {
+        return signed("RegisterManagedInstance", REGION, body, body, false, hash);
+    }
+
+    @Test
     void identityCannotRegisterAnotherInstanceOrAnotherRegion() throws Exception {
         String other = registration("i-00000000000000001", publicKey);
         signed("RegisterManagedInstance", REGION, other, other, false).then().defaultParser(Parser.JSON).statusCode(400)
@@ -229,11 +268,20 @@ class SsmEc2RegistrationIntegrationTest {
     }
 
     private Response signed(String operation, String region, String signedBody, String sentBody, boolean forged) {
+        return signed(operation, region, signedBody, sentBody, forged, null);
+    }
+
+    private Response signed(String operation, String region, String signedBody, String sentBody,
+                            boolean forged, String hash) {
         byte[] bytes = signedBody.getBytes(StandardCharsets.UTF_8);
-        SdkHttpFullRequest request = SdkHttpFullRequest.builder().uri(endpoint).method(SdkHttpMethod.POST)
+        SdkHttpFullRequest.Builder builder = SdkHttpFullRequest.builder().uri(endpoint).method(SdkHttpMethod.POST)
                 .putHeader("X-Amz-Target", "AmazonSSM." + operation)
                 .putHeader("Content-Type", "application/x-amz-json-1.1")
-                .contentStreamProvider(() -> new ByteArrayInputStream(bytes)).build();
+                .contentStreamProvider(() -> new ByteArrayInputStream(bytes));
+        if (hash != null) {
+            builder.putHeader("x-amz-content-sha256", hash);
+        }
+        SdkHttpFullRequest request = builder.build();
         SdkHttpFullRequest signed = Aws4Signer.create().sign(request, Aws4SignerParams.builder()
                 .awsCredentials(AwsSessionCredentials.create(credential.getAccessKeyId(),
                         forged ? "wrong-secret" : credential.getSecretAccessKey(), credential.getSessionToken()))
