@@ -109,6 +109,11 @@ class EcrRegistryAuthenticationHttpTest {
     }
 
     private int requestToHost(HttpMethod method, String path, String token, String host) throws Exception {
+        return requestToHost(method, path, token, host, null, "");
+    }
+
+    private int requestToHost(HttpMethod method, String path, String token, String host,
+                              String contentType, String body) throws Exception {
         HttpClient client = vertx.createHttpClient();
         try {
             HttpClientRequest req = client.request(new RequestOptions().setHost("127.0.0.1").setPort(frontend.actualPort())
@@ -117,7 +122,10 @@ class EcrRegistryAuthenticationHttpTest {
             if (token != null) {
                 req.putHeader("Authorization", token);
             }
-            HttpClientResponse response = req.send(Buffer.buffer()).toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
+            if (contentType != null) {
+                req.putHeader("Content-Type", contentType);
+            }
+            HttpClientResponse response = req.send(Buffer.buffer(body)).toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
             response.body().toCompletionStage().toCompletableFuture().get(5, TimeUnit.SECONDS);
             if (response.statusCode() == 401) {
                 assertTrue(response.getHeader("WWW-Authenticate").startsWith("Basic "));
@@ -284,6 +292,61 @@ class EcrRegistryAuthenticationHttpTest {
         assertEquals("/v2/111111111111/us-east-1/app/blobs/uploads/", forwardedUri.get());
         assertEquals(200, request(HttpMethod.POST, "/v2/app/blobs/uploads/?%6dount=sha256:abc&%66rom=source", token));
         assertEquals("/v2/111111111111/us-east-1/app/blobs/uploads/", forwardedUri.get());
+    }
+
+    @Test
+    void nestedOperationSegmentsKeepTheFullRepositoryPermissionAndMountSource() throws Exception {
+        String token = "Basic " + auth.issue("us-east-1").authorizationToken();
+        String repository = "team/manifests/image";
+        when(iam.resolveCallerContext(eq("ISSUED"), any())).thenReturn(CallerContext.of(List.of(
+                "{\"Statement\":{\"Effect\":\"Allow\",\"Action\":\"ecr:*\","
+                        + "\"Resource\":\"arn:aws:ecr:us-east-1:111111111111:repository/" + repository + "\"}}")));
+        assertEquals(200, request(HttpMethod.PUT, "/v2/" + repository + "/manifests/latest", token));
+        assertEquals(200, request(HttpMethod.POST, "/v2/" + repository
+                + "/blobs/uploads/?mount=sha256:abc&from=" + repository, token));
+        assertTrue(forwardedUri.get().contains("from=111111111111%2Fus-east-1%2Fteam%2Fmanifests%2Fimage"));
+    }
+
+    @Test
+    void enforcedUploadRejectsFormBodyMountsBeforeTheyCanReachDistribution() throws Exception {
+        String token = "Basic " + auth.issue("us-east-1").authorizationToken();
+        when(iam.resolveCallerContext(eq("ISSUED"), any())).thenReturn(CallerContext.of(List.of(
+                "{\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"ecr:InitiateLayerUpload\",\"Resource\":\"*\"},"
+                        + "{\"Effect\":\"Deny\",\"Action\":\"ecr:GetDownloadUrlForLayer\",\"Resource\":\"*\"}]}")));
+        for (String contentType : List.of("application/x-www-form-urlencoded",
+                "application/x-www-form-urlencoded; charset=UTF-8", "Application/X-Www-Form-Urlencoded")) {
+            assertEquals(403, requestToHost(HttpMethod.POST, "/v2/app/blobs/uploads/", token,
+                    "111111111111.dkr.ecr.us-east-1.localhost:4566", contentType,
+                    "mount=sha256%3Aabc&from=source"));
+        }
+        assertEquals(0, backendRequests.get());
+    }
+
+    @Test
+    void enforcedUploadRejectsMultipartMountBodyBeforeDistribution() throws Exception {
+        String token = "Basic " + auth.issue("us-east-1").authorizationToken();
+        when(iam.resolveCallerContext(eq("ISSUED"), any())).thenReturn(CallerContext.of(List.of(
+                "{\"Statement\":[{\"Effect\":\"Allow\",\"Action\":\"ecr:InitiateLayerUpload\",\"Resource\":\"*\"},"
+                        + "{\"Effect\":\"Deny\",\"Action\":\"ecr:GetDownloadUrlForLayer\",\"Resource\":\"*\"}]}")));
+        String body = "--mount-boundary\r\nContent-Disposition: form-data; name=\"mount\"\r\n\r\nsha256:abc\r\n"
+                + "--mount-boundary\r\nContent-Disposition: form-data; name=\"from\"\r\n\r\nsource\r\n"
+                + "--mount-boundary--\r\n";
+        assertEquals(403, requestToHost(HttpMethod.POST, "/v2/app/blobs/uploads/", token,
+                "111111111111.dkr.ecr.us-east-1.localhost:4566", "multipart/form-data; boundary=mount-boundary",
+                body));
+        assertEquals(0, backendRequests.get());
+    }
+
+    @Test
+    void ordinaryUploadAndIamOffFormBodyKeepTheirExistingPaths() throws Exception {
+        String token = "Basic " + auth.issue("us-east-1").authorizationToken();
+        assertEquals(200, requestToHost(HttpMethod.POST, "/v2/app/blobs/uploads/", token,
+                "111111111111.dkr.ecr.us-east-1.localhost:4566", "application/octet-stream", "blob"));
+        when(config.services().iam().enforcementEnabled()).thenReturn(false);
+        assertEquals(200, requestToHost(HttpMethod.POST, "/v2/app/blobs/uploads/", null,
+                "111111111111.dkr.ecr.us-east-1.localhost:4566", "application/x-www-form-urlencoded",
+                "mount=sha256%3Aabc&from=source"));
+        assertEquals(2, backendRequests.get());
     }
 
     @Test

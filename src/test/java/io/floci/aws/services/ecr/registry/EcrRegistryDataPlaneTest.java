@@ -73,6 +73,22 @@ class EcrRegistryDataPlaneTest {
     }
 
     @Test
+    void operationWordsInsideRepositoryNamesDoNotChangeTheAuthorizationTarget() {
+        for (String repository : List.of("team/manifests/image", "team/blobs/image", "team/tags/image",
+                "team/blobs/uploads/image")) {
+            for (String operation : List.of("/manifests/latest", "/blobs/sha256:abc", "/tags/list",
+                    "/blobs/uploads/", "/blobs/uploads/session")) {
+                EcrRegistryDataPlane.RegistryRequest request = EcrRegistryDataPlane.requestFor(
+                        "111111111111.dkr.ecr.us-east-1.localhost:4566", "/v2/" + repository + operation,
+                        null, "hostname").orElseThrow();
+                assertEquals(repository, request.repositoryName(), repository + operation);
+                assertEquals(operation.startsWith("/manifests/") ? "latest" : null, request.tag());
+                assertEquals("/v2/111111111111/us-east-1/" + repository + operation, request.backendUri());
+            }
+        }
+    }
+
+    @Test
     void hostnameStyleManifestWriteUsesInternalRegistryNamespace() {
         EcrRegistryDataPlane.RegistryRequest request = EcrRegistryDataPlane.requestFor(
                 "000000000000.dkr.ecr.us-east-1.localhost:4566",

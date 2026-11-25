@@ -34,20 +34,23 @@ public class LambdaImagePullService {
         if (!config.services().iam().enforcementEnabled() || EcrRegistryManager.ecrImage(imageUri).isEmpty()) {
             return operation.apply(null);
         }
-        if (!AwsArnUtils.isArnFor(function.getFunctionArn(), "lambda")) {
+        String functionArn = function.getFunctionArn();
+        String accountId = function.getAccountId();
+        if (!AwsArnUtils.isArnFor(functionArn, "lambda")) {
             throw denied("The function identity is unavailable.");
         }
-        AwsArnUtils.Arn source = AwsArnUtils.parse(function.getFunctionArn());
+        AwsArnUtils.Arn source = AwsArnUtils.parse(functionArn);
         if (!source.resource().startsWith("function:") || source.resource().equals("function:")
-                || function.getAccountId() != null && !source.accountId().equals(function.getAccountId())) {
+                || accountId != null && !source.accountId().equals(accountId)) {
             throw denied("The function identity is unavailable.");
         }
-        Optional<String> refusal = roles.refusal(function.getRole(), source.accountId(),
-                ServicePrincipals.of("lambda"), function.getFunctionArn(), List.of());
+        String roleArn = function.getRole();
+        Optional<String> refusal = roles.refusal(roleArn, source.accountId(),
+                ServicePrincipals.of("lambda"), functionArn, List.of());
         if (refusal.isPresent()) {
             throw denied(refusal.get());
         }
-        return pulls.withLambdaPull(imageUri, function.getRole(), function.getFunctionArn(), operation);
+        return pulls.withLambdaPull(imageUri, roleArn, functionArn, operation);
     }
 
     private static AwsException denied(String reason) {

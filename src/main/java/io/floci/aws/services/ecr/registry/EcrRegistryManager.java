@@ -77,10 +77,11 @@ public class EcrRegistryManager {
      * {@code <account>.dkr.ecr.<region>.<dnsSuffix>/<repo>[:tag]}.
      */
     private static final Pattern AWS_ECR_URI = Pattern.compile(
-            "^([0-9]{12})\\.dkr\\.ecr\\.([a-z0-9-]+)\\." + AwsPartitions.dnsSuffixRegex() + "/(.+)$");
+            "^([0-9]{12})\\.dkr\\.ecr\\.([a-z0-9-]+)\\." + AwsPartitions.dnsSuffixRegex() + "(?::443)?/(.+)$");
 
     /** The host and port of a {@code repositoryUri} Floci's ECR hands out. */
     private static final String FLOCI_REGISTRY_HOST = "localhost(?:\\.floci\\.io)?:[0-9]+";
+    private static final String LOOPBACK_REGISTRY_HOST = "(?:localhost(?:\\.floci\\.io)?|127\\.0\\.0\\.1|\\[::1\\]):[0-9]+";
 
     /**
      * The Region of an image in an ECR repository: in {@code <account>.dkr.ecr.<region>.<dnsSuffix>/<repo>}, AWS's
@@ -89,13 +90,13 @@ public class EcrRegistryManager {
      * Floci's in the path style.
      */
     private static final Pattern ECR_IMAGE_REGION = Pattern.compile("^(?:[0-9]{12}\\.dkr\\.ecr\\.([a-z0-9-]+)\\.(?:"
-            + AwsPartitions.dnsSuffixRegex() + "|" + FLOCI_REGISTRY_HOST + ")"
-            + "|" + FLOCI_REGISTRY_HOST + "/[0-9]{12}/([a-z0-9-]+))/.+$");
+            + AwsPartitions.dnsSuffixRegex() + "(?::443)?|" + FLOCI_REGISTRY_HOST + ")"
+            + "|" + LOOPBACK_REGISTRY_HOST + "/[0-9]{12}/([a-z0-9-]+))/.+$");
 
     /** The account, Region and path of an image in an ECR repository, in {@link #ECR_IMAGE_REGION}'s forms. */
     private static final Pattern ECR_IMAGE_PARTS = Pattern.compile("^(?:([0-9]{12})\\.dkr\\.ecr\\.([a-z0-9-]+)\\.(?:"
-            + AwsPartitions.dnsSuffixRegex() + "|" + FLOCI_REGISTRY_HOST + ")"
-            + "|" + FLOCI_REGISTRY_HOST + "/([0-9]{12})/([a-z0-9-]+))/(.+)$");
+            + AwsPartitions.dnsSuffixRegex() + "(?::443)?|" + FLOCI_REGISTRY_HOST + ")"
+            + "|" + LOOPBACK_REGISTRY_HOST + "/([0-9]{12})/([a-z0-9-]+))/(.+)$");
 
     /**
      * The container name actually in use. Differs from {@link #registryContainerName()} only when
@@ -367,8 +368,9 @@ public class EcrRegistryManager {
             return "https://" + host + ":" + advertisedPort();
         }
         String scheme = config.services().ecr().tlsEnabled() ? "https" : "http";
-        return scheme + "://" + accountId + ".dkr.ecr."
-                + region + ".localhost:" + advertisedPort();
+        String host = "path".equalsIgnoreCase(config.services().ecr().uriStyle())
+                ? "localhost" : accountId + ".dkr.ecr." + region + ".localhost";
+        return scheme + "://" + host + ":" + advertisedPort();
     }
 
     /**

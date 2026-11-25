@@ -60,6 +60,8 @@ public class EcrRegistryDataPlane {
     private static final Pattern NATIVE_ECR_HOST = Pattern.compile(
             "^([0-9]{12})\\.dkr\\.ecr\\.([a-z0-9-]+)\\.(" + AwsPartitions.dnsSuffixRegex() + ")(?::443)?$");
     private static final String MANIFESTS_PATH = "/manifests/";
+    private static final Pattern REPOSITORY_OPERATION = Pattern.compile(
+            "^(.+)/(?:manifests/[^/]+|blobs/uploads(?:/[^/]*)?|blobs/[^/]+|tags/list)$");
     private static final long REPOSITORY_LOCK_POLL_MILLIS = 5;
     /**
      * The most a manifest PUT waiting for its repository's write lock may buffer. A manifest
@@ -742,6 +744,14 @@ public class EcrRegistryDataPlane {
         for (String action : actions(method, request.backendUri(), request.storageRepositoryName())) {
             permit(context, identity, request, request.repositoryName(), action);
         }
+        String contentType = context.request().getHeader("Content-Type");
+        if ("POST".equals(method) && contentType != null) {
+            String mediaType = contentType.split(";", 2)[0].trim();
+            if ("application/x-www-form-urlencoded".equalsIgnoreCase(mediaType)
+                    || "multipart/form-data".equalsIgnoreCase(mediaType)) {
+                throw new AwsException("DENIED", "Form-encoded registry uploads are not supported", 403);
+            }
+        }
         String mount = queryParameter(context.request().query(), "mount");
         if (!"POST".equals(method) || mount.isBlank()) {
             return request;
@@ -749,8 +759,8 @@ public class EcrRegistryDataPlane {
         String from = queryParameter(context.request().query(), "from");
         String storageFrom = null;
         if (!from.isBlank()) {
-            Optional<RegistryRequest> source = requestFor(context.request().host(), "/v2/" + from + "/manifests/mount",
-                    context.request().query(), config.services().ecr().uriStyle());
+            Optional<RegistryRequest> source = requestFor(context.request().host(), "/v2/" + from,
+                    context.request().query(), config.services().ecr().uriStyle(), true);
             if (source.isPresent() && source.get().accountId().equals(request.accountId())
                     && source.get().region().equals(request.region())) {
                 try {
@@ -862,13 +872,19 @@ public class EcrRegistryDataPlane {
     }
 
     static Optional<RegistryRequest> requestFor(String host, String path, String query, String uriStyle) {
+        return requestFor(host, path, query, uriStyle, false);
+    }
+
+    private static Optional<RegistryRequest> requestFor(String host, String path, String query, String uriStyle,
+                                                       boolean repositoryReference) {
         String registryPath = "/v2".equals(path) ? "/v2/" : path;
         if (!registryPath.startsWith("/v2/")) {
             return Optional.empty();
         }
         Matcher hostMatch = registryHost(host, query);
         if (hostMatch != null) {
-            String repository = "/v2/".equals(registryPath) ? "" : repositoryName(registryPath.substring("/v2/".length()));
+            String repositoryPath = registryPath.substring("/v2/".length());
+            String repository = repositoryReference ? repositoryPath : repositoryName(repositoryPath);
             String storageRepositoryName = hostMatch.group(1) + "/" + hostMatch.group(2) + "/" + repository;
             String backendUri = repository.isEmpty()
                     ? registryPath + querySuffix(query, true)
@@ -877,7 +893,7 @@ public class EcrRegistryDataPlane {
                             + querySuffix(query, true);
             return Optional.of(new RegistryRequest(hostMatch.group(1), hostMatch.group(2), repository,
                     storageRepositoryName, repository, backendUri,
-                    tag(path)));
+                    repositoryReference ? null : tag(path)));
         }
         // A loopback host is the address Floci itself hands a Docker daemon other than Docker Desktop
         // for the ECS, Lambda and EMR Serverless images it pulls, path style in either URI style
@@ -895,11 +911,11 @@ public class EcrRegistryDataPlane {
                 || !segments[1].matches("[a-z0-9-]+")) {
             return Optional.empty();
         }
-        String repository = repositoryName(segments[2]);
+        String repository = repositoryReference ? segments[2] : repositoryName(segments[2]);
         String storageRepositoryName = segments[0] + "/" + segments[1] + "/" + repository;
         return Optional.of(new RegistryRequest(segments[0], segments[1], repository,
                 storageRepositoryName, storageRepositoryName,
-                registryPath + querySuffix(query, true), tag(registryPath)));
+                registryPath + querySuffix(query, true), repositoryReference ? null : tag(registryPath)));
     }
 
     /**
@@ -961,21 +977,13 @@ public class EcrRegistryDataPlane {
     }
 
     private static String repositoryName(String path) {
-        int manifests = path.indexOf(MANIFESTS_PATH);
-        if (manifests >= 0) {
-            return path.substring(0, manifests);
-        }
-        int blobs = path.indexOf("/blobs/");
-        if (blobs >= 0) {
-            return path.substring(0, blobs);
-        }
-        int tags = path.indexOf("/tags/");
-        return tags >= 0 ? path.substring(0, tags) : path;
+        Matcher operation = REPOSITORY_OPERATION.matcher(path);
+        return operation.matches() ? operation.group(1) : path;
     }
 
     private static String tag(String path) {
-        int manifests = path.indexOf(MANIFESTS_PATH);
-        if (manifests < 0) {
+        int manifests = repositoryName(path).length();
+        if (!path.startsWith(MANIFESTS_PATH, manifests)) {
             return null;
         }
         String reference = path.substring(manifests + MANIFESTS_PATH.length());

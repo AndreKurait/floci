@@ -8,6 +8,7 @@ import io.floci.aws.core.common.RequestContext;
 import io.floci.aws.services.ecr.EcrService;
 import io.floci.aws.services.ecr.model.Repository;
 import io.floci.aws.services.ecr.registry.EcrRegistryAuthorization;
+import io.floci.aws.services.ecr.registry.EcrRegistryManager;
 import io.floci.aws.services.ecr.registry.EcrWorkloadImagePull;
 import io.floci.aws.services.iam.AssumeRolePolicyEvaluator;
 import io.floci.aws.services.iam.IamPolicyEvaluator;
@@ -205,6 +206,35 @@ class LambdaImagePullServiceTest {
     }
 
     @Test
+    void trustCheckAndCredentialUseTheSameRoleSnapshot() {
+        ServiceRoleAuthorizer authorizer = mock(ServiceRoleAuthorizer.class);
+        EcrWorkloadImagePull credentials = mock(EcrWorkloadImagePull.class);
+        LambdaFunction changing = mock(LambdaFunction.class);
+        when(changing.getFunctionArn()).thenReturn(SOURCE);
+        when(changing.getAccountId()).thenReturn(ACCOUNT);
+        when(changing.getRole()).thenReturn(ROLE, ROLE + "-changed");
+        when(authorizer.refusal(eq(ROLE), eq(ACCOUNT), anyString(), eq(SOURCE), eq(List.of())))
+                .thenReturn(Optional.empty());
+
+        new LambdaImagePullService(config, authorizer, credentials).pull(changing, IMAGE, ignored -> "pulled");
+
+        verify(credentials).withLambdaPull(eq(IMAGE), eq(ROLE), eq(SOURCE), any());
+        verify(changing, times(1)).getRole();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {
+            "127.0.0.1:4566/111111111111/us-east-1/image:latest",
+            "[::1]:4566/111111111111/us-east-1/image:latest",
+            "111111111111.dkr.ecr.us-east-1.amazonaws.com:443/image:latest"
+    })
+    void alternateRoutableEcrEndpointsCannotSkipTheRoleCheck(String image) {
+        assertPulled(image);
+        when(iam.findRole(ACCOUNT, "pull")).thenReturn(Optional.empty());
+        assertDenied(image);
+    }
+
+    @Test
     void iamOffAndNonEcrPreserveTheOriginalCredentialPath() {
         when(config.services().iam().enforcementEnabled()).thenReturn(false);
         assertEquals("original", pulls.pull(function, IMAGE, credentials -> {
@@ -222,7 +252,7 @@ class LambdaImagePullServiceTest {
             assertNotNull(credentials);
             issued.set(header(credentials));
             EcrRegistryAuthorization.Identity identity = auth.authenticate(issued.get(), REGION);
-            String resource = RESOURCE.replace(ACCOUNT, image.substring(0, 12));
+            String resource = RESOURCE.replace(ACCOUNT, EcrRegistryManager.ecrImage(image).orElseThrow().registryId());
             assertDoesNotThrow(() -> auth.requirePermission(identity,
                     "ecr:BatchGetImage", resource, repository.getRepositoryPolicyText()));
             assertDoesNotThrow(() -> auth.requirePermission(identity,
