@@ -17,6 +17,16 @@ public class SubscriptionFilter {
 
     public SubscriptionFilter() {}
 
+    public SubscriptionFilter(SubscriptionFilter source) {
+        filterName = source.filterName;
+        logGroupName = source.logGroupName;
+        filterPattern = source.filterPattern;
+        destinationArn = source.destinationArn;
+        distribution = source.distribution;
+        applyOnTransformedLogs = source.applyOnTransformedLogs;
+        creationTime = source.creationTime;
+    }
+
     public String getFilterName() { return filterName; }
     public void setFilterName(String filterName) { this.filterName = filterName; }
 
