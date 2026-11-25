@@ -71,6 +71,40 @@ class RequestResourcesTest {
     }
 
     @Test
+    void heterogeneousTargetsUseHeldIdentityAndKeepOrderDuplicatesAndUnknowns() {
+        String prefix = "arn:aws:ec2:us-east-1:000000000000:";
+        StoredResourceArns stored = mock(StoredResourceArns.class);
+        when(stored.findById("vpce-held", "us-east-1"))
+                .thenReturn(Optional.of(prefix + "vpc-endpoint/vpce-held"));
+        List<String> expected = List.of(prefix + "network-interface/eni-known",
+                prefix + "vpc-endpoint/vpce-held", "*", prefix + "vpc-endpoint/vpce-held");
+        for (String operation : List.of("ec2:CreateTags", "ec2:DeleteTags")) {
+            assertEquals(expected, of(operation, form("ResourceId.1=eni-known&ResourceId.2=vpce-held"
+                    + "&ResourceId.3=vpce-missing&ResourceId.4=vpce-held&ResourceId.6=vpce-ignored"), stored));
+            assertEquals(expected, of(operation,
+                    json("{\"Resources\":[\"eni-known\",\"vpce-held\",\"vpce-missing\",\"vpce-held\"]}"), stored));
+            assertEquals(expected, RequestResources.ofBody(operation,
+                    new ObjectMapper().valueToTree(Map.of("Resources",
+                            List.of("eni-known", "vpce-held", "vpce-missing", "vpce-held"))),
+                    "aws", "us-east-1", "000000000000", stored));
+        }
+    }
+
+    @Test
+    void heldTargetsCannotIntroduceUnmodeledTypesOrOtherAccountsRegionsAndPartitions() {
+        StoredResourceArns stored = mock(StoredResourceArns.class);
+        String named = "arn:aws:ec2:us-east-1:000000000000:vpc-endpoint/vpce-held";
+        when(stored.findById("vpce-held", "us-east-1")).thenReturn(Optional.of(named));
+        assertEquals(List.of("*"), of("ec2:StartInstances", form("InstanceId.1=vpce-held"), stored));
+        for (String arn : List.of(named.replace("000000000000", "111111111111"),
+                named.replace("us-east-1", "eu-west-1"), named.replace("arn:aws:", "arn:aws-cn:"),
+                "arn:aws:ec2:us-east-1:000000000000:unmodeled/vpce-held", "not-an-arn")) {
+            when(stored.findById("vpce-held", "us-east-1")).thenReturn(Optional.of(arn));
+            assertEquals(List.of("*"), of("ec2:CreateTags", form("ResourceId.1=vpce-held"), stored), arn);
+        }
+    }
+
+    @Test
     void ec2ListsUseSdkWireNamesAndIgnoreForgedQuerySpellings() {
         String prefix = "arn:aws:ec2:us-east-1:000000000000:";
         List<String> expected = List.of(prefix + "network-interface/*", prefix + "security-group/sg-one",

@@ -3762,6 +3762,11 @@ floci populates:
   `s3:PutBucketTagging` (the `<Tagging>` body), for S3 Control's `s3:TagResource` (its `Tags` body),
   and for every create in the tag-on-create table whose action takes it, as described under the
   tag-on-create check above.
+EC2 tag requests also use a caller-owned VPC endpoint's stored identity when its ID has no
+prefix in the pinned model. The generated Service Reference catalog remains the authority for
+the action's resource types. Missing endpoints keep wildcard authorization; the lookup never
+borrows an endpoint from another account or Region.
+
 - `aws:ResourceTag/<key>`: the target resource's current tags, for `ec2:CreateTags`,
   `ec2:DeleteTags`, `ec2:TerminateInstances` and `ec2:DescribeInstances` (the first
   `ResourceId.N` or `InstanceId.N`), and for `s3:GetBucketTagging`, `s3:DeleteBucket` and the
