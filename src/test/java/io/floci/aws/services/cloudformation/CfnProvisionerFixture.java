@@ -46,6 +46,7 @@ import io.floci.aws.services.cloudformation.provisioners.CloudTrailCfnProvisione
 import io.floci.aws.services.cloudformation.provisioners.CloudWatchCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.CloudWatchCompositeAlarmCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.CloudWatchDashboardCfnProvisioner;
+import io.floci.aws.services.cloudformation.provisioners.CloudWatchInsightRuleCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.CodeDeployCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.CognitoCfnProvisioner;
 import io.floci.aws.services.cloudformation.provisioners.CognitoIdentityProviderCfnProvisioner;
@@ -135,6 +136,7 @@ import io.floci.aws.services.cloudfront.CloudFrontService;
 import io.floci.aws.services.cloudmap.CloudMapService;
 import io.floci.aws.services.cloudtrail.CloudTrailService;
 import io.floci.aws.services.cloudwatch.dashboards.CloudWatchDashboardsService;
+import io.floci.aws.services.cloudwatch.insights.CloudWatchInsightRulesService;
 import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsMetricFilterService;
 import io.floci.aws.services.cloudwatch.logs.CloudWatchLogsService;
 import io.floci.aws.services.cloudwatch.metrics.CloudWatchMetricsService;
@@ -301,6 +303,7 @@ final class CfnProvisionerFixture {
         // dispatcher. They exist only so inferredProvisioners() can wire their provisioner.
         private FlowLogService flowLogService;
         private CloudWatchDashboardsService cloudWatchDashboardsService;
+        private CloudWatchInsightRulesService cloudWatchInsightRulesService;
         private CloudWatchLogsMetricFilterService logsMetricFilterService;
         private IotAuthorizerService iotAuthorizerService;
         private IotDomainConfigurationService iotDomainConfigurationService;
@@ -445,6 +448,9 @@ final class CfnProvisionerFixture {
             }
             if (cloudWatchDashboardsService != null) {
                 discovered.add(new CloudWatchDashboardCfnProvisioner(cloudWatchDashboardsService));
+            }
+            if (cloudWatchInsightRulesService != null) {
+                discovered.add(new CloudWatchInsightRuleCfnProvisioner(cloudWatchInsightRulesService));
             }
             if (iamService != null) {
                 discovered.add(new IamRoleCfnProvisioner(iamService));
@@ -919,6 +925,11 @@ final class CfnProvisionerFixture {
 
         public Builder cloudWatchDashboards(CloudWatchDashboardsService v) {
             this.cloudWatchDashboardsService = v;
+            return this;
+        }
+
+        public Builder cloudWatchInsightRules(CloudWatchInsightRulesService v) {
+            this.cloudWatchInsightRulesService = v;
             return this;
         }
 

@@ -228,6 +228,9 @@
   "AWS::CloudWatch::Dashboard": [
     "DashboardName"
   ],
+  "AWS::CloudWatch::InsightRule": [
+    "RuleName"
+  ],
   "AWS::CodeBuild::Project": [
     "Name"
   ],
