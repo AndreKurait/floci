@@ -54,6 +54,7 @@ public class CapacityReservation {
     private String region;
     private List<Tag> tags = new ArrayList<>();
     private List<String> instanceIds = new ArrayList<>();
+    private Map<String, String> instanceOwners = new LinkedHashMap<>();
     private Map<String, CapacityReservationMove> completedMoves = new HashMap<>();
 
     public CapacityReservation() {}
@@ -90,6 +91,7 @@ public class CapacityReservation {
         tags = new ArrayList<>(other.tags);
         completedMoves = new HashMap<>(other.completedMoves);
         instanceIds = new ArrayList<>(other.instanceIds);
+        instanceOwners = new LinkedHashMap<>(other.instanceOwners);
     }
 
     public Map<String, String> getRequestTags() { return requestTags; }
@@ -172,6 +174,9 @@ public class CapacityReservation {
 
     public List<Tag> getTags() { return tags; }
     public void setTags(List<Tag> tags) { this.tags = tags; }
+
+    public Map<String, String> getInstanceOwners() { return instanceOwners; }
+    public void setInstanceOwners(Map<String, String> instanceOwners) { this.instanceOwners = instanceOwners; }
 
     public List<String> getInstanceIds() { return instanceIds; }
     public void setInstanceIds(List<String> instanceIds) { this.instanceIds = instanceIds; }
