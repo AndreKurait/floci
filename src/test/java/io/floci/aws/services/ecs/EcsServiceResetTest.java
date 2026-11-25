@@ -8,9 +8,12 @@ import io.floci.aws.services.ecs.model.ContainerDefinition;
 import io.floci.aws.services.ecs.model.EcsTask;
 import io.floci.aws.services.ecs.model.LaunchType;
 import io.floci.aws.testing.InMemoryStorageFactory;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -24,6 +27,7 @@ import static org.mockito.Mockito.when;
  * A state reset wipes the ECS stores, so what ECS keeps only in memory has to go with them: a cluster
  * created after the reset under an earlier name starts with no tasks, container instances or deployments.
  */
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class EcsServiceResetTest {
 
     private static final String REGION = "us-east-1";

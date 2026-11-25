@@ -6,11 +6,14 @@ import io.floci.aws.services.ecs.container.EcsContainerManager;
 import io.floci.aws.services.ecs.model.ContainerDefinition;
 import io.floci.aws.services.ecs.model.TaskDefinition;
 import io.floci.aws.testing.InMemoryStorageFactory;
+import io.floci.aws.testing.ParallelLocks;
 import io.floci.aws.testing.ParkingStore;
 import io.floci.aws.testing.ThreadStates;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.util.List;
 import java.util.Set;
@@ -23,6 +26,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /** Two registrations of one family that overlap each get a revision of their own. */
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class EcsTaskDefinitionRevisionRaceTest {
 
     private static final String REGION = "us-east-1";
