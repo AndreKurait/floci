@@ -11,6 +11,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import java.nio.charset.StandardCharsets;
@@ -48,6 +49,82 @@ class AppConfigDeploymentLifecycleTest {
 
     @TempDir
     Path directory;
+
+    @ParameterizedTest
+    @CsvSource({"0.001,1800", "0.01,18000", "1.0,1800000"})
+    void explicitTimeScalePreservesGrowthBakeAndRequestedMinutes(double scale, long rolloutMillis) {
+        Clock clock = mock(Clock.class);
+        when(clock.instant()).thenReturn(START);
+        AppConfigService service = new AppConfigService(factory(),
+                new RegionResolver("us-east-1", "000000000000"), clock, mock(AppConfigAlarmMonitor.class), scale);
+        Scope scope = scope(service);
+        String strategy = service.createDeploymentStrategy(Map.of(
+                "Name", "scaled", "DeploymentDurationInMinutes", 30,
+                "FinalBakeTimeInMinutes", 30, "GrowthFactor", 20)).getId();
+        Deployment started = deploy(service, scope, "1", strategy);
+        int number = started.getDeploymentNumber();
+        when(clock.instant()).thenReturn(START.plusMillis(rolloutMillis / 5 - 1));
+        assertEquals(0.0f, service.getDeployment(scope.app(), scope.env(), number).getPercentageComplete());
+        when(clock.instant()).thenReturn(START.plusMillis(rolloutMillis / 5));
+        assertEquals(20.0f, service.getDeployment(scope.app(), scope.env(), number).getPercentageComplete());
+        when(clock.instant()).thenReturn(START.plusMillis(rolloutMillis));
+        Deployment baking = service.getDeployment(scope.app(), scope.env(), number);
+        assertEquals("BAKING", baking.getState());
+        assertEquals(30, baking.getDeploymentDurationInMinutes());
+        assertEquals(30, baking.getFinalBakeTimeInMinutes());
+        when(clock.instant()).thenReturn(START.plusMillis(rolloutMillis * 2));
+        Deployment completed = service.getDeployment(scope.app(), scope.env(), number);
+        assertEquals("COMPLETE", completed.getState());
+        assertEquals(START.plusMillis(rolloutMillis * 2).toString(), completed.getCompletedAt());
+    }
+
+    @Test
+    void acceleratedBakeStillRollsBackWhenItsMonitorTrips() {
+        Clock clock = mock(Clock.class);
+        when(clock.instant()).thenReturn(START);
+        AppConfigAlarmMonitor alarms = mock(AppConfigAlarmMonitor.class);
+        AppConfigService service = new AppConfigService(factory(),
+                new RegionResolver("us-east-1", "000000000000"), clock, alarms, 0.001);
+        Scope scope = scope(service);
+        String strategy = service.createDeploymentStrategy(Map.of(
+                "Name", "scaled", "DeploymentDurationInMinutes", 30,
+                "FinalBakeTimeInMinutes", 30, "GrowthFactor", 20)).getId();
+        Deployment started = deploy(service, scope, "1", strategy);
+        when(clock.instant()).thenReturn(START.plusMillis(1800));
+        assertEquals("BAKING", service.getDeployment(
+                scope.app(), scope.env(), started.getDeploymentNumber()).getState());
+        when(alarms.rollbackCause(null)).thenReturn("monitor is ALARM");
+        assertEquals("ROLLED_BACK", service.getDeployment(
+                scope.app(), scope.env(), started.getDeploymentNumber()).getState());
+    }
+
+    @Test
+    void tinyPositiveScaleKeepsBothPositivePhases() {
+        Clock clock = mock(Clock.class);
+        when(clock.instant()).thenReturn(START);
+        AppConfigService service = new AppConfigService(factory(),
+                new RegionResolver("us-east-1", "000000000000"), clock, mock(AppConfigAlarmMonitor.class), Double.MIN_VALUE);
+        Scope scope = scope(service);
+        String strategy = service.createDeploymentStrategy(Map.of(
+                "Name", "scaled", "DeploymentDurationInMinutes", 1,
+                "FinalBakeTimeInMinutes", 1, "GrowthFactor", 20)).getId();
+        Deployment started = deploy(service, scope, "1", strategy);
+        assertEquals("DEPLOYING", started.getState());
+        when(clock.instant()).thenReturn(START.plusMillis(1));
+        assertEquals("BAKING", service.getDeployment(
+                scope.app(), scope.env(), started.getDeploymentNumber()).getState());
+        when(clock.instant()).thenReturn(START.plusMillis(2));
+        assertEquals("COMPLETE", service.getDeployment(
+                scope.app(), scope.env(), started.getDeploymentNumber()).getState());
+    }
+
+    @ParameterizedTest
+    @ValueSource(doubles = {0, -1, 1.1, Double.NaN, Double.POSITIVE_INFINITY})
+    void invalidTimeScaleIsRejectedBeforeOpeningStorage(double scale) {
+        assertThrows(IllegalArgumentException.class, () -> new AppConfigService(mock(StorageFactory.class),
+                new RegionResolver("us-east-1", "000000000000"), Clock.systemUTC(),
+                mock(AppConfigAlarmMonitor.class), scale));
+    }
 
     @Test
     void bakingDeadlineAndRollbackSurviveRestart() {
