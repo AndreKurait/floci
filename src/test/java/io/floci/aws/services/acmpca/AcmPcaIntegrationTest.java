@@ -76,6 +76,25 @@ class AcmPcaIntegrationTest {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
+    @Test
+    void activatedAuthorityReplaysRootIssuanceToken() {
+        try (Owned owned = new Owned("activation-replay", "us-east-1")) {
+            String ca = owned.create(owned.client, UUID.randomUUID().toString());
+            String csr = owned.client.getCertificateAuthorityCsr(input -> input.certificateAuthorityArn(ca)).csr();
+            String token = UUID.randomUUID().toString();
+            String issued = owned.issue(owned.client, ca, csr, owned.rootTemplate(), token, 365);
+            String certificate = owned.client.getCertificate(input -> input
+                    .certificateAuthorityArn(ca).certificateArn(issued)).certificate();
+            owned.client.importCertificateAuthorityCertificate(input -> input
+                    .certificateAuthorityArn(ca).certificate(SdkBytes.fromUtf8String(certificate)));
+            assertEquals(issued, owned.issue(owned.client, ca, csr, owned.rootTemplate(), token, 365));
+            error("InvalidStateException", () -> owned.issue(owned.client, ca, csr,
+                    owned.rootTemplate(), UUID.randomUUID().toString(), 365));
+            assertEquals(certificate, owned.client.getCertificate(input -> input
+                    .certificateAuthorityArn(ca).certificateArn(issued)).certificate());
+        }
+    }
+
     @ParameterizedTest
     @ValueSource(strings = {"us-east-1", "cn-north-1", "us-gov-west-1"})
     void rootAndLeafCertificatesVerifyAcrossTheLifecycle(String region) throws Exception {
