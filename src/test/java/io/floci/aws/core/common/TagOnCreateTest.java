@@ -24,6 +24,23 @@ import static org.mockito.Mockito.when;
 class TagOnCreateTest {
 
     @Test
+    void cloudFrontReadsEveryTagTheXmlControllerAttaches() {
+        String xml = "<CreateKeyValueStoreRequest xmlns:c='urn:test'><Tags><Items>"
+                + "<c:Tag><c:Key>team</c:Key><c:Value>old</c:Value></c:Tag></Items></Tags>"
+                + "<Tag><Key>team</Key><Value>blue&amp;green</Value></Tag><Tag><Key>empty</Key></Tag>"
+                + "<Tag><Value>ignored</Value></Tag></CreateKeyValueStoreRequest>";
+        ContainerRequestContext ctx = mock(ContainerRequestContext.class);
+        when(ctx.getEntityStream()).thenReturn(new ByteArrayInputStream(xml.getBytes(StandardCharsets.UTF_8)));
+        Tagging tagging = TagOnCreate.of("cloudfront:CreateKeyValueStore", ctx).orElseThrow();
+        assertEquals("cloudfront:TagResource", tagging.action());
+        assertTrue(tagging.requestTags());
+        assertEquals(List.of(set(Map.of("team", "blue&green", "empty", ""))), tagging.sets());
+        assertEquals(List.of(Map.of("aws:RequestTag/team", List.of("blue&green"),
+                "aws:RequestTag/empty", List.of(""), "aws:TagKeys", List.of("team", "empty"))),
+                TagOnCreate.requestTagContexts(tagging));
+    }
+
+    @Test
     void controlTowerUsesModeledTagMapsAndChecksTheCreateActionWithTheirTags() {
         for (String operation : List.of("CreateLandingZone", "EnableControl", "EnableBaseline")) {
             Tagging tagging = TagOnCreate.of("controltower:" + operation, json(
