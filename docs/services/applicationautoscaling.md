@@ -34,7 +34,7 @@ Auto Scaling groups over the Query protocol under the `autoscaling` signing name
 ## Pagination
 
 `DescribeScalableTargets` accepts `MaxResults` from 1 to 50 and defaults to 50.
-`DescribeScalingPolicies` accepts `MaxResults` from 1 to 10 and defaults to 10.
+`DescribeScalingPolicies` accepts positive integer `MaxResults` values and defaults to 10.
 `DescribeScheduledActions` accepts `MaxResults` from 1 to 50 and defaults to 50.
 It filters by resource, dimension, and up to 50 action names. A dimension requires a resource ID.
 When more results remain, pass the returned `NextToken` with the same operation,
