@@ -79,6 +79,7 @@ import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.math.BigInteger;
+import java.net.BindException;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -1884,6 +1885,30 @@ class IotMqttBrokerServiceTest {
     }
 
     @Test
+    void awaitClosedRejectsAnOwnedPortThatRefusesConnections() throws Exception {
+        int port;
+        try (Socket owner = new Socket()) {
+            owner.setReuseAddress(false);
+            owner.bind(new InetSocketAddress("127.0.0.1", 0));
+            port = owner.getLocalPort();
+            assertFalse(accepts(port), "the bound socket has no listener");
+            assertThrows(AssertionError.class, () -> awaitClosed(port, Duration.ofMillis(100)));
+        }
+        awaitClosed(port);
+    }
+
+    @Test
+    void awaitClosedRejectsAnOwnedListenerUntilItCloses() throws Exception {
+        int port;
+        try (ServerSocket owner = new ServerSocket()) {
+            owner.bind(new InetSocketAddress("127.0.0.1", 0));
+            port = owner.getLocalPort();
+            assertThrows(AssertionError.class, () -> awaitClosed(port, Duration.ofMillis(100)));
+        }
+        awaitClosed(port);
+    }
+
+    @Test
     void rulesAreSkippedFromAResetUntilItEnds() throws Exception {
         assertSkipsWaitingAndLaterRules(broker::beforeReset, broker::afterReset);
         assertTrue(rulesRun(), "rules run again once the reset ends");
@@ -1892,7 +1917,7 @@ class IotMqttBrokerServiceTest {
     @Test
     void rulesAreSkippedFromAStopUntilARestart() throws Exception {
         broker.startIfEnabled();
-        assertSkipsWaitingAndLaterRules(broker::stop, broker::startIfEnabled);
+        assertSkipsWaitingAndLaterRules(broker::stop, this::startAfterListenersClose);
         assertTrue(rulesRun(), "a publish after the restart runs its rules");
     }
 
@@ -1901,7 +1926,7 @@ class IotMqttBrokerServiceTest {
         broker.startIfEnabled();
         assertSkipsWaitingAndLaterRules(() -> broker.onShutdownStarted(null), () -> {
             broker.stop();
-            broker.startIfEnabled();
+            startAfterListenersClose();
         });
         assertTrue(rulesRun(), "a publish after the restart runs its rules");
     }
@@ -2455,12 +2480,29 @@ class IotMqttBrokerServiceTest {
         }
     }
 
-    /** Vert.x resolves close() a moment before the OS releases the port; poll like the lazy-start test. */
+    private void startAfterListenersClose() {
+        awaitClosed(plainPort);
+        awaitClosed(tlsPort);
+        broker.startIfEnabled();
+    }
+
     private static void awaitClosed(int port) {
-        long deadline = System.currentTimeMillis() + 5_000;
-        while (accepts(port)) {
-            if (System.currentTimeMillis() > deadline) {
-                throw new AssertionError("port " + port + " still accepts connections");
+        awaitClosed(port, Duration.ofSeconds(5));
+    }
+
+    private static void awaitClosed(int port, Duration timeout) {
+        long deadline = System.nanoTime() + timeout.toNanos();
+        while (true) {
+            try (ServerSocket socket = new ServerSocket()) {
+                socket.setReuseAddress(true);
+                socket.bind(new InetSocketAddress("127.0.0.1", port));
+                return;
+            } catch (BindException occupied) {
+                if (System.nanoTime() - deadline >= 0) {
+                    throw new AssertionError("port " + port + " is still bound", occupied);
+                }
+            } catch (IOException e) {
+                throw new AssertionError("cannot check release of port " + port, e);
             }
             try {
                 Thread.sleep(50);
