@@ -370,6 +370,7 @@ class EmrServerlessJobRunServiceTest {
         assertEquals(batch, job.runId());
         assertEquals(ACCOUNT_ID, job.accountId());
         assertEquals(REGION, job.region());
+        assertEquals(applications.getApplication(applicationId).getArn(), job.imagePullSourceArn());
         assertEquals("emr-7.5.0", job.releaseLabel());
         assertNull(job.imageTemplate());
         assertNull(job.customImage());
@@ -1059,6 +1060,7 @@ class EmrServerlessJobRunServiceTest {
         assertTrue(runner.stopped.isEmpty());
         assertTrue(tasks.isEmpty());
         assertTrue(runner.jobs.get(0).interruptible(), "its driver gets the SIGTERM through an init process");
+        assertEquals(applications.getApplication(graceful).getArn(), runner.jobs.get(0).imagePullSourceArn());
         assertEquals("CANCELLED", service.getJobRun(graceful, ended, null).getState());
 
         String outlasted = service.startJobRun(graceful, request(null, null)).getJobRunId();

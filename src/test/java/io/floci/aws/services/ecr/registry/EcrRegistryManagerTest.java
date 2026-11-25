@@ -138,6 +138,7 @@ class EcrRegistryManagerTest {
         storage = Mockito.mock(EmulatorConfig.StorageConfig.class);
         when(config.services()).thenReturn(Mockito.mock(EmulatorConfig.ServicesConfig.class));
         when(config.services().ecr()).thenReturn(ecr);
+        when(config.services().iam()).thenReturn(Mockito.mock(EmulatorConfig.IamServiceConfig.class));
         when(config.port()).thenReturn(4566);
         when(config.docker()).thenReturn(docker);
         when(config.storage()).thenReturn(storage);
@@ -762,9 +763,9 @@ class EcrRegistryManagerTest {
             "hostname, true, false, 000000000000.dkr.ecr.us-east-1.localhost:4566/app, http://000000000000.dkr.ecr.us-east-1.localhost:4566",
             "hostname, false, true, 000000000000.dkr.ecr.us-east-1.localhost:4566/app, http://000000000000.dkr.ecr.us-east-1.localhost:4566",
             "hostname, true, true, 000000000000.dkr.ecr.us-east-1.localhost.floci.io:4566/app, https://000000000000.dkr.ecr.us-east-1.localhost.floci.io:4566",
-            "path, false, false, localhost:4566/000000000000/us-east-1/app, http://000000000000.dkr.ecr.us-east-1.localhost:4566",
-            "path, true, false, localhost:4566/000000000000/us-east-1/app, http://000000000000.dkr.ecr.us-east-1.localhost:4566",
-            "path, false, true, localhost:4566/000000000000/us-east-1/app, http://000000000000.dkr.ecr.us-east-1.localhost:4566",
+            "path, false, false, localhost:4566/000000000000/us-east-1/app, http://localhost:4566",
+            "path, true, false, localhost:4566/000000000000/us-east-1/app, http://localhost:4566",
+            "path, false, true, localhost:4566/000000000000/us-east-1/app, http://localhost:4566",
             "path, true, true, localhost.floci.io:4566/000000000000/us-east-1/app, https://localhost.floci.io:4566"
     })
     void advertisedUrisRequireBothTlsAndOptIn(String style, boolean globalTls, boolean tlsUris,
@@ -823,7 +824,7 @@ class EcrRegistryManagerTest {
     @ParameterizedTest
     @CsvSource({
             "hostname, false, 000000000000.dkr.ecr.us-east-1.localhost:54321/app, http://000000000000.dkr.ecr.us-east-1.localhost:54321",
-            "path, false, localhost:54321/000000000000/us-east-1/app, http://000000000000.dkr.ecr.us-east-1.localhost:54321",
+            "path, false, localhost:54321/000000000000/us-east-1/app, http://localhost:54321",
             "hostname, true, 000000000000.dkr.ecr.us-east-1.localhost.floci.io:54321/app, https://000000000000.dkr.ecr.us-east-1.localhost.floci.io:54321",
             "path, true, localhost.floci.io:54321/000000000000/us-east-1/app, https://localhost.floci.io:54321"
     })
@@ -986,6 +987,19 @@ class EcrRegistryManagerTest {
         assertEquals(AWS_ECR_IMAGE, rewritten);
         verify(dockerClient).inspectImageCmd(AWS_ECR_IMAGE);
         verify(lifecycleManager, Mockito.never()).createAndStart(any());
+    }
+
+    @Test
+    void rewriteImageUri_enforcedPullOfLocallyPresentAwsReferenceStillUsesEmulatorRegistry() {
+        when(config.services().iam().enforcementEnabled()).thenReturn(true);
+        Mockito.doReturn(new InspectImageResponse()).when(inspectImage).exec();
+        when(lifecycleManager.createAndStart(any())).thenReturn(
+                new ContainerLifecycleManager.ContainerInfo("container-id", Map.of()));
+
+        assertEquals("localhost:4566/123456789012/us-east-1/backend-user:1",
+                manager.rewriteImageUri(AWS_ECR_IMAGE));
+        verify(dockerClient, never()).inspectImageCmd(AWS_ECR_IMAGE);
+        verify(lifecycleManager).createAndStart(any());
     }
 
     @Test
@@ -1202,7 +1216,10 @@ class EcrRegistryManagerTest {
             "000000000000.dkr.ecr.us-east-1.localhost:4566/spark/custom:7.5.0, us-east-1",
             "000000000000.dkr.ecr.us-east-1.localhost.floci.io:4566/spark/custom:7.5.0, us-east-1",
             "localhost:4566/000000000000/us-west-2/spark/custom:7.5.0, us-west-2",
-            "localhost.floci.io:4566/000000000000/us-west-2/spark/custom:7.5.0, us-west-2"
+            "localhost.floci.io:4566/000000000000/us-west-2/spark/custom:7.5.0, us-west-2",
+            "127.0.0.1:4566/000000000000/us-west-2/spark/custom:7.5.0, us-west-2",
+            "[::1]:4566/000000000000/us-west-2/spark/custom:7.5.0, us-west-2",
+            "123456789012.dkr.ecr.eu-west-1.amazonaws.com:443/spark/custom:7.5.0, eu-west-1"
     })
     void anImageInAnEcrRepositoryHasItsRepositorysRegion(String image, String region) {
         assertEquals(Optional.of(region), EcrRegistryManager.imageRegion(image));
@@ -1231,4 +1248,22 @@ class EcrRegistryManagerTest {
                 null)), EcrRegistryManager.ecrImage("000000000000.dkr.ecr.eu-west-1.localhost:4566/spark"));
         assertEquals(Optional.empty(), EcrRegistryManager.ecrImage("python:3.12"));
     }
+
+    @ParameterizedTest
+    @CsvSource({"us-east-1,amazonaws.com", "cn-north-1,amazonaws.com.cn", "us-gov-west-1,amazonaws.com"})
+    void nativeRegistryAddressesMatchAuthorizationAndPartition(String region, String suffix) {
+        when(ecr.nativeUri()).thenReturn(true);
+        when(ecr.uriStyle()).thenReturn("path");
+        String host = "123456789012.dkr.ecr." + region + "." + suffix;
+        assertEquals(host + "/team/image", manager.getRepositoryUri("123456789012", region, "team/image"));
+        assertEquals("https://" + host, manager.getProxyEndpoint("123456789012", region));
+        verify(lifecycleManager, never()).getDockerClient();
+    }
+
+    @Test
+    void explicitRegistryAuthorizationPreservesDefaultLocalEndpointStyle() {
+        assertEquals("http://123456789012.dkr.ecr.eu-west-1.localhost:4566",
+                manager.getProxyEndpoint("123456789012", "eu-west-1"));
+    }
+
 }

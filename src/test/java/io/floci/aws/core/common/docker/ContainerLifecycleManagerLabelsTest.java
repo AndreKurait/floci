@@ -8,16 +8,21 @@ import com.github.dockerjava.api.command.InspectVolumeCmd;
 import com.github.dockerjava.api.command.RemoveContainerCmd;
 import com.github.dockerjava.api.command.StartContainerCmd;
 import com.github.dockerjava.api.command.WaitContainerCmd;
+import com.github.dockerjava.api.exception.DockerClientException;
 import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.model.AuthConfig;
 import com.github.dockerjava.api.model.Capability;
 import com.github.dockerjava.api.model.HostConfig;
 import com.github.dockerjava.core.command.WaitContainerResultCallback;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.services.lambda.launcher.ImageCacheService;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.mockito.ArgumentCaptor;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
@@ -30,6 +35,7 @@ import java.util.OptionalInt;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
@@ -38,6 +44,7 @@ import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 /**
@@ -48,6 +55,7 @@ import static org.mockito.Mockito.when;
  */
 @ExtendWith(MockitoExtension.class)
 @DisplayName("ContainerLifecycleManager — default emulator labels")
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class ContainerLifecycleManagerLabelsTest {
 
     @Mock
@@ -203,6 +211,33 @@ class ContainerLifecycleManagerLabelsTest {
         manager().create(new ContainerSpec("busybox:stable"), "linux/arm64");
 
         verify(imageCacheService).ensureImageExists("busybox:stable", "linux/arm64");
+        verify(dockerClient).createContainerCmd("sha256:arm64");
+        verify(createCmd).withPlatform("linux/arm64");
+    }
+
+    @Test
+    void credentialPullFailureDoesNotCreateContainerOrVolumes() {
+        AuthConfig credentials = new AuthConfig().withRegistryAddress("localhost:4566")
+                .withUsername("AWS").withPassword("private-pull");
+        when(imageCacheService.ensureImageExists("localhost:4566/image", "linux/arm64", credentials))
+                .thenThrow(new DockerClientException("Requested image pull is denied"));
+
+        assertThrows(DockerClientException.class,
+                () -> manager().create(new ContainerSpec("localhost:4566/image"), "linux/arm64", credentials));
+
+        verifyNoInteractions(dockerClient);
+    }
+
+    @Test
+    void explicitPullCredentialKeepsResolvedImageAndPlatform() {
+        AuthConfig credentials = new AuthConfig().withRegistryAddress("localhost:4566")
+                .withUsername("AWS").withPassword("private-pull");
+        when(imageCacheService.ensureImageExists("localhost:4566/image", "linux/arm64", credentials))
+                .thenReturn("sha256:arm64");
+        CreateContainerCmd createCmd = stubCreateContainer("sha256:arm64");
+
+        manager().create(new ContainerSpec("localhost:4566/image"), "linux/arm64", credentials);
+
         verify(dockerClient).createContainerCmd("sha256:arm64");
         verify(createCmd).withPlatform("linux/arm64");
     }

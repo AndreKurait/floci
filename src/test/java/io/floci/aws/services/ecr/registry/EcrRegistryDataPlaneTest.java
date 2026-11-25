@@ -73,6 +73,22 @@ class EcrRegistryDataPlaneTest {
     }
 
     @Test
+    void operationWordsInsideRepositoryNamesDoNotChangeTheAuthorizationTarget() {
+        for (String repository : List.of("team/manifests/image", "team/blobs/image", "team/tags/image",
+                "team/blobs/uploads/image")) {
+            for (String operation : List.of("/manifests/latest", "/blobs/sha256:abc", "/tags/list",
+                    "/blobs/uploads/", "/blobs/uploads/session")) {
+                EcrRegistryDataPlane.RegistryRequest request = EcrRegistryDataPlane.requestFor(
+                        "111111111111.dkr.ecr.us-east-1.localhost:4566", "/v2/" + repository + operation,
+                        null, "hostname").orElseThrow();
+                assertEquals(repository, request.repositoryName(), repository + operation);
+                assertEquals(operation.startsWith("/manifests/") ? "latest" : null, request.tag());
+                assertEquals("/v2/111111111111/us-east-1/" + repository + operation, request.backendUri());
+            }
+        }
+    }
+
+    @Test
     void hostnameStyleManifestWriteUsesInternalRegistryNamespace() {
         EcrRegistryDataPlane.RegistryRequest request = EcrRegistryDataPlane.requestFor(
                 "000000000000.dkr.ecr.us-east-1.localhost:4566",
@@ -138,7 +154,7 @@ class EcrRegistryDataPlaneTest {
     }
 
     @Test
-    void anAwsRegistryHostIsServedOnlyAsAMirrorRequestsNamespaceInItsRegionsPartition() {
+    void awsRegistryHostsAndMirrorNamespacesStayInTheirRegionsPartition() {
         // A region under another partition's suffix names no registry.
         assertFalse(EcrRegistryDataPlane.requestFor("172.17.0.1:4566", "/v2/app/manifests/v1",
                 "ns=111122223333.dkr.ecr.cn-north-1.amazonaws.com", "hostname").isPresent());
@@ -147,9 +163,16 @@ class EcrRegistryDataPlaneTest {
         // Another registry's namespace, such as a public registry's, is not Floci's.
         assertFalse(EcrRegistryDataPlane.requestFor("172.17.0.1:4566", "/v2/library/nginx/manifests/1",
                 "ns=docker.io", "hostname").isPresent());
-        // A request sent to the AWS host itself is not a mirror request.
-        assertFalse(EcrRegistryDataPlane.requestFor("111122223333.dkr.ecr.us-east-1.amazonaws.com",
-                "/v2/app/manifests/v1", null, "hostname").isPresent());
+        EcrRegistryDataPlane.RegistryRequest nativeRequest = EcrRegistryDataPlane.requestFor(
+                "111122223333.dkr.ecr.us-east-1.amazonaws.com", "/v2/app/manifests/v1", null, "hostname")
+                .orElseThrow();
+        assertEquals("111122223333", nativeRequest.accountId());
+        assertEquals("us-east-1", nativeRequest.region());
+        assertEquals("/v2/111122223333/us-east-1/app/manifests/v1", nativeRequest.backendUri());
+        EcrRegistryDataPlane.RegistryRequest explicitMirrorPort = EcrRegistryDataPlane.requestFor(
+                "172.17.0.1:4566", "/v2/app/manifests/v1",
+                "ns=111122223333.dkr.ecr.eu-west-1.amazonaws.com%3A443", "hostname").orElseThrow();
+        assertEquals("/v2/111122223333/eu-west-1/app/manifests/v1", explicitMirrorPort.backendUri());
     }
 
     @Test
@@ -1278,4 +1301,32 @@ class EcrRegistryDataPlaneTest {
     }
 
     private record RegistryResponse(int status, String contentType, String apiVersion, String body) {}
+    @Test
+    void nativeRegistryHostAndMirrorNamespaceKeepAccountRegionRouting() {
+        EcrRegistryDataPlane.RegistryRequest request = EcrRegistryDataPlane.requestFor("123456789012.dkr.ecr.cn-north-1.amazonaws.com.cn",
+                "/v2/team/image/manifests/latest", null, "hostname").orElseThrow();
+        assertEquals("/v2/123456789012/cn-north-1/team/image/manifests/latest", request.backendUri());
+        EcrRegistryDataPlane.RegistryRequest mirror = EcrRegistryDataPlane.requestFor("localhost:4566", "/v2/team/image/manifests/latest",
+                "ns=123456789012.dkr.ecr.us-east-1.amazonaws.com", "hostname").orElseThrow();
+        assertEquals("/v2/123456789012/us-east-1/team/image/manifests/latest", mirror.backendUri());
+    }
+
+    @Test
+    void nativeRegistryRoutingRejectsUnknownRegionIncludingMirrorNamespace() {
+        String host = "123456789012.dkr.ecr.not-a-region.amazonaws.com";
+        assertTrue(EcrRegistryDataPlane.requestFor(host,
+                "/v2/team/image/manifests/latest", null, "hostname").isEmpty());
+        assertTrue(EcrRegistryDataPlane.requestFor("localhost:4566",
+                "/v2/team/image/manifests/latest", "ns=" + host, "hostname").isEmpty());
+    }
+
+    @Test
+    void nativeRegistryRoutingRejectsForeignSuffixAndWrongPartition() {
+        for (String host : List.of("123456789012.dkr.ecr.cn-north-1.amazonaws.com",
+                "123456789012.dkr.ecr.us-east-1.amazonaws.com.evil.example",
+                "123456789012.dkr.ecr.us-east-1.amazonaws.com:1234")) {
+            assertTrue(EcrRegistryDataPlane.requestFor(host, "/v2/team/image/manifests/latest", null, "hostname").isEmpty());
+        }
+    }
+
 }

@@ -11,6 +11,7 @@ import com.github.dockerjava.api.exception.DockerException;
 import com.github.dockerjava.api.exception.InternalServerErrorException;
 import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.exception.UnauthorizedException;
+import com.github.dockerjava.api.model.AuthConfig;
 import com.github.dockerjava.api.model.Info;
 import com.github.dockerjava.api.model.PullResponseItem;
 import io.floci.aws.config.EmulatorConfig;
@@ -25,10 +26,16 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 
+import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -36,6 +43,7 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.nullable;
+import static org.mockito.Mockito.RETURNS_SELF;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
@@ -48,6 +56,130 @@ class ImageCacheServiceTest {
     private static final String REGISTRY_REPO = "registry.example:5000/app";
     private static final String REGISTRY_IMAGE = REGISTRY_REPO + ":latest";
     private static final String LOCAL_IMAGE = "app-local:latest";
+
+    @Test
+    void suppliedCredentialReachesRegistryEvenWhenImageWasAlreadyResolved() {
+        FakeDaemon daemon = new FakeDaemon();
+        daemon.store(REGISTRY_IMAGE, image("sha256:cached"));
+        daemon.registry.put(REGISTRY_IMAGE, image("sha256:authorized"));
+        ImageCacheService service = newService(daemon.client);
+        assertEquals("sha256:cached", service.ensureImageExists(REGISTRY_IMAGE));
+        AuthConfig credential = new AuthConfig().withRegistryAddress("registry.example:5000")
+                .withUsername("AWS").withPassword("per-pull");
+
+        assertEquals("sha256:authorized", service.ensureImageExists(REGISTRY_IMAGE, null, credential));
+        assertEquals(1, daemon.pulls.get());
+        assertEquals(1, daemon.pullCredentials.size());
+        AuthConfig forwarded = daemon.pullCredentials.getFirst();
+        assertEquals(credential.getUsername(), forwarded.getUsername());
+        assertEquals(credential.getPassword(), forwarded.getPassword());
+        assertEquals(credential.getRegistryAddress(), forwarded.getRegistryAddress());
+    }
+
+    @Test
+    void suppliedCredentialCannotFallBackToLocalImageAfterRegistryDenial() {
+        FakeDaemon daemon = new FakeDaemon();
+        daemon.store(REGISTRY_IMAGE, image("sha256:cached"));
+        ImageCacheService service = newService(daemon.client);
+        AuthConfig credential = new AuthConfig().withRegistryAddress("registry.example:5000")
+                .withUsername("AWS").withPassword("per-pull");
+        when(daemon.client.pullImageCmd(REGISTRY_IMAGE)).thenThrow(new UnauthorizedException("denied"));
+
+        for (ImagePullBehavior behavior : ImagePullBehavior.values()) {
+            assertThrows(UnauthorizedException.class,
+                    () -> service.resolveForLaunch(REGISTRY_IMAGE, behavior, null, credential));
+        }
+        assertThrows(UnauthorizedException.class,
+                () -> service.ensureImageExists(REGISTRY_IMAGE, null, credential));
+    }
+
+    @Test
+    void credentialsAreRequestedOnlyAfterTheImageLockIsAcquired() throws Exception {
+        DockerClient docker = mock(DockerClient.class);
+        PullImageCmd pull = mock(PullImageCmd.class, RETURNS_SELF);
+        PullImageResultCallback callback = mock(PullImageResultCallback.class);
+        InspectImageCmd inspect = mock(InspectImageCmd.class);
+        when(docker.pullImageCmd(REGISTRY_IMAGE)).thenReturn(pull);
+        when(pull.exec(any(PullImageResultCallback.class))).thenReturn(callback);
+        when(docker.inspectImageCmd(REGISTRY_IMAGE)).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(image("sha256:authorized"));
+        CountDownLatch firstPullStarted = new CountDownLatch(1);
+        CountDownLatch releaseFirstPull = new CountDownLatch(1);
+        AtomicInteger pulls = new AtomicInteger();
+        when(callback.awaitCompletion(anyLong(), any())).thenAnswer(invocation -> {
+            if (pulls.incrementAndGet() == 1) {
+                firstPullStarted.countDown();
+                assertTrue(releaseFirstPull.await(5, TimeUnit.SECONDS));
+            }
+            return true;
+        });
+        AtomicInteger generation = new AtomicInteger();
+        AtomicInteger secondCredentialGeneration = new AtomicInteger(-1);
+        Supplier<AuthConfig> firstCredentials = () -> credentials("first");
+        Supplier<AuthConfig> secondCredentials = () -> {
+            secondCredentialGeneration.set(generation.get());
+            return credentials("second");
+        };
+        ImageCacheService service = newService(docker);
+        AtomicReference<Throwable> failure = new AtomicReference<>();
+        Thread first = new Thread(() -> {
+            try {
+                service.resolveForLaunchWithCredentials(REGISTRY_IMAGE, ImagePullBehavior.ALWAYS,
+                        "linux/amd64", firstCredentials);
+            } catch (Throwable error) {
+                failure.compareAndSet(null, error);
+            }
+        });
+        Thread second = new Thread(() -> {
+            try {
+                service.resolveForLaunchWithCredentials(REGISTRY_IMAGE, ImagePullBehavior.ALWAYS,
+                        "linux/amd64", secondCredentials);
+            } catch (Throwable error) {
+                failure.compareAndSet(null, error);
+            }
+        });
+        try {
+            first.start();
+            assertTrue(firstPullStarted.await(5, TimeUnit.SECONDS));
+            second.start();
+            await().atMost(5, TimeUnit.SECONDS).until(() -> second.getState() == Thread.State.BLOCKED);
+            assertEquals(-1, secondCredentialGeneration.get());
+            generation.incrementAndGet();
+            releaseFirstPull.countDown();
+            first.join(5000);
+            second.join(5000);
+            assertEquals(1, secondCredentialGeneration.get());
+            assertEquals(2, pulls.get());
+            assertFalse(first.isAlive());
+            assertFalse(second.isAlive());
+            assertNull(failure.get());
+        } finally {
+            releaseFirstPull.countDown();
+            first.interrupt();
+            second.interrupt();
+            first.join(5000);
+            second.join(5000);
+        }
+    }
+
+    @Test
+    void transientRetryRequestsFreshCredentialsForTheNextAttempt() {
+        FakeDaemon daemon = new FakeDaemon();
+        daemon.registry.put(REGISTRY_IMAGE, image("sha256:authorized"));
+        PullImageCmd successfulPull = daemon.client.pullImageCmd(REGISTRY_IMAGE);
+        when(daemon.client.pullImageCmd(REGISTRY_IMAGE))
+                .thenThrow(new InternalServerErrorException("temporary registry failure")).thenReturn(successfulPull);
+        AtomicInteger attempts = new AtomicInteger();
+        ImageCacheService service = newService(daemon.client);
+        assertEquals("sha256:authorized", service.ensureImageExistsWithCredentials(REGISTRY_IMAGE, "linux/amd64",
+                () -> credentials("attempt-" + attempts.incrementAndGet())));
+        assertEquals(2, attempts.get());
+        assertEquals("attempt-2", daemon.pullCredentials.getFirst().getPassword());
+    }
+
+    private static AuthConfig credentials(String password) {
+        return new AuthConfig().withRegistryAddress("registry.example:5000").withUsername("AWS").withPassword(password);
+    }
 
     @Test
     void pullsImageWhenInspectionReportsNotFound() throws Exception {
@@ -716,6 +848,7 @@ class ImageCacheServiceTest {
         final Set<String> hangingPulls = new HashSet<>();
         final AtomicInteger pulls = new AtomicInteger();
         final List<String> pullPlatforms = new ArrayList<>();
+        final List<AuthConfig> pullCredentials = new ArrayList<>();
 
         FakeDaemon() {
             when(client.inspectImageCmd(anyString())).thenAnswer(invocation -> {
@@ -733,7 +866,10 @@ class ImageCacheServiceTest {
             when(client.pullImageCmd(anyString())).thenAnswer(invocation -> {
                 String reference = invocation.getArgument(0);
                 PullImageCmd pull = mock(PullImageCmd.class);
-                when(pull.withAuthConfig(any())).thenReturn(pull);
+                when(pull.withAuthConfig(any())).thenAnswer(auth -> {
+                    pullCredentials.add(auth.getArgument(0));
+                    return pull;
+                });
                 when(pull.withPlatform(anyString())).thenAnswer(platform -> {
                     pullPlatforms.add(platform.getArgument(0));
                     return pull;
