@@ -1,5 +1,8 @@
 package io.floci.aws.services.codedeploy;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.dataformat.cbor.CBORFactory;
 import io.floci.aws.testing.EnforcementFixtures;
 import io.floci.aws.testing.IamEnforcementProfile;
 import io.floci.aws.testing.PartitionCleanup;
@@ -24,6 +27,7 @@ import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.equalTo;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /** Wire compatibility and IAM decisions; actual agent execution is covered separately. */
 @QuarkusTest
@@ -33,6 +37,7 @@ class CodeDeployAgentProtocolIntegrationTest {
     private static final String REGION = "us-east-1";
     private static final String SECURE = "codedeploy-commands-secure";
     private static final String SECURE_TARGET = "CodeDeployCommandService.";
+    private static final ObjectMapper CBOR = new ObjectMapper(new CBORFactory());
 
     @TestHTTPResource("/")
     static URI baseUri;
@@ -88,6 +93,36 @@ class CodeDeployAgentProtocolIntegrationTest {
         call(key, SECURE, "us-west-2", SECURE_TARGET + "PostHostCommandUpdate",
                 Map.of("HostCommandIdentifier", command)).statusCode(400)
                 .body("__type", equalTo("InvalidHostCommandIdentifierException"));
+    }
+
+    @Test
+    void theRpcFacadeKeepsAgentEnvelopesAsStringsAndCompletionHasNoBody() throws Exception {
+        String key = user(SECURE + ":*");
+        String id = "d-" + UUID.randomUUID();
+        CodeDeployAgentCommands.Session session = commands.open(ACCOUNT, REGION, id, id,
+                List.of("host"), Map.of("DeploymentId", id));
+        cleanup.register(() -> commands.close(session));
+        CodeDeployAgentCommands.Ticket ticket = commands.enqueue(session, "host", "Install");
+
+        JsonNode poll = CBOR.readTree(rpc(key, "PollHostCommand", Map.of("HostIdentifier", "host")));
+        String command = poll.at("/HostCommand/HostCommandIdentifier").textValue();
+        assertEquals("Install", poll.at("/HostCommand/CommandName").textValue());
+        JsonNode specification = CBOR.readTree(rpc(key, "GetDeploymentSpecification",
+                Map.of("HostIdentifier", "host", "DeploymentExecutionId", id)));
+        JsonNode envelope = specification.at("/DeploymentSpecification/GenericEnvelope");
+        assertEquals("PKCS7/JSON", envelope.path("Format").textValue());
+        assertTrue(envelope.path("Payload").isTextual());
+        assertTrue(envelope.path("Payload").textValue().contains("BEGIN PKCS7"));
+        assertEquals("InProgress", CBOR.readTree(rpc(key, "PutHostCommandAcknowledgement",
+                Map.of("HostCommandIdentifier", command))).path("CommandStatus").textValue());
+        assertEquals("InProgress", CBOR.readTree(rpc(key, "PostHostCommandUpdate",
+                Map.of("HostCommandIdentifier", command, "EstimatedCompletionTime", "2026-02-19T12:00:00Z")))
+                .path("CommandStatus").textValue());
+        assertEquals(0, rpc(key, "PutHostCommandComplete",
+                Map.of("HostCommandIdentifier", command, "CommandStatus", "Succeeded",
+                        "Diagnostics", Map.of("Format", "JSON", "Payload", "{\"error_code\":0}"))).length);
+        assertEquals(new CodeDeployAgentCommands.Result("Succeeded", "{\"error_code\":0}"),
+                ticket.result().toCompletableFuture().join());
     }
 
     @Test
@@ -147,5 +182,13 @@ class CodeDeployAgentProtocolIntegrationTest {
         return given().header("Authorization", auth(key, region, scope))
                 .header("X-Amz-Target", target).contentType("application/x-amz-json-1.1")
                 .body(request).post("/").then();
+    }
+
+    private byte[] rpc(String key, String operation, Map<String, Object> request) throws Exception {
+        return given().header("Authorization", auth(key, REGION, SECURE))
+                .header("smithy-protocol", "rpc-v2-cbor").contentType("application/cbor")
+                .body(CBOR.writeValueAsBytes(request))
+                .post("/service/CodeDeployCommandService/operation/" + operation)
+                .then().statusCode(200).extract().asByteArray();
     }
 }

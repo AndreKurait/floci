@@ -1,7 +1,9 @@
 {
-  "_source": {"generator": "tools/aws/regen_rpcv2_cbor_shapes.py", "botocore": "botocore 1.44.9 (installed package)", "ec2messages": "aws/amazon-ssm-agent agent/runcommand/mds/mdsservice.go blob f3e4d67147e5027ca2568d597077e56310921610"},
+  "_source": {"generator": "tools/aws/regen_rpcv2_cbor_shapes.py", "botocore": "botocore 1.44.9 (installed package)", "ec2messages": "aws/amazon-ssm-agent agent/runcommand/mds/mdsservice.go blob f3e4d67147e5027ca2568d597077e56310921610", "codedeploy-commands": "aws/aws-codedeploy-agent crates/codedeploy-commands/src/ types.rs blob 11c19b70191a0bbb6e47868adcef9ba040259523; client.rs blob c568e6e59897565b8e37ddf1864c963090c7a6d4"},
   "aliases": {
     "ACM": "acm",
+    "ACM PCA": "acm-pca",
+    "ACMPrivateCA": "acm-pca",
     "AWS Marketplace Entitlement Service": "marketplace-entitlement",
     "AWS242ServiceCatalogService": "servicecatalog",
     "AWSBCMPricingCalculator": "bcm-pricing-calculator",
@@ -52,6 +54,8 @@
     "CodeBuild": "codebuild",
     "CodeBuild_20161006": "codebuild",
     "CodeDeploy": "codedeploy",
+    "CodeDeployCommandService": "codedeploy-commands",
+    "CodeDeployCommandService_v20141006": "codedeploy-commands",
     "CodeDeploy_20141006": "codedeploy",
     "CodePipeline": "codepipeline",
     "CodePipeline_20150709": "codepipeline",
@@ -221,6 +225,43 @@
         "UpdateSummary": {"type": "structure", "members": {"RequestedAt": {"shape": "TStamp"}, "UpdatedAt": {"shape": "TStamp"}}},
         "X509AttributeFilter": {"type": "structure", "members": {"NotAfter": {"shape": "TimestampRange"}, "NotBefore": {"shape": "TimestampRange"}}},
         "X509Attributes": {"type": "structure", "members": {"NotAfter": {"shape": "TStamp"}, "NotBefore": {"shape": "TStamp"}}}
+      }
+    },
+    "acm-pca": {
+      "timestampFormat": "unixTimestamp",
+      "operations": {
+        "CreatePermission": {"input": null, "output": null, "hasOutput": false},
+        "DeleteCertificateAuthority": {"input": null, "output": null, "hasOutput": false},
+        "DeletePermission": {"input": null, "output": null, "hasOutput": false},
+        "DeletePolicy": {"input": null, "output": null, "hasOutput": false},
+        "DescribeCertificateAuthority": {"input": null, "output": "DescribeCertificateAuthorityResponse", "hasOutput": true},
+        "DescribeCertificateAuthorityAuditReport": {"input": null, "output": "DescribeCertificateAuthorityAuditReportResponse", "hasOutput": true},
+        "ImportCertificateAuthorityCertificate": {"input": "ImportCertificateAuthorityCertificateRequest", "output": null, "hasOutput": false},
+        "IssueCertificate": {"input": "IssueCertificateRequest", "output": null, "hasOutput": true},
+        "ListCertificateAuthorities": {"input": null, "output": "ListCertificateAuthoritiesResponse", "hasOutput": true},
+        "ListPermissions": {"input": null, "output": "ListPermissionsResponse", "hasOutput": true},
+        "PutPolicy": {"input": null, "output": null, "hasOutput": false},
+        "RestoreCertificateAuthority": {"input": null, "output": null, "hasOutput": false},
+        "RevokeCertificate": {"input": null, "output": null, "hasOutput": false},
+        "TagCertificateAuthority": {"input": null, "output": null, "hasOutput": false},
+        "UntagCertificateAuthority": {"input": null, "output": null, "hasOutput": false},
+        "UpdateCertificateAuthority": {"input": null, "output": null, "hasOutput": false}
+      },
+      "shapes": {
+        "CertificateAuthorities": {"type": "list", "member": "CertificateAuthority"},
+        "CertificateAuthority": {"type": "structure", "members": {"CreatedAt": {"shape": "TStamp"}, "LastStateChangeAt": {"shape": "TStamp"}, "NotBefore": {"shape": "TStamp"}, "NotAfter": {"shape": "TStamp"}, "RestorableUntil": {"shape": "TStamp"}}},
+        "CertificateBodyBlob": {"type": "blob"},
+        "CertificateChainBlob": {"type": "blob"},
+        "CsrBlob": {"type": "blob"},
+        "DescribeCertificateAuthorityAuditReportResponse": {"type": "structure", "members": {"CreatedAt": {"shape": "TStamp"}}},
+        "DescribeCertificateAuthorityResponse": {"type": "structure", "members": {"CertificateAuthority": {"shape": "CertificateAuthority"}}},
+        "ImportCertificateAuthorityCertificateRequest": {"type": "structure", "members": {"Certificate": {"shape": "CertificateBodyBlob"}, "CertificateChain": {"shape": "CertificateChainBlob"}}},
+        "IssueCertificateRequest": {"type": "structure", "members": {"Csr": {"shape": "CsrBlob"}}},
+        "ListCertificateAuthoritiesResponse": {"type": "structure", "members": {"CertificateAuthorities": {"shape": "CertificateAuthorities"}}},
+        "ListPermissionsResponse": {"type": "structure", "members": {"Permissions": {"shape": "PermissionList"}}},
+        "Permission": {"type": "structure", "members": {"CreatedAt": {"shape": "TStamp"}}},
+        "PermissionList": {"type": "list", "member": "Permission"},
+        "TStamp": {"type": "timestamp"}
       }
     },
     "apigatewayv2": {
@@ -1055,6 +1096,14 @@
         "Time": {"type": "timestamp"},
         "TimeRange": {"type": "structure", "members": {"start": {"shape": "Timestamp"}, "end": {"shape": "Timestamp"}}},
         "Timestamp": {"type": "timestamp"}
+      }
+    },
+    "codedeploy-commands": {
+      "timestampFormat": "unixTimestamp",
+      "operations": {
+        "PutHostCommandComplete": {"input": null, "output": null, "hasOutput": false}
+      },
+      "shapes": {
       }
     },
     "codepipeline": {
