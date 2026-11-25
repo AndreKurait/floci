@@ -498,6 +498,16 @@ class SecurityGroupFirewallDockerNightlyIntegrationTest {
         return docker.inspectExecCmd(id).exec().getExitCodeLong().intValue();
     }
 
+    private int execute(String worker, String... command) throws Exception {
+        String id = docker.execCreateCmd(worker).withAttachStdout(true).withAttachStderr(true)
+                .withCmd(command)
+                .exec().getId();
+        try (ResultCallback.Adapter<Frame> callback = new ResultCallback.Adapter<>()) {
+            assertTrue(docker.execStartCmd(id).exec(callback).awaitCompletion(5, TimeUnit.SECONDS));
+        }
+        return docker.inspectExecCmd(id).exec().getExitCodeLong().intValue();
+    }
+
     private static SecurityGroup group(String id, boolean egress, String cidr) {
         SecurityGroup group = new SecurityGroup();
         group.setGroupId(id);

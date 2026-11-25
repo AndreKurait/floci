@@ -13,6 +13,7 @@ import io.floci.aws.core.common.SweepWorker;
 import io.floci.aws.core.common.dns.DnsClientVpcSource;
 import io.floci.aws.core.common.dns.EmbeddedDnsServer;
 import io.floci.aws.core.common.docker.ContainerBuilder;
+import io.floci.aws.core.common.docker.ContainerExec;
 import io.floci.aws.core.common.docker.ContainerLifecycleManager;
 import io.floci.aws.core.common.docker.ContainerSpec;
 import io.floci.aws.core.common.docker.ContainerStorageHelper;
@@ -237,7 +238,24 @@ public class SecurityGroupFirewallManager implements DnsClientVpcSource {
                 .withLabels(extraLabels);
         linkLocalIps.forEach(builder::withLinkLocalIp);
         return startHelper(builder, resourceId, "protected",
-                helperId -> apply(helperId, SecurityGroupNftCompiler.initialRuleset()));
+                helperId -> {
+                    apply(helperId, SecurityGroupNftCompiler.initialRuleset());
+                    configureProtectedResolver(helperId);
+                });
+    }
+
+    private void configureProtectedResolver(String helperId) {
+        String resolver = embeddedDnsServer.getServerIp().orElse(null);
+        if (resolver != null) {
+            // Docker's resolver does not forward from internal networks. Workloads inherit
+            // this file, so finish configuring the VPC resolver before admitting any workload.
+            ContainerExec.Result result = ContainerExec.run(dockerClient, helperId, new String[]{
+                    "sh", "-c", "printf 'nameserver %s\\noptions ndots:0\\n' \"$1\" > /etc/resolv.conf",
+                    "floci-vpc-dns", resolver}, 10).throwIfTimedOut(helperId);
+            if (result.exitCode() != 0) {
+                throw new IllegalStateException("Cannot configure namespace DNS: " + result.summary());
+            }
+        }
     }
 
     /**
