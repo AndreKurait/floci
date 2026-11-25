@@ -2,11 +2,13 @@ package io.floci.aws.services.lambda.launcher;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.CopyArchiveToContainerCmd;
+import com.github.dockerjava.transport.DockerHttpClient;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.docker.ContainerBuilder;
 import io.floci.aws.core.common.docker.ContainerLifecycleManager;
 import io.floci.aws.core.common.docker.ContainerLogStreamer;
+import io.floci.aws.core.common.docker.DockerExitEvents;
 import io.floci.aws.core.common.docker.DockerHostResolver;
 import io.floci.aws.core.common.docker.LaunchedContainerAwsEnv;
 import io.floci.aws.services.ecr.registry.EcrRegistryManager;
@@ -66,12 +68,12 @@ class ContainerLauncherCodeVolumeReuseTest {
 
         RecordingLauncher(ContainerLifecycleManager lifecycleManager, EmulatorConfig config) {
             super(mock(ContainerBuilder.class), lifecycleManager, mock(DockerClient.class),
-                    mock(ContainerLogStreamer.class),
+                    mock(DockerHttpClient.class), mock(ContainerLogStreamer.class),
                     mock(ImageResolver.class), mock(RuntimeApiServerFactory.class),
                     mock(DockerHostResolver.class), config, new RegionResolver("us-east-1", "000000000000"),
                     mock(EcrRegistryManager.class),
                     mock(LambdaLayerService.class), mock(LaunchedContainerAwsEnv.class),
-                    mock(LambdaExecutionRoleCredentials.class), null);
+                    mock(LambdaExecutionRoleCredentials.class), null, mock(DockerExitEvents.class));
         }
 
         @Override
@@ -283,11 +285,12 @@ class ContainerLauncherCodeVolumeReuseTest {
         when(containerBuilder.newContainer("img")).thenReturn(builder);
         when(builder.build()).thenThrow(new IllegalStateException("stop before Docker"));
         ContainerLauncher real = new ContainerLauncher(containerBuilder, lifecycleManager,
-                mock(DockerClient.class), mock(ContainerLogStreamer.class), mock(ImageResolver.class),
+                mock(DockerClient.class), mock(DockerHttpClient.class), mock(ContainerLogStreamer.class), mock(ImageResolver.class),
                 mock(RuntimeApiServerFactory.class), mock(DockerHostResolver.class), config,
                 new RegionResolver("us-east-1", "000000000000"),
                 mock(EcrRegistryManager.class), mock(LambdaLayerService.class),
-                mock(LaunchedContainerAwsEnv.class), mock(LambdaExecutionRoleCredentials.class), null);
+                mock(LaunchedContainerAwsEnv.class), mock(LambdaExecutionRoleCredentials.class), null,
+                mock(DockerExitEvents.class));
 
         assertThrows(IllegalStateException.class,
                 () -> real.populateCodeVolume("vol", fn("sha"), "img"));

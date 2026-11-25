@@ -4,6 +4,21 @@ Floci emulates the AWS services listed below on a single port (`4566`). All serv
 
 This page is the canonical reference for supported service and operation counts. Some services expose separate control-plane and data-plane rows below. Other docs (and the README) should link here rather than duplicating the table.
 
+## Smithy RPC v2 CBOR
+
+Services with a JSON `X-Amz-Target` endpoint also accept Smithy RPC v2 CBOR at
+`POST /service/{serviceName}/operation/{operation}`, with `Content-Type: application/cbor`
+and `smithy-protocol: rpc-v2-cbor`. The service name is its target prefix without the final dot;
+for example, CodeBuild uses `/service/CodeBuild_20161006/operation/ListProjects`. SDKs that
+select this protocol use the same operations, accounts, regions, and IAM checks as JSON clients.
+
+Modeled blobs use CBOR byte strings. Modeled timestamps use tag 1 with epoch seconds, including
+members whose JSON form is an ISO date. An operation without an output shape returns no body or
+content type. Event-stream operations retain AWS event-stream framing and encode each event payload
+as CBOR, including modeled binary records and timestamps. The existing root-path, `X-Amz-Target`
+legacy CBOR routes retain their own dialect;
+its timestamp conventions do not change.
+
 ## Service Matrix
 
 Operation counts are exact. For dispatch-table services (Query and JSON 1.1) each count reflects one case per AWS action in the handler. For REST-based services the count reflects distinct AWS SDK operations, collapsing routes where one JAX-RS handler fans out via query-string or header markers (e.g. `PUT /{bucket}/{key}` → `PutObject`, `PutObjectTagging`, `PutObjectAcl`, etc.). `make docs-check` checks every count against the handlers that serve it, except S3's, which is kept by hand because its handlers pick most operations by query string.
@@ -16,13 +31,13 @@ Operation counts are exact. For dispatch-table services (Query and JSON 1.1) eac
 | [S3](s3.md) | `/{bucket}/{key}` | REST XML | 58 |
 | [S3 Vectors](s3vectors.md) | `POST /{OperationName}` | REST JSON | 16 |
 | [S3 Tables](s3tables.md) | `/buckets`, `/namespaces/*`, `/tables/*` | REST JSON | 27 |
-| [DynamoDB](dynamodb.md) | `POST /` + `X-Amz-Target: DynamoDB_20120810.*` | JSON 1.1 | 53 |
+| [DynamoDB](dynamodb.md) | `POST /` + `X-Amz-Target: DynamoDB_20120810.*` | JSON 1.1 | 54 |
 | [DynamoDB Streams](dynamodb.md#streams) | `POST /` + `X-Amz-Target: DynamoDBStreams_20120810.*` | JSON 1.1 | 4 |
-| [Lambda](lambda.md) | `/2015-03-31/functions/...` + `/2025-12-01/durable-executions/...` | REST JSON | 68 |
+| [Lambda](lambda.md) | `/2015-03-31/functions/...` + `/2025-12-01/durable-executions/...` | REST JSON | 69 |
 | [Lambda MicroVMs](lambda-microvms.md) | `/2025-09-09/...` + `/2026-04-04/...` | REST JSON | 23 |
 | [Lambda Web Functions](lambda-web-functions.md) | `/2025-03-07/web-functions/...` | REST JSON | 20 |
-| [API Gateway v1](api-gateway.md) | `/restapis/...` | REST JSON | 101 |
-| [API Gateway v2](api-gateway.md#v2) | `/v2/apis/...` | REST JSON | 66 (+ the data plane) |
+| [API Gateway v1](api-gateway.md) | `/restapis/...` | REST JSON | 102 |
+| [API Gateway v2](api-gateway.md#v2) | `/v2/apis/...` | REST JSON | 67 (+ the data plane) |
 | [IAM](iam.md) | `POST /` with `Action=` param | Query | 180 |
 | [STS](sts.md) | `POST /` with `Action=` param | Query | 11 |
 | [AWS Sign-In](iam.md#aws-sign-in-login-credentials) | `/v1/authorize`, `/v1/token` | REST JSON | 2 |
@@ -35,14 +50,14 @@ Operation counts are exact. For dispatch-table services (Query and JSON 1.1) eac
 | [Kinesis](kinesis.md) | `POST /` + `X-Amz-Target: Kinesis_20131202.*` | JSON 1.1 | 32 |
 | [Managed Service for Apache Flink](kinesisanalytics.md) | `POST /` + `X-Amz-Target: KinesisAnalytics_20180523.*` | JSON 1.1 | 15 |
 | [Payment Cryptography](payment-cryptography.md) | `POST /` + `X-Amz-Target: PaymentCryptographyControlPlane.*` | JSON 1.0 | 32 |
-| [Payment Cryptography data plane](payment-cryptography-data.md) | `POST /keys/{KeyIdentifier}/encrypt` and the rest | REST JSON | 13 |
+| [Payment Cryptography data plane](payment-cryptography-data.md) | `POST /keys/{KeyIdentifier}/encrypt` and the rest | REST JSON | 14 |
 | [Secrets Manager](secrets-manager.md) | `POST /` + `X-Amz-Target: secretsmanager.*` | JSON 1.1 | 23 |
 | [Step Functions](step-functions.md) | `POST /` + `X-Amz-Target: AmazonStatesService.*` | JSON 1.1 | 32 |
 | [SWF](swf.md) | `POST /` + `X-Amz-Target: SimpleWorkflowService.*` | JSON 1.0 | 39 |
 | [CloudFormation](cloudformation.md) | `POST /` with `Action=` param | Query | 36 |
 | [Cloud Control API](cloudcontrol.md) | `POST /` + `X-Amz-Target: CloudApiService.*` | JSON 1.1 | 5 |
 | [EventBridge](eventbridge.md) | `POST /` + `X-Amz-Target: AmazonEventBridge.*` | JSON 1.1 | 41 |
-| [EventBridge V2](eventbridgev2.md) | `POST /service/AWSEventsV2/operation/*` | Smithy RPC v2 CBOR | 10 |
+| [EventBridge V2](eventbridgev2.md) | `POST /service/AWSEventsV2/operation/*` | Smithy RPC v2 CBOR | 15 |
 | [EventBridge Scheduler](scheduler.md) | `/schedules/*`, `/schedule-groups/*`, `/tags/*` | REST JSON | 12 |
 | [EventBridge Pipes](pipes.md) | `/v1/pipes/*` | REST JSON | 10 |
 | [CloudWatch OAM](oam.md) | REST paths such as `POST /CreateSink` and `POST /CreateLink` | REST JSON | 15 |
@@ -68,7 +83,7 @@ Operation counts are exact. For dispatch-table services (Query and JSON 1.1) eac
 | [ElastiCache](elasticache.md) | `POST /` with `Action=` param + TCP proxy | Query + RESP | 38 |
 | [MemoryDB](memorydb.md) | `POST /` + `X-Amz-Target: AmazonMemoryDB.*` + TCP proxy | JSON 1.1 + RESP | 13 |
 | [Aurora DSQL](dsql.md) | `/cluster`, `/cluster/{identifier}`, `/cluster/{identifier}/policy` + TLS endpoint | REST JSON + wire | 9 |
-| [RDS](rds.md) | `POST /` with `Action=` param + TCP proxy | Query + wire | 121 |
+| [RDS](rds.md) | `POST /` with `Action=` param + TCP proxy | Query + wire | 125 |
 | [RDS Data API](rds-data.md) | `/Execute`, `/BatchExecute`, `/BeginTransaction`, `/CommitTransaction`, `/RollbackTransaction` | REST JSON | 5 |
 | [Timestream for InfluxDB](timestream-influxdb.md) | `POST /` + `X-Amz-Target: AmazonTimestreamInfluxDB.*` + InfluxDB container | JSON 1.0 + InfluxDB HTTP | 24 |
 | [MSK](msk.md) | `/v1/clusters/...`, `/api/v2/clusters/...` + Redpanda broker | REST JSON + Kafka | 21 |
@@ -108,7 +123,7 @@ Operation counts are exact. For dispatch-table services (Query and JSON 1.1) eac
 | [Bedrock Runtime](bedrock-runtime.md) | `/model/{modelId}/converse`, `/model/{modelId}/converse-stream`, `/model/{modelId}/invoke` | REST JSON | 3 (`InvokeModelWithResponseStream` answers 501) |
 | [Bedrock AgentCore Control](bedrock-agentcore.md) | `/runtimes/*`, `/gateways/*`, `/memories/*`, `/identities/*`, `/browsers*`, `/browser-profiles*`, `/code-interpreters*`, `/harnesses*`, `/resourcepolicy/*`, `/tags/{resourceArn}` | REST JSON | 71 (+ 3 tagging via shared `/tags/{arn}` route) |
 | [Bedrock AgentCore](bedrock-agentcore.md#data-plane-invokeagentruntime) | `/runtimes/{agentRuntimeArn}/invocations` | REST JSON (binary payload) | 1 (canned-response stub) |
-| [EKS](eks.md) | `/clusters`, `/clusters/{name}`, `/tags/{resourceArn}` | REST JSON | 35 |
+| [EKS](eks.md) | `/clusters`, `/clusters/{name}`, `/tags/{resourceArn}` | REST JSON | 36 |
 | [ELB v2](elb.md) | `POST /` with `Action=` param | Query | 37 |
 | [ELB Classic (v1)](elb-classic.md) | `POST /` with `Action=` and `Version=2012-06-01` | Query | 20 |
 | [WAF v2](wafv2.md) | `POST /` + `X-Amz-Target: AWSWAF_20190729.*` | JSON 1.1 | 35 |
@@ -133,10 +148,10 @@ Operation counts are exact. For dispatch-table services (Query and JSON 1.1) eac
 | [AWS FIS](fis.md) | `/experimentTemplates/*`, `/experiments/*`, `/actions/*`, `/targetResourceTypes/*`, `/safetyLevers/*`, `/tags/*` | REST JSON | 26 |
 | [CodeGuru Reviewer](codegurureviewer.md) | `/associations`, `/associations/{associationArn}`, `/tags/*` | REST JSON | 7 |
 | [CodeArtifact](codeartifact.md) | `/v1/domain*`, `/v1/repository*`, `/v1/package`, `/v1/package/version*`, `/v1/package-group*`, `/v1/list-associated-packages`, `/v1/get-associated-package-group`, `/v1/tag*`, `/v1/authorization-token`, `/codeartifact/maven/*`, `/codeartifact/npm/*`, `/codeartifact/pypi/*` | REST JSON | 48 |
-| [CloudFront](cloudfront.md) | `/2020-05-31/distribution/*`, `/2020-05-31/cache-policy/*`, `/2020-05-31/function/*`, `/2020-05-31/key-value-store/*` | REST XML | 97 |
+| [CloudFront](cloudfront.md) | `/2020-05-31/distribution/*`, `/2020-05-31/cache-policy/*`, `/2020-05-31/function/*`, `/2020-05-31/key-value-store/*` | REST XML | 111 |
 | [CloudFront KeyValueStore](cloudfront.md#key-value-stores) | `/key-value-stores/*` | REST JSON | 6 |
 | [Route53](route53.md) | `/2013-04-01/hostedzone/*`, `/2013-04-01/healthcheck/*`, `/2013-04-01/change/*`, `/2013-04-01/delegationset/*` | REST XML | 31 |
-| [Route 53 Resolver](route53resolver.md) | `POST /` + `X-Amz-Target: Route53Resolver.*` | JSON 1.1 | 24 |
+| [Route 53 Resolver](route53resolver.md) | `POST /` + `X-Amz-Target: Route53Resolver.*` | JSON 1.1 | 25 |
 | [Amazon SageMaker](sagemaker.md) | `POST /` + `X-Amz-Target: SageMaker.*` | JSON 1.1 | 20 |
 | [SageMaker Runtime](sagemaker.md#endpoint-hosting) | `/endpoints/{EndpointName}/invocations` | REST (binary payload) | 1 |
 | [Cloud Map](cloudmap.md) | `POST /` + `X-Amz-Target: Route53AutoNaming_v20170314.*` | JSON 1.1 | 22 |
@@ -154,7 +169,7 @@ Operation counts are exact. For dispatch-table services (Query and JSON 1.1) eac
 | [BCM Data Exports](bcm-data-exports.md) | `POST /` + `X-Amz-Target: AWSBillingAndCostManagementDataExports.*` | JSON 1.1 | 7 |
 | [Transfer Family](transfer.md) | `POST /` + `X-Amz-Target: TransferService.*` | JSON 1.1 | 17 |
 | [DataSync](datasync.md) | `POST /` + `X-Amz-Target: FmrsService.*` | JSON 1.1 | 48 |
-| [IoT Core](iot.md) | `/things/...`, `/endpoint`, rules/policies REST paths | REST JSON | 83 |
+| [IoT Core](iot.md) | `/things/...`, `/endpoint`, rules/policies REST paths | REST JSON | 85 |
 | [IoT Data](iot.md#iot-data) | `/things/{thingName}/shadow`, MQTT topics | REST JSON | 11 |
 
 **Lambda, ElastiCache, RDS, MSK, MWAA, ECS, EKS, and OpenSearch** spin up real Docker containers and support IAM authentication and SigV4 request signing, the same auth flow as production AWS. **RDS Data API** executes SQL against the local RDS containers through AWS-compatible REST JSON routes.

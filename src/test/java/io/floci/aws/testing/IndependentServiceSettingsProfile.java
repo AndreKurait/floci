@@ -22,7 +22,7 @@ import java.util.Map;
  *   token as soon as it is issued. {@code KinesisListShardsTokenExpiryIntegrationTest} relies on
  *   it.</li>
  *   <li>{@code floci.services.neptune.db-type=neo4j} backs a new cluster with Neo4j rather than
- *   Gremlin Server. {@code NeptuneOpenCypherIntegrationTest} relies on it.</li>
+ *   Gremlin Server. {@code NeptuneOpenCypherDockerNightlyIntegrationTest} relies on it.</li>
  *   <li>{@code floci.services.route53.vpc-association-control-plane-delay-ms=150} keeps a hosted
  *   zone busy for 150 ms after a VPC association or authorization change, so an overlapping change
  *   is refused.
@@ -39,7 +39,7 @@ import java.util.Map;
  *   <li>{@code floci.services.rds-data.database-resuming-exception-enabled=true} answers a
  *   statement sent to a paused Aurora Serverless cluster with DatabaseResumingException, and
  *   {@code floci.services.rds.aurora-resume-delay-millis=5000} keeps the cluster resuming for five
- *   seconds. {@code RdsDataResumingIntegrationTest} relies on both.</li>
+ *   seconds. {@code RdsDataResumingDockerNightlyIntegrationTest} relies on both.</li>
  *   <li>{@code floci.services.firehose.flush-record-count=1} delivers every record to S3 as soon as
  *   it arrives. {@code FirehoseFlushRecordCountIntegrationTest} relies on it.</li>
  *   <li>{@code floci.services.lambda.runtime-images."python3.12"} pins the {@code python3.12}
@@ -51,7 +51,7 @@ import java.util.Map;
  *   {@code floci.services.iot.mqtt.port=}{@value #IOT_MQTT_PORT} pin to an address it knows.</li>
  *   <li>{@code floci.services.ec2.mock=false} runs instances as real containers, and
  *   {@code floci.services.ec2.volume-block-devices=true} attaches EBS volumes to them as block
- *   devices. {@code Ec2VolumeBlockDeviceDockerIntegrationTest} relies on both.</li>
+ *   devices. {@code Ec2VolumeBlockDeviceDockerNightlyIntegrationTest} relies on both.</li>
  *   <li>{@code floci.services.sagemaker.gpu.enabled=true} gives a training job on a GPU instance
  *   type a GPU, and fails a job whose GPU request Floci cannot honour rather than training it on
  *   CPU. {@code SageMakerGpuIntegrationTest} relies on it.</li>
@@ -72,11 +72,14 @@ import java.util.Map;
  *   reports as the applied value of the standard On-Demand vCPU quota.
  *   {@code ServiceQuotasAppliedValueIntegrationTest} relies on it. EC2 only enforces that quota
  *   when {@code floci.services.ec2.enforce-vcpu-quotas} is on, which it is not here, so
- *   {@code Ec2VolumeBlockDeviceDockerIntegrationTest}'s instances never meet it.</li>
+ *   {@code Ec2VolumeBlockDeviceDockerNightlyIntegrationTest}'s instances never meet it.</li>
  *   <li>{@code floci.services.elbv2.mock=false} runs the real ELBv2 data plane, so a listener
  *   forwards to its targets, and {@code floci.services.elbv2.backend-keep-alive=false} opens a
  *   fresh connection to the target for every request it forwards.
  *   {@code ElbV2BackendNoKeepAliveIntegrationTest} relies on both.</li>
+ *   <li>{@code floci.services.glue.runner-mode=docker} runs a Spark job's script through the Docker
+ *   runner rather than simulating the run. {@code GlueScriptRunIntegrationTest} relies on it, with
+ *   the container replaced by a mock runner.</li>
  * </ul>
  *
  * <p>Each override is inert for the other classes. Each one is read by a single service: the
@@ -84,7 +87,7 @@ import java.util.Map;
  * Neptune cluster creation, Route53 VPC association and authorization, CloudFront origin fetches,
  * Cognito app client validation, the Scheduler dispatcher, the RDS Data API and Aurora auto-pause,
  * Firehose delivery, the Lambda runtime image resolver, the IoT MQTT broker, EC2, SageMaker
- * training jobs, Bedrock Runtime, ElastiCache, Service Quotas and the ELBv2 data plane, which
+ * training jobs, Bedrock Runtime, ElastiCache, Service Quotas, Glue job runs and the ELBv2 data plane, which
  * only acts once a class creates a listener or registers a target. Each class is the only one here
  * that calls its service, so no override reaches another class. Strict claiming is read for every
  * request, but only changes the answer to an RPC-signaled request no protocol claims, which only
@@ -134,7 +137,8 @@ public class IndependentServiceSettingsProfile implements QuarkusTestProfile {
                 Map.entry("floci.protocols.strict-claiming", "true"),
                 Map.entry("floci.services.servicequotas.standard-on-demand-vcpus", "7"),
                 Map.entry("floci.services.elbv2.mock", "false"),
-                Map.entry("floci.services.elbv2.backend-keep-alive", "false")));
+                Map.entry("floci.services.elbv2.backend-keep-alive", "false"),
+                Map.entry("floci.services.glue.runner-mode", "docker")));
         overrides.putAll(new YamlConfigSource("runtime-images", """
                 floci:
                   services:

@@ -14,12 +14,15 @@ import software.amazon.awssdk.services.paymentcryptography.model.KeyUsage;
 import software.amazon.awssdk.services.paymentcryptographydata.PaymentCryptographyDataClient;
 import software.amazon.awssdk.services.paymentcryptographydata.model.EncryptionDecryptionAttributes;
 import software.amazon.awssdk.services.paymentcryptographydata.model.EncryptionMode;
+import software.amazon.awssdk.services.paymentcryptographydata.model.GenerateAs2805KekValidationResponse;
 import software.amazon.awssdk.services.paymentcryptographydata.model.GenerateMacRequest;
 import software.amazon.awssdk.services.paymentcryptographydata.model.IncomingDiffieHellmanTr31KeyBlock;
 import software.amazon.awssdk.services.paymentcryptographydata.model.KeyDerivationFunction;
 import software.amazon.awssdk.services.paymentcryptographydata.model.KeyDerivationHashAlgorithm;
 import software.amazon.awssdk.services.paymentcryptographydata.model.MacAlgorithm;
 import software.amazon.awssdk.services.paymentcryptographydata.model.MacAttributes;
+import software.amazon.awssdk.services.paymentcryptographydata.model.RandomKeyMaxLength;
+import software.amazon.awssdk.services.paymentcryptographydata.model.RandomKeySendVariantMask;
 import software.amazon.awssdk.services.paymentcryptographydata.model.ReEncryptionAttributes;
 import software.amazon.awssdk.services.paymentcryptographydata.model.SymmetricEncryptionAttributes;
 import software.amazon.awssdk.services.paymentcryptographydata.model.SymmetricKeyAlgorithm;
@@ -198,6 +201,67 @@ class PaymentCryptographyDataPlaneTest {
     }
 
     @Test
+    void aHashedMacIsMadeUnderAKeyThatCarriesTheHash() {
+        // The reference's guide: a key whose algorithm is a keyed hash carries the hash, and
+        // the request names the mac by the name of the family.
+        String hmacKeyArn = TestFixtures.paymentCryptographyClient().createKey(r -> r
+                .keyAttributes(a -> a
+                        .keyAlgorithm(KeyAlgorithm.HMAC_SHA256)
+                        .keyClass(KeyClass.SYMMETRIC_KEY)
+                        .keyUsage(KeyUsage.TR31_M7_HMAC_KEY)
+                        .keyModesOfUse(m -> m.generate(true).verify(true)))
+                .exportable(true))
+                .key().keyArn();
+
+        String value = client.generateMac(r -> r
+                .keyIdentifier(hmacKeyArn)
+                .messageData(MESSAGE)
+                .generationAttributes(MacAttributes.builder()
+                        .algorithm(MacAlgorithm.HMAC)
+                        .build()))
+                .mac();
+
+        // The length is ignored for the keyed hash, so the mac is the whole hash: sixty-four
+        // hexadecimal characters of SHA-256.
+        assertThat(value).hasSize(64);
+
+        client.verifyMac(r -> r
+                .keyIdentifier(hmacKeyArn)
+                .messageData(MESSAGE)
+                .mac(value)
+                .verificationAttributes(MacAttributes.builder()
+                        .algorithm(MacAlgorithm.HMAC)
+                        .build()));
+    }
+
+    @Test
+    void aKeyEncryptsInEveryModeTheReferenceNames() {
+        for (EncryptionMode mode : new EncryptionMode[] {EncryptionMode.ECB, EncryptionMode.CBC,
+                EncryptionMode.CFB, EncryptionMode.CFB1, EncryptionMode.CFB8, EncryptionMode.CFB64,
+                EncryptionMode.CFB128, EncryptionMode.OFB}) {
+            String cipherText = client.encryptData(r -> r
+                    .keyIdentifier(keyArn)
+                    .plainText(PLAIN_TEXT)
+                    .encryptionAttributes(EncryptionDecryptionAttributes.builder()
+                            .symmetric(SymmetricEncryptionAttributes.builder().mode(mode).build())
+                            .build()))
+                    .cipherText();
+
+            assertThat(cipherText).hasSize(PLAIN_TEXT.length());
+
+            String plainText = client.decryptData(r -> r
+                    .keyIdentifier(keyArn)
+                    .cipherText(cipherText)
+                    .decryptionAttributes(EncryptionDecryptionAttributes.builder()
+                            .symmetric(SymmetricEncryptionAttributes.builder().mode(mode).build())
+                            .build()))
+                    .plainText();
+
+            assertThat(plainText).isEqualTo(PLAIN_TEXT);
+        }
+    }
+
+    @Test
     void aMacOfAnotherMessageIsRefused() {
         String value = client.generateMac(r -> r
                 .keyIdentifier(macKeyArn)
@@ -234,6 +298,49 @@ class PaymentCryptographyDataPlaneTest {
                         .build())));
         assertThat(refusal.awsErrorDetails().errorCode()).isEqualTo("ResourceNotFoundException");
         assertThat(refusal.statusCode()).isEqualTo(404);
+    }
+
+    @Test
+    @DisplayName("A key encryption key answers a KEK validation of itself")
+    void aKeyEncryptionKeyAnswersAKeyEncryptionKeyValidationOfItself() {
+        String kekArn;
+        try (PaymentCryptographyClient control = TestFixtures.paymentCryptographyClient()) {
+            kekArn = control.createKey(r -> r
+                    .keyAttributes(a -> a
+                            .keyAlgorithm(KeyAlgorithm.TDES_2_KEY)
+                            .keyClass(KeyClass.SYMMETRIC_KEY)
+                            .keyUsage(KeyUsage.TR31_K0_KEY_ENCRYPTION_KEY)
+                            .keyModesOfUse(m -> m.encrypt(true).decrypt(true)))
+                    .exportable(true))
+                    .key().keyArn();
+        }
+        // Every key the test made is deleted when the class is done with it.
+        keyArns.add(kekArn);
+
+        // The node that starts the exchange makes a random number and answers with the two
+        // numbers the ceremony is made of.
+        GenerateAs2805KekValidationResponse asked = client.generateAs2805KekValidation(r -> r
+                .keyIdentifier(kekArn)
+                .randomKeySendVariantMask(RandomKeySendVariantMask.VARIANT_MASK_82)
+                .kekValidationType(t -> t.kekValidationRequest(q -> q
+                        .deriveKeyAlgorithm(SymmetricKeyAlgorithm.TDES_2_KEY)
+                        .randomKeyMaxLength(RandomKeyMaxLength.BYTES_16))));
+
+        assertThat(asked.keyArn()).isEqualTo(kekArn);
+        assertThat(asked.keyCheckValue()).hasSize(6);
+        assertThat(asked.randomKeySend()).hasSize(32);
+        assertThat(asked.randomKeyReceive()).hasSize(32);
+
+        // The node that answers deciphers the number it was given and answers with the
+        // inverted value, which is the one the first node expects.
+        GenerateAs2805KekValidationResponse answered = client.generateAs2805KekValidation(r -> r
+                .keyIdentifier(kekArn)
+                .randomKeySendVariantMask(RandomKeySendVariantMask.VARIANT_MASK_82)
+                .kekValidationType(t -> t.kekValidationResponse(q -> q
+                        .randomKeySend(asked.randomKeySend()))));
+
+        assertThat(answered.randomKeySend()).isEqualTo(asked.randomKeySend());
+        assertThat(answered.randomKeyReceive()).isEqualTo(asked.randomKeyReceive());
     }
 
     /** Bytes as the data plane carries them: hexadecimal. */

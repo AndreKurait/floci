@@ -70,8 +70,8 @@ Floci emulates the Amazon EMR (Elastic MapReduce) management API. Clusters (job 
 | `RemoveAutoTerminationPolicy` | Removes a cluster's auto termination policy |
 | `PutAutoScalingPolicy` | Attaches an automatic scaling policy to a core or task instance group |
 | `RemoveAutoScalingPolicy` | Removes an instance group's automatic scaling policy |
-| `ListReleaseLabels` | List release labels, newest first, by prefix or application; see [Release catalogue](#release-catalogue) |
-| `DescribeReleaseLabel` | A release's applications and Amazon Linux releases (the latest release without a label) |
+| `ListReleaseLabels` | List release labels, in AWS's order, by prefix or application; see [Release catalogue](#release-catalogue) |
+| `DescribeReleaseLabel` | A release's applications and Amazon Linux releases (the first one listed without a label) |
 | `ListSupportedInstanceTypes` | The instance types a release supports, with vCPU, memory, storage and architecture |
 | `GetBlockPublicAccessConfiguration` | Returns the account's block public access configuration for the Region |
 | `PutBlockPublicAccessConfiguration` | Sets the account's block public access configuration for the Region |
@@ -96,6 +96,35 @@ them returns.
 adding that it "is idempotent but asynchronous". On an earlier release a `RUNNING` step answers `FAILED` with "Step
 is not in a cancellable state: RUNNING".
 
+`DescribeCluster`'s `Ec2InstanceAttributes` give back what `RunJobFlow`'s `Instances` asked for. The subnet is the one
+`Ec2SubnetId` names, else the first of the instance fleets' `Ec2SubnetIds`, from which EMR "chooses the Amazon EC2
+subnet with the best fit"; the availability zone is the one `Placement` names, else the first of its
+`AvailabilityZones`. `RequestedEc2SubnetIds` and `RequestedEc2AvailabilityZones` are the ones requested, an empty
+list when none was, as AWS gives them, and a request naming both is refused with `ValidationException`, as
+"RequestedEc2SubnetIDs and RequestedEc2AvailabilityZones cannot be specified together"; AWS's wording for it is not
+documented, so it is Floci's. `IamInstanceProfile` is the `JobFlowRole`, "The IAM role that was specified when the
+cluster was launched", and `AdditionalMasterSecurityGroups` and `AdditionalSlaveSecurityGroups` are the ones given.
+
+`DescribeCluster` also gives back the cluster's own settings as `RunJobFlow` took them: `EbsRootVolumeIops`,
+`EbsRootVolumeThroughput`, `LogEncryptionKmsKeyId`, `RepoUpgradeOnBoot`, `PlacementGroupConfigs` as its
+`PlacementGroups`, and `MonitoringConfiguration`. `RepoUpgradeOnBoot` "Applies only when CustomAmiID is used", and is
+`SECURITY` for a cluster with a custom AMI that names none, as "If omitted, the default is SECURITY".
+`OSReleaseLabel` is the one asked for, else the latest Amazon Linux release `DescribeReleaseLabel` lists for the
+cluster's release, as "If no Amazon Linux release was specified, the default Amazon Linux release is shown in the
+response". Of `KerberosAttributes` only the `Realm` is kept and given back, never a password, and a cluster without
+them answers an empty structure, as AWS does. A member the model requires (the `Realm` and `KdcAdminPassword`, a
+placement group's `InstanceRole`, a CloudWatch log configuration's `Enabled`) or a value outside its enum is refused
+with the framework's `ValidationException`. So are two placement groups for one instance role, and one for the primary
+nodes of a cluster without multiple primary nodes, in AWS's words: "Placement group supports single placement strategy
+for an instance role. Found multiple strategy for the following instance role: MASTER", and "Placement group support
+for master node is available only for multi-master cluster and not for single-master cluster." A cluster has multiple
+primary nodes with "an instance count value of 3 for the primary node instance group", or "the TargetOnDemandCapacity
+of 3, TargetSpotCapacity of 0 for the primary instance fleet". As "only primary node types are supported by the
+placement group strategy, and the SPREAD strategy is applied to those primary nodes", a placement group for another
+role, or with a strategy other than `SPREAD` or `NONE`, is refused with `ValidationException` too, in Floci's words.
+One without a strategy gets `SPREAD`, as "the MASTER instance role automatically uses SPREAD as the placement group
+strategy".
+
 The limits the API reference and the Management Guide give steps are checked, in each operation's own error code, in
 Floci's words, as no source gives AWS's: a `StepConcurrencyLevel` from 1 to 256 ("You can specify a minimum of 1 step
 and a maximum of 256 steps"), which `RunJobFlow` refuses with `ValidationException` and `ModifyCluster` with
@@ -105,8 +134,11 @@ given time", a `CANCEL_PENDING` one counted as running), which `RunJobFlow` and 
 step is not submitted and the action fails with a message that the ActionOnFailure setting is not valid"), which
 `AddJobFlowSteps` refuses with `ValidationException`, a step naming none taking `TERMINATE_CLUSTER`, as it is
 submitted, and so refused too; and `CancelSteps` "Available only
-in Amazon EMR versions 4.8.0 and later, excluding version 5.0.0", with at most 256 steps a request, refused otherwise
-with `InvalidRequestException`.
+in Amazon EMR versions 4.8.0 and later, excluding version 5.0.0", with at most 100 steps a request from release
+7.14.0 and 256 before it ("With Amazon EMR releases 7.14.0 and later, the maximum number of steps you can cancel per
+request is 100. With earlier releases, the maximum is 256 steps per request"), refused otherwise with
+`InvalidRequestException`. A `StepCancellationOption` other than `SEND_INTERRUPT` and `TERMINATE_PROCESS` gets the
+framework's enum message.
 
 In the `docker` runner mode a cancelled `RUNNING` step is `CANCEL_PENDING` while its driver stops, and keeps its
 place among the running steps until the driver is gone: then it is `CANCELLED`, and the next `PENDING` step starts.
@@ -114,7 +146,13 @@ That is Floci's reading of the Management Guide's "Canceling a running step does
 running, assuming no change to stepConcurrencyLevel", beside "Canceling a running or pending step removes that step
 from the active step count"; its step events have a `CANCEL_PENDING` row, "was cancelled at Time and is pending
 cancellation". Cancelling a `CANCEL_PENDING` step again answers `SUBMITTED`, and the step is `CANCELLED` however
-its driver ends. The step's container stops, and what the applications it started on YARN have logged goes to
+its driver ends. `StepCancellationOption` says how the driver goes, as the Management Guide's "Cancel steps" describes:
+with `SEND_INTERRUPT`, the default, "EMR sends a SIGTERM signal to the step", and the step's command, which a step's
+container runs under an init process so that the signal reaches it, may catch it to clean up, or runs on if it
+ignores it; with `TERMINATE_PROCESS` "EMR sends a SIGKILL signal to the step and all its descendant processes which
+terminates them immediately", as Floci's cancel always did. A `TERMINATE_PROCESS` cancel kills a step a
+`SEND_INTERRUPT` one left running, and a cluster's end kills it too. The step's container stops, and what the
+applications it started on YARN have logged goes to
 `containers/` (see **Output**), while an application in `--deploy-mode cluster` runs on to its end: EMR's cancel
 signals the step and its descendant processes, and "asynchronous processes are not affected", as the Management
 Guide puts it. In the `immediate` mode nothing runs, so a cancelled `RUNNING` step is `CANCELLED` at once and makes
@@ -145,7 +183,15 @@ synthetic IDs and addresses of the `MASTER`
 group's or fleet's instance first, so the primary node keeps `i-00000000000000001` and `10.0.0.1`, as
 `DescribeCluster`'s `MasterPublicDnsName` says, while the others resize, and every other instance's private
 address is `10.<group>.0.<n>`, its group's or fleet's number in the cluster and its own in it, so it too stays while
-another resizes. An instance fleet has an instance for each unit of its capacity, its on-demand ones first, each of the
+another resizes. `ModifyInstanceGroups`' `EC2InstanceIdsToTerminate` ends those instances of a group, which leave the
+listing and, in the `docker` runner mode, take their core or task node with them, its HDFS blocks moved first; "After
+you terminate the instances, the instance group will not return to its original requested size", so the group's
+requested and running counts go down by as many. The group's other instances keep their IDs, addresses and nodes, as
+do the cluster's other groups', and an instance the group gets later takes a new ID, not an ended one's. An
+`InstanceCount` beside them is the group's size after that. An ID that is not one of the group's instances is refused
+with `ValidationException`, and a `MASTER` group's with `InvalidRequestException`, as its count is; AWS's wording for
+these is not documented, so it is Floci's. An instance fleet has an instance for each unit of its capacity, its
+on-demand ones first, each of the
 first instance type in its `InstanceTypeConfigs`. `InstanceGroupId` and `InstanceGroupTypes` keep instance groups'
 instances, `InstanceFleetId` and `InstanceFleetType` instance fleets', and a call's filters all apply together.
 `ListInstances` retains each group's or fleet's
@@ -166,6 +212,16 @@ A cluster's `SecurityConfiguration` names one `CreateSecurityConfiguration` made
 `RunJobFlow` naming one that does not exist is refused with `ValidationException` "Security configuration does not
 exist: <name>"; no source gives AWS's answer, so the code is the one `RunJobFlow` refuses its other input with, and the
 wording that of `DescribeSecurityConfiguration` and `DeleteSecurityConfiguration`.
+A cluster made with `RunJobFlow`'s uniform form, `MasterInstanceType`, `SlaveInstanceType` and `InstanceCount` in place
+of `InstanceGroups` or `InstanceFleets`, gets the instance groups that form describes: "If the value is 1, the same
+instance serves as both the master and core and task node. If the value is greater than 1, one instance is the master
+node and all others are core and task nodes." That is a `MASTER` group of one `MasterInstanceType` instance and, for a
+count above 1, a `CORE` group of the rest as `SlaveInstanceType`, both `ON_DEMAND`. The master group is named
+`Master InstanceGroup`, as in `DescribeJobFlows`' sample response; no source names the core group, so Floci names it
+`Core InstanceGroup`. A single instance needs no `SlaveInstanceType`, as AWS runs one without it, but core nodes do, as
+"all three must be present": a request for more instances without it is refused with `ValidationException`
+"SlaveInstanceType is required when InstanceCount is greater than 1."; AWS's wording is not documented, so it is
+Floci's.
 A cluster has instance groups or instance fleets, never both, as "instance fleets and instance groups cannot coexist in a
 cluster": `RunJobFlow` with both is refused with `ValidationException` "The RunJobFlow request can contain
 InstanceFleets parameters or InstanceGroups parameters, but not both.", the API reference's own words, and
@@ -178,8 +234,45 @@ without its `InstanceType`, both required, is refused with the framework's `Vali
 neither bid price, the defaults the API reference gives, and its `EbsConfiguration` as one `EbsBlockDevice` per volume.
 The reference names no devices, so Floci names them `/dev/sdb`, `/dev/sdc` and on. A config attaching more than 25
 volumes to an instance is refused with `ValidationException` "There is a limit of 25 volumes per instance.", the
-Management Guide's own limit and sentence; AWS's error for it is not documented. `ModifyInstanceFleet` changes a
-fleet's target capacities only; the `InstanceTypeConfigs` it takes are not applied.
+Management Guide's own limit and sentence; AWS's error for it is not documented. A fleet keeps its
+`LaunchSpecifications`, `ResizeSpecifications` and `Context`, which `ListInstanceFleets` gives back, and
+`ModifyInstanceFleet` changes the target capacities, `ResizeSpecifications`, `InstanceTypeConfigs` and `Context` it
+gives; Floci provisions nothing the specifications would steer, so they change no instance. The configs replace the
+fleet's own, as the Management Guide's "Reconfiguring instance fleets" warns: "Not including fields can result in
+overwriting specifications you declared at launch". They must name every instance type the fleet has, as "You must
+include all instance types that are part of your instance fleet in the modify request"; one that leaves a type out is
+refused with `InvalidRequestException`, AWS's error for it not being documented. Its configs are checked as
+`AddInstanceFleet` checks them, and on both calls specifications that are not an object, or a `Context` that is not a
+string, are refused with `SerializationException`, as every member of the wrong JSON type is.
+An instance group keeps its `EbsConfiguration` and `CustomAmiId`, from `RunJobFlow` or `AddInstanceGroups`, and
+`ListInstanceGroups` gives them back as its `EbsBlockDevices`, one per volume named as a fleet's are, its
+`EbsOptimized` and its `CustomAmiId`, under the same limit of 25 volumes per instance; its instances' EC2 descriptions
+give its `CustomAmiId` as their image, over the cluster's. `ListInstances` gives each instance its `PublicIpAddress`,
+the one its `PublicDnsName` names, in 203.0.113.0/24, RFC 5737's documentation range, for a cluster's first 254
+instances and past them in 100.64.0.0/10, RFC 6598's shared address space. It gives an `EbsVolumes` entry for each
+device its group or instance type config gives it, with a volume id of Floci's own that differs between clusters.
+`ModifyInstanceGroups` keeps a group's `ShrinkPolicy`, which `ListInstanceGroups` gives back, and a shrink it comes with
+follows its `InstanceResizePolicy`: it ends the "Specific list of instances to be terminated when shrinking an instance
+group" first, then the group's last instances, passing the "Specific list of instances to be protected when shrinking an
+instance group". Those instances end as `EC2InstanceIdsToTerminate` ends them, so their ids are not taken again, and a
+later entry of the same request for the group counts from what an earlier one leaves. An id to terminate that is not
+one of the group's running instances is refused with `ValidationException`, as `EC2InstanceIdsToTerminate` refuses it,
+and so is a shrink the protected instances leave short, rather than ending one of them; AWS's answer to either is not
+documented, so the wording is Floci's. Its `DecommissionTimeout` changes nothing, as Floci's nodes have no
+decommissioning to wait for.
+`ModifyInstanceGroups` keeps the `Configurations` it gives a group, which `ListInstanceGroups` gives back with the
+group's `ConfigurationsVersion`. With `ReconfigurationType` `MERGE` they are merged into the group's own, as the Release
+Guide's "Reconfigure an instance group in a running cluster" has it: "This option only adds or modifies the new
+configurations that you submit. It preserves existing configurations." A classification they name takes their
+properties over its own, and its nested configurations are merged the same way; the group's other classifications
+stay. `OVERWRITE`, the default, replaces them. `MERGE` is "supported for Amazon EMR releases 5.35.0 and 6.6.0 and
+later"; on an earlier release it is refused with `ValidationException`, in Floci's wording, and a type that is neither
+with the framework's enum message.
+A managed scaling policy, from `PutManagedScalingPolicy` or `RunJobFlow`, takes a `UtilizationPerformanceIndex` of 1,
+25, 50, 75 or 100 only, as the Management Guide's "Advanced Scaling for Amazon EMR" says: "If you set the index to
+values other than these, it results in a validation error." One outside the model's 1 to 100 is refused with the
+framework's `ValidationException`, and another with `ValidationException` in Floci's wording, as the guide gives none.
+The policy is kept and given back as written.
 
 A cluster that is `TERMINATING`, `TERMINATED` or `TERMINATED_WITH_ERRORS` also refuses `ModifyCluster`,
 the four `Set*` setters, and `Put` and `Remove` of its managed scaling, auto-termination and automatic
@@ -241,6 +334,11 @@ lifecycle on its cluster but runs no server for it.
   hour". AWS's endpoint is an `https://` URL per session without a port; a Spark Connect URL holds no path, so Floci's
   is its address alone, port included, and the token names the session. No `Credentials` are given. A session that has
   ended, or is `TERMINATING`, is refused with `InvalidRequestException`, in Floci's own wording.
+* **ServerUrl**: in the `docker` mode, once a session's server answers, `GetSession` and `ListSessions` give it Floci's
+  own address in Spark Connect's form, such as `sc://localhost:4566`, as "The Spark Connect server URL for the
+  session", which a client uses "with the Credentials returned by GetSessionEndpoint". A call there still needs
+  `GetSessionEndpoint`'s token, which routes it to the session's server, so the server is reached no other way. AWS's
+  form is not documented. An ended session has none.
 * **ListSessions** returns the newest sessions first, as "Newer sessions are returned first", the later of two started
   in the same millisecond first too, filtered by `SessionStates`, at most `MaxResults` (1 to 100, 100 by default) to a
   page.
@@ -512,7 +610,7 @@ holding the driver and its executors, or a command or a script. The cluster itse
   release, which has no Hive image, from `emr-7.5.0`'s, with their data in a third volume and permissions off. Where
   the cluster was created with core nodes the DataNodes are theirs instead (see **YARN**), and HDFS keeps what EMR's does, one copy
   of a block below four core nodes, two below ten and three otherwise, or what the `hdfs-site` classification's
-  `dfs.replication` says, which is the one property of that classification Floci applies. On a cluster with Hive or HCatalog (see **Which steps run**), the same container runs Hive's
+  `dfs.replication` says, which is the one property of that classification Floci applies. On a cluster with Hive or HCatalog (see **Which steps run**), or Floci's Trino (see **Trino**), the same container runs Hive's
   metastore service, which EMR's HCatalog server is, on port 9083, its Derby database in that volume and its warehouse
   in the HDFS; it reaches the S3 locations of tables through Floci's S3 as the role of the cluster's EC2 instance
   profile, as the bootstrap actions do, with a session that goes with the container. It gets the cluster's `core-site`
@@ -730,6 +828,27 @@ holding the driver and its executors, or a command or a script. The cluster itse
   such a cluster, `command-runner.jar pig ...` or a script's, gets the same. With `pig.enabled` off, a Pig step on a
   cluster whose `Applications` name Pig is `FAILED` without running ("Floci does not run this step: Pig is not in the
   image steps run in. floci.services.emr.pig.enabled adds Apache Pig to it.").
+* **Trino**: no AWS image carries Trino, so Floci runs it on a cluster whose `Applications` name it only with
+  `trino.enabled` on (`FLOCI_SERVICES_EMR_TRINO_ENABLED=true`), off by default, as its image is the Trino project's,
+  about 1 GB to pull. The cluster's primary node then runs Trino's coordinator, which runs the queries too, as a
+  cluster of one node's does, in a container of its own that shares the node's network, as a daemon of the node: from
+  `trino.image`, `trinodb/trino:%s` by default, `%s` the Trino version the release's page in the Release Guide gives
+  without AWS's `-amzn-N` suffix (446 for `emr-7.5.0`), with `trino.memory-mb` of memory, 2048 by default, 80% of
+  which the image gives Trino's heap. It listens on 8889: "By default, Amazon EMR configures the Presto web interface
+  on the Presto coordinator to use port 8889 (for PrestoDB and Trino)". EMR installs `hive-client` and
+  `hcatalog-server` with Trino, so the cluster's image has Hive and its primary node runs Hive's metastore service, as
+  on a cluster with HCatalog (see **Storage**), and Trino's catalog, `hive`, is that metastore, its warehouse in the
+  cluster's HDFS and its tables' S3 locations on Floci's S3. With `trino-connector-hive` setting `hive.metastore` to
+  `glue`, as the Release Guide's "Launch an Amazon EMR cluster with Trino" does, the catalog is Floci's Glue Data
+  Catalog instead; the classification's other properties go into the catalog after Floci's, a later configuration's
+  winning. Trino reaches S3 and Glue as the cluster's EC2 instance profile's role, with a session of its own, as the
+  metastore does. A step runs `trino-cli`, as the Release Guide's "Start the Trino CLI by running trino-cli" does on
+  the primary node, through `command-runner.jar`: the CLI of the same Trino, which Floci copies into the cluster's
+  image from Trino's image as it makes it, on the image's Java 17, connects to the coordinator unless the step names a
+  `--server` of its own. The cluster's first step starts Trino, with its HDFS, and waits up to three minutes for it to
+  answer, a Trino that does not failing the step. It goes before its primary node, whose network it shares, when the
+  cluster ends, on a reset and on a shutdown, and one an earlier Floci left goes when the EMR service starts, whatever
+  its cluster, as its session went with that Floci: the cluster's next step starts another.
 * **S3DistCp**: the image has no `s3-dist-cp`, so a `command-runner.jar` step whose
   first argument is `s3-dist-cp`, the Release Guide's form, runs Floci's own program instead, through
   `spark-submit` in the step's container, copying through Hadoop's file systems: `--src` and `--dest` take
@@ -897,7 +1016,15 @@ holding the driver and its executors, or a command or a script. The cluster itse
   cluster, its standard output and error also go to Floci's S3 once the step ends, gzipped, as
   `stdout.gz` and `stderr.gz` under `<LogUri>/<cluster-id>/steps/<step-id>/`, the step log folder of the
   Management Guide's "Log locations" (an `s3n://` or `s3a://` `LogUri` names the same bucket). A
-  cancelled step's logs hold what its driver wrote until it was stopped. Logs that cannot be written,
+  cancelled step's logs hold what its driver wrote until it was stopped. From release 7.11, a step's
+  `StepMonitoringConfiguration` sends its logs, and its applications' container logs, to its own `LogUri` instead, as
+  its options "take precedence over any cluster-wide logging settings" (Management Guide, "Customizing the log
+  location for step log files"), still only on a cluster with a `LogUri`: "If your cluster does not enable cluster
+  logging, step logs will not be uploaded to S3 even if you provide a StepMonitoringConfiguration". The guide gives no
+  layout under a step's own destination, so it is the cluster's. A node a resize removes while such steps run puts its
+  containers' logs at their destination when they share one, and at the cluster's otherwise. `DescribeStep` and
+  `ListSteps` give a step's own `LogUri` and `EncryptionKeyArn` back; the logs are not encrypted with the key. Logs
+  that cannot be written,
   to a bucket that does not exist say, leave the step as it ended. On a cluster that runs YARN, the logs of its
   applications' containers, a cluster-mode driver's output among them, go gzipped to
   `<LogUri>/<cluster-id>/containers/<application>/<container>/` when a step ends, "Application container logs. The logs
@@ -926,8 +1053,6 @@ holding the driver and its executors, or a command or a script. The cluster itse
   that it does not scale below them, but no error for the request.
 - **No YARN node labels.** An application master can run on any node, as on EMR's 6.x releases by default. EMR's 7.x
   releases label nodes by market type and 5.x's keep application masters on core nodes.
-- **No nodes for a cluster made with `MasterInstanceType`, `SlaveInstanceType` and `InstanceCount`.** Floci keeps no
-  instance groups for that older form of `RunJobFlow`, so such a cluster runs on its primary node alone.
 - **An `emr-spark-*` cluster's HDFS and YARN are `emr-7.5.0`'s.** The Release Guide lists both at Hadoop 3.4.2 for
   `emr-spark-8.0.0` and `emr-spark-8.1.0`, and EMR Serverless publishes no image holding them, so the primary node runs
   Hadoop 3.4.0's. Spark and its Hadoop client are the release's own.
@@ -940,6 +1065,14 @@ holding the driver and its executors, or a command or a script. The cluster itse
 - **Pig is Apache's 0.18.0, and only with `pig.enabled`.** EMR's 7.x releases ship Pig 0.17.0, whose Apache build is
   for Hadoop 2; no AWS image carries Pig, so Floci downloads Apache's 0.18.0, for Hadoop 3, when it is enabled, and
   runs it on the image's Tez (see **Pig steps**).
+- **Trino is the Trino project's build, from the first step, with its `hive` catalog alone, and only with
+  `trino.enabled`.** EMR ships its own `-amzn` builds; Floci runs the Trino project's image of the same version (see
+  **Trino**). The cluster's first step starts it, as it does the primary node's HDFS, where EMR's runs once the
+  cluster is up, and Floci gives no address to reach it from outside the cluster's network. Its one catalog is
+  `hive`: no other `trino-connector-*` classification, nor `trino-config`, applies yet. With `docker-network` set to
+  `host`, `container:<id>` or `none` it does not run, as the metastore service does not. From `emr-7.14.0` on, "When
+  you select Trino as the only application at launch, Amazon EMR no longer starts YARN and HDFS"; Floci's primary node
+  still runs the HDFS, beside the metastore.
 - **Tez's intermediate data is not compressed on YARN.** The images name the LZO codec for it, whose native library they
   lack, so Floci turns that compression off, which a `tez-site` classification can turn back on with a codec they have.
 - **No Hive metastore service in a network namespace the steps share.** With `docker-network` set to `host` or
@@ -1006,25 +1139,39 @@ its `STARTING` event, has its events sent after the rest of that call's.
 | `FLOCI_SERVICES_EMR_PIG_ENABLED` | `false` | Add Apache Pig, downloaded once per release's image, to a `docker` cluster whose `Applications` name Pig, so its Pig steps run (see [Running steps](#running-steps)) |
 | `FLOCI_SERVICES_EMR_PIG_URLS` | `https://dlcdn.apache.org/pig/pig-0.18.0/pig-0.18.0.tar.gz,https://archive.apache.org/dist/pig/pig-0.18.0/pig-0.18.0.tar.gz` | Where Floci downloads Pig's binary distribution from, the first that answers; a mirror names its own |
 | `FLOCI_SERVICES_EMR_PIG_SHA256` | `6845adb936a3c3bcc71451765953cae4103e410ba2f6c5a47cc9becade0a434a`, `pig-0.18.0.tar.gz`'s | The SHA-256 the download must have; set it with another distribution |
+| `FLOCI_SERVICES_EMR_TRINO_ENABLED` | `false` | Run Trino's coordinator on the primary node of a `docker` cluster whose `Applications` name Trino, with `trino-cli` for its steps (see [Running steps](#running-steps)) |
+| `FLOCI_SERVICES_EMR_TRINO_IMAGE` | `trinodb/trino:%s` | The image Trino runs from, `%s` the Trino version of the cluster's release; one with no `%s` serves every release |
+| `FLOCI_SERVICES_EMR_TRINO_MEMORY_MB` | `2048` | The memory of Trino's container, in MiB, 80% of which is its heap |
 | `FLOCI_SERVICES_EMR_RECONCILE_CONTAINERS_ON_STARTUP` | `true` | Remove the step drivers and bootstrap containers a previous run of this Floci left on the Docker daemon, and the images bootstrap actions left for clusters that are gone or have ended, when the EMR service starts; turn it off when two Floci instances share a daemon with the same port and no resource namespace |
 
 ## Release catalogue
 
 `ListReleaseLabels`, `DescribeReleaseLabel` and `ListSupportedInstanceTypes` read a curated catalogue,
-not AWS's full list: `emr-7.5.0` (Floci's default), `emr-7.4.0`, `emr-6.15.0`, `emr-6.14.0` and
-`emr-5.36.2`. Each release's applications and versions come from its page in the Amazon EMR Release
-Guide, with names lowercased and AWS's `-amzn-N` build suffix dropped, as the API reports them, and
-its two most recent Amazon Linux releases. A `floci.services.emr.default-release-label` outside the
-catalogue is still listed, with no applications.
+not AWS's full list: every `emr-7.x` release, `emr-7.0.0` to `emr-7.14.0` (`emr-7.5.0` is Floci's
+default), then `emr-6.15.0`, `emr-6.14.0` and `emr-5.36.2`, and the AWS runtime for Apache Spark's
+`emr-spark-8.0.0`, `emr-spark-8.1.0` and `emr-spark-8.2.0`. Each release's applications and versions
+come from its page in the Amazon EMR Release Guide. Names are spelled as that page's list of
+applications spells them, which is how AWS answers them (`Spark`, `HBase`, `ZooKeeper`), with `Trino`
+for "Trino (PrestoSQL)". Versions drop AWS's `-amzn-N` build suffix, as the API gives "the concise
+version of the application". Each release has the two most recent Amazon Linux releases its page lists;
+the `emr-7.14.0`, `emr-spark-8.1.0` and `emr-spark-8.2.0` pages list none, so those report none. A
+`floci.services.emr.default-release-label` outside the catalogue is still listed, with no applications.
 
-`ListReleaseLabels` filters by `Prefix` (such as `emr-6`) and `Application` (`spark` or
-`spark@3.4.1`, matched without regard to case) and pages with `MaxResults` (1 to 100) /
-`NextToken`; a token only works with the filters it was issued for. `DescribeReleaseLabel` answers
-every application at once, since AWS reserves its `MaxResults` and `NextToken` for future use.
-`ListSupportedInstanceTypes` reports common families (c5, m5, m5d, m6g, r5, r6g) with
-their EC2 sizes. An unknown release label, a bad token or an out-of-range `MaxResults` is
-`InvalidRequestException`. `RunJobFlow` does not check its release label or instance types against
-the catalogue.
+`ListReleaseLabels` lists the numbered releases newest first, as AWS does. The `emr-spark-*` releases
+come after them, oldest first, as AWS answered for that family; where AWS puts them among the numbered
+releases is not recorded. It filters by `Prefix` (such as `emr-6`) and `Application` (`spark` or
+`spark@3.4.1`, matched without regard to case) and pages with `MaxResults` (1 to 100) / `NextToken`; a
+token only works with the filters it was issued for. `DescribeReleaseLabel` answers every application
+at once, since AWS reserves its `MaxResults` and `NextToken` for future use, and describes the first
+release listed, `emr-7.14.0`, when given no label. `ListSupportedInstanceTypes` reports common
+families (c5, m5, m5d, m6g, r5, r6g) with their EC2 sizes.
+
+An unknown release label is `InvalidRequestException` in AWS's recorded wording, which differs between
+the two operations. `DescribeReleaseLabel` answers "The release label isn't valid." with `ErrorCode`
+`InvalidInputParameter`. `ListSupportedInstanceTypes` names the label, as in "The supplied release label
+is invalid: emr-1.0.0.", with `ErrorCode` `INVALID_RELEASE_LABEL`, and a missing one reads `null`. A bad token
+or an out-of-range `MaxResults` is `InvalidRequestException` too. `RunJobFlow` does not check its
+release label or instance types against the catalogue.
 
 ## Example
 

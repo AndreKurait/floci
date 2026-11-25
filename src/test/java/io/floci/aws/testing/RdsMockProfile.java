@@ -28,21 +28,21 @@ import java.util.Set;
  *   use the ALB listener at 127.0.0.1 as its custom origin, which CloudFront otherwise refuses as a
  *   private address. {@code CloudFrontWebSocketIntegrationTest} relies on it.</li>
  *   <li>{@code floci.services.eks.mock=false} runs EKS clusters as real k3s containers.
- *   {@code EksRegistryHostsDockerIntegrationTest} relies on it, since it creates its cluster and
- *   node group through the EKS API. {@code EksStorageClassDockerIntegrationTest} and
- *   {@code EksNodeMountPropagationDockerIntegrationTest} start theirs through
+ *   {@code EksRegistryHostsDockerNightlyIntegrationTest} relies on it, since it creates its cluster and
+ *   node group through the EKS API. {@code EksStorageClassDockerNightlyIntegrationTest} and
+ *   {@code EksNodeMountPropagationDockerNightlyIntegrationTest} start theirs through
  *   {@code EksClusterManager}, which runs a k3s container either way.</li>
  *   <li>{@code floci.services.cur.emit-mode=synchronous} and
  *   {@code floci.services.bcm-data-exports.emit-mode=synchronous} write billing reports inline,
  *   and {@code quarkus.http.test-port} and {@code quarkus.http.port} set to one free port, chosen
  *   once when the class loads, give the DuckDB sidecar a real port to reach Floci S3 on, since the
  *   endpoint a container is handed is built from {@code quarkus.http.port}.
- *   {@code CurEmissionIntegrationTest} and {@code CurNonDefaultAccountEmissionIntegrationTest} rely
+ *   {@code CurEmissionDockerNightlyIntegrationTest} and {@code CurNonDefaultAccountEmissionDockerNightlyIntegrationTest} rely
  *   on them. The other classes only see a listener on that port instead of another random one.</li>
  *   <li>{@code floci.services.iot.enabled=false} turns IoT off, so its data-plane host routing never
  *   sees a request. {@code ApiGatewayCustomDomainIamAuthIntegrationTest} relies on it, to check the
  *   custom-domain invocation path with IoT disabled.</li>
- *   <li>{@code floci.services.emr.default-release-label=emr-7.9.0} sets a default release the
+ *   <li>{@code floci.services.emr.default-release-label=emr-7.15.0} sets a default release the
  *   catalogue does not describe. {@code EmrReleaseCatalogCustomDefaultIntegrationTest} relies on
  *   it.</li>
  *   <li>{@code floci.services.firehose.flush-record-count=2} delivers a batch of two records inline.
@@ -102,7 +102,7 @@ public class RdsMockProfile implements QuarkusTestProfile {
                 Map.entry("quarkus.http.test-port", String.valueOf(TEST_PORT)),
                 Map.entry("quarkus.http.port", String.valueOf(TEST_PORT)),
                 Map.entry("floci.services.iot.enabled", "false"),
-                Map.entry("floci.services.emr.default-release-label", "emr-7.9.0"),
+                Map.entry("floci.services.emr.default-release-label", "emr-7.15.0"),
                 Map.entry("floci.services.firehose.flush-record-count", "2"),
                 Map.entry("floci.services.elasticache.default-image", ELASTICACHE_SHELL_LESS_IMAGE),
                 Map.entry("floci.services.elasticache.shell-less-backend", "true"),

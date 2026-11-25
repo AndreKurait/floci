@@ -62,6 +62,13 @@
 # check fails until the actions of no resource type list the model's scope.
 # src/main/resources/aws/iam-paginators.json, what each paged IAM list pages by, is generated
 # from botocore's IAM model and paginators by tools/aws/regen_iam_paginators.py.
+# src/main/resources/aws/iam-cloudtrail-shapes.json, how a CloudTrail record names and types an IAM
+# call's members and errors, is generated from botocore's IAM model by
+# tools/aws/regen_iam_cloudtrail_shapes.py.
+# src/main/resources/aws/cloudtrail-s3-data-events.json, the name CloudTrail records each S3 data event
+# under and whether it is read-only, is generated from botocore's S3 model, the S3 user guide's data
+# events table, which tools/aws/fetch_cloudtrail_s3_data_events.py vendors, and AWS's S3 service
+# reference by tools/aws/regen_cloudtrail_s3_data_events.py (make cloudtrail-s3-data-events-sync).
 
 PYTHON ?= python3
 
@@ -105,7 +112,8 @@ PREFIX ?= $(HOME)/.local
         iam-passed-network-connectors-check iam-passed-network-connectors-verify \
         iam-passed-network-connectors-test iam-tag-on-create-sync iam-tag-on-create-check \
         iam-tag-on-create-verify iam-tag-on-create-test iam-request-resources-sync iam-request-resources-check \
-        iam-request-resources-verify iam-request-resources-test iam-data-verify
+        iam-request-resources-verify iam-request-resources-test iam-data-verify \
+        cloudtrail-s3-data-events-sync cloudtrail-s3-data-events-check cloudtrail-s3-data-events-verify
 
 help: ## List the targets below
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-14s %s\n", $$1, $$2}'
@@ -307,6 +315,7 @@ aws-data-sync-botocore: ## Regenerate only the AWS data derived from botocore, s
 	$(PYTHON) tools/aws/regen_securityhub_shapes.py
 	$(PYTHON) tools/aws/regen_rekognition_shapes.py
 	$(PYTHON) tools/aws/regen_kinesis_shapes.py
+	$(PYTHON) tools/aws/regen_eventbridgev2_shapes.py
 	$(PYTHON) tools/aws/regen_config_shapes.py
 	$(PYTHON) tools/aws/regen_iam_shapes.py
 	$(PYTHON) tools/aws/regen_sts_shapes.py
@@ -318,9 +327,11 @@ aws-data-sync-botocore: ## Regenerate only the AWS data derived from botocore, s
 	$(PYTHON) tools/aws/regen_eks_shapes.py
 	$(PYTHON) tools/aws/regen_organizations_shapes.py
 	$(PYTHON) tools/aws/regen_emr_serverless_shapes.py
+	$(PYTHON) tools/aws/regen_rpcv2_cbor_shapes.py
 	$(PYTHON) tools/aws/regen_query_services.py
 	$(PYTHON) tools/aws/regen_rest_routes.py
 	$(PYTHON) tools/aws/regen_iam_paginators.py
+	$(PYTHON) tools/aws/regen_iam_cloudtrail_shapes.py
 
 aws-data-check: aws-data-check-botocore ## CI gate: the vendored AWS data must match a fresh generation
 	@$(PYTHON) tools/aws/regen_partitions.py --check || { \
@@ -449,6 +460,10 @@ aws-data-check-botocore: ## The AWS data derived from botocore must match a fres
 		echo "error: Kinesis request shapes are out of date; run 'make aws-data-sync'."; \
 		exit 1; \
 	}
+	@$(PYTHON) tools/aws/regen_eventbridgev2_shapes.py --check || { \
+		echo "error: EventBridge V2 request shapes are out of date; run 'make aws-data-sync'."; \
+		exit 1; \
+	}
 	@$(PYTHON) tools/aws/regen_config_shapes.py --check || { \
 		echo "error: AWS Config request shapes are out of date; run 'make aws-data-sync'."; \
 		exit 1; \
@@ -499,6 +514,10 @@ aws-data-check-botocore: ## The AWS data derived from botocore must match a fres
 		echo "       Run 'make aws-data-sync' and commit the result."; \
 		exit 1; \
 	}
+	@$(PYTHON) tools/aws/regen_rpcv2_cbor_shapes.py --check || { \
+		echo "error: RPC v2 CBOR wire shapes are stale; run make aws-data-sync-botocore."; \
+		exit 1; \
+	}
 	@$(PYTHON) tools/aws/regen_query_services.py --check || { \
 		echo ""; \
 		echo "error: src/main/resources/aws/query-services.json is out of date."; \
@@ -517,6 +536,13 @@ aws-data-check-botocore: ## The AWS data derived from botocore must match a fres
 		echo "       Run 'make aws-data-sync' and commit the result."; \
 		exit 1; \
 	}
+	@$(PYTHON) tools/aws/regen_iam_cloudtrail_shapes.py --check || { \
+		echo ""; \
+		echo "error: src/main/resources/aws/iam-cloudtrail-shapes.json is out of date."; \
+		echo "       Run 'make aws-data-sync' and commit the result."; \
+		exit 1; \
+	}
+	@$(MAKE) --no-print-directory cloudtrail-s3-data-events-check
 	@$(MAKE) --no-print-directory iam-passed-roles-check
 	@$(MAKE) --no-print-directory iam-passed-network-connectors-check
 	@$(MAKE) --no-print-directory iam-tag-on-create-check
@@ -593,7 +619,8 @@ IAM_ACTION_RESOURCES_PATHS := src/main/resources/aws/iam-action-resources.json \
 	tools/aws/regen_iam_action_resources.py tools/aws/test_regen_iam_action_resources.py
 IAM_AUTHORIZED_ACTIONS_PATHS := src/main/resources/aws/iam-authorized-actions.json \
 	tools/aws/regen_iam_authorized_actions.py tools/aws/test_regen_iam_authorized_actions.py \
-	src/main/resources/aws/rest-routes.json
+	src/main/resources/aws/rest-routes.json tools/aws/sources/s3-required-actions.json \
+	tools/aws/fetch_s3_required_actions.py tools/aws/test_fetch_s3_required_actions.py
 IAM_PASSED_ROLES_PATHS := src/main/resources/aws/iam-passed-roles.json $(IAM_PASSED_ROLES_GENERATOR) \
 	tools/aws/test_regen_iam_passed_roles.py
 IAM_PASSED_NETWORK_CONNECTORS_PATHS := src/main/resources/aws/iam-passed-network-connectors.json \
@@ -618,13 +645,26 @@ DOCUMENTED_ROUTES_PATHS := src/main/resources/aws/rest-routes.json tools/aws/reg
 IAM_REQUEST_RESOURCES_PATHS := src/main/resources/aws/iam-request-resources.json \
 	tools/aws/regen_iam_request_resources.py $(IAM_PASSED_ROLES_GENERATOR) \
 	tools/aws/test_regen_iam_request_resources.py tools/aws/sources/athena-glue-ddl-permissions.json \
-	tools/aws/fetch_athena_glue_ddl_permissions.py tools/aws/test_fetch_athena_glue_ddl_permissions.py
+	tools/aws/fetch_athena_glue_ddl_permissions.py tools/aws/test_fetch_athena_glue_ddl_permissions.py \
+	tools/aws/regen_iam_authorized_actions.py tools/aws/sources/s3-required-actions.json \
+	tools/aws/sources/apigateway-arn-formats.json tools/aws/fetch_apigateway_arn_formats.py \
+	tools/aws/test_fetch_apigateway_arn_formats.py src/main/resources/aws/iam-authorized-actions.json \
+	tools/aws/sources/kms-api-permissions.json tools/aws/fetch_kms_api_permissions.py \
+	tools/aws/test_fetch_kms_api_permissions.py tools/aws/sources/dynamodb-permissions.json \
+	tools/aws/fetch_dynamodb_permissions.py tools/aws/test_fetch_dynamodb_permissions.py \
+	tools/aws/sources/iam-identifiers.json tools/aws/fetch_iam_identifiers.py tools/aws/test_fetch_iam_identifiers.py \
+	tools/aws/sources/required-resource-types.json tools/aws/fetch_required_resource_types.py \
+	tools/aws/test_fetch_required_resource_types.py
+CLOUDTRAIL_S3_DATA_EVENTS_PATHS := src/main/resources/aws/cloudtrail-s3-data-events.json \
+	tools/aws/sources/cloudtrail-s3-data-events.json tools/aws/fetch_cloudtrail_s3_data_events.py \
+	tools/aws/test_fetch_cloudtrail_s3_data_events.py tools/aws/regen_cloudtrail_s3_data_events.py \
+	tools/aws/test_regen_cloudtrail_s3_data_events.py
 
 iam-data-verify: ## CI gate (online): every vendored IAM file must still match AWS; CHANGED="<paths>" checks only the ones they cover
 	@# Every check runs even when an earlier one fails, so one file's drift cannot hide another's
 	@# state. Sequential steps in CI stop at the first failure, which once left the action
 	@# resource gate unexercised while the namespace list was stale.
-	@namespaces=0; actions=0; authorized=0; passed=0; connectors=0; tagged=0; requested=0; dynamodb=0; conditionkeys=0; s3control=0; requestkeys=0; routes=0; \
+	@namespaces=0; actions=0; authorized=0; passed=0; connectors=0; tagged=0; requested=0; dynamodb=0; conditionkeys=0; s3control=0; requestkeys=0; routes=0; cloudtrail=0; \
 	changed="$(strip $(CHANGED))"; \
 	if [ -n "$(CHANGED_FILE)" ]; then changed=$$(cat "$(CHANGED_FILE)") || exit 1; fi; \
 	covers() { \
@@ -669,9 +709,13 @@ iam-data-verify: ## CI gate (online): every vendored IAM file must still match A
 	if covers "$(DOCUMENTED_ROUTES_PATHS)" "the REST routes AWS documents for endpoints botocore does not model"; then \
 		$(MAKE) --no-print-directory documented-routes-verify || routes=$$?; \
 	fi; \
+	if covers "$(CLOUDTRAIL_S3_DATA_EVENTS_PATHS)" "the names CloudTrail records S3 data events under"; then \
+		$(MAKE) --no-print-directory cloudtrail-s3-data-events-verify || cloudtrail=$$?; \
+	fi; \
 	if [ $$namespaces -ne 0 ] || [ $$actions -ne 0 ] || [ $$authorized -ne 0 ] || [ $$passed -ne 0 ] \
 			|| [ $$connectors -ne 0 ] || [ $$tagged -ne 0 ] || [ $$requested -ne 0 ] || [ $$dynamodb -ne 0 ] \
-			|| [ $$conditionkeys -ne 0 ] || [ $$s3control -ne 0 ] || [ $$requestkeys -ne 0 ] || [ $$routes -ne 0 ]; then \
+			|| [ $$conditionkeys -ne 0 ] || [ $$s3control -ne 0 ] || [ $$requestkeys -ne 0 ] || [ $$routes -ne 0 ] \
+			|| [ $$cloudtrail -ne 0 ]; then \
 		echo ""; \
 		echo "error: vendored IAM data does not match upstream:"; \
 		if [ $$namespaces -ne 0 ]; then \
@@ -700,6 +744,7 @@ iam-data-verify: ## CI gate (online): every vendored IAM file must still match A
 		if [ $$s3control -ne 0 ]; then echo "       the S3 Control tag condition key table"; fi; \
 		if [ $$requestkeys -ne 0 ]; then echo "       the request condition key table"; fi; \
 		if [ $$routes -ne 0 ]; then echo "       the REST routes AWS documents, see its message above"; fi; \
+		if [ $$cloudtrail -ne 0 ]; then echo "       the names CloudTrail records S3 data events under, see its message above"; fi; \
 		exit 1; \
 	fi
 
@@ -933,7 +978,7 @@ s3control-tag-condition-keys-verify: ## Check the S3 Control tag condition actio
 	$(PYTHON) tools/aws/regen_s3control_tag_condition_keys.py --verify
 
 .PHONY: request-condition-keys-sync request-condition-keys-check request-condition-keys-verify
-request-condition-keys-sync: ## Regenerate the Lambda Web, Redshift and Route 53 request condition keys from AWS and botocore
+request-condition-keys-sync: ## Regenerate the Lambda Web, Redshift, Route 53 and STS request condition keys from AWS and botocore
 	$(PYTHON) tools/aws/regen_request_condition_keys.py
 request-condition-keys-check: ## Check the request condition key members against pinned botocore
 	$(PYTHON) tools/aws/regen_request_condition_keys.py --check
@@ -945,3 +990,20 @@ documented-routes-sync: ## Read the REST routes AWS documents for endpoints boto
 	$(PYTHON) tools/aws/regen_rest_routes.py --fetch-documented
 documented-routes-verify: ## CI gate (online): the vendored documented REST routes must still be the ones AWS's pages give
 	$(PYTHON) tools/aws/regen_rest_routes.py --verify
+
+cloudtrail-s3-data-events-sync: ## Regenerate src/main/resources/aws/cloudtrail-s3-data-events.json (online; commit the result)
+	$(PYTHON) tools/aws/regen_cloudtrail_s3_data_events.py
+
+cloudtrail-s3-data-events-check: ## CI gate (offline): the vendored S3 data event names must be botocore's and the vendored page's
+	@$(PYTHON) tools/aws/regen_cloudtrail_s3_data_events.py --check || { \
+		echo ""; \
+		echo "error: src/main/resources/aws/cloudtrail-s3-data-events.json is out of date."; \
+		echo "       Run 'make cloudtrail-s3-data-events-sync' and commit the result."; \
+		exit 1; \
+	}
+
+cloudtrail-s3-data-events-verify: ## CI gate (online): the S3 data event names and read-only flags must still be what AWS gives
+	@status=0; \
+	$(PYTHON) tools/aws/fetch_cloudtrail_s3_data_events.py --verify || status=1; \
+	$(PYTHON) tools/aws/regen_cloudtrail_s3_data_events.py --verify || status=1; \
+	exit $$status
