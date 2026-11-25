@@ -357,7 +357,7 @@ OUTPUT = REPO_ROOT / "src/main/resources/aws/iam-request-resources.json"
 
 # The namespaces read, in batches: each moves here from NOT_COVERED with the tests that show its ARNs
 # are the ones its handlers mint.
-NAMESPACES = ("access-analyzer", "account", "acm", "application-autoscaling", "aps", "athena", "bcm-data-exports",
+NAMESPACES = ("access-analyzer", "account", "acm", "acm-pca", "application-autoscaling", "aps", "athena", "bcm-data-exports",
               "bcm-pricing-calculator", "budgets", "ce", "cloudfront", "cloudfront-keyvaluestore", "cloudtrail",
               "codebuild", "codepipeline", "cognito-identity", "cognito-idp", "controlcatalog", "controltower", "cur",
               "datasync", "ec2", "ecr", "ecs", "elasticloadbalancing", "elasticmapreduce", "emr-containers",
@@ -3934,8 +3934,75 @@ def read_resources(operation: str, types: list[str], formats: dict[str, str], mo
     resources = with_qualifier(resources, types, formats, members, models, name)
     resources = with_partial_arns(resources, partial_arn_members(models, name, formats))
     resources = with_map_keys(resources, types, formats, models, name)
+    resources = without_documented_descendant_arns(resources, formats, models, name)
     # Two rules naming the same resource the same way name it once.
     return [resource for index, resource in enumerate(resources) if resource not in resources[:index]]
+
+
+def without_documented_descendant_arns(resources: list[dict], formats: dict[str, str],
+                                      models: dict[str, dict], operation: str) -> list[dict]:
+    """An explicitly documented descendant ARN is not another parent ID when a required member names the parent.
+
+    Only mandatory ARN forms from botocore's code examples qualify. Names and paths may contain slashes, so
+    this distinction applies only to formats whose own variables are IDs. Optional parents, qualifiers, and
+    ambiguous examples retain the existing rules.
+    """
+    if len({resource["arn"] for resource in resources if resource.get("arn") and resource.get("types")}) < 2:
+        return resources
+    if len(models) > 1:
+        apart = [without_documented_descendant_arns(resources, formats, {client: model}, operation)
+                 for client, model in models.items()]
+        return apart[0] if all(result == apart[0] for result in apart) else resources
+    examples: dict[str, set[str]] = {}
+    required: set[str] = set()
+    for model in models.values():
+        spec = model["operations"].get(operation, {})
+        if "input" not in spec:
+            continue
+        shape = model["shapes"][spec["input"]["shape"]]
+        required.update(shape.get("required", []))
+        for name, member in shape.get("members", {}).items():
+            documentation = member.get("documentation", "")
+            if not re.search(r"\bmust be (?:in |of )?(?:the )?(?:following )?form\b",
+                             _lead_text(documentation)):
+                continue
+            for block in re.findall(r"<code>(.*?)</code>", documentation, re.DOTALL):
+                example = re.sub(r"<[^>]+>", "", block).strip()
+                if re.fullmatch(r"arn:[^\s<>]+", example):
+                    examples.setdefault(name, set()).add(example)
+    if not required or not examples:
+        return resources
+    excluded: dict[str, set[str]] = {}
+    for kind, arn_format in formats.items():
+        variables = VARIABLE_RE.findall(arn_format)
+        own = [variable for variable in variables if variable not in KNOWN_VARIABLES]
+        if not own or any(kind_of(variable) != "id" for variable in own):
+            continue
+        pattern = re.escape(arn_format)
+        for variable in variables:
+            pattern = pattern.replace(re.escape("${" + variable + "}"),
+                                      "[^:/]*" if variable in ("Region", "Account") else "[^:/]+")
+        parents = {name for name, forms in examples.items() if name in required
+                   and any(resource.get("arn") == name and kind in resource.get("types", [])
+                           and set(resource) == {"arn", "types"} for resource in resources)
+                   and all(re.fullmatch(pattern, form) for form in forms)}
+        if not parents:
+            continue
+        descendant = pattern + r"(?:/[A-Za-z][A-Za-z0-9-]*/[^:/]+)+"
+        for name, forms in examples.items():
+            if name not in parents and all(re.fullmatch(descendant, form) for form in forms):
+                excluded.setdefault(name, set()).add(kind)
+    result = []
+    for resource in resources:
+        removed = excluded.get(resource.get("arn", ""), set())
+        if not removed or "types" not in resource:
+            result.append(resource)
+            continue
+        kept = [kind for kind in resource["types"] if kind not in removed]
+        if kept:
+            result.append({**resource, "types": kept})
+    return result
+
 
 
 def typed_target_fields(models: dict[str, dict], operation: str) -> dict[str, list[str]]:

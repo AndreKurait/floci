@@ -53,6 +53,7 @@ order:
   - AWS::Cognito
   - AWS::VerifiedPermissions
   - AWS::CertificateManager
+  - AWS::ACMPCA
   - AWS::Events
   - AWS::EventsV2
   - AWS::Scheduler
@@ -146,6 +147,7 @@ service_labels:
   AWS::BedrockAgentCore: Bedrock AgentCore
   AWS::CDK: CDK
   AWS::CertificateManager: ACM
+  AWS::ACMPCA: AWS Private CA
   AWS::CloudFormation: CloudFormation
   AWS::CloudFront: CloudFront
   AWS::CloudTrail: CloudTrail
