@@ -19,8 +19,8 @@ class SsmPutParameterOverwriteTest {
     void anOverwriteWithoutATypeKeepsTheTypeOfTheParameter() {
         SsmService ssmService = new SsmService(
                 new InMemoryStorage<>(), new InMemoryStorage<>(), new InMemoryStorage<>(), 5);
-        SsmJsonHandler handler = new SsmJsonHandler(ssmService, null, null, objectMapper,
-                mock(IamEnforcementFilter.class), mock(SsmPatchBaselineService.class), null, null, null);
+        SsmJsonHandler handler = new SsmJsonHandler(ssmService, null, objectMapper,
+                mock(IamEnforcementFilter.class));
         ObjectNode create = objectMapper.createObjectNode()
                 .put("Name", "/app/password").put("Value", "first").put("Type", "SecureString");
         handler.handle("PutParameter", create, REGION, "auth");
