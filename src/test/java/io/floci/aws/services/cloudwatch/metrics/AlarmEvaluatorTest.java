@@ -30,6 +30,7 @@ import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.spy;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
@@ -203,6 +204,19 @@ class AlarmEvaluatorTest {
         when(metricsService.allAlarms()).thenThrow(new RuntimeException("storage hiccup"));
 
         assertDoesNotThrow(evaluator::evaluateAll);
+    }
+
+    @Test
+    void aTickThatEndsInAnErrorDoesNotStopTheNextOne() {
+        when(metricsService.allAlarms())
+                .thenThrow(new StackOverflowError("storage hiccup"))
+                .thenReturn(List.of());
+
+        // The scheduler runs evaluateAll itself at a fixed rate and cancels it for good once it throws.
+        assertDoesNotThrow(evaluator::evaluateAll);
+        assertDoesNotThrow(evaluator::evaluateAll);
+
+        verify(metricsService, times(2)).allAlarms();
     }
 
     @Test

@@ -441,6 +441,7 @@ public class FirehoseService implements ResourceProvider, StoredResourceArns {
             source.setDeliveryStartTimestamp(Instant.now());
         }
         DeliveryStreamDescription description = new DeliveryStreamDescription(name, arn, s3Config, redshift, source);
+        description.setCreateTimestamp(clock.instant());
         description.setAccountId(accountId);
         description.setTags(tags);
         if (deliveryStreamType != null && !deliveryStreamType.isBlank()) {
@@ -524,7 +525,7 @@ public class FirehoseService implements ResourceProvider, StoredResourceArns {
             current.canonicalizeProcessors();
         }
         stream.setVersionId(String.valueOf(parseVersionId(stream.getVersionId()) + 1));
-        stream.setLastUpdateTimestamp(Instant.now());
+        stream.setLastUpdateTimestamp(clock.instant());
         streamPut(streamKey, stream);
         LOG.infov("Updated destination {0} of Firehose delivery stream {1}", destinationId, name);
     }
@@ -559,7 +560,7 @@ public class FirehoseService implements ResourceProvider, StoredResourceArns {
             mergeRedshiftDestination(current, update);
             current.canonicalizeProcessors();
             stream.setVersionId(String.valueOf(parseVersionId(stream.getVersionId()) + 1));
-            stream.setLastUpdateTimestamp(Instant.now());
+            stream.setLastUpdateTimestamp(clock.instant());
             streamPut(streamKey, stream);
             LOG.infov("Updated Redshift destination {0} of Firehose delivery stream {1}", destinationId, name);
         }
@@ -1128,6 +1129,11 @@ public class FirehoseService implements ResourceProvider, StoredResourceArns {
      *                          or null for records that are not read from a source stream.
      */
     private void putRecordBatch(String streamKey, String streamName, List<Record> records, Runnable checkpointAdvance) {
+        for (Record r : records) {
+            if (r.getData() == null) {
+                throw new AwsException("InvalidArgumentException", "Record data must not be null.", 400);
+            }
+        }
         DeliveryStreamDescription stream = describeDeliveryStreamByKey(streamKey);
         List<byte[]> buffer = buffers.computeIfAbsent(
                 streamKey, k -> Collections.synchronizedList(new ArrayList<>()));
@@ -1580,7 +1586,7 @@ public class FirehoseService implements ResourceProvider, StoredResourceArns {
             resources.add(new ExplorerResource(
                     arn, "firehose:deliverystream", "firehose",
                     parsed.region(), parsed.accountId(),
-                    stream.getCreateTimestamp() != null ? stream.getCreateTimestamp() : Instant.now(),
+                    stream.getCreateTimestamp() != null ? stream.getCreateTimestamp() : clock.instant(),
                     tags));
         }
         return resources;

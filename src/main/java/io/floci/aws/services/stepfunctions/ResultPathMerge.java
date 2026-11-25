@@ -135,7 +135,12 @@ public final class ResultPathMerge {
                     throw new ResultPathMatchException(
                             "Failed to apply ResultPath '" + path + "': only a numeric array index or a single-quoted field name is supported in '[" + token + "]'");
                 }
-                segments.add(Integer.valueOf(token));
+                try {
+                    segments.add(Integer.valueOf(token));
+                } catch (NumberFormatException e) {
+                    throw new ResultPathMatchException(
+                            "Failed to apply ResultPath '" + path + "': array index '" + token + "' is out of range");
+                }
             } else {
                 throw new ResultPathMatchException(
                         "Failed to apply ResultPath '" + path + "': unsupported reference path syntax");
