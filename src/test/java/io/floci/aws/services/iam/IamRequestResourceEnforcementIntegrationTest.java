@@ -298,23 +298,17 @@ class IamRequestResourceEnforcementIntegrationTest {
         assertTrue(error.path("message").asText().contains("states:DescribeStateMachine"), error.toString());
     }
 
-    /**
-     * A Step Functions Local {@code <stateMachineArn>#<test case>} is checked as given: it is no ARN AWS has, and
-     * nothing botocore or the Service Reference says reads it otherwise. So a grant on the machine alone does not
-     * reach a start naming a test case, a grant covering it does, and a deny on the machine alone does not apply.
-     */
+    /** The Local test-case suffix selects execution behavior; authorization still checks the underlying state machine. */
     @Test
-    void aStateMachinesTestCaseIsCheckedAsGiven() {
+    void aStateMachinesTestCaseIsCheckedOnTheMachineItRuns() {
         String arn = createStateMachine("res-tc-" + suffix());
         User user = user("res-tc");
         user.policy(allowOn("states:StartExecution", arn));
-        refusedJson(startExecution(user, arn + "#"), "states:StartExecution");
-        user.policy(allowOn("states:StartExecution", arn + "*"));
         startExecution(user, arn + "#").statusCode(200);
 
         user.policy(allowOn("states:StartExecution", "*") + ",{\"Effect\":\"Deny\",\"Action\":\"states:StartExecution\","
                 + "\"Resource\":\"" + arn + "\"}");
-        startExecution(user, arn + "#").statusCode(200);
+        refusedJson(startExecution(user, arn + "#"), "states:StartExecution");
     }
 
     /**
