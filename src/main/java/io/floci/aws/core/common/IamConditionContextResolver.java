@@ -310,14 +310,6 @@ public class IamConditionContextResolver {
         return null;
     }
 
-            case "mq" -> mqConfigurationConditions(action, ctx);
-            case "lambda" -> lambdaConditionContext(action, ctx);
-            case "redshift" -> RequestConditionKeys.requestKeys(action).isEmpty() ? null
-                    : requestConditions(action, formParameters(ctx)::get);
-            default -> null;
-        };
-    }
-
     private Map<String, List<String>> mqConfigurationConditions(String action, ContainerRequestContext ctx) {
         if ("mq:CreateConfiguration".equals(action)) {
             JsonNode body = PassedRoles.jsonBody(ctx);

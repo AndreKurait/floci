@@ -61,11 +61,6 @@ class RestCrossServiceRouteCollisionIntegrationTest {
             "servicecatalog, GET, /applications",
             "servicecatalog, GET, /applications/app-123",
             "servicecatalog, DELETE, /applications/app-123",
-            "mq, POST, /v1/configurations",
-            "mq, GET, /v1/configurations",
-            "mq, GET, /v1/configurations/c-123",
-            "mq, PUT, /v1/configurations/c-123",
-            "mq, DELETE, /v1/configurations/c-123",
             "securityhub, GET, /associations",
             "securityhub, POST, /associations",
             "macie2, GET, /jobs/job-123",
@@ -92,6 +87,26 @@ class RestCrossServiceRouteCollisionIntegrationTest {
             .header("x-amzn-query-error", "UnknownOperationException;Sender")
             .body("__type", equalTo("UnknownOperationException"))
             .body("message", equalTo("Unknown operation: " + method + " " + path));
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "POST, /v1/configurations, 400",
+            "GET, /v1/configurations, 200",
+            "GET, /v1/configurations/c-123, 400",
+            "PUT, /v1/configurations/c-123, 400",
+            "DELETE, /v1/configurations/c-123, 400"
+    })
+    void mqConfigurationCallsReachTheirOwningService(String method, String path, int status) {
+        given()
+            .header("Authorization", PartitionMatrix.sigV4Auth("us-east-1", "mq"))
+            .contentType("application/json")
+            .body("{}")
+        .when()
+            .request(method, path)
+        .then()
+            .statusCode(status)
+            .contentType(containsString("application/json"));
     }
 
     @Test
