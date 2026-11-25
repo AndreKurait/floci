@@ -1712,9 +1712,9 @@ public class Ec2ContainerManager {
      * than killing the executor task.
      *
      * <p>Every release of the teardown is best effort and independent of the container removal, so
-     * one that fails neither skips the removal nor keeps the instance from terminating. The
-     * instance ends {@code terminated} even when Docker refuses the removal; the callback is then
-     * skipped, and the container is collected on the next start.
+     * one that fails neither skips the removal nor keeps a removed instance from terminating.
+     * If Docker refuses removal, the instance stays shutting-down and retains its endpoint ownership
+     * until a termination retry establishes that the container is gone.
      */
     public void terminate(Instance instance, Runnable afterTeardown) {
         String containerId;
@@ -1744,6 +1744,10 @@ public class Ec2ContainerManager {
                     // iptables/veth teardown lags behind container removal; prevents port-reuse conflicts.
                     pause(500);
                 }
+                if (!containerGone) {
+                    // Keep ownership while Docker still holds the endpoint. TerminateInstances can retry.
+                    return;
+                }
                 if (firewallManager != null && firewallManager.enabled() && firewallEniId != null) {
                     cleanupStep(instance, "firewall registration", () -> firewallManager.unregister(firewallEniId));
                 }
@@ -1762,9 +1766,10 @@ public class Ec2ContainerManager {
                         instance.getOwnerId(), instance.getRegion(), instance.getSubnetId(),
                         instance.getPrivateIpAddress()));
             } finally {
-                // Whatever the teardown managed, the instance must not stay shutting-down: nothing
-                // else would ever finish it, and a leftover container is collected on the next start.
-                instance.markTerminated(System.currentTimeMillis());
+                // Ancillary cleanup cannot undo successful removal; failed removal remains retryable.
+                if (containerGone) {
+                    instance.markTerminated(System.currentTimeMillis());
+                }
                 persist(instance);
                 if (afterTeardown != null && containerGone) {
                     try {
