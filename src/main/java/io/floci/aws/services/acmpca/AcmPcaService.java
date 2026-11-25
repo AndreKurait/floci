@@ -219,10 +219,14 @@ public class AcmPcaService implements Resettable, AcmPrivateCertificateAuthoriti
         return certificateResponse(authority.certificatePem(), authority.certificateChainPem());
     }
 
+    public void validateRevocationConfiguration(JsonNode request) {
+        PrivateCaRequests.revocation(request);
+    }
+
     public synchronized ObjectNode update(JsonNode request, String region) {
         requireAcceptingWrites();
         fields(request, "request", Set.of("CertificateAuthorityArn", "Status", "RevocationConfiguration"));
-        PrivateCaRequests.revocation(request);
+        validateRevocationConfiguration(request);
         String requested = optionalText(request, "Status");
         if (requested != null && !Set.of("ACTIVE", "DISABLED").contains(requested)) {
             throw invalid("Status must be ACTIVE or DISABLED");
