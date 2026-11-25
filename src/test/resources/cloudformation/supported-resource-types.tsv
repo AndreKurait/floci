@@ -24,6 +24,7 @@ AWS::AppConfig::Application	AppConfigCfnProvisioner
 AWS::AppConfig::ConfigurationProfile	AppConfigCfnProvisioner
 AWS::AppConfig::DeploymentStrategy	AppConfigCfnProvisioner
 AWS::AppConfig::Environment	AppConfigCfnProvisioner
+AWS::AppConfig::HostedConfigurationVersion	AppConfigHostedVersionCfnProvisioner
 AWS::AppSync::ApiKey	AppSyncCfnProvisioner
 AWS::AppSync::DataSource	AppSyncCfnProvisioner
 AWS::AppSync::FunctionConfiguration	AppSyncCfnProvisioner
