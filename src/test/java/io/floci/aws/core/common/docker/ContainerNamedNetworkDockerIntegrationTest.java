@@ -62,7 +62,11 @@ class ContainerNamedNetworkDockerIntegrationTest {
             assertEquals(name, inspect.getHostConfig().getNetworkMode());
             assertEquals(Set.of(name), inspect.getNetworkSettings().getNetworks().keySet());
             int port = info.publishedHostPort(8080).orElseThrow();
-            HttpRequest request = HttpRequest.newBuilder(URI.create("http://127.0.0.1:" + port))
+            String dockerHost = System.getenv("TESTCONTAINERS_HOST_OVERRIDE");
+            if (dockerHost == null || dockerHost.isBlank()) {
+                dockerHost = "127.0.0.1";
+            }
+            HttpRequest request = HttpRequest.newBuilder(URI.create("http://" + dockerHost + ":" + port))
                     .timeout(Duration.ofSeconds(10)).build();
             try (HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()) {
                 await().atMost(Duration.ofSeconds(20)).ignoreExceptions().untilAsserted(() -> {
