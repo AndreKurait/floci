@@ -153,6 +153,29 @@ class ElbV2HealthCheckerTest {
     }
 
     @Test
+    void tcpProbeConnectsWithoutSendingHttpOrApplyingTheHttpMatcher() throws Exception {
+        CompletableFuture<Integer> received = new CompletableFuture<>();
+        AtomicInteger bytes = new AtomicInteger();
+        NetServer server = vertx.createNetServer().connectHandler(socket -> socket
+                .handler(buffer -> bytes.addAndGet(buffer.length()))
+                .closeHandler(ignored -> received.complete(bytes.get())))
+                .listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        ElbV2HealthChecker checker = healthChecker();
+        try {
+            TargetGroup group = targetGroup(server.actualPort(), "404", 1, 1);
+            group.setProtocol("TCP");
+            group.setHealthCheckProtocol("TCP");
+            TargetDescription target = target("127.0.0.1", server.actualPort());
+            checker.addTargets(group.getTargetGroupArn(), List.of(target), group);
+            assertEquals(0, received.get(2, TimeUnit.SECONDS), "A TCP health check must send no HTTP payload");
+            await().atMost(Duration.ofSeconds(2)).untilAsserted(() -> assertEquals("healthy",
+                    checker.getHealth(group.getTargetGroupArn(), target.getId(), target.getPort()).state()));
+        } finally {
+            server.close().toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
+        }
+    }
+
+    @Test
     void tcpCheckPassesOnAnOpenConnectionWithoutSpeakingHttp() throws Exception {
         NetServer server = vertx.createNetServer().connectHandler(NetSocket::close)
                 .listen(0, "127.0.0.1").toCompletionStage().toCompletableFuture().get(2, TimeUnit.SECONDS);
