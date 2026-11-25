@@ -39,6 +39,16 @@ table of that name, the one DynamoDB acts on.
   and the index of a statement with `?` placeholders is read before they are bound. A request naming nothing is
   checked as its own operation on `*`; a state machine's task naming nothing is left to DynamoDB to answer.
 
+## Compressed requests
+
+DynamoDB JSON 1.0 requests accept `Content-Encoding: gzip` for modern operations and the supported
+legacy operations. Signature verification uses the compressed bytes. Floci then decompresses the
+body before IAM evaluates table resources and item keys.
+
+The decompressed body is limited to 16,000,000 bytes, matching the largest request accepted in a live
+AWS probe. Floci returns HTTP 413 for larger bodies and HTTP 400 for invalid gzip; that probe received
+HTTP 500 for these cases. DynamoDB Streams and other request formats retain their existing handling.
+
 ## Supported Actions
 
 | Action | Description |
