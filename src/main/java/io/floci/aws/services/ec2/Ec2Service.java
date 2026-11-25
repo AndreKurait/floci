@@ -2636,6 +2636,8 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     // sharing a monitor on hash collision.
     private static final int LOCK_STRIPES = 512;
     private final Object[] resourceLocks = newLockStripes();
+    /** Separate stripes keep slow Docker calls outside topology locks without reordering device changes. */
+    private final Object[] interfaceDeviceLocks = newLockStripes();
 
     /** The AMI state a deregistered image is tombstoned with; one of EC2's documented ImageState values. */
     private static final String DEREGISTERED_STATE = "deregistered";
@@ -17586,12 +17588,20 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
     }
 
     private void carrySubnetIpv6Blocks(String region, String subnetId, InstanceNetworkInterface eni) {
-        Subnet subnet = subnetId == null ? null : subnets.get(key(region, subnetId)).orElse(null);
+        carrySubnetIpv6Blocks(callerAccountId(), region, subnetId, eni);
+    }
+
+    private void carrySubnetIpv6Blocks(String account, String region, String subnetId, InstanceNetworkInterface eni) {
+        Subnet subnet = subnetId == null ? null : subnets instanceof AccountAwareStorageBackend<Subnet> aware
+                ? aware.getForAccount(account, key(region, subnetId)).orElse(null)
+                : subnets.get(key(region, subnetId)).orElse(null);
         if (subnet == null) {
             return;
         }
         eni.setSubnetIpv6CidrBlocks(new ArrayList<>(associatedIpv6Blocks(subnet)));
-        Vpc vpc = vpcs.get(key(region, subnet.getVpcId())).orElse(null);
+        Vpc vpc = vpcs instanceof AccountAwareStorageBackend<Vpc> aware
+                ? aware.getForAccount(account, key(region, subnet.getVpcId())).orElse(null)
+                : vpcs.get(key(region, subnet.getVpcId())).orElse(null);
         if (vpc != null) {
             eni.setVpcIpv6CidrBlocks(new ArrayList<>(vpc.getIpv6CidrBlockAssociationSet().stream()
                     .filter(assoc -> "associated".equalsIgnoreCase(assoc.getIpv6CidrBlockState()))
@@ -17807,14 +17817,29 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
      */
     public NetworkInterfaceAttachment attachNetworkInterface(String region, String networkInterfaceId,
                                                               String instanceId, int deviceIndex) {
-        // Under the topology lock, so the standalone record and the instance's copy change together for anything
-        // that reads both, ModifyNetworkInterfaceAttribute among them.
-        synchronized (attachmentTopologyLock(region)) {
-            return attachNetworkInterfaceLocked(region, networkInterfaceId, instanceId, deviceIndex);
+        synchronized (interfaceDeviceLock(callerAccountId(), region, instanceId)) {
+            InterfaceDeviceChange change;
+            synchronized (attachmentTopologyLock(region)) {
+                change = attachNetworkInterfaceLocked(region, networkInterfaceId, instanceId, deviceIndex);
+            }
+            if (containerManager != null) {
+                containerManager.plugNetworkInterface(change.instance(), change.device());
+                if (change.device().getSharedNetworkContainerId() != null) {
+                    instances.persistIfCurrent(key(region, instanceId), change.instance());
+                }
+            }
+            return change.attachment();
         }
     }
 
-    private NetworkInterfaceAttachment attachNetworkInterfaceLocked(String region, String networkInterfaceId,
+    private Object interfaceDeviceLock(String account, String region, String instanceId) {
+        return interfaceDeviceLocks[Math.floorMod(Objects.hash(account, region, instanceId), interfaceDeviceLocks.length)];
+    }
+
+    private record InterfaceDeviceChange(Instance instance, InstanceNetworkInterface device,
+                                         NetworkInterfaceAttachment attachment) {}
+
+    private InterfaceDeviceChange attachNetworkInterfaceLocked(String region, String networkInterfaceId,
                                                                     String instanceId, int deviceIndex) {
         NetworkInterface ni = requireStandaloneNetworkInterface(region, networkInterfaceId);
         if (ni.getAttachment() != null) {
@@ -17861,13 +17886,16 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         attached.setPrivateDnsName(ni.getPrivateDnsName());
         attached.setGroups(new ArrayList<>(ni.getGroups()));
         attached.setIpv6Addresses(new ArrayList<>(ni.getIpv6Addresses()));
-        carrySubnetIpv6Blocks(region, ni.getSubnetId(), attached);
+        carrySubnetIpv6Blocks(callerAccountId(), region, ni.getSubnetId(), attached);
         attached.setAttachmentId(attachment.getAttachmentId());
         attached.setDeviceIndex(deviceIndex);
         attached.setAttachTime(attachment.getAttachTime());
         inst.getNetworkInterfaces().add(attached);
         storeInstance(region, inst);
-        return attachment;
+        if (containerManager != null) {
+            containerManager.refreshInstanceMetadata(inst);
+        }
+        return new InterfaceDeviceChange(inst, attached, attachment);
     }
 
     /** The endpoints of an attachment held in the caller's account and Region, without changing it. */
@@ -17900,24 +17928,46 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
         if (attachmentId == null || attachmentId.isBlank()) {
             throw new AwsException("MissingParameter", "The request must contain the parameter AttachmentId", 400);
         }
-        // As attaching does: the standalone record and the instance's copy change together.
+        NetworkInterfaceAttachment observed;
         synchronized (attachmentTopologyLock(region)) {
-            return detachNetworkInterfaceLocked(region, attachmentId);
+            observed = interfaceByAttachment(region, attachmentId).getAttachment();
+        }
+        String hostAccount = observed.getInstanceOwnerId() != null ? observed.getInstanceOwnerId() : callerAccountId();
+        // Do not acquire a device stripe while holding the topology monitor: attach takes them in this order.
+        synchronized (interfaceDeviceLock(hostAccount, region, observed.getInstanceId())) {
+            InterfaceDeviceChange change;
+            synchronized (attachmentTopologyLock(region)) {
+                change = detachNetworkInterfaceLocked(region, attachmentId);
+            }
+            if (containerManager != null && change.instance() != null && change.device() != null) {
+                containerManager.unplugNetworkInterface(change.instance(), change.device());
+            }
+            return change.attachment();
         }
     }
 
-    private NetworkInterfaceAttachment detachNetworkInterfaceLocked(String region, String attachmentId) {
-        NetworkInterface ni = networkInterfaces.scan(k -> k.startsWith(region + "::")).stream()
+    private NetworkInterface interfaceByAttachment(String region, String attachmentId) {
+        return networkInterfaces.scan(k -> k.startsWith(region + "::")).stream()
                 .filter(n -> n.getAttachment() != null && attachmentId.equals(n.getAttachment().getAttachmentId()))
                 .findFirst()
                 .orElseThrow(() -> new AwsException("InvalidAttachmentID.NotFound",
                         "The attachment ID '" + attachmentId + "' does not exist", 400));
+    }
+
+    private InterfaceDeviceChange detachNetworkInterfaceLocked(String region, String attachmentId) {
+        NetworkInterface ni = interfaceByAttachment(region, attachmentId);
         NetworkInterfaceAttachment detached = ni.getAttachment();
+        String hostAccount = detached.getInstanceOwnerId() != null ? detached.getInstanceOwnerId() : callerAccountId();
+        Instance holder = instances instanceof AccountAwareStorageBackend<Instance> aware
+                ? aware.getForAccount(hostAccount, key(region, detached.getInstanceId())).orElse(null)
+                : instances.get(key(region, detached.getInstanceId())).orElse(null);
+        InstanceNetworkInterface device = holder == null ? null : holder.getNetworkInterfaces().stream()
+                .filter(eni -> ni.getNetworkInterfaceId().equals(eni.getNetworkInterfaceId())).findFirst().orElse(null);
         ni.setAttachment(null);
         ni.setStatus("available");
         networkInterfaces.put(key(region, ni.getNetworkInterfaceId()), ni);
         detachFromInstance(region, detached.getInstanceId(), ni.getNetworkInterfaceId());
-        return detached;
+        return new InterfaceDeviceChange(holder, device, detached);
     }
 
     // ─── Network interface permissions ───────────────────────────────────────────────
@@ -18108,6 +18158,9 @@ public class Ec2Service implements ContainerTeardown, ResourceProvider, Resettab
                 aware.putForAccount(safeAccount, key(region, instanceId), inst);
             } else {
                 storeInstance(region, inst);
+            }
+            if (containerManager != null) {
+                containerManager.refreshInstanceMetadata(inst);
             }
         }
     }

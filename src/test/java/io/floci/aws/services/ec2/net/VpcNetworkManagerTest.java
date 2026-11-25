@@ -1,5 +1,7 @@
 package io.floci.aws.services.ec2.net;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.ConnectToNetworkCmd;
 import com.github.dockerjava.api.command.CreateNetworkCmd;
@@ -40,6 +42,7 @@ import static org.awaitility.Awaitility.await;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
@@ -1441,4 +1444,242 @@ class VpcNetworkManagerTest {
                 VpcNetworkManager.allocateSubBlock(parent, 16, List.of(parent)),
                 "a fully claimed parent yields nothing rather than an overlapping block");
     }
+    private static final String INTERFACE_MAC = "02:11:22:33:44:55";
+
+    /** The guest namespace's endpoints, before and after the connect, as Docker reports them. */
+    private void endpointsAcrossConnect(Map<String, ContainerNetwork> before, Map<String, ContainerNetwork> after) {
+        InspectContainerResponse first = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
+        when(first.getNetworkSettings().getNetworks()).thenReturn(before);
+        InspectContainerResponse second = mock(InspectContainerResponse.class, RETURNS_DEEP_STUBS);
+        when(second.getNetworkSettings().getNetworks()).thenReturn(after);
+        InspectContainerCmd inspect = mock(InspectContainerCmd.class);
+        when(docker.inspectContainerCmd("helper-1")).thenReturn(inspect);
+        when(inspect.exec()).thenReturn(first, second);
+    }
+
+    private ContainerNetwork endpointWith(String address, String mac) {
+        ContainerNetwork endpoint = observedEndpoint(address);
+        when(endpoint.getMacAddress()).thenReturn(mac);
+        return endpoint;
+    }
+
+    @Test
+    void anAttachedInterfaceIsPluggedWithItsOwnAddressAndMac() {
+        manager.declareVpc(ACCOUNT, REGION, "vpc-2", "172.31.0.0/16");
+        manager.declareSubnet(ACCOUNT, REGION, "vpc-2", "subnet-c", "172.31.5.0/24");
+        String address = manager.allocatePrivateIp(ACCOUNT, REGION, "subnet-c").orElseThrow();
+        String networkName = manager.networkName(ACCOUNT, REGION, "vpc-2");
+        endpointsAcrossConnect(Map.of(), Map.of(networkName, endpointWith(address, "02:11:22:33:44:55")));
+
+        assertEquals(Optional.of(networkName),
+                manager.attachInterface(ACCOUNT, REGION, "vpc-2", "subnet-c", "helper-1", address, INTERFACE_MAC));
+
+        ConnectToNetworkCmd connect = docker.connectToNetworkCmd();
+        verify(connect).withContainerId("helper-1");
+        verify(connect).withNetworkId(networkName);
+        ArgumentCaptor<ContainerNetwork> endpoint = ArgumentCaptor.forClass(ContainerNetwork.class);
+        verify(connect).withContainerNetwork(endpoint.capture());
+        JsonNode sent = new ObjectMapper().valueToTree(endpoint.getValue());
+        assertEquals(address, sent.path("IPAMConfig").path("IPv4Address").asText());
+        assertEquals(INTERFACE_MAC, sent.path("MacAddress").asText());
+        assertFalse(sent.has("GwPriority"), "the attached device leaves the namespace's default route alone");
+        verify(docker, never()).disconnectFromNetworkCmd();
+    }
+
+    private static final String DOCKER_MAC = "02:42:ac:1f:05:09";
+
+    private static String links(String deviceMac) {
+        return "[{\"ifname\":\"lo\",\"address\":\"00:00:00:00:00:00\"},"
+                + "{\"ifname\":\"eth0\",\"address\":\"02:42:ac:11:00:02\"},"
+                + "{\"ifname\":\"eth1\",\"address\":\"" + deviceMac + "\"}]";
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void whereDockerKeepsItsOwnMacTheNamespaceOwnerGivesTheDeviceTheInterfacesMac(boolean announcementAvailable) {
+        manager.declareVpc(ACCOUNT, REGION, "vpc-2", "172.31.0.0/16");
+        manager.declareSubnet(ACCOUNT, REGION, "vpc-2", "subnet-c", "172.31.5.0/24");
+        String address = manager.allocatePrivateIp(ACCOUNT, REGION, "subnet-c").orElseThrow();
+        String networkName = manager.networkName(ACCOUNT, REGION, "vpc-2");
+        // Docker 25 applies an endpoint MAC only when it creates a container, not on connect.
+        endpointsAcrossConnect(Map.of(), Map.of(networkName, endpointWith(address, DOCKER_MAC)));
+        List<String> commands = new ArrayList<>();
+        String[] device = {DOCKER_MAC};
+        manager.namespaceCommand = (container, command) -> {
+            assertEquals("helper-1", container);
+            commands.add(String.join(" ", command));
+            if (command[0].equals("sh")) {
+                device[0] = INTERFACE_MAC;
+                return "";
+            }
+            if (command[0].equals("arping") && !announcementAvailable) {
+                throw new IllegalStateException("arping unavailable in this namespace");
+            }
+            return links(device[0]);
+        };
+
+        assertEquals(Optional.of(networkName),
+                manager.attachInterface(ACCOUNT, REGION, "vpc-2", "subnet-c", "helper-1", address, INTERFACE_MAC));
+
+        assertEquals(List.of("ip -j link",
+                "sh -c ip link set dev eth1 down && ip link set dev eth1 address " + INTERFACE_MAC
+                        + " && ip link set dev eth1 up",
+                "ip -j link", "arping -U -c 1 -w 1 -I eth1 " + address), commands);
+        verify(docker, never()).disconnectFromNetworkCmd();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"command fails", "device keeps Docker's MAC", "Docker reports no MAC"})
+    void aDeviceThatCannotTakeTheInterfacesMacIsUnpluggedAndRefused(String damage) {
+        manager.declareVpc(ACCOUNT, REGION, "vpc-2", "172.31.0.0/16");
+        manager.declareSubnet(ACCOUNT, REGION, "vpc-2", "subnet-c", "172.31.5.0/24");
+        String address = manager.allocatePrivateIp(ACCOUNT, REGION, "subnet-c").orElseThrow();
+        String networkName = manager.networkName(ACCOUNT, REGION, "vpc-2");
+        endpointsAcrossConnect(Map.of(), Map.of(networkName,
+                endpointWith(address, damage.equals("Docker reports no MAC") ? null : DOCKER_MAC)));
+        manager.namespaceCommand = (container, command) -> {
+            if (command[0].equals("sh") && damage.equals("command fails")) {
+                throw new IllegalStateException("RTNETLINK answers: Operation not permitted");
+            }
+            return links(DOCKER_MAC);
+        };
+
+        IllegalStateException failure = assertThrows(IllegalStateException.class,
+                () -> manager.attachInterface(ACCOUNT, REGION, "vpc-2", "subnet-c", "helper-1", address, INTERFACE_MAC));
+
+        assertTrue(failure.getMessage().contains("could not give the attached device the interface's MAC"),
+                failure.getMessage());
+        verify(docker.disconnectFromNetworkCmd()).withContainerId("helper-1");
+        verify(docker.disconnectFromNetworkCmd()).withNetworkId(networkName);
+    }
+
+    @Test
+    void anEndpointWithoutTheInterfacesAddressIsUnpluggedAndRefused() {
+        manager.declareVpc(ACCOUNT, REGION, "vpc-2", "172.31.0.0/16");
+        manager.declareSubnet(ACCOUNT, REGION, "vpc-2", "subnet-c", "172.31.5.0/24");
+        String address = manager.allocatePrivateIp(ACCOUNT, REGION, "subnet-c").orElseThrow();
+        String networkName = manager.networkName(ACCOUNT, REGION, "vpc-2");
+        endpointsAcrossConnect(Map.of(), Map.of(networkName, endpointWith("172.31.5.99", INTERFACE_MAC)));
+        manager.namespaceCommand = (container, command) -> {
+            throw new AssertionError("no MAC change for an endpoint with the wrong address");
+        };
+
+        assertThrows(IllegalStateException.class,
+                () -> manager.attachInterface(ACCOUNT, REGION, "vpc-2", "subnet-c", "helper-1", address, INTERFACE_MAC));
+        verify(docker.disconnectFromNetworkCmd()).withNetworkId(networkName);
+    }
+
+    @Test
+    void aNamespaceAlreadyOnTheInterfacesVpcNetworkIsNotGivenASecondEndpoint() {
+        manager.declareVpc(ACCOUNT, REGION, "vpc-2", "172.31.0.0/16");
+        manager.declareSubnet(ACCOUNT, REGION, "vpc-2", "subnet-c", "172.31.5.0/24");
+        String address = manager.allocatePrivateIp(ACCOUNT, REGION, "subnet-c").orElseThrow();
+        String networkName = manager.networkName(ACCOUNT, REGION, "vpc-2");
+        endpointsAcrossConnect(Map.of(networkName, endpointWith("172.31.5.20", "02:aa:aa:aa:aa:aa")), Map.of());
+
+        assertThrows(IllegalStateException.class,
+                () -> manager.attachInterface(ACCOUNT, REGION, "vpc-2", "subnet-c", "helper-1", address, INTERFACE_MAC));
+        verify(docker.connectToNetworkCmd(), never()).exec();
+    }
+
+    @Test
+    void anInterfaceOffEveryPlannedNetworkOrWithoutAMacIsNotPlugged() {
+        manager.declareVpc(ACCOUNT, REGION, "vpc-2", "172.31.0.0/16");
+        manager.declareSubnet(ACCOUNT, REGION, "vpc-2", "subnet-c", "172.31.5.0/24");
+        String address = manager.allocatePrivateIp(ACCOUNT, REGION, "subnet-c").orElseThrow();
+
+        assertTrue(manager.attachInterface(ACCOUNT, REGION, "vpc-2", "subnet-c", "helper-1", "192.168.9.9", INTERFACE_MAC)
+                .isEmpty());
+        assertTrue(manager.attachInterface(ACCOUNT, REGION, "vpc-9", "subnet-9", "helper-1", address, INTERFACE_MAC)
+                .isEmpty());
+        assertTrue(manager.attachInterface(ACCOUNT, REGION, "vpc-2", "subnet-c", "helper-1", address, null).isEmpty());
+        verify(docker.connectToNetworkCmd(), never()).exec();
+    }
+
+    @Test
+    void unpluggingRemovesOnlyTheInterfacesVpcEndpoint() {
+        manager.declareVpc(ACCOUNT, REGION, "vpc-2", "172.31.0.0/16");
+        manager.declareSubnet(ACCOUNT, REGION, "vpc-2", "subnet-c", "172.31.5.0/24");
+        String address = manager.allocatePrivateIp(ACCOUNT, REGION, "subnet-c").orElseThrow();
+        String networkName = manager.networkName(ACCOUNT, REGION, "vpc-2");
+        endpointsAcrossConnect(Map.of(), Map.of(networkName, endpointWith(address, INTERFACE_MAC)));
+        manager.attachInterface(ACCOUNT, REGION, "vpc-2", "subnet-c", "helper-1", address, INTERFACE_MAC);
+
+        manager.detachInterface(ACCOUNT, REGION, "vpc-2", "helper-1");
+        manager.detachInterface(ACCOUNT, REGION, "vpc-never-created", "helper-1");
+
+        verify(docker.disconnectFromNetworkCmd(), times(1)).withNetworkId(networkName);
+        verify(docker.disconnectFromNetworkCmd(), times(1)).exec();
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"owned", "foreign deployment", "foreign account", "foreign region", "foreign VPC",
+            "different subnet", "missing network", "different address", "missing endpoint"})
+    void restoringAnAttachedMacUsesOnlyTheExistingOwnedNetwork(String scenario) {
+        manager.declareVpc(ACCOUNT, REGION, "vpc-2", "172.31.0.0/16");
+        manager.declareSubnet(ACCOUNT, REGION, "vpc-2", "subnet-c", "172.31.5.0/24");
+        String address = "172.31.5.10";
+        String networkName = manager.networkName(ACCOUNT, REGION, "vpc-2");
+        Map<String, String> labels = newLabels("vpc-2", "4650");
+        labels.put("io.floci.account", ACCOUNT);
+        switch (scenario) {
+            case "foreign deployment" -> labels.put("io.floci.owner", "9999");
+            case "foreign account" -> labels.put("io.floci.account", OTHER_ACCOUNT);
+            case "foreign region" -> labels.put("io.floci.region", "eu-west-1");
+            case "foreign VPC" -> labels.put("io.floci.resource-id", "vpc-other");
+            default -> { }
+        }
+        if (!scenario.equals("missing network")) {
+            existingNetwork(networkName, scenario.equals("different subnet") ? "10.20.0.0/16" : "172.31.0.0/16",
+                    labels);
+        }
+        Map<String, ContainerNetwork> endpoints = scenario.equals("missing endpoint") ? Map.of()
+                : Map.of(networkName, endpointWith(
+                        scenario.equals("different address") ? "172.31.5.99" : address, DOCKER_MAC));
+        endpointsAcrossConnect(endpoints, endpoints);
+        AtomicBoolean repaired = new AtomicBoolean();
+        manager.namespaceCommand = (container, command) -> {
+            if (command[0].equals("sh")) {
+                repaired.set(true);
+            }
+            return links(repaired.get() ? INTERFACE_MAC : DOCKER_MAC);
+        };
+
+        manager.restoreInterface(ACCOUNT, REGION, "vpc-2", "helper-1", address, INTERFACE_MAC);
+
+        assertEquals(scenario.equals("owned"), repaired.get());
+        verify(docker.createNetworkCmd(), never()).exec();
+        verify(docker.connectToNetworkCmd(), never()).exec();
+        verify(docker, never()).disconnectFromNetworkCmd();
+    }
+
+    @Test
+    void anOwnedEndpointCanBeDetachedAfterReconstructingTheNetworkManager() {
+        manager.declareVpc(ACCOUNT, REGION, "vpc-2", "172.31.0.0/16");
+        manager.declareSubnet(ACCOUNT, REGION, "vpc-2", "subnet-c", "172.31.5.0/24");
+        String address = "172.31.5.10";
+        String networkName = manager.networkName(ACCOUNT, REGION, "vpc-2");
+        Map<String, String> labels = newLabels("vpc-2", "4650");
+        labels.put("io.floci.account", ACCOUNT);
+        existingNetwork(networkName, "172.31.0.0/16", labels);
+        Map<String, ContainerNetwork> endpoints = Map.of(networkName, endpointWith(address, DOCKER_MAC));
+        endpointsAcrossConnect(endpoints, endpoints);
+        manager.namespaceCommand = (container, command) -> links(INTERFACE_MAC);
+
+        manager.detachInterface(ACCOUNT, REGION, "vpc-2", "helper-1", address, INTERFACE_MAC);
+
+        verify(docker.disconnectFromNetworkCmd()).withNetworkId(networkName);
+        verify(docker.disconnectFromNetworkCmd()).withContainerId("helper-1");
+        verify(docker.disconnectFromNetworkCmd()).exec();
+        verify(docker.createNetworkCmd(), never()).exec();
+        verify(docker.connectToNetworkCmd(), never()).exec();
+    }
+
+    private ContainerNetwork observedEndpoint(String address) {
+        ContainerNetwork endpoint = mock(ContainerNetwork.class);
+        when(endpoint.getIpAddress()).thenReturn(address);
+        return endpoint;
+    }
+
+
 }

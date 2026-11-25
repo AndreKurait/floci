@@ -32,6 +32,33 @@ Every supplied target needs a grant, and an explicit deny on any target rejects 
 before association. `ReleaseAddress` also resolves the allocation named by `AllocationId`,
 so policies can scope release to that allocation or its stored tags.
 
+## Secondary network interfaces
+
+Attachments remain recorded in EC2 responses and IMDS by default. Set
+`FLOCI_SERVICES_EC2_HOT_ATTACH_NETWORK_INTERFACES=true` to also add a physical device
+on the existing Docker VPC-network backend. Supported attachments carry the
+interface's primary private IPv4 address and MAC; detach removes only that device.
+The network is selected using the interface owner's account. Device operations run outside the regional topology lock
+and retain attach/detach ordering for each instance.
+
+Successful physical attachments retain their Docker namespace owner in instance
+storage. With physical attachment enabled, start, reboot and metadata recovery
+restore the MAC only on an existing endpoint in the same owned account/VPC network.
+Recovery does not reconnect a missing endpoint. Older attachment records without
+physical ownership must be explicitly detached and reattached to acquire it.
+
+After changing a device's MAC, Floci attempts a one-second `arping` announcement
+from the namespace owner so peers replace the temporary Docker MAC in their
+neighbor caches. Existing guests without `arping` or permission to send ARP remain
+supported: Floci logs the announcement failure and leaves the repaired device
+attached, but peers may need to expire their old neighbor entries.
+
+Physical attachment remains record-only when VPC networks are disabled, no container
+exists, security-group enforcement is enabled, the namespace already has an
+interface in that account's VPC, or the backend cannot assign the declared address.
+The reason is logged. Docker provides one endpoint per network; this option does
+not add per-interface security-group enforcement or native IPv6 routing.
+
 ## Instance Execution Model
 
 `RunInstances` launches a **real Docker container** for each instance. By default, the container is kept alive with `tail -f /dev/null` so any base image works regardless of its default CMD. Catalog entries that opt into the `systemd` guest runtime start `/sbin/init` instead, with the Docker mounts needed for a systemd-based cloud-image guest. Those guests also get the Docker host's `/lib/modules/<KernelVersion>` (the running kernel's directory only, so the guest's own package manager keeps a writable `/lib/modules`) read-only, so `modprobe` finds modules the shared kernel already has (for example `br_netfilter`, which Kubernetes node setup loads). The mount is read-only, but it is not a boundary for a privileged guest: one can remount that directory read-write and load any module built for the shared kernel (see the warning below). On Docker Desktop or OrbStack, that directory is the Linux VM's, which may not hold modules matching the kernel that VM is running. If `/lib/modules/<KernelVersion>` does not exist on the Docker daemon's host, Docker creates an empty root-owned directory there and `modprobe` still fails. The bind is read-only, so a guest that installs the `linux-modules` package for the host's exact kernel version cannot write into it.
@@ -1854,6 +1881,13 @@ observes the launch first. A terminated mock instance has no public address, and
 back.
 
 ### IPv6 launch metadata and interface creation
+
+IMDS lists attached interfaces under `meta-data/network/interfaces/macs/`. Each MAC answers
+its device number, interface ID, local hostname and primary IPv4 address, MAC, owner,
+security group IDs and names, subnet ID and VPC ID. Attaching or detaching an interface
+refreshes these answers for existing metadata sessions without extending their expiry.
+An unknown MAC or missing value returns 404. Subnet and VPC IPv4 CIDR categories and
+secondary private IPv4 addresses in `local-ipv4s` are not served.
 
 An implicit primary interface launched into a subnet with `AssignIpv6AddressOnCreation` and an associated IPv6 block receives one address through the shared collision-aware allocator. `DescribeInstances` and IMDS report the primary address and per-interface IPv6 addresses, subnet blocks and VPC blocks. These metadata changes do not enable guest IPv6 routing.
 

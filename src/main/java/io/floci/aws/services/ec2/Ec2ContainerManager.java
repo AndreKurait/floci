@@ -138,6 +138,7 @@ public class Ec2ContainerManager {
      */
     static final String LABEL_OWNER = ContainerStorageHelper.OWNER_LABEL;
     private static final ContainerStorageHelper.LabelAliases ALIASES = ContainerStorageHelper.CONTAINER_LABEL_ALIASES;
+    static final String METADATA_HELPER_LABEL = "io.floci.ec2.metadata-helper";
 
     /**
      * Identity of the Floci deployment that owns a container, for scoping the startup sweep.
@@ -1132,6 +1133,135 @@ public class Ec2ContainerManager {
     }
 
     /**
+     * Puts an interface AttachNetworkInterface attached into the instance's network namespace, as a
+     * hot attach adds a device to a running instance: the interface's MAC and primary private
+     * IPv4 on its own VPC's network (EC2 User Guide, "Attach a network interface to an instance").
+     * The interface stays record-only, as before, wherever this backend cannot give it its own
+     * device with its own security groups; the reason is returned and logged.
+     *
+     * @return empty once plugged, otherwise why the interface is record-only
+     */
+    public Optional<String> plugNetworkInterface(Instance instance, InstanceNetworkInterface eni) {
+        String reason = hotAttachBlocker(instance, eni);
+        if (reason == null) {
+            try {
+                String helper = networkContainerOf(instance);
+                if (vpcNetworkManager.attachInterface(interfaceAccount(instance, eni), instance.getRegion(), eni.getVpcId(), eni.getSubnetId(),
+                        helper, eni.getPrivateIpAddress(), eni.getMacAddress()).isEmpty()) {
+                    reason = "its address is not on a VPC network Floci created";
+                } else {
+                    eni.setSharedNetworkContainerId(helper);
+                }
+            } catch (RuntimeException failure) {
+                reason = failure.getMessage() == null ? failure.getClass().getSimpleName() : failure.getMessage();
+            }
+        }
+        if (reason != null) {
+            LOG.infov("Interface {0} attached to EC2 instance {1} is record-only: {2}",
+                    eni.getNetworkInterfaceId(), instance.getInstanceId(), reason);
+        }
+        return Optional.ofNullable(reason);
+    }
+
+    /** Removes the device {@link #plugNetworkInterface} added, when there is one. */
+    public void unplugNetworkInterface(Instance instance, InstanceNetworkInterface eni) {
+        if (hotAttachBlocker(instance, eni) != null) {
+            return;
+        }
+        try {
+            vpcNetworkManager.detachInterface(interfaceAccount(instance, eni), instance.getRegion(), eni.getVpcId(),
+                    networkContainerOf(instance), eni.getPrivateIpAddress(), eni.getMacAddress());
+        } catch (RuntimeException failure) {
+            LOG.warnv("Could not unplug interface {0} from EC2 instance {1}: {2}",
+                    eni.getNetworkInterfaceId(), instance.getInstanceId(), failure.getMessage());
+        }
+    }
+
+    /** Null when this backend can give the attached interface its own device; otherwise why not. */
+    String hotAttachBlocker(Instance instance, InstanceNetworkInterface eni) {
+        if (!config.services().ec2().hotAttachNetworkInterfaces()) {
+            return "physical network-interface attachment is disabled";
+        }
+        if (vpcNetworkManager == null || !vpcNetworkManager.enabled()) {
+            return "VPC networks are disabled";
+        }
+        if (instance.getDockerContainerId() == null) {
+            return "the instance has no container";
+        }
+        if (firewallManager != null && firewallManager.enabled()) {
+            return "security-group enforcement filters the namespace with the primary interface's groups only";
+        }
+        if (eni.getVpcId() == null || eni.getMacAddress() == null || eni.getPrivateIpAddress() == null) {
+            return "the interface has no VPC, MAC or private address";
+        }
+        if ((Objects.equals(interfaceAccount(instance, eni), instance.getOwnerId())
+                && eni.getVpcId().equals(instance.getVpcId())) || instance.getNetworkInterfaces().stream().anyMatch(other ->
+                other != eni && !Objects.equals(other.getNetworkInterfaceId(), eni.getNetworkInterfaceId())
+                        && Objects.equals(interfaceAccount(instance, other), interfaceAccount(instance, eni))
+                        && eni.getVpcId().equals(other.getVpcId()))) {
+            return "the instance already holds an interface in VPC " + eni.getVpcId()
+                    + ", and Docker gives a namespace one endpoint per network";
+        }
+        return null;
+    }
+
+    /** The container that owns the instance's network namespace: its helper, or the guest itself. */
+    private String networkContainerOf(Instance instance) {
+        String containerId = instance.getDockerContainerId();
+        String helperId = namespaceOwnerId(dockerClient.inspectContainerCmd(containerId).exec());
+        if (helperId == null) {
+            return containerId;
+        }
+        InspectContainerResponse helper = dockerClient.inspectContainerCmd(helperId).exec();
+        Map<String, String> labels = helper.getConfig().getLabels();
+        String networkMode = helper.getHostConfig() == null ? null : helper.getHostConfig().getNetworkMode();
+        if (networkMode == null || "host".equals(networkMode) || networkMode.startsWith("container:")
+                || !ALIASES.consistent(helperId, labels)
+                || !"true".equals(labels.get(METADATA_HELPER_LABEL))
+                || ALIASES.matches(labels, ContainerStorageHelper.SECURITY_GROUP_HELPER_LABEL, "true")
+                || !"ec2".equals(labels.get(LABEL_SERVICE))
+                || !instance.getInstanceId().equals(labels.get(LABEL_RESOURCE_ID))
+                || !Objects.equals(instance.getOwnerId(), labels.get(ContainerStorageHelper.ACCOUNT_LABEL))
+                || !Objects.equals(instance.getRegion(), labels.get(ContainerStorageHelper.REGION_LABEL))
+                || !ALIASES.matches(labels, LABEL_OWNER, ownerIdentity())) {
+            throw new IllegalStateException("Hot attachment requires the instance's own metadata namespace helper");
+        }
+        return helperId;
+    }
+
+    /** Docker can restore its original endpoint MAC when a standalone workload restarts. */
+    void restoreAttachedNetworkInterfaces(Instance instance) {
+        for (InstanceNetworkInterface eni : List.copyOf(instance.getNetworkInterfaces())) {
+            if (eni.getDeviceIndex() == 0 || eni.getSharedNetworkContainerId() == null
+                    || hotAttachBlocker(instance, eni) != null) {
+                continue;
+            }
+            try {
+                String helper = networkContainerOf(instance);
+                if (!helper.equals(eni.getSharedNetworkContainerId())) {
+                    continue;
+                }
+                vpcNetworkManager.restoreInterface(interfaceAccount(instance, eni), instance.getRegion(), eni.getVpcId(),
+                        helper, eni.getPrivateIpAddress(), eni.getMacAddress());
+            } catch (RuntimeException failure) {
+                LOG.warnv(failure, "Could not restore interface {0} of EC2 instance {1}",
+                        eni.getNetworkInterfaceId(), instance.getInstanceId());
+            }
+        }
+    }
+
+    private static String interfaceAccount(Instance instance, InstanceNetworkInterface eni) {
+        return eni.getOwnerId() == null ? instance.getOwnerId() : eni.getOwnerId();
+    }
+
+    /** Serves the instance's current interfaces after attachment or detachment. */
+    public void refreshInstanceMetadata(Instance instance) {
+        if (metadataServer != null) {
+            metadataServer.refreshInstance(instance);
+        }
+    }
+
+    /**
      * Gracefully stops a running container (30 second timeout then SIGKILL).
      * Updates instance state through stopping → stopped.
      */
@@ -1252,6 +1382,7 @@ public class Ec2ContainerManager {
                 rollbackProtectedMetadataRegistration(instance, protectedMetadataAddress, retainedMetadataRegistration);
                 return;
             }
+            restoreAttachedNetworkInterfaces(instance);
             InstanceState running = InstanceState.running();
             if (!instance.compareAndSetState(pending, running)) {
                 rollbackProtectedMetadataRegistration(instance, protectedMetadataAddress, retainedMetadataRegistration);
@@ -1429,6 +1560,7 @@ public class Ec2ContainerManager {
         metadataServer.registerContainer(containerIp, instance.getInstanceId(), instance);
         refreshImdsSourceRegistration(instance, containerId, containerIp);
         refreshMetadataAddresses(instance, containerId);
+        restoreAttachedNetworkInterfaces(instance);
         return true;
     }
 
@@ -1835,6 +1967,7 @@ public class Ec2ContainerManager {
         executor.submit(() -> {
             try {
                 dockerClient.restartContainerCmd(containerId).exec();
+                restoreAttachedNetworkInterfaces(instance);
                 LOG.infov("Rebooted EC2 container {0}", containerId);
             } catch (Exception e) {
                 LOG.warnv("Error rebooting EC2 container {0}: {1}", containerId, e.getMessage());

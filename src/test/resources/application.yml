@@ -375,6 +375,7 @@ floci:
       mock-public-addresses: none
       instance-resource-limits: true
       aws-faithful-private-ip: false
+      hot-attach-network-interfaces: ${FLOCI_SERVICES_EC2_HOT_ATTACH_NETWORK_INTERFACES:false}
       # container-ips-routable: true  # see src/main/resources/application.yml
       # Off explicitly, not merely by implication of mock: true above. Tests must not create or
       # reconcile Docker networks on whatever daemon CI happens to have.

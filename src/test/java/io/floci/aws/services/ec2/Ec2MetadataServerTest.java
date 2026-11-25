@@ -1,5 +1,6 @@
 package io.floci.aws.services.ec2;
 
+import io.floci.aws.services.ec2.model.GroupIdentifier;
 import io.floci.aws.services.ec2.model.Instance;
 import io.floci.aws.services.ec2.model.InstanceNetworkInterface;
 import io.floci.aws.services.ec2.model.Placement;
@@ -9,7 +10,9 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -147,6 +150,66 @@ class Ec2MetadataServerTest {
         Instance noIpv6 = new Instance();
         noIpv6.setNetworkInterfaces(new ArrayList<>(List.of(ipv4Only)));
         assertEquals(null, Ec2MetadataServer.primaryIpv6(noIpv6));
+    }
+
+    @Test
+    void eachInterfaceAnswersItsOwnIpv4CategoriesByMacIncludingAnAttachedDevice() {
+        InstanceNetworkInterface primary = new InstanceNetworkInterface();
+        primary.setMacAddress("02:aa:bb:cc:dd:ee");
+        primary.setNetworkInterfaceId("eni-0primary");
+        primary.setPrivateIpAddress("10.1.0.10");
+        InstanceNetworkInterface attached = new InstanceNetworkInterface();
+        attached.setMacAddress("02:11:22:33:44:55");
+        attached.setDeviceIndex(1);
+        attached.setNetworkInterfaceId("eni-0attached");
+        attached.setPrivateIpAddress("172.31.5.9");
+        attached.setPrivateDnsName("ip-172-31-5-9.eu-west-1.compute.internal");
+        attached.setOwnerId("111111111111");
+        attached.setSubnetId("subnet-0customer");
+        attached.setVpcId("vpc-0customer");
+        GroupIdentifier group = new GroupIdentifier();
+        group.setGroupId("sg-0customer");
+        group.setGroupName("customer");
+        attached.setGroups(new ArrayList<>(List.of(group)));
+        Instance instance = new Instance();
+        instance.setNetworkInterfaces(new ArrayList<>(List.of(primary, attached)));
+        String mac = "02:11:22:33:44:55";
+
+        assertEquals("02:aa:bb:cc:dd:ee/\n02:11:22:33:44:55/", Ec2MetadataServer.macListing(instance));
+        Map<String, String> expected = Map.of(
+                "device-number", "1", "interface-id", "eni-0attached", "local-ipv4s", "172.31.5.9",
+                "mac", mac, "owner-id", "111111111111", "security-group-ids", "sg-0customer",
+                "security-groups", "customer", "subnet-id", "subnet-0customer", "vpc-id", "vpc-0customer",
+                "local-hostname", "ip-172-31-5-9.eu-west-1.compute.internal");
+        expected.forEach((category, value) -> assertEquals(value, Ec2MetadataServer.interfaceValues(
+                instance, mac, Ec2MetadataServer.INTERFACE_CATEGORIES.get(category)).orElseThrow(), category));
+        assertEquals("0", Ec2MetadataServer.interfaceValues(instance, "02:AA:BB:CC:DD:EE",
+                Ec2MetadataServer.INTERFACE_CATEGORIES.get("device-number")).orElseThrow());
+        assertTrue(Ec2MetadataServer.interfaceValues(instance, "02:aa:bb:cc:dd:ee",
+                Ec2MetadataServer.INTERFACE_CATEGORIES.get("owner-id")).isEmpty());
+        assertEquals(String.join("\n", new TreeSet<>(expected.keySet())),
+                Ec2MetadataServer.interfaceListing(instance, mac).orElseThrow());
+        assertTrue(Ec2MetadataServer.interfaceListing(instance, "02:00:00:00:00:00").isEmpty());
+    }
+
+    @Test
+    void refreshingAnInstanceServesItsCurrentRecordAtEveryAddress() {
+        Ec2MetadataServer server = new Ec2MetadataServer(null, null, null, (InstanceConnectKeys) null);
+        Instance launched = new Instance();
+        launched.setInstanceId("i-0guest");
+        Instance other = new Instance();
+        other.setInstanceId("i-0other");
+        server.reconcileContainerAddresses(Set.of("192.0.2.10", "192.0.2.11"), launched);
+        server.reconcileContainerAddresses(Set.of("192.0.2.12"), other);
+        Instance attached = new Instance();
+        attached.setInstanceId("i-0guest");
+
+        server.refreshInstance(attached);
+
+        assertTrue(server.registeredContainer("192.0.2.10").orElseThrow() == attached);
+        assertTrue(server.registeredContainer("192.0.2.11").orElseThrow() == attached);
+        assertTrue(server.registeredContainer("192.0.2.12").orElseThrow() == other);
+        server.refreshInstance(null);
     }
 
     @Test
