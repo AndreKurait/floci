@@ -1,4 +1,4 @@
-package io.floci.aws.services.lambda.launcher;
+package io.floci.aws.core.common.docker;
 
 import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.Test;
@@ -13,11 +13,11 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 @ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
-class LambdaDockerFlagsTest {
+class DockerFlagsTest {
 
     @Test
     void parsesSupportedFlagsAndQuotedValues() {
-        LambdaDockerFlags flags = LambdaDockerFlags.parse(
+        DockerFlags flags = DockerFlags.parse(
                 "--env \"NODE_EXTRA_CA_CERTS=/opt/certs/root ca.pem\" "
                         + "--volume /tmp/certs:/opt/certs:ro "
                         + "--publish 127.0.0.1:5050:5050 --add-host api.local:host-gateway "
@@ -38,7 +38,7 @@ class LambdaDockerFlagsTest {
 
     @Test
     void supportsShortAliases() {
-        LambdaDockerFlags flags = LambdaDockerFlags.parse(
+        DockerFlags flags = DockerFlags.parse(
                 "-e KEY=value -v host:/container -p 8080:80 -u 1000");
 
         assertEquals(List.of("KEY=value"), flags.environment());
@@ -50,14 +50,14 @@ class LambdaDockerFlagsTest {
     @Test
     void rejectsUnsupportedFlags() {
         IllegalArgumentException exception = assertThrows(IllegalArgumentException.class,
-                () -> LambdaDockerFlags.parse("--cap-add NET_ADMIN"));
+                () -> DockerFlags.parse("--cap-add NET_ADMIN"));
 
         assertTrue(exception.getMessage().contains("--cap-add"));
     }
 
     @Test
     void rejectsMissingFlagValues() {
-        assertThrows(IllegalArgumentException.class, () -> LambdaDockerFlags.parse("--env"));
-        assertThrows(IllegalArgumentException.class, () -> LambdaDockerFlags.parse("--dns --privileged"));
+        assertThrows(IllegalArgumentException.class, () -> DockerFlags.parse("--env"));
+        assertThrows(IllegalArgumentException.class, () -> DockerFlags.parse("--dns --privileged"));
     }
 }

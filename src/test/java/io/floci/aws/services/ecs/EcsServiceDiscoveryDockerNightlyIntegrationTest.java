@@ -10,6 +10,7 @@ import io.floci.aws.services.ecs.model.AwsVpcConfiguration;
 import io.floci.aws.services.ecs.model.ContainerDefinition;
 import io.floci.aws.services.ecs.model.CreateServiceRequest;
 import io.floci.aws.services.ecs.model.EcsTask;
+import io.floci.aws.services.ecs.model.LaunchType;
 import io.floci.aws.services.ecs.model.NetworkConfiguration;
 import io.floci.aws.services.ecs.model.NetworkMode;
 import io.floci.aws.services.ecs.model.TaskDefinition;
@@ -162,6 +163,7 @@ class EcsServiceDiscoveryDockerNightlyIntegrationTest {
         request.setServiceName(ECS_SERVICE_NAME);
         request.setTaskDefinition(taskDef.getTaskDefinitionArn());
         request.setDesiredCount(1);
+        request.setLaunchType(LaunchType.FARGATE);
         request.setNetworkConfiguration(networkConfiguration);
         request.setServiceRegistries(List.of(Map.of(
                 "registryArn", cloudMapSvc.getArn(),
