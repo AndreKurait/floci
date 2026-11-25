@@ -21,6 +21,7 @@ import io.floci.aws.services.ec2.net.VpcNetworkManager;
 import io.floci.aws.services.ec2.net.VpcRoutingManager;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.lambda.launcher.ImageCacheService;
+import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -41,6 +42,9 @@ import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.Mockito.*;
 
 class ElbClassicDockerRecoveryTest {
+    @TempDir
+    Path journalDirectory;
+
     @ParameterizedTest
     @ValueSource(booleans = {false, true})
     void startupRetiresOwnedWorkloadBeforeHelperAndRetainsBlockedLease(boolean blocked) throws Exception {
@@ -120,9 +124,11 @@ class ElbClassicDockerRecoveryTest {
         }
     }
 
-    private static String create(DockerClient docker, List<String> created, String name,
+    private String create(DockerClient docker, List<String> created, String name,
                                  Map<String, String> labels, String network) throws IOException {
-        Path manifest = Path.of(System.getenv("FLOCI_AGENT_RUN_DIR"), "docker-ownership.txt");
+        String configured = System.getenv("FLOCI_AGENT_RUN_DIR");
+        Path directory = configured == null || configured.isBlank() ? journalDirectory : Path.of(configured);
+        Path manifest = directory.resolve("docker-ownership.txt");
         Files.writeString(manifest, "planned " + name + "\n", StandardOpenOption.CREATE, StandardOpenOption.APPEND);
         String id = docker.createContainerCmd("alpine:3.21").withName(name).withLabels(labels)
                 .withHostConfig(HostConfig.newHostConfig().withNetworkMode(network))
