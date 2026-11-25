@@ -9,6 +9,7 @@ import io.floci.aws.core.common.dns.DnsClientVpcSource.ClientVpc;
 import io.floci.aws.core.common.dns.EmbeddedDnsServer;
 import io.floci.aws.core.common.docker.ContainerBuilder;
 import io.floci.aws.core.common.docker.ContainerLifecycleManager;
+import io.floci.aws.core.common.docker.CurrentContainerNetworkResolver;
 import io.floci.aws.core.common.docker.LocallyBuiltHelperImage;
 import io.floci.aws.services.ec2.model.SecurityGroup;
 import io.quarkus.test.InjectMock;
@@ -49,6 +50,7 @@ class SecurityGroupNamespaceDnsDockerIntegrationTest {
     @Inject ContainerLifecycleManager lifecycle;
     @Inject ContainerBuilder builder;
     @Inject DockerClient docker;
+    @Inject CurrentContainerNetworkResolver currentContainer;
     @Inject EmulatorConfig config;
     @InjectMock EmbeddedDnsServer embeddedDns;
     private DnsTarget activeTarget;
@@ -63,6 +65,7 @@ class SecurityGroupNamespaceDnsDockerIntegrationTest {
         String suffix = UUID.randomUUID().toString().substring(0, 8);
         String eni = "eni-resolver-" + suffix;
         String network = null;
+        String runner = null;
         String relay = null;
         String workload = null;
         SecurityGroupFirewallManager.Namespace namespace = null;
@@ -71,18 +74,27 @@ class SecurityGroupNamespaceDnsDockerIntegrationTest {
                     .withInternal(internal).exec().getId();
             String gateway = docker.inspectNetworkCmd().withNetworkId(network).exec()
                     .getIpam().getConfig().getFirst().getGateway();
+            String targetAddress = gateway;
+            Optional<String> runnerId = currentContainer.resolveContainerId();
+            if (runnerId.isPresent()) {
+                runner = runnerId.orElseThrow();
+                docker.connectToNetworkCmd().withContainerId(runner).withNetworkId(network).exec();
+                String networkName = docker.inspectNetworkCmd().withNetworkId(network).exec().getName();
+                targetAddress = docker.inspectContainerCmd(runner).exec().getNetworkSettings()
+                        .getNetworks().get(networkName).getIpAddress();
+            }
             String helperImage = config.network().securityGroupEnforcement().helperImage();
             LocallyBuiltHelperImage.ensureBuilt(docker, builder, helperImage, "floci/network-helper:local",
                     "/docker/network-helper.Dockerfile");
-            try (DnsTarget target = new DnsTarget(gateway)) {
+            try (DnsTarget target = new DnsTarget(targetAddress)) {
                 activeTarget = target;
                 relay = lifecycle.createAndStart(builder.newContainer(helperImage)
                         .withName("floci-resolver-target-" + suffix)
                         .withDockerNetwork(Optional.of(network))
                         .withEntrypoint(List.of("sh", "-c"))
                         .withCmd(List.of("socat -T 2 UDP4-RECVFROM:53,reuseaddr,fork UDP4:"
-                                + gateway + ":" + target.port() + " & exec socat TCP4-LISTEN:53,reuseaddr,fork TCP4:"
-                                + gateway + ":" + target.tcp.getLocalPort())).build()).containerId();
+                                + targetAddress + ":" + target.port() + " & exec socat TCP4-LISTEN:53,reuseaddr,fork TCP4:"
+                                + targetAddress + ":" + target.tcp.getLocalPort())).build()).containerId();
                 String resolver = docker.inspectContainerCmd(relay).exec().getNetworkSettings()
                         .getNetworks().values().iterator().next().getIpAddress();
                 when(embeddedDns.getServerIp()).thenReturn(Optional.of(resolver));
@@ -138,6 +150,9 @@ class SecurityGroupNamespaceDnsDockerIntegrationTest {
                 lifecycle.removeIfExistsStrict(relay);
             }
             if (network != null) {
+                if (runner != null) {
+                    docker.disconnectFromNetworkCmd().withContainerId(runner).withNetworkId(network).exec();
+                }
                 docker.removeNetworkCmd(network).exec();
             }
         }

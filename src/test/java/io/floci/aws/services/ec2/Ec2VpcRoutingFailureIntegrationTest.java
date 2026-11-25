@@ -11,8 +11,13 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.mockito.InOrder;
+import software.amazon.awssdk.core.interceptor.Context;
+import software.amazon.awssdk.core.interceptor.ExecutionAttributes;
+import software.amazon.awssdk.core.interceptor.ExecutionInterceptor;
+import software.amazon.awssdk.http.SdkHttpRequest;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.ec2.Ec2Client;
+import software.amazon.awssdk.services.ec2.model.CreateNatGatewayRequest;
 import software.amazon.awssdk.services.ec2.model.Ec2Exception;
 import software.amazon.awssdk.services.ec2.model.NatGateway;
 import software.amazon.awssdk.services.ec2.model.Route;
@@ -184,7 +189,7 @@ class Ec2VpcRoutingFailureIntegrationTest {
         when(routing.enabled()).thenReturn(true);
         when(routing.hasInternetGateway(anyString(), anyString())).thenReturn(true);
         doNothing().when(routing).reconcile();
-        try (Ec2Client client = AwsTestClients.create(Ec2Client.builder(), account, Region.US_EAST_1)) {
+        try (Ec2Client client = tokenlessNatClient(account)) {
             String vpc = client.createVpc(request -> request.cidrBlock("10.138.0.0/16")).vpc().vpcId();
             String subnet = client.createSubnet(request -> request.vpcId(vpc)
                     .cidrBlock("10.138.1.0/24")).subnet().subnetId();
@@ -193,6 +198,7 @@ class Ec2VpcRoutingFailureIntegrationTest {
                 doAnswer(invocation -> {
                     // The emulator model and SDK response model share the NatGateway name.
                     io.floci.aws.services.ec2.model.NatGateway gateway = invocation.getArgument(2);
+                    assertNull(gateway.getClientToken(), "This fixture exercises tokenless native completion");
                     String id = gateway.getNatGatewayId();
                     assertEquals("pending", client.describeNatGateways(request -> request.natGatewayIds(id))
                             .natGateways().getFirst().stateAsString());
@@ -300,7 +306,7 @@ class Ec2VpcRoutingFailureIntegrationTest {
         CompletableFuture<String> setupEntered = new CompletableFuture<>();
         CountDownLatch finishSetup = new CountDownLatch(1);
         AtomicBoolean firstSetup = new AtomicBoolean(true);
-        try (Ec2Client client = AwsTestClients.create(Ec2Client.builder(), account, Region.US_EAST_1);
+        try (Ec2Client client = tokenlessNatClient(account);
                 ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
             String vpc = client.createVpc(request -> request.cidrBlock("10.140.0.0/16")).vpc().vpcId();
             String subnet = client.createSubnet(request -> request.vpcId(vpc)
@@ -311,6 +317,7 @@ class Ec2VpcRoutingFailureIntegrationTest {
                     if (firstSetup.compareAndSet(true, false)) {
                         // The emulator model and SDK response model share the NatGateway name.
                         io.floci.aws.services.ec2.model.NatGateway gateway = invocation.getArgument(2);
+                        assertNull(gateway.getClientToken(), "This fixture exercises tokenless native completion");
                         setupEntered.complete(gateway.getNatGatewayId());
                         assertTrue(finishSetup.await(20, TimeUnit.SECONDS), "Setup was not released");
                         if (setupFails) {
@@ -373,4 +380,21 @@ class Ec2VpcRoutingFailureIntegrationTest {
         }
     }
 
+
+    /** SDKs fill this optional token; these races exercise the separate tokenless completion path. */
+    private static Ec2Client tokenlessNatClient(String account) {
+        return AwsTestClients.create(Ec2Client.builder().overrideConfiguration(configuration ->
+                configuration.addExecutionInterceptor(new ExecutionInterceptor() {
+                    @Override
+                    public SdkHttpRequest modifyHttpRequest(Context.ModifyHttpRequest context,
+                                                            ExecutionAttributes attributes) {
+                        if (!(context.request() instanceof CreateNatGatewayRequest)) {
+                            return context.httpRequest();
+                        }
+                        assertEquals(1, context.httpRequest().rawQueryParameters().get("ClientToken").size(),
+                                "The SDK-generated token must be explicitly removed from this fixture request");
+                        return context.httpRequest().toBuilder().removeQueryParameter("ClientToken").build();
+                    }
+                })), account, Region.US_EAST_1);
+    }
 }
