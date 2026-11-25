@@ -10,6 +10,7 @@ import io.floci.aws.services.apigateway.ApiGatewayAwsExecuteController;
 import io.floci.aws.services.apigateway.ApiGatewayExecuteController;
 import io.floci.aws.services.apigateway.ApiGatewayUserRequestController;
 import io.floci.aws.services.appsync.graphql.AppSyncExecutionController;
+import io.floci.aws.services.cloudfront.CloudFrontFunctionTestController;
 import io.floci.aws.services.iam.IamService;
 import io.floci.aws.services.iam.RequestBodyReader;
 import io.floci.aws.services.s3.S3ControlController;
@@ -184,6 +185,11 @@ public class SigV4HeaderSignatureFilter implements ContainerRequestFilter {
             incompleteSignature(ctx, resource, "Authorization header requires 'Credential' (in the form "
                     + "<access key>/<date>/<region>/<service>/aws4_request), 'SignedHeaders' and "
                     + "'Signature' parameters.");
+            return;
+        }
+        if (resource != null && CloudFrontFunctionTestController.class.isAssignableFrom(resource)
+                && !"cloudfront".equals(scope.service())) {
+            signatureDoesNotMatch(ctx, resource, "Credential should be scoped to correct service: 'cloudfront'");
             return;
         }
         if (!SigV4RequestValidator.containsHeader(signed.signedHeaders(), "host")) {

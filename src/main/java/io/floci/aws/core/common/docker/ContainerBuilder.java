@@ -263,6 +263,8 @@ public class ContainerBuilder {
         private final Map<String, String> tmpfs = new HashMap<>();
         private Long memorySwapBytes;
         private Long memorySwappiness;
+        private Long pidsLimit;
+        private boolean noNewPrivileges;
         private boolean javaTrustStore;
         private String dnsName;
         private final List<String> joinedNetworks = new ArrayList<>();
@@ -839,6 +841,21 @@ public class ContainerBuilder {
             return this;
         }
 
+        /** Caps the container's processes and threads. */
+        public Builder withPidsLimit(long limit) {
+            if (limit < 1) {
+                throw new IllegalArgumentException("The PID limit must be positive");
+            }
+            this.pidsLimit = limit;
+            return this;
+        }
+
+        /** Prevents exec from granting privileges through setuid or file capabilities. */
+        public Builder withNoNewPrivileges() {
+            this.noNewPrivileges = true;
+            return this;
+        }
+
         private void requireNoExistingDeviceRequest() {
             if (!deviceRequests.isEmpty()) {
                 throw new IllegalStateException(
@@ -937,7 +954,7 @@ public class ContainerBuilder {
                     Map.copyOf(portBindingHostIps),
                     init,
                     new LinuxOptions(List.copyOf(capAdd), List.copyOf(capDrop), List.copyOf(devices),
-                            shmSizeBytes, Map.copyOf(tmpfs), memorySwapBytes, memorySwappiness),
+                            shmSizeBytes, Map.copyOf(tmpfs), memorySwapBytes, memorySwappiness, pidsLimit, noNewPrivileges),
                     javaTrustStore,
                     dnsName,
                     List.copyOf(joinedNetworks)

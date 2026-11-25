@@ -3,6 +3,7 @@ package io.floci.aws.core.common;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.RequestOperationResolver.ResolvedOperation;
+import io.floci.aws.services.cloudfront.CloudFrontFunctionTestController;
 import io.floci.aws.services.cloudtrail.CloudTrailService;
 import io.floci.aws.services.cloudwatch.metrics.OtlpMetricsController;
 import io.floci.aws.services.iam.AccessDeniedMessages;
@@ -378,6 +379,12 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 && (auth == null || !claimsSigV4(auth))) {
             ctx.abortWith(AwsProtocolClaimFilter.errorResponse(403, "MissingAuthenticationTokenException",
                     "Request is missing Authentication Token"));
+            return;
+        }
+        if (auth == null && resourceInfo != null && resourceInfo.getResourceClass() != null
+                && CloudFrontFunctionTestController.class.isAssignableFrom(resourceInfo.getResourceClass())) {
+            ctx.abortWith(AwsQueryResponse.error("MissingAuthenticationToken", MISSING_AUTHENTICATION_TOKEN,
+                    AwsNamespaces.CLOUDFRONT, 403));
             return;
         }
         if (auth == null) {

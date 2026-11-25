@@ -2,10 +2,12 @@ package io.floci.aws.services.iam;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsRegions;
 import io.floci.aws.core.common.RequestPathLabels;
 import io.floci.aws.core.common.RequestResources;
 import io.floci.aws.core.common.StoredResourceArns;
+import io.floci.aws.services.cloudfront.CloudFrontFunctionTestRoute;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
@@ -91,6 +93,10 @@ public class ResourceArnBuilder {
                                        String region, String accountId, String partition) {
         if (credentialScope == null) {
             return List.of("*");
+        }
+        if ("cloudfront".equals(credentialScope) && "cloudfront:TestFunction".equals(operation)) {
+            return List.of(AwsArnUtils.Arn.global(partition, "cloudfront", accountId,
+                    "function/" + CloudFrontFunctionTestRoute.name(ctx)).toString());
         }
         return namedResources(credentialScope, operation, ctx, region, accountId, partition);
     }
