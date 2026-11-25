@@ -58,6 +58,18 @@ public class CfnResourceDispatcher {
         return registry.isCustomResourceType(resourceType);
     }
 
+    public String referenceValue(String resourceType, String physicalId) {
+        return registry.forType(resourceType).map(owner -> owner.referenceValue(physicalId)).orElse(physicalId);
+    }
+
+    /** Projects response IDs without changing the identity used by lifecycle operations. */
+    public String publicPhysicalId(String resourceType, String physicalId) {
+        if (physicalId == null) {
+            return null;
+        }
+        return registry.forType(resourceType).map(owner -> owner.publicPhysicalId(physicalId)).orElse(physicalId);
+    }
+
     /** Resolve an attribute using its resource owner's declared type. */
     public JsonNode attributeValue(String resourceType, String attributeName, String value) {
         return registry.forType(resourceType)
