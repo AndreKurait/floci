@@ -22,6 +22,7 @@ import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
+import java.time.Clock;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -70,6 +71,7 @@ public class GlueSchemaRegistryService {
     private final StorageBackend<String, SchemaVersion> versionStore;
     private final StorageBackend<String, Map<String, MetadataInfo>> metadataStore;
     private final RegionResolver regionResolver;
+    private final Clock clock;
 
     private final Map<String, NavigableMap<Long, String>> versionByNumber = new ConcurrentHashMap<>();
     private final Map<String, Map<String, String>> versionByDefinitionHash = new ConcurrentHashMap<>();
@@ -99,11 +101,21 @@ public class GlueSchemaRegistryService {
                               StorageBackend<String, SchemaVersion> versionStore,
                               StorageBackend<String, Map<String, MetadataInfo>> metadataStore,
                               RegionResolver regionResolver) {
+        this(registryStore, schemaStore, versionStore, metadataStore, regionResolver, Clock.systemUTC());
+    }
+
+    GlueSchemaRegistryService(StorageBackend<String, Registry> registryStore,
+                              StorageBackend<String, Schema> schemaStore,
+                              StorageBackend<String, SchemaVersion> versionStore,
+                              StorageBackend<String, Map<String, MetadataInfo>> metadataStore,
+                              RegionResolver regionResolver,
+                              Clock clock) {
         this.registryStore = registryStore;
         this.schemaStore = schemaStore;
         this.versionStore = versionStore;
         this.metadataStore = metadataStore;
         this.regionResolver = regionResolver;
+        this.clock = clock;
     }
 
     @PostConstruct
@@ -119,12 +131,20 @@ public class GlueSchemaRegistryService {
         if (registryStore.get(registryKey(region, name)).isPresent()) {
             throw new AwsException("AlreadyExistsException", "Registry already exists: " + name, 400);
         }
-        Registry registry = new Registry(name);
+        Registry registry = newRegistry(name);
         registry.setDescription(description);
         registry.setTags(tags);
         registry.setRegistryArn(buildRegistryArn(region, name));
         registryStore.put(registryKey(region, name), registry);
         LOG.infov("Created Glue Registry: {0}", name);
+        return registry;
+    }
+
+    private Registry newRegistry(String name) {
+        Registry registry = new Registry(name);
+        Instant now = clock.instant();
+        registry.setCreatedTime(now);
+        registry.setUpdatedTime(now);
         return registry;
     }
 
@@ -154,7 +174,7 @@ public class GlueSchemaRegistryService {
     public Registry updateRegistry(RegistryId registryId, String description, String region) {
         Registry registry = getRegistry(registryId, region);
         registry.setDescription(description);
-        registry.setUpdatedTime(Instant.now());
+        registry.setUpdatedTime(clock.instant());
         registryStore.put(registryKey(region, registry.getRegistryName()), registry);
         return registry;
     }
@@ -198,7 +218,7 @@ public class GlueSchemaRegistryService {
                     "Schema definition is not valid " + dataFormat + ": " + defError, 400);
         }
 
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         Schema schema = new Schema();
         schema.setRegistryName(registry.getRegistryName());
         schema.setRegistryArn(registry.getRegistryArn());
@@ -272,7 +292,7 @@ public class GlueSchemaRegistryService {
             validateCheckpointVersionExists(schema, checkpointVersionNumber);
             schema.setSchemaCheckpoint(checkpointVersionNumber);
         }
-        schema.setUpdatedTime(Instant.now());
+        schema.setUpdatedTime(clock.instant());
         schemaStore.put(schemaKey(schema), schema);
         return schema;
     }
@@ -322,7 +342,7 @@ public class GlueSchemaRegistryService {
                     "Schema is incompatible: " + compat.reason(), 400);
         }
 
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         long nextVersion = schema.getNextSchemaVersion() != null ? schema.getNextSchemaVersion() : 1L;
         SchemaVersion version = new SchemaVersion();
         version.setSchemaVersionId(UUID.randomUUID().toString());
@@ -468,7 +488,7 @@ public class GlueSchemaRegistryService {
         } else {
             schema.setLatestSchemaVersion(byNumber.lastKey());
         }
-        schema.setUpdatedTime(Instant.now());
+        schema.setUpdatedTime(clock.instant());
         schemaStore.put(key, schema);
         return results;
     }
@@ -496,7 +516,7 @@ public class GlueSchemaRegistryService {
 
         Map<String, MetadataInfo> metadata = metadataStore.get(schemaVersionId).orElseGet(LinkedHashMap::new);
         MetadataInfo info = metadata.get(key);
-        Instant now = Instant.now();
+        Instant now = clock.instant();
         if (info == null) {
             info = new MetadataInfo(value, now);
         } else if (value.equals(info.getMetadataValue())) {
@@ -1037,7 +1057,7 @@ public class GlueSchemaRegistryService {
     }
 
     private Registry autoCreateDefaultRegistry(String region) {
-        Registry registry = new Registry(DEFAULT_REGISTRY_NAME);
+        Registry registry = newRegistry(DEFAULT_REGISTRY_NAME);
         registry.setRegistryArn(buildRegistryArn(region, DEFAULT_REGISTRY_NAME));
         registryStore.put(registryKey(region, DEFAULT_REGISTRY_NAME), registry);
         LOG.infov("Auto-created default Glue Registry");

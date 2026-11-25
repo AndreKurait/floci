@@ -9,6 +9,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.LockSupport;
 import java.util.function.BooleanSupplier;
+import java.util.function.LongSupplier;
 import java.util.function.Supplier;
 
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -31,7 +32,19 @@ public final class ThreadStates {
      */
     public static void awaitBlockedOrDone(AtomicReference<Thread> thread, Future<?> task)
             throws InterruptedException {
-        awaitBlockedOrDone(thread::get, task::isDone, 5);
+        awaitBlockedOrDone(thread, task, System::nanoTime, Thread::sleep);
+    }
+
+    /** The {@link Future} overload with its timeout and poll pause read from the caller's time source. */
+    static void awaitBlockedOrDone(AtomicReference<Thread> thread, Future<?> task, LongSupplier nanoTime,
+                                   Pause pause) throws InterruptedException {
+        awaitBlockedOrDone(thread::get, task::isDone, 5, nanoTime, pause);
+    }
+
+    /** The pause between two looks at the thread: {@link Thread#sleep(long)} outside this helper's own test. */
+    @FunctionalInterface
+    interface Pause {
+        void millis(long millis) throws InterruptedException;
     }
 
     /**
@@ -41,18 +54,18 @@ public final class ThreadStates {
      * way the test needs.
      */
     public static void awaitBlockedOrDone(Thread thread) throws InterruptedException {
-        assertTrue(awaitBlockedOrDone(() -> thread, () -> !thread.isAlive(), 10),
+        assertTrue(awaitBlockedOrDone(() -> thread, () -> !thread.isAlive(), 10, System::nanoTime, Thread::sleep),
                 "worker blocked or finished before timeout");
     }
 
-    private static boolean awaitBlockedOrDone(Supplier<Thread> thread, BooleanSupplier done, long timeoutSeconds)
-            throws InterruptedException {
-        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(timeoutSeconds);
-        while (System.nanoTime() < deadline && !done.getAsBoolean()) {
+    private static boolean awaitBlockedOrDone(Supplier<Thread> thread, BooleanSupplier done, long timeoutSeconds,
+                                              LongSupplier nanoTime, Pause pause) throws InterruptedException {
+        long deadline = nanoTime.getAsLong() + TimeUnit.SECONDS.toNanos(timeoutSeconds);
+        while (nanoTime.getAsLong() < deadline && !done.getAsBoolean()) {
             if (isBlocked(thread.get())) {
                 return true;
             }
-            Thread.sleep(5);
+            pause.millis(5);
         }
         return done.getAsBoolean() || isBlocked(thread.get());
     }

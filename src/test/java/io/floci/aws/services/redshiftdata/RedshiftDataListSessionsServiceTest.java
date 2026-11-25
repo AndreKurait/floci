@@ -118,7 +118,7 @@ class RedshiftDataListSessionsServiceTest {
             } finally {
                 release.countDown();
             }
-            await().atMost(Duration.ofSeconds(5)).untilAsserted(() ->
+            await().pollDelay(Duration.ZERO).pollInterval(Duration.ofMillis(10)).atMost(Duration.ofSeconds(5)).untilAsserted(() ->
                     assertEquals("AVAILABLE", fixture.list().path("Sessions").get(0).path("Status").asText()));
         }
     }

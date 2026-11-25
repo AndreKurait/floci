@@ -13,7 +13,7 @@ import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import org.jboss.logging.Logger;
 
-import java.time.Instant;
+import java.time.Clock;
 
 /**
  * Invokes a target-tracking or step-scaling policy when the CloudWatch alarm behind it fires.
@@ -66,12 +66,20 @@ public class ScalingPolicyAlarmActionHandler implements AlarmActionHandler {
 
     private final ApplicationAutoScalingService service;
     private final Instance<CapacityAdjuster> adjusters;
+    private final Clock clock;
 
     @Inject
     public ScalingPolicyAlarmActionHandler(ApplicationAutoScalingService service,
                                            @Any Instance<CapacityAdjuster> adjusters) {
+        this(service, adjusters, Clock.systemUTC());
+    }
+
+    /** Reads the cooldowns' time from {@code clock}: the system clock outside tests. */
+    ScalingPolicyAlarmActionHandler(ApplicationAutoScalingService service, Instance<CapacityAdjuster> adjusters,
+                                    Clock clock) {
         this.service = service;
         this.adjusters = adjusters;
+        this.clock = clock;
     }
 
     @Override
@@ -249,10 +257,10 @@ public class ScalingPolicyAlarmActionHandler implements AlarmActionHandler {
         };
     }
 
-    private static boolean withinCooldown(ScalingPolicy policy, boolean scaleOut) {
+    private boolean withinCooldown(ScalingPolicy policy, boolean scaleOut) {
         int cooldownSeconds = cooldownSeconds(policy, scaleOut);
         double last = scaleOut ? policy.getLastScaleOutTime() : policy.getLastScaleInTime();
-        return last > 0 && (Instant.now().getEpochSecond() - last) < cooldownSeconds;
+        return last > 0 && (clock.instant().getEpochSecond() - last) < cooldownSeconds;
     }
 
     private static int cooldownSeconds(ScalingPolicy policy, boolean scaleOut) {
@@ -268,8 +276,8 @@ public class ScalingPolicyAlarmActionHandler implements AlarmActionHandler {
         return cooldown != null ? cooldown : DEFAULT_COOLDOWN_SECONDS;
     }
 
-    private static void stampCooldown(ScalingPolicy policy, boolean scaleOut) {
-        double now = Instant.now().getEpochSecond();
+    private void stampCooldown(ScalingPolicy policy, boolean scaleOut) {
+        double now = clock.instant().getEpochSecond();
         if (scaleOut) {
             policy.setLastScaleOutTime(now);
         } else {
