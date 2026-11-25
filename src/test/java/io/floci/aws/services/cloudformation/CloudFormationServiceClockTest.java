@@ -43,7 +43,7 @@ class CloudFormationServiceClockTest {
     void setUp() {
         CfnResourceDispatcher provisioner = mock(CfnResourceDispatcher.class);
         when(provisioner.provision(anyString(), anyString(), any(), any(), anyString(), anyString(), anyString(),
-                any(), any(), any(), any())).thenAnswer(invocation -> {
+                any(), any(), any(), any(), any(), any(), any())).thenAnswer(invocation -> {
                     StackResource resource = new StackResource();
                     resource.setLogicalId(invocation.getArgument(0));
                     resource.setResourceType(invocation.getArgument(1));
@@ -69,6 +69,7 @@ class CloudFormationServiceClockTest {
 
         clock.advance(Duration.ofMinutes(5));
         service.executeChangeSet(STACK, "create", REGION, ACCOUNT).get(30, TimeUnit.SECONDS);
+        assertEquals("CREATE_COMPLETE", service.describeStacks(STACK, REGION).get(0).getStatus());
         Instant executed = START.plus(Duration.ofMinutes(5));
 
         List<StackEvent> events = service.describeStackEvents(STACK, REGION);
