@@ -13,11 +13,64 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def workflow_script():
-    workflow = (ROOT / ".github/workflows/compatibility.yml").read_text()
-    step = workflow.split("      - name: Run signed Python SDK IAM permissions\n", 1)[1]
-    block = step.split("        run: |\n", 1)[1].split("\n      - name:", 1)[0]
-    return textwrap.dedent(block)
+def workflow_script(workflow=None):
+    if workflow is None:
+        workflow = (ROOT / ".github/workflows/compatibility.yml").read_text()
+    lines = workflow.splitlines()
+    matches = [i for i, line in enumerate(lines)
+               if line.strip() == "- name: Run signed Python SDK IAM permissions"]
+    if len(matches) != 1:
+        raise ValueError("Expected exactly one signed Python SDK IAM permissions step")
+    start = matches[0]
+    step_indent = len(lines[start]) - len(lines[start].lstrip())
+    end = next((i for i in range(start + 1, len(lines))
+                if lines[i].strip() and len(lines[i]) - len(lines[i].lstrip()) <= step_indent),
+               len(lines))
+    runs = [i for i in range(start + 1, end) if lines[i].strip() == "run: |"]
+    if len(runs) != 1:
+        raise ValueError("Expected exactly one literal run block in the signed IAM step")
+    run = runs[0]
+    run_indent = len(lines[run]) - len(lines[run].lstrip())
+    block_end = next((i for i in range(run + 1, end)
+                      if lines[i].strip() and len(lines[i]) - len(lines[i].lstrip()) <= run_indent),
+                     end)
+    block = textwrap.dedent("\n".join(lines[run + 1:block_end]))
+    if not block.strip():
+        raise ValueError("The signed IAM step must execute a script")
+    return block + "\n"
+
+
+class WorkflowExtractionTest(unittest.TestCase):
+    def test_step_indentation_does_not_change_the_executed_script(self):
+        for spaces in (4, 6):
+            with self.subTest(spaces=spaces):
+                workflow = textwrap.indent(
+                    "- name: Run signed Python SDK IAM permissions\n"
+                    "  if: matrix.test == 'sdk-test-python'\n"
+                    "  run: |\n"
+                    "    printf 'signed IAM\\n'\n"
+                    "  shell: bash\n"
+                    "- uses: example/action@revision\n",
+                    " " * spaces,
+                )
+                self.assertEqual("printf 'signed IAM\\n'\n", workflow_script(workflow))
+
+    def test_missing_or_duplicate_signed_step_fails(self):
+        step = "- name: Run signed Python SDK IAM permissions\n  run: |\n    true\n"
+        for workflow in ("jobs: {}\n", step + step):
+            with self.subTest(workflow=workflow), self.assertRaises(ValueError):
+                workflow_script(workflow)
+
+    def test_missing_script_cannot_borrow_a_later_steps_script(self):
+        workflow = (
+            "- name: Run signed Python SDK IAM permissions\n"
+            "  if: matrix.test == 'sdk-test-python'\n"
+            "- name: Another step\n"
+            "  run: |\n"
+            "    true\n"
+        )
+        with self.assertRaises(ValueError):
+            workflow_script(workflow)
 
 
 class SignedPythonIamRunnerTest(unittest.TestCase):
