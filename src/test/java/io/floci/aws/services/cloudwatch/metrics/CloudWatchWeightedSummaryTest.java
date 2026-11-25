@@ -17,6 +17,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Instant;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
@@ -48,6 +49,9 @@ class CloudWatchWeightedSummaryTest {
         assertEquals(11, point.maximum());
         assertEquals(8.6, point.average());
         assertEquals(2, store.keys().size());
+        assertEquals(Map.of("p50", 7.0, "p90", 11.0), service.getMetricStatistics(
+                "Example/Weighted", "Latency", List.of(), START.minusSeconds(1), START.plusSeconds(1),
+                60, List.of("p50", "p90"), "Milliseconds", REGION).getFirst().extendedStatistics());
     }
 
     @ParameterizedTest
