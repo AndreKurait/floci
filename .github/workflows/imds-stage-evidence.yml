@@ -38,7 +38,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [4]
+        shard: [5]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -88,6 +88,7 @@ jobs:
           # An empty includesFile makes surefire fall back to its default includes
           # and run the ENTIRE suite into this shard's timeout.
           test -s shard.txt
+          grep -Fxq "io/floci/aws/services/ec2/AutoScalingConfigurationUserDataIntegrationTest" shard.txt
           echo "shard ${{ matrix.shard }}/$SHARD_TOTAL: $(wc -l < shard.txt) classes"
 
       # A nightly check (*NightlyIntegrationTest) never runs in the shards: Surefire leaves it out
