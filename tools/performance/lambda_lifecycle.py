@@ -16,6 +16,10 @@ parser.add_argument("--endpoint", default="http://localhost:4566")
 parser.add_argument("--samples", type=int, default=5)
 parser.add_argument("--warm-invocations", type=int, default=20)
 args = parser.parse_args()
+if args.samples < 1:
+    parser.error("--samples must be at least 1")
+if args.warm_invocations < 0:
+    parser.error("--warm-invocations must not be negative")
 client = boto3.client(
     "lambda", endpoint_url=args.endpoint, region_name="us-east-1",
     aws_access_key_id="test", aws_secret_access_key="test",
@@ -57,7 +61,10 @@ for sample in range(args.samples):
             observations["delete_ms"].append((time.perf_counter() - start) * 1000)
 summary = {}
 for metric, values in observations.items():
-    summary[metric] = {"n": len(values), "median": statistics.median(values),
-                       "p95": sorted(values)[math.ceil(len(values) * .95) - 1],
-                       "min": min(values), "max": max(values), "samples": values}
+    summary[metric] = {"n": len(values)}
+    if values:  # --warm-invocations 0 records no warm invocations
+        summary[metric].update(median=statistics.median(values),
+                               p95=sorted(values)[math.ceil(len(values) * .95) - 1],
+                               min=min(values), max=max(values))
+    summary[metric]["samples"] = values
 print(json.dumps(summary, indent=2))
