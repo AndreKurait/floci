@@ -108,6 +108,7 @@ import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Answers.RETURNS_DEEP_STUBS;
 import static org.mockito.Answers.RETURNS_SELF;
@@ -3680,6 +3681,50 @@ class Ec2ContainerManagerTest {
         assertEquals(Set.of(Capability.NET_ADMIN, Capability.NET_RAW, Capability.SYS_PTRACE),
                 Set.of(host.getCapDrop()));
         assertEquals("container:firewall-helper", host.getNetworkMode());
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"minimal", "systemd", "image"})
+    void configuredCapabilityAddsReachDocker(String runtime) throws Exception {
+        ContainerSpec spec = launchConfiguredGuest(new ResolvedAmiImage(
+                "example/guest:1", runtime, "systemd".equals(runtime), "linux/arm64"), Map.of(
+                "FLOCI_SERVICES_EC2_PRIVILEGED", "false",
+                "FLOCI_SERVICES_EC2_CAP_ADD", "SYSLOG,cap_sys_ptrace"),
+                false, true, false);
+
+        HostConfig host = createGuestHostConfig(spec);
+        assertFalse(Boolean.TRUE.equals(host.getPrivileged()));
+        assertEquals(Set.of(Capability.SYSLOG, Capability.SYS_PTRACE), Set.of(host.getCapAdd()));
+        assertNull(host.getCapDrop());
+    }
+
+    @Test
+    void configuredCapabilityAddsCannotOverrideMandatorySecurityGroupContainment() throws Exception {
+        ContainerSpec spec = launchConfiguredGuest(new ResolvedAmiImage(
+                "example/guest:1", ResolvedAmiImage.IMAGE_RUNTIME, false, "linux/arm64"), Map.of(
+                "FLOCI_SERVICES_EC2_CAP_ADD", "NET_ADMIN,SYSLOG"),
+                true, true, false);
+
+        HostConfig host = createGuestHostConfig(spec);
+        assertEquals(Set.of(Capability.SYSLOG), Set.of(host.getCapAdd()));
+        assertEquals(Set.of(Capability.NET_ADMIN, Capability.NET_RAW), Set.of(host.getCapDrop()));
+    }
+
+    @Test
+    void defaultGuestCapabilitiesAddNothing() throws Exception {
+        ContainerSpec spec = launchWithRealBuilder(new ResolvedAmiImage(
+                "example/guest:1", ResolvedAmiImage.IMAGE_RUNTIME, false, "linux/arm64"));
+
+        assertNull(createGuestHostConfig(spec).getCapAdd());
+    }
+
+    @Test
+    void capabilityBothAddedAndDroppedIsRefused() {
+        IllegalStateException refused = assertThrows(IllegalStateException.class, () ->
+                Ec2ContainerManager.requireDisjointCapabilities(
+                        List.of("cap_syslog", "SYS_PTRACE"), List.of("SYSLOG", "NET_RAW")));
+        assertEquals("EC2 guest capabilities both added and dropped: [SYSLOG]", refused.getMessage());
+        Ec2ContainerManager.requireDisjointCapabilities(List.of("SYSLOG"), List.of("NET_RAW"));
     }
 
     private static HostConfig createGuestHostConfig(ContainerSpec spec) {

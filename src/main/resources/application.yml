@@ -839,6 +839,7 @@ floci:
       proxy-max-port: 9499
       keep-running-on-shutdown: false
     ec2:
+      cap-add: ${FLOCI_SERVICES_EC2_CAP_ADD:}
       extra-env: ${FLOCI_SERVICES_EC2_EXTRA_ENV:}
       ulimits: ${FLOCI_SERVICES_EC2_ULIMITS:}
       # read-only-binds:               # Paths belong to the Docker daemon host.

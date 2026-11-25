@@ -281,6 +281,26 @@ from guest containers. Security-group enforcement always disables privileged mod
 and keeps its existing network-capability restrictions. These settings apply to
 guests, not the trusted metadata helper.
 
+An unprivileged guest gets Docker's default capability set. An image whose own
+startup grants a file capability outside that set (for example
+`setcap cap_syslog+ep` on an agent binary, which a root user on an EC2 instance
+can do) cannot exec that file as another user. Add the capabilities such an
+image needs:
+
+```yaml
+floci:
+  services:
+    ec2:
+      privileged: false
+      cap-add: [SYSLOG]
+```
+
+The equivalent environment variable is `FLOCI_SERVICES_EC2_CAP_ADD=SYSLOG`, with
+the same name rules. A capability listed in both `cap-add` and `cap-drop`
+refuses launch. Security-group enforcement still removes `NET_ADMIN` and
+`NET_RAW` from the added set.
+
+
 ### Binding registered AMIs to local images
 
 An external catalog entry can declare `registrationNames`, an optional list of
@@ -1684,6 +1704,7 @@ State is reported settled rather than transitional, as elsewhere in this service
 
 | Environment variable | Default | Description |
 |---|---|---|
+| `FLOCI_SERVICES_EC2_CAP_ADD` | unset | Comma-separated Linux capabilities to add to unprivileged guest containers; security-group enforcement still removes `NET_ADMIN` and `NET_RAW`; overlap with `CAP_DROP` refuses launch |
 | `FLOCI_SERVICES_EC2_IMDS_PORT` | `9169` | Host port for the IMDS server |
 | `FLOCI_SERVICES_EC2_SSH_PORT_RANGE_START` | `2200` | Start of SSH host port range |
 | `FLOCI_SERVICES_EC2_SSH_PORT_RANGE_END` | `2299` | End of SSH host port range |

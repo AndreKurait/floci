@@ -4,6 +4,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.BuildImageResultCallback;
+import com.github.dockerjava.api.model.Capability;
+import com.github.dockerjava.api.model.HostConfig;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.dns.EmbeddedDnsServer;
@@ -28,13 +30,14 @@ import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
-import org.junit.jupiter.params.provider.ValueSource;
+import org.junit.jupiter.params.provider.CsvSource;
 
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -95,7 +98,8 @@ class Ec2ConfiguredGuestStartupDockerTest {
             result.write_text(json.dumps({'boot': boot, 'input': content, 'instance': instance,
                 'arguments': sys.argv[1:], 'environment': os.environ['CUSTOM_MODE'],
                 'limits': resource.getrlimit(resource.RLIMIT_NOFILE),
-                'endpoint': os.environ['AWS_ENDPOINT_URL'], 'account': observed_account, 'token': bool(token)}))
+                'endpoint': os.environ['AWS_ENDPOINT_URL'], 'account': observed_account, 'token': bool(token),
+                'capabilities': Path('/proc/self/status').read_text()}))
             while True:
                 time.sleep(60)
             """;
@@ -110,8 +114,9 @@ class Ec2ConfiguredGuestStartupDockerTest {
     @TempDir Path directory;
 
     @ParameterizedTest
-    @ValueSource(booleans = {false, true})
-    void imageEntrypointReadsMetadataAndReadOnlyConfigurationOnEveryStart(boolean customResolver) throws Exception {
+    @CsvSource({"false,false", "true,false", "false,true", "true,true"})
+    void imageEntrypointReadsMetadataAndReadOnlyConfigurationOnEveryStart(boolean customResolver,
+                                                                        boolean addCapability) throws Exception {
         assumeTrue(DockerAvailability.answers(docker), "Docker must be available");
         String suffix = UUID.randomUUID().toString().replace("-", "");
         Path input = directory.resolve("input with spaces,commas");
@@ -128,6 +133,10 @@ class Ec2ConfiguredGuestStartupDockerTest {
         when(ec2.extraEnv()).thenReturn(Optional.of(List.of("CUSTOM_MODE=ready",
                 "CUSTOM_ACCOUNT=" + config.defaultAccountId())));
         when(ec2.ulimits()).thenReturn(Optional.of(List.of("nofile=1024:2048")));
+        if (addCapability) {
+            when(ec2.privileged()).thenReturn(false);
+            when(ec2.capAdd()).thenReturn(Optional.of(List.of("SYS_PTRACE")));
+        }
         List<EmulatorConfig.Ec2ServiceConfig.GuestReadOnlyBind> binds = new ArrayList<>();
         binds.add(bind(input, "/startup/input"));
         if (customResolver) {
@@ -163,6 +172,9 @@ class Ec2ConfiguredGuestStartupDockerTest {
                         null, "us-east-1");
                 await().atMost(Duration.ofSeconds(90)).untilAsserted(() -> assertStartup(instance, "first", 1,
                         customResolver ? endpoint.baseUrl(false) : endpoint.baseUrl()));
+                if (addCapability) {
+                    assertGuestCapability(instance);
+                }
                 String mode = docker.inspectContainerCmd(instance.getDockerContainerId()).exec()
                         .getHostConfig().getNetworkMode();
                 assertTrue(mode.startsWith("container:"));
@@ -173,6 +185,9 @@ class Ec2ConfiguredGuestStartupDockerTest {
                 manager.start(instance);
                 await().atMost(Duration.ofSeconds(60)).untilAsserted(() -> assertStartup(instance, "second", 2,
                         customResolver ? endpoint.baseUrl(false) : endpoint.baseUrl()));
+                if (addCapability) {
+                    assertGuestCapability(instance);
+                }
                 assertEquals("second", Files.readString(input));
             } finally {
                 try {
@@ -250,6 +265,23 @@ class Ec2ConfiguredGuestStartupDockerTest {
             } finally {
                 manager.stop();
             }
+        }
+    }
+
+    private void assertGuestCapability(Instance instance) throws Exception {
+        HostConfig host = docker.inspectContainerCmd(instance.getDockerContainerId()).exec().getHostConfig();
+        assertFalse(Boolean.TRUE.equals(host.getPrivileged()));
+        assertTrue(Arrays.asList(host.getCapAdd())
+                .contains(Capability.SYS_PTRACE));
+        ContainerExec.Result read = ContainerExec.runMerged(docker, instance.getDockerContainerId(),
+                new String[]{"cat", "/startup-result.json"}, 10);
+        assertEquals(0, read.exitCode());
+        String status = JSON.readTree(read.stdout()).path("capabilities").asText();
+        for (String field : List.of("CapEff:", "CapBnd:")) {
+            String value = status.lines().filter(line -> line.startsWith(field))
+                    .findFirst().orElseThrow().substring(field.length()).trim();
+            assertTrue((Long.parseUnsignedLong(value, 16) & (1L << 19)) != 0,
+                    "SYS_PTRACE must reach the guest process " + field);
         }
     }
 
