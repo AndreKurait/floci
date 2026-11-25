@@ -495,6 +495,20 @@ shape names. `Values` accepts 1 to 150 numeric samples with optional matching, n
 samples without expanding their counts and reject combinations with `Value` or `StatisticValues`.
 The console's supported numeric values use the same bounds.
 
+Query clients using `Version=2013-01-16` route the common modeled operations through the
+same handlers as the current API, for both GET and POST. Implemented common operations
+include `ListMetrics`, `GetMetricStatistics`, `PutMetricAlarm`, `DescribeAlarms`,
+`DescribeAlarmHistory` and `DeleteAlarms`, with the same storage, account/region scope
+and IAM checks. Successful responses use the requested 2013 XML namespace.
+
+This is not complete legacy-version compatibility. Its `GetMetricData` input uses
+`Defaults` and `Metrics` instead of the current `MetricDataQueries` shape, so legacy
+JSON and Query requests return `UnsupportedOperation` rather than running the modern
+operation. The 2013 Query route rejects operations outside that version's model,
+including metric streams and resource tags. Unknown Query versions or operation
+names remain invalid. The console JSON target has the narrower operation and member
+rules described below.
+
 **Endpoint:** `http://localhost:4566/`. Query: GET or POST; JSON: POST.
 
 JSON 1.0 requests name their operation in `X-Amz-Target` with the `GraniteServiceVersion20100801.`
