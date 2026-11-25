@@ -78,7 +78,7 @@ class AccountRegionOrganizationIamIntegrationTest {
             AccountClient client = AwsTestClients.create(AccountClient.builder(), owner, Region.US_EAST_1, endpoint);
             accounts.put(owner, client);
             Map<String, String> baseline = projection(client);
-            assertEquals(34, baseline.size());
+            assertEquals(36, baseline.size());
             assertEquals("DISABLED", baseline.get(TARGET));
             baselines.put(owner, baseline);
         }
@@ -151,7 +151,7 @@ class AccountRegionOrganizationIamIntegrationTest {
     void anExactManagementOrganizationMemberArnAuthorizesTheTargetsWholeRegionView() {
         IamUserFixture user = user(management, memberArn(target));
         try (AccountClient caller = user.accountClient()) {
-            assertEquals(34, caller.listRegions(r -> r.accountId(target)).regions().size());
+            assertEquals(36, caller.listRegions(r -> r.accountId(target)).regions().size());
             assertEquals("DISABLED", caller.getRegionOptStatus(r -> r.accountId(target).regionName(TARGET))
                     .regionOptStatusAsString());
             assertEquals(200, caller.enableRegion(r -> r.accountId(target).regionName(TARGET))
