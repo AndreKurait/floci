@@ -642,6 +642,9 @@ NOT_COVERED: dict[str, str] = {
                       "named in the path",
     "ses": _LATER,
     "signin": _REST,
+    "ssmmessages": "not read yet: SsmChannelAuthentication authorizes the served operations itself, "
+                   "CreateControlChannel, OpenControlChannel and CreateDataChannel unscoped and "
+                   "OpenDataChannel on its session",
     "sso-oauth": _REST,
     "swf": "not read yet: the Service Reference gives a domain's ARN no Region, `swf::<account>:/domain/<name>`, "
            "while the SWF Developer Guide gives it as arn:aws:swf:Region:AccountID:/domain/DomainName, as Floci mints "

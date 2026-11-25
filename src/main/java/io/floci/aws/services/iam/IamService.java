@@ -5569,6 +5569,11 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         return currentSession(accessKeyId).map(SessionCredential::getExpiration);
     }
 
+    /** The EC2 node for which IMDS issued this live credential, when it is an instance session. */
+    public Optional<String> findEc2SessionInstanceId(String accessKeyId) {
+        return currentSession(accessKeyId).map(SessionCredential::getEc2InstanceId);
+    }
+
     /**
      * Whether a secret access key is the seeded deployer's, which Floci's documentation publishes.
      * The secret is what makes that credential public, whatever ID the key was seeded under, and

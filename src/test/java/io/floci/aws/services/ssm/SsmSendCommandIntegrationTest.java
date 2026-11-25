@@ -1,8 +1,10 @@
 package io.floci.aws.services.ssm;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.testing.RestAssuredJsonUtils;
 import io.quarkus.test.junit.QuarkusMock;
 import io.quarkus.test.junit.QuarkusTest;
+import io.quarkus.test.junit.TestProfile;
 import io.restassured.path.json.JsonPath;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
@@ -10,6 +12,8 @@ import org.junit.jupiter.api.MethodOrderer;
 import org.junit.jupiter.api.Order;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestMethodOrder;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.time.Instant;
 import java.util.Map;
@@ -29,6 +33,7 @@ import static org.mockito.Mockito.reset;
 import static org.mockito.Mockito.when;
 
 @QuarkusTest
+@TestProfile(SsmDirectCommandProfile.class)
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 class SsmSendCommandIntegrationTest {
 
@@ -188,11 +193,12 @@ class SsmSendCommandIntegrationTest {
 
     // ── ec2messages agent protocol ─────────────────────────────────────────
 
-    @Test
+    @ParameterizedTest
+    @ValueSource(strings = {"EC2WindowsMessageDeliveryService.", "AmazonSSMMessageDeliveryService."})
     @Order(7)
-    void agentGetsEndpoint() {
+    void agentGetsEndpoint(String targetPrefix) {
         given()
-            .header("X-Amz-Target", "EC2WindowsMessageDeliveryService.GetEndpoint")
+            .header("X-Amz-Target", targetPrefix + "GetEndpoint")
             .contentType(SSM_CT)
             .body("""
                 {
