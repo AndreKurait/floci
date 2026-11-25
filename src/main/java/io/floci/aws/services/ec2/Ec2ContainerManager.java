@@ -643,7 +643,10 @@ public class Ec2ContainerManager {
         GuestOptions options = guestOptions(config.services().ec2());
         boolean customResolver = options.mounts().stream().anyMatch(mount ->
                 "/etc".equals(mount.getTarget()) || "/etc/resolv.conf".equals(mount.getTarget()));
-        String serviceEndpoint = customResolver ? reachableEndpoint.baseUrl(false) : reachableEndpoint.baseUrl();
+        // Guests opting into trusted TLS retain literal endpoint selection for a custom resolver.
+        String serviceEndpoint = config.services().ec2().guestTlsEndpoint()
+                ? reachableEndpoint.baseUrlWithTls(!customResolver)
+                : (customResolver ? reachableEndpoint.baseUrl(false) : reachableEndpoint.baseUrl());
 
         return portAllocator.allocateAndStart(
                 config.services().ec2().sshPortRangeStart(),

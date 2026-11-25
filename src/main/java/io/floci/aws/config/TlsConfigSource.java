@@ -12,17 +12,22 @@ import org.eclipse.microprofile.config.spi.ConfigSource;
 import org.jboss.logging.Logger;
 
 import java.io.IOException;
+import java.net.InetAddress;
+import java.net.NetworkInterface;
+import java.net.SocketException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.cert.X509Certificate;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 
 /**
  * A MicroProfile {@link ConfigSource} that dynamically provides Quarkus TLS/SSL
@@ -247,7 +252,39 @@ public class TlsConfigSource implements ConfigSource {
         List<String> sans = new ArrayList<>(DEFAULT_SAN_HOSTNAMES);
         sans.addAll(extractCustomHostnames());
         sans.addAll(awsSpoofSans());
+        if ("true".equalsIgnoreCase(resolveProperty("floci.services.ec2.guest-tls-endpoint", "false"))) {
+            interfaceAddresses().stream().filter(address -> !sans.contains(address)).forEach(sans::add);
+        }
         return sans;
+    }
+
+    /**
+     * This host's non-loopback, non-link-local interface addresses, sorted. With
+     * {@code floci.services.ec2.guest-tls-endpoint} an EC2 guest that brings its own resolver is given
+     * Floci's https endpoint by address (the current container network's address when Floci runs in a
+     * container), so the server certificate must name it. Only addresses Floci itself listens on are
+     * added, so the certificate names no one else's host.
+     */
+    static List<String> interfaceAddresses() {
+        Set<String> addresses = new TreeSet<>();
+        try {
+            for (NetworkInterface nic : Collections.list(NetworkInterface.getNetworkInterfaces())) {
+                if (!nic.isUp() || nic.isLoopback()) {
+                    continue;
+                }
+                for (InetAddress address : Collections.list(nic.getInetAddresses())) {
+                    if (address.isLoopbackAddress() || address.isLinkLocalAddress() || address.isAnyLocalAddress()) {
+                        continue;
+                    }
+                    String text = address.getHostAddress();
+                    int scope = text.indexOf('%');
+                    addresses.add(scope < 0 ? text : text.substring(0, scope));
+                }
+            }
+        } catch (SocketException e) {
+            LOG.warnv("TLS: could not list interface addresses for the server certificate: {0}", e.getMessage());
+        }
+        return List.copyOf(addresses);
     }
 
     /**

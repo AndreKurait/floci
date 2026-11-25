@@ -4033,6 +4033,18 @@ public interface EmulatorConfig {
         boolean awsFaithfulPrivateIp();
 
         /**
+         * Give EC2 guests Floci's HTTPS endpoint (FLOCI_SERVICES_EC2_GUEST_TLS_ENDPOINT). When true and TLS is
+         * enabled, a guest's {@code AWS_ENDPOINT_URL} names Floci over https, as a Lambda's does, and the
+         * self-signed server certificate also covers this host's interface addresses, the address a guest with
+         * its own resolver is given. Requests a guest sends then arrive with {@code aws:SecureTransport} true, as
+         * an instance's requests to AWS do, so a bucket policy that denies insecure transport admits them. The
+         * guest must trust Floci's CA: the bundle Floci copies in at {@code /etc/floci-ca-bundle.pem} does, a
+         * bundle the guest's own environment names may not. When false (the default) guests keep the HTTP endpoint.
+         */
+        @WithDefault("false")
+        boolean guestTlsEndpoint();
+
+        /**
          * Whether an EC2 instance's Docker container IP is routable from the machines that
          * consume Floci's API responses (Terraform, Terratest, your shell). When true,
          * DescribeInstances / DescribeAddresses report the container IP, so the address they

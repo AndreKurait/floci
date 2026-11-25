@@ -126,6 +126,7 @@ import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.doNothing;
 import static org.mockito.Mockito.doReturn;
 import static org.mockito.Mockito.doThrow;
+import static org.mockito.Mockito.lenient;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.timeout;
@@ -3617,6 +3618,24 @@ class Ec2ContainerManagerTest {
         assertNull(spec.cmd());
     }
 
+    @ParameterizedTest
+    @CsvSource({
+            "/etc/resolv.conf,https://172.30.0.2:4680",
+            "/etc/guest-ca.pem,https://localhost.floci.io:4680"
+    })
+    void guestTlsEndpointGivesGuestsFlociHttpsEndpoint(String target, String endpoint) throws Exception {
+        ContainerSpec spec = launchConfiguredGuest(new ResolvedAmiImage(
+                "example/guest:1", ResolvedAmiImage.IMAGE_RUNTIME, false, "linux/arm64"), Map.of(
+                "FLOCI_SERVICES_EC2_GUEST_TLS_ENDPOINT", "true",
+                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__SOURCE", "/host/input",
+                "FLOCI_SERVICES_EC2_READ_ONLY_BINDS_0__TARGET", target), false, true, false);
+
+        // The guest's requests then carry aws:SecureTransport true, so a bucket policy that denies insecure
+        // transport (aws:SecureTransport false) admits a guest's reads.
+        assertTrue(spec.env().contains("AWS_ENDPOINT_URL=" + endpoint));
+        assertEquals(1, spec.env().stream().filter(value -> value.startsWith("AWS_ENDPOINT_URL=")).count());
+    }
+
     @Test
     void configuredGuestOptionsPreserveInstanceProfileAndProtectedNamespace() throws Exception {
         ContainerSpec spec = launchConfiguredGuest(ResolvedAmiImage.minimal("ubuntu:24.04"), Map.of(
@@ -3772,6 +3791,8 @@ class Ec2ContainerManagerTest {
         ContainerReachableEndpoint reachableEndpoint = mock(ContainerReachableEndpoint.class);
         when(reachableEndpoint.baseUrl()).thenReturn("http://localhost.floci.io:4680");
         when(reachableEndpoint.baseUrl(false)).thenReturn("http://172.30.0.2:4680");
+        lenient().when(reachableEndpoint.baseUrlWithTls(true)).thenReturn("https://localhost.floci.io:4680");
+        lenient().when(reachableEndpoint.baseUrlWithTls(false)).thenReturn("https://172.30.0.2:4680");
         PortAllocator portAllocator = mock(PortAllocator.class);
         when(portAllocator.allocate(anyInt(), anyInt())).thenReturn(2201);
         when(portAllocator.allocateAndStart(anyInt(), anyInt(), any())).thenCallRealMethod();
