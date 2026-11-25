@@ -90,12 +90,12 @@
   "AWS::AppConfig::Deployment": [
     "ApplicationId",
     "ConfigurationProfileId",
-    "ConfigurationVersion",
     "DeploymentStrategyId",
-    "Description",
-    "DynamicExtensionParameters",
     "EnvironmentId",
+    "Description",
+    "ConfigurationVersion",
     "KmsKeyIdentifier",
+    "DynamicExtensionParameters",
     "Tags"
   ],
   "AWS::AppConfig::DeploymentStrategy": [
@@ -108,9 +108,9 @@
   "AWS::AppConfig::HostedConfigurationVersion": [
     "ApplicationId",
     "ConfigurationProfileId",
+    "Description",
     "Content",
     "ContentType",
-    "Description",
     "LatestVersionNumber",
     "VersionLabel"
   ],
@@ -270,11 +270,11 @@
     "ComputePlatform"
   ],
   "AWS::CodeDeploy::DeploymentConfig": [
-    "ComputePlatform",
     "DeploymentConfigName",
     "MinimumHealthyHosts",
-    "TrafficRoutingConfig",
-    "ZonalConfig"
+    "ComputePlatform",
+    "ZonalConfig",
+    "TrafficRoutingConfig"
   ],
   "AWS::CodeDeploy::DeploymentGroup": [
     "DeploymentGroupName",
