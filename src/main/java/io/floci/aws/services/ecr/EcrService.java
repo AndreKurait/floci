@@ -34,6 +34,7 @@ import io.floci.aws.services.ecr.model.PullThroughCacheRule;
 import io.floci.aws.services.ecr.model.RegistrySettings;
 import io.floci.aws.services.ecr.model.Repository;
 import io.floci.aws.services.ecr.model.RepositoryCreationTemplate;
+import io.floci.aws.services.ecr.registry.EcrRegistryAuthorization;
 import io.floci.aws.services.ecr.registry.EcrRegistryManager;
 import io.floci.aws.services.ecr.registry.RegistryHttpClient;
 import jakarta.enterprise.context.ApplicationScoped;
@@ -44,7 +45,6 @@ import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.ArrayList;
-import java.util.Base64;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -774,15 +774,16 @@ public class EcrService implements ResourceProvider, Resettable {
     // GetAuthorizationToken
     // ============================================================
 
+    @Inject
+    EcrRegistryAuthorization registryAuthorization;
+
     public AuthorizationData getAuthorizationToken() {
         // Deliberately not gated on the backing registry: AWS answers this call from the
         // control plane, and both values here are computed without Docker. Gating it made
         // every SDK client retry a 500 before its first repository call.
-        String token = Base64.getEncoder()
-                .encodeToString("AWS:floci".getBytes(StandardCharsets.UTF_8));
-        Instant expires = Instant.now().plusSeconds(12 * 60 * 60);
+        EcrRegistryAuthorization.IssuedToken issued = registryAuthorization.issue();
         String proxy = registryManager.getProxyEndpoint();
-        return new AuthorizationData(token, expires, proxy);
+        return new AuthorizationData(issued.authorizationToken(), issued.expiresAt(), proxy);
     }
 
     // ============================================================
@@ -1797,6 +1798,11 @@ public class EcrService implements ResourceProvider, Resettable {
                 .map(Repository::getImageTagMutability)
                 .filter("IMMUTABLE"::equals)
                 .isPresent();
+    }
+
+    /** Returns the physical registry namespace selected for an ECR repository. */
+    public Optional<Repository> registryRepository(String name, String account, String region) {
+        return repositoryInAccount(account, key(region, account, name));
     }
 
     /**
