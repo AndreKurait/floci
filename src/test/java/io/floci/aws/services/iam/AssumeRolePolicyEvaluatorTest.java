@@ -34,6 +34,70 @@ class AssumeRolePolicyEvaluatorTest {
     }
 
     @Test
+    void boundRolePrincipalMatchesItsIdAndRejectsARecreatedRole() {
+        String roleArn = "arn:aws:iam::111111111111:role/team/app";
+        String sessionArn = "arn:aws:sts::111111111111:assumed-role/app/session";
+        IamService.CallerArns original = new IamService.CallerArns(sessionArn, roleArn,
+                IamService.CallerArns.TYPE_ASSUMED_ROLE, "AROAORIGINAL:session", null);
+        IamService.CallerArns recreated = new IamService.CallerArns(sessionArn, roleArn,
+                IamService.CallerArns.TYPE_ASSUMED_ROLE, "AROARECREATED:session", null);
+        String document = trust("{\"AWS\":\"AROAORIGINAL\"}");
+        assertEquals(TrustDecision.ALLOW, evaluator.decide(document, original, CALLER_ACCOUNT, Map.of()));
+        assertEquals(TrustDecision.NEUTRAL, evaluator.decide(document, recreated, CALLER_ACCOUNT,
+                Map.of("aws:userid", List.of("AROAORIGINAL:session"))));
+        assertEquals(TrustDecision.NEUTRAL, evaluator.decide(document, caller(sessionArn, roleArn),
+                CALLER_ACCOUNT, Map.of("aws:userid", List.of("AROAORIGINAL:session"))));
+        assertEquals(TrustDecision.ALLOW, evaluator.decide(trust("{\"AWS\":\"" + roleArn + "\"}"),
+                recreated, CALLER_ACCOUNT, Map.of()), "Historical ARN rows retain their existing matcher");
+    }
+
+    @Test
+    void boundUserPrincipalFollowsTheIdAcrossRenameAndStillChecksConditions() {
+        String renamedArn = "arn:aws:iam::111111111111:user/new/alicia";
+        IamService.CallerArns renamed = new IamService.CallerArns(renamedArn, renamedArn,
+                IamService.CallerArns.TYPE_USER, "AIDAORIGINAL", "alicia");
+        String document = """
+                {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"sts:AssumeRole",
+                 "Principal":{"AWS":"AIDAORIGINAL"},
+                 "Condition":{"ArnEquals":{"aws:PrincipalArn":"%s"}}}]}
+                """.formatted(renamedArn);
+        assertEquals(TrustDecision.ALLOW, evaluator.decide(document, renamed, CALLER_ACCOUNT, Map.of()));
+        assertEquals(TrustDecision.NEUTRAL, evaluator.decide(document.replace(renamedArn, CALLER_ARN),
+                renamed, CALLER_ACCOUNT, Map.of()));
+        IamService.CallerArns wrongType = new IamService.CallerArns(renamedArn, renamedArn,
+                IamService.CallerArns.TYPE_FEDERATED_USER, "AIDAORIGINAL", null);
+        assertEquals(TrustDecision.NEUTRAL, evaluator.decide(document, wrongType, CALLER_ACCOUNT, Map.of()));
+    }
+
+    @Test
+    void denyByImmutableIdWinsOverWildcardAllow() {
+        IamService.CallerArns user = new IamService.CallerArns(CALLER_ARN, CALLER_ARN,
+                IamService.CallerArns.TYPE_USER, "AIDAORIGINAL", "alice");
+        String document = """
+                {"Version":"2012-10-17","Statement":[
+                 {"Effect":"Allow","Action":"sts:AssumeRole","Principal":"*"},
+                 {"Effect":"Deny","Action":"sts:AssumeRole","Principal":{"AWS":["AIDAOTHER","AIDAORIGINAL"]}}]}
+                """;
+        assertEquals(TrustDecision.EXPLICIT_DENY, evaluator.decide(document, user, CALLER_ACCOUNT, Map.of()));
+    }
+
+    @Test
+    void explicitIdentityDoesNotInventAConditionUserid() {
+        IamService.CallerArns session = new IamService.CallerArns(
+                "arn:aws:sts::111111111111:assumed-role/app", "arn:aws:iam::111111111111:role/app",
+                IamService.CallerArns.TYPE_ASSUMED_ROLE, null, null);
+        String document = trust("{\"AWS\":\"AROAORIGINAL\"}");
+        assertEquals(TrustDecision.ALLOW, evaluator.decideWithPrincipalId(
+                document, session, CALLER_ACCOUNT, Map.of(), "AROAORIGINAL"));
+        String conditional = document.replace("\"Effect\":\"Allow\"",
+                "\"Effect\":\"Allow\",\"Condition\":{\"StringLike\":{\"aws:userid\":\"*\"}}");
+        assertEquals(TrustDecision.NEUTRAL, evaluator.decideWithPrincipalId(
+                conditional, session, CALLER_ACCOUNT, Map.of(), "AROAORIGINAL"));
+        assertEquals(TrustDecision.NEUTRAL, evaluator.decideWithPrincipalId(
+                document, session, CALLER_ACCOUNT, Map.of(), "AROAREPLACEMENT"));
+    }
+
+    @Test
     void allowsAServicePrincipalInTheUniversalForm() {
         assertTrue(evaluator.allowsService(
                 trust("{\"Service\":\"redshift.amazonaws.com\"}"), "redshift.amazonaws.com"));

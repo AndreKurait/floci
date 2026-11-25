@@ -1772,7 +1772,7 @@ public class IamQueryHandler {
                 .elem("RoleId", r.getRoleId())
                 .elem("Arn", r.getArn())
                 .elem("CreateDate", isoDate(r.getCreateDate()))
-                .elem("AssumeRolePolicyDocument", r.getAssumeRolePolicyDocument())
+                .elem("AssumeRolePolicyDocument", iamService.renderAssumeRolePolicy(r.getAssumeRolePolicyDocument()))
                 .raw(tagsElement(r.getTags()))
                 .start("InstanceProfileList");
         for (InstanceProfile profile : iamService.listInstanceProfilesForRole(r.getRoleName())) {
@@ -3797,7 +3797,7 @@ public class IamQueryHandler {
                 .elem("Arn", r.getArn())
                 .elem("CreateDate", isoDate(r.getCreateDate()))
                 .elem("MaxSessionDuration", (long) r.getMaxSessionDuration())
-                .elem("AssumeRolePolicyDocument", r.getAssumeRolePolicyDocument())
+                .elem("AssumeRolePolicyDocument", iamService.renderAssumeRolePolicy(r.getAssumeRolePolicyDocument()))
                 .elem("Description", r.getDescription())
                 .raw(detailed ? permissionsBoundaryXml(r.getPermissionsBoundaryArn()) : "")
                 .raw(detailed ? tagsElement(r.getTags()) : "")

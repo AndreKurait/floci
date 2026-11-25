@@ -220,8 +220,8 @@ public class LambdaTaskAuthorizer {
         CallerArns trustCaller = new CallerArns(RoleResourceAccessAuthorizer.sessionArn(callerRoleArn), callerRoleArn,
                 CallerArns.TYPE_ASSUMED_ROLE, null, null)
                 .withOrganization(iamService.organizationContextOf(callerId.accountId()).orElse(null));
-        TrustDecision trust = trustEvaluator.decide(target.get().getAssumeRolePolicyDocument(), trustCaller,
-                callerId.accountId(), context);
+        TrustDecision trust = trustEvaluator.decideWithPrincipalId(target.get().getAssumeRolePolicyDocument(), trustCaller,
+                callerId.accountId(), context, executionRole.get().getRoleId());
         ResourceAccountRelationship relationship = RoleResourceAccessAuthorizer.relationship(callerId.accountId(), roleAccount);
         // A grant to the execution role's account delegates to that account, so within it the
         // role's own policies have to allow the call too, as they do across accounts anyway.
