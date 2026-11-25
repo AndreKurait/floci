@@ -177,7 +177,7 @@ class EcsImagePullDockerIntegrationTest {
         registryContainerId = dockerClient.createContainerCmd(TestImages.REGISTRY)
                 .withExposedPorts(registryPort)
                 .withHostConfig(HostConfig.newHostConfig().withPortBindings(new PortBinding(
-                        Ports.Binding.bindIpAndPort("127.0.0.1", hostPort), registryPort)))
+                        Ports.Binding.bindIpAndPort(registryBindAddress(), hostPort), registryPort)))
                 .exec()
                 .getId();
         dockerClient.startContainerCmd(registryContainerId).exec();
@@ -186,7 +186,7 @@ class EcsImagePullDockerIntegrationTest {
         for (int attempt = 0; attempt < 50; attempt++) {
             try {
                 HttpResponse<Void> response = http.send(
-                        HttpRequest.newBuilder(URI.create("http://" + registry + "/v2/")).build(),
+                        HttpRequest.newBuilder(URI.create("http://" + registryHttpAddress(registry) + "/v2/")).build(),
                         HttpResponse.BodyHandlers.discarding());
                 if (response.statusCode() == 200) {
                     return registry;
@@ -199,10 +199,20 @@ class EcsImagePullDockerIntegrationTest {
         throw new IllegalStateException("registry at " + registry + " never answered");
     }
 
+    private static String registryBindAddress() {
+        String host = System.getenv("TESTCONTAINERS_HOST_OVERRIDE");
+        return host == null || host.isBlank() ? "127.0.0.1" : "0.0.0.0";
+    }
+
+    private static String registryHttpAddress(String registry) {
+        String host = System.getenv("TESTCONTAINERS_HOST_OVERRIDE");
+        return host == null || host.isBlank() ? registry : host + registry.substring(registry.lastIndexOf(':'));
+    }
+
     /** The digest the registry serves for the tag, which is what a pull of it resolves to. */
     private static String registryDigest(String registry, String repository) throws Exception {
         HttpResponse<Void> response = HttpClient.newHttpClient().send(
-                HttpRequest.newBuilder(URI.create("http://" + registry + "/v2/" + repository + "/manifests/latest"))
+                HttpRequest.newBuilder(URI.create("http://" + registryHttpAddress(registry) + "/v2/" + repository + "/manifests/latest"))
                         .method("HEAD", HttpRequest.BodyPublishers.noBody())
                         .header("Accept", MANIFEST_TYPES)
                         .build(),
