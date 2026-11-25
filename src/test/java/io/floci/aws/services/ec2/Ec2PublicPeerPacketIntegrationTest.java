@@ -3,12 +3,19 @@ package io.floci.aws.services.ec2;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.BuildImageResultCallback;
 import com.github.dockerjava.api.model.HostConfig;
+import com.github.dockerjava.core.DefaultDockerClientConfig;
+import com.github.dockerjava.core.DockerClientImpl;
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.core.common.docker.ContainerDetector;
 import io.floci.aws.core.common.docker.ContainerExec;
 import io.floci.aws.core.common.docker.ContainerStorageHelper;
+import io.floci.aws.core.common.docker.CurrentContainerNetworkResolver;
+import io.floci.aws.core.common.docker.FlociDockerHttpClient;
 import io.floci.aws.testing.DockerAvailability;
 import io.floci.aws.testing.TestImages;
 import io.quarkus.test.InjectMock;
+import io.quarkus.test.common.QuarkusTestResource;
+import io.quarkus.test.common.QuarkusTestResourceLifecycleManager;
 import io.quarkus.test.common.http.TestHTTPResource;
 import io.quarkus.test.junit.QuarkusTest;
 import io.quarkus.test.junit.QuarkusTestProfile;
@@ -29,6 +36,7 @@ import software.amazon.awssdk.services.ec2.model.InstanceStateName;
 import software.amazon.awssdk.services.ec2.model.IpPermission;
 import software.amazon.awssdk.services.ec2.model.NatGateway;
 
+import java.io.IOException;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -49,10 +57,11 @@ import static org.mockito.Mockito.when;
 
 @QuarkusTest
 @TestProfile(Ec2PublicPeerPacketIntegrationTest.RoutedVpc.class)
+@QuarkusTestResource(value = Ec2PublicPeerPacketIntegrationTest.ControlNetwork.class,
+        restrictToAnnotatedClass = true)
 class Ec2PublicPeerPacketIntegrationTest {
     public static class RoutedVpc implements QuarkusTestProfile {
         private static final String NAMESPACE = "ec2-public-peers-" + UUID.randomUUID();
-        private static final String CONTROL_NETWORK = NAMESPACE + "-control";
 
         @Override
         public Map<String, String> getConfigOverrides() {
@@ -64,7 +73,6 @@ class Ec2PublicPeerPacketIntegrationTest {
                     "floci.network.security-group-enforcement.enabled", "true",
                     "floci.network.vpc-routing.enabled", "true",
                     "floci.network.vpc-routing.public-aws-api", "false",
-                    "floci.services.docker-network", CONTROL_NETWORK,
                     "floci.docker.resource-namespace", NAMESPACE);
         }
     }
@@ -80,11 +88,9 @@ class Ec2PublicPeerPacketIntegrationTest {
     @BeforeEach
     void prepareOwnedNetworkAndGuestImage() throws Exception {
         assumeTrue(DockerAvailability.answers(docker), "Docker is required for public peer packets");
-        String network = docker.createNetworkCmd().withName(config.services().dockerNetwork().orElseThrow())
-                .withInternal(true).exec().getId();
-        cleanup.addFirst(() -> docker.removeNetworkCmd(network).exec());
         Files.writeString(imageContext.resolve("Dockerfile"),
-                "FROM " + TestImages.BUSYBOX + "\nRUN mkdir -p /var/lib\n");
+                "FROM " + TestImages.BUSYBOX + "\nRUN mkdir -p /var/lib\n"
+                        + "LABEL floci.test.fixture=" + UUID.randomUUID() + "\n");
         try (BuildImageResultCallback build = docker.buildImageCmd(imageContext.toFile()).withPull(false).start()) {
             String image = build.awaitImageId(60, TimeUnit.SECONDS);
             cleanup.addFirst(() -> docker.removeImageCmd(image).exec());
@@ -382,5 +388,69 @@ class Ec2PublicPeerPacketIntegrationTest {
                 new String[]{"wget", "-q", "-T", "2", "-O", "-", "http://" + address + ":8080/cgi-bin/identity"}, 10);
         assertFalse(result.timedOut(), result.summary());
         return result;
+    }
+
+    public static class ControlNetwork implements QuarkusTestResourceLifecycleManager {
+        private DockerClient docker;
+        private String network;
+        private String runner;
+
+        @Override
+        public Map<String, String> start() {
+            DefaultDockerClientConfig config = DefaultDockerClientConfig.createDefaultConfigBuilder().build();
+            docker = DockerClientImpl.getInstance(config, new FlociDockerHttpClient.Builder()
+                    .dockerHost(config.getDockerHost()).sslConfig(config.getSSLConfig())
+                    .connectionTimeout(Duration.ofSeconds(10)).responseTimeout(Duration.ofSeconds(30)).build());
+            if (!DockerAvailability.answers(docker)) {
+                stop();
+                return Map.of();
+            }
+            try {
+                network = docker.createNetworkCmd().withName("floci-public-peer-control-" + UUID.randomUUID())
+                        .withInternal(true).exec().getId();
+                String address = docker.inspectNetworkCmd().withNetworkId(network).exec()
+                        .getIpam().getConfig().getFirst().getGateway();
+                runner = new CurrentContainerNetworkResolver(docker, new ContainerDetector())
+                        .resolveContainerId().orElse(null);
+                if (runner != null) {
+                    docker.connectToNetworkCmd().withContainerId(runner).withNetworkId(network).exec();
+                    String networkName = docker.inspectNetworkCmd().withNetworkId(network).exec().getName();
+                    address = docker.inspectContainerCmd(runner).exec().getNetworkSettings()
+                            .getNetworks().get(networkName).getIpAddress();
+                }
+                return Map.of("floci.services.docker-network", network,
+                        "floci.services.lambda.docker-host-override", address,
+                        "floci.dns.listen-address", address);
+            } catch (RuntimeException failure) {
+                try {
+                    stop();
+                } catch (RuntimeException cleanupFailure) {
+                    failure.addSuppressed(cleanupFailure);
+                }
+                throw failure;
+            }
+        }
+
+        @Override
+        public void stop() {
+            try {
+                if (network != null) {
+                    if (runner != null) {
+                        docker.disconnectFromNetworkCmd().withContainerId(runner).withNetworkId(network).exec();
+                        runner = null;
+                    }
+                    docker.removeNetworkCmd(network).exec();
+                    network = null;
+                }
+            } finally {
+                if (docker != null) {
+                    try {
+                        docker.close();
+                    } catch (IOException failure) {
+                        throw new IllegalStateException("Cannot close the public-peer network Docker client", failure);
+                    }
+                }
+            }
+        }
     }
 }
