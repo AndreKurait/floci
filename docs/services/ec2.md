@@ -1348,8 +1348,11 @@ With IAM enforcement enabled, the generated request-resource catalog checks inte
 endpoint operations on their resource ARNs. Creating an interface also names its subnet and security
 groups; creating an endpoint also names its VPC, subnets, security groups and route tables.
 `ModifyVpcEndpoint` includes both added and removed resources. Tag requests recognize the interface
-ID prefix supplied by the pinned botocore model. Endpoint, attachment and endpoint-service IDs
-without a model-backed prefix remain checked on `*`.
+ID prefix supplied by the pinned botocore model. A VPC endpoint held in the caller's account and
+Region is checked on its stored identity even when the model supplies no ID prefix. The generated
+catalog still determines which resource types each action may authorize. Unknown endpoint IDs,
+attachment IDs and endpoint-service IDs without a model-backed prefix remain checked on `*`.
+Every target in a tag batch must be authorized before any target's tags change.
 
 `DetachNetworkInterface` resolves the attachment's instance and interface in the caller's account
 and Region, then checks both resources. An attachment that cannot be resolved uses the caller's

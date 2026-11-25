@@ -720,6 +720,42 @@ class Ec2ServiceTest {
                 service.networkInterfaceAttachmentArns(region, attachment.getAttachmentId()));
     }
 
+    @Test
+    void endpointAuthorizationFindsOnlyStoredCallerIdsWithoutChangingOrSeedingThem() {
+        String region = "us-east-1";
+        String owner = "000000000000";
+        AccountAwareStorageBackend<VpcEndpoint> endpoints =
+                new AccountAwareStorageBackend<>(new InMemoryStorage<>(), null, owner);
+        Ec2Service service = spy(new Ec2Service(mockConfig(true), mock(Ec2ContainerManager.class),
+                mock(Ec2PortForwardManager.class), mock(AmiImageResolver.class), mock(Ec2ImageCatalog.class),
+                new Ec2InstanceTypeCatalog(),
+                new InMemoryStorageFactory(Map.of("ec2-vpc-endpoints.json", endpoints))));
+        VpcEndpoint endpoint = new VpcEndpoint();
+        endpoint.setVpcEndpointId("opaque-held-id");
+        endpoint.setRegion(region);
+        endpoint.setState("available");
+        endpoints.putForAccount(owner, region + "::" + endpoint.getVpcEndpointId(), endpoint);
+        Ec2StoredResourceArns stored = new Ec2StoredResourceArns(service, new RegionResolver(region, owner));
+        String expected = AwsArnUtils.Arn.of("ec2", region, owner,
+                "vpc-endpoint/" + endpoint.getVpcEndpointId()).toString();
+
+        assertEquals(Optional.of(expected), stored.findById(endpoint.getVpcEndpointId(), region));
+        assertTrue(stored.findById(endpoint.getVpcEndpointId(), "eu-west-1").isEmpty());
+        assertTrue(stored.findById("vpce-missing", region).isEmpty());
+        assertTrue(stored.findById(null, region).isEmpty());
+        assertTrue(stored.findById(" ", region).isEmpty());
+        assertSame(endpoint, endpoints.getForAccount(owner, region + "::" + endpoint.getVpcEndpointId()).orElseThrow());
+        assertEquals("available", endpoint.getState());
+        assertEquals(1, endpoints.scanForAccount(owner, key -> true).size());
+
+        doReturn("111111111111").when(service).callerAccountId();
+        assertTrue(stored.findById(endpoint.getVpcEndpointId(), region).isEmpty());
+        doReturn(owner).when(service).callerAccountId();
+        endpoints.deleteForAccount(owner, region + "::" + endpoint.getVpcEndpointId());
+        assertTrue(stored.findById(endpoint.getVpcEndpointId(), region).isEmpty());
+        assertEquals(List.of(), endpoints.scanForAccount(owner, key -> true));
+    }
+
     private static List<String> attachmentArns(String region, String account, String instance, String eni) {
         return List.of(AwsArnUtils.Arn.of("ec2", region, account, "instance/" + instance).toString(),
                 AwsArnUtils.Arn.of("ec2", region, account, "network-interface/" + eni).toString());
