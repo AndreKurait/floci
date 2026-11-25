@@ -383,3 +383,7 @@ See [Docker's bridge network documentation](https://docs.docker.com/engine/netwo
 **Disk not reclaimed after deleting images.** Deleting the last tag of an image, deleting by digest, or a lifecycle policy expiring an image removes its manifest, but blobs remain on disk until garbage collection runs. Trigger it with `curl -X POST http://localhost:4566/_floci/ecr/gc`. The endpoint runs `registry garbage-collect` inside the backing container and returns the reclaimed blob list. The operation is serialized: ECR API calls block for its duration (typically a few seconds).
 
 **`*.localhost` does not resolve to loopback on this platform.** Set `floci.services.ecr.uri-style: path` to fall back to `localhost:<port>/<account>/<region>/<repo>` URIs. On Docker Desktop the rewrite of AWS-shaped Lambda, ECS and EMR Serverless images keeps `<account>.dkr.ecr.<region>.localhost`; there, build the image under the AWS-shaped URI the function or task definition names, and Floci uses it as-is (`FLOCI_SERVICES_ECR_PREFER_LOCAL_IMAGES`).
+
+## Cross-account repository reads
+
+With IAM enforcement enabled, repository API requests use the account selected by `registryId`. Cross-account image pulls require both the caller identity permission and a repository policy granting that caller access to the target repository. An explicit deny in either policy takes precedence. Repository URI refreshes retain the owning account namespace. `GetAuthorizationToken` still requires its separate identity permission.
