@@ -208,6 +208,12 @@ public class KinesisService implements ResourceProvider {
     public KinesisStream createStream(String streamName, int shardCount, String streamMode,
                                       Integer maxRecordSizeInKiB, Map<String, String> tags,
                                       Integer retentionPeriodHours, String region) {
+        if (shardCount < 1) {
+            throw new AwsException("ValidationException", "1 validation error detected: Value '" + shardCount
+                    + "' at 'shardCount' failed to satisfy constraint: "
+                    + "Member must have value greater than or equal to 1", 400);
+        }
+
         String resolvedMode = streamMode != null ? streamMode : DEFAULT_STREAM_MODE;
         validateStreamMode(resolvedMode);
         if (maxRecordSizeInKiB != null) {
