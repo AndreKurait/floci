@@ -162,7 +162,7 @@ public class AccountService implements Resettable, StoredResourceArns, AccountPl
         return new AccountInformation(account.getId(), account.getName(), created, state);
     }
 
-    private String resolveTargetAccount(String callerAccountId, JsonNode request) {
+    String resolveTargetAccount(String callerAccountId, JsonNode request) {
         String requestedAccountId = text(request, "AccountId");
         if (requestedAccountId == null) {
             return callerAccountId;
