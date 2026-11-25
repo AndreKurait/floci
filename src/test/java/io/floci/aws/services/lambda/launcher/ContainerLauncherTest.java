@@ -701,6 +701,7 @@ class ContainerLauncherTest {
         launcher.launch(fn);
 
         assertEquals(javaTrustStore, captureRealContainerSpec().javaTrustStore());
+        assertTrue(captureRealContainerSpec().init(), "Runtime must receive normal Unix shutdown signals");
     }
 
     @Test
@@ -708,6 +709,7 @@ class ContainerLauncherTest {
         launcher.launch(imageFunction());
 
         assertTrue(captureRealContainerSpec().javaTrustStore());
+        assertTrue(captureRealContainerSpec().init(), "Custom images also need signal forwarding and reaping");
     }
 
     @Test

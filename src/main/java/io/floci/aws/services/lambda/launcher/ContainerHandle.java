@@ -4,6 +4,7 @@ import io.floci.aws.services.lambda.model.ContainerState;
 import io.floci.aws.services.lambda.runtime.RuntimeApiServer;
 
 import java.io.Closeable;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
 import java.util.function.Supplier;
@@ -25,6 +26,7 @@ public class ContainerHandle {
     private Closeable logStream;
     private Function<Boolean, Supplier<String>> logTailReader = initialization -> () -> "";
     private final AtomicBoolean invoked = new AtomicBoolean();
+    private CompletableFuture<Void> extensionExit = CompletableFuture.completedFuture(null);
 
     public ContainerHandle(String containerId, String functionName,
                            RuntimeApiServer runtimeApiServer, ContainerState state) {
@@ -64,6 +66,9 @@ public class ContainerHandle {
 
     public Closeable getLogStream() { return logStream; }
     public void setLogStream(Closeable logStream) { this.logStream = logStream; }
+    void setExtensionExit(CompletableFuture<Void> extensionExit) { this.extensionExit = extensionExit; }
+
+    CompletableFuture<Void> extensionExit() { return extensionExit; }
 
     public void setLogTailReader(Function<Boolean, Supplier<String>> reader) { this.logTailReader = reader; }
 
