@@ -7,6 +7,20 @@ the calling account and region. Persisted records from older versions that did n
 record a region remain available only in `floci.default-region`. New writes store
 their region explicitly in all storage modes.
 
+With IAM enforcement enabled, AppConfig and AppConfigData requests require the
+caller's `appconfig:` permissions. Scoped policies use canonical resource IDs even
+when the request uses names. Configuration sessions authorize both creation and
+polling against the application/environment/configuration ARN; a denied poll does
+not consume its token. Passing retrieval or monitor roles also requires
+`iam:PassRole` for the AppConfig service. IAM enforcement remains disabled by default.
+
+Tagged `CreateApplication` and `CreateDeploymentStrategy` requests also require
+`appconfig:TagResource` on `application/*` or `deploymentstrategy/*` in the request's
+partition, account and Region. Both the create action and tagging action evaluate
+`aws:RequestTag` and `aws:TagKeys` conditions. An untagged create needs only its create
+permission. This tag-on-create admission currently covers these two operations;
+child-resource and deployment creation tags remain outside this admission scope.
+
 ## Management Plane (AppConfig)
 
 The management plane allows you to create and manage applications, environments, configuration profiles, and hosted configuration versions.
@@ -114,8 +128,8 @@ Floci provisions these resource types:
 `ConfigurationProfileId` and `Id`. A configuration profile's `KmsKeyArn` is not set.
 
 An update that changes only mutable properties keeps the ID and changes the resource in place: the name and
-description of an application, environment or configuration profile, an environment's `Monitors`, an application's
-`Tags`, and a deployment strategy's description, duration, final bake time, growth factor and growth type. A property
+description of an application, environment or configuration profile, an environment's `Monitors`, `Tags` on all four resource types, and a deployment strategy's description, duration, final bake time, growth factor
+and growth type. A property
 the template drops is cleared, or set back to its default (`FinalBakeTimeInMinutes` 0, `GrowthType` `LINEAR`). A
 change to a createOnly property (`ApplicationId` on an environment or configuration profile, `LocationUri` on a
 configuration profile, `Name` or `ReplicateTo` on a deployment strategy) replaces the resource: the new one is
@@ -126,9 +140,12 @@ A change to a configuration profile's `Type` is accepted on update and not appli
 type it was created with, as `UpdateConfigurationProfile` has no `Type` member.
 
 Deleting an environment deletes its deployments, and deleting a configuration profile deletes its hosted configuration
-versions. Floci keeps tags on applications only, so `Tags` on the other three types are accepted and not stored, as
-`TagResource` treats them; so are a configuration profile's `KmsKeyIdentifier`, `RetrievalRoleArn` and `Validators`,
-and `DeletionProtectionCheck`. `ReplicateTo: SSM_DOCUMENT` writes no SSM document.
+versions. Tags supplied at creation and through `TagResource` are stored on applications, environments,
+configuration profiles and custom deployment strategies. `TagResource` merges keys, `UntagResource` removes
+the named keys, and `ListTagsForResource` reads the remaining map. Tags persist with their resource and use the
+same account, region and parent-application identity. CloudFormation replaces the complete tag set on an in-place
+update and restores it on rollback. A configuration profile's `KmsKeyIdentifier`, `RetrievalRoleArn` and `Validators`,
+and `DeletionProtectionCheck` are accepted and not stored. `ReplicateTo: SSM_DOCUMENT` writes no SSM document.
 `AWS::AppConfig::HostedConfigurationVersion`, `Deployment`, `Extension` and `ExtensionAssociation` are not provisioned.
 
 A stack created before Floci provisioned these types holds stubs for them, and an update creates the real resource in

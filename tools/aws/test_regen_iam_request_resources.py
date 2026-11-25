@@ -1844,6 +1844,18 @@ def test_a_member_one_client_locates_and_another_carries_in_a_body_it_reads_is_l
         r.located_members({"one": one, "two": two}, "GetThing")
 
 
+@pytest.mark.parametrize("kind", ["integer", "long"])
+def test_numeric_uri_labels_name_resources_and_location_index_retains_query_labels(kind):
+    svc = rest_model(
+        {"GetDeployment": {"DeploymentNumber": "Number", "Limit": "Number", "Count": "Number"}},
+        {"GetDeployment": {"DeploymentNumber": "uri:DeploymentNumber", "Limit": "querystring:limit"}})
+    svc["shapes"]["Number"] = {"type": kind}
+    assert r.request_members({"svc": svc}, "GetDeployment") == {"DeploymentNumber": "DeploymentNumber"}
+    assert r.located_members({"svc": svc}, "GetDeployment") == (
+        {"DeploymentNumber": "{DeploymentNumber}", "Limit": "?limit"}, {})
+
+
+
 def test_a_member_located_apart_by_a_client_whose_routes_are_not_vendored_is_an_error(monkeypatch):
     one = rest_model({"GetThing": {"ThingName": "String"}}, {"GetThing": {"ThingName": "uri:ThingName"}})
     two = rest_model({"GetThing": {"ThingName": "String"}}, {"GetThing": {"ThingName": "querystring:thing"}})
@@ -3673,3 +3685,77 @@ def test_a_resource_named_after_its_path_or_signed_for_is_checked():
                 {"type": "group", "fill": {"GroupNameWithPath": "NewGroupName"}, "renames": "GroupName"},
                 dict(signer, signer="yes"), dict(signer, types=["user", "group"]), dict(signer, fill={})):
         assert r._resource_problems("iam:Op", bad, types, USERS_FORMATS), bad
+
+
+APPCONFIG_FORMATS = {
+    "application": "arn:${Partition}:appconfig:${Region}:${Account}:application/${ApplicationId}",
+    "environment": ("arn:${Partition}:appconfig:${Region}:${Account}:"
+                    "application/${ApplicationId}/environment/${EnvironmentId}"),
+    "configurationprofile": ("arn:${Partition}:appconfig:${Region}:${Account}:"
+                             "application/${ApplicationId}/configurationprofile/${ConfigurationProfileId}"),
+    "configuration": ("arn:${Partition}:appconfig:${Region}:${Account}:"
+                      "application/${ApplicationId}/environment/${EnvironmentId}"
+                      "/configuration/${ConfigurationProfileId}"),
+}
+
+
+@pytest.mark.parametrize("operation", ["GetHostedConfigurationVersion", "DeleteHostedConfigurationVersion"])
+def test_hosted_versions_keep_the_profile_arn_shared_by_two_reference_types(operation):
+    formats = {**APPCONFIG_FORMATS, "hostedconfigurationversion": APPCONFIG_FORMATS["configurationprofile"]}
+    inputs = {"ApplicationId": "String", "ConfigurationProfileId": "String", "VersionNumber": "Number"}
+    svc = rest_model({operation: inputs}, {operation: {member: "uri:" + member for member in inputs}})
+    svc["shapes"][operation + "In"]["required"] = list(inputs)
+    svc["shapes"]["Number"] = {"type": "integer"}
+    types = ["application", "configurationprofile", "hostedconfigurationversion"]
+    entry = r.entry_for("appconfig:" + operation, {"action": "appconfig:" + operation, "types": types},
+                        formats, {"appconfig": svc})
+    assert entry["resources"] == [
+        {"type": "application", "fill": {"ApplicationId": "ApplicationId"}},
+        {"type": "configurationprofile",
+         "fill": {"ApplicationId": "ApplicationId", "ConfigurationProfileId": "ConfigurationProfileId"}},
+    ]
+    assert entry["located"] == {"ApplicationId": "{ApplicationId}",
+                                "ConfigurationProfileId": "{ConfigurationProfileId}"}
+
+
+def test_legacy_configuration_reads_the_profile_beside_the_application_and_environment():
+    inputs = {"Application": "String", "Environment": "String", "Configuration": "String"}
+    svc = rest_model({"GetConfiguration": inputs},
+                     {"GetConfiguration": {member: "uri:" + member for member in inputs}})
+    svc["shapes"]["GetConfigurationIn"]["required"] = list(inputs)
+    types = ["application", "configurationprofile", "environment"]
+    entry = r.entry_for("appconfig:GetConfiguration", {"action": "appconfig:GetConfiguration", "types": types},
+                        APPCONFIG_FORMATS, {"appconfig": svc})
+    assert entry["resources"] == [
+        {"type": "application", "fill": {"ApplicationId": "Application"}},
+        {"type": "environment", "fill": {"ApplicationId": "Application", "EnvironmentId": "Environment"}},
+        {"type": "configurationprofile",
+         "fill": {"ApplicationId": "Application", "ConfigurationProfileId": "Configuration"}},
+    ]
+    assert entry["located"] == {member: "{" + member + "}" for member in inputs}
+
+
+def test_configuration_token_reaches_the_configuration_and_keeps_its_query_location():
+    svc = rest_model({"GetLatestConfiguration": {"ConfigurationToken": "String"}},
+                     {"GetLatestConfiguration": {"ConfigurationToken": "querystring:configuration_token"}})
+    entry = r.entry_for("appconfig:GetLatestConfiguration",
+                        {"action": "appconfig:GetLatestConfiguration", "types": ["configuration"]},
+                        APPCONFIG_FORMATS, {"appconfigdata": svc})
+    assert entry["resources"] == [{"types": ["configuration"], "through": "ConfigurationToken"}]
+    assert entry["located"] == {"ConfigurationToken": "?configuration_token"}
+
+
+@pytest.mark.parametrize("change", ["missing_member", "missing_type", "changed_format"])
+def test_legacy_configuration_reader_rejects_model_or_reference_drift(change):
+    formats = dict(APPCONFIG_FORMATS)
+    types = ["application", "configurationprofile", "environment"]
+    inputs = members("Application", "Environment", "Configuration")
+    if change == "missing_member":
+        del inputs["Configuration"]
+    elif change == "missing_type":
+        types.remove("configurationprofile")
+    else:
+        formats["configurationprofile"] += "/version/${Version}"
+    with pytest.raises(ValueError, match="review"):
+        r.with_appconfig_resource_reads([], "appconfig:GetConfiguration", types, formats, inputs)
+

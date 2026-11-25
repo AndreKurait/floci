@@ -6,6 +6,8 @@ import io.floci.aws.core.common.RequestScopes;
 import io.quarkus.test.junit.QuarkusTest;
 import jakarta.inject.Inject;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.ValueSource;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -25,6 +27,9 @@ class AppConfigRegionIntegrationTest {
 
     @Inject
     RegionResolver regions;
+
+    @Inject
+    AppConfigResourceArns arns;
 
     @Test
     void identicalNamesResolveOnlyWithinTheirAccountAndRegion() {
@@ -54,10 +59,10 @@ class AppConfigRegionIntegrationTest {
         }
     }
 
-    @Test
-    void foreignRegionCannotConsumeAConfigurationSession() {
+    @ParameterizedTest
+    @ValueSource(strings = {"us-east-1", "cn-north-1", "us-gov-west-1"})
+    void foreignAccountOrRegionCannotAuthorizeOrConsumeAConfigurationSession(String region) {
         String account = "333333333333";
-        String region = regions.getDefaultRegion();
         RequestScopes.runAs(account, region, () -> {
             String app = service.createApplication(Map.of("Name", "session-" + UUID.randomUUID())).getId();
             String env = service.createEnvironment(app, Map.of("Name", "environment")).getId();
@@ -67,8 +72,18 @@ class AppConfigRegionIntegrationTest {
                 String token = data.startConfigurationSession(Map.of(
                         "ApplicationIdentifier", app, "EnvironmentIdentifier", env,
                         "ConfigurationProfileIdentifier", profile));
-                RequestScopes.runAs(account, "us-west-2", () -> assertEquals("BadRequestException",
-                        assertThrows(AwsException.class, () -> data.getLatestConfiguration(token)).getErrorCode()));
+                String configuration = regions.buildArn("appconfig", region, "application/" + app
+                        + "/environment/" + env + "/configuration/" + profile);
+                assertEquals(List.of(configuration), arns.through("ConfigurationToken", token, region));
+                for (Scope scope : List.of(new Scope(account, "us-west-2"), new Scope("444455556666", region))) {
+                    RequestScopes.runAs(scope.account(), scope.region(), () -> {
+                        assertEquals("BadRequestException", assertThrows(AwsException.class,
+                                () -> arns.through("ConfigurationToken", token, scope.region())).getErrorCode());
+                        assertEquals("BadRequestException",
+                                assertThrows(AwsException.class, () -> data.getLatestConfiguration(token)).getErrorCode());
+                    });
+                }
+                assertEquals(List.of(configuration), arns.through("ConfigurationToken", token, region));
                 assertEquals(0, data.getLatestConfiguration(token).content().length);
             } finally {
                 service.deleteEnvironment(app, env);

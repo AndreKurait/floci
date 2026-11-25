@@ -113,12 +113,10 @@
             <scope>test</scope>
         </dependency>
         <dependency>
-            <groupId>com.google.protobuf</groupId>
-            <artifactId>protobuf-java-util</artifactId>
-        </dependency>
-        <dependency>
-            <groupId>com.google.api.grpc</groupId>
-            <artifactId>proto-google-common-protos</artifactId>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>appconfig</artifactId>
+            <version>${aws.sdk.version}</version>
+            <scope>test</scope>
         </dependency>
         <dependency>
             <groupId>software.amazon.awssdk</groupId>
