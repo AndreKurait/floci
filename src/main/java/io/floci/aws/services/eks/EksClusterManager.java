@@ -7,11 +7,13 @@ import com.github.dockerjava.api.command.InspectContainerResponse;
 import com.github.dockerjava.api.model.Container;
 import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.Info;
+import io.floci.aws.config.ContainerCaBundle;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.config.FlociCertificateAuthority;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.AwsRegions;
+import io.floci.aws.core.common.Digests;
 import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.StripedLocks;
 import io.floci.aws.core.common.dns.DnsAnswer;
@@ -27,6 +29,7 @@ import io.floci.aws.core.common.docker.ContainerLifecycleManager;
 import io.floci.aws.core.common.docker.ContainerLifecycleManager.ContainerInfo;
 import io.floci.aws.core.common.docker.ContainerLogStreamer;
 import io.floci.aws.core.common.docker.ContainerNetworks;
+import io.floci.aws.core.common.docker.ContainerReachableEndpoint;
 import io.floci.aws.core.common.docker.ContainerSpec;
 import io.floci.aws.core.common.docker.ContainerStorageHelper;
 import io.floci.aws.core.common.docker.DockerHostResolver;
@@ -44,22 +47,27 @@ import io.floci.aws.services.ec2.Ec2MetadataProxy;
 import io.floci.aws.services.ec2.Ec2MetadataServer;
 import io.floci.aws.services.ec2.Ec2Service;
 import io.floci.aws.services.ec2.VpcRouteTableListener;
+import io.floci.aws.services.ec2.model.GroupIdentifier;
 import io.floci.aws.services.ec2.model.Instance;
+import io.floci.aws.services.ec2.model.InstanceNetworkInterface;
 import io.floci.aws.services.ec2.model.InstanceState;
 import io.floci.aws.services.ec2.model.LaunchTemplateData;
 import io.floci.aws.services.ec2.model.Placement;
 import io.floci.aws.services.ec2.model.RouteTable;
 import io.floci.aws.services.ec2.model.Tag;
+import io.floci.aws.services.ec2.net.Cidr4;
 import io.floci.aws.services.ecr.registry.EcrRegistryManager;
 import io.floci.aws.services.eks.model.CertificateAuthority;
 import io.floci.aws.services.eks.model.Cluster;
 import io.floci.aws.services.eks.model.ClusterIdentity;
 import io.floci.aws.services.eks.model.ClusterOidcKey;
+import io.floci.aws.services.eks.model.ElasticLoadBalancing;
 import io.floci.aws.services.eks.model.LogSetup;
 import io.floci.aws.services.eks.model.Nodegroup;
 import io.floci.aws.services.eks.model.NodegroupStatus;
 import io.floci.aws.services.eks.model.OidcIdentity;
 import io.floci.aws.services.eks.model.ResourcesVpcConfig;
+import io.floci.aws.services.eks.model.StorageConfig;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry;
@@ -71,6 +79,7 @@ import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
+import java.io.UncheckedIOException;
 import java.net.HttpURLConnection;
 import java.net.Inet4Address;
 import java.net.Inet6Address;
@@ -85,6 +94,7 @@ import java.nio.file.attribute.PosixFilePermissions;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Base64;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -105,7 +115,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.function.BiFunction;
+import java.util.function.BooleanSupplier;
 import java.util.function.Consumer;
+import java.util.function.Supplier;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
@@ -128,6 +140,17 @@ public class EksClusterManager
     private static final String ENDPOINT_HOST_LABEL = "io.floci.eks.endpoint-host";
     /** Marks a node started behind {@link #RSHARE_ENTRYPOINT}, whose mounts are shared. */
     private static final String SHARED_MOUNTS_LABEL = "io.floci.eks.shared-mounts";
+    /** The pod network a node was started with: {@link #FLANNEL_POD_NETWORK}, or {@code vpc:} and its prefixes. */
+    private static final String POD_NETWORK_LABEL = "io.floci.eks.pod-network";
+    /** The digest of the registries.yaml a node was started with; a node without one has none, or predates the label. */
+    private static final String REGISTRY_MIRROR_LABEL = "io.floci.eks.registry-mirror";
+    private static final String FLANNEL_POD_NETWORK = "flannel";
+    private static final String VPC_POD_NETWORK_LABEL_PREFIX = "vpc:";
+    /** The k3s arguments that leave pod addresses to the VPC pod network's bridge configuration. */
+    static final List<String> VPC_POD_NETWORK_SERVER_ARGS = List.of("--flannel-backend=none",
+            "--disable-network-policy", "--kube-controller-manager-arg=allocate-node-cidrs=false");
+    /** Whether the node runs k3s's ServiceLB, which an EKS Auto Mode node with load balancing on runs without. */
+    static final String SERVICE_LB_LABEL = "io.floci.eks.service-lb";
     private static final Pattern HOSTNAME = Pattern.compile(
             "[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*");
 
@@ -137,6 +160,9 @@ public class EksClusterManager
     // Tar entry extracted at /etc; the archive path creates /etc/rancher/k3s, which does not
     // exist yet in a created-but-not-started k3s container.
     private static final String REGISTRIES_TAR_ENTRY = "rancher/k3s/registries.yaml";
+    // The resolv.conf k3s hands its pods (--resolv-conf), extracted at /etc as registries.yaml is.
+    static final String POD_RESOLV_CONF_TAR_ENTRY = "rancher/k3s/floci-resolv.conf";
+    static final String POD_RESOLV_CONF_PATH = "/etc/" + POD_RESOLV_CONF_TAR_ENTRY;
     // k3s applies every manifest in its server manifests directory at startup, and again whenever
     // one changes on disk, so dropping the file in before the container starts is enough to get the
     // MutatingWebhookConfiguration registered. The directory sits under the cluster's named data
@@ -147,6 +173,37 @@ public class EksClusterManager
     static final String CONTAINERD_CERTS_LINK = "etc/containerd/certs.d";
     static final String POD_IDENTITY_MANIFEST_FILE = "floci-eks-pod-identity.yaml";
     static final String POD_IDENTITY_MANIFEST_TAR_ENTRY = "server/manifests/" + POD_IDENTITY_MANIFEST_FILE;
+    // The manifest while Floci registers no pod identity webhook: no objects, so k3s deletes what it held before.
+    static final String POD_IDENTITY_MANIFEST_REMOVED = """
+            # Floci registers no EKS Pod Identity webhook for this cluster now; its log says why.
+            # k3s deletes the MutatingWebhookConfiguration an earlier version of this file created.
+            """;
+    static final String BLOCK_STORAGE_MANIFEST_FILE = "floci-eks-auto-mode-block-storage.yaml";
+    static final String BLOCK_STORAGE_MANIFEST_TAR_ENTRY = "server/manifests/" + BLOCK_STORAGE_MANIFEST_FILE;
+    // The manifest once block storage is off: no objects, so k3s deletes the provisioner it held before.
+    static final String BLOCK_STORAGE_MANIFEST_REMOVED = """
+            # EKS Auto Mode block storage is off for this cluster.
+            # k3s deletes the provisioner an earlier version of this file created.
+            """;
+    static final String COMPUTE_MANIFEST_FILE = "floci-eks-auto-mode-compute.yaml";
+    static final String COMPUTE_MANIFEST_TAR_ENTRY = "server/manifests/" + COMPUTE_MANIFEST_FILE;
+    // The manifest once compute is off: no objects, so k3s deletes the node pools, node class and their kinds.
+    static final String COMPUTE_MANIFEST_REMOVED = """
+            # EKS Auto Mode compute is off for this cluster.
+            # k3s deletes the node pools, node class and kinds an earlier version of this file created.
+            """;
+    /** The comment in the compute manifest that starts the {@code default} NodeClass. */
+    private static final String DEFAULT_NODE_CLASS_MARKER = "# The default NodeClass";
+    /** The label EKS Auto Mode's nodes carry, given to the cluster's node while compute is on. */
+    static final String AUTO_COMPUTE_LABEL_KEY = "eks.amazonaws.com/compute-type"; // partition-literal: a label
+    static final String AUTO_COMPUTE_LABEL = AUTO_COMPUTE_LABEL_KEY + "=auto";
+    static final String LOAD_BALANCING_MANIFEST_FILE = "floci-eks-auto-mode-load-balancing.yaml";
+    static final String LOAD_BALANCING_MANIFEST_TAR_ENTRY = "server/manifests/" + LOAD_BALANCING_MANIFEST_FILE;
+    // The manifest once load balancing is off: no objects, so k3s deletes the IngressClassParams kind it held before.
+    static final String LOAD_BALANCING_MANIFEST_REMOVED = """
+            # EKS Auto Mode load balancing is off for this cluster.
+            # k3s deletes the IngressClassParams kind an earlier version of this file created.
+            """;
     private static final String ENDPOINT_MODE_NETWORK = "network";
     public static final String DEFAULT_POD_CIDR = "10.42.0.0/16";
 
@@ -188,6 +245,7 @@ public class EksClusterManager
     private final Ec2MetadataServer metadataServer;
     private final EksOidcService oidcService;
     private final FlociCertificateAuthority certificateAuthority;
+    private final ContainerReachableEndpoint reachableEndpoint;
     private final ContainerLogStreamer logStreamer;
     private final Ec2ImageCatalog imageCatalog;
     private final Ec2InstanceTypeCatalog instanceTypeCatalog = new Ec2InstanceTypeCatalog();
@@ -211,6 +269,8 @@ public class EksClusterManager
     private record VpcLease(String accountId, String region, String vpcId, String subnetId, String address) {}
     private record ClusterVpcSubnet(String vpcId, String subnetId) {}
     private final Map<String, VpcLease> clusterVpcLeases = new ConcurrentHashMap<>();
+    /** The IPv4 /28 prefixes leased for each cluster node's pods, by cluster resource name. */
+    private final Map<String, List<String>> clusterPodPrefixes = new ConcurrentHashMap<>();
     /**
      * The k3s containers whose guest setup waits for their API server to answer, by container ID. On a cgroup v2
      * host, k3s moves the root cgroup's processes into {@code /init} and then enables the cgroup controllers, which
@@ -304,6 +364,47 @@ public class EksClusterManager
 
     private VpcLease acquireClusterVpcLease(Cluster cluster, String accountId, String region,
                                             boolean allocateWhenUnreserved) {
+        VpcLease lease = acquireNodeAddressLease(cluster, accountId, region, allocateWhenUnreserved);
+        if (lease != null) {
+            leasePodPrefixes(cluster, lease, allocateWhenUnreserved);
+        }
+        return lease;
+    }
+
+    /**
+     * With {@code vpc-pod-network}, leases the node's IPv4 /28 prefixes in its subnet: those it held before a restart,
+     * when they are still free, and new ones up to {@code vpc-pod-prefixes} when {@code allocate}. An adopted container
+     * does not allocate, as it keeps handing out the prefixes it was started with; a container started later on the
+     * same lease, one replacing it among them, tops the list up. Without the setting the node holds none.
+     */
+    private void leasePodPrefixes(Cluster cluster, VpcLease lease, boolean allocate) {
+        String resourceName = clusterResourceName(cluster);
+        Ec2Service ec2 = ec2Service();
+        if (!config.services().eks().vpcPodNetwork() || ec2 == null) {
+            cluster.setNodePodPrefixes(null);
+            return;
+        }
+        List<String> prefixes = clusterPodPrefixes.get(resourceName);
+        if (prefixes == null) {
+            List<String> held = cluster.getNodePodPrefixes();
+            prefixes = new ArrayList<>(held == null || held.isEmpty() ? List.of()
+                    : ec2.reserveVpcPrefixes(lease.accountId(), lease.region(), lease.subnetId(), held));
+            clusterPodPrefixes.put(resourceName, prefixes);
+        }
+        int wanted = config.services().eks().vpcPodPrefixes();
+        if (allocate && prefixes.size() < wanted) {
+            prefixes.addAll(ec2.allocateVpcPrefixes(lease.accountId(), lease.region(), lease.subnetId(),
+                    wanted - prefixes.size()));
+            if (prefixes.size() < wanted) {
+                LOG.warnv("EKS cluster {0} holds {1} of its {2} pod prefixes: subnet {3} has no other free /28",
+                        cluster.getName(), prefixes.size(), wanted, lease.subnetId());
+            }
+        }
+        cluster.setNodePodPrefixes(prefixes.isEmpty() ? null : new ArrayList<>(prefixes));
+    }
+
+    private VpcLease acquireNodeAddressLease(Cluster cluster, String accountId, String region,
+                                             boolean allocateWhenUnreserved) {
         ClusterVpcSubnet subnet = resolveClusterSubnet(cluster);
         if (subnet == null) {
             return null;
@@ -351,9 +452,14 @@ public class EksClusterManager
 
     private void releaseClusterVpcLease(Cluster cluster, String resourceName) {
         VpcLease lease = clusterVpcLeases.remove(resourceName);
+        List<String> prefixes = clusterPodPrefixes.remove(resourceName);
         Ec2Service ec2 = ec2Service();
         if (lease != null && ec2 != null) {
             ec2.releaseVpcPrivateIp(lease.accountId(), lease.region(), lease.subnetId(), lease.address());
+            if (prefixes != null) {
+                prefixes.forEach(prefix -> ec2.releaseVpcPrefix(lease.accountId(), lease.region(), lease.subnetId(),
+                        prefix));
+            }
         }
     }
 
@@ -494,133 +600,6 @@ public class EksClusterManager
                 entry -> clusterResourceName.equals(entry.getValue().clusterResourceName()));
     }
 
-    public EksClusterManager(ContainerBuilder containerBuilder,
-                             ContainerLifecycleManager lifecycleManager,
-                             ContainerDetector containerDetector,
-                             PortAllocator portAllocator,
-                             DockerHostResolver dockerHostResolver,
-                             EcrRegistryManager ecrRegistryManager,
-                             EmulatorConfig config,
-                             RegionResolver regionResolver) {
-        this(containerBuilder, lifecycleManager, containerDetector, portAllocator,
-                dockerHostResolver, ecrRegistryManager, config, regionResolver, null, null, null, null);
-    }
-
-    public EksClusterManager(ContainerBuilder containerBuilder,
-                             ContainerLifecycleManager lifecycleManager,
-                             ContainerDetector containerDetector,
-                             PortAllocator portAllocator,
-                             DockerHostResolver dockerHostResolver,
-                             EcrRegistryManager ecrRegistryManager,
-                             EmulatorConfig config,
-                             RegionResolver regionResolver,
-                             Ec2MetadataServer metadataServer) {
-        this(containerBuilder, lifecycleManager, containerDetector, portAllocator,
-                dockerHostResolver, ecrRegistryManager, config, regionResolver, metadataServer, null, null, null);
-    }
-
-    public EksClusterManager(ContainerBuilder containerBuilder,
-                             ContainerLifecycleManager lifecycleManager,
-                             ContainerDetector containerDetector,
-                             PortAllocator portAllocator,
-                             DockerHostResolver dockerHostResolver,
-                             EcrRegistryManager ecrRegistryManager,
-                             EmulatorConfig config,
-                             RegionResolver regionResolver,
-                             Ec2MetadataServer metadataServer,
-                             EksOidcService oidcService) {
-        this(containerBuilder, lifecycleManager, containerDetector, portAllocator,
-                dockerHostResolver, ecrRegistryManager, config, regionResolver, metadataServer, oidcService, null, null);
-    }
-
-    public EksClusterManager(ContainerBuilder containerBuilder,
-                             ContainerLifecycleManager lifecycleManager,
-                             ContainerDetector containerDetector,
-                             PortAllocator portAllocator,
-                             DockerHostResolver dockerHostResolver,
-                             EcrRegistryManager ecrRegistryManager,
-                             EmulatorConfig config,
-                             RegionResolver regionResolver,
-                             Ec2MetadataServer metadataServer,
-                             EksOidcService oidcService,
-                             FlociCertificateAuthority certificateAuthority) {
-        this(containerBuilder, lifecycleManager, containerDetector, portAllocator,
-                dockerHostResolver, ecrRegistryManager, config, regionResolver, metadataServer, oidcService,
-                certificateAuthority, null);
-    }
-
-    public EksClusterManager(ContainerBuilder containerBuilder,
-                             ContainerLifecycleManager lifecycleManager,
-                             ContainerDetector containerDetector,
-                             PortAllocator portAllocator,
-                             DockerHostResolver dockerHostResolver,
-                             EcrRegistryManager ecrRegistryManager,
-                             EmulatorConfig config,
-                             RegionResolver regionResolver,
-                             Ec2MetadataServer metadataServer,
-                             EksOidcService oidcService,
-                             ContainerLogStreamer logStreamer) {
-        this(containerBuilder, lifecycleManager, containerDetector, portAllocator,
-                dockerHostResolver, ecrRegistryManager, config, regionResolver, metadataServer, oidcService,
-                null, logStreamer);
-    }
-
-    public EksClusterManager(ContainerBuilder containerBuilder,
-                             ContainerLifecycleManager lifecycleManager,
-                             ContainerDetector containerDetector,
-                             PortAllocator portAllocator,
-                             DockerHostResolver dockerHostResolver,
-                             EcrRegistryManager ecrRegistryManager,
-                             EmulatorConfig config,
-                             RegionResolver regionResolver,
-                             Ec2MetadataServer metadataServer,
-                             EksOidcService oidcService,
-                             FlociCertificateAuthority certificateAuthority,
-                             ContainerLogStreamer logStreamer) {
-        this(containerBuilder, lifecycleManager, containerDetector, portAllocator,
-                dockerHostResolver, ecrRegistryManager, config, regionResolver, metadataServer,
-                oidcService, certificateAuthority, logStreamer, (StorageBackend<String, Nodegroup>) null);
-    }
-
-    public EksClusterManager(ContainerBuilder containerBuilder,
-                             ContainerLifecycleManager lifecycleManager,
-                             ContainerDetector containerDetector,
-                             PortAllocator portAllocator,
-                             DockerHostResolver dockerHostResolver,
-                             EcrRegistryManager ecrRegistryManager,
-                             EmulatorConfig config,
-                             RegionResolver regionResolver,
-                             Ec2MetadataServer metadataServer,
-                             EksOidcService oidcService,
-                             FlociCertificateAuthority certificateAuthority,
-                             ContainerLogStreamer logStreamer,
-                             StorageBackend<String, Nodegroup> nodeGroupStorage) {
-        this(containerBuilder, lifecycleManager, containerDetector, portAllocator,
-                dockerHostResolver, ecrRegistryManager, config, regionResolver, metadataServer,
-                oidcService, certificateAuthority, logStreamer, nodeGroupStorage,
-                RetryingTarCopier.DEFAULT_BACKOFF_MS);
-    }
-
-    EksClusterManager(ContainerBuilder containerBuilder,
-                      ContainerLifecycleManager lifecycleManager,
-                      ContainerDetector containerDetector,
-                      PortAllocator portAllocator,
-                      DockerHostResolver dockerHostResolver,
-                      EcrRegistryManager ecrRegistryManager,
-                      EmulatorConfig config,
-                      RegionResolver regionResolver,
-                      Ec2MetadataServer metadataServer,
-                      EksOidcService oidcService,
-                      FlociCertificateAuthority certificateAuthority,
-                      ContainerLogStreamer logStreamer,
-                      StorageBackend<String, Nodegroup> nodeGroupStorage,
-                      long archiveRetryBackoffMillis) {
-        this(containerBuilder, lifecycleManager, containerDetector, portAllocator,
-                dockerHostResolver, ecrRegistryManager, config, regionResolver, metadataServer,
-                oidcService, certificateAuthority, logStreamer, nodeGroupStorage,
-                archiveRetryBackoffMillis, new Ec2ImageCatalog());
-    }
-
     EksClusterManager(ContainerBuilder containerBuilder,
                       ContainerLifecycleManager lifecycleManager,
                       ContainerDetector containerDetector,
@@ -635,7 +614,8 @@ public class EksClusterManager
                       ContainerLogStreamer logStreamer,
                       StorageBackend<String, Nodegroup> nodeGroupStorage,
                       long archiveRetryBackoffMillis,
-                      Ec2ImageCatalog imageCatalog) {
+                      Ec2ImageCatalog imageCatalog,
+                      ContainerReachableEndpoint reachableEndpoint) {
         this.containerBuilder = containerBuilder;
         this.lifecycleManager = lifecycleManager;
         this.containerDetector = containerDetector;
@@ -651,6 +631,7 @@ public class EksClusterManager
         this.nodeGroupStorage = nodeGroupStorage;
         this.archiveRetryBackoffMillis = archiveRetryBackoffMillis;
         this.imageCatalog = imageCatalog;
+        this.reachableEndpoint = reachableEndpoint;
     }
 
     @Inject
@@ -667,14 +648,15 @@ public class EksClusterManager
                              FlociCertificateAuthority certificateAuthority,
                              ContainerLogStreamer logStreamer,
                              StorageFactory storageFactory,
-                             Ec2ImageCatalog imageCatalog) {
+                             Ec2ImageCatalog imageCatalog,
+                             ContainerReachableEndpoint reachableEndpoint) {
         this(containerBuilder, lifecycleManager, containerDetector, portAllocator,
                 dockerHostResolver, ecrRegistryManager, config, regionResolver, metadataServer,
                 oidcService, certificateAuthority, logStreamer,
                 storageFactory != null
                         ? storageFactory.create("eks", "eks-nodegroups.json",
                                 new TypeReference<Map<String, Nodegroup>>() {})
-                        : null, RetryingTarCopier.DEFAULT_BACKOFF_MS, imageCatalog);
+                        : null, RetryingTarCopier.DEFAULT_BACKOFF_MS, imageCatalog, reachableEndpoint);
     }
 
     /**
@@ -707,13 +689,7 @@ public class EksClusterManager
      * k3s container that failed for its own reasons.
      */
     public boolean isDockerReachable() {
-        try {
-            lifecycleManager.getDockerClient().pingCmd().exec();
-            return true;
-        } catch (Exception e) {
-            LOG.debugv("Docker daemon is not reachable: {0}", e.getMessage());
-            return false;
-        }
+        return lifecycleManager.isDockerReachable();
     }
 
     /**
@@ -823,17 +799,22 @@ public class EksClusterManager
         String resourceName = clusterResourceName(cluster);
         boolean hadLeaseBeforeLaunch = clusterVpcLeases.containsKey(resourceName);
         String previousNodeIp = cluster != null ? cluster.getNodePrivateIp() : null;
+        List<String> previousPodPrefixes = cluster != null ? cluster.getNodePodPrefixes() : null;
         VpcLease vpcLease = acquireClusterVpcLease(cluster, labelAccountId, clusterRegion);
         String nodeIp = vpcLease != null ? vpcLease.address() : null;
+        VpcPodNetwork podNetwork = vpcPodNetwork(cluster, vpcLease, true);
         String restoredNodeIp = (previousNodeIp != null && !previousNodeIp.isBlank()
                 && previousNodeIp.equals(nodeIp)) ? previousNodeIp : null;
 
         List<String> serverArgs;
         String endpointHost;
+        boolean serviceLb = serviceLb(cluster);
         ContainerBuilder.Builder specBuilder;
         String webhookLocalFile = null;
         SigningKeyFiles signingKeyFiles = null;
         String auditPolicyLocalFile = null;
+        String podResolvConf = null;
+        String registries = null;
         ContainerSpec spec;
         String containerId;
         try {
@@ -841,11 +822,21 @@ public class EksClusterManager
                     config.services().eks().disableCni(),
                     defaultStorageClass,
                     serviceCidr,
-                    clusterCidr,
+                    podNetwork != null ? podNetwork.vpcCidr() : clusterCidr,
                     nodeIp);
+            if (podNetwork != null) {
+                serverArgs.addAll(VPC_POD_NETWORK_SERVER_ARGS);
+            }
             endpointHost = endpointHost();
             if (!"localhost".equals(endpointHost)) {
                 serverArgs.add("--tls-san=" + endpointHost);
+            }
+            if (!serviceLb) {
+                serverArgs.add("--disable=servicelb");
+            }
+            if (computeOn(cluster)) {
+                // Auto Mode's nodes carry this label, which workloads select them by.
+                serverArgs.add("--node-label=" + AUTO_COMPUTE_LABEL);
             }
 
             EksNodeCapacity.Limits nodeLimits = resolveNodeCapacity(cluster);
@@ -894,6 +885,12 @@ public class EksClusterManager
             labels.put(NODE_CAPACITY_LABEL, capacityLabel(cluster, nodeLimits));
             labels.put(DEFAULT_STORAGE_CLASS_LABEL, String.valueOf(defaultStorageClass));
             labels.put(SHARED_MOUNTS_LABEL, "true");
+            labels.put(POD_NETWORK_LABEL, podNetworkLabel(podNetwork));
+            registries = startingRegistriesYaml(cluster);
+            if (registries != null) {
+                labels.put(REGISTRY_MIRROR_LABEL, registryMirrorLabel(registries));
+            }
+            labels.put(SERVICE_LB_LABEL, String.valueOf(serviceLb));
             if (!"localhost".equals(endpointHost)) {
                 labels.put(ENDPOINT_HOST_LABEL, endpointHost);
             }
@@ -920,7 +917,9 @@ public class EksClusterManager
                 specBuilder.withEmbeddedDns();
             }
 
-            if (config.services().eks().ecrRegistryMirror() && config.services().ecr().enabled()) {
+            // The IMDS forward resolves Floci's host in the node too (configureLinkLocalMetadataEndpoint).
+            if ((config.services().eks().ecrRegistryMirror() && config.services().ecr().enabled())
+                    || config.services().eks().imds()) {
                 specBuilder.withHostDockerInternalOnLinux();
             }
 
@@ -968,6 +967,10 @@ public class EksClusterManager
             }
 
             List<String> callerArgs = resolveCallerArgs(cluster);
+            podResolvConf = podResolvConf(callerArgs);
+            if (podResolvConf != null) {
+                serverArgs.add("--resolv-conf=" + POD_RESOLV_CONF_PATH);
+            }
             if (!callerArgs.isEmpty()) {
                 serverArgs.addAll(callerArgs);
             }
@@ -980,7 +983,10 @@ public class EksClusterManager
             // `mount --make-rshared /` before k3s starts gives the node the same; kind's own node
             // image runs the same fix in its entrypoint. RSHARE_ENTRYPOINT is POSIX sh-compatible
             // (no bashisms): the k3s image has no bash, only busybox sh.
-            specBuilder.withEntrypoint(RSHARE_ENTRYPOINT);
+            if (podNetwork != null) {
+                podNetwork.env(nodeIp).forEach(specBuilder::withEnv);
+            }
+            specBuilder.withEntrypoint(podNetwork != null ? VPC_POD_NETWORK_ENTRYPOINT : RSHARE_ENTRYPOINT);
             specBuilder.withCmd(buildRshareWrappedCmd(serverArgs));
             spec = specBuilder.build();
 
@@ -992,6 +998,7 @@ public class EksClusterManager
                 releaseClusterVpcLease(cluster, resourceName);
                 if (cluster != null) {
                     cluster.setNodePrivateIp(restoredNodeIp);
+                    cluster.setNodePodPrefixes(restoredNodeIp != null ? previousPodPrefixes : null);
                 }
             }
             throw e;
@@ -1013,9 +1020,15 @@ public class EksClusterManager
                     throw new IllegalStateException("Failed to attach restored EKS container "
                             + containerName + " to VPC " + vpcLease.vpcId());
                 }
+                if (podNetwork != null) {
+                    LOG.warnv("EKS cluster {0} runs its pods on k3s''s own network: its node could not join VPC {1}",
+                            cluster.getName(), vpcLease.vpcId());
+                    dropVpcPodNetwork(specBuilder, serverArgs, podNetwork, clusterCidr, nodeIp);
+                }
                 releaseClusterVpcLease(cluster, resourceName);
                 if (cluster != null) {
                     cluster.setNodePrivateIp(null);
+                    cluster.setNodePodPrefixes(null);
                 }
                 vpcLease = null;
                 lifecycleManager.removeIfExistsStrict(containerName, true);
@@ -1032,9 +1045,12 @@ public class EksClusterManager
         if (auditPolicyLocalFile != null) {
             copyAuditPolicyIntoContainer(containerId, auditPolicyLocalFile, cluster.getName());
         }
-        injectEcrRegistryMirror(containerId, cluster);
+        injectEcrRegistryMirror(containerId, cluster, registries);
         linkContainerdCertsDir(containerId, cluster.getName());
         registerPodIdentityWebhook(containerId, cluster);
+        applyBlockStorage(containerId, cluster);
+        applyCompute(containerId, cluster);
+        applyLoadBalancing(containerId, cluster);
         if (signingKeyFiles != null) {
             copySigningKeysIntoContainer(containerId, signingKeyFiles, cluster.getName());
         }
@@ -1042,6 +1058,12 @@ public class EksClusterManager
         deferGuestSetup(containerId, false);
         ContainerInfo info;
         try {
+            if (podResolvConf != null) {
+                // Part of the start: k3s would hand its pods a resolver file that is not there, and no pod could start.
+                RetryingTarCopier.copyBytes(lifecycleManager.getDockerClient(), containerId, "/etc",
+                        POD_RESOLV_CONF_TAR_ENTRY, podResolvConf.getBytes(StandardCharsets.UTF_8), 0644,
+                        RetryingTarCopier.DEFAULT_MAX_ATTEMPTS, archiveRetryBackoffMillis);
+            }
             info = lifecycleManager.startCreated(containerId, spec);
         } catch (Exception e) {
             abandonGuestSetup(containerId, "its container could not be started");
@@ -1063,6 +1085,7 @@ public class EksClusterManager
                 releaseClusterVpcLease(cluster, resourceName);
                 if (cluster != null) {
                     cluster.setNodePrivateIp(restoredNodeIp);
+                    cluster.setNodePodPrefixes(restoredNodeIp != null ? previousPodPrefixes : null);
                 }
             }
             throw e;
@@ -1131,8 +1154,14 @@ public class EksClusterManager
         // A node started before its mounts were shared keeps private mounts, on which a CSI node plugin's
         // Bidirectional mounts fail: it is replaced on the same data volume, as one with another capacity is.
         boolean privateMounts = existingLabels == null || !"true".equals(existingLabels.get(SHARED_MOUNTS_LABEL));
-        if (capacityChanged || privateMounts || onAnotherNetwork(existing.get())
-                || !endpointHost.equals(certificateHost(existingLabels))) {
+        // One started with another pod network or registry mirror is replaced too. ServiceLB is a k3s server flag: a
+        // node started with it on while load balancing is on, or the reverse, is replaced too. A node from before the
+        // label ran ServiceLB.
+        boolean serviceLbChanged = serviceLb(cluster) != (existingLabels == null
+                || !"false".equals(existingLabels.get(SERVICE_LB_LABEL)));
+        if (capacityChanged || privateMounts || serviceLbChanged || onAnotherNetwork(existing.get())
+                || !endpointHost.equals(certificateHost(existingLabels)) || podNetworkChanged(cluster, existingLabels)
+                || registryMirrorChanged(cluster, existingLabels)) {
             replaceClusterContainer(cluster, null);
         }
     }
@@ -1180,6 +1209,13 @@ public class EksClusterManager
             acquireClusterVpcLease(cluster, resolveClusterAccountId(cluster), clusterRegion(cluster), false);
         }
         recordClusterNodeInstance(cluster, info.containerId());
+        // The manifest written at creation names the address and certificate Floci had then.
+        registerPodIdentityWebhook(info.containerId(), cluster,
+                () -> survivingNodeResolvesThroughFloci(info.containerId()));
+        applyBlockStorage(info.containerId(), cluster);
+        applyCompute(info.containerId(), cluster);
+        applyLoadBalancing(info.containerId(), cluster);
+        applyComputeLabel(cluster, info.containerId());
         activeClusters.put(clusterResourceName(cluster), cluster);
         attachClusterLogs(cluster, true, true, false);
 
@@ -1194,8 +1230,9 @@ public class EksClusterManager
         int oldPort = cluster.getHostPort();
         String containerName = cluster.getDockerName();
         String backupName = capacityBackupName(cluster);
-        String oldCertificateHost = certificateHost(lifecycleManager.findByName(containerName)
-                .map(Container::getLabels).orElse(null));
+        Map<String, String> oldLabels = lifecycleManager.findByName(containerName).map(Container::getLabels).orElse(null);
+        String oldCertificateHost = certificateHost(oldLabels);
+        List<String> oldPodPrefixes = labelPodPrefixes(startedPodNetwork(oldLabels));
         DockerClient docker = lifecycleManager.getDockerClient();
         try {
             lifecycleManager.removeIfExistsStrict(backupName, true);
@@ -1225,6 +1262,7 @@ public class EksClusterManager
             LOG.warnv("Could not replace the k3s container of EKS cluster {0}: {1}; restoring surviving node",
                     cluster.getName(), replacement.getMessage());
             restorePreviousNodeType(cluster, previousType);
+            retainPodPrefixes(cluster, oldPodPrefixes);
             if (!renamed) {
                 return false;
             }
@@ -1464,6 +1502,8 @@ public class EksClusterManager
 
             registerAllJoinedNodes(cluster, containerId);
 
+            applyComputeLabel(cluster, containerId);
+
             LOG.infov("Finalized EKS cluster {0} with CA data extracted", cluster.getName());
         } catch (Exception e) {
             LOG.warnv("Could not extract kubeconfig for cluster {0}: {1}",
@@ -1634,6 +1674,39 @@ public class EksClusterManager
                 ? cluster.getNodeInstanceType() : DEFAULT_NODE_INSTANCE_TYPE;
     }
 
+    /**
+     * Whether the cluster's node gets k3s's ServiceLB: not while EKS Auto Mode load balancing is on, which serves
+     * the LoadBalancer Services of no class itself, as {@code eks.amazonaws.com/nlb} is then the cluster default.
+     */
+    static boolean serviceLb(Cluster cluster) {
+        return cluster == null || cluster.getKubernetesNetworkConfig() == null
+                || !ElasticLoadBalancing.loadBalancingOn(cluster.getKubernetesNetworkConfig().getElasticLoadBalancing());
+    }
+
+    /**
+     * Whether the cluster's running node was started without ServiceLB, leaving the LoadBalancer Services of no
+     * class to EKS Auto Mode. A node whose load balancing was turned on after it started keeps ServiceLB, and with
+     * it those Services, until it is next replaced.
+     */
+    public boolean runsWithoutServiceLb(Cluster cluster) {
+        return cluster.getDockerName() != null && lifecycleManager.findByName(cluster.getDockerName())
+                .map(Container::getLabels)
+                .map(labels -> "false".equals(labels.get(SERVICE_LB_LABEL)))
+                .orElse(false);
+    }
+
+    /**
+     * Replaces the cluster's node on its data volume when it runs ServiceLB and load balancing is on, or runs
+     * without it and load balancing is off, so it starts as {@link #serviceLb} says; a node that already agrees is
+     * kept. Answers false when the replacement failed and the old node was restored.
+     */
+    boolean replaceNodeForServiceLb(Cluster cluster) {
+        if (cluster.getContainerId() == null || runsWithoutServiceLb(cluster) != serviceLb(cluster)) {
+            return true;
+        }
+        return replaceClusterContainer(cluster, null);
+    }
+
     /** Recreate the shared node with its named data volume intact, restoring its old type on failure. */
     boolean restartForNodeCapacity(Cluster cluster, String previousType) {
         if (cluster.getContainerId() == null) {
@@ -1742,9 +1815,9 @@ public class EksClusterManager
             try {
                 String logStream = "kube-apiserver-" + hash;
                 Closeable handle = fromNow
-                        ? logStreamer.attachFromNowForAccount(
+                        ? logStreamer.attachPolledFromNowForAccount(
                                 accountId, containerId, logGroup, logStream, region, "eks:" + cluster.getName())
-                        : logStreamer.attachForAccount(
+                        : logStreamer.attachPolledForAccount(
                                 accountId, containerId, logGroup, logStream, region, "eks:" + cluster.getName());
                 if (handle != null) {
                     handles.add(handle);
@@ -1806,7 +1879,7 @@ public class EksClusterManager
                 .withAttachStdout(true)
                 .withAttachStderr(false)
                 .exec();
-        return dockerClient
+        return lifecycleManager.getStreamingDockerClient()
                 .execStartCmd(execCreate.getId())
                 .exec(logStreamer.execLogCallbackForAccount(
                         accountId, logGroup, logStream, region, "eks-audit:" + clusterName, false));
@@ -2029,6 +2102,197 @@ public class EksClusterManager
                     + "CSI drivers and an external CNI may not work' >&2; exec /bin/k3s \"$@\"");
 
     /**
+     * {@link #RSHARE_ENTRYPOINT}, preceded by the node's side of the VPC pod network, from what
+     * {@link VpcPodNetwork#env} sets. With flannel off, k3s leaves containerd's CNI paths at their defaults,
+     * {@code /opt/cni/bin} and {@code /etc/cni/net.d}, so the plugins the image ships in its {@code /bin/cni} go there
+     * and the bridge configuration over the node's prefixes beside them. The bridge, {@code cni0}, is created here with
+     * each prefix's gateway address, as the bridge plugin gives a bridge the gateway of one subnet only. The interface
+     * holding the node's VPC address
+     * answers ARP for the pods' addresses, as the VPC delivers a prefix's traffic to the interface it is delegated to,
+     * and traffic from a prefix leaving the VPC takes the node's address, as the VPC CNI's SNAT gives it. It runs on
+     * every start of the container, whose network namespace a restart rebuilds.
+     */
+    static final List<String> VPC_POD_NETWORK_ENTRYPOINT = List.of("sh", "-c", String.join("\n",
+            "mkdir -p /opt/cni/bin /etc/cni/net.d",
+            "for plugin in bridge host-local loopback portmap; do ln -sf /bin/cni /opt/cni/bin/$plugin; done",
+            "printf '%s' \"$FLOCI_POD_CNI_CONFIG\" > /etc/cni/net.d/10-floci-vpc.conflist",
+            "ip link add cni0 type bridge 2>/dev/null || true",
+            "for gateway in $FLOCI_POD_GATEWAYS; do ip addr add \"$gateway\" dev cni0 2>/dev/null || true; done",
+            "ip link set cni0 up",
+            "iface=$(ip -o -4 addr show | awk -v ip=\"$FLOCI_NODE_IP\""
+                    + " '{ split($4, a, \"/\"); if (a[1] == ip) { print $2; exit } }')",
+            "if [ -n \"$iface\" ]; then echo 1 > \"/proc/sys/net/ipv4/conf/$iface/proxy_arp\"; else"
+                    + " echo \"floci: WARN: no interface holds $FLOCI_NODE_IP, so pod addresses do not answer on the VPC\""
+                    + " >&2; fi",
+            "for prefix in $FLOCI_POD_PREFIXES; do",
+            "  iptables -t nat -C POSTROUTING -s \"$prefix\" ! -d \"$FLOCI_VPC_CIDR\" -j MASQUERADE 2>/dev/null"
+                    + " || iptables -t nat -A POSTROUTING -s \"$prefix\" ! -d \"$FLOCI_VPC_CIDR\" -j MASQUERADE",
+            "done",
+            RSHARE_ENTRYPOINT.get(2)));
+
+    /** The VPC pod network a node runs: its VPC's range on the Docker network, and the prefixes its pods use. */
+    record VpcPodNetwork(String vpcCidr, List<String> prefixes) {
+
+        /** What {@link #VPC_POD_NETWORK_ENTRYPOINT} reads, for a node at {@code nodeIp}. */
+        Map<String, String> env(String nodeIp) {
+            Map<String, String> env = new LinkedHashMap<>();
+            env.put("FLOCI_NODE_IP", nodeIp);
+            env.put("FLOCI_VPC_CIDR", vpcCidr);
+            env.put("FLOCI_POD_PREFIXES", String.join(" ", prefixes));
+            env.put("FLOCI_POD_GATEWAYS", prefixes.stream().map(prefix -> podGateway(prefix) + "/" + prefixLength(prefix))
+                    .collect(Collectors.joining(" ")));
+            env.put("FLOCI_POD_CNI_CONFIG", podCniConfig(prefixes));
+            return env;
+        }
+
+        String label() {
+            return VPC_POD_NETWORK_LABEL_PREFIX + String.join(",", prefixes);
+        }
+    }
+
+    /**
+     * The bridge CNI configuration over {@code prefixes}: one bridge, {@code cni0}, holding in each prefix the address
+     * its pods route through, which the node gives it, host-local handing out the rest of the prefixes in order, and no
+     * masquerade, which the node applies to traffic leaving the VPC only.
+     */
+    static String podCniConfig(List<String> prefixes) {
+        String ranges = prefixes.stream()
+                .map(prefix -> "{\"subnet\": \"" + prefix + "\", \"gateway\": \"" + podGateway(prefix) + "\"}")
+                .collect(Collectors.joining(", "));
+        return "{\"cniVersion\": \"1.0.0\", \"name\": \"floci-vpc\", \"plugins\": ["
+                + "{\"type\": \"bridge\", \"bridge\": \"cni0\", \"isGateway\": false, \"ipMasq\": false,"
+                + " \"hairpinMode\": true, \"ipam\": {\"type\": \"host-local\", \"ranges\": [[" + ranges + "]],"
+                + " \"routes\": [{\"dst\": \"0.0.0.0/0\"}]}},"
+                + " {\"type\": \"portmap\", \"capabilities\": {\"portMappings\": true}}]}";
+    }
+
+    /** The address the pods of {@code prefix} route through: its first host address, which the node holds. */
+    static String podGateway(String prefix) {
+        return Cidr4.format(podPrefix(prefix).network() + 1);
+    }
+
+    private static int prefixLength(String prefix) {
+        return podPrefix(prefix).prefix();
+    }
+
+    private static Cidr4 podPrefix(String prefix) {
+        return Cidr4.parse(prefix).orElseThrow(() -> new IllegalArgumentException("not a CIDR: " + prefix));
+    }
+
+    /**
+     * The VPC pod network a node holding {@code lease} runs, or null when it runs k3s's flannel network: the setting is
+     * off, {@code disable-cni} leaves the pod network to an external CNI, the node holds no address or prefix in a
+     * Docker-backed VPC, or the VPC has no Docker network range. {@code warn} logs why a node that asks for it does
+     * not get it.
+     */
+    private VpcPodNetwork vpcPodNetwork(Cluster cluster, VpcLease lease, boolean warn) {
+        EmulatorConfig.EksServiceConfig eks = config.services().eks();
+        if (!eks.vpcPodNetwork() || lease == null) {
+            return null;
+        }
+        String why = null;
+        Optional<String> vpcCidr = Optional.empty();
+        if (eks.disableCni()) {
+            why = "disable-cni leaves the pod network to an external CNI";
+        } else if (cluster.getNodePodPrefixes() == null || cluster.getNodePodPrefixes().isEmpty()) {
+            why = "its node holds no VPC prefix";
+        } else {
+            Ec2Service ec2 = ec2Service();
+            vpcCidr = ec2 == null ? Optional.empty() : ec2.effectiveVpcCidr(lease.accountId(), lease.region(), lease.vpcId());
+            if (vpcCidr.isEmpty()) {
+                why = "VPC " + lease.vpcId() + " has no Docker network range";
+            }
+        }
+        if (why != null) {
+            if (warn) {
+                LOG.warnv("EKS cluster {0} runs its pods on k3s''s own network: {1}", cluster.getName(), why);
+            }
+            return null;
+        }
+        return new VpcPodNetwork(vpcCidr.get(), List.copyOf(cluster.getNodePodPrefixes()));
+    }
+
+    private static String podNetworkLabel(VpcPodNetwork podNetwork) {
+        return podNetwork == null ? FLANNEL_POD_NETWORK : podNetwork.label();
+    }
+
+    /**
+     * Whether a surviving node runs another pod network than it should: k3s's flannel network while the VPC pod network
+     * is on, the VPC while it is off, or prefixes it no longer holds all of. A replacement leases the prefixes a node
+     * lacks. A node on k3s's network is replaced only when its replacement would run the VPC's: it leases the prefixes
+     * for it here, and gives them back when it cannot, so a node that falls back to k3s's network is not replaced again
+     * on every start.
+     */
+    private boolean podNetworkChanged(Cluster cluster, Map<String, String> existingLabels) {
+        String existing = startedPodNetwork(existingLabels);
+        VpcLease lease = resolveClusterVpcLease(cluster);
+        EmulatorConfig.EksServiceConfig eks = config.services().eks();
+        if (!eks.vpcPodNetwork() || eks.disableCni() || lease == null) {
+            return !FLANNEL_POD_NETWORK.equals(existing);
+        }
+        VpcPodNetwork current = vpcPodNetwork(cluster, lease, false);
+        if (current == null && FLANNEL_POD_NETWORK.equals(existing)) {
+            leasePodPrefixes(cluster, lease, true);
+            if (vpcPodNetwork(cluster, lease, false) != null) {
+                return true;
+            }
+            retainPodPrefixes(cluster, List.of());
+            return false;
+        }
+        return current == null || !current.label().equals(existing);
+    }
+
+    /** The pod network a node was started with, by its label: k3s's own when it has none, as before the label. */
+    private static String startedPodNetwork(Map<String, String> labels) {
+        return labels == null ? FLANNEL_POD_NETWORK : labels.getOrDefault(POD_NETWORK_LABEL, FLANNEL_POD_NETWORK);
+    }
+
+    /** The prefixes a node started with the pod network {@code label} hands out: none on k3s's own network. */
+    private static List<String> labelPodPrefixes(String label) {
+        return label.startsWith(VPC_POD_NETWORK_LABEL_PREFIX)
+                ? List.of(label.substring(VPC_POD_NETWORK_LABEL_PREFIX.length()).split(",")) : List.of();
+    }
+
+    /**
+     * Gives back the prefixes the node holds other than {@code kept}: a node that keeps running after its replacement
+     * failed hands out only the prefixes it was started with, not those leased for the replacement.
+     */
+    private void retainPodPrefixes(Cluster cluster, List<String> kept) {
+        String resourceName = clusterResourceName(cluster);
+        List<String> held = clusterPodPrefixes.get(resourceName);
+        VpcLease lease = clusterVpcLeases.get(resourceName);
+        Ec2Service ec2 = ec2Service();
+        if (held == null || lease == null || ec2 == null) {
+            return;
+        }
+        List<String> released = held.stream().filter(prefix -> !kept.contains(prefix)).toList();
+        released.forEach(prefix -> ec2.releaseVpcPrefix(lease.accountId(), lease.region(), lease.subnetId(), prefix));
+        held.removeAll(released);
+        cluster.setNodePodPrefixes(held.isEmpty() ? null : new ArrayList<>(held));
+    }
+
+    /** Takes the VPC pod network off the spec of a node falling back to the bridge: it starts on k3s's own network. */
+    private static void dropVpcPodNetwork(ContainerBuilder.Builder spec, List<String> serverArgs,
+                                          VpcPodNetwork podNetwork, String clusterCidr, String nodeIp) {
+        VPC_POD_NETWORK_SERVER_ARGS.forEach(serverArgs::remove);
+        int cidrAt = serverArgs.indexOf("--cluster-cidr=" + podNetwork.vpcCidr());
+        if (cidrAt >= 0 && clusterCidr != null && !clusterCidr.isBlank()) {
+            serverArgs.set(cidrAt, "--cluster-cidr=" + clusterCidr);
+        } else if (cidrAt >= 0) {
+            serverArgs.remove(cidrAt);
+        }
+        podNetwork.env(nodeIp).keySet().forEach(spec::withoutEnv);
+        spec.withEntrypoint(RSHARE_ENTRYPOINT);
+        spec.withLabels(Map.of(POD_NETWORK_LABEL, FLANNEL_POD_NETWORK));
+    }
+
+    /** Where pod traffic reaches the node from: its VPC prefixes on the VPC pod network, else k3s's pod CIDR. */
+    private String podSourceCidrs(Cluster cluster) {
+        VpcPodNetwork podNetwork = vpcPodNetwork(cluster, resolveClusterVpcLease(cluster), false);
+        return podNetwork == null ? cluster.getPodCidr() : String.join(",", podNetwork.prefixes());
+    }
+
+    /**
      * Builds the CMD to pair with {@link #RSHARE_ENTRYPOINT}: an unused $0 placeholder
      * followed by the real k3s server args, so the entrypoint's "$@" expands to exactly
      * {@code serverArgs}, the args the image's own {@code /bin/k3s} entrypoint would take.
@@ -2038,6 +2302,34 @@ public class EksClusterManager
         wrappedCmd.add("floci-k3s");
         wrappedCmd.addAll(serverArgs);
         return wrappedCmd;
+    }
+
+    /**
+     * The resolv.conf k3s hands its pods, naming only Floci's embedded DNS server, or null when k3s keeps
+     * its own choice: embedded DNS is off, not running or not reachable from the cluster's Docker network,
+     * or the caller set the kubelet's resolv-conf.
+     * k3s otherwise reads the node's /etc/resolv.conf, which on a user-defined Docker network names only
+     * Docker's loopback resolver 127.0.0.11. k3s refuses a loopback-only file and writes one naming a
+     * public resolver instead, so CoreDNS never asks Floci and names only Floci holds do not resolve.
+     * Floci's public fallback resolvers stay out of the file: CoreDNS picks among its upstreams at random,
+     * so one of them would answer some lookups of Floci's names. Floci forwards every other name itself.
+     */
+    private String podResolvConf(List<String> callerArgs) {
+        if (EksClusterArgs.setsKubeletResolvConf(callerArgs)) {
+            return null;
+        }
+        return nodeDnsServerIp().map(dnsServerIp -> "nameserver " + dnsServerIp + "\n").orElse(null);
+    }
+
+    /**
+     * Floci's embedded DNS server, when the cluster's node resolves through it: embedded DNS is on for EKS, so
+     * the node gets it as its resolver, and the server is running and reachable from the cluster's Docker network.
+     */
+    private Optional<String> nodeDnsServerIp() {
+        if (!config.services().eks().embeddedDns()) {
+            return Optional.empty();
+        }
+        return containerBuilder.embeddedDnsServerIpReachableOn(config.services().eks().dockerNetwork());
     }
 
     /**
@@ -2584,42 +2876,81 @@ public class EksClusterManager
     }
 
     /**
-     * Generates and injects {@code /etc/rancher/k3s/registries.yaml} into the (created,
-     * not-yet-started) k3s container so its containerd can pull images pushed to the Floci ECR
-     * registry. Mirrors every repository hostname the cluster can pull from Floci: its own account
-     * and the default account, across every region of the cluster's partition, plus the path-style
-     * {@code localhost:<port>} form, including {@code localhost.floci.io} aliases when TLS registry
-     * URIs are enabled, to Floci's in-network data plane. Public registries are never matched. A
-     * failure disables the mirror for this cluster but does not abort its startup, matching the
-     * webhook contract.
+     * The {@code /etc/rancher/k3s/registries.yaml} Floci gives {@code cluster}'s k3s container so its containerd can pull
+     * images pushed to the Floci ECR registry, or null when it gives none: the mirror or ECR is off. It mirrors every
+     * repository hostname the cluster can pull from Floci: its own account and the default account, across every region
+     * of the cluster's partition, plus the path-style {@code localhost:<port>} form, including {@code localhost.floci.io}
+     * aliases when TLS registry URIs are enabled, to Floci's in-network data plane. The same two accounts' registry hosts
+     * as AWS names them are mirrored as well. Public registries and other accounts' are never matched.
      */
-    void injectEcrRegistryMirror(String containerId, Cluster cluster) {
-        String clusterName = cluster.getName();
+    String registriesYaml(Cluster cluster) {
         if (!config.services().eks().ecrRegistryMirror() || !config.services().ecr().enabled()) {
-            return;
+            return null;
+        }
+        String region = regionResolver.regionOf(cluster.getArn());
+        String endpoint = "http://" + dockerHostResolver.resolve() + ":" + config.port();
+        boolean tlsUri = config.services().ecr().tlsUri() && config.tls().enabled();
+        return buildRegistriesYaml(mirrorAccounts(resolveClusterAccountId(cluster), config.defaultAccountId()),
+                mirrorRegions(region), ecrRegistryManager.advertisedPort(), endpoint, tlsUri);
+    }
+
+    /**
+     * The registries.yaml a k3s container created now gets: {@link #registriesYaml}, or none when the registry is
+     * unavailable, matching the webhook contract: the cluster starts without a mirror.
+     */
+    String startingRegistriesYaml(Cluster cluster) {
+        String content = registriesYaml(cluster);
+        if (content == null) {
+            return null;
         }
         try {
             ecrRegistryManager.ensureStarted();
         } catch (Exception e) {
             LOG.warnv("EKS cluster {0} gets no ECR registry mirror: registry unavailable: {1}",
-                    clusterName, e.getMessage());
+                    cluster.getName(), e.getMessage());
+            return null;
+        }
+        return content;
+    }
+
+    /**
+     * Injects {@code content}, from {@link #startingRegistriesYaml}, into the created, not yet started k3s container. A
+     * failure leaves this cluster without the mirror but does not abort its startup.
+     */
+    void injectEcrRegistryMirror(String containerId, Cluster cluster, String content) {
+        if (content == null) {
             return;
         }
-        String region = regionResolver.regionOf(cluster.getArn());
-        String endpoint = "http://" + dockerHostResolver.resolve() + ":" + config.port();
-        boolean tlsUri = config.services().ecr().tlsUri() && config.tls().enabled();
-        String content = buildRegistriesYaml(mirrorAccounts(resolveClusterAccountId(cluster), config.defaultAccountId()),
-                mirrorRegions(region), ecrRegistryManager.advertisedPort(), endpoint, tlsUri);
+        String clusterName = cluster.getName();
         writeLocalCopy(localClusterFile(cluster, "registries", "registries.yaml"), content, clusterName);
         try {
             RetryingTarCopier.copyBytes(lifecycleManager.getDockerClient(), containerId, "/etc",
                     REGISTRIES_TAR_ENTRY, content.getBytes(StandardCharsets.UTF_8), 0644,
                     RetryingTarCopier.DEFAULT_MAX_ATTEMPTS, archiveRetryBackoffMillis);
-            LOG.infov("Injected ECR registry mirror ({0}) into k3s cluster {1}", endpoint, clusterName);
+            LOG.infov("Injected ECR registry mirror into k3s cluster {0}", clusterName);
         } catch (Exception e) {
             LOG.warnv("EKS cluster {0} gets no ECR registry mirror: could not copy registries.yaml "
                     + "into the k3s container: {1}", clusterName, e.getMessage());
         }
+    }
+
+    /**
+     * Whether a surviving node runs another registries.yaml than the one Floci gives it now, such as one written before
+     * the mirror set grew, or none: it is replaced then, on its data volume, and its replacement gets the current one.
+     * It is not replaced while the registry is unavailable, as the replacement would get no mirror either, nor to take
+     * a mirror away when the setting is off.
+     */
+    boolean registryMirrorChanged(Cluster cluster, Map<String, String> existingLabels) {
+        String wanted = registriesYaml(cluster);
+        if (wanted == null || existingLabels != null
+                && registryMirrorLabel(wanted).equals(existingLabels.get(REGISTRY_MIRROR_LABEL))) {
+            return false;
+        }
+        return startingRegistriesYaml(cluster) != null;
+    }
+
+    static String registryMirrorLabel(String registriesYaml) {
+        return Digests.sha256Hex(registriesYaml);
     }
 
     /**
@@ -2675,10 +3006,27 @@ public class EksClusterManager
      *
      * <p>Kubernetes requires an {@code https} {@code clientConfig.url} and a {@code caBundle} it
      * trusts, neither of which Floci can offer with TLS off, so the webhook is skipped with a
-     * warning in that case. A failure here leaves the cluster running without pod identity
-     * injection, matching the token webhook and the ECR mirror.
+     * warning in that case. The API server also checks that Floci's certificate names the URL's
+     * host, so the URL uses Floci's hostname when the node resolves through Floci's DNS, and the
+     * webhook is skipped with a warning when the certificate does not name the host. A skipped
+     * webhook still replaces the manifest, through {@link #removePodIdentityWebhook}. A failure
+     * here leaves the cluster running without pod identity injection, matching the token webhook
+     * and the ECR mirror.
+     *
+     * <p>Also called when a surviving container is adopted: the manifest written at creation names
+     * Floci's address and certificate as they were then, and k3s applies the rewritten file.
      */
     void registerPodIdentityWebhook(String containerId, Cluster cluster) {
+        registerPodIdentityWebhook(containerId, cluster, () -> nodeDnsServerIp().isPresent());
+    }
+
+    /**
+     * {@code nodeResolvesThroughFloci} answers whether the node finds Floci's hostname through Floci's DNS
+     * server. It is asked only once the webhook can be registered: an adopted node answers it with a Docker
+     * inspect.
+     */
+    private void registerPodIdentityWebhook(String containerId, Cluster cluster,
+                                            BooleanSupplier nodeResolvesThroughFloci) {
         if (!config.services().eks().podIdentityWebhook()) {
             return;
         }
@@ -2688,6 +3036,7 @@ public class EksClusterManager
                     + "https admission webhook URL, and Floci serves HTTP with floci.tls.enabled=false. "
                     + "Set FLOCI_TLS_ENABLED=true to have pods mutated. Pods still start, without the "
                     + "pod identity token or credentials environment variables.", clusterName);
+            removePodIdentityWebhook(containerId, cluster);
             return;
         }
         if (certificateAuthority == null) {
@@ -2695,19 +3044,246 @@ public class EksClusterManager
                     + "put in the webhook caBundle", clusterName);
             return;
         }
-        String url = "https://" + dockerHostResolver.resolve() + ":" + config.port()
+        boolean nodeUsesEmbeddedDns = nodeResolvesThroughFloci.getAsBoolean();
+        Optional<String> baseUrl = reachableEndpoint.httpsBaseUrl(nodeUsesEmbeddedDns);
+        if (baseUrl.isEmpty()) {
+            LOG.warnv("EKS Pod Identity injection is off for cluster {0}: the certificate Floci serves does not "
+                    + "name the host of {1}, where the cluster''s API server would call the webhook, so it would "
+                    + "refuse the handshake. Pods still start, without the pod identity token or credentials "
+                    + "environment variables. To have them mutated, serve a certificate that names that host, or "
+                    + "set FLOCI_HOSTNAME to a name the certificate covers while the cluster resolves through "
+                    + "Floci''s embedded DNS (floci.services.eks.embedded-dns): the API server then calls Floci "
+                    + "by that name.", clusterName, reachableEndpoint.baseUrl(nodeUsesEmbeddedDns));
+            removePodIdentityWebhook(containerId, cluster);
+            return;
+        }
+        String url = baseUrl.get()
                 + podIdentityWebhookPath(clusterName, resolveClusterAccountId(cluster), clusterRegion(cluster));
-        String manifest = buildPodIdentityWebhookConfiguration(url, certificateAuthority.caPem());
-        writeLocalCopy(localClusterFile(cluster, "webhook", POD_IDENTITY_MANIFEST_FILE), manifest, clusterName);
         try {
-            byte[] tar = tarSingleFile(POD_IDENTITY_MANIFEST_TAR_ENTRY, manifest);
-            RetryingTarCopier.copyStreamed(lifecycleManager.getDockerClient(), containerId, K3S_DATA_DIR,
-                    POD_IDENTITY_MANIFEST_FILE, out -> out.write(tar),
-                    RetryingTarCopier.DEFAULT_MAX_ATTEMPTS, archiveRetryBackoffMillis);
+            installPodIdentityManifest(containerId, cluster, buildPodIdentityWebhookConfiguration(url,
+                    ContainerCaBundle.endpointTrustPem(config, certificateAuthority.caPem())));
             LOG.infov("Registered the EKS Pod Identity mutating webhook ({0}) for cluster {1}", url, clusterName);
         } catch (Exception e) {
-            LOG.warnv("EKS cluster {0} gets no pod identity injection: could not copy {1} into the k3s "
+            LOG.warnv("EKS cluster {0} gets no pod identity injection: could not install {1} into the k3s "
                     + "container: {2}", clusterName, POD_IDENTITY_MANIFEST_FILE, e.getMessage());
+        }
+    }
+
+    /**
+     * Replaces the manifest with {@link #POD_IDENTITY_MANIFEST_REMOVED}. The manifest, and the webhook
+     * configuration k3s created from it, live on the cluster's data volume, which outlives a restart and a
+     * replaced container, so a webhook registered under an earlier address, certificate or TLS setting would
+     * otherwise keep being called, each pod creation waiting out its timeout. k3s applies a changed manifest
+     * by pruning what the earlier version created, among the kinds it held, so a file with no objects deletes
+     * that configuration.
+     */
+    private void removePodIdentityWebhook(String containerId, Cluster cluster) {
+        try {
+            installPodIdentityManifest(containerId, cluster, POD_IDENTITY_MANIFEST_REMOVED);
+        } catch (Exception e) {
+            LOG.warnv("EKS cluster {0} may keep a pod identity webhook registered before: could not replace {1} "
+                    + "in the k3s container: {2}", cluster.getName(), POD_IDENTITY_MANIFEST_FILE, e.getMessage());
+        }
+    }
+
+    private void installPodIdentityManifest(String containerId, Cluster cluster, String manifest) {
+        installManifest(containerId, cluster, "webhook", POD_IDENTITY_MANIFEST_FILE, POD_IDENTITY_MANIFEST_TAR_ENTRY,
+                manifest);
+    }
+
+    /**
+     * Writes {@code manifest} into the k3s container's {@code server/manifests}, which k3s applies, and keeps a
+     * local copy under {@code <dataPath>/<kind>/...} for {@link #localClusterFile}.
+     */
+    private void installManifest(String containerId, Cluster cluster, String kind, String fileName, String tarEntry,
+                                 String manifest) {
+        writeLocalCopy(localClusterFile(cluster, kind, fileName), manifest, cluster.getName());
+        byte[] tar = tarSingleFile(tarEntry, manifest);
+        RetryingTarCopier.copyStreamed(lifecycleManager.getDockerClient(), containerId, K3S_DATA_DIR,
+                fileName, out -> out.write(tar),
+                RetryingTarCopier.DEFAULT_MAX_ATTEMPTS, archiveRetryBackoffMillis);
+    }
+
+    /**
+     * Installs the EKS Auto Mode block storage provisioner while the cluster's {@code storageConfig.blockStorage} is
+     * enabled: claims of a StorageClass naming {@code ebs.csi.eks.amazonaws.com} are then provisioned from the
+     * node's disk. Otherwise, if it was installed before, replaces it with {@link #BLOCK_STORAGE_MANIFEST_REMOVED}:
+     * the manifest lives on the cluster's data volume, which outlives a restart, and k3s prunes what it created.
+     */
+    void applyBlockStorage(String containerId, Cluster cluster) {
+        applyAutoModeManifest(containerId, cluster, StorageConfig.blockStorageOn(cluster.getStorageConfig()),
+                BLOCK_STORAGE_MANIFEST_FILE, BLOCK_STORAGE_MANIFEST_TAR_ENTRY, this::blockStorageManifest,
+                BLOCK_STORAGE_MANIFEST_REMOVED, "block storage provisioner");
+    }
+
+    /**
+     * Installs an EKS Auto Mode capability's manifest while it is {@code enabled}, or, if it was installed before,
+     * replaces it with {@code removed}, which holds no objects: the manifest lives on the cluster's data volume,
+     * which outlives a restart, and k3s prunes what it created.
+     */
+    private void applyAutoModeManifest(String containerId, Cluster cluster, boolean enabled, String fileName,
+                                       String tarEntry, Supplier<String> manifest, String removed, String what) {
+        try {
+            if (!enabled && !Files.exists(localClusterFile(cluster, "auto-mode", fileName))) {
+                return;
+            }
+            installManifest(containerId, cluster, "auto-mode", fileName, tarEntry, enabled ? manifest.get() : removed);
+            if (enabled) {
+                LOG.infov("Installed the EKS Auto Mode {0} for cluster {1}", what, cluster.getName());
+            }
+        } catch (Exception e) {
+            LOG.warnv("EKS cluster {0} gets no Auto Mode {1}: could not install {2} into the k3s container: {3}",
+                    cluster.getName(), what, fileName, e.getMessage());
+        }
+    }
+
+    /**
+     * Installs the {@code IngressClassParams} kind while the cluster's EKS Auto Mode load balancing is on, as Auto
+     * Mode does, so the IngressClass an Application Load Balancer is configured through can name its parameters;
+     * otherwise removes it, as {@link #applyBlockStorage} removes the provisioner.
+     */
+    void applyLoadBalancing(String containerId, Cluster cluster) {
+        boolean enabled = cluster.getKubernetesNetworkConfig() != null
+                && ElasticLoadBalancing.loadBalancingOn(cluster.getKubernetesNetworkConfig().getElasticLoadBalancing());
+        applyAutoModeManifest(containerId, cluster, enabled, LOAD_BALANCING_MANIFEST_FILE,
+                LOAD_BALANCING_MANIFEST_TAR_ENTRY, this::loadBalancingManifest, LOAD_BALANCING_MANIFEST_REMOVED,
+                "IngressClassParams kind");
+    }
+
+    /** The IngressClassParams kind EKS Auto Mode load balancing installs. */
+    String loadBalancingManifest() {
+        return resource(EksClusterManager.class.getResourceAsStream("/eks/auto-mode-load-balancing.yaml"),
+                "/eks/auto-mode-load-balancing.yaml");
+    }
+
+    /**
+     * Installs, while the cluster's EKS Auto Mode compute is on, the NodePool and NodeClass kinds, the {@code default}
+     * NodeClass and the built-in node pools its {@code computeConfig.nodePools} names, as Auto Mode does (measured), and
+     * removes what it no longer names; otherwise removes them all. Floci launches no nodes for them.
+     */
+    void applyCompute(String containerId, Cluster cluster) {
+        applyAutoModeManifest(containerId, cluster, computeOn(cluster), COMPUTE_MANIFEST_FILE, COMPUTE_MANIFEST_TAR_ENTRY,
+                () -> computeManifest(cluster), COMPUTE_MANIFEST_REMOVED, "node pools");
+    }
+
+    /**
+     * Gives the cluster's running node the label EKS Auto Mode's nodes carry while compute is on, and takes it off
+     * once compute is off. k3s's {@code --node-label} adds a label when the node starts but never removes one, and a
+     * node started before Floci set it has none until it restarts. A cluster that never had Auto Mode compute is left
+     * alone.
+     */
+    void applyComputeLabel(Cluster cluster, String containerId) {
+        if (cluster.getComputeConfig() == null || containerId == null) {
+            return;
+        }
+        String label = computeOn(cluster) ? AUTO_COMPUTE_LABEL : AUTO_COMPUTE_LABEL_KEY + "-";
+        try {
+            ContainerExec.Result result = execInContainerForResult(containerId, new String[]{"kubectl", "label",
+                    "node", deriveClusterNodePrivateDnsName(cluster), "--overwrite", label}, 15);
+            if (result.exitCode() != 0) {
+                LOG.warnv("Could not set the Auto Mode label of EKS cluster {0}''s node: {1}", cluster.getName(),
+                        result.summary());
+            }
+        } catch (Exception e) {
+            LOG.warnv("Could not set the Auto Mode label of EKS cluster {0}''s node: {1}", cluster.getName(),
+                    e.getMessage());
+        }
+    }
+
+    static boolean computeOn(Cluster cluster) {
+        return cluster != null && cluster.getComputeConfig() != null
+                && Boolean.TRUE.equals(cluster.getComputeConfig().enabled());
+    }
+
+    /**
+     * The kinds and the {@code default} NodeClass, with the node role's name, the cluster's subnets and its security
+     * group as Auto Mode sets them, then the pools the cluster names. Without a node role there are no pools, and no
+     * NodeClass is written.
+     */
+    String computeManifest(Cluster cluster) {
+        String manifest = resource(EksClusterManager.class.getResourceAsStream("/eks/auto-mode-compute.yaml"),
+                "/eks/auto-mode-compute.yaml");
+        String roleArn = cluster.getComputeConfig().nodeRoleArn();
+        if (roleArn == null || roleArn.isBlank()) {
+            return manifest.substring(0, manifest.indexOf(DEFAULT_NODE_CLASS_MARKER));
+        }
+        ResourcesVpcConfig vpc = cluster.getResourcesVpcConfig();
+        List<String> subnets = vpc == null || vpc.getSubnetIds() == null ? List.of() : vpc.getSubnetIds();
+        String securityGroup = vpc == null ? null : vpc.getClusterSecurityGroupId();
+        StringBuilder out = new StringBuilder(manifest
+                .replace("%ROLE%", roleArn.substring(roleArn.lastIndexOf('/') + 1))
+                .replace("%SUBNET_TERMS%", selectorTerms(subnets))
+                .replace("%SECURITY_GROUP_TERMS%", selectorTerms(securityGroup == null ? List.of() : List.of(securityGroup))));
+        List<String> pools = cluster.getComputeConfig().nodePools() == null ? List.of()
+                : cluster.getComputeConfig().nodePools();
+        if (pools.contains("general-purpose")) {
+            out.append(resource(EksClusterManager.class.getResourceAsStream("/eks/auto-mode-nodepool-general-purpose.yaml"),
+                    "/eks/auto-mode-nodepool-general-purpose.yaml"));
+        }
+        if (pools.contains("system")) {
+            out.append(resource(EksClusterManager.class.getResourceAsStream("/eks/auto-mode-nodepool-system.yaml"),
+                    "/eks/auto-mode-nodepool-system.yaml"));
+        }
+        return out.toString();
+    }
+
+    /** The rest of a selector terms key's line: {@code []} for none, else one {@code - id:} term a line. */
+    private static String selectorTerms(List<String> ids) {
+        if (ids.isEmpty()) {
+            return " []";
+        }
+        StringBuilder terms = new StringBuilder();
+        for (String id : ids) {
+            terms.append("\n  - id: ").append(id);
+        }
+        return terms.toString();
+    }
+
+    /** A packaged resource the caller opened with an inline literal, which the native image build finds. */
+    private static String resource(InputStream in, String path) {
+        try (in) {
+            if (in == null) {
+                throw new IllegalStateException("missing resource " + path);
+            }
+            return new String(in.readAllBytes(), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /** The block storage manifest with the configured provisioner and helper images. */
+    String blockStorageManifest() {
+        // An inline literal, which the native image build finds and packages.
+        try (InputStream in = EksClusterManager.class.getResourceAsStream("/eks/auto-mode-block-storage.yaml")) {
+            if (in == null) {
+                throw new IllegalStateException("missing resource /eks/auto-mode-block-storage.yaml");
+            }
+            return new String(in.readAllBytes(), StandardCharsets.UTF_8)
+                    .replace("%PROVISIONER_IMAGE%", config.services().eks().blockStorageProvisionerImage())
+                    .replace("%HELPER_IMAGE%", config.services().eks().blockStorageHelperImage());
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    /**
+     * Whether an adopted node resolves through Floci's DNS server. A container keeps the resolvers it was
+     * created with, so a node created while that server was off or out of its reach cannot find Floci's
+     * hostname now, nor can one created when the server had another address.
+     */
+    private boolean survivingNodeResolvesThroughFloci(String containerId) {
+        Optional<String> dnsServerIp = nodeDnsServerIp();
+        if (dnsServerIp.isEmpty()) {
+            return false;
+        }
+        try {
+            InspectContainerResponse inspect = lifecycleManager.getDockerClient().inspectContainerCmd(containerId).exec();
+            String[] resolvers = inspect.getHostConfig() == null ? null : inspect.getHostConfig().getDns();
+            return resolvers != null && Arrays.asList(resolvers).contains(dnsServerIp.get());
+        } catch (Exception e) {
+            LOG.warnv("Could not read the resolvers of k3s container {0}, so its pod identity webhook is called "
+                    + "at the Docker host: {1}", containerId, e.getMessage());
+            return false;
         }
     }
 
@@ -2723,8 +3299,8 @@ public class EksClusterManager
     /**
      * Builds the {@code MutatingWebhookConfiguration} k3s auto-applies. Scoped to pod {@code CREATE}
      * alone, and {@code failurePolicy: Ignore} so an unreachable or failing Floci never blocks a pod
-     * from being created. The {@code caBundle} is Floci's local CA, base64 of the PEM as Kubernetes
-     * expects.
+     * from being created. The {@code caBundle} is what {@code GET /_floci/ca.pem} serves, which
+     * trusts Floci's HTTPS endpoint, base64 of the PEM as Kubernetes expects.
      *
      * <p>{@code timeoutSeconds} is 3, not the Kubernetes default of 10: Floci is a local process, so
      * a healthy call takes milliseconds, and the timeout only ever runs down when Floci is
@@ -2810,8 +3386,11 @@ public class EksClusterManager
      * ({@code localhost:<port>}), all pointing at Floci's in-network data plane. The port is the
      * one the repository URIs advertise, which differs from the endpoint's port when Floci's
      * container publishes its port on another host port. The TLS URI mode adds the corresponding
-     * {@code localhost.floci.io} aliases. k3s supports no partial wildcards and a {@code "*"}
-     * catch-all would also intercept public registries, so the hostnames are enumerated explicitly.
+     * {@code localhost.floci.io} aliases. Each account's registry host as AWS names it,
+     * {@code <account>.dkr.ecr.<region>.<dnsSuffix>}, is mirrored too, so an image a chart names
+     * that way is pulled from Floci; containerd still tries AWS last, for an image Floci does not
+     * hold. k3s supports no partial wildcards and a {@code "*"} catch-all would also intercept
+     * public registries and other accounts' registries, so the hostnames are enumerated explicitly.
      */
     static String buildRegistriesYaml(String accountId, List<String> regions, int advertisedPort, String endpoint) {
         return buildRegistriesYaml(accountId, regions, advertisedPort, endpoint, false);
@@ -2832,6 +3411,7 @@ public class EksClusterManager
                     appendMirror(yaml, accountId + ".dkr.ecr." + region + ".localhost.floci.io:" + advertisedPort,
                             endpoint);
                 }
+                appendMirror(yaml, accountId + ".dkr.ecr." + region + "." + AwsRegions.dnsSuffixFor(region), endpoint);
             }
         }
         appendMirror(yaml, "localhost:" + advertisedPort, endpoint);
@@ -2927,6 +3507,12 @@ public class EksClusterManager
         }
     }
 
+    /**
+     * With {@code imds}, registers the cluster's node with the metadata server and answers IMDS in the node: NAT rules
+     * send the node's requests, and with {@code imds-pod-network} its pods' too, straight to Floci's metadata service
+     * (see {@link EksPodNetworkRouting#buildImdsForwardCommand}). No relay process runs in the node, so nothing has
+     * to be installed there, which a stock {@code rancher/k3s} image could not do.
+     */
     void configureLinkLocalMetadataEndpoint(Cluster cluster, String containerId) {
         if (!config.services().eks().imds()) {
             return;
@@ -2949,27 +3535,14 @@ public class EksClusterManager
                 metadataServer.reconcileClusterNodeAddresses(containerIps.allIps(), nodeInstance);
             }
 
-            ContainerExec.Result install = execInContainerForResult(containerId,
-                    Ec2MetadataProxy.installCommand(), 180);
-            if (install.exitCode() != 0) {
-                LOG.warnv("Could not install IMDS proxy dependencies for EKS cluster {0}: {1}",
-                        cluster.getName(), install.summary());
+            ContainerExec.Result forward = execInContainerForResult(containerId,
+                    EksPodNetworkRouting.buildImdsForwardCommand(podSourceCidrs(cluster),
+                            config.services().eks().imdsPodNetwork(), dockerHostResolver.resolve(),
+                            config.services().ec2().imdsPort()), 30);
+            if (forward.exitCode() != 0) {
+                LOG.warnv("Could not forward the link-local IMDS address for EKS cluster {0} to Floci: {1}",
+                        cluster.getName(), forward.summary());
                 return;
-            }
-
-            String flociHost = dockerHostResolver.resolve();
-            int imdsPort = config.services().ec2().imdsPort();
-
-            ContainerExec.Result start = execInContainerForResult(containerId,
-                    Ec2MetadataProxy.startCommand(flociHost, imdsPort), 30);
-            if (start.exitCode() != 0) {
-                LOG.warnv("Could not start link-local IMDS proxy for EKS cluster {0}: {1}",
-                        cluster.getName(), start.summary());
-                return;
-            }
-
-            if (config.services().eks().imdsPodNetwork()) {
-                configurePodNetworkRouting(cluster, containerId);
             }
 
             LOG.infov("Configured link-local IMDS endpoint for EKS cluster {0}", cluster.getName());
@@ -3050,7 +3623,7 @@ public class EksClusterManager
     private void forwardPodIdentityAddress(Cluster cluster, String containerId) {
         try {
             ContainerExec.Result forward = execInContainerForResult(containerId,
-                    EksPodNetworkRouting.buildPodIdentityForwardCommand(cluster.getPodCidr(),
+                    EksPodNetworkRouting.buildPodIdentityForwardCommand(podSourceCidrs(cluster),
                             dockerHostResolver.resolve(), config.port()), 30);
             if (forward.exitCode() != 0) {
                 LOG.warnv("Could not forward the Pod Identity address for EKS cluster {0} to Floci: {1}",
@@ -3076,26 +3649,6 @@ public class EksClusterManager
             }
         } catch (Exception e) {
             LOG.warnv("Could not remove the Pod Identity forward for EKS cluster {0}: {1}",
-                    cluster.getName(), e.getMessage());
-        }
-    }
-
-    void configurePodNetworkRouting(Cluster cluster, String containerId) {
-        configurePodNetworkRouting(cluster, containerId, EksPodNetworkRouting.DEFAULT_ENDPOINTS);
-    }
-
-    void configurePodNetworkRouting(Cluster cluster, String containerId, List<LinkLocalEndpoint> endpoints) {
-        try {
-            String[] routingCmd = EksPodNetworkRouting.buildRoutingCommand(
-                    EksPodNetworkRouting.DEFAULT_POD_CIDR,
-                    endpoints);
-            ContainerExec.Result routing = execInContainerForResult(containerId, routingCmd, 15);
-            if (routing.exitCode() != 0) {
-                LOG.warnv("Could not configure link-local pod network routing for EKS cluster {0}: {1}",
-                        cluster.getName(), routing.summary());
-            }
-        } catch (Exception e) {
-            LOG.warnv("Could not configure link-local pod network routing for EKS cluster {0}: {1}",
                     cluster.getName(), e.getMessage());
         }
     }
@@ -3236,6 +3789,58 @@ public class EksClusterManager
         }
     }
 
+    /**
+     * What a read of a service account found: the service account as {@code kubectl get --output json} prints it,
+     * null for one that does not exist; or that the read failed, which says nothing about the service account.
+     */
+    record ServiceAccountRead(boolean succeeded, String json) {
+
+        static ServiceAccountRead found(String json) {
+            return new ServiceAccountRead(true, json);
+        }
+
+        static ServiceAccountRead absent() {
+            return new ServiceAccountRead(true, null);
+        }
+
+        static ServiceAccountRead failed() {
+            return new ServiceAccountRead(false, null);
+        }
+    }
+
+    /**
+     * Reads the service account {@code name} in {@code namespace} with kubectl in the cluster's server container,
+     * for the pod identity webhook, which is handed only the pod. A cluster with no container has none to read. A
+     * failed read is logged as a warning, and a service account that does not exist at debug level.
+     */
+    ServiceAccountRead serviceAccount(Cluster cluster, String namespace, String name, int timeoutSeconds) {
+        String containerId = cluster.getContainerId();
+        if (containerId == null) {
+            return ServiceAccountRead.absent();
+        }
+        try {
+            ContainerExec.Result result = execInContainerSeparatingStderr(containerId,
+                    new String[]{"kubectl", "--request-timeout=" + timeoutSeconds + "s", "get", "serviceaccount", name,
+                            "--namespace", namespace, "--output", "json"}, timeoutSeconds);
+            if (!result.timedOut() && result.exitCode() == 0) {
+                return ServiceAccountRead.found(result.stdout());
+            }
+            if (!result.timedOut() && result.stderr() != null && result.stderr().contains("(NotFound)")) {
+                LOG.debugv("Service account {0}/{1} does not exist in cluster {2}", namespace, name,
+                        cluster.getName());
+                return ServiceAccountRead.absent();
+            }
+            LOG.warnv("Could not read service account {0}/{1} in cluster {2}, so its pods get no IAM role "
+                    + "injected: {3}", namespace, name, cluster.getName(),
+                    result.timedOut() ? "kubectl did not answer in " + timeoutSeconds + "s" : result.summary());
+            return ServiceAccountRead.failed();
+        } catch (RuntimeException e) {
+            LOG.warnv(e, "Could not read service account {0}/{1} in cluster {2}, so its pods get no IAM role "
+                    + "injected", namespace, name, cluster.getName());
+            return ServiceAccountRead.failed();
+        }
+    }
+
     String clusterRegion(Cluster cluster) {
         String region = cluster == null ? null : AwsArnUtils.regionOrDefault(cluster.getArn(), null);
         if (region != null && !region.isBlank()) {
@@ -3311,7 +3916,7 @@ public class EksClusterManager
                 labels.put("eks.amazonaws.com/nodegroup", nodegroup.getNodegroupName()); // partition-literal: Kubernetes node label key is partition-invariant
             }
 
-            String imageId = resolveNodegroupImageId(nodegroup);
+            String imageId = resolveNodegroupImageId(nodegroup, region);
             if (imageId != null && !imageId.isBlank()) {
                 labels.put("eks.amazonaws.com/nodegroup-image", imageId); // partition-literal: Kubernetes node label key is partition-invariant
             }
@@ -3361,11 +3966,8 @@ public class EksClusterManager
         return nodeInstanceType(cluster);
     }
 
-    private String resolveNodegroupImageId(Nodegroup nodegroup) {
+    private String resolveNodegroupImageId(Nodegroup nodegroup, String region) {
         if (nodegroup != null) {
-            if (nodegroup.getReleaseVersion() != null && !nodegroup.getReleaseVersion().isBlank()) {
-                return nodegroup.getReleaseVersion().trim();
-            }
             if (nodegroup.getLaunchTemplate() instanceof Map<?, ?> map) {
                 Object directImage = map.get("imageId");
                 if (directImage != null && !directImage.toString().isBlank()) {
@@ -3378,7 +3980,7 @@ public class EksClusterManager
                     String version = map.get("version") != null ? map.get("version").toString().trim() : null;
                     if ((id != null && !id.isBlank()) || (name != null && !name.isBlank())) {
                         try {
-                            LaunchTemplateData data = ec2.resolveLaunchTemplateData(null, id, name, version);
+                            LaunchTemplateData data = ec2.resolveLaunchTemplateData(region, id, name, version);
                             if (data != null && data.getImageId() != null && !data.getImageId().isBlank()) {
                                 return data.getImageId().trim();
                             }
@@ -3388,8 +3990,15 @@ public class EksClusterManager
                     }
                 }
             }
+            // The release version names the AMI's release, not the AMI: the label carries the recommended AMI's id.
+            return EksAmiReleaseVersions.recommendedImage(imageCatalog, nodegroup.getVersion(), nodegroup.getAmiType())
+                    .map(image -> image.imageId).orElse("ami-eks-k3s");
         }
         return "ami-eks-k3s";
+    }
+
+    Ec2ImageCatalog imageCatalog() {
+        return imageCatalog;
     }
 
     String buildRegisterWithTaints(Nodegroup nodegroup) {
@@ -3457,6 +4066,19 @@ public class EksClusterManager
     }
 
     String deriveClusterNodeInstanceId(Cluster cluster, String region, String accountId) {
+        return "i-" + clusterNodeHex(cluster, region, accountId, "");
+    }
+
+    String deriveClusterNodeNetworkInterfaceId(Cluster cluster, String region, String accountId) {
+        return "eni-" + clusterNodeHex(cluster, region, accountId, "-eni");
+    }
+
+    private String deriveClusterNodeInterfaceAttachmentId(Cluster cluster, String region, String accountId) {
+        return "eni-attach-" + clusterNodeHex(cluster, region, accountId, "-eni-attach");
+    }
+
+    /** 17 hex digits derived from the cluster's identity and {@code purpose}, so the node's ids survive a restart. */
+    private String clusterNodeHex(Cluster cluster, String region, String accountId, String purpose) {
         String safeClusterName = (cluster != null && cluster.getName() != null && !cluster.getName().isBlank())
                 ? cluster.getName()
                 : "eks-cluster";
@@ -3467,9 +4089,9 @@ public class EksClusterManager
                 ? region
                 : clusterRegion(cluster);
 
-        String seed = safeClusterName + "-" + safeAccountId + "-" + safeRegion;
+        String seed = safeClusterName + "-" + safeAccountId + "-" + safeRegion + purpose;
         String hex = UUID.nameUUIDFromBytes(seed.getBytes(StandardCharsets.UTF_8)).toString().replace("-", "");
-        return "i-" + (hex.length() >= 17 ? hex.substring(0, 17) : (hex + "00000000000000000").substring(0, 17));
+        return hex.substring(0, 17);
     }
 
     String deriveClusterNodeInstanceId(Cluster cluster) {
@@ -3557,7 +4179,48 @@ public class EksClusterManager
         tags.add(new Tag("kubernetes.io/cluster/" + safeClusterName, "owned"));
         tags.add(new Tag(CLUSTER_NAME_TAG, safeClusterName));
         inst.setTags(tags);
+        addPrimaryNetworkInterface(inst, cluster, safeRegion, safeAccountId);
         return inst;
+    }
+
+    /**
+     * The node's primary network interface, in the node's subnet at the address leased for it there. An EKS node's
+     * interface carries the cluster security group, where the AWS Load Balancer Controller opens a target's ports, so
+     * the node instance and its interface hold it. A node outside a subnet has no interface, and neither has one
+     * without a subnet address, whose own address is then its container's on a network that is not the subnet's.
+     */
+    private void addPrimaryNetworkInterface(Instance inst, Cluster cluster, String region, String accountId) {
+        String leased = cluster.getNodePrivateIp();
+        if (inst.getVpcId() == null || inst.getSubnetId() == null || leased == null || leased.isBlank()) {
+            return;
+        }
+        List<GroupIdentifier> groups = clusterSecurityGroup(cluster, region, accountId).map(List::of).orElse(List.of());
+        inst.setSecurityGroups(new ArrayList<>(groups));
+        InstanceNetworkInterface eni = new InstanceNetworkInterface();
+        eni.setNetworkInterfaceId(deriveClusterNodeNetworkInterfaceId(cluster, region, accountId));
+        eni.setSubnetId(inst.getSubnetId());
+        eni.setVpcId(inst.getVpcId());
+        eni.setOwnerId(accountId);
+        eni.setPrivateIpAddress(inst.getPrivateIpAddress());
+        eni.setPrivateDnsName(inst.getPrivateDnsName());
+        eni.setGroups(new ArrayList<>(groups));
+        if (cluster.getNodePodPrefixes() != null) {
+            eni.setIpv4Prefixes(new ArrayList<>(cluster.getNodePodPrefixes()));
+        }
+        eni.setAttachmentId(deriveClusterNodeInterfaceAttachmentId(cluster, region, accountId));
+        eni.setDeviceIndex(0);
+        inst.getNetworkInterfaces().add(eni);
+    }
+
+    /** The cluster security group, named as EC2 holds it, or empty when the cluster has none EC2 holds. */
+    private Optional<GroupIdentifier> clusterSecurityGroup(Cluster cluster, String region, String accountId) {
+        String groupId = cluster.getResourcesVpcConfig() == null ? null
+                : cluster.getResourcesVpcConfig().getClusterSecurityGroupId();
+        Ec2Service ec2 = ec2Service();
+        if (groupId == null || groupId.isBlank() || ec2 == null) {
+            return Optional.empty();
+        }
+        return ec2.securityGroupName(accountId, region, groupId).map(name -> new GroupIdentifier(groupId, name));
     }
 
     @Override
@@ -3846,6 +4509,11 @@ public class EksClusterManager
         return ContainerExec.runMerged(lifecycleManager.getDockerClient(), containerId, cmd, timeoutSeconds);
     }
 
+    /** {@link #execInContainerForResult} keeping stderr out of stdout, for output that is parsed. */
+    ContainerExec.Result execInContainerSeparatingStderr(String containerId, String[] cmd, int timeoutSeconds) {
+        return ContainerExec.run(lifecycleManager.getDockerClient(), containerId, cmd, timeoutSeconds);
+    }
+
     /**
      * Executes launch template UserData script(s) inside the running cluster container.
      *
@@ -3872,6 +4540,7 @@ public class EksClusterManager
         }
         return UserDataPipeline.executeUserData(
                 dockerClient,
+                lifecycleManager.getStreamingDockerClient(),
                 node.containerId(),
                 context,
                 userData,

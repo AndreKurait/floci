@@ -8,11 +8,9 @@ import io.floci.aws.core.common.AwsException;
 import io.floci.aws.core.common.RequestChecks;
 import io.floci.aws.core.common.RequestResources;
 import io.floci.aws.core.common.StoredResourceArns;
-import io.floci.aws.services.dynamodb.DynamoDbPartiQLParser;
-import io.floci.aws.services.dynamodb.DynamoDbTableNames;
+import io.floci.aws.services.dynamodb.DynamoDbStoredResourceArns;
 import io.floci.aws.services.eventbridge.EventBridgeService;
 import io.floci.aws.services.iam.IamAuthorizedActions;
-import io.floci.aws.services.iam.ResourceArnBuilder;
 import io.floci.aws.services.redshiftdata.RedshiftDataTargetSubmitter;
 import io.floci.aws.services.s3.S3ConditionKeys;
 import io.floci.aws.services.s3.S3ResourceArns;
@@ -99,9 +97,11 @@ record TaskPermissions(String deniedError, List<Permission> permissions, boolean
      *                       the ARN its format gives the name
      * @param states         the state machine or activity whose task a callback's token names; without it a token
      *                       names nothing
+     * @param scheduler      the schedule group a Scheduler request naming none acts on, Scheduler's default; without
+     *                       it such a request's group is open
      */
     record ControlServices(StoredResourceArns cloudFormation, StoredResourceArns secrets,
-                           StoredResourceArns states) {
+                           StoredResourceArns states, StoredResourceArns scheduler) {
     }
 
     /** The permissions of a mapped integration, or nothing for one that is not checked. */
@@ -132,7 +132,8 @@ record TaskPermissions(String deniedError, List<Permission> permissions, boolean
      */
     static Optional<TaskPermissions> of(StatesIntegration integration, JsonNode input, StateMachine machine,
                                         StoredResourceArns redshiftData, StoredResourceArns ecs, boolean callback) {
-        return of(integration, input, machine, redshiftData, ecs, callback, new ControlServices(null, null, null));
+        return of(integration, input, machine, redshiftData, ecs, callback,
+                new ControlServices(null, null, null, null));
     }
 
     /**
@@ -150,7 +151,7 @@ record TaskPermissions(String deniedError, List<Permission> permissions, boolean
                                         StoredResourceArns redshiftData, StoredResourceArns ecs, boolean callback,
                                         ControlServices control) {
         if (integration.isSdkService("scheduler") && SCHEDULER.contains(integration.api())) {
-            return Optional.of(scheduler(integration.api(), input, machine));
+            return Optional.of(scheduler(integration.api(), input, machine, control.scheduler()));
         }
         if (integration.isSdkService("cloudformation") && servedByCloudFormation(integration.api())) {
             return Optional.of(cloudFormation(AslExecutor.capitalizeFirst(integration.api()), input, machine,
@@ -275,76 +276,49 @@ record TaskPermissions(String deniedError, List<Permission> permissions, boolean
                 buses.stream().map(bus -> new Permission("events:PutEvents", bus)).toList());
     }
 
-    /** The action on the table {@code TableName} gives, or nothing without one, which DynamoDB answers. */
-    private static TaskPermissions dynamoDbOptimized(String api, JsonNode input, StateMachine machine) {
-        String tableName = input.path("TableName").asText("").trim();
-        if (tableName.isEmpty()) {
-            return accessDenied(DYNAMODB_OPTIMIZED_PREFIX, List.of());
-        }
-        AwsArnUtils.Arn owner = AwsArnUtils.parse(machine.getStateMachineArn());
-        return accessDenied(DYNAMODB_OPTIMIZED_PREFIX, List.of(new Permission(
-                "dynamodb:" + AslExecutor.capitalizeFirst(api),
-                ResourceArnBuilder.toDynamoDbTableArn(tableName, owner.region(), owner.accountId()))));
-    }
-
     /**
-     * The check a direct request of the operation gets: a transaction by each item's own action on its table,
-     * and anything else by its action on the resources it names, every table of a batch. A value that is not an
-     * ARN where the request names a resource by one reaches nothing, so DynamoDB answers it.
+     * The action on the table the request names, as the request-resources table reads it, or nothing for a request
+     * naming none, which DynamoDB answers.
      */
-    private static TaskPermissions dynamoDbSdk(String operation, JsonNode input, StateMachine machine) {
+    private static TaskPermissions dynamoDbOptimized(String api, JsonNode input, StateMachine machine) {
+        String action = "dynamodb:" + AslExecutor.capitalizeFirst(api);
         AwsArnUtils.Arn owner = AwsArnUtils.parse(machine.getStateMachineArn());
-        if ("TransactWriteItems".equals(operation) || "TransactGetItems".equals(operation)) {
-            return accessDenied(DYNAMODB_SDK_PREFIX, dynamoDbTransaction(operation, input, owner));
-        }
-        String namedAs = "dynamodb:" + operation;
-        List<String> named = RequestResources.reads(namedAs)
-                ? RequestResources.ofBody(namedAs, input, owner.partition(), owner.region(), owner.accountId(), null)
-                : ResourceArnBuilder.dynamoDbArns(input, owner.region(), owner.accountId());
-        String action = dynamoDbAction(operation, input);
-        return accessDenied(DYNAMODB_SDK_PREFIX, named.stream()
-                .filter(resource -> ANY_RESOURCE.equals(resource) || AwsArnUtils.isArn(resource))
+        return accessDenied(DYNAMODB_OPTIMIZED_PREFIX, RequestResources.ofBody(action, input, owner.partition(),
+                owner.region(), owner.accountId(), null).stream()
+                .filter(AwsArnUtils::isArn)
                 .map(resource -> new Permission(action, resource))
                 .toList());
     }
 
-    /** {@code ExecuteStatement} is authorized by what its statement does, as a direct request is. */
-    private static String dynamoDbAction(String operation, JsonNode input) {
-        String statementAction = "ExecuteStatement".equals(operation)
-                ? DynamoDbPartiQLParser.iamAction(input.path("Statement").asText(null)) : null;
-        return statementAction != null ? statementAction : "dynamodb:" + operation;
-    }
-
     /**
-     * Each item's own action on the table it names, resolved within the state machine's account as execution
-     * resolves it, the same for a table named by its ARN. An item DynamoDB would refuse, whose table name does not
-     * resolve or which names no table, needs nothing here: the service answers for the whole transaction.
+     * The check a direct request of the operation gets, as the request-resources table reads it: one whose request's
+     * parts each take an action (a transaction's items, each PartiQL statement) by each part's action on what it names,
+     * a transaction's with {@code dynamodb:EnclosingOperation}, and anything else by its action on the resources it
+     * names, every table of a batch. A request whose parts name nothing, or a value that is not an ARN where the
+     * request names a resource by one, reaches nothing, so DynamoDB answers it.
      */
-    private static List<Permission> dynamoDbTransaction(String operation, JsonNode input, AwsArnUtils.Arn owner) {
-        boolean read = "TransactGetItems".equals(operation);
-        List<String> kinds = read ? List.of("Get") : List.of("Put", "Delete", "Update", "ConditionCheck");
-        Map<String, List<String>> enclosing = Map.of("dynamodb:EnclosingOperation", List.of(operation));
-        List<Permission> permissions = new ArrayList<>();
-        JsonNode items = input.path("TransactItems");
-        if (!items.isArray()) {
-            return permissions;
-        }
-        for (JsonNode item : items) {
-            for (String kind : kinds) {
-                String tableName = item.path(kind).path("TableName").asText("").trim();
-                if (tableName.isEmpty()) {
-                    continue;
-                }
-                try {
-                    String table = DynamoDbTableNames.resolveWithRegion(tableName, owner.region()).name();
-                    permissions.add(new Permission("dynamodb:" + kind + "Item",
-                            ResourceArnBuilder.toDynamoDbTableArn(table, owner.region(), owner.accountId()), enclosing));
-                } catch (AwsException expected) {
-                    LOG.debugv("Transaction item names a table DynamoDB will refuse: {0}", tableName);
-                }
+    private static TaskPermissions dynamoDbSdk(String operation, JsonNode input, StateMachine machine) {
+        AwsArnUtils.Arn owner = AwsArnUtils.parse(machine.getStateMachineArn());
+        String namedAs = "dynamodb:" + operation;
+        if (RequestResources.checkedByParts(namedAs)) {
+            boolean transaction = operation.startsWith("Transact") || "ExecuteTransaction".equals(operation);
+            List<Permission> permissions = new ArrayList<>();
+            for (RequestResources.Target target : RequestResources.targetsOfBody(namedAs, input, owner.partition(),
+                    owner.region(), owner.accountId(), DynamoDbStoredResourceArns.STATEMENTS)) {
+                Map<String, List<String>> context = transaction && target.element() != null
+                        ? Map.of("dynamodb:EnclosingOperation", List.of(operation)) : Map.of();
+                target.resources().stream()
+                        .filter(resource -> ANY_RESOURCE.equals(resource) || AwsArnUtils.isArn(resource))
+                        .forEach(resource -> permissions.add(new Permission(target.action(), resource, context)));
             }
+            return accessDenied(DYNAMODB_SDK_PREFIX, permissions);
         }
-        return permissions;
+        List<String> named = RequestResources.ofBody(namedAs, input, owner.partition(), owner.region(),
+                owner.accountId(), null);
+        return accessDenied(DYNAMODB_SDK_PREFIX, (named.isEmpty() ? List.of(ANY_RESOURCE) : named).stream()
+                .filter(resource -> ANY_RESOURCE.equals(resource) || AwsArnUtils.isArn(resource))
+                .map(resource -> new Permission(namedAs, resource))
+                .toList());
     }
 
     /**
@@ -567,18 +541,22 @@ record TaskPermissions(String deniedError, List<Permission> permissions, boolean
     }
 
     /**
-     * The action on the schedule its name and group give, read as the integration reads them, a group left out being
-     * {@code default}. A request naming no schedule is refused by Scheduler.
+     * The action on the schedule the request names, as the request-resources table reads it for a direct Scheduler
+     * request: its name and group, a group left out being the one {@code stored} gives as Scheduler's default. A request
+     * naming no schedule is refused by Scheduler.
      */
-    private static TaskPermissions scheduler(String api, JsonNode input, StateMachine machine) {
-        String name = text(input.path("Name"));
-        if (name == null) {
+    private static TaskPermissions scheduler(String api, JsonNode input, StateMachine machine,
+                                             StoredResourceArns stored) {
+        if (text(input.path("Name")) == null) {
             return accessDenied(SCHEDULER_PREFIX, List.of());
         }
-        String group = text(input.path("GroupName"));
-        return accessDenied(SCHEDULER_PREFIX, List.of(new Permission(
-                "scheduler:" + AslExecutor.capitalizeFirst(api),
-                arn(machine, "scheduler", "schedule/" + (group == null ? "default" : group) + "/" + name))));
+        String operation = AslExecutor.capitalizeFirst(api);
+        String action = IamAuthorizedActions.actionFor("scheduler", operation);
+        AwsArnUtils.Arn owner = AwsArnUtils.parse(machine.getStateMachineArn());
+        return accessDenied(SCHEDULER_PREFIX, RequestResources.ofBody("scheduler:" + operation, input,
+                        owner.partition(), owner.region(), owner.accountId(), stored).stream()
+                .map(resource -> new Permission(action, resource))
+                .toList());
     }
 
     /**
@@ -663,12 +641,6 @@ record TaskPermissions(String deniedError, List<Permission> permissions, boolean
             LOG.debugv("The {0} request names no task: {1}", operation, expected.getMessage());
             return List.of();
         }
-    }
-
-    /** The ARN of a resource of the state machine's partition, Region and account. */
-    private static String arn(StateMachine machine, String service, String resource) {
-        AwsArnUtils.Arn owner = AwsArnUtils.parse(machine.getStateMachineArn());
-        return new AwsArnUtils.Arn(owner.partition(), service, owner.region(), owner.accountId(), resource).toString();
     }
 
     /** The value when it is the non-blank string an id has to be, as the integrations require of one. */

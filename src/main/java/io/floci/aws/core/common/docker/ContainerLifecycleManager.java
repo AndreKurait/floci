@@ -58,6 +58,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
+import java.util.function.LongSupplier;
 import java.util.regex.Pattern;
 
 /**
@@ -93,10 +94,14 @@ public class ContainerLifecycleManager {
     private static final String LOOPBACK_HOST_IP = "127.0.0.1";
 
     private final DockerClient dockerClient;
+    private final DockerClient streamingDockerClient;
     private final ImageCacheService imageCacheService;
     private final ContainerDetector containerDetector;
     private final EmulatorConfig config;
     private final long archiveRetryBackoffMillis;
+    private final LongSupplier nanoTime;
+    private final CreateWait createWait;
+    private final GelfLogListener gelfLogListener;
 
     /** Volumes whose shared-ownership root has already been initialised this process (run-once guard). */
     private final ConcurrentHashMap<String, Boolean> initializedSharedVolumes = new ConcurrentHashMap<>();
@@ -109,11 +114,23 @@ public class ContainerLifecycleManager {
 
     @Inject
     public ContainerLifecycleManager(DockerClient dockerClient,
+                                     @StreamingDocker DockerClient streamingDockerClient,
+                                     ImageCacheService imageCacheService,
+                                     ContainerDetector containerDetector,
+                                     EmulatorConfig config,
+                                     GelfLogListener gelfLogListener) {
+        this(dockerClient, streamingDockerClient, imageCacheService, containerDetector, config,
+                RetryingTarCopier.DEFAULT_BACKOFF_MS, System::nanoTime, TimeUnit.NANOSECONDS::sleep,
+                gelfLogListener);
+    }
+
+    public ContainerLifecycleManager(DockerClient dockerClient,
+                                     DockerClient streamingDockerClient,
                                      ImageCacheService imageCacheService,
                                      ContainerDetector containerDetector,
                                      EmulatorConfig config) {
-        this(dockerClient, imageCacheService, containerDetector, config,
-                RetryingTarCopier.DEFAULT_BACKOFF_MS);
+        this(dockerClient, streamingDockerClient, imageCacheService, containerDetector, config,
+                GelfLogListener.disabled());
     }
 
     ContainerLifecycleManager(DockerClient dockerClient,
@@ -121,11 +138,68 @@ public class ContainerLifecycleManager {
                               ContainerDetector containerDetector,
                               EmulatorConfig config,
                               long archiveRetryBackoffMillis) {
+        this(dockerClient, imageCacheService, containerDetector, config, archiveRetryBackoffMillis,
+                System::nanoTime, TimeUnit.NANOSECONDS::sleep);
+    }
+
+    ContainerLifecycleManager(DockerClient dockerClient,
+                              ImageCacheService imageCacheService,
+                              ContainerDetector containerDetector,
+                              EmulatorConfig config,
+                              long archiveRetryBackoffMillis,
+                              LongSupplier nanoTime,
+                              CreateWait createWait) {
+        this(dockerClient, dockerClient, imageCacheService, containerDetector, config, archiveRetryBackoffMillis,
+                nanoTime, createWait, GelfLogListener.disabled());
+    }
+
+    ContainerLifecycleManager(DockerClient dockerClient,
+                              ImageCacheService imageCacheService,
+                              ContainerDetector containerDetector,
+                              EmulatorConfig config,
+                              GelfLogListener gelfLogListener) {
+        this(dockerClient, dockerClient, imageCacheService, containerDetector, config,
+                RetryingTarCopier.DEFAULT_BACKOFF_MS, System::nanoTime, TimeUnit.NANOSECONDS::sleep, gelfLogListener);
+    }
+
+    private ContainerLifecycleManager(DockerClient dockerClient,
+                                      DockerClient streamingDockerClient,
+                                      ImageCacheService imageCacheService,
+                                      ContainerDetector containerDetector,
+                                      EmulatorConfig config,
+                                      long archiveRetryBackoffMillis,
+                                      LongSupplier nanoTime,
+                                      CreateWait createWait,
+                                      GelfLogListener gelfLogListener) {
+        this.gelfLogListener = gelfLogListener;
         this.dockerClient = dockerClient;
+        this.streamingDockerClient = streamingDockerClient;
         this.imageCacheService = imageCacheService;
         this.containerDetector = containerDetector;
         this.config = config;
         this.archiveRetryBackoffMillis = archiveRetryBackoffMillis;
+        this.nanoTime = nanoTime;
+        this.createWait = createWait;
+    }
+
+    // A container created in the log-driver mode dials the listener as it starts, a stopped one adopted
+    // after a restart of Floci included, and the start fails when nothing listens there.
+    private void startLogListener() {
+        if (!gelfLogListener.enabled()) {
+            return;
+        }
+        try {
+            gelfLogListener.ensureStarted();
+        } catch (IllegalStateException e) {
+            LOG.warnv("{0}: a container that sends its log there will not start: {1}", e.getMessage(),
+                    e.getCause() == null ? "" : e.getCause().getMessage());
+        }
+    }
+
+    /** Pause between creation checks; tests advance the monotonic clock instead of sleeping. */
+    @FunctionalInterface
+    interface CreateWait {
+        void sleep(long nanos) throws InterruptedException;
     }
 
     /**
@@ -235,6 +309,12 @@ public class ContainerLifecycleManager {
         return create(spec, resolvedImage, null);
     }
 
+    /** Creates a container Docker removes as soon as its process exits. */
+    public String createAutoRemoving(ContainerSpec spec) {
+        String resolvedImage = imageCacheService.ensureImageExists(spec.image());
+        return create(spec, resolvedImage, null, true, true);
+    }
+
     /**
      * Creates a container for a specific Docker platform.
      *
@@ -252,7 +332,12 @@ public class ContainerLifecycleManager {
     }
 
     private String create(ContainerSpec spec, String resolvedImage, String platform, boolean removeAnonymousVolumes) {
-        String containerId = createWithCaBundle(spec, resolvedImage, platform, removeAnonymousVolumes);
+        return create(spec, resolvedImage, platform, removeAnonymousVolumes, false);
+    }
+
+    private String create(ContainerSpec spec, String resolvedImage, String platform, boolean removeAnonymousVolumes,
+                          boolean autoRemove) {
+        String containerId = createWithCaBundle(spec, resolvedImage, platform, removeAnonymousVolumes, autoRemove);
         if (spec.hasNetworkConfiguration()) {
             try {
                 attachNetworkBeforeStart(containerId, spec);
@@ -275,11 +360,14 @@ public class ContainerLifecycleManager {
     }
 
     private String createWithCaBundle(ContainerSpec spec, String resolvedImage, String platform,
-                                      boolean removeAnonymousVolumes) {
+                                      boolean removeAnonymousVolumes, boolean autoRemove) {
         LOG.debugv("Creating container from spec: image={0}, name={1}", spec.image(), spec.name());
 
         // Built once: a dynamic port binding allocates its host port here.
         HostConfig hostConfig = buildHostConfig(spec);
+        if (autoRemove) {
+            hostConfig.withAutoRemove(true);
+        }
         Optional<Path> caBundle = ContainerCaBundle.hostPath(config);
         if (caBundle.isEmpty()) {
             return createContainer(spec, resolvedImage, platform, hostConfig, spec.env());
@@ -339,7 +427,12 @@ public class ContainerLifecycleManager {
         if (spec.workingDir() != null && !spec.workingDir().isBlank()) {
             createCmd.withWorkingDir(spec.workingDir());
         }
-        if (spec.exposedPorts() != null && !spec.exposedPorts().isEmpty()) {
+        // A container sharing a network namespace (host, none, container:<id>) has no endpoint
+        // of its own for Docker to expose a port on, and the daemon refuses an exposed port
+        // together with container:<id> ("conflicting options: port exposing and the container
+        // type network mode"). The spec keeps the ports: resolveEndpoints still answers them
+        // through the namespace's owner.
+        if (spec.exposedPorts() != null && !spec.exposedPorts().isEmpty() && !spec.sharesNetworkNamespace()) {
             ExposedPort[] exposed = spec.exposedPorts().stream()
                     .map(ExposedPort::tcp)
                     .toArray(ExposedPort[]::new);
@@ -354,17 +447,39 @@ public class ContainerLifecycleManager {
         labels.put(CREATE_ATTEMPT_LABEL, createAttemptId);
         createCmd.withLabels(labels);
 
+        String budgetedService = serviceBudget(labels);
+        if (budgetedService != null) {
+            DockerServiceBudget.reserve(budgetedService, config.docker().serviceMaxContainers().get(budgetedService));
+        }
         String containerId;
         try {
             containerId = createWithConflictRecovery(createCmd, spec, createAttemptId);
+            DockerContainerServices.record(containerId, spec.name(), labels);
         } catch (DockerException e) {
             if (ContainerRejectedException.isRejection(e)) {
                 throw new ContainerRejectedException(e);
             }
             throw e;
+        } finally {
+            if (budgetedService != null) {
+                DockerServiceBudget.release(budgetedService);
+            }
         }
         LOG.infov("Created container {0} (name={1}, not yet started)", containerId, spec.name());
         return containerId;
+    }
+
+    /** The service of a container to create when {@code floci.docker.service-max-containers} gives it a budget. */
+    private String serviceBudget(Map<String, String> labels) {
+        if (config == null || config.docker() == null) {
+            return null;
+        }
+        Map<String, Integer> budgets = config.docker().serviceMaxContainers();
+        if (budgets == null || budgets.isEmpty()) {
+            return null;
+        }
+        String service = ContainerStorageHelper.labelValue(labels, ContainerStorageHelper.SERVICE_LABEL);
+        return service != null && budgets.containsKey(service) ? service : null;
     }
 
     /**
@@ -380,8 +495,13 @@ public class ContainerLifecycleManager {
      * non-transient and rethrows it immediately, so without this it surfaces as a spurious build
      * failure, and leaks the container the first attempt actually created, untracked.
      *
-     * <p>Recovery only fires for a named spec, and only adopts a candidate whose image, labels, and
-     * this exact call's {@link #CREATE_ATTEMPT_LABEL} all match. Image and labels alone cannot tell
+     * <p>Docker can reserve the name before the original create becomes visible to list or inspect.
+     * Successful empty lookups may be retried for one additional configured Docker API timeout,
+     * using monotonic elapsed time. Each lookup retains the transport's own timeout and retries;
+     * this budget bounds polling, not an already running lookup.
+     *
+     * <p>Recovery only fires for a named spec, and only adopts a candidate whose labels and
+     * this exact call's {@link #CREATE_ATTEMPT_LABEL} all match. Image and spec labels alone cannot tell
      * this call's own lost-response replay apart from a second, genuinely concurrent
      * {@code create()} racing on the same fixed name/image/labels, which would otherwise be adopted
      * as if it were this invocation's container.
@@ -391,13 +511,52 @@ public class ContainerLifecycleManager {
         try {
             return createCmd.exec().getId();
         } catch (ConflictException e) {
-            if (spec.name() != null) {
-                Optional<Container> existing = findByName(spec.name());
-                if (existing.isPresent() && matchesSpec(existing.get(), spec, createAttemptId)) {
-                    LOG.infov("Create for {0} hit a name conflict; an earlier attempt''s response "
-                            + "was lost but the container exists, adopting {1}",
-                            spec.name(), existing.get().getId());
-                    return existing.get().getId();
+            if (spec.name() == null) {
+                throw e;
+            }
+            long started = nanoTime.getAsLong();
+            long budget = TimeUnit.SECONDS.toNanos(config.docker().apiTimeoutSeconds());
+            int attempt = 0;
+            while (!Thread.currentThread().isInterrupted()) {
+                if (attempt > 0 && nanoTime.getAsLong() - started >= budget) {
+                    break;
+                }
+                Optional<Container> existing;
+                try {
+                    existing = findByNameStrict(spec.name());
+                } catch (RuntimeException lookupFailure) {
+                    // An unreadable inventory is not evidence that creation is still pending.
+                    e.addSuppressed(lookupFailure);
+                    throw e;
+                }
+                if (Thread.currentThread().isInterrupted()) {
+                    break;
+                }
+                if (existing.isPresent()) {
+                    if (matchesSpec(existing.get(), spec, createAttemptId)) {
+                        LOG.infov("Create for {0} hit a name conflict; an earlier attempt''s response "
+                                + "was lost but the container exists, adopting {1}",
+                                spec.name(), existing.get().getId());
+                        return existing.get().getId();
+                    }
+                    break;
+                }
+                long remaining = budget - (nanoTime.getAsLong() - started);
+                if (remaining <= 0) {
+                    break;
+                }
+                if (attempt == 0) {
+                    LOG.infov("Reconciling reserved name {0} while its container creation finishes", spec.name());
+                }
+                attempt++;
+                long delay = TimeUnit.MILLISECONDS.toNanos(DockerRetry.backoffDelay(
+                        attempt, RetryingDockerHttpClient.BACKOFF_MS, DockerRetry.BACKOFF_CAP_MS));
+                try {
+                    createWait.sleep(Math.min(remaining, delay));
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    e.addSuppressed(interrupted);
+                    break;
                 }
             }
             throw e;
@@ -590,6 +749,7 @@ public class ContainerLifecycleManager {
      * rather than a raw {@code dockerClient.startContainerCmd(...)} call.
      */
     void startContainer(String containerId) {
+        startLogListener();
         try {
             dockerClient.startContainerCmd(containerId).exec();
         } catch (NotModifiedException alreadyRunning) {
@@ -630,6 +790,7 @@ public class ContainerLifecycleManager {
      */
     public void stopAndRemove(String containerId, Closeable logStream, int stopTimeoutSeconds) {
         boolean stoppedOrMissing = stop(containerId, stopTimeoutSeconds);
+        readLastLogLines(logStream);
 
         // Force removal is the recovery path when Docker could not stop the container cleanly. It also
         // terminates the follow-log transport, allowing its terminal callback to drain the final tail.
@@ -648,6 +809,25 @@ public class ContainerLifecycleManager {
         if (logStream != null && (stoppedOrMissing || removedOrMissing)) {
             closeLogStreamAfterContainerStop(logStream);
         }
+    }
+
+    /**
+     * A log read on a timer ({@link ContainerLogStreamer#attachPolled}) has not seen what the container
+     * wrote since its last read, and cannot once the container is removed, so read it between the stop
+     * and the removal. A follow stream needs nothing: the removal ends it and it drains its own tail.
+     */
+    private static void readLastLogLines(Closeable logStream) {
+        if (logStream instanceof PolledLogHandle polled) {
+            polled.drainBeforeRemove();
+        }
+    }
+
+    /**
+     * Reads what a polled log has not seen yet, for a caller that force-removes its container itself
+     * instead of going through {@link #stopAndRemove}: once the container is gone its log cannot be read.
+     */
+    public void readLogBeforeRemoval(Closeable logStream) {
+        readLastLogLines(logStream);
     }
 
     /**
@@ -706,6 +886,23 @@ public class ContainerLifecycleManager {
         stopAndRemoveStrict(containerId, logStream, stopTimeoutSeconds, false);
     }
 
+    /**
+     * Stops and removes a container, reporting whether Docker confirmed it gone, for a caller that
+     * holds something of the container's, such as a link-local address, that must not be handed on
+     * while the container survives. A failure is logged rather than thrown, and the log stream is
+     * left open, as {@link #stopAndRemoveStrict(String, Closeable)} leaves it.
+     */
+    public boolean stopAndConfirmRemoved(String containerId, Closeable logStream, int stopTimeoutSeconds,
+                                         boolean removeAnonymousVolumes) {
+        try {
+            stopAndRemoveStrict(containerId, logStream, stopTimeoutSeconds, removeAnonymousVolumes);
+            return true;
+        } catch (RuntimeException e) {
+            LOG.warnv("Container {0} was not confirmed removed: {1}", containerId, e.getMessage());
+            return false;
+        }
+    }
+
     /** Strict teardown that can also reclaim the container's anonymous volumes. */
     public void stopAndRemoveStrict(String containerId, Closeable logStream, int stopTimeoutSeconds,
                                      boolean removeAnonymousVolumes) {
@@ -725,6 +922,7 @@ public class ContainerLifecycleManager {
             stopFailure = e;
             LOG.warnv("Error stopping container {0}: {1}", containerId, e.getMessage());
         }
+        readLastLogLines(logStream);
 
         try {
             RemoveContainerCmd remove = dockerClient.removeContainerCmd(containerId).withForce(true);
@@ -1170,24 +1368,28 @@ public class ContainerLifecycleManager {
      */
     public Optional<Container> findByName(String name) {
         try {
-            List<Container> containers = dockerClient.listContainersCmd()
-                    .withShowAll(true)
-                    .exec();
-
-            for (Container c : containers) {
-                String[] names = c.getNames();
-                if (names == null) {
-                    continue;
-                }
-                for (String n : names) {
-                    // Docker prefixes names with /
-                    if (n.equals("/" + name) || n.equals(name)) {
-                        return Optional.of(c);
-                    }
-                }
-            }
+            return findByNameStrict(name);
         } catch (Exception e) {
             LOG.debugv("Error searching for container {0}: {1}", name, e.getMessage());
+        }
+        return Optional.empty();
+    }
+
+    private Optional<Container> findByNameStrict(String name) {
+        List<Container> containers = dockerClient.listContainersCmd()
+                .withShowAll(true)
+                .exec();
+        for (Container c : containers) {
+            String[] names = c.getNames();
+            if (names == null) {
+                continue;
+            }
+            for (String n : names) {
+                // Docker prefixes names with /
+                if (n.equals("/" + name) || n.equals(name)) {
+                    return Optional.of(c);
+                }
+            }
         }
         return Optional.empty();
     }
@@ -1497,12 +1699,37 @@ public class ContainerLifecycleManager {
     }
 
     /**
+     * Whether the Docker daemon answers a ping, which is how a missing daemon is told apart from a
+     * container that failed for its own reasons. The one probe the container-backed services share.
+     */
+    public boolean isDockerReachable() {
+        try {
+            dockerClient.pingCmd().exec();
+            return true;
+        } catch (RuntimeException e) {
+            LOG.debugv("Docker daemon is not reachable: {0}", e.getMessage());
+            return false;
+        }
+    }
+
+    /**
      * Returns the underlying control-plane DockerClient for operations not covered by this
      * manager. Prefer using manager methods when available. A stream that stays open for a
      * container's lifetime belongs on the {@link StreamingDocker} client instead.
      */
     public DockerClient getDockerClient() {
         return dockerClient;
+    }
+
+    /**
+     * Returns the {@link StreamingDocker} client, for a request that holds its connection for as long
+     * as what it follows, so it never takes a control-plane lease: an exec start whose output may run
+     * long, a container wait, or a followed log. Only those belong here: the streaming transport
+     * replays nothing but a container wait after a dropped connection, while the control-plane one
+     * also replays reads.
+     */
+    public DockerClient getStreamingDockerClient() {
+        return streamingDockerClient;
     }
 
     /**

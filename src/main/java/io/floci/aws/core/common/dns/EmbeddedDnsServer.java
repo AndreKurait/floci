@@ -317,8 +317,9 @@ public class EmbeddedDnsServer {
             short qtype = buf.getShort();
             short qclass = buf.getShort();
             int questionEnd = buf.position();
+            boolean standardQuery = qdCount == 1 && qclass == 1 && (flags & 0x7840) == 0;
 
-            vertx.<QueryPlan>executeBlocking(() -> planQuery(qname, senderHost, myIp, qtype), false)
+            vertx.<QueryPlan>executeBlocking(() -> planQuery(qname, senderHost, myIp, qtype, standardQuery), false)
                     .onSuccess(plan -> {
                         if (plan.answer().isEmpty()) {
                             if (!plan.ruleTargets().isEmpty()) {
@@ -334,8 +335,7 @@ public class EmbeddedDnsServer {
                             return;
                         }
                         DnsAnswer records = plan.answer().orElseThrow();
-                        if (records.isPublicAuthorityAnswer()
-                                && (qdCount != 1 || qclass != 1 || (flags & 0x7840) != 0)) {
+                        if (records.isPublicAuthorityAnswer() && !standardQuery) {
                             records = DnsAnswer.refused();
                         }
                         byte[] response = records.isPublicAuthorityAnswer()
@@ -377,8 +377,31 @@ public class EmbeddedDnsServer {
         return resolveRecordWithOwnership(name, myIp, 1);
     }
 
+    /** Only one stored resource may claim an alias target; failures cannot fall through to DNS. */
+    public Optional<DnsAnswer> resolveAliasTarget(String name, String hostedZoneId, int type, String listenerAddress) {
+        DnsAnswer resolved = null;
+        if (recordSources != null) {
+            for (DnsRecordSource source : recordSources) {
+                try {
+                    Optional<DnsAnswer> candidate = source.resolveAliasTarget(name, hostedZoneId, type, listenerAddress);
+                    if (candidate.isPresent()) {
+                        if (resolved != null) {
+                            return Optional.of(DnsAnswer.refused());
+                        }
+                        resolved = candidate.orElseThrow();
+                    }
+                } catch (RuntimeException failure) {
+                    LOG.debugv("DNS alias source {0} failed to resolve {1}: {2}",
+                            source.getClass().getSimpleName(), name, failure.getMessage());
+                    return Optional.of(DnsAnswer.refused());
+                }
+            }
+        }
+        return Optional.ofNullable(resolved);
+    }
+
     private Optional<DnsAnswer> resolveRecordWithOwnership(String name, String myIp, int type) {
-        Optional<DnsAnswer> stored = resolveFromRecordSources(name, type, true);
+        Optional<DnsAnswer> stored = resolveFromRecordSources(name, type, true, myIp);
         if (stored.isPresent()) {
             return stored;
         }
@@ -404,6 +427,10 @@ public class EmbeddedDnsServer {
         }
     }
 
+    QueryPlan planQuery(String name, String clientAddress, String myIp, int type) {
+        return planQuery(name, clientAddress, myIp, type, true);
+    }
+
     /**
      * Stored public authority answers take precedence over broad emulator suffix spoofing.
      * Other names the emulator itself owns come first, whatever the rules say. Route 53 Resolver does
@@ -413,10 +440,13 @@ public class EmbeddedDnsServer {
      *
      * <p>A forwarding rule associated with the querying VPC is then applied before Floci resolves
      * the name from a record source, because a Resolver rule takes precedence over a private
-     * hosted zone that matches the same name.
+     * hosted zone that matches the same name. An address query under an emulator suffix that the
+     * stored zone refuses, such as an alias to a target Floci does not serve, is then answered as
+     * the emulator's own name, unless the packet has a shape the zone refuses on its own: more
+     * than one question, a class other than IN, or a non-standard opcode or flag.
      */
-    QueryPlan planQuery(String name, String clientAddress, String myIp, int type) {
-        Optional<DnsAnswer> stored = resolveFromRecordSources(name, type, true);
+    QueryPlan planQuery(String name, String clientAddress, String myIp, int type, boolean standardQuery) {
+        Optional<DnsAnswer> stored = resolveFromRecordSources(name, type, true, myIp);
         Optional<DnsAnswer> emulatorName = resolveEmulatorName(name, myIp, type);
         if (emulatorName.isPresent() && stored.isEmpty()) {
             return QueryPlan.answering(emulatorName.orElseThrow());
@@ -426,6 +456,10 @@ public class EmbeddedDnsServer {
         Optional<DnsForwardingRule> rule = matchingRule(name, clientAddress);
         if (rule.isPresent() && rule.orElseThrow().forwards()) {
             return QueryPlan.forwardingTo(rule.orElseThrow().targets());
+        }
+        if (standardQuery && matchesSuffix(name) && (type == 1 || type == 28)
+                && stored.filter(answer -> answer.responseCode() == 5).isPresent()) {
+            return QueryPlan.answering(emulatorName.orElseThrow());
         }
         return stored.or(() -> resolveFromRecordSources(name, type))
                 .map(QueryPlan::answering).orElse(QueryPlan.UPSTREAM);
@@ -509,10 +543,11 @@ public class EmbeddedDnsServer {
      * through to the upstream resolvers, which is what happened before any source existed.
      */
     private Optional<DnsAnswer> resolveFromRecordSources(String name, int type) {
-        return resolveFromRecordSources(name, type, false);
+        return resolveFromRecordSources(name, type, false, null);
     }
 
-    private Optional<DnsAnswer> resolveFromRecordSources(String name, int type, boolean authoritative) {
+    private Optional<DnsAnswer> resolveFromRecordSources(
+            String name, int type, boolean authoritative, String listenerAddress) {
         if (recordSources == null) {
             return Optional.empty();
         }
@@ -523,7 +558,7 @@ public class EmbeddedDnsServer {
         Optional<DnsAnswer> empty = Optional.empty();
         for (DnsRecordSource source : recordSources) {
             try {
-                Optional<DnsAnswer> answer = authoritative ? source.resolveAuthoritative(name, type)
+                Optional<DnsAnswer> answer = authoritative ? source.resolveAuthoritative(name, type, listenerAddress)
                         : source.resolve(name, type);
                 if (answer != null && answer.isPresent()) {
                     if (answer.get().isEmpty()) {

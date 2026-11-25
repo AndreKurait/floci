@@ -401,25 +401,26 @@ floci:
     log-max-size: "10m"
     log-max-file: "3"
     docker-host: unix:///var/run/docker.sock
-    # FLOCI_DOCKER_MAX_CONNECTIONS: connection pool size for Floci's short Docker calls, plus
-    # CodeBuild phase execs, EKS audit followers and ECS Exec sessions. Past the limit,
-    # create/start/stop/remove wait for a free connection and the emulator stalls. Keep in step
+    # FLOCI_DOCKER_MAX_CONNECTIONS: connection pool size for Floci's short Docker calls. Past the
+    # limit, create/start/stop/remove wait for a free connection and the emulator stalls. Keep in step
     # with the @WithDefault on EmulatorConfig.DockerConfig.maxConnections: a value set here WINS
     # over the annotation.
     max-connections: 1024
     # FLOCI_DOCKER_STREAMING_MAX_CONNECTIONS: separate pool for streams that last a container's
     # lifetime, so they never starve create/start/stop/remove. Each live Lambda container holds 2
-    # (log follow and exit watcher) plus one per extension; 2048 covers the 500 containers the
-    # runtime API port range allows with two extensions each. Keep in step with the @WithDefault on
+    # (log follow and exit watcher) plus one per extension, and each CodeBuild phase, SSM command, ECS
+    # Exec session, EKS audit follower, user data script and EMR bootstrap action one; 3072 covers the
+    # 500 Lambda containers the runtime API port range allows with two extensions each (2000) and
+    # leaves about 1000 for everything else. Keep in step with the @WithDefault on
     # EmulatorConfig.DockerConfig.streamingMaxConnections: a value set here WINS over the annotation.
-    streaming-max-connections: 2048
+    streaming-max-connections: 3072
     # FLOCI_DOCKER_CONNECTION_REQUEST_TIMEOUT_SECONDS: how long a Docker call waits for a free pooled
     # connection before failing, for both pools. Keep in step with the @WithDefault on
     # EmulatorConfig.DockerConfig.connectionRequestTimeoutSeconds: a value set here WINS over the annotation.
     connection-request-timeout-seconds: 30
     # FLOCI_DOCKER_API_TIMEOUT_SECONDS: how long a Docker call waits for the daemon's response before
-    # failing; long-lived streams (waits, followed logs, exec output, pulls) are exempt. It applies per
-    # attempt: a control-plane request that is safe to repeat is tried up to six times. Keep in step with
+    # failing; long-lived streams (waits, followed logs, exec output, pulls) are exempt. It bounds the
+    # whole call: a request that is safe to repeat is not retried past it. Keep in step with
     # the @WithDefault on EmulatorConfig.DockerConfig.apiTimeoutSeconds: a value set here WINS over the annotation.
     api-timeout-seconds: 300
     # FLOCI_DOCKER_IMAGE_PULL_TIMEOUT_SECONDS: how long each attempt at an image pull may take; a pull
@@ -432,6 +433,36 @@ floci:
     # threads, written only while a pool is in use; 0 turns them off. Keep in step with the
     # @WithDefault on EmulatorConfig.DockerConfig.poolGaugeIntervalSeconds: a value set here WINS over the annotation.
     pool-gauge-interval-seconds: 60
+    # FLOCI_DOCKER_BREAKER_FAILURE_THRESHOLD: consecutive Docker call attempts (each retry counts)
+    # that fail at the transport before Floci pings the daemon and, if that fails too, fails every Docker call at once until the
+    # daemon answers; 0 turns this off. FLOCI_DOCKER_BREAKER_PROBE_INTERVAL_SECONDS: seconds between
+    # those pings. Keep both in step with the @WithDefault on EmulatorConfig.DockerConfig: a value set
+    # here WINS over the annotation.
+    breaker-failure-threshold: 3
+    breaker-probe-interval-seconds: 5
+    # FLOCI_DOCKER_MAX_CONCURRENT_LAUNCHES: most container creates and starts sent to the daemon at
+    # once; more wait up to connection-request-timeout-seconds for one to finish. 0 = twice the CPUs
+    # Floci sees, at least 4. Keep in step with the @WithDefault on
+    # EmulatorConfig.DockerConfig.maxConcurrentLaunches: a value set here WINS over the annotation.
+    max-concurrent-launches: 0
+    # FLOCI_DOCKER_EVENTS_EXIT_DETECTION: see Lambda containers exit through one Docker events
+    # subscription instead of a wait stream per container. Keep in step with the @WithDefault on
+    # EmulatorConfig.DockerConfig.eventsExitDetection: a value set here WINS over the annotation.
+    events-exit-detection: false
+    # FLOCI_DOCKER_LOG_POLL_INTERVAL_MILLIS: milliseconds between the reads of a long-lived service
+    # container's log (databases, brokers, registries), read on a timer instead of a follow stream held
+    # for the container's life; at least 100. Keep in step with the @WithDefault on
+    # EmulatorConfig.DockerConfig.logPollIntervalMillis: a value set here WINS over the annotation.
+    log-poll-interval-millis: 1000
+    # FLOCI_DOCKER_LOG_DRIVER_MODE: opt-in; long-lived service containers push their logs to Floci
+    # through Docker's gelf driver instead of being read on a timer. Needs a daemon that can reach
+    # Floci (Docker Desktop or the same host). FLOCI_DOCKER_LOG_DRIVER_HOST overrides the host the
+    # daemon dials. Keep in step with the @WithDefault on EmulatorConfig.DockerConfig.logDriverMode.
+    log-driver-mode: false
+    # FLOCI_DOCKER_LOG_DRIVER_PORT: the listener's port in the log-driver mode (GELF's standard port).
+    # Docker dials it on every start of a container created in the mode, so it stays fixed. Keep in
+    # step with the @WithDefault on EmulatorConfig.DockerConfig.logDriverPort.
+    log-driver-port: 12201
     resource-namespace: ""          # FLOCI_DOCKER_RESOURCE_NAMESPACE; scopes child container/volume names
     docker-config-path: ""
     # extra-labels:                 # Extra Docker labels applied to every Floci-created container and volume
@@ -471,6 +502,9 @@ floci:
       stream-shard-rollover-seconds: 0     # FLOCI_SERVICES_DYNAMODB_STREAM_SHARD_ROLLOVER_SECONDS. 0: shards stay open.
       stream-iterator-expiry-enabled: false   # FLOCI_SERVICES_DYNAMODB_STREAM_ITERATOR_EXPIRY_ENABLED. 15-minute iterators.
       stream-retention-enabled: false      # FLOCI_SERVICES_DYNAMODB_STREAM_RETENTION_ENABLED. 24-hour records and shards.
+      stream-max-records: 1000             # FLOCI_SERVICES_DYNAMODB_STREAM_MAX_RECORDS. Records kept per stream.
+      transaction-conflicts-enabled: false # FLOCI_SERVICES_DYNAMODB_TRANSACTION_CONFLICTS_ENABLED. Busy items cancel overlapping transactions (native engine).
+      randomize-attribute-order: true      # FLOCI_SERVICES_DYNAMODB_RANDOMIZE_ATTRIBUTE_ORDER. Shuffle attributes and map keys where AWS does (native engine).
       backend: native                      # FLOCI_SERVICES_DYNAMODB_BACKEND: native or local
       # local-endpoint: http://dynamodb-local:8000   # FLOCI_SERVICES_DYNAMODB_LOCAL_ENDPOINT
       local-connect-timeout-seconds: 2     # FLOCI_SERVICES_DYNAMODB_LOCAL_CONNECT_TIMEOUT_SECONDS
@@ -504,7 +538,7 @@ floci:
       init-timeout-seconds: 10                # FLOCI_SERVICES_LAMBDA_INIT_TIMEOUT_SECONDS - time a cold runtime has to request its first invocation; the function's Timeout wins when longer
       container-drain-timeout-seconds: 15      # FLOCI_SERVICES_LAMBDA_CONTAINER_DRAIN_TIMEOUT_SECONDS - shared shutdown budget for both Lambda pools
       # warm-pool-max-per-function:           # FLOCI_SERVICES_LAMBDA_WARM_POOL_MAX_PER_FUNCTION - idle containers kept per function (default max(4, cpus))
-      warm-pool-max-total: 0                  # FLOCI_SERVICES_LAMBDA_WARM_POOL_MAX_TOTAL - idle containers kept across all functions, LRU evicted beyond it; 0 = unbounded
+      warm-pool-max-total: 128                # FLOCI_SERVICES_LAMBDA_WARM_POOL_MAX_TOTAL - idle containers kept across all functions, LRU evicted beyond it; 0 = unbounded. Keep in step with the @WithDefault on EmulatorConfig.LambdaServiceConfig.warmPoolMaxTotal
       region-concurrency-limit: 1000
       unreserved-concurrency-min: 100
       accept-external-layer-arns: false       # FLOCI_SERVICES_LAMBDA_ACCEPT_EXTERNAL_LAYER_ARNS - accept a Layers ARN from another account (content is never mounted). AWS answers these through the layer resource policy, which Floci does not model, so the default refuses them like AWS refuses a non-public one. Turn on to attach public layers such as Powertools.
@@ -512,15 +546,20 @@ floci:
       # extra-hosts:                          # Extra /etc/hosts entries for Lambda containers, "hostname:ip" ("host-gateway" allowed as ip)
       # container-name-prefix: floci          # FLOCI_SERVICES_LAMBDA_CONTAINER_NAME_PREFIX — base name prefix for spawned containers and code volumes ([A-Za-z0-9][A-Za-z0-9_.-]*; invalid values fall back to "floci")
       # code-volume-populate-concurrency:     # FLOCI_SERVICES_LAMBDA_CODE_VOLUME_POPULATE_CONCURRENCY — max concurrent first-time code-volume populates (default max(2, cpus/2), which a CPU-constrained container collapses to 2)
-      executor: docker                        # docker | kubernetes (run Lambda environments as pods)
+      executor: docker                        # docker | kubernetes (run Lambda environments as pods) | process (run provided.* bootstraps on this machine)
       durable-sweep-enabled: true             # FLOCI_SERVICES_LAMBDA_DURABLE_SWEEP_ENABLED - fire durable execution timers (waits, step retries, execution timeouts, retention)
       durable-sweep-interval-seconds: 1       # FLOCI_SERVICES_LAMBDA_DURABLE_SWEEP_INTERVAL_SECONDS
       # kubernetes:
       #   namespace: default                  # Namespace Lambda pods are created in
       #   labels:                             # Extra pod labels, key=value entries
       #     - team=platform
+      #   node-selector:                      # Pod node selector, key=value entries
+      #     - workload-type=lambda
+      #   tolerations:                        # Taints the pods tolerate: key=value:Effect (Equal) or key:Effect (Exists)
+      #     - workload-type=lambda:NoSchedule
       #   floci-address:                      # Host/IP pods use to reach Floci; auto-detected in-cluster
       #   init-image: busybox:1.36            # Init container image (needs sh, wget, unzip)
+      #   unschedulable-grace-seconds: 0      # Seconds an Unschedulable pod may wait while a cluster autoscaler adds a node (0 = fail the cold start immediately)
       hot-reload:
         enabled: false
       reactive-s3-sync:
@@ -537,6 +576,7 @@ floci:
       enabled: true
       enforcement-enabled: false
       seed-deployer-principal: false
+      seed-deployer-access-key-id: floci   # floci, or 16 to 128 word characters to be able to deactivate or delete the key
       # account-alias: ""  # When set, seeds the account alias at startup so callers can read one
                            # without creating it first. Unset means the account has no alias,
                            # matching AWS. Example: FLOCI_SERVICES_IAM_ACCOUNT_ALIAS=my-account
@@ -688,6 +728,10 @@ floci:
         enabled: false                      # true = add Apache Pig, downloaded, to a docker cluster that installs Pig
         # urls: https://dlcdn.apache.org/pig/pig-0.18.0/pig-0.18.0.tar.gz,https://archive.apache.org/dist/pig/pig-0.18.0/pig-0.18.0.tar.gz
         # sha256: 6845adb936a3c3bcc71451765953cae4103e410ba2f6c5a47cc9becade0a434a
+      trino:
+        enabled: false                      # true = run Trino on a docker cluster that installs Trino
+        # image: trinodb/trino:%s           # %s = the release's Trino version
+        # memory-mb: 2048                   # its container's memory, 80% of which is Trino's heap
       # Remove the step drivers a previous run of this deployment left on the daemon, and the images
       # bootstrap actions left for clusters that are gone or have ended, when the EMR service starts.
       # Scoped to this deployment's own containers and images.
@@ -702,6 +746,7 @@ floci:
       max-stored-events: 20000
     cloudwatchmetrics:
       enabled: true
+      max-stored-datapoints: 100000
     paymentcryptography:
       enabled: true
     secretsmanager:
@@ -760,6 +805,9 @@ floci:
       enabled: true
       job-run-duration-seconds: 0   # 0 = job runs succeed as soon as they start
       crawler-run-duration-seconds: 0   # 0 = crawls finish as soon as they start
+      runner-mode: immediate   # docker = run a glueetl job's script in a container of the image below
+      image: public.ecr.aws/glue/aws-glue-libs:5
+      # docker-network: floci_default
     ses:
       enabled: true
       # smtp-host: mailpit          # SMTP server for email relay (empty = store only)
@@ -878,6 +926,8 @@ floci:
       uri-style: hostname
       tls-uri: false
       prefer-local-images: true
+      lifecycle-sweep-enabled: true          # FLOCI_SERVICES_ECR_LIFECYCLE_SWEEP_ENABLED - apply repository lifecycle policies in the background
+      lifecycle-sweep-interval-seconds: 60   # FLOCI_SERVICES_ECR_LIFECYCLE_SWEEP_INTERVAL_SECONDS
     ui:
       enabled: true
       image: "floci/floci-ui:0.7.0"
@@ -934,8 +984,12 @@ floci:
       ecr-registry-mirror: true    # inject a registries.yaml so pods can pull images pushed to Floci ECR
       disable-cni: false           # start k3s without its bundled flannel/kube-proxy so a real CNI (e.g. Cilium) can take over
       default-storage-class: false # start k3s without its bundled local-path provisioner to match EKS
+      block-storage-provisioner-image: rancher/local-path-provisioner:v0.0.35 # serves EKS Auto Mode block storage (ebs.csi.eks.amazonaws.com)
+      block-storage-helper-image: rancher/mirrored-library-busybox:1.37.0     # its helper pods
       imds: false                  # expose link-local IMDS (169.254.169.254) inside the cluster container
       imds-pod-network: false      # route link-local IMDS traffic from ordinary pod network namespaces (requires imds: true)
+      vpc-pod-network: false       # give pods addresses from /28 prefixes of the node's subnet, as VPC CNI prefix delegation does
+      vpc-pod-prefixes: 2          # how many /28 prefixes a node holds with vpc-pod-network (1 to 16)
       irsa-signing-key: true       # sign k3s service account tokens with the cluster OIDC key
       pod-identity-webhook: true   # register a mutating webhook that injects pod identity credentials (needs floci.tls.enabled)
       embedded-dns: true           # point cluster containers at Floci's embedded DNS to resolve Route 53 private zones
@@ -1121,6 +1175,12 @@ floci:
     emrcontainers:
       enabled: true
       job-run-duration-seconds: 0   # 0 = a job run completes as soon as it is submitted
+      runner-mode: immediate        # docker = run each job run's Spark job in a container
+      # docker-network: floci-network
+      # image-template: "registry.internal/emr-on-eks/spark/%s"   # %s = the container image tag, emr-7.2.0:20240610
+      # Remove the drivers a previous run of this deployment left on the daemon before the first job
+      # run starts. Scoped to this deployment's own containers.
+      reconcile-containers-on-startup: true
     ssoadmin:
       enabled: true
     ssooidc:

@@ -24,8 +24,10 @@ import jakarta.ws.rs.core.MediaType;
 import jakarta.ws.rs.core.Response;
 import org.jboss.logging.Logger;
 
+import static io.floci.aws.services.ses.SesV2Json.cvetNotFound;
 import static io.floci.aws.services.ses.SesV2Json.parseTagsArray;
 import static io.floci.aws.services.ses.SesV2Json.readOptionBody;
+import static io.floci.aws.services.ses.SesV2Json.remapCvetException;
 import static io.floci.aws.services.ses.SesV2Json.remapV1Exception;
 
 /**
@@ -102,7 +104,7 @@ public class SesCvetController {
                     cvetJson(cvetService.getCustomVerificationEmailTemplate(templateName, region),
                             true)).build();
         } catch (AwsException e) {
-            throw remapV1Exception(e);
+            throw remapCvetException(e, templateName);
         }
     }
 
@@ -114,10 +116,10 @@ public class SesCvetController {
         try {
             CustomVerificationEmailTemplate t = parseCvet(readOptionBody(objectMapper, body));
             t.setTemplateName(templateName);
-            sesService.updateCustomVerificationEmailTemplate(t, region);
+            sesService.replaceCustomVerificationEmailTemplate(t, region);
             return Response.ok(objectMapper.createObjectNode()).build();
         } catch (AwsException e) {
-            throw remapV1Exception(e);
+            throw remapCvetException(e, templateName);
         }
     }
 
@@ -126,12 +128,10 @@ public class SesCvetController {
     public Response deleteCustomVerificationEmailTemplate(@Context HttpHeaders headers,
                                                           @PathParam("templateName") String templateName) {
         String region = regionResolver.resolveRegion(headers);
-        try {
-            cvetService.deleteCustomVerificationEmailTemplate(templateName, region);
-            return Response.ok(objectMapper.createObjectNode()).build();
-        } catch (AwsException e) {
-            throw remapV1Exception(e);
+        if (!cvetService.deleteCustomVerificationEmailTemplate(templateName, region)) {
+            throw cvetNotFound(templateName);
         }
+        return Response.ok(objectMapper.createObjectNode()).build();
     }
 
     private CustomVerificationEmailTemplate parseCvet(JsonNode request) {
@@ -150,8 +150,11 @@ public class SesCvetController {
         ObjectNode o = objectMapper.createObjectNode();
         o.put("TemplateName", t.getTemplateName());
         o.put("FromEmailAddress", t.getFromEmailAddress());
-        o.put("TemplateSubject", t.getTemplateSubject());
-        if (includeContent) {
+        // A v1 update can clear the subject or the content; a cleared member is left out.
+        if (t.getTemplateSubject() != null) {
+            o.put("TemplateSubject", t.getTemplateSubject());
+        }
+        if (includeContent && t.getTemplateContent() != null) {
             o.put("TemplateContent", t.getTemplateContent());
         }
         o.put("SuccessRedirectionURL", t.getSuccessRedirectionURL());

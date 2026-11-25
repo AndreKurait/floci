@@ -14,7 +14,8 @@ import java.util.function.Supplier;
 
 /**
  * Logs how busy the Docker connection pools are, once per interval: for each pool its leased,
- * available and pending connections against its limit and its open long-lived streams by kind, then
+ * available and pending connections against its limit and its open long-lived streams by kind and by
+ * the service of the container they follow ({@link DockerContainerServices}), then
  * the number of docker-java stream threads. A line is written only while some pool has a lease, a
  * caller waiting for one, or an open stream, so an idle emulator logs nothing. It is the measurement
  * the Docker admission work is sized from (BL-215); there is no metrics endpoint.
@@ -80,7 +81,7 @@ final class DockerPoolGaugeLogger {
      * The text of one reading, pools in name order, or null when every pool is idle, in which case the
      * stream threads are not counted. For example
      * {@code control-plane leased=2 available=6 pending=0 max=1024; streaming leased=40 available=0
-     * pending=0 max=2048 streams[logs=20 wait=20]; stream threads=40}.
+     * pending=0 max=2048 streams[logs=20 wait=20] services[lambda=36 unattributed=4]; stream threads=40}.
      */
     static String line(Map<String, FlociDockerHttpClient.PoolGauges> readings, IntSupplier streamThreads) {
         if (readings.values().stream().allMatch(FlociDockerHttpClient.PoolGauges::idle)) {
@@ -98,30 +99,19 @@ final class DockerPoolGaugeLogger {
                 reading.openStreams().forEach((kind, open) -> streams.add(kind + "=" + open));
                 part.append(" streams[").append(String.join(" ", streams)).append(']');
             }
+            if (!reading.openStreamsByService().isEmpty()) {
+                List<String> services = new ArrayList<>();
+                reading.openStreamsByService().forEach((service, open) -> services.add(service + "=" + open));
+                part.append(" services[").append(String.join(" ", services)).append(']');
+            }
             parts.add(part.toString());
         });
         parts.add("stream threads=" + streamThreads.getAsInt());
         return String.join("; ", parts);
     }
 
-    /** Counts the live docker-java stream threads by name, without capturing any thread's stack. */
+    /** The live docker-java stream callbacks, each on its own virtual thread. */
     static int countStreamThreads() {
-        ThreadGroup root = Thread.currentThread().getThreadGroup();
-        while (root.getParent() != null) {
-            root = root.getParent();
-        }
-        Thread[] threads = new Thread[root.activeCount() + 16];
-        int listed = root.enumerate(threads, true);
-        while (listed == threads.length) {
-            threads = new Thread[threads.length * 2];
-            listed = root.enumerate(threads, true);
-        }
-        int count = 0;
-        for (int i = 0; i < listed; i++) {
-            if (threads[i].getName().startsWith(STREAM_THREAD_PREFIX)) {
-                count++;
-            }
-        }
-        return count;
+        return FlociInvocationBuilder.activeStreams();
     }
 }

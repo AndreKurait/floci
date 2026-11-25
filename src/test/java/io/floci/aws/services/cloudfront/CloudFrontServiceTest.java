@@ -20,9 +20,11 @@ import io.floci.aws.services.cloudfront.model.OriginRequestPolicy;
 import io.floci.aws.services.cloudfront.model.PublicKey;
 import io.floci.aws.services.cloudfront.model.ResponseHeadersPolicy;
 import io.floci.aws.services.cloudfront.model.StreamingDistribution;
+import io.floci.aws.testing.ParallelLocks;
 import jakarta.ws.rs.core.Response;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.function.Executable;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.mockito.Mockito;
 
 import java.security.KeyPairGenerator;
@@ -47,6 +49,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.when;
 
+@ResourceLock(ParallelLocks.PORTS)
 class CloudFrontServiceTest {
 
     private static final String ACCOUNT = "000000000000";
@@ -1841,6 +1844,38 @@ class CloudFrontServiceTest {
                         ResponseHeadersPolicyConfigCodec.PolicyHeader::value,
                         (left, right) -> right,
                         LinkedHashMap::new));
+    }
+
+    @Test
+    void createDistributionKeepsTheConnectionModeTheConfigNames() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        Distribution tenantOnly = distribution(true, List.of());
+        tenantOnly.getConfig().setConnectionMode("tenant-only");
+
+        Distribution created = service.createDistribution(tenantOnly, Map.of());
+
+        assertEquals("tenant-only", service.getDistribution(created.getId()).getConfig().getConnectionMode());
+    }
+
+    @Test
+    void createAndUpdateDistributionRefuseAConnectionModeOutsideItsEnumeration() {
+        CloudFrontService service = serviceWithDomainSuffix("cloudfront.net");
+        Distribution created = service.createDistribution(distribution(true, List.of()), Map.of());
+        Distribution shared = distribution(true, List.of());
+        shared.getConfig().setConnectionMode("shared");
+
+        AwsException onCreate = assertAws("InvalidArgument",
+                () -> service.createDistribution(shared, Map.of()));
+        AwsException onUpdate = assertAws("InvalidArgument",
+                () -> service.updateDistribution(created.getId(), created.getEtag(), shared));
+
+        assertEquals("The ConnectionMode specified is not valid.", onCreate.getMessage());
+        assertEquals("The ConnectionMode specified is not valid.", onUpdate.getMessage());
+        // Neither refusal stored anything: no second distribution, and the first is as it was.
+        assertEquals(1, service.listDistributions(null, 100).size());
+        Distribution unchanged = service.getDistribution(created.getId());
+        assertNull(unchanged.getConfig().getConnectionMode());
+        assertEquals(created.getEtag(), unchanged.getEtag());
     }
 
     private static AwsException assertAws(

@@ -5,11 +5,13 @@ import io.floci.aws.core.common.BackendAuthenticator;
 import io.floci.aws.core.common.PostgresWire;
 import io.floci.aws.services.acm.CertificateGenerator;
 import io.floci.aws.services.acm.model.KeyAlgorithm;
+import io.floci.aws.testing.ParallelLocks;
 import io.floci.aws.testutil.IamServiceTestHelper;
 import io.floci.aws.testutil.LogCapture;
 import io.floci.aws.testutil.SigV4TokenTestHelper;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -59,6 +61,7 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+@ResourceLock(ParallelLocks.PORTS)
 class PostgresProtocolHandlerTest {
 
     private static final int SSL_REQUEST_CODE = 80877103;
@@ -439,6 +442,66 @@ class PostgresProtocolHandlerTest {
     }
 
     @Test
+    void forceSslRefusesPlaintextStartupBeforeContactingTheBackend() throws Exception {
+        try (ServerSocket clientServer = new ServerSocket(0);
+             Socket ourClient = connectTestSocket("localhost", clientServer.getLocalPort());
+             Socket proxyClient = acceptTestSocket(clientServer)) {
+
+            AtomicReference<Object> outcome = new AtomicReference<>();
+            Thread authThread = Thread.ofVirtual().start(() -> outcome.set(authenticateRequiringSsl(proxyClient)));
+
+            DataOutputStream clientOut = new DataOutputStream(ourClient.getOutputStream());
+            writeStartup(clientOut, "dbadmin", "appdb");
+            DataInputStream clientIn = new DataInputStream(ourClient.getInputStream());
+            Map<Character, String> error = readErrorResponse(clientIn);
+
+            assertEquals("FATAL", error.get('S'));
+            assertEquals("28000", error.get('C'));
+            assertEquals("no pg_hba.conf entry for host \"" + ourClient.getLocalAddress().getHostAddress()
+                    + "\", user \"dbadmin\", database \"appdb\", no encryption", error.get('M'));
+            assertEquals(-1, clientIn.read(), "the proxy closes the refused connection");
+            authThread.join(5_000);
+            assertFalse(authThread.isAlive(), "authThread did not terminate");
+            assertEquals("no session", outcome.get());
+        }
+    }
+
+    @Test
+    void forceSslAcceptsStartupOverTls() throws Exception {
+        try (ServerSocket clientServer = new ServerSocket(0);
+             Socket ourClient = connectTestSocket("localhost", clientServer.getLocalPort());
+             Socket proxyClient = acceptTestSocket(clientServer)) {
+
+            Thread authThread = Thread.ofVirtual().start(() -> authenticateRequiringSsl(proxyClient));
+
+            DataOutputStream clientOut = new DataOutputStream(ourClient.getOutputStream());
+            writeSslRequest(clientOut);
+            assertEquals('S', new DataInputStream(ourClient.getInputStream()).readUnsignedByte());
+            try (SSLSocket sslClient = trustedClientSocket(ourClient)) {
+                sslClient.startHandshake();
+                writeStartup(new DataOutputStream(sslClient.getOutputStream()), "dbadmin", "appdb");
+                readCleartextPasswordChallenge(new DataInputStream(sslClient.getInputStream()));
+            } finally {
+                authThread.join(5_000);
+                assertFalse(authThread.isAlive(), "authThread did not terminate");
+            }
+        }
+    }
+
+    private Object authenticateRequiringSsl(Socket proxyClient) {
+        try {
+            PostgresProtocolHandler.AuthenticatedSession session = PostgresProtocolHandler.authenticate(
+                    proxyClient, NEVER_CONNECT, "dbadmin", "adminpass", "postgres",
+                    false, testSigV4Validator(), testBinding(), testTlsCertificates(),
+                    (user, pass) -> PasswordValidator.AuthResult.MASTER_EQUIVALENT, 5000,
+                    true, true, (user, database, parameters) -> { }, null, true);
+            return session == null ? "no session" : session;
+        } catch (IOException e) {
+            return e;
+        }
+    }
+
+    @Test
     void acceptsPostgresSslRequestAndContinuesStartup() throws Exception {
         AtomicReference<String> backendDatabase = new AtomicReference<>();
 
@@ -732,6 +795,99 @@ class PostgresProtocolHandlerTest {
             assertEquals("dbadmin", backendStartup.get().get("user"), "backend connection is still opened as master");
             assertEquals("SET SESSION AUTHORIZATION \"approle\"", backendQuery.get());
         }
+    }
+
+    @Test
+    void iamSessionIsOpenedAsTheHandoverSuperuserWhenTheMasterIsNone() throws Exception {
+        AtomicReference<Map<String, String>> backendStartup = new AtomicReference<>();
+        AtomicReference<String> backendQuery = new AtomicReference<>();
+
+        try (ServerSocket backendServer = new ServerSocket(0);
+             ServerSocket clientServer = new ServerSocket(0)) {
+
+            int backendPort = backendServer.getLocalPort();
+            Thread backendThread = Thread.ofVirtual().start(() -> {
+                try {
+                    mockBackendRoleSwitch(backendServer, backendStartup, backendQuery, "approle", true);
+                } catch (IOException e) {
+                    throw new RuntimeException(e);
+                }
+            });
+
+            try (Socket ourClient = connectTestSocket("localhost", clientServer.getLocalPort())) {
+                ourClient.setSoTimeout(5_000);
+                Socket proxyClient = acceptTestSocket(clientServer);
+                Socket backend = connectTestSocket("localhost", backendPort);
+                Thread authThread = Thread.ofVirtual().start(() -> {
+                    try {
+                        PostgresProtocolHandler.AuthenticatedSession session = PostgresProtocolHandler.authenticate(
+                                proxyClient, () -> backend, "dbadmin", "adminpass", "postgres",
+                                true, testSigV4Validator(), testBinding(), testTlsCertificates(),
+                                (user, pass) -> PasswordValidator.AuthResult.MASTER_EQUIVALENT, 5000, true, true,
+                                (user, database, parameters) -> { }, null, false,
+                                new PostgresProtocolHandler.BackendLogin("rdsadmin", "start-secret"));
+                        if (session != null) {
+                            PostgresProtocolHandler.bridge(session);
+                        }
+                    } catch (IOException e) {
+                        throw new RuntimeException(e);
+                    }
+                });
+
+                DataOutputStream clientOut = new DataOutputStream(ourClient.getOutputStream());
+                DataInputStream clientIn = new DataInputStream(ourClient.getInputStream());
+                writeStartup(clientOut, "approle", "postgres");
+                readCleartextPasswordChallenge(clientIn);
+                writePassword(clientOut, rdsToken("approle"));
+                readAuthenticationOk(clientIn);
+                assertEquals("approle", readParametersUntilReadyForQuery(clientIn).get("session_authorization"));
+
+                ourClient.close();
+                proxyClient.close();
+                authThread.join(5_000);
+                backendThread.join(5_000);
+                assertFalse(authThread.isAlive(), "authThread did not terminate");
+                assertFalse(backendThread.isAlive(), "backendThread did not terminate");
+            }
+
+            assertEquals("rdsadmin", backendStartup.get().get("user"));
+            assertEquals("SET SESSION AUTHORIZATION \"approle\"", backendQuery.get());
+        }
+    }
+
+    @ParameterizedTest
+    @ValueSource(booleans = {true, false})
+    void noClientLogsInAsTheHandoverSuperuser(boolean iam) throws Exception {
+        ByteArrayOutputStream input = new ByteArrayOutputStream();
+        DataOutputStream out = new DataOutputStream(input);
+        writeStartup(out, "rdsadmin", "postgres");
+        writePassword(out, iam ? rdsToken("rdsadmin") : "start-secret");
+        MemorySocket client = new MemorySocket(input.toByteArray());
+
+        assertNull(PostgresProtocolHandler.authenticate(
+                client, NEVER_CONNECT, "dbadmin", "adminpass", "postgres",
+                true, testSigV4Validator(), testBinding(), testTlsCertificates(),
+                (user, pass) -> PasswordValidator.AuthResult.PASSTHROUGH, 5000, true, true,
+                (user, database, parameters) -> { }, null, false,
+                new PostgresProtocolHandler.BackendLogin("rdsadmin", "start-secret")));
+
+        DataInputStream clientIn = new DataInputStream(
+                new ByteArrayInputStream(client.getOutputStream().toByteArray()));
+        readCleartextPasswordChallenge(clientIn);
+        Map<Character, String> error = readErrorResponse(clientIn);
+        assertEquals("FATAL", error.get('S'));
+        assertEquals("28P01", error.get('C'));
+        assertEquals("password authentication failed for user \"rdsadmin\"", error.get('M'));
+    }
+
+    @Test
+    void roleQueryFollowsOnlyTheGrantsThatMakeAMember() {
+        String query = PostgresProtocolHandler.databaseRoleQuery("app_user", true, false);
+
+        assertTrue(query.contains("'inherit_option')::pg_catalog.bool, true) OR COALESCE("));
+        assertTrue(query.contains("'set_option')::pg_catalog.bool, true))"));
+        assertEquals(2, query.split("pg_catalog.to_jsonb\\(a\\) OPERATOR\\(pg_catalog.->>\\) 'inherit_option'",
+                -1).length - 1, "Both the first grant and every indirect one must make a member");
     }
 
     @Test

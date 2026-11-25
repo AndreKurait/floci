@@ -270,7 +270,7 @@ public class CognitoService implements ResourceProvider, StoredResourceArns {
                 lambdaService,
                 acmService,
                 new VerificationCodeService(storageFactory, clock),
-                new CognitoMessageDispatcher(sesService, snsService, regionResolver.getDefaultRegion()),
+                new CognitoMessageDispatcher(sesService, snsService, regionResolver),
                 certificateManager,
                 clock,
                 emulatorConfig.services().cognito().enforceTokenValidityLimits(),
@@ -2366,22 +2366,20 @@ public class CognitoService implements ResourceProvider, StoredResourceArns {
         // again. That includes a function calling back for the username it was given.
         String inFlightKey = regionResolver.getAccountId() + "::" + userKey(userPoolId, signInKey(pool, username));
         if (!userCreatesInFlight.add(inFlightKey)) {
-            throw new AwsException("UsernameExistsException", "User already exists", 400);
+            throw new AwsException("UsernameExistsException", "User account already exists", 400);
         }
         try {
-            aliasHolderToMove(pool, username, forceAliasCreation);
+            requireUsernameAvailable(pool, username);
             String password = initialPassword(pool, temporaryPassword);
             CognitoUser user = newAdminCreatedUser(pool, username, attributes, password);
 
-            // Before anything is stored, so a trigger that refuses the user leaves the pool unchanged,
-            // including the alias a ForceAliasCreation request would move.
+            // Before anything is stored, so a trigger that refuses the user leaves the pool unchanged.
             authFlowHandler.firePreSignUpForAdminCreateUser(pool, user, validationData, clientMetadata);
             Invitation invitation = "SUPPRESS".equals(messageAction) ? null : new Invitation(password,
                     deliveryMediums, invitationCustomMessage(pool, user, deliveryMediums, clientMetadata));
 
             synchronized (lock) {
-                return storeAdminCreatedUserUnderUserLock(userPoolId, username, forceAliasCreation, user,
-                        invitation);
+                return storeAdminCreatedUserUnderUserLock(userPoolId, username, user, invitation);
             }
         } finally {
             userCreatesInFlight.remove(inFlightKey);
@@ -2463,31 +2461,19 @@ public class CognitoService implements ResourceProvider, StoredResourceArns {
     }
 
     /**
-     * The user whose verified alias an AdminCreateUser for {@code username} moves to the new user,
-     * or null when no user has that username or alias. Throws when one does and the request
-     * cannot take it: {@code UsernameExistsException} for a username or an unverified alias, and
-     * {@code AliasExistsException} for a verified alias without ForceAliasCreation.
+     * Refuses an AdminCreateUser for {@code username} when a user already has it as their username
+     * or, in a {@code UsernameAttributes} pool, as their sign-in email or phone number. AWS answers
+     * {@code UsernameExistsException} there whether or not the address is verified, and
+     * ForceAliasCreation does not move it to the new user.
      */
-    private CognitoUser aliasHolderToMove(UserPool pool, String username, boolean forceAliasCreation) {
+    private void requireUsernameAvailable(UserPool pool, String username) {
         CognitoUser existing = findUserByUsername(pool, username);
-        String aliasAttribute = null;
         if (usesAliasUsernames(pool) && existing == null) {
-            aliasAttribute = aliasAttributeForValue(pool, username);
-            existing = findUserByAlias(pool.getId(), aliasAttribute, username);
+            existing = findUserByAlias(pool.getId(), aliasAttributeForValue(pool, username), username);
         }
-        if (existing == null) {
-            return null;
+        if (existing != null) {
+            throw new AwsException("UsernameExistsException", "User account already exists", 400);
         }
-        boolean existingAliasVerified = aliasAttribute != null
-                && "true".equalsIgnoreCase(existing.getAttributes().get(aliasAttribute + "_verified"));
-        if (!existingAliasVerified) {
-            throw new AwsException("UsernameExistsException", "User already exists", 400);
-        }
-        if (!forceAliasCreation) {
-            throw new AwsException("AliasExistsException",
-                    "An account with the given " + aliasAttribute + " already exists.", 400);
-        }
-        return existing;
     }
 
     /**
@@ -2635,26 +2621,15 @@ public class CognitoService implements ResourceProvider, StoredResourceArns {
         }
     }
 
-    private CognitoUser storeAdminCreatedUserUnderUserLock(String userPoolId, String username,
-                                                           boolean forceAliasCreation, CognitoUser user,
+    private CognitoUser storeAdminCreatedUserUnderUserLock(String userPoolId, String username, CognitoUser user,
                                                            Invitation invitation) {
         // Read again under the lock rather than reused from before the triggers: while they ran, the
-        // pool may have been deleted, another request may have taken the username or alias, and
-        // the alias holder may have been updated or deleted, which writing back an earlier read
-        // would undo.
+        // pool may have been deleted or another request may have taken the username.
         UserPool pool = describeUserPool(userPoolId);
-        CognitoUser aliasHolder = aliasHolderToMove(pool, username, forceAliasCreation);
+        requireUsernameAvailable(pool, username);
         // Sent once nothing else can refuse the request and before anything is stored, so a failed
-        // delivery leaves no user behind and the alias where it was.
+        // delivery leaves no user behind.
         deliverInvitation(pool, user, invitation);
-        if (aliasHolder != null) {
-            String aliasAttribute = aliasAttributeForValue(pool, username);
-            aliasHolder.getAttributes().remove(aliasAttribute);
-            aliasHolder.getAttributes().put(aliasAttribute + "_verified", "false");
-            aliasHolder.setLastModifiedDate(System.currentTimeMillis() / 1000L);
-            userStore.put(userKey(userPoolId, aliasHolder.getUsername()), aliasHolder);
-        }
-
         userStore.put(userKey(userPoolId, user.getUsername()), user);
         LOG.infov("Created user {0} in pool {1}", user.getUsername(), userPoolId);
         return user;
@@ -4952,9 +4927,16 @@ public class CognitoService implements ResourceProvider, StoredResourceArns {
     /**
      * Mints new access and ID tokens from a refresh token, as the sign-in that issued it did: an OAuth
      * grant's access token keeps the grant's scopes, and has an ID token only with {@code openid}.
-     * Shared by {@code GetTokensFromRefreshToken} and the OAuth token endpoint's refresh_token grant.
+     * Shared by {@code GetTokensFromRefreshToken} and the OAuth token endpoint's refresh_token grant,
+     * which has no {@code ClientMetadata} to pass.
      */
     public Map<String, Object> getTokensFromRefreshToken(String clientId, String refreshToken) {
+        return getTokensFromRefreshToken(clientId, refreshToken, Map.of());
+    }
+
+    /** As above, with the request's {@code ClientMetadata}, which reaches only the PreTokenGeneration trigger. */
+    public Map<String, Object> getTokensFromRefreshToken(String clientId, String refreshToken,
+                                                         Map<String, String> clientMetadata) {
         if (refreshToken == null) {
             throw new AwsException("InvalidParameterException", "RefreshToken is required", 400);
         }
@@ -4988,7 +4970,8 @@ public class CognitoService implements ResourceProvider, StoredResourceArns {
 
         UserPool pool = describeUserPool(poolId);
         CognitoUser user = adminGetUser(poolId, username);
-        ClaimsOverride override = authFlowHandler.preTokenGenerationForRefresh(pool, client, user, scopes);
+        ClaimsOverride override = authFlowHandler.preTokenGenerationForRefresh(pool, client, user, scopes,
+                clientMetadata);
 
         // Use refresh token UUID as origin_jti for derived tokens
         Map<String, Object> result = new HashMap<>();

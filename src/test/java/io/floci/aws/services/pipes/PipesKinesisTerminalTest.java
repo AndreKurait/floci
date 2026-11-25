@@ -9,7 +9,10 @@ import io.floci.aws.services.dynamodb.backend.DynamoDbStreamReader;
 import io.floci.aws.services.kinesis.KinesisService;
 import io.floci.aws.services.pipes.model.Pipe;
 import io.floci.aws.services.sqs.SqsService;
+import io.floci.aws.testing.ParallelLocks;
 import io.vertx.core.Vertx;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 
@@ -22,6 +25,7 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.*;
 import static org.mockito.Mockito.*;
 
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class PipesKinesisTerminalTest {
     @ParameterizedTest
     @CsvSource({"true,0,success", "false,0,success", "true,1,success", "false,1,success", "true,2,success", "false,2,success",
@@ -81,7 +85,8 @@ class PipesKinesisTerminalTest {
         EmulatorConfig config = mock(EmulatorConfig.class);
         when(config.effectiveBaseUrl()).thenReturn("http://localhost:4566");
         PipesPoller poller = new PipesPoller(mock(Vertx.class), sqs, kinesis, mock(DynamoDbStreamReader.class),
-                mock(PipesKafkaConsumerManager.class), target, new PipesFilterMatcher(mapper), mapper, config);
+                mock(PipesKafkaConsumerManager.class), target, new PipesFilterMatcher(mapper), mapper, config,
+                new RegionResolver("eu-west-1", "111111111111"));
         try {
             for (int i = 0; i < recordCount + 3; i++) {
                 poller.pollKinesis(pipe, "eu-west-1");

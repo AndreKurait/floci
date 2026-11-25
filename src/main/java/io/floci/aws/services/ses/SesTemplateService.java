@@ -6,6 +6,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.core.common.AwsArnUtils;
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.AwsRegions;
 import io.floci.aws.core.common.PaginatedResult;
 import io.floci.aws.core.storage.StorageBackend;
 import io.floci.aws.core.storage.StorageFactory;
@@ -47,7 +48,7 @@ import java.util.regex.Pattern;
  * {@link SecureRandom} (no static instance, so no native-image run-time-init registration).
  *
  * <p>Tag validation is a shared cross-resource concern, so {@code createTemplate} calls
- * {@link SesTags#validate} rather than depending back on the facade.
+ * {@link SesTags} rather than depending back on the facade.
  */
 @ApplicationScoped
 public class SesTemplateService implements SesTaggable {
@@ -85,9 +86,13 @@ public class SesTemplateService implements SesTaggable {
     }
 
     public EmailTemplate createTemplate(EmailTemplate template, String region, String accountId) {
+        requirePresent(template);
+        // SES checks the tags before the template itself, except for a reserved key, which it
+        // refuses after the template, before it looks the name up, and in words of its own.
+        SesTags.validateIgnoringSystemKeys(template.getTags());
         validateTemplate(template);
         dropEmptyParts(template);
-        SesTags.validate(template.getTags());
+        SesTags.requireNoSystemKeys(template.getTags(), "Invalid tags");
         String key = templateKey(region, template.getTemplateName());
         if (templateStore.get(key).isPresent()) {
             throw new AwsException("AlreadyExists",
@@ -102,13 +107,18 @@ public class SesTemplateService implements SesTaggable {
     }
 
     public EmailTemplate getTemplate(String templateName, String region) {
+        validateTemplateName(templateName);
+        return stored(templateName, region);
+    }
+
+    private EmailTemplate stored(String templateName, String region) {
         return templateStore.get(templateKey(region, templateName))
                 .orElseThrow(() -> new AwsException("TemplateDoesNotExist",
                         "Template " + templateName + " does not exist.", 400));
     }
 
     EmailContent.InlineTemplate inline(EmailContent.Template template, String region) {
-        EmailTemplate stored = getTemplate(template.templateName(), region);
+        EmailTemplate stored = stored(template.templateName(), region);
         return new EmailContent.InlineTemplate(stored.getSubject(), stored.getTextPart(),
                 stored.getHtmlPart(), template.templateData(), template.headers());
     }
@@ -131,6 +141,7 @@ public class SesTemplateService implements SesTaggable {
     }
 
     public void deleteTemplate(String templateName, String region) {
+        validateTemplateName(templateName);
         String key = templateKey(region, templateName);
         if (templateStore.get(key).isEmpty()) {
             throw new AwsException("TemplateDoesNotExist",
@@ -173,10 +184,14 @@ public class SesTemplateService implements SesTaggable {
         templateStore.put(templateKey(region, template.getTemplateName()), template);
     }
 
-    private static void validateTemplate(EmailTemplate template) {
+    private static void requirePresent(EmailTemplate template) {
         if (template == null) {
             throw new AwsException("InvalidTemplate", "Template is required.", 400);
         }
+    }
+
+    private static void validateTemplate(EmailTemplate template) {
+        requirePresent(template);
         validateTemplateName(template.getTemplateName());
         // SES asks for the subject first, then for a part, and a blank value counts as missing.
         if (template.getSubject() == null || template.getSubject().isBlank()) {
@@ -203,43 +218,90 @@ public class SesTemplateService implements SesTaggable {
         }
     }
 
+    /**
+     * The name rules create, update, get, delete and test-render apply before anything else, in
+     * SES's order: blank, then longer than {@value SesNames#MAX_LENGTH}, then a character
+     * outside ASCII letters, digits, '_' and '-'. The sends, the tag operations and the tenant
+     * association read a template without them: what SES answers there for such a name is not known.
+     */
     private static void validateTemplateName(String templateName) {
         if (templateName == null || templateName.isBlank()) {
-            throw new AwsException("InvalidTemplate", "TemplateName is required.", 400);
+            throw new AwsException("InvalidParameterValue", "The template name must be specified.", 400);
         }
-        if (Character.isWhitespace(templateName.charAt(0))
-                || Character.isWhitespace(templateName.charAt(templateName.length() - 1))) {
-            throw new AwsException("InvalidTemplate",
-                    "TemplateName must not contain leading or trailing whitespace.", 400);
-        }
+        SesNames.requireMaxLength(templateName, "InvalidParameterValue", "Template name");
+        SesNames.requireAllowedCharacters(templateName, "InvalidParameterValue", "Template name");
     }
 
     private static String templateKey(String region, String templateName) {
-        validateTemplateName(templateName);
         return "template::" + region + "::" + templateName;
     }
 
     /**
-     * Extracts the template name from an SES template ARN of the form
-     * {@code arn:aws:ses:<region>:<account>:template/<name>}. Region and
-     * account segments are not validated; only the {@code template/<name>}
-     * suffix is required.
+     * The template a send's {@code TemplateArn} names, on v1 and v2 alike. SES checks the ARN's
+     * partition, service, region and resource type, each with a message of its own, and not its
+     * account (probe-confirmed). The order among several mismatches at once is not probed.
      */
-    public static String templateNameFromArn(String arn) {
-        if (arn == null || arn.isBlank()) {
-            throw new AwsException("InvalidParameterValue", "TemplateArn is required.", 400);
+    public static String templateNameFromArn(String arn, String region) {
+        if (!AwsArnUtils.looksLikeArn(arn)) {
+            throw new AwsException("InvalidParameterValue", "ARNs must start with 'arn:': " + arn, 400);
         }
-        int marker = arn.indexOf(":template/");
-        if (!AwsArnUtils.looksLikeArn(arn) || marker < 0) {
+        AwsArnUtils.Arn parsed;
+        try {
+            parsed = AwsArnUtils.parse(arn);
+        } catch (IllegalArgumentException e) {
             throw new AwsException("InvalidParameterValue",
                     "TemplateArn is not a valid SES template ARN: " + arn, 400);
         }
-        String name = arn.substring(marker + ":template/".length());
-        if (name.isEmpty()) {
-            throw new AwsException("InvalidParameterValue",
-                    "TemplateArn is missing a template name: " + arn, 400);
+        String partition = AwsRegions.partitionFor(region);
+        if (!partition.equals(parsed.partition())) {
+            throw invalidTemplateArn(arn, "Partition should be <" + partition + ">");
         }
+        if (!"ses".equals(parsed.service())) {
+            throw invalidTemplateArn(arn, "Vendor should be <ses>");
+        }
+        if (!region.equals(parsed.region())) {
+            throw invalidTemplateArn(arn, "Template must be in region <" + region + ">");
+        }
+        if (!parsed.resource().startsWith("template/")) {
+            throw invalidTemplateArn(arn, "Relative ID should start with <template/>");
+        }
+        String name = parsed.resource().substring("template/".length());
+        if (name.isEmpty()) {
+            throw new AwsException("InvalidParameterValue", "The template name must be specified.", 400);
+        }
+        SesNames.requireAllowedCharacters(name, "InvalidParameterValue", "Template name");
         return name;
+    }
+
+    /**
+     * The name rule a send applies to the stored template it names, worded unlike the template
+     * operations' rule and checked just before the sender verification (probe-confirmed on the v1
+     * and v2 sends).
+     */
+    public static void requireSendTemplateName(String name) {
+        if (name.length() > SesNames.MAX_LENGTH) {
+            throw new AwsException("InvalidParameterValue",
+                    "Template name " + name + " exceeds maximum allowed length " + SesNames.MAX_LENGTH, 400);
+        }
+        if (!SesNames.hasOnlyAllowedCharacters(name)) {
+            throw new AwsException("InvalidParameterValue", "Template name " + name
+                    + " is only allowed to contain alphanumeric characters, underscore, and dash", 400);
+        }
+    }
+
+    /**
+     * A send may name its template beside a {@code TemplateArn} only when both name the same
+     * template; a malformed ARN is reported first (probe-confirmed on both protocols).
+     */
+    public static void requireNameAlignsWithArn(String name, String arn, String region) {
+        if (!name.equals(templateNameFromArn(arn, region))) {
+            throw new AwsException("InvalidParameterValue", "The SES resource '" + name
+                    + "' does not align with the given ARN '" + arn + "'.", 400);
+        }
+    }
+
+    private static AwsException invalidTemplateArn(String arn, String reason) {
+        return new AwsException("InvalidParameterValue", "Invalid template ARN <" + arn + ">. " + reason, 400);
     }
 
     /** The ARN-dispatched tag operations, sharing the store behind {@code CreateEmailTemplate.Tags}. */
@@ -278,6 +340,7 @@ public class SesTemplateService implements SesTaggable {
 
     public String renderTestTemplate(String templateName, String templateDataRaw, String region,
                                      String accountId) {
+        validateTemplateName(templateName);
         // The rendering data is read before the template is looked up: both wrong answers the data error.
         JsonNode templateData = parseRenderingData(objectMapper, templateDataRaw);
         // TestRenderTemplate words a missing template its own way, unlike the template CRUD.

@@ -10,6 +10,8 @@ import org.junit.jupiter.api.Test;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -58,6 +60,12 @@ class SesCvetServiceTest {
         AwsException e = assertThrows(AwsException.class,
                 () -> service.getCustomVerificationEmailTemplate("ghost", REGION));
         assertEquals("CustomVerificationEmailTemplateDoesNotExist", e.getErrorCode());
+        assertEquals("Provided custom verification email template name does not exist.", e.getMessage());
+    }
+
+    @Test
+    void delete_unknown_reportsAbsenceWithoutThrowing() {
+        assertFalse(service.deleteCustomVerificationEmailTemplate("ghost", REGION));
     }
 
     @Test
@@ -65,7 +73,7 @@ class SesCvetServiceTest {
         service.createCustomVerificationEmailTemplate(template("t1"), REGION);
         assertTrue(service.find("t1", REGION).isPresent());
 
-        service.deleteCustomVerificationEmailTemplate("t1", REGION);
+        assertTrue(service.deleteCustomVerificationEmailTemplate("t1", REGION));
         assertTrue(service.find("t1", REGION).isEmpty());
     }
 
@@ -85,7 +93,7 @@ class SesCvetServiceTest {
 
         CustomVerificationEmailTemplate replacement = template("t1");
         replacement.setTemplateSubject("Verify again");
-        service.updateCustomVerificationEmailTemplate(replacement, REGION);
+        service.replaceCustomVerificationEmailTemplate(replacement, REGION);
 
         CustomVerificationEmailTemplate updated = service.getCustomVerificationEmailTemplate("t1", REGION);
         assertEquals("Verify again", updated.getTemplateSubject());
@@ -93,9 +101,59 @@ class SesCvetServiceTest {
     }
 
     @Test
+    void patch_keepsTheMembersLeftOutAndTheTags() {
+        service.createCustomVerificationEmailTemplate(template("t1"), REGION);
+        service.tag("t1", REGION, List.of(new Tag("env", "dev")));
+        CustomVerificationEmailTemplate before = service.getCustomVerificationEmailTemplate("t1", REGION);
+
+        CustomVerificationEmailTemplate changes = new CustomVerificationEmailTemplate();
+        changes.setTemplateName("t1");
+        changes.setTemplateSubject("Verify again");
+        service.patchCustomVerificationEmailTemplate(changes, REGION);
+
+        CustomVerificationEmailTemplate patched = service.getCustomVerificationEmailTemplate("t1", REGION);
+        assertEquals("Verify again", patched.getTemplateSubject());
+        assertEquals(before.getFromEmailAddress(), patched.getFromEmailAddress());
+        assertEquals(before.getTemplateContent(), patched.getTemplateContent());
+        assertEquals(before.getSuccessRedirectionURL(), patched.getSuccessRedirectionURL());
+        assertEquals(before.getFailureRedirectionURL(), patched.getFailureRedirectionURL());
+        assertEquals(List.of(new Tag("env", "dev")), patched.getTags());
+    }
+
+    @Test
+    void patch_emptySubjectAndContentClear_emptySenderAndUrlsAreLeftAlone() {
+        service.createCustomVerificationEmailTemplate(template("t1"), REGION);
+        CustomVerificationEmailTemplate before = service.getCustomVerificationEmailTemplate("t1", REGION);
+
+        CustomVerificationEmailTemplate changes = new CustomVerificationEmailTemplate();
+        changes.setTemplateName("t1");
+        changes.setTemplateSubject("");
+        changes.setTemplateContent("");
+        changes.setFromEmailAddress("");
+        changes.setSuccessRedirectionURL("");
+        changes.setFailureRedirectionURL("");
+        service.patchCustomVerificationEmailTemplate(changes, REGION);
+
+        CustomVerificationEmailTemplate patched = service.getCustomVerificationEmailTemplate("t1", REGION);
+        assertNull(patched.getTemplateSubject());
+        assertNull(patched.getTemplateContent());
+        assertEquals(before.getFromEmailAddress(), patched.getFromEmailAddress());
+        assertEquals(before.getSuccessRedirectionURL(), patched.getSuccessRedirectionURL());
+        assertEquals(before.getFailureRedirectionURL(), patched.getFailureRedirectionURL());
+    }
+
+    @Test
+    void patch_unknown_throwsDoesNotExist() {
+        AwsException e = assertThrows(AwsException.class,
+                () -> service.patchCustomVerificationEmailTemplate(template("ghost"), REGION));
+        assertEquals("CustomVerificationEmailTemplateDoesNotExist", e.getErrorCode());
+    }
+
+    @Test
     void update_unknown_throwsDoesNotExist() {
         AwsException e = assertThrows(AwsException.class,
-                () -> service.updateCustomVerificationEmailTemplate(template("ghost"), REGION));
+                () -> service.replaceCustomVerificationEmailTemplate(template("ghost"), REGION));
         assertEquals("CustomVerificationEmailTemplateDoesNotExist", e.getErrorCode());
+        assertEquals("Provided custom verification email template name does not exist.", e.getMessage());
     }
 }

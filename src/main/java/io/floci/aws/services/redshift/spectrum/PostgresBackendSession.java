@@ -1,5 +1,6 @@
 package io.floci.aws.services.redshift.spectrum;
 
+import io.floci.aws.core.common.PostgresWire;
 import io.floci.aws.services.redshift.proxy.PostgresWireDecoder;
 
 import java.io.IOException;
@@ -7,6 +8,9 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
 
 public final class PostgresBackendSession implements BackendSql {
     private static final String SQLSTATE_IO = "58030";
@@ -19,6 +23,45 @@ public final class PostgresBackendSession implements BackendSql {
     @Override
     public Object connectionKey() {
         return backend;
+    }
+
+    @Override
+    public Optional<String> queryString(String sql) {
+        try {
+            OutputStream output = backend.getOutputStream();
+            output.write(PostgresWireDecoder.encodeQuery(sql));
+            output.flush();
+            return awaitSingleString(new PostgresWireDecoder(backend.getInputStream()));
+        } catch (IOException exception) {
+            abandon(backend, exception);
+            throw new SpectrumReadException(SQLSTATE_IO, "Unable to run a statement on the Redshift backend", exception);
+        }
+    }
+
+    @Override
+    public List<List<String>> queryRows(String sql) {
+        try {
+            OutputStream output = backend.getOutputStream();
+            output.write(PostgresWireDecoder.encodeQuery(sql));
+            output.flush();
+            return awaitRows(new PostgresWireDecoder(backend.getInputStream()));
+        } catch (IOException exception) {
+            abandon(backend, exception);
+            throw new SpectrumReadException(SQLSTATE_IO, "Unable to run a statement on the Redshift backend", exception);
+        }
+    }
+
+    /**
+     * Closes a backend whose private exchange did not finish. Its replies may still arrive, and the response pump
+     * would forward them to the client as if the client had asked; a closed connection is the one state where
+     * nothing can be misattributed.
+     */
+    static void abandon(Socket backend, IOException cause) {
+        try {
+            backend.close();
+        } catch (IOException closeFailure) {
+            cause.addSuppressed(closeFailure);
+        }
     }
 
     @Override
@@ -124,6 +167,53 @@ public final class PostgresBackendSession implements BackendSql {
             message = decoder.nextMessage();
         }
         throw new IOException("PostgreSQL closed before ReadyForQuery");
+    }
+
+    private static Optional<String> awaitSingleString(PostgresWireDecoder decoder) throws IOException {
+        SpectrumReadException failure = null;
+        String value = null;
+        boolean seenRow = false;
+        PostgresWireDecoder.FrontendMessage message = decoder.nextMessage();
+        while (message != null) {
+            if (message.type() == 'D' && !seenRow) {
+                seenRow = true;
+                value = firstColumn(message.body());
+            } else if (message.type() == 'E') {
+                failure = toException(message.body());
+            } else if (message.type() == 'Z') {
+                if (failure != null) {
+                    throw failure;
+                }
+                return Optional.ofNullable(value);
+            }
+            message = decoder.nextMessage();
+        }
+        throw new IOException("PostgreSQL closed before ReadyForQuery");
+    }
+
+    private static List<List<String>> awaitRows(PostgresWireDecoder decoder) throws IOException {
+        SpectrumReadException failure = null;
+        List<List<String>> rows = new ArrayList<>();
+        PostgresWireDecoder.FrontendMessage message = decoder.nextMessage();
+        while (message != null) {
+            if (message.type() == 'D') {
+                rows.add(PostgresWire.dataRowValues(message.body()));
+            } else if (message.type() == 'E') {
+                failure = toException(message.body());
+            } else if (message.type() == 'Z') {
+                if (failure != null) {
+                    throw failure;
+                }
+                return rows;
+            }
+            message = decoder.nextMessage();
+        }
+        throw new IOException("PostgreSQL closed before ReadyForQuery");
+    }
+
+    static String firstColumn(byte[] body) {
+        List<String> row = PostgresWire.dataRowValues(body);
+        return row.isEmpty() ? null : row.get(0);
     }
 
     private static long rowCount(String tag) {

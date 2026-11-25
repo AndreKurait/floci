@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.AwsException;
+import io.floci.aws.core.common.RegionResolver;
 import io.floci.aws.core.common.ServiceRegistry;
 import io.floci.aws.services.ecs.EcsService;
 import io.floci.aws.services.ecs.model.ContainerOverride;
@@ -23,8 +24,11 @@ import io.floci.aws.services.sns.SnsService;
 import io.floci.aws.services.sqs.SqsService;
 import io.floci.aws.services.sqs.model.MessageAttributeValue;
 import io.floci.aws.services.stepfunctions.StepFunctionsService;
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.mockito.ArgumentCaptor;
@@ -57,6 +61,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class ScheduleInvokerTest {
 
     private static final String TOPIC_ARN = "arn:aws:sns:us-east-1:000000000000:repro-topic";
@@ -84,13 +89,18 @@ class ScheduleInvokerTest {
     }
 
     private ScheduleInvoker invokerWithRedshiftEnabled(boolean redshiftEnabled, boolean redshiftDataEnabled) {
+        return invoker(redshiftEnabled, redshiftDataEnabled, new RegionResolver("us-east-1", "000000000000"));
+    }
+
+    private ScheduleInvoker invoker(boolean redshiftEnabled, boolean redshiftDataEnabled,
+                                    RegionResolver regionResolver) {
         EmulatorConfig config = mock(EmulatorConfig.class, RETURNS_DEEP_STUBS);
         when(config.baseUrl()).thenReturn("http://localhost:4566");
         ServiceRegistry serviceRegistry = mock(ServiceRegistry.class);
         when(serviceRegistry.isServiceEnabled("redshift-data")).thenReturn(redshiftEnabled && redshiftDataEnabled);
         return new ScheduleInvoker(sqsService, lambdaService, snsService,
                 eventBridgeService, ecsService, stepFunctionsService, redshiftDataService,
-                new ObjectMapper(), config, serviceRegistry);
+                new ObjectMapper(), config, regionResolver, serviceRegistry);
     }
 
     /** Delivers one occurrence of a schedule in {@code region} whose target is {@code target}. */
@@ -113,11 +123,22 @@ class ScheduleInvokerTest {
 
     @Test
     void aScheduleWithoutAnArnLivesInTheDeploymentDefaultRegion() {
+        ScheduleInvoker chinaInvoker = invoker(true, true, new RegionResolver("cn-north-1", "000000000000"));
+        Target target = new Target();
+        target.setArn("arn:aws:scheduler:::aws-sdk:sqs:sendMessage");
+        target.setRoleArn("arn:aws:iam::000000000000:role/x");
+        target.setInput("{\"QueueUrl\":\"http://localhost:4566/000000000000/q\",\"MessageBody\":\"hi\"}");
         Schedule schedule = new Schedule();
-        assertEquals("cn-north-1", ScheduleInvoker.regionOf(schedule, "cn-north-1"));
+        schedule.setTarget(target);
+
+        chinaInvoker.invoke(schedule, SCHEDULED_AT);
+        verify(sqsService).sendMessage(eq("http://localhost:4566/000000000000/q"), eq("hi"), eq(0),
+                isNull(), isNull(), any(), eq("cn-north-1"));
 
         schedule.setArn("arn:aws:scheduler:eu-west-1:000000000000:schedule/default/nightly");
-        assertEquals("eu-west-1", ScheduleInvoker.regionOf(schedule, "cn-north-1"));
+        chinaInvoker.invoke(schedule, SCHEDULED_AT);
+        verify(sqsService).sendMessage(eq("http://localhost:4566/000000000000/q"), eq("hi"), eq(0),
+                isNull(), isNull(), any(), eq("eu-west-1"));
     }
 
     @Test

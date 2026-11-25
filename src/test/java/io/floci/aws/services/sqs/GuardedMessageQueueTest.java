@@ -12,11 +12,14 @@ import io.floci.aws.services.sqs.GuardedMessageQueue.HandleResult;
 import io.floci.aws.services.sqs.GuardedMessageQueue.MessageCounts;
 import io.floci.aws.services.sqs.model.Message;
 import io.floci.aws.services.sqs.model.MessageAttributeValue;
+import io.floci.aws.testing.ParallelLocks;
 import io.floci.aws.testing.StorageTestBackends;
 import jakarta.enterprise.inject.Instance;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.parallel.ResourceAccessMode;
+import org.junit.jupiter.api.parallel.ResourceLock;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
@@ -51,6 +54,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
+@ResourceLock(value = ParallelLocks.PORTS, mode = ResourceAccessMode.READ)
 class GuardedMessageQueueTest {
 
     private static final String KEY = "us-east-1::/000000000000/failure";
@@ -148,6 +152,42 @@ class GuardedMessageQueueTest {
 
         ClaimResult reClaimed = queue.claimVisibleMessages(1, 30, false, -1, null);
         assertEquals(1, reClaimed.claimed().size());
+    }
+
+    @Test
+    void changeVisibility_expectedVisibleAtNoLongerCurrent_keepsTheNewerVisibility() {
+        queue.addMessage(new Message("msg"));
+        Message claimed = queue.claimVisibleMessages(1, 30, false, -1, null).claimed().get(0);
+        Instant setByClaim = claimed.getVisibleAt();
+        ReceiptHandle handle = ReceiptHandle.parse(claimed.getReceiptHandle());
+        assertEquals(HandleResult.APPLIED, queue.changeVisibility(handle, 60, false));
+
+        assertEquals(HandleResult.VISIBILITY_CHANGED, queue.changeVisibility(handle, setByClaim, 0, false));
+        assertTrue(queue.claimVisibleMessages(1, 30, false, -1, null).claimed().isEmpty());
+    }
+
+    @Test
+    void changeVisibility_expectedVisibleAtStillCurrent_appliesTheTimeout() {
+        queue.addMessage(new Message("msg"));
+        Message claimed = queue.claimVisibleMessages(1, 30, false, -1, null).claimed().get(0);
+        ReceiptHandle handle = ReceiptHandle.parse(claimed.getReceiptHandle());
+
+        assertEquals(HandleResult.APPLIED, queue.changeVisibility(handle, claimed.getVisibleAt(), 0, false));
+        assertEquals(1, queue.claimVisibleMessages(1, 30, false, -1, null).claimed().size());
+    }
+
+    @Test
+    void changeVisibility_fifoMessageReceivedAgain_keepsTheNewReceiversVisibility() {
+        Message message = new Message("msg");
+        message.setMessageGroupId("group");
+        queue.addMessage(message);
+        Message first = queue.claimVisibleMessages(1, 0, true, -1, null).claimed().get(0);
+        ReceiptHandle firstHandle = ReceiptHandle.parse(first.getReceiptHandle());
+        Instant setByFirstClaim = first.getVisibleAt();
+        assertEquals(1, queue.claimVisibleMessages(1, 30, true, -1, null).claimed().size());
+
+        assertEquals(HandleResult.VISIBILITY_CHANGED, queue.changeVisibility(firstHandle, setByFirstClaim, 0, true));
+        assertTrue(queue.claimVisibleMessages(1, 30, true, -1, null).claimed().isEmpty());
     }
 
     @Test
