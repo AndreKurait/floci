@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Predicate;
 
 /** Builds only rules for an endpoint's private nftables table. Docker's tables are untouched. */
 public final class SecurityGroupNftCompiler {
@@ -107,6 +108,13 @@ public final class SecurityGroupNftCompiler {
 
     public static String compile(Endpoint target, Collection<Endpoint> peers,
                                  Map<String, List<String>> prefixLists, List<String> vpcResolvers) {
+        return compile(target, peers, prefixLists, vpcResolvers, peer -> true);
+    }
+
+    /** Withholds peer accepts until that peer enforces the target's current identity. */
+    static String compile(Endpoint target, Collection<Endpoint> peers,
+                          Map<String, List<String>> prefixLists, List<String> vpcResolvers,
+                          Predicate<Endpoint> admitted) {
         if (target == null || target.groups() == null || target.groups().isEmpty()) {
             throw new IllegalArgumentException("Protected endpoint needs at least one security group");
         }
@@ -157,7 +165,8 @@ public final class SecurityGroupNftCompiler {
                         continue;
                     }
                     for (Endpoint peer : managed) {
-                        if (!target.accountId().equals(peer.accountId()) || !target.region().equals(peer.region())
+                        if (!admitted.test(peer) || !target.accountId().equals(peer.accountId())
+                                || !target.region().equals(peer.region())
                                 || !target.vpcId().equals(peer.vpcId())) {
                             continue;
                         }
