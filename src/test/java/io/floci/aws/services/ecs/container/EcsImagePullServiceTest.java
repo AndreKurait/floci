@@ -38,6 +38,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 import static org.junit.jupiter.api.Assertions.*;
 import static org.mockito.ArgumentMatchers.*;
@@ -65,7 +66,7 @@ class EcsImagePullServiceTest {
     private EcsTask task;
     private TaskDefinition definition;
     private IamRole executionRole;
-    private Function<AuthConfig, String> cache;
+    private Function<Supplier<AuthConfig>, String> cache;
 
     @BeforeEach
     @SuppressWarnings("unchecked")
@@ -275,6 +276,10 @@ class EcsImagePullServiceTest {
         return """
                 {"Statement":{"Effect":"Allow","Principal":{"Service":"%s"},"Action":"sts:AssumeRole"}}
                 """.formatted(principal);
+    }
+
+    private static String header(Supplier<AuthConfig> credentials) {
+        return header(credentials.get());
     }
 
     private static String header(AuthConfig credentials) {

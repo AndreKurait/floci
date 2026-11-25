@@ -622,7 +622,7 @@ public class ContainerLauncher implements LambdaRuntimeLauncher {
                 throw new IllegalStateException("The image-pull authorizer is unavailable");
             }
             return imagePulls.pull(fn, spec.image(),
-                    credentials -> lifecycleManager.create(spec, platform.orElse(null), credentials));
+                    credentials -> lifecycleManager.createWithCredentials(spec, platform.orElse(null), credentials));
         }
         return platform.map(value -> lifecycleManager.create(spec, value))
                 .orElseGet(() -> lifecycleManager.create(spec));

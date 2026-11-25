@@ -731,7 +731,7 @@ public class EcsContainerManager {
             throw new AwsException("ResourceInitializationError", "The image-pull authorizer is unavailable.", 400);
         }
         return imagePulls.pull(task, definition, containerInstanceId, image, credentials ->
-                lifecycleManager.resolveImageForLaunch(image,
+                lifecycleManager.resolveImageForLaunchWithCredentials(image,
                         config.services().ecs().imagePullBehavior(), platform, credentials));
     }
 

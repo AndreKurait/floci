@@ -15,6 +15,7 @@ import jakarta.inject.Inject;
 import java.util.List;
 import java.util.Optional;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 /** Resolves the function's owning identity before a private ECR image enters the cache. */
 @ApplicationScoped
@@ -30,7 +31,7 @@ public class LambdaImagePullService {
         this.pulls = pulls;
     }
 
-    public <T> T pull(LambdaFunction function, String imageUri, Function<AuthConfig, T> operation) {
+    public <T> T pull(LambdaFunction function, String imageUri, Function<Supplier<AuthConfig>, T> operation) {
         if (!config.services().iam().enforcementEnabled() || EcrRegistryManager.ecrImage(imageUri).isEmpty()) {
             return operation.apply(null);
         }

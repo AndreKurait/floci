@@ -86,6 +86,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Function;
+import java.util.function.Supplier;
 import java.util.stream.Stream;
 
 import static io.floci.aws.testing.DockerDaemonVersionFixtures.stubDaemonVersion;
@@ -1409,11 +1410,12 @@ class ContainerLauncherTest {
         LambdaImagePullService pulls = mock(LambdaImagePullService.class);
         AuthConfig credentials = new AuthConfig().withRegistryAddress("localhost:4566")
                 .withUsername("AWS").withPassword("per-pull");
+        Supplier<AuthConfig> credentialSource = () -> credentials;
         doAnswer(invocation -> {
-            Function<AuthConfig, String> create = invocation.getArgument(2);
-            return create.apply(credentials);
+            Function<Supplier<AuthConfig>, String> create = invocation.getArgument(2);
+            return create.apply(credentialSource);
         }).when(pulls).pull(any(), anyString(), any());
-        when(lifecycleManager.create(any(), any(), eq(credentials))).thenReturn("container-123");
+        when(lifecycleManager.createWithCredentials(any(), any(), eq(credentialSource))).thenReturn("container-123");
         ContainerReachableEndpoint endpoint =
                 new ContainerReachableEndpoint(config, dockerHostResolver, embeddedDnsServer, null, 4566);
         ContainerLauncher authorized = new ContainerLauncher(
@@ -1428,7 +1430,7 @@ class ContainerLauncherTest {
         try {
             authorized.launch(function);
             verify(pulls).pull(eq(function), eq(function.getImageUri()), any());
-            verify(lifecycleManager).create(any(), any(), eq(credentials));
+            verify(lifecycleManager).createWithCredentials(any(), any(), eq(credentialSource));
             verify(lifecycleManager, never()).create(any());
             verify(lifecycleManager, never()).create(any(), anyString());
         } finally {

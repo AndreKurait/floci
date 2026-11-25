@@ -29,6 +29,7 @@ import org.mockito.InOrder;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -202,11 +203,12 @@ class EcsContainerManagerImagePullTest {
         String image = "111111111111.dkr.ecr.us-east-1.amazonaws.com/image:latest";
         AuthConfig credentials = new AuthConfig().withRegistryAddress("111111111111.dkr.ecr.us-east-1.amazonaws.com")
                 .withUsername("AWS").withPassword("per-pull");
+        Supplier<AuthConfig> credentialSource = () -> credentials;
         doAnswer(invocation -> {
-            Function<AuthConfig, LaunchImage> operation = invocation.getArgument(4);
-            return operation.apply(credentials);
+            Function<Supplier<AuthConfig>, LaunchImage> operation = invocation.getArgument(4);
+            return operation.apply(credentialSource);
         }).when(imagePulls).pull(any(), any(), eq("i-owned"), eq(image), any());
-        when(lifecycleManager.resolveImageForLaunch(image, ImagePullBehavior.ALWAYS, null, credentials))
+        when(lifecycleManager.resolveImageForLaunchWithCredentials(image, ImagePullBehavior.ALWAYS, null, credentialSource))
                 .thenReturn(new LaunchImage(APP_IMAGE_ID, "sha256:new-manifest"));
         when(lifecycleManager.resolveImageForLaunch(SIDECAR_IMAGE, ImagePullBehavior.ALWAYS, null))
                 .thenReturn(new LaunchImage(SIDECAR_IMAGE_ID, null));
@@ -217,7 +219,7 @@ class EcsContainerManagerImagePullTest {
         manager.startTask(task(), definition, List.of(), "us-east-1", "i-owned");
 
         verify(lifecycleManager, never()).resolveImageForLaunch(image, ImagePullBehavior.ALWAYS, null);
-        verify(lifecycleManager).resolveImageForLaunch(image, ImagePullBehavior.ALWAYS, null, credentials);
+        verify(lifecycleManager).resolveImageForLaunchWithCredentials(image, ImagePullBehavior.ALWAYS, null, credentialSource);
         verify(containerBuilder).newContainer(APP_IMAGE_ID);
     }
 

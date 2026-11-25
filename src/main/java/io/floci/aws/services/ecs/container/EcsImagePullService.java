@@ -22,6 +22,7 @@ import jakarta.inject.Inject;
 import java.util.List;
 import java.util.Optional;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 /** Selects the agent's image-pull identity independently of the task's application credentials. */
 @ApplicationScoped
@@ -45,7 +46,7 @@ public class EcsImagePullService {
     }
 
     public <T> T pull(EcsTask task, TaskDefinition definition, String containerInstanceId,
-                      String imageUri, Function<AuthConfig, T> operation) {
+                      String imageUri, Function<Supplier<AuthConfig>, T> operation) {
         if (!config.services().iam().enforcementEnabled() || EcrRegistryManager.ecrImage(imageUri).isEmpty()) {
             return operation.apply(null);
         }

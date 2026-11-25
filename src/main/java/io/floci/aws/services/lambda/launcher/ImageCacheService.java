@@ -20,11 +20,13 @@ import org.jboss.logging.Logger;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.Supplier;
 import java.util.regex.Pattern;
 
 /**
@@ -98,10 +100,16 @@ public class ImageCacheService {
                 return resolvedImage;
             }
             resolvedImage = resolvedImageReference(imageUri,
-                    pull(imageKey, explicitPlatform ? requestedPlatform : null, credentials).image());
+                    pull(imageKey, explicitPlatform ? requestedPlatform : null, null).image());
             resolvedImages.put(imageKey, resolvedImage);
             return resolvedImage;
         }
+    }
+
+    /** Resolves credentials after lock admission and again before every registry pull attempt. */
+    public String ensureImageExistsWithCredentials(String imageUri, String platform, Supplier<AuthConfig> credentials) {
+        return credentials == null ? ensureImageExists(imageUri, platform)
+                : resolveForLaunchWithCredentials(imageUri, ImagePullBehavior.ALWAYS, platform, credentials).imageId();
     }
 
     /**
@@ -125,6 +133,13 @@ public class ImageCacheService {
     public LaunchImage resolveForLaunch(String imageUri, ImagePullBehavior behavior, String platform,
                                         AuthConfig credentials) {
         validateRegistryCredentials(imageUri, credentials);
+        return resolveForLaunchWithCredentials(imageUri, behavior, platform,
+                credentials == null ? null : () -> credentials);
+    }
+
+    /** The caller owns the supplied credential source and revokes its leases when this launch finishes. */
+    public LaunchImage resolveForLaunchWithCredentials(String imageUri, ImagePullBehavior behavior, String platform,
+                                                       Supplier<AuthConfig> credentials) {
         if (isImageId(imageUri)) {
             return new LaunchImage(existingImageId(imageUri), null);
         }
@@ -174,7 +189,7 @@ public class ImageCacheService {
         return resolvedImageReference(imageId, image);
     }
 
-    private LocalImage pullOrUseCached(ImageKey imageKey, String platform, AuthConfig credentials) {
+    private LocalImage pullOrUseCached(ImageKey imageKey, String platform, Supplier<AuthConfig> credentials) {
         try {
             return pull(imageKey, platform, credentials);
         } catch (RuntimeException e) {
@@ -188,7 +203,7 @@ public class ImageCacheService {
         }
     }
 
-    private LocalImage cachedOrPull(ImageKey imageKey, String platform, AuthConfig credentials) {
+    private LocalImage cachedOrPull(ImageKey imageKey, String platform, Supplier<AuthConfig> credentials) {
         InspectImageResponse cached = cachedImage(imageKey);
         return cached != null ? new LocalImage(cached, null) : pull(imageKey, platform, credentials);
     }
@@ -203,14 +218,16 @@ public class ImageCacheService {
      *
      * @param platform the platform to ask the registry for, or null for the daemon's own
      */
-    private LocalImage pull(ImageKey imageKey, String platform, AuthConfig credentials) {
+    private LocalImage pull(ImageKey imageKey, String platform, Supplier<AuthConfig> credentials) {
         String imageUri = imageKey.imageUri();
         LOG.infov("Pulling image: {0}", imageUri);
         AtomicReference<ManifestDigestCallback> lastAttempt = new AtomicReference<>();
         try {
             runWithRetry(imageUri, MAX_PULL_ATTEMPTS, INITIAL_BACKOFF_MS, () -> {
+                AuthConfig attemptCredentials = credentials == null ? null
+                        : Objects.requireNonNull(credentials.get(), "Pull credential source returned null");
                 PullImageCmd pullImage = dockerClient.pullImageCmd(imageUri)
-                        .withAuthConfig(resolveAuth(imageUri, credentials));
+                        .withAuthConfig(resolveAuth(imageUri, attemptCredentials));
                 if (platform != null) {
                     pullImage.withPlatform(platform);
                 }
