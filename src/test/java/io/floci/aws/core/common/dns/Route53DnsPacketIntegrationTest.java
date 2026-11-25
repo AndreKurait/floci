@@ -61,8 +61,10 @@ class Route53DnsPacketIntegrationTest {
         change(id, "CREATE", record(name, "SRV", 17,
                 "20 0 8080 first." + zone + ".", "10 100 65535 second." + zone));
 
+        DnsClientVpcSource.ClientVpc origin = new DnsClientVpcSource.ClientVpc(
+                config.defaultAccountId(), "us-east-1", "vpc-srv");
         byte[] request = DnsTestQuery.query(name, 33, 0x1234);
-        byte[] response = query(request);
+        byte[] response = query(request, origin);
         assertPrivateHeader(response, 0, 2);
         ByteBuffer packet = ByteBuffer.wrap(response);
         packet.position(request.length);
@@ -83,9 +85,9 @@ class Route53DnsPacketIntegrationTest {
         assertEquals(List.of("10 100 65535 second." + zone, "20 0 8080 first." + zone),
                 values.stream().sorted().toList());
 
-        assertPrivateHeader(query(DnsTestQuery.query(name, 1, 0x1234)), 0, 0);
-        assertPrivateHeader(query(DnsTestQuery.query("_tcp." + zone, 33, 0x1234)), 0, 0);
-        assertPrivateHeader(query(DnsTestQuery.query("absent." + zone, 33, 0x1234)), 3, 0);
+        assertPrivateHeader(query(DnsTestQuery.query(name, 1, 0x1234), origin), 0, 0);
+        assertPrivateHeader(query(DnsTestQuery.query("_tcp." + zone, 33, 0x1234), origin), 0, 0);
+        assertPrivateHeader(query(DnsTestQuery.query("absent." + zone, 33, 0x1234), origin), 3, 0);
     }
 
     @ParameterizedTest
@@ -368,9 +370,10 @@ class Route53DnsPacketIntegrationTest {
         createZone(awsName);
         byte[] address = query(DnsTestQuery.query(awsName, 1, 0x1234));
         assertNegative(address, awsName, 0, 900);
-        for (String label : List.of("weighted", "alias", "leaf.delegated")) {
+        for (String label : List.of("weighted", "leaf.delegated")) {
             assertHeader(query(DnsTestQuery.query(label + "." + name, 16, 0x1234)), 5, false, 0, 0);
         }
+        assertNegative(query(request("alias." + name, 16)), name, 0, 900);
     }
 
     @ParameterizedTest
@@ -389,6 +392,8 @@ class Route53DnsPacketIntegrationTest {
         alias.setAliasTarget(cloudFront);
         change(id, "CREATE", alias);
 
+        assertEquals(5, source.resolveAuthoritative(name, type, "127.0.0.1")
+                .orElseThrow().responseCode(), "unsupported target should reach the refusal fallback");
         byte[] response = query(DnsTestQuery.query(name, type, 0x1234));
         assertPrivateHeader(response, 0, answers);
         if (type == 1) {
@@ -398,7 +403,6 @@ class Route53DnsPacketIntegrationTest {
         for (int field : List.of(2, 4, -1, -2)) {
             assertHeader(query(malformed(DnsTestQuery.query(name, type, 0x1234), field)), 5, false, 0, 0);
         }
-        assertNegative(query(request("alias." + name, 16)), name, 0, 900);
     }
 
     @Test
