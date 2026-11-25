@@ -7717,13 +7717,12 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
 
     /**
      * What the identity behind a session's credentials says about MFA, or null when the session
-     * publishes neither key. A federated user is one such session: the guide's note that the keys
-     * are "not present for federated identities or requests made using access keys to sign AWS
-     * CLI, AWS API, or AWS SDK requests" puts GetFederationToken credentials with the long-term
-     * keys rather than with the sessions that can carry a device.
+     * publishes neither key. Federated and assumed-role sessions do not carry MFA context:
+     * AssumeRole authenticates MFA on its request, while GetSessionToken retains it in the session.
      */
     private CallerArns.SessionMfa sessionMfa(SessionCredential session) {
-        if (isFederatedUserSession(session)) {
+        if (isFederatedUserSession(session)
+                || session.getRoleArn() != null && !isAccountRootArn(session.getRoleArn())) {
             return null;
         }
         Instant authenticatedAt = session.getMfaAuthenticatedAt();
