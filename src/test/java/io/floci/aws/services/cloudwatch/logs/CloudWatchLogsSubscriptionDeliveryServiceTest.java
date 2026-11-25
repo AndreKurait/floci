@@ -15,6 +15,7 @@ import jakarta.enterprise.event.Event;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.mockito.Mockito;
 
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -89,8 +90,8 @@ class CloudWatchLogsSubscriptionDeliveryServiceTest {
                 kinesisService,
                 firehoseService,
                 regionResolver,
-                MAPPER
-        );
+                MAPPER,
+                Mockito.mock(CloudWatchLogsSubscriptionAdmissionService.class));
 
         doAnswer(invocation -> {
             LogEventsIngested event = invocation.getArgument(0);
