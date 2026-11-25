@@ -1,9 +1,11 @@
 package io.floci.aws.config;
 
+import io.floci.aws.testing.ParallelLocks;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.api.parallel.ResourceLock;
 
 import java.io.ByteArrayInputStream;
 import java.net.Inet4Address;
@@ -27,6 +29,7 @@ import static org.junit.jupiter.api.Assumptions.assumeFalse;
  * Floci's https endpoint by address, so the self-signed server certificate must name this host's interface
  * addresses; without it the certificate keeps its configured names only.
  */
+@ResourceLock(ParallelLocks.TLS_CONFIG)
 class TlsConfigSourceGuestAddressTest {
 
     private static final int IP_ADDRESS = 7;
