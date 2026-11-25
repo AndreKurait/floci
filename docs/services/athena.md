@@ -5,11 +5,51 @@
 
 Floci emulates Amazon Athena with **real SQL execution** powered by a [floci-duck](https://hub.docker.com/r/floci/floci-duck) sidecar container running DuckDB. When a query is submitted, Floci spins up the sidecar on first use, registers every Glue database as a DuckDB schema (`CREATE SCHEMA IF NOT EXISTS "<schema>"`) with qualified views (`"<db>"."<table>"`) pointing to S3 data, creates unqualified view aliases for the query context database in DuckDB's default `main` schema, then executes the SQL and stores results as CSV in S3.
 
+## Prepared statements
+
+`CreatePreparedStatement`, `GetPreparedStatement`, `UpdatePreparedStatement`,
+`DeletePreparedStatement`, and `BatchGetPreparedStatement` store SQL text and
+optional descriptions within an existing workgroup, including `primary`.
+Names are unique within each workgroup and at most 1000 statements may be stored.
+These operations do not execute SQL, add SQL `PREPARE` or `EXECUTE` support,
+or implement `ListPreparedStatements` or a CloudFormation resource.
+
+Get and batch get return `StatementName`, `WorkGroupName`, `QueryStatement`,
+optional `Description`, and numeric epoch-seconds `LastModifiedTime`. Batch get
+accepts at most 256 statement names, as stated in the API operation description,
+and returns missing names under `UnprocessedPreparedStatementNames`. Floci uses
+`STATEMENTNAME_NOT_FOUND` for those entries; single get, update, and delete return
+`ResourceNotFoundException` for an absent statement. Request types, name patterns,
+and documented string lengths are validated before mutation. An explicit empty
+description is invalid. Updating replaces the SQL text. Omitting `Description`
+preserves its existing value; supplying a description replaces that value.
+
+Prepared statements use the existing workgroup storage in memory, persistent,
+hybrid, and WAL modes. Legacy workgroups start with no statements. Reads and
+writes are scoped to the caller's account and region. IAM uses each operation's
+same-named Athena action, the workgroup ARN, and its live `aws:ResourceTag` values.
+Updates atomically replace the stored statement map; hybrid durability retains
+its normal asynchronous flush behavior.
+
+Deleting a workgroup containing prepared statements
+requires `RecursiveDeleteOption=true`; omission and `false` reject deletion.
+Recursive deletion removes the statements with their workgroup, and recreating
+the name starts empty. Description preservation, missing-statement batch errors,
+and omitted, false, and true recursive-delete options were verified against AWS
+in `us-east-2` with Boto3 1.43.108 on November 13, 2026, using temporary workgroups
+without executing queries. The built-in `primary` workgroup cannot be deleted
+through the API.
+
 ## Supported Actions
 
 <!-- floci:actions:start -->
 | Action | Description |
 | --- | --- |
+| `CreatePreparedStatement` | Stores SQL text and an optional description in a workgroup |
+| `GetPreparedStatement` | Returns one stored statement and its last modification time |
+| `UpdatePreparedStatement` | Replaces a stored statement's SQL text and optional description |
+| `DeletePreparedStatement` | Deletes one stored statement |
+| `BatchGetPreparedStatement` | Returns up to 256 stored statements and per-name errors for missing entries |
 | `CreateNamedQuery` | Saves SQL text in a workgroup and returns its ID |
 | `GetNamedQuery` | Returns a saved query's name, database, SQL text, description and workgroup |
 | `BatchGetNamedQuery` | Returns up to 50 saved queries and per-ID errors for missing queries |
