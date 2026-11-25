@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.aws.core.common.auth.SigV4Canonicalization;
 import io.floci.aws.services.iam.IamActionRegistry;
+import io.floci.aws.services.memorydb.MemoryDbParameterGroupTarget;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.core.MultivaluedMap;
 
@@ -569,6 +570,9 @@ public final class RequestResources {
      */
     public static List<String> created(String operation, String tagging, ContainerRequestContext ctx, String partition,
                                        String region, String accountId, Map<String, String> labels) {
+        if ("memorydb:CreateParameterGroup".equals(operation)) {
+            return List.of(MemoryDbParameterGroupTarget.createdArn(PassedRoles.jsonBody(ctx), partition, region, accountId));
+        }
         RequestResourceMembers.Table table = RequestResourceMembers.table();
         return created(table, operation, tagging, resources -> served(resources, ctx),
                 () -> ec2Query(table, operation,
