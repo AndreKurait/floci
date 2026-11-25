@@ -65,7 +65,7 @@ class AmazonMqConfigurationServiceTest {
             throw new AwsException("AccessDeniedException", "denied", 403);
         }));
         assertEquals(403, denied.getHttpStatus());
-        assertEquals("arn:aws:mq:us-east-1:" + ACCOUNT + ":configuration:" + id(1), candidate.get());
+        assertEquals(AmazonMqConfigurationService.configurationArn(service.scope(), id(1)), candidate.get());
         assertTrue(storage.isEmpty());
         Configuration created = service.create(request, arn -> assertEquals(id(2), arn.substring(arn.lastIndexOf(':') + 1)));
         assertEquals(Map.of("team", "audit"), created.tags());

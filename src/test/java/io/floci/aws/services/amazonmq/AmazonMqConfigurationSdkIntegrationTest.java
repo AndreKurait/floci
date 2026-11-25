@@ -2,6 +2,7 @@ package io.floci.aws.services.amazonmq;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import io.floci.aws.core.common.AwsArnUtils.Arn;
 import io.floci.aws.testing.AwsTestClients;
 import io.quarkus.test.junit.QuarkusTest;
 import io.restassured.response.Response;
@@ -396,7 +397,7 @@ class AmazonMqConfigurationSdkIntegrationTest {
 
     private void cleanupUnexpectedMskReceipt(Reservation reservation) {
         String arn = reservation.response.arn();
-        assertTrue(arn.startsWith("arn:aws:kafka:us-east-1:" + ACCOUNT + ":configuration/" + reservation.name + "/"));
+        assertTrue(arn.startsWith(Arn.of("kafka", "us-east-1", ACCOUNT, "configuration/" + reservation.name + "/").toString()));
         assertNotNull(reservation.rawCreate, "Unknown service cleanup needs the original raw receipt");
         JsonNode creationTime = reservation.rawCreate.get("creationTime");
         assertNotNull(creationTime, "Unknown service cleanup needs a captured creation identity");

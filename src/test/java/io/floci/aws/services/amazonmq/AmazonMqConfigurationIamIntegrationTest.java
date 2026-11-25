@@ -53,7 +53,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 @TestProfile(SignedIamEnforcementProfile.class)
 class AmazonMqConfigurationIamIntegrationTest {
 
-    private static final String PREFIX = "arn:aws:mq:us-east-1:000000000000:configuration:";
+    private String configurationPrefix;
     private static final String CONFIG_ACTIONS = "[\"mq:DescribeConfiguration\",\"mq:UpdateConfiguration\","
             + "\"mq:DeleteConfiguration\",\"mq:DescribeConfigurationRevision\",\"mq:ListConfigurationRevisions\"]";
     private static final ObjectMapper JSON = new ObjectMapper();
@@ -72,6 +72,7 @@ class AmazonMqConfigurationIamIntegrationTest {
 
     @BeforeEach
     void setup() {
+        configurationPrefix = regionResolver.buildArn("mq", "us-east-1", "000000000000", "configuration:");
         marker = "mq-iam-" + UUID.randomUUID().toString().substring(0, 8);
         sequence = new AtomicLong(UUID.randomUUID().getLeastSignificantBits() & Long.MAX_VALUE);
         AmazonMqConfigurationService deterministic = new AmazonMqConfigurationService(
@@ -84,6 +85,12 @@ class AmazonMqConfigurationIamIntegrationTest {
 
     @AfterEach
     void cleanup() {
+        List<AssertionError> failures = cleanupOwned();
+        root.close();
+        assertAll(failures.stream().map(failure -> () -> { throw failure; }));
+    }
+
+    private List<AssertionError> cleanupOwned() {
         List<AssertionError> failures = new ArrayList<>();
         for (Owned row : owned.reversed()) {
             try {
@@ -96,7 +103,11 @@ class AmazonMqConfigurationIamIntegrationTest {
                 }
                 assertEquals(row.arn(), current.arn());
                 assertEquals(row.name(), current.name());
-                assertEquals(row.tags(), current.tags());
+                try {
+                    assertEquals(row.tags(), current.tags());
+                } catch (AssertionError mismatch) {
+                    failures.add(mismatch);
+                }
                 root.deleteConfiguration(request -> request.configurationId(row.id()));
                 assertEquals(404, assertThrows(MqException.class,
                         () -> root.describeConfiguration(request -> request.configurationId(row.id()))).statusCode());
@@ -104,8 +115,42 @@ class AmazonMqConfigurationIamIntegrationTest {
                 failures.add(new AssertionError("Owned configuration cleanup failed: " + row.id(), failure));
             }
         }
-        root.close();
-        assertAll(failures.stream().map(failure -> () -> { throw failure; }));
+        return failures;
+    }
+
+    @Test
+    void unexpectedSuccessfulDenialAttemptRemainsOwnedAndIsDeleted() {
+        assertThrows(AssertionError.class, () -> denied(() -> create(root, "unexpected", Map.of())));
+        assertEquals(1, owned.size());
+        String id = owned.getFirst().id();
+        assertTrue(cleanupOwned().isEmpty());
+        assertEquals(404, assertThrows(MqException.class,
+                () -> root.describeConfiguration(request -> request.configurationId(id))).statusCode());
+    }
+
+    @Test
+    void tagMismatchIsReportedAfterOwnedConfigurationIsDeleted() {
+        Owned created = create(root, "mismatched-tags", Map.of("owner", marker));
+        owned.set(0, new Owned(created.id(), created.arn(), created.name(), Map.of("owner", "wrong")));
+        try {
+            assertEquals(1, cleanupOwned().size());
+            assertEquals(404, assertThrows(MqException.class,
+                    () -> root.describeConfiguration(request -> request.configurationId(created.id()))).statusCode());
+        } finally {
+            owned.set(0, created);
+        }
+    }
+
+    @Test
+    void identityMismatchPreventsCleanupDeletion() {
+        Owned created = create(root, "identity", Map.of());
+        owned.set(0, new Owned(created.id(), created.arn(), "not-owned", created.tags()));
+        try {
+            assertEquals(1, cleanupOwned().size());
+            assertEquals(created.name(), describe(root, created).name());
+        } finally {
+            owned.set(0, created);
+        }
     }
 
     @Test
@@ -113,8 +158,7 @@ class AmazonMqConfigurationIamIntegrationTest {
         Owned a = create(root, "existing", Map.of("owner", marker));
         DescribeConfigurationResponse before = describe(root, a);
         try (User user = SignedIamUsers.createUser(endpoint, "mq-none-"); MqClient caller = client(user)) {
-            denied(() -> caller.createConfiguration(request -> request.name(marker + "-denied")
-                    .engineType(EngineType.RABBITMQ).engineVersion("3.13")));
+            denied(() -> create(caller, "denied", Map.of()));
             denied(() -> caller.listConfigurations(request -> request.maxResults(100)));
             denied(() -> caller.describeConfiguration(request -> request.configurationId(a.id())));
             denied(() -> caller.updateConfiguration(request -> request.configurationId(a.id()).data("eA==")));
@@ -137,7 +181,7 @@ class AmazonMqConfigurationIamIntegrationTest {
             assertEquals(403, denied.statusCode());
             assertTrue(denied.body().contains("AccessDenied"));
             assertNoName(name);
-            policy(user, allow("mq:CreateConfiguration", "*") + "," + allow("mq:CreateTags", PREFIX + "c-"
+            policy(user, allow("mq:CreateConfiguration", "*") + "," + allow("mq:CreateTags", configurationPrefix + "c-"
                     + new UUID(0, sequence.get() + 99)));
             assertEquals(403, presigned(user, body).statusCode());
             assertNoName(name);
@@ -145,10 +189,6 @@ class AmazonMqConfigurationIamIntegrationTest {
             policy(user, allow("mq:CreateConfiguration", "*") + "," + allow("mq:CreateTags", exactArn));
             HttpResponse<String> accepted = presigned(user, body);
             JsonNode receipt = JSON.readTree(accepted.body());
-            if (accepted.statusCode() == 200 && receipt.path("id").isTextual() && receipt.path("arn").isTextual()) {
-                owned.add(new Owned(receipt.path("id").asText(), receipt.path("arn").asText(), name,
-                        Map.of("owner", marker)));
-            }
             assertEquals(200, accepted.statusCode(), accepted.body());
             assertEquals(exactArn, receipt.path("arn").asText());
             assertEquals(Map.of("owner", marker), root.describeConfiguration(request -> request
@@ -162,8 +202,7 @@ class AmazonMqConfigurationIamIntegrationTest {
             Owned a = create(caller, "tagless", Map.of());
             assertTrue(describe(root, a).tags().isEmpty());
             policy(user, allow("mq:CreateTags", "*"));
-            denied(() -> caller.createConfiguration(request -> request.name(marker + "-missing-primary")
-                    .engineType(EngineType.RABBITMQ).engineVersion("3.13").tags(Map.of("owner", marker))));
+            denied(() -> create(caller, "missing-primary", Map.of("owner", marker)));
             assertNoName(marker + "-missing-primary");
         }
     }
@@ -174,8 +213,7 @@ class AmazonMqConfigurationIamIntegrationTest {
                 + "\"ForAllValues:StringEquals\":{\"aws:TagKeys\":[\"owner\"]}";
         try (User user = user(allowWithCondition("\"mq:CreateConfiguration\"", "*", conditions)
                 + "," + allowWithCondition("\"mq:CreateTags\"", "*", conditions)); MqClient caller = client(user)) {
-            denied(() -> caller.createConfiguration(request -> request.name(marker + "-wrong-tag")
-                    .engineType(EngineType.RABBITMQ).engineVersion("3.13").tags(Map.of("owner", "wrong"))));
+            denied(() -> create(caller, "wrong-tag", Map.of("owner", "wrong")));
             assertNoName(marker + "-wrong-tag");
             Owned a = create(caller, "conditioned", Map.of("owner", marker));
             policy(user, allowWithCondition(CONFIG_ACTIONS, a.arn(),
@@ -236,8 +274,7 @@ class AmazonMqConfigurationIamIntegrationTest {
         try (User user = user(allow("mq:*", "*") + ","
                 + "{\"Effect\":\"Deny\",\"Action\":\"mq:CreateTags\",\"Resource\":\"*\"}");
                 MqClient caller = client(user)) {
-            denied(() -> caller.createConfiguration(request -> request.name(marker + "-explicit")
-                    .engineType(EngineType.RABBITMQ).engineVersion("3.13").tags(Map.of("owner", marker))));
+            denied(() -> create(caller, "explicit", Map.of("owner", marker)));
             assertNoName(marker + "-explicit");
         }
     }
@@ -249,13 +286,17 @@ class AmazonMqConfigurationIamIntegrationTest {
                     "engineVersion", "3.13"));
             URI uri = endpoint.resolve("v1/configurations?Action=ListConfigurations&Operation=ListConfigurations");
             Map<String, String> headers = user.signer("mq").headersFor("POST", uri,
-                    Map.of("X-Amz-Target", "AmazonMQ.ListConfigurations"), body.getBytes(StandardCharsets.UTF_8));
+                    Map.of("x-amz-target", "AmazonMQ.ListConfigurations"), body.getBytes(StandardCharsets.UTF_8));
             HttpRequest.Builder request = HttpRequest.newBuilder(uri).timeout(Duration.ofSeconds(10))
-                    .header("Content-Type", "application/json").POST(HttpRequest.BodyPublishers.ofString(body));
+                    .header("Content-Type", "application/json").header("X-Amz-Target", "AmazonMQ.ListConfigurations")
+                    .POST(HttpRequest.BodyPublishers.ofString(body));
             headers.forEach((name, value) -> { if (!name.equalsIgnoreCase("host")) { request.header(name, value); } });
             try (HttpClient http = HttpClient.newHttpClient()) {
                 HttpResponse<String> response = http.send(request.build(), HttpResponse.BodyHandlers.ofString());
+                rememberHttpCreate(response, body);
                 assertEquals(403, response.statusCode(), response.body());
+                assertTrue(response.body().contains("AccessDenied"), response.body());
+                assertTrue(response.body().contains("mq:CreateConfiguration"), response.body());
                 assertNoName(marker + "-header");
             }
         }
@@ -271,8 +312,7 @@ class AmazonMqConfigurationIamIntegrationTest {
             try {
                 SignedIamUsers.iam(endpoint, "PutUserPermissionsBoundary", Map.of("UserName", user.name(),
                         "PermissionsBoundary", boundary)).then().statusCode(200);
-                denied(() -> caller.createConfiguration(request -> request.name(marker + "-boundary-denied")
-                        .engineType(EngineType.RABBITMQ).engineVersion("3.13").tags(Map.of("owner", marker))));
+                denied(() -> create(caller, "boundary-denied", Map.of("owner", marker)));
                 assertNoName(marker + "-boundary-denied");
                 create(caller, "boundary-tagless", Map.of());
             } finally {
@@ -287,7 +327,8 @@ class AmazonMqConfigurationIamIntegrationTest {
     void assumedRoleSessionPolicyCapsTheAdditionalTagGrant() throws Exception {
         String roleName = marker + "-role";
         String trust = "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\","
-                + "\"Principal\":{\"AWS\":\"arn:aws:iam::000000000000:root\"},\"Action\":\"sts:AssumeRole\"}]}";
+                + "\"Principal\":{\"AWS\":\"" + regionResolver.buildGlobalArn("iam", "000000000000", "root")
+                + "\"},\"Action\":\"sts:AssumeRole\"}]}";
         String roleArn = SignedIamUsers.iam(endpoint, "CreateRole", Map.of("RoleName", roleName,
                 "AssumeRolePolicyDocument", trust)).then().statusCode(200).extract().xmlPath()
                 .getString("CreateRoleResponse.CreateRoleResult.Role.Arn");
@@ -301,8 +342,7 @@ class AmazonMqConfigurationIamIntegrationTest {
                 try (MqClient caller = AwsTestClients.create(MqClient.builder(), AwsSessionCredentials.create(
                         credentials.accessKeyId(), credentials.secretAccessKey(), credentials.sessionToken()),
                         Region.US_EAST_1, endpoint)) {
-                    denied(() -> caller.createConfiguration(request -> request.name(marker + "-session-denied")
-                            .engineType(EngineType.RABBITMQ).engineVersion("3.13").tags(Map.of("owner", marker))));
+                    denied(() -> create(caller, "session-denied", Map.of("owner", marker)));
                     assertNoName(marker + "-session-denied");
                     create(caller, "session-tagless", Map.of());
                 }
@@ -359,8 +399,7 @@ class AmazonMqConfigurationIamIntegrationTest {
         try (User user = user(allow("mq:*", "*") + ","
                 + "{\"Effect\":\"Deny\",\"Action\":\"mq:*\",\"Resource\":\"*\"}");
                 MqClient caller = client(user)) {
-            denied(() -> caller.createConfiguration(request -> request.name(marker + "-explicit-all-denied")
-                    .engineType(EngineType.RABBITMQ).engineVersion("3.13")));
+            denied(() -> create(caller, "explicit-all-denied", Map.of()));
             denied(() -> caller.listConfigurations(request -> request.maxResults(100)));
             denied(() -> caller.describeConfiguration(request -> request.configurationId(a.id())));
             denied(() -> caller.updateConfiguration(request -> request.configurationId(a.id()).data("eA==")));
@@ -391,7 +430,23 @@ class AmazonMqConfigurationIamIntegrationTest {
                 .header("Authorization", "").header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(body)).build();
         try (HttpClient http = HttpClient.newHttpClient()) {
-            return http.send(request, HttpResponse.BodyHandlers.ofString());
+            HttpResponse<String> response = http.send(request, HttpResponse.BodyHandlers.ofString());
+            rememberHttpCreate(response, body);
+            return response;
+        }
+    }
+
+    private void rememberHttpCreate(HttpResponse<String> response, String requestBody) throws Exception {
+        if (response.statusCode() != 200) {
+            return;
+        }
+        JsonNode receipt = JSON.readTree(response.body());
+        JsonNode request = JSON.readTree(requestBody);
+        Map<String, String> tags = request.has("tags")
+                ? JSON.convertValue(request.get("tags"), new TypeReference<Map<String, String>>() {}) : Map.of();
+        if (receipt.path("id").isTextual() && receipt.path("arn").isTextual()) {
+            owned.add(new Owned(receipt.path("id").asText(), receipt.path("arn").asText(),
+                    request.path("name").asText(), tags));
         }
     }
 
@@ -430,7 +485,7 @@ class AmazonMqConfigurationIamIntegrationTest {
     }
 
     private String nextArn() {
-        return PREFIX + "c-" + new UUID(0, sequence.get() + 1);
+        return configurationPrefix + "c-" + new UUID(0, sequence.get() + 1);
     }
 
     private static String policyDocument(String statements) {
