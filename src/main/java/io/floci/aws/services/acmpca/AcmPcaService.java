@@ -21,6 +21,7 @@ import io.floci.aws.services.acmpca.model.CertificateAuthority.IssueToken;
 import io.floci.aws.services.acmpca.model.CertificateAuthority.IssuedCertificate;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.inject.Inject;
+import org.bouncycastle.asn1.x500.X500Name;
 import org.bouncycastle.pkcs.PKCS10CertificationRequest;
 
 import java.io.UncheckedIOException;
@@ -151,9 +152,10 @@ public class AcmPcaService implements Resettable, AcmPrivateCertificateAuthoriti
         } else {
             parent = PrivateCaCertificates.certificate(authority.certificatePem());
             if (pathLength != null) {
-                int subordinateCount = 0;
+                int subordinateCount = csr.getSubject().equals(
+                        X500Name.getInstance(parent.getSubjectX500Principal().getEncoded())) ? 0 : 1;
                 for (X509Certificate issuer : PrivateCaCertificates.certificates(chainOf(authority))) {
-                    if ((long) pathLength + subordinateCount >= issuer.getBasicConstraints()) {
+                    if ((long) pathLength + subordinateCount > issuer.getBasicConstraints()) {
                         throw invalid("The template path length exceeds the remaining issuer chain allowance");
                     }
                     if (!issuer.getSubjectX500Principal().equals(issuer.getIssuerX500Principal())) {
@@ -164,8 +166,15 @@ public class AcmPcaService implements Resettable, AcmPrivateCertificateAuthoriti
         }
         Instant notBefore = PrivateCaRequests.validity(request, now, true);
         Instant notAfter = PrivateCaRequests.validity(request, now, false);
-        if (!notBefore.isBefore(notAfter) || parent != null && notAfter.isAfter(parent.getNotAfter().toInstant())) {
+        if (!notBefore.isBefore(notAfter)) {
             throw new AwsException("InvalidArgsException", "The requested validity exceeds the CA validity", 400);
+        }
+        if (parent != null) {
+            for (X509Certificate issuer : PrivateCaCertificates.certificates(chainOf(authority))) {
+                if (notAfter.isAfter(issuer.getNotAfter().toInstant())) {
+                    throw invalid("The requested validity exceeds the issuer chain validity");
+                }
+            }
         }
         X509Certificate certificate = PrivateCaCertificates.issue(
                 csr, authority.privateKeyPem(), parent, pathLength, notBefore, notAfter);

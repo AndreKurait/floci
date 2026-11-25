@@ -580,11 +580,12 @@ class AcmPcaServiceTest {
     }
 
     @ParameterizedTest
-    @CsvSource({"false,1,0,false,false", "true,1,0,false,false",
-            "false,2,0,false,true", "true,3,0,false,true",
-            "false,1,-1,false,true", "false,1,0,true,true"})
+    @CsvSource({"false,1,0,false,false,false", "true,1,0,false,false,false",
+            "false,2,0,false,false,true", "true,3,0,false,false,true",
+            "false,1,-1,false,false,true", "false,1,0,true,false,true",
+            "false,1,0,false,true,true", "true,2,0,false,true,true"})
     void issuanceHonorsRemainingAncestorPathLength(boolean rootLimited, int allowance, int requestedPathLength,
-                                                  boolean rollover, boolean allowed) throws Exception {
+                                                  boolean rollover, boolean childRollover, boolean allowed) throws Exception {
         AdjustableClock clock = new AdjustableClock();
         InMemoryStorage<String, CertificateAuthority> store = new InMemoryStorage<>();
         AcmPcaService service = service(store, clock);
@@ -615,7 +616,8 @@ class AcmPcaServiceTest {
                 .put("CertificateChain", Base64.getEncoder().encodeToString(chain.getBytes(StandardCharsets.US_ASCII))),
                 REGION);
         CertificateAuthority before = store.get(ca).orElseThrow();
-        PrivateCaCertificates.KeyMaterial child = PrivateCaCertificates.create(Map.of("CommonName", "Child"));
+        PrivateCaCertificates.KeyMaterial child = PrivateCaCertificates.create(
+                Map.of("CommonName", childRollover ? "Signer" : "Child"));
         ObjectNode request = issueRequest(ca, child.csrPem(), false);
         if (requestedPathLength >= 0) {
             request.put("TemplateArn", "arn:aws:acm-pca:::template/SubordinateCACertificate_PathLen"
@@ -626,6 +628,54 @@ class AcmPcaServiceTest {
             X509Certificate certificate = PrivateCaCertificates.certificate(service.certificate(
                     arn(ca).put("CertificateArn", issued), REGION).path("Certificate").asText());
             assertEquals(requestedPathLength, certificate.getBasicConstraints());
+            assertDoesNotThrow(() -> certificate.verify(signer.getPublicKey()));
+        } else {
+            error("InvalidArgsException", () -> service.issue(request, REGION));
+            assertEquals(before, store.get(ca).orElseThrow(), "Rejected issuance must preserve certificates and tokens");
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"30,10,30,20,false,false", "10,30,30,20,false,false",
+            "30,30,10,20,false,false", "30,10,30,10,false,true",
+            "10,30,30,10,false,true", "30,30,10,10,false,true",
+            "30,10,30,20,true,false", "30,10,30,5,true,true"})
+    void issuanceHonorsEveryIssuerExpiration(int rootDays, int intermediateDays, int signerDays,
+                                            int requestedDays, boolean subordinate, boolean allowed) throws Exception {
+        AdjustableClock clock = new AdjustableClock();
+        InMemoryStorage<String, CertificateAuthority> store = new InMemoryStorage<>();
+        AcmPcaService service = service(store, clock);
+        String ca = service.create(createRequest(null).put("CertificateAuthorityType", "SUBORDINATE"), REGION)
+                .path("CertificateAuthorityArn").asText();
+        CertificateAuthority pending = store.get(ca).orElseThrow();
+        PrivateCaCertificates.KeyMaterial rootKey = PrivateCaCertificates.create(Map.of("CommonName", "Root"));
+        PrivateCaCertificates.KeyMaterial intermediateKey =
+                PrivateCaCertificates.create(Map.of("CommonName", "Intermediate"));
+        Instant start = clock.instant().minusSeconds(60);
+        X509Certificate rootCertificate = PrivateCaCertificates.issue(PrivateCaCertificates.csr(rootKey.csrPem()),
+                rootKey.privateKeyPem(), null, null, start, clock.instant().plus(rootDays, ChronoUnit.DAYS));
+        X509Certificate intermediate = PrivateCaCertificates.issue(PrivateCaCertificates.csr(intermediateKey.csrPem()),
+                rootKey.privateKeyPem(), rootCertificate, 2, start,
+                clock.instant().plus(intermediateDays, ChronoUnit.DAYS));
+        X509Certificate signer = PrivateCaCertificates.issue(PrivateCaCertificates.csr(pending.csrPem()),
+                intermediateKey.privateKeyPem(), intermediate, 1, start,
+                clock.instant().plus(signerDays, ChronoUnit.DAYS));
+        String chain = PrivateCaCertificates.pem(intermediate) + PrivateCaCertificates.pem(rootCertificate);
+        service.importCertificate(importRequest(ca, PrivateCaCertificates.pem(signer))
+                .put("CertificateChain", Base64.getEncoder().encodeToString(chain.getBytes(StandardCharsets.US_ASCII))),
+                REGION);
+        CertificateAuthority before = store.get(ca).orElseThrow();
+        PrivateCaCertificates.KeyMaterial child = PrivateCaCertificates.create(Map.of("CommonName", "Child"));
+        ObjectNode request = issueRequest(ca, child.csrPem(), false);
+        request.putObject("Validity").put("Type", "DAYS").put("Value", requestedDays);
+        if (subordinate) {
+            request.put("TemplateArn", "arn:aws:acm-pca:::template/SubordinateCACertificate_PathLen0/V1");
+        }
+        if (allowed) {
+            String issued = service.issue(request, REGION).path("CertificateArn").asText();
+            X509Certificate certificate = PrivateCaCertificates.certificate(service.certificate(
+                    arn(ca).put("CertificateArn", issued), REGION).path("Certificate").asText());
+            assertEquals(clock.instant().plus(requestedDays, ChronoUnit.DAYS), certificate.getNotAfter().toInstant());
             assertDoesNotThrow(() -> certificate.verify(signer.getPublicKey()));
         } else {
             error("InvalidArgsException", () -> service.issue(request, REGION));
