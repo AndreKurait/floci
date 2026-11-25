@@ -217,6 +217,10 @@ on the listener socket.
 
 ### Health checks
 
+`CreateTargetGroup` and `ModifyTargetGroup` reject `HealthCheckIntervalSeconds` outside
+5 to 300 before changing stored settings or active timers. An omitted interval keeps
+the existing update value.
+
 For non-Lambda targets, the checker probes `HealthCheckPort`, or the target's traffic
 port when configured as `traffic-port`. With `HealthCheckProtocol=TCP` it opens a
 connection and passes once the target accepts it; `HealthCheckPath` and the matcher are
