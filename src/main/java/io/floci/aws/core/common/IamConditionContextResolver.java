@@ -5,6 +5,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import io.floci.aws.config.EmulatorConfig;
+import io.floci.aws.services.cloudfront.CloudFrontFunctionTestRoute;
+import io.floci.aws.services.cloudfront.CloudFrontFunctionTesting;
 import io.floci.aws.services.dynamodb.DynamoDbConditionKeys;
 import io.floci.aws.services.dynamodb.DynamoDbFacade;
 import io.floci.aws.services.dynamodb.DynamoDbPartiQLParser;
@@ -115,13 +117,13 @@ public class IamConditionContextResolver {
     private final EmulatorConfig config;
     private final CurrentVertxRequest currentVertxRequest;
     private final Clock clock;
+    private final Instance<CloudFrontFunctionTesting> cloudFrontFunctionTesting;
     private final ResolvedServiceCatalog serviceCatalog;
 
     /**
      * The system clock, not the CDI one: Object Lock's remaining retention days has to count from the
      * same now as S3Service, which checks retention against {@code Instant.now()}.
      */
-    @Inject
     public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
                                        Instance<Ec2Service> ec2Service,
                                        Instance<S3Service> s3Service,
@@ -139,6 +141,27 @@ public class IamConditionContextResolver {
                 config, currentVertxRequest, serviceCatalog, Clock.systemUTC());
     }
 
+
+    @Inject
+    public IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                       Instance<Ec2Service> ec2Service,
+                                       Instance<S3Service> s3Service,
+                                       Instance<IamService> iamService,
+                                       Instance<LambdaWebService> lambdaWebService,
+                                       Instance<RequestConditionSpelling> requestConditionSpellings,
+                                       Instance<StoredResourceArns> storedResourceArns,
+                                       RequestContext requestContext,
+                                       RegionResolver regionResolver,
+                                       EmulatorConfig config,
+                                       CurrentVertxRequest currentVertxRequest,
+                                       ResolvedServiceCatalog serviceCatalog,
+                                       Instance<CloudFrontFunctionTesting> cloudFrontFunctionTesting) {
+        this(dynamoDbFacade, ec2Service, s3Service, iamService,
+                lambdaWebService, requestConditionSpellings, storedResourceArns, requestContext, regionResolver,
+                config, currentVertxRequest, serviceCatalog, Clock.systemUTC(), cloudFrontFunctionTesting);
+    }
+
+
     IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
                                 Instance<Ec2Service> ec2Service,
                                 Instance<S3Service> s3Service,
@@ -151,6 +174,24 @@ public class IamConditionContextResolver {
                                 EmulatorConfig config,
                                 CurrentVertxRequest currentVertxRequest,
                                 ResolvedServiceCatalog serviceCatalog, Clock clock) {
+        this(dynamoDbFacade, ec2Service, s3Service, iamService,
+                lambdaWebService, requestConditionSpellings, storedResourceArns, requestContext, regionResolver,
+                config, currentVertxRequest, serviceCatalog, clock, null);
+    }
+
+    IamConditionContextResolver(Instance<DynamoDbFacade> dynamoDbFacade,
+                                Instance<Ec2Service> ec2Service,
+                                Instance<S3Service> s3Service,
+                                Instance<IamService> iamService,
+                                Instance<LambdaWebService> lambdaWebService,
+                                Instance<RequestConditionSpelling> requestConditionSpellings,
+                                Instance<StoredResourceArns> storedResourceArns,
+                                RequestContext requestContext,
+                                RegionResolver regionResolver,
+                                EmulatorConfig config,
+                                CurrentVertxRequest currentVertxRequest,
+                                ResolvedServiceCatalog serviceCatalog, Clock clock,
+                                Instance<CloudFrontFunctionTesting> cloudFrontFunctionTesting) {
         this.dynamoDbFacade = dynamoDbFacade;
         this.ec2Service = ec2Service;
         this.s3Service = s3Service;
@@ -164,6 +205,18 @@ public class IamConditionContextResolver {
         this.currentVertxRequest = currentVertxRequest;
         this.clock = clock;
         this.serviceCatalog = serviceCatalog;
+        this.cloudFrontFunctionTesting = cloudFrontFunctionTesting;
+    }
+
+    private Map<String, List<String>> cloudFrontTestConditionContext(String action, ContainerRequestContext ctx) {
+        if (!"cloudfront:TestFunction".equals(action) || cloudFrontFunctionTesting == null
+                || !cloudFrontFunctionTesting.isResolvable()) {
+            return null;
+        }
+        Map<String, List<String>> conditions = new LinkedHashMap<>();
+        cloudFrontFunctionTesting.get().currentTags(CloudFrontFunctionTestRoute.name(ctx))
+                .forEach((key, value) -> conditions.put(RESOURCE_TAG_PREFIX + key, List.of(value)));
+        return conditions.isEmpty() ? null : conditions;
     }
 
     /**
@@ -276,6 +329,8 @@ public class IamConditionContextResolver {
                                              ContainerRequestContext ctx) {
         return switch (credentialScope) {
             case "s3" -> s3ConditionContext(action, ctx);
+            case "cloudfront" -> "cloudfront:TestFunction".equals(action)
+                    ? cloudFrontTestConditionContext(action, ctx) : requestMemberConditions(action, ctx);
             case "ec2" -> ec2ConditionContext(action, ctx);
             case "dynamodb" -> dynamoDbConditionContext(action, ctx);
             case "iam" -> iamConditionContext(action, ctx);

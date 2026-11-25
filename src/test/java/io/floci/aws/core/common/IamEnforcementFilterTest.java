@@ -21,6 +21,8 @@ import io.floci.aws.services.s3.S3ScratchSpace;
 import io.floci.aws.services.s3.S3Service;
 import io.floci.aws.services.scheduler.SchedulerController;
 import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
+import io.vertx.core.http.HttpServerRequest;
+import io.vertx.ext.web.RoutingContext;
 import jakarta.enterprise.inject.Instance;
 import jakarta.ws.rs.container.ContainerRequestContext;
 import jakarta.ws.rs.container.ResourceInfo;
@@ -833,6 +835,34 @@ class IamEnforcementFilterTest {
 
         verify(iamService, times(2)).isExpiredSession("ASIASESSION", moment);
         verify(iamService, times(2)).resolveCallerContext("ASIASESSION", moment);
+    }
+
+    @Test
+    void forwardedStatementsDoNotInheritTheOuterConnectionsTransport() {
+        CurrentVertxRequest current = mock(CurrentVertxRequest.class);
+        RoutingContext routing = mock(RoutingContext.class);
+        HttpServerRequest request = mock(HttpServerRequest.class);
+        when(current.getCurrent()).thenReturn(routing);
+        when(routing.request()).thenReturn(request);
+        when(request.isSSL()).thenReturn(true);
+        requestContext.setAccountId("000000000000");
+        requestContext.setRegion("us-east-1");
+        requestContext.setAccessKeyId("AKIAFORWARDED");
+        when(iamService.resolveCallerContext(eq("AKIAFORWARDED"), any()))
+                .thenReturn(CallerContext.of(List.of()));
+        IamEnforcementFilter filter = newFilter(current);
+
+        assertTrue(filter.statementRefusal("athena:StartQueryExecution", "CREATE DATABASE",
+                Map.of("database", "transport"), false).isEmpty());
+
+        ArgumentCaptor<Map<String, List<String>>> contexts = ArgumentCaptor.captor();
+        verify(evaluator, atLeastOnce()).evaluateResolvedResourcePolicy(any(), any(), any(), any(), any(),
+                contexts.capture());
+        for (Map<String, List<String>> context : contexts.getAllValues()) {
+            assertEquals(List.of("true"), context.get("aws:ViaAWSService"));
+            assertTrue(!context.containsKey("aws:SecureTransport"));
+        }
+        verifyNoInteractions(request);
     }
 
     @Test

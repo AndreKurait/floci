@@ -20,6 +20,8 @@ import java.util.Map;
  * @param memorySwapBytes memory plus swap the container may use, in bytes; equal to the memory
  *        limit means no swap (null = daemon default)
  * @param memorySwappiness swappiness from 0 to 100 (null = daemon default)
+ * @param pidsLimit maximum processes and threads (null = daemon default)
+ * @param noNewPrivileges prevent exec from granting additional privileges
  */
 public record LinuxOptions(
         List<String> capAdd,
@@ -28,8 +30,22 @@ public record LinuxOptions(
         Long shmSizeBytes,
         Map<String, String> tmpfs,
         Long memorySwapBytes,
-        Long memorySwappiness
+        Long memorySwappiness,
+        Long pidsLimit,
+        boolean noNewPrivileges
 ) {
+    public LinuxOptions {
+        if (pidsLimit != null && pidsLimit < 1) {
+            throw new IllegalArgumentException("The PID limit must be positive");
+        }
+    }
+
+    public LinuxOptions(List<String> capAdd, List<String> capDrop, List<Device> devices,
+                        Long shmSizeBytes, Map<String, String> tmpfs, Long memorySwapBytes,
+                        Long memorySwappiness) {
+        this(capAdd, capDrop, devices, shmSizeBytes, tmpfs, memorySwapBytes, memorySwappiness, null, false);
+    }
+
     public static final LinuxOptions NONE =
             new LinuxOptions(List.of(), List.of(), List.of(), null, Map.of(), null, null);
 }

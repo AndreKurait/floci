@@ -3,6 +3,7 @@ package io.floci.aws.core.common;
 import com.fasterxml.jackson.databind.JsonNode;
 import io.floci.aws.config.EmulatorConfig;
 import io.floci.aws.core.common.RequestOperationResolver.ResolvedOperation;
+import io.floci.aws.services.cloudfront.CloudFrontFunctionTestController;
 import io.floci.aws.services.cloudtrail.CloudTrailService;
 import io.floci.aws.services.cloudtrail.S3DataEvents;
 import io.floci.aws.services.cloudwatch.metrics.OtlpMetricsController;
@@ -30,6 +31,7 @@ import io.floci.aws.services.s3.S3ObjectActions;
 import io.floci.aws.services.s3.S3ScratchSpace;
 import io.floci.aws.services.s3.S3Service;
 import io.quarkus.vertx.http.runtime.CurrentVertxRequest;
+import io.vertx.ext.web.RoutingContext;
 import jakarta.enterprise.context.ApplicationScoped;
 import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
@@ -382,6 +384,12 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                     "Request is missing Authentication Token"));
             return;
         }
+        if (auth == null && resourceInfo != null && resourceInfo.getResourceClass() != null
+                && CloudFrontFunctionTestController.class.isAssignableFrom(resourceInfo.getResourceClass())) {
+            ctx.abortWith(AwsQueryResponse.error("MissingAuthenticationToken", MISSING_AUTHENTICATION_TOKEN,
+                    AwsNamespaces.CLOUDFRONT, 403));
+            return;
+        }
         if (auth == null) {
             if (emptyHeader) {
                 // An empty header is not a missing one: "Authorization header cannot be empty" is
@@ -654,7 +662,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
         if ("logs:CreateLogGroup".equals(action) && conditionContext != null
                 && !conditionContext.getOrDefault("aws:TagKeys", List.of()).isEmpty()) {
             String taggingResource = resources.getFirst();
-            Map<String, List<String>> taggingContext = IamConditionContextResolver.withGlobalContext(
+            Map<String, List<String>> taggingContext = withRequestContext(
                     conditionContext, taggingResource, region, accountId, accountId);
             if (evaluator.evaluate(caller, null, "logs:TagResource", taggingResource, taggingContext) == Decision.DENY
                     && evaluator.evaluate(caller, null, "logs:TagLogGroup", taggingResource, taggingContext)
@@ -1005,7 +1013,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
             if (callerArns != null) {
                 callerArns.putPrincipalKeys(context);
             }
-            Map<String, List<String>> effectiveContext = IamConditionContextResolver.withGlobalContext(
+            Map<String, List<String>> effectiveContext = withRequestContext(
                     context, connector, region, accountId, accountId);
             if (evaluator.evaluate(caller, null, action, connector, effectiveContext) != Decision.DENY) {
                 continue;
@@ -1199,6 +1207,28 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                 .orElse(List.of());
     }
 
+    private Map<String, List<String>> withRequestContext(Map<String, List<String>> serviceContext,
+                                                        String resourceArn, String region,
+                                                        String accountId, String resourceOwnerAccountId) {
+        return withRequestContext(serviceContext, resourceArn, region, accountId, resourceOwnerAccountId, null);
+    }
+
+    private Map<String, List<String>> withRequestContext(Map<String, List<String>> serviceContext,
+                                                        String resourceArn, String region,
+                                                        String accountId, String resourceOwnerAccountId, String action) {
+        Map<String, List<String>> context = IamConditionContextResolver.withGlobalContext(
+                serviceContext, resourceArn, region, accountId, resourceOwnerAccountId, action);
+        putRequestTransport(context);
+        return context;
+    }
+
+    private void putRequestTransport(Map<String, List<String>> context) {
+        RoutingContext routingContext = currentVertxRequest == null ? null : currentVertxRequest.getCurrent();
+        if (routingContext != null && routingContext.request() != null) {
+            context.put("aws:SecureTransport", List.of(Boolean.toString(routingContext.request().isSSL())));
+        }
+    }
+
     /**
      * Evaluates one action against every resource and target context, aborting the request with
      * AccessDenied on the first DENY. Returns true when the request was aborted.
@@ -1269,7 +1299,7 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
                         conditionContextResolver.resourceTags(resource));
                 taggedContext = IamConditionContextResolver.withResourceTags(taggedContext,
                         conditionContextResolver.resourceKeys(action, resource));
-                Map<String, List<String>> effectiveContext = IamConditionContextResolver.withGlobalContext(
+                Map<String, List<String>> effectiveContext = withRequestContext(
                         taggedContext, resource, region, accountId, resourceOwnerAccountId, action);
                 ResourcePolicyDecision resourcePolicyDecision = evaluator.evaluateResourcePolicyFor(
                         effectiveResourcePolicies, principal, action, resource, effectiveContext);
@@ -1380,8 +1410,8 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
      * covered by its signed policy document and do not correspond to what {@code S3Controller}
      * actually applies to the uploaded object, so trusting one here would let an attacker satisfy a
      * tag-scoped grant condition with a header the object is never actually tagged with. Only the
-     * caller-identity {@code aws:PrincipalArn} and the server-derived global keys (via {@link
-     * IamConditionContextResolver#withGlobalContext}) are safe to add.
+     * caller-identity {@code aws:PrincipalArn} and the server-derived global keys, including
+     * the connection's TLS state, are safe to add.
      */
     public void authorizeAdditionalResource(
             String authorizationHeader,
@@ -1524,6 +1554,10 @@ public class IamEnforcementFilter implements ContainerRequestFilter {
 
             String region = requestContext.getRegion() == null
                     ? config.defaultRegion() : requestContext.getRegion();
+            if (conditionContext == null) {
+                conditionContext = new HashMap<>();
+            }
+            putRequestTransport(conditionContext);
             Decided decided = decideAs(caller, accountId, region, action, resource, conditionContext,
                     resourcePolicyDecision, resourceOwnerAccountId);
             if (decided.decision() != Decision.DENY) {
