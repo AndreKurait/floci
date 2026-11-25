@@ -87,6 +87,12 @@ class AutoScalingMetricsPublicationIntegrationTest {
                         service.deleteAutoScalingGroup(owner.region, name, false);
                     }
                     assertTrue(service.describeAutoScalingGroups(owner.region, List.of(name)).isEmpty());
+                    if (owner.launchConfigurationCreated) {
+                        service.deleteLaunchConfiguration(owner.region, launchConfigurationName());
+                        assertTrue(service.describeLaunchConfigurations(owner.region,
+                                List.of(launchConfigurationName())).isEmpty());
+                        events.add("verified-owned-launch-configuration-absent:" + owner.account + ":" + owner.region);
+                    }
                     owner.absent = true;
                     events.add("verified-owned-group-absent:" + owner.account + ":" + owner.region);
                 });
@@ -178,19 +184,29 @@ class AutoScalingMetricsPublicationIntegrationTest {
                 CloudWatchClient.builder().region(Region.of(region)).endpointOverride(endpoint)
                         .credentialsProvider(credentials).overrideConfiguration(overrides)
                         .httpClientBuilder(UrlConnectionHttpClient.builder()).build());
-        RequestScopes.runAs(account, region, () ->
-                assertTrue(service.describeAutoScalingGroups(region, List.of(name)).isEmpty()));
+        RequestScopes.runAs(account, region, () -> {
+            assertTrue(service.describeAutoScalingGroups(region, List.of(name)).isEmpty());
+            assertTrue(service.describeLaunchConfigurations(region, List.of(launchConfigurationName())).isEmpty());
+        });
         owners.add(owner);
         events.add("direct-service-create-intent:" + account + ":" + region);
         persist();
         RequestScopes.runAs(account, region, () -> {
-            AutoScalingGroup group = service.createAutoScalingGroup(region, name, "synthetic-zero-capacity-config",
+            service.createLaunchConfiguration(region, launchConfigurationName(), null, "ami-12345678", "t3.micro",
+                    null, List.of(), null, null, false);
+            owner.launchConfigurationCreated = true;
+            events.add("created-owned-launch-configuration:" + account + ":" + region);
+            AutoScalingGroup group = service.createAutoScalingGroup(region, name, launchConfigurationName(),
                     null, null, null, null, 0, maximum, 0, 300, List.of(region + "a"), null, null, null,
                     "EC2", 0, null, Map.of(), Map.of(), null);
             owner.incarnation = group.getMetricsIncarnation();
         });
         persist();
         return owner;
+    }
+
+    private String launchConfigurationName() {
+        return name + "-zero-capacity";
     }
 
     private void assertPoint(Owner owner, double expected) {
@@ -237,6 +253,7 @@ class AutoScalingMetricsPublicationIntegrationTest {
         private final CloudWatchClient cloudWatch;
         private String incarnation;
         private boolean absent;
+        private boolean launchConfigurationCreated;
 
         private Owner(String account, String region, AutoScalingClient asg, CloudWatchClient cloudWatch) {
             this.account = account;
