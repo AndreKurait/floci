@@ -255,6 +255,7 @@ public class AcmService implements ResourceProvider, StoredResourceArns {
         }
         cert.setCertOptions(options != null ? options : CertificateOptions.defaultOptions());
         cert.setCertAuthorityArn(certAuthorityArn);
+        cert.setManagedPrivateAuthority(authority.isPresent());
         cert.setIdempotencyToken(idempotencyToken);
         cert.setTags(tags != null ? new HashMap<>(tags) : new HashMap<>());
 
@@ -788,6 +789,15 @@ public class AcmService implements ResourceProvider, StoredResourceArns {
                 LOG.infov("Certificate {0} not renewed: its private CA is not ACTIVE", certificateArn);
                 return cert;
             }
+            if (authority.isEmpty()
+                    && (cert.isManagedPrivateAuthority()
+                        || !certificateAuthority.isIssuedByUs(Pem.parseCertificate(cert.getCertificateBody())))) {
+                cert.setRenewalStatus("FAILED");
+                cert.setRenewalUpdatedAt(clock.instant());
+                store.put(regionKey(region, cert.extractCertificateId()), cert);
+                LOG.infov("Certificate {0} not renewed: its original private CA is unavailable", certificateArn);
+                return cert;
+            }
             CertificateGenerator.GeneratedCertificate generated = authority.isPresent()
                 ? certificateGenerator.generateIssuedCertificate(cert.getDomainName(), sans, alg, null,
                     authority.get().issuer(), CertificateGenerator.LeafUsage.SERVER, privateNotAfter(authority.get()))
@@ -807,6 +817,7 @@ public class AcmService implements ResourceProvider, StoredResourceArns {
             applyIssuedMaterial(renewed, alg, generated, chainPem);
             renewed.setCertOptions(cert.getCertOptions());
             renewed.setCertAuthorityArn(cert.getCertAuthorityArn());
+            renewed.setManagedPrivateAuthority(cert.isManagedPrivateAuthority() || authority.isPresent());
             renewed.setIdempotencyToken(cert.getIdempotencyToken());
             renewed.setTags(cert.getTags() != null ? new HashMap<>(cert.getTags()) : new HashMap<>());
             renewed.setInUseBy(cert.getInUseBy() != null ? new ArrayList<>(cert.getInUseBy()) : new ArrayList<>());
