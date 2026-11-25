@@ -27,6 +27,7 @@ public class SessionCredential {
     private Instant issuedAt;
     /** Inline session policy passed to AssumeRole/GetFederationToken — further restricts role policies. */
     private String sessionPolicyDocument;
+    private Map<String, List<String>> cognitoIdentityClaims = Map.of();
     /**
      * Account of the caller that minted this session, captured at mint time. Used to route
      * temporary credentials that carry no role ARN (e.g. GetSessionToken) back to the caller. A
@@ -237,5 +238,16 @@ public class SessionCredential {
     public void setTransitiveTagKeys(List<String> transitiveTagKeys) {
         this.transitiveTagKeys = transitiveTagKeys == null
                 ? new ArrayList<>() : new ArrayList<>(transitiveTagKeys);
+    }
+    public Map<String, List<String>> getCognitoIdentityClaims() {
+        return cognitoIdentityClaims;
+    }
+
+    public void setCognitoIdentityClaims(Map<String, List<String>> claims) {
+        Map<String, List<String>> copy = new LinkedHashMap<>();
+        if (claims != null) {
+            claims.forEach((key, value) -> copy.put(key, List.copyOf(value)));
+        }
+        this.cognitoIdentityClaims = Map.copyOf(copy);
     }
 }

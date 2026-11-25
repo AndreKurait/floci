@@ -51,6 +51,7 @@ import io.floci.aws.services.iam.model.ServiceSpecificCredential;
 import io.floci.aws.services.iam.model.SessionCredential;
 import io.floci.aws.services.iam.model.SigningCertificate;
 import io.floci.aws.services.iam.model.SshPublicKey;
+import io.floci.aws.services.iam.model.VerifiedIdentityContext;
 import io.floci.aws.services.iam.model.VirtualMfaDevice;
 import io.quarkus.runtime.Startup;
 import jakarta.annotation.PostConstruct;
@@ -5915,6 +5916,31 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         return session;
     }
 
+    /** Registers a verified Cognito identity with the same real credential and policy path as STS. */
+    public void registerCognitoIdentitySession(String ownerAccountId, String accessKeyId, String secretKey,
+                                               String sessionToken, String roleArn, Instant expiration,
+                                               String policy, String originAccountId, String sessionName,
+                                               String assumedRoleId, Map<String, List<String>> claims) {
+        SessionCredential session = new SessionCredential(accessKeyId, secretKey, sessionToken, roleArn,
+                expiration, policy, originAccountId);
+        session.setRoleSessionName(sessionName);
+        session.setAssumedRoleId(assumedRoleId);
+        session.setCognitoIdentityClaims(claims);
+        putSessionForAccount(ownerAccountId, accessKeyId, session);
+    }
+
+    public Map<String, List<String>> cognitoIdentityContext(String accessKeyId) {
+        if (accessKeyId == null) {
+            return Map.of();
+        }
+        return currentSession(accessKeyId).map(session -> {
+            Map<String, List<String>> context = new LinkedHashMap<>();
+            session.getCognitoIdentityClaims().forEach((key, value) ->
+                    context.put(ServicePrincipals.of("cognito-identity") + ":" + key, value));
+            return Map.copyOf(context);
+        }).orElse(Map.of());
+    }
+
     private void putSessionForAccount(String accountId, String sessionAccessKeyId, SessionCredential session) {
         if (sessions instanceof AccountAwareStorageBackend<SessionCredential> aware) {
             aware.putForAccount(accountId, sessionAccessKeyId, session);
@@ -6478,7 +6504,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             String userName = akOpt.get().getUserName();
             List<String> identityPolicies = userIdentityPolicies(userName);
             String boundaryDoc = resolveUserBoundaryDocument(userName);
-            return new CallerContext(identityPolicies, null, boundaryDoc);
+            return new CallerContext(identityPolicies, null, boundaryDoc)
+                    .withVerifiedIdentityContext(new VerifiedIdentityContext(Map.of()));
         }
 
         // Check assumed-role sessions. These can be stored under the account that minted the
@@ -6491,47 +6518,53 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                 return null; // expired — unknown key → bypass
             }
 
-            if (session.getDelegatedApproverArn() != null) {
-                return delegatedApproverContext(session);
-            }
-            if (isFederatedUserSession(session)) {
-                return withFederatedUserLimits(federatedUserContext(session));
-            }
-            if (session.getRoleArn() == null && session.getPresignedAction() != null) {
-                // A locally minted identity session can carry a restrictive session policy.
-                return session.getSessionPolicyDocument() == null ? null
-                        : new CallerContext(List.of(SCOPED_IDENTITY_SESSION_BASE_POLICY),
-                                session.getSessionPolicyDocument(), null);
-            }
-            if (isSessionTokenSession(session)) {
-                return sessionTokenContext(session);
-            }
-            if (isAccountRootArn(session.getRoleArn())) {
-                // A privileged session (AssumeRoot) acts as the member account's root user, which
-                // no identity policy grants and none denies: collecting role policies for a root
-                // ARN finds none, which would refuse everything. What scopes it is its task
-                // policy, and the five AWS publishes for the purpose carry Deny statements only,
-                // so it is read beside the root's own allow-all rather than as a session policy,
-                // where an intersection with nothing to allow would refuse everything too.
-                return new CallerContext(session.getSessionPolicyDocument() == null
-                        ? List.of(SCOPED_IDENTITY_SESSION_BASE_POLICY)
-                        : List.of(SCOPED_IDENTITY_SESSION_BASE_POLICY, session.getSessionPolicyDocument()),
-                        null, null);
-            }
-            // A session that claimed a delegation request is recorded as its owner under its own
-            // assumed-role ARN, AssociateDelegationRequest storing "the ARN of the current calling
-            // identity", so the owner grant is looked up by that ARN and not by the role's.
-            String sessionAccount = AwsArnUtils.accountOrDefault(session.getRoleArn(),
-                    regionResolver.getAccountId());
-            List<String> identityPolicies = withDelegationOwnerGrant(
-                    collectRolePolicies(session.getRoleArn()), sessionAccount,
-                    assumedRoleSessionArn(session, session.getRoleArn()));
-            String boundaryDoc = resolveRoleBoundaryDocument(session.getRoleArn());
-            return new CallerContext(identityPolicies, session.getSessionPolicyDocument(), boundaryDoc);
+            CallerContext caller = sessionCallerContext(session);
+            return caller == null ? null : caller.withVerifiedIdentityContext(
+                    new VerifiedIdentityContext(session.getCognitoIdentityClaims()));
         }
 
         // Unknown key — bypass
         return null;
+    }
+
+    private CallerContext sessionCallerContext(SessionCredential session) {
+        if (session.getDelegatedApproverArn() != null) {
+            return delegatedApproverContext(session);
+        }
+        if (isFederatedUserSession(session)) {
+            return withFederatedUserLimits(federatedUserContext(session));
+        }
+        if (session.getRoleArn() == null && session.getPresignedAction() != null) {
+            // A locally minted identity session can carry a restrictive session policy.
+            return session.getSessionPolicyDocument() == null ? null
+                    : new CallerContext(List.of(SCOPED_IDENTITY_SESSION_BASE_POLICY),
+                            session.getSessionPolicyDocument(), null);
+        }
+        if (isSessionTokenSession(session)) {
+            return sessionTokenContext(session);
+        }
+        if (isAccountRootArn(session.getRoleArn())) {
+            // A privileged session (AssumeRoot) acts as the member account's root user, which
+            // no identity policy grants and none denies: collecting role policies for a root
+            // ARN finds none, which would refuse everything. What scopes it is its task
+            // policy, and the five AWS publishes for the purpose carry Deny statements only,
+            // so it is read beside the root's own allow-all rather than as a session policy,
+            // where an intersection with nothing to allow would refuse everything too.
+            return new CallerContext(session.getSessionPolicyDocument() == null
+                    ? List.of(SCOPED_IDENTITY_SESSION_BASE_POLICY)
+                    : List.of(SCOPED_IDENTITY_SESSION_BASE_POLICY, session.getSessionPolicyDocument()),
+                    null, null);
+        }
+        // A session that claimed a delegation request is recorded as its owner under its own
+        // assumed-role ARN, AssociateDelegationRequest storing "the ARN of the current calling
+        // identity", so the owner grant is looked up by that ARN and not by the role's.
+        String sessionAccount = AwsArnUtils.accountOrDefault(session.getRoleArn(),
+                regionResolver.getAccountId());
+        List<String> identityPolicies = withDelegationOwnerGrant(
+                collectRolePolicies(session.getRoleArn()), sessionAccount,
+                assumedRoleSessionArn(session, session.getRoleArn()));
+        String boundaryDoc = resolveRoleBoundaryDocument(session.getRoleArn());
+        return new CallerContext(identityPolicies, session.getSessionPolicyDocument(), boundaryDoc);
     }
 
     /**
@@ -6664,7 +6697,16 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
                              String userId, String userName, boolean permissionsBoundary,
                              Map<String, String> principalTags, SessionMfa sessionMfa,
                              PrincipalOrganization.OrganizationContext organization,
-                             Instant tokenIssueTime) {
+                             Instant tokenIssueTime, VerifiedIdentityContext verifiedIdentityContext) {
+
+        /** Source-compatible constructor retaining every existing principal attribute. */
+        public CallerArns(String callerArn, String principalArn, String principalType,
+                          String userId, String userName, boolean permissionsBoundary,
+                          Map<String, String> principalTags, SessionMfa sessionMfa,
+                          PrincipalOrganization.OrganizationContext organization, Instant tokenIssueTime) {
+            this(callerArn, principalArn, principalType, userId, userName, permissionsBoundary,
+                    principalTags, sessionMfa, organization, tokenIssueTime, null);
+        }
 
         public CallerArns {
             principalTags = Map.copyOf(principalTags);
@@ -6704,7 +6746,7 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         /** Copy of this caller with what the session it signed with says about MFA. */
         public CallerArns withSessionMfa(SessionMfa mfa) {
             return new CallerArns(callerArn, principalArn, principalType, userId, userName,
-                    permissionsBoundary, principalTags, mfa, organization, tokenIssueTime);
+                    permissionsBoundary, principalTags, mfa, organization, tokenIssueTime, verifiedIdentityContext);
         }
 
         /**
@@ -6715,13 +6757,18 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
         public CallerArns withOrganization(PrincipalOrganization.OrganizationContext context) {
             return context == null ? this : new CallerArns(callerArn, principalArn, principalType,
                     userId, userName, permissionsBoundary, principalTags, sessionMfa, context,
-                    tokenIssueTime);
+                    tokenIssueTime, verifiedIdentityContext);
         }
 
         /** The same caller, signing with temporary credentials issued at {@code issuedAt}. */
         public CallerArns withTokenIssueTime(Instant issuedAt) {
             return new CallerArns(callerArn, principalArn, principalType, userId, userName,
-                    permissionsBoundary, principalTags, sessionMfa, organization, issuedAt);
+                    permissionsBoundary, principalTags, sessionMfa, organization, issuedAt, verifiedIdentityContext);
+        }
+
+        public CallerArns withVerifiedIdentityContext(VerifiedIdentityContext context) {
+            return new CallerArns(callerArn, principalArn, principalType, userId, userName,
+                    permissionsBoundary, principalTags, sessionMfa, organization, tokenIssueTime, context);
         }
 
         /** A caller without stored principal tags, including account-root and federated identities. */
@@ -6807,6 +6854,11 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             }
             if (tokenIssueTime != null) {
                 context.put("aws:TokenIssueTime", List.of(tokenIssueTime.toString()));
+            }
+            if (verifiedIdentityContext != null) {
+                Map<String, List<String>> verified = verifiedIdentityContext.mergeInto(context);
+                context.clear();
+                context.putAll(verified);
             }
         }
 
@@ -6914,7 +6966,8 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
 
         Optional<AccessKey> akOpt = accessKeys.get(accessKeyId);
         if (akOpt.isPresent()) {
-            return users.get(akOpt.get().getUserName()).map(IamService::callerForUser);
+            return users.get(akOpt.get().getUserName()).map(IamService::callerForUser)
+                    .map(arns -> arns.withVerifiedIdentityContext(new VerifiedIdentityContext(Map.of())));
         }
 
         Optional<SessionCredential> sessionOpt = findSessionForCallerContext(accessKeyId);
@@ -6929,11 +6982,13 @@ public class IamService implements SessionAccountLookup, ResourceProvider {
             // instead of at each of the identities below.
             CallerArns.SessionMfa mfa = sessionMfa(session);
             return callerForSession(session)
-                    .map(caller -> caller.withSessionMfa(mfa).withTokenIssueTime(session.getIssuedAt()));
+                    .map(caller -> caller.withSessionMfa(mfa).withTokenIssueTime(session.getIssuedAt())
+                            .withVerifiedIdentityContext(new VerifiedIdentityContext(session.getCognitoIdentityClaims())));
         }
 
         return Optional.empty();
     }
+
 
     /**
      * What the identity behind a session's credentials says about MFA, or null when the session

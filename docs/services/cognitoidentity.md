@@ -4,8 +4,8 @@
 **Endpoint:** `http://localhost:4566/` (SigV4 service `cognito-identity`)
 
 Cognito Identity is the federated identity pool API, distinct from the Cognito user pool
-API (`cognito-idp`, documented in [Cognito](cognito.md)). Floci emulates the identity pool
-management plane; the identity and credential-vending data plane is not emulated.
+API (`cognito-idp`, documented in [Cognito](cognito.md)). Floci supports identity pool management, guest identities, developer identity links,
+and enhanced or classic credential flows backed by real IAM role sessions.
 
 ## Supported Actions
 
@@ -24,6 +24,15 @@ management plane; the identity and credential-vending data plane is not emulated
 | `ListTagsForResource` | List a pool's tags |
 | `SetPrincipalTagAttributeMap` | Map principal tags to user attributes for one provider |
 | `GetPrincipalTagAttributeMap` | Read a provider's principal tag attribute map |
+| `GetId` | Create an unauthenticated identity in an enabled pool |
+| `DescribeIdentity` | Read identity dates and provider names |
+| `ListIdentities` | Page through identities, optionally hiding disabled identities |
+| `DeleteIdentities` | Delete owned identities |
+| `GetOpenIdToken` | Issue a signed guest token for an enabled classic flow |
+| `GetOpenIdTokenForDeveloperIdentity` | Link developer users and issue a signed identity token |
+| `GetCredentialsForIdentity` | Exchange a guest identity or signed developer token for a scoped role session |
+| `LookupDeveloperIdentity` | Resolve an identity or page its developer user identifiers |
+| `UnlinkDeveloperIdentity` | Remove a developer user link and disable access after its last link |
 <!-- floci:actions:end -->
 
 Pool ids use the AWS `<region>:<uuid>` format (`us-east-1:0f4a...`), and pool ARNs the
@@ -43,19 +52,40 @@ visible on the next `DescribeIdentityPool` and vice versa.
 `SetIdentityPoolRoles` has run, never as null, so a provider read that dereferences them
 does not crash.
 
-## Not implemented
+## Identity and credential flows
 
-The identity and credential-vending operations are absent and return
-`UnknownOperationException`:
+Guest `GetId`, `GetOpenIdToken`, and `GetCredentialsForIdentity` use the identity's regional
+pool and owner. Administrative identity operations require the owning account and request
+region. Developer token requests accept exactly the pool's configured developer provider.
+The enhanced flow accepts that signed token under its exact `iss` value in `Logins`.
 
-`GetId`, `GetCredentialsForIdentity`, `GetOpenIdToken`, `GetOpenIdTokenForDeveloperIdentity`,
-`DescribeIdentity`, `ListIdentities`, `DeleteIdentities`, `UnlinkIdentity`,
-`UnlinkDeveloperIdentity`, `LookupDeveloperIdentity`, `MergeDeveloperIdentities`.
+Identity tokens use persisted per-pool RSA signing keys and RS512 signatures. Their issuer,
+audience, subject, authentication methods, and validity window are verified before role
+exchange, including when IAM enforcement is disabled. Older commercial regions use the
+global Cognito identity issuer; other regions use their regional issuer and partition DNS
+suffix. This is separate from the existing RS256 EKS web identity path.
 
-These mint real STS session credentials and signed OIDC tokens against a pool's configured
-providers. An identity id handed out by `GetId` is only usable as input to
-`GetCredentialsForIdentity` or `GetOpenIdToken`, so serving it alone would move the failure
-one call later instead of removing it.
+Role exchange evaluates the real role trust policy, including pool audience and authentication
+method conditions. Enhanced roles must belong to the pool's account and partition. Classic
+cross-account roles must constrain the pool audience. Returned credentials are registered IAM
+sessions with expiration, session-token authentication, role policies, and Cognito condition
+context. Enhanced guest permissions are restricted to the combined documented inline and
+managed guest policy allow sets, intersected with role permissions. Enhanced sessions cannot
+call identity-pool or Cognito Sync APIs. Classic sessions retain role grants and any requested
+inline session-policy restriction.
+
+Identity records, developer links, and signing keys persist through storage reloads. Removing
+the last developer link disables new public token and credential access; it never turns an
+authenticated identity into a guest. It does not revoke already issued IAM sessions.
+
+## Limitations
+
+External identity-provider token validation and linking, `UnlinkIdentity`, and
+`MergeDeveloperIdentities` are not implemented. `GetId` and `GetOpenIdToken` currently support
+guests without `Logins`; authenticated access uses developer-issued tokens. Requests with
+active role mappings, principal-tag mappings, requested `PrincipalTags`, or `CustomRoleArn`
+are refused instead of silently selecting a default role. Classic exchange does not accept
+managed session-policy ARNs. These limits also apply when IAM enforcement is disabled.
 
 ## Configuration
 

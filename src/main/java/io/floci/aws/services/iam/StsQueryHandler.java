@@ -22,12 +22,14 @@ import io.floci.aws.core.common.WebIdentityToken;
 import io.floci.aws.core.common.WebIdentityTokenVerifier;
 import io.floci.aws.core.common.XmlBuilder;
 import io.floci.aws.services.apigatewayv2.JwtSignatureVerifier;
+import io.floci.aws.services.cognitoidentity.CognitoIdentityCredentials;
 import io.floci.aws.services.iam.model.DelegationRequest;
 import io.floci.aws.services.iam.model.IamPolicy;
 import io.floci.aws.services.iam.model.IamRole;
 import io.floci.aws.services.iam.model.OpenIDConnectProvider;
 import io.floci.aws.services.iam.model.OutboundWebIdentityFederation;
 import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.enterprise.inject.Instance;
 import jakarta.inject.Inject;
 import jakarta.ws.rs.core.Context;
 import jakarta.ws.rs.core.HttpHeaders;
@@ -92,6 +94,9 @@ public class StsQueryHandler {
 
     /** CSPRNG for session secret keys and session tokens; ordinary IDs keep using {@link ThreadLocalRandom}. */
     private final SecureRandom secureRandom = new SecureRandom();
+
+    @Inject
+    Instance<CognitoIdentityCredentials> cognitoIdentities;
 
     @Context
     HttpHeaders headers;
@@ -704,6 +709,28 @@ public class StsQueryHandler {
         String callerAccountId = regionResolver.getAccountId();
         String accountId = AwsArnUtils.accountOrDefault(roleArn, callerAccountId);
 
+        if (cognitoIdentities != null && cognitoIdentities.isResolvable()
+                && cognitoIdentities.get().recognizes(webIdentityToken, roleArn)) {
+            if (params.keySet().stream().anyMatch(key -> key.startsWith("PolicyArns."))) {
+                return AwsQueryResponse.error("ValidationError",
+                        "Managed session-policy ARNs are not supported for Cognito token exchange.", AwsNamespaces.STS, 400);
+            }
+            try {
+                CognitoIdentityCredentials.Credentials issued = cognitoIdentities.get().assumeRole(
+                        webIdentityToken, roleArn, sessionName, durationSeconds, getParam(params, "Policy"),
+                        getIntParam(params, "MinimumSessionTokenSize", 0));
+                String result = new XmlBuilder()
+                        .raw(credentialsXml(issued.accessKeyId(), issued.secretKey(), issued.sessionToken(), issued.expiration()))
+                        .start("AssumedRoleUser").elem("Arn", issued.assumedRoleArn())
+                        .elem("AssumedRoleId", issued.assumedRoleId()).end("AssumedRoleUser")
+                        .elem("PackedPolicySize", "0").elem("Provider", issued.issuer())
+                        .elem("Audience", issued.audience()).elem("SubjectFromWebIdentityToken", issued.identityId()).build();
+                return Response.ok(AwsQueryResponse.envelope("AssumeRoleWithWebIdentity", AwsNamespaces.STS, result)).build();
+            } catch (AwsException e) {
+                return AwsQueryResponse.error(e.getErrorCode(), e.getMessage(), AwsNamespaces.STS, e.getHttpStatus());
+            }
+        }
+
         WebIdentityOutcome outcome = verifyWebIdentityToken(webIdentityToken, roleName, accountId, roleArn,
                 sessionName);
         if (outcome.denial() != null) {
@@ -807,6 +834,8 @@ public class StsQueryHandler {
             return new WebIdentityOutcome(null, null, denial);
         }
     }
+
+
 
     /**
      * Inspects {@code token} and decides whether it may assume {@code roleArn} as the session
